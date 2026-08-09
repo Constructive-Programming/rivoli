@@ -288,7 +288,7 @@ fn fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses(
 // softmax folds in. No test in this file exercises one line of sparse selection, and none
 // is named as though it did.
 
-use rivoli::v4compress::LayerKind;
+use rivoli::kvcompress::LayerKind;
 use rivoli::v4oracle::forward::compress_topk;
 use rivoli::v4oracle::weights::V4Config as OracleCfg;
 

@@ -1,6 +1,6 @@
 //! The V4 layer loop, scored against `bin/v4-oracle`'s **real-weight** per-layer goldens.
 //!
-//! This is the gate. `src/v4gpu.rs`'s own `mod tests` covers the placement and fill rules the
+//! This is the gate. `src/f4gpu.rs`'s own `mod tests` covers the placement and fill rules the
 //! port has measured to be invisible to any numeric comparison; this file covers the arithmetic,
 //! at real dims, against the reference — and it is the first thing in this port to score the
 //! whole of `Block.forward` (hyper-connections, attention, router, MoE) rather than attention
@@ -80,7 +80,7 @@
 //!
 //! # CORRECTED 2026-08-05 — the attention half is bisected, and `attn_out` cannot carry the reading put on it
 //!
-//! `V4Engine::probe_attn_stages` reads `q`, `kv_entry`, `attn_derot` and `attn_out` out of the
+//! `F4Engine::probe_attn_stages` reads `q`, `kv_entry`, `attn_derot` and `attn_out` out of the
 //! scratch buffers ONE `attention` call leaves them in, so the attention half is bisected at four
 //! points instead of bounded at one. Three of those four are new here; `attn_out` replaces the
 //! single-tensor probe this file used before.
@@ -307,7 +307,7 @@
 //!   class, not the act_quant family that lives on that tensor. The full table is in that
 //!   doc.
 
-// `rocm`: `v4gpu` is `rocm`-gated because every launcher it drives is `backend::hip`'s, and
+// `rocm`: `f4gpu` is `rocm`-gated because every launcher it drives is `backend::hip`'s, and
 // since 2026-08-06 that is the only backend. The rule this cites — do not add stubs that
 // claim a parity nothing measured — is worth stating directly whatever enforces it. It
 // briefly had no enforcer at all: `tests/kernel_coverage.rs` went with the Vulkan backend on
@@ -317,9 +317,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 use rivoli::artifact::model::{V4Config, load_config};
+use rivoli::f4gpu::F4Engine;
 use rivoli::math::f32_to_bf16;
-use rivoli::memory::pin::V4Pin;
-use rivoli::v4gpu::V4Engine;
+use rivoli::memory::pin::F4Pin;
 use rivoli::v4oracle::golden::GoldenSet;
 
 #[path = "common/v4_artifact_dir.rs"]
@@ -644,10 +644,10 @@ fn open_goldens() -> Option<GoldenSet> {
 
 /// **Criterion 5, and it has no other test anywhere.**
 ///
-/// `V4Pin::build` deliberately does NOT refuse an artifact that starts past layer 0 — which
+/// `F4Pin::build` deliberately does NOT refuse an artifact that starts past layer 0 — which
 /// layers a file holds is a property of the loader, and refusing it there made every partial
 /// artifact but the first unloadable. A DECODE is the thing that cannot start at layer 3, because
-/// there is no residual stream to enter the model with. `V4Pin::layer` takes ABSOLUTE ids, so a
+/// there is no residual stream to enter the model with. `F4Pin::layer` takes ABSOLUTE ids, so a
 /// pin over 3..6 answers every lookup correctly and the arithmetic is a different model's, with
 /// nothing anywhere to notice.
 ///
@@ -657,17 +657,17 @@ fn a_pin_that_does_not_start_at_layer_zero_cannot_decode() -> bool {
         return false;
     };
     let cfg: V4Config = load_config(&dir).expect("l3-5 config");
-    let pin = V4Pin::build(&dir, &cfg, CAPACITY, "2q", Default::default(), None)
+    let pin = F4Pin::build(&dir, &cfg, CAPACITY, "2q", Default::default(), None)
         .expect("the LOADER must accept a partial artifact — that is the whole point of the split");
     assert_eq!(
         pin.range(),
         3..6,
         "the fixture whose range does not start at 0"
     );
-    // `map(|_| ())` because `V4Engine` is not `Debug` and `expect_err` wants it to be. Turning
+    // `map(|_| ())` because `F4Engine` is not `Debug` and `expect_err` wants it to be. Turning
     // the Ok side into `()` is the narrow fix; deriving `Debug` on an engine holding 30 raw
     // device pointers would print addresses and imply they were inspectable.
-    let err = V4Engine::new(pin, cfg, 8, 4)
+    let err = F4Engine::new(pin, cfg, 8, 4)
         .map(|_| ())
         .expect_err("a decode must refuse a pin that starts at layer 3")
         .to_string();
@@ -680,11 +680,11 @@ fn a_pin_that_does_not_start_at_layer_zero_cannot_decode() -> bool {
 
 /// The context ceiling, refused at startup rather than 41 layers into some later token.
 fn a_context_past_the_indexers_reach_is_refused_at_startup(dir: &str, cfg: &V4Config) {
-    let pin = V4Pin::build(dir, cfg, CAPACITY, "2q", Default::default(), None).expect("pin");
+    let pin = F4Pin::build(dir, cfg, CAPACITY, "2q", Default::default(), None).expect("pin");
     // 2052 at the shipped `index_topk = 512`. `prompt + ngen + 1` is the context, so this asks
     // for exactly one position too many.
     let over = 4 * (cfg.index_topk + 1);
-    let err = V4Engine::new(pin, cfg.clone(), 8, over)
+    let err = F4Engine::new(pin, cfg.clone(), 8, over)
         .map(|_| ())
         .expect_err("a context past the positional selection's reach must be refused")
         .to_string();
@@ -719,7 +719,7 @@ fn every_layer_matches_the_oracle_at_real_weights(
         meta(gs, "model")
     );
 
-    let pin = V4Pin::build(dir, cfg, CAPACITY, "2q", Default::default(), None).expect("pin");
+    let pin = F4Pin::build(dir, cfg, CAPACITY, "2q", Default::default(), None).expect("pin");
     // The oversubscription this test's value depends on, asserted rather than assumed.
     let routed = (pin.range().len() * cfg.n_experts) as u64
         * rivoli::artifact::quant::f4_expert_stride(cfg.hidden, cfg.moe_inter) as u64;
@@ -732,7 +732,7 @@ fn every_layer_matches_the_oracle_at_real_weights(
     // Read off the PIN, before it is moved into the engine — the engine needs no accessor for
     // something its caller already had.
     let held = pin.range();
-    let mut e = V4Engine::new(pin, cfg.clone(), ids.len(), steps + 1).expect("engine");
+    let mut e = F4Engine::new(pin, cfg.clone(), ids.len(), steps + 1).expect("engine");
     // Only the layers the goldens cover AND the pin holds, and only the ratio-0 ones — see the
     // header on why layer 2 is uninterpretable.
     let scored: Vec<usize> = (0..layers)
@@ -921,7 +921,7 @@ fn every_layer_matches_the_oracle_at_real_weights(
 
 /// **ONE `#[test]`, and that is not tidiness.**
 ///
-/// libtest runs `#[test]` fns on parallel threads, and each case here builds a `V4Pin` — a
+/// libtest runs `#[test]` fns on parallel threads, and each case here builds a `F4Pin` — a
 /// `DeviceTier` allocation, a pool VMM and an io_uring ring. Run in parallel on 2026-08-05 that
 /// **wedged the device**: 19 threads, four `io_sq_thread`s (the tell — four rings means four
 /// pools), zero output in 12 minutes, killed by PID. `--test-threads=1` fixes it and is the wrong

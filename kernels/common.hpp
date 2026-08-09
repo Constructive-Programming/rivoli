@@ -558,7 +558,7 @@ __device__ __forceinline__ float e2m1f(unsigned int nib) {
 // finite ±2^14 (`fminf`/`fmaxf` return the non-NaN operand). So a 0xff scale byte must be
 // REJECTED AT LOAD, in S3, alongside the `tid2eid` range check that `parse_tid2eid`
 // performs host-side. (That obligation used to be stated at `moe.hip::moe_gate_v4` too;
-// the device router was DELETED 2026-08-09 — `v4gpu.rs::route_row` carries why — so this
+// the device router was DELETED 2026-08-09 — `f4gpu.rs::route_row` carries why — so this
 // is now the only place in `kernels/` that names it, which is the reason to keep it here
 // rather than fold it into the deleted kernel's note.)
 // b == 0 is 2^-127, which is BELOW f32's smallest normal, so `b << 23` would silently hand

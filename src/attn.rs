@@ -8,7 +8,7 @@
 //! free functions above it — see the banner below `streaming_rows`. V4 is MQA and shares
 //! none of the MLA machinery, so nothing before that banner applies to it.
 
-use crate::v4compress::LayerKind;
+use crate::kvcompress::LayerKind;
 use anyhow::{Result, bail, ensure};
 
 /// Which tokens each decode step attends over. Selected once per layer per token.
@@ -126,7 +126,7 @@ pub struct Sel {
     pub win: usize,
     /// The layer class. [`LayerKind`], not a `usize` ratio, and that is not style: every
     /// path below divides by the ratio, and `LayerKind::Plain` — which has no compressor —
-    /// would hand back the 0 that turns the division into a panic. `v4compress` carries
+    /// would hand back the 0 that turns the division into a panic. `kvcompress` carries
     /// the same argument at its own `compress_topk`.
     pub kind: LayerKind,
     /// `index_topk` from the config (512). Read only on a layer that `has_indexer`, where
@@ -143,7 +143,7 @@ impl Sel {
     /// The `(rows, cols)` a buffer for this selection must hold.
     ///
     /// Fallible for the reason [`v4_topk_idxs`] is, and derived from the same two
-    /// `v4compress` functions the fill uses, so `attention` can check a caller's uploaded
+    /// `kvcompress` functions the fill uses, so `attention` can check a caller's uploaded
     /// shape without building the selection twice.
     pub fn shape(&self) -> Result<(usize, usize)> {
         if self.win == 0 {
@@ -196,7 +196,7 @@ impl Sel {
 ///
 /// Appends `rows * cols` entries to `out` and returns `(rows, cols)`; `-1` masks a slot.
 ///
-/// **This function ports nothing.** Both halves are [`crate::v4compress`]'s — a review
+/// **This function ports nothing.** Both halves are [`crate::kvcompress`]'s — a review
 /// found this file had re-derived `window_topk`, `compress_topk`, `compress_offset` and
 /// `should_compress` alongside that module's existing ports of the same four reference
 /// functions, with different spellings, so jscpd could not see it. The values agreed; they
@@ -206,8 +206,8 @@ impl Sel {
 /// **The two phases index DIFFERENT spaces.** At prefill the window columns are absolute
 /// positions `0..seqlen` and the compressed ones continue from `seqlen`; at decode they are
 /// ring SLOTS `0..window_size` and the compressed ones continue from `window_size`.
-/// `v4compress::compress_offset` owns that split; the write-side half belongs to whoever
-/// places the compressor's output, which is `v4compress::compress`'s caller.
+/// `kvcompress::compress_offset` owns that split; the write-side half belongs to whoever
+/// places the compressor's output, which is `kvcompress::compress`'s caller.
 ///
 /// **This is the POSITIONAL compressed selection.** For a ratio-128 layer that is the whole
 /// story — the reference has no `Indexer` there. For a ratio-4 layer it stands in for
@@ -222,7 +222,7 @@ pub fn v4_topk_idxs(sel: Sel, out: &mut Vec<i32>) -> Result<(usize, usize)> {
     // against `out.len()` outright.
     let start = out.len();
     let (rows, cols) = sel.shape()?;
-    let win = crate::v4compress::window_topk(sel.win, sel.seqlen, sel.start_pos);
+    let win = crate::kvcompress::window_topk(sel.win, sel.seqlen, sel.start_pos);
     // The window columns `window_topk` actually produced; `n_comp` is the rest of `cols`.
     // Derived from the fill rather than re-running `Sel::n_comp` — which `shape()` has
     // already called, so a second call could only return the same value or diverge.
@@ -230,8 +230,8 @@ pub fn v4_topk_idxs(sel: Sel, out: &mut Vec<i32>) -> Result<(usize, usize)> {
     let comp = if n_comp == 0 {
         Vec::new()
     } else {
-        let offset = crate::v4compress::compress_offset(sel.win, sel.seqlen, sel.start_pos);
-        crate::v4compress::compress_topk(sel.kind, sel.seqlen, sel.start_pos, offset)
+        let offset = crate::kvcompress::compress_offset(sel.win, sel.seqlen, sel.start_pos);
+        crate::kvcompress::compress_topk(sel.kind, sel.seqlen, sel.start_pos, offset)
     };
     for (t, w) in win.iter().enumerate() {
         out.extend_from_slice(w);
@@ -375,11 +375,11 @@ pub mod v4 {
 
     /// The two intra-attention split marks (M6) — [`attention`] records each on `stream`
     /// at a fixed point in its launch sequence, and the CALLER reads the spans at a join
-    /// it already pays (`v4gpu`'s gate-logits D2H), so this adds no sync, event wait, or
+    /// it already pays (`f4gpu`'s gate-logits D2H), so this adds no sync, event wait, or
     /// join. `Option`al because the probe/test callers have no profile to feed; `None`
     /// records nothing and is bit-identical to the pre-M6 call.
     ///
-    /// The two marks cut the call's 2→3 route-split span (`v4gpu::V4Profile`'s `attn_ns`)
+    /// The two marks cut the call's 2→3 route-split span (`f4gpu::Profile`'s `attn_ns`)
     /// into three, tiled by construction — each sub-span shares an endpoint with the
     /// next, so their sum IS the whole span up to per-query float rounding:
     ///
@@ -448,7 +448,7 @@ pub mod v4 {
         pub wo_b: Fp8W,
         /// The M10 width fusion: `wkv` and `wq_a` as ONE `[head_dim + q_lora_rank, dim]`
         /// weight — `wkv`'s rows FIRST, then `wq_a`'s, both weight bytes and 128×128
-        /// scale grids concatenated row-wise (`V4Pin` builds it at load; the seam is
+        /// scale grids concatenated row-wise (`F4Pin` builds it at load; the seam is
         /// scale-exact because `head_dim` is a 128-multiple, which the pin checks).
         ///
         /// `Some` ⇒ decode replaces the two grid-starved GEMVs (M8: 512 and 1024 waves
@@ -484,7 +484,7 @@ pub mod v4 {
         /// How many query rows every buffer below is sized for, checked against the `m`
         /// the step implies. The failure it catches is REUSE — allocate once at `max_m`,
         /// then hand a `Prefill` to a decode-sized scratch. Same hazard and same fix as
-        /// `v4compress::Buffers::scratch_rows`, which cites this struct for its reason.
+        /// `kvcompress::Buffers::scratch_rows`, which cites this struct for its reason.
         pub rows: usize,
         /// `[m, dim]` — the activation-quantized copy of `x`.
         pub xq: *mut f32,
@@ -500,7 +500,7 @@ pub mod v4 {
         /// compressed one**, because at prefill `sparse_attn` reads
         /// `torch.cat([kv, kv_compress], dim=1)` and the selection indexes that
         /// concatenation as one space. The compressor writes the tail, at
-        /// `v4compress::compress`. Nothing here can check it — see [`Scratch::rows`].
+        /// `kvcompress::compress`. Nothing here can check it — see [`Scratch::rows`].
         /// **And at least `head_dim + q_lora_rank` floats when the caller passes
         /// [`Weights::wqkv`]**: a fused decode writes its whole `[wkv ‖ wq_a]` output
         /// row here — KV entry at the base, exactly where the unfused path puts it, q
@@ -523,7 +523,7 @@ pub mod v4 {
         pub x: *const f32,
         /// Interleaved `(cos, sin)` for THIS layer's class.
         ///
-        /// **Build it as `v4compress::freqs_cis(rope_for_layer(compressed, rope_theta,
+        /// **Build it as `kvcompress::freqs_cis(rope_for_layer(compressed, rope_theta,
         /// kind), ..)`, with the same `kind` this call gets.** A ratio-0 layer uses
         /// `rope_theta = 10000` with YaRN off; every compressed layer uses
         /// `compress_rope_theta = 160000` with it. The two tables have the same type,
@@ -794,7 +794,7 @@ pub mod v4 {
     ///   `seqlen + n_comp` at prefill and `window + n_comp` at decode — NOT `seqlen` and
     ///   `window`, which is what it was before compressed columns existed: the compressed
     ///   selection legitimately names rows past the window region, which is the whole
-    ///   point of `v4compress::compress_offset`. The shape is checked below; the VALUES
+    ///   point of `kvcompress::compress_offset`. The shape is checked below; the VALUES
     ///   are not and cannot be cheaply, which is the cost of letting the caller own the
     ///   selection buffer.
     /// - **On a compressed layer the compressor must already have run for this same
@@ -1007,7 +1007,7 @@ pub mod v4 {
         // `Compressor.forward` does two writes — `self.kv_cache[:, :seqlen//ratio]` AND the
         // return value `Attention.forward` concatenates — and doing only the second here
         // meant reaching into `s.kv`'s tail for rows this function never wrote. The
-        // obligation is on `v4compress::compress`'s doc, where its reader is.
+        // obligation is on `kvcompress::compress`'s doc, where its reader is.
         //
         // `Finish` has ONE `out`, so the second destination is a device COPY after a single
         // `compress` call, never a second call: `compress` read-modify-writes
@@ -1094,7 +1094,7 @@ mod v4_guard_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::Sel;
     use super::v4::{Dims, Fp8W, Io, Pass, Scratch, Weights, attention};
-    use crate::v4compress::LayerKind;
+    use crate::kvcompress::LayerKind;
 
     /// The shipped V4 geometry, so a rejection below is about the guard and not about a
     /// shape the kernels would refuse anyway.

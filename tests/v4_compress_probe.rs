@@ -28,7 +28,7 @@
 //! reads 167 GB of index metadata, so it must not be a hard failure on a machine without it.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rivoli::v4compress::{LayerKind, compress_offset, compress_topk};
+use rivoli::kvcompress::{LayerKind, compress_offset, compress_topk};
 use rivoli::v4oracle::forward::{Counters, Defect, LayerCtx, LayerW, Oracle};
 use rivoli::v4oracle::weights::{V4Config, WMat};
 use std::collections::HashMap;
@@ -259,7 +259,7 @@ fn ratio_128_decode_completes_exactly_one_block_at_start_pos_127() {
 /// the oracle's own copy now that it is public.
 ///
 /// Note what this is and is not: the two implementations are not independent derivations
-/// (`src/v4compress.rs`'s `jscpd:ignore` region states why), so agreement here is a **drift
+/// (`src/kvcompress.rs`'s `jscpd:ignore` region states why), so agreement here is a **drift
 /// tripwire**. The non-vacuity half is the part that closes the hole.
 #[test]
 fn ratio_128_selection_is_vacuous_at_the_emit_prompt_and_discriminating_at_the_probe() {

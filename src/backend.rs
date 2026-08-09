@@ -78,7 +78,7 @@ pub use crate::backend::hip::*;
 /// and a default, and the launchers' own `# Safety` blocks now distinguish the two.
 ///
 /// It also removes a token-level hazard that is not hypothetical: merging the layer-loop and
-/// stream branches produced a jscpd clone between `gpu.rs` and `v4gpu.rs` that was **not in
+/// stream branches produced a jscpd clone between `gpu.rs` and `f4gpu.rs` that was **not in
 /// either branch alone** — two unrelated call sites whose multi-line argument lists happened
 /// to end in the same `null_mut(), )?; }` sequence, 24 tokens. `kernels/` is outside jscpd
 /// and `git` saw no conflict, so the build script was the only thing that could catch it.

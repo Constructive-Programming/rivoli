@@ -71,9 +71,9 @@ pub fn load_corpus(path: &str, tok: &crate::artifact::tokenizer::Tokenizer) -> R
 }
 
 /// Per-position record/force/score state for ONE armed instrument — shared by BOTH
-/// engines' decode hooks (`GpuEngine`'s and `V4Engine`'s `trace_step`/`next_token`), which
+/// engines' decode hooks (`GpuEngine`'s and `F4Engine`'s `trace_step`/`next_token`), which
 /// is the point: the forcing rule, the dump byte format, and the NLL accumulation live
-/// here exactly once, so the two engines cannot drift on any of them. Lived in `v4gpu.rs`
+/// here exactly once, so the two engines cannot drift on any of them. Lived in `f4gpu.rs`
 /// until 2026-08-08, when GLM gained the same instruments.
 ///
 /// Two constructors, two instruments:
@@ -285,15 +285,15 @@ pub fn run(
 }
 
 /// The V4 twin of [`run`] — same tail ([`finish`]), a different scorer:
-/// [`crate::v4gpu::V4Engine::nll_forced`] reuses `generate`'s free-run loop and its existing
+/// [`crate::f4gpu::F4Engine::nll_forced`] reuses `generate`'s free-run loop and its existing
 /// force hook rather than a second bespoke forward loop (V4's `forward` only ever produces
 /// logits for the LAST row it is given, so there is no per-token forward to duplicate
 /// outside `generate`'s own decode arm — see that method's doc). `on_tok` is threaded
 /// through rather than read off `self.heartbeat` the way GLM's [`crate::gpu::GpuEngine`]
-/// does, because `V4Engine` has no heartbeat field of its own — its callers beat the
+/// does, because `F4Engine` has no heartbeat field of its own — its callers beat the
 /// watchdog from `generate`'s callback instead.
 pub fn run_v4(
-    engine: &mut crate::v4gpu::V4Engine,
+    engine: &mut crate::f4gpu::F4Engine,
     ids: &[u32],
     out: Option<&String>,
     label: &str,
@@ -359,7 +359,7 @@ mod tests {
     }
 
     /// The toy-row check the brief asks for: a hand-computed softmax over 4 logits, scored
-    /// against each possible target. This is exactly the computation `V4Engine::trace_step`
+    /// against each possible target. This is exactly the computation `F4Engine::trace_step`
     /// now also drives — `nll_of` itself is untouched, but nothing in this repo pinned its
     /// output against arithmetic worked out by hand before today.
     #[test]

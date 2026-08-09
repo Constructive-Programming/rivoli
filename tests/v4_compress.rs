@@ -15,7 +15,7 @@
 //!    the test fails the day someone lengthens the emit prompt and the hole closes — which
 //!    is exactly when the report needs rewriting.
 
-use rivoli::v4compress::{
+use rivoli::kvcompress::{
     LayerKind, RopeParams, compress_dst, compress_offset, compress_topk, freqs_cis, rope_for_layer,
     should_compress, window_topk,
 };

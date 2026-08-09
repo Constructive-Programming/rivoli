@@ -9,7 +9,7 @@
 // compressor's pooled rows (:374-376) — and the oracle factors them into one helper
 // (`indexer_spread`) with the argument that "the Hadamard spread exists to make the fp4
 // grouping well-conditioned, so applying one without the other is a different algorithm,
-// not a partial one". `act_quant_f4_rotated` is that helper. `v4compress.rs::compress`
+// not a partial one". `act_quant_f4_rotated` is that helper. `kvcompress.rs::compress`
 // launches it as the compressor's finish when `Geom::indexer` built the geometry, and
 // `Geom::attention` cannot reach it.
 //
@@ -220,9 +220,9 @@ extern "C" __global__ void act_quant_f4_rotated(float* __restrict__ x, int d) {
 // Hadamard is pure adds and subtracts, and the fp4 scale is a single multiply), so widening
 // the pragma would suppress nothing and would suggest it had.
 // **NOT WIRED INTO THE ENGINE, AND NOT DEAD — IT IS THE FIX FOR A LIVE LIMITATION.**
-// `v4gpu.rs` selects compressed blocks POSITIONALLY, which agrees with `Indexer.forward` on
+// `f4gpu.rs` selects compressed blocks POSITIONALLY, which agrees with `Indexer.forward` on
 // the block SET only below `positional_context_limit(index_topk)` = 4·(512+1) = **2052
-// tokens**, and `V4Engine::new` refuses at startup above it rather than silently attending
+// tokens**, and `F4Engine::new` refuses at startup above it rather than silently attending
 // the oldest blocks forever. This kernel is what lifts that ceiling: it is already scored
 // bit-identical against the checkpoint's own compressed KV by
 // `tests/v4_indexer_kernel.rs::indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv`.

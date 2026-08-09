@@ -45,7 +45,7 @@
 //!
 //! * **Anything the oracle is also wrong about.** The kernel was written from `model.py`
 //!   AND from the oracle's transliteration of it; a shared misreading is invisible here by
-//!   construction. `src/v4compress.rs`'s `jscpd:ignore` region makes the same point about
+//!   construction. `src/kvcompress.rs`'s `jscpd:ignore` region makes the same point about
 //!   the host half and is worth reading.
 //! * **The indexer's compressor** (`rotate = true`: Hadamard + fp4 instead of the partial
 //!   fp8). Not exercised here; it landed 2026-08-05 and is scored by
@@ -73,9 +73,9 @@
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::device_sync;
+use rivoli::kvcompress::{Buffers, Finish, Geom, LayerKind};
 use rivoli::math::f32_to_bf16;
 use rivoli::memory::device::DeviceBuf;
-use rivoli::v4compress::{Buffers, Finish, Geom, LayerKind};
 use rivoli::v4oracle::forward::{CompState, CompressorW, Counters, Defect, Oracle};
 use rivoli::v4oracle::weights::{Checkpoint, V4Config};
 
@@ -606,7 +606,7 @@ impl Cell {
             // without ever exercising the argument. `device_sync` below joins every stream.
             let stream = HipStream::new().expect("hip stream");
             let n =
-                unsafe { rivoli::v4compress::compress(&self.geom, &b, s, start_pos, stream.raw()) }
+                unsafe { rivoli::kvcompress::compress(&self.geom, &b, s, start_pos, stream.raw()) }
                     .expect("compress launch");
             device_sync().expect("device_sync");
             got.extend_from_slice(&out.read()[..n * d]);
@@ -1052,7 +1052,7 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
     // — are excluded here rather than silently passing inside the list.
     // Derived by EXHAUSTIVE match over `Defect::ALL` rather than spelled as a list. A list
     // silently omits any variant added later; the match makes one a compile error, which is
-    // the same argument `src/v4compress.rs` makes about wildcards on domain enums — and the
+    // the same argument `src/kvcompress.rs` makes about wildcards on domain enums — and the
     // moment a new breakage is added is exactly when someone must decide whether the
     // compressor can see it.
     assert_records_are_well_formed();

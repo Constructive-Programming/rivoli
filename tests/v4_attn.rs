@@ -11,7 +11,7 @@
 //! `sparse_attn` were executed by no test in this tree.
 //!
 //! The compressed cell drives the whole block step the way S3's layer loop must:
-//! `v4compress::compress`, its output placed at BOTH destinations from ONE call, then
+//! `kvcompress::compress`, its output placed at BOTH destinations from ONE call, then
 //! `attention`. What it does NOT cover is stated at `COMP_LAYER` — the ratio-4 class, whose
 //! `Indexer` returns score-ORDERED blocks where `v4_topk_idxs` returns them positionally.
 //!
@@ -108,11 +108,11 @@ use rivoli::backend::hip::{
     device_sync, fill_u32, launch_act_quant_f8_prefix, launch_gather_attn_shared_kv,
     launch_gemv_fp8_bf16, launch_rope_adjacent, memcpy_dtod_async,
 };
-use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3};
-use rivoli::memory::device::DeviceBuf;
-use rivoli::v4compress::{
+use rivoli::kvcompress::{
     Buffers, Finish, Geom, LayerKind, RopeParams, compress, freqs_cis, rope_for_layer,
 };
+use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3};
+use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::forward::{Capture, Defect, LayerCtx, Oracle};
 use rivoli::v4oracle::numerics::{FP8_MAX, act_quant_inplace, fast_round_scale};
 use rivoli::v4oracle::toy::{self, ToyModel};
@@ -150,7 +150,7 @@ const COMP_LAYER: usize = 3;
 /// makes that defect structurally unable to fire.
 ///
 /// It is also `>= ratio` on [`COMP_LAYER`] (`should_compress` is `seqlen >= ratio` at
-/// prefill, `src/v4compress.rs`), so the prefill emits a compressed block — below 8 it
+/// prefill, `src/kvcompress.rs`), so the prefill emits a compressed block — below 8 it
 /// emits none and every compressed assertion would pass vacuously.
 const PROMPT: usize = 12;
 const DECODES: usize = 2;
@@ -886,7 +886,7 @@ impl Gpu {
     /// the emit decision and slides the pooling window. So a probe that wants to re-attend
     /// over a perturbed cache must call THIS, and calling `step` twice would corrupt exactly
     /// the state S3 requirement 3 is about — the trap
-    /// `src/v4compress.rs::compress` documents at its "never a second call".
+    /// `src/kvcompress.rs::compress` documents at its "never a second call".
     fn attend(&mut self, d: &Dims, p: &Phase) -> StepOut {
         let x = dev_f32(golden(p, "attn_norm_out"));
         let mut idx = Vec::new();

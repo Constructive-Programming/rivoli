@@ -64,7 +64,7 @@ mod common;
 ///
 /// The three compressor launchers are here because `tests/v4_compress_kernel.rs` scores
 /// them as ONE unit against S1b's oracle over four cells with exact defect impersonation,
-/// which is a stronger claim than three by-name launches would be — `v4compress::compress`
+/// which is a stronger claim than three by-name launches would be — `kvcompress::compress`
 /// picks which of the three runs from the geometry and the position, and that dispatch is
 /// itself part of what the oracle checks. Splitting them apart to satisfy a string match
 /// would test less.
@@ -84,8 +84,8 @@ const INDIRECT: &[Indirect] = &[Indirect {
         "kv_compress_prefill",
         "kv_compress_decode",
     ],
-    launched_by: "src/v4compress.rs",
-    entry: "v4compress::compress(",
+    launched_by: "src/kvcompress.rs",
+    entry: "kvcompress::compress(",
 }];
 
 /// Every launcher name declared in `backend`, in both declaration forms.
@@ -301,60 +301,60 @@ fn every_launcher_has_an_oracle() {
 ///
 /// **This exists because the same information, written as a comment in `src/backend/hip.rs`,
 /// was wrong on SIX of its entries the day it was written.** Review caught `swiglu` filed as
-/// GLM-only (`v4gpu.rs` calls it — and that call is the tree's most-documented open defect),
+/// GLM-only (`f4gpu.rs` calls it — and that call is the tree's most-documented open defect),
 /// `swiglu_clamped_bf16` credited with a V4 caller it does not have, and `act_quant_f8`,
 /// `vadd` and `flag_nonfinite` each under the wrong engine. The naming principle this
 /// refactor serves says to move the model list into the comments; a list nothing checks is
 /// how that trade turns into a net loss, so it moved here instead.
 ///
-/// `gpu.rs` is the GLM-5.2 decode path (`.vq3`/`.i4`); `v4gpu.rs`, `attn.rs` and
-/// `v4compress.rs` are DeepSeek-V4-Flash-0731's (`.f4`). An empty slice asserts the launcher
+/// `gpu.rs` is the GLM-5.2 decode path (`.vq3`/`.i4`); `f4gpu.rs`, `attn.rs` and
+/// `kvcompress.rs` are DeepSeek-V4-Flash-0731's (`.f4`). An empty slice asserts the launcher
 /// has NO engine caller, which is a real and interesting state — three of them are staged
 /// work, not dead code, and saying so is the point.
 const OWNERS: &[(&str, &[&str])] = &[
-    ("act_quant_f8", &["v4gpu.rs"]),
-    ("act_quant_f8_prefix", &["attn.rs", "v4compress.rs"]),
-    ("act_quant_f4_rotated", &["v4compress.rs"]),
+    ("act_quant_f8", &["f4gpu.rs"]),
+    ("act_quant_f8_prefix", &["attn.rs", "kvcompress.rs"]),
+    ("act_quant_f4_rotated", &["kvcompress.rs"]),
     ("append_kv", &["gpu.rs"]),
-    ("argmax", &["gpu.rs", "v4gpu.rs"]),
+    ("argmax", &["gpu.rs", "f4gpu.rs"]),
     ("attend", &["gpu.rs"]),
-    ("embed_bf16_row_bcast", &["v4gpu.rs"]),
+    ("embed_bf16_row_bcast", &["f4gpu.rs"]),
     ("embed_i8_row", &["gpu.rs"]),
     ("flag_nonfinite", &["gpu.rs"]),
     ("gather_attn_shared_kv", &["attn.rs"]),
     ("gather_rope", &["gpu.rs"]),
-    ("gemm_bf16", &["v4compress.rs", "v4gpu.rs"]),
-    ("gemv_f32", &["gpu.rs", "v4gpu.rs"]),
+    ("gemm_bf16", &["kvcompress.rs", "f4gpu.rs"]),
+    ("gemv_f32", &["gpu.rs", "f4gpu.rs"]),
     ("gemv_fp8", &["gpu.rs"]),
-    ("gemv_fp8_bf16", &["attn.rs", "v4gpu.rs"]),
+    ("gemv_fp8_bf16", &["attn.rs", "f4gpu.rs"]),
     ("gemv_i4", &[]),
     ("gemv_i8", &["gpu.rs"]),
     ("gemv_vq", &[]),
-    ("hc_head_collapse", &["v4gpu.rs"]),
-    ("hc_post", &["v4gpu.rs"]),
-    ("hc_pre", &["v4gpu.rs"]),
+    ("hc_head_collapse", &["f4gpu.rs"]),
+    ("hc_post", &["f4gpu.rs"]),
+    ("hc_pre", &["f4gpu.rs"]),
     ("index_append", &["gpu.rs"]),
     ("index_head_route", &["gpu.rs"]),
     ("index_pool_push", &["gpu.rs"]),
     ("index_score", &["gpu.rs"]),
     ("index_score_blocks", &[]),
     ("index_topk", &["gpu.rs"]),
-    ("kv_compress_decode", &["v4compress.rs"]),
-    ("kv_compress_deposit", &["v4compress.rs"]),
-    ("kv_compress_prefill", &["v4compress.rs"]),
+    ("kv_compress_decode", &["kvcompress.rs"]),
+    ("kv_compress_deposit", &["kvcompress.rs"]),
+    ("kv_compress_prefill", &["kvcompress.rs"]),
     ("layernorm", &["gpu.rs"]),
     ("mla_absorb_fp8", &["gpu.rs"]),
     ("mla_value_fp8", &["gpu.rs"]),
-    ("moe_acc_drain", &["gpu.rs", "v4gpu.rs"]),
+    ("moe_acc_drain", &["gpu.rs", "f4gpu.rs"]),
     ("moe_expert_range", &["gpu.rs"]),
-    ("moe_expert_range_f4", &["v4gpu.rs"]),
+    ("moe_expert_range_f4", &["f4gpu.rs"]),
     ("moe_expert_range_i4", &["gpu.rs"]),
     ("qk_norm", &["attn.rs"]),
-    ("rmsnorm_batch", &["attn.rs", "v4gpu.rs"]),
+    ("rmsnorm_batch", &["attn.rs", "f4gpu.rs"]),
     ("rmsnorm_single", &["gpu.rs"]),
     ("rope_adjacent", &["attn.rs"]),
     ("rope_interleave", &["gpu.rs"]),
-    ("swiglu", &["gpu.rs", "v4gpu.rs"]),
+    ("swiglu", &["gpu.rs", "f4gpu.rs"]),
     ("swiglu_clamped_bf16", &[]),
     ("vadd", &["gpu.rs"]),
     ("vq_encode", &["bin/convert.rs"]),

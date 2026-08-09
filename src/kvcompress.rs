@@ -503,7 +503,7 @@ pub enum Quantize {
     HadamardFp4,
 }
 
-/// The `repr(C)` mirror of `kernels/kvcompress.hip`'s `V4Comp`, and the only part of
+/// The `repr(C)` mirror of `kernels/kvcompress.hip`'s `CompGeom`, and the only part of
 /// [`Geom`] that crosses the ABI wall.
 ///
 /// Split out from [`Geom`] when [`Geom::indexer`] landed. It would have been simpler to add
@@ -556,11 +556,11 @@ pub struct Geom {
 // was deleted 2026-08-06; `src/backend/hip.rs`'s `ExpertDesc` carries it now.)
 const _: () = assert!(
     size_of::<GeomAbi>() == 28 && align_of::<GeomAbi>() == 4,
-    "GeomAbi must stay six i32 and one f32 — the layout kernels/kvcompress.hip's V4Comp declares"
+    "GeomAbi must stay six i32 and one f32 — the layout kernels/kvcompress.hip's CompGeom declares"
 );
 const _: () = assert!(
     size_of::<Finish>() == 3 * size_of::<*const f32>(),
-    "Finish must stay three pointers — kernels/kvcompress.hip's V4Fin"
+    "Finish must stay three pointers — kernels/kvcompress.hip's CompFinish"
 );
 
 impl Geom {
@@ -704,7 +704,7 @@ impl Geom {
 }
 
 /// What the compressor's finish stage reads and writes — the same three pointers for both
-/// pool kernels, in `kernels/kvcompress.hip`'s `V4Fin` layout.
+/// pool kernels, in `kernels/kvcompress.hip`'s `CompFinish` layout.
 ///
 /// One struct rather than three parameters because the three must AGREE with each other and
 /// nothing in a flat argument list makes them:

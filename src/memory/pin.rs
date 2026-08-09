@@ -342,7 +342,7 @@ fn place_indexer(
 /// and one shared expert per MoE layer out of the `.vq3`/`.i4` slab.
 /// Total bytes of the `*.safetensors` in an artifact directory, less one file by name.
 ///
-/// Shared by [`resident_bytes`] (GLM) and [`V4Pin::build`], and the reason is the one
+/// Shared by [`resident_bytes`] (GLM) and [`F4Pin::build`], and the reason is the one
 /// [`resident_bytes`] gives at length: the converter writes exactly the tensor list the pin
 /// places, so the FILE is the footprint and a second derivation of the placement layout is
 /// the copy that drifts. `skip` is GLM's unplaced `indexer.safetensors`; V4 has none.
@@ -679,7 +679,7 @@ impl<'a> Pin<'a> {
 // `place_f32`/`place_fp8`/`place_shared`'s `DeviceTier` plumbing, `safetensors_bytes`, and
 // `ExpertSet` itself.
 //
-// The routed FP4 streaming pool IS owned here now (`V4Pin::routed`), over the same
+// The routed FP4 streaming pool IS owned here now (`F4Pin::routed`), over the same
 // [`crate::memory::routed::RoutedPool`] GLM's `Pin` uses — see that module for why it is
 // shared and what was verified byte-parameterised before sharing it.
 //
@@ -719,7 +719,7 @@ pub struct HyperConn {
 /// vary with `compress_ratio` (`ape` is `[ratio, coff·head_dim]`, `coff = 1 + (ratio == 4)`)
 /// and belong to the attention path that reads them, not to the pin that places them.
 #[derive(Clone, Copy)]
-pub struct V4Compressor {
+pub struct CompressorWeights {
     pub ape: *const f32,
     pub norm: *const f32,
     pub wgate: *const f32,
@@ -732,10 +732,10 @@ pub struct V4Compressor {
 /// `Compressor` of its own to build the keys it scores against — it has no `wk`/`k_norm`.
 /// Its `compressor` is not `Option`: an indexer without one cannot exist.
 #[derive(Clone, Copy)]
-pub struct V4IndexerPin {
+pub struct F4IndexerPin {
     pub wq_b: Fp8Weight,
     pub weights_proj: *const f32,
-    pub compressor: V4Compressor,
+    pub compressor: CompressorWeights,
 }
 
 /// How a layer's gate SELECTS experts.
@@ -750,7 +750,7 @@ pub struct V4IndexerPin {
 /// bias, top-k) runs on the CPU, and the hash path is a lookup by TOKEN ID, which the host
 /// already holds. Placing 6.2 MB of `tid2eid` per hash layer on the device to index it
 /// there would buy nothing.
-pub enum V4Route {
+pub enum GateRoute {
     /// `tid2eid[token * top_k + j]` — already range-checked, see [`parse_tid2eid`].
     Hash { tid2eid: Vec<u32> },
     /// The router correction bias added before top-k, `n_experts` long.
@@ -758,7 +758,7 @@ pub enum V4Route {
 }
 
 /// One V4 layer's resident weights.
-pub struct V4LayerPin {
+pub struct F4LayerPin {
     pub attn_norm: *const f32,
     pub ffn_norm: *const f32,
     /// `q_norm` (over `q_lora_rank`) and `kv_norm` (over `head_dim`). The weightless QK-norm
@@ -781,19 +781,19 @@ pub struct V4LayerPin {
     pub wo_b: Fp8Weight,
     /// Router gate `[n_experts, hidden]` f32, device-side (the scores are a GEMV).
     pub gate_w: *const f32,
-    pub route: V4Route,
+    pub route: GateRoute,
     pub hc_attn: HyperConn,
     pub hc_ffn: HyperConn,
     /// The always-on shared expert — fp8 e4m3, resident, NOT in the `.f4`.
     pub shared: Fp8Mlp,
     /// Present iff `compress_ratio != 0`.
-    pub compressor: Option<V4Compressor>,
+    pub compressor: Option<CompressorWeights>,
     /// Present iff `compress_ratio == 4`.
-    pub indexer: Option<V4IndexerPin>,
+    pub indexer: Option<F4IndexerPin>,
 }
 
 /// The V4 resident weight set, plus the validated `.f4` routed-expert source.
-pub struct V4Pin {
+pub struct F4Pin {
     #[allow(dead_code)] // RAII owner of the slab every pointer below points into.
     tier: DeviceTier,
     /// `[vocab, hidden]` bf16. See [`Bf16Weight`] — exposed, not consumed.
@@ -807,7 +807,7 @@ pub struct V4Pin {
     /// exactly the kind of thing a caller gets right once and then forgets: an absolute
     /// layer id used as a direct index into a pin over layers 3..6 reads layer 6's weights
     /// for layer 3 and never fails.
-    layers: Vec<V4LayerPin>,
+    layers: Vec<F4LayerPin>,
     range: std::ops::Range<usize>,
     /// The `.f4` set: fd owner for the routed pool, and the thing whose headers and lengths
     /// — one per layer in the artifact's range — were validated at startup rather than at
@@ -819,7 +819,7 @@ pub struct V4Pin {
     /// The routed FP4 streaming pool. **Not optional, and that is the size argument**: the
     /// shipped 43-layer `.f4` set is 137 GiB against a ~115 GiB budget, so unlike GLM's
     /// (~41% residency) V4's routed experts cannot all be resident on any configuration
-    /// this machine has. A `V4Pin` without a pool cannot run the model at all.
+    /// this machine has. A `F4Pin` without a pool cannot run the model at all.
     pub routed: RoutedPool,
 }
 
@@ -846,8 +846,12 @@ fn place_hc(tier: &mut DeviceTier, st: &Safetensors, base: &str) -> Result<Hyper
 
 /// Place one `Compressor` — the attention's own or the indexer's, which differ only in
 /// width and are therefore the same four names under different prefixes.
-fn place_compressor(tier: &mut DeviceTier, st: &Safetensors, base: &str) -> Result<V4Compressor> {
-    Ok(V4Compressor {
+fn place_compressor(
+    tier: &mut DeviceTier,
+    st: &Safetensors,
+    base: &str,
+) -> Result<CompressorWeights> {
+    Ok(CompressorWeights {
         ape: place_f32(tier, st, &format!("{base}.ape"))?,
         norm: place_f32(tier, st, &format!("{base}.norm.weight"))?,
         wgate: place_f32(tier, st, &format!("{base}.wgate.weight"))?,
@@ -886,7 +890,7 @@ fn parse_tid2eid(
     // nothing else — `TensorDesc.len` comes from the header's `data_offsets` and is never
     // confronted with `product(shape) x 8` — so a tensor whose byte span disagrees with its
     // declared shape passes the check above, `chunks_exact` drops the partial tail, and the
-    // returned table is SHORT. `V4Route::Hash`'s consumer indexes it at
+    // returned table is SHORT. `GateRoute::Hash`'s consumer indexes it at
     // `token * top_k + j`, so a short table is an out-of-bounds read for the last tokens.
     let want = vocab * top_k * 8;
     ensure!(
@@ -910,7 +914,7 @@ fn parse_tid2eid(
         .collect()
 }
 
-impl V4Pin {
+impl F4Pin {
     /// Build the V4 resident set and its `.f4` streaming pool from artifact directory
     /// `dir`. `capacity` is the total device budget: the resident set takes the artifact's
     /// own `*.safetensors` size and everything left grows the pool.
@@ -1002,7 +1006,7 @@ impl V4Pin {
             // whichever branch the artifact happens to satisfy.
             let route = if cfg.layer_routes_by_hash(l) {
                 let (raw, shape) = st.typed(&format!("{lb}.ffn.gate.tid2eid"), Dtype::I64)?;
-                V4Route::Hash {
+                GateRoute::Hash {
                     tid2eid: parse_tid2eid(raw, shape, cfg.vocab, cfg.top_k, cfg.n_experts)
                         .with_context(|| format!("layer {l}"))?,
                 }
@@ -1015,7 +1019,7 @@ impl V4Pin {
                     bias.len(),
                     cfg.n_experts
                 );
-                V4Route::Scored { bias }
+                GateRoute::Scored { bias }
             };
             let mut fp8 = |name: &str| place_fp8(&mut tier, &st, &format!("{a}.{name}"), block);
             let (wq_b, wo_a, wo_b) = (fp8("wq_b")?, fp8("wo_a")?, fp8("wo_b")?);
@@ -1051,7 +1055,7 @@ impl V4Pin {
                 up: sh(w3)?,
                 down: sh(w2)?,
             };
-            layers.push(V4LayerPin {
+            layers.push(F4LayerPin {
                 attn_norm: place_f32(&mut tier, &st, &format!("{lb}.attn_norm.weight"))?,
                 ffn_norm: place_f32(&mut tier, &st, &format!("{lb}.ffn_norm.weight"))?,
                 q_norm: place_f32(&mut tier, &st, &format!("{a}.q_norm.weight"))?,
@@ -1074,8 +1078,8 @@ impl V4Pin {
                     .transpose()?,
                 indexer: cfg
                     .layer_has_indexer(l)?
-                    .then(|| -> Result<V4IndexerPin> {
-                        Ok(V4IndexerPin {
+                    .then(|| -> Result<F4IndexerPin> {
+                        Ok(F4IndexerPin {
                             wq_b: place_fp8(&mut tier, &st, &format!("{a}.indexer.wq_b"), block)?,
                             weights_proj: place_f32(
                                 &mut tier,
@@ -1136,7 +1140,7 @@ impl V4Pin {
     /// One layer's resident weights by ABSOLUTE layer id.
     ///
     /// The only way in, so the artifact-order offset cannot be applied twice or not at all.
-    pub fn layer(&self, l: usize) -> Result<&V4LayerPin> {
+    pub fn layer(&self, l: usize) -> Result<&F4LayerPin> {
         self.layers
             .get(l.checked_sub(self.range.start).unwrap_or(usize::MAX))
             .with_context(|| {

@@ -162,7 +162,7 @@ fn top1_prob(bytes: &[u8]) -> f32 {
     (1.0 / sum) as f32
 }
 
-/// `pub(crate)` for `v4gpu`, which uploads `ExpertDescF4`/f32/i32 arrays the same way.
+/// `pub(crate)` for `f4gpu`, which uploads `ExpertDescF4`/f32/i32 arrays the same way.
 /// A second copy would be a `build.rs` duplication error, and a wrapper that only forwards
 /// would be a third name for two lines.
 pub(crate) fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
@@ -683,7 +683,7 @@ pub struct GpuEngine<'a> {
     /// `--logit-dump` / `--force-tokens` on a GLM artifact (V4-only until 2026-08-08),
     /// armed by [`GpuEngine::arm_logit_trace`], `None` on every stock run. State, forcing
     /// rule and dump byte format are [`crate::eval::LogitTrace`]'s, shared with
-    /// `V4Engine`. Costs a blocking vocab-sized D2H per emitted token when armed, so no
+    /// `F4Engine`. Costs a blocking vocab-sized D2H per emitted token when armed, so no
     /// run carrying it is a benchmark. REFUSED under speculation — `generate` bails when
     /// armed with `mtp` — because a verify pass emits up to two tokens per iteration and
     /// the rows-per-position bookkeeping under acceptance would silently break the
@@ -2882,7 +2882,7 @@ impl<'a> GpuEngine<'a> {
     /// argmax, through the trace hook when a `teacher-forcing` build has one armed. One
     /// definition for the post-prefill seed, the plain decode step and the follow-up
     /// re-seed, so the three sites cannot diverge on whether they record — the same shape
-    /// `V4Engine::next_token` carries. The speculative branches keep raw
+    /// `F4Engine::next_token` carries. The speculative branches keep raw
     /// `argmax`/`argmax_rows`: they are unreachable while a trace is armed (`generate`'s
     /// precondition), and hooking them anyway would imply a rows-per-position semantics
     /// this instrument deliberately refuses.

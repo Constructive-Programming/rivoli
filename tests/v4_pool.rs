@@ -36,7 +36,7 @@ use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::artifact::quant::{f4_expert_stride, f4_slot_offsets};
 use rivoli::backend::{Stream, device_sync};
 use rivoli::fetch::asyncfetch::Ticket;
-use rivoli::memory::pin::V4Pin;
+use rivoli::memory::pin::F4Pin;
 use rivoli::memory::routed::ExpertSlot;
 
 #[path = "common/v4_artifact_dir.rs"]
@@ -75,7 +75,7 @@ const CAPACITY: usize = 5 << 30;
 /// above is closed on the accepted path and left open at those three — which is the right
 /// trade, since a refusal case that transposed its buffers is still refused.
 fn submit(
-    pin: &mut V4Pin,
+    pin: &mut F4Pin,
     layer: usize,
     sel: &[usize],
 ) -> (Vec<ExpertSlot>, Vec<RoutedFmt>, Vec<Ticket>) {
@@ -94,7 +94,7 @@ fn submit(
 /// see whatever was in the slot. This is the host-side spelling of what `gpu.rs`'s expert
 /// loop does per launch.
 fn submit_and_land(
-    pin: &mut V4Pin,
+    pin: &mut F4Pin,
     stream: &Stream,
     layer: usize,
     sel: &[usize],
@@ -122,7 +122,7 @@ fn submit_and_land(
 /// page-aligned block, and borrowing or duplicating it puts a second owner on a descriptor
 /// the streamer is using. The offset is what the test needs from `read_spec`, not the
 /// descriptor. No `unsafe` at all this way.
-fn block_from_disk(dir: &str, pin: &V4Pin, layer: usize, expert: usize) -> Vec<u8> {
+fn block_from_disk(dir: &str, pin: &F4Pin, layer: usize, expert: usize) -> Vec<u8> {
     use std::os::unix::fs::FileExt;
     let (_, begin, len) = pin.f4.read_spec(layer, expert).unwrap();
     let f = std::fs::File::open(format!("{dir}/L{layer:02}.f4")).unwrap();
@@ -158,19 +158,19 @@ fn routed_bytes(cfg: &V4Config, n_layers: usize) -> usize {
 /// One fixture, opened: the pin, a stream to enqueue ticket waits on, and the two things the
 /// cases index by. A struct because the three cases below take exactly these and `jscpd`
 /// refuses the third copy of the parameter list — which is the right call, since a
-/// `(&V4Config, &mut V4Pin, &Stream, usize, &str)` list is four same-shaped references and a
+/// `(&V4Config, &mut F4Pin, &Stream, usize, &str)` list is four same-shaped references and a
 /// transposition in it would compile.
 struct Case<'a> {
     cfg: &'a V4Config,
-    pin: &'a mut V4Pin,
+    pin: &'a mut F4Pin,
     stream: &'a Stream,
     layer: usize,
     dir: &'a str,
 }
 
-fn open(dir: &str) -> (V4Config, V4Pin) {
+fn open(dir: &str) -> (V4Config, F4Pin) {
     let cfg: V4Config = load_config(dir).unwrap();
-    let pin = V4Pin::build(dir, &cfg, CAPACITY, "2q", Default::default(), None)
+    let pin = F4Pin::build(dir, &cfg, CAPACITY, "2q", Default::default(), None)
         .unwrap_or_else(|e| panic!("{dir} must load with a pool: {e:#}"));
     (cfg, pin)
 }
@@ -179,7 +179,7 @@ fn open(dir: &str) -> (V4Config, V4Pin) {
 /// id. `None` when this machine has no artifact — the caller returns, like every other
 /// artifact-gated test in this tree. One function because the four-line preamble was
 /// identical in three tests, which `build.rs`'s duplication gate refuses.
-fn l0_2() -> Option<(V4Config, V4Pin, Stream, usize, String)> {
+fn l0_2() -> Option<(V4Config, F4Pin, Stream, usize, String)> {
     let dir = v4_artifact_dir::v4_artifact("L00.f4")?;
     let (cfg, pin) = open(&dir);
     let layer = pin.range().start;
@@ -361,7 +361,7 @@ fn a_budget_too_small_for_one_batch_is_refused_at_build() {
     let capacity = resident + (16 << 20) + 5 * stride;
     let e = format!(
         "{:#}",
-        V4Pin::build(&dir, &cfg, capacity, "2q", Default::default(), None)
+        F4Pin::build(&dir, &cfg, capacity, "2q", Default::default(), None)
             .err()
             .expect("a pool too small for one batch must be refused at build")
     );
@@ -492,8 +492,8 @@ fn a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(c: &mut Case<
 /// **ONE `#[test]`, and that is not tidiness — it is the only thing that keeps the device
 /// from being oversubscribed.**
 ///
-/// libtest runs `#[test]` fns on parallel threads. Each case below builds a `V4Pin`, and a
-/// `V4Pin` is a `DeviceTier` allocation plus a pool VMM plus an io_uring ring — so five of
+/// libtest runs `#[test]` fns on parallel threads. Each case below builds a `F4Pin`, and a
+/// `F4Pin` is a `DeviceTier` allocation plus a pool VMM plus an io_uring ring — so five of
 /// them start at once, five tiers compete for a budget sized for one, and five `AsyncFetch`
 /// reapers race. Run that way on 2026-08-05 it **wedged the device**: 19 threads, two in
 /// `kfd_wait_on_events`, **four `io_sq_thread`s** (the tell — four rings, four pools), zero
@@ -560,7 +560,7 @@ fn measure_what_an_f4_miss_costs() {
         .unwrap()
         .len() as usize;
     let stride = f4_expert_stride(cfg.hidden, cfg.moe_inter);
-    let mut pin = V4Pin::build(
+    let mut pin = F4Pin::build(
         &dir,
         &cfg,
         resident + (16 << 20) + (4 << 30),
@@ -599,7 +599,7 @@ fn measure_what_an_f4_miss_costs() {
     // One closure, two passes: `jscpd` refuses the second copy of a timed loop, and it is
     // right to — the two passes must be the SAME work for the cold/warm ratio to mean
     // anything, and two spellings is how they would stop being.
-    let pass = |pin: &mut V4Pin| {
+    let pass = |pin: &mut F4Pin| {
         let t = std::time::Instant::now();
         for (l, sel) in &batches {
             submit_and_land(pin, &stream, *l, sel);

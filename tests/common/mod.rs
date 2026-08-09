@@ -38,7 +38,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
-use rivoli::v4compress::LayerKind;
+use rivoli::kvcompress::LayerKind;
 use rivoli::v4oracle::forward::{Capture, CompressorW, IndexerW, LayerCtx, LayerW, Oracle};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
 use rivoli::v4oracle::weights::{Checkpoint, NamedRng, V4Config};

@@ -1858,7 +1858,7 @@ fn sinkhorn_iteration_count_is_live() {
 /// the authority, and taking it directly asserts the same thing about the FP4 path while
 /// removing the last caller of a kernel the engine never reached. Routing in this engine is
 /// HOST work (`math::route_into`, the router `architecture.md` INV-1 is stated about);
-/// `v4gpu.rs::route_row` carries why. **This test therefore covers no router at all** — that
+/// `f4gpu.rs::route_row` carries why. **This test therefore covers no router at all** — that
 /// is the trade the deletion made, and it is recorded here rather than left to be discovered,
 /// because a reader who sees a golden-fed selection will otherwise assume it was checked.
 #[test]

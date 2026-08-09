@@ -62,15 +62,15 @@
 //!   projection's re-association cannot be mistaken for a scoring error.
 //! * **A misreading of `model.py` shared between [`host_score`] and the oracle**, since the
 //!   score chain is now transliterated twice. Same class of gap as the one
-//!   `v4compress.rs`'s `jscpd:ignore` region names for `freqs_cis`.
+//!   `kvcompress.rs`'s `jscpd:ignore` region names for `freqs_cis`.
 //!
 //! Skips with a printed reason when the checkpoint is absent; there is no CI here.
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 use rivoli::backend::hip::{device_sync, launch_act_quant_f4_rotated, launch_index_score_blocks};
+use rivoli::kvcompress::{Geom, LayerKind, Quantize, ScoreDims};
 use rivoli::memory::device::DeviceBuf;
-use rivoli::v4compress::{Geom, LayerKind, Quantize, ScoreDims};
 use rivoli::v4oracle::forward::{Counters, Defect, Oracle};
 use rivoli::v4oracle::numerics::{
     bf16_decode, bf16_encode, fp4_act_quant_inplace, hadamard_rotate,
@@ -436,7 +436,7 @@ fn device_score(q: &[f32], kv: &[f32], w: &[f32], d: ScoreDims) -> Vec<f32> {
 ///
 /// What that costs, precisely: this is a second transliteration of the same nine lines, so a
 /// shared misreading of `model.py` between it and the oracle is invisible — the same class of
-/// gap `v4compress.rs`'s `jscpd:ignore` region names for `freqs_cis`. What it still buys is
+/// gap `kvcompress.rs`'s `jscpd:ignore` region names for `freqs_cis`. What it still buys is
 /// everything the KERNEL could get wrong on its own: the bf16 store placement, the relu
 /// order, the summation order, and the head/block indexing.
 fn host_score(q: &[f32], kv: &[f32], w: &[f32], d: ScoreDims) -> Vec<f32> {

@@ -1894,7 +1894,7 @@ fn batched_rows_are_bit_identical_to_single_rows() {
 /// the output directly and an oracle that reached for `silu` would be measuring the wrong
 /// function at a tolerance loose enough to hide it.
 ///
-/// Run IN PLACE (`h` aliases `g`), because that is how `gpu.rs:2010` and `v4gpu.rs:1406` —
+/// Run IN PLACE (`h` aliases `g`), because that is how `gpu.rs:2010` and `f4gpu.rs:1406` —
 /// the only two callers — launch it, and the aliasing is a documented safety claim rather
 /// than an accident. A kernel that read `g[i]` after writing `h[i]` would still pass a
 /// non-aliased test.

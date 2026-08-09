@@ -140,7 +140,7 @@ struct Args {
     ///
     /// Works on BOTH architectures since 2026-08-08. GLM scores it through
     /// `GpuEngine::nll_forced`'s own forward loop (`src/eval.rs::run`); a V4 artifact scores
-    /// it through `V4Engine::nll_forced`, which reuses `generate`'s free-run loop and the
+    /// it through `F4Engine::nll_forced`, which reuses `generate`'s free-run loop and the
     /// same force hook `--logit-dump`/`--force-tokens` use, rather than a second bespoke
     /// scoring loop — see that method's doc for why V4 had no per-token forward to
     /// duplicate in the first place. `conflicts_with_all` below because on V4 both a
@@ -177,7 +177,7 @@ struct Args {
     /// A/B between two BUILDS on a free-running decode (argmax flips, max |Δlogit|), where
     /// `--ppl` is corpus perplexity under teacher forcing. Under `teacher-forcing` because
     /// both are instruments on the same per-token logit row, not because they answer the
-    /// same question — see `V4Engine::nll_forced` for how `--ppl` reuses this same
+    /// same question — see `F4Engine::nll_forced` for how `--ppl` reuses this same
     /// `logit_trace` hook for its own, unrelated purpose.
     #[cfg(feature = "teacher-forcing")]
     #[arg(long, value_name = "PATH", conflicts_with = "port")]
@@ -656,7 +656,7 @@ fn force_list_for(dump: &str, force_path: Option<&str>) -> Result<Option<Vec<u32
 /// `run_v4`, so a backend-less build does not carry a never-constructed struct.
 #[cfg(feature = "rocm")]
 #[derive(Default)]
-struct V4Instr {
+struct Instruments {
     #[cfg(feature = "teacher-forcing")]
     logit_dump: Option<String>,
     #[cfg(feature = "teacher-forcing")]
@@ -676,7 +676,7 @@ fn run_v4(
     attn: &str,
     port: Option<u16>,
     no_mtp: bool,
-    instr: V4Instr,
+    instr: Instruments,
     // Gated to match the `Args` field it comes from, which has been `#[cfg(feature = "trace")]`
     // since the watchdog moved off an env var. Ungated it was an unused parameter on every
     // `--features rocm` build without `trace` — a warning nothing watches, because CI has no
@@ -747,7 +747,7 @@ fn run_v4(
     let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
     // `--ppl` scores a fixed corpus instead of decoding, so `-bench` is meaningless there —
     // the same split GLM's `main` makes for its own `ppl_ids`. Loaded here, before `ngen` and
-    // before the pin is built, because `V4Engine::new`'s sizing below has to know which of the
+    // before the pin is built, because `F4Engine::new`'s sizing below has to know which of the
     // two runs this is.
     #[cfg(feature = "teacher-forcing")]
     let ppl_ids: Option<Vec<u32>> = match &instr.ppl {
@@ -755,7 +755,7 @@ fn run_v4(
             let ids = rivoli::eval::load_corpus(path, &tok)?;
             // Checked here, before the pin/engine below size themselves off `ids.len() - 1`
             // (see that computation's comment) — an underflow there would be a panic with no
-            // token count in it, for a failure `V4Engine::nll_forced` would refuse anyway.
+            // token count in it, for a failure `F4Engine::nll_forced` would refuse anyway.
             anyhow::ensure!(
                 ids.len() >= 2,
                 "--ppl corpus {path:?} tokenizes to {} token(s); need at least 2 to score a \
@@ -808,7 +808,7 @@ fn run_v4(
 
     let cap = device_budget(cfg.max_mem)?;
     let t = std::time::Instant::now();
-    let pin = rivoli::memory::pin::V4Pin::build(
+    let pin = rivoli::memory::pin::F4Pin::build(
         &cfg.model,
         &v4,
         cap,
@@ -819,7 +819,7 @@ fn run_v4(
     info!("v4 pin built in {:.1}s", t.elapsed().as_secs_f64());
     // Sizing differs for the two runs this can be. The free-run path needs `max_m` to cover
     // the widest single `forward` call, which is the whole chat prompt (prefill is ONE call
-    // over it). `V4Engine::nll_forced` never calls `forward` with more than one token at a
+    // over it). `F4Engine::nll_forced` never calls `forward` with more than one token at a
     // time — even its own "prefill" is `ids[..1]` (see that method's doc for why one-at-a-time
     // is not a shortcut here, it is what `generate`'s existing loop already does) — so scoring
     // needs `max_m` of only 1, and needs `max_ctx` to cover the CORPUS rather than the unused
@@ -832,7 +832,7 @@ fn run_v4(
         Some(ids) => (1, ids.len() - 1),
         None => (prompt_ids.len(), ngen),
     };
-    let mut engine = rivoli::v4gpu::V4Engine::new(pin, v4, size_prompt_len, size_ngen)?;
+    let mut engine = rivoli::f4gpu::F4Engine::new(pin, v4, size_prompt_len, size_ngen)?;
     #[cfg(feature = "teacher-forcing")]
     if let Some(path) = &instr.logit_dump {
         // No `--no-mtp` requirement here, unlike the GLM branch: this decode is
@@ -842,7 +842,7 @@ fn run_v4(
         engine.arm_logit_trace(path, force)?;
     }
     #[cfg(not(feature = "teacher-forcing"))]
-    let V4Instr {} = instr; // consume the empty bundle so the parameter is not unused
+    let Instruments {} = instr; // consume the empty bundle so the parameter is not unused
     // Wedge watchdog, same as GLM's. A V4 layer streams 6 of 256 experts against GLM's 8 of 256
     // over half as many layers, so the shared default is if anything generous here.
     //
@@ -858,7 +858,7 @@ fn run_v4(
     // --- `--ppl` on a V4 artifact: teacher-forced quality gate, not a decode -------------
     // Same shape as the GLM branch (`src/main.rs`'s other `rivoli::eval::run` call): return
     // before the free-running `generate` below, because the two are mutually exclusive by
-    // design. `V4Engine::nll_forced` does the scoring; `rivoli::eval::run_v4` is the same
+    // design. `F4Engine::nll_forced` does the scoring; `rivoli::eval::run_v4` is the same
     // log-and-write tail `rivoli::eval::run` uses for GLM, so the two `.nll` files this
     // engine can produce are byte-for-byte the same format regardless of which architecture
     // wrote them.
@@ -982,9 +982,9 @@ fn main() -> Result<()> {
             // One struct rather than two more cfg'd parameters: `run_v4` already forks on
             // `trace` for `watchdog_secs`, and a second independent feature would need four
             // call arms (`#[cfg]` on a call ARGUMENT is not stable, only on a formal
-            // parameter). `V4Instr` is empty without `teacher-forcing`, so the ungated
+            // parameter). `Instruments` is empty without `teacher-forcing`, so the ungated
             // parameter carries no dead value on a stock build.
-            let instr = V4Instr {
+            let instr = Instruments {
                 #[cfg(feature = "teacher-forcing")]
                 logit_dump: a.logit_dump.clone(),
                 #[cfg(feature = "teacher-forcing")]

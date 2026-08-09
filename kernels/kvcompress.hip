@@ -10,11 +10,11 @@
 //     SEPARATE call in the reference (`act_quant(kv[..., :-rd], 64, ...)` at model.py:378,
 //     after `apply_rotary_emb`), and S2b already ships it as `mla.hip::act_quant_f8_prefix` /
 //     `rivoli_act_quant_f8_prefix` with exactly the (row_stride, n, block) signature this needs.
-//     `v4compress.rs::compress` launches it. Writing a second one here would be a third
+//     `kvcompress.rs::compress` launches it. Writing a second one here would be a third
 //     copy of e4m3-RNE in this tree — see the note on `f2e4m3_rne` below.
 //   * The indexer's compressor (`rotate = true`: Hadamard + fp4 instead of partial fp8).
 //     LANDED 2026-08-05 as `kernels/blockindex.hip::act_quant_f4_rotated`, which
-//     `v4compress.rs::compress` launches as the finish when `Geom::indexer` built the
+//     `kvcompress.rs::compress` launches as the finish when `Geom::indexer` built the
 //     geometry. Only the FINISH is there; the pooling below is shared by both compressors.
 //
 // A NOTE ON DUPLICATION, because this file had to choose. `kernels/` is NOT watched by
@@ -36,8 +36,8 @@
 // `d`, `cd`, `ents` and `rd` are all plausible in each other's positions, and `cd`/`ents`
 // are DERIVED — `cd = coff*d`, `ents = coff*ratio` — so a caller that computed one from a
 // stale `coff` would produce a kernel that reads the right shape with the wrong stride.
-// `v4compress.rs::GeomAbi`, which only `Geom::build` constructs, derives all three.
-struct V4Comp {
+// `kvcompress.rs::GeomAbi`, which only `Geom::build` constructs, derives all three.
+struct CompGeom {
     int ratio;
     int coff;   // 1 + overlap (model.py:298)
     int d;      // this compressor's head_dim
@@ -57,9 +57,9 @@ struct V4Comp {
 //     which is also `[d]` on the attention path.
 //   * `out` is `[nblk, d]` at prefill and one row at decode.
 //
-// Mirrored by `v4compress.rs::Finish`; the two are ONE `repr(C)` layout and must be edited
-// together. Passed by pointer across the wall for the same reason `V4Comp` is.
-struct V4Fin {
+// Mirrored by `kvcompress.rs::Finish`; the two are ONE `repr(C)` layout and must be edited
+// together. Passed by pointer across the wall for the same reason `CompGeom` is.
+struct CompFinish {
     const float* norm;
     const float* freqs;
     float* out;
@@ -172,8 +172,8 @@ __device__ __forceinline__ void compress_pool_row(const float* const* kvp, const
 // rows_per_pos`, i.e. one position per row going up by ONE. A compressor's rows are blocks,
 // so consecutive output rows are `ratio` positions apart. Calling `rope_adjacent` per row would
 // be one launch per compressed block — 512 launches for a 2048-token prefill at ratio 4.
-__device__ __forceinline__ void compress_finish_row(float* __restrict__ row, V4Fin f, int pos,
-                                           V4Comp p, float* red) {
+__device__ __forceinline__ void compress_finish_row(float* __restrict__ row, CompFinish f, int pos,
+                                           CompGeom p, float* red) {
     for (int e = threadIdx.x; e < p.d; e += blockDim.x) row[e] = rbf16(row[e]);
     __syncthreads();
 
@@ -228,7 +228,7 @@ extern "C" __global__ void kv_compress_deposit(const float* __restrict__ kv,
                                              const float* __restrict__ score,
                                              const float* __restrict__ ape,
                                              float* __restrict__ kv_state,
-                                             float* __restrict__ score_state, V4Comp p, int s,
+                                             float* __restrict__ score_state, CompGeom p, int s,
                                              int slot0) {
     int remainder = s % p.ratio;
     int cutoff = s - remainder;
@@ -277,8 +277,8 @@ extern "C" __global__ void kv_compress_deposit(const float* __restrict__ kv,
 // every entry takes the first arm with `half == 0` — the same code, no branch on the ratio.
 extern "C" __global__ void kv_compress_prefill(const float* __restrict__ kv,
                                                const float* __restrict__ score,
-                                               const float* __restrict__ ape, V4Fin f,
-                                               V4Comp p) {
+                                               const float* __restrict__ ape, CompFinish f,
+                                               CompGeom p) {
     __shared__ const float* kvp[COMPRESS_ENTS_MAX];
     __shared__ const float* scp[COMPRESS_ENTS_MAX];
     __shared__ const float* apep[COMPRESS_ENTS_MAX];
@@ -330,8 +330,8 @@ extern "C" __global__ void kv_compress_prefill(const float* __restrict__ kv,
 // `(start_pos + 1) % ratio == 0` — the caller decides, and does not launch otherwise, which
 // is why there is no `should` flag here. At ratio 128 that is one launch in 128.
 extern "C" __global__ void kv_compress_decode(float* __restrict__ kv_state,
-                                              float* __restrict__ score_state, V4Fin f,
-                                              V4Comp p, int start_pos) {
+                                              float* __restrict__ score_state, CompFinish f,
+                                              CompGeom p, int start_pos) {
     __shared__ const float* kvp[COMPRESS_ENTS_MAX];
     __shared__ const float* scp[COMPRESS_ENTS_MAX];
     __shared__ float red[256];
@@ -386,7 +386,7 @@ extern "C" __global__ void kv_compress_decode(float* __restrict__ kv_state,
 // `#[repr(C)]` agrees today, and neither guarantees the other across a compiler bump. A
 // pointer has one representation everywhere, and the deref happens on the host side of the
 // wall where both halves are compiled by the same hipcc.
-static int compress_guard(V4Comp p) {
+static int compress_guard(CompGeom p) {
     if (p.ratio <= 1 || p.d <= 0 || p.rd <= 0 || p.coff < 1 || p.coff > 2) return 1001;
     if (p.rd > p.d || (p.rd & 1)) return 1002;
     if (p.cd != p.coff * p.d || p.ents != p.coff * p.ratio) return 1003;
@@ -417,10 +417,10 @@ extern "C" int rivoli_gemm_bf16(const float* x, const unsigned short* w, float* 
 }
 
 extern "C" int rivoli_kv_compress_deposit(const float* kv, const float* score, const float* ape,
-                                          float* kv_state, float* score_state, const V4Comp* pp,
+                                          float* kv_state, float* score_state, const CompGeom* pp,
                                           int s, int slot0, void* stream) {
     if (!pp) return 1000;
-    V4Comp p = *pp;
+    CompGeom p = *pp;
     int g = compress_guard(p);
     if (g) return g;
     if (s <= 0) return 1005;
@@ -437,15 +437,15 @@ extern "C" int rivoli_kv_compress_deposit(const float* kv, const float* score, c
 }
 
 extern "C" int rivoli_kv_compress_prefill(const float* kv, const float* score, const float* ape,
-                                          const V4Fin* ff, const V4Comp* pp, int nblk,
+                                          const CompFinish* ff, const CompGeom* pp, int nblk,
                                           void* stream) {
     if (!pp || !ff) return 1000;
-    V4Comp p = *pp;
+    CompGeom p = *pp;
     int g = compress_guard(p);
     if (g) return g;
     // NOT a no-op success: `nblk == 0` means the caller believed a block would be emitted
     // when none can be, and silently launching nothing hands it an unwritten `out`.
-    // `v4compress.rs::compress` decides emission from `should_compress` and does not call
+    // `kvcompress.rs::compress` decides emission from `should_compress` and does not call
     // this when it is false.
     if (nblk <= 0) return 1006;
     hipGetLastError();
@@ -456,10 +456,10 @@ extern "C" int rivoli_kv_compress_prefill(const float* kv, const float* score, c
 }
 
 extern "C" int rivoli_kv_compress_decode(float* kv_state, float* score_state,
-                                         const V4Fin* ff, const V4Comp* pp, int start_pos,
+                                         const CompFinish* ff, const CompGeom* pp, int start_pos,
                                          void* stream) {
     if (!pp || !ff) return 1000;
-    V4Comp p = *pp;
+    CompGeom p = *pp;
     int g = compress_guard(p);
     if (g) return g;
     if (start_pos <= 0) return 1007;  // start_pos == 0 is the prefill path, not this one

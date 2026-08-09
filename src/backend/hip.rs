@@ -4,7 +4,7 @@
 
 #![cfg(feature = "rocm")]
 
-use crate::v4compress::{Finish, GeomAbi, ScoreDims};
+use crate::kvcompress::{Finish, GeomAbi, ScoreDims};
 use anyhow::{Result, bail};
 use std::ffi::c_void;
 
@@ -197,7 +197,7 @@ macro_rules! launchers {
 //
 // It is a test and not a comment here for a measured reason: the first draft of this change
 // put the lists in this file as prose, and a review found SIX of them wrong on the day they
-// were written — `swiglu` claimed GLM-only while `v4gpu.rs` calls it, `swiglu_clamped_bf16`
+// were written — `swiglu` claimed GLM-only while `f4gpu.rs` calls it, `swiglu_clamped_bf16`
 // claimed a V4 caller it does not have, and `act_quant_f8`/`vadd`/`flag_nonfinite` were each
 // filed under the wrong engine. A hand-maintained ownership list is exactly the artefact
 // `tests/kernel_coverage.rs` already refuses to carry ("an exemption asserts nothing and
@@ -311,7 +311,7 @@ launchers! {
     ///
     /// **`wexpert` and `h` are indexed by the DESCRIPTOR index — whatever placement the
     /// caller chose for `descs` — not by position within `[e_start, e_start+e_count)`.**
-    /// (`v4gpu::routed_experts` writes launch order since 2026-08-07; the GLM twins'
+    /// (`f4gpu::routed_experts` writes launch order since 2026-08-07; the GLM twins'
     /// callers write absolute ids.) So both must be sized for `n_desc`, not for `e_count`:
     /// `wexpert` is `n_desc·nrow` f32 and `h` is `n_desc·nrow·inter` f32. A caller that read
     /// these as range-relative and allocated `e_count` of them would run off the end the first
@@ -688,7 +688,7 @@ launchers! {
     /// clamped arithmetic `launch_moe_expert_range_f4` already runs on the fp4 routed experts.
     /// **NOT YET WIRED, as of 2026-08-05, and this launcher existing does not fix anything by
     /// itself.** *[CORRECTED 2026-08-08: the V4 loop exists now and calls the unclamped
-    /// [`launch_swiglu`] from its shared-expert chain — `v4gpu.rs::shared_expert` names the
+    /// [`launch_swiglu`] from its shared-expert chain — `f4gpu.rs::shared_expert` names the
     /// deviation (`Defect::SwigluUnclamped`) at the call. So this launcher's caller-to-be
     /// exists and still does not call it; the sentence below about what the wiring must do
     /// stands.]* The clamped combine is available and gated (`tests/v4_kernel.rs` §7), and
@@ -1045,8 +1045,8 @@ launchers! {
     /// why it is one launcher rather than a step inside either. [`launch_act_quant_f8_prefix`] is the
     /// *other* compressor's finish and takes a partial extent; this one has none — the Hadamard
     /// covers the whole row, RoPE tail included. Handing either the other's extent is finite,
-    /// plausible and wrong, so `v4compress::Geom` carries which is due and
-    /// `v4compress::compress` matches on it.
+    /// plausible and wrong, so `kvcompress::Geom` carries which is due and
+    /// `kvcompress::compress` matches on it.
     ///
     /// `d` must be a power of two no greater than 256 and a multiple of 32; the launcher
     /// refuses otherwise (guards 1002/1003/1004) rather than transforming a length the

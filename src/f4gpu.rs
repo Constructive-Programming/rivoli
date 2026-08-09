@@ -1,4 +1,29 @@
-//! The DeepSeek-V4-Flash layer loop — `Transformer.forward` on device.
+//! The `.f4` decode loop — `Transformer.forward` on device.
+//!
+//! USED BY: DeepSeek-V4-Flash-0731, and nothing else today.
+//!
+//! # The name says the artifact format, and that is NARROWER than it sounds
+//!
+//! Renamed from `v4gpu`/`V4Engine` on 2026-08-09, because naming a decode loop after the
+//! model that first needed it is the mistake this tree spent the day removing. `f4` follows
+//! the convention already in the repo — `.f4`/`.vq3`/`.i4` artifacts, the `dot_f4_wave_r`
+//! family — and it is the actual dispatch fact: `gpu.rs::launch_expert_range` bails on
+//! `RoutedFmt::F4` naming this file's launcher.
+//!
+//! **But the name over-promises, and a reader must not take it at face value: a different
+//! `.f4` model would NOT drop in here.** This loop hard-codes an architecture, not a format.
+//! It assumes shared-K=V MQA over a sliding window plus a compressed region, a
+//! `[s, hc_mult, dim]` hyper-connection residual, and per-layer KV compression keyed to
+//! `compress_ratio`. Its SHARED expert is not even fp4 — it is fp8 e4m3, resident, and runs
+//! through `gemv_fp8_bf16`. So `f4` names what the routed experts are stored as and what the
+//! dispatch keys on; it does not name what this file is compatible with. A second `.f4`
+//! model wanting to reuse this would be a port, not a configuration.
+//!
+//! That is the honest cost of picking a name from the format axis. It was chosen over
+//! `MqaHcEngine` — truer to the mechanism — because a cryptic name at every call site buys
+//! precision nobody reads, and over keeping `V4` because a product version number is the one
+//! thing the naming principle is explicitly against. The over-promise is written down here
+//! instead of being fixed in the identifier.
 //!
 //! GLM's counterpart is [`crate::gpu`]. This is a separate module rather than a second arm
 //! inside it, and the reason is not file size: the two share **no** per-layer step. V4 carries
@@ -21,11 +46,11 @@
 //! to discover them from a number:
 //!
 //! * the resident fp8 **shared expert is unclamped** — `v4oracle::Defect::SwigluUnclamped`, one
-//!   contribution in seven, on every layer. See [`V4Engine::shared_expert`].
+//!   contribution in seven, on every layer. See [`F4Engine::shared_expert`].
 //! * on the 21 ratio-4 layers the compressed block set is chosen **positionally** rather than by
 //!   the lightning indexer's scores. Below `4 * (index_topk + 1)` positions the SET is the same
 //!   (fixed by the causal mask) and only the online-softmax fold ORDER differs; above it the two
-//!   disagree on the set, which is why [`V4Engine::new`] refuses that context outright.
+//!   disagree on the set, which is why [`F4Engine::new`] refuses that context outright.
 //! * **the MoE output is not bf16-rounded.** `MoE.forward` ends `return y.type_as(x)`
 //!   (model.py:649) and `Oracle::moe` ends `round_bf16(&mut y)`; the engine's `sub` after
 //!   [`launch_moe_acc_drain`] holds a bf16 shared-expert output plus a fixed-point routed sum with
@@ -39,7 +64,7 @@
 //! # Synchronisation this loop OWNS
 //!
 //! Six of the launchers `attn::v4::attention` uses take no stream, neither does
-//! `v4compress::compress`, and `memcpy_dtod` is a blocking `hipMemcpy` on the null stream
+//! `kvcompress::compress`, and `memcpy_dtod` is a blocking `hipMemcpy` on the null stream
 //! (`kernels/linalg.hip:692`). So attention, the compressor, the norms and the router GEMV all
 //! run on the **null stream**; the MoE experts run on `compute_stream`/`miss_stream`, and the
 //! shared-expert chain on `shared_stream` (M7) — all `hipStreamNonBlocking` and therefore NOT
@@ -86,14 +111,14 @@ use crate::backend::hip::{
 };
 use crate::backend::{Event, NULL_STREAM, Stream};
 use crate::gpu::as_le_bytes;
-use crate::math::{Scoring, f32_to_bf16, route_into};
-use crate::memory::device::DeviceBuf;
-use crate::memory::pin::{Fp8Weight, V4Compressor, V4Pin, V4Route};
-use crate::memory::routed::ExpertSlot;
-use crate::v4compress::{
+use crate::kvcompress::{
     Buffers, Finish, Geom, LayerKind, RopeParams, compress, compress_dst, compress_offset,
     freqs_cis, rope_for_layer,
 };
+use crate::math::{Scoring, f32_to_bf16, route_into};
+use crate::memory::device::DeviceBuf;
+use crate::memory::pin::{CompressorWeights, F4Pin, Fp8Weight, GateRoute};
+use crate::memory::routed::ExpertSlot;
 use anyhow::{Context, Result, ensure};
 use std::ffi::c_void;
 
@@ -251,8 +276,8 @@ struct Extent {
 /// Adds **≈0.5 GB** of device memory over 43 layers — 21 ratio-4 layers at 16.8 MB for the
 /// `wkv`+`wgate` pair plus 20 ratio-128 layers at 8.4 MB — beside the ≈1 GB of f32 the pin already
 /// holds, plus one read-back per tensor at startup. (An earlier note here said "~1 GB", which is
-/// the f32 that is already there, not the addition.) Placing bf16 in `V4Pin` instead would be strictly better —
-/// it would REPLACE the f32 rather than adding to it — but that changes `V4Compressor`'s field
+/// the f32 that is already there, not the addition.) Placing bf16 in `F4Pin` instead would be strictly better —
+/// it would REPLACE the f32 rather than adding to it — but that changes `CompressorWeights`'s field
 /// types and `tests/v4_pin.rs` with it, and this is the loop's bug to fix.
 fn narrow_to_bf16(src: *const f32, n: usize) -> Result<DeviceBuf> {
     let mut bytes = Vec::new();
@@ -273,7 +298,7 @@ fn narrow_to_bf16(src: *const f32, n: usize) -> Result<DeviceBuf> {
 /// One compressed layer's compressor: geometry, pooling state, scratch.
 ///
 /// `None` on a ratio-0 layer in both halves at once — `Geom::attention` refuses
-/// [`LayerKind::Plain`] and `V4LayerPin::compressor` is `None` there — so the pair cannot
+/// [`LayerKind::Plain`] and `F4LayerPin::compressor` is `None` there — so the pair cannot
 /// disagree about whether a layer compresses.
 ///
 /// The four buffers are named `state_*`/`proj_*` rather than after `Buffers`' own fields, which
@@ -298,13 +323,13 @@ impl LayerCompressor {
         cfg: &V4Config,
         kind: LayerKind,
         max_m: usize,
-        cw: Option<&V4Compressor>,
+        cw: Option<&CompressorWeights>,
     ) -> Result<Option<Self>> {
         let eps = cfg.rms_norm_eps as f32;
         let geom = Geom::attention(kind, cfg.head_dim, cfg.qk_rope_head_dim, eps);
         let (Some(geom), Some(cw)) = (geom, cw) else {
             // Asserted rather than assumed: `Geom::attention` refuses `LayerKind::Plain` and
-            // `V4LayerPin::compressor` is `None` there, and the two are decided in different
+            // `F4LayerPin::compressor` is `None` there, and the two are decided in different
             // files off the same config. A layer with one and not the other is a loader bug that
             // would otherwise surface as a null-pointer launch.
             ensure!(
@@ -370,7 +395,7 @@ impl DeviceLayer {
         kind: LayerKind,
         max_ctx: usize,
         max_m: usize,
-        cw: Option<&V4Compressor>,
+        cw: Option<&CompressorWeights>,
     ) -> Result<Self> {
         // `max_ctx / ratio` is the reference's own sizing of `kv_cache[:, window_size:]`, and 0
         // on a ratio-0 layer. `div_ceil` and not `/`: at `max_ctx = 13, ratio = 4` the block
@@ -478,7 +503,7 @@ fn read_prefix(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
     Ok(read_f32(&bytes))
 }
 
-/// Everything ONE [`V4Engine::probe_attn_stages`] call leaves readable, in pipeline order.
+/// Everything ONE [`F4Engine::probe_attn_stages`] call leaves readable, in pipeline order.
 ///
 /// A struct and not a 4-tuple: all four are `Vec<f32>`, so every permutation type-checks and the
 /// failure is a comparison against the wrong golden. Same argument [`Extent`] makes about its two
@@ -586,13 +611,13 @@ impl AttnStages {
 ///
 /// What each bucket brackets, exactly — the names follow GLM's and approximate like GLM's:
 ///
-/// * `route_ns` — the gate-logits D2H plus [`V4Engine::route_row`]'s host math. The D2H is
+/// * `route_ns` — the gate-logits D2H plus [`F4Engine::route_row`]'s host math. The D2H is
 ///   the layer's FIRST blocking call and the null stream carries everything before it, so
 ///   the wait drains the attention half, both `hc_pre`/norm launches and the gate GEMV
 ///   still in flight: most of `route` is attention GPU time, not routing. GLM's `route`
 ///   contains the same drain behind the same D2H, which is what keeps the columns
 ///   comparable — and is why the HB=16 attention win was quoted in `route` there.
-/// * `moe_ns` — [`V4Engine::shared_expert`] plus [`V4Engine::routed_experts`]: the shared
+/// * `moe_ns` — [`F4Engine::shared_expert`] plus [`F4Engine::routed_experts`]: the shared
 ///   expert's launches, the pool submit, both existing `device_sync`s (expert compute and
 ///   whatever fetch was not hidden behind it), and the drain launch. The analog of GLM's
 ///   `moe` block_on wall.
@@ -607,7 +632,7 @@ impl AttnStages {
 /// buckets are sub-spans of the decode wall on one thread.
 ///
 /// * `tail_ns` — M2's ranking item (3), the remainder's own decomposition: the head-tail
-///   launches ([`V4Engine::head_tail`]) plus [`V4Engine::argmax`] — whose `device_sync` is
+///   launches ([`F4Engine::head_tail`]) plus [`F4Engine::argmax`] — whose `device_sync` is
 ///   where the whole tail's GPU time drains, the existing join the M1 rule requires. Printed
 ///   INSIDE the remainder term, not beside it: the remainder stays `wall − route − moe` and
 ///   `tail` names the head share of it, leaving `remainder − tail` = the per-layer
@@ -665,14 +690,14 @@ impl AttnStages {
 ///
 /// # The moe split (M6): host tiling of `moe_ns`, plus three device attributions
 ///
-/// `moe_ns` is a HOST wall (two `Instant` brackets in [`V4Engine::moe`]), so its split
+/// `moe_ns` is a HOST wall (two `Instant` brackets in [`F4Engine::moe`]), so its split
 /// is host sub-intervals that tile it — disjoint by construction, `resid ≥ 0` — read at
 /// clocks the path already holds, plus three same-stream event pairs read behind the
 /// SECOND `device_sync` the routed path already pays. What each holds, exactly:
 ///
-/// * `moe_sh_ns` — the [`V4Engine::shared_expert`] call: five launch ENQUEUES onto the
+/// * `moe_sh_ns` — the [`F4Engine::shared_expert`] call: five launch ENQUEUES onto the
 ///   shared stream (M7, 2026-08-08 — the call sits INSIDE the row-0
-///   [`V4Engine::routed_experts`], after `sync1`, so the sync it follows cannot wait on
+///   [`F4Engine::routed_experts`], after `sync1`, so the sync it follows cannot wait on
 ///   it; the chain's GPU time is `moe_shg_ns` and its join is `sync2`). Before M7 the
 ///   chain rode the null stream and its unhidden tail exposed in `moe_h2d_ns`,
 ///   measured 15.5 ms/token in M6.
@@ -725,7 +750,7 @@ impl AttnStages {
 /// gate (±3% of the recorded 130.7) is the control, and a breach is reported before
 /// any reading of either split.
 #[derive(Default)]
-struct V4Profile {
+struct Profile {
     route_ns: u128,
     /// `route_row`'s host share of `route_ns` — accumulated beside it, never beyond it.
     route_host_ns: u128,
@@ -751,8 +776,8 @@ struct V4Profile {
     moe_miss_ns: u128,
 }
 
-/// The route-split marks' indices into [`V4Engine::route_ev`], program order — named so
-/// the record sites and the pair reads spell the same map [`V4Profile`] documents, and a
+/// The route-split marks' indices into [`F4Engine::route_ev`], program order — named so
+/// the record sites and the pair reads spell the same map [`Profile`] documents, and a
 /// transposed pair is visible at the call site instead of plausible. M6 renumbered the
 /// tail three when the two intra-attention marks landed between SEL and ATTN_DONE; the
 /// names are why no pair read had to change for it.
@@ -766,7 +791,7 @@ const M_ATTN_DONE: usize = 5;
 const M_FFN_NORMED: usize = 6;
 const M_GATE: usize = 7;
 
-/// The moe-split pairs' indices into [`V4Engine::moe_ev`] — [`V4Profile`]'s "moe split"
+/// The moe-split pairs' indices into [`F4Engine::moe_ev`] — [`Profile`]'s "moe split"
 /// section is the coverage map. Pairs, not a program-order chain: SH is a null-stream
 /// pair, RES a compute-stream pair, MISS a miss-stream pair, so only same-index-pair
 /// spans are meaningful.
@@ -790,16 +815,16 @@ fn ev_span_ns(a: &Event, b: &Event, what: &str) -> Result<u128> {
 
 /// Everything one V4 decode needs that does not vary between tokens.
 ///
-/// Every device buffer is allocated once in [`V4Engine::new`] and none per token, which is
+/// Every device buffer is allocated once in [`F4Engine::new`] and none per token, which is
 /// `gpu.rs`'s rule and why a decode does not allocate on the hot path.
-pub struct V4Engine {
-    pin: V4Pin,
+pub struct F4Engine {
+    pin: F4Pin,
     cfg: V4Config,
     dims: v4::Dims,
     rope: RopeTables,
     layers: Vec<DeviceLayer>,
     /// Which layers this pin holds. `0..n_layers` for a whole-model decode; a shorter prefix is
-    /// a golden comparison and [`V4Engine::new`] says so at startup.
+    /// a golden comparison and [`F4Engine::new`] says so at startup.
     range: std::ops::Range<usize>,
     max_ctx: usize,
     /// Query rows every `[m, ..]` buffer is sized for — the prompt length, because V4's prefill
@@ -807,9 +832,9 @@ pub struct V4Engine {
     /// compressor's block pooling are whole-prompt by construction).
     max_m: usize,
     /// The token ids of the step in flight. Held because a hash layer's `tid2eid` is indexed by
-    /// token id, and [`V4Engine::moe`] does not otherwise see them.
+    /// token id, and [`F4Engine::moe`] does not otherwise see them.
     step_ids: Vec<u32>,
-    /// Rows the last [`V4Engine::set_residual`] (or [`V4Engine::forward`]) loaded.
+    /// Rows the last [`F4Engine::set_residual`] (or [`F4Engine::forward`]) loaded.
     ///
     /// Closes the one way the probe API can produce a plausible wrong number instead of an error:
     /// loading a 13-row residual and then driving one row reads row 0 and scores it against a
@@ -862,12 +887,12 @@ pub struct V4Engine {
     sel: Vec<usize>,
     /// `[n_desc]` f32 indexed by ABSOLUTE expert id, zero for every expert this token did not
     /// route to. The kernel skips a zero weight, so the zeros are correctness and not thrift.
-    /// The scatter source for [`V4Engine::routed_experts`]'s launch-order gather, and read
+    /// The scatter source for [`F4Engine::routed_experts`]'s launch-order gather, and read
     /// directly by the probe API's last-row weights — which is why it stays absolute.
     wexpert_host: Vec<f32>,
     /// `[n_desc]` f32 in LAUNCH order — the descriptor index space the device buffers share
-    /// (residents at `[0, n_res)`, misses after; see [`V4Engine::routed_experts`]). Gathered
-    /// from [`V4Engine::wexpert_host`] per token row. Entries past this row's selection are
+    /// (residents at `[0, n_res)`, misses after; see [`F4Engine::routed_experts`]). Gathered
+    /// from [`F4Engine::wexpert_host`] per token row. Entries past this row's selection are
     /// never written after construction, so they stay zero — and a zero weight makes a
     /// wrongly-computed launch range write `h = 0` instead of plausible values, the same
     /// defense the null descriptors give the pointer side.
@@ -891,8 +916,8 @@ pub struct V4Engine {
     argmax_dev: DeviceBuf,
     argmax_host: Vec<u8>,
     /// Backs TWO instruments, `None` on every stock run: §M9's `--logit-dump` /
-    /// `--force-tokens` drift A/B, armed by [`V4Engine::arm_logit_trace`] (writes a `.lt`
-    /// file); and `--ppl`'s corpus perplexity, armed by [`V4Engine::nll_forced`] (writes
+    /// `--force-tokens` drift A/B, armed by [`F4Engine::arm_logit_trace`] (writes a `.lt`
+    /// file); and `--ppl`'s corpus perplexity, armed by [`F4Engine::nll_forced`] (writes
     /// nothing per step, just accumulates NLLs). Both are teacher-forced quality
     /// instruments that put a per-token vocab-sized D2H on the decode path (`trace_step`),
     /// so a tok/s from a build that could even ARM either means nothing — that shared cost
@@ -906,38 +931,38 @@ pub struct V4Engine {
     miss_stream: Stream,
     /// The shared-expert chain's stream (M7): off the null stream so the routed path's
     /// blocking H2D copies stop ordering behind it, enqueued after `sync1`, joined by
-    /// `sync2` — see [`V4Engine::routed_experts`].
+    /// `sync2` — see [`F4Engine::routed_experts`].
     shared_stream: Stream,
     hits0: u64,
     misses0: u64,
-    prof: V4Profile,
+    prof: Profile,
     /// The eight route-split marks (six of M4's, two of M6's inside `attention`),
-    /// program order (see [`V4Profile`]). ONE array reused every layer: each layer's
+    /// program order (see [`Profile`]). ONE array reused every layer: each layer's
     /// pairs are read at its own gate D2H, before the next layer records over them, so
     /// reuse cannot cross-read.
     route_ev: [Event; 8],
-    /// The three moe-split pairs (see [`V4Profile`]'s moe section and the `MO_*`
+    /// The three moe-split pairs (see [`Profile`]'s moe section and the `MO_*`
     /// constants). Reused per layer like `route_ev` — read behind the routed path's own
     /// closing `device_sync` before the next layer records over them — with one further
     /// rule the route marks do not need: a pair a call did NOT record this layer is not
     /// read either, because a reused event retains its previous recording.
     moe_ev: [Event; 6],
     /// `Some` from layer top until the gate D2H returns — the token saying "this `moe`
-    /// call closes a window [`V4Engine::layer`] opened". Today `moe` is only entered from
+    /// call closes a window [`F4Engine::layer`] opened". Today `moe` is only entered from
     /// `layer`, which always opens the window first; the `Option` is what keeps a FUTURE
     /// probe-driven `moe` from booking a window that never opened or reading marks it
     /// never recorded (`probe_attn_stages` already records marks 2..=5 and never reads).
     win_t0: Option<std::time::Instant>,
 }
 
-impl V4Engine {
-    /// Build the engine over a loaded [`V4Pin`]. `prompt_len + ngen + 1` is the context.
-    pub fn new(pin: V4Pin, cfg: V4Config, prompt_len: usize, ngen: usize) -> Result<Self> {
+impl F4Engine {
+    /// Build the engine over a loaded [`F4Pin`]. `prompt_len + ngen + 1` is the context.
+    pub fn new(pin: F4Pin, cfg: V4Config, prompt_len: usize, ngen: usize) -> Result<Self> {
         let range = pin.range();
-        // **A decode has to start at layer 0.** `V4Pin::build` deliberately does not enforce
+        // **A decode has to start at layer 0.** `F4Pin::build` deliberately does not enforce
         // this — which layers a file holds is a property of the LOADER, and refusing a partial
         // artifact there made every one but the first unloadable — but a forward pass has no
-        // residual stream to enter at layer 3. `V4Pin::layer` takes ABSOLUTE ids, so a pin over
+        // residual stream to enter at layer 3. `F4Pin::layer` takes ABSOLUTE ids, so a pin over
         // 3..6 answers every lookup correctly and the arithmetic is a different model's, with
         // nothing anywhere to notice. The check was in neither place before this line.
         ensure!(
@@ -1005,7 +1030,7 @@ impl V4Engine {
             let kind = LayerKind::from_config(&cfg, l)
                 .with_context(|| format!("classifying layer {l}"))?;
             // The pin's compressor for this layer, so `LayerCompressor` can narrow its weights. Read
-            // through `V4Pin::layer`, which applies the artifact-order offset exactly once.
+            // through `F4Pin::layer`, which applies the artifact-order offset exactly once.
             let cw = pin.layer(l)?.compressor;
             layers.push(DeviceLayer::new(&cfg, kind, max_ctx, max_m, cw.as_ref())?);
         }
@@ -1085,7 +1110,7 @@ impl V4Engine {
             shared_stream: Stream::shared()?,
             hits0,
             misses0,
-            prof: V4Profile::default(),
+            prof: Profile::default(),
             // Infallible at runtime — the loop above pushed exactly fourteen and the
             // split took six — but `try_into`'s error type is the `Vec` back, so
             // `context` is the honest spelling.
@@ -1282,7 +1307,7 @@ impl V4Engine {
     /// Assemble `Buffers`, make the call, and hand back `(blocks emitted, the buffer they are
     /// in)`.
     ///
-    /// Split from [`V4Engine::compress_and_place`] for the BORROW and not for safety — an
+    /// Split from [`F4Engine::compress_and_place`] for the BORROW and not for safety — an
     /// earlier doc here claimed the split was what kept `compress` to one call site, which is
     /// backwards: this function *is* the second entry point, and what keeps the call to one is
     /// that this one is private with a single caller. Returning `src` rather than letting the
@@ -1450,7 +1475,7 @@ impl V4Engine {
     /// # The device router was DECLINED and then DELETED, and this is why
     ///
     /// `moe_gate_v4` existed, was verified, carried FOUR tests, and took `tid2eid` as a device
-    /// `*const i64` — while `V4Pin` parses the table to a host `Vec<u32>` and argues that
+    /// `*const i64` — while `F4Pin` parses the table to a host `Vec<u32>` and argues that
     /// "placing 6.2 MB of `tid2eid` per hash layer on the device to index it there would buy
     /// nothing". Both are defensible and they are opposite; the port recorded it so this stage
     /// would decide deliberately rather than discover it at the call site. The reasons:
@@ -1488,12 +1513,12 @@ impl V4Engine {
         let logits = &self.gl_host[t * n_desc * 4..(t + 1) * n_desc * 4];
         let lp = self.pin.layer(layer)?;
         let (bias, hash) = match &lp.route {
-            V4Route::Scored { bias } => (bias.as_slice(), None),
+            GateRoute::Scored { bias } => (bias.as_slice(), None),
             // A hash layer has no bias. It still RUNS the gate: the scores become the WEIGHTS
             // even though the selection ignores them, and reading `tid2eid` while skipping the
             // gate leaves the weights uniform — which decodes fluently and wrongly
             // (`Defect::HashRoutingIgnored`'s mirror image).
-            V4Route::Hash { tid2eid } => (self.zero_bias.as_slice(), Some(tid2eid)),
+            GateRoute::Hash { tid2eid } => (self.zero_bias.as_slice(), Some(tid2eid)),
         };
         route_into(
             logits,
@@ -1530,7 +1555,7 @@ impl V4Engine {
         );
         let scale = self.cfg.routed_scale as f32 / sum;
         self.wexpert_host.fill(0.0);
-        // Indexed by ABSOLUTE expert id — this is the scatter [`V4Engine::routed_experts`]
+        // Indexed by ABSOLUTE expert id — this is the scatter [`F4Engine::routed_experts`]
         // gathers into launch order (and the probe API reads directly), sized `n_desc` rather
         // than `e_count`. The id is in range on both paths and by two independent
         // mechanisms: the scored path selects indices OF this
@@ -1563,7 +1588,7 @@ impl V4Engine {
     fn routed_experts(&mut self, layer: usize, t: usize, shared_rows: Option<usize>) -> Result<()> {
         let (dim, inter, n_desc) = (self.cfg.hidden, self.cfg.moe_inter, self.cfg.n_experts);
         // The M6 moe-split host brackets — every boundary below is a clock read beside
-        // a call the path already makes; [`V4Profile`]'s moe section is the coverage map.
+        // a call the path already makes; [`Profile`]'s moe section is the coverage map.
         let t_entry = std::time::Instant::now();
         self.pin.routed.submit(
             layer,
@@ -1582,7 +1607,7 @@ impl V4Engine {
         // restated `submit`'s postcondition and could not fire.
         // **`fmt` is READ, not ignored.** `submit` returns it so the caller can dispatch, which is
         // exactly what GLM's `launch_expert_range` does — and `desc_of_f4` below builds an F4
-        // descriptor unconditionally. The pool is single-format today (`V4Pin::build` hands
+        // descriptor unconditionally. The pool is single-format today (`F4Pin::build` hands
         // `RoutedPool::new` the same `TierFmt` twice), so this cannot fire; it is here because the
         // consequence if a second container is ever paired with `.f4` is not a fault. `.f4` and
         // `.i4` tile IDENTICALLY for 25% of all `i_dim`, both models' dimensions included
@@ -1748,7 +1773,7 @@ impl V4Engine {
         let t_read = std::time::Instant::now();
         // Pair reads, behind the sync that retired them. ONLY the pairs this call
         // recorded: a reused event keeps its previous recording, so reading an
-        // unrecorded pair would book a stale span as this layer's (see [`V4Profile`]).
+        // unrecorded pair would book a stale span as this layer's (see [`Profile`]).
         if n_res > 0 {
             self.prof.moe_res_ns += ev_span_ns(
                 &self.moe_ev[MO_RES0],
@@ -1855,7 +1880,7 @@ impl V4Engine {
     /// `Expert.forward`'s two input projections for the SHARED expert — `w1` into `sh_g` and
     /// `w3` into `sh_u`, over all `m` rows.
     ///
-    /// Split out because [`V4Engine::probe_shared_operands`] has to run exactly these two and
+    /// Split out because [`F4Engine::probe_shared_operands`] has to run exactly these two and
     /// cannot read them back from `shared_expert`: that method writes the SwiGLU product over
     /// `sh_g` in place.
     ///
@@ -1891,7 +1916,7 @@ impl V4Engine {
 
     /// `MoE.forward` over `m` rows: the gate, then the routed experts one row at a time —
     /// with the shared expert (batched over all rows) enqueued from inside the row-0
-    /// [`V4Engine::routed_experts`] onto its own stream (M7; the why is at that call).
+    /// [`F4Engine::routed_experts`] onto its own stream (M7; the why is at that call).
     fn moe(&mut self, layer: usize, m: usize) -> Result<()> {
         let (dim, n_experts) = (self.cfg.hidden, self.cfg.n_experts);
         let gate_w = self.pin.layer(layer)?.gate_w;
@@ -1937,7 +1962,7 @@ impl V4Engine {
         self.route_ev[M_GATE].record(NULL_STREAM)?;
         // The one blocking D2H on the per-layer path, and GLM pays the same one: `route_into` is
         // host math. `m * n_experts` f32 — 1 KB at decode. The bracket is free — the D2H is a
-        // join the path already pays (see [`V4Profile`] for what its wait actually contains).
+        // join the path already pays (see [`Profile`] for what its wait actually contains).
         let t0 = std::time::Instant::now();
         self.gate_logits.copy_out_into(&mut self.gl_host)?;
         self.prof.route_ns += t0.elapsed().as_nanos();
@@ -1987,7 +2012,7 @@ impl V4Engine {
 
     /// `hc_pre` then the sublayer's `RMSNorm`, into `xw`/`post`/`comb`.
     ///
-    /// Split out of [`V4Engine::layer`] so [`V4Engine::probe_pre_norm`] can stop here — the first
+    /// Split out of [`F4Engine::layer`] so [`F4Engine::probe_pre_norm`] can stop here — the first
     /// gate run localised a real error to somewhere in `hc_pre -> attn_norm -> attention ->
     /// hc_post -> hc_pre -> ffn_norm` and could not say which, because `ffn_norm_out` is the
     /// earliest tensor the loop leaves readable. This is the one before it.
@@ -2054,7 +2079,7 @@ impl V4Engine {
     fn layer(&mut self, layer: usize, m: usize, start_pos: usize) -> Result<()> {
         let (dim, hc) = (self.cfg.hidden, self.cfg.hc_mult);
         let null = std::ptr::null_mut();
-        // The route-split window opens (see [`V4Profile`]): the wall clock first, then mark
+        // The route-split window opens (see [`Profile`]): the wall clock first, then mark
         // 0, so the window contains the mark by construction. The stream is drained here on
         // every layer but the step's first (the previous layer's end-of-layer sync), where
         // only the embed gather can be pending.
@@ -2104,7 +2129,7 @@ impl V4Engine {
 
     /// Bind this step's token ids and bound its position; returns the row count.
     ///
-    /// **One function because the two entry points into [`V4Engine::layer`] fell out of step.**
+    /// **One function because the two entry points into [`F4Engine::layer`] fell out of step.**
     /// `forward` had the position bound and `probe_layer` did not, which a review found: the
     /// rotary tables are built at exactly `max_ctx` positions and `launch_rope_adjacent` reads
     /// `tbl + pos0 * rd` with no bound of its own, so a probe driver walking further than the
@@ -2179,7 +2204,7 @@ impl V4Engine {
     /// `hc_head`, the final `RMSNorm`, `ParallelHead` — the last three ops of
     /// `Transformer.forward`, over the LAST of `m` rows.
     ///
-    /// Split from [`V4Engine::forward`] so [`V4Engine::probe_head_tail`] can drive it on a
+    /// Split from [`F4Engine::forward`] so [`F4Engine::probe_head_tail`] can drive it on a
     /// residual the caller supplied. That is what makes it gateable at all: the port records
     /// that these three ops "have neither an implementation nor a golden" and that "the first
     /// decode's logits are ungated by construction" — `bin/v4-oracle`'s `head.probe.*` goldens
@@ -2368,7 +2393,7 @@ impl V4Engine {
     /// **This is what closes the hole the port names as structural** — "the last three ops of
     /// `Transformer.forward` have neither an implementation nor a golden … the first decode's
     /// logits are ungated by construction". They have both now: the implementation is
-    /// [`V4Engine::head_tail`] and the golden is `bin/v4-oracle`'s `head.probe.logits`, taken on
+    /// [`F4Engine::head_tail`] and the golden is `bin/v4-oracle`'s `head.probe.logits`, taken on
     /// a DECLARED probe rather than on the layer chain — which is exactly why it is a golden
     /// (composing 43 layers at `--layers 2` would produce a logits vector that is not any
     /// quantity the model computes, and `fixed_probe`'s doc says so).
@@ -2393,7 +2418,7 @@ impl V4Engine {
         self.pin.routed.hits() - self.hits0
     }
 
-    /// See [`V4Engine::pool_hits`].
+    /// See [`F4Engine::pool_hits`].
     pub fn pool_misses(&self) -> u64 {
         self.pin.routed.misses() - self.misses0
     }
@@ -2407,7 +2432,7 @@ impl V4Engine {
     /// bytes), so a later `probe_layer` on the same step is unaffected. On a compressing layer it
     /// is emphatically not: `compress` read-modify-writes the pooling state and the decode path
     /// slides the window, so a second pass double-deposits — the exact trap
-    /// `v4compress::compress` documents at its "never a second call".
+    /// `kvcompress::compress` documents at its "never a second call".
     pub fn probe_attn_stages(
         &mut self,
         layer: usize,
@@ -2449,7 +2474,7 @@ impl V4Engine {
     /// `hc_pre` + the sublayer norm ALONE, returning `xw`.
     ///
     /// The earliest comparable tensor in a block: `attn_norm_out` at `ffn = false`. Idempotent, so
-    /// it may run before [`V4Engine::probe_layer`] on the same loaded residual.
+    /// it may run before [`F4Engine::probe_layer`] on the same loaded residual.
     pub fn probe_pre_norm(
         &mut self,
         layer: usize,
@@ -2469,7 +2494,7 @@ impl V4Engine {
 
     /// The `[m, dim]` working tensor — `hc_pre`'s output after its `RMSNorm`.
     ///
-    /// **The bisection point the block-output comparison lacks.** After [`V4Engine::probe_layer`]
+    /// **The bisection point the block-output comparison lacks.** After [`F4Engine::probe_layer`]
     /// this holds the FFN's `ffn_norm_out`: `moe` copies it into `xq` and quantizes THAT, leaving
     /// this intact. So everything up to and including attention, `hc_post`, the second `hc_pre` and
     /// its norm is UPSTREAM of it, and the entire MoE — router, routed experts, shared expert,
@@ -2482,7 +2507,7 @@ impl V4Engine {
         read_prefix(&self.xw, m * self.cfg.hidden)
     }
 
-    /// The routing decision of the LAST row the previous [`V4Engine::probe_layer`] drove:
+    /// The routing decision of the LAST row the previous [`F4Engine::probe_layer`] drove:
     /// `(expert ids, their weights)` in selection order.
     ///
     /// **The router is otherwise ungated, and it carries the invisible defect.**
@@ -2505,7 +2530,7 @@ impl V4Engine {
     /// The shared expert's two SwiGLU operands, recomputed and read back — `(gate, up)`, each
     /// `[m, moe_inter]`.
     ///
-    /// **The one measurement that says whether [`V4Engine::shared_expert`]'s missing clamp
+    /// **The one measurement that says whether [`F4Engine::shared_expert`]'s missing clamp
     /// actually binds at this prompt.** `Expert.forward` does `up.clamp(-limit, limit)` and
     /// `gate.min(limit)` at `swiglu_limit = 10.0`; if neither operand reaches 10 the clamp is
     /// INERT here and the whole deviation reduces to `F.silu`'s multiply form plus one missing
@@ -2652,7 +2677,7 @@ impl V4Engine {
         // Decode-only buckets: whatever the prefill accumulated is discarded here, and the
         // pool counters are re-read here, so the PROFILE line below decomposes exactly the
         // wall that `tok/s` is computed over — not the prefill's.
-        self.prof = V4Profile::default();
+        self.prof = Profile::default();
         let fetch0 = self.pin.routed.fetch_ns();
         let miss1 = self.pin.routed.misses();
         let mut pos = prompt.len();
@@ -2667,7 +2692,7 @@ impl V4Engine {
             // **Prefill and decode index different spaces**, and nothing in the types says so:
             // `start_pos == 0` means the selection's window columns are ABSOLUTE positions
             // `0..seqlen` over the prompt's own KV, and `start_pos > 0` means they are ring SLOTS
-            // `0..window_size`. `v4compress::compress_offset` owns that split and
+            // `0..window_size`. `kvcompress::compress_offset` owns that split and
             // `attn::v4::Pass` is the discriminant. What this loop contributes is that `pos` is
             // never 0 here — the prefill consumed position 0 — so the decode arm is unreachable
             // with a prefill's index space and vice versa.
@@ -2696,7 +2721,7 @@ impl V4Engine {
             dm as f64 * stride as f64 / 1e9,
             dm as f64 / out.len().max(1) as f64,
         );
-        // The per-token phase decomposition, decode-only (see [`V4Profile`] for what each
+        // The per-token phase decomposition, decode-only (see [`Profile`] for what each
         // bucket brackets). Same denominator as `tok/s` above — `out.len()` — so the terms
         // and the wall stay one arithmetic. `fetch`/`miss` here are the DECODE deltas, where
         // the hit/miss line above spans prefill too; both GLM conventions, kept so the two
@@ -2737,7 +2762,7 @@ impl V4Engine {
             fetch_ns / 1e6 / dec_miss.max(1) as f64,
             dec_miss as f64 * stride as f64 / 1e9 / n,
         );
-        // The route split (M4, see [`V4Profile`]): where the D2H wait's GPU time goes. The
+        // The route split (M4, see [`Profile`]): where the D2H wait's GPU time goes. The
         // four spans tile marks 0→7 inside `win`, the host wall that contains them; `resid`
         // is the wall's unexplained share (the D2H copy + pre-mark-0 lag) and the summing
         // check itself. `d2h + host` restates `route` as its halves, same accumulators.
@@ -2762,7 +2787,7 @@ impl V4Engine {
              gate {gate_ms:.1}ms | win {win_ms:.1}ms (resid {resid_ms:.1}ms) | \
              d2h {d2h_ms:.1}ms + host {host_ms:.1}ms"
         );
-        // The attn split (M6, see [`V4Profile`]): three sub-spans tiling `attn` at
+        // The attn split (M6, see [`Profile`]): three sub-spans tiling `attn` at
         // SHARED marks, so the residual is an identity check, not a remainder — four
         // independent float queries of the same four events, allowed either sign.
         let (qkv_ms, attend_ms) = (per(self.prof.qkv_ns), per(self.prof.attend_ns));
@@ -2780,7 +2805,7 @@ impl V4Engine {
             "ATTN-SPLIT/tok: qkv {qkv_ms:.1}ms | attend {attend_ms:.1}ms | \
              oproj {oproj_ms:.1}ms | attn {attn_ms:.1}ms (resid {attn_resid_ms:.2}ms)"
         );
-        // The moe split (M6, see [`V4Profile`]): seven host spans tiling `moe` (resid =
+        // The moe split (M6, see [`Profile`]): seven host spans tiling `moe` (resid =
         // clock gaps + the instrument's own pair reads, non-negative by construction),
         // then the three device attributions — NOT addends: shared overlaps the resident
         // batch (M7), res and miss overlap each other across streams.
@@ -2845,7 +2870,7 @@ mod tests {
 
     /// INV-7. A compressed block's destination row is a pure function of its POSITION, in
     /// **both coordinate systems the layer loop writes** — which is the half of the invariant
-    /// that belongs to `v4gpu` rather than to `v4compress`.
+    /// that belongs to `f4gpu` rather than to `kvcompress`.
     ///
     /// `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees`
     /// already proves the other half comprehensively (the gapped script against an appending

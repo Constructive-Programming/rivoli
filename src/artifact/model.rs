@@ -1174,7 +1174,7 @@ mod tests {
             (vec![("swiglu_limit", "0.0")], "CLAMPED"),
             // The two f64 -> f32 NARROWING failures, which a bare `> 0.0` on the f64 admits.
             // Both are device-free here and were not testable where this check first lived
-            // (`V4Engine::new`, which allocates device buffers and needs a real pin).
+            // (`F4Engine::new`, which allocates device buffers and needs a real pin).
             // `1e-46` underflows to `0.0f32`: LOUD, guard 1006 at the first MoE layer.
             (vec![("swiglu_limit", "1e-46")], "narrows to 0"),
             // `1e39` saturates to `f32::INFINITY`, passes every `> 0.0`, and makes

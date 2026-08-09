@@ -174,7 +174,7 @@ extern "C" __global__ void moe_acc_drain(
 //     (e_count=1, per-expert Signal overlap); the [e_start,e_count) range form is the
 //     hook for a batching of RESIDENT experts (whose Signals are already ready)
 //     into a single launch, to cut host-gated launch bubbles. [2026-08-07: the V4 fp4
-//     caller cashed that hook in — `v4gpu::routed_experts` batches its residents into one
+//     caller cashed that hook in — `f4gpu::routed_experts` batches its residents into one
 //     range in LAUNCH order; this GLM vq/i4 path still launches one per range.]
 // `nrow` token rows through ONE read of the expert weights. The grid is unchanged — the
 // row axis is inside each wave, not beside it — so this is the same launch shape doing
@@ -247,7 +247,7 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
 //
 // The six spans below are cast to `common.hpp::gu8p` (GLOBAL address space) at every use —
 // the typedef's comment carries the measurement and the rejected alternatives. The cast is
-// TRUE by construction: every span points at a device arena or heap allocation (v4gpu's
+// TRUE by construction: every span points at a device arena or heap allocation (f4gpu's
 // placement, `tests/v4_kernel.rs`'s `DeviceBuf`s), and host GTT memory is still the global
 // aperture on this APU; no LDS or scratch address can reach a descriptor. It asserts only
 // the address SPACE — what the pointer may alias is untouched.

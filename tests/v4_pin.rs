@@ -1,11 +1,11 @@
-//! `V4Pin::build` against the shipped `.f4` artifact.
+//! `F4Pin::build` against the shipped `.f4` artifact.
 //!
 //! **Separate from `tests/v4_loading.rs` because this one needs the GPU.** Placement goes
 //! through `DeviceTier`, which allocates a real device slab and refuses to start if another
 //! tenant holds GPU memory — so this file follows the repo's GPU-test idiom (`tests/vk.rs`)
 //! and simply runs, failing when the device is busy. `v4_loading.rs` stays host-only.
 //!
-//! What it is for: `V4Pin::build` resolves ~40 tensors a layer by NAME into typed fields,
+//! What it is for: `F4Pin::build` resolves ~40 tensors a layer by NAME into typed fields,
 //! and a name resolved into the wrong field is silent — every one of these tensors exists,
 //! so nothing fails to load. The dimensions are the discriminant. `wq_a` is `[1024, 4096]`
 //! and `wkv` is `[512, 4096]`; `wo_a` is `[8192, 4096]` and `wo_b` its transpose. Swapping
@@ -20,7 +20,7 @@
 //! | `v4-f4-l3-5` | 3-5 | 128, 4, 128 | all **scored** | all three, layer 4 only |
 //!
 //! `l3-5` is also the only one whose range does not start at 0, so it is what proves
-//! `V4Pin::layer`'s absolute-id mapping — against `l0-2` alone an off-by-`range.start` bug
+//! `F4Pin::layer`'s absolute-id mapping — against `l0-2` alone an off-by-`range.start` bug
 //! is invisible, because the offset is zero.
 //!
 //! **What this CANNOT see, stated rather than implied:** `w1` and `w3` (gate and up) have
@@ -31,7 +31,7 @@
 #![cfg(feature = "rocm")]
 
 use rivoli::artifact::model::{V4Config, load_config};
-use rivoli::memory::pin::{V4Pin, V4Route};
+use rivoli::memory::pin::{F4Pin, GateRoute};
 
 #[path = "common/v4_artifact_dir.rs"]
 mod v4_artifact_dir;
@@ -59,7 +59,7 @@ fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
         "no V4 artifact on this machine — nothing was checked"
     );
     // The union, asserted. Otherwise a machine with only `l0-2` would run all-green having
-    // never constructed a `V4Route::Scored`, and this test would report coverage it does
+    // never constructed a `GateRoute::Scored`, and this test would report coverage it does
     // not have — which is the failure mode this whole port keeps re-learning.
     assert!(
         all.hash && all.scored && all.indexer && all.compressor_only,
@@ -82,10 +82,10 @@ struct Seen {
 fn check_one(dir: &str) -> Seen {
     let mut seen = Seen::default();
     let cfg: V4Config = load_config(dir).unwrap();
-    // `V4Pin::build` now also builds the `.f4` streaming pool, so it takes a device budget.
+    // `F4Pin::build` now also builds the `.f4` streaming pool, so it takes a device budget.
     // 12 GiB against a 3-layer fixture's ~2.5 GiB resident leaves ~9.5 GiB of pool — the
     // pool's own behaviour is `tests/v4_pool.rs`'s subject; here it only has to construct.
-    let pin = V4Pin::build(dir, &cfg, 12 << 30, "2q", Default::default(), None)
+    let pin = F4Pin::build(dir, &cfg, 12 << 30, "2q", Default::default(), None)
         .unwrap_or_else(|e| panic!("{dir} must load: {e:#}"));
     let range = pin.range();
 
@@ -98,7 +98,7 @@ fn check_one(dir: &str) -> Seen {
         cfg.n_layers
     );
     // Absolute ids only. Outside the range must be refused rather than wrapping into
-    // another layer's weights — the failure `V4Pin::layer` exists to make impossible.
+    // another layer's weights — the failure `F4Pin::layer` exists to make impossible.
     assert!(pin.layer(range.end).is_err(), "{dir}: past the end");
     if range.start > 0 {
         assert!(
@@ -138,7 +138,7 @@ fn check_one(dir: &str) -> Seen {
         // Routing: the CONFIG decides which branch, and the artifact carries only that
         // branch's tensor — so a disagreement is a failed load, not a silent fallback.
         match &p.route {
-            V4Route::Hash { tid2eid } => {
+            GateRoute::Hash { tid2eid } => {
                 seen.hash = true;
                 assert!(
                     cfg.layer_routes_by_hash(l),
@@ -157,7 +157,7 @@ fn check_one(dir: &str) -> Seen {
                     cfg.n_experts
                 );
             }
-            V4Route::Scored { bias } => {
+            GateRoute::Scored { bias } => {
                 seen.scored = true;
                 assert!(
                     !cfg.layer_routes_by_hash(l),
@@ -194,7 +194,7 @@ fn check_one(dir: &str) -> Seen {
 
     // The routed set is addressable at the artifact's OWN first layer — not at 0, which is
     // not in `l3-5` at all — and stops at the last ROUTED expert: the `.f4` has no shared
-    // block and `V4Pin` must not have opened it as though it did.
+    // block and `F4Pin` must not have opened it as though it did.
     let l0 = range.start;
     assert!(pin.f4.read_spec(l0, cfg.n_experts - 1).is_ok(), "{dir}");
     assert!(pin.f4.read_spec(l0, cfg.n_experts).is_err(), "{dir}");

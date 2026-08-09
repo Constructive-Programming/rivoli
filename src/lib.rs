@@ -42,7 +42,7 @@ pub mod math;
 ///
 /// Separate from [`indexer`], which is GLM's DSA lightning indexer: V4's `Indexer` shares
 /// the name and none of the structure — no `wk`, no `k_norm`, its own nested `Compressor`.
-pub mod v4compress;
+pub mod kvcompress;
 
 pub mod telemetry;
 /// The DeepSeek-V4-Flash numerical oracle (S1b of `docs/investigations/v4-flash-port.md`).
@@ -81,7 +81,7 @@ pub mod gpu;
 /// `v4_*` twin and never would have, and "no V4 decode path at all" was one of the measured
 /// reasons it was retired rather than finished.
 #[cfg(feature = "rocm")]
-pub mod v4gpu;
+pub mod f4gpu;
 
 /// Teacher-forced scoring (`--ppl`). An instrument, not an engine feature — nothing in a
 /// decode reaches it — so it is a module boundary AND a feature boundary, and the two
