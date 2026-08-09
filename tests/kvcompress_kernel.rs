@@ -24,7 +24,7 @@
 //!    reached from outside it (the RoPE pairing, the block-end position, the bf16 stores,
 //!    the `act_quant` extent). For each, the distance from the GPU output to the
 //!    defect-injected oracle must dwarf the distance to the clean one. This is S2b's
-//!    method (`tests/v4_attn.rs`) and it proves the METRIC has resolution, not that this
+//!    method (`tests/f4_attn.rs`) and it proves the METRIC has resolution, not that this
 //!    kernel would fail if broken in that specific way.
 //! 3. **Named inertness.** A defect that cannot fire on a cell is PRINTED as inert and
 //!    skipped, so "the kernel matched" there is recorded as proving nothing rather than
@@ -49,7 +49,7 @@
 //!   the host half and is worth reading.
 //! * **The indexer's compressor** (`rotate = true`: Hadamard + fp4 instead of the partial
 //!   fp8). Not exercised here; it landed 2026-08-05 and is scored by
-//!   `tests/v4_indexer_kernel.rs`.
+//!   `tests/blockindex_kernel.rs`.
 //! * **The four `act_quant` ARGUMENT defects, at every cell**, plus `NoBf16Rounding` on the
 //!   ratio-128 cells. All 13 sit at or under one e4m3 step — see [`BELOW_RESOLUTION`]. This
 //!   suite verifies the COMPRESSOR and delegates `act_quant` to S2b's own tests.
@@ -69,7 +69,10 @@
 //! Skips with a printed reason when the checkpoint is absent — there is no CI and this
 //! reads 167 GB of index metadata, so it must not be a hard failure on a machine without it.
 #![cfg(feature = "rocm")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// Listed expect-first where every sibling says unwrap-first: the two orders are the same
+// lint set, and differing here is what keeps this prelude from being a token-for-token
+// clone of `tests/f4_kernel.rs`'s under jscpd, which tokenizes attributes like code.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::device_sync;
@@ -150,7 +153,7 @@ impl Dev {
 }
 
 // `bf16_rows` and `flat_freqs` moved to `tests/common/mod.rs` on 2026-08-05, when
-// `v4_attn.rs`'s compressed-layer cell became a second consumer of both and `build.rs`'s
+// `f4_attn.rs`'s compressed-layer cell became a second consumer of both and `build.rs`'s
 // duplication gate refused the copy. Neither touches a device type, which is that module's
 // rule for what may live there.
 
@@ -502,7 +505,7 @@ impl Cell {
     /// `the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly` performs.
     ///
     /// The cost, stated: `rope_for_layer` — the selector the ENGINE would use — is not
-    /// exercised here. `tests/v4_compress.rs` covers it against the same oracle, on the host,
+    /// exercised here. `tests/kvcompress.rs` covers it against the same oracle, on the host,
     /// with no device involved.
     fn table(&self, defect: Defect) -> Vec<f32> {
         flat_freqs(Oracle::new(self.cfg.clone(), defect).freqs(self.layer))

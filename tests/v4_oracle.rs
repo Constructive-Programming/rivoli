@@ -402,7 +402,7 @@ fn hadamard_is_its_own_inverse() {
     // pins the transform's SHAPE without settling its basis ORDER — no property here can
     // decide that, because every candidate order is orthogonal and symmetric and so passes
     // this test identically. The order is settled SEPARATELY, against the package's own
-    // documented contract, in `tests/v4_hadamard_basis.rs`; it was marked INFERRED here
+    // documented contract, in `tests/hadamard_basis.rs`; it was marked INFERRED here
     // until 2026-08-05.
     let mut r = NamedRng::new("hadamard");
     for n in [2usize, 8, 128] {
@@ -669,7 +669,7 @@ fn expect(d: Defect) -> Option<Expect> {
         // 64 heads have 63, and at 64 heads the same fold disagrees with torch **72.6%** of
         // the time (`Oracle::bf16_sum`). Raising the toy's head count would let the grid see
         // it, and is deliberately NOT done here: `V4Config::toy` is the shared fixture for
-        // `tests/v4_attn.rs` and `tests/v4_kernel.rs` and moving it would invalidate their
+        // `tests/f4_attn.rs` and `tests/f4_kernel.rs` and moving it would invalidate their
         // goldens. Covered absolutely instead, by
         // `bf16_reduction_matches_torch_and_not_a_running_fold`, which is the only kind of
         // check that could have caught this class at all -- see that test's header.

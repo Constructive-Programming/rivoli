@@ -67,7 +67,7 @@ use crate::v4oracle::weights::{V4Config, WMat};
 /// what harness consolidation would introduce.
 ///
 /// Declaration order is `ALL` order, and `None` must stay first: `breakages()` filters it out
-/// by value, but `tests/v4_attn.rs`'s grid indexes off the order.
+/// by value, but `tests/f4_attn.rs`'s grid indexes off the order.
 macro_rules! defects {
     ($( $(#[$m:meta])* $v:ident ),+ $(,)?) => {
         /// A single, deliberately-wrong variant of the transliteration.
@@ -349,7 +349,7 @@ impl Defect {
 /// The split-k GEMV's fold, on the oracle's own per-element arithmetic — one half of the
 /// partial-ordering spec in `docs/investigations/v4-decode-decomposition.md` §M9; the other
 /// half is `gemv_fp8_bf16_splitk` (unmerged — see [`Oracle::splitk_fold`]'s note), and
-/// `tests/v4_kernel.rs::the_splitk_kernel_folds_in_the_registered_partial_order` pins the
+/// `tests/f4_kernel.rs::the_splitk_kernel_folds_in_the_registered_partial_order` pins the
 /// kernel to a transliteration of the SAME spec bit-for-bit, which is what closes the
 /// "oracle models a different reassociation than the kernel executes" failure mode.
 ///
@@ -392,7 +392,7 @@ pub fn splitk_fold(x: &[f32], w: &[f32]) -> f32 {
 
 /// §M9's partition and combine tree, generic over the per-thread chain — ONE definition,
 /// shared by [`splitk_fold`] (the oracle's per-element chain) and the device test's
-/// transliteration of the kernel's fma chain (`tests/v4_kernel.rs::FoldRow::splitk`).
+/// transliteration of the kernel's fma chain (`tests/f4_kernel.rs::FoldRow::splitk`).
 /// Review 2026-08-08 found the earlier arrangement held two private copies of the
 /// partition and ladder whose agreement was inspection, not code — exactly failure mode
 /// #8's residual surface. Hoisted so the fold's SHAPE exists once: `chain(start, stride)`
@@ -416,7 +416,7 @@ pub fn splitk_combine(chain: impl Fn(usize, usize) -> f32) -> f32 {
 /// Out-of-range lanes are not modelled: on the device they self-double, but lane 0's
 /// dependency cone reads a lane only at a step where all of that lane's prior updates
 /// were in-range, so the cone never contains a doubled value —
-/// `tests/v4_kernel.rs::the_fp8_dot_sums_in_source_order_through_both_loops` records the
+/// `tests/f4_kernel.rs::the_fp8_dot_sums_in_source_order_through_both_loops` records the
 /// same argument for the serial kernel's ladder, and both fold tests replay this exact
 /// function.
 pub fn wave_ladder(mut lanes: [f32; 32]) -> f32 {
@@ -949,7 +949,7 @@ impl Oracle {
     /// The QK-norm: `q *= rsqrt(q.square().mean(-1) + eps)` over `head_dim`, applied after
     /// the unflatten to (heads, head_dim), with **no learnable weight** (model.py:504).
     ///
-    /// `pub` since 2026-08-06 so `tests/v4_head_tail.rs` can score
+    /// `pub` since 2026-08-06 so `tests/headtail.rs` can score
     /// `kernels/mla.hip::qk_norm` against it. The alternative was a host transliteration
     /// of the seven lines below, which `build.rs`'s duplication gate would have rejected —
     /// and rightly, because a reference carrying the same bf16 placement as the thing it

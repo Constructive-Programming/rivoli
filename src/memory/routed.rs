@@ -536,7 +536,7 @@ impl RoutedPool {
     }
 
     /// Device bytes this pool may hold. Read by the startup log and by
-    /// `tests/v4_pool.rs`, which needs it to ASSERT that its eviction case is one — a test
+    /// `tests/f4_pool.rs`, which needs it to ASSERT that its eviction case is one — a test
     /// whose premise ("the working set exceeds the budget") is assumed rather than checked
     /// passes silently the day a fixture grows.
     pub fn budget(&self) -> usize {
@@ -650,7 +650,7 @@ impl RoutedPool {
         // took the phase-1a HIT path — returning `Ok` with an `ExpertSlot` pointing at
         // poison, or at the previous tenant's weights. That is exactly the silent-wrong-bytes
         // case the ticket protocol exists to make impossible, reintroduced through the error
-        // path. Found by review, 2026-08-05; `tests/v4_pool.rs` performs the first half of it
+        // path. Found by review, 2026-08-05; `tests/f4_pool.rs` performs the first half of it
         // deliberately and now asserts the pool is unchanged afterwards.
         //
         // Both tiers, because a miss may be admitted to either and `submit` cannot know which

@@ -1347,7 +1347,7 @@ fn every_byte_pattern_decodes_right_in_both_dot_paths() {
 ///
 /// The fp8 twin of the sweep above cannot reuse its oracle: `Oracle::linear` folds
 /// sequentially and the kernel wave-reduces, so that comparison rides [`TOL`]
-/// (tests/v4_attn.rs) and would wave through an unroll that split the accumulator chain
+/// (tests/f4_attn.rs) and would wave through an unroll that split the accumulator chain
 /// — the exact failure the M7 change must not have. So the reference here is a host
 /// transliteration of the KERNEL's own fold: per-lane strided accumulation in the
 /// emitted contraction (`q = x1·l1` rounded, then three fmas, then `acc = fma(s, q,
@@ -2222,7 +2222,7 @@ fn the_shared_expert_clamp_is_live_and_the_fixture_reaches_it() {
 /// hide under: `silu(-12)` and `silu(-10)` are `-7.373e-5` and `-4.540e-4`, which are nowhere
 /// near each other in bf16. Resolution is what moved, not the claim.
 ///
-/// The pattern is `tests/v4_compress_kernel.rs`'s: record the measured separation, say plainly
+/// The pattern is `tests/kvcompress_kernel.rs`'s: record the measured separation, say plainly
 /// which metric cannot resolve it, and name the instrument that can — rather than widening
 /// [`TOL`] until a green appears, which here would have meant a 3x loosening that every other
 /// test in this file pays for.

@@ -1,7 +1,7 @@
 //! Locating the shipped `.f4` artifact, for the two V4 loading-path test binaries.
 //!
 //! A free-standing file included by `#[path]` rather than an item in `common/mod.rs`:
-//! `mod common;` compiles that whole module, and `tests/v4_loading.rs` is deliberately
+//! `mod common;` compiles that whole module, and `tests/f4_loading.rs` is deliberately
 //! host-only — it must not pull in the GPU-shaped helpers to borrow one path lookup.
 
 /// A V4 artifact directory, or `None` when this machine has none.

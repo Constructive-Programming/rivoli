@@ -39,7 +39,7 @@
 //!
 //! `distinct` / `longest repeated block` cannot see anything wrong here (CLAUDE.md; they have
 //! misled three investigations in this repo). The gate is `src/v4oracle`'s per-layer goldens at
-//! REAL weights, reachable through `bin/v4-oracle emit`, and `tests/v4_loop.rs` is what drives
+//! REAL weights, reachable through `bin/v4-oracle emit`, and `tests/f4_loop.rs` is what drives
 //! it. **Fluent text out of this file is evidence of nothing.**
 //!
 //! Two deviations from the reference are live and named at their call sites, so no reader has
@@ -178,7 +178,7 @@ fn positional_context_limit(index_topk: usize) -> usize {
 ///
 /// One construction serves both classes. `freqs_cis(rope_for_layer(.., Plain))` is asserted
 /// equal to `attn::v4_rope_table_ratio0` by
-/// `tests/v4_attn.rs::the_two_rope_table_constructions_agree_on_the_un_yarned_table`, so there
+/// `tests/f4_attn.rs::the_two_rope_table_constructions_agree_on_the_un_yarned_table`, so there
 /// is no reason to carry the second builder here as well.
 struct RopeTables {
     /// `(theta bits, original_seq_len) -> table`. At most two entries on any real config; a
@@ -270,7 +270,7 @@ struct Extent {
 /// `[1024, 4096]` at ratio 4, `[512, 4096]` at ratio 128, matching `[cd, dim]`); `convert_v4`
 /// widens them to f32 because `Compressor.__init__` declares the module fp32, and this narrows
 /// the same values back. A widened bf16 round-trips bit-identically, so no value moves — which
-/// also means it is not a deviation to name. `tests/v4_attn.rs::LayerCompressor::new` has always done this
+/// also means it is not a deviation to name. `tests/f4_attn.rs::LayerCompressor::new` has always done this
 /// (`u16b(&bf16_rows(&cw.wkv))`); the engine simply had no counterpart.
 ///
 /// Adds **≈0.5 GB** of device memory over 43 layers — 21 ratio-4 layers at 16.8 MB for the
@@ -278,7 +278,7 @@ struct Extent {
 /// holds, plus one read-back per tensor at startup. (An earlier note here said "~1 GB", which is
 /// the f32 that is already there, not the addition.) Placing bf16 in `F4Pin` instead would be strictly better —
 /// it would REPLACE the f32 rather than adding to it — but that changes `CompressorWeights`'s field
-/// types and `tests/v4_pin.rs` with it, and this is the loop's bug to fix.
+/// types and `tests/f4_pin.rs` with it, and this is the loop's bug to fix.
 fn narrow_to_bf16(src: *const f32, n: usize) -> Result<DeviceBuf> {
     let mut bytes = Vec::new();
     // SAFETY: `src` is a pin placement of at least `n` f32 (its `[cd, dim]` extent, computed by
@@ -384,7 +384,7 @@ struct DeviceLayer {
     /// columns are `window_size + block`.
     cache: DeviceBuf,
     /// Rows in `cache`. Carried because `DeviceBuf` has no length and the placement indexes it
-    /// by row — the same reason `tests/v4_attn.rs::Gpu` carries `ring_rows`.
+    /// by row — the same reason `tests/f4_attn.rs::Gpu` carries `ring_rows`.
     cache_rows: usize,
     comp: Option<LayerCompressor>,
 }
@@ -511,7 +511,7 @@ fn read_prefix(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
 ///
 /// `attn_core_out` is deliberately absent and **cannot** be added — the output de-rotation is IN
 /// PLACE on `s.o` (`launch_rope_adjacent(s.o, .., inverse = true)`), so by the time `attention` returns
-/// the pre-image is gone. `tests/v4_attn.rs` drives `sparse_attn` separately for exactly that
+/// the pre-image is gone. `tests/f4_attn.rs` drives `sparse_attn` separately for exactly that
 /// reason; this makes the same partition available at real weights, minus that one cell.
 ///
 /// # These four are NOT equally sharp
@@ -524,7 +524,7 @@ fn read_prefix(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
 /// activation requantizations, each a step function that amplifies re-association noise ~16x, and
 /// a tensor's distance from the oracle is set by how many of them sit upstream of it. The
 /// mechanism, the measured amplification and the per-tensor ladder are stated ONCE, in
-/// `tests/v4_loop.rs`'s `# CORRECTED 2026-08-05` header. They are deliberately not restated here:
+/// `tests/f4_loop.rs`'s `# CORRECTED 2026-08-05` header. They are deliberately not restated here:
 /// an earlier draft copied the table into this doc and the two had already contradicted each other
 /// on the size of a bf16 ULP within the same session — jscpd does not see comments, so nothing
 /// would have caught it.
@@ -585,7 +585,7 @@ impl AttnStages {
     /// and near-blind to SCALING defects — `SkipQkNorm` roughly doubles every element of `q` and
     /// reads 1.07. The statistic that separated every defect review could construct is the
     /// differing-element FRACTION, and nothing in this tree asserts it yet; that is the owed work
-    /// recorded in `tests/v4_loop.rs`.
+    /// recorded in `tests/f4_loop.rs`.
     ///
     /// Two further limits. The envelope draws its perturbed element POSITIONS uniformly at random,
     /// while the device's are wherever `hc_pre`'s fold order crossed a bf16 boundary — clustering
@@ -1233,7 +1233,7 @@ impl F4Engine {
             // start_pos/ratio`, i.e. 131 at the goldens' prompt) against the attention scratch's
             // row count (`max_m + max_m/4`, i.e. 17) — and fired at the first decode position
             // that completed a block on any compressing layer. Two different coordinate systems
-            // with the same type. Found by review; invisible to `tests/v4_loop.rs`, which scores
+            // with the same type. Found by review; invisible to `tests/f4_loop.rs`, which scores
             // ratio-0 layers only.
             if sel_base != persist_base {
                 let rows = self.max_m + self.max_m.div_ceil(INDEXED_RATIO);
@@ -1495,17 +1495,17 @@ impl F4Engine {
     /// was in when *it* was deleted.
     ///
     /// (This said "was 8-test covered" until 2026-08-09. COUNTED rather than inherited when the
-    /// section was deleted: `tests/v4_kernel.rs` §4 held four `#[test]` functions, not eight.
+    /// section was deleted: `tests/f4_kernel.rs` §4 held four `#[test]` functions, not eight.
     /// The 8 was carried forward unchecked from 2026-08-05 and repeated into a commit message
     /// before anyone counted — a small number, but this file's whole argument is that an
     /// unverified claim reads exactly like a verified one.)
     ///
-    /// **DELETED 2026-08-09** (kernel, launcher, and `tests/v4_kernel.rs` §4), on the reasoning
+    /// **DELETED 2026-08-09** (kernel, launcher, and `tests/f4_kernel.rs` §4), on the reasoning
     /// above going unchallenged for the four days since it was written: the decision was
     /// architectural, not provisional, so the kernel was not a staged alternative but a second
     /// implementation of a rule — "the selection bias must not reach the weights" — that INV-1
     /// states about exactly one router. Two routers is two places for it to be wrong, and the
-    /// second one had no caller to keep it honest. `tests/v4_kernel.rs::ffn_out_matches_the_golden`
+    /// second one had no caller to keep it honest. `tests/f4_kernel.rs::ffn_out_matches_the_golden`
     /// was its last user and now reads the selection from the golden it was already asserting
     /// against; its doc records what that test stopped covering.
     fn route_row(&mut self, layer: usize, t: usize) -> Result<()> {
@@ -1831,7 +1831,7 @@ impl F4Engine {
     ///
     /// `launch_swiglu_clamped_bf16(g, u, n, limit, h, stream)` is being written elsewhere and this
     /// is the one call site it replaces. Until it lands, **no output from this loop is
-    /// reference-faithful**, and `tests/v4_loop.rs` scores against a `Defect::SwigluUnclamped`
+    /// reference-faithful**, and `tests/f4_loop.rs` scores against a `Defect::SwigluUnclamped`
     /// oracle rather than the clean one for exactly this reason — which is a gate on the wiring
     /// with a named hole, not a gate on the model.
     fn shared_expert(&mut self, layer: usize, m: usize) -> Result<()> {
@@ -2253,7 +2253,7 @@ impl F4Engine {
             // `launch_gemm_bf16` computes exactly this at `m = 1`: runtime `(m, n, k)` over
             // a bf16 `[n, k]` weight is a head GEMV at `m = 1, n = vocab, k = hidden`.
             //
-            // **Verified at TOY extents, not these.** `tests/v4_head_tail.rs`'s
+            // **Verified at TOY extents, not these.** `tests/headtail.rs`'s
             // `the_lm_head_needs_no_kernel_of_its_own` runs it at vocab 1024 / dim 512 against
             // `rel < 1e-3`, and says outright that the real `(1, 129280, 4096)` shape is not
             // covered — four literal assertions claiming otherwise were deleted there for being
@@ -2367,7 +2367,7 @@ impl F4Engine {
     /// ring at `pos % window` and — on a compressing layer — deposits into the pooling state and
     /// slides the window. Calling it twice for one `(layer, start_pos)`, which is a plausible thing
     /// for a driver re-scoring a comparison to do, double-deposits exactly the state S3
-    /// requirement 3 is about. `tests/v4_attn.rs` splits `step` from `attend` for this reason;
+    /// requirement 3 is about. `tests/f4_attn.rs` splits `step` from `attend` for this reason;
     /// there is no such split here, so the obligation is the caller's and is written down.
     pub fn probe_layer(&mut self, layer: usize, ids: &[u32], start_pos: usize) -> Result<()> {
         ensure!(
@@ -2839,7 +2839,7 @@ impl F4Engine {
 /// The device-free half of this loop's own checks.
 ///
 /// Everything here runs with no GPU: it is arithmetic and placement rules. The device-touching
-/// half is `tests/v4_loop.rs`, which drives the loop against `bin/v4-oracle`'s real-weight
+/// half is `tests/f4_loop.rs`, which drives the loop against `bin/v4-oracle`'s real-weight
 /// per-layer goldens — and the split matters, because the two things this module gets wrong
 /// most easily are **invisible to a numeric golden**. The port measured that: injecting the
 /// append rule left every attention golden bit-identical, `attn_out` included, on a script built
@@ -2872,7 +2872,7 @@ mod tests {
     /// **both coordinate systems the layer loop writes** — which is the half of the invariant
     /// that belongs to `f4gpu` rather than to `kvcompress`.
     ///
-    /// `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees`
+    /// `tests/kvcompress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees`
     /// already proves the other half comprehensively (the gapped script against an appending
     /// placer, the ratio-128 boundary, `region_base = 0` for the indexer's nested compressor,
     /// and the `Plain` refusal before either division), so the §8b row cites BOTH — the same

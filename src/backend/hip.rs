@@ -691,7 +691,7 @@ launchers! {
     /// [`launch_swiglu`] from its shared-expert chain — `f4gpu.rs::shared_expert` names the
     /// deviation (`Defect::SwigluUnclamped`) at the call. So this launcher's caller-to-be
     /// exists and still does not call it; the sentence below about what the wiring must do
-    /// stands.]* The clamped combine is available and gated (`tests/v4_kernel.rs` §7), and
+    /// stands.]* The clamped combine is available and gated (`tests/f4_kernel.rs` §7), and
     /// the shared expert's fix is to call THIS and not [`launch_swiglu`] — because that one
     /// gives `v4oracle::Defect::SwigluUnclamped` on one contribution in seven of all 43
     /// layers, fluent and wrong.
@@ -1411,9 +1411,9 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 // suite's test COUNT rose, which is exactly what a census catches and a green suite does
 // not.
 //
-// The substance behind the count, for these six: `tests/v4_attn.rs` scores four of them
-// inside the whole attention block, and `tests/v4_head_tail.rs` scores `rmsnorm_batch` and
-// `qk_norm` on their own. An earlier version of this line said `v4_attn.rs` covered all
+// The substance behind the count, for these six: `tests/f4_attn.rs` scores four of them
+// inside the whole attention block, and `tests/headtail.rs` scores `rmsnorm_batch` and
+// `qk_norm` on their own. An earlier version of this line said `f4_attn.rs` covered all
 // six and was wrong about two.
 
 // --- head tail (S3) -------------------------------------------------------------------

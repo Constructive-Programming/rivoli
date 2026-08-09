@@ -689,7 +689,7 @@ impl F4Expert<'_> {
 /// fsync its manifest, and that asymmetry is correct — a torn manifest is unrecoverable, a
 /// torn layer file is regenerable.
 /// **The temp name carries the pid, and that is not decoration** — self-review 2026-08-07,
-/// the same lesson `bin/ppl`, `v4_loading`, `v4_encoding` and `v4_oracle` each learned on
+/// the same lesson `bin/ppl`, `f4_loading`, `v4_encoding` and `v4_oracle` each learned on
 /// their own scratch paths. Agents share this machine and `convert` takes no lock (it is CPU
 /// only; the GPU flock does not serialise it), so two runs into one `out_dir` are reachable.
 /// On a FIXED `<path>.part` both would `File::create` + truncate + write the same path
@@ -1299,7 +1299,7 @@ impl ExpertSet {
     /// fixed here.** `begin` is a function of the EXPERT only, so the layer→file mapping
     /// `files[layer - first_layer]` is observable solely through which fd comes back — and
     /// `tests/artifact.rs` calls `read_spec(dense_layers, 0)` and nothing else, so a wrong
-    /// mapping survives it. `tests/v4_loading.rs`'s non-zero-start case is the one test that
+    /// mapping survives it. `tests/f4_loading.rs`'s non-zero-start case is the one test that
     /// pins this, by resolving each fd through `/proc/self/fd` and asserting the FILENAME.
     /// That instrument was arrived at the hard way: two injected wrong mappings passed a
     /// distinct-fds check and an offset check first, because `layer % files.len()` is

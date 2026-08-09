@@ -217,7 +217,7 @@ impl Fp8Buf {
 /// `toy::build` stores `wo_a` DENSE, because that is what the reference holds after
 /// `convert.py` dequantizes it. The engine reads the checkpoint's fp8 bytes and
 /// dequantizes on the fly instead, which is not an approximation over the scale range
-/// weight tensors use — `fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses` in `tests/v4_attn_host.rs` checks every e4m3 code against scale codes
+/// weight tensors use — `fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses` in `tests/f4_attn_host.rs` checks every e4m3 code against scale codes
 /// 40..=200 and exhibits the tiny-scale boundary where it would stop. The real
 /// `layers.0.attn.wo_a` carries 33,554,432 weight bytes byte-identically from the
 /// checkpoint and its 2048 scales widen from `F8_E8M0` to f32 bit-exactly, with codes
@@ -717,7 +717,7 @@ struct Gpu {
     freqs: DeviceBuf,
     /// Rows in `ring` — `window + max_seq_len/ratio`. Carried because `DeviceBuf` has no
     /// length and [`Gpu::poke`] indexes it by row; the same reason
-    /// `tests/v4_compress_kernel.rs::Dev` carries an element count.
+    /// `tests/kvcompress_kernel.rs::Dev` carries an element count.
     ring_rows: usize,
     max_m: usize,
     /// This layer's class and `index_topk`, fixed at construction. `attention` overwrites
@@ -1524,7 +1524,7 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
 /// - **Not ordering within the stream.** A stream is FIFO, so membership implies order here;
 ///   the goldens are what say the order is right.
 /// - **Not the compressor.** `Harness::new` is a PLAIN layer, so `compress` never runs. Its
-///   own conversion is covered by `tests/v4_compress_kernel.rs` driving it on a real stream —
+///   own conversion is covered by `tests/kvcompress_kernel.rs` driving it on a real stream —
 ///   which, by the same argument as above, is an arithmetic gate and not a membership one.
 ///
 /// # Why the poison cannot hide a break
@@ -2314,7 +2314,7 @@ fn moved(clean: &[Phase], broken: &[Phase]) -> Vec<(&'static str, Score)> {
 /// back equal, and each is a separate arm below carrying its own argument:
 ///
 /// 1. **Wrong layer class.** `CompressorNoOverlap` ([`COMP_LAYER`] is `NonOverlap`, so there
-///    is no overlap term to disable — the pair `tests/v4_compress_kernel.rs` asserts at the
+///    is no overlap term to disable — the pair `tests/kvcompress_kernel.rs` asserts at the
 ///    real weights) and `RopeYarnEverywhere` (keys off `!compressed` in `Oracle::freqs`, so
 ///    it is the ratio-0 layers' defect). Its sibling `RopeBaseThetaEverywhere` DOES reach
 ///    this layer, and having both here is what stops "a rope defect" reading as one thing.
@@ -2371,7 +2371,7 @@ fn expect_moves(d: Defect) -> &'static [&'static str] {
         // de-rotation, so a pairing defect moves everything downstream of the block's input.
         Defect::RopeAllDims | Defect::RopeFirstDims | Defect::RopeHalfSplit => EVERY_ROPE,
         // The layer's TABLE: `Oracle::freqs` hands a compressed layer the YaRN one, and both
-        // of these swap it. `RopeNoYarn` is S3 requirement 4 and `v4_compress_kernel.rs`
+        // of these swap it. `RopeNoYarn` is S3 requirement 4 and `kvcompress_kernel.rs`
         // records that it cannot see it at `ratio4/decode`; here it moves six goldens.
         Defect::RopeNoYarn | Defect::RopeBaseThetaEverywhere => EVERY_ROPE,
         // The KV quantizer, which the compressor's finish also calls (`forward.rs:1253`) —
@@ -2406,7 +2406,7 @@ fn expect_moves(d: Defect) -> &'static [&'static str] {
         // jscpd:ignore-start
         //
         // THE ARGUMENT FOR THE EXEMPTION, in place as `build.rs` requires. This arm and
-        // `tests/v4_compress_kernel.rs::in_compressor_scope` are two EXHAUSTIVE matches over
+        // `tests/kvcompress_kernel.rs::in_compressor_scope` are two EXHAUSTIVE matches over
         // one 51-variant enum, so they necessarily share its variant list, and jscpd sees
         // that as a clone. Being exhaustive is the point in both: a `Defect` added later must
         // be classified in each, because the two answer different questions — "can a
@@ -2442,7 +2442,7 @@ fn expect_moves(d: Defect) -> &'static [&'static str] {
         //    ue8m0 scale is a power of two and e4m3 is scale-invariant under those, so
         //    re-blocking moves nothing until an in-block dynamic range of ~2^13, which the
         //    toy does not reach. It is NOT a theorem — `src/attn.rs`'s `KV_QUANT_BLOCK` doc
-        //    records the same derivation as CORRECTED, and `tests/v4_compress_kernel.rs`
+        //    records the same derivation as CORRECTED, and `tests/kvcompress_kernel.rs`
         //    finds the defect live on one cell of four at the real weights, one e4m3 step,
         //    6 of 32768 elements. An empty list here is an observation this run reproduces.
         //

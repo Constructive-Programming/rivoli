@@ -25,9 +25,9 @@ use serde_json::Value;
 /// var which does not resolve is a FAILURE and not a skip, because libtest hides stderr on
 /// a passing test. `dead_code` because this is the first consumer that needs only two of
 /// its three entry points.
-#[path = "common/v4_artifact_dir.rs"]
+#[path = "common/f4_artifact_dir.rs"]
 #[allow(dead_code)]
-mod v4_artifact_dir;
+mod f4_artifact_dir;
 
 /// The checkpoint's `encoding/` folder, or `None` when this machine has no checkpoint.
 ///
@@ -35,7 +35,7 @@ mod v4_artifact_dir;
 /// weights index, where this FAILS on a missing `encoding/`. Not reconciled — that file is
 /// not this change's to move — so the panic names which file wanted what.
 fn encoding_dir() -> Option<String> {
-    v4_artifact_dir::v4_artifact_at(
+    f4_artifact_dir::v4_artifact_at(
         "RIVOLI_V4_SRC",
         "/var/db/rivoli/deepseek-v4-flash-0731",
         "encoding/encoding_dsv4.py",
@@ -46,7 +46,7 @@ fn encoding_dir() -> Option<String> {
 /// An artifact whose `tokenizer.json` is DeepSeek-V4's. Any of them will do — the converter
 /// copies it verbatim — so this takes the small three-layer fixture.
 fn tokenizer() -> Option<rivoli::artifact::tokenizer::Tokenizer> {
-    let dir = v4_artifact_dir::v4_artifact("tokenizer.json")?;
+    let dir = f4_artifact_dir::v4_artifact("tokenizer.json")?;
     Some(rivoli::artifact::tokenizer::Tokenizer::load(&dir).unwrap())
 }
 

@@ -314,7 +314,7 @@ mod tests {
     /// A per-test scratch file path, unique per pid+thread so `cargo test`'s parallel
     /// default cannot make two tests collide. A bare file in the temp dir, not a subdir:
     /// nothing here needs one, and the shorter setup also keeps this from token-colliding
-    /// with the tempdir fixtures `tests/v4_loading.rs`/`tests/v4_oracle.rs` carry (the
+    /// with the tempdir fixtures `tests/f4_loading.rs`/`tests/v4_oracle.rs` carry (the
     /// jscpd gate found exactly that clone in an earlier draft of this module's tests).
     fn tmp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(

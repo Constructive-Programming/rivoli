@@ -28,7 +28,7 @@
 //! >
 //! > On arrival here it found **18 of 48 launchers with no oracle** — `src/backend/hip.rs`
 //! > had simply never been scanned. Three places had already RECORDED that gap in prose
-//! > (`src/backend/hip.rs`'s V4 launcher note, `tests/v4_loop.rs`, `tests/common/mod.rs`'s
+//! > (`src/backend/hip.rs`'s V4 launcher note, `tests/f4_loop.rs`, `tests/common/mod.rs`'s
 //! > `absent`) and not one of them was a gate, which is the same lesson one turn further on:
 //! > a written-down gap is not an enforced one.
 //! >
@@ -62,7 +62,7 @@ mod common;
 /// `launched_by` stops launching one of them, if no test calls `entry`, or if a name is not
 /// a launcher at all.
 ///
-/// The three compressor launchers are here because `tests/v4_compress_kernel.rs` scores
+/// The three compressor launchers are here because `tests/kvcompress_kernel.rs` scores
 /// them as ONE unit against S1b's oracle over four cells with exact defect impersonation,
 /// which is a stronger claim than three by-name launches would be — `kvcompress::compress`
 /// picks which of the three runs from the geometry and the position, and that dispatch is
@@ -273,10 +273,13 @@ fn every_launcher_has_an_oracle() {
          checked what they compute. A passing suite says nothing about them.\n\n\
          Oracles are filed by the kernel source the launcher wraps: kernels/fwd.hip -> \
          tests/fwd_kernel.rs, indexer.hip -> tests/indexer_kernel.rs, linalg.hip and \
-         mla.hip and moe.hip -> tests/kernel.rs, and the v4* kernels -> the matching \
-         tests/v4_*.rs. Two live exceptions, so you are not misled into moving them: \
+         mla.hip and moe.hip -> tests/kernel.rs, kvcompress.hip -> \
+         tests/kvcompress_kernel.rs, blockindex.hip -> tests/blockindex_kernel.rs, \
+         headtail.hip -> tests/headtail.rs, and the .f4 engine's mla.hip/linalg.hip/\
+         attn.hip launchers -> tests/f4_kernel.rs and tests/f4_attn.rs. Two live \
+         exceptions, so you are not misled into moving them: \
          index_topk's oracle predates tests/indexer_kernel.rs and stays in \
-         tests/kernel.rs, and mla.hip's qk_norm is scored in tests/v4_head_tail.rs \
+         tests/kernel.rs, and mla.hip's qk_norm is scored in tests/headtail.rs \
          beside its sibling rmsnorm_batch. ({} has no exemption list — the empty one it used \
          to carry only invited parking work here. `INDIRECT` is not one: every hop is \
          asserted.)\n",

@@ -76,7 +76,7 @@ mod tests {
 //
 // The two host functions below are pure, and they sit at MODULE scope rather than in
 // `mod v4` for a reason that is easy to undo by tidying: `mod v4` is
-// `#[cfg(feature = "rocm")]`, while `tests/v4_attn_host.rs` deliberately carries no
+// `#[cfg(feature = "rocm")]`, while `tests/f4_attn_host.rs` deliberately carries no
 // feature gate so the selection can be scored against the oracle on any machine. Moving
 // them inside breaks that test's build, not its assertions.
 //
@@ -361,7 +361,7 @@ mod v4_tests {
 /// no twin, and stubs claiming an unmeasured parity were declined rather than written.
 ///
 /// This does not touch `gpu.rs`'s layer loop: it takes device pointers the caller owns
-/// and performs one block's launches, so `tests/v4_attn.rs` drives exactly what S3 will.
+/// and performs one block's launches, so `tests/f4_attn.rs` drives exactly what S3 will.
 #[cfg(feature = "rocm")]
 pub mod v4 {
     use crate::artifact::model::V4Config;
@@ -434,7 +434,7 @@ pub mod v4 {
     /// Holding it fp8 rather than as the bf16 `convert.py` produces is not a deviation
     /// from that note: over the scale range weight tensors use, dequantizing an e4m3
     /// value against a power-of-two block scale gives bit-identical bf16 — measured over
-    /// every e4m3 code by `tests/v4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`.
+    /// every e4m3 code by `tests/f4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`.
     #[derive(Clone, Copy)]
     pub struct Weights {
         pub wq_a: Fp8W,
@@ -457,7 +457,7 @@ pub mod v4 {
         /// output value is bit-identical; what moves is WHERE the q intermediate lands:
         /// `s.kv + head_dim`, because the fused output must be contiguous and the KV
         /// entry must stay at `s.kv`, where its consumers (the ring write here, the
-        /// `kv_entry` probe readback, `tests/v4_attn.rs`'s harness) already look. The
+        /// `kv_entry` probe readback, `tests/f4_attn.rs`'s harness) already look. The
         /// q intermediate has no consumer outside this call — the engine's selection
         /// is positional, so the reference's indexer (the reader [`Scratch::qr`] is
         /// kept separate for) never runs. `s.kv` must then hold `head_dim +
@@ -542,7 +542,7 @@ pub mod v4 {
         /// draft of this said that and it is the over-generalization the suite itself
         /// retracted: `ratio128/decode` is NOT in the exempt registry and is still required
         /// to separate.
-        /// `tests/v4_compress_kernel.rs`'s `ratio4/decode` cell scores the no-yarn swap
+        /// `tests/kvcompress_kernel.rs`'s `ratio4/decode` cell scores the no-yarn swap
         /// bit-identical to the defect oracle and 8 bf16 codes from clean — under the
         /// `RESOLVABLE` floor of 64 (`4 * E4M3_ULP`, and `E4M3_ULP` is 16 bf16 codes, so 8
         /// is half an e4m3 step). That suite lists the cell in `NO_YARN_BELOW_RESOLUTION`
@@ -632,7 +632,7 @@ pub mod v4 {
         ///
         /// Called by `from_config` AND by [`attention`]: `Dims` is `Copy` with `pub`
         /// fields, so a struct literal or a later `d.head_dim = 0` skips `from_config`
-        /// entirely — and the struct literal is what `tests/v4_attn.rs::dims` does today,
+        /// entirely — and the struct literal is what `tests/f4_attn.rs::dims` does today,
         /// which is the shape a layer loop copies by default (S3 requirement 7). Sealing
         /// the fields stops the literal and not the mutation, and costs every reader an
         /// accessor; checking at the point of use stops both, for ~15 integer compares
@@ -919,7 +919,7 @@ pub mod v4 {
             // the reference), so `rs` is quantized to ~0.4% steps and the two orders land on
             // different steps. Measured on a compressed layer: `Defect::QkNormAfterRope`
             // moves `.q` on 1287/24576 elements at rel 7.4e-3, and three goldens downstream
-            // (`tests/v4_attn.rs::expect_moves`). What IS true is narrower and is why the
+            // (`tests/f4_attn.rs::expect_moves`). What IS true is narrower and is why the
             // defect stays out of both separation sweeps: its distance measures the bf16
             // ROUNDING scale rather than a defect's reach, so ranking it beside the others
             // would misstate the sweep's resolution. (It is not that the sweep cannot see it
@@ -1069,7 +1069,7 @@ pub mod v4 {
 /// `memcpy_dtod_async` with a null destination.
 ///
 /// **This is the rejecting half only, and deliberately so.** The accepting half is the
-/// whole of `tests/v4_attn.rs`, which drives `attention` to completion against the oracle
+/// whole of `tests/f4_attn.rs`, which drives `attention` to completion against the oracle
 /// with `rows == max_m` and valid dims; if either guard were inverted, all five of its
 /// comparisons would fail to run at all. What a rejection-only test cannot do by itself is
 /// tell "the guard fired" from "something failed" — so each case below asserts on the

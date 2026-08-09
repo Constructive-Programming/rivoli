@@ -24,8 +24,8 @@ use rivoli::artifact::format::{
 use rivoli::artifact::model::V4Config;
 use rivoli::artifact::quant::{VQ_ALIGN, f4_expert_stride, i4_expert_stride, vq_expert_stride};
 
-#[path = "common/v4_artifact_dir.rs"]
-mod v4_artifact_dir;
+#[path = "common/f4_artifact_dir.rs"]
+mod f4_artifact_dir;
 
 /// Toy dims: the smallest that keep the three formats' strides distinct and give each
 /// projection more than one FP4 group.
@@ -423,7 +423,7 @@ fn open_shipped(dir: &str) -> (V4Config, std::ops::Range<usize>, ExpertSet) {
 /// broke, at the real 256 × 13369344, read from the file `convert_v4 --verify` produced.
 #[test]
 fn the_shipped_f4_artifact_opens_at_its_own_layer_range() {
-    let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else {
+    let Some(dir) = f4_artifact_dir::v4_artifact("L00.f4") else {
         return;
     };
     let (cfg, range, set) = open_shipped(&dir);
@@ -459,7 +459,7 @@ fn the_shipped_f4_artifact_opens_at_its_own_layer_range() {
 /// silently returning layer 3's descriptor.
 #[test]
 fn an_f4_set_that_does_not_start_at_layer_zero_is_addressed_by_absolute_id() {
-    let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else {
+    let Some(dir) = f4_artifact_dir::v4_artifact_l3_5("L03.f4") else {
         return;
     };
     let (_cfg, range, set) = open_shipped(&dir);

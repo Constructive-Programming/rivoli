@@ -407,7 +407,7 @@ const V4_RES_EXPERT_READS_PER_TOKEN: f64 = 5.885 * 43.0;
 fn run_v4_res(name: &str, hidden: usize, inter: usize, e_count: usize, ranges: usize) -> u64 {
     // V4's config value, hand-copied. The launcher only refuses a clamp-DISABLING limit (rc
     // 1006); a finite-but-wrong one runs silently, and only this section's fingerprint
-    // disagreeing with `tests/v4_kernel.rs` would ever show it.
+    // disagreeing with `tests/f4_kernel.rs` would ever show it.
     const SWIGLU_LIMIT: f32 = 10.0;
     // Row and group sizing from `quant.rs`, not a local `32` that could drift from `F4_GROUP`
     // into a scale ROW STRIDE error. `per_expert` is then summed from the spans this probe
@@ -458,7 +458,7 @@ fn run_v4_res(name: &str, hidden: usize, inter: usize, e_count: usize, ranges: u
     // no data-dependent path and no LDS LUT for a shared fill to collapse into a broadcast),
     // and what must differ between experts is which DRAM pages they occupy. Gate and up
     // therefore share bytes, so `g == u`; that makes a w1/w3 swap invisible here, which is not
-    // this probe's job — `tests/v4_kernel.rs::Wiring::SwapGateUp` covers it against an oracle,
+    // this probe's job — `tests/f4_kernel.rs::Wiring::SwapGateUp` covers it against an oracle,
     // and `a_dispatch_split_into_ranges_matches_one_range` covers absolute-vs-range-relative
     // descriptor indexing at two non-adjacent non-zero starts, bit-identically. **Every arm of
     // §M11's round patches only `dot_f4_wave_r`'s inner loop**, so fold order is the one thing
@@ -466,7 +466,7 @@ fn run_v4_res(name: &str, hidden: usize, inter: usize, e_count: usize, ranges: u
     let mut parts: Vec<DeviceBuf> = Vec::with_capacity(n_desc * 6);
     let mut descs: Vec<ExpertDescF4> = Vec::with_capacity(n_desc);
     for _ in 0..n_desc {
-        // Address taken BEFORE the move into `parts`, for the reason tests/v4_kernel.rs's
+        // Address taken BEFORE the move into `parts`, for the reason tests/f4_kernel.rs's
         // `F4Experts::upload` gives: recovering it by index afterwards works until the buffer
         // count changes, and then a descriptor silently points at another projection.
         let mut push = |b: &[u8]| {

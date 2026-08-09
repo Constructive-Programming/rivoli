@@ -55,7 +55,7 @@ use common::{assert_bits, f32b, f32v, rel, u16b};
 /// because `dev` was `DeviceBuf` under HIP and `Buf` under Vulkan. That rule died with the
 /// second backend on 2026-08-06 and `common` now owns `dev`/`zeros`/`back`. What keeps this
 /// struct is narrower: the typed `p()`/`pm()`/`read()` accessors, which the four bare
-/// functions do not provide. `tests/v4_compress_kernel.rs` wraps it the same way.
+/// functions do not provide. `tests/kvcompress_kernel.rs` wraps it the same way.
 struct Dev(DeviceBuf);
 
 impl Dev {
@@ -421,10 +421,10 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
 
 /// `kernels/mla.hip::qk_norm` against `Oracle::qk_norm`.
 ///
-/// Here rather than in `tests/v4_attn.rs` because of what it IS rather than where it is
+/// Here rather than in `tests/f4_attn.rs` because of what it IS rather than where it is
 /// called: it is a per-row bf16-rounded RMS normalisation, the direct sibling of
 /// `rmsnorm_batch` above, and the two differ in exactly the way this file already exists to
-/// pin — where the statistic is taken and in what precision. `v4_attn.rs` scores the whole
+/// pin — where the statistic is taken and in what precision. `f4_attn.rs` scores the whole
 /// attention block, in which this kernel's contribution is one bf16 step wide.
 ///
 /// **Bit-exact, and that is forced rather than chosen.** The kernel bf16-rounds `rs`, so

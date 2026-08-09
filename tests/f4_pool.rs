@@ -1,10 +1,10 @@
 //! The `.f4` routed streaming pool, end to end on the shipped artifact.
 //!
 //! **Needs the GPU** — a pool is a VMM allocation plus an io_uring reaper writing into it —
-//! so this follows the repo's GPU-test idiom (`tests/v4_pin.rs`, `tests/vk.rs`): it simply
+//! so this follows the repo's GPU-test idiom (`tests/f4_pin.rs`, `tests/vk.rs`): it simply
 //! runs, and fails when another tenant holds the device. The host-only half of the same
 //! path (what an `.f4` set reports about itself, what `TierFmt` derives) is in
-//! `tests/v4_loading.rs` and stays there.
+//! `tests/f4_loading.rs` and stays there.
 //!
 //! What this exists to establish, in order of how much it would cost to get wrong:
 //!
@@ -39,8 +39,8 @@ use rivoli::fetch::asyncfetch::Ticket;
 use rivoli::memory::pin::F4Pin;
 use rivoli::memory::routed::ExpertSlot;
 
-#[path = "common/v4_artifact_dir.rs"]
-mod v4_artifact_dir;
+#[path = "common/f4_artifact_dir.rs"]
+mod f4_artifact_dir;
 
 /// A device budget for a fixture run: the pin sizes its resident tier off the artifact and
 /// the pool gets the rest, so this is `resident + pool`.
@@ -180,7 +180,7 @@ fn open(dir: &str) -> (V4Config, F4Pin) {
 /// artifact-gated test in this tree. One function because the four-line preamble was
 /// identical in three tests, which `build.rs`'s duplication gate refuses.
 fn l0_2() -> Option<(V4Config, F4Pin, Stream, usize, String)> {
-    let dir = v4_artifact_dir::v4_artifact("L00.f4")?;
+    let dir = f4_artifact_dir::v4_artifact("L00.f4")?;
     let (cfg, pin) = open(&dir);
     let layer = pin.range().start;
     Some((cfg, pin, Stream::new().unwrap(), layer, dir))
@@ -260,7 +260,7 @@ fn a_resolved_slot_holds_that_experts_bytes_at_the_f4_offsets(c: &mut Case<'_>) 
 /// through the same `read_spec` the streamer used, so it is the bytes and not the arithmetic
 /// that is checked.
 fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
-    let Some(dir) = v4_artifact_dir::v4_artifact_l3_5("L03.f4") else {
+    let Some(dir) = f4_artifact_dir::v4_artifact_l3_5("L03.f4") else {
         return;
     };
     let (cfg, mut pin) = open(&dir);
@@ -349,7 +349,7 @@ fn the_pool_streams_by_absolute_layer_id_on_a_set_that_starts_at_three() {
 /// not. Sized from the artifact's own resident footprint so the case is reached by a budget
 /// too small for six experts and not by one too small for the resident set.
 fn a_budget_too_small_for_one_batch_is_refused_at_build() {
-    let Some(dir) = v4_artifact_dir::v4_artifact("L00.f4") else {
+    let Some(dir) = f4_artifact_dir::v4_artifact("L00.f4") else {
         return;
     };
     let cfg: V4Config = load_config(&dir).unwrap();
@@ -501,7 +501,7 @@ fn a_miss_carries_a_real_ticket_and_a_hit_carries_the_resident_one(c: &mut Case<
 /// `gpustream` hang, and here it was self-inflicted.
 ///
 /// `--test-threads=1` fixes it and is the wrong fix: it lives in whoever remembers to type
-/// it, and the failure mode for forgetting is a wedged sole-tenant GPU. `tests/v4_pin.rs`
+/// it, and the failure mode for forgetting is a wedged sole-tenant GPU. `tests/f4_pin.rs`
 /// already made this call — one test, an internal loop over fixtures — so this follows it.
 /// The cost is coarser test names; every assertion below carries its own message, which is
 /// what a failure actually needs.
@@ -537,7 +537,7 @@ fn the_f4_streaming_pool() {
 /// residency argument in `docs/investigations/v4-flash-port.md` was forced to borrow from
 /// GLM.
 ///
-/// `cargo test --features rocm --test v4_pool -- --ignored --nocapture`, with
+/// `cargo test --features rocm --test f4_pool -- --ignored --nocapture`, with
 /// `RIVOLI_V4_ARTIFACT_FULL` pointing at the 43-layer set.
 ///
 /// **What it can and cannot measure, stated because the difference is the whole caveat.** It

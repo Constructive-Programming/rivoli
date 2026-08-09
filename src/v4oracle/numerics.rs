@@ -259,7 +259,7 @@ pub fn fp4_act_quant_inplace(row: &mut [f32], block: usize) {
 /// read off the reference, only off the dependency. It was, and this implementation was
 /// right.
 ///
-/// **`tests/v4_hadamard_basis.rs` holds the evidence chain, the gate and the measurement.**
+/// **`tests/hadamard_basis.rs` holds the evidence chain, the gate and the measurement.**
 /// It pins this function to an explicitly constructed Sylvester matrix bit-for-bit and
 /// carries its own negative control. Deliberately not restated here: the numbers belong with
 /// the code that produces them, and an earlier version of this comment carried a copy that

@@ -59,7 +59,7 @@ impl GoldenSet {
     }
 
     /// One metadata value by key. The single lookup every consumer goes through --
-    /// [`GoldenSet::defect`], `tests/v4_loop.rs::meta`, `cmp`'s provenance check -- because
+    /// [`GoldenSet::defect`], `tests/f4_loop.rs::meta`, `cmp`'s provenance check -- because
     /// three hand-rolled `.iter().find(...)` chains over the same field are a jscpd clone
     /// waiting to be typed (review, 2026-08-07).
     pub fn meta_get(&self, key: &str) -> Option<&str> {

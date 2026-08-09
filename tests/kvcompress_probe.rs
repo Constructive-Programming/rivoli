@@ -1,6 +1,6 @@
 //! **Closing the three coverage holes, at real weights.**
 //!
-//! `tests/v4_compress.rs` records the holes as executable facts about the *shipped* goldens.
+//! `tests/kvcompress.rs` records the holes as executable facts about the *shipped* goldens.
 //! This file closes them, by driving `Oracle::compressor` and `Oracle::indexer` directly —
 //! which the coordinator made possible at `6dd5a3e` by exposing them — on the real
 //! checkpoint's compressor and indexer tensors, at probe lengths and an `index_topk` the
@@ -44,8 +44,8 @@ use common::{
 // ---------------------------------------------------------------------------------------
 //
 // `compressor_w` and the probe lengths moved to `tests/common/mod.rs` when
-// `v4_compress_kernel.rs` needed the same two compressors. `indexer_w` followed on
-// 2026-08-05 when `v4_indexer_kernel.rs` became its second consumer -- the comment here used
+// `kvcompress_kernel.rs` needed the same two compressors. `indexer_w` followed on
+// 2026-08-05 when `blockindex_kernel.rs` became its second consumer -- the comment here used
 // to argue that a second consumer did not exist, and the duplication gate found the copy the
 // moment one did.
 

@@ -1263,7 +1263,7 @@ mod tests {
     /// `memory::routed::TierFmt` carries a `RoutedFmt` and not the `int4: bool` it replaced.
     ///
     /// They do diverge outside that band — the toy `(64, 32)` fixtures in
-    /// `tests/v4_loading.rs` are such a case (32 and 64 are both `< 97 mod 128`) — so a check
+    /// `tests/f4_loading.rs` are such a case (32 and 64 are both `< 97 mod 128`) — so a check
     /// that compares them is not vacuous everywhere, only where it matters.
     #[test]
     fn f4_slot_offsets_match_the_shipped_block_and_are_indistinguishable_from_i4() {
@@ -1354,7 +1354,7 @@ mod tests {
         // the pair that made the point, so it is the pair that is pinned.
         assert_eq!(f4_slot_offsets(hidden, 96), i4_slot_offsets(hidden, 96));
         assert_ne!(f4_expert_bytes(hidden, 96), i4_expert_bytes(hidden, 96));
-        // `tests/v4_loading.rs`'s toy fixtures are out of band on BOTH, which is the only
+        // `tests/f4_loading.rs`'s toy fixtures are out of band on BOTH, which is the only
         // reason a test can SEE an `.f4` set resolved through `.i4`'s layout at all. There is
         // no runtime check for it — that is the finding above, not an omission.
         assert_ne!(f4_slot_offsets(64, 32), i4_slot_offsets(64, 32));

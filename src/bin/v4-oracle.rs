@@ -639,7 +639,7 @@ fn defects(model: &Path, layer: usize, decode_steps: usize) -> Result<()> {
 /// claims to move must move, and everything else must be bit-identical -- and the second
 /// half is the informative one, because a defect that moves everything proves nothing.
 /// `defects` answers that in memory for one probe-driven layer; this answers it for the
-/// emit path's real layer chain, which is what `tests/v4_loop.rs` actually consumes.
+/// emit path's real layer chain, which is what `tests/f4_loop.rs` actually consumes.
 ///
 /// The one thing it DOES refuse is a pair taken at different prompts: every tensor then
 /// differs for a reason that is not a defect, and the table would read as "moves

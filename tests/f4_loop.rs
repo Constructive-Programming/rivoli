@@ -16,7 +16,7 @@
 //!   binary needs no feature and touches no GPU, so it can run beside a held device.
 //!
 //! An explicitly-set env var that does not resolve is a FAILURE, never a skip, for the reason
-//! `tests/common/v4_artifact_dir.rs` states: libtest captures stderr on passing tests, so an
+//! `tests/common/f4_artifact_dir.rs` states: libtest captures stderr on passing tests, so an
 //! `eprintln!` skip is invisible in a green run.
 //!
 //! # Why layers 0 and 1 and not layer 2
@@ -69,7 +69,7 @@
 //!
 //! **The 5e-2 bound is a CHOSEN separation, not a measured one, and the numbers behind it were taken
 //! elsewhere.** The port's seen-red record — `rel 4.2e-1` and `6.7e-1` on `attn_derot`, `1.06` on
-//! `q` — is `tests/v4_attn.rs`'s attention cell, on tensors this file did not read when this was
+//! `q` — is `tests/f4_attn.rs`'s attention cell, on tensors this file did not read when this was
 //! written (CORRECTED 2026-08-05: it reads both now). No break has
 //! ever been measured through `check` on `L*.out`. Those figures are the right order of magnitude to
 //! calibrate against and they do not transfer directly, for a reason stated below: `hc_post` mixes
@@ -322,13 +322,13 @@ use rivoli::math::f32_to_bf16;
 use rivoli::memory::pin::F4Pin;
 use rivoli::v4oracle::golden::GoldenSet;
 
-#[path = "common/v4_artifact_dir.rs"]
-mod v4_artifact_dir;
-use v4_artifact_dir::{v4_artifact, v4_artifact_l3_5};
+#[path = "common/f4_artifact_dir.rs"]
+mod f4_artifact_dir;
+use f4_artifact_dir::{v4_artifact, v4_artifact_l3_5};
 
 /// Device budget for the fixture pins.
 ///
-/// **The same 5 GiB `tests/v4_pool.rs` uses, and the first value here was wrong in the direction
+/// **The same 5 GiB `tests/f4_pool.rs` uses, and the first value here was wrong in the direction
 /// that made the whole gate red.** Measured on the shipped fixture: `resident.safetensors` is
 /// 2,607,031,354 B = **2.428 GiB**, so `pool_budget` leaves `CAPACITY - 2.428 GiB - 16 MiB` against
 /// a `3 x 256 x 13,369,344 B` = **9.56 GiB** routed set. At the 8 GiB this first said, the pool is
@@ -337,14 +337,14 @@ use v4_artifact_dir::{v4_artifact, v4_artifact_l3_5};
 ///
 /// The comment this replaces said "resident set 2.5 GB ... under 60% of the set" while asserting
 /// `budget * 2 < routed`, i.e. under 50% — a GB/GiB mix beside a bound that did not match the prose.
-/// That is precisely the failure `tests/v4_pool.rs` records ("a 0.06% margin read as 8%"),
+/// That is precisely the failure `tests/f4_pool.rs` records ("a 0.06% margin read as 8%"),
 /// reproduced in the file that cites it. Numbers restated in one unit.
 ///
 /// Oversubscription is the point: a budget large enough to hold everything would make every lookup a
 /// HIT and the streaming path would be untested by the only test that drives the real router. It is
 /// asserted rather than assumed, because a fixture that grew would silently turn this into an
 /// all-resident run. Note what 205 slots against ~156 distinct lookups does NOT buy: no eviction.
-/// That is `tests/v4_pool.rs`'s case, not this one; here the prefill misses and the decode hits.
+/// That is `tests/f4_pool.rs`'s case, not this one; here the prefill misses and the decode hits.
 const CAPACITY: usize = 5 << 30;
 
 /// Where `v4-oracle emit --layers 2 --decode-steps 1` put its output.
@@ -817,7 +817,7 @@ fn every_layer_matches_the_oracle_at_real_weights(
             // half is now read above, by re-running it alone (`probe_attn_stages`); the MoE half
             // still is not, so `.out` remains the only comparison that sees it, and remains unable
             // to attribute WHICH half moved. The 4.2e-1 the port measured for a dropped persist
-            // copy was measured on `attn_derot` in `tests/v4_attn.rs` — a tensor this file now
+            // copy was measured on `attn_derot` in `tests/f4_attn.rs` — a tensor this file now
             // reads too, though at real weights rather than toy dims.
             // `None` for the same reason as `ffn_norm_out` above, and more so: `.out` is that
             // tensor diluted through `hc_post` with four residual copies AND the whole MoE.
@@ -926,7 +926,7 @@ fn every_layer_matches_the_oracle_at_real_weights(
 /// **wedged the device**: 19 threads, four `io_sq_thread`s (the tell — four rings means four
 /// pools), zero output in 12 minutes, killed by PID. `--test-threads=1` fixes it and is the wrong
 /// fix, because it lives in whoever remembers to type it and the cost of forgetting is a wedged
-/// sole-tenant GPU. `tests/v4_pin.rs` and `tests/v4_pool.rs` both made this call; this follows
+/// sole-tenant GPU. `tests/f4_pin.rs` and `tests/f4_pool.rs` both made this call; this follows
 /// them.
 ///
 /// **Order is load-bearing.** The layer-0 refusal runs first and drops its pin, so it does not

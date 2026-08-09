@@ -541,7 +541,7 @@ pub struct V4Config {
     /// is exactly the setup where the decode path reaches for the wrong one.
     ///
     /// For anyone who finds it looking inert: at 512 it does not truncate until **2052
-    /// tokens** — `4 * (index_topk + 1)`, enforced by `tests/v4_compress.rs`'s
+    /// tokens** — `4 * (index_topk + 1)`, enforced by `tests/kvcompress.rs`'s
     /// `indexer_topk_never_cuts_at_the_emit_prompt` and recorded in
     /// `docs/investigations/v4-flash-port.md`, "A hole S3 inherits". Below that the
     /// selection is decided entirely by the causal mask, so a wrong value changes nothing

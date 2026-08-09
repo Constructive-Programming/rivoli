@@ -1,9 +1,9 @@
 //! `F4Pin::build` against the shipped `.f4` artifact.
 //!
-//! **Separate from `tests/v4_loading.rs` because this one needs the GPU.** Placement goes
+//! **Separate from `tests/f4_loading.rs` because this one needs the GPU.** Placement goes
 //! through `DeviceTier`, which allocates a real device slab and refuses to start if another
 //! tenant holds GPU memory — so this file follows the repo's GPU-test idiom (`tests/vk.rs`)
-//! and simply runs, failing when the device is busy. `v4_loading.rs` stays host-only.
+//! and simply runs, failing when the device is busy. `f4_loading.rs` stays host-only.
 //!
 //! What it is for: `F4Pin::build` resolves ~40 tensors a layer by NAME into typed fields,
 //! and a name resolved into the wrong field is silent — every one of these tensors exists,
@@ -33,16 +33,16 @@
 use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::memory::pin::{F4Pin, GateRoute};
 
-#[path = "common/v4_artifact_dir.rs"]
-mod v4_artifact_dir;
+#[path = "common/f4_artifact_dir.rs"]
+mod f4_artifact_dir;
 
 #[test]
-fn v4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
+fn f4_pin_places_every_tensor_into_the_field_its_dimensions_predict() {
     let mut ran = 0;
     let mut all = Seen::default();
     for dir in [
-        v4_artifact_dir::v4_artifact("resident.safetensors"),
-        v4_artifact_dir::v4_artifact_l3_5("resident.safetensors"),
+        f4_artifact_dir::v4_artifact("resident.safetensors"),
+        f4_artifact_dir::v4_artifact_l3_5("resident.safetensors"),
     ]
     .into_iter()
     .flatten()
@@ -84,7 +84,7 @@ fn check_one(dir: &str) -> Seen {
     let cfg: V4Config = load_config(dir).unwrap();
     // `F4Pin::build` now also builds the `.f4` streaming pool, so it takes a device budget.
     // 12 GiB against a 3-layer fixture's ~2.5 GiB resident leaves ~9.5 GiB of pool — the
-    // pool's own behaviour is `tests/v4_pool.rs`'s subject; here it only has to construct.
+    // pool's own behaviour is `tests/f4_pool.rs`'s subject; here it only has to construct.
     let pin = F4Pin::build(dir, &cfg, 12 << 30, "2q", Default::default(), None)
         .unwrap_or_else(|e| panic!("{dir} must load: {e:#}"));
     let range = pin.range();

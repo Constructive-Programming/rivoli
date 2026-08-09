@@ -54,7 +54,7 @@
 //!   and [`host_score`] agree with each other exactly, and neither is pinned to torch's
 //!   order.
 //! * **The basis order** is *not* in this list any more. It was S1b's highest-risk
-//!   inference; `tests/v4_hadamard_basis.rs` settled it against `fast_hadamard_transform`'s
+//!   inference; `tests/hadamard_basis.rs` settled it against `fast_hadamard_transform`'s
 //!   own documented contract on 2026-08-05, so the Hadamard this file exercises is pinned to
 //!   something other than the oracle's opinion of it.
 //! * **`wq_b` and `weights_proj`.** Their GEMVs are S2b's kernels and are scored there; this
@@ -178,8 +178,8 @@ fn host_spread(rows: &mut [f32], d: usize) {
 /// every store silently absent.
 ///
 /// **Not the only copy in `tests/`, and the count above is deliberately scoped.**
-/// `v4_hadamard_basis.rs::rbf` is this function byte for byte, under another name and with a
-/// doc making the same argument; `v4_head_tail.rs::bf` and two closures further down this
+/// `hadamard_basis.rs::rbf` is this function byte for byte, under another name and with a
+/// doc making the same argument; `headtail.rs::bf` and two closures further down this
 /// file are the scalar form. `build.rs`'s gate sees none of them — each is under jscpd's
 /// DEFAULT `minLines: 5`, which `.jscpd.json` does NOT set, so raising it is a one-line config
 /// change nobody would find by grepping the file that is supposed to govern the gate. That is
@@ -535,7 +535,7 @@ fn indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv() {
 ///
 /// Two of the oracle's four indexer breakages are expressible as a change to a kernel INPUT
 /// rather than to the kernel, which is the strongest technique this suite has (it is
-/// `v4_compress_kernel.rs`'s "exact defect impersonation"): `IndexerNoWeights` is `w` set to
+/// `kvcompress_kernel.rs`'s "exact defect impersonation"): `IndexerNoWeights` is `w` set to
 /// all ones, and `IndexerNoFp4Quant` is a `q` that skipped the fp4 step. For each, the
 /// kernel must track the correspondingly-perturbed host reference and must be far from the
 /// clean one.

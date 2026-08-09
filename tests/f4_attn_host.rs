@@ -4,7 +4,7 @@
 //! *selection*, so no numeric tolerance can stand in for it: a wrong rotation attends to
 //! real vectors at the wrong positions and produces fluent wrong text. It is also pure,
 //! so it can be gated without a GPU — which is why it lives here rather than in
-//! `tests/v4_attn.rs`, and why this file carries no `#![cfg(feature = "rocm")]`.
+//! `tests/f4_attn.rs`, and why this file carries no `#![cfg(feature = "rocm")]`.
 //!
 //! **What agreement here does and does not prove.** Both sides transliterate the same
 //! ten lines of `get_window_topk_idxs`, so a shared misreading passes. What makes the

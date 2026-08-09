@@ -7,12 +7,12 @@
 //!
 //! The pooling itself is device work: `kernels/kvcompress.hip`, launched in the reference's
 //! own order by [`compress`] below and scored against `Oracle::compressor` by
-//! `tests/v4_compress_kernel.rs`.
+//! `tests/kvcompress_kernel.rs`.
 //!
 //! The indexer's device half landed 2026-08-05 and is `kernels/blockindex.hip`:
 //! `act_quant_f4_rotated` (the Hadamard + fp4 finish, which is also [`Geom::indexer`]'s) and
 //! `index_score_blocks` (the `einsum`/relu/weight/sum chain), scored by
-//! `tests/v4_indexer_kernel.rs` — the spread against the oracle, the score against a host
+//! `tests/blockindex_kernel.rs` — the spread against the oracle, the score against a host
 //! transliteration of `model.py`, because the oracle's own head-sum is a confirmed defect as
 //! of 2026-08-05. Read that file's header before treating a green run as a verdict. **The selection is not there** — the causal mask and the
 //! top-k stay with the caller, because `Oracle::indexer` exports the full pre-top-k score
@@ -452,7 +452,7 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
 /// one slot early, so every later query selects it BY POSITION, weights it `exp(l - max)`,
 /// and attends a window that is off by `ratio` tokens on 41 of 43 layers — fluent, wrong, and
 /// permanent for the rest of the sequence.
-/// `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees` pins it by
+/// `tests/kvcompress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees` pins it by
 /// running a skipped step against an appending placer and asserting they disagree.
 ///
 /// `seqlen` is read only at prefill and `start_pos` only at decode; both are taken because
@@ -645,7 +645,7 @@ impl Geom {
             return None;
         }
         // Sound because `quant` is not an input to any derived integer, which is not left to
-        // this comment: `tests/v4_indexer_kernel.rs` asserts `a.abi() == i.abi()` for exactly
+        // this comment: `tests/blockindex_kernel.rs` asserts `a.abi() == i.abi()` for exactly
         // this pair. The `?` cannot fire — `has_indexer()` implies ratio 4, which
         // `compressor_ratio()` answers `Some` for.
         Some(Self {

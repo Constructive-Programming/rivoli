@@ -47,8 +47,8 @@
 //! | suite | result under the wrong basis |
 //! |---|---|
 //! | `tests/v4_oracle.rs` (27) | **all pass** |
-//! | `tests/v4_compress.rs` (7) | **all pass** |
-//! | `tests/v4_compress_probe.rs` (4) — incl. the ranking probe | **all pass** |
+//! | `tests/kvcompress.rs` (7) | **all pass** |
+//! | `tests/kvcompress_probe.rs` (4) — incl. the ranking probe | **all pass** |
 //!
 //! `hadamard_is_its_own_inverse` passes because a symmetric matrix is involutive whichever
 //! order its rows are in — [`both_candidate_matrices_are_symmetric_so_involution_cannot_separate_them`]

@@ -1,6 +1,6 @@
 //! The device-free half of the kernel-oracle scaffolding, shared by ten test binaries:
-//! `docs`, `invariants`, `kernel`, `v4_attn`, `v4_compress_kernel`, `v4_compress_probe`,
-//! `v4_head_tail`, `v4_indexer_kernel`, `v4_kernel` and `v4_oracle`.
+//! `docs`, `invariants`, `kernel`, `f4_attn`, `kvcompress_kernel`, `kvcompress_probe`,
+//! `headtail`, `blockindex_kernel`, `f4_kernel` and `v4_oracle`.
 //!
 //! It was copy-pasted per file until 2026-07-30, and the copies had already started to
 //! drift: two spellings of the same `Lcg` bug note, two `assert_close` bodies with the
@@ -27,8 +27,8 @@
 //! > that survives is the gate, not the location. Move a device helper here ungated and you
 //! > break `docs` and `invariants`, which is the failure the second agent predicted.
 //!
-//! **Five older oracle files still spell their own uploader** (`v4_kernel`, `v4_attn`,
-//! `v4_head_tail`, `v4_compress_kernel`, `v4_indexer_kernel`) and survive the duplication
+//! **Five older oracle files still spell their own uploader** (`f4_kernel`, `f4_attn`,
+//! `headtail`, `kvcompress_kernel`, `blockindex_kernel`) and survive the duplication
 //! gate only because their `.expect` strings differ — a half-migration, not a design.
 //!
 //! `dead_code` is allowed because this module is compiled into EACH test binary and none
@@ -98,7 +98,7 @@ pub fn f16b(v: &[f32]) -> Vec<u8> {
 /// comparison downstream silently measures that instead of the arithmetic.
 ///
 /// Here rather than in one test file because two suites now upload the compressor's
-/// `wkv`/`wgate` — `v4_compress_kernel.rs` at the real checkpoint and `v4_attn.rs` at the toy
+/// `wkv`/`wgate` — `kvcompress_kernel.rs` at the real checkpoint and `f4_attn.rs` at the toy
 /// — and `build.rs`'s duplication gate sees a second copy.
 pub fn bf16_rows(w: &rivoli::v4oracle::weights::WMat) -> Vec<u16> {
     let (rows, cols) = (w.rows(), w.cols());
@@ -171,7 +171,7 @@ pub fn u32v(b: &[u8]) -> Vec<u32> {
 /// Upload `b` to a fresh device buffer.
 ///
 /// `max(1)` because a zero-length allocation is not a thing this allocator does — the
-/// sentence is `tests/v4_kernel.rs`'s, and four of the five per-file uploaders this one
+/// sentence is `tests/f4_kernel.rs`'s, and four of the five per-file uploaders this one
 /// supersedes carry the guard. The copy promoted here (from `tests/kernel.rs`) was the one
 /// that did NOT, which would have made the shared helper strictly weaker than the copies it
 /// replaces. Reachable through `zeros(0)` or an empty fixture, not by anything today.
@@ -254,8 +254,8 @@ pub fn assert_bitwise<T: PartialEq + std::fmt::Debug>(want: &[T], got: &[T], lab
 /// Not `assert_bitwise(want, got)` directly on the floats: `PartialEq` for f32 says
 /// `-0.0 == 0.0`, so a sign-dropping defect passes an assertion that claims exactness, and
 /// says `NaN != NaN`, so a NaN-poisoned buffer fails one for the wrong reason. Five call
-/// sites spelled the `.to_bits()` fold on both operands; `tests/v4_kernel.rs` and
-/// `tests/v4_hadamard_basis.rs` each keep a private `bits()` for the same reason.
+/// sites spelled the `.to_bits()` fold on both operands; `tests/f4_kernel.rs` and
+/// `tests/hadamard_basis.rs` each keep a private `bits()` for the same reason.
 pub fn assert_bits(want: &[f32], got: &[f32], label: &str) {
     let b = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
     assert_bitwise(&b(want), &b(got), label);
@@ -264,7 +264,7 @@ pub fn assert_bits(want: &[f32], got: &[f32], label: &str) {
 /// `golden.rs::Diff.rel` — max absolute disagreement over the largest expected magnitude.
 ///
 /// The metric the oracle's own gate uses, so an anti-vacuity arm here is scored the same way
-/// the goldens are. Moved out of `tests/v4_head_tail.rs` on 2026-08-06 when
+/// the goldens are. Moved out of `tests/headtail.rs` on 2026-08-06 when
 /// `tests/indexer_kernel.rs` reimplemented it under another name.
 pub fn rel(got: &[f32], want: &[f32]) -> f32 {
     // Length first: `zip` truncates, so a short `got` would score 0.0 and read as perfect
@@ -309,7 +309,7 @@ pub fn assert_close(want: &[f32], got: &[f32], label: &str) {
 /// The largest magnitude in a slice — the scale every tolerance in this suite is stated
 /// against.
 ///
-/// Extracted because a second tolerance FORMULA now exists: `tests/v4_kernel.rs` bounds
+/// Extracted because a second tolerance FORMULA now exists: `tests/f4_kernel.rs` bounds
 /// relative to the bf16 quantum instead of [`err_tol`]'s `1e-3·max + 1e-3`, whose absolute
 /// floor is 5% of the signal at that fixture's scale. The formulas differ on purpose; the
 /// SCALE they are stated against must not, and three copies of this fold were the duplicate
@@ -329,7 +329,7 @@ pub fn report(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
 
 /// [`report`] against a tolerance RELATIVE to the largest expected element, for callers
 /// whose signal is too small for [`err_tol`]'s `1e-3` absolute floor to mean anything —
-/// `tests/v4_kernel.rs`, where one routed MoE layer's output is ~2e-2 and that floor would
+/// `tests/f4_kernel.rs`, where one routed MoE layer's output is ~2e-2 and that floor would
 /// be 5% of it.
 ///
 /// Takes the ratio and computes the metric itself. An earlier version took `(err, tol, mx)`
@@ -578,11 +578,11 @@ impl Lcg {
 }
 
 // ---------------------------------------------------------------------------------------
-// V4-Flash checkpoint scaffolding, shared by `v4_compress_probe.rs` and
-// `v4_compress_kernel.rs`
+// V4-Flash checkpoint scaffolding, shared by `kvcompress_probe.rs` and
+// `kvcompress_kernel.rs`
 // ---------------------------------------------------------------------------------------
 //
-// These moved here from `v4_compress_probe.rs` when the kernel test needed the same loader:
+// These moved here from `kvcompress_probe.rs` when the kernel test needed the same loader:
 // both drive the SAME two compressors (layer 2 at ratio 4, layer 3 at ratio 128), one
 // against the oracle alone and one against the GPU, and a second copy of `compressor_w`
 // would be a second set of shape assertions that could drift apart while both stayed green.
@@ -690,7 +690,7 @@ pub fn compressor_w(
 
 /// One layer's `attn.indexer.*`, as [`IndexerW`].
 ///
-/// Lifted here from `v4_compress_probe.rs` when `v4_indexer_kernel.rs` became a second
+/// Lifted here from `kvcompress_probe.rs` when `blockindex_kernel.rs` became a second
 /// consumer and `build.rs`'s duplication gate found the copy. The comment that moved with it
 /// is the load-bearing part: `wq_b` is fp8 on disk (it ships a `.scale`), unlike
 /// `weights_proj`, which is bare bf16 — and V4's `Indexer` has **no `wk` and no `k_norm`**.
@@ -718,7 +718,7 @@ pub fn indexer_w(ck: &Checkpoint, layer: usize, c: &V4Config) -> IndexerW {
 
 /// Drive one PREFILL `run_layer` over `h` and return what it captured.
 ///
-/// `tests/v4_kernel.rs` and `tests/v4_oracle.rs` each built the same six-field `LayerCtx` at
+/// `tests/f4_kernel.rs` and `tests/v4_oracle.rs` each built the same six-field `LayerCtx` at
 /// `start_pos: 0, step_tag: "pre"`, wrapped in the same `fresh_state`/`Capture`/`run_layer`
 /// sequence, and `build.rs`'s duplication gate found the copy. Nothing here touches a device
 /// type, which is this module's rule for what may live in it.
@@ -758,7 +758,7 @@ pub fn prefill_capture(
 /// [`probe`] with the one row width that is not arbitrary. `hc_mult * dim` is what the mHC
 /// residual is, and it was spelled at three call sites in two files under two different
 /// treatments — `v4_oracle`'s `fixed_h` wrapped it and argued the wrapper was worth it, while
-/// `v4_kernel` inlined the identical product twice with no comment. jscpd sees none of that
+/// `f4_kernel` inlined the identical product twice with no comment. jscpd sees none of that
 /// (each site was a single expression, far under its default `minLines: 5`), which makes it a
 /// "known, not merely unseen" case rather than a licence to leave it.
 ///
@@ -772,8 +772,8 @@ pub fn residual_probe(cfg: &V4Config, tag: &str, s: usize) -> Vec<f32> {
 /// A deterministic bf16 activation block, `[n, dim]`, seeded by `name`.
 ///
 /// **Changing the draw or the `NamedRng` sequence re-bases goldens in five suites at once** —
-/// `v4_oracle`, `v4_kernel`, `v4_indexer_kernel`, `v4_compress_kernel` and
-/// `v4_compress_probe`. `v4_oracle` and `v4_kernel` reach it only through
+/// `v4_oracle`, `f4_kernel`, `blockindex_kernel`, `kvcompress_kernel` and
+/// `kvcompress_probe`. `v4_oracle` and `f4_kernel` reach it only through
 /// [`residual_probe`], so neither file can see its own exposure from its own source.
 ///
 /// This doc line was orphaned onto `indexer_w` until 2026-08-06, which is how a shared

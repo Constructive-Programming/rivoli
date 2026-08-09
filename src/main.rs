@@ -890,7 +890,7 @@ fn run_v4(
     // purpose (CLAUDE.md — they have misled three investigations here), and this loop has two
     // NAMED deviations from the reference (the unclamped shared expert, and positional block
     // selection on the ratio-4 layers). A degeneration verdict on top of that would be a number
-    // standing in for a gate. `tests/v4_loop.rs` is the gate.
+    // standing in for a gate. `tests/f4_loop.rs` is the gate.
     // Prompt and reply LABELLED and on separate lines. Concatenating them was right while the
     // prompt was raw and the model was continuing a document; under chat framing `generate`
     // returns the assistant's answer alone, and an answer normally restates the question — so
