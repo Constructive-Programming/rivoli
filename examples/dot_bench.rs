@@ -14,17 +14,21 @@
 //! The `v4res` section (2026-08-09) does the same for the fp4 routed experts' RESIDENT range
 //! — the `res` span, the engine's largest single bucket — and takes its working set as a
 //! parameter so the 32 MB MALL confound §M11 names first is measured rather than argued.
+//! The `glmi4` section (2026-08-09) is that same instrument pointed at GLM-5.2's int4 routed
+//! experts — `dot_i4_wave_r`, the shipping default's MoE compute — at R = 1 and R = 2, which
+//! is the question `docs/investigations/int4-moe-unroll.md` opens.
 //! Run: cargo run --release --features rocm --example dot_bench
 #![cfg(feature = "rocm")]
 #![allow(clippy::expect_used)]
 use rivoli::artifact::quant::{
-    VQ_DIM, VQ_K, f4_groups, f4_row_bytes, matvec_fp8, matvec_i4, quant_i4, quant_vq,
+    VQ_DIM, VQ_K, f4_groups, f4_row_bytes, i4_expert_bytes, i4_groups, i4_row_bytes, matvec_fp8,
+    matvec_i4, quant_i4, quant_vq,
 };
 use rivoli::backend::hip::{
-    ExpertDescF4, attend_scratch_floats, device_sync, launch_act_quant_f8, launch_argmax,
-    launch_attend, launch_gemv_fp8, launch_gemv_i4, launch_gemv_i8, launch_gemv_vq,
+    ExpertDesc, ExpertDescF4, attend_scratch_floats, device_sync, launch_act_quant_f8,
+    launch_argmax, launch_attend, launch_gemv_fp8, launch_gemv_i4, launch_gemv_i8, launch_gemv_vq,
     launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_expert_range_f4,
-    launch_rmsnorm, launch_v4_gemv_fp8,
+    launch_moe_expert_range_i4, launch_rmsnorm, launch_v4_gemv_fp8,
 };
 use rivoli::math::{f32_to_e4m3, f32_to_f16};
 use rivoli::memory::device::DeviceBuf;
@@ -391,6 +395,14 @@ const V4_RES_EXPERT_READS_PER_TOKEN: f64 = 5.885 * 43.0;
 ///
 /// Returns the `e_start = 0` fingerprint so the caller can check the two arms agree — see
 /// `main`, where the expectation is asserted rather than left for the eye.
+///
+/// **`run_glm_i4` below is this function's twin and is NOT factored with it.** `examples/` is
+/// outside `build.rs`'s jscpd gate, so nothing will report it if the two drift — this
+/// cross-reference is the only thing pinning them, and an edit here should ask whether it
+/// belongs there too. What is deliberately DIFFERENT there, so a "fix" does not undo it: int4
+/// group scales are f32 where these are one e8m0 byte; there is no `act_quant_f8` (GLM's int4
+/// path consumes raw f32 activations); the launcher takes `nrow` instead of `n_desc` and a
+/// swiglu limit; and it derives NO ms/token, because GLM has no booked span to project onto.
 fn run_v4_res(name: &str, hidden: usize, inter: usize, e_count: usize, ranges: usize) -> u64 {
     // V4's config value, hand-copied. The launcher only refuses a clamp-DISABLING limit (rc
     // 1006); a finite-but-wrong one runs silently, and only this section's fingerprint
@@ -592,6 +604,313 @@ fn run_v4_res(name: &str, hidden: usize, inter: usize, e_count: usize, ranges: u
     h
 }
 
+/// GLM-5.2's int4 routed-expert range at the artifact's real dims — the serial rate of
+/// `dot_i4_wave_r`, which is `--mode int4` outright and, through the HOT format,
+/// `--mode hybrid`'s resident half. `docs/investigations/int4-moe-unroll.md` G1.
+///
+/// **This is the only instrument that can see a change to this loop, and that is a
+/// deliberate scope choice, not a shortcut.** GLM decodes 483 ms/token with ~260 ms of it
+/// fetch exposure (180.4 miss/token x 1.44 ms/miss), so a kernel win of tens of percent on
+/// a fraction of the compute is below the wall's resolving power at any n this project can
+/// afford. A wall A/B staged against it would be a gate structurally incapable of seeing
+/// the thing under test. So this row prints a RATE and **derives no ms/token from it** —
+/// unlike `run_v4_res`, which can, because V4 has a booked `res` span to project onto.
+///
+/// **It also cannot be validated against the engine the way `run_v4_res`'s probe A was.**
+/// V4 had a booked 24.3 ms serial `res` span, so its band was a reproduction gate. There is
+/// no equivalent booked GLM int4 expert-compute span, so the band printed below is only a
+/// sanity band — "is this measuring DRAM at all" — and the `mall-ctl` row beside it is what
+/// actually makes the number trustworthy.
+///
+/// `ranges` is that instrument, for the reason `run_v4_res` gives at length: gfx1151 has a
+/// 32 MB MALL, so a probe that replays one range gets partial cache service and overstates
+/// the rate. One range here is 6 x 20.05 MB = 120 MB — already 3.8x the MALL, which is why
+/// the control has to be MEASURED rather than assumed to be free.
+///
+/// `nrow` is 1 or 2: GLM instantiates `dot_i4_wave_r<2>` because speculative decode was
+/// measured to pay (1.108x at `--mtp-min-conf 0.8`), and R = 2 is the whole reason M11's fp4
+/// result cannot be copied across — the loop body holds `2R` accumulators and reads `2R`
+/// `float4`s per step. **GB/s is WEIGHT bytes over time at both**, because one read of the
+/// weight row serves both token rows; so the two `nrow` rows are not competing arms, and
+/// only depth-vs-depth WITHIN an `nrow` is a comparison.
+///
+/// Returns `(row 0's fingerprint, row 1's if `nrow == 2`)`, and **both halves are gated**.
+///
+/// Row 0 is arithmetically independent of `nrow` — `a0[t]` accumulates per `t` with no
+/// cross-row term, and `moe_down_i4_impl` reads `he = h_in + e*R*inter`, so `t = 0` is always
+/// the same slice — so every arm here, R = 1 and R = 2 alike, must return the same row-0
+/// value. Row 1's inputs are just as `ranges`-independent (separate generator, `n_desc`-
+/// independent lengths), so the two R = 2 arms must agree on row 1 as well.
+///
+/// **Row 1 is fingerprinted because without it this probe is blind to the one failure it
+/// exists to price.** An unroll that broke `vt = v + t * v_stride` for `t = 1` past the first
+/// trip would leave row 0 bit-identical and sail through a row-0-only gate — and the R = 2
+/// path is precisely what this stretch is measuring. `tests/kernel.rs::
+/// batched_rows_are_bit_identical_to_single_rows` covers row 0 against `nrow = 1`; nothing
+/// covered row 1 at depth.
+fn run_glm_i4(
+    name: &str,
+    hidden: usize,
+    inter: usize,
+    e_count: usize,
+    ranges: usize,
+    nrow: usize,
+) -> (u64, Option<u64>) {
+    // The four spans this probe actually uploads, so the GB/s denominator cannot disagree
+    // with the traffic. int4 group scales are **f32**, so each scale span is `groups * 4`
+    // BYTES; using `i4_groups(dim)` with a one-byte scale — the fp4 twin's e8m0 width —
+    // understates `per_expert` by 884,736 B (4.41%) and would report every GB/s below 4.41%
+    // **LOW**, since `report_bytes` divides bytes by time.
+    //
+    // Note, because it is a trap in the other direction: copying `f4_row_bytes`/`f4_groups`
+    // in verbatim gives the IDENTICAL number here, not a wrong one — `I4_GROUP`(128) /
+    // `F4_GROUP`(32) == 4 == `sizeof(f32)`, so `i4_groups(d) * 4 == f4_groups(d) * 1` at every
+    // dim. The hazard is the scale WIDTH, not the helper names.
+    let (gu_packed, dn_packed) = (inter * i4_row_bytes(hidden), hidden * i4_row_bytes(inter));
+    let (gu_scale, dn_scale) = (inter * i4_groups(hidden) * 4, hidden * i4_groups(inter) * 4);
+    let per_expert = 2 * (gu_packed + gu_scale) + dn_packed + dn_scale;
+    // What this catches, stated precisely, because `run_v4_res` above DECLINES the same assert
+    // as "comparing an expression with itself" and the two should not give opposite advice on
+    // the same question: both sides compose `i4_row_bytes`/`i4_groups`, so this does NOT check
+    // the scale width or the group size — it checks that the probe reduces gate/up over
+    // `hidden` and down over `inter`, i.e. a transposed `(o, i)` pair. That is worth one line
+    // here and is not worth it there, because `run_v4_res` uploads its spans from the same two
+    // `f4_*` helpers its denominator is summed from, while this one is the FIRST consumer of
+    // the int4 layout outside `src/`.
+    //
+    // The check that is not weak is external and recorded in the investigation doc: at
+    // 6144/2048 this is 20,054,016 bytes and `/var/db/rivoli/glm52-vq3-full/L03.i4` is
+    // 5,153,882,112 = 257 x that exactly (256 routed + the shared expert).
+    assert_eq!(
+        per_expert,
+        i4_expert_bytes(hidden, inter),
+        "probe uploads a different expert block than the artifact stores"
+    );
+    let n_desc = ranges * e_count;
+    let ws_mb = n_desc * per_expert / 1_000_000; // decimal, to match the GB/s denominator
+    // Checked HERE, before a byte is uploaded or a launch is timed — a guard placed after
+    // `time()` fires only once the measurement it was meant to prevent has been paid for.
+    // `ranges > 1` is what marks an engine-condition arm; the control arm is a cache artifact
+    // on purpose and has no floor.
+    assert!(
+        ranges == 1 || ws_mb >= 1000,
+        "engine-condition arm must rotate >= 1 GB past the 32 MB MALL; this one rotates {ws_mb} MB"
+    );
+
+    // TOKEN ROW 0's inputs are drawn first and at `nrow`- and `n_desc`-independent lengths, so
+    // every arm's row-0 fingerprint is comparable: `x` row 0 is the same `hidden` draws
+    // everywhere, and `w`'s first `e_count` entries are the same whether `n_desc` is 6 or 54.
+    // Row 1's inputs come off a SEPARATE generator for that reason — letting them share the
+    // stream would make `n_desc` shift row 0's routing weights.
+    let seed = 0x14E5 ^ hidden as u64 ^ ((inter as u64) << 24);
+    let mut r = Rng(seed);
+    let x0 = rnd(&mut r, hidden);
+    let w0 = f32v(&rnd_scale(&mut r, n_desc));
+    let mut r1 = Rng(seed ^ 0x5EC0_0000);
+    let x1 = rnd(&mut r1, hidden);
+    let w1 = f32v(&rnd_scale(&mut r1, n_desc));
+    // `wexpert` is indexed `[e * nrow + t]` (token row fastest), so row 0's weight for expert
+    // `e` sits at `e * nrow` and is `w0[e]` at either width.
+    let mut wex = Vec::with_capacity(n_desc * nrow);
+    for e in 0..n_desc {
+        wex.push(w0[e]);
+        if nrow == 2 {
+            wex.push(w1[e]);
+        }
+    }
+    let xb = dev(&if nrow == 2 {
+        [x0.as_slice(), x1.as_slice()].concat()
+    } else {
+        x0.clone()
+    });
+    let wb = dev(&f32b(&wex));
+
+    // One set of weight bytes, `n_desc` copies at DISTINCT device addresses — `run_v4_res`'s
+    // pattern and its reason: the kernel reads every weight byte exactly once whatever its
+    // value (the nibble decode is `bfe`/`add`/`cvt`, register-only, with no data-dependent
+    // path and no LDS table a shared fill could collapse into a broadcast), and what must
+    // differ between experts is which DRAM pages they occupy. NOT `pattern()`: its repeating
+    // 4 KiB block aliases with these row strides (gate/up rows 3072 B, down rows 1024 B), which
+    // would collapse the drained residual's entropy and weaken the fingerprint.
+    //
+    // Gate and up therefore share bytes, so `g == u` and a w1/w3 swap is invisible here. That
+    // is not this probe's job — `tests/kernel.rs` covers int4 against the CPU oracle. What the
+    // fingerprint has to catch is FOLD ORDER, because that is the only thing an unroll of this
+    // loop can change.
+    let mut wr = Rng(0x14B0);
+    let bytes_of = |r: &mut Rng, n: usize| -> Vec<u8> {
+        (0..n).map(|_| ((r.f() + 1.0) * 127.5) as u8).collect()
+    };
+    let packed_gu = bytes_of(&mut wr, gu_packed);
+    let packed_dn = bytes_of(&mut wr, dn_packed);
+    // f32 group scales in [0.01, 0.11) — the same band `rnd_scale` uses everywhere here, and
+    // small enough that the accumulated partials stay far under `moe_fixed`'s +/-2^14
+    // saturation, which would flatten the residual into a constant and make the fingerprint
+    // match any kernel. The `distinct` line below is what reports it if that ever stops
+    // holding.
+    let scale_gu = rnd_scale(&mut wr, gu_scale / 4);
+    let scale_dn = rnd_scale(&mut wr, dn_scale / 4);
+
+    let mut parts: Vec<DeviceBuf> = Vec::with_capacity(n_desc * 6);
+    let mut descs: Vec<ExpertDesc> = Vec::with_capacity(n_desc);
+    for _ in 0..n_desc {
+        // Address taken BEFORE the move into `parts`, for the reason `run_v4_res` gives:
+        // recovering it by index afterwards works until the buffer count changes, and then a
+        // descriptor silently points at another projection.
+        let mut push = |b: &[u8]| {
+            let d = dev(b);
+            let p = d.ptr();
+            parts.push(d);
+            p
+        };
+        // `ExpertDesc`'s scale fields are typed `*const u16` from the VQ carrier; the int4
+        // kernel reads them as `const float*`. One layout, the kernel picks the
+        // interpretation — see the type's own doc.
+        descs.push(ExpertDesc {
+            gate_indices: push(&packed_gu),
+            gate_scales: push(&scale_gu) as *const u16,
+            up_indices: push(&packed_gu),
+            up_scales: push(&scale_gu) as *const u16,
+            down_indices: push(&packed_dn),
+            down_scales: push(&scale_dn) as *const u16,
+        });
+    }
+    // SAFETY: `ExpertDesc` is `#[repr(C)]` plain addresses, so the span is exactly the slice's
+    // bytes.
+    let descb = dev(unsafe {
+        std::slice::from_raw_parts(
+            descs.as_ptr() as *const u8,
+            std::mem::size_of_val(&descs[..]),
+        )
+    });
+    // `wexpert` and `h` are indexed by the ABSOLUTE descriptor index, not by position in the
+    // range, so both are sized for `n_desc` — which is what lets `e_start > 0` rotate at all.
+    let mut hb = dev(&vec![0u8; n_desc * nrow * inter * 4]);
+    // ONE accumulator stream row (this probe launches on the null stream only), `nrow` token
+    // rows, so the drain below takes `n = nrow * hidden` and `rows = 1`. The engine passes
+    // `rows = MOE_ACC_ROWS` because it has a second, miss-stream row to fold in.
+    let mut ab = dev(&vec![0u8; nrow * hidden * 8]);
+    let mut ob = dev(&vec![0u8; nrow * hidden * 4]);
+    let (xp, wp) = (xb.ptr() as *const f32, wb.ptr() as *const f32);
+    let dp = descb.ptr() as *const ExpertDesc;
+    let (hp, ap, op) = (
+        hb.ptr_mut() as *mut f32,
+        ab.ptr_mut() as *mut u64,
+        ob.ptr_mut() as *mut f32,
+    );
+    // NO `act_quant_f8` here, unlike the fp4 twin: GLM's int4 path consumes raw f32
+    // activations. Quantizing them would measure a different kernel's inputs.
+    //
+    // SAFETY: every buffer above is sized for `n_desc` ABSOLUTE expert slots and `nrow` token
+    // rows, and stays alive until this function returns; every range below is inside that
+    // bound.
+    let launch = |e_start: usize| unsafe {
+        launch_moe_expert_range_i4(
+            xp,
+            hidden,
+            inter,
+            e_start,
+            e_count,
+            dp,
+            wp,
+            hp,
+            ap,
+            nrow,
+            std::ptr::null_mut(),
+        )
+        .expect("moe_expert_range_i4");
+    };
+
+    // The fingerprint first, off the freshly zeroed `acc`/`out` allocations — the drain resets
+    // `acc`, so nothing has to be cleared by hand and the timing loop's atomics cannot ride
+    // into the reading.
+    launch(0);
+    // SAFETY: same stream (the null one), so the range's atomics precede the drain.
+    unsafe { launch_moe_acc_drain(op, ap, nrow * hidden, 1, 1.0, std::ptr::null_mut()) }
+        .expect("drain");
+    device_sync().expect("s");
+    let out = ob.copy_out().expect("out");
+    let row0 = &out[..hidden * 4];
+    let row1 = (nrow == 2).then(|| fnv(&out[hidden * 4..]));
+    let distinct = f32v(row0)
+        .iter()
+        .map(|v| v.to_bits())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+
+    let bytes = e_count * per_expert;
+    // A whole number of sweeps, so every expert is read the same number of times and `time`'s
+    // one untimed warm-up only shifts the phase. 6 GB is a CEILING on the timed weight traffic,
+    // not a floor — this floors the sweep count — so the rows land at 5.4 / 5.9 / 5.4 / 5.9 /
+    // 5.0 GB. That is enough work that launch overhead and clock noise are small shares at both
+    // a 120 MB launch and a 20 MB one, which is the only property being bought here.
+    let iters = ((6_000_000_000usize / (ranges * bytes)).max(1) * ranges) as u32;
+    let turn = std::cell::Cell::new(0usize);
+    let us = time(iters, &|| {
+        let t = turn.get();
+        turn.set(t + 1);
+        launch((t % ranges) * e_count);
+    });
+    let gbs = report_bytes(
+        name,
+        "i4res",
+        &format!("[{e_count}e r{nrow} {hidden}x{inter} ws{ws_mb}MB]"),
+        bytes,
+        us,
+    );
+    // Gated on `e_count > 1` as well as on `ranges`, and that is not tidiness: the `e_count = 1`
+    // row rotates 50 ranges, so `ranges > 1` alone would print this band over the ONE row where
+    // a low rate is the measurement rather than a fault. M8 measured 66 GB/s at 512–1024 waves
+    // on this box, so a sub-90 reading at the engine's real launch size is plausible AND
+    // correct — an operator obeying a KILL printed there would discard a valid row.
+    if ranges > 1 && e_count > 1 {
+        // Registered BEFORE the device, and it is a SANITY band, not a reproduction gate —
+        // see this function's doc. Floor: the `.vq3` MoE batch, a random codebook gather,
+        // measured 109.4 GB/s (benchmarks.md "DSA indexer round", the per-layer rows — and
+        // that row may itself be partly cache-served, which only makes it a WEAKER floor and
+        // so cannot make this band too generous), and int4 is a sequential
+        // read that must beat it. Ceiling: M11's fp4 ballast arms, with the whole decode and
+        // every FMA removed, topped out at 200.20 GB/s on this box, so a stock decoding loop
+        // above that is reading cache, not DRAM.
+        //
+        // The band is COMPARED, not merely printed. `run_v4_res` prints its band and leaves the
+        // comparison to the operator's eye, and this repo's own rule is that a thing called a
+        // gate has to be able to say "no" — so the verdict is appended to the line here. It is
+        // still not an `assert!`, for the reason the degeneracy note below gives: an abort would
+        // cost every remaining row in the same process, and a KILL here means the HARNESS is
+        // wrong, which is a thing to read and diagnose rather than to crash on.
+        let verdict = if gbs >= 200.0 || gbs <= 90.0 {
+            "  <-- KILL: harness, not kernel"
+        } else if !(130.0..=175.0).contains(&gbs) {
+            "  <-- OUT OF BAND (not a kill)"
+        } else {
+            "  <-- in band"
+        };
+        println!(
+            "            band 130-175 GB/s registered pre-device; KILL >=200 or <=90{verdict}"
+        );
+    }
+    // Reported, NOT asserted — `run_v4_res`'s argument: a guard expected to go red on a
+    // planned arm is one an operator learns to skip, and an abort here would also cost the
+    // control row that runs after it in the same process. Full entropy puts `distinct` at
+    // ~`hidden`; a collapse to a handful means `moe_fixed` saturated and the fingerprint
+    // below would then match ANY kernel.
+    let degenerate = if distinct * 4 > hidden {
+        ""
+    } else {
+        "  DEGENERATE — constant residual, this fnv matches any kernel"
+    };
+    let h = fnv(row0);
+    println!(
+        "            fnv {h:016x}  row 0 of {nrow}  (seed {seed:#x}, {n_desc} experts, {ranges} \
+         ranges x {iters} iters, {distinct} distinct){degenerate}"
+    );
+    if let Some(h1) = row1 {
+        println!("            fnv {h1:016x}  row 1 of {nrow}");
+    }
+    (h, row1)
+}
+
 fn run_i8(name: &str, o_dim: usize, i_dim: usize) {
     let packed = pattern(o_dim * i_dim, |v| (v * 127.0) as i8 as u8);
     let scale: Vec<f32> = vec![1.0; o_dim];
@@ -740,7 +1059,9 @@ fn run_tail_rest(vocab: usize, hidden: usize) {
 /// `-- mla gemv` runs only those sections; no argument runs all of them, so a per-kernel
 /// A/B can book only the rows it is about to compare.
 fn main() {
-    const SECTIONS: [&str; 7] = ["moe", "gemv", "v4gemv", "v4res", "mla", "attend", "tail"];
+    const SECTIONS: [&str; 8] = [
+        "moe", "gemv", "v4gemv", "v4res", "glmi4", "mla", "attend", "tail",
+    ];
     let want: Vec<String> = std::env::args().skip(1).collect();
     // A typo must NOT silently select nothing. Every number this branch rests on — the
     // timings and the fnv fingerprints both — is read off this binary's stdout, so an
@@ -804,6 +1125,77 @@ fn main() {
             engine, ctl,
             "the two working sets disagree on the [0, e_count) range — a ranges-dependent bug, \
              not a cache effect"
+        );
+    }
+    // GLM-5.2's int4 routed experts at the shape read out of the artifact manifest
+    // (`/var/db/rivoli/glm52-vq3-full/manifest.json`: hidden_size 6144,
+    // moe_intermediate_size 2048, n_routed_experts 256) — NOT from prose. The per-expert byte
+    // count and its check against the artifact are at `run_glm_i4`'s `assert_eq!`.
+    //
+    // `e_count = 6`: GLM does NOT launch one range per layer the way V4 does. `gpu.rs`
+    // batches each RUN of consecutive resident selections among the 9 descriptors (top-8 +
+    // shared) and launches each miss singly on the miss stream, so real runs are short —
+    // DERIVED, not counted: at the recorded 67.7% decode hit the expected run length is
+    // 1/(1 - 0.677) ~= 3.1, so ~1-3. The mechanism is read off `gpu.rs`; the distribution is
+    // not, and the engine's selection trace could settle it if it ever matters. The
+    // `e1` row below is here because of that — it measures what launch size costs instead of
+    // asserting that the grid is saturated either way (at `e_count = 1` gate/up is already
+    // `1 x inter` = 2048 waves and down is 6144, against ~1280 machine slots).
+    //
+    // Two working sets per width on purpose: `ranges = 9` is 54 experts = 1.083 GB = 33x the
+    // 32 MB MALL, against `ranges = 1` = 120 MB, the naive harness. Both draw the same
+    // experts 0..6 and the same token row 0, so every `e_count = 6` row's fingerprint is
+    // expected to agree — across the MALL control AND across R = 1 vs R = 2.
+    if on("glmi4") {
+        println!(
+            "\nGLM-5.2 int4 resident-expert range (serial rate; the shipping default's MoE \
+             compute). The `mall-ctl` rows replay ONE range and are a cache artifact by design:"
+        );
+        // Built in call order, not collected afterwards: each `run_glm_i4` allocates and frees
+        // its own ~1 GB working set, so the rows must run one at a time and in this order.
+        let fp = [
+            (
+                "R1         ",
+                run_glm_i4("glm i4 R1        ", 6144, 2048, 6, 9, 1),
+            ),
+            (
+                "R1 mall-ctl",
+                run_glm_i4("glm i4 R1 mall-ctl", 6144, 2048, 6, 1, 1),
+            ),
+            (
+                "R2         ",
+                run_glm_i4("glm i4 R2        ", 6144, 2048, 6, 9, 2),
+            ),
+            (
+                "R2 mall-ctl",
+                run_glm_i4("glm i4 R2 mall-ctl", 6144, 2048, 6, 1, 2),
+            ),
+        ];
+        // `e_count = 1`, 50 ranges = 1.003 GB. Its fingerprint is NOT comparable to the rows
+        // above and is deliberately left out of the check: it drains ONE expert's
+        // contribution, not six, so a different value is correct.
+        run_glm_i4("glm i4 R1 e1     ", 6144, 2048, 1, 50, 1);
+        for (tag, (h0, _)) in &fp[1..] {
+            assert_eq!(
+                *h0, fp[0].1.0,
+                "{tag} disagrees with R1 on token row 0 — row 0's arithmetic is independent \
+                 of `nrow` and of `ranges`, so this is a descriptor/indexing bug or a fold-order \
+                 change, not a cache effect"
+            );
+        }
+        // ROW 1, across the two R = 2 arms. Row 0 above cannot see a `t = 1` addressing bug —
+        // it is bit-identical at `nrow = 1`, which is exactly why a row-0-only gate would pass
+        // one. R = 2 is what this stretch is measuring, so its second row gets a gate too.
+        assert_eq!(
+            fp[2].1.1, fp[3].1.1,
+            "the two R = 2 working sets disagree on token row 1 — row 1's inputs are drawn from \
+             an `n_desc`-independent generator, so this is an indexing or fold-order change, not \
+             a cache effect"
+        );
+        assert!(
+            fp[2].1.1.is_some() && fp[2].1.1 != Some(fp[2].1.0),
+            "the R = 2 arm must report a row 1, and it must differ from row 0 — equal rows would \
+             mean row 1 is reading row 0's activations, which is the bug this gate exists for"
         );
     }
     // GLM-5.2 manifest: num_attention_heads 64, qk_head_dim 256 (= qk_nope 192 + rope
