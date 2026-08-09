@@ -367,8 +367,8 @@ pub mod v4 {
     use crate::artifact::model::V4Config;
     use crate::backend::Event;
     use crate::backend::hip::{
-        launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_qk_norm, launch_v4_rmsnorm,
-        launch_v4_rope, launch_v4_sparse_attn, memcpy_dtod_async,
+        launch_act_quant_f8_prefix, launch_gather_attn_shared_kv, launch_gemv_fp8_grouped,
+        launch_qk_norm, launch_rmsnorm_batch, launch_rope_adjacent, memcpy_dtod_async,
     };
     use anyhow::{Result, bail, ensure};
     use std::ffi::c_void;
@@ -393,7 +393,7 @@ pub mod v4 {
     ///   corrected 2026-08-09 with the re-count). The fp8
     ///   GEMVs carry ~39.9 of this span's ~39.9 MB/layer of weight bytes either way.
     /// * `qkv_done` → `attend_done`: the **attend core** — the phase-dependent KV
-    ///   cache/ring write copies (one row at decode) and `launch_v4_sparse_attn` itself.
+    ///   cache/ring write copies (one row at decode) and `launch_gather_attn_shared_kv` itself.
     ///   ≤~1 MB of gathered KV at this benchmark's positions; a big span here is kernel
     ///   shape, not traffic.
     /// * `attend_done` → mark 3 (caller's `M_ATTN_DONE`, recorded after this call
@@ -404,7 +404,7 @@ pub mod v4 {
         /// Records after the KV entry's partial `act_quant` — the q/kv chains' last
         /// enqueue, before any cache write.
         pub qkv_done: &'a Event,
-        /// Records after `launch_v4_sparse_attn` — before the output de-rotation.
+        /// Records after `launch_gather_attn_shared_kv` — before the output de-rotation.
         pub attend_done: &'a Event,
     }
 
@@ -685,7 +685,7 @@ pub mod v4 {
             // looks entirely ordinary — passes the rope bound (`512 > 512` is false), is
             // even, and then satisfies the multiple-of-64 test below because
             // `0.is_multiple_of(64)` is TRUE. That is the same `is_multiple_of`-admits-zero
-            // property the zero sweep was added for. It reached `launch_v4_act_quant` with
+            // property the zero sweep was added for. It reached `launch_act_quant_f8_prefix` with
             // `n = 0` and came back as `argument guard rejected (1001)`: late, opaque, and
             // exactly what the sweep exists to prevent.
             if d.head_dim == d.rope_head_dim {
@@ -887,13 +887,13 @@ pub mod v4 {
         // SAFETY: deferred to the call sites — each is the caller's-contract launch it
         // textually replaces.
         let gemv1 = |x: *const f32, wt: Fp8W, n_out: usize, k: usize, out: *mut f32| unsafe {
-            launch_v4_gemv_fp8(x, wt.w, wt.scale, m, n_out, k, FP8_BLOCK, 1, out, stream)
+            launch_gemv_fp8_grouped(x, wt.w, wt.scale, m, n_out, k, FP8_BLOCK, 1, out, stream)
         };
         // SAFETY: caller's contract; `xq` is `[m, dim]` and `x` is not modified, and a
         // `Some(wqkv)` caller granted `s.kv` the `hd + q_lora` floats the fused row
         // needs (the `Weights::wqkv` obligation above).
         unsafe {
-            launch_v4_act_quant(io.x, s.xq, m, d.dim, d.dim, FP8_BLOCK, stream)?;
+            launch_act_quant_f8_prefix(io.x, s.xq, m, d.dim, d.dim, FP8_BLOCK, stream)?;
             let (q_lora, dim) = (d.q_lora_rank, d.dim);
             let qr = if let Some(f) = fused {
                 // The seam arithmetic (kernel scale row = `j >> 7`) is exact only on a
@@ -906,8 +906,8 @@ pub mod v4 {
                 gemv1(s.xq, w.wq_a, q_lora, dim, s.qr)?;
                 s.qr
             };
-            launch_v4_rmsnorm(qr, w.q_norm, m, q_lora, d.norm_eps, stream)?;
-            launch_v4_act_quant(qr, s.qrq, m, q_lora, q_lora, FP8_BLOCK, stream)?;
+            launch_rmsnorm_batch(qr, w.q_norm, m, q_lora, d.norm_eps, stream)?;
+            launch_act_quant_f8_prefix(qr, s.qrq, m, q_lora, q_lora, FP8_BLOCK, stream)?;
             gemv1(s.qrq, w.wq_b, nhd, q_lora, s.q)?;
             // QK-norm BEFORE RoPE (model.py:504 then :505). Read off the reference, not
             // inferred from a green test -- which is the part that matters and is unchanged.
@@ -930,8 +930,8 @@ pub mod v4 {
             // bounds it by what dropping bf16 rounding entirely costs. Third time in this
             // port that an exact-arithmetic equivalence was taken for a bitwise one; see
             // `KV_QUANT_BLOCK` above for the second.
-            launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, stream)?;
-            launch_v4_rope(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false, stream)?;
+            launch_qk_norm(s.q, m * nh, hd, d.norm_eps, stream)?;
+            launch_rope_adjacent(s.q, io.freqs, m * nh, hd, rd, pos0, nh, false, stream)?;
 
             // -- kv --------------------------------------------------------------------
             // At a fused decode the entry is already in `s.kv[0..hd]` — the concat's kv
@@ -939,12 +939,12 @@ pub mod v4 {
             if fused.is_none() {
                 gemv1(s.xq, w.wkv, hd, dim, s.kv)?;
             }
-            launch_v4_rmsnorm(s.kv, w.kv_norm, m, hd, d.norm_eps, stream)?;
-            launch_v4_rope(s.kv, io.freqs, m, hd, rd, pos0, 1, false, stream)?;
+            launch_rmsnorm_batch(s.kv, w.kv_norm, m, hd, d.norm_eps, stream)?;
+            launch_rope_adjacent(s.kv, io.freqs, m, hd, rd, pos0, 1, false, stream)?;
             // PARTIAL: the RoPE'd tail keeps bf16 precision. Quantizing the whole entry
             // is the llama.cpp failure mode v4-flash-port.md §0.2 names -- it corrupts
             // the positional dims and produces noise without a crash.
-            launch_v4_act_quant(s.kv, s.kv, m, hd, hd - rd, KV_QUANT_BLOCK, stream)?;
+            launch_act_quant_f8_prefix(s.kv, s.kv, m, hd, hd - rd, KV_QUANT_BLOCK, stream)?;
         }
         // M6 mark: the q/kv chains' last enqueue. See [`SplitMarks`] for the exact span.
         if let Some(mk) = marks {
@@ -1016,7 +1016,7 @@ pub mod v4 {
 
         // SAFETY: caller's contract.
         unsafe {
-            launch_v4_sparse_attn(
+            launch_gather_attn_shared_kv(
                 s.q,
                 kv_src,
                 w.attn_sink,
@@ -1036,12 +1036,12 @@ pub mod v4 {
             }
 
             // -- output ----------------------------------------------------------------
-            launch_v4_rope(s.o, io.freqs, m * nh, hd, rd, pos0, nh, true, stream)?;
+            launch_rope_adjacent(s.o, io.freqs, m * nh, hd, rd, pos0, nh, true, stream)?;
             // `o.view(b, s, o_groups, -1)` needs no gather: group `g` is the contiguous
             // run of heads `[g * n_heads/o_groups, ...)`, all `head_dim` dims of each.
             // `groups = o_groups`: `o` is `m` rows of `o_groups` contiguous `gd`-wide
             // head runs, and output row `j` takes run `j / o_lora_rank`.
-            launch_v4_gemv_fp8(
+            launch_gemv_fp8_grouped(
                 s.o,
                 w.wo_a.w,
                 w.wo_a.scale,
@@ -1053,7 +1053,7 @@ pub mod v4 {
                 s.y,
                 stream,
             )?;
-            launch_v4_act_quant(s.y, s.y, m, gr, gr, FP8_BLOCK, stream)?;
+            launch_act_quant_f8_prefix(s.y, s.y, m, gr, gr, FP8_BLOCK, stream)?;
             gemv1(s.y, w.wo_b, d.dim, gr, io.out)?;
         }
         Ok(())

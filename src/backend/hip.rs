@@ -162,7 +162,7 @@ macro_rules! launchers {
 // > are DIFFERENT kernels that merely take the same shape — `gemv_fp8`/`i8`/`i4`/`vq` all take
 // > `x, packed, scale, o_dim, i_dim, y`". Counted rather than asserted: the 41 declarations
 // > below have **41 distinct parameter lists — zero exact duplicates**, and exactly one PAIR
-// > shares even a type sequence under different names (`act_quant_f8` and `v4_indexer_spread`,
+// > shares even a type sequence under different names (`act_quant_f8` and `act_quant_f4_rotated`,
 // > both `*mut f32, i32, i32, *mut c_void`). The `gemv` family does not actually agree:
 // > `gemv_vq` takes seven parameters (`indices`, `scales`, `codebook`), `gemv_i4` takes six.
 //
@@ -187,6 +187,28 @@ macro_rules! launchers {
 // those line ranges. That is the "stale exemption is a hole in the gate" failure happening
 // inside the change that was supposed to prevent it. This one is anchored to the macro
 // invocation, so anything added outside it is gated.
+//
+// ── WHICH MODEL USES WHICH KERNEL ───────────────────────────────────────────────────────
+//
+// Kernels are named for what they DO, not for the model that introduced them. Until
+// 2026-08-09 fifteen of them carried a `v4_` prefix and were renamed for their mechanism.
+// The model affiliation those prefixes carried is now `tests/kernel_coverage.rs::OWNERS`,
+// which maps every launcher to the engine source files that call it and is CHECKED.
+//
+// It is a test and not a comment here for a measured reason: the first draft of this change
+// put the lists in this file as prose, and a review found SIX of them wrong on the day they
+// were written — `swiglu` claimed GLM-only while `v4gpu.rs` calls it, `swiglu_clamped_bf16`
+// claimed a V4 caller it does not have, and `act_quant_f8`/`vadd`/`flag_nonfinite` were each
+// filed under the wrong engine. A hand-maintained ownership list is exactly the artefact
+// `tests/kernel_coverage.rs` already refuses to carry ("an exemption asserts nothing and
+// rots silently"), and trading a name that was inaccurate-but-self-maintaining for a comment
+// that is inaccurate and hand-maintained would have made this refactor a net loss.
+//
+// The pairs worth knowing before reaching for either are documented AT the kernels, because
+// that is where the arithmetic that separates them is: `rmsnorm_single`/`rmsnorm_batch` (one
+// statistic vs one per row), `gemv_fp8`/`gemv_fp8_grouped` (input slicing and store dtype),
+// `swiglu`/`swiglu_clamped_bf16` (not one parameter apart at any `L`), and
+// `rope_interleave`/`rope_adjacent` (half-split vs adjacent pair convention).
 launchers! {
     /// VQ-int3 GEMV `y = W·x` (group scales applied inside the decode).
     ///
@@ -613,7 +635,7 @@ launchers! {
     ///
     /// Takes a `stream`, and it is the only one of GLM's GEMVs that does. The reason is V4: this
     /// is the launcher `Gate.forward` maps to (`linear(x.float(), weight.float())`), so on the V4
-    /// layer path it sits between `launch_v4_rmsnorm` and `launch_moe_expert_range_f4`, which both
+    /// layer path it sits between `launch_rmsnorm_batch` and `launch_moe_expert_range_f4`, which both
     /// take one. Left on the null stream it would read a norm that no stream had been waited on —
     /// rivoli's streams are `hipStreamNonBlocking` — giving wrong logits and therefore a wrong
     /// SELECTION, which is the one V4 defect class no downstream numeric comparison can attribute.
@@ -704,7 +726,7 @@ launchers! {
     /// `g`, `u` and `h` are each `n` f32 and must outlive `stream`'s completion. `h` may alias
     /// `g` or `u` — every thread reads both, then writes once, and that write depends on both
     /// reads. `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_v4_swiglu_clamped -> rivoli_v4_swiglu_clamped, "v4_swiglu_clamped" (
+    launch_swiglu_clamped_bf16 -> rivoli_swiglu_clamped_bf16, "swiglu_clamped_bf16" (
         g: *const f32,
         u: *const f32,
         n: usize as i32,
@@ -717,7 +739,7 @@ launchers! {
     ///
     /// # Safety
     /// Device pointers (`x`, `w`, `y` each `n` f32) live until the next [`device_sync`].
-    launch_rmsnorm -> rivoli_rmsnorm, "rmsnorm" (
+    launch_rmsnorm_single -> rivoli_rmsnorm_single, "rmsnorm_single" (
         x: *const f32,
         w: *const f32,
         n: usize as i32,
@@ -729,7 +751,7 @@ launchers! {
     ///
     /// # Safety
     /// `base` is a device buffer of `count·stride` f32, live until the next [`device_sync`].
-    launch_rope -> rivoli_rope, "rope" (
+    launch_rope_interleave -> rivoli_rope_interleave, "rope_interleave" (
         base: *mut f32,
         count: usize as i32,
         stride: usize as i32,
@@ -858,7 +880,7 @@ launchers! {
     /// `src` and `dst` are device buffers of at least `rows * row_stride` f32 (the same
     /// buffer, or non-overlapping ones), and must outlive `stream`'s completion. `stream`
     /// is a live `hipStream_t`, or null for the default stream.
-    launch_v4_act_quant -> rivoli_v4_act_quant, "v4_act_quant" (
+    launch_act_quant_f8_prefix -> rivoli_act_quant_f8_prefix, "act_quant_f8_prefix" (
         src: *const f32,
         dst: *mut f32,
         rows: usize as i32,
@@ -874,7 +896,7 @@ launchers! {
     /// # Safety
     /// Device pointers must outlive `stream`'s completion: `x` (`rows * d` f32), `w` (`d` f32).
     /// `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_v4_rmsnorm -> rivoli_v4_rmsnorm, "v4_rmsnorm" (
+    launch_rmsnorm_batch -> rivoli_rmsnorm_batch, "rmsnorm_batch" (
         x: *mut f32,
         w: *const f32,
         rows: usize as i32,
@@ -890,7 +912,7 @@ launchers! {
     /// # Safety
     /// `q` is a device buffer of at least `rows * d` f32, and must outlive `stream`'s
     /// completion. `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_v4_qk_norm -> rivoli_v4_qk_norm, "v4_qk_norm" (
+    launch_qk_norm -> rivoli_qk_norm, "qk_norm" (
         q: *mut f32,
         rows: usize as i32,
         d: usize as i32,
@@ -905,7 +927,7 @@ launchers! {
     /// sees the whole activation); `groups = o_groups` is the grouped `wo_a` einsum, whose
     /// input groups are contiguous runs of heads and so need no gather.
     ///
-    /// Does NOT quantize the activation — [`launch_v4_act_quant`] is a separate launch where
+    /// Does NOT quantize the activation — [`launch_act_quant_f8_prefix`] is a separate launch where
     /// the reference performs one, and `wo_a` gets none at all.
     ///
     /// # Safety
@@ -915,7 +937,7 @@ launchers! {
     /// signature took the row and group strides separately, where the in-bounds relation was
     /// a three-way inequality nothing checked. `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_v4_gemv_fp8 -> rivoli_v4_gemv_fp8, "v4_gemv_fp8" (
+    launch_gemv_fp8_grouped -> rivoli_gemv_fp8_grouped, "gemv_fp8_grouped" (
         x: *const f32,
         w: *const u8,
         wscale: *const f32,
@@ -937,7 +959,7 @@ launchers! {
     /// per row, indexed by `idxs`, so at least `max(idxs) + 1` rows), `sink` (`h` f32), `idxs`
     /// (`m * topk` i32), `o` (`m * h * d` f32). `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_v4_sparse_attn -> rivoli_v4_sparse_attn, "v4_sparse_attn" (
+    launch_gather_attn_shared_kv -> rivoli_gather_attn_shared_kv, "gather_attn_shared_kv" (
         q: *const f32,
         kv: *const f32,
         sink: *const f32,
@@ -955,7 +977,7 @@ launchers! {
     /// path, which is the one `Compressor.wkv`/`wgate` take (`Linear(..., dtype=float32)`,
     /// model.py:302).
     ///
-    /// Deliberately NOT [`launch_v4_gemv_fp8`]: that one quantizes the activation to fp8 at
+    /// Deliberately NOT [`launch_gemv_fp8_grouped`]: that one quantizes the activation to fp8 at
     /// block 128 in front of the GEMM, which the reference does only for quantized `Linear`s.
     /// Sending the compressor through it would introduce a quantization the reference never
     /// applies, and the resulting error would be indistinguishable from a pooling bug.
@@ -964,7 +986,7 @@ launchers! {
     /// `x` is `m · k` live f32, `w` is `n · k` live u16, `out` is `m · n` writable f32, none
     /// aliasing another (every kernel parameter is `__restrict__`), all live until `stream`
     /// completes. `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_v4_dense_gemm_bf16 -> rivoli_v4_dense_gemm_bf16, "v4_dense_gemm_bf16" (
+    launch_gemm_bf16 -> rivoli_gemm_bf16, "gemm_bf16" (
         x: *const f32,
         w: *const u16,
         out: *mut f32,
@@ -981,7 +1003,7 @@ launchers! {
     /// `w` is `>= (token + 1) * hidden` live u16, `x` is `hc * hidden` writable f32, they do not
     /// alias (both are `__restrict__`), and both outlive `stream`'s completion. `stream` is a
     /// live `hipStream_t`, or null for the default stream.
-    launch_v4_embed_bf16_row -> rivoli_v4_embed_bf16_row, "v4_embed_bf16_row" (
+    launch_embed_bf16_row_bcast -> rivoli_embed_bf16_row_bcast, "embed_bf16_row_bcast" (
         w: *const u16,
         token: usize as i32,
         hidden: usize as i32,
@@ -1000,7 +1022,7 @@ launchers! {
     /// `pre` is `s * hc` writable; `y` is `s * dim` writable. None aliases another (every kernel
     /// parameter is `__restrict__`) and all outlive `stream`'s completion. `stream` is a live
     /// `hipStream_t`, or null for the default stream.
-    launch_v4_hc_head -> rivoli_v4_hc_head, "v4_hc_head" (
+    launch_hc_head_collapse -> rivoli_hc_head_collapse, "hc_head_collapse" (
         h: *const f32,
         fnw: *const f32,
         base: *const f32,
@@ -1020,7 +1042,7 @@ launchers! {
     /// `Compressor.forward` performs when `rotate = true` (model.py:374-376).
     ///
     /// Applied to BOTH the indexer's `q` rows and its nested compressor's pooled rows, which is
-    /// why it is one launcher rather than a step inside either. [`launch_v4_act_quant`] is the
+    /// why it is one launcher rather than a step inside either. [`launch_act_quant_f8_prefix`] is the
     /// *other* compressor's finish and takes a partial extent; this one has none — the Hadamard
     /// covers the whole row, RoPE tail included. Handing either the other's extent is finite,
     /// plausible and wrong, so `v4compress::Geom` carries which is due and
@@ -1034,7 +1056,7 @@ launchers! {
     /// `x` is `rows · d` writable, 4-byte-aligned, device-resident f32, read and written in
     /// place, and outlives `stream`'s completion. `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_v4_indexer_spread -> rivoli_v4_indexer_spread, "v4_indexer_spread" (
+    launch_act_quant_f4_rotated -> rivoli_act_quant_f4_rotated, "act_quant_f4_rotated" (
         x: *mut f32,
         rows: usize as i32,
         d: usize as i32,
@@ -1078,7 +1100,7 @@ launchers! {
     /// Device pointers must outlive `stream`'s completion: `x` (`rows * row_len` f32), `tbl`
     /// (at least `(pos0 + rows / rows_per_pos) * rd` f32, interleaved cos/sin). `stream` is a
     /// live `hipStream_t`, or null for the default stream.
-    launch_v4_rope -> rivoli_v4_rope, "v4_rope" (
+    launch_rope_adjacent -> rivoli_rope_adjacent, "rope_adjacent" (
         x: *mut f32,
         tbl: *const f32,
         rows: usize as i32,
@@ -1095,7 +1117,7 @@ launchers! {
     ///
     /// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
     /// decode deposits its single row at slot `start_pos % ratio`. See
-    /// `kernels/v4compress.hip::v4_compress_state` for why that is a unification and not a
+    /// `kernels/v4compress.hip::kv_compress_deposit` for why that is a unification and not a
     /// coincidence.
     ///
     /// Must be launched on **every** call, including one that emits no block: the reference
@@ -1111,7 +1133,7 @@ launchers! {
     /// parameter is `__restrict__`. `p` is read host-side before the launch; the device buffers
     /// must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or null for the
     /// default stream.
-    launch_v4_compress_state -> rivoli_v4_compress_state, "v4_compress_state" (
+    launch_kv_compress_deposit -> rivoli_kv_compress_deposit, "kv_compress_deposit" (
         kv: *const f32,
         score: *const f32,
         ape: *const f32,
@@ -1127,7 +1149,7 @@ launchers! {
     /// softmax over the pooling window, the bf16 store, `RMSNorm`, and the RoPE at each block's
     /// FIRST absolute position.
     ///
-    /// Does **not** run `act_quant`; call [`launch_v4_act_quant`] over dims `[0, d - rd)` at
+    /// Does **not** run `act_quant`; call [`launch_act_quant_f8_prefix`] over dims `[0, d - rd)` at
     /// block 64 afterwards, which is the order and the partial extent model.py:373-378 uses.
     ///
     /// Refuses `nblk <= 0` (guard 1006) rather than launching nothing and returning success,
@@ -1139,7 +1161,7 @@ launchers! {
     /// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
     /// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
     /// null for the default stream.
-    launch_v4_compress_prefill -> rivoli_v4_compress_prefill, "v4_compress_prefill" (
+    launch_kv_compress_prefill -> rivoli_kv_compress_prefill, "kv_compress_prefill" (
         kv: *const f32,
         score: *const f32,
         ape: *const f32,
@@ -1153,7 +1175,7 @@ launchers! {
     /// slide the window.
     ///
     /// Reads no activation: this step's row was already deposited by
-    /// [`launch_v4_compress_state`], `ape` included. Call **only** when
+    /// [`launch_kv_compress_deposit`], `ape` included. Call **only** when
     /// `(start_pos + 1) % ratio == 0`; the launcher refuses otherwise (guard 1009) rather than
     /// pooling a half-filled window into finite, plausible, wrong numbers.
     ///
@@ -1162,7 +1184,7 @@ launchers! {
     /// [`Finish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
     /// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
     /// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_v4_compress_pool_decode -> rivoli_v4_compress_pool_decode, "v4_compress_pool_decode" (
+    launch_kv_compress_decode -> rivoli_kv_compress_decode, "kv_compress_decode" (
         kv_state: *mut f32,
         score_state: *mut f32,
         f: &Finish as *const Finish,
@@ -1209,7 +1231,7 @@ launchers! {
 // ONE launcher does not fit `launchers!` above, and the macro refuses what it cannot prove
 // mechanical rather than reshaping it.
 //
-//   `launch_v4_indexer_score`  destructures `ScoreDims` into four i32s before the call, with
+//   `launch_index_score_blocks`  destructures `ScoreDims` into four i32s before the call, with
 //                              prose in place saying the struct exists to keep the four in the
 //                              right order. A positional 1:1 DSL cannot express one parameter
 //                              becoming four arguments, and the alternative — four bare `usize`
@@ -1247,7 +1269,7 @@ unsafe extern "C" {
 
     // DSA lightning indexer (indexer.hip).
 
-    fn rivoli_v4_indexer_score(
+    fn rivoli_index_score_blocks(
         q: *const f32,
         kv: *const f32,
         w: *const f32,
@@ -1305,7 +1327,7 @@ pub unsafe fn memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> Result<
 /// with sixteen launches. Those launches now take a stream, and a blocking `hipMemcpy`
 /// between two of them does NOT wait on it: rivoli's streams are `hipStreamNonBlocking`, so
 /// the null stream has no implicit ordering against them, and the copy would read `s.qr`
-/// before `v4_rmsnorm` wrote it. See the banner above the V4 attention launchers.
+/// before `rmsnorm_batch` wrote it. See the banner above the V4 attention launchers.
 ///
 /// # Safety
 /// `dst` and `src` must be valid, `bytes`-sized, NON-OVERLAPPING device regions, and must
@@ -1390,8 +1412,8 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 // not.
 //
 // The substance behind the count, for these six: `tests/v4_attn.rs` scores four of them
-// inside the whole attention block, and `tests/v4_head_tail.rs` scores `v4_rmsnorm` and
-// `v4_qk_norm` on their own. An earlier version of this line said `v4_attn.rs` covered all
+// inside the whole attention block, and `tests/v4_head_tail.rs` scores `rmsnorm_batch` and
+// `qk_norm` on their own. An earlier version of this line said `v4_attn.rs` covered all
 // six and was wrong about two.
 
 // --- head tail (S3) -------------------------------------------------------------------
@@ -1419,7 +1441,7 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 /// `__restrict__`, so that covers the three inputs against each other and not only `score`
 /// against them. All 4-byte aligned, device-resident, and outliving `stream`'s completion;
 /// `stream` is a live `hipStream_t`, or null for the default stream.
-pub unsafe fn launch_v4_indexer_score(
+pub unsafe fn launch_index_score_blocks(
     q: *const f32,
     kv: *const f32,
     w: *const f32,
@@ -1428,7 +1450,7 @@ pub unsafe fn launch_v4_indexer_score(
     stream: *mut c_void,
 ) -> Result<()> {
     // `dims`, not `d`: `d` means a head width everywhere else in this file, including in
-    // `launch_v4_indexer_spread` directly above.
+    // `launch_act_quant_f4_rotated` directly above.
     //
     // Narrowed once, all four together, so the `as i32` soup is not interleaved with the
     // pointers at the call. `ScoreDims` is what keeps the four in the right order.
@@ -1441,7 +1463,7 @@ pub unsafe fn launch_v4_indexer_score(
     let (s, n_comp) = (s as i32, n_comp as i32);
     let (heads, hd) = (heads as i32, hd as i32);
     // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe { rivoli_v4_indexer_score(q, kv, w, score, s, n_comp, heads, hd, stream) };
-    ensure_hip_status(r, "v4_indexer_score")
+    let r = unsafe { rivoli_index_score_blocks(q, kv, w, score, s, n_comp, heads, hd, stream) };
+    ensure_hip_status(r, "index_score_blocks")
 }
 // jscpd:ignore-end

@@ -6,14 +6,14 @@
 //
 // WHAT IS NOT HERE, and why:
 //
-//   * the final `RMSNorm` — `kernels/mla.hip::v4_rmsnorm` already does exactly it, one
+//   * the final `RMSNorm` — `kernels/mla.hip::rmsnorm_batch` already does exactly it, one
 //     block per row, and it bf16-rounds on the way out as `RMSNorm.forward` does. The
-//     other candidate, `kernels/linalg.hip::rmsnorm`, is `dim3(1)` — single-row — so
+//     other candidate, `kernels/linalg.hip::rmsnorm_single`, is `dim3(1)` — single-row — so
 //     handing it `s x dim` would take ONE statistic over every token. That is a real
 //     defect, modelled as `Defect::HeadNormOverAllTokens`, and it is invisible at decode
 //     because `s == 1` there.
 //
-//   * the lm_head GEMV — `kernels/v4compress.hip::v4_dense_gemm_bf16` already computes
+//   * the lm_head GEMV — `kernels/v4compress.hip::gemm_bf16` already computes
 //     `out[m,n] = x[m,k] . w[n,k]` for f32 activations against bf16 weights, which IS
 //     `logits = head.weight @ x` at `m = 1, n = vocab_size, k = hidden`. A second kernel
 //     differing only in extents would be pure duplication, and `kernels/` is NOT scanned
@@ -22,9 +22,15 @@
 //     mapping on device rather than asserting it here.
 //
 // EVERY HELPER COMES FROM `common.hpp` — `wave_sum`, `bf16f`, `rbf16`. None is redefined.
-// That matters more than usual here: `mla.hip::v4_rbf16` and `v4compress.hip::v4c_rbf16`
-// are already two separate copies of `common.hpp::rbf16`, and because `kernels/` is
-// outside the duplication gate they were caught by nobody. This file adds no third.
+// That matters more than usual here, because `kernels/` is outside the duplication gate
+// (`build.rs` covers `src`, `tests` and itself only) so nothing mechanical stops a third
+// copy of a helper from appearing.
+//
+// CORRECTED 2026-08-09. This said `mla.hip::v4_rbf16` and `v4compress.hip::v4c_rbf16` "are
+// already two separate copies of `common.hpp::rbf16`". They WERE; both have since been
+// folded into `common.hpp::rbf16` and neither identifier exists anywhere in `kernels/`. The
+// warning stands, the example was stale — which is the same failure it describes, wearing a
+// comment instead of a function.
 #include "common.hpp"
 
 // `Transformer.forward` lines 914-916: `h = embed(input_ids)`, then
@@ -38,8 +44,8 @@
 // that way (its `MODEL_LEVEL` marks it `Emit::Verbatim(Dtype::Bf16)`), so the int8 path
 // `embed_i8_row` — which multiplies by a per-token scale — does not apply and there is no
 // scale tensor to give it.
-extern "C" __global__ void v4_embed_bf16_row(const unsigned short* __restrict__ w, int token,
-                                             int hidden, int hc, float* __restrict__ x) {
+extern "C" __global__ void embed_bf16_row_bcast(const unsigned short* __restrict__ w, int token,
+                                                int hidden, int hc, float* __restrict__ x) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= hidden) return;
     // `size_t`: at vocab 129280 x hidden 4096 the last row starts at 5.3e8, which still
@@ -53,19 +59,19 @@ extern "C" __global__ void v4_embed_bf16_row(const unsigned short* __restrict__ 
 //
 // ONE WAVE PER TOKEN, deliberately. The reduction is over `hc * dim` = 16384 at real
 // dimensions, and a block-wide reduction would need a shared-memory ladder — which
-// `mla.hip::v4_block_sum` already implements. Re-implementing it here would be a third
+// `common.hpp::block_sum_lds` already implements. Re-implementing it here would be a third
 // copy of a helper that is invisible to the duplication gate, so this uses `wave_sum` from
 // `common.hpp` instead and accepts one wave's worth of parallelism. Decode runs a single
 // token, so the occupancy this gives up is a prefill concern for S4, not a decode one.
 //
 // `scale` is `[1]` — ONE scalar broadcast over every mix. A `Block`'s `hc_*_scale` is `[3]`
 // (pre, post, comb); indexing this one as if it were that reads past the tensor.
-extern "C" __global__ void v4_hc_head_gate(const float* __restrict__ h,
-                                           const float* __restrict__ fnw,
-                                           const float* __restrict__ base,
-                                           const float* __restrict__ scale,
-                                           float* __restrict__ pre, int s, int hc, int dim,
-                                           float eps, float hc_eps) {
+extern "C" __global__ void hc_head_collapse_gate(const float* __restrict__ h,
+                                            const float* __restrict__ fnw,
+                                            const float* __restrict__ base,
+                                            const float* __restrict__ scale,
+                                            float* __restrict__ pre, int s, int hc, int dim,
+                                            float eps, float hc_eps) {
     int t = blockIdx.x;
     // The launcher sizes the grid at exactly `s`, so this cannot fire today. It is here
     // because the blend below bound-checks and this did not: an over-launched or grid-strided
@@ -117,9 +123,9 @@ extern "C" __global__ void v4_hc_head_gate(const float* __restrict__ h,
 // that rather than against a rounding the build does not perform. `mla.hip` blocks the same
 // contraction where it needs to; this does not need to, but the difference is stated rather
 // than assumed away.
-extern "C" __global__ void v4_hc_head_blend(const float* __restrict__ h,
-                                            const float* __restrict__ pre,
-                                            float* __restrict__ y, int hc, int dim, int s) {
+extern "C" __global__ void hc_head_collapse_blend(const float* __restrict__ h,
+                                             const float* __restrict__ pre,
+                                             float* __restrict__ y, int hc, int dim, int s) {
     size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= (size_t)s * (size_t)dim) return;
     size_t t = id / (size_t)dim, d = id % (size_t)dim;
@@ -129,30 +135,30 @@ extern "C" __global__ void v4_hc_head_blend(const float* __restrict__ h,
     y[id] = rbf16(acc);
 }
 
-extern "C" int rivoli_v4_embed_bf16_row(const unsigned short* w, int token, int hidden, int hc,
-                                        float* x, void* stream) {
+extern "C" int rivoli_embed_bf16_row_bcast(const unsigned short* w, int token, int hidden, int hc,
+                                           float* x, void* stream) {
     if (hidden <= 0 || token < 0 || hc <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_embed_bf16_row, dim3((unsigned)((hidden + 255) / 256)), dim3(256), 0,
+    hipLaunchKernelGGL(embed_bf16_row_bcast, dim3((unsigned)((hidden + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, w, token, hidden, hc, x);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_hc_head(const float* h, const float* fnw, const float* base,
-                                 const float* scale, float* pre, float* y, int s, int hc, int dim,
-                                 float eps, float hc_eps, void* stream) {
+extern "C" int rivoli_hc_head_collapse(const float* h, const float* fnw, const float* base,
+                                       const float* scale, float* pre, float* y, int s, int hc, int dim,
+                                       float eps, float hc_eps, void* stream) {
     if (s <= 0 || hc <= 0 || dim <= 0) return 1001;
     hipGetLastError();
     // One wave per token for the gate; `wave_sum` requires a FULL wave, so the block is
     // exactly WAVE threads and every lane is active.
-    hipLaunchKernelGGL(v4_hc_head_gate, dim3((unsigned)s), dim3(WAVE), 0, (hipStream_t)stream, h,
+    hipLaunchKernelGGL(hc_head_collapse_gate, dim3((unsigned)s), dim3(WAVE), 0, (hipStream_t)stream, h,
                        fnw, base, scale, pre, s, hc, dim, eps, hc_eps);
     hipError_t e = hipGetLastError();
     if (e != hipSuccess) return -(int)e;
     size_t n = (size_t)s * (size_t)dim;
     // Same stream, so the gate's writes precede the blend's reads without a host sync.
-    hipLaunchKernelGGL(v4_hc_head_blend, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
+    hipLaunchKernelGGL(hc_head_collapse_blend, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, h, pre, y, hc, dim, s);
     e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;

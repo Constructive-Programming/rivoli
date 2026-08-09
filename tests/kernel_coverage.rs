@@ -80,13 +80,44 @@ struct Indirect {
 
 const INDIRECT: &[Indirect] = &[Indirect {
     launchers: &[
-        "v4_compress_state",
-        "v4_compress_prefill",
-        "v4_compress_pool_decode",
+        "kv_compress_deposit",
+        "kv_compress_prefill",
+        "kv_compress_decode",
     ],
     launched_by: "src/v4compress.rs",
     entry: "v4compress::compress(",
 }];
+
+/// Every launcher name declared in `backend`, in both declaration forms.
+///
+/// Factored out when the OWNERS census below became a second reader of it — `build.rs`'s
+/// jscpd gate rejected the copy, which is the gate doing its job: two parsers of the same
+/// convention drift, and the one that drifts silently is the one whose failure mode is a
+/// pass. `decl` and `stem` stay parameters rather than literals here for the reason the
+/// caller builds them at runtime: a literal `pub unsafe fn launch_` in this file would make
+/// the file look like a launcher declaration to its own scanner.
+fn launcher_names(backend: &str, decl: &str, stem: &str) -> Vec<String> {
+    backend
+        .lines()
+        .map(str::trim_start)
+        .filter_map(|l| {
+            l.strip_prefix(decl)
+                .and_then(|rest| rest.split('(').next())
+                .or_else(|| {
+                    // `launch_<name> -> rivoli_<sym>, "<tag>" (`
+                    l.strip_prefix(stem)
+                        .filter(|_| l.contains(" -> rivoli_"))
+                        .and_then(|rest| rest.split(" ->").next())
+                })
+        })
+        // `String::from`, not `str::to_string` — the latter made this function's last five
+        // lines a token-for-token match with `tests/matrix.rs`'s array parser, which ends the
+        // same way and is followed by the same `read_to_string` helper shape. jscpd counts a
+        // shared SUFFIX as a clone (`src/backend/hip.rs` records the same effect on parameter
+        // lists), and there is nothing real to factor between two unrelated parsers.
+        .map(String::from)
+        .collect()
+}
 
 /// Read a source file relative to the crate root.
 ///
@@ -167,35 +198,24 @@ fn every_launcher_has_an_oracle() {
     // relocated into a sibling module would leave the census silently — the denominator
     // shrinking is precisely what the rule exists to notice.
     let backend = corpus("src/backend", "");
-    let launchers: Vec<String> = backend
-        .lines()
-        .map(str::trim_start)
-        .filter_map(|l| {
-            l.strip_prefix(&decl)
-                .and_then(|rest| rest.split('(').next())
-                .or_else(|| {
-                    // `launch_<name> -> rivoli_<sym>, "<tag>" (`
-                    l.strip_prefix(&stem)
-                        .filter(|_| l.contains(" -> rivoli_"))
-                        .and_then(|rest| rest.split(" ->").next())
-                })
-        })
-        .map(str::to_string)
-        .collect();
+    let launchers = launcher_names(&backend, &decl, &stem);
 
     // Anti-vacuity: a parse that silently matches nothing passes forever. This has bitten
     // twice already — once when a filter skipped the only file it existed to police, and
     // once when a naming convention changed underneath a scanner.
     //
-    // The floor is 40 against a MEASURED 47 on 2026-08-06 (48 until `launch_vaxpy`, which
-    // this census found uncovered and which turned out to be dead, was deleted the same
-    // day). It was 5 when this scanned
+    // The floor is 40 against a MEASURED 46 on 2026-08-09 (47 until `launch_moe_gate_v4` went
+    // with the device router; 48 until `launch_vaxpy`, which this census found uncovered and
+    // which turned out to be dead, was deleted 2026-08-06). Re-derived rather than left at the
+    // old number: this file's own argument is that not re-deriving is how the guard goes
+    // vacuous, and a count that drifts silently under a floor it never approaches is the
+    // slowest possible version of that. It was 5 when this scanned
     // `vk.rs`, which had ~16; carried over unexamined it would have tolerated a parse that
     // found a tenth of them, and re-keying a check onto a 3x larger subject without
     // re-deriving its floor is how an anti-vacuity guard quietly becomes vacuous.
     assert!(
         launchers.len() >= 40,
-        "found only {} launchers under src/backend/ (48 on 2026-08-06) — the declaration \
+        "found only {} launchers under src/backend/ (46 on 2026-08-09) — the declaration \
          pattern has changed and this check is no longer examining what it claims to",
         launchers.len()
     );
@@ -256,8 +276,8 @@ fn every_launcher_has_an_oracle() {
          mla.hip and moe.hip -> tests/kernel.rs, and the v4* kernels -> the matching \
          tests/v4_*.rs. Two live exceptions, so you are not misled into moving them: \
          index_topk's oracle predates tests/indexer_kernel.rs and stays in \
-         tests/kernel.rs, and mla.hip's v4_qk_norm is scored in tests/v4_head_tail.rs \
-         beside its sibling v4_rmsnorm. ({} has no exemption list — the empty one it used \
+         tests/kernel.rs, and mla.hip's qk_norm is scored in tests/v4_head_tail.rs \
+         beside its sibling rmsnorm_batch. ({} has no exemption list — the empty one it used \
          to carry only invited parking work here. `INDIRECT` is not one: every hop is \
          asserted.)\n",
         missing.len(),
@@ -273,5 +293,130 @@ fn every_launcher_has_an_oracle() {
         "{} launchers, all exercised ({} of them through an engine entry point)",
         launchers.len(),
         indirect.len()
+    );
+}
+
+/// Which engine source files launch each kernel — the model affiliation the `v4_` prefixes
+/// carried until they were renamed for behaviour on 2026-08-09.
+///
+/// **This exists because the same information, written as a comment in `src/backend/hip.rs`,
+/// was wrong on SIX of its entries the day it was written.** Review caught `swiglu` filed as
+/// GLM-only (`v4gpu.rs` calls it — and that call is the tree's most-documented open defect),
+/// `swiglu_clamped_bf16` credited with a V4 caller it does not have, and `act_quant_f8`,
+/// `vadd` and `flag_nonfinite` each under the wrong engine. The naming principle this
+/// refactor serves says to move the model list into the comments; a list nothing checks is
+/// how that trade turns into a net loss, so it moved here instead.
+///
+/// `gpu.rs` is the GLM-5.2 decode path (`.vq3`/`.i4`); `v4gpu.rs`, `attn.rs` and
+/// `v4compress.rs` are DeepSeek-V4-Flash-0731's (`.f4`). An empty slice asserts the launcher
+/// has NO engine caller, which is a real and interesting state — three of them are staged
+/// work, not dead code, and saying so is the point.
+const OWNERS: &[(&str, &[&str])] = &[
+    ("act_quant_f8", &["v4gpu.rs"]),
+    ("act_quant_f8_prefix", &["attn.rs", "v4compress.rs"]),
+    ("act_quant_f4_rotated", &["v4compress.rs"]),
+    ("append_kv", &["gpu.rs"]),
+    ("argmax", &["gpu.rs", "v4gpu.rs"]),
+    ("attend", &["gpu.rs"]),
+    ("embed_bf16_row_bcast", &["v4gpu.rs"]),
+    ("embed_i8_row", &["gpu.rs"]),
+    ("flag_nonfinite", &["gpu.rs"]),
+    ("gather_attn_shared_kv", &["attn.rs"]),
+    ("gather_rope", &["gpu.rs"]),
+    ("gemm_bf16", &["v4compress.rs", "v4gpu.rs"]),
+    ("gemv_f32", &["gpu.rs", "v4gpu.rs"]),
+    ("gemv_fp8", &["gpu.rs"]),
+    ("gemv_fp8_grouped", &["attn.rs", "v4gpu.rs"]),
+    ("gemv_i4", &[]),
+    ("gemv_i8", &["gpu.rs"]),
+    ("gemv_vq", &[]),
+    ("hc_head_collapse", &["v4gpu.rs"]),
+    ("hc_post", &["v4gpu.rs"]),
+    ("hc_pre", &["v4gpu.rs"]),
+    ("index_append", &["gpu.rs"]),
+    ("index_head_route", &["gpu.rs"]),
+    ("index_pool_push", &["gpu.rs"]),
+    ("index_score", &["gpu.rs"]),
+    ("index_score_blocks", &[]),
+    ("index_topk", &["gpu.rs"]),
+    ("kv_compress_decode", &["v4compress.rs"]),
+    ("kv_compress_deposit", &["v4compress.rs"]),
+    ("kv_compress_prefill", &["v4compress.rs"]),
+    ("layernorm", &["gpu.rs"]),
+    ("mla_absorb_fp8", &["gpu.rs"]),
+    ("mla_value_fp8", &["gpu.rs"]),
+    ("moe_acc_drain", &["gpu.rs", "v4gpu.rs"]),
+    ("moe_expert_range", &["gpu.rs"]),
+    ("moe_expert_range_f4", &["v4gpu.rs"]),
+    ("moe_expert_range_i4", &["gpu.rs"]),
+    ("qk_norm", &["attn.rs"]),
+    ("rmsnorm_batch", &["attn.rs", "v4gpu.rs"]),
+    ("rmsnorm_single", &["gpu.rs"]),
+    ("rope_adjacent", &["attn.rs"]),
+    ("rope_interleave", &["gpu.rs"]),
+    ("swiglu", &["gpu.rs", "v4gpu.rs"]),
+    ("swiglu_clamped_bf16", &[]),
+    ("vadd", &["gpu.rs"]),
+    ("vq_encode", &["bin/convert.rs"]),
+];
+
+/// Every launcher appears in [`OWNERS`] exactly once, and every claim in it is true of the
+/// tree — both directions, because a list that only checks the files it names cannot notice
+/// a caller appearing somewhere new, which is precisely how the prose version went stale.
+#[test]
+fn every_launcher_is_attributed_to_the_paths_that_call_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let backend = corpus("src/backend", "");
+    let decl = format!("pub unsafe fn {}", "launch_");
+    let stem = format!("{}{}", "launch", "_");
+    let mut launchers = launcher_names(&backend, &decl, &stem);
+    launchers.sort();
+    launchers.dedup();
+
+    let listed: Vec<String> = OWNERS.iter().map(|(n, _)| n.to_string()).collect();
+    let mut sorted = listed.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), OWNERS.len(), "OWNERS has a duplicate name");
+    assert_eq!(
+        sorted, launchers,
+        "OWNERS and the launcher set disagree. Every launcher needs a row and every row needs \
+         a launcher — a name that is neither is the stale-exemption failure this file exists \
+         to refuse."
+    );
+
+    // Which files ACTUALLY call each launcher, comments excluded. A doc comment naming
+    // `launch_swiglu_clamped_bf16(...)` is what made the prose version credit it with a
+    // caller it does not have, so a line starting `//` is not a call site.
+    for (name, owners) in OWNERS {
+        let mut actual: Vec<String> = Vec::new();
+        for p in common::walk(&root, "rs") {
+            if p.ends_with("backend/hip.rs") {
+                continue;
+            }
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap_or_else(|e| panic!("{} is not under {}: {e}", p.display(), root.display()))
+                .to_string_lossy()
+                .to_string();
+            let calls = source(&p).lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains(&format!("{stem}{name}("))
+            });
+            if calls {
+                actual.push(rel);
+            }
+        }
+        actual.sort();
+        let mut want: Vec<String> = owners.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(
+            want, actual,
+            "OWNERS says launch_{name} is called from {want:?}, the tree says {actual:?}"
+        );
+    }
+    println!(
+        "{} launchers attributed, all verified against the tree",
+        OWNERS.len()
     );
 }

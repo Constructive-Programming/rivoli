@@ -12,10 +12,10 @@
 # happened to an agent on 2026-08-05.
 src/artifact/format.rs	n_experts + usize::from(has_shared)	n_experts + 1	v4_loading f4_refuses_a_file_sized_for_a_shared_block	blocks_plus_one: this must be refused
 kernels/common.hpp	gt = fminf(gt, limit);	gt = fminf(fmaxf(gt, -limit), limit);	v4_kernel the_clamped_combine_is_bit_exact_elementwise	differs: g=
-kernels/linalg.hip	!(limit > 0.0f && limit < INFINITY)	!(limit > 0.0f)	v4_kernel v4_swiglu_clamped_guards	an infinite limit
+kernels/linalg.hip	!(limit > 0.0f && limit < INFINITY)	!(limit > 0.0f)	v4_kernel swiglu_clamped_bf16_guards	an infinite limit
 kernels/moe.hip	!(swiglu_limit > 0.0f && swiglu_limit < INFINITY)	!(swiglu_limit > 0.0f)	v4_kernel expert_range_f4_guards	infinite swiglu limit
 src/v4oracle/forward.rs	_ => b(terms.sum::<f32>()),	_ => terms.fold(0.0f32, |a, t| b(a + t)),	v4_oracle bf16_reduction_matches_torch_and_not_a_running_fold	does not accumulate in f32 and round once
-src/attn.rs	launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, stream)?;	launch_v4_qk_norm(s.q, m * nh, hd, d.norm_eps, std::ptr::null_mut())?;	v4_attn the_attention_block_is_entirely_on_its_stream	while the stream was GATED
+src/attn.rs	launch_qk_norm(s.q, m * nh, hd, d.norm_eps, stream)?;	launch_qk_norm(s.q, m * nh, hd, d.norm_eps, std::ptr::null_mut())?;	v4_attn the_attention_block_is_entirely_on_its_stream	while the stream was GATED
 #
 # --- launcher-census oracles, added 2026-08-06 with tests/kernel_coverage.rs -------------
 #
@@ -42,7 +42,7 @@ tests/indexer_kernel.rs	                launch_index_pool_push(kb.ptr() as *cons
 tests/indexer_kernel.rs	    let hb = dev(&subset	    let hb = dev(&[0usize, 1, 2, 3]	indexer_kernel index_score_reduces_over_the_active_heads_only	MISA, 4 of 64 heads
 tests/indexer_kernel.rs	                m_blocks,	                m_blocks - 1,	indexer_kernel index_head_route_averages_over_the_block_pool	rel=1.0e-5
 tests/kernel.rs	    unsafe { launch_swiglu(gp as *const f32, ub.ptr() as *const f32, n, gp, null) }	    unsafe { launch_swiglu(ub.ptr() as *const f32, gp as *const f32, n, gp, null) }	kernel swiglu_matches_the_division_form_in_place	rel=1.0e-5
-tests/kernel.rs	        unsafe { launch_rope(b.ptr_mut() as *mut f32, count, stride, seg, pos, theta) }	        unsafe { launch_rope(b.ptr_mut() as *mut f32, count, seg, seg, pos, theta) }	kernel rope_interleaves_pairs_and_is_a_permutation_at_position_zero	pure de-interleave
+tests/kernel.rs	        unsafe { launch_rope_interleave(b.ptr_mut() as *mut f32, count, stride, seg, pos, theta) }	        unsafe { launch_rope_interleave(b.ptr_mut() as *mut f32, count, seg, seg, pos, theta) }	kernel rope_interleaves_pairs_and_is_a_permutation_at_position_zero	pure de-interleave
 tests/kernel.rs	        let (sb, cbb, nb) = (dev(&f32b(&sub)), dev(&f32b(&cb)), dev(&f32b(&cbnorm)));	        let (sb, cbb, nb) = (dev(&f32b(&sub)), dev(&f32b(&cb)), dev(&f32b(&cbnorm.iter().map(|v| -v).collect::<Vec<f32>>())));	kernel vq_encode_picks_the_nearest_codebook_entry	vq_encode indices
 tests/kernel.rs	    gemv_i4(GemvIo::new(&xb, &pb, &sb, &mut yb), o_dim, i_dim);	    gemv_i4(GemvIo::new(&xb, &pb, &sb, &mut yb), o_dim, i_dim / 2);	kernel gemv_i4_matches_oracle	rel=1.0e-5
-tests/v4_head_tail.rs	        launch_v4_qk_norm(qb.pm(), rows, head_dim, cfg.norm_eps, stream.raw())	        launch_v4_qk_norm(qb.pm(), rows / 2, head_dim * 2, cfg.norm_eps, stream.raw())	v4_head_tail v4_qk_norm_matches_the_oracle_bit_for_bit	of 768 elements differ
+tests/v4_head_tail.rs	        launch_qk_norm(qb.pm(), rows, head_dim, cfg.norm_eps, stream.raw())	        launch_qk_norm(qb.pm(), rows / 2, head_dim * 2, cfg.norm_eps, stream.raw())	v4_head_tail qk_norm_matches_the_oracle_bit_for_bit	of 768 elements differ

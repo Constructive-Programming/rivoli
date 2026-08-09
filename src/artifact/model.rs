@@ -607,7 +607,7 @@ pub struct V4Config {
     /// `inference/kernel.py`, a different file.
     ///
     /// Added with `hc_sinkhorn_iters` and for the same reason: `launch_hc_pre` and
-    /// `launch_v4_hc_head` both take it and nothing here supplied it. `f64` because JSON
+    /// `launch_hc_head_collapse` both take it and nothing here supplied it. `f64` because JSON
     /// numbers are; the kernels narrow to f32 at the call, as `rms_norm_eps` already does.
     ///
     /// Required rather than defaulted for the reason a default of 0.0 would be *nearly*

@@ -355,11 +355,11 @@ extern "C" int rivoli_mla_attend(
 // Two passes, not the reference's online (flash) softmax: the same mathematics, and the
 // logits fit LDS at every `topk` this model reaches (128 window slots at ratio 0, plus
 // `index_topk` compressed slots where S2c adds them). One block per (query row, head).
-extern "C" __global__ void v4_sparse_attn(const float* __restrict__ q,
-                                          const float* __restrict__ kv,
-                                          const float* __restrict__ sink,
-                                          const int* __restrict__ idxs, int h, int d,
-                                          int topk, float scale, float* __restrict__ o) {
+extern "C" __global__ void gather_attn_shared_kv(const float* __restrict__ q,
+                                           const float* __restrict__ kv,
+                                           const float* __restrict__ sink,
+                                           const int* __restrict__ idxs, int h, int d,
+                                           int topk, float scale, float* __restrict__ o) {
     extern __shared__ float lds[];
     float* qs = lds;          // [d]   this head's query row
     float* lg = lds + d;      // [topk] logits, then softmax weights
@@ -443,9 +443,9 @@ extern "C" __global__ void v4_sparse_attn(const float* __restrict__ q,
 // Takes a STREAM. Sixth and last of `attn::v4::attention`'s launcher set, all converted
 // together on 2026-08-05 — see `mla.hip`'s "V4 launchers" banner for why the set cannot be
 // converted in parts, and `linalg.hip::rivoli_memcpy_dtod_async` for the seventh member.
-extern "C" int rivoli_v4_sparse_attn(const float* q, const float* kv, const float* sink,
-                                     const int* idxs, int m, int h, int d, int topk,
-                                     float scale, float* o, void* stream) {
+extern "C" int rivoli_gather_attn_shared_kv(const float* q, const float* kv, const float* sink,
+                                            const int* idxs, int m, int h, int d, int topk,
+                                            float scale, float* o, void* stream) {
     if (m <= 0 || h <= 0 || d <= 0 || topk <= 0) return 1001;
     // 1002 is the size-bound code this tree uses (attn.hip's flash launcher, indexer.hip).
     // THIS is the guard between a `head_dim` past the per-thread accumulator and output
@@ -457,7 +457,7 @@ extern "C" int rivoli_v4_sparse_attn(const float* q, const float* kv, const floa
     // The static `red`/`bc` are counted here too: they come out of the same 64 KB.
     if (lds + sizeof(float) * (V4_ATTN_THREADS + 2) > 65536) return 1006;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_sparse_attn, dim3((unsigned)h, (unsigned)m), dim3(V4_ATTN_THREADS),
+    hipLaunchKernelGGL(gather_attn_shared_kv, dim3((unsigned)h, (unsigned)m), dim3(V4_ATTN_THREADS),
                        (unsigned)lds, (hipStream_t)stream, q, kv, sink, idxs, h, d, topk, scale,
                        o);
     hipError_t e = hipGetLastError();

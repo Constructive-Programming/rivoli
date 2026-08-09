@@ -31,7 +31,7 @@
 //!   [`launch_moe_acc_drain`] holds a bf16 shared-expert output plus a fixed-point routed sum with
 //!   no final round, and `hc_post` consumes that. Attention's output IS rounded (the `wo_b` GEMV
 //!   does it), so the two sublayers are inconsistent. It needs a kernel — there is no bare
-//!   round-to-bf16 launcher and `launch_v4_rmsnorm` also norms — so it is NAMED here rather than
+//!   round-to-bf16 launcher and `launch_rmsnorm_batch` also norms — so it is NAMED here rather than
 //!   fixed. Magnitude: ~half a bf16 ULP on `hc_post`'s `post * x` term, well inside the gate's
 //!   bound, which is exactly why naming it matters: a reader seeing `ffn_out` move would otherwise
 //!   attribute all of it to the unclamped shared expert and stop looking. Found by review.
@@ -79,10 +79,10 @@ use crate::artifact::model::V4Config;
 use crate::artifact::quant::{FP8_BLOCK, f4_expert_stride, read_f32};
 use crate::attn::{Sel, v4, v4_topk_idxs};
 use crate::backend::hip::{
-    ExpertDescF4, device_sync, fill_u32, launch_act_quant_f8, launch_argmax, launch_gemv_f32,
-    launch_hc_post, launch_hc_pre, launch_moe_acc_drain, launch_moe_expert_range_f4, launch_swiglu,
-    launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_gemv_fp8, launch_v4_hc_head,
-    launch_v4_rmsnorm, memcpy_dtod,
+    ExpertDescF4, device_sync, fill_u32, launch_act_quant_f8, launch_argmax,
+    launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_gemv_f32, launch_gemv_fp8_grouped,
+    launch_hc_head_collapse, launch_hc_post, launch_hc_pre, launch_moe_acc_drain,
+    launch_moe_expert_range_f4, launch_rmsnorm_batch, launch_swiglu, memcpy_dtod,
 };
 use crate::backend::{Event, NULL_STREAM, Stream};
 use crate::gpu::as_le_bytes;
@@ -200,7 +200,7 @@ impl RopeTables {
         if let Some((_, buf)) = self.tables.iter().find(|(k, _)| *k == key) {
             return Ok(buf.ptr().cast());
         }
-        // Interleaved `(cos, sin)` — the layout `launch_v4_rope` indexes, and the one
+        // Interleaved `(cos, sin)` — the layout `launch_rope_adjacent` indexes, and the one
         // `v4_rope_table_ratio0` produces. Written as a push pair rather than a `flat_map` over
         // the tuple so it reads as the layout it is.
         let pairs = freqs_cis(p, self.max_pos);
@@ -231,7 +231,7 @@ struct Extent {
     start_pos: usize,
 }
 
-/// Narrow a `[n]` f32 device buffer to the bf16 `launch_v4_dense_gemm_bf16` reads.
+/// Narrow a `[n]` f32 device buffer to the bf16 `launch_gemm_bf16` reads.
 ///
 /// **This exists because handing that launcher the pin's f32 pointer is not a precision loss —
 /// it is a row-stride error, and a review caught it before any device ran.** The kernel indexes
@@ -485,7 +485,7 @@ fn read_prefix(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
 /// `usize`.
 ///
 /// `attn_core_out` is deliberately absent and **cannot** be added — the output de-rotation is IN
-/// PLACE on `s.o` (`launch_v4_rope(s.o, .., inverse = true)`), so by the time `attention` returns
+/// PLACE on `s.o` (`launch_rope_adjacent(s.o, .., inverse = true)`), so by the time `attention` returns
 /// the pre-image is gone. `tests/v4_attn.rs` drives `sparse_attn` separately for exactly that
 /// reason; this makes the same partition available at real weights, minus that one cell.
 ///
@@ -826,7 +826,7 @@ pub struct V4Engine {
     cur: usize,
 
     /// `hc_pre`'s `y` — the `[m, dim]` tensor the norms and the sublayer see. NOT the residual,
-    /// which is why `attn_norm`/`ffn_norm` may be in-place `launch_v4_rmsnorm` here.
+    /// which is why `attn_norm`/`ffn_norm` may be in-place `launch_rmsnorm_batch` here.
     xw: DeviceBuf,
     /// The fp8-quantized copy of `xw`. Separate because the ROUTER must see the unquantized
     /// activation — `Gate.forward` is `linear(x.float(), weight.float())`, with no activation
@@ -835,7 +835,7 @@ pub struct V4Engine {
     xq: DeviceBuf,
     post: DeviceBuf,
     comb: DeviceBuf,
-    /// `launch_v4_hc_head`'s `[s, hc]` scratch gate vector.
+    /// `launch_hc_head_collapse`'s `[s, hc]` scratch gate vector.
     head_pre: DeviceBuf,
     /// The sublayer output `hc_post` consumes — attention's `io.out`, then the MoE's.
     sub: DeviceBuf,
@@ -1221,7 +1221,7 @@ impl V4Engine {
         }
 
         // **Twice is the specific failure, and this is the one place that says so.** Every path
-        // in `compress` runs `launch_v4_compress_state` before the emit decision, which is a
+        // in `compress` runs `launch_kv_compress_deposit` before the emit decision, which is a
         // read-modify-write of `kv_state`/`score_state` — and the decode path also slides the
         // pooling window. So a second call re-deposits the same rows and slides again, which
         // corrupts exactly the state S3 requirement 3 is about, finitely and plausibly.
@@ -1784,7 +1784,7 @@ impl V4Engine {
 
     /// The resident fp8 shared expert, batched over all `m` rows.
     ///
-    /// Batched where the routed experts cannot be: `launch_v4_gemv_fp8` takes `m`, and the shared
+    /// Batched where the routed experts cannot be: `launch_gemv_fp8_grouped` takes `m`, and the shared
     /// expert is one weight set read by every row, so its fp8 weights are read once for the whole
     /// prompt.
     ///
@@ -1798,7 +1798,7 @@ impl V4Engine {
     /// passed to this one: V4 bf16-rounds both operands BEFORE the clamp, bf16-rounds the
     /// product, and uses `F.silu`'s `g·sigmoid(g)` rather than `g/(1 + e^-g)`.
     ///
-    /// `launch_v4_swiglu_clamped(g, u, n, limit, h, stream)` is being written elsewhere and this
+    /// `launch_swiglu_clamped_bf16(g, u, n, limit, h, stream)` is being written elsewhere and this
     /// is the one call site it replaces. Until it lands, **no output from this loop is
     /// reference-faithful**, and `tests/v4_loop.rs` scores against a `Defect::SwigluUnclamped`
     /// oracle rather than the clean one for exactly this reason — which is a gate on the wiring
@@ -1830,7 +1830,7 @@ impl V4Engine {
             launch_act_quant_f8(g, m, inter, stream)?;
             // WRITES `sub` — does not accumulate into it. `MoE.forward` starts from `y = zeros`
             // and the routed drain adds on top; see `routed_experts`.
-            launch_v4_gemv_fp8(
+            launch_gemv_fp8_grouped(
                 g,
                 down.packed,
                 down.scale,
@@ -1875,7 +1875,7 @@ impl V4Engine {
         // outliving this engine; `g` and `u` are `max_m * inter`, three distinct allocations.
         for (w, dst) in [(gate, g), (up, u)] {
             unsafe {
-                launch_v4_gemv_fp8(
+                launch_gemv_fp8_grouped(
                     xq, w.packed, w.scale, m, inter, dim, FP8_BLOCK, 1, dst, stream,
                 )?;
             }
@@ -2004,7 +2004,7 @@ impl V4Engine {
             launch_hc_pre(
                 self.h[self.cur].ptr().cast(),
                 hcw.func,
-                // `scale` THEN `base`. `launch_v4_hc_head` takes them the other way round and both
+                // `scale` THEN `base`. `launch_hc_head_collapse` takes them the other way round and both
                 // are `*const f32`, so a swap compiles, runs, and is finite.
                 hcw.scale,
                 hcw.base,
@@ -2019,13 +2019,13 @@ impl V4Engine {
                 self.comb.ptr_mut().cast(),
                 null,
             )?;
-            // `launch_v4_rmsnorm`, in place on `hc_pre`'s output — NOT GLM's `linalg.hip::rmsnorm`,
+            // `launch_rmsnorm_batch`, in place on `hc_pre`'s output — NOT GLM's `linalg.hip::rmsnorm_single`,
             // which is out-of-place, does not bf16-round, and is SINGLE-ROW (`dim3(1)`, one mean
             // over its whole `n`), so handing it `m * dim` would take a joint statistic over every
             // token and read the norm weight past its allocation. V4's `RMSNorm` returns bf16 and
             // this kernel rounds, which is S3 requirement 1 satisfied by SELECTION rather than by
             // editing a shared kernel.
-            launch_v4_rmsnorm(
+            launch_rmsnorm_batch(
                 self.xw.ptr_mut().cast(),
                 norm,
                 m,
@@ -2100,7 +2100,7 @@ impl V4Engine {
     ///
     /// **One function because the two entry points into [`V4Engine::layer`] fell out of step.**
     /// `forward` had the position bound and `probe_layer` did not, which a review found: the
-    /// rotary tables are built at exactly `max_ctx` positions and `launch_v4_rope` reads
+    /// rotary tables are built at exactly `max_ctx` positions and `launch_rope_adjacent` reads
     /// `tbl + pos0 * rd` with no bound of its own, so a probe driver walking further than the
     /// engine was sized for read past the table — plausible garbage frequencies, which is
     /// `Defect::RopeNoYarn`'s shape. Two copies of two guards is two places for them to diverge
@@ -2138,7 +2138,7 @@ impl V4Engine {
         self.cur = 0;
         self.loaded_rows = m;
         // `embed` then the `hc_mult` copies — `Transformer.forward` 914-916. One launch per token
-        // because `launch_v4_embed_bf16_row` gathers ONE row and broadcasts it into `hc` copies.
+        // because `launch_embed_bf16_row_bcast` gathers ONE row and broadcasts it into `hc` copies.
         for (t, &tok) in ids.iter().enumerate() {
             ensure!(
                 (tok as usize) < self.cfg.vocab,
@@ -2149,7 +2149,7 @@ impl V4Engine {
             // checked; the destination is row `t` of an `m * hc * dim` allocation with
             // `t < m <= max_m`.
             unsafe {
-                launch_v4_embed_bf16_row(
+                launch_embed_bf16_row_bcast(
                     self.pin.embed.packed,
                     tok as usize,
                     dim,
@@ -2192,7 +2192,7 @@ impl V4Engine {
         // `head_pre` is `hc` writable; `head_x` is `dim`; `logits` is `vocab`. None aliases
         // another, which every parameter of these three launchers requires.
         unsafe {
-            launch_v4_hc_head(
+            launch_hc_head_collapse(
                 h_last.cast::<f32>().add(last * hc * dim),
                 self.pin.hc_head.func,
                 // `base` THEN `scale` — the OPPOSITE order from `launch_hc_pre` above. Both are
@@ -2210,7 +2210,7 @@ impl V4Engine {
                 self.cfg.hc_eps as f32,
                 std::ptr::null_mut(),
             )?;
-            launch_v4_rmsnorm(
+            launch_rmsnorm_batch(
                 self.head_x.ptr_mut().cast(),
                 self.pin.final_norm,
                 1,
@@ -2219,7 +2219,7 @@ impl V4Engine {
                 NULL_STREAM,
             )?;
             // `head.weight` is bf16 in the artifact and there is no int8 head to reach for.
-            // `launch_v4_dense_gemm_bf16` computes exactly this at `m = 1`: runtime `(m, n, k)` over
+            // `launch_gemm_bf16` computes exactly this at `m = 1`: runtime `(m, n, k)` over
             // a bf16 `[n, k]` weight is a head GEMV at `m = 1, n = vocab, k = hidden`.
             //
             // **Verified at TOY extents, not these.** `tests/v4_head_tail.rs`'s
@@ -2233,7 +2233,7 @@ impl V4Engine {
             // a one-row activation is a 129,280-wave launch. That is a performance argument with no
             // measurement attached, so the honest instruction was "call it first, then price it".
             // Called; S4 prices it.
-            launch_v4_dense_gemm_bf16(
+            launch_gemm_bf16(
                 self.head_x.ptr().cast(),
                 self.pin.head.packed,
                 self.logits.ptr_mut().cast(),

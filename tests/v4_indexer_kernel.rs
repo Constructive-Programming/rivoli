@@ -2,20 +2,20 @@
 //! `docs/investigations/v4-flash-port.md`.
 //!
 //! The two halves are gated against DIFFERENT references, and the difference matters:
-//! `v4_indexer_spread` against S1b's oracle, `v4_indexer_score` against a host
+//! `act_quant_f4_rotated` against S1b's oracle, `index_score_blocks` against a host
 //! transliteration of `model.py` that **the oracle currently contradicts** (see below). A
 //! green run of the score half is not a correctness verdict until the oracle's fix lands.
 //!
 //! Two kernels:
 //!
-//! * `v4_indexer_spread` — `rotate_activation` then `fp4_act_quant(·, 32)`, the finish
+//! * `act_quant_f4_rotated` — `rotate_activation` then `fp4_act_quant(·, 32)`, the finish
 //!   `Compressor.forward` performs when `rotate = true` and the same operation
 //!   `Indexer.forward` applies to its `q` rows. It is `Geom::indexer`'s finish, and
 //!   `geom_indexer_and_geom_attention_do_not_finish_the_same_way` is the test that the two
 //!   cannot be interchanged. Scored against the ORACLE's own `hadamard_rotate` and
 //!   `fp4_act_quant_inplace`, on **synthetic** rows built to reach binades real activations
 //!   may not.
-//! * `v4_indexer_score` — the `einsum` / `relu_` / `weights` / sum chain, on the
+//! * `index_score_blocks` — the `einsum` / `relu_` / `weights` / sum chain, on the
 //!   **checkpoint's own** compressed KV, scored against a host transliteration of
 //!   `model.py:425-427`.
 //!
@@ -68,7 +68,7 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::backend::hip::{device_sync, launch_v4_indexer_score, launch_v4_indexer_spread};
+use rivoli::backend::hip::{device_sync, launch_act_quant_f4_rotated, launch_index_score_blocks};
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4compress::{Geom, LayerKind, Quantize, ScoreDims};
 use rivoli::v4oracle::forward::{Counters, Defect, Oracle};
@@ -151,7 +151,7 @@ fn assert_bits(want: &[f32], got: &[f32], label: &str) {
 }
 
 /// `Oracle::indexer_spread` on the host, over `rows` rows of `d` — the value
-/// `v4_indexer_spread` must reproduce.
+/// `act_quant_f4_rotated` must reproduce.
 ///
 /// Written from the oracle's public primitives rather than by calling `indexer_spread`,
 /// which is private. That is not a re-derivation: `hadamard_rotate` and
@@ -201,7 +201,7 @@ fn store_bf16(row: &mut [f32]) {
 fn device_spread(host_in: &[f32], rows: usize, d: usize) -> Vec<f32> {
     let buf = up(host_in);
     // SAFETY: `buf` is `rows * d` writable f32 by the caller's fixture and outlives the sync.
-    unsafe { launch_v4_indexer_spread(buf.ptr() as *mut f32, rows, d, std::ptr::null_mut()) }
+    unsafe { launch_act_quant_f4_rotated(buf.ptr() as *mut f32, rows, d, std::ptr::null_mut()) }
         .expect("spread launch");
     device_sync().expect("sync");
     down(&buf, rows * d)
@@ -224,7 +224,7 @@ fn assert_spread_matches(host_in: &[f32], rows: usize, d: usize, label: &str) {
 // the spread — Geom::indexer's finish
 // =======================================================================================
 
-/// `v4_indexer_spread` reproduces `Oracle::indexer_spread` bit for bit.
+/// `act_quant_f4_rotated` reproduces `Oracle::indexer_spread` bit for bit.
 ///
 /// Synthetic rows rather than checkpoint ones, and deliberately: what this kernel must get
 /// right is the *arithmetic*, and the fixture is built to reach the corners real
@@ -312,7 +312,7 @@ fn the_spread_launcher_refuses_widths_the_hadamard_cannot_transform() {
     let p = buf.ptr() as *mut f32;
     let bad = |rows: usize, d: usize| {
         // SAFETY: refused before any launch; `buf` is 1024 f32, larger than any accepted here.
-        unsafe { launch_v4_indexer_spread(p, rows, d, std::ptr::null_mut()) }.is_err()
+        unsafe { launch_act_quant_f4_rotated(p, rows, d, std::ptr::null_mut()) }.is_err()
     };
     assert!(bad(0, 128), "zero rows");
     assert!(bad(1, 0), "zero width");
@@ -330,7 +330,7 @@ fn the_spread_launcher_refuses_widths_the_hadamard_cannot_transform() {
     // And the shape the model actually uses is ACCEPTED, so the guards above are not simply
     // refusing everything.
     // SAFETY: `buf` is 1024 f32 >= 1 * 128.
-    unsafe { launch_v4_indexer_spread(p, 1, 128, std::ptr::null_mut()) }.expect("128 is legal");
+    unsafe { launch_act_quant_f4_rotated(p, 1, 128, std::ptr::null_mut()) }.expect("128 is legal");
     device_sync().expect("sync");
 }
 
@@ -404,7 +404,7 @@ fn device_score(q: &[f32], kv: &[f32], w: &[f32], d: ScoreDims) -> Vec<f32> {
     // SAFETY: every buffer is sized by `d`, device-resident, non-aliasing, and outlives the
     // sync below.
     unsafe {
-        launch_v4_indexer_score(
+        launch_index_score_blocks(
             dq.ptr() as *const f32,
             dkv.ptr() as *const f32,
             dw.ptr() as *const f32,
@@ -418,7 +418,7 @@ fn device_score(q: &[f32], kv: &[f32], w: &[f32], d: ScoreDims) -> Vec<f32> {
     down(&out, d.s * d.n_comp)
 }
 
-/// `model.py:425-427` on the host — the value `v4_indexer_score` must reproduce.
+/// `model.py:425-427` on the host — the value `index_score_blocks` must reproduce.
 ///
 /// **Transcribed from `model.py`, not from `Oracle::indexer`** — and on 2026-08-05 that
 /// stopped being only a limitation and became the reason this file is right where the
@@ -464,7 +464,7 @@ fn host_score(q: &[f32], kv: &[f32], w: &[f32], d: ScoreDims) -> Vec<f32> {
     out
 }
 
-/// `v4_indexer_score` is bit-identical to the reference chain, on the checkpoint's own
+/// `index_score_blocks` is bit-identical to the reference chain, on the checkpoint's own
 /// compressed KV.
 ///
 /// The `kv` side is REAL: it is `CompState::cache` after `Oracle::indexer` has run layer 2's
@@ -542,7 +542,7 @@ fn indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv() {
 ///
 /// The silent case is what makes it a matrix rather than a list. Scaling a `q` row belonging
 /// to a query OTHER than the ones under comparison must leave every score bit-identical:
-/// `v4_indexer_score`'s `t` indexing is the thing that would break, and a defect model that
+/// `index_score_blocks`'s `t` indexing is the thing that would break, and a defect model that
 /// moved everything would prove nothing about it.
 #[test]
 fn the_score_comparison_rejects_perturbed_inputs_and_only_the_right_ones() {
@@ -633,7 +633,7 @@ fn the_score_launcher_refuses_an_empty_compressed_region() {
     let (p, m) = (buf.ptr() as *const f32, buf.ptr() as *mut f32);
     let go = |d: ScoreDims| {
         // SAFETY: refused before any launch in every case asserted here.
-        unsafe { launch_v4_indexer_score(p, p, p, m, d, std::ptr::null_mut()) }.is_err()
+        unsafe { launch_index_score_blocks(p, p, p, m, d, std::ptr::null_mut()) }.is_err()
     };
     let ok = ScoreDims {
         s: 1,

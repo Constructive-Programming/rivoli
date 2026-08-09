@@ -235,7 +235,7 @@ extern "C" int rivoli_mla_value_fp8(
 // heads, and its last `rope_head_dim` dims carry the position. So none of the `mla_*`
 // kernels above apply — there is no per-head K/V, no nope/rope tensor split, and no
 // latent cache. What is here is `Attention.forward`'s elementwise and GEMV work
-// (inference/model.py:490-548); the softmax core is `v4_sparse_attn` in attn.hip.
+// (inference/model.py:490-548); the softmax core is `gather_attn_shared_kv` in attn.hip.
 //
 // EVERY defect available in this path is silent-wrong — a missing QK-norm, RoPE on the
 // wrong pairing, the partial fp8 quantization applied to the whole entry. The gate is
@@ -259,7 +259,7 @@ extern "C" int rivoli_mla_value_fp8(
 // they move, so the expectation is that it is free — but that is an expectation, and S4
 // is where it gets priced with the oracle available to bound the error either way.
 //
-// VERIFIED IN THE ISA, not assumed: at `--offload-arch=gfx1151 -O3`, `v4_rope`'s
+// VERIFIED IN THE ISA, not assumed: at `--offload-arch=gfx1151 -O3`, `rope_adjacent`'s
 // `a*c - b*s` emits 4 `v_mul_f32` and ZERO fma-class instructions, while
 // `mla_absorb_fp8` above — same file, same flags, outside this pragma — emits 14. A
 // pragma in the wrong place would have been invisible otherwise, since the wrong answer
@@ -268,10 +268,10 @@ extern "C" int rivoli_mla_value_fp8(
 // **"fma-class" here means `v_fma_f32` and `v_fmac_f32` ONLY** — float FMAs, the thing
 // `contract(off)` governs. Re-measured 2026-08-05 and both numbers stand, but the
 // distinction was not stated and it matters: a `v_fma|v_mac|v_mad` grep reports 1 for
-// `v4_rope` and 32 for `mla_absorb_fp8`, because `v_mad_u64_u32`/`v_mad_i64_i32` are
+// `rope_adjacent` and 32 for `mla_absorb_fp8`, because `v_mad_u64_u32`/`v_mad_i64_i32` are
 // ADDRESS arithmetic that contraction neither does nor should touch. On a kernel with
 // nine of those, a genuine one-instruction regression is a 10% move in a number nobody
-// looks twice at — found by the indexer agent on `v4_indexer_score`, where the pragma
+// looks twice at — found by the indexer agent on `index_score_blocks`, where the pragma
 // moved 1 `v_fmac_f32` to 0 while the naive count read 10 → 9. Count narrowly, and
 // compare a DELTA rather than an absolute.
 //
@@ -313,8 +313,8 @@ extern "C" int rivoli_mla_value_fp8(
 // reference's `inplace=True` and reproduces the pre-M10 body exactly — the amax scan
 // completes before the first write either way. NO `__restrict__` on either pointer for
 // that reason: they alias at every in-place call site.
-extern "C" __global__ void v4_act_quant(const float* src, float* dst, int rows,
-                                        int row_stride, int n, int block) {
+extern "C" __global__ void act_quant_f8_prefix(const float* src, float* dst, int rows,
+                                               int row_stride, int n, int block) {
     int nb = n / block;
     size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= (size_t)rows * (size_t)nb) return;
@@ -343,8 +343,8 @@ extern "C" __global__ void v4_act_quant(const float* src, float* dst, int rows,
 // One block per row. `1.0f/sqrtf` and not `rsqrtf`: `rsqrtf` is a hardware
 // approximation, and this factor multiplies the whole row, so its error is not a
 // rounding difference — it is a systematic scale on every downstream logit.
-extern "C" __global__ void v4_rmsnorm(float* __restrict__ x, const float* __restrict__ w,
-                                      int d, float eps) {
+extern "C" __global__ void rmsnorm_batch(float* __restrict__ x, const float* __restrict__ w,
+                                         int d, float eps) {
     __shared__ float red[256];
     float* row = x + (size_t)blockIdx.x * d;
     float p = 0.0f;
@@ -364,7 +364,7 @@ extern "C" __global__ void v4_rmsnorm(float* __restrict__ x, const float* __rest
 //    defect matrix for exactly that reason (tests/v4_oracle.rs::
 //    qk_norm_order_is_a_rounding_difference_not_an_arithmetic_one). The launch order in
 //    src/attn.rs is therefore justified by model.py, not by a green test.
-// 2. It is computed in **BF16**, unlike `v4_rmsnorm`. `RMSNorm.forward` opens with
+// 2. It is computed in **BF16**, unlike `rmsnorm_batch`. `RMSNorm.forward` opens with
 //    `x = x.float()`; model.py:504 does not, and `q` is bf16 out of `fp8_gemm`, so the
 //    square, the mean, the `+ eps` and the `rsqrt` are all bf16-valued. Keeping the
 //    statistic in f32 leaves the factor up to 2^-9 (~0.2%) off, identically for every
@@ -376,7 +376,7 @@ extern "C" __global__ void v4_rmsnorm(float* __restrict__ x, const float* __rest
 // are wrong the same way and no golden can tell. That is a shared blind spot created by
 // agreeing with the instrument, and it is stated here because nothing else in the tree
 // states it.
-extern "C" __global__ void v4_qk_norm(float* __restrict__ q, int d, float eps) {
+extern "C" __global__ void qk_norm(float* __restrict__ q, int d, float eps) {
     __shared__ float red[256];
     float* row = q + (size_t)blockIdx.x * d;
     float p = 0.0f;
@@ -413,9 +413,9 @@ extern "C" __global__ void v4_qk_norm(float* __restrict__ q, int d, float eps) {
 // barrier. The trailing sweep is `round_bf16(row)` over the WHOLE row, as the oracle
 // does: the untouched dims are already bf16 so it is a no-op on them, and doing it
 // unconditionally removes a standing assumption about what the previous kernel left.
-extern "C" __global__ void v4_rope(float* __restrict__ x, const float* __restrict__ tbl,
-                                   int row_len, int rd, int pos0, int rows_per_pos,
-                                   int inverse) {
+extern "C" __global__ void rope_adjacent(float* __restrict__ x, const float* __restrict__ tbl,
+                                         int row_len, int rd, int pos0, int rows_per_pos,
+                                         int inverse) {
     float* row = x + (size_t)blockIdx.x * row_len;
     float* seg = row + (row_len - rd);
     const float* t = tbl + (size_t)(pos0 + (int)blockIdx.x / rows_per_pos) * rd;
@@ -429,6 +429,19 @@ extern "C" __global__ void v4_rope(float* __restrict__ x, const float* __restric
     for (int i = threadIdx.x; i < row_len; i += blockDim.x) row[i] = rbf16(row[i]);
 }
 
+// **Stores bf16-rounded**, unlike `linalg.hip::gemv_fp8`, which stores raw f32. That is the
+// first thing a caller has to know and the second thing the name says, so it leads here:
+// `rbf16(acc)` matches the reference's store and every caller in this engine wants it, but a
+// caller reaching across from the GLM path would silently gain a rounding.
+//
+// USED BY: DeepSeek-V4-Flash-0731 only (`qkv`, `wo_a`, `wo_b`, the shared expert).
+// GLM-5.2 uses `linalg.hip::gemv_fp8`.
+//
+// **`_grouped` NAMES THE MISUSE HAZARD.** The two fp8 GEMVs differ on two axes and only one
+// of them corrupts quietly: confuse the store dtype and you get a rounding, confuse the
+// input slicing and every output row reads the wrong activations. Hence the suffix went to
+// `groups` and the store went in this paragraph. Renamed from `v4_gemv_fp8` 2026-08-09.
+//
 // The quantized `Linear` of model.py:114-127, and the grouped `wo_a` einsum of
 // model.py:541-544, as ONE kernel — they differ only in which slice of the input a given
 // output row reads.
@@ -450,7 +463,7 @@ extern "C" __global__ void v4_rope(float* __restrict__ x, const float* __restric
 // (`(n_out/group_rows − 1)·x_group_stride + k ≤ x_row_stride`) that nothing verified.
 //
 // NO activation quantization here. `Linear.forward` does its `act_quant` before calling
-// the GEMM, so `v4_act_quant` is a separate launch on the caller's side; `wo_a` gets none
+// the GEMM, so `act_quant_f8_prefix` is a separate launch on the caller's side; `wo_a` gets none
 // at all, which is the whole content of the plan's DECIDED note of 2026-08-05 — `wo_a`
 // ships fp8 on disk and `convert.py` dequantizes it to bf16 (convert.py:123-127), and an
 // fp8 GEMV here would not match the oracle bit-for-bit, making a real bug and the format
@@ -462,11 +475,11 @@ extern "C" __global__ void v4_rope(float* __restrict__ x, const float* __restric
 // One wave per output row, via `dot_fp8_wave` — whose summation order is NOT the
 // oracle's sequential fold. That re-association is the floor on the tolerance, and it is
 // measured rather than assumed (tests/v4_attn.rs).
-extern "C" __global__ void v4_gemv_fp8(const float* __restrict__ x,
-                                       const unsigned char* __restrict__ w,
-                                       const float* __restrict__ wscale, int m, int n_out,
-                                       int k, int block, int groups,
-                                       float* __restrict__ out) {
+extern "C" __global__ void gemv_fp8_grouped(const float* __restrict__ x,
+                                            const unsigned char* __restrict__ w,
+                                            const float* __restrict__ wscale, int m, int n_out,
+                                            int k, int block, int groups,
+                                            float* __restrict__ out) {
     __shared__ float lut[256];
     e4m3_lut_build(lut, threadIdx.x);
     __syncthreads();
@@ -486,7 +499,7 @@ extern "C" __global__ void v4_gemv_fp8(const float* __restrict__ x,
 // -hipError. All pointers device-resident; launch-only.
 //
 // **Every one takes a `stream`, and they took none until 2026-08-05.** These five plus
-// `attn.hip::rivoli_v4_sparse_attn` are the whole of `attn::v4::attention`, and they were
+// `attn.hip::rivoli_gather_attn_shared_kv` are the whole of `attn::v4::attention`, and they were
 // declined a stream once on the grounds that "there is nothing to overlap with". That
 // premise died when the `.f4` routed streaming pool landed and was measured at 1.082
 // ms/miss, 12.36 GB/s over the real 137.06 GiB expert set: there is now a fetch to overlap
@@ -501,11 +514,11 @@ extern "C" __global__ void v4_gemv_fp8(const float* __restrict__ x,
 // `hipMemcpy` and the block interleaves six of them with these launches, so it needed an
 // `_async` twin for the same reason. See that function's note.
 //
-// `stream` is trailing on all of them, matching `rivoli_hc_pre`/`rivoli_v4_dense_gemm_bf16`,
+// `stream` is trailing on all of them, matching `rivoli_hc_pre`/`rivoli_gemm_bf16`,
 // and `nullptr` is the null stream — so a caller that has no stream yet is unchanged.
 
-extern "C" int rivoli_v4_act_quant(const float* src, float* dst, int rows, int row_stride,
-                                   int n, int block, void* stream) {
+extern "C" int rivoli_act_quant_f8_prefix(const float* src, float* dst, int rows, int row_stride,
+                                          int n, int block, void* stream) {
     if (rows <= 0 || n <= 0 || block <= 0 || row_stride < n) return 1001;
     // A quant-FROM-SOURCE (`src != dst`) writes only dims [0, n) of each dst row, so a
     // partial-width one (`n < row_stride` — the KV entry's shape) would leave dst's tail
@@ -517,39 +530,39 @@ extern "C" int rivoli_v4_act_quant(const float* src, float* dst, int rows, int r
     // `kernel.py::act_quant` asserts `N % block_size == 0`. Without this a ragged tail
     // block would be quantized against its own amax and produce values the reference
     // cannot produce — silently, since every shape in the model divides evenly today.
-    // 1004 is this file's divisibility code (cf. rivoli_v4_gemv_fp8 below); 1002 is a
+    // 1004 is this file's divisibility code (cf. rivoli_gemv_fp8_grouped below); 1002 is a
     // size bound. Getting them the wrong way round costs nothing at the call site and
     // misleads everyone who learned the codes from the other ~60 launchers.
     if (n % block) return 1004;
     size_t total = (size_t)rows * (size_t)(n / block);
     hipGetLastError();
-    hipLaunchKernelGGL(v4_act_quant, dim3((unsigned)((total + 255) / 256)), dim3(256), 0,
+    hipLaunchKernelGGL(act_quant_f8_prefix, dim3((unsigned)((total + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, src, dst, rows, row_stride, n, block);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_rmsnorm(float* x, const float* w, int rows, int d, float eps,
-                                 void* stream) {
+extern "C" int rivoli_rmsnorm_batch(float* x, const float* w, int rows, int d, float eps,
+                                    void* stream) {
     if (rows <= 0 || d <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_rmsnorm, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, x, w,
+    hipLaunchKernelGGL(rmsnorm_batch, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, x, w,
                        d, eps);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_qk_norm(float* q, int rows, int d, float eps, void* stream) {
+extern "C" int rivoli_qk_norm(float* q, int rows, int d, float eps, void* stream) {
     if (rows <= 0 || d <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_qk_norm, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, q, d,
+    hipLaunchKernelGGL(qk_norm, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, q, d,
                        eps);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_rope(float* x, const float* tbl, int rows, int row_len, int rd,
-                              int pos0, int rows_per_pos, int inverse, void* stream) {
+extern "C" int rivoli_rope_adjacent(float* x, const float* tbl, int rows, int row_len, int rd,
+                                    int pos0, int rows_per_pos, int inverse, void* stream) {
     if (rows <= 0 || row_len <= 0 || rd <= 0 || rows_per_pos <= 0 || pos0 < 0) return 1001;
     if (rd > row_len) return 1002;
     // `view_as_complex` needs an even count to pair, and the table holds rd/2 pairs.
@@ -558,15 +571,15 @@ extern "C" int rivoli_v4_rope(float* x, const float* tbl, int rows, int row_len,
     if (rd & 1) return 1005;
     if (rows % rows_per_pos) return 1004;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_rope, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, x, tbl,
+    hipLaunchKernelGGL(rope_adjacent, dim3((unsigned)rows), dim3(256), 0, (hipStream_t)stream, x, tbl,
                        row_len, rd, pos0, rows_per_pos, inverse);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_gemv_fp8(const float* x, const unsigned char* w, const float* wscale,
-                                  int m, int n_out, int k, int block, int groups, float* out,
-                                  void* stream) {
+extern "C" int rivoli_gemv_fp8_grouped(const float* x, const unsigned char* w, const float* wscale,
+                                       int m, int n_out, int k, int block, int groups, float* out,
+                                       void* stream) {
     if (m <= 0 || n_out <= 0 || k <= 0 || block <= 0 || groups <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
     // A `groups` that does not divide `n_out` would send the last partial group's rows to
@@ -574,7 +587,7 @@ extern "C" int rivoli_v4_gemv_fp8(const float* x, const unsigned char* w, const 
     if (n_out % groups) return 1004;
     size_t total = (size_t)m * (size_t)n_out;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_gemv_fp8,
+    hipLaunchKernelGGL(gemv_fp8_grouped,
                        dim3((unsigned)((total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK)),
                        dim3(ROWS_PER_BLOCK * WAVE), 0, (hipStream_t)stream, x, w, wscale, m, n_out,
                        k, block, groups, out);

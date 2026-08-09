@@ -9,7 +9,8 @@ use rivoli::backend::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8,
     launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_expert_range,
-    launch_moe_expert_range_i4, launch_rope, launch_swiglu, launch_vadd, launch_vq_encode,
+    launch_moe_expert_range_i4, launch_rope_interleave, launch_swiglu, launch_vadd,
+    launch_vq_encode,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::memory::device::DeviceBuf;
@@ -1959,8 +1960,8 @@ fn rope_interleaves_pairs_and_is_a_permutation_at_position_zero() {
     let run = |pos: usize| -> Vec<f32> {
         let mut b = dev(&f32b(&base));
         // SAFETY: `base` is `count * stride` live device f32 for the whole call.
-        unsafe { launch_rope(b.ptr_mut() as *mut f32, count, stride, seg, pos, theta) }
-            .expect("rope");
+        unsafe { launch_rope_interleave(b.ptr_mut() as *mut f32, count, stride, seg, pos, theta) }
+            .expect("rope_interleave");
         f32v(&back(&b))
     };
 

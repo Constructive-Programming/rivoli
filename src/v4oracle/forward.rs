@@ -265,14 +265,14 @@ defects! {
     HeadNormSkipped,
     /// Run the final `RMSNorm` but return f32, skipping the bf16 store `RMSNorm.forward`
     /// performs on the way out. Measured at 7.5e-3 on a 3.1 max (0.24%) elsewhere in this
-    /// port, and it is a live choice on the device: `kernels/mla.hip::v4_rmsnorm` bf16-rounds
-    /// and `kernels/linalg.hip::rmsnorm` does not.
+    /// port, and it is a live choice on the device: `kernels/mla.hip::rmsnorm_batch` bf16-rounds
+    /// and `kernels/linalg.hip::rmsnorm_single` does not.
     HeadNormNotBf16,
     /// Take the final `RMSNorm`'s statistic JOINTLY over all `s * dim` values instead of per
     /// token: what handing a single-row norm kernel an `s x dim` buffer does. Invisible at
     /// decode (`s == 1`), which is the only shape most smoke tests run.
     ///
-    /// Only the STATISTIC is modelled. `kernels/linalg.hip::rmsnorm` would also read its
+    /// Only the STATISTIC is modelled. `kernels/linalg.hip::rmsnorm_single` would also read its
     /// `dim`-long gain past the end of the tensor, which is undefined rather than wrapped;
     /// this tiles the gain instead, which is the charitable realization. The joint statistic
     /// is the load-bearing half, and an out-of-bounds read is not a thing an oracle can
@@ -283,7 +283,9 @@ defects! {
     HeadLogitsFromFirstRow,
 
     // -- candidate designs, modelled before they are built -------------------------------
-    /// The split-k fp8 GEMV's fold order (`kernels/mla.hip::v4_gemv_fp8_splitk`), applied to
+    /// The split-k fp8 GEMV's fold order (`gemv_fp8_grouped_splitk` — **NOT BUILT**; it lives on
+/// branch `wt/v4-splitk`, was measured and REJECTED in §M9, and must not be confused with
+/// `kernels/linalg.hip::gemv_fp8_splitk`, which is GLM's and ships), applied to
     /// exactly the GEMVs the device dispatch predicate selects — see [`Oracle::splitk_selects`]
     /// for the predicate and [`splitk_fold`] for the partial ordering, both derived from the
     /// ONE spec in `docs/investigations/v4-decode-decomposition.md` §M9.
@@ -346,7 +348,7 @@ impl Defect {
 
 /// The split-k GEMV's fold, on the oracle's own per-element arithmetic — one half of the
 /// partial-ordering spec in `docs/investigations/v4-decode-decomposition.md` §M9; the other
-/// half is `kernels/mla.hip::v4_gemv_fp8_splitk`, and
+/// half is `gemv_fp8_grouped_splitk` (unmerged — see [`Oracle::splitk_fold`]'s note), and
 /// `tests/v4_kernel.rs::the_splitk_kernel_folds_in_the_registered_partial_order` pins the
 /// kernel to a transliteration of the SAME spec bit-for-bit, which is what closes the
 /// "oracle models a different reassociation than the kernel executes" failure mode.
@@ -815,12 +817,12 @@ impl Oracle {
         }
     }
 
-    /// Whether the device would dispatch this GEMV to `v4_gemv_fp8_splitk` — the oracle
+    /// Whether the device would dispatch this GEMV to `gemv_fp8_grouped_splitk` — the oracle
     /// half of the ONE dispatch predicate, spec'd in
     /// `docs/investigations/v4-decode-decomposition.md` §M9 and mirrored by
-    /// `kernels/mla.hip::rivoli_v4_gemv_fp8`.
+    /// `kernels/mla.hip::rivoli_gemv_fp8_grouped`.
     ///
-    /// `WMat::Fp8` here stands for "goes through `v4_gemv_fp8`" — every fp8-quantized
+    /// `WMat::Fp8` here stands for "goes through `gemv_fp8_grouped`" — every fp8-quantized
     /// linear on the oracle's path does, and the one fp8-on-disk tensor consumed as Dense
     /// (`wo_a`, whose device GEMV reads the fp8 bytes but is measured bit-equal to the
     /// bf16 dequant) is excluded by shape anyway: `n_out = 8192 > 2048`, and it is also
@@ -921,8 +923,8 @@ impl Oracle {
     /// Split out for the head tail alone, which needs both halves independently: the store is
     /// what `Defect::HeadNormNotBf16` suppresses, and `d` is what `HeadNormOverAllTokens`
     /// widens to `s * dim`. Both are choices a device implementation actually faces —
-    /// `kernels/mla.hip::v4_rmsnorm` bf16-rounds and is one block per row, while
-    /// `kernels/linalg.hip::rmsnorm` neither rounds nor spans rows.
+    /// `kernels/mla.hip::rmsnorm_batch` bf16-rounds and is one block per row, while
+    /// `kernels/linalg.hip::rmsnorm_single` neither rounds nor spans rows.
     fn rmsnorm_raw(&self, x: &mut [f32], d: usize, w: &[f32]) {
         // `zip` below stops at the shorter side, so a short `w` would leave the tail of every
         // row not merely un-gained but UN-SCALED by `rs`, and say nothing. That is reachable:
@@ -948,7 +950,7 @@ impl Oracle {
     /// the unflatten to (heads, head_dim), with **no learnable weight** (model.py:504).
     ///
     /// `pub` since 2026-08-06 so `tests/v4_head_tail.rs` can score
-    /// `kernels/mla.hip::v4_qk_norm` against it. The alternative was a host transliteration
+    /// `kernels/mla.hip::qk_norm` against it. The alternative was a host transliteration
     /// of the seven lines below, which `build.rs`'s duplication gate would have rejected —
     /// and rightly, because a reference carrying the same bf16 placement as the thing it
     /// scores is wrong in the same places.

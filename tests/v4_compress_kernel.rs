@@ -1046,7 +1046,7 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
     let Some((ck, cfg, list)) = cells() else {
         return;
     };
-    // The compressor's own breakages, the RoPE ones inside `v4c_finish_row`, the four
+    // The compressor's own breakages, the RoPE ones inside `compress_finish_row`, the four
     // `act_quant` ones (S2b's kernel, this module's call arguments) and the bf16 stores.
     // Defects outside the compressor — the attention core, the router, the MoE, the indexer
     // — are excluded here rather than silently passing inside the list.
@@ -1143,7 +1143,7 @@ fn each_in_scope_defect_is_further_from_the_gpu_than_the_clean_oracle_is() {
 /// every list that claims to cover the compressor.
 fn in_compressor_scope(d: Defect) -> bool {
     match d {
-        // The compressor's own three, the RoPE inside `v4c_finish_row`, the four
+        // The compressor's own three, the RoPE inside `compress_finish_row`, the four
         // `act_quant` arguments and the bf16 stores.
         Defect::CompressorNoOverlap
         | Defect::CompressorNoApe

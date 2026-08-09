@@ -83,13 +83,13 @@
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
-    ExpertDescF4, device_sync, launch_act_quant_f8, launch_hc_post, launch_hc_pre,
-    launch_moe_acc_drain, launch_moe_expert_range_f4, launch_rmsnorm, launch_v4_act_quant,
-    launch_v4_gemv_fp8, launch_v4_swiglu_clamped,
+    ExpertDescF4, device_sync, launch_act_quant_f8, launch_act_quant_f8_prefix,
+    launch_gemv_fp8_grouped, launch_hc_post, launch_hc_pre, launch_moe_acc_drain,
+    launch_moe_expert_range_f4, launch_rmsnorm_single, launch_swiglu_clamped_bf16,
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
-    forward::{Capture, Counters, Defect, ExpertW, LayerCtx, LayerW, Oracle, wave_ladder},
+    forward::{Capture, Counters, Defect, ExpertW, LayerW, Oracle, wave_ladder},
     numerics::{
         act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e4m3_decode, e8m0_decode, silu,
     },
@@ -1143,8 +1143,8 @@ impl FoldRow<'_> {
     /// (`common.hpp::fp8_dot_strided`: `q = x1·l1` rounded, then three fmas, then
     /// `acc = fma(s, q, acc)`; the scalar tail is `acc = fma(x·l, s, acc)`) — the
     /// transliteration BOTH fold-order tests build their partials from. `start`/`stride`
-    /// are the kernel's own arguments: `(lane, 32)` under wave-per-row `v4_gemv_fp8`,
-    /// `(threadIdx.x, 256)` under `v4_gemv_fp8_splitk`. One definition, because the two
+    /// are the kernel's own arguments: `(lane, 32)` under wave-per-row `gemv_fp8_grouped`,
+    /// `(threadIdx.x, 256)` under `gemv_fp8_grouped_splitk`. One definition, because the two
     /// tests pin the same chain against two different combine trees, and a drift between
     /// two copies would be indistinguishable from the kernel drift they exist to catch.
     fn chain(&self, start: usize, stride: usize) -> f32 {
@@ -1164,7 +1164,7 @@ impl FoldRow<'_> {
         acc
     }
 
-    /// The row under `v4_gemv_fp8`'s WAVE-PER-ROW fold: 32 lane chains at stride 32, one
+    /// The row under `gemv_fp8_grouped`'s WAVE-PER-ROW fold: 32 lane chains at stride 32, one
     /// ladder (`v4oracle::forward::wave_ladder` — the shared definition). UNROUNDED — the
     /// caller applies the bf16 store where the kernel does.
     fn serial(&self) -> f32 {
@@ -1176,7 +1176,7 @@ impl FoldRow<'_> {
     }
 }
 
-/// Upload `(x, w, scales)` and dispatch `launch_v4_gemv_fp8` at `(m, n_out, k, block)`,
+/// Upload `(x, w, scales)` and dispatch `launch_gemv_fp8_grouped` at `(m, n_out, k, block)`,
 /// groups = 1 — the device harness both fold-order tests share. Which KERNEL runs is the
 /// launcher's shape dispatch, which is part of what the split-k test asserts.
 fn gemv_fp8_on_device(
@@ -1195,7 +1195,7 @@ fn gemv_fp8_on_device(
     // `ceil(n_out/block) * ceil(k/block)` f32, `od` is `m * n_out` f32; `sync_f32` joins
     // the device before any buffer drops.
     unsafe {
-        launch_v4_gemv_fp8(
+        launch_gemv_fp8_grouped(
             xd.ptr().cast(),
             wd.ptr().cast(),
             sd.ptr().cast(),
@@ -1208,7 +1208,7 @@ fn gemv_fp8_on_device(
             stream.raw(),
         )
     }
-    .expect("v4_gemv_fp8 dispatch");
+    .expect("gemv_fp8_grouped dispatch");
     sync_f32(&od)
 }
 
@@ -1342,7 +1342,7 @@ fn every_byte_pattern_decodes_right_in_both_dot_paths() {
     assert_matches(&want, &got, "byte-pattern sweep (fp4)");
 }
 
-/// `v4_gemv_fp8`'s summation ORDER, pinned bit-for-bit — the M7 unroll's oracle
+/// `gemv_fp8_grouped`'s summation ORDER, pinned bit-for-bit — the M7 unroll's oracle
 /// (`common.hpp::fp8_dot_strided`, docs/investigations/v4-decode-decomposition.md §M7).
 ///
 /// The fp8 twin of the sweep above cannot reuse its oracle: `Oracle::linear` folds
@@ -1580,11 +1580,11 @@ fn gpu_hc_post(
     sync_f32(&y)
 }
 
-/// `rmsnorm` on the GPU, so the `hc_pre` comparison lands on a golden the oracle emits.
+/// `rmsnorm_single` on the GPU, so the `hc_pre` comparison lands on a golden the oracle emits.
 ///
-/// **rivoli's `rmsnorm` kernel does NOT bf16-round its output, and V4's `RMSNorm.forward`
+/// **rivoli's `rmsnorm_single` kernel does NOT bf16-round its output, and V4's `RMSNorm.forward`
 /// returns bf16** (`model.py:197-202` computes in f32 and the module's dtype is bf16). That
-/// is a real gap and it is NOT this stream's to close — `rmsnorm` is shared with the GLM
+/// is a real gap and it is NOT this stream's to close — `rmsnorm_single` is shared with the GLM
 /// path, where adding a store would change shipped output. `mhc_reproduces_the_layer_
 /// goldens` applies the missing round on the host and PRINTS what it was worth, so the
 /// number is on the record rather than absorbed into a tolerance. **S3 owns supplying it.**
@@ -1596,7 +1596,7 @@ fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     );
     let (xb, wb) = (to_device(&f32b(x)), to_device(&f32b(w)));
     let mut y = zeros(x.len() * 4);
-    // ONE LAUNCH PER TOKEN. `rivoli_rmsnorm` is single-row — `dim3(1)`, one mean over its
+    // ONE LAUNCH PER TOKEN. `rivoli_rmsnorm_single` is single-row — `dim3(1)`, one mean over its
     // whole `n`, and `w[i]` indexed over that same `n`. Handing it `s·dim` took a JOINT rms
     // over every token (the oracle's is per token, `x.chunks_mut(d)`) and read the norm
     // weight `s-1` rows past its allocation. Both were silent: the golden's length still
@@ -1605,7 +1605,7 @@ fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     for t in 0..x.len() / dim {
         // SAFETY: row `t` is `dim` live f32 inside both buffers, and `w` is `dim` long.
         unsafe {
-            launch_rmsnorm(
+            launch_rmsnorm_single(
                 (xb.ptr() as *const f32).add(t * dim),
                 wb.ptr() as *const f32,
                 dim,
@@ -1613,7 +1613,7 @@ fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
                 (y.ptr_mut() as *mut f32).add(t * dim),
             )
         }
-        .expect("rmsnorm");
+        .expect("rmsnorm_single");
     }
     sync_f32(&y)
 }
@@ -1665,7 +1665,7 @@ fn mhc_reproduces_the_layer_goldens() {
         "the driver's h is not what the oracle recorded"
     );
 
-    // The bf16 store `rmsnorm` is missing (see `gpu_rmsnorm`). Measured on the way past so
+    // The bf16 store `rmsnorm_single` is missing (see `gpu_rmsnorm`). Measured on the way past so
     // the size of the gap is recorded rather than inferred: `report` prints the unrounded
     // error next to the rounded one, and if the two are ever the same number the missing
     // store has stopped mattering and this wrapper can go.
@@ -1925,7 +1925,7 @@ fn ffn_out_matches_the_golden() {
 // (model.py:632) and `Expert.forward` clamps both. Until 2026-08-05 the shared expert's only
 // available combine was `launch_swiglu`, which is GLM's, is unclamped, and rounds nothing —
 // `Defect::SwigluUnclamped` on one contribution in seven of every one of the 43 layers,
-// fluent and wrong. `launch_v4_swiglu_clamped` is the fix and this section is its gate.
+// fluent and wrong. `launch_swiglu_clamped_bf16` is the fix and this section is its gate.
 //
 // It gates the KERNEL, not the engine. As of 2026-08-05 the shared expert has no caller — the
 // V4 layer loop is being written separately — so what these tests establish is that the
@@ -1976,14 +1976,14 @@ fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
         .collect()
 }
 
-/// One row of the resident fp8 shared expert on the GPU: three `v4_gemv_fp8` and the clamped
+/// One row of the resident fp8 shared expert on the GPU: three `gemv_fp8_grouped` and the clamped
 /// combine, `Expert.forward` with `weights = None`.
 ///
 /// The launch order IS the arithmetic, so it is spelled rather than abstracted:
 /// `act_quant(x)` once (both `w1` and `w3` read the identical quantized row — the reference
 /// runs a separate `act_quant` inside each `Linear`, on the same row at the same block, so
 /// the bytes are identical), then `w1`/`w3`, then the combine, then `act_quant(h)` and `w2`.
-/// Every `v4_gemv_fp8` bf16-rounds its own output, which is where `Linear`'s bf16 store lives.
+/// Every `gemv_fp8_grouped` bf16-rounds its own output, which is where `Linear`'s bf16 store lives.
 ///
 /// `limit` is a parameter and not `cfg.swiglu_limit` because the whole test below is an A/B
 /// on it. There is no way to ask for the unclamped form: the launcher refuses `<= 0`, NaN
@@ -2007,10 +2007,10 @@ fn gpu_shared_expert(
     // is `[o_dim, i_dim]` e4m3 with a 128x128 f32 scale grid by `upload_fp8_shared`'s
     // contract. All five outlive the `device_sync` inside `sync_f32`.
     unsafe {
-        launch_v4_act_quant(xq.ptr().cast(), xq.ptr_mut().cast(), 1, dim, dim, blk, st)
+        launch_act_quant_f8_prefix(xq.ptr().cast(), xq.ptr_mut().cast(), 1, dim, dim, blk, st)
             .expect("act_quant x");
         let xp = xq.ptr().cast::<f32>();
-        launch_v4_gemv_fp8(
+        launch_gemv_fp8_grouped(
             xp,
             w[0].0.ptr(),
             sc(0),
@@ -2023,7 +2023,7 @@ fn gpu_shared_expert(
             st,
         )
         .expect("w1");
-        launch_v4_gemv_fp8(
+        launch_gemv_fp8_grouped(
             xp,
             w[2].0.ptr(),
             sc(2),
@@ -2038,7 +2038,7 @@ fn gpu_shared_expert(
         .expect("w3");
         // IN PLACE into `g`: `h` becomes `w2`'s input, which is one fewer allocation and is
         // how `gpu.rs` already drives GLM's `swiglu`. Safe by the kernel's own note.
-        launch_v4_swiglu_clamped(
+        launch_swiglu_clamped_bf16(
             g.ptr().cast(),
             u.ptr().cast(),
             inter,
@@ -2047,9 +2047,9 @@ fn gpu_shared_expert(
             st,
         )
         .expect("clamped swiglu");
-        launch_v4_act_quant(g.ptr().cast(), g.ptr_mut().cast(), 1, inter, inter, blk, st)
+        launch_act_quant_f8_prefix(g.ptr().cast(), g.ptr_mut().cast(), 1, inter, inter, blk, st)
             .expect("act_quant h");
-        launch_v4_gemv_fp8(
+        launch_gemv_fp8_grouped(
             g.ptr().cast(),
             w[1].0.ptr(),
             sc(1),
@@ -2279,7 +2279,7 @@ fn the_shared_expert_gate_clamp_matches_and_the_asymmetry_is_below_resolution() 
     );
 }
 
-/// `v4_swiglu_clamped` elementwise against a host transliteration, BIT FOR BIT.
+/// `swiglu_clamped_bf16` elementwise against a host transliteration, BIT FOR BIT.
 ///
 /// Bitwise is legitimate here and nowhere else in this file: the kernel is one thread per
 /// element with no reduction, so there is no summation order to diverge from and none of
@@ -2334,7 +2334,7 @@ fn the_clamped_combine_is_bit_exact_elementwise() {
     let stream = HipStream::new().expect("hip stream");
     // SAFETY: three live `n`-element f32 buffers, outliving the sync in `sync_f32`.
     unsafe {
-        launch_v4_swiglu_clamped(
+        launch_swiglu_clamped_bf16(
             gb.ptr().cast(),
             ub.ptr().cast(),
             n,
@@ -2343,7 +2343,7 @@ fn the_clamped_combine_is_bit_exact_elementwise() {
             stream.raw(),
         )
     }
-    .expect("v4_swiglu_clamped");
+    .expect("swiglu_clamped_bf16");
     let got = sync_f32(&hb);
     // **THE ASYMMETRY GATE's anti-vacuity arm, and it is HOST vs HOST.** The same probes under
     // a SYMMETRIC gate clamp — the plausible wrong version, and the one
@@ -2424,7 +2424,7 @@ fn the_clamped_combine_is_bit_exact_elementwise() {
 /// 1006 is deliberately the same one `moe.hip`'s fp4 launcher returns for the same check on
 /// the same argument, and that launcher had the identical hole.
 #[test]
-fn v4_swiglu_clamped_guards() {
+fn swiglu_clamped_bf16_guards() {
     let mut b = zeros(64);
     let (p, pm) = (b.ptr().cast::<f32>(), b.ptr_mut().cast::<f32>());
     let nul = std::ptr::null_mut();
@@ -2436,22 +2436,22 @@ fn v4_swiglu_clamped_guards() {
             (
                 1001,
                 "zero elements",
-                launch_v4_swiglu_clamped(p, p, 0, 10.0, pm, nul).map_err(|e| e.to_string()),
+                launch_swiglu_clamped_bf16(p, p, 0, 10.0, pm, nul).map_err(|e| e.to_string()),
             ),
             (
                 1006,
                 "an unclamped limit",
-                launch_v4_swiglu_clamped(p, p, 16, 0.0, pm, nul).map_err(|e| e.to_string()),
+                launch_swiglu_clamped_bf16(p, p, 16, 0.0, pm, nul).map_err(|e| e.to_string()),
             ),
             (
                 1006,
                 "a negative limit",
-                launch_v4_swiglu_clamped(p, p, 16, -1.0, pm, nul).map_err(|e| e.to_string()),
+                launch_swiglu_clamped_bf16(p, p, 16, -1.0, pm, nul).map_err(|e| e.to_string()),
             ),
             (
                 1006,
                 "a NaN limit",
-                launch_v4_swiglu_clamped(p, p, 16, f32::NAN, pm, nul).map_err(|e| e.to_string()),
+                launch_swiglu_clamped_bf16(p, p, 16, f32::NAN, pm, nul).map_err(|e| e.to_string()),
             ),
             // +inf is the case a `!(limit > 0.0f)` guard ADMITS, and it disables the clamp
             // exactly as thoroughly as `limit = 0` would: `fminf(gt, inf)` is `gt`. It sits
@@ -2461,7 +2461,7 @@ fn v4_swiglu_clamped_guards() {
             (
                 1006,
                 "an infinite limit",
-                launch_v4_swiglu_clamped(p, p, 16, f32::INFINITY, pm, nul)
+                launch_swiglu_clamped_bf16(p, p, 16, f32::INFINITY, pm, nul)
                     .map_err(|e| e.to_string()),
             ),
         ]

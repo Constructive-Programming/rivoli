@@ -10,8 +10,8 @@
 //! `tests/v4_compress_kernel.rs`.
 //!
 //! The indexer's device half landed 2026-08-05 and is `kernels/v4indexer.hip`:
-//! `v4_indexer_spread` (the Hadamard + fp4 finish, which is also [`Geom::indexer`]'s) and
-//! `v4_indexer_score` (the `einsum`/relu/weight/sum chain), scored by
+//! `act_quant_f4_rotated` (the Hadamard + fp4 finish, which is also [`Geom::indexer`]'s) and
+//! `index_score_blocks` (the `einsum`/relu/weight/sum chain), scored by
 //! `tests/v4_indexer_kernel.rs` — the spread against the oracle, the score against a host
 //! transliteration of `model.py`, because the oracle's own head-sum is a confirmed defect as
 //! of 2026-08-05. Read that file's header before treating a green run as a verdict. **The selection is not there** — the causal mask and the
@@ -546,7 +546,7 @@ pub struct Geom {
     quant: Quantize,
 }
 
-// The `repr(C)` mirror, pinned at compile time. `v4c_guard` already catches a REORDER of
+// The `repr(C)` mirror, pinned at compile time. `compress_guard` already catches a REORDER of
 // the six `int`s at run time — swap `ratio`/`coff` or `cd`/`ents` and guard 1003 fires,
 // swap `d`/`rd` and 1002 does — which a size check cannot do, since a reorder is
 // size-invariant. What the guard cannot catch is a field being ADDED, REMOVED, or changed
@@ -588,7 +588,7 @@ impl Geom {
     /// geometries on the SAME layer, and taking one for the other still "works".
     ///
     /// Only the ratio is validated here, by the `LayerKind` that carries it. `d`,
-    /// `rope_head_dim` and `norm_eps` are taken on trust and checked by `v4c_guard` at the
+    /// `rope_head_dim` and `norm_eps` are taken on trust and checked by `compress_guard` at the
     /// launch (1002 for `rd > d` or odd `rd`, 1001 for a zero). That split is deliberate
     /// rather than an omission: those three come from the config, so a bad one is a bad
     /// checkpoint and belongs at the wall where every launcher sees it — but it does mean a
@@ -766,8 +766,8 @@ pub use device::{Buffers, compress};
 mod device {
     use super::{Finish, Geom, LayerKind, Quantize, should_compress};
     use crate::backend::hip::{
-        launch_v4_act_quant, launch_v4_compress_pool_decode, launch_v4_compress_prefill,
-        launch_v4_compress_state, launch_v4_dense_gemm_bf16, launch_v4_indexer_spread,
+        launch_act_quant_f4_rotated, launch_act_quant_f8_prefix, launch_gemm_bf16,
+        launch_kv_compress_decode, launch_kv_compress_deposit, launch_kv_compress_prefill,
     };
     use anyhow::{Result, ensure};
     use std::ffi::c_void;
@@ -819,7 +819,7 @@ mod device {
     ///
     /// This function used to run on the null stream, handing `null` to the four compress
     /// launchers that already took one, and this doc argued the fifth step
-    /// ([`launch_v4_act_quant`]) should not gain a stream because that would leave it on a
+    /// ([`launch_act_quant_f8_prefix`]) should not gain a stream because that would leave it on a
     /// different stream from the four before it. Both halves of that have gone:
     ///
     /// - The premise it rested on — "with the `.f4` streaming pool that would give them
@@ -864,7 +864,7 @@ mod device {
     ///
     /// **A device copy after ONE call — never a second call.** [`Finish`] carries a single
     /// `out`, so "write both destinations" reads like two invocations; it is not. Every
-    /// path here runs [`launch_v4_compress_state`] before the emit decision, and that is a
+    /// path here runs [`launch_kv_compress_deposit`] before the emit decision, and that is a
     /// read-modify-write of `kv_state`/`score_state` (the decode path also slides the
     /// window). A second call re-deposits the same rows into the pooling state and slides
     /// again — finite, plausible, wrong, and it corrupts exactly the state S3 requirement 3
@@ -927,9 +927,9 @@ mod device {
         let slot0 = start_pos % ratio;
         // SAFETY: caller's contract on `b`; both GEMMs write scratch checked above.
         unsafe {
-            launch_v4_dense_gemm_bf16(b.x, b.wkv, b.kv, seqlen, g.cd(), b.dim, stream)?;
-            launch_v4_dense_gemm_bf16(b.x, b.wgate, b.score, seqlen, g.cd(), b.dim, stream)?;
-            launch_v4_compress_state(
+            launch_gemm_bf16(b.x, b.wkv, b.kv, seqlen, g.cd(), b.dim, stream)?;
+            launch_gemm_bf16(b.x, b.wgate, b.score, seqlen, g.cd(), b.dim, stream)?;
+            launch_kv_compress_deposit(
                 b.kv,
                 b.score,
                 b.ape,
@@ -951,13 +951,13 @@ mod device {
             let nblk = seqlen / ratio;
             // SAFETY: as above; `b.fin.out` is `nblk · d` by its field contract.
             unsafe {
-                launch_v4_compress_prefill(b.kv, b.score, b.ape, &b.fin, g.abi(), nblk, stream)?;
+                launch_kv_compress_prefill(b.kv, b.score, b.ape, &b.fin, g.abi(), nblk, stream)?;
             }
             nblk
         } else {
             // SAFETY: as above; `b.fin.out` is one row of `d` by its field contract.
             unsafe {
-                launch_v4_compress_pool_decode(
+                launch_kv_compress_decode(
                     b.kv_state,
                     b.score_state,
                     &b.fin,
@@ -986,7 +986,15 @@ mod device {
                 // would be the third (see `kernels/v4compress.hip`'s header).
                 // SAFETY: `b.fin.out` is `emitted · d` writable f32 by the field's contract.
                 Quantize::PartialFp8 => unsafe {
-                    launch_v4_act_quant(b.fin.out, b.fin.out, emitted, d, d - rd, 64, stream)?
+                    launch_act_quant_f8_prefix(
+                        b.fin.out,
+                        b.fin.out,
+                        emitted,
+                        d,
+                        d - rd,
+                        64,
+                        stream,
+                    )?
                 },
                 // model.py:374-376 `rotate_activation(kv)` then `fp4_act_quant(kv, 32, True)`
                 // — the WHOLE row, `rd` included. Note what this does NOT do: it takes no
@@ -995,7 +1003,7 @@ mod device {
                 // direction.
                 // SAFETY: as above; the spread reads and writes `emitted · d` in place.
                 Quantize::HadamardFp4 => unsafe {
-                    launch_v4_indexer_spread(b.fin.out, emitted, d, stream)?
+                    launch_act_quant_f4_rotated(b.fin.out, emitted, d, stream)?
                 },
             }
         }

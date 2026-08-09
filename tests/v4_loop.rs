@@ -228,7 +228,7 @@
 //! Two things that derivation is NOT. It is calibrated through the HOST TRANSCRIPTION, not through
 //! `check` — so it inherits the transcription's fidelity, and the probe says plainly that it
 //! models `src/attn.rs` rather than the kernels. And the envelope depends on today's
-//! `attn_norm_out` deviation; if `hc_pre` or `v4_rmsnorm` changes, re-run §8 rather than trusting
+//! `attn_norm_out` deviation; if `hc_pre` or `rmsnorm_batch` changes, re-run §8 rather than trusting
 //! these four numbers.
 //!
 //! ## What was RED, and what replaced it — 2026-08-07

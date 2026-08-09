@@ -31,8 +31,8 @@ use crate::backend::{
     launch_gemv_fp8, launch_gemv_i8, launch_index_append, launch_index_head_route,
     launch_index_pool_push, launch_index_score, launch_index_topk, launch_layernorm,
     launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_expert_range,
-    launch_moe_expert_range_i4, launch_rmsnorm, launch_rope, launch_swiglu, launch_vadd,
-    stream_signal,
+    launch_moe_expert_range_i4, launch_rmsnorm_single, launch_rope_interleave, launch_swiglu,
+    launch_vadd, stream_signal,
 };
 use crate::fetch::asyncfetch::Ticket;
 use crate::math::{E4M3_BLOCK, route_into, topk_into};
@@ -215,7 +215,7 @@ unsafe fn rmsnorm_rows(
     for r in 0..nrow {
         // SAFETY: forwarded from this function's own contract; r < nrow, so both
         // `.add(r * hidden)` land inside the caller's allocations.
-        unsafe { launch_rmsnorm(x.add(r * hidden), w, hidden, eps, xn.add(r * hidden))? };
+        unsafe { launch_rmsnorm_single(x.add(r * hidden), w, hidden, eps, xn.add(r * hidden))? };
     }
     Ok(())
 }
@@ -1344,7 +1344,7 @@ impl<'a> GpuEngine<'a> {
                     kp,
                 )?;
                 launch_layernorm(kp, ip.k_norm_w, ip.k_norm_b, hd, K_NORM_EPS, kp)?;
-                launch_rope(kp, 1, rope, rope, pos, theta)?;
+                launch_rope_interleave(kp, 1, rope, rope, pos, theta)?;
                 launch_index_append(kp, kcp, pos, hd)?;
                 if active_heads.is_some() {
                     launch_index_pool_push(kp as *const f32, poolp, pos, hd)?;
@@ -1379,7 +1379,7 @@ impl<'a> GpuEngine<'a> {
                     1,
                     iqp,
                 )?;
-                launch_rope(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
+                launch_rope_interleave(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
                 // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
                 launch_gemv_f32(
                     xnp,
@@ -1783,8 +1783,8 @@ impl<'a> GpuEngine<'a> {
                         // swapped one at 0.0% over 63 drafts. A 0% arm is what makes 53.5%
                         // readable as "the head works", not "the metric is loose".
                         launch_embed_i8_row(emb.packed, emb.scale, t as usize, cfg.hidden, cr)?;
-                        launch_rmsnorm(cr, m.enorm, cfg.hidden, eps, cr)?; // in-place
-                        launch_rmsnorm(
+                        launch_rmsnorm_single(cr, m.enorm, cfg.hidden, eps, cr)?; // in-place
+                        launch_rmsnorm_single(
                             hp.add(r * cfg.hidden),
                             m.hnorm,
                             cfg.hidden,
@@ -1959,7 +1959,13 @@ impl<'a> GpuEngine<'a> {
                 // offset 0); `post_ln`/`gate_w` are resident weights of THIS layer;
                 // pred_xn/pred_gl are hidden / n_experts f32 device scratch.
                 unsafe {
-                    launch_rmsnorm(xp, post_ln, hidden, eps, self.pred_xn.ptr_mut() as *mut f32)?;
+                    launch_rmsnorm_single(
+                        xp,
+                        post_ln,
+                        hidden,
+                        eps,
+                        self.pred_xn.ptr_mut() as *mut f32,
+                    )?;
                     launch_gemv_f32(
                         self.pred_xn.ptr() as *const f32,
                         gate_w,
@@ -1998,7 +2004,7 @@ impl<'a> GpuEngine<'a> {
                 )?;
                 for r in 0..nrow {
                     let p = qrp.add(r * cfg.q_lora_rank);
-                    launch_rmsnorm(p, q_a_ln, cfg.q_lora_rank, eps, p)?; // in-place
+                    launch_rmsnorm_single(p, q_a_ln, cfg.q_lora_rank, eps, p)?; // in-place
                 }
                 launch_gemv_fp8(
                     qrp, q_b.packed, q_b.scale, q_b.o_dim, q_b.i_dim, q_b.block, nrow, qp,
@@ -2017,9 +2023,9 @@ impl<'a> GpuEngine<'a> {
                     // `comp`'s row stride is kvl+rope but the norm covers only the first
                     // kvl, so this cannot ride a single-stride batched rmsnorm.
                     let c = compp.add(r * (kvl + rope));
-                    launch_rmsnorm(c, kv_a_ln, kvl, eps, c)?; // normalize latent (first kvl)
-                    launch_rope(c.add(kvl), 1, rope, rope, pos + r, theta)?; // rope the key
-                    launch_rope(qp.add(r * h * qh + nope), h, qh, rope, pos + r, theta)?;
+                    launch_rmsnorm_single(c, kv_a_ln, kvl, eps, c)?; // normalize latent (first kvl)
+                    launch_rope_interleave(c.add(kvl), 1, rope, rope, pos + r, theta)?; // rope the key
+                    launch_rope_interleave(qp.add(r * h * qh + nope), h, qh, rope, pos + r, theta)?;
                     launch_append_kv(c, c.add(kvl), lc8p, lscalep, rcp, pos + r, kvl, rope, nb)?;
                 }
                 launch_mla_absorb_fp8(

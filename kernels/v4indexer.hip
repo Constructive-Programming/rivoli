@@ -9,7 +9,7 @@
 // compressor's pooled rows (:374-376) — and the oracle factors them into one helper
 // (`indexer_spread`) with the argument that "the Hadamard spread exists to make the fp4
 // grouping well-conditioned, so applying one without the other is a different algorithm,
-// not a partial one". `v4_indexer_spread` is that helper. `v4compress.rs::compress`
+// not a partial one". `act_quant_f4_rotated` is that helper. `v4compress.rs::compress`
 // launches it as the compressor's finish when `Geom::indexer` built the geometry, and
 // `Geom::attention` cannot reach it.
 //
@@ -25,7 +25,7 @@
 //     set-invariant at `index_topk = 512` (the recorded "hole S3 inherits"), so a set
 //     comparison accepts an arbitrarily wrong ranking while a score comparison cannot.
 //   * `wq_b` and `weights_proj`. Both are ordinary projections already in the tree —
-//     `v4_gemv_fp8` (wq_b ships fp8 + scale) and `v4_dense_gemm_bf16` (weights_proj is
+//     `gemv_fp8_grouped` (wq_b ships fp8 + scale) and `gemm_bf16` (weights_proj is
 //     bare bf16). A third GEMV here would be a third summation order to reconcile.
 //
 // DUPLICATION. `kernels/` is not watched by `build.rs`'s jscpd gate, so nothing mechanical
@@ -35,7 +35,7 @@
 
 #include "common.hpp"
 
-// The widest row `v4_indexer_spread` will rotate. `index_head_dim` is 128 in the shipped
+// The widest row `act_quant_f4_rotated` will rotate. `index_head_dim` is 128 in the shipped
 // config; 256 leaves headroom without making the LDS request interesting (256 floats = 1 KB
 // per block). Guard 1002 refuses anything larger rather than overrunning the tile.
 #define V4I_D_MAX 256
@@ -67,7 +67,7 @@
 // stage is the whole synchronization" is true only given that — this helper barriers at the
 // END of each stage, so the FIRST stage's reads are unsynchronized against whatever filled
 // the tile. The one caller satisfies it; a second one must too.
-__device__ __forceinline__ void v4i_hadamard(float* sh, int d) {
+__device__ __forceinline__ void hadamard_lds(float* sh, int d) {
     for (int h = 1; h < d; h <<= 1) {
         for (int t = (int)threadIdx.x; t < (d >> 1); t += (int)blockDim.x) {
             // `t` enumerates butterflies; `off` is the position within a half-block and
@@ -94,13 +94,13 @@ __device__ __forceinline__ void v4i_hadamard(float* sh, int d) {
 // bf16 tensor, so both stores are the reference's own dtype and not an approximation of it.
 //
 // The row is staged through LDS because the Hadamard reads every element `log2(d)` times.
-extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
+extern "C" __global__ void act_quant_f4_rotated(float* __restrict__ x, int d) {
     __shared__ float sh[V4I_D_MAX];
     float* row = x + (size_t)blockIdx.x * d;
     for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) sh[i] = row[i];
     __syncthreads();
 
-    v4i_hadamard(sh, d);
+    hadamard_lds(sh, d);
 
     // `scale = x.size(-1) ** -0.5`, applied after the butterfly exactly as the oracle does.
     // `1.0f / sqrtf(d)`, NOT `rsqrtf`: the fast reciprocal square root is a 1-ulp
@@ -114,7 +114,7 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
 
     // `fp4_act_quant(row, 32, inplace=True)`. One thread owns a whole block of 32, so the
     // amax scan and the write-back are serial over it and in the oracle's own order — the
-    // same mapping and the same argument as `mla.hip::v4_act_quant`. Parallelising inside a
+    // same mapping and the same argument as `mla.hip::act_quant_f8_prefix`. Parallelising inside a
     // block would re-associate an absmax that is exact today and buy nothing: the op moves
     // 512 bytes per row.
     int nb = d / FP4_QUANT_BLOCK;
@@ -122,7 +122,7 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
         float* seg = sh + b * FP4_QUANT_BLOCK;
         // Seeded with the floor rather than folded from 0 and floored after. Identical for
         // `fmaxf`, which is associative here and returns the non-NaN operand either way, and
-        // it is the idiom `v4_act_quant` already uses for the fp8 floor.
+        // it is the idiom `act_quant_f8_prefix` already uses for the fp8 floor.
         float amax = FP4_QUANT_AMAX_FLOOR;
         for (int i = 0; i < FP4_QUANT_BLOCK; ++i) amax = fmaxf(amax, fabsf(seg[i]));
         float s = fast_round_scale(amax, FP4_MAX_INV);
@@ -147,7 +147,7 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
 //     2026-08-05 — that was the defect below, not the reason.)
 //
 // Every other kernel in this port re-associates something and pays for it in tolerance
-// (`v4c_block_sum` and `wave_sum` both say so at their definitions). This one does not need
+// (`common.hpp::block_sum_lds` and `wave_sum` both say so at their definitions). This one does not need
 // to: at the shapes the model runs, `s * n_comp` threads each doing `h * hd` MACs is
 // 512 threads x 8192 MACs at a 2048-token decode, which is small work in an awkward shape
 // rather than a lot of work. If it ever becomes the bottleneck, the lever is a wave per
@@ -203,12 +203,12 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
 //
 // VERIFIED IN THE ISA on 2026-08-05, and run RED FIRST so the check was seen to move. At
 // `--offload-arch=gfx1151 -O3 --cuda-device-only -S`, counting only FLOAT fma-class
-// instructions between `v4_indexer_score:` and its `.Lfunc_end`:
+// instructions between `index_score_blocks:` and its `.Lfunc_end`:
 //
 //     pragma removed:  1 x v_fmac_f32_e32      <- the inner dot's multiply-add, fused
 //     pragma restored: 0                        <- no float fusion anywhere in the kernel
 //
-// and `v4_indexer_spread` is unchanged at 0 either way, which is the measured form of this
+// and `act_quant_f4_rotated` is unchanged at 0 either way, which is the measured form of this
 // note's claim that widening the pragma would suppress nothing there.
 //
 // COUNT FLOAT OPS ONLY. A naive `v_fma|v_mac|v_mad` grep reports 10 against 9 here, because
@@ -216,15 +216,15 @@ extern "C" __global__ void v4_indexer_spread(float* __restrict__ x, int d) {
 // arithmetic that the pragma neither does nor should touch. Those 9 swamp the one signal
 // that matters and would have made a real regression look like noise.
 //
-// Scoped to the scoring kernel: `v4_indexer_spread` above has no multiply-add to fuse (the
+// Scoped to the scoring kernel: `act_quant_f4_rotated` above has no multiply-add to fuse (the
 // Hadamard is pure adds and subtracts, and the fp4 scale is a single multiply), so widening
 // the pragma would suppress nothing and would suggest it had.
 #pragma clang fp contract(off)
-extern "C" __global__ void v4_indexer_score(const float* __restrict__ q,
-                                            const float* __restrict__ kv,
-                                            const float* __restrict__ w,
-                                            float* __restrict__ score, int s, int n_comp,
-                                            int heads, int hd) {
+extern "C" __global__ void index_score_blocks(const float* __restrict__ q,
+                                              const float* __restrict__ kv,
+                                              const float* __restrict__ w,
+                                              float* __restrict__ score, int s, int n_comp,
+                                              int heads, int hd) {
     size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     // `size_t`, matching the launcher's `(size_t)s * n_comp`. In `int` the product overflows
     // at ~2.1M entries — reachable at a long prefill, where `s` and `n_comp` both grow — and
@@ -255,7 +255,7 @@ extern "C" __global__ void v4_indexer_score(const float* __restrict__ q,
 // Return codes follow the tree's convention: 0 ok, POSITIVE argument guard, NEGATIVE
 // -hipError. All pointers device-resident; launch-only, nothing synchronizes.
 
-extern "C" int rivoli_v4_indexer_spread(float* x, int rows, int d, void* stream) {
+extern "C" int rivoli_act_quant_f4_rotated(float* x, int rows, int d, void* stream) {
     if (rows <= 0 || d <= 0) return 1001;
     // Three real limits, each able to fire, each exercised by
     // `the_spread_launcher_refuses_widths_the_hadamard_cannot_transform`. `V4I_D_MAX` bounds
@@ -270,15 +270,15 @@ extern "C" int rivoli_v4_indexer_spread(float* x, int rows, int d, void* stream)
     hipGetLastError();
     // One block per row; `d/2` butterflies at the widest stage, so 128 threads saturates
     // every stage at `d = 256` and wastes nothing at 128.
-    hipLaunchKernelGGL(v4_indexer_spread, dim3((unsigned)rows), dim3(128), 0,
+    hipLaunchKernelGGL(act_quant_f4_rotated, dim3((unsigned)rows), dim3(128), 0,
                        (hipStream_t)stream, x, d);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_indexer_score(const float* q, const float* kv, const float* w,
-                                       float* score, int s, int n_comp, int heads, int hd,
-                                       void* stream) {
+extern "C" int rivoli_index_score_blocks(const float* q, const float* kv, const float* w,
+                                         float* score, int s, int n_comp, int heads, int hd,
+                                         void* stream) {
     if (s <= 0 || heads <= 0 || hd <= 0) return 1001;
     // NOT a no-op success. `n_comp == 0` is `end_pos / ratio` before the first block
     // completes — a real state the reference reaches — but there the reference produces an
@@ -288,7 +288,7 @@ extern "C" int rivoli_v4_indexer_score(const float* q, const float* kv, const fl
     if (n_comp <= 0) return 1005;
     size_t total = (size_t)s * (size_t)n_comp;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_indexer_score, dim3((unsigned)((total + 255) / 256)), dim3(256), 0,
+    hipLaunchKernelGGL(index_score_blocks, dim3((unsigned)((total + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, q, kv, w, score, s, n_comp, heads, hd);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;

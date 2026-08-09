@@ -259,8 +259,18 @@ extern "C" __global__ void swiglu(
     h[i] = (gv / (1.0f + expf(-gv))) * u[i];
 }
 
-// DeepSeek-V4's `Expert.forward` combine for the resident fp8 SHARED expert:
+// `Expert.forward`'s combine for a resident fp8 SHARED expert:
 // h[i] = bf16( silu(min(bf16(g[i]), L)) · clamp(bf16(u[i]), ±L) ).
+//
+// USED BY: DeepSeek-V4-Flash-0731 only. GLM-5.2 uses `swiglu` directly above and has no
+// `swiglu_limit`.
+//
+// **THE `_bf16` SUFFIX IS LOAD-BEARING AND THE `_clamped` HALF IS NOT ENOUGH.** Renamed from
+// `v4_swiglu_clamped` on 2026-08-09 — the model name was wrong (this is an arithmetic
+// contract, not a vendor's kernel) but it was doing one useful job by accident: it stopped
+// the name reading as "`swiglu`, with a clamp". It is not that, and a reader who believes it
+// is will reach for the wrong one. Hence `_bf16`, which names the difference that survives
+// when `L` is taken away.
 //
 // Sits here, directly under `swiglu`, so that the two are readable side by side — because
 // the interesting fact about them is that they are NOT the same function with a parameter,
@@ -279,10 +289,13 @@ extern "C" __global__ void swiglu(
 //     this line dropped the conditional and read as though the difference were routine;
 //   * this bf16-rounds the RESULT, which is the reference's `x.to(dtype)` before `w2`.
 //
-// So adding an `L` parameter to `swiglu` and passing something meaning "unclamped" from
-// GLM's four call sites could not have produced this kernel — it would have produced GLM's
-// arithmetic under a V4 name, which is the silent-wrong this whole port is built to avoid.
-// GLM has no `swiglu_limit` and never should: `rivoli_v4_swiglu_clamped` refuses
+// **So adding an `L` parameter to `swiglu` is the specific refactor that must never happen.**
+// Passing something meaning "unclamped" from GLM's four call sites could not have produced
+// this kernel — it would have produced GLM's arithmetic under this kernel's name, which is
+// the silent-wrong this whole port is built to avoid. That is a live hazard rather than a
+// historical one: the two now differ by a suffix rather than by a vendor prefix, so the
+// merge looks more reasonable than it did, not less.
+// GLM has no `swiglu_limit` and never should: `rivoli_swiglu_clamped_bf16` refuses
 // `L <= 0` (and NaN) exactly as `moe.hip`'s fp4 launcher does, so "unclamped" is not
 // spellable THROUGH THIS ENTRY POINT. Note what that does and does not buy as of
 // 2026-08-05: V4's shared expert has no caller yet, so nothing is currently prevented from
@@ -305,9 +318,9 @@ extern "C" __global__ void swiglu(
 // observe the overwrite. `gpu.rs` already launches `swiglu` this way (`h == g`), which is
 // what the shared expert wants too — `g`'s buffer becomes `h` and then `w2`'s input, one
 // fewer scratch allocation per layer.
-extern "C" __global__ void v4_swiglu_clamped(
-    const float* __restrict__ g, const float* __restrict__ u, int n, float limit,
-    float* __restrict__ h) {
+extern "C" __global__ void swiglu_clamped_bf16(
+                                               const float* __restrict__ g, const float* __restrict__ u, int n, float limit,
+                                               float* __restrict__ h) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     h[i] = rbf16(swiglu_clamped(g[i], u[i], limit));
@@ -315,9 +328,25 @@ extern "C" __global__ void v4_swiglu_clamped(
 
 // y[i] = x[i]·(1/sqrt(mean(x²)+eps))·w[i] — RMSNorm, matching math.rs. One block
 // reduces Σx² in LDS (tree order), then every thread scales.
-extern "C" __global__ void rmsnorm(
-    const float* __restrict__ x, const float* __restrict__ w, int n, float eps,
-    float* __restrict__ y) {
+//
+// USED BY: GLM-5.2 (`gpu.rs`, one launch per row). DeepSeek-V4-Flash uses
+// `mla.hip::rmsnorm_batch`.
+//
+// **`_single` MEANS ONE ROW, AND THAT IS THE WHOLE POINT OF THE NAME.** The grid is
+// `dim3(1)`, so this takes ONE statistic over whatever it is handed. Passing it `s x dim`
+// therefore normalises every token against a single shared mean instead of per row — a real
+// defect, modelled as `v4oracle::Defect::HeadNormOverAllTokens`, and **invisible at decode
+// because `s == 1` there**, which is why it needs a name rather than a comment.
+//
+// Renamed from bare `rmsnorm` on 2026-08-09 for exactly that reason. A name claiming the
+// general operation while silently implementing the single-row case is the same failure as
+// naming a mechanism after a model: it tells the reader something that is not true, and the
+// caller who believes it gets fluent wrong text. `mla.hip::rmsnorm_batch` is the row-wise
+// one; neither name is now the unmarked default, which is deliberate — there is no correct
+// answer to "which rmsnorm did you mean" that a caller should be allowed to skip.
+extern "C" __global__ void rmsnorm_single(
+                                          const float* __restrict__ x, const float* __restrict__ w, int n, float eps,
+                                          float* __restrict__ y) {
     __shared__ float red[256];
     int t = threadIdx.x;
     float local = 0.0f;
@@ -365,9 +394,21 @@ extern "C" __global__ void act_quant_f8(float* __restrict__ v, size_t nblk) {
 // pre-sublayer copies through a learned combination matrix. A plain residual add in place
 // of `hc_post` runs, converges to nothing useful, and never errors.
 //
-// HC_MULT is 4 and is not a knob: `hc_split_sinkhorn`'s `mix_hc = (2 + hc)·hc` layout is
-// how the mHC weights are PACKED on disk, so another value is a different checkpoint. The
-// launchers refuse anything else rather than pretending to generalise.
+// **HC_MULT IS A CHECKPOINT CONSTANT WEARING A GENERIC NAME, AND THAT IS THE INVERSE OF THE
+// HAZARD THE `v4_*` RENAMES OF 2026-08-09 ADDRESSED.** Naming a reusable mechanism after the
+// model that introduced it tells the reader it is narrower than it is; naming a model's own
+// constant generically tells them it is wider. Both put the same wrong idea in the same
+// reader's head, so this one is documented rather than renamed:
+//
+// USED BY: DeepSeek-V4-Flash-0731 only, at the value 4. `hc_split_sinkhorn`'s
+// `mix_hc = (2 + hc)·hc` layout is how the mHC weights are PACKED on disk, so **another
+// value is a different checkpoint, not a tuning knob** — there is no configuration of this
+// engine in which changing it is meaningful. The launchers refuse anything else rather than
+// pretending to generalise.
+//
+// `v4head.hip::hc_head_collapse_gate` takes the same quantity as a runtime `hc` parameter, and
+// that is not an inconsistency to fix in either direction: the collapse genuinely is
+// width-agnostic, and this packing genuinely is not.
 #define HC_MULT 4
 #define HC_MIX ((2 + HC_MULT) * HC_MULT)
 
@@ -690,11 +731,11 @@ extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h, vo
 
 // Takes a STREAM, as `rivoli_swiglu` directly above does since M7. Same reason `rivoli_hc_pre` gives
 // below: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so the null stream does
-// not implicitly order against them, and this runs between two `rivoli_v4_gemv_fp8` launches
+// not implicitly order against them, and this runs between two `rivoli_gemv_fp8_grouped` launches
 // that are now stream-parameterised. A null-stream combine between two stream-ordered GEMVs
 // reads `g`/`u` before they are written — an unordered activation, which is a silent wrong.
-extern "C" int rivoli_v4_swiglu_clamped(const float* g, const float* u, int n, float limit,
-                                        float* h, void* stream) {
+extern "C" int rivoli_swiglu_clamped_bf16(const float* g, const float* u, int n, float limit,
+                                          float* h, void* stream) {
     if (n <= 0) return 1001;
     // 1006, and deliberately the SAME code AND the same expression as `moe.hip`'s fp4
     // launcher, for the same check on the same argument — a reader who learned it there gets
@@ -730,16 +771,16 @@ extern "C" int rivoli_v4_swiglu_clamped(const float* g, const float* u, int n, f
     // happens this launcher is the whole defence.
     if (!(limit > 0.0f && limit < INFINITY)) return 1006;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_swiglu_clamped, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
+    hipLaunchKernelGGL(swiglu_clamped_bf16, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, g, u, n, limit, h);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_rmsnorm(const float* x, const float* w, int n, float eps, float* y) {
+extern "C" int rivoli_rmsnorm_single(const float* x, const float* w, int n, float eps, float* y) {
     if (n <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(rmsnorm, dim3(1), dim3(256), 0, 0, x, w, n, eps, y);
+    hipLaunchKernelGGL(rmsnorm_single, dim3(1), dim3(256), 0, 0, x, w, n, eps, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -772,7 +813,7 @@ extern "C" int rivoli_act_quant_f8(float* v, int n_rows, int row_len, void* stre
 // order is one lane-strided comb + one `wave_sum` ladder, so a second wave cannot share a
 // row without moving bits; more width has to come from splitting the kernel, not the block.
 //
-// Takes a STREAM, unlike `rmsnorm`/`swiglu` above. rivoli's streams are created
+// Takes a STREAM, unlike `rmsnorm_single`/`swiglu` above. rivoli's streams are created
 // `hipStreamNonBlocking` (`async.hip`), so the null stream does NOT implicitly order against
 // them: an mHC result on stream 0 feeding an FP4 expert range on a caller stream would be
 // unordered, and an unordered residual is a silent wrong.
@@ -807,7 +848,7 @@ extern "C" int rivoli_hc_post(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_rope(float* base, int count, int stride, int seg, int pos, double theta) {
+extern "C" int rivoli_rope_interleave(float* base, int count, int stride, int seg, int pos, double theta) {
     if (count <= 0 || seg <= 0 || (seg & 1) || (seg / 2) > 1024) return 1001;
     if (count > 1 && stride < seg) return 1001;
     hipGetLastError();
@@ -856,7 +897,7 @@ extern "C" int rivoli_memcpy_dtod(void* dst, const void* src, size_t bytes) {
 // four KV ring writes, of which one or two run depending on the phase). Once those kernels take a stream, a blocking `hipMemcpy` between two of them
 // does NOT wait on the stream: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so
 // the null stream has no implicit ordering against them. The copy would read `s.qr` before
-// `v4_rmsnorm` wrote it. Found 2026-08-05 while converting that block's six launchers —
+// `rmsnorm_batch` wrote it. Found 2026-08-05 while converting that block's six launchers —
 // converting six of the seven operations would have introduced the very race the earlier
 // decline of the partial fix predicted.
 extern "C" int rivoli_memcpy_dtod_async(void* dst, const void* src, size_t bytes,

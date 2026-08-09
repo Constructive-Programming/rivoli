@@ -124,7 +124,7 @@ __device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
 // The trailing `__syncthreads()` is what makes `red` reusable for a second reduction in the
 // same kernel; the other of the two spellings this was unified from lacked it. No shipped
 // caller reduces twice, so it buys one barrier per row against a landmine for the first
-// caller that does. That barrier is NEW for `v4_rmsnorm` and `v4_qk_norm`, which had the
+// caller that does. That barrier is NEW for `rmsnorm_batch` and `qk_norm`, which had the
 // spelling without it: one extra block barrier per token per norm, on the decode path.
 // UNMEASURED — these kernels are bandwidth-bound so the expectation is that it is free,
 // but that is an expectation, in the same sense as `mla.hip`'s pragma note.
@@ -145,7 +145,7 @@ __device__ __forceinline__ float block_sum_lds(float v, float* red) {
 //
 // ONE definition, because there are two callers and they must agree bit for bit or the
 // comparison the whole port rests on stops meaning anything: `moe.hip::moe_gateup_f4_impl`
-// (the fp4 ROUTED experts) and `linalg.hip::v4_swiglu_clamped` (the fp8 SHARED expert).
+// (the fp4 ROUTED experts) and `linalg.hip::swiglu_clamped_bf16` (the fp8 SHARED expert).
 // `MoE.__init__` passes `swiglu_limit` to `shared_experts` as well as to the routed ones
 // (model.py:632), so the two run the same arithmetic on different weight formats. Hoisted
 // here rather than copied because `build.rs`'s jscpd gate does not scan `kernels/`
@@ -228,7 +228,7 @@ __host__ __device__ __forceinline__ int absorb_nquad(int kvl) { return (kvl + 3)
 // thread owns of `x·lut[w]·scale`, using a uint-per-lane load (4 fp8 → 128B/wave) atop
 // the LUT + a scalar tail. The caller reduces. [CORRECTED 2026-08-08: this said "shared
 // by `dot_fp8_wave` and `gemv_fp8_splitk`" — the splitk kernels moved to
-// `fp8_dot_strided_r` when the `_r` family landed, so `dot_fp8_wave` → `v4_gemv_fp8` is
+// `fp8_dot_strided_r` when the `_r` family landed, so `dot_fp8_wave` → `gemv_fp8_grouped` is
 // the ONLY consumer, which is what scopes the M7 unroll's blast radius below.]
 __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
                                                  const unsigned char* __restrict__ wrow,
@@ -255,7 +255,7 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
     // issued its three vmem loads and then waited them all down (`s_waitcnt vmcnt(0)`
     // before the closing fmac, EVERY iteration), so each wave held exactly one 128-B
     // weight request in flight per GTT round-trip — M6 measured the only kernel built
-    // from this loop (`v4_gemv_fp8`) at 2–2.8× its bytes on all three of its spans while
+    // from this loop (`gemv_fp8_grouped`) at 2–2.8× its bytes on all three of its spans while
     // issue sat at 42 instr/128 B, ~3× lighter than streaming needs. Unroll 8 puts 1 KB
     // of weight stream in flight per wave (read back from the ISA: loads `s_clause`'d,
     // waits counted down from vmcnt(23), ONE vmcnt(0) per 1 KB) at VGPR 86 = 96/wave =
@@ -556,7 +556,11 @@ __device__ __forceinline__ float e2m1f(unsigned int nib) {
 // format's NaN, which is the right DECODE — reading it as `2^128` would be worse — but it
 // does not poison anything downstream: `moe_fixed`'s saturating clamp launders a NaN into a
 // finite ±2^14 (`fminf`/`fmaxf` return the non-NaN operand). So a 0xff scale byte must be
-// REJECTED AT LOAD, in S3, alongside the `tid2eid` range check `moe_gate_v4` names.
+// REJECTED AT LOAD, in S3, alongside the `tid2eid` range check that `parse_tid2eid`
+// performs host-side. (That obligation used to be stated at `moe.hip::moe_gate_v4` too;
+// the device router was DELETED 2026-08-09 — `v4gpu.rs::route_row` carries why — so this
+// is now the only place in `kernels/` that names it, which is the reason to keep it here
+// rather than fold it into the deleted kernel's note.)
 // b == 0 is 2^-127, which is BELOW f32's smallest normal, so `b << 23` would silently hand
 // back +0 — a whole 32-weight group zeroed with no error anywhere.
 //
@@ -741,10 +745,10 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
     // **Load-bearing, and MEASURED IN THE ISA rather than argued — 2026-08-05.** This
     // function had a twin inside `mla.hip`, below that file's own file-scope
     // `#pragma clang fp contract(off)`. S3 requirement 11 deleted the twin and pointed
-    // `v4_act_quant` here; `common.hpp` is included ABOVE that pragma and clang attaches FP
+    // `act_quant_f8_prefix` here; `common.hpp` is included ABOVE that pragma and clang attaches FP
     // options per expression at parse time, so inlining into a `contract(off)` caller does
     // NOT restore the property — the subnormal branch's `scaled - m` (fed by `a * 512.0f`)
-    // began fusing. Counted inside `v4_act_quant` at `--offload-arch=gfx1151 -O3`, and the
+    // began fusing. Counted inside `act_quant_f8_prefix` at `--offload-arch=gfx1151 -O3`, and the
     // delta is **one `v_fma_f32`**: 4 at 78796eb, 5 with this pragma removed, 4 with it
     // (6 / 7 / 6 counting `v_fmac_f32` too). A third tier of 7 / 8 / 7 is
     // reachable by also counting the one `v_div_fmas_f32` — DON'T: that belongs to the f32
@@ -756,7 +760,7 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
     // **Count `v_fma_f32`/`v_fmac_f32`, and compare a DELTA rather than an absolute.** A
     // `v_fma|v_mac|v_mad` grep reads 15 / 16 / 15 here, because eight `v_mad_u64_u32` are
     // ADDRESS arithmetic that contraction neither does nor should touch — enough to make a
-    // one-instruction regression look like noise. Found on `v4_indexer_score`, where the
+    // one-instruction regression look like noise. Found on `index_score_blocks`, where the
     // same pragma moved 1 `v_fmac_f32` to 0 while a naive count read 10 → 9.
     //
     // Values do not move either way: reaching this branch bounds `a` to (2^-10, 2^-6),

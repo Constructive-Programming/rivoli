@@ -121,7 +121,7 @@ pub fn bf16_rows(w: &rivoli::v4oracle::weights::WMat) -> Vec<u16> {
 }
 
 /// `(cos, sin)` pairs flattened to the `[pos][2*i], [pos][2*i+1]` layout every V4 rotary
-/// consumer indexes — `v4c_finish_row` on the device and `Io::freqs` in `attn::v4`.
+/// consumer indexes — `compress_finish_row` on the device and `Io::freqs` in `attn::v4`.
 pub fn flat_freqs(t: &[(f32, f32)]) -> Vec<f32> {
     t.iter().flat_map(|&(c, s)| [c, s]).collect()
 }

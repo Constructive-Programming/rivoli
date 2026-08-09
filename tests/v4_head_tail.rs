@@ -15,12 +15,12 @@
 //! bitwise gate would reject correct code.
 //!
 //! What each half can promise is different, and the tests say which is which:
-//! - `v4_hc_head_blend` sums over `hc_mult` copies SEQUENTIALLY, in the oracle's own ORDER,
+//! - `hc_head_collapse_blend` sums over `hc_mult` copies SEQUENTIALLY, in the oracle's own ORDER,
 //!   so given the same gate vector it is exactly reproducible -- as an FMA reduction, which
 //!   is what hipcc's default `-ffp-contract=fast` makes it. Asserted bitwise against the
 //!   device's own `pre`, and against `mul_add` rather than `+ p * x`; see `kernels/v4head.hip`
 //!   for the measurement.
-//! - `v4_hc_head_gate` reduces 16384 terms with `wave_sum`, so it re-associates and is
+//! - `hc_head_collapse_gate` reduces 16384 terms with `wave_sum`, so it re-associates and is
 //!   compared under a tolerance.
 //!
 //! And one thing this suite CANNOT do, stated so nobody reads its green as more than it is:
@@ -35,8 +35,8 @@
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
-    device_sync, launch_v4_dense_gemm_bf16, launch_v4_embed_bf16_row, launch_v4_hc_head,
-    launch_v4_qk_norm, launch_v4_rmsnorm,
+    device_sync, launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_hc_head_collapse,
+    launch_qk_norm, launch_rmsnorm_batch,
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
@@ -140,7 +140,7 @@ impl Fixture {
         (g("hc_head_out"), g("final_norm_out"), g("logits"))
     }
 
-    /// The same three, on the device: `v4_hc_head` -> `v4_rmsnorm` -> `v4_dense_gemm_bf16`,
+    /// The same three, on the device: `hc_head_collapse` -> `rmsnorm_batch` -> `gemm_bf16`,
     /// plus the gate vector `pre`, which `the_blend_is_bit_exact_given_the_gate` needs in order
     /// to test the blend WITHOUT the gate's re-association already in its input.
     fn device(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -161,7 +161,7 @@ impl Fixture {
         // SAFETY: every buffer above is sized exactly as each launcher's contract requires
         // and outlives the sync below; none aliases another.
         unsafe {
-            launch_v4_hc_head(
+            launch_hc_head_collapse(
                 hb.p(),
                 fnb.p(),
                 bb.p(),
@@ -175,15 +175,15 @@ impl Fixture {
                 self.cfg.hc_eps,
                 stream.raw(),
             )
-            .expect("v4_hc_head");
+            .expect("hc_head_collapse");
         }
         let hc_out = yb.read();
-        // `v4_rmsnorm` is one block per ROW and bf16-rounds on the way out, which is what
-        // `RMSNorm.forward` does. `linalg.hip::rmsnorm` is single-row and would take one
+        // `rmsnorm_batch` is one block per ROW and bf16-rounds on the way out, which is what
+        // `RMSNorm.forward` does. `linalg.hip::rmsnorm_single` is single-row and would take one
         // statistic over every token -- `Defect::HeadNormOverAllTokens`, invisible at s == 1.
         // SAFETY: `yb` is `s * dim` live f32, `nb` is `dim`; both outlive the sync.
         unsafe {
-            launch_v4_rmsnorm(
+            launch_rmsnorm_batch(
                 yb.pm(),
                 nb.p(),
                 self.s,
@@ -191,7 +191,7 @@ impl Fixture {
                 self.cfg.norm_eps,
                 stream.raw(),
             )
-            .expect("v4_rmsnorm");
+            .expect("rmsnorm_batch");
         }
         let norm_out = yb.read();
         // `ParallelHead.forward` slices `x[:, -1]` -- the LAST row only.
@@ -199,7 +199,7 @@ impl Fixture {
         // SAFETY: `last` is the final `dim` f32 of `yb`; `lb` is `vocab * dim` live u16;
         // `lgb` is `vocab` writable f32. m=1 n=vocab k=dim matches the kernel's [m,k]x[n,k].
         unsafe {
-            launch_v4_dense_gemm_bf16(
+            launch_gemm_bf16(
                 last,
                 lb.p() as *const u16,
                 lgb.pm(),
@@ -208,7 +208,7 @@ impl Fixture {
                 dim,
                 stream.raw(),
             )
-            .expect("v4_dense_gemm_bf16");
+            .expect("gemm_bf16");
         }
         (hc_out, norm_out, lgb.read(), preb.read())
     }
@@ -240,7 +240,7 @@ fn the_embedding_gather_is_bit_exact_and_broadcasts_every_copy() {
         // SAFETY: `tb` holds `vocab * hidden` u16 and `token < vocab`; `xb` is `hc * hidden`
         // writable f32. Both outlive the download below.
         unsafe {
-            launch_v4_embed_bf16_row(
+            launch_embed_bf16_row_bcast(
                 tb.p() as *const u16,
                 token,
                 hidden,
@@ -248,7 +248,7 @@ fn the_embedding_gather_is_bit_exact_and_broadcasts_every_copy() {
                 xb.pm(),
                 stream.raw(),
             )
-            .expect("v4_embed_bf16_row");
+            .expect("embed_bf16_row_bcast");
         }
         let got = xb.read();
         let want = o.embed(&w, &[token as u32]);
@@ -305,14 +305,14 @@ fn the_blend_is_bit_exact_given_the_gate() {
     // The two halves of `hc_head` promise DIFFERENT things, and conflating them is how a gate
     // ends up either too loose to catch anything or red against correct code.
     //
-    // `v4_hc_head_blend` sums over `hc_mult` copies SEQUENTIALLY, in the oracle's own order,
+    // `hc_head_collapse_blend` sums over `hc_mult` copies SEQUENTIALLY, in the oracle's own order,
     // so it is exactly reproducible -- and stays so at any `dim`, because `hc_mult` does not
     // grow. That is asserted against the device's OWN `pre`, not the oracle's: feeding the
     // oracle's gate vector would fold the gate's re-association back in and measure the sum
     // of both halves, which is what the first version of this test did while its name
     // promised otherwise.
     //
-    // `v4_hc_head_gate` reduces `hc_mult * dim` with `wave_sum` and cannot be bit-exact; its
+    // `hc_head_collapse_gate` reduces `hc_mult * dim` with `wave_sum` and cannot be bit-exact; its
     // contribution is reported here and bounded, not pinned.
     let f = Fixture::new(4096, 32, 8);
     let (dim, hc) = (f.cfg.dim, f.cfg.hc_mult);
@@ -394,7 +394,7 @@ fn the_blend_is_bit_exact_given_the_gate() {
 
 #[test]
 fn the_lm_head_needs_no_kernel_of_its_own() {
-    // `v4_dense_gemm_bf16` computes `out[m,n] = x[m,k] . w[n,k]` for f32 activations against
+    // `gemm_bf16` computes `out[m,n] = x[m,k] . w[n,k]` for f32 activations against
     // bf16 weights. `ParallelHead.forward` is `F.linear(x.float(), weight)` with `weight`
     // `[vocab, dim]` bf16 on disk -- the same shape at `m = 1, n = vocab, k = dim`. Verified
     // rather than argued, because writing a second GEMV that differed only in extents would
@@ -412,18 +412,18 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
     let (_, _, g_lg, _) = f.device();
     assert_eq!(g_lg.len(), 1024, "one row of logits, whatever s was");
     let r = rel(&g_lg, &w_lg);
-    println!("lm_head via v4_dense_gemm_bf16 at vocab 1024: rel {r:.3e}");
+    println!("lm_head via gemm_bf16 at vocab 1024: rel {r:.3e}");
     assert!(
         r < 1e-3,
         "the existing dense GEMM does not reproduce the lm_head: rel {r:.3e}"
     );
 }
 
-/// `kernels/mla.hip::v4_qk_norm` against `Oracle::qk_norm`.
+/// `kernels/mla.hip::qk_norm` against `Oracle::qk_norm`.
 ///
 /// Here rather than in `tests/v4_attn.rs` because of what it IS rather than where it is
 /// called: it is a per-row bf16-rounded RMS normalisation, the direct sibling of
-/// `v4_rmsnorm` above, and the two differ in exactly the way this file already exists to
+/// `rmsnorm_batch` above, and the two differ in exactly the way this file already exists to
 /// pin — where the statistic is taken and in what precision. `v4_attn.rs` scores the whole
 /// attention block, in which this kernel's contribution is one bf16 step wide.
 ///
@@ -443,7 +443,7 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
 /// grid, and the statistic is per row: a kernel that reduced over the whole buffer, or that
 /// indexed `blockIdx.x` against the wrong stride, is invisible at one row.
 #[test]
-fn v4_qk_norm_matches_the_oracle_bit_for_bit() {
+fn qk_norm_matches_the_oracle_bit_for_bit() {
     let (rows, head_dim) = (6usize, 128usize);
     let cfg = V4Config::toy();
     let mut r = NamedRng::new("v4-qk-norm-device");
@@ -463,7 +463,7 @@ fn v4_qk_norm_matches_the_oracle_bit_for_bit() {
     // SAFETY: `qb` is `rows * head_dim` live f32, written in place, and outlives the sync
     // inside `read`. `stream` is a live HipStream handle.
     unsafe {
-        launch_v4_qk_norm(qb.pm(), rows, head_dim, cfg.norm_eps, stream.raw()).expect("v4_qk_norm");
+        launch_qk_norm(qb.pm(), rows, head_dim, cfg.norm_eps, stream.raw()).expect("qk_norm");
     }
     let got = qb.read();
 
@@ -471,10 +471,10 @@ fn v4_qk_norm_matches_the_oracle_bit_for_bit() {
     // "the kernel matches the oracle" is satisfied by a kernel that writes nothing. The
     // per-row scale spread above is what makes this large.
     let moved = rel(&want, &q);
-    println!("v4_qk_norm: the norm moves the input by rel {moved:.3e}");
+    println!("qk_norm: the norm moves the input by rel {moved:.3e}");
     assert!(
         moved > 0.5,
         "the fixture is already normalised; the comparison is vacuous"
     );
-    assert_bits(&want, &got, "v4_qk_norm");
+    assert_bits(&want, &got, "qk_norm");
 }

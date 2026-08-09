@@ -8,12 +8,12 @@
 //
 //   * `act_quant` — the partial block-64 fp8 quantization of dims [0, d-rd). It is a
 //     SEPARATE call in the reference (`act_quant(kv[..., :-rd], 64, ...)` at model.py:378,
-//     after `apply_rotary_emb`), and S2b already ships it as `mla.hip::v4_act_quant` /
-//     `rivoli_v4_act_quant` with exactly the (row_stride, n, block) signature this needs.
+//     after `apply_rotary_emb`), and S2b already ships it as `mla.hip::act_quant_f8_prefix` /
+//     `rivoli_act_quant_f8_prefix` with exactly the (row_stride, n, block) signature this needs.
 //     `v4compress.rs::compress` launches it. Writing a second one here would be a third
 //     copy of e4m3-RNE in this tree — see the note on `f2e4m3_rne` below.
 //   * The indexer's compressor (`rotate = true`: Hadamard + fp4 instead of partial fp8).
-//     LANDED 2026-08-05 as `kernels/v4indexer.hip::v4_indexer_spread`, which
+//     LANDED 2026-08-05 as `kernels/v4indexer.hip::act_quant_f4_rotated`, which
 //     `v4compress.rs::compress` launches as the finish when `Geom::indexer` built the
 //     geometry. Only the FINISH is there; the pooling below is shared by both compressors.
 //
@@ -47,7 +47,7 @@ struct V4Comp {
     float eps;  // norm_eps
 };
 
-// What `v4c_finish_row` reads and writes. The three travel together because they must AGREE
+// What `compress_finish_row` reads and writes. The three travel together because they must AGREE
 // with each other, and nothing in a flat argument list makes them:
 //
 //   * `freqs` must be the layer's COMPRESSED table — `compress_rope_theta = 160000` with
@@ -70,7 +70,7 @@ struct V4Fin {
 // `Compressor.wkv`/`wgate` are `Linear(..., dtype=torch.float32)` (model.py:302-303), which
 // in `model.py::linear` means NO `act_quant` on the activation and no weight scales: a
 // plain dot in f32 against weights the checkpoint stores in bf16. That is why this is here
-// and not `v4_gemv_fp8` — routing the compressor through the fp8 GEMV would quantize an
+// and not `gemv_fp8_grouped` — routing the compressor through the fp8 GEMV would quantize an
 // activation the reference leaves alone, and the error would look like a pooling bug.
 //
 // bf16 weights on device, not f32: the values are bf16 on disk, so `bf16f` reproduces them
@@ -79,9 +79,9 @@ struct V4Fin {
 //
 // One wave per output element; lanes stride the reduction dim, so the loads are coalesced.
 // `wave_sum`'s fixed shuffle ladder re-associates against the oracle's sequential dot.
-extern "C" __global__ void v4_dense_gemm_bf16(const float* __restrict__ x,
-                                              const unsigned short* __restrict__ w,
-                                              float* __restrict__ out, int m, int n, int k) {
+extern "C" __global__ void gemm_bf16(const float* __restrict__ x,
+                                      const unsigned short* __restrict__ w,
+                                      float* __restrict__ out, int m, int n, int k) {
     int gw = (int)((blockIdx.x * blockDim.x + threadIdx.x) / WAVE);
     int lane = (int)(threadIdx.x % WAVE);
     // `size_t`, matching the launcher's `(size_t)m * n`. In `int` the product overflows at
@@ -115,9 +115,9 @@ extern "C" __global__ void v4_dense_gemm_bf16(const float* __restrict__ x,
 // means the position embedding is ALREADY in the score. Prefill adds it here, since at
 // ratio 4 one source row is shared between two output blocks and pre-adding it into `score`
 // would double-add for one of them; decode adds it once at the state deposit, model.py:349.
-__device__ __forceinline__ void v4c_pool_row(const float* const* kvp, const float* const* scp,
-                                             const float* const* apep, int ents, int d,
-                                             float* __restrict__ outrow) {
+__device__ __forceinline__ void compress_pool_row(const float* const* kvp, const float* const* scp,
+                                         const float* const* apep, int ents, int d,
+                                         float* __restrict__ outrow) {
     for (int e = threadIdx.x; e < d; e += blockDim.x) {
         float mx = -INFINITY;
         for (int j = 0; j < ents; ++j) {
@@ -167,13 +167,13 @@ __device__ __forceinline__ void v4c_pool_row(const float* const* kvp, const floa
 // The RoPE pairing is ADJACENT (`2i`, `2i+1`), not rivoli's half-split — `view_as_complex`
 // on the last axis. S1b flagged this as the port's easiest silent inversion.
 //
-// This is `mla.hip::v4_rope`'s rotation with a different position rule, which is the whole
-// reason it is not a call to it: `v4_rope` derives its position as `pos0 + blockIdx.x /
+// This is `mla.hip::rope_adjacent`'s rotation with a different position rule, which is the whole
+// reason it is not a call to it: `rope_adjacent` derives its position as `pos0 + blockIdx.x /
 // rows_per_pos`, i.e. one position per row going up by ONE. A compressor's rows are blocks,
-// so consecutive output rows are `ratio` positions apart. Calling `v4_rope` per row would
+// so consecutive output rows are `ratio` positions apart. Calling `rope_adjacent` per row would
 // be one launch per compressed block — 512 launches for a 2048-token prefill at ratio 4.
-__device__ __forceinline__ void v4c_finish_row(float* __restrict__ row, V4Fin f, int pos,
-                                               V4Comp p, float* red) {
+__device__ __forceinline__ void compress_finish_row(float* __restrict__ row, V4Fin f, int pos,
+                                           V4Comp p, float* red) {
     for (int e = threadIdx.x; e < p.d; e += blockDim.x) row[e] = rbf16(row[e]);
     __syncthreads();
 
@@ -224,7 +224,7 @@ __device__ __forceinline__ void v4c_finish_row(float* __restrict__ row, V4Fin f,
 //
 // The two loops write disjoint slots: [0, ratio) and [state_off + slot0, ...) with
 // `state_off == ratio` whenever the first loop runs at all. One grid-strided kernel is safe.
-extern "C" __global__ void v4_compress_state(const float* __restrict__ kv,
+extern "C" __global__ void kv_compress_deposit(const float* __restrict__ kv,
                                              const float* __restrict__ score,
                                              const float* __restrict__ ape,
                                              float* __restrict__ kv_state,
@@ -275,7 +275,7 @@ extern "C" __global__ void v4_compress_state(const float* __restrict__ kv,
 // which is `new_tensor[:, :, ratio:] = tensor[..., d:]` and `new_tensor[:, 1:, :ratio] =
 // tensor[:, :-1, ..., :d]` read backwards. At ratio 128 `coff == 1`, `ents == ratio`, and
 // every entry takes the first arm with `half == 0` — the same code, no branch on the ratio.
-extern "C" __global__ void v4_compress_prefill(const float* __restrict__ kv,
+extern "C" __global__ void kv_compress_prefill(const float* __restrict__ kv,
                                                const float* __restrict__ score,
                                                const float* __restrict__ ape, V4Fin f,
                                                V4Comp p) {
@@ -314,11 +314,11 @@ extern "C" __global__ void v4_compress_prefill(const float* __restrict__ kv,
     __syncthreads();
 
     float* row = f.out + (size_t)b * p.d;
-    v4c_pool_row(kvp, scp, apep, p.ents, p.d, row);
+    compress_pool_row(kvp, scp, apep, p.ents, p.d, row);
     __syncthreads();
     // Prefill's first block is block 0 (model.py:370 `freqs_cis[:cutoff:ratio]`), so the
     // rotation position is the block's own first token.
-    v4c_finish_row(row, f, b * p.ratio, p, red);
+    compress_finish_row(row, f, b * p.ratio, p, red);
 }
 
 // Decode pooling: the window is complete, so gather it out of the state and emit one block.
@@ -326,12 +326,12 @@ extern "C" __global__ void v4_compress_prefill(const float* __restrict__ kv,
 // window slide at the end safe against the reads above it.
 //
 // It takes NO `kv`/`score`/`ape`: this step's row was already deposited by
-// `v4_compress_state`, with its `ape` row added there. Launched ONLY when
+// `kv_compress_deposit`, with its `ape` row added there. Launched ONLY when
 // `(start_pos + 1) % ratio == 0` — the caller decides, and does not launch otherwise, which
 // is why there is no `should` flag here. At ratio 128 that is one launch in 128.
-extern "C" __global__ void v4_compress_pool_decode(float* __restrict__ kv_state,
-                                                   float* __restrict__ score_state, V4Fin f,
-                                                   V4Comp p, int start_pos) {
+extern "C" __global__ void kv_compress_decode(float* __restrict__ kv_state,
+                                              float* __restrict__ score_state, V4Fin f,
+                                              V4Comp p, int start_pos) {
     __shared__ const float* kvp[V4C_ENTS_MAX];
     __shared__ const float* scp[V4C_ENTS_MAX];
     __shared__ float red[256];
@@ -348,7 +348,7 @@ extern "C" __global__ void v4_compress_pool_decode(float* __restrict__ kv_state,
     __syncthreads();
 
     // `nullptr` for `ape`: it was added at the state deposit (model.py:349).
-    v4c_pool_row(kvp, scp, nullptr, p.ents, p.d, f.out);
+    compress_pool_row(kvp, scp, nullptr, p.ents, p.d, f.out);
     __syncthreads();
     // model.py:372 `freqs_cis[start_pos + 1 - ratio]`. Since this kernel only runs when
     // `start_pos + 1` is a multiple of `ratio`, that equals `(start_pos / ratio) * ratio` —
@@ -359,7 +359,7 @@ extern "C" __global__ void v4_compress_pool_decode(float* __restrict__ kv_state,
     // where the index is 0 and the position is 0 — they agree — and at the SECOND block
     // (255) they are 1 and 128. A probe that stops at the first block cannot tell them
     // apart, which is why `tests/v4_compress_kernel.rs` steps to the second.
-    v4c_finish_row(f.out, f, (start_pos / p.ratio) * p.ratio, p, red);
+    compress_finish_row(f.out, f, (start_pos / p.ratio) * p.ratio, p, red);
     __syncthreads();
 
     // model.py:357-358 — the window slides: this block's normal half becomes the next
@@ -386,7 +386,7 @@ extern "C" __global__ void v4_compress_pool_decode(float* __restrict__ kv_state,
 // `#[repr(C)]` agrees today, and neither guarantees the other across a compiler bump. A
 // pointer has one representation everywhere, and the deref happens on the host side of the
 // wall where both halves are compiled by the same hipcc.
-static int v4c_guard(V4Comp p) {
+static int compress_guard(V4Comp p) {
     if (p.ratio <= 1 || p.d <= 0 || p.rd <= 0 || p.coff < 1 || p.coff > 2) return 1001;
     if (p.rd > p.d || (p.rd & 1)) return 1002;
     if (p.cd != p.coff * p.d || p.ents != p.coff * p.ratio) return 1003;
@@ -404,24 +404,24 @@ static int v4c_guard(V4Comp p) {
     return 0;
 }
 
-extern "C" int rivoli_v4_dense_gemm_bf16(const float* x, const unsigned short* w, float* out,
-                                         int m, int n, int k, void* stream) {
+extern "C" int rivoli_gemm_bf16(const float* x, const unsigned short* w, float* out,
+                                int m, int n, int k, void* stream) {
     if (m <= 0 || n <= 0 || k <= 0) return 1001;
     hipGetLastError();
     size_t waves = (size_t)m * n;
     size_t threads = waves * WAVE;
-    hipLaunchKernelGGL(v4_dense_gemm_bf16, dim3((unsigned)((threads + 255) / 256)), dim3(256), 0,
+    hipLaunchKernelGGL(gemm_bf16, dim3((unsigned)((threads + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, x, w, out, m, n, k);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_compress_state(const float* kv, const float* score, const float* ape,
-                                        float* kv_state, float* score_state, const V4Comp* pp,
-                                        int s, int slot0, void* stream) {
+extern "C" int rivoli_kv_compress_deposit(const float* kv, const float* score, const float* ape,
+                                          float* kv_state, float* score_state, const V4Comp* pp,
+                                          int s, int slot0, void* stream) {
     if (!pp) return 1000;
     V4Comp p = *pp;
-    int g = v4c_guard(p);
+    int g = compress_guard(p);
     if (g) return g;
     if (s <= 0) return 1005;
     if (slot0 < 0 || slot0 + s % p.ratio > p.ratio) return 1008;
@@ -430,18 +430,18 @@ extern "C" int rivoli_v4_compress_state(const float* kv, const float* score, con
     // single pass.
     int rem = s % p.ratio;
     size_t n = (size_t)(p.ratio > rem ? p.ratio : rem) * p.cd;
-    hipLaunchKernelGGL(v4_compress_state, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
+    hipLaunchKernelGGL(kv_compress_deposit, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, kv, score, ape, kv_state, score_state, p, s, slot0);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_compress_prefill(const float* kv, const float* score, const float* ape,
+extern "C" int rivoli_kv_compress_prefill(const float* kv, const float* score, const float* ape,
                                           const V4Fin* ff, const V4Comp* pp, int nblk,
                                           void* stream) {
     if (!pp || !ff) return 1000;
     V4Comp p = *pp;
-    int g = v4c_guard(p);
+    int g = compress_guard(p);
     if (g) return g;
     // NOT a no-op success: `nblk == 0` means the caller believed a block would be emitted
     // when none can be, and silently launching nothing hands it an unwritten `out`.
@@ -449,18 +449,18 @@ extern "C" int rivoli_v4_compress_prefill(const float* kv, const float* score, c
     // this when it is false.
     if (nblk <= 0) return 1006;
     hipGetLastError();
-    hipLaunchKernelGGL(v4_compress_prefill, dim3((unsigned)nblk), dim3(256), 0,
+    hipLaunchKernelGGL(kv_compress_prefill, dim3((unsigned)nblk), dim3(256), 0,
                        (hipStream_t)stream, kv, score, ape, *ff, p);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_v4_compress_pool_decode(float* kv_state, float* score_state,
-                                              const V4Fin* ff, const V4Comp* pp, int start_pos,
-                                              void* stream) {
+extern "C" int rivoli_kv_compress_decode(float* kv_state, float* score_state,
+                                         const V4Fin* ff, const V4Comp* pp, int start_pos,
+                                         void* stream) {
     if (!pp || !ff) return 1000;
     V4Comp p = *pp;
-    int g = v4c_guard(p);
+    int g = compress_guard(p);
     if (g) return g;
     if (start_pos <= 0) return 1007;  // start_pos == 0 is the prefill path, not this one
     // The caller must only reach here on a position that COMPLETES a block. Refusing rather
@@ -468,10 +468,10 @@ extern "C" int rivoli_v4_compress_pool_decode(float* kv_state, float* score_stat
     // numbers, and the reference would have emitted nothing at all.
     if ((start_pos + 1) % p.ratio != 0) return 1009;
     hipGetLastError();
-    // ONE block, always. `v4_compress_pool_decode` uses `__syncthreads()` to order the pool
+    // ONE block, always. `kv_compress_decode` uses `__syncthreads()` to order the pool
     // against the window slide; with a wider grid that barrier would order nothing and the
     // slide would race the reads.
-    hipLaunchKernelGGL(v4_compress_pool_decode, dim3(1), dim3(256), 0, (hipStream_t)stream,
+    hipLaunchKernelGGL(kv_compress_decode, dim3(1), dim3(256), 0, (hipStream_t)stream,
                        kv_state, score_state, *ff, p, start_pos);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;

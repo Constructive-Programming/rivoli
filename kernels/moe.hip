@@ -321,7 +321,7 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
             // `common.hpp::swiglu_clamped` — bf16 both operands, clamp `up` both sides and
             // `gate` only from above, `x·sigmoid(x)`, return the product UNROUNDED. It was
             // these four statements inline here until 2026-08-05, hoisted when the fp8 SHARED
-            // expert needed the identical arithmetic (`launch_v4_swiglu_clamped`): the two
+            // expert needed the identical arithmetic (`launch_swiglu_clamped_bf16`): the two
             // must agree bit for bit, `kernels/` is not watched by jscpd, and a second copy
             // would drift silently. The hoist was MEASURED bit-neutral, not assumed —
             // `tests/v4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` carries the
@@ -424,7 +424,7 @@ extern "C" int rivoli_moe_expert_range_f4(
     // `!(x > 0)` alone admits +inf, which is the same destination and quieter — `fminf(gt,
     // inf)` returns `gt`, so the clamp simply vanishes and the expert runs
     // `v4oracle::Defect::SwigluUnclamped` with no error anywhere. Found 2026-08-05, after the
-    // one-sided form had been copied into `linalg.hip::rivoli_v4_swiglu_clamped` as a
+    // one-sided form had been copied into `linalg.hip::rivoli_swiglu_clamped_bf16` as a
     // deliberate match; both were fixed together.
     //
     // Rejects NaN (every compare against NaN is false), 0, negative, -inf and +inf. The

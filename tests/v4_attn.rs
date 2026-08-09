@@ -105,8 +105,8 @@ use rivoli::attn::{
 };
 use rivoli::backend::gpustream::{HipStream, Timeline};
 use rivoli::backend::hip::{
-    device_sync, fill_u32, launch_v4_act_quant, launch_v4_gemv_fp8, launch_v4_rope,
-    launch_v4_sparse_attn, memcpy_dtod_async,
+    device_sync, fill_u32, launch_act_quant_f8_prefix, launch_gather_attn_shared_kv,
+    launch_gemv_fp8_grouped, launch_rope_adjacent, memcpy_dtod_async,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3};
 use rivoli::memory::device::DeviceBuf;
@@ -1293,7 +1293,7 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
     let stream = HipStream::new().expect("hip stream");
     // SAFETY: all six buffers outlive the sync below.
     unsafe {
-        launch_v4_sparse_attn(
+        launch_gather_attn_shared_kv(
             q.ptr().cast(),
             kv.ptr().cast(),
             sink.ptr().cast(),
@@ -1307,7 +1307,7 @@ fn sparse_attn_alone_matches_the_oracle_including_the_sink() {
             stream.raw(),
         )
     }
-    .expect("v4_sparse_attn");
+    .expect("gather_attn_shared_kv");
     device_sync().expect("sync");
     println!("{} sparse_attn in isolation", p.tag);
     assert_within("attn_core_out", &read(&o), golden(p, "attn_core_out"));
@@ -1539,17 +1539,17 @@ fn each_in_scope_defect_is_further_away_than_the_kernels_are() {
 ///   so a value already on the e4m3 grid would come back unchanged. Not argued — the poison is
 ///   checked against the HOST `act_quant_inplace` below. That check generalises to the KV
 ///   entry's block-64 quantization even though it is run at 128: for a constant-filled block
-///   `amax` is the same at every block size, and `v4_act_quant` always takes
+///   `amax` is the same at every block size, and `act_quant_f8_prefix` always takes
 ///   `fast_round_scale`, which is what `act_quant_inplace(.., true)` does.
 /// - **`sparse_attn`, and this is the one that nearly escapes.** With `q` and `kv` both
 ///   constant the softmax is uniform, so `o` comes back holding a convex combination of
 ///   `kv`'s single value — i.e. that value. `POISON[5] != POISON[4]` is the only reason it is
 ///   visible. "Writes a buffer it does not read" would NOT have covered it.
-/// - **The two `rmsnorm`s and `qk_norm`.** In place, but a constant row normalises to about
+/// - **The two `rmsnorm_batch`es and `qk_norm`.** In place, but a constant row normalises to about
 ///   the weight (or to 1.0), which is not the constant.
 /// - **The three `rope`s.** Visible at ANY position, and not for the reason that first
 ///   suggests itself: an earlier draft of this said a position-0 row is the identity and
-///   demanded `p.m >= 2`. `kernels/mla.hip::v4_rope` ends with an unconditional
+///   demanded `p.m >= 2`. `kernels/mla.hip::rope_adjacent` ends with an unconditional
 ///   `row[i] = rbf16(row[i])` over the whole row, and every poison pattern here has non-zero
 ///   mantissa bits below bf16's, so even the identity rotation moves it.
 /// - **The five `gemv_fp8`s.** Each writes a buffer it does not read, from a poisoned input.
@@ -1827,7 +1827,7 @@ fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
 ///
 /// Each returns before any launch and before any pointer is read, so one scratch buffer
 /// stands in for all of them. These exist because a guard nobody exercises is a guard
-/// nobody knows is inverted — and `v4_sparse_attn`'s `d` cap in particular is the only
+/// nobody knows is inverted — and `gather_attn_shared_kv`'s `d` cap in particular is the only
 /// thing between a `head_dim` past the per-thread accumulator and output dims that are
 /// silently never written. The model runs 512 against a cap of 1024, so nothing else in
 /// this suite comes near it.
@@ -1850,7 +1850,7 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // the boundary on one line each — which is the claim being made — instead of burying
         // it in the eleventh and twelfth positions of a repeated list.
         let sparse_attn_at = |head_dim, topk| {
-            launch_v4_sparse_attn(
+            launch_gather_attn_shared_kv(
                 p,
                 p,
                 p,
@@ -1879,23 +1879,23 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // A `groups` that does not divide `n_out` would index a slice no input was sized
         // for. This is the guard the three-parameter form could not express at all.
         guard(
-            launch_v4_gemv_fp8(p, b.ptr(), p, 1, 10, 128, 128, 3, pm, std::ptr::null_mut()),
+            launch_gemv_fp8_grouped(p, b.ptr(), p, 1, 10, 128, 128, 3, pm, std::ptr::null_mut()),
             "1004",
             "groups not dividing n_out",
         );
         guard(
-            launch_v4_gemv_fp8(p, b.ptr(), p, 1, 8, 128, 96, 1, pm, std::ptr::null_mut()),
+            launch_gemv_fp8_grouped(p, b.ptr(), p, 1, 8, 128, 96, 1, pm, std::ptr::null_mut()),
             "1003",
             "non-power-of-two block",
         );
         // `view_as_complex` cannot pair an odd count.
         guard(
-            launch_v4_rope(pm, p, 1, 8, 3, 0, 1, false, std::ptr::null_mut()),
+            launch_rope_adjacent(pm, p, 1, 8, 3, 0, 1, false, std::ptr::null_mut()),
             "1005",
             "odd rope_head_dim",
         );
         guard(
-            launch_v4_rope(pm, p, 1, 8, 16, 0, 1, false, std::ptr::null_mut()),
+            launch_rope_adjacent(pm, p, 1, 8, 16, 0, 1, false, std::ptr::null_mut()),
             "1002",
             "rope span over the row",
         );
@@ -1908,7 +1908,7 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // "matches the oracle" and the output says "argument guard rejected". One guard,
         // one assertion.
         guard(
-            launch_v4_act_quant(pm, pm, 1, 64, 60, 64, std::ptr::null_mut()),
+            launch_act_quant_f8_prefix(pm, pm, 1, 64, 60, 64, std::ptr::null_mut()),
             "1004",
             "a ragged quantization span",
         );
@@ -1918,7 +1918,15 @@ fn the_c_abi_argument_guards_reject_out_of_domain_shapes() {
         // distinct-pointer arm needs an offset dst; `wrapping_add` because the guard
         // rejects before any dereference, so the address only has to differ.
         guard(
-            launch_v4_act_quant(p, pm.wrapping_add(64), 1, 128, 64, 64, std::ptr::null_mut()),
+            launch_act_quant_f8_prefix(
+                p,
+                pm.wrapping_add(64),
+                1,
+                128,
+                64,
+                64,
+                std::ptr::null_mut(),
+            ),
             "1002",
             "a partial-width quant-from-source",
         );
@@ -2029,7 +2037,7 @@ fn dims_accept_the_real_artifact_and_reject_a_ragged_kv_span() {
     }
 }
 
-/// `v4_act_quant` against the oracle, on data CHOSEN to reach e4m3's subnormal range and
+/// `act_quant_f8_prefix` against the oracle, on data CHOSEN to reach e4m3's subnormal range and
 /// sit exactly on its rounding ties.
 ///
 /// The model fixture cannot cover this and no amount of it would. `act_quant`'s
@@ -2092,7 +2100,7 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
     // SAFETY: `buf` is one row of BLOCK f32 and outlives the sync below.
     let stream = HipStream::new().expect("hip stream");
     unsafe {
-        launch_v4_act_quant(
+        launch_act_quant_f8_prefix(
             buf.ptr().cast(),
             buf.ptr_mut().cast(),
             1,
@@ -2102,7 +2110,7 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
             stream.raw(),
         )
     }
-    .expect("v4_act_quant");
+    .expect("act_quant_f8_prefix");
     device_sync().expect("sync");
     let got = read(&buf);
     // Bit-exact, not within a tolerance: `act_quant` is comparisons, a power-of-two
@@ -2111,7 +2119,7 @@ fn act_quant_matches_the_oracle_on_the_subnormal_ties_that_pick_the_rounding_rul
         got.iter()
             .zip(&want)
             .all(|(a, b)| a.to_bits() == b.to_bits()),
-        "v4_act_quant disagrees with the oracle on the subnormal ties:\n  got  {:?}\n  want {:?}",
+        "act_quant_f8_prefix disagrees with the oracle on the subnormal ties:\n  got  {:?}\n  want {:?}",
         &got[..16],
         &want[..16]
     );
