@@ -148,10 +148,19 @@ fn main() -> Result<()> {
     // stride padding stays zero from this single zeroed allocation.
     let mut buf = vec![0u8; n * stride];
     for l in from..to {
-        let (path, tmp) = (format!("{art}/L{l:02}.i4"), format!("{art}/L{l:02}.i4.tmp"));
-        // Drop a tmp left by an aborted run BEFORE measuring free space — it is the
-        // space this layer is about to reuse, and counting it would refuse the very
-        // resume the abort message recommends.
+        // The tmp name carries the pid for the reason `format::write_expert_layer` gives at
+        // length: agents share this machine and a convert takes no lock, so two runs into one
+        // artifact dir are reachable. On a FIXED `L{ll}.i4.tmp` both would `File::create` +
+        // truncate + write concurrently, and the rename would publish interleaved bytes —
+        // which, being two writes OF EQUAL LENGTH, yields a file of exactly the right length
+        // and sails through `open_routed`'s length check. This was the last fixed-name
+        // publisher in the tree (found by review 2026-08-10).
+        let path = format!("{art}/L{l:02}.i4");
+        let tmp = format!("{path}.{}.tmp", std::process::id());
+        // Drop a tmp left by an aborted run of THIS pid before measuring free space — it is
+        // the space this layer is about to reuse, and counting it would refuse the very
+        // resume the abort message recommends. Another pid's tmp is not ours to remove, and
+        // is now distinguishable.
         let _ = std::fs::remove_file(&tmp);
         // Peak extra usage is one layer: the tmp exists alongside the file it
         // replaces, and the old blocks free at the rename. Refuse to start a layer

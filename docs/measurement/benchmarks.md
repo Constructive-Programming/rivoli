@@ -343,9 +343,10 @@ which rules out anything deterministic about token 4042 and is the signature of 
 
 **INV-1 is EXONERATED by direct measurement** — but note the instrument is **not in this
 tree**. `--checksum-route` / `--features corruption-probe` exists only in tag
-`archive/belady-residency-bound` (`544fea7`), on a 2026-08-04 base that predates the
-`f4gpu`→`hip.rs` rename and the device-router deletion, so re-running this needs a
-forward-port first. What it did: hash, per MoE layer, the gate logits the router SAW and the
+`archive/belady-residency-bound` (`544fea7`), on the `9ffb468` base (2026-08-04) that predates
+the `v4gpu.rs`→`f4gpu.rs` rename (`0f39cc4`) and the device-router deletion (`b8ff613`), so
+re-running this needs a forward-port first — its `src/gpu.rs` hunks are the +211 lines to
+re-place. What it did: hash, per MoE layer, the gate logits the router SAW and the
 experts it PICKED — pure host-side, so no device traffic and no I/O during the run. Across
 **388,875 records per arm** (5185 positions × 75 MoE layers), in both pairs: **rows where the
 logits AGREE and the picks DIFFER — 0.** Where picks diverge the logits diverged first, at the

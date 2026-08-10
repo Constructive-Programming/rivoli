@@ -302,7 +302,7 @@ fn main() -> Result<()> {
                 LAYER_WINDOW,
                 |e, slot| expert(e).pack(slot),
             )
-            .with_context(|| format!("repack layer {l}"))?;
+            .with_context(|| format!("write layer {l} (repack or I/O)"))?;
             eprintln!("convert_v4: wrote {path} ({n} bytes)");
         }
 

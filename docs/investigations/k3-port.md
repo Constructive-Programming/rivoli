@@ -295,14 +295,33 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    a quiet NaN and `quant.rs:748` **bails**. Item 11 settles the semantics for free; only the
    *presence* question needs bytes. Host and device must change together or the divergence is
    silent — `moe_fixed`'s clamp launders NaN into a finite ±2^14.
-3. **Thread `moe_latent` (3584) separately from `hidden` (7168).** *(Tier 1.)* The fp4 kernels
-   already take `hidden`/`inter` as runtime arguments (`moe.hip:300`), and `ACT_QUANT_BLOCK=128`
-   divides both 3584 and 3072 — so the work is entirely in what Rust binds. Loader sites:
-   `pin.rs:948` (`SetDims::new`, and a second at `:449`), `quant.rs:184`/`:777`/`:1042`,
-   `format.rs:557`/`:1266`, `model.rs:147`. Decode sites, where a wrong value passes every
-   length check: `f4gpu.rs:1586` (dispatch), `f4gpu.rs:1139` (the accumulator must be latent-wide).
-   **`f4gpu.rs:1834`/`:1888` are the shared expert and must stay FULL width** — they are not
-   latent sites, and listing them as such points at the substitution that breaks all 92 layers.
+3. **Thread `moe_latent` (3584) separately from `hidden` (7168).** *(Tier 1. Host half DONE
+   2026-08-10.)* The fp4 kernels already take the widths as runtime arguments
+   (`moe.hip:300`) and `ACT_QUANT_BLOCK=128` divides both 3584 and 3072, so the work is
+   entirely in what Rust binds.
+   **Done:** the expert-geometry layer's `hidden` is now `expert_in`, named for the role —
+   `quant::vq_expert_layout` (the chokepoint all six `*_expert_{bytes,stride}` /
+   `*_slot_offsets` go through) plus the three structs a K3 call site fills: `SetDims`,
+   `F4Expert`, `ExpertHeader`. Rename-only; `ExpertHeader`'s 40-byte on-disk layout is
+   unchanged. Cited by name rather than line, since these move:
+   `quant::vq_expert_layout` carries the argument, `model::ensure_group_aligned` the check.
+   **Still to do, and the list matters more than the rename:** every call site still binds
+   `cfg.hidden` positionally, which is right for GLM and V4 and wrong for K3. The latent sites
+   are `SetDims::new` in both pins, and the `*_expert_bytes` / `*_slot_offsets` calls in
+   `pin.rs`, `convert*.rs` and `fp8_to_i4.rs`.
+   **Sites that must stay FULL width (7168), because a mechanical "bind latent wherever the
+   parameter is now called `expert_in`" pass breaks them silently:**
+   - `f4gpu.rs` shared-expert dispatch (two sites) — the trunk-side `[7168,6144]`.
+   - `pin.rs:373`/`:375` — the SHARED expert's resident footprint, computed with
+     `i4_expert_bytes`/`vq_expert_bytes`, i.e. the routed geometry. Correct for GLM only
+     because its shared expert has the routed dims.
+   - `pin.rs:466` — `shared_off` reuses the routed `*_slot_offsets`.
+
+   Decode sites where a wrong value passes every length check: `f4gpu.rs` MoE dispatch, and
+   the accumulator, which must be latent-wide (item 4).
+   Note for K3: `ensure_group_aligned(latent, moe_inter, …)` stops covering the trunk widths,
+   so its "one check covers both" comment no longer holds there. No practical hole — 7168 and
+   6144 are multiples of both 32 and 64 — but the comment needs the caveat when K3 lands.
 4. **The MoE accumulator drains into the residual.** `moe_acc_drain` fuses de-fixed-point into
    the residual add at one width; K3 needs the aggregate intercepted **in latent space** for
    the RMSNorm and up-projection first. That is a new drain-to-buffer kernel with its own

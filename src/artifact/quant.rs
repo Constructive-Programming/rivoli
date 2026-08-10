@@ -276,6 +276,11 @@ fn expert_stride(bytes: usize) -> usize {
 /// `fill(e, &mut block[..bytes])` for each. The padding between `bytes` and `stride` is
 /// left as the caller found it.
 ///
+/// **`fill` must write all `bytes` it is given.** Nothing here clears a slot first, and the one
+/// caller reuses its buffer across windows, so a partial write leaves whatever the previous
+/// occupant of those bytes was — see `format::write_expert_layer`, which spells out the failure
+/// this produces and why it is worse than the zeros the old whole-layer buffer would have left.
+///
 /// Called only by `format::write_expert_layer`, which windows it — both converters reach it
 /// through there rather than filling a whole-layer buffer. The split is by DISJOINT
 /// `split_at_mut` slices rather than by index, so the borrow checker witnesses that no two

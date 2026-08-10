@@ -486,7 +486,7 @@ fn main() -> Result<()> {
                 encode_expert(src, &base, projs, cb, slot, enc, validate)
             },
         )
-        .with_context(|| format!("encode layer {l}"))?;
+        .with_context(|| format!("write layer {l} (encode or I/O)"))?;
         eprintln!("convert: wrote {path}");
     }
 

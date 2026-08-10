@@ -704,12 +704,21 @@ impl F4Expert<'_> {
 
 /// Host memory one call to [`write_expert_layer`] may hold, regardless of the layer's size.
 ///
-/// 1 GiB, chosen against the two things it trades off. It must stay a large multiple of one
-/// expert block so [`crate::artifact::quant::fill_expert_blocks`] still has more blocks per
-/// window than it has threads — at K3's 17.55 MB that is 61 blocks against ~32 threads, and
-/// at GLM's 4.2 MB it is 255. And it must stay small next to the machine: this box is 128 GB
-/// of LPDDR5 *shared with the GPU*, `/tmp` is a 63 GB tmpfs living in that same RAM, and a
-/// convert runs alongside whatever else holds the arena.
+/// 1 GiB, chosen against the two things it trades off. It must stay large RELATIVE TO one
+/// expert block (not a multiple of one — it is a multiple of none of the four strides) so
+/// [`crate::artifact::quant::fill_expert_blocks`] still has more blocks per window than it has
+/// threads. Blocks per 1 GiB window, against ~32 threads:
+///
+/// | format | expert bytes = stride | per window |
+/// |---|---:|---:|
+/// | GLM `.vq3` 6144/2048 | 15,335,424 | 70 |
+/// | GLM `.i4` 6144/2048 | 20,054,016 | 53 |
+/// | V4 `.f4` 4096/2048 | 13,369,344 | 80 |
+/// | K3 `.f4` 3584/3072 | 17,547,264 | 61 |
+///
+/// And it must stay small next to the machine: this box is 128 GB of LPDDR5 *shared with the
+/// GPU*, `/tmp` is a 63 GB tmpfs living in that same RAM, and a convert runs alongside whatever
+/// else holds the arena.
 pub const LAYER_WINDOW: usize = 1 << 30;
 
 /// The header has to fit the block-0 pad it is written into. Both are compile-time constants,
@@ -722,10 +731,11 @@ const _: () = assert!(EXPERT_HEADER_BYTES <= VQ_ALIGN);
 ///
 /// **Bounded, because the buffered form does not scale past GLM.** Both converters used to
 /// allocate the whole file (`vec![0u8; VQ_ALIGN + blocks * stride]`), fill it, and write it in
-/// one call: 3.4 GB per layer for V4 and 3.7 GB for GLM, survivable, but **15.7 GB for
-/// Kimi-K3** (896 experts x 17.55 MB) on a box whose entire LPDDR5 is 128 GB and shared with
-/// the GPU. The buffer was pure waste at any size — every byte was written out once and never
-/// re-read. Parallelism survives because the window is the unit, not the expert:
+/// one call: 3.42 GB per layer for V4 (256 blocks) and 3.94 GB for GLM (257 — its shared expert
+/// rides the same slab), survivable, but **15.72 GB for Kimi-K3** (896 x 17,547,264) on a box
+/// whose entire LPDDR5 is 128 GB and shared with the GPU. The buffer was pure waste at any
+/// size — every byte was written out once and never re-read.
+/// Parallelism survives because the window is the unit, not the expert:
 /// `fill_expert_blocks` still packs each window across all threads over disjoint slices, so
 /// serialising the pack to save memory was never on the table.
 ///
@@ -753,10 +763,25 @@ const _: () = assert!(EXPERT_HEADER_BYTES <= VQ_ALIGN);
 /// `I4Source::stamp` DOES fsync its manifest, and that asymmetry is right — a torn manifest is
 /// unrecoverable, a torn layer file is regenerable.
 ///
-/// Each block is `stride` bytes of which only `bytes` are ever written, and the
-/// `bytes..stride` padding must be zero for the output to stay byte-identical to the buffered
-/// form — which G1a asserts. See the comment at the window allocation for why that needs no
-/// per-window clear.
+/// **`fill` must write all `bytes` of the slot it is handed.** This is a real obligation, not a
+/// formality, and it is stronger than what the buffered form required. The whole-layer `vec!`
+/// gave every block fresh zeros, so a closure that wrote only part of its slot left the rest
+/// `0x00`; the reused window hands it **the previous expert's payload**. Both current closures
+/// are total — `encode_expert` advances `off` by `vq_proj_bytes` across exactly three
+/// projections, and `F4Expert::pack` copies six spans that tile `[0, f4_expert_bytes)` — but
+/// the tree already contains a helper built to tolerate a short write:
+/// [`crate::artifact::quant::write_le_scales`] "stop[s] at whichever of the two runs out".
+///
+/// Concretely, the shape to avoid: a scale iterator one group short (`f4_groups` is
+/// `div_ceil`, or a format that reads scales from the source instead of computing them) leaves
+/// the tail of that projection's scale span holding **another expert's e8m0 exponents**. Right
+/// file length, every length check passes, and `--verify` compares through the same `spans()`
+/// so it never looks there. Under the buffered writer the identical bug wrote `0x00` = a dead
+/// group, which is visible. `bin/fp8_to_i4` states this same requirement correctly for its own
+/// reused buffer; the debug-only clear below keeps dev builds behaving like the old writer.
+///
+/// The `bytes..stride` padding is a weaker and separate matter: nothing writes it at all, so it
+/// stays zero from the single allocation — see the comment there.
 ///
 /// `window` is the host-memory ceiling and both converters pass [`LAYER_WINDOW`]. It is a
 /// parameter rather than a constant read from inside so a test can reach the window BOUNDARY
@@ -803,6 +828,13 @@ pub fn write_expert_layer(
     let mut win = vec![0u8; per * stride];
     for start in (0..blocks).step_by(per) {
         let span = &mut win[..per.min(blocks - start) * stride];
+        // Dev-profile only, and NOT for the padding — for the DATA region. It costs nothing in
+        // release and makes a `fill` that writes less than `bytes` degrade the way it did under
+        // the whole-layer buffer: zeros, a visibly dead group, instead of the previous expert's
+        // payload read as this one's. See the `fill` obligation in the doc comment. This is
+        // insurance, not a check — it cannot report the short write, only defuse it.
+        #[cfg(debug_assertions)]
+        span.fill(0);
         crate::artifact::quant::fill_expert_blocks(
             span,
             stride,
@@ -1225,10 +1257,20 @@ pub struct SetDims {
 impl SetDims {
     /// Build from the layer range and the expert-block dims.
     ///
-    /// Positional, against the "named fields make a transposition visible" argument above:
-    /// the struct literal was character-identical at both engine call sites bar the range,
-    /// which `jscpd` refuses. Every call site passes `…expert_in, …moe_inter` as named field
-    /// accesses, so a swap stays readable there.
+    /// Positional, against the "named fields make a transposition visible" argument above: the
+    /// struct literal was character-identical at both engine call sites bar the range, which
+    /// `jscpd` refuses.
+    ///
+    /// **That trade got worse on 2026-08-10 and this is the note saying so.** It used to be
+    /// covered by every call site reading `…hidden, …moe_inter` — argument text matching
+    /// parameter name, so a swap was visible anyway. After `hidden` became `expert_in` the
+    /// callers still pass `cfg.hidden` (`pin.rs`, `tests/f4_loading.rs`), which is correct for
+    /// GLM and V4 because for them the two widths are one number, but the textual match is
+    /// gone. A K3 site written `SetDims::new(range, cfg.n_experts, cfg.hidden, cfg.moe_inter)`
+    /// is exactly the substitution this struct exists to prevent and nothing at the call site
+    /// flags it. The K3 pin is the third call site; once it exists the literals are no longer
+    /// character-identical, so the `jscpd` objection lapses and `new` should go back to taking
+    /// the struct.
     pub fn new(
         layers: std::ops::Range<usize>,
         n_experts: usize,
@@ -1344,9 +1386,14 @@ impl ExpertSet {
                         && h.expert_in as usize == expert_in
                         && h.moe_inter as usize == moe_inter
                         && h.stride as usize == stride,
+                    // `expert_in (hidden_size)` rather than bare `expert_in`: whoever reads this
+                    // is holding a config.json and an artifact, and `expert_in` is a name that
+                    // appears in neither. For GLM and V4 the value IS `hidden_size`; on K3 it
+                    // is `routed_expert_hidden_size`, which is why both are named.
                     "{path}: header (layer {} experts {} expert_in {} moe_inter {} stride {}) \
-                     disagrees with config (layer {l} experts {n_experts} expert_in {expert_in} \
-                     moe_inter {moe_inter} stride {stride})",
+                     disagrees with config (layer {l} experts {n_experts} \
+                     expert_in [hidden_size / routed_expert_hidden_size] {expert_in} \
+                     moe_inter [moe_intermediate_size] {moe_inter} stride {stride})",
                     h.layer,
                     h.n_experts,
                     h.expert_in,
@@ -2055,6 +2102,29 @@ mod tests {
             "stride 0 accepted"
         );
         assert!(!std::path::Path::new(&zero).exists(), "refused but created");
+
+        // Another process's debris is NOT adopted. This arm moved here from `write_atomic`'s
+        // test when that function was deleted: the pid-suffixed `.part` is the defence against
+        // two concurrent converts into one `out_dir`, whose interleaved writes OF EQUAL LENGTH
+        // yield a file of exactly the right length — the one corruption shape `open_routed`'s
+        // length check cannot see. Seeded longer than the payload so adopting it would fail on
+        // length rather than on content, and left in place afterwards to prove it was untouched.
+        let foreign = format!("{path}.999999.part");
+        std::fs::write(&foreign, vec![0xFDu8; buf.len() + 64]).unwrap();
+        let again = format!("{dir}/L05.f4");
+        write_expert_layer(&again, &header, stride, bytes, blocks, 2 * stride, fill).unwrap();
+        assert_eq!(
+            std::fs::read(&again).unwrap().len(),
+            buf.len(),
+            "adopted it"
+        );
+        assert_eq!(
+            std::fs::read(&foreign).unwrap().len(),
+            buf.len() + 64,
+            "consumed another process's .part"
+        );
+        std::fs::remove_file(&foreign).unwrap();
+
         let got = std::fs::read(&path).unwrap();
 
         assert_eq!(n as usize, buf.len(), "reported length");
