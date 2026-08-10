@@ -108,8 +108,8 @@ Every row verified against the tree 2026-08-09.
 | expert streaming, io_uring fetch, byte arena, residency cache | **reuse verbatim** |
 | sigmoid router with selection-only bias | **reuse** — `Scoring` enum ships it |
 | `Arch` enum, per-arch help and refusal | **reuse** — `arch.rs` is already the multi-arm shape |
-| bf16 trunk GEMV | **exists** — `v4_dense_gemm_bf16` (`v4compress.hip:82`), already V4's lm_head. A *performance* problem, not a new family |
-| `resident.safetensors` bf16 | **already accepted** — `Dtype::Bf16`, `format.rs:99` |
+| bf16 trunk GEMV | **exists** — `gemm_bf16` (`kvcompress.hip:82`), already V4's lm_head. A *performance* problem, not a new family |
+| `resident.safetensors` bf16 | **already accepted** — `Dtype::Bf16`, `format.rs:100` |
 | `.f4` shared block | **VOID** — `has_shared()` is false for F4, which is already correct: K3's shared MLP is bf16 and trunk-side |
 | **KDA, 69 layers** | **new kernel family** — the bulk of S2 |
 | **AttnRes** | **new**, and unplanned until S0 found it |
@@ -278,11 +278,14 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
 
 ### S1a — artifact: config, `Arch`, naming, `.f4`
 
-1. **`SafeWriter` must stream.** *(Tier 1, blocks everything.)* `format.rs:148-154` holds every
-   resident tensor as `Vec<u8>` until `write`, sized for a ~10 GiB set. 113.49 GB does not fit.
-   Two-pass: header and offsets, then stream bytes. `write_atomic` (`:703`) needs the same, and
-   so does the routed path — `convert_v4.rs:298` buffers a whole layer, which for K3 is
-   896 × 17.55 MB = **15.7 GB**.
+1. **`SafeWriter` must stream — DONE 2026-08-10.** *(Was Tier 1, blocked everything.)* It held
+   every resident tensor as a `Vec<u8>` until `write`, sized for a ~10 GiB set, and ~113.5 GB
+   does not fit. `SafeWriter` (`format.rs:169`) now carries a `Cow` per tensor so verbatim
+   copies borrow the source mmap; host-RAM peak is the sum of the CONVERTED tensors. `write`
+   also became atomic — a borrowed payload is read at write time, so truncating a path that is
+   also a mapped source would SIGBUS. **Still owed: the ROUTED writer.**
+   `convert_v4.rs:304` buffers a whole layer through `write_atomic(&path, &buf)`, which for K3
+   is 896 x 17.55 MB = **15.7 GB** per layer file.
 2. **Settle e8m0 `0xff`.** *(Tier 1.)* The reference maps 255 → zero; rivoli's `e8m0f` returns
    a quiet NaN and `quant.rs:748` **bails**. Item 11 settles the semantics for free; only the
    *presence* question needs bytes. Host and device must change together or the divergence is
@@ -290,10 +293,10 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
 3. **Thread `moe_latent` (3584) separately from `hidden` (7168).** *(Tier 1.)* The fp4 kernels
    already take `hidden`/`inter` as runtime arguments (`moe.hip:300`), and `ACT_QUANT_BLOCK=128`
    divides both 3584 and 3072 — so the work is entirely in what Rust binds. Loader sites:
-   `pin.rs:870` (`SetDims::new`, and a second at `:381`), `quant.rs:184`/`:777`/`:1037`,
-   `format.rs:522`/`:1228`, `model.rs:147`. Decode sites, where a wrong value passes every
-   length check: `v4gpu.rs:1540` (dispatch), `:1111` (the accumulator must be latent-wide).
-   **`v4gpu.rs:1789`/`:1843` are the shared expert and must stay FULL width** — they are not
+   `pin.rs:948` (`SetDims::new`, and a second at `:449`), `quant.rs:184`/`:777`/`:1042`,
+   `format.rs:557`/`:1266`, `model.rs:147`. Decode sites, where a wrong value passes every
+   length check: `f4gpu.rs:1586` (dispatch), `f4gpu.rs:1139` (the accumulator must be latent-wide).
+   **`f4gpu.rs:1834`/`:1888` are the shared expert and must stay FULL width** — they are not
    latent sites, and listing them as such points at the substitution that breaks all 92 layers.
 4. **The MoE accumulator drains into the residual.** `moe_acc_drain` fuses de-fixed-point into
    the residual add at one width; K3 needs the aggregate intercepted **in latent space** for
@@ -311,7 +314,7 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    refusals** — those are bespoke bails in `run_v4` (`main.rs:729`), not matches, so omitting
    them compiles clean and silently accepts the flags.
 7. Assert the config scalars of §1 rather than defaulting them, and write the K3 pin's own
-   `top_k * rows + n_shared <= MAX_BATCH` check — `pin.rs:341` exists only on GLM's path.
+   `top_k * rows + n_shared <= MAX_BATCH` check — `pin.rs:409` exists only on GLM's path.
 
 Tokenizer work defers to S4: **there is no `chat_template`** in `tokenizer_config.json`;
 rendering lives in `encoding_k3.py` with an XML-ish `<message role=...>` framing, so the port
@@ -365,7 +368,7 @@ safetensors; a C fixture may be its own layout), and which converter binary K3 u
    `self_attention_res_*`, not `attn_res_*`.
 2. **Gated MLA** — RoPE removed but the 64 rope dims **still cached and still scored**, softmax
    scale over **192**, output gate **before `o_proj` with no norm**.
-3. **The latent sandwich** — two bf16 trunk GEMVs plus `v4_rmsnorm` (already width-generic),
+3. **The latent sandwich** — two bf16 trunk GEMVs plus `rmsnorm_batch` (`mla.hip:346`, already width-generic),
    with the accumulator interception of S1a.4.
 4. **SiTU-GLU + fp4 MoE** — §3b.
 5. **KDA** — the new family and the bulk of the stage. **Decompose into units with their own
@@ -376,8 +379,8 @@ safetensors; a C fixture may be its own layout), and which converter binary K3 u
    conditions (`k3-architecture.md` §4).
 6. **Router** — sigmoid, bias on selection only, weights from the **unbiased** score,
    renormalised over the 16.
-7. **Trunk GEMV, for speed.** `v4_dense_gemm_bf16` is correct and carries S2/S3 unchanged — but
-   it is **verified only at vocab 1024 / dim 512** (`v4gpu.rs:2207` says so outright), so it is
+7. **Trunk GEMV, for speed.** `gemm_bf16` is correct and carries S2/S3 unchanged — but
+   it is **verified only at vocab 1024 / dim 512** (`f4gpu.rs:2253` says so outright), so it is
    an oracle that itself needs a tolerance before it can settle one. Its inner loop is one wave
    per output *element* with scalar u16 loads; at 108.81 GB/token that loop is the decode.
 
@@ -392,7 +395,7 @@ A `src/k3gpu.rs` and a `main.rs` K3 branch. Name **every deviation from the refe
 call site** — V4's three named deviations are what let its reviews catch two criticals before
 the GPU did. §3c's KV deviation is the first entry.
 
-**Do not write `k3gpu.rs` by mirroring `v4gpu.rs`** — `build.rs` runs `jscpd --min-tokens 15`
+**Do not write `k3gpu.rs` by mirroring `f4gpu.rs`** — `build.rs` runs `jscpd --min-tokens 15`
 and panics on any clone, at zero budget. Factor when it fires; do not pre-emptively design a
 three-model skeleton.
 
