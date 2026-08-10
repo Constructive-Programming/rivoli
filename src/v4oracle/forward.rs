@@ -1666,7 +1666,7 @@ impl Oracle {
 /// `[[f(t, j) for j in range(cols)] for t in range(seqlen)]` — the shape BOTH prefill
 /// comprehensions in `model.py` have, and nothing else.
 ///
-/// It owns the RECTANGULARITY that `attn::v4_topk_idxs` refuses a ragged buffer for, and no
+/// It owns the RECTANGULARITY that `attn::gather_slot_idxs` refuses a ragged buffer for, and no
 /// selection logic: every index and every `-1` below stays with its own function, so a wrong
 /// one cannot travel between [`window_topk`] and [`compress_topk`].
 fn prefill_rows(seqlen: usize, cols: usize, f: impl Fn(usize, usize) -> i64) -> Vec<Vec<i64>> {
@@ -1689,7 +1689,7 @@ pub fn window_topk(win: usize, seqlen: usize, start_pos: usize) -> Vec<Vec<i64>>
     } else {
         // `win == 0` gives `cols == 0`, so `win - 1` is never reached and this is `seqlen`
         // empty rows rather than the overflow panic a dev-profile build used to take. Not
-        // reachable: `attn::v4_topk_idxs` returns early on `win == 0` and `sliding_window` is
+        // reachable: `attn::gather_slot_idxs` returns early on `win == 0` and `sliding_window` is
         // 128 in the shipped config. Recorded because it is the one input on which this
         // spelling and the nested one it replaced differ.
         prefill_rows(seqlen, win.min(seqlen), |t, j| {

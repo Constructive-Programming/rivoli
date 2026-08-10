@@ -81,10 +81,10 @@ mod tests {
 // them inside breaks that test's build, not its assertions.
 //
 // Only ONE of them is independent of the oracle in the way that matters.
-// `v4_topk_idxs` is written against `model.py`, not against
+// `gather_slot_idxs` is written against `model.py`, not against
 // `v4oracle::forward::window_topk` — that one is `pub` for the defect matrix's use, and
 // calling it here would make the selection gate vacuous, since the engine and the
-// instrument would then agree by construction. `v4_rope_table_ratio0` gets no such
+// instrument would then agree by construction. `rope_table_plain` gets no such
 // credit: the oracle's `precompute_freqs_cis` is private, so there was never an option
 // to share it, and its only cross-check is an out-of-tree numpy transliteration of
 // `precompute_freqs_cis` (agreed to <= 16 f32 ULP, pure libm spread) plus the end-to-end
@@ -100,7 +100,7 @@ mod tests {
 /// parameters at all rather than a flag defaulting to off, because a table built with the
 /// right theta and no interpolation is `Defect::RopeNoYarn`: the frequencies stay
 /// plausible at every scale and the text stays fluent. S2c owns the compressed table.
-pub fn v4_rope_table_ratio0(rd: usize, max_pos: usize, theta: f32) -> Vec<f32> {
+pub fn rope_table_plain(rd: usize, max_pos: usize, theta: f32) -> Vec<f32> {
     let inv: Vec<f32> = (0..rd / 2)
         .map(|i| 1.0 / theta.powf((2 * i) as f32 / rd as f32))
         .collect();
@@ -115,7 +115,7 @@ pub fn v4_rope_table_ratio0(rd: usize, max_pos: usize, theta: f32) -> Vec<f32> {
     out
 }
 
-/// What one selection is over — the arguments [`v4_topk_idxs`] and [`Sel::shape`] share.
+/// What one selection is over — the arguments [`gather_slot_idxs`] and [`Sel::shape`] share.
 ///
 /// A struct because three of its fields are `usize` and any permutation of
 /// `win`/`seqlen`/`start_pos`/`index_topk` type-checks, while the failure is not a panic:
@@ -131,7 +131,7 @@ pub struct Sel {
     pub kind: LayerKind,
     /// `index_topk` from the config (512). Read only on a layer that `has_indexer`, where
     /// it is the length past which this positional selection REFUSES — see
-    /// [`v4_topk_idxs`].
+    /// [`gather_slot_idxs`].
     pub index_topk: usize,
     /// Query rows: the prompt length at prefill, 1 at decode.
     pub seqlen: usize,
@@ -142,7 +142,7 @@ pub struct Sel {
 impl Sel {
     /// The `(rows, cols)` a buffer for this selection must hold.
     ///
-    /// Fallible for the reason [`v4_topk_idxs`] is, and derived from the same two
+    /// Fallible for the reason [`gather_slot_idxs`] is, and derived from the same two
     /// `kvcompress` functions the fill uses, so `attention` can check a caller's uploaded
     /// shape without building the selection twice.
     pub fn shape(&self) -> Result<(usize, usize)> {
@@ -214,7 +214,7 @@ impl Sel {
 /// `Indexer.forward` and agrees with it only on the SET, only below `ratio * (index_topk +
 /// 1)` = 2052 positions, and never on the score ORDER that `sparse_attn`'s online softmax
 /// folds in. Past that length it REFUSES rather than degrading — see [`Sel::n_comp`].
-pub fn v4_topk_idxs(sel: Sel, out: &mut Vec<i32>) -> Result<(usize, usize)> {
+pub fn gather_slot_idxs(sel: Sel, out: &mut Vec<i32>) -> Result<(usize, usize)> {
     if sel.win == 0 {
         return Ok((0, 0));
     }
@@ -264,7 +264,7 @@ mod v4_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
 
-    /// [`v4_topk_idxs`] on a ratio-0 layer, which is every case these two tests drive.
+    /// [`gather_slot_idxs`] on a ratio-0 layer, which is every case these two tests drive.
     ///
     /// `LayerKind::Plain` has no compressed columns, so `index_topk` is never read, and only
     /// the three positional values vary. The `Result` is RETURNED rather than unwrapped so a
@@ -277,7 +277,7 @@ mod v4_tests {
         pos: usize,
         out: &mut Vec<i32>,
     ) -> Result<(usize, usize)> {
-        v4_topk_idxs(
+        gather_slot_idxs(
             Sel {
                 win,
                 kind: LayerKind::Plain,
@@ -337,7 +337,7 @@ mod v4_tests {
         // Position 0 is (1, 0) for every pair -- the identity rotation. A table that
         // indexed `pos` wrong would almost always still start here, so the real check is
         // the pair below.
-        let t = v4_rope_table_ratio0(4, 3, 10000.0);
+        let t = rope_table_plain(4, 3, 10000.0);
         assert_eq!(&t[..4], &[1.0, 0.0, 1.0, 0.0]);
         // Pair `i` turns at theta^(-2i/rd): pair 0 at 1 rad/step, pair 1 at 1/100.
         for (pos, row) in t.chunks_exact(4).enumerate() {
@@ -552,7 +552,7 @@ pub mod v4 {
         /// what gates the requirement — though note it is asserted only at `>= RESOLVABLE`,
         /// so a 500x collapse in that separation would still pass.
         pub freqs: *const f32,
-        /// `[idxs_shape.0, idxs_shape.1]` i32, from [`super::v4_topk_idxs`].
+        /// `[idxs_shape.0, idxs_shape.1]` i32, from [`super::gather_slot_idxs`].
         pub idxs: *const i32,
         /// The `(rows, cols)` the caller actually uploaded. Checked against what this
         /// step requires, because the two disagree silently: the shapes differ between
@@ -954,7 +954,7 @@ pub mod v4 {
         // -- cache and attention ---------------------------------------------------------
         // What `sparse_attn` reads differs by phase, and so does the index space:
         // prefill attends the prompt's own KV by ABSOLUTE POSITION, decode attends the
-        // ring by SLOT. See `v4_topk_idxs`.
+        // ring by SLOT. See `gather_slot_idxs`.
         //
         // A compressed layer needs no extra arm here, and that is the whole point of the
         // buffer layout: at prefill the compressor has already written its blocks to
@@ -1009,7 +1009,7 @@ pub mod v4 {
         // meant reaching into `s.kv`'s tail for rows this function never wrote. The
         // obligation is on `kvcompress::compress`'s doc, where its reader is.
         //
-        // `Finish` has ONE `out`, so the second destination is a device COPY after a single
+        // `CompFinish` has ONE `out`, so the second destination is a device COPY after a single
         // `compress` call, never a second call: `compress` read-modify-writes
         // `kv_state`/`score_state` before it decides whether to emit, so calling it twice
         // deposits the same rows into the pooling window twice and slides it twice.

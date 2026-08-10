@@ -1,9 +1,8 @@
 //! Emit per-layer golden activations for DeepSeek-V4-Flash from the real checkpoint, and
 //! re-run the defect matrix against real weights.
 //!
-//! Keeps its model name (category (b), 2026-08-09) for the same reason `v4oracle` does: it
-//! drives a transliteration of one model's reference, and its name is a recorded command
-//! line in the port's docs.
+//! Keeps its model name (2026-08-09 rename pass): it is a recorded command line in the
+//! port's docs, and `v4oracle`'s module doc says why transliterations stay model-named.
 //!
 //! S1b of `docs/investigations/v4-flash-port.md`. Needs no feature and touches no engine
 //! code — like `bin/ppl`, it is host arithmetic that never sees a GPU, so there is no decode

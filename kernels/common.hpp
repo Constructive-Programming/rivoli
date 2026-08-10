@@ -106,6 +106,11 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
 // not conflict. `moe.hip` spelled its copy `bf16r`; that one carries the magnitude the
 // rounding is worth.
 __device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
+// NAMING RULE for `bf16` in kernel names, stated here because this helper is what the rule
+// is about: a trailing `_bf16` names the STORE (`gemv_fp8_bf16`, `swiglu_clamped_bf16` —
+// both end in `rbf16`); `bf16` elsewhere in a name is the INPUT dtype (`gemm_bf16` weights,
+// `embed_bf16_row_bcast` source table). If a new kernel would break that split, rename
+// rather than adding a third sense.
 
 // Block-wide sum of `v` into every thread. `red` is caller-owned LDS of `blockDim.x`
 // floats; on return every thread holds the total.
@@ -263,7 +268,7 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
     // this body must re-read the ISA. Bit-identical by the M5 unroll argument: `acc` is
     // one serial FP chain and LLVM neither splits nor re-associates it without
     // fast-math; the fold order stays ascending `j`. Pinned on hardware by
-    // `tests/v4_kernel.rs::the_fp8_dot_sums_in_source_order_through_both_loops`, which
+    // `tests/f4_kernel.rs::the_fp8_dot_sums_in_source_order_through_both_loops`, which
     // also walks the unroll REMAINDER loop no engine dimension reaches (every real
     // per-lane trip count divides 8). `fp8_dot_strided_r` below is deliberately NOT
     // unrolled: its callers (GLM splitk, mla absorb/value) measured at budget, and R
@@ -542,7 +547,7 @@ typedef const unsigned char __attribute__((address_space(1)))* gu8p;
 // small integer, `0.5f * (float)half` is exact (power-of-two scaling of an exact value),
 // and the sign is OR'd into the payload bits, so code 8 decodes to -0.0f — the same
 // negative zero the ternary's `-mag` produced and `v4oracle`'s F4_LUT holds.
-// `tests/v4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise` sweeps all 16
+// `tests/f4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise` sweeps all 16
 // against `v4oracle::numerics::e2m1_decode` at the bit level.
 __device__ __forceinline__ float e2m1f(unsigned int nib) {
     unsigned int half = (0xC8643210u >> ((nib & 7u) << 2)) & 0xFu;
@@ -575,7 +580,7 @@ __device__ __forceinline__ float e2m1f(unsigned int nib) {
 // `b<<23` is strictly larger, and the 0xff arm ORs the quiet bit onto what is then
 // 0x7f800000, giving the identical 0x7fc00000 NaN. All 256 bytes are swept bitwise against
 // `v4oracle::numerics::e8m0_decode` by
-// `tests/v4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise`.
+// `tests/f4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise`.
 __device__ __forceinline__ float e8m0f(unsigned char b) {
     unsigned int t = (unsigned int)b << 23;
     unsigned int bits = t > (1u << 22) ? t : (1u << 22);
@@ -646,10 +651,10 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
         // The epilogue remainder chains off the main loop's exit values, so it continues the
         // same order. `-ffast-math` is absent (`build.rs`), but `-ffp-contract=fast` is clang's
         // HIP default, which is why this was read and not assumed
-        // (`tests/v4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` records that
+        // (`tests/f4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` records that
         // lesson).
         //
-        // Multi-trip coverage is `tests/v4_kernel.rs::the_dword_path_matches_the_oracle_at_
+        // Multi-trip coverage is `tests/f4_kernel.rs::the_dword_path_matches_the_oracle_at_
         // multiple_trips` (1280/1024 = 5 and 4 trips; at `V4Config::toy` gate/up runs this loop
         // ONCE and down never enters it, so every other test executes only the remainder copy).
         // Measured 2026-08-09: it gates arithmetic wrong past the first trip — red at 65x
@@ -767,7 +772,7 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
     // where `a` is normal and `a * 512.0f` is exact, so the FMA elides two roundings that
     // were already no-ops. The pragma is here for the CLAIM, not the arithmetic —
     // `mla.hip`'s "VERIFIED IN THE ISA" note and the `ULP_BUDGET = 1` it justifies in
-    // `tests/v4_attn.rs` both rest on contraction being absent from the V4 path, and a
+    // `tests/f4_attn.rs` both rest on contraction being absent from the V4 path, and a
     // silent 8th instruction makes those two false while nothing goes red.
 #pragma clang fp contract(off)
     if (isnan(x)) return 0x7f;
@@ -810,7 +815,7 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
 // One element of a block-128 group, fused quantize-then-dequantize: the value a V4 GEMM
 // actually sees. `e4m3f` is reused rather than rewritten because DECODE is unambiguous —
 // only the ENCODE rule differs between the two engines. What pins the pair is the round
-// trip, in `tests/v4_kernel.rs::act_quant_f8_is_bit_identical_to_the_oracle`, over all 254
+// trip, in `tests/f4_kernel.rs::act_quant_f8_is_bit_identical_to_the_oracle`, over all 254
 // finite codes. That test's own doc states what the round trip can and cannot prove.
 __device__ __forceinline__ float act_quant_roundtrip(float x, float s) {
     // Written with comparisons, NOT `fminf`/`fmaxf`, so a NaN PROPAGATES. Those two return

@@ -297,7 +297,7 @@ extern "C" int rivoli_mla_value_fp8(
 // The reference's `inplace` cast back to bf16 is therefore a no-op, and so is the
 // oracle's `round_bf16` after `act_quant_inplace`. Checked over every e4m3 code against
 // scale codes 40..=200 by
-// `tests/v4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`,
+// `tests/f4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`,
 // which also exhibits the tiny-scale boundary where it stops holding.
 //
 // One thread per (row, block): `block` is 64 or 128, the amax scan and the write-back
@@ -437,10 +437,13 @@ extern "C" __global__ void rope_adjacent(float* __restrict__ x, const float* __r
 // USED BY: DeepSeek-V4-Flash-0731 only (`qkv`, `wo_a`, `wo_b`, the shared expert).
 // GLM-5.2 uses `linalg.hip::gemv_fp8`.
 //
-// **`_grouped` NAMES THE MISUSE HAZARD.** The two fp8 GEMVs differ on two axes and only one
-// of them corrupts quietly: confuse the store dtype and you get a rounding, confuse the
-// input slicing and every output row reads the wrong activations. Hence the suffix went to
-// `groups` and the store went in this paragraph. Renamed from `v4_gemv_fp8` 2026-08-09.
+// **`_bf16` NAMES THE HAZARD THE COMPILER CANNOT CATCH.** The two fp8 GEMVs differ on two
+// axes: the bf16-rounded store and the grouped input slicing. The launchers have different
+// ARITIES (this one takes `groups`; `gemv_fp8` does not), so confusing the slicing is a
+// compile error — the store dtype is the only axis a caller can be quietly wrong about,
+// and that is what the suffix carries. The slicing is spelled out below. Renamed from
+// `v4_gemv_fp8` 2026-08-09 (briefly `gemv_fp8_grouped`, revised the same day on the arity
+// observation above).
 //
 // The quantized `Linear` of model.py:114-127, and the grouped `wo_a` einsum of
 // model.py:541-544, as ONE kernel — they differ only in which slice of the input a given
@@ -470,11 +473,11 @@ extern "C" __global__ void rope_adjacent(float* __restrict__ x, const float* __r
 // choice indistinguishable. Reading the fp8 bytes and dequantizing here is NOT a third
 // option: over the scale range any weight tensor uses it produces the same bf16 values
 // `convert.py` would have written (4 significant bits into 8), measured by
-// `tests/v4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`.
+// `tests/f4_attn_host.rs::fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses`.
 //
 // One wave per output row, via `dot_fp8_wave` — whose summation order is NOT the
 // oracle's sequential fold. That re-association is the floor on the tolerance, and it is
-// measured rather than assumed (tests/v4_attn.rs).
+// measured rather than assumed (tests/f4_attn.rs).
 extern "C" __global__ void gemv_fp8_bf16(const float* __restrict__ x,
                                             const unsigned char* __restrict__ w,
                                             const float* __restrict__ wscale, int m, int n_out,

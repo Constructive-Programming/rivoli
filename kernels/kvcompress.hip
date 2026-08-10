@@ -2,7 +2,7 @@
 // branches (overlap at ratio 4, non-overlap at ratio 128) and both phases.
 //
 // S2c of docs/investigations/v4-flash-port.md. Scored against `src/v4oracle/`'s
-// `Oracle::compressor` by `tests/v4_compress_kernel.rs`.
+// `Oracle::compressor` by `tests/kvcompress_kernel.rs`.
 //
 // WHAT IS DELIBERATELY NOT HERE, and where it is instead:
 //
@@ -358,7 +358,7 @@ extern "C" __global__ void kv_compress_decode(float* __restrict__ kv_state,
     // port-hostile slip here: at ratio 128 the first block completes at `start_pos` 127,
     // where the index is 0 and the position is 0 — they agree — and at the SECOND block
     // (255) they are 1 and 128. A probe that stops at the first block cannot tell them
-    // apart, which is why `tests/v4_compress_kernel.rs` steps to the second.
+    // apart, which is why `tests/kvcompress_kernel.rs` steps to the second.
     compress_finish_row(f.out, f, (start_pos / p.ratio) * p.ratio, p, red);
     __syncthreads();
 

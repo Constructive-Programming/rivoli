@@ -13,7 +13,7 @@
 //! The compressed cell drives the whole block step the way S3's layer loop must:
 //! `kvcompress::compress`, its output placed at BOTH destinations from ONE call, then
 //! `attention`. What it does NOT cover is stated at `COMP_LAYER` — the ratio-4 class, whose
-//! `Indexer` returns score-ORDERED blocks where `v4_topk_idxs` returns them positionally.
+//! `Indexer` returns score-ORDERED blocks where `gather_slot_idxs` returns them positionally.
 //!
 //! Every defect available in this path is silent-wrong — a missing QK-norm, RoPE on the
 //! wrong pairing, `attn_sink` treated as a real key, a mis-grouped `wo_a`. None crash and
@@ -99,9 +99,8 @@
 use rivoli::artifact::model::V4Config as EngineV4Config;
 use rivoli::artifact::quant::e8m0;
 use rivoli::attn::{
-    Sel,
+    Sel, gather_slot_idxs, rope_table_plain,
     v4::{Dims, Fp8W, Io, Pass, Scratch, Weights, attention},
-    v4_rope_table_ratio0, v4_topk_idxs,
 };
 use rivoli::backend::gpustream::{HipStream, Timeline};
 use rivoli::backend::hip::{
@@ -109,7 +108,7 @@ use rivoli::backend::hip::{
     launch_gemv_fp8_bf16, launch_rope_adjacent, memcpy_dtod_async,
 };
 use rivoli::kvcompress::{
-    Buffers, Finish, Geom, LayerKind, RopeParams, compress, freqs_cis, rope_for_layer,
+    Buffers, CompFinish, Geom, LayerKind, RopeParams, compress, freqs_cis, rope_for_layer,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3};
 use rivoli::memory::device::DeviceBuf;
@@ -134,7 +133,7 @@ const LAYER: usize = 0;
 /// indexer**, YaRN and `compress_rope_theta`. Layer 2 (ratio 4) is the other compressed
 /// class and is deliberately NOT the cell here — its `Indexer` returns
 /// **score-ordered** blocks (`Oracle::topk_idx` sorts by score, and the indexer selects
-/// through it) where [`v4_topk_idxs`] returns them
+/// through it) where [`gather_slot_idxs`] returns them
 /// positionally, so engine and oracle would fold `sparse_attn`'s softmax over the same SET
 /// in a different ORDER and every disagreement below would be uninterpretable. That is the
 /// gap `docs/investigations/v4-flash-port.md` §"The pre-indexer shortcut is narrower than it
@@ -302,7 +301,7 @@ fn upload_plain_selection(
     start_pos: usize,
 ) -> ((usize, usize), DeviceBuf) {
     let mut idx = Vec::new();
-    let shape = v4_topk_idxs(
+    let shape = gather_slot_idxs(
         Sel {
             seqlen,
             start_pos,
@@ -805,7 +804,7 @@ impl Gpu {
             // `compress_rope_theta` and `original_seq_len` together, which is what makes
             // `Defect::RopeNoYarn` unrepresentable for a caller that goes through it
             // (`docs/investigations/v4-flash-port.md`, the owed "Io built by something that
-            // takes LayerKind"). The ratio-0 arm keeps `v4_rope_table_ratio0` because
+            // takes LayerKind"). The ratio-0 arm keeps `rope_table_plain` because
             // that is the function the ratio-0 ENGINE path calls, so the ratio-0 cell scores
             // the shipped construction rather than a second one built for the test; the
             // compressed arm does the same for `freqs_cis`/`rope_for_layer`. This called it a
@@ -814,7 +813,7 @@ impl Gpu {
             // it, and `src/attn.rs`'s own note says the function had no such credit before.
             freqs: dev_f32(&match kind {
                 LayerKind::Plain => {
-                    v4_rope_table_ratio0(d.rope_head_dim, cfg.max_seq_len, cfg.rope_theta)
+                    rope_table_plain(d.rope_head_dim, cfg.max_seq_len, cfg.rope_theta)
                 }
                 LayerKind::Overlap | LayerKind::NonOverlap(_) => flat_freqs(&freqs_cis(
                     rope_for_layer(compressed_rope(cfg), cfg.rope_theta, kind),
@@ -895,7 +894,7 @@ impl Gpu {
             start_pos: p.start_pos,
             ..self.sel
         };
-        let shape = v4_topk_idxs(sel, &mut idx).unwrap();
+        let shape = gather_slot_idxs(sel, &mut idx).unwrap();
         let idxb = dev_i32(&idx);
         let io = self.io(&x, &idxb, shape);
         let step = if p.start_pos == 0 {
@@ -988,7 +987,7 @@ impl Gpu {
     /// **Both destinations at prefill, from ONE call.** `Compressor.forward` assigns
     /// `self.kv_cache[:, :seqlen // ratio]` — the persistent region every LATER decode step
     /// selects by position — *and* returns the same blocks for `Attention.forward` to
-    /// `torch.cat` onto the prompt's KV for THIS step. `Finish` carries a single `out`, so
+    /// `torch.cat` onto the prompt's KV for THIS step. `CompFinish` carries a single `out`, so
     /// the second destination is a device COPY: `compress` read-modify-writes
     /// `kv_state`/`score_state` before it decides whether to emit, so a second call would
     /// re-deposit the pooling window and slide it again.
@@ -998,7 +997,7 @@ impl Gpu {
     /// every contiguous script — which is why [`comp_script`] has a gap in it.
     fn compress_and_place(&mut self, d: &Dims, x: &DeviceBuf, p: &Phase) -> Option<(usize, usize)> {
         let c = self.comp.as_mut()?;
-        let fin = Finish {
+        let fin = CompFinish {
             norm: c.norm.ptr().cast(),
             freqs: self.freqs.ptr().cast(),
             out: c.out.ptr_mut().cast(),
@@ -1742,7 +1741,7 @@ fn the_attention_block_is_entirely_on_its_stream() {
 fn the_selection_shape_guard_rejects_a_short_prefill_and_accepts_a_decode() {
     let (_, d, clean, mut gpu) = Harness::new().parts();
     let p = &clean[0];
-    // A prefill of 4 against a window of 8: `v4_topk_idxs` returns 4 columns, and the
+    // A prefill of 4 against a window of 8: `gather_slot_idxs` returns 4 columns, and the
     // whole point is that `window` is the plausible wrong answer.
     let short = 4usize;
     assert!(
@@ -2843,10 +2842,10 @@ fn the_compressed_region_is_read_exactly_where_the_selection_names_it() {
 
 /// The two constructions of the un-YaRN'd rotary table agree, bit for bit.
 ///
-/// `Gpu::new` builds the ratio-0 table with `v4_rope_table_ratio0` and the compressed one
+/// `Gpu::new` builds the ratio-0 table with `rope_table_plain` and the compressed one
 /// with `freqs_cis(rope_for_layer(..))`, and a comment there used to call that a
 /// "cross-check" while nothing compared them. This is the comparison, and it is not
-/// bookkeeping: `src/attn.rs` records that `v4_rope_table_ratio0`'s only cross-check was an
+/// bookkeeping: `src/attn.rs` records that `rope_table_plain`'s only cross-check was an
 /// out-of-tree numpy transliteration plus the end-to-end `.q` golden. `rope_for_layer` with
 /// `LayerKind::Plain` passes `original_seq_len = 0`, which disables the YaRN branch, so the
 /// two must produce identical tables — and if they ever do not, one of the two cells in this
@@ -2856,7 +2855,7 @@ fn the_compressed_region_is_read_exactly_where_the_selection_names_it() {
 #[test]
 fn the_two_rope_table_constructions_agree_on_the_un_yarned_table() {
     let cfg = V4Config::toy();
-    let direct = v4_rope_table_ratio0(cfg.rope_head_dim, cfg.max_seq_len, cfg.rope_theta);
+    let direct = rope_table_plain(cfg.rope_head_dim, cfg.max_seq_len, cfg.rope_theta);
     let compressed = compressed_rope(&cfg);
     let via_selector = flat_freqs(&freqs_cis(
         rope_for_layer(compressed, cfg.rope_theta, LayerKind::Plain),

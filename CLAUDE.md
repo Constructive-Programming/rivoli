@@ -52,6 +52,7 @@ cargo build --release --features rocm        # the only backend
 cargo test  --release --features rocm        # HANGS intermittently — see below; sweep per-binary
 tests/feature-matrix.sh                      # every feature combo compiles (34 cells, no GPU)
 tests/mode-matrix.sh <artifact>              # mode x policy x attn, 36 cells, all decode (~90 min, GPU)
+tests/smoke-matrix.sh                        # BOTH models x settings, 12 tokens/cell + V4 refusal asserts (~30 min, GPU)
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.

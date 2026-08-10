@@ -394,13 +394,10 @@ struct QuantConfig {
 /// all heads), grouped low-rank output projection, hyper-connection residuals, a
 /// hash-routed prefix, and routed experts shipped as FP4 nibbles with e8m0 block scales.
 ///
-/// **The model name is deliberate and load-bearing — this survived the 2026-08-09
-/// rename-for-behaviour pass as category (b).** This struct IS that checkpoint's
-/// `config.json`: every `#[serde(rename)]` below is one of its JSON keys, and the unrenamed
-/// fields are its keys verbatim. A behaviour-derived name here would claim a generality the
-/// serde layer cannot deliver — deserializing any other model's config through it is a
-/// refusal, by design. The engine that consumes it (`f4gpu`) is named for what it does; the
-/// description of one checkpoint is named for the checkpoint.
+/// **The model name is deliberate and load-bearing** (kept through the 2026-08-09
+/// rename-for-behaviour pass): this struct IS that checkpoint's `config.json` — every
+/// `#[serde(rename)]` below is one of its JSON keys, the unrenamed fields are its keys
+/// verbatim — so deserializing another model's config through it is a refusal by design.
 ///
 /// Every field is REQUIRED. See the module header for why that is not negotiable.
 #[derive(Debug, Clone, Deserialize)]

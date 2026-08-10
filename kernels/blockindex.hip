@@ -1,8 +1,10 @@
-// V4-Flash `Indexer.forward` (model.py:409-441) — the device-side scoring, and the
-// Hadamard+fp4 "spread" its compressor shares with it.
+// The V4-Flash Hadamard+fp4 spread (`act_quant_f4_rotated` — the live kernel here,
+// launched by `kvcompress.rs::compress` as the compressor's finish), and the NOT-YET-WIRED
+// block scorer `Indexer.forward` (model.py:409-441) the file is named for — see the note at
+// `index_score_blocks` for why the scorer is staged work, not dead code.
 //
 // S2c-indexer of docs/investigations/v4-flash-port.md. Scored against `src/v4oracle/`'s
-// `Oracle::indexer` by `tests/v4_indexer_kernel.rs`.
+// `Oracle::indexer` by `tests/blockindex_kernel.rs`.
 //
 // WHAT IS HERE AND WHY IT IS ONE FILE. `rotate_activation` + `fp4_act_quant` is applied at
 // TWO places in the reference — to the indexer's `q` rows (:420-422) and to its nested
@@ -46,7 +48,7 @@
 // THE BASIS ORDER IS THE SETTLED PART, and it was the port's highest-risk assumption until
 // 2026-08-05: `rotate_activation` calls `fast_hadamard_transform.hadamard_transform`, which
 // documents itself as `F.linear(x, scipy.linalg.hadamard(dim))` — Sylvester's construction,
-// natural order, NOT sequency. `tests/v4_hadamard_basis.rs` carries the evidence chain and
+// natural order, NOT sequency. `tests/hadamard_basis.rs` carries the evidence chain and
 // pins the oracle's implementation to an explicitly built Sylvester matrix. Getting it wrong
 // would be invisible upstream (every candidate order is orthogonal, so the dot product is
 // unchanged) and a different ranking downstream, because it permutes which coordinates share
@@ -225,13 +227,12 @@ extern "C" __global__ void act_quant_f4_rotated(float* __restrict__ x, int d) {
 // tokens**, and `F4Engine::new` refuses at startup above it rather than silently attending
 // the oldest blocks forever. This kernel is what lifts that ceiling: it is already scored
 // bit-identical against the checkpoint's own compressed KV by
-// `tests/v4_indexer_kernel.rs::indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv`.
+// `tests/blockindex_kernel.rs::indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv`.
 //
-// Recorded because "no caller" reads as "delete me" — it was proposed for deletion on
-// 2026-08-09 alongside `moe_gate_v4` and spared on exactly this distinction. That one was
-// DECLINED architecturally (routing is host work; INV-1 names one router). This one is
-// staged work behind a documented engine limitation, and deleting it would have thrown away
-// the bit-exactness evidence along with the kernel.
+// Recorded because "no caller" reads as "delete me": this is staged work behind a
+// documented engine limitation, and deleting it would throw away the bit-exactness
+// evidence with the kernel. (Proposed for deletion 2026-08-09 and spared on exactly that
+// distinction — contrast `f4gpu.rs::route_row`'s deleted device router.)
 #pragma clang fp contract(off)
 extern "C" __global__ void index_score_blocks(const float* __restrict__ q,
                                               const float* __restrict__ kv,

@@ -248,7 +248,7 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
 // The six spans below are cast to `common.hpp::gu8p` (GLOBAL address space) at every use —
 // the typedef's comment carries the measurement and the rejected alternatives. The cast is
 // TRUE by construction: every span points at a device arena or heap allocation (f4gpu's
-// placement, `tests/v4_kernel.rs`'s `DeviceBuf`s), and host GTT memory is still the global
+// placement, `tests/f4_kernel.rs`'s `DeviceBuf`s), and host GTT memory is still the global
 // aperture on this APU; no LDS or scratch address can reach a descriptor. It asserts only
 // the address SPACE — what the pointer may alias is untouched.
 
@@ -324,7 +324,7 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
             // expert needed the identical arithmetic (`launch_swiglu_clamped_bf16`): the two
             // must agree bit for bit, `kernels/` is not watched by jscpd, and a second copy
             // would drift silently. The hoist was MEASURED bit-neutral, not assumed —
-            // `tests/v4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` carries the
+            // `tests/f4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` carries the
             // hash and the argument.
             float sw = swiglu_clamped(g[t], u[t], limit);
             // ENFORCED, not inherited. `0 · finite` is exactly zero, but the gate has no

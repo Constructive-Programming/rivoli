@@ -520,7 +520,7 @@ pub enum Quantize {
 /// make every one of those positions plausible in the others.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GeomAbi {
+pub struct CompGeom {
     ratio: i32,
     coff: i32,
     d: i32,
@@ -542,7 +542,7 @@ pub struct GeomAbi {
 /// plausible, wrong. Here the algorithm is a field, chosen once by whichever constructor ran.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Geom {
-    abi: GeomAbi,
+    abi: CompGeom,
     quant: Quantize,
 }
 
@@ -555,12 +555,12 @@ pub struct Geom {
 // edit was made. (`backend/vk.rs`'s `ExpertDesc` assert was the same idiom until that file
 // was deleted 2026-08-06; `src/backend/hip.rs`'s `ExpertDesc` carries it now.)
 const _: () = assert!(
-    size_of::<GeomAbi>() == 28 && align_of::<GeomAbi>() == 4,
-    "GeomAbi must stay six i32 and one f32 — the layout kernels/kvcompress.hip's CompGeom declares"
+    size_of::<CompGeom>() == 28 && align_of::<CompGeom>() == 4,
+    "CompGeom must stay six i32 and one f32 — the layout kernels/kvcompress.hip's CompGeom declares"
 );
 const _: () = assert!(
-    size_of::<Finish>() == 3 * size_of::<*const f32>(),
-    "Finish must stay three pointers — kernels/kvcompress.hip's CompFinish"
+    size_of::<CompFinish>() == 3 * size_of::<*const f32>(),
+    "CompFinish must stay three pointers — kernels/kvcompress.hip's CompFinish"
 );
 
 impl Geom {
@@ -606,7 +606,7 @@ impl Geom {
         let ratio = kind.compressor_ratio()?;
         let coff = kind.coff();
         Some(Self {
-            abi: GeomAbi {
+            abi: CompGeom {
                 ratio: ratio as i32,
                 coff: coff as i32,
                 d: d as i32,
@@ -658,7 +658,7 @@ impl Geom {
     /// module and Rust has no friend declaration; it hands out a shared reference to an
     /// all-private-field type, so a caller can pass it across the wall and cannot build or
     /// mutate one.
-    pub fn abi(&self) -> &GeomAbi {
+    pub fn abi(&self) -> &CompGeom {
         &self.abi
     }
 
@@ -723,7 +723,7 @@ impl Geom {
 /// chosen once, together, and not three times each.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct Finish {
+pub struct CompFinish {
     pub norm: *const f32,
     pub freqs: *const f32,
     pub out: *mut f32,
@@ -733,7 +733,7 @@ pub struct Finish {
 /// (`einsum("bshd,btd->bsht")`, model.py:425).
 ///
 /// A struct because they are four bare `usize` in a row and every one is plausible in any
-/// other's position — the same argument `Finish` makes about its three pointers, and the one
+/// other's position — the same argument `CompFinish` makes about its three pointers, and the one
 /// `tests/common/mod.rs::Mla` makes about six. `heads` and `hd` in particular are 64 and 128
 /// on every layer that has an indexer, so a transposed pair indexes a real row of `q` and
 /// produces a finite score.
@@ -764,7 +764,7 @@ pub use device::{Buffers, compress};
 /// `gpu.rs`.
 #[cfg(feature = "rocm")]
 mod device {
-    use super::{Finish, Geom, LayerKind, Quantize, should_compress};
+    use super::{CompFinish, Geom, LayerKind, Quantize, should_compress};
     use crate::backend::hip::{
         launch_act_quant_f4_rotated, launch_act_quant_f8_prefix, launch_gemm_bf16,
         launch_kv_compress_decode, launch_kv_compress_deposit, launch_kv_compress_prefill,
@@ -793,8 +793,8 @@ mod device {
         /// `[ratio, cd]` f32.
         pub ape: *const f32,
         /// `Compressor.norm`'s weight, the layer's COMPRESSED rotary table, and the
-        /// destination. See [`Finish`] for what each must be and why they are one field.
-        pub fin: Finish,
+        /// destination. See [`CompFinish`] for what each must be and why they are one field.
+        pub fin: CompFinish,
         /// `[ents, cd]` f32, zero-initialised.
         pub kv_state: *mut f32,
         /// `[ents, cd]` f32, **-inf**-initialised. Zero-initialising it instead makes every
@@ -862,7 +862,7 @@ mod device {
     /// concatenation `attn::v4::attention` reads now) and COPY them to
     /// `cache + window_size * head_dim` (what the next decode reads).
     ///
-    /// **A device copy after ONE call — never a second call.** [`Finish`] carries a single
+    /// **A device copy after ONE call — never a second call.** [`CompFinish`] carries a single
     /// `out`, so "write both destinations" reads like two invocations; it is not. Every
     /// path here runs [`launch_kv_compress_deposit`] before the emit decision, and that is a
     /// read-modify-write of `kv_state`/`score_state` (the decode path also slides the

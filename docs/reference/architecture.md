@@ -552,11 +552,11 @@ different populations. Numbering converts "the doc drifted" into something a che
 | **INV-4** | A device-side wait may be enqueued BEFORE its producer exists and still waits (the property `hipStreamWaitEvent` lacks) | `gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits` (a second half lived in `tests/vk.rs` until the Vulkan backend was retired 2026-08-06) |
 | **INV-5** | An expert cannot be launched without enqueueing its data dependency: every descriptor carries a `Ticket` and `wait_on` is the only way to consume one | `pin.rs::inv_5_every_descriptor_carries_a_ticket` |
 | **INV-6** | A wait can always be released from the HOST, so a producer that dies owing a ticket cannot hang the device (HIP: monotone CAS into signal memory) | `gpustream.rs::inv_6_a_host_release_retires_an_enqueued_wait` (the Vulkan half, `vkSignalSemaphore`, went with that backend 2026-08-06) |
-| **INV-7** | On V4, a compressed block's destination row is a pure function of its POSITION — `window_size + start_pos / ratio`, never "the next free slot" — in both coordinate systems the layer loop writes | `v4gpu.rs::inv_7_a_compressed_blocks_row_is_a_pure_function_of_its_position`, `tests/v4_compress.rs::compress_dst_is_positional_…` |
+| **INV-7** | On V4, a compressed block's destination row is a pure function of its POSITION — `window_size + start_pos / ratio`, never "the next free slot" — in both coordinate systems the layer loop writes | `f4gpu.rs::inv_7_a_compressed_blocks_row_is_a_pure_function_of_its_position`, `tests/kvcompress.rs::compress_dst_is_positional_…` |
 
 INV-7 is the V4 layer loop's, and it is **two halves like INV-4 and INV-6** — for a different
 reason, though. The registering half must live under `src/` because `tests/invariants.rs` walks
-`src/` only; the half in `tests/v4_compress.rs` is the older and broader one (the gapped script
+`src/` only; the half in `tests/kvcompress.rs` is the older and broader one (the gapped script
 against an appending placer, the ratio-128 boundary, `region_base = 0` for the indexer's nested
 compressor, and the `Plain` refusal before either division). What the `src/` half adds is the part
 that belongs to the loop rather than to `compress_dst`: at prefill ONE block has TWO destinations
@@ -669,13 +669,13 @@ module root (`src/<group>.rs`) over a directory, so the tree mirrors the section
 - **Top level** — `gpu` (the async forward pass, single- or two-row: `MAXROW`, §13), `math`,
   `attn`/`indexer` (attention modes + DSA), `telemetry` (the always-on PROFILE summary,
   plus the `otlp` feature below), `watchdog`.
-- **Top level, DeepSeek-V4 only** — `v4gpu` (its layer loop: `gpu`'s counterpart, not a branch
-  inside it, because the two share no per-layer step), `v4compress` (the KV compressor and the
+- **Top level, DeepSeek-V4 only** — `f4gpu` (its layer loop: `gpu`'s counterpart, not a branch
+  inside it, because the two share no per-layer step), `kvcompress` (the KV compressor and the
   sparse indexer's host half), `v4oracle` (the CPU transliteration S2/S3 are scored against).
-  `v4gpu` is **`rocm`-only**, as is `gpu` — since 2026-08-06 that is the only backend, but the
-  gate predates it: every launcher `v4gpu` drives is `backend::hip`'s, the Vulkan backend had
+  `f4gpu` is **`rocm`-only**, as is `gpu` — since 2026-08-06 that is the only backend, but the
+  gate predates it: every launcher `f4gpu` drives is `backend::hip`'s, the Vulkan backend had
   no `v4_*` twin, and "no V4 decode path at all" was one of the measured reasons it was
-  retired rather than finished. `v4compress`'s host half and `v4oracle` are ungated — see
+  retired rather than finished. `kvcompress`'s host half and `v4oracle` are ungated — see
   `src/lib.rs` for each argument.
 - **`--features otlp`** — exports the same intervals the PROFILE summary sums as real OTLP
   spans and metrics, one emission at run end. Off by default: the opentelemetry stack is

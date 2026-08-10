@@ -1,6 +1,6 @@
 //! The V4 selection arithmetic, scored against S1b's oracle on the HOST.
 //!
-//! `src/attn.rs::v4_topk_idxs` decides which cache slots every query attends. It is a
+//! `src/attn.rs::gather_slot_idxs` decides which cache slots every query attends. It is a
 //! *selection*, so no numeric tolerance can stand in for it: a wrong rotation attends to
 //! real vectors at the wrong positions and produces fluent wrong text. It is also pure,
 //! so it can be gated without a GPU — which is why it lives here rather than in
@@ -15,7 +15,7 @@
 //! misreading.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::attn::{Sel, v4_topk_idxs};
+use rivoli::attn::{Sel, gather_slot_idxs};
 use rivoli::v4oracle::forward::window_topk;
 
 /// The engine's flat buffer, re-shaped into the oracle's row form so the two can be
@@ -41,7 +41,7 @@ fn engine_sel(
         seqlen,
         start_pos,
     };
-    let (rows, cols) = v4_topk_idxs(sel, &mut flat).expect("selection within index_topk");
+    let (rows, cols) = gather_slot_idxs(sel, &mut flat).expect("selection within index_topk");
     assert_eq!(
         flat.len(),
         rows * cols,
@@ -192,7 +192,7 @@ fn win_one_diverges_from_the_reference_and_is_unreachable() {
     // would make the model attend only its own token. The assertion is here so that the
     // divergence is a decision on the record and not a latent surprise for S3.
     let mut flat = Vec::new();
-    let (rows, cols) = v4_topk_idxs(
+    let (rows, cols) = gather_slot_idxs(
         Sel {
             win: 1,
             kind: LayerKind::Plain,
@@ -273,7 +273,7 @@ fn fp8_times_a_power_of_two_is_exact_in_bf16_over_the_range_the_checkpoint_uses(
 // The COMPRESSED half of the selection — S3 prerequisite 5.
 // ═══════════════════════════════════════════════════════════════════════════════════
 //
-// `v4_topk_idxs(Sel { comp: Some(..), .. })` is `torch.cat([get_window_topk_idxs(...),
+// `gather_slot_idxs(Sel { comp: Some(..), .. })` is `torch.cat([get_window_topk_idxs(...),
 // get_compress_topk_idxs(...)], dim=-1)`. The oracle's twin is the pair
 // `window_topk` / `compress_topk`, which it also concatenates — so the two sides are
 // again structurally different (one flat i32 buffer with a derived offset, versus two
@@ -523,11 +523,11 @@ fn the_positional_selection_refuses_past_the_indexer_truncation_point() {
         !msg.contains("  "),
         "collapsed line continuation in the message: {msg:?}"
     );
-    // ...and `v4_topk_idxs` refuses too, not just the shape probe. A fill that succeeded
+    // ...and `gather_slot_idxs` refuses too, not just the shape probe. A fill that succeeded
     // where the shape refused would be the engine attending a selection nothing checked.
     let mut flat = Vec::new();
     assert!(
-        v4_topk_idxs(sel(r4, 15), &mut flat).is_err(),
+        gather_slot_idxs(sel(r4, 15), &mut flat).is_err(),
         "the fill did not refuse"
     );
     assert!(flat.is_empty(), "the fill wrote rows before refusing");

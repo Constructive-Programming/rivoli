@@ -23,11 +23,20 @@ verdict: The staged plan to make V4-Flash decode. S1 LANDED 2026-08-05 (.f4 repa
 > `f4_loop.rs`, `v4_compress*`→`kvcompress*`, `v4_head_tail.rs`→`headtail.rs`,
 > `v4_indexer_kernel.rs`→`blockindex_kernel.rs`, `v4_{pin,pool,loading,attn_host}`→`f4_*`,
 > `v4_hadamard_basis.rs`→`hadamard_basis.rs`.
+> Post-review (same pass): `V4Instr`→`InstrumentFlags`, Rust `GeomAbi`/`Finish`→
+> `CompGeom`/`CompFinish` (now the SAME names as their HIP ABI mirrors, so one grep finds
+> both halves of the wall), `v4_rope_table_ratio0`→`rope_table_plain`,
+> `v4_topk_idxs`→`gather_slot_idxs`.
 > **DELETED 2026-08-09**: `moe_gate_v4` (the device router) — `f4gpu.rs::route_row` carries
 > the rationale; INV-1's host router is the only router.
 > Unchanged, deliberately: `V4Config`, `v4oracle`/`v4-oracle`, `convert_v4`,
-> `dsv4_encoding`, `V4_PROJ`, the `RIVOLI_V4_*` env vars, the `b"V4LT"`/`b"RIVV4GLD"`
-> magics, and `dot_bench`'s recorded `v4gemv`/`v4res` section names.
+> `dsv4_encoding`, `V4_PROJ` and its `v4_expert_projs`/`v4_expert_base` (checkpoint tensor
+> name strings), the `RIVOLI_V4_*` env vars, the `b"V4LT"`/`b"RIVV4GLD"` magics, and
+> `dot_bench`'s recorded `v4gemv`/`v4res` section names. Also considered and left: GLM's
+> `src/gpu.rs` and `tests/kernel.rs` — the same logic reaches them (`.vq3`/`.i4` engine,
+> its kernel oracles), but `gpu.rs` also hosts crate-shared helpers so its rename is a
+> separate move, and `kernel.rs`'s filing predates the split; recorded so the asymmetry
+> reads as declined, not missed.
 
 
 # DeepSeek-V4-Flash-0731 → first decode, first benchmark

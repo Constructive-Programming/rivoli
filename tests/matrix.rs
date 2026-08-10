@@ -48,17 +48,14 @@ fn read(p: &str) -> String {
     std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{p}: {e}"))
 }
 
-/// Every mode/policy/attn the CLI accepts is exercised by the correctness matrix, and the
-/// matrix names nothing the CLI would reject.
-///
-/// `auto` is the one deliberate exclusion: it resolves to dense or dsa at startup, so a
-/// cell for it duplicates whichever it chose while hiding which that was.
-#[test]
-fn the_mode_matrix_covers_exactly_what_the_cli_accepts() {
+/// The `Mode`s `config.rs` parses and the `--attn` values `main.rs` offers (minus `auto`,
+/// the one deliberate exclusion — it resolves to dense or dsa at startup, so a cell for it
+/// duplicates whichever it chose while hiding which). Shared by the mode-matrix and
+/// smoke-matrix guards; factored the day the second guard landed, because `build.rs`'s
+/// duplication gate rejected the copy.
+fn engine_modes_and_attns() -> (BTreeSet<String>, BTreeSet<String>) {
     let main = read("src/main.rs");
     let cfg = read("src/artifact/config.rs");
-    let sh = read("tests/mode-matrix.sh");
-
     let modes: BTreeSet<String> = cfg
         .lines()
         .filter_map(|l| l.split_once("\" => Ok(Mode::"))
@@ -68,9 +65,21 @@ fn the_mode_matrix_covers_exactly_what_the_cli_accepts() {
         modes.len() >= 3,
         "parsed {modes:?} from Mode::parse — the match arms must have moved"
     );
-
     let mut attns = cli_values(&main, "dense");
     assert!(attns.remove("auto"), "--attn should still offer `auto`");
+    (modes, attns)
+}
+
+/// Every mode/policy/attn the CLI accepts is exercised by the correctness matrix, and the
+/// matrix names nothing the CLI would reject.
+///
+/// `auto` is the one deliberate exclusion: it resolves to dense or dsa at startup, so a
+/// cell for it duplicates whichever it chose while hiding which that was.
+#[test]
+fn the_mode_matrix_covers_exactly_what_the_cli_accepts() {
+    let main = read("src/main.rs");
+    let sh = read("tests/mode-matrix.sh");
+    let (modes, attns) = engine_modes_and_attns();
 
     for (dim, engine, script) in [
         ("modes", modes, script_array(&sh, "MODES")),
@@ -85,6 +94,28 @@ fn the_mode_matrix_covers_exactly_what_the_cli_accepts() {
             engine, script,
             "tests/mode-matrix.sh {dim} drifted from the engine.\n  \
              engine accepts: {engine:?}\n  matrix runs:    {script:?}"
+        );
+    }
+}
+
+/// The same guard for `smoke-matrix.sh`, added the day that script was born rather than
+/// after its first drift: it carries the same hand-written `GLM_MODES`/`GLM_ATTNS` arrays
+/// mode-matrix.sh warns about ("a declared support list is exactly the thing that drifts —
+/// bench-matrix.sh enumerated `top-m` for months"), and its own commit initially recorded
+/// "adds no coupling to matrix.rs" as if that were a feature. The coupling IS the point.
+#[test]
+fn the_smoke_matrix_covers_exactly_what_the_cli_accepts() {
+    let sh = read("tests/smoke-matrix.sh");
+    let (modes, attns) = engine_modes_and_attns();
+
+    for (dim, engine, script) in [
+        ("GLM_MODES", modes, script_array(&sh, "GLM_MODES")),
+        ("GLM_ATTNS", attns, script_array(&sh, "GLM_ATTNS")),
+    ] {
+        assert_eq!(
+            engine, script,
+            "tests/smoke-matrix.sh {dim} drifted from the engine.\n  \
+             engine accepts: {engine:?}\n  smoke runs:     {script:?}"
         );
     }
 }

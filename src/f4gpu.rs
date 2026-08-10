@@ -4,11 +4,10 @@
 //!
 //! # The name says the artifact format, and that is NARROWER than it sounds
 //!
-//! Renamed from `v4gpu`/`V4Engine` on 2026-08-09, because naming a decode loop after the
-//! model that first needed it is the mistake this tree spent the day removing. `f4` follows
-//! the convention already in the repo — `.f4`/`.vq3`/`.i4` artifacts, the `dot_f4_wave_r`
-//! family — and it is the actual dispatch fact: `gpu.rs::launch_expert_range` bails on
-//! `RoutedFmt::F4` naming this file's launcher.
+//! Renamed from `v4gpu`/`V4Engine` on 2026-08-09. `f4` follows the convention already in
+//! the repo — `.f4`/`.vq3`/`.i4` artifacts, the `dot_f4_wave_r` family — and it is the
+//! actual dispatch fact: `gpu.rs::launch_expert_range` bails on `RoutedFmt::F4` naming this
+//! file's launcher.
 //!
 //! **But the name over-promises, and a reader must not take it at face value: a different
 //! `.f4` model would NOT drop in here.** This loop hard-codes an architecture, not a format.
@@ -19,11 +18,9 @@
 //! dispatch keys on; it does not name what this file is compatible with. A second `.f4`
 //! model wanting to reuse this would be a port, not a configuration.
 //!
-//! That is the honest cost of picking a name from the format axis. It was chosen over
-//! `MqaHcEngine` — truer to the mechanism — because a cryptic name at every call site buys
-//! precision nobody reads, and over keeping `V4` because a product version number is the one
-//! thing the naming principle is explicitly against. The over-promise is written down here
-//! instead of being fixed in the identifier.
+//! That is the honest cost of picking a name from the format axis (chosen over the truer
+//! but cryptic `MqaHcEngine`, and over keeping a product version number); the over-promise
+//! is written down here instead of being fixed in the identifier.
 //!
 //! GLM's counterpart is [`crate::gpu`]. This is a separate module rather than a second arm
 //! inside it, and the reason is not file size: the two share **no** per-layer step. V4 carries
@@ -102,7 +99,7 @@
 
 use crate::artifact::model::V4Config;
 use crate::artifact::quant::{FP8_BLOCK, f4_expert_stride, read_f32};
-use crate::attn::{Sel, v4, v4_topk_idxs};
+use crate::attn::{Sel, gather_slot_idxs, v4};
 use crate::backend::hip::{
     ExpertDescF4, device_sync, fill_u32, launch_act_quant_f8, launch_argmax,
     launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_gemv_f32, launch_gemv_fp8_bf16,
@@ -112,7 +109,7 @@ use crate::backend::hip::{
 use crate::backend::{Event, NULL_STREAM, Stream};
 use crate::gpu::as_le_bytes;
 use crate::kvcompress::{
-    Buffers, Finish, Geom, LayerKind, RopeParams, compress, compress_dst, compress_offset,
+    Buffers, CompFinish, Geom, LayerKind, RopeParams, compress, compress_dst, compress_offset,
     freqs_cis, rope_for_layer,
 };
 use crate::math::{Scoring, f32_to_bf16, route_into};
@@ -177,7 +174,7 @@ fn positional_context_limit(index_topk: usize) -> usize {
 /// `2445645`.
 ///
 /// One construction serves both classes. `freqs_cis(rope_for_layer(.., Plain))` is asserted
-/// equal to `attn::v4_rope_table_ratio0` by
+/// equal to `attn::rope_table_plain` by
 /// `tests/f4_attn.rs::the_two_rope_table_constructions_agree_on_the_un_yarned_table`, so there
 /// is no reason to carry the second builder here as well.
 struct RopeTables {
@@ -226,7 +223,7 @@ impl RopeTables {
             return Ok(buf.ptr().cast());
         }
         // Interleaved `(cos, sin)` — the layout `launch_rope_adjacent` indexes, and the one
-        // `v4_rope_table_ratio0` produces. Written as a push pair rather than a `flat_map` over
+        // `rope_table_plain` produces. Written as a push pair rather than a `flat_map` over
         // the tuple so it reads as the layout it is.
         let pairs = freqs_cis(p, self.max_pos);
         let mut flat = Vec::with_capacity(pairs.len() * 2);
@@ -1159,7 +1156,7 @@ impl F4Engine {
     /// **ONE `compress` call; one or two placements.** `Compressor.forward` performs two writes
     /// and only one of them is the return value: it assigns `self.kv_cache[:, :seqlen // ratio]`
     /// — the persistent region every later decode step selects by position — *and* returns the
-    /// same blocks for `Attention.forward` to `torch.cat` onto this step's prompt KV. `Finish`
+    /// same blocks for `Attention.forward` to `torch.cat` onto this step's prompt KV. `CompFinish`
     /// carries a single `out`, so the second destination is a device COPY and never a second
     /// `compress`. Why a second call is the hazard is stated once, at the call below.
     ///
@@ -1342,7 +1339,7 @@ impl F4Engine {
             wkv: c.w_kv.ptr().cast(),
             wgate: c.w_gate.ptr().cast(),
             ape: cw.ape,
-            fin: Finish {
+            fin: CompFinish {
                 norm: cw.norm,
                 // The layer's COMPRESSED rotary table, resolved through the ONE site.
                 freqs,
@@ -1390,7 +1387,7 @@ impl F4Engine {
             start_pos,
         };
         self.idx_host.clear();
-        let shape = v4_topk_idxs(sel, &mut self.idx_host)
+        let shape = gather_slot_idxs(sel, &mut self.idx_host)
             .with_context(|| format!("layer {layer} selection at ({m}, {start_pos})"))?;
         self.idx_dev.copy_in_at(0, as_le_bytes(&self.idx_host))?;
 

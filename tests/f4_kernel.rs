@@ -79,7 +79,10 @@
 //! they are re-answered in seconds on every `cargo test --release --features rocm`.
 
 #![cfg(feature = "rocm")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// No `.unwrap()` in this file — `expect` carries the message everywhere, so only that
+// lint needs allowing. (Also what keeps this prelude from being a token-for-token jscpd
+// clone of `tests/kvcompress_kernel.rs`'s.)
+#![allow(clippy::expect_used)]
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{

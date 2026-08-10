@@ -1,6 +1,6 @@
 // The V4-Flash HEAD TAIL: the embedding gather, and `Block.hc_head`.
 //
-// Scored against `src/v4oracle/forward.rs` via `tests/v4_head_tail.rs`. Read that file's
+// Scored against `src/v4oracle/forward.rs` via `tests/headtail.rs`. Read that file's
 // header before changing anything here — in particular, do NOT expect the gate to be
 // bit-exact at real dimensions, and do not "fix" a kernel to make it so.
 //
@@ -86,7 +86,7 @@ extern "C" __global__ void hc_head_collapse_gate(const float* __restrict__ h,
     // for every mix, NOT one per hyper-connection copy. Getting that wrong type-checks and
     // produces the right shapes; it is `Defect::HeadHcRsqrtPerCopy`, and note that at real
     // dimensions its signal is the same order as this kernel's own re-association noise, so
-    // the goldens CANNOT catch it — see tests/v4_head_tail.rs.
+    // the goldens CANNOT catch it — see tests/headtail.rs.
     float p = 0.0f;
     for (size_t i = lane; i < hcd; i += WAVE) p += flat[i] * flat[i];
     float rs = 1.0f / sqrtf(wave_sum(p) / (float)hcd + eps);

@@ -4,7 +4,7 @@
 
 #![cfg(feature = "rocm")]
 
-use crate::kvcompress::{Finish, GeomAbi, ScoreDims};
+use crate::kvcompress::{CompFinish, CompGeom, ScoreDims};
 use anyhow::{Result, bail};
 use std::ffi::c_void;
 
@@ -1139,7 +1139,7 @@ launchers! {
         ape: *const f32,
         kv_state: *mut f32,
         score_state: *mut f32,
-        p: &GeomAbi as *const GeomAbi,
+        p: &CompGeom as *const CompGeom,
         s: usize as i32,
         slot0: usize as i32,
         stream: *mut c_void,
@@ -1157,7 +1157,7 @@ launchers! {
     ///
     /// # Safety
     /// `kv`/`score` are at least `nblk · p.ratio() · p.cd()` live f32; `ape` is
-    /// `p.ratio() · p.cd()`; `f` satisfies [`Finish`]'s field contract with `out` sized
+    /// `p.ratio() · p.cd()`; `f` satisfies [`CompFinish`]'s field contract with `out` sized
     /// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
     /// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
     /// null for the default stream.
@@ -1165,8 +1165,8 @@ launchers! {
         kv: *const f32,
         score: *const f32,
         ape: *const f32,
-        f: &Finish as *const Finish,
-        p: &GeomAbi as *const GeomAbi,
+        f: &CompFinish as *const CompFinish,
+        p: &CompGeom as *const CompGeom,
         nblk: usize as i32,
         stream: *mut c_void,
     );
@@ -1181,14 +1181,14 @@ launchers! {
     ///
     /// # Safety
     /// The two state buffers are `p.state_len()` f32 and are read-modify-written; `f` satisfies
-    /// [`Finish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
+    /// [`CompFinish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
     /// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
     /// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
     launch_kv_compress_decode -> rivoli_kv_compress_decode, "kv_compress_decode" (
         kv_state: *mut f32,
         score_state: *mut f32,
-        f: &Finish as *const Finish,
-        p: &GeomAbi as *const GeomAbi,
+        f: &CompFinish as *const CompFinish,
+        p: &CompGeom as *const CompGeom,
         start_pos: usize as i32,
         stream: *mut c_void,
     );

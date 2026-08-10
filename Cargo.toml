@@ -69,7 +69,7 @@ safetensors = { version = "0.8.0", default-features = false, features = ["alloc"
 
 [features]
 # Teacher-forced instruments, all of them on BOTH architectures since 2026-08-08: `--ppl`
-# (`src/eval.rs`; `GpuEngine::nll_forced` for GLM, `V4Engine::nll_forced` for V4) and
+# (`src/eval.rs`; `GpuEngine::nll_forced` for GLM, `F4Engine::nll_forced` for V4) and
 # `--logit-dump`/`--force-tokens` (the build-vs-build drift A/B born at §M9, state in
 # `eval::LogitTrace`, hooked into each engine's decode loop). One feature for the lot: the
 # same class of instrument (a forced decode scored/recorded per position, blocking D2H on

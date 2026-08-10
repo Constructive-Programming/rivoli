@@ -362,7 +362,7 @@ fn geom_indexer_and_geom_attention_do_not_finish_the_same_way() {
     // `Geom::indexer` now builds its abi as `..Self::attention(kind, d, rope_head_dim,
     // norm_eps)?`, a functional update overriding only `quant`, so the two halves cannot
     // differ. Before that both constructors were wrappers around one private `Geom::build`
-    // holding the single `GeomAbi` literal, called once each with a different `Quantize`; the
+    // holding the single `CompGeom` literal, called once each with a different `Quantize`; the
     // dedup inlined it into the already-existing `Geom::attention` and deleted it, so this was
     // an inlining and not a rename.
     //

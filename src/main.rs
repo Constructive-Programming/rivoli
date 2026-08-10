@@ -656,7 +656,7 @@ fn force_list_for(dump: &str, force_path: Option<&str>) -> Result<Option<Vec<u32
 /// `run_v4`, so a backend-less build does not carry a never-constructed struct.
 #[cfg(feature = "rocm")]
 #[derive(Default)]
-struct Instruments {
+struct InstrumentFlags {
     #[cfg(feature = "teacher-forcing")]
     logit_dump: Option<String>,
     #[cfg(feature = "teacher-forcing")]
@@ -676,7 +676,7 @@ fn run_v4(
     attn: &str,
     port: Option<u16>,
     no_mtp: bool,
-    instr: Instruments,
+    instr: InstrumentFlags,
     // Gated to match the `Args` field it comes from, which has been `#[cfg(feature = "trace")]`
     // since the watchdog moved off an env var. Ungated it was an unused parameter on every
     // `--features rocm` build without `trace` — a warning nothing watches, because CI has no
@@ -842,7 +842,7 @@ fn run_v4(
         engine.arm_logit_trace(path, force)?;
     }
     #[cfg(not(feature = "teacher-forcing"))]
-    let Instruments {} = instr; // consume the empty bundle so the parameter is not unused
+    let InstrumentFlags {} = instr; // consume the empty bundle so the parameter is not unused
     // Wedge watchdog, same as GLM's. A V4 layer streams 6 of 256 experts against GLM's 8 of 256
     // over half as many layers, so the shared default is if anything generous here.
     //
@@ -982,9 +982,9 @@ fn main() -> Result<()> {
             // One struct rather than two more cfg'd parameters: `run_v4` already forks on
             // `trace` for `watchdog_secs`, and a second independent feature would need four
             // call arms (`#[cfg]` on a call ARGUMENT is not stable, only on a formal
-            // parameter). `Instruments` is empty without `teacher-forcing`, so the ungated
+            // parameter). `InstrumentFlags` is empty without `teacher-forcing`, so the ungated
             // parameter carries no dead value on a stock build.
-            let instr = Instruments {
+            let instr = InstrumentFlags {
                 #[cfg(feature = "teacher-forcing")]
                 logit_dump: a.logit_dump.clone(),
                 #[cfg(feature = "teacher-forcing")]

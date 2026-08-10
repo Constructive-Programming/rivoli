@@ -69,14 +69,11 @@
 //! Skips with a printed reason when the checkpoint is absent — there is no CI and this
 //! reads 167 GB of index metadata, so it must not be a hard failure on a machine without it.
 #![cfg(feature = "rocm")]
-// Listed expect-first where every sibling says unwrap-first: the two orders are the same
-// lint set, and differing here is what keeps this prelude from being a token-for-token
-// clone of `tests/f4_kernel.rs`'s under jscpd, which tokenizes attributes like code.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::device_sync;
-use rivoli::kvcompress::{Buffers, Finish, Geom, LayerKind};
+use rivoli::kvcompress::{Buffers, CompFinish, Geom, LayerKind};
 use rivoli::math::f32_to_bf16;
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::forward::{CompState, CompressorW, Counters, Defect, Oracle};
@@ -571,7 +568,7 @@ impl Cell {
             }
 
             let x_dev = Dev::f32(&x);
-            let fin = Finish {
+            let fin = CompFinish {
                 norm: self.norm.p(),
                 freqs: freqs_dev.p(),
                 out: out.pm(),
@@ -812,7 +809,7 @@ fn zeroing_ape_reproduces_the_no_ape_defect_exactly() {
 ///
 /// This is the hazard `docs/investigations/v4-flash-port.md` records from S2b — `Io.freqs`
 /// is a raw pointer that cannot distinguish the two tables — measured rather than argued.
-/// `Finish` groups the pointer with `norm` and `out` for the same reason; nothing in the
+/// `CompFinish` groups the pointer with `norm` and `out` for the same reason; nothing in the
 /// type system tells the two tables apart, so a test has to.
 #[test]
 fn the_ratio_0_rope_table_reproduces_the_no_yarn_defect_exactly() {

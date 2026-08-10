@@ -2,13 +2,12 @@
 # Both models, every user-selectable setting, ~12 tokens each: does the engine still decode,
 # and does it still refuse what it documents refusing? A smoke gate, not a benchmark.
 #
-# Born 2026-08-10 as the regression gate for the rename-for-behaviour pass (branch
-# wt/rename-by-behaviour), on the owner's requirement: "we test both models and the multiple
+# Born 2026-08-10 on the owner's requirement: "we test both models and the multiple
 # settings (even if just for 12 tokens) to exercise and make sure we're still working with
-# no regressions." Named for what it does, not for that branch — the gate outlives it.
+# no regressions."
 #
-# HOW IT RELATES TO tests/mode-matrix.sh: that sweep is GLM-only, 36 cells x 3 cache
-# policies, ~90 min — a pre-release gate. This one is both models, one cache policy,
+# HOW IT RELATES TO tests/mode-matrix.sh: that sweep is GLM-only, 36 cells total
+# (3 modes x 4 attn x 3 cache policies), ~90 min — a pre-release gate. This one is both models, one cache policy,
 # 15 cells, and exists to answer "did this change break decode anywhere" in tens of
 # minutes. The classification rules are mode-matrix.sh's (a refusal on a GLM cell is a
 # CRASH, not a category), plus one category that sweep retired and this one needs:
@@ -28,11 +27,13 @@
 # Usage: tests/smoke-matrix.sh
 #   RIVOLI_GLM_ART=/var/db/rivoli/glm52-vq3-full   RIVOLI_V4_ART=/var/db/rivoli/v4-f4-full
 #   RIVOLI_MAX_MEM=115 (GLM)  RIVOLI_MAX_MEM_V4=100  RIVOLI_NGEN=12  RIVOLI_TIMEOUT=900
-#   RIVOLI_SMOKE_SABOTAGE=<cell>  — self-test: inject a failure into that cell (e.g.
-#     "glm/int4/dense") and confirm this script reports FAIL. Prove the gate can go red
-#     before trusting it green; a classifier whose failure mode is a pass gates nothing.
+#   Red-proof: `RIVOLI_MAX_MEM=1 RIVOLI_MAX_MEM_V4=1 tests/smoke-matrix.sh` must FAIL every
+#     decode cell (budget below one layer) while the refusal cells stay green — prove the
+#     gate can go red before trusting it green. (An earlier draft carried a sabotage env var
+#     that APPENDED a second --max-mem; clap rejects duplicates, so it would have proven
+#     clap's arm rather than the engine's. The existing knob does it right for free.)
 #
-# Artifact paths are the ones benchmarks.md records (7x v4-f4-full, 3x glm52-vq3-full).
+# Artifact paths are the ones benchmarks.md records (7x v4-f4-full, 6x glm52-vq3-full).
 # The GPU lock protocol is mode-matrix.sh's: flock -E 66 so "lock busy" is distinguishable
 # from "binary exited 1", build OUTSIDE the lock, one fresh process per cell so no cell
 # inherits a warm expert pool.
@@ -51,7 +52,6 @@ MEM_V4="${RIVOLI_MAX_MEM_V4:-100}"
 TIMEOUT="${RIVOLI_TIMEOUT:-900}"
 LOCK_WAIT="${RIVOLI_LOCK_WAIT:-5400}"
 GPU_LOCK="${RIVOLI_GPU_LOCK:-/var/run/sys-gpu.lock}"
-SABOTAGE="${RIVOLI_SMOKE_SABOTAGE:-}"
 # mode-matrix.sh's prompt, for its recorded reason: the default prompt trips the
 # degeneration warning on this checkpoint, which would flag every cell.
 PROMPT="${RIVOLI_PROMPT:-Explain how a CPU cache hierarchy works, and why it exists.}"
@@ -74,13 +74,6 @@ cell() {
   local id="$1" art="$2" mem="$3" expect="$4"; shift 4
   local out="$LOG/${id//\//-}.log" verdict detail rc
   local -a extra=("$@")
-  if [ "$SABOTAGE" = "$id" ]; then
-    # --max-mem 1: passes the CLI, fails in the engine when the device budget cannot hold
-    # one layer — a runtime failure, so the sabotage exercises the same classifier arm a
-    # real regression would, not clap's.
-    extra+=(--max-mem 1)
-    echo "SABOTAGE armed on $id (--max-mem 1 appended)"
-  fi
   flock -E 66 -w "$LOCK_WAIT" "$GPU_LOCK" \
     timeout -k 30 "$TIMEOUT" "$BIN" "$art" -bench "$NGEN" \
     --max-mem "$mem" --prompt "$PROMPT" "${extra[@]}" >"$out" 2>&1
@@ -88,16 +81,27 @@ cell() {
   if [ $rc -eq 66 ] && [ ! -s "$out" ]; then
     verdict=FAIL; detail="NO GPU — lock busy >${LOCK_WAIT}s, never ran"
   elif [ "$expect" = decode ]; then
-    # Poison first: a decode that reported tok/s AND flagged non-finite values is a failure,
-    # and checking tok/s first would classify it PASS.
+    # Poison first: a decode that reported throughput AND flagged non-finite values is a
+    # failure, and checking the witness first would classify it PASS.
     if grep -aqiE 'panicked|non-finite|NaN detected|degenerat' "$out"; then
       verdict=FAIL; detail="poison marker: $(grep -aioE 'panicked|non-finite|NaN detected|degenerat[a-z]*' "$out" | head -1)"
-    elif [ $rc -eq 0 ] && grep -aq 'tok/s' "$out"; then
-      verdict=PASS; detail="$(grep -ao '[0-9.]* tok/s' "$out" | tail -1)"
+    # Decode witness is PER MODEL: the GLM bench epilogue prints `N tok/s`; run_v4 never
+    # does — its always-on witness is the `PROFILE/tok:` line (f4gpu.rs). Requiring tok/s
+    # alone made the v4/default cell permanently red on a healthy tree (review, 2026-08-10).
+    elif [ $rc -eq 0 ] && grep -aqE 'tok/s|PROFILE/tok:' "$out"; then
+      verdict=PASS
+      detail="$(grep -aoE '[0-9.]+ tok/s' "$out" | tail -1)"
+      [ -n "$detail" ] || detail="$(grep -aoE 'PROFILE/tok: [0-9.]+ms wall' "$out" | tail -1)"
     elif [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
       verdict=FAIL; detail="TIMEOUT ${TIMEOUT}s"
     else
-      verdict=FAIL; detail="rc=$rc $(grep -aiE '^error|panicked' "$out" | head -1 || tail -1 "$out")"
+      # NOT `grep ... | head -1 || tail -1`: head exits 0 on empty input, so the fallback
+      # never ran and the diagnostic collapsed to a bare rc — the `| tail eats the exit
+      # code` trap, caught by review before this script's first device run.
+      verdict=FAIL
+      detail="$(grep -aiE '^error|panicked' "$out" | head -1)"
+      [ -n "$detail" ] || detail="$(tail -1 "$out")"
+      detail="rc=$rc $detail"
     fi
   else
     # `-e` because the pattern itself may start with `--` (the --attn refusal does), and
