@@ -576,14 +576,23 @@ impl Safetensors {
 //     `scales_b: T.Tensor[(N, ceildiv(K, 32))]` indexed `[n, k]` — `[o_dim, f4_groups]`
 //     row-major, which IS checked, by the shape guard in `F4Expert::spans`.
 
-/// One V4 routed expert, located in a source checkpoint: which tensors it is made of and
-/// what shape they must have.
+/// One routed expert — V4's or K3's — located in a source checkpoint: which tensors it is made
+/// of and what shape they must have.
 ///
-/// A struct rather than four positional arguments repeated at every entry point, for the
-/// reason `SetDims` gives: nothing about a transposed `(expert_in, moe_inter)` fails a check —
-/// an expert's three projections are `(moe_inter, expert_in)·2 + (expert_in, moe_inter)`, so the
-/// swap produces exactly the same byte count and streams the wrong weights. Named fields
-/// make the swap visible at the call site instead of invisible inside an argument list.
+/// It exists to pair the six spans that `spans`, [`Self::pack`] and [`Self::diff`] all walk in
+/// the same order, so the writer and the verifier cannot disagree about the layout.
+///
+/// > **CORRECTED 2026-08-11.** This said the struct existed "rather than four positional
+/// > arguments repeated at every entry point", so that a transposed `(expert_in, moe_inter)`
+/// > would be visible at the call site. That justification stopped holding when
+/// > [`RoutedRepack`] landed: there is now exactly ONE construction site outside the tests, and
+/// > it copies `RoutedRepack`'s own already-named fields, so the transposition it guarded
+/// > against is guarded there instead. The swap is still the hazard the sentence described —
+/// > an expert's three projections are `(moe_inter, expert_in)·2 + (expert_in, moe_inter)`, so a
+/// > transposition produces the same byte count and streams the wrong weights — it is just no
+/// > longer this type's job to prevent it. Flagged by review; the type could now be folded into
+/// > `RoutedRepack` (~20 lines) and was left alone because the split by cardinality, one per
+/// > layer against one per expert, still reads correctly.
 pub struct F4Expert<'a> {
     pub src: &'a Safetensors,
     /// `layers.{l}.ffn.experts.{e}` — see `quant::v4_expert_base`. On K3,
@@ -648,16 +657,35 @@ impl RoutedRepack<'_> {
     ///
     /// `Sync` on the closure because `fill_expert_blocks` packs the window's experts in parallel
     /// and each thread calls `base` for its own expert. Both callers pass a plain `format!`, so
-    /// the bound costs them nothing — but it has to be stated, since without it the whole loop
-    /// silently becomes single-threaded-only and the compiler is the one that says so.
+    /// the bound costs them nothing. (An earlier draft of this line said omitting it would
+    /// "silently" make the loop single-threaded — it would not: `write_expert_layer` requires
+    /// `Sync`, so leaving it off is a compile error, which is the good outcome.)
     pub fn layer(&self, l: usize, base: impl Fn(usize) -> String + Sync) -> Result<()> {
         let (ne, tool) = (self.n_experts, self.tool);
         let stride = crate::artifact::quant::f4_expert_stride(self.expert_in, self.moe_inter);
         let ebytes = crate::artifact::quant::f4_expert_bytes(self.expert_in, self.moe_inter);
         let path = format!("{}/L{l:02}.f4", self.out_dir);
         let reused = std::fs::metadata(&path).is_ok();
-        if reused {
+        // "reusing" only when there is a write to skip. On a `--verify-only` run the file is the
+        // thing being checked, not something being reused, and saying so 92 times above 92
+        // "verified" lines is noise a reader has to learn to ignore.
+        if reused && self.write {
             eprintln!("{tool}: {path} exists, reusing");
+        }
+        // **`--verify-only` now writes NOTHING, and that is a deliberate behaviour change** made
+        // when this loop was factored out of `convert_v4` (2026-08-11) and spotted by review
+        // rather than by me. The old inline form was `if !reused { write… }` with no verify-only
+        // guard, so `convert_v4 --verify-only` over a range containing an unconverted layer
+        // silently CONVERTED it — against that flag's own `--help`, which promises the run is
+        // read-only. Refusing here is what the flag says; the message has to be explicit, because
+        // the alternative is `std::fs::read` failing with a bare ENOENT and a reader concluding
+        // the artifact is damaged rather than incomplete.
+        if self.verify && !self.write && !reused {
+            bail!(
+                "{path} does not exist, so there is nothing to verify — layer {l} has never been \
+                 converted. `--verify-only` is read-only by contract and will not create it; drop \
+                 the flag to convert, or narrow the layer range to what this artifact holds."
+            );
         }
         let expert = |e| F4Expert {
             src: self.src,
@@ -1165,6 +1193,35 @@ impl I4Source {
     }
 }
 
+/// The `f4_source` provenance block, written by both `.f4` converters and read by
+/// [`f4_layer_range`].
+///
+/// **Deliberately adjacent to its only reader.** `layers` is not decoration — `f4_layer_range` is
+/// the loader's sole source for which layers an artifact holds, and treats the block's absence as
+/// a hard error — so the producer and the consumer of this shape must agree, and the cheapest way
+/// to guarantee that is one function between them. Factored 2026-08-11, when `convert_k3` became
+/// the second producer and the duplication gate refused the copy; before that `convert_k3` omitted
+/// the block entirely and every artifact it wrote was unopenable.
+///
+/// `tool` and `chain` are for a human reading a manifest six months later — two `.f4` sets built
+/// from different checkpoints are byte-indistinguishable on disk. `src` is the checkpoint path.
+///
+/// **`chain` is fixed rather than a parameter, and it is accurate for both producers.** Each was
+/// passing its own string — `"fp4->fp4 (repack)"` and `"mxfp4->fp4 (repack)"` — which rustfmt then
+/// reflowed into two six-line calls differing only in two literals: a jscpd clone, and the
+/// "formatting manufactured duplication" case `CLAUDE.md` records. Collapsing it is not a
+/// concession to the gate: V4's routed experts and K3's are the SAME encoding, OCP MX e2m1 nibbles
+/// with e8m0 group scales, so both really are `fp4 -> fp4`, and the `tool` field already
+/// distinguishes which converter ran.
+pub fn f4_source(tool: &str, src_dir: &str, layers: std::ops::Range<usize>) -> serde_json::Value {
+    serde_json::json!({
+        "tool": tool,
+        "chain": "fp4->fp4 (repack)",
+        "src": src_dir,
+        "layers": [layers.start, layers.end],
+    })
+}
+
 /// The layer range an `.f4` artifact actually HOLDS, from `manifest.json`'s `f4_source`,
 /// confronted with the model's own layer count.
 ///
@@ -1201,7 +1258,13 @@ pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usiz
     let f = v
         .get_mut("f4_source")
         .map(serde_json::Value::take)
-        .with_context(|| format!("{path} has no `f4_source` — not a convert_v4 artifact"))?;
+        // Both converters that produce `.f4` are named, because the message is the first thing a
+        // reader sees and "not a convert_v4 artifact" in front of a Kimi-K3 directory sends them
+        // looking for the wrong bug. `convert_k3` shipped without this stamp for exactly one
+        // commit, and this is the error it produced.
+        .with_context(|| {
+            format!("{path} has no `f4_source` — not a convert_v4 or convert_k3 artifact")
+        })?;
     let [from, to] = serde_json::from_value::<F4Source>(f)
         .with_context(|| format!("{path}: f4_source malformed"))?
         .layers;

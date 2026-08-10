@@ -20,7 +20,7 @@
 
 use rivoli::artifact::quant::{
     F4_GROUP, K3_PACKED, K3_PROJ, K3_SCALE, K3_TEXT_PREFIX, f4_expert_bytes, f4_groups,
-    f4_row_bytes, k3_expert_base, k3_expert_proj,
+    f4_row_bytes, k3_expert_base,
 };
 
 const FAMILIES: &str = include_str!("../docs/measurement/k3-reference/tensor-families.tsv");
@@ -53,6 +53,28 @@ fn families() -> Vec<Family> {
             }
         })
         .collect()
+}
+
+/// `(hidden, expert_in, moe_inter)` read from the **vendored `config.json`**, the same file
+/// `model.rs`'s `k3_base_matches_the_shipped_config` pins the schema against.
+///
+/// Added 2026-08-11 so the assertions below relate three things — the config, the tensor shapes in
+/// the index, and this engine's geometry functions — rather than relating literals to themselves.
+/// Two assertions here were `assert_eq!(<literal>, <literal>)` before review, which cannot fail.
+fn shipped_dims() -> (usize, usize, usize) {
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("../docs/measurement/k3-reference/config.json"))
+            .expect("the vendored config must parse");
+    let t = &v["text_config"];
+    let get = |k: &str| {
+        t[k].as_u64()
+            .unwrap_or_else(|| panic!("text_config.{k} is not an integer")) as usize
+    };
+    (
+        get("hidden_size"),
+        get("routed_expert_hidden_size"),
+        get("moe_intermediate_size"),
+    )
 }
 
 fn find<'a>(fams: &'a [Family], name: &str) -> &'a Family {
@@ -111,27 +133,30 @@ fn the_k3_names_are_the_checkpoints_own() {
             f.name
         );
     }
-    // The six expert tensors, by construction rather than by hand-spelling.
-    for (p, proj) in K3_PROJ.iter().enumerate() {
-        let (packed, scale) = k3_expert_proj(7, 42, p);
-        assert!(packed.ends_with(&format!(".{proj}.{K3_PACKED}")));
-        assert!(scale.ends_with(&format!(".{proj}.{K3_SCALE}")));
+    // The six expert tensors, composed **the way `F4Expert::spans` composes them** — `{base}.{proj}`
+    // then the two suffixes — so this pins the string shape a conversion actually runs against.
+    // It used to call a `k3_expert_proj` helper that nothing in `src/` used, and assert that its
+    // output ended with the same constants it had just concatenated: a guard unable to fire, on a
+    // path the converter never takes. Helper deleted, review 2026-08-11.
+    for proj in K3_PROJ {
+        let base = format!("{}.{proj}", k3_expert_base(7, 42));
         // Substitute the two indices back out and the result must BE a shipped family.
-        for n in [&packed, &scale] {
+        for n in [format!("{base}.{K3_PACKED}"), format!("{base}.{K3_SCALE}")] {
             let fam = n
                 .replace("layers.7.", "layers.{L}.")
                 .replace("experts.42.", "experts.{E}.");
             let got = find(&fams, &fam);
-            assert_eq!(got.count, 82_432, "{fam}: 92 MoE layers x 896 experts");
+            // 92 MoE layers x 896 experts. Read off the TSV, and it is the one count that proves
+            // these families cover the dense layer's ABSENCE as well as the MoE layers' presence:
+            // 93 layers would be 83,328.
+            assert_eq!(got.count, 92 * 896, "{fam}");
+            assert_ne!(got.count, 93 * 896, "{fam}: layer 0 has no experts");
             assert_eq!(
                 got.dtype, "U8",
                 "{fam}: MXFP4 nibbles and e8m0 scales are both U8"
             );
         }
     }
-    // 82,432 is 92 x 896 — asserted, not restated, because it is the one number that proves
-    // these families cover the dense layer's ABSENCE as well as the MoE layers' presence.
-    assert_eq!(92 * 896, 82_432);
     assert_eq!(
         k3_expert_base(3, 0),
         "language_model.model.layers.3.block_sparse_moe.experts.0"
@@ -156,16 +181,17 @@ fn the_k3_names_are_the_checkpoints_own() {
         assert_eq!(f.dtype, "BF16", "{tensor} is trunk-side and NOT quantized");
     }
     // The shared expert: ONE fused MLP per layer at FULL width, which is why `.f4` has no shared
-    // block. `[7168, 6144]` down — 6144 is 2 x moe_inter, the "two shared experts" fused.
+    // block. Its down projection is `[hidden, 2 x moe_inter]` — **against the vendored CONFIG's
+    // dims, not against literals**. `assert_eq!(6144, 2 * 3072)` stood here until review
+    // 2026-08-11 pointed out it is a compile-time identity over constants that reads nothing:
+    // this form fails if the config and the tensor shapes ever disagree, which is the fact worth
+    // holding.
+    let (hidden, _, moe_inter) = shipped_dims();
     let sh = find(&fams, &moe("shared_experts.down_proj.weight"));
     assert_eq!(
         (sh.count, sh.shape.clone(), sh.dtype.as_str()),
-        (92, vec![7168, 6144], "BF16")
-    );
-    assert_eq!(
-        6144,
-        2 * 3072,
-        "the fused width is two experts' worth of intermediate"
+        (92, vec![hidden, 2 * moe_inter], "BF16"),
+        "the fused shared MLP is two experts' worth of intermediate at full width"
     );
 }
 
@@ -182,7 +208,14 @@ fn the_k3_names_are_the_checkpoints_own() {
 #[test]
 fn the_shipped_expert_layout_is_already_rivolis() {
     let fams = families();
-    let (expert_in, moe_inter) = (3584, 3072);
+    // **From the vendored config, not hardcoded** — the widths under test are `expert_in` (the
+    // 3584 latent, NOT `hidden_size`) and `moe_inter`, and reading them from the file is what
+    // makes this test relate the config to the shipped shapes instead of restating both.
+    let (hidden, expert_in, moe_inter) = shipped_dims();
+    assert_ne!(
+        expert_in, hidden,
+        "routed_expert_hidden_size == hidden_size: the latent this whole stage exists for is gone"
+    );
     // Slot order is gate, up, down — so the first two are entered at the latent and the third at
     // the intermediate. Getting this pairing wrong is the `w2`-in-the-wrong-slot case.
     let widths = [

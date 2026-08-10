@@ -286,7 +286,7 @@ download" never excluded metadata).
 | 7 | trunk re-read | **Confirmed by bind count** (93/token), **not by timing** — §4b | `k3_trunk.c:361` |
 | 8 | pin the reference | Ladder, split sweep, `environment.txt`, `replication.tsv` vendored | — |
 | 9 | correct `other-models.md` §2 | done, dated note in place | — |
-| 10 | first-party index | **Done.** 497,220 tensors → 50 families, **every text-side family maps to a documented section**; `g_proj`/`o_proj` on all 93 (both families gate), `o_norm` on 69 (KDA only — confirming MLA gates without a norm), `mlp.*_proj` on exactly 1. **No tensor in the checkpoint is unexplained** | index |
+| 10 | first-party index | **Done.** 497,220 tensors → **60 families, 48 of them text-side** (CORRECTED 2026-08-11: this said "50 families" under an unstated reduction rule. The rule is now stated and mechanical — collapse `.layers.<n>.`, `.experts.<n>.` and `.blocks.<n>.` — and the result is vendored at `docs/measurement/k3-reference/tensor-families.tsv`, asserted by `tests/k3_names.rs`. A family count with no rule behind it is not a measurement), **every text-side family maps to a documented section**; `g_proj`/`o_proj` on all 93 (both families gate), `o_norm` on 69 (KDA only — confirming MLA gates without a norm), `mlp.*_proj` on exactly 1. **No tensor in the checkpoint is unexplained** | index |
 | **11** | **first-party modeling code** | **DONE 2026-08-10** — results below | `modeling_kimi_linear.py` @ HF, read raw |
 
 **Item 11 — results.** ~156 KB of first-party source read raw and checked line-by-line

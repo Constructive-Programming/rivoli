@@ -2114,13 +2114,30 @@ mod tests {
                  serde, which is the shape that hides a zeroed dimension. Got: {err}"
             );
         }
-        // One level down. Each arm supplies the OTHER array, so the failure can only be the
-        // named key going missing — not the dict being empty.
-        for (k, only) in [
-            ("kda_layers", r#"{"full_attn_layers":[4]}"#),
-            ("full_attn_layers", r#"{"kda_layers":[1,2,3]}"#),
+        // One level down: **all SEVEN fields of `linear_attn_config`**, each dropped from an
+        // otherwise complete dict.
+        //
+        // The first version of this loop dropped only the two arrays and supplied nothing else, so
+        // it reported `missing field \`kda_layers\`` merely because serde names the FIRST missing
+        // field in declaration order — the five scalars were absent from every arm and untested,
+        // and reordering the struct would have made it pass for the wrong reason. Review
+        // 2026-08-11. Building each arm by deletion from the full dict is what makes the failure
+        // attributable to the named key.
+        let full = k3_linear_attn(93);
+        for k in [
+            "full_attn_layers",
+            "kda_layers",
+            "num_heads",
+            "head_dim",
+            "short_conv_kernel_size",
+            "gate_lower_bound",
+            "use_full_rank_gate",
         ] {
-            let err = k3_err(&[("linear_attn_config", only)]);
+            let doc: serde_json::Value = serde_json::from_str(&full).unwrap();
+            let mut obj = doc.as_object().unwrap().clone();
+            assert!(obj.remove(k).is_some(), "{k:?} is not in the fixture dict");
+            let one_short = serde_json::to_string(&obj).unwrap();
+            let err = k3_err(&[("linear_attn_config", &one_short)]);
             assert!(
                 err.contains(&format!("missing field `{k}`")),
                 "{k:?} inside linear_attn_config has a default. Got: {err}"

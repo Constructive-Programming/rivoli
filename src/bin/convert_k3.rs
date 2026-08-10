@@ -29,10 +29,10 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
-    F4_NAMING_K3, RoutedRepack, SafeWriter, Safetensors, finish_artifact,
+    F4_NAMING_K3, FormatMeta, RoutedRepack, SafeWriter, Safetensors, f4_source, finish_artifact,
 };
 use rivoli::artifact::model::{K3Config, load_config};
-use rivoli::artifact::quant::{K3_TEXT_PREFIX, f4_expert_stride, k3_expert_base};
+use rivoli::artifact::quant::{FP8_BLOCK, K3_TEXT_PREFIX, k3_expert_base};
 
 #[derive(Parser)]
 #[command(about = "Repack a Kimi-K3 checkpoint into a rivoli artifact")]
@@ -67,10 +67,15 @@ fn is_routed(name: &str) -> bool {
 /// Is this tensor part of the multimodal front end?
 ///
 /// Skipped explicitly rather than by omission: `vision_tower` (27 blocks) and `mm_projector` are
-/// SIBLINGS of `language_model` in the name tree, so anything that filtered by "not under
-/// language_model" would also drop nothing and anything that copied everything would carry ~600 MB
-/// of weights this engine has no path for. `quantization_config.ignore` names both, which is the
-/// one part of that block worth believing.
+/// SIBLINGS of `language_model` in the name tree, so a filter phrased as "not under
+/// language_model" would drop nothing, and copying everything would carry a vision tower this
+/// engine has no path for. `quantization_config.ignore` names both `vision_tower` and
+/// `mm_projector`, which is the one part of that block worth believing.
+///
+/// **No byte figure here on purpose.** An earlier draft said "~600 MB"; the vendored
+/// `tensor-families.tsv` records `?` for every vision shape (none of the three shard headers
+/// fetched covered them), so there is nothing in this repo to derive it from and an estimate
+/// stated as a measurement is the defect this port keeps catching.
 fn is_vision(name: &str) -> bool {
     name.starts_with("vision_tower.") || name.starts_with("mm_projector.")
 }
@@ -107,17 +112,39 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.out_dir)?;
 
     let layers: Vec<usize> = (args.from..to).collect();
-    // Only the shards holding what we are about to read. A checkpoint still downloading has
-    // truncated shards, and opening one would fail a run over layers we are not converting.
-    // K3 is 1.42 TiB across 96 shards, so this is not a nicety.
-    let wanted: Vec<String> = layers
+    // **ONE list of layers, driving both which shards get opened and what the resident writer
+    // emits** — the pairing `convert_v4`'s `MODEL_LEVEL` comment insists on ("two things that
+    // have to agree"). This converter broke it from the other end until review 2026-08-11: the
+    // resident pass looped over `src.names()`, which is every tensor in every OPENED SHARD, so
+    // the resident set was a function of the checkpoint's shard boundaries rather than of the
+    // request. Two consequences, both real on this checkpoint:
+    //
+    //   * layer 0's dense `mlp.*` tensors landed in the resident set only because
+    //     `embed_tokens` (no `layers.`, so always wanted) happens to share shard 1 with them.
+    //     Luck, not design — and `--from 5 --to 6` on a different sharding would drop the dense
+    //     layer while `ensure!(kept > 0)` stayed quiet.
+    //   * a partial run silently over-collected: every trunk tensor that shared a shard with a
+    //     requested layer, while the manifest claimed only `[from, to)`.
+    //
+    // The dense prefix is ALWAYS included, and that is not the same as "the requested range".
+    // Layer 0 carries no experts, so it is never in `from..to`; it is also trunk the model
+    // cannot decode without. `convert_v4` has no dense layers and so never had to say this.
+    let resident_layers: Vec<usize> = (0..k3.first_k_dense_replace).chain(args.from..to).collect();
+    let wanted: Vec<String> = resident_layers
         .iter()
         .map(|l| format!("{K3_TEXT_PREFIX}layers.{l}."))
         .collect();
-    let src = Safetensors::open_indexed(&args.src_dir, |n| {
+    // A tensor this run is responsible for: model-level (no `layers.` at all — `embed_tokens`,
+    // `norm`, `lm_head`, `output_attn_res_*`, verified against all 60 families in
+    // `tensor-families.tsv`) or belonging to one of `resident_layers`.
+    let in_scope = |n: &str| {
         !is_vision(n)
             && (!n.contains("layers.") || wanted.iter().any(|p| n.starts_with(p.as_str())))
-    })?;
+    };
+    // Only the shards holding what we are about to read. A checkpoint still downloading has
+    // truncated shards, and opening one would fail a run over layers we are not converting.
+    // K3 is 1.42 TiB across 96 shards, so this is not a nicety.
+    let src = Safetensors::open_indexed(&args.src_dir, in_scope)?;
     eprintln!(
         "convert_k3: hidden={} latent={expert_in} moe_inter={moe_inter} experts={ne} \
          layers {}..{to} (of {}, dense prefix {})",
@@ -153,10 +180,17 @@ fn main() -> Result<()> {
     // `SafeWriter`'s `Cow` borrows them straight from the source mmap and host RAM peak stays the
     // sum of the CONVERTED tensors — which here is zero.
     //
-    // Driven off what the checkpoint HAS, not off a list of names this port believes in. The two
-    // exclusions are explicit and each is a one-line predicate above; anything else present in the
-    // source lands in the resident set, which is the right default for a trunk that is entirely
-    // BF16 (G0 item 3) and for a port whose next stages will need tensors this one does not read.
+    // Driven off what the checkpoint HAS *within this run's scope* — `in_scope` above, the same
+    // predicate that chose the shards — minus the routed experts, which `.f4` carries. Anything
+    // else present lands in the resident set, which is the right default for a trunk that is
+    // entirely BF16 (G0 item 3) and for a port whose next stages will need tensors this one does
+    // not read.
+    //
+    // **The norms are copied VERBATIM as BF16, and `convert_v4` does not do that** — it widens
+    // them to f32 (`add_widened`) because the loader reads norms as f32. K3's trunk is BF16 on
+    // disk and this converter is a passthrough, so the widening question belongs to whoever
+    // writes the K3 loader; it is recorded here rather than left for them to discover, because a
+    // BF16 tensor read as f32 is not a length error, it is half the rows at wrong magnitudes.
     let mut w = SafeWriter::new();
     let (mut kept, mut skipped_routed, mut skipped_vision) = (0usize, 0usize, 0usize);
     for name in src.names() {
@@ -168,15 +202,30 @@ fn main() -> Result<()> {
             skipped_routed += 1;
             continue;
         }
+        if !in_scope(name) {
+            continue; // a tensor that rode along in an opened shard — see `resident_layers`
+        }
         let (bytes, dtype, shape) = src.raw(name)?;
         w.add(name, dtype, shape.to_vec(), bytes);
         kept += 1;
     }
+    // **A guard that can actually fire.** The previous one was `kept > 0` with a message blaming
+    // "the prefix or the two predicates" — but neither can produce zero: a wrong prefix makes the
+    // resident set LARGER, and every opened shard carries trunk tensors. Review 2026-08-11.
+    //
+    // This one names the hazard that exists: if `is_routed`'s literal ever stops matching, 896
+    // experts x 6 tensors x each converted layer land in `resident.safetensors` — 15.72 GB per
+    // layer of duplicated weights, an artifact that still loads. `>=` rather than `==` because a
+    // shard may hold more than one layer's experts, and this run only accounts for its own.
+    let want_skipped = layers.len() * ne * 6;
     ensure!(
-        kept > 0,
-        "no resident tensors matched — every name was filtered, which means the prefix or the \
-         two predicates are wrong rather than the checkpoint being empty"
+        skipped_routed >= want_skipped,
+        "only {skipped_routed} routed tensors were skipped, expected at least {want_skipped} \
+         ({} layers x {ne} experts x 6) — `is_routed` is no longer matching the checkpoint's \
+         expert names, and those weights are about to be duplicated into the resident set",
+        layers.len()
     );
+    ensure!(kept > 0, "the resident set is empty — nothing was in scope");
     let path = format!("{}/resident.safetensors", args.out_dir);
     w.write(&path)?;
     eprintln!(
@@ -188,17 +237,25 @@ fn main() -> Result<()> {
     let text = std::fs::read_to_string(format!("{}/config.json", args.src_dir))
         .with_context(|| "read source config.json")?;
     let mut manifest: serde_json::Value = serde_json::from_str(&text)?;
-    manifest["format"] = serde_json::json!({
-        "routed": "f4",
-        "layers": [args.from, to],
-        "expert_in": expert_in,
-        "moe_inter": moe_inter,
-        "n_experts": ne,
-        // Recomputed rather than carried out of the loop: `RoutedRepack` derives it from
-        // `expert_in`/`moe_inter` through the same `f4_expert_stride`, so there is one definition
-        // and no local that could drift from the bytes on disk.
-        "expert_stride": f4_expert_stride(expert_in, moe_inter),
-    });
+    // **`format` is `FormatMeta`, the shape the only reader in the tree parses** (`FormatMeta::load`
+    // → `version`/`vq_*`/`fp8_block`). Until review 2026-08-11 this wrote a bespoke object —
+    // `routed`/`layers`/`expert_in`/`moe_inter`/`n_experts`/`expert_stride` — which was a THIRD
+    // meaning for one key and would have failed `FormatMeta::load` on a K3 artifact. Four of those
+    // six keys were also a second, unvalidated copy of `ExpertHeader`, which the pool reads and
+    // checks at open; a JSON duplicate nothing cross-checks can only drift from the bytes.
+    manifest["format"] = serde_json::to_value(FormatMeta::current(FP8_BLOCK))?;
+    // **`f4_source` is NOT decoration, and omitting it made every artifact this tool produced
+    // unopenable.** `f4_layer_range` is "the loader's only source for which layers exist" and
+    // treats an absent `f4_source` as a hard error — so a K3 artifact without it failed at load
+    // with "not a convert_v4 artifact", which is both a refusal and a lie. Found by review
+    // 2026-08-11; the earlier code recorded the range inside its own `format` object, where
+    // nothing looks.
+    //
+    // `layers` is the range this artifact HOLDS, and `num_hidden_layers` is deliberately left
+    // alone — every per-layer structure in a K3 config (`linear_attn_config`'s two arrays,
+    // `first_k_dense_replace`) is indexed by the REAL layer id, so renumbering a partial artifact
+    // as a small MODEL would mis-key all of them.
+    manifest["f4_source"] = f4_source("convert_k3", &args.src_dir, args.from..to);
     finish_artifact(
         "convert_k3",
         &args.out_dir,

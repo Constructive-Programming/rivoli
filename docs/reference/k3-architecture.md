@@ -16,8 +16,11 @@ plan; this is the specification it builds against.
 **Provenance, one paragraph.** First extracted through a summarizing fetch layer, then
 re-verified against the raw pinned C source (every quoted block matches; abridgements are
 elisions, marked — no block is a compilable transcript). Verified against the checkpoint
-itself 2026-08-10: **structure** via the safetensors index (all 50 tensor families map to a
-section, nothing unexplained) and **arithmetic** via `modeling_kimi_linear.py` — MLA, AttnRes,
+itself 2026-08-10: **structure** via the safetensors index (all **48 text-side** tensor families
+map to a section, nothing unexplained — CORRECTED 2026-08-11 from "50", which used no stated
+reduction rule; the rule and the 60-family total, 12 of them vision, are now vendored at
+`docs/measurement/k3-reference/tensor-families.tsv`) and **arithmetic** via
+`modeling_kimi_linear.py` — MLA, AttnRes,
 MoE, router and SiTU-GLU confirmed line-by-line, corrections and one C-divergence recorded
 inline at §2, §4 and §5. Still third-party: **the KDA inner arithmetic** (first-party
 delegates to `fla-core`, §4) and **the MXFP4 unpack** (compressed-tensors, §9) — and the C

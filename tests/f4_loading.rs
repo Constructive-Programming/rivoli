@@ -276,7 +276,14 @@ fn magic_separates_the_formats_when_the_length_cannot() {
 #[test]
 fn f4_header_dims_and_layer_id_are_confronted_with_the_config() {
     // Needles name the FIELD, not just "header dims": that ensure! spans layer, n_experts,
-    // hidden and moe_inter, so a substring matching all four would not say which fired.
+    // expert_in and moe_inter, so a substring matching all four would not say which fired.
+    //
+    // **`expert_in`, not `hidden`, since 2026-08-09** — the expert-geometry layer renamed the
+    // parameter for its ROLE, because K3 enters its routed experts at a 3584 latent rather than at
+    // `hidden_size`. This needle went stale then and **nobody noticed until 2026-08-11**, because
+    // this suite is not in the sweep the K3 work was running (`artifact`, `v4_artifact`, `docs`,
+    // `lib artifact::`). The test was right and red for two days; the fix is one word here, and the
+    // lesson is that a per-suite sweep is not a test run.
     f4_refuses(
         "transposed",
         N_LAYERS,
@@ -284,7 +291,7 @@ fn f4_header_dims_and_layer_id_are_confronted_with_the_config() {
             transpose: true,
             ..Defect::OK
         },
-        &format!("hidden {MOE_INTER} moe_inter {HIDDEN}"),
+        &format!("expert_in {MOE_INTER} moe_inter {HIDDEN}"),
     );
     f4_refuses(
         "layer_skew",

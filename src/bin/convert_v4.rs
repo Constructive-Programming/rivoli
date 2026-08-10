@@ -28,7 +28,8 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
-    Dtype, F4_NAMING_V4, FormatMeta, RoutedRepack, SafeWriter, Safetensors, finish_artifact,
+    Dtype, F4_NAMING_V4, FormatMeta, RoutedRepack, SafeWriter, Safetensors, f4_source,
+    finish_artifact,
 };
 use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::artifact::quant::{FP8_BLOCK, V4_PROJ, v4_expert_base};
@@ -345,12 +346,7 @@ fn main() -> Result<()> {
     //
     // Overwritten, not merged: the resident set above is rewritten for exactly this range
     // on every run, so the artifact really does cover only [from, to) afterwards.
-    manifest["f4_source"] = serde_json::json!({
-        "tool": "convert_v4",
-        "chain": "fp4->fp4 (repack)",
-        "src": args.src_dir,
-        "layers": [args.from, to],
-    });
+    manifest["f4_source"] = f4_source("convert_v4", &args.src_dir, args.from..to);
     finish_artifact(
         "convert_v4",
         &args.out_dir,

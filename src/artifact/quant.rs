@@ -911,11 +911,12 @@ pub fn k3_expert_base(layer: usize, e: usize) -> String {
     format!("{K3_TEXT_PREFIX}layers.{layer}.block_sparse_moe.experts.{e}")
 }
 
-/// `(packed, scale)` tensor names for slot `p` of routed expert `e` in `layer`.
-pub fn k3_expert_proj(layer: usize, e: usize, p: usize) -> (String, String) {
-    let base = format!("{}.{}", k3_expert_base(layer, e), K3_PROJ[p]);
-    (format!("{base}.{K3_PACKED}"), format!("{base}.{K3_SCALE}"))
-}
+// There is deliberately no `k3_expert_proj(layer, e, p) -> (packed, scale)` helper. One existed
+// for a day and was DELETED 2026-08-11 after review: nothing in `src/` called it — `F4Expert::spans`
+// composes those six names itself from `F4Naming`, which is the path a conversion actually runs —
+// and its only test asserted that the helper's output ended with the same three constants the
+// helper had just concatenated. A second constructor for a string the engine builds elsewhere is
+// a second thing to keep in step, and a test of it is a guard unable to fire.
 
 // jscpd:ignore-start — the four `matvec_*` oracles' PARAMETER LISTS. `matvec_i4` and
 // `matvec_i8` take character-identical arguments (`y, x, packed, scale, o_dim, i_dim`),
