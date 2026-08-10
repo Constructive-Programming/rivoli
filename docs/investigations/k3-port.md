@@ -30,8 +30,13 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
 - **The memory budget is the binding constraint.** At `--max-mem 115` the 113.51 GB resident
   set leaves ≈5.7 GB; on the **auto** path the budget is `MemAvailable − 16 GiB` ≈ 107 GB and
   **the resident set does not fit at all**. §4d.
-- **`SafeWriter` streams as of 2026-08-10**, which is what unblocks conversion; the ROUTED
-  writer is still owed. §S1a item 1.
+- **Both writers stream as of 2026-08-10** — `SafeWriter` for the resident tensors and
+  `write_expert_layer` for the routed ones, the latter in 1 GiB windows against a 15.72 GB
+  layer. Conversion is unblocked. §S1a item 1. *(This said "the ROUTED writer is still owed"
+  until 2026-08-10, contradicting item 1 in the same document; corrected after review.)*
+- **The load boundary is in and refuses**: `Arch::KimiK3`, `K3Config`, and a dispatch arm that
+  parses before it bails. §S1a items 6 and 7, and the third bullet of G1a is MET. The `.f4`
+  repack and `convert_k3` are what remain of S1a's artifact half.
 
 ## G. The gate model
 
@@ -347,7 +352,12 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    `mla_use_nope: false` refuses at startup naming the field.
    **`lib.rs` needed nothing** — `artifact::model` is already `pub`, so the plan line asking
    for an export was wrong.
-   **Still to do:** the `.f4` repack and `src/bin/convert_k3.rs`.
+   **Still to do:** the `.f4` repack and `src/bin/convert_k3.rs`. **`convert_k3` must copy the
+   source `config.json` into the manifest with its `text_config` wrapper INTACT** (adding
+   `format`, as `convert_v4.rs` and `convert.rs` both do). A converter that helpfully flattens
+   the nesting away produces an artifact the shipped binary refuses on its own manifest —
+   `K3Config` requires `text_config`, and the wrapper is also the only level that names the
+   architecture. Surfaced by review 2026-08-10, before it cost a re-conversion.
    **The refusal obligation moved, it did not go away.** There is no `run_k3` yet, and an
    unconditional bail refuses every flag by refusing the run — so the `--port`/`--mode`/
    `--attn` bails are absent on purpose, with that reasoning recorded at the dispatch arm.
@@ -363,6 +373,15 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    `kda_layers` **partition** of `1..=n_layers`. `every_k3_field_is_required` is red-proved
    by injecting `#[serde(default)]` on `mla_use_nope`: it fails with "has a default", which
    is the false-green shape V4's `index_topk` note describes.
+   **§3e is implemented in BOTH readings**, which an earlier draft of this item got wrong by
+   treating them as alternatives: `mla_use_nope` is required true, *and* `rope_theta` is carried
+   as an `Option` that `validate` refuses when present. Without the second, `K3TextConfig`'s
+   lack of `deny_unknown_fields` means a rotary base sitting in `text_config` is silently
+   ignored — which is the wrong-dict signal §3e wanted the second reading for.
+   **Also added after review:** `kv_lora_rank` is checked against guard 1004's two bounds
+   (`% 128 == 0`, `<= MLA_ACC_REGS * SUBW` = 512) that §1 recorded and item 7 had dropped. A
+   **zero** passes the kernel's own guard — `0 % 128 == 0` and `!(0 > 512)` — so 24 layers of
+   attention would contribute nothing with no error anywhere.
    **Two config-shaped gaps, both deliberate and both loud if wrong.** `linear_attn_config`'s
    five scalars (`kda_heads`, `kda_head_dim`, `conv_k`, the gate lower bound, one more) are
    absent because their JSON key *spellings* are not among the fields §1 verified against the
@@ -382,10 +401,12 @@ hand-transliterates that module. No gate through G3 consumes a template.
   offset-identically**, proven by a test that opens them.
 - A config missing or contradicting any load-bearing field **refuses at startup**, proven by
   feeding it one. **MET 2026-08-10** — `mla_use_nope: false` in a hand-written manifest is
-  refused by the shipped binary before it reads a dimension, and 24 more contradiction cases
-  plus one-per-field requiredness are covered by `k3_rejects_the_silently_wrong_settings`,
-  `k3_layer_partition_must_be_a_partition` and `every_k3_field_is_required`. The other three
-  bullets of this gate are open.
+  refused by the shipped binary before it reads a dimension. That case is one of the **35** rows
+  in `k3_rejects_the_silently_wrong_settings`; `k3_layer_partition_must_be_a_partition` adds 5
+  broken layer maps plus a positive control, and `every_k3_field_is_required` covers all 30
+  `text_config` fields one at a time plus both arrays inside `linear_attn_config`. Three of
+  those gates are red-proved by deliberate injection (a `#[serde(default)]`, an emptied
+  `hidden_flags`, and a transposed width pair). The other three bullets of this gate are open.
 - Byte accounting reproduced **from the artifact**, both halves.
 
 ### S1b — the gate harness

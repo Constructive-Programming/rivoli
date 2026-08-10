@@ -132,6 +132,60 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::*;
 
+    /// Every architecture, so a new variant cannot ship with an arm nobody looked at.
+    ///
+    /// Added 2026-08-10 with `KimiK3`, after review found that four of its six arms were
+    /// unasserted — and so were V4's. The gap that matters: splitting a shared
+    /// `DeepseekV4 | KimiK3` arm and giving one of them an empty `hidden_flags` reddened
+    /// nothing, and `--help` would then advertise `--attn` on an architecture whose only
+    /// refusal path is a `bail!` in a branch that architecture does not go through.
+    ///
+    /// Written as an INVARIANT over the list rather than a table of expected strings: the
+    /// strings are prose that will be reworded, while "no `--attn` means those four knobs are
+    /// hidden" is the property `artifact_resolved_help` actually depends on.
+    #[test]
+    fn every_arch_answers_its_own_help_questions() {
+        // The `--attn`-shaped knobs. Named here rather than imported, because the point is to
+        // fail if `hidden_flags` and this list drift — see `arch_help_matches_the_parser` for
+        // the same idea against the parser.
+        const ATTN_KNOBS: [&str; 4] = ["attn", "sinks", "window", "misa_heads"];
+        for arch in [Arch::GlmMoeDsa, Arch::DeepseekV4, Arch::KimiK3] {
+            let name = arch.name();
+            assert!(
+                !name.is_empty() && name == name.to_lowercase() && !name.contains(' '),
+                "{name:?} is not a kebab name fit for a help header"
+            );
+            assert!(!arch.summary().is_empty(), "{name} has no summary");
+            match arch.attn_modes() {
+                // An architecture WITH `--attn` must not hide the flag it offers.
+                Some(modes) => {
+                    assert!(
+                        modes.contains(&"auto"),
+                        "{name}: --attn has no default mode"
+                    );
+                    assert!(
+                        !arch.hidden_flags().contains(&"attn"),
+                        "{name} offers --attn and also hides it"
+                    );
+                }
+                // ...and one WITHOUT it must hide all four knobs and say why, since `--help`
+                // hiding a flag is the only notice a user gets.
+                None => {
+                    for knob in ATTN_KNOBS {
+                        assert!(
+                            arch.hidden_flags().contains(&knob),
+                            "{name} has no --attn but leaves --{knob} in its help"
+                        );
+                    }
+                    assert!(
+                        !arch.attn_fixed_note().is_empty(),
+                        "{name} hides --attn without saying why"
+                    );
+                }
+            }
+        }
+    }
+
     /// An unknown architecture must not resolve. The engine refuses it at startup; this
     /// pins the *recogniser* so a future rename cannot quietly make an unknown checkpoint
     /// look like a known one.

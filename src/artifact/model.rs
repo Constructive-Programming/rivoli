@@ -892,10 +892,12 @@ impl V4Config {
 /// mistake that "silently swaps KDA and MLA layers".
 ///
 /// **Both arrays are ONE-BASED.** That is not a style note: zero-based MLA is
-/// `[3, 7, …, 87, 91, 92]`, so reading them zero-based shifts every attention layer by one
-/// and 91/92 — which are adjacent, breaking the every-fourth pattern — land wrong in a way
-/// no shape check sees. [`K3TextConfig::layer_is_mla`] is the only reader that does the
-/// conversion, so there is one place to get it right.
+/// `[3, 7, …, 87, 91, 92]`, so reading them zero-based shifts every attention layer by one, in
+/// a way no shape check sees — both families take `[hidden]` in and return `[hidden]`. The
+/// tail is what makes the slip hard to eyeball: **91 and 92 are adjacent**, so the
+/// every-fourth stride runs 3…91 (23 entries) and only 92 is off it.
+/// [`K3TextConfig::layer_is_mla`] is the only reader that does the conversion, so there is one
+/// place to get it right.
 ///
 /// The dict's five scalars (`kda_heads`, `kda_head_dim`, `conv_k`, the gate lower bound, and
 /// one more) are **deliberately absent**: their JSON key spellings are not among the fields
@@ -930,6 +932,15 @@ pub struct K3Config {
 /// has not verified against the shipped file is *absent* rather than guessed — a wrong key on
 /// a required field refuses the real checkpoint with `missing field`, which is loud and
 /// fixable, while a guessed key with a `#[serde(default)]` is the silent version.
+///
+/// **Hold a [`K3Config`], not this.** This type is `pub` with `pub` fields and derives
+/// `Deserialize`, so one can be produced by deserializing the inner dict alone or by a struct
+/// literal — either of which skips [`parse_config`] and therefore skips both the architecture
+/// check and `validate`. Only `K3Config` is evidence that those ran, which is the property the
+/// module header claims and which holds for `ModelConfig`/`V4Config` because there the
+/// validating type IS the carried type. Flagged by review 2026-08-10; the nesting is what
+/// separates them, so the discipline is a convention here rather than a type guarantee, and
+/// `main.rs`'s dispatch arm keeps the wrapper for exactly this reason.
 ///
 /// `quantization_config` is absent on purpose, and it is the one omission that is a decision
 /// rather than a gap: the block **mis-declares its own scope** (`targets: ["Linear"]` with an
@@ -973,6 +984,14 @@ pub struct K3TextConfig {
     // jscpd:ignore-end
     /// RMSNorm epsilon (1e-5 in the shipped config, and note the first-party MLA LoRA norms
     /// use 1e-6 where the C reference wrote 1e-5 — `k3-architecture.md` §5).
+    ///
+    /// **The one required field whose JSON key §1 of the plan does not itself record** — its
+    /// table has no row for it, and `k3-architecture.md` spells it `rms_eps`, which is the C
+    /// reference's *field* name rather than a JSON key. It is HF-standard on both GLM and V4 so
+    /// it is almost certainly right, and it is needed, so the "omit what you cannot spell" rule
+    /// applied to `linear_attn_config`'s scalars does not reach it. If the shipped file spells
+    /// it otherwise this refuses with `missing field` — the loud direction, and the fix is to
+    /// correct the rename, never to default it.
     pub rms_norm_eps: f64,
 
     // --- attention. Which layer is which comes from the partition, not from a stride.
@@ -982,6 +1001,12 @@ pub struct K3TextConfig {
     /// NoPE, asserted POSITIVELY. Checking only that `rope_theta` is absent cannot tell "this
     /// model applies no rotation" from "we descended into the wrong dict" — plan §3e.
     pub mla_use_nope: bool,
+    /// §3e's secondary reading, and the ONLY field here that must be **absent**. `Option` rather
+    /// than a required field for that reason, which is the module header's rule read forward
+    /// rather than broken: what is banned is a default standing in for a value the engine needs,
+    /// and this is a value the engine must not find. `validate` refuses `Some`.
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
     /// Both default to `False` in the first-party modeling code, so both must come from the
     /// config rather than from a Rust default that happens to agree today (G0 item 11).
     pub mla_use_output_gate: bool,
@@ -1053,6 +1078,9 @@ impl K3TextConfig {
         // The descent check. `parse_config` already matched the WRAPPER's pair against
         // `Arch::KimiK3`; this is the nested pair, and it is what distinguishes "descended
         // into `text_config` of a Kimi-K3 config" from "descended into some other dict".
+        // Both halves are quoted, and the pair is checked as ONE `ensure!` on purpose: which of
+        // the two disagrees is not the interesting fact — "we are in the wrong dict" is, and a
+        // reader holding the file wants both spellings in front of them to see that.
         ensure!(
             self.model_type == "kimi_linear"
                 && self.architectures == ["KimiLinearForCausalLM".to_string()],
@@ -1061,6 +1089,24 @@ impl K3TextConfig {
              think we descended into, or the checkpoint's text model is a different family",
             self.model_type,
             self.architectures
+        );
+        // §3e's SECONDARY check, and it is the reason this field exists at all. NoPE is asserted
+        // positively below (`mla_use_nope`), because "this model applies no rotation" and "we
+        // descended into the wrong dict" are otherwise the same observation — but the plan asks
+        // for both readings, and without this the struct's lack of `deny_unknown_fields` means a
+        // `rope_theta` sitting in `text_config` is silently ignored rather than being the signal
+        // it is. An `Option` is the right shape here for once: the module bans defaults on
+        // fields that must be PRESENT, and this one must be ABSENT.
+        //
+        // If a real K3 `text_config` turns out to carry a `rope_theta` for some path this port
+        // does not walk, the fix is to delete this check and say so — not to relax it to a
+        // value comparison, which would re-admit the wrong-dict case.
+        ensure!(
+            self.rope_theta.is_none(),
+            "text_config carries rope_theta {:?}, but this model is NoPE (`mla_use_nope`) and \
+             no rotation table is built. A rotary base in a dict that should have none is the \
+             signal that the descent landed somewhere else",
+            self.rope_theta
         );
         // A zero width passes every divisibility check below (0 is a multiple of anything)
         // and then sizes an expert row, an arena stride and a GEMV `dim` to nothing.
@@ -1073,16 +1119,48 @@ impl K3TextConfig {
             ("num_attention_heads", self.n_heads),
             ("num_hidden_layers", self.n_layers),
             ("attn_res_block_size", self.attn_res_block_size),
+            // The two LoRA ranks belong here for a sharper reason than the rest, found by
+            // review 2026-08-10: the MLA kernel's own guard does NOT catch a zero.
+            // `kernels/attn.hip:293` is `if (kvl > MLA_ACC_REGS * SUBW || kvl % 128) return
+            // 1004`, and `0 % 128 == 0` while `!(0 > 512)` — so a zero-width latent passes
+            // guard 1004, and 24 layers of attention contribute nothing with no error
+            // anywhere. `V4Config` omits the same pair; K3 is where §1 of the plan wrote the
+            // constraint down, so it is restated here.
+            ("q_lora_rank", self.q_lora_rank),
+            ("kv_lora_rank", self.kv_lora_rank),
         ] {
             ensure!(dim > 0, "{what} is 0");
         }
+        // The other half of guard 1004, restated at the load boundary because the boundary names
+        // the FIELD where the kernel names a code. 512 (this checkpoint's value) sits exactly at
+        // the cap: `MLA_ACC_REGS * SUBW` is 16 * 32, and `kernels/attn.hip:54` derives the 16
+        // from the `⌈kvl/SUBW⌉` lane-private accumulator registers.
+        //
+        // TWO checks rather than one conjunction, so a refusal names which bound was crossed —
+        // and so each test row proves its own half. As `a && b` both rows matched both halves of
+        // the message and neither was a test of anything.
+        ensure!(
+            self.kv_lora_rank.is_multiple_of(128),
+            "kv_lora_rank {} is not a multiple of 128 — `rivoli_mla_attend` refuses it with \
+             guard 1004 (kernels/attn.hip:293)",
+            self.kv_lora_rank
+        );
+        ensure!(
+            self.kv_lora_rank <= 512,
+            "kv_lora_rank {} exceeds the 512 (MLA_ACC_REGS * SUBW) the MLA kernel's \
+             lane-private accumulator can hold — guard 1004, kernels/attn.hip:293",
+            self.kv_lora_rank
+        );
         self.validate_layer_partition()?;
         ensure!(
-            self.first_k_dense_replace < self.n_layers,
-            "first_k_dense_replace {} >= num_hidden_layers {} — every layer would be dense \
-             and no routed expert would ever run",
+            self.first_k_dense_replace > 0 && self.first_k_dense_replace < self.n_layers,
+            "first_k_dense_replace {} is not in 1..{} — at 0 layer 0 would run the routed MoE \
+             path, and this checkpoint ships no expert tensors for it (only the dense \
+             `intermediate_size` {} pair, which would go unused); at n_layers every layer \
+             would be dense and no routed expert would ever run",
             self.first_k_dense_replace,
-            self.n_layers
+            self.n_layers,
+            self.dense_inter
         );
         ensure!(
             self.top_k > 0 && self.top_k <= self.n_experts,
@@ -1140,24 +1218,25 @@ impl K3TextConfig {
              output projection out of the embedding table is a different set of weights at \
              the same shape"
         );
-        ensure!(
-            self.rms_norm_eps > 0.0,
-            "rms_norm_eps {} must be positive",
-            self.rms_norm_eps
-        );
-        // Checked in the f32 domain the kernel works in, not only in the f64 JSON carries —
-        // the same narrowing pair `V4Config`'s `swiglu_limit` documents at length. Underflow
-        // (`x <= 2^-150` -> `0.0f32`) collapses SiTU-GLU's shape; overflow (`x > ~3.4e38` ->
-        // `inf`, which passes any `> 0.0` test) is the silent one.
-        for (what, beta) in [
+        // Every f64 the kernels narrow to f32, checked in the f32 domain rather than only in the
+        // f64 JSON carries — the narrowing pair `V4Config`'s `swiglu_limit` documents at length.
+        // Underflow (`x <= 2^-150` -> `0.0f32`) collapses the value; overflow (`x > ~3.4e38` ->
+        // `inf`, which passes any bare `> 0.0` test) is the silent one.
+        //
+        // **`rms_norm_eps` belongs in this loop, and was checked in f64 alone until review
+        // 2026-08-10.** `gpu.rs:1743` and `f4gpu.rs:325` both do `cfg.rms_norm_eps as f32`, and
+        // `V4Config::hc_eps`'s own doc already said so ("the kernels narrow to f32 at the call,
+        // as `rms_norm_eps` already does") — so the same check was being done two ways six lines
+        // apart. A `1e-46` eps passes an f64 positivity test and reaches every RMSNorm as `0.0f32`.
+        for (what, x) in [
+            ("rms_norm_eps", self.rms_norm_eps),
             ("activation_situ_beta", self.activation_situ_beta),
             ("activation_linear_beta", self.activation_linear_beta),
         ] {
-            let narrowed = beta as f32;
+            let narrowed = x as f32;
             ensure!(
                 narrowed > 0.0 && narrowed.is_finite(),
-                "{what} {beta} narrows to {narrowed} in f32, the domain the fused SiTU-GLU \
-                 expert kernel works in"
+                "{what} {x} narrows to {narrowed} in f32, the domain the kernels work in"
             );
         }
         // The routed experts' widths, and ONLY those: `expert_in` is the latent 3584, so this
@@ -1227,6 +1306,12 @@ impl K3TextConfig {
     /// getting it wrong as the mistake that "silently swaps KDA and MLA layers", and the
     /// swap is invisible downstream: both families take the same `[hidden]` input and return
     /// the same shape.
+    ///
+    /// **No caller in this tree yet** — `pub` for the S2 layer loop, and pinned meanwhile by
+    /// `k3_baseline_parses`, which asserts the whole zero-based map including the adjacent tail.
+    /// The linear scan is 24 elements against 93 layers, ~2.2k compares a token, which is
+    /// nothing at this engine's rate; if it ever matters, `validate` has already proven the
+    /// partition and can hand out a precomputed mask instead.
     pub fn layer_is_mla(&self, layer: usize) -> Result<bool> {
         ensure!(layer < self.n_layers, "layer {layer} >= {}", self.n_layers);
         Ok(self
@@ -1236,6 +1321,13 @@ impl K3TextConfig {
     }
 
     /// Is `layer` the dense-FFN prefix (no routed experts)? Layer 0 in the shipped config.
+    ///
+    /// No caller in this tree yet either. **Note the asymmetry with the sibling above: this one
+    /// does not bounds-check**, because it cannot be wrong in a way a check would catch — an
+    /// out-of-range id is not `< first_k_dense_replace` and reads as "not dense", which is the
+    /// same answer it gives for every real layer but the first. `V4Config::layer_routes_by_hash`
+    /// is the same shape for the same reason. `layer_is_mla` returns `Result` because there a
+    /// missing id would read as "KDA", which is a positive claim about arithmetic.
     pub fn layer_is_dense(&self, layer: usize) -> bool {
         layer < self.first_k_dense_replace
     }
@@ -1703,8 +1795,9 @@ mod tests {
     // ── K3Config ───────────────────────────────────────────────────────────────────
 
     /// One-based `full_attn_layers`, as `docs/reference/k3-architecture.md` §2 quotes it from
-    /// the shipped config. 22 entries on the every-fourth stride, then **92 and 93 adjacent** —
-    /// the pattern breaks at the end, which is why this is transcribed rather than generated.
+    /// the shipped config. The every-fourth stride runs 4…92 — **23** entries — and then
+    /// **93 is adjacent to 92**, off the stride. That one off-pattern entry is why this is
+    /// transcribed rather than generated from a step-4 range.
     const K3_MLA_ONE_BASED: [usize; 24] = [
         4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92,
         93,
@@ -1837,9 +1930,13 @@ mod tests {
     /// on the WRAPPER, so the nested `model_type`/`architectures` are ordinary required fields
     /// here — dropping either must fail as a missing field, not fall back to the wrapper's.
     ///
-    /// Same top-level-only limitation as V4's: `linear_attn_config`'s two arrays are one JSON
-    /// value, so their individual requiredness rides on
-    /// [`k3_layer_partition_must_be_a_partition`] instead.
+    /// **`linear_attn_config`'s two arrays are covered too**, by the second loop. `K3_TEXT`'s
+    /// rows are whole JSON values, so dropping that key drops the dict entire — the limitation
+    /// V4's twin documents and accepts. An earlier draft of this doc claimed the two arrays'
+    /// requiredness "rides on `k3_layer_partition_must_be_a_partition`"; **it did not.** Every
+    /// case in that test emits both keys, so a `#[serde(default)]` on `kda_layers` would have
+    /// left the whole suite green while this comment asserted otherwise. Caught by review
+    /// 2026-08-10, and the fix was to make the claim true rather than to soften it.
     #[test]
     fn every_k3_field_is_required() {
         for (k, _) in K3_TEXT {
@@ -1848,6 +1945,18 @@ mod tests {
                 err.contains(&format!("missing field `{k}`")),
                 "{k:?} has a default: dropping it was rejected by something other than \
                  serde, which is the shape that hides a zeroed dimension. Got: {err}"
+            );
+        }
+        // One level down. Each arm supplies the OTHER array, so the failure can only be the
+        // named key going missing — not the dict being empty.
+        for (k, only) in [
+            ("kda_layers", r#"{"full_attn_layers":[4]}"#),
+            ("full_attn_layers", r#"{"kda_layers":[1,2,3]}"#),
+        ] {
+            let err = k3_err(&[("linear_attn_config", only)]);
+            assert!(
+                err.contains(&format!("missing field `{k}`")),
+                "{k:?} inside linear_attn_config has a default. Got: {err}"
             );
         }
     }
@@ -1859,40 +1968,82 @@ mod tests {
     /// Single-key overrides, and each one PRESENT-but-wrong rather than absent — a dropped key
     /// fails as a missing field and never reaches the `ensure!`, which is the false-green
     /// shape `every_v4_field_is_required`'s notes call out.
+    ///
+    /// **Each `want` names the FIELD, not just the check.** Reviewed 2026-08-10: two rows
+    /// shared `"F4_GROUP"`, and with that substring, transposing `ensure_f4_group_aligned`'s two
+    /// arguments left both rows green while every refusal named the wrong config key. A `want`
+    /// that only proves *some* check fired is not a test of the row it sits on.
     #[test]
     fn k3_rejects_the_silently_wrong_settings() {
         for (key, bad, want) in [
-            ("model_type", r#""deepseek_v4""#, "text_config declares"),
-            ("architectures", r#"["LlamaForCausalLM"]"#, "descended into"),
+            // The nested-descent pair. Each row names its own conjunct's VALUE, so neither can
+            // pass on the other's — the two share one `ensure!`.
+            ("model_type", r#""deepseek_v4""#, r#""deepseek_v4" / "#),
+            (
+                "architectures",
+                r#"["LlamaForCausalLM"]"#,
+                "LlamaForCausalLM",
+            ),
             ("mla_use_nope", "false", "mla_use_nope is false"),
+            // §3e's secondary reading — the only field that must be ABSENT, so this row ADDS a
+            // key the fixture does not carry rather than replacing one.
+            ("rope_theta", "10000.0", "carries rope_theta"),
             ("mla_use_output_gate", "false", "output_gate is false"),
             ("use_full_rank_gate", "false", "use_full_rank_gate is false"),
             ("latent_moe_use_norm", "false", "use_norm is false"),
             ("moe_renormalize", "false", "moe_renormalize is false"),
             ("topk_method", r#""greedy""#, "noaux_tc"),
-            ("num_expert_group", "8", "grouped routing"),
-            ("topk_group", "4", "grouped routing"),
+            // Same treatment: one `ensure!` covers both, so each row asserts on its own value.
+            ("num_expert_group", "8", "num_expert_group 8"),
+            ("topk_group", "4", "topk_group 4"),
             ("num_nextn_predict_layers", "1", "no MTP head"),
             ("tie_word_embeddings", "true", "separate lm_head"),
             ("num_experts_per_token", "900", "not in 1..="),
             ("num_experts_per_token", "0", "not in 1..="),
             ("num_shared_experts", "0", "always-on MLP"),
             ("first_k_dense_replace", "93", "every layer would be dense"),
-            ("rms_norm_eps", "0.0", "must be positive"),
-            // The two f64 -> f32 narrowing failures. `1e-46` underflows to `0.0f32`; `1e39`
+            ("first_k_dense_replace", "0", "is not in 1..93"),
+            // The three f64 -> f32 narrowing failures. `1e-46` underflows to `0.0f32`; `1e39`
             // saturates to infinity, which passes any bare `> 0.0` test — that is the silent
             // direction and the reason the check is `is_finite()` rather than a bound.
+            // `rms_norm_eps` is in this set because `gpu.rs:1743` and `f4gpu.rs:325` both do
+            // `cfg.rms_norm_eps as f32`; it was checked in f64 alone until review.
+            ("rms_norm_eps", "1e-46", "narrows to 0"),
             ("activation_situ_beta", "1e-46", "narrows to 0"),
             ("activation_linear_beta", "1e39", "narrows to inf"),
-            // Group alignment, on the LATENT width and on `moe_inter`. 3600 is a multiple of
-            // neither 32 nor the 16 an fp4 nibble pair would round to.
-            ("routed_expert_hidden_size", "3600", "F4_GROUP"),
-            ("moe_intermediate_size", "3000", "F4_GROUP"),
+            // Group alignment, on the LATENT width and on `moe_inter`. 3600 % 32 == 16 and
+            // 3000 % 32 == 24 — neither is a multiple of `F4_GROUP`, and each `want` names its
+            // own key so a transposed argument pair cannot pass both.
+            (
+                "routed_expert_hidden_size",
+                "3600",
+                "is 3600, not a multiple",
+            ),
+            (
+                "moe_intermediate_size",
+                "3000",
+                "moe_intermediate_size is 3000",
+            ),
             // Zero passes every divisibility check (0 is a multiple of anything) and then
-            // sizes a row, a stride and a GEMV `dim` to nothing.
+            // sizes a row, a stride and a GEMV `dim` to nothing. One row per entry of
+            // `validate`'s width table, so deleting any entry reddens exactly one row —
+            // three of the ten were sampled until review pointed out the rest were free.
             ("hidden_size", "0", "hidden_size is 0"),
             ("routed_expert_hidden_size", "0", "expert_hidden_size is 0"),
+            ("moe_intermediate_size", "0", "moe_intermediate_size is 0"),
+            ("intermediate_size", "0", "intermediate_size is 0"),
+            ("vocab_size", "0", "vocab_size is 0"),
+            ("num_attention_heads", "0", "num_attention_heads is 0"),
+            ("num_hidden_layers", "0", "num_hidden_layers is 0"),
             ("attn_res_block_size", "0", "attn_res_block_size is 0"),
+            ("q_lora_rank", "0", "q_lora_rank is 0"),
+            ("kv_lora_rank", "0", "kv_lora_rank is 0"),
+            // Non-zero but refused by `rivoli_mla_attend`'s guard 1004, which the load boundary
+            // restates. Two SEPARATE `ensure!`s, so each row proves its own half: 500 is not a
+            // multiple of 128, and 640 is one but exceeds MLA_ACC_REGS*SUBW = 512. As one
+            // conjunctive check both rows matched both substrings and neither proved anything.
+            ("kv_lora_rank", "500", "not a multiple of 128"),
+            ("kv_lora_rank", "640", "exceeds the 512"),
         ] {
             let err = k3_err(&[(key, bad)]);
             assert!(err.contains(want), "{key}={bad}: want {want:?}, got: {err}");

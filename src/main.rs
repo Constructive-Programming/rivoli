@@ -1011,10 +1011,17 @@ fn main() -> Result<()> {
             // startup, before anything reads a dimension. Bailing first would leave the whole
             // schema unreachable from the binary — parsed only by unit tests, which is how a
             // load boundary rots.
+            // **The `K3Config` is kept, not shed for its `.text`.** `K3TextConfig` has public
+            // fields and `Deserialize`, so one can be produced from the inner dict alone — which
+            // skips `parse_config` and therefore skips both the architecture check and
+            // `validate`. Only `K3Config` carries the evidence that those ran, which is the
+            // property the module header claims for `ModelConfig` and `V4Config`, where the
+            // validating type IS the carried type. Whatever `run_k3` eventually looks like
+            // should take `&K3Config` for the same reason.
             let k3 = rivoli::artifact::model::load_config::<rivoli::artifact::model::K3Config>(
                 &cfg.model,
-            )?
-            .text;
+            )?;
+            let k3 = &k3.text; // read-only view; the validated `K3Config` above stays in scope
             let arch = Arch::KimiK3;
             info!(
                 "model: {} ({}) — {} layers ({} MLA / {} KDA), hidden {}, routed experts at \
