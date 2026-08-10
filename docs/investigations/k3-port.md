@@ -181,7 +181,7 @@ is confirmed by `k3_trunk.c`'s bind count, not by timing.
 
 **And rivoli's own 7.0 GB/s is the same instrument class** — `other-models.md:336`,
 "`dd iflag=direct`, 4 GiB". rivoli's probes at the expert-read shape (15.34 MB, against K3's
-17.55 MB) measure **12.39 GB/s at QD1 and 14.76 at QD16** (`benchmarks.md:2430`). The MoE layer
+17.55 MB) measure **12.39 GB/s at QD1 and 14.76 at QD16** (`benchmarks.md` "Storage: sequential ordering buys nothing at QD>=2"). The MoE layer
 issues 16 concurrent expert reads, so QD16 is the operating point.
 
 ### 4c. The predicted operating point

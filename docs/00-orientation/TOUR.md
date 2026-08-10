@@ -76,8 +76,9 @@ Read [`reference/architecture.md`](../reference/architecture.md) for the real ve
 
 5. **`docs/` is mostly closed investigation.** Read
    [`INDEX.md`](INDEX.md) and use the verdict column to decide what *not* to open. Reading
-   `benchmarks.md` or `vulkan-port.md` end to end will cost you an afternoon and teach you
-   mostly about rejected options.
+   `vulkan-port.md` end to end will cost you an afternoon and teach you mostly about rejected
+   options. (`benchmarks.md` was compacted 2026-08-10 from 4,070 lines to ~375 and *is* now
+   readable whole — its STATE table is the live state.)
 
 ## Build and test
 
