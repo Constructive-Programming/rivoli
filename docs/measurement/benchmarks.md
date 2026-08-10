@@ -4000,3 +4000,31 @@ resolving power at any n this project can afford.
 every measurement row had printed — the ballast's saturated-constant residual makes its two
 token rows legitimately equal. Their rates are intact and are used above; recorded here because
 `run_round.sh` classifies a non-zero rc as "not a measurement".
+
+
+## GLM int4-unroll engine A/B — byte-identical at --mode int4, 128 tokens, MTP active (2026-08-10)
+
+One arm per side, `--mode int4 --max-mem 115 -bench 128`, the recorded 218-token prompt
+(md5-length-guarded read: the run script REFUSES to start unless the prompt file reads
+exactly 1065 chars — added after a first attempt ran both arms on an EMPTY prompt when a
+session restart moved the scratchpad; that broken pair still came back identical at 9
+tokens, kept here as corroboration, not evidence). Baseline `82366e6` (stock), treatment
+`7a6279f` (`#pragma unroll 4` on `dot_i4_wave_r`). Both binaries built before the device
+was requested; witness (KFD + GTT + llama-swap `/running` via the ClusterIP
+`10.43.48.47:8080` — the pod IP died with a k3s restart mid-session) clean on all four
+samples: kfd=0, gtt=18,673,664 B, fleet=0 throughout.
+
+| gate | base | treatment |
+|---|---|---|
+| reply md5 (1583 B) | `ba97d99d983f1641469d4d0ca6aaf086` | IDENTICAL |
+| expert lookups | 143013 hit / 42197 miss | IDENTICAL |
+| MTP drafts accepted | 63/84 | IDENTICAL |
+| tokens | 128 | 128 |
+| tok/s | 2.30 | 2.19 (noise at n=1; no wall claim) |
+
+MTP active means the R=2 kernel path ran and is byte-neutral under the pragma — the
+register-pressure concern the investigation opened with, discharged on the engine, not
+just the microbench. No wall claim is made or possible: GLM decode at this residency is
+dominated by fetch exposure and 128 tokens has no resolving power; the lever's value is
+the measured serial rate (+12.6% R=1 / +16.4% R=2, benchmarks.md "GLM int4 MoE unroll
+round") arriving as recurring-cost efficiency, per the ranking rule.
