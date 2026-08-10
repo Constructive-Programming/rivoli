@@ -1003,6 +1003,49 @@ fn main() -> Result<()> {
             #[cfg(not(feature = "trace"))]
             return run_v4(&cfg, &a.attn, a.port, a.no_mtp, instr);
         }
+        rivoli::arch::Arch::KimiK3 => {
+            use rivoli::arch::Arch;
+            // **The config is parsed BEFORE the refusal, deliberately.** `K3Config` is the
+            // only part of the K3 path that exists, and it is the part G1a asks for: a
+            // manifest that omits or contradicts a load-bearing field must refuse here, at
+            // startup, before anything reads a dimension. Bailing first would leave the whole
+            // schema unreachable from the binary — parsed only by unit tests, which is how a
+            // load boundary rots.
+            let k3 = rivoli::artifact::model::load_config::<rivoli::artifact::model::K3Config>(
+                &cfg.model,
+            )?
+            .text;
+            let arch = Arch::KimiK3;
+            info!(
+                "model: {} ({}) — {} layers ({} MLA / {} KDA), hidden {}, routed experts at \
+                 latent {} x inter {}, {} heads, {} experts top{}, vocab {}",
+                arch.name(),
+                arch.summary(),
+                k3.n_layers,
+                k3.linear_attn_config.full_attn_layers.len(),
+                k3.linear_attn_config.kda_layers.len(),
+                k3.hidden,
+                k3.expert_in,
+                k3.moe_inter,
+                k3.n_heads,
+                k3.n_experts,
+                k3.top_k,
+                k3.vocab
+            );
+            // No `run_k3` yet, and no flag refusals either — because an unconditional bail
+            // refuses every flag by refusing the run. **When the decode path lands, `run_k3`
+            // must hand-write them**: `--port`, `--mode` and `--attn` are bespoke `bail!`s in
+            // `run_v4` (search for `--attn does not apply`), not match arms, so a `run_k3`
+            // that omits them compiles clean and silently ACCEPTS knobs it cannot honour.
+            // `arch.rs` hiding a flag from `--help` is not the parser rejecting it.
+            bail!(
+                "{} artifacts do not decode yet — S1a converts and validates, and the KDA \
+                 kernel family (69 of {} layers) is S2. The config parsed, which is what this \
+                 stage promises: see docs/investigations/k3-port.md.",
+                arch.name(),
+                k3.n_layers
+            );
+        }
     }
     // (Until 2026-08-08 a bail! here refused --logit-dump/--force-tokens as "V4-only
     // instruments" — both now work on a GLM artifact too, armed further down once the

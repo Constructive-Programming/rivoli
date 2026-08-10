@@ -332,13 +332,44 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    `routed_expert_{down,up}_proj` and `block_sparse_moe.gate.weight`, all three of which ship
    **BF16** on disk. Drive off the presence of `.weight_packed`; do not trust the config.
    Skip `vision_tower` and `mm_projector` explicitly.
-6. `.f4` repack, `Arch::KimiK3` plumbing (`arch.rs` six arms + a both-directions recogniser
-   test, `K3Config` + `impl ArchConfig`, `main.rs:979` dispatch + `run_k3`, `lib.rs`,
-   `src/bin/convert_k3.rs`). **`run_k3` must hand-write the `--port` and attention-flag
-   refusals** — those are bespoke bails in `run_v4` (`main.rs:729`), not matches, so omitting
-   them compiles clean and silently accepts the flags.
-7. Assert the config scalars of §1 rather than defaulting them, and write the K3 pin's own
-   `top_k * rows + n_shared <= MAX_BATCH` check — `pin.rs:409` exists only on GLM's path.
+6. `.f4` repack, `Arch::KimiK3` plumbing. **Plumbing DONE 2026-08-10; the repack and the
+   converter are NOT.**
+   **Done:** `Arch::KimiK3` and its six arms, recognised on the **top** level only
+   (`KimiK3ForConditionalGeneration` / `kimi_k3`) — the nested `KimiLinearForCausalLM` /
+   `kimi_linear` pair is deliberately *rejected* by the recogniser, because it names the
+   linear-attention family rather than this checkpoint; `K3Config::validate` asserts it
+   instead, where the key it descended through is available to quote. `attn_modes` is `None`
+   and the same four flags V4 hides are hidden. `K3Config` + `K3TextConfig` +
+   `impl ArchConfig`, every field required, plus the `main.rs` dispatch arm — which **parses
+   the config and then bails**, in that order, so the schema is reachable from the binary
+   rather than only from unit tests. Verified end to end against a hand-written manifest: the
+   good one logs `93 layers (24 MLA / 69 KDA) … latent 3584` and refuses to decode; one with
+   `mla_use_nope: false` refuses at startup naming the field.
+   **`lib.rs` needed nothing** — `artifact::model` is already `pub`, so the plan line asking
+   for an export was wrong.
+   **Still to do:** the `.f4` repack and `src/bin/convert_k3.rs`.
+   **The refusal obligation moved, it did not go away.** There is no `run_k3` yet, and an
+   unconditional bail refuses every flag by refusing the run — so the `--port`/`--mode`/
+   `--attn` bails are absent on purpose, with that reasoning recorded at the dispatch arm.
+   **When the decode path lands, `run_k3` must hand-write them**: they are bespoke bails in
+   `run_v4`, not match arms, so a `run_k3` that omits them compiles clean and silently accepts
+   the flags. `arch.rs` hiding a flag from `--help` is not the parser rejecting it.
+7. Assert the config scalars of §1 rather than defaulting them — **DONE 2026-08-10**, in
+   `K3TextConfig::validate`: the five positive flags (`mla_use_nope`, `mla_use_output_gate`,
+   `use_full_rank_gate`, `latent_moe_use_norm`, `moe_renormalize`), the degenerate routing
+   groups, `topk_method == "noaux_tc"`, `num_nextn_predict_layers == 0`,
+   `!tie_word_embeddings`, both SiTU betas in the **f32** domain the kernel works in, the
+   zero-width widths (0 passes every divisibility check), and the `full_attn_layers` /
+   `kda_layers` **partition** of `1..=n_layers`. `every_k3_field_is_required` is red-proved
+   by injecting `#[serde(default)]` on `mla_use_nope`: it fails with "has a default", which
+   is the false-green shape V4's `index_topk` note describes.
+   **Two config-shaped gaps, both deliberate and both loud if wrong.** `linear_attn_config`'s
+   five scalars (`kda_heads`, `kda_head_dim`, `conv_k`, the gate lower bound, one more) are
+   absent because their JSON key *spellings* are not among the fields §1 verified against the
+   shipped file, and a guessed key on a required field refuses the real checkpoint. So is
+   `quantization_config`, for the opposite reason — item 5 says not to trust it.
+   **Still to do:** the K3 pin's own `top_k * rows + n_shared <= MAX_BATCH` check —
+   `pin.rs:409` exists only on GLM's path, and there is no K3 pin yet.
 
 Tokenizer work defers to S4: **there is no `chat_template`** in `tokenizer_config.json`;
 rendering lives in `encoding_k3.py` with an XML-ish `<message role=...>` framing, so the port
@@ -350,7 +381,11 @@ hand-transliterates that module. No gate through G3 consumes a template.
 - The existing GLM (675 GiB) and V4 (~146 GiB) artifacts still open **byte- and
   offset-identically**, proven by a test that opens them.
 - A config missing or contradicting any load-bearing field **refuses at startup**, proven by
-  feeding it one.
+  feeding it one. **MET 2026-08-10** — `mla_use_nope: false` in a hand-written manifest is
+  refused by the shipped binary before it reads a dimension, and 24 more contradiction cases
+  plus one-per-field requiredness are covered by `k3_rejects_the_silently_wrong_settings`,
+  `k3_layer_partition_must_be_a_partition` and `every_k3_field_is_required`. The other three
+  bullets of this gate are open.
 - Byte accounting reproduced **from the artifact**, both halves.
 
 ### S1b — the gate harness

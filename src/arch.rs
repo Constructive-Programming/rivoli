@@ -24,6 +24,9 @@ pub enum Arch {
     GlmMoeDsa,
     /// DeepSeek-V4-Flash-0731: shared-K=V MQA, sliding window + per-layer KV compression.
     DeepseekV4,
+    /// Kimi-K3: 69 KDA (linear-attention) layers interleaved with 24 gated MLA layers, and
+    /// routed experts that run in a 3584-wide LATENT rather than at `hidden_size` 7168.
+    KimiK3,
 }
 
 impl Arch {
@@ -32,10 +35,21 @@ impl Arch {
     /// carries the answer: GLM's manifest ships `architectures: ["GlmMoeDsaForCausalLM"]`,
     /// DeepSeek-V4 ships both `architectures: ["DeepseekV4ForCausalLM"]` and
     /// `model_type: "deepseek_v4"`.
+    ///
+    /// **Kimi-K3 is recognised on the TOP level only, and that is the whole subtlety.** Its
+    /// `config.json` is a `KimiK3ForConditionalGeneration` multimodal wrapper whose nested
+    /// `text_config` declares a *different* pair — `KimiLinearForCausalLM` / `kimi_linear`,
+    /// the linear-attention family K3's text model belongs to. `K3Config` descends into that
+    /// dict, so a recogniser that descended first would look for `kimi_k3` where the file says
+    /// `kimi_linear` and refuse the real checkpoint. The nested pair is not accepted here
+    /// either: `KimiLinear` names a family, not this checkpoint, and admitting it would let a
+    /// foreign member of that family resolve as K3. `K3Config::validate` asserts the nested
+    /// spelling as a secondary check, where it can quote the key it descended through.
     pub fn from_manifest_str(s: &str) -> Option<Self> {
         match s {
             "GlmMoeDsaForCausalLM" | "glm_moe_dsa" => Some(Arch::GlmMoeDsa),
             "DeepseekV4ForCausalLM" | "deepseek_v4" => Some(Arch::DeepseekV4),
+            "KimiK3ForConditionalGeneration" | "kimi_k3" => Some(Arch::KimiK3),
             _ => None,
         }
     }
@@ -45,6 +59,7 @@ impl Arch {
         match self {
             Arch::GlmMoeDsa => "glm-moe-dsa",
             Arch::DeepseekV4 => "deepseek-v4",
+            Arch::KimiK3 => "kimi-k3",
         }
     }
 
@@ -53,6 +68,7 @@ impl Arch {
         match self {
             Arch::GlmMoeDsa => "MLA + q-LoRA, DSA lightning indexer",
             Arch::DeepseekV4 => "shared-K=V MQA, sliding window + per-layer KV compression",
+            Arch::KimiK3 => "69 KDA + 24 gated MLA (NoPE), latent-space routed experts",
         }
     }
 
@@ -62,10 +78,15 @@ impl Arch {
     /// the weights: window 128, per-layer compression at ratio 4 or 128, and an indexer
     /// only on the ratio-4 layers. There is no row-selection policy to pick, so offering
     /// the flag at all would be offering a knob that cannot turn.
+    ///
+    /// K3 is `None` for the same reason arrived at differently: which of its 93 layers is KDA
+    /// and which is gated MLA is a *partition declared in the config* (`linear_attn_config`)
+    /// and confirmed by which layers ship `kv_a_proj_with_mqa`. A KDA layer has no row set to
+    /// select from at all — it carries a recurrent state, not a KV cache.
     pub fn attn_modes(self) -> Option<&'static [&'static str]> {
         match self {
             Arch::GlmMoeDsa => Some(&["auto", "dense", "streaming", "dsa", "misa"]),
-            Arch::DeepseekV4 => None,
+            Arch::DeepseekV4 | Arch::KimiK3 => None,
         }
     }
 
@@ -77,6 +98,11 @@ impl Arch {
             Arch::DeepseekV4 => {
                 "attention is fixed by the weights (window 128, per-layer compression \
                  4/128, indexer on the ratio-4 layers)"
+            }
+            Arch::KimiK3 => {
+                "attention is fixed by the weights (`linear_attn_config` partitions the 93 \
+                 layers into 69 KDA and 24 gated MLA; a KDA layer keeps a recurrent state, \
+                 not a KV cache, so there are no rows to select)"
             }
         }
     }
@@ -91,8 +117,12 @@ impl Arch {
     pub fn hidden_flags(self) -> &'static [&'static str] {
         match self {
             Arch::GlmMoeDsa => &[],
-            // Every one of these is a `--attn streaming`/`misa` knob, and V4 has no `--attn`.
-            Arch::DeepseekV4 => &["attn", "sinks", "window", "misa_heads"],
+            // Every one of these is a `--attn streaming`/`misa` knob, and neither V4 nor K3
+            // has an `--attn`. The MTP flags are deliberately NOT hidden on either, even
+            // though K3 ships `num_nextn_predict_layers: 0` and so has no head to run: V4's
+            // branch says so with an `info!` instead (its fp4 MoE kernel refuses nrow != 1),
+            // and one mechanism for one fact beats two that can disagree.
+            Arch::DeepseekV4 | Arch::KimiK3 => &["attn", "sinks", "window", "misa_heads"],
         }
     }
 }
@@ -113,6 +143,12 @@ mod tests {
             "GlmForCausalLM",
             "glm_moe",
             "deepseek_v4 ",
+            // K3's own NESTED spellings, which must not resolve here. See
+            // `from_manifest_str`: they name the linear-attention family the text model
+            // belongs to, not this checkpoint, and `K3Config::validate` is where they are
+            // asserted — with the key it descended through available to quote.
+            "KimiLinearForCausalLM",
+            "kimi_linear",
         ] {
             assert_eq!(Arch::from_manifest_str(s), None, "{s:?} must not resolve");
         }
@@ -127,6 +163,10 @@ mod tests {
             Arch::from_manifest_str("deepseek_v4"),
             Some(Arch::DeepseekV4)
         );
+        // Both of K3's TOP-level spellings, since the wrapper is the level that names it.
+        for s in ["KimiK3ForConditionalGeneration", "kimi_k3"] {
+            assert_eq!(Arch::from_manifest_str(s), Some(Arch::KimiK3), "{s:?}");
+        }
     }
 
     /// The shown list must be the parsed list. This module is presentation policy, so the

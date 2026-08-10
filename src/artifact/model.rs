@@ -3,9 +3,11 @@
 //! **One type per architecture, and the type is the proof.** [`ModelConfig`] describes the
 //! MLA (multi-head latent attention) + dense-prefix lineage — GLM-5.2, DeepSeek-V3.
 //! [`V4Config`] describes DeepSeek-V4-Flash: shared-KV MQA, no dense layers, hash-routed
-//! prefix, FP4 experts. Each refuses the other by name at [`crate::arch::Arch`], *before*
-//! serde looks at a single dimension, so holding a value of either type is evidence about
-//! which architecture the snapshot is.
+//! prefix, FP4 experts. [`K3Config`] describes Kimi-K3: KDA/MLA interleaved, routed experts
+//! in a latent narrower than `hidden_size`, and — alone among the three — a config nested
+//! behind a multimodal wrapper. Each refuses the others by name at [`crate::arch::Arch`],
+//! *before* serde looks at a single dimension, so holding a value of any one of them is
+//! evidence about which architecture the snapshot is.
 //!
 //! **Neither type may give an absent field a default.** V4's config lacks
 //! `kv_lora_rank`, `qk_nope_head_dim`, `v_head_dim`, `intermediate_size` and
@@ -18,7 +20,7 @@
 //! snapshots of the same architecture* — each one says so at its declaration.
 
 use crate::arch::Arch;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 /// Resolve a config document's architecture, from `model_type` and `architectures` BOTH.
@@ -169,6 +171,21 @@ fn ensure_group_aligned(
         );
     }
     Ok(())
+}
+
+/// [`ensure_group_aligned`] at [`crate::artifact::quant::F4_GROUP`] — the routed-expert
+/// scheme both `.f4` models use, so both configs' `validate` want the same four arguments.
+/// Wrapped rather than restated at each call: the five-line form was a duplication-gate
+/// failure the moment K3 became the second caller, and the group is not the interesting part
+/// of either call. The interesting part is *which width* is `expert_in` — `cfg.hidden` on V4,
+/// the 3584 latent on K3 — which is what the one-line call sites now show.
+fn ensure_f4_group_aligned(expert_in: usize, moe_inter: usize) -> Result<()> {
+    ensure_group_aligned(
+        expert_in,
+        moe_inter,
+        crate::artifact::quant::F4_GROUP,
+        stringify!(F4_GROUP),
+    )
 }
 
 /// GLM-5.2 nests theta under `rope_parameters`; we only need theta.
@@ -820,12 +837,8 @@ impl ArchConfig for V4Config {
         // The FP4 group scale runs along the INPUT dim, so both expert input widths must
         // divide it exactly — `f4_groups` rounds up, and a ragged tail would give the
         // last group a scale covering fewer weights than the kernel assumes.
-        ensure_group_aligned(
-            self.hidden,
-            self.moe_inter,
-            crate::artifact::quant::F4_GROUP,
-            stringify!(F4_GROUP),
-        )
+        // `self.hidden` is the `expert_in` argument, and on V4 those are equal.
+        ensure_f4_group_aligned(self.hidden, self.moe_inter)
     }
 }
 
@@ -861,6 +874,371 @@ impl V4Config {
     // one shared expert is fp8 e4m3 and is resident. A single `top_k + n_shared` count is
     // right for a MoE launch and WRONG for per-token stream traffic, and it is the traffic
     // number this port keeps needing — so the two are spelled out separately at each use.
+}
+
+// ── Kimi-K3 ─────────────────────────────────────────────────────────────────────────
+//
+// A third struct, on the same argument the V4 section states: a shared schema is the
+// mechanism by which a field added for one architecture silently satisfies another's parse.
+
+/// The two layer arrays under `linear_attn_config`, which between them decide whether a
+/// layer runs KDA or gated MLA.
+///
+/// **Both are required, and [`K3TextConfig::validate`] asserts the PARTITION** rather than
+/// trusting either. The two reference implementations read opposite arrays — the C consumes
+/// `full_attn_layers` and derives KDA as the complement, first-party `is_kda_layer` consumes
+/// `kda_layers` and derives MLA — so neither is "the derived one", and a config where they
+/// disagree would give two readers two different layer maps. The reference names that as the
+/// mistake that "silently swaps KDA and MLA layers".
+///
+/// **Both arrays are ONE-BASED.** That is not a style note: zero-based MLA is
+/// `[3, 7, …, 87, 91, 92]`, so reading them zero-based shifts every attention layer by one
+/// and 91/92 — which are adjacent, breaking the every-fourth pattern — land wrong in a way
+/// no shape check sees. [`K3TextConfig::layer_is_mla`] is the only reader that does the
+/// conversion, so there is one place to get it right.
+///
+/// The dict's five scalars (`kda_heads`, `kda_head_dim`, `conv_k`, the gate lower bound, and
+/// one more) are **deliberately absent**: their JSON key spellings are not among the fields
+/// §1 of `docs/investigations/k3-port.md` verified against the shipped `config.json`, and
+/// declaring a guessed key would refuse the real checkpoint on a missing field. They are S2's
+/// to add, with the spellings read off the file. Nothing here reads them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinearAttnConfig {
+    pub full_attn_layers: Vec<usize>,
+    pub kda_layers: Vec<usize>,
+}
+
+/// Kimi-K3, as its `config.json` ships it: a `KimiK3ForConditionalGeneration` multimodal
+/// wrapper around the text model.
+///
+/// The nesting is carried rather than flattened away, because it is load-bearing twice over.
+/// The wrapper is the level that names the architecture ([`Arch::from_manifest_str`]), the
+/// nested dict is the level that carries the dimensions, and `vision_config` — which this
+/// port does not implement — is a sibling of `text_config` rather than of anything inside it.
+/// Flattening would cost a hand-written `Deserialize` and would hide which level a field came
+/// from, which §3e of the plan names as exactly how a key goes missing for the wrong reason.
+#[derive(Debug, Clone, Deserialize)]
+pub struct K3Config {
+    #[serde(rename = "text_config")]
+    pub text: K3TextConfig,
+}
+
+/// The `text_config` dict — Kimi-K3's text model, `KimiLinearForCausalLM`.
+///
+/// **Every field is REQUIRED**, as in [`V4Config`], and for the same reason: a defaulted
+/// dimension does not crash, it produces fluent wrong text. A field whose JSON key this port
+/// has not verified against the shipped file is *absent* rather than guessed — a wrong key on
+/// a required field refuses the real checkpoint with `missing field`, which is loud and
+/// fixable, while a guessed key with a `#[serde(default)]` is the silent version.
+///
+/// `quantization_config` is absent on purpose, and it is the one omission that is a decision
+/// rather than a gap: the block **mis-declares its own scope** (`targets: ["Linear"]` with an
+/// `ignore` list that omits `routed_expert_{down,up}_proj` and `block_sparse_moe.gate.weight`,
+/// all three of which ship BF16). The converter drives off the presence of `.weight_packed`
+/// instead — `docs/investigations/k3-port.md` S1a item 5 — so a schema that read this block
+/// would be reading a field nothing is allowed to trust.
+#[derive(Debug, Clone, Deserialize)]
+pub struct K3TextConfig {
+    /// The NESTED architecture pair — `KimiLinearForCausalLM` / `kimi_linear`, which differs
+    /// from the wrapper's. Carried so `validate` can assert it: this struct is reached by
+    /// descending through `text_config`, and a descent that landed in some other dict of a
+    /// multimodal config would otherwise be indistinguishable from the right one.
+    pub model_type: String,
+    pub architectures: Vec<String>,
+
+    // jscpd:ignore-start — the four dimension serde renames, which coincide with
+    // `V4Config`'s (and `ModelConfig`'s) because all three checkpoints declare these under
+    // the SAME HuggingFace-standard JSON names.
+    //
+    // Exempted on exactly the argument the MoE-rename block above states, and the argument
+    // is now stronger for having a third instance: three architectures agreeing on four
+    // JSON names is a coincidence of the checkpoints, not a shared contract, and a shared
+    // struct becomes the attractor for a FIFTH field that is not shared. K3 is the proof —
+    // it agrees on these four and disagrees on `num_experts_per_token` (`_tok` everywhere
+    // else), on `num_experts` (`n_routed_experts` on V4), and on nesting the whole dict
+    // behind a wrapper. A shared core would have had to special-case all three.
+    //
+    // No factoring was priced this time, because the cheap one is refuted by construction:
+    // `#[serde(flatten)]` over a shared `Dims` struct puts `cfg.dims.hidden` at every call
+    // site in gpu.rs/pin.rs/format.rs/main.rs to delete four lines of attribute, which is
+    // the arithmetic the MoE block already rejected.
+    #[serde(rename = "num_hidden_layers")]
+    pub n_layers: usize,
+    #[serde(rename = "hidden_size")]
+    pub hidden: usize,
+    #[serde(rename = "vocab_size")]
+    pub vocab: usize,
+    #[serde(rename = "num_attention_heads")]
+    pub n_heads: usize,
+    // jscpd:ignore-end
+    /// RMSNorm epsilon (1e-5 in the shipped config, and note the first-party MLA LoRA norms
+    /// use 1e-6 where the C reference wrote 1e-5 — `k3-architecture.md` §5).
+    pub rms_norm_eps: f64,
+
+    // --- attention. Which layer is which comes from the partition, not from a stride.
+    pub linear_attn_config: LinearAttnConfig,
+    pub q_lora_rank: usize,
+    pub kv_lora_rank: usize,
+    /// NoPE, asserted POSITIVELY. Checking only that `rope_theta` is absent cannot tell "this
+    /// model applies no rotation" from "we descended into the wrong dict" — plan §3e.
+    pub mla_use_nope: bool,
+    /// Both default to `False` in the first-party modeling code, so both must come from the
+    /// config rather than from a Rust default that happens to agree today (G0 item 11).
+    pub mla_use_output_gate: bool,
+    pub use_full_rank_gate: bool,
+    /// AttnRes block size (12). The residual is taken across a block of layers rather than
+    /// per layer — `k3-architecture.md` §3.
+    pub attn_res_block_size: usize,
+
+    // --- MoE. The routed experts run in a LATENT that is not `hidden_size`; see
+    // `quant::vq_expert_layout` and plan §2 for what assuming otherwise costs.
+    #[serde(rename = "num_experts")]
+    pub n_experts: usize,
+    /// `num_experts_per_token` — note the spelling. GLM and V4 both write
+    /// `num_experts_per_tok`, and this checkpoint does not.
+    #[serde(rename = "num_experts_per_token")]
+    pub top_k: usize,
+    /// Declared 2, but the checkpoint ships **one fused MLP** per layer (`down_proj`
+    /// `[7168, 6144]` BF16) — G0 item 4. So this is the config's count of shared experts, not
+    /// a count of tensors, and the converter must not go looking for two.
+    #[serde(rename = "num_shared_experts")]
+    pub n_shared: usize,
+    /// `routed_expert_hidden_size` — the 3584-wide latent the routed experts are entered at,
+    /// **not** `hidden_size` 7168. Named for the role, matching
+    /// [`crate::artifact::quant::vq_expert_layout`]'s parameter.
+    #[serde(rename = "routed_expert_hidden_size")]
+    pub expert_in: usize,
+    #[serde(rename = "moe_intermediate_size")]
+    pub moe_inter: usize,
+    /// RMSNorm on the routed AGGREGATE, in latent space, before the up-projection.
+    pub latent_moe_use_norm: bool,
+    pub moe_renormalize: bool,
+    /// Grouped routing is **degenerate, not absent**: both are 1. Asserted rather than
+    /// ignored — a checkpoint with real groups would need a grouped top-k this engine does
+    /// not have, and would otherwise route through the ungrouped path with no error.
+    pub num_expert_group: usize,
+    pub topk_group: usize,
+    /// `noaux_tc` — the first-party name for bias-on-selection-only, which is what
+    /// `math::Scoring`'s sigmoid arm already implements.
+    pub topk_method: String,
+    /// SiTU-GLU's two betas (4.0 and 25.0), fused inside the fp4 expert kernel — plan §3b.
+    pub activation_situ_beta: f64,
+    pub activation_linear_beta: f64,
+
+    // --- layer 0 is dense, and simultaneously a KDA layer and an AttnRes boundary.
+    pub first_k_dense_replace: usize,
+    #[serde(rename = "intermediate_size")]
+    pub dense_inter: usize,
+
+    /// 0 — no MTP head, so no speculative decode and `MAXROW` is 1. Asserted rather than
+    /// assumed: a non-zero value means tensors this port does not convert.
+    pub num_nextn_predict_layers: usize,
+    /// False. A tied head would read the output projection out of the embedding table, which
+    /// is a different set of weights at the same shape.
+    pub tie_word_embeddings: bool,
+}
+
+impl ArchConfig for K3Config {
+    const ARCH: Arch = Arch::KimiK3;
+
+    fn validate(&self) -> Result<()> {
+        self.text.validate()
+    }
+}
+
+impl K3TextConfig {
+    /// Cross-field checks. As in [`V4Config`], each guards a failure that produces text
+    /// rather than an error.
+    fn validate(&self) -> Result<()> {
+        // The descent check. `parse_config` already matched the WRAPPER's pair against
+        // `Arch::KimiK3`; this is the nested pair, and it is what distinguishes "descended
+        // into `text_config` of a Kimi-K3 config" from "descended into some other dict".
+        ensure!(
+            self.model_type == "kimi_linear"
+                && self.architectures == ["KimiLinearForCausalLM".to_string()],
+            "text_config declares {:?} / {:?} — a Kimi-K3 wrapper's text model is \
+             \"kimi_linear\" / [\"KimiLinearForCausalLM\"]. Either this is not the dict we \
+             think we descended into, or the checkpoint's text model is a different family",
+            self.model_type,
+            self.architectures
+        );
+        // A zero width passes every divisibility check below (0 is a multiple of anything)
+        // and then sizes an expert row, an arena stride and a GEMV `dim` to nothing.
+        for (what, dim) in [
+            ("hidden_size", self.hidden),
+            ("routed_expert_hidden_size", self.expert_in),
+            ("moe_intermediate_size", self.moe_inter),
+            ("intermediate_size", self.dense_inter),
+            ("vocab_size", self.vocab),
+            ("num_attention_heads", self.n_heads),
+            ("num_hidden_layers", self.n_layers),
+            ("attn_res_block_size", self.attn_res_block_size),
+        ] {
+            ensure!(dim > 0, "{what} is 0");
+        }
+        self.validate_layer_partition()?;
+        ensure!(
+            self.first_k_dense_replace < self.n_layers,
+            "first_k_dense_replace {} >= num_hidden_layers {} — every layer would be dense \
+             and no routed expert would ever run",
+            self.first_k_dense_replace,
+            self.n_layers
+        );
+        ensure!(
+            self.top_k > 0 && self.top_k <= self.n_experts,
+            "num_experts_per_token {} is not in 1..={}",
+            self.top_k,
+            self.n_experts
+        );
+        ensure!(
+            self.n_shared > 0,
+            "num_shared_experts is 0 — the always-on MLP is a third of this layer's \
+             arithmetic, and its absence is not something the routed path compensates for"
+        );
+        ensure!(
+            self.num_expert_group == 1 && self.topk_group == 1,
+            "num_expert_group {} / topk_group {}: grouped routing is degenerate in this \
+             checkpoint and this engine has no grouped top-k. Real groups would route \
+             through the ungrouped path with no error",
+            self.num_expert_group,
+            self.topk_group
+        );
+        ensure!(
+            self.topk_method == "noaux_tc",
+            "topk_method {:?}: only `noaux_tc` (bias on SELECTION only, never on the \
+             returned weight) is implemented. Any other method picks plausible-but-wrong \
+             experts and never crashes",
+            self.topk_method
+        );
+        // Each of these defaults to `false` somewhere — in the first-party modeling code for
+        // the two gates, and in Rust for any `bool` this port forgot to read. Requiring the
+        // POSITIVE value means a config that omits one is a refusal, not a silent downgrade
+        // to an architecture the weights were not trained for.
+        for (what, flag) in [
+            ("mla_use_nope", self.mla_use_nope),
+            ("mla_use_output_gate", self.mla_use_output_gate),
+            ("use_full_rank_gate", self.use_full_rank_gate),
+            ("latent_moe_use_norm", self.latent_moe_use_norm),
+            ("moe_renormalize", self.moe_renormalize),
+        ] {
+            ensure!(
+                flag,
+                "{what} is false; this port implements only the true form and the shipped \
+                 config sets it. Turning it off changes the arithmetic, not the shapes"
+            );
+        }
+        ensure!(
+            self.num_nextn_predict_layers == 0,
+            "num_nextn_predict_layers {} != 0 — this checkpoint has no MTP head, so a \
+             non-zero value means tensors nothing here converts and a batched verify pass \
+             with no kernel behind it",
+            self.num_nextn_predict_layers
+        );
+        ensure!(
+            !self.tie_word_embeddings,
+            "tie_word_embeddings is true — K3 ships a separate lm_head, and reading the \
+             output projection out of the embedding table is a different set of weights at \
+             the same shape"
+        );
+        ensure!(
+            self.rms_norm_eps > 0.0,
+            "rms_norm_eps {} must be positive",
+            self.rms_norm_eps
+        );
+        // Checked in the f32 domain the kernel works in, not only in the f64 JSON carries —
+        // the same narrowing pair `V4Config`'s `swiglu_limit` documents at length. Underflow
+        // (`x <= 2^-150` -> `0.0f32`) collapses SiTU-GLU's shape; overflow (`x > ~3.4e38` ->
+        // `inf`, which passes any `> 0.0` test) is the silent one.
+        for (what, beta) in [
+            ("activation_situ_beta", self.activation_situ_beta),
+            ("activation_linear_beta", self.activation_linear_beta),
+        ] {
+            let narrowed = beta as f32;
+            ensure!(
+                narrowed > 0.0 && narrowed.is_finite(),
+                "{what} {beta} narrows to {narrowed} in f32, the domain the fused SiTU-GLU \
+                 expert kernel works in"
+            );
+        }
+        // The routed experts' widths, and ONLY those: `expert_in` is the latent 3584, so this
+        // says nothing about the trunk's 7168 or the shared MLP's 6144. Both of those happen
+        // to be multiples of 32, so there is no hole today — but it is an accident of this
+        // checkpoint, not something this call checks.
+        ensure_f4_group_aligned(self.expert_in, self.moe_inter)
+    }
+
+    /// `full_attn_layers` and `kda_layers` must partition `1..=n_layers` — both present, no
+    /// duplicates, no overlap, nothing missing, nothing out of range.
+    ///
+    /// Asserted rather than derived from one array, because the two reference implementations
+    /// read opposite ones (see [`LinearAttnConfig`]). Every failure here is a layer running
+    /// the wrong attention family, which is arithmetic rather than a shape — no length check
+    /// downstream sees it.
+    fn validate_layer_partition(&self) -> Result<()> {
+        let (mla, kda) = (
+            &self.linear_attn_config.full_attn_layers,
+            &self.linear_attn_config.kda_layers,
+        );
+        ensure!(
+            mla.len() + kda.len() == self.n_layers,
+            "full_attn_layers ({}) + kda_layers ({}) = {} layers, but num_hidden_layers is {}",
+            mla.len(),
+            kda.len(),
+            mla.len() + kda.len(),
+            self.n_layers
+        );
+        // One pass over both, so overlap, duplication and gaps are all the same check: every
+        // one-based id in range exactly once.
+        let mut seen = vec![false; self.n_layers];
+        for (what, ids) in [("full_attn_layers", mla), ("kda_layers", kda)] {
+            for &one_based in ids {
+                let l = one_based
+                    .checked_sub(1)
+                    .with_context(|| format!("{what} contains 0; these arrays are ONE-BASED"))?;
+                let slot = seen.get_mut(l).with_context(|| {
+                    format!(
+                        "{what} contains layer {one_based}, past num_hidden_layers {}",
+                        self.n_layers
+                    )
+                })?;
+                ensure!(
+                    !*slot,
+                    "layer {one_based} appears twice across full_attn_layers/kda_layers — \
+                     the two arrays must partition the layers, and an overlap means the two \
+                     reference implementations would disagree about this layer's family"
+                );
+                *slot = true;
+            }
+        }
+        // Unreachable while the length check above holds, and kept anyway: it is the
+        // invariant the readers actually depend on, and the length check is the accident.
+        if let Some(l) = seen.iter().position(|s| !s) {
+            bail!(
+                "layer {} (one-based) is in neither full_attn_layers nor kda_layers",
+                l + 1
+            );
+        }
+        Ok(())
+    }
+
+    /// Does zero-based `layer` run gated MLA? (Otherwise KDA.)
+    ///
+    /// **The one place the one-based → zero-based conversion happens.** The reference names
+    /// getting it wrong as the mistake that "silently swaps KDA and MLA layers", and the
+    /// swap is invisible downstream: both families take the same `[hidden]` input and return
+    /// the same shape.
+    pub fn layer_is_mla(&self, layer: usize) -> Result<bool> {
+        ensure!(layer < self.n_layers, "layer {layer} >= {}", self.n_layers);
+        Ok(self
+            .linear_attn_config
+            .full_attn_layers
+            .contains(&(layer + 1)))
+    }
+
+    /// Is `layer` the dense-FFN prefix (no routed experts)? Layer 0 in the shipped config.
+    pub fn layer_is_dense(&self, layer: usize) -> bool {
+        layer < self.first_k_dense_replace
+    }
 }
 
 /// The load boundary is the only place a foreign snapshot is inspected before its
@@ -1320,5 +1698,268 @@ mod tests {
         // rather than only from the fixture.
         parse_config::<V4Config>(&text).expect("the shipped config must parse");
         assert!(ModelConfig::load(DIR).is_err());
+    }
+
+    // ── K3Config ───────────────────────────────────────────────────────────────────
+
+    /// One-based `full_attn_layers`, as `docs/reference/k3-architecture.md` §2 quotes it from
+    /// the shipped config. 22 entries on the every-fourth stride, then **92 and 93 adjacent** —
+    /// the pattern breaks at the end, which is why this is transcribed rather than generated.
+    const K3_MLA_ONE_BASED: [usize; 24] = [
+        4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92,
+        93,
+    ];
+
+    /// `linear_attn_config` with `kda_layers` DERIVED as the complement, so the baseline
+    /// fixture cannot fail `validate_layer_partition` for a transcription slip in 69 numbers.
+    /// The partition check earns its keep against `k3_layer_partition_must_be_a_partition`,
+    /// which injects broken arrays on purpose.
+    fn k3_linear_attn(layers: usize) -> String {
+        // Clipped to `layers` so a shrunk fixture is still a partition — the small-model
+        // positive control at the end of the partition test depends on it.
+        let mla: Vec<usize> = K3_MLA_ONE_BASED
+            .iter()
+            .copied()
+            .filter(|&l| l <= layers)
+            .collect();
+        let kda: Vec<usize> = (1..=layers).filter(|l| !mla.contains(l)).collect();
+        format!(r#"{{"full_attn_layers":{mla:?},"kda_layers":{kda:?}}}"#)
+    }
+
+    /// Kimi-K3's `text_config`, field for field, from §1 of `docs/investigations/k3-port.md`
+    /// (read off the shipped `config.json` 2026-08-09).
+    ///
+    /// There is no `k3_base_matches_the_shipped_config` twin of V4's yet, because there is no
+    /// checkpoint on this machine to pin against — the plan's G0 was met from metadata alone.
+    /// Add it when one lands; until then these values are the plan's, not the file's.
+    const K3_TEXT: &[(&str, &str)] = &[
+        // The NESTED pair, which differs from the wrapper's on purpose — see
+        // `Arch::from_manifest_str`.
+        ("model_type", r#""kimi_linear""#),
+        ("architectures", r#"["KimiLinearForCausalLM"]"#),
+        ("num_hidden_layers", "93"),
+        ("hidden_size", "7168"),
+        ("vocab_size", "163840"),
+        ("num_attention_heads", "96"),
+        ("rms_norm_eps", "1e-05"),
+        // A placeholder: `k3_json` always overrides it with `k3_linear_attn`'s derived pair.
+        // It is listed here anyway so `every_k3_field_is_required` covers the key — an
+        // override with an empty value deletes it, which is what that test does.
+        ("linear_attn_config", "null"),
+        ("q_lora_rank", "1536"),
+        ("kv_lora_rank", "512"),
+        ("mla_use_nope", "true"),
+        ("mla_use_output_gate", "true"),
+        ("use_full_rank_gate", "true"),
+        ("attn_res_block_size", "12"),
+        ("num_experts", "896"),
+        ("num_experts_per_token", "16"),
+        ("num_shared_experts", "2"),
+        ("routed_expert_hidden_size", "3584"),
+        ("moe_intermediate_size", "3072"),
+        ("latent_moe_use_norm", "true"),
+        ("moe_renormalize", "true"),
+        ("num_expert_group", "1"),
+        ("topk_group", "1"),
+        ("topk_method", r#""noaux_tc""#),
+        ("activation_situ_beta", "4.0"),
+        ("activation_linear_beta", "25.0"),
+        ("first_k_dense_replace", "1"),
+        ("intermediate_size", "33792"),
+        ("num_nextn_predict_layers", "0"),
+        ("tie_word_embeddings", "false"),
+    ];
+
+    /// The whole document: the multimodal wrapper (which is the level that names the
+    /// architecture) around a `text_config` built from [`K3_TEXT`]. `overrides` patch the
+    /// NESTED dict, which is where every field this port reads lives.
+    fn k3_json(overrides: &[(&str, &str)]) -> String {
+        let lac = k3_linear_attn(93);
+        // Injected first so a caller's own `linear_attn_config` override — including a
+        // deletion — still wins; `json_obj` applies them in order.
+        let mut ov: Vec<(&str, &str)> = vec![("linear_attn_config", &lac)];
+        ov.extend_from_slice(overrides);
+        let text = json_obj(K3_TEXT, &ov);
+        format!(
+            r#"{{"model_type":"kimi_k3",
+                 "architectures":["KimiK3ForConditionalGeneration"],
+                 "text_config":{text}}}"#
+        )
+    }
+
+    fn parse_k3(overrides: &[(&str, &str)]) -> Result<K3Config> {
+        parse_config(&k3_json(overrides))
+    }
+
+    /// The refusal message for a config that must not parse. Three tests below want it, and
+    /// spelling `format!("{:#}", …unwrap_err())` out in each was a real duplication-gate
+    /// failure waiting to happen — `build.rs` runs jscpd at `--min-tokens 15` over `src/`.
+    fn k3_err(overrides: &[(&str, &str)]) -> String {
+        format!("{:#}", parse_k3(overrides).unwrap_err())
+    }
+
+    #[test]
+    fn k3_baseline_parses() {
+        let c = parse_k3(&[]).expect("Kimi-K3's own config must load").text;
+        assert_eq!((c.n_layers, c.hidden, c.vocab), (93, 7168, 163840));
+        assert_eq!((c.n_experts, c.top_k, c.n_shared), (896, 16, 2));
+        // **The assumption break this whole stage exists for**: the routed experts are
+        // entered at 3584, not at `hidden_size`. If these two are ever read as equal, every
+        // expert row stride and every fp4 dot `dim` on the MoE path is wrong by 2x.
+        assert_eq!((c.expert_in, c.moe_inter), (3584, 3072));
+        assert_ne!(c.expert_in, c.hidden);
+        assert_eq!((c.q_lora_rank, c.kv_lora_rank), (1536, 512));
+        assert_eq!((c.first_k_dense_replace, c.dense_inter), (1, 33792));
+
+        // The layer map, zero-based, including the two ADJACENT ones at the end that the
+        // every-fourth stride does not predict.
+        let mla: Vec<usize> = (0..c.n_layers)
+            .filter(|&l| c.layer_is_mla(l).unwrap())
+            .collect();
+        assert_eq!(mla.len(), 24);
+        assert_eq!(&mla[..3], &[3, 7, 11]);
+        assert_eq!(&mla[22..], &[91, 92]);
+        // Layer 0 is simultaneously KDA, dense, and an AttnRes boundary — the least
+        // representative layer in the model and the one everyone tests first.
+        assert!(!c.layer_is_mla(0).unwrap() && c.layer_is_dense(0));
+        assert!(!c.layer_is_dense(1));
+        assert!(
+            c.layer_is_mla(c.n_layers).is_err(),
+            "no bound on the layer id"
+        );
+    }
+
+    /// **No field of `text_config` may be defaulted**, checked field-by-field for the reason
+    /// [`every_v4_field_is_required`] states: `is_err()` alone cannot tell "required" from
+    /// "defaulted to something `validate` happens to reject".
+    ///
+    /// Unlike V4's, this loop skips nothing. The discriminant that `parse_config` reads lives
+    /// on the WRAPPER, so the nested `model_type`/`architectures` are ordinary required fields
+    /// here — dropping either must fail as a missing field, not fall back to the wrapper's.
+    ///
+    /// Same top-level-only limitation as V4's: `linear_attn_config`'s two arrays are one JSON
+    /// value, so their individual requiredness rides on
+    /// [`k3_layer_partition_must_be_a_partition`] instead.
+    #[test]
+    fn every_k3_field_is_required() {
+        for (k, _) in K3_TEXT {
+            let err = k3_err(&[(k, "")]);
+            assert!(
+                err.contains(&format!("missing field `{k}`")),
+                "{k:?} has a default: dropping it was rejected by something other than \
+                 serde, which is the shape that hides a zeroed dimension. Got: {err}"
+            );
+        }
+    }
+
+    /// Every setting whose wrong value is arithmetic rather than a shape: a false gate, a
+    /// routing method that picks plausible-but-wrong experts, a tied head reading the
+    /// embedding table. None of these would fail a length check anywhere downstream.
+    ///
+    /// Single-key overrides, and each one PRESENT-but-wrong rather than absent — a dropped key
+    /// fails as a missing field and never reaches the `ensure!`, which is the false-green
+    /// shape `every_v4_field_is_required`'s notes call out.
+    #[test]
+    fn k3_rejects_the_silently_wrong_settings() {
+        for (key, bad, want) in [
+            ("model_type", r#""deepseek_v4""#, "text_config declares"),
+            ("architectures", r#"["LlamaForCausalLM"]"#, "descended into"),
+            ("mla_use_nope", "false", "mla_use_nope is false"),
+            ("mla_use_output_gate", "false", "output_gate is false"),
+            ("use_full_rank_gate", "false", "use_full_rank_gate is false"),
+            ("latent_moe_use_norm", "false", "use_norm is false"),
+            ("moe_renormalize", "false", "moe_renormalize is false"),
+            ("topk_method", r#""greedy""#, "noaux_tc"),
+            ("num_expert_group", "8", "grouped routing"),
+            ("topk_group", "4", "grouped routing"),
+            ("num_nextn_predict_layers", "1", "no MTP head"),
+            ("tie_word_embeddings", "true", "separate lm_head"),
+            ("num_experts_per_token", "900", "not in 1..="),
+            ("num_experts_per_token", "0", "not in 1..="),
+            ("num_shared_experts", "0", "always-on MLP"),
+            ("first_k_dense_replace", "93", "every layer would be dense"),
+            ("rms_norm_eps", "0.0", "must be positive"),
+            // The two f64 -> f32 narrowing failures. `1e-46` underflows to `0.0f32`; `1e39`
+            // saturates to infinity, which passes any bare `> 0.0` test — that is the silent
+            // direction and the reason the check is `is_finite()` rather than a bound.
+            ("activation_situ_beta", "1e-46", "narrows to 0"),
+            ("activation_linear_beta", "1e39", "narrows to inf"),
+            // Group alignment, on the LATENT width and on `moe_inter`. 3600 is a multiple of
+            // neither 32 nor the 16 an fp4 nibble pair would round to.
+            ("routed_expert_hidden_size", "3600", "F4_GROUP"),
+            ("moe_intermediate_size", "3000", "F4_GROUP"),
+            // Zero passes every divisibility check (0 is a multiple of anything) and then
+            // sizes a row, a stride and a GEMV `dim` to nothing.
+            ("hidden_size", "0", "hidden_size is 0"),
+            ("routed_expert_hidden_size", "0", "expert_hidden_size is 0"),
+            ("attn_res_block_size", "0", "attn_res_block_size is 0"),
+        ] {
+            let err = k3_err(&[(key, bad)]);
+            assert!(err.contains(want), "{key}={bad}: want {want:?}, got: {err}");
+        }
+    }
+
+    /// The two layer arrays must PARTITION `1..=n_layers`. Every case here is a layer running
+    /// the wrong attention family — KDA where MLA belongs or the reverse — which the reference
+    /// itself names as the mistake its one-based indexing invites, and which nothing
+    /// downstream can see: both families take `[hidden]` in and return `[hidden]`.
+    #[test]
+    fn k3_layer_partition_must_be_a_partition() {
+        let lac = |mla: &[usize], kda: &[usize]| {
+            format!(r#"{{"full_attn_layers":{mla:?},"kda_layers":{kda:?}}}"#)
+        };
+        let complement: Vec<usize> = (1..=93).filter(|l| !K3_MLA_ONE_BASED.contains(l)).collect();
+        // **Every case but the first keeps both lengths right.** The length check runs first,
+        // so a short array reports only that — and a case that trips it proves nothing about
+        // the check it was written for. Two of these were exactly that until it was noticed.
+        let mut overlap = complement.clone();
+        overlap[0] = 4; // layer 4 is MLA in the real config; claim it for KDA as well
+        // One-based read as zero-based: the specific slip the reference calls out. Lengths
+        // stay right; layer 3 is claimed twice and layer 93 by nobody.
+        let shifted: Vec<usize> = K3_MLA_ONE_BASED.iter().map(|l| l - 1).collect();
+        // Out of range and zero, both inside a full-length array so the length check passes.
+        let (mut oob, mut zero) = (K3_MLA_ONE_BASED, K3_MLA_ONE_BASED);
+        (oob[0], zero[0]) = (94, 0);
+        for (bad, want) in [
+            (lac(&[4], &complement), "= 70 layers"),
+            (lac(&K3_MLA_ONE_BASED, &overlap), "appears twice"),
+            (lac(&shifted, &complement), "appears twice"),
+            (lac(&oob, &complement), "past num_hidden_layers"),
+            (lac(&zero, &complement), "ONE-BASED"),
+        ] {
+            let err = k3_err(&[("linear_attn_config", &bad)]);
+            assert!(err.contains(want), "want {want:?} for {bad}, got: {err}");
+        }
+        // The positive control: a 4-layer model whose only MLA layer is 4. Without it every
+        // row above could pass on a `validate_layer_partition` that refuses everything.
+        let small = k3_linear_attn(4);
+        parse_k3(&[("linear_attn_config", &small), ("num_hidden_layers", "4")])
+            .expect("1..=4 with layer 4 as the only MLA layer IS a partition");
+    }
+
+    /// A K3 config must not become a zero-filled config of either other architecture, nor
+    /// the reverse. Same defect as [`each_config_refuses_the_other_architecture`], third hat:
+    /// K3's wrapper is the only one of the three whose dimensions are not at the top level, so
+    /// a foreign config fed to `K3Config` fails on the WRAPPER's discriminant rather than on a
+    /// missing `text_config`.
+    #[test]
+    fn k3_refuses_the_other_architectures() {
+        let k3 = k3_json(&[]);
+        for err in [
+            format!("{:#}", parse_config::<ModelConfig>(&k3).unwrap_err()),
+            format!("{:#}", parse_config::<V4Config>(&k3).unwrap_err()),
+        ] {
+            assert!(
+                err.contains("kimi_k3") && !err.contains("missing field"),
+                "must refuse on the architecture, not on a field: {err}"
+            );
+        }
+        for foreign in [cfg_json(&[]), v4_json(&[])] {
+            let err = format!("{:#}", parse_config::<K3Config>(&foreign).unwrap_err());
+            assert!(
+                err.contains("KimiK3") && !err.contains("text_config"),
+                "must refuse on the architecture, not on the missing nesting: {err}"
+            );
+        }
     }
 }
