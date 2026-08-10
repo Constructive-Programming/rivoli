@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — ~25 GB/token fully resident at fp8, so the ceiling is GTT bandwidth, not NVMe. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + per-head output gate is a new kernel family (rivoli is MLA-only), per-layer RoPE-on/off is new plumbing, and the DFlash block-16 drafter generalises MAXROW=2 to 17 — cheap here precisely because the model is dense, so a 17-row verify costs one weight read. S0 NOT STARTED: every §1 number is model-card provenance through a summarizing fetch, unverified — the exact trap K3's G0 was reopened for twice.
+verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1 is blocked on K3's S1a landing the Arch seam, not on anything here. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
 ---
 
 # Muse Glimmer-30B — implementation plan
@@ -18,14 +18,18 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
 
 ## STATE
 
-- **S0 is DONE except its one measurement; G0 is NOT MET on that alone.** The forward pass is
+- **S0 is DONE and G0 is MET (2026-08-10).** The forward pass is
   first-party-verified and lives in **`docs/reference/glimmer-architecture.md`** — raw
   `config.json`, the safetensors headers by range request, and transformers' own
   `modeling_muse_glimmer.py` (the repo ships no modeling code; `muse_glimmer` is native to
   transformers 5.15.0.dev0), pinned at `f84ecc3a0ea984a4c04542a84269e3d065350a6e`. **Eight
   load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
-  card's errors beside them. Unmet: sustained resident-GEMV bandwidth, blocked on GPU
-  contention (below). The DFlash drafter (S6) is still open and being researched.
+  card's errors beside them. The DFlash drafter is settled too — §S6 and
+  `glimmer-architecture.md` §11.
+- **S1 is blocked on Kimi-K3, by design, not on anything here.** The `Arch`/`ArchConfig`
+  seam, the streaming `SafeWriter` and the per-arch converter shape all arrive with K3's S1a,
+  in progress on `wt/k3-s1a`. Re-verify §3's reuse table against the merged tree before
+  starting — several rows name files K3 will have moved.
 - **§1 below is superseded.** It is kept as written, with a correction column, because what
   the card got wrong is the reusable lesson. Read `glimmer-architecture.md` instead.
 - **The design is inverted relative to every model this engine runs.** Glimmer is dense.
@@ -187,21 +191,42 @@ capacity-planned. tmpfs and contention discipline per CLAUDE.md still apply.
    `tie_word_embeddings: false` with both matrices shipped.
 4. **Done.** `docs/reference/glimmer-architecture.md`, line-cited to
    `modeling_muse_glimmer.py`, with no summarizing fetch anywhere in the chain.
-5. **NOT DONE — blocked.** Sustained resident-GEMV GB/s at Glimmer shapes. The GPU was not
-   sole-tenant: `/var/run/sys-gpu.lock` held (`flock -w 1` → exit 1, captured not swallowed),
-   `gpu_busy_percent` 100 across six samples, llama-swap holding 41.24 GB of GTT
-   (`qwen3-embedding-4b`, `qwen3.6-medium`, `whisper`) with **zero kfd entries**. No number
-   taken in preference to one that would be discarded. Re-run under
-   `reference/gpu-lock.md`'s shared-lock contract.
+5. **MOVED to S5. Not done, and it was never a G0 item.**
+
+   > **CORRECTED 2026-08-10.** This was written as a G0 item ("register the predicted band
+   > from a measured number") and that was a placement error, not a discovery. G0 asks
+   > whether the *forward pass* is known; sustained GB/s is a throughput fact that **nothing
+   > in S1, S2, S3 or S4 consumes** — the §4 economics that matter early (fp8-vs-int4, the
+   > DFlash break-even at N>1.1) are ratios of byte counts and need no absolute bandwidth.
+   > Left where it was, a contended GPU would have blocked all correctness work for a number
+   > only S5 spends. It is now a **precondition of S5/G5**, where it binds. The move does not
+   > weaken it: no throughput claim may be registered without it, exactly as before.
+
+   Attempted twice 2026-08-10 and correctly refused both times: `/var/run/sys-gpu.lock` held
+   (`flock -w` → exit 1, captured rather than swallowed — the false-green trap),
+   `gpu_busy_percent` 100 across six one-second samples, llama-swap holding 41.24 then
+   64.02 GB of GTT across `qwen3-embedding-4b`, `qwen3.6-medium` and `whisper`, with **zero
+   `/sys/class/kfd/kfd/proc/` entries** — a kfd-only check would have called the machine free
+   and produced a number that had to be discarded. Re-run under `reference/gpu-lock.md`'s
+   shared-lock contract.
 6. **Done, and it moved.** The least representative layer is **not** layer 0 — every layer is
    structurally identical here, so the blind spot is arithmetic, not positional: the logit
    path is argmax-invariant (§STATE). Gates must cover a sliding layer, a full layer, a
    window-boundary crossing, layer 51 (full, and last), **and probability space**.
 
-**G0 — met when** every row has a recorded answer and a first-party source (**met**), the
-reference doc exists (**met**), and the predicted band is registered from a measured number
-(**NOT met — item 5**). G0 is therefore **NOT MET**, on one item, and S1 does not start
-until it is.
+### G0 — **MET 2026-08-10**
+
+Every unknown has a recorded answer and a first-party source, and
+`reference/glimmer-architecture.md` exists and is line-cited. What G0 does **not** assert,
+so that the next reader does not over-trust it: two things there are arguments rather than
+measurements — §6's RoPE permutation (G1b owes it a fixture) and the DFlash break-even (a
+byte ratio, not an observed τ) — and the bandwidth item is now S5's, above.
+
+**S1 is blocked, but not on G0.** It is sequenced behind Kimi-K3: `Arch`/`ArchConfig`, the
+streaming `SafeWriter` and the per-arch converter shape all arrive with K3's own S1a, which
+is in progress on `wt/k3-s1a`. Building that seam here would collide with it. When K3's S1a
+lands, re-verify §3's reuse table against the merged tree before starting — several rows
+name files K3 will have moved.
 
 ### S1a — artifact. No GPU.
 
@@ -278,7 +303,13 @@ repeated-block); byte accounting from the artifact; determinism across two runs.
 
 ### S5 — throughput.
 
-Undrafted first: measure against the S0-registered band; miss is explained and recorded or
+**Precondition (moved here from S0 item 5, 2026-08-10):** measure sustained resident-GEMV
+GB/s at Glimmer shapes on gfx1151 and register the predicted band from it *before* the first
+decode run. Sole-tenant, under `/var/run/sys-gpu.lock`, with a contention witness sampled per
+arm — and the witness must read `mem_info_gtt_used`, not only `/sys/class/kfd/kfd/proc/`,
+which is blind to the Vulkan tenants that actually occupy this machine.
+
+Undrafted first: measure against that registered band; miss is explained and recorded or
 the gate is not met. Then the int4 lever (`fp8_to_i4` path, group-128 — the int4-scales
 lesson says group scales are what made int4 usable) with a paired dNLL gate from `bin/ppl`
 on the 5000-token corpus, single format so the A/B is safe. Layer-major prefill: verify it
