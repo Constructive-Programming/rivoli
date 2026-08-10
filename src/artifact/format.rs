@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 
 use crate::artifact::quant::{
-    VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VQ_K, f4_expert_bytes, f4_expert_stride, i4_expert_bytes,
-    i4_expert_stride, vq_expert_bytes, vq_expert_stride,
+    VQ_ALIGN, VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VQ_K, f4_expert_bytes, f4_expert_stride,
+    i4_expert_bytes, i4_expert_stride, vq_expert_bytes, vq_expert_stride,
 };
 
 /// The `format` section of `manifest.json` — everything the loader needs beyond
@@ -739,6 +739,95 @@ pub fn write_atomic(path: &str, bytes: &[u8]) -> Result<()> {
     let part = format!("{path}.{}.part", std::process::id());
     std::fs::write(&part, bytes).with_context(|| format!("write {part}"))?;
     std::fs::rename(&part, path).with_context(|| format!("rename {part} -> {path}"))
+}
+
+/// Host memory one call to [`write_expert_layer`] may hold, regardless of the layer's size.
+///
+/// 1 GiB, chosen against the two things it trades off. It must stay a large multiple of one
+/// expert block so [`crate::artifact::quant::fill_expert_blocks`] still has more blocks per
+/// window than it has threads — at K3's 17.55 MB that is 61 blocks against ~32 threads, and
+/// at GLM's 4.2 MB it is 255. And it must stay small next to the machine: this box is 128 GB
+/// of LPDDR5 *shared with the GPU*, `/tmp` is a 63 GB tmpfs living in that same RAM, and a
+/// convert runs alongside whatever else holds the arena.
+pub const LAYER_WINDOW: usize = 1 << 30;
+
+/// Write one layer's expert file — header block, then `blocks` expert blocks — in bounded
+/// host memory, published by rename exactly as [`write_atomic`] does.
+///
+/// **This exists because the buffered form does not scale past GLM.** Both converters used to
+/// allocate the whole file (`vec![0u8; VQ_ALIGN + blocks * stride]`), fill it, and hand it to
+/// `write_atomic`: 3.4 GB per layer for V4 and 3.7 GB for GLM, which is survivable, but
+/// **15.7 GB for Kimi-K3** (896 experts x 17.55 MB) on a box whose entire LPDDR5 is 128 GB and
+/// shared with the GPU. The buffer was pure waste at any size — every byte was written out
+/// once and never re-read.
+///
+/// Parallelism is preserved by windowing rather than by streaming one expert at a time:
+/// `fill_expert_blocks` still packs each window across all threads over disjoint slices, so
+/// the only thing that changed is how much is resident at once. Serialising the pack to save
+/// memory would have traded a multi-hour convert for a buffer.
+///
+/// Each block is `stride` bytes of which only `bytes` are ever written, and the `bytes..stride`
+/// padding must be zero for the output to be byte-identical to the buffered form — which G1a
+/// asserts. That falls out of allocating the window zeroed once; see the comment at the
+/// allocation for why re-zeroing per window is NOT needed, and how a plausible argument that
+/// it was survived until someone tried to make the test fail without it.
+///
+/// No `fsync` before the rename, matching `write_atomic` — see the paragraph above it. The
+/// failure this defends against is a killed process, which rename ordering already covers.
+/// `window` is the host-memory ceiling and both converters pass [`LAYER_WINDOW`]; it is a
+/// parameter rather than a constant read from inside because the window BOUNDARY is where this
+/// can go wrong in a way nothing else catches — one window's tail landing in the next window's
+/// inter-block padding — and a test cannot afford to allocate a gigabyte to reach it. A
+/// thin wrapper supplying the constant would be a second copy of this parameter list, which
+/// `jscpd` refuses (measured: 6 lines, 45 tokens).
+pub fn write_expert_layer(
+    path: &str,
+    header: &[u8; EXPERT_HEADER_BYTES],
+    stride: usize,
+    bytes: usize,
+    blocks: usize,
+    window: usize,
+    fill: impl Fn(usize, &mut [u8]) -> Result<()> + Sync,
+) -> Result<u64> {
+    use std::io::Write;
+    ensure!(
+        EXPERT_HEADER_BYTES <= VQ_ALIGN,
+        "header {EXPERT_HEADER_BYTES} B does not fit the {VQ_ALIGN} B block-0 pad"
+    );
+    let part = format!("{path}.{}.part", std::process::id());
+    let mut f = std::io::BufWriter::new(
+        std::fs::File::create(&part).with_context(|| format!("create {part}"))?,
+    );
+    // Block 0 is the header, padded to `VQ_ALIGN` so expert 0 starts block-aligned for the
+    // loader's O_DIRECT reads. Same layout the buffered writer produced.
+    let mut pad = [0u8; VQ_ALIGN];
+    pad[..EXPERT_HEADER_BYTES].copy_from_slice(header);
+    f.write_all(&pad).with_context(|| format!("write {part}"))?;
+
+    let per = (window / stride.max(1)).clamp(1, blocks.max(1));
+    // Zeroed ONCE, not per window, and the reuse is safe for a specific reason:
+    // `fill_expert_blocks` hands each closure `&mut slot[..bytes]`, so the `bytes..stride`
+    // padding is never written by anybody and stays zero for the buffer's whole life — the
+    // same way it did in the whole-layer `vec!` this replaced. A per-window `fill(0)` was
+    // here first, justified as stopping one window's tail leaking into the next window's
+    // padding; the red-proof for that showed the test stayed GREEN without it, because there
+    // is no path that dirties padding in the first place. It was a memset of up to 1 GiB per
+    // window (~16 GiB per K3 layer) defending against nothing.
+    let mut win = vec![0u8; per * stride];
+    let mut done = 0usize;
+    while done < blocks {
+        let take = per.min(blocks - done);
+        let span = &mut win[..take * stride];
+        crate::artifact::quant::fill_expert_blocks(span, stride, bytes, take, |j, slot| {
+            fill(done + j, slot)
+        })?;
+        f.write_all(span).with_context(|| format!("write {part}"))?;
+        done += take;
+    }
+    f.flush().with_context(|| format!("flush {part}"))?;
+    drop(f);
+    std::fs::rename(&part, path).with_context(|| format!("rename {part} -> {path}"))?;
+    Ok((VQ_ALIGN + blocks * stride) as u64)
 }
 
 /// Write `<out_dir>/manifest.json` and copy `aux` (tokenizer and friends) beside it, so
@@ -1974,6 +2063,73 @@ mod tests {
         );
         assert_eq!(strays(), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Streaming a layer in windows produces the same file the whole-layer buffer did, and
+    /// keeps doing so when the block count is not a multiple of the window.
+    ///
+    /// The reference arm here is the code both converters used to run inline — allocate
+    /// `VQ_ALIGN + blocks * stride`, stamp the header, `fill_expert_blocks` over the rest,
+    /// write once. That is what G1a's byte-identity claim is against, so it is spelled out
+    /// rather than derived from the thing under test.
+    ///
+    /// `stride > bytes` and every payload non-zero, so a block landing in the wrong slot moves
+    /// bytes rather than merely repeating them, and any padding that got written shows up.
+    ///
+    /// `blocks = 7` against `per = 2` deliberately leaves a short final window; an off-by-one
+    /// there writes 8 blocks or 6, and the length assertion catches it.
+    ///
+    /// **What this test does NOT cover, established by trying:** it does not detect a window
+    /// buffer being reused without clearing. It was written believing it did, and the
+    /// red-proof — deleting the per-window `fill(0)` — left it green, which is how that memset
+    /// turned out to be defending against a path that does not exist. Recording the negative
+    /// because the next person to look at the reuse will have the same worry.
+    #[test]
+    fn a_windowed_expert_layer_is_byte_identical_to_the_buffered_one() {
+        let dir = tmpdir("expert_layer");
+        let (stride, bytes, blocks) = (64usize, 40usize, 7usize);
+        let header = ExpertHeader::new(F4_MAGIC, 3, blocks, 128, 64, stride).to_bytes();
+        // Distinct non-zero payload per expert, and the LAST byte of each differs, so a
+        // block written into the wrong slot moves bytes rather than merely repeating them.
+        let fill = |e: usize, slot: &mut [u8]| -> Result<()> {
+            slot.fill(0xA0 | (e as u8 & 0x0f));
+            slot[bytes - 1] = 0xE0 | (e as u8 & 0x0f);
+            Ok(())
+        };
+
+        // Reference: the whole-layer buffer, as both converters wrote it before 2026-08-10.
+        let mut buf = vec![0u8; VQ_ALIGN + blocks * stride];
+        buf[..EXPERT_HEADER_BYTES].copy_from_slice(&header);
+        crate::artifact::quant::fill_expert_blocks(
+            &mut buf[VQ_ALIGN..],
+            stride,
+            bytes,
+            blocks,
+            fill,
+        )
+        .unwrap();
+
+        // One window per two blocks: four windows, the last holding one block.
+        let path = format!("{dir}/L03.f4");
+        let n =
+            write_expert_layer(&path, &header, stride, bytes, blocks, 2 * stride, fill).unwrap();
+        let got = std::fs::read(&path).unwrap();
+
+        assert_eq!(n as usize, buf.len(), "reported length");
+        assert_eq!(got.len(), buf.len(), "file length");
+        assert_eq!(
+            got,
+            buf,
+            "windowed output differs from the buffered form at byte {:?}",
+            got.iter().zip(&buf).position(|(a, b)| a != b)
+        );
+        // Independent of the reference arm: every block's padding is zero. Stated separately
+        // because if BOTH arms grew the same padding bug the comparison above would pass.
+        for e in 0..blocks {
+            let pad = &got[VQ_ALIGN + e * stride + bytes..VQ_ALIGN + (e + 1) * stride];
+            assert!(pad.iter().all(|&b| b == 0), "block {e} padding not zero");
+        }
+        assert_eq!(walk_parts(&dir), Vec::<String>::new(), "left a temp file");
     }
 
     /// The reader stopped doing its own offset arithmetic on 2026-08-06 and the comment

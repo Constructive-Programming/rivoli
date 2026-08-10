@@ -284,8 +284,18 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    (`format.rs:169`), so verbatim copies borrow the source mmap and host-RAM peak is the sum of
    the CONVERTED tensors. `write` also became atomic: a borrowed payload is read at write time,
    so truncating a path that is also a mapped source would SIGBUS.
-   **Still owed — the ROUTED writer.** `convert_v4.rs:304` buffers a whole layer through
-   `write_atomic(&path, &buf)`, which for K3 is 896 x 17.55 MB = **15.7 GB** per layer file.
+   **The ROUTED writer — DONE 2026-08-10.** Both converters buffered a whole layer through
+   `write_atomic(&path, &buf)`: 3.4 GB for V4, 3.7 GB for GLM, **15.7 GB** for K3
+   (896 x 17.55 MB) on a 128 GB host whose RAM the GPU shares. `write_expert_layer`
+   (`format.rs`) streams it in 1 GiB windows and keeps `fill_expert_blocks`'s thread-parallel
+   pack inside each window — at K3's stride that is 61 blocks per window against ~32 threads,
+   so nothing serialises. Asserted byte-identical to the buffered form, including a short
+   final window.
+   One negative worth not re-deriving: a per-window `fill(0)`, added to stop one window's tail
+   reaching the next window's inter-block padding, is **unnecessary** — `fill_expert_blocks`
+   only ever exposes `&mut slot[..bytes]`, so padding is written by nobody and stays zero from
+   the single initial allocation. The red-proof (delete it, expect red) came back green, which
+   is the only reason we know; it was ~16 GiB of memset per K3 layer defending nothing.
 2. **Settle e8m0 `0xff`.** *(Tier 1.)* The reference maps 255 → zero; rivoli's `e8m0f` returns
    a quiet NaN and `quant.rs:748` **bails**. Item 11 settles the semantics for free; only the
    *presence* question needs bytes. Host and device must change together or the divergence is

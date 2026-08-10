@@ -28,13 +28,12 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
-    Dtype, EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, F4Expert, FormatMeta, SafeWriter,
-    Safetensors, finish_artifact, write_atomic,
+    Dtype, ExpertHeader, F4_MAGIC, F4Expert, FormatMeta, LAYER_WINDOW, SafeWriter, Safetensors,
+    finish_artifact, write_expert_layer,
 };
 use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::artifact::quant::{
-    FP8_BLOCK, V4_PROJ, VQ_ALIGN, f4_expert_bytes, f4_expert_stride, fill_expert_blocks,
-    v4_expert_base,
+    FP8_BLOCK, V4_PROJ, VQ_ALIGN, f4_expert_bytes, f4_expert_stride, v4_expert_base,
 };
 
 // NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
@@ -292,20 +291,22 @@ fn main() -> Result<()> {
             // One aligned block for the header, then `ne` routed blocks — and NO shared block,
             // unlike `.vq3`/`.i4`. V4's shared expert is fp8 e4m3, a different format entirely;
             // a block written past `ne` would be the wrong ARITHMETIC, not just wrong weights.
-            let mut buf = vec![0u8; VQ_ALIGN + ne * stride];
-            buf[..EXPERT_HEADER_BYTES].copy_from_slice(
-                &ExpertHeader::new(F4_MAGIC, l, ne, hidden, moe_inter, stride).to_bytes(),
-            );
-            fill_expert_blocks(&mut buf[VQ_ALIGN..], stride, ebytes, ne, |e, slot| {
-                expert(e).pack(slot)
-            })
-            .with_context(|| format!("repack layer {l}"))?;
             // tmp→rename: `std::fs::write` is not atomic and a layer file is 3.4 GB, so a run
             // killed mid-write would otherwise leave a short `L{ll}.f4` that the next run
-            // reuses and never re-reads. Shared with `bin/convert` since 2026-08-06, which
-            // did NOT have it — see [`write_atomic`].
-            write_atomic(&path, &buf)?;
-            eprintln!("convert_v4: wrote {path} ({} bytes)", buf.len());
+            // reuses and never re-reads. Streamed in bounded windows rather than buffered
+            // whole — see [`write_expert_layer`], which is also what makes K3's 896-expert
+            // layer (15.7 GB) writable at all.
+            let n = write_expert_layer(
+                &path,
+                &ExpertHeader::new(F4_MAGIC, l, ne, hidden, moe_inter, stride).to_bytes(),
+                stride,
+                ebytes,
+                ne,
+                LAYER_WINDOW,
+                |e, slot| expert(e).pack(slot),
+            )
+            .with_context(|| format!("repack layer {l}"))?;
+            eprintln!("convert_v4: wrote {path} ({n} bytes)");
         }
 
         // Verification reads the FILE, and runs on a REUSED layer too. Two reasons it is

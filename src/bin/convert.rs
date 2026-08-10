@@ -11,13 +11,13 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
-    Dtype, ExpertHeader, FormatMeta, SafeWriter, Safetensors, VQ3_MAGIC, finish_artifact,
-    write_atomic,
+    Dtype, ExpertHeader, FormatMeta, LAYER_WINDOW, SafeWriter, Safetensors, VQ3_MAGIC,
+    finish_artifact, write_expert_layer,
 };
 use rivoli::artifact::quant::{
-    ExpertProjs, FP8_BLOCK, PROJ, VQ_ALIGN, VQ_DIM, VQ_K, expert_base, expert_projs,
-    fill_expert_blocks, learn_codebook, quant_vq, read_f32, sample_subvectors, vq_expert_bytes,
-    vq_proj_bytes, vq_row_bytes, write_le_scales,
+    ExpertProjs, FP8_BLOCK, PROJ, VQ_DIM, VQ_K, expert_base, expert_projs, learn_codebook,
+    quant_vq, read_f32, sample_subvectors, vq_expert_bytes, vq_proj_bytes, vq_row_bytes,
+    write_le_scales,
 };
 use rivoli::math::bf16_to_f32;
 // Only the tests still take the layout on its own; the encoders go through `expert_projs`,
@@ -466,27 +466,29 @@ fn main() -> Result<()> {
         if std::fs::metadata(&path).is_ok() {
             continue;
         }
-        let mut buf = vec![0u8; VQ_ALIGN + (d.n_experts + 1) * stride];
-        let hdr =
-            ExpertHeader::new(VQ3_MAGIC, l, d.n_experts, d.hidden, d.moe_inter, stride).to_bytes();
-        buf[..hdr.len()].copy_from_slice(&hdr);
         // Encode all n_experts+1 blocks (routed 0..n, shared = n) in parallel over
         // disjoint block slices — quant_vq is pure and Safetensors is Sync.
         let (src, cb, projs) = (&src, &codebooks, &projs);
         let enc = encoders.as_ref();
         let validate = args.validate;
         let blocks = d.n_experts + 1;
-        fill_expert_blocks(&mut buf[VQ_ALIGN..], stride, ebytes, blocks, |e, slot| {
-            let base = expert_base(l, e, d.n_experts);
-            encode_expert(src, &base, projs, cb, slot, enc, validate)
-        })
-        .with_context(|| format!("encode layer {l}"))?;
         // NOT `std::fs::write`: the `continue` above skips an existing path without reading
         // it, so a run killed mid-write would leave a short 3.7 GB `L{ll}.vq3` that re-running
-        // this command can never repair. `convert_v4` has had the tmp+rename since it was
-        // written and this loop did not — see [`write_atomic`] for how that divergence was
-        // found and why there is now one implementation.
-        write_atomic(&path, &buf)?;
+        // this command can never repair. One implementation with `convert_v4`, which windows
+        // the encode rather than buffering the whole layer — see [`write_expert_layer`].
+        write_expert_layer(
+            &path,
+            &ExpertHeader::new(VQ3_MAGIC, l, d.n_experts, d.hidden, d.moe_inter, stride).to_bytes(),
+            stride,
+            ebytes,
+            blocks,
+            LAYER_WINDOW,
+            |e, slot| {
+                let base = expert_base(l, e, d.n_experts);
+                encode_expert(src, &base, projs, cb, slot, enc, validate)
+            },
+        )
+        .with_context(|| format!("encode layer {l}"))?;
         eprintln!("convert: wrote {path}");
     }
 
