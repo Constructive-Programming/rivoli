@@ -45,7 +45,11 @@ V4_ART="${RIVOLI_V4_ART:-/var/db/rivoli/v4-f4-full}"
 # prints "tok/s", refuses, or emits a poison marker, and every verdict arm below can be
 # driven host-side (and was, before this script's first real run). Overriding it skips the
 # build — a stub needs none.
-BIN="${RIVOLI_BIN:-./target/release/rivoli}"
+#
+# The default honours CARGO_TARGET_DIR: agents on this machine build into per-worktree
+# target dirs (CLAUDE.md: the shared default target/ corrupts under concurrent builds), and
+# a hard-coded ./target/release/rivoli would silently test whatever stale binary sat there.
+BIN="${RIVOLI_BIN:-${CARGO_TARGET_DIR:-./target}/release/rivoli}"
 NGEN="${RIVOLI_NGEN:-12}"
 MEM_GLM="${RIVOLI_MAX_MEM:-115}"
 MEM_V4="${RIVOLI_MAX_MEM_V4:-100}"
