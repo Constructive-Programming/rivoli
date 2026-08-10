@@ -1059,11 +1059,12 @@ fn main() {
     // `v4gemv` and `v4res` KEEP their model-derived names, deliberately, where the kernels
     // they drive were renamed for behaviour on 2026-08-09 (`gemv_fp8_bf16` and the fp4
     // resident range). These strings are the CLI of a benchmark whose runs are recorded in
-    // `docs/measurement/benchmarks.md` — the M8 and M11 rounds name `dot_bench v4gemv` and
-    // `dot_bench v4res` in their command lines — and that file is append-only history that
-    // has to stay reproducible. Renaming them would make every recorded invocation a lie.
-    // So the inconsistency below is load-bearing, not an oversight. (`glmi4`, 2026-08-10,
-    // is the same deal — its round is recorded in benchmarks.md under that token.)
+    // `docs/measurement/benchmarks.md` and in the git history before its 2026-08-10
+    // compaction. Renaming them would make every recorded invocation a lie, and a recorded
+    // command that no longer runs cannot be re-run to settle a question — the reason
+    // benchmarks.md keeps command forms even though it dropped the per-arm tables. So the
+    // inconsistency below is load-bearing, not an oversight. (`glmi4`, 2026-08-10, is the
+    // same deal.) See benchmarks.md, "Section tokens recorded rounds invoke".
     const SECTIONS: [&str; 8] = [
         "moe", "gemv", "v4gemv", "v4res", "glmi4", "mla", "attend", "tail",
     ];

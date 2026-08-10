@@ -82,11 +82,16 @@ the stale block bannered). The method half had been 39 KB deep where nobody foun
   do not write a literal `INV-<digit>` token into §8b prose for an invariant that no longer
   exists: the parser reads it as a live claim.
 - **`measurement/benchmarks.md` was append-only until 2026-08-10 and is NOT any more.** It had
-  grown to 4,070 lines of journal; it is now the verdict of each round, ~375 lines. Record a new
-  result as a short section, and when one is superseded REPLACE it and say so. Two things are
-  not yours to drop: the **section titles** (155 inbound citations resolve by name) and the
-  **reproducibility artefacts** — the canonical 218-token prompt, the reply md5 gates, the
-  recorded command forms. Git history holds the journal; `investigations/` holds the arguments.
+  grown to 4,070 lines of journal; it is now the verdict of each round. Record a new result as
+  a short section, and when one is superseded REPLACE it and say so. Two things are not yours
+  to drop: the **section titles** (155 inbound citations resolve by name) and the
+  **reproducibility artefacts** — the canonical 218-token prompt, the reply md5 gates, kernel
+  fingerprints, the recorded command forms. Git history holds the journal; `investigations/`
+  holds the arguments. **Both halves now have a test** (`tests/docs.rs`):
+  `benchmarks_citations_resolve` fails on a quoted name no longer in the file, and
+  `benchmarks_stays_compact` caps the line count. Do not trust this bullet — it was prose
+  alone for one day, and in that day a compaction dropped four cited anchors while two
+  hand-verification passes reported zero.
 - **Verdicts are for ruling files out.** The reader's best outcome is answering their
   question from the index and never opening anything.
 

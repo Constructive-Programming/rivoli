@@ -196,7 +196,7 @@ a status and a one-line **verdict** so you can decide what *not* to read.
 | | |
 |---|---|
 | `docs/reference/` | true about the engine today — `architecture.md` is the one meant to be read whole |
-| `docs/measurement/` | how to measure, the roadmap, traces, and the append-only benchmark log |
+| `docs/measurement/` | how to measure, the roadmap, traces, and the benchmark record (verdicts; per-arm rows are in git history) |
 | `docs/investigations/` | questions asked, answered and closed. Read the verdict; open the file only to re-open the question |
 
 ## Serve — OpenAI API, and llama-swap

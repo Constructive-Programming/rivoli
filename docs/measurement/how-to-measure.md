@@ -41,8 +41,36 @@ about *where* the time went in all five cases and wrong about *why* in four:
 | 5 lm_head | split-K, "same shape argument as o_proj" | not grid-starved at all (19,360 blocks); it is load width |
 
 Every one of those corrections came from a compiler that was available the whole time,
-free, while the GPU was the bottleneck. See docs/measurement/benchmarks.md, "Read the ISA before you book
-the device", for the invocations and the two ways an instruction count lies.
+free, while the GPU was the bottleneck. Both invocations are CPU-only and need no device:
+
+```sh
+# 1. The gfx1151 ISA for a kernel translation unit.
+hipcc --offload-arch=gfx1151 -O3 --cuda-device-only -S kernels/linalg.hip -o /tmp/k.s
+awk '/^gemv_fp8_splitk:/,/^\.Lfunc_end/' /tmp/k.s > /tmp/kernel.s   # isolate one kernel
+awk '/Inner Loop Header/,/s_cbranch_execnz/' /tmp/kernel.s          # isolate its hot loop
+
+# 2. Registers, scratch, spills, occupancy.
+hipcc --offload-arch=gfx1151 -O3 -Rpass-analysis=kernel-resource-usage -c kernels/attn.hip -o /dev/null
+```
+
+**Three ways a static instruction count lies.** Each cost an afternoon:
+
+- **Unroll factors differ between the versions being compared.** Normalize before quoting a
+  ratio. `mla_absorb_fp8`'s loops were unrolled ×3 before a fix and ×2 after, so raw block
+  sizes (498 vs 52) suggest ~10× where per iteration it is ~6×. Count a once-per-iteration
+  op — `ds_load`, or the weight load — to recover the factor.
+- **A guarded path inflates the count when the guard is not taken at real dims.** That same
+  kernel's 498 instructions include a 64-bit Newton–Raphson division behind `v_cmpx_ne_u64`
+  which is **dead** at GLM dims (`row` ≤ 24576, `block` = 128, both fit in 32 bits). When a
+  count spans a branch, say which side runs.
+- **Do not conclude "no divide in the loop" by grepping for `v_rcp_iflag_f32`.** LLVM
+  strength-reduces a division by a loop-invariant runtime value into a magic multiply, so the
+  reciprocal disappears while the cost does not. For a **signed** divide what survives is the
+  quotient correction — that is the signature to grep for. `kernels/common.hpp` cites this.
+
+Count the cost you may have added, not just the one you removed: one exec-mask sequence
+(`s_and_saveexec_b32`) went 6 → **37** → 4 across a round where only the mask handling
+changed.
 
 **All four corrected mechanisms have now been implemented and measured, and the ISA was
 right every time** — absorb's load width 1.40×, lm_head's load width 1.78×, attend's LDS

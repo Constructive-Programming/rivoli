@@ -1,7 +1,7 @@
 ---
 scope: engine
 status: data
-verdict: The measured record, COMPACTED 2026-08-10 from a 4,070-line journal to its verdicts — no longer append-only. Every section title is preserved as a citation anchor (155 inbound references, mostly by name), as are the canonical 218-token prompt, the four reply md5 gates, the recorded command forms and the RETRACTION. Live state: quality ladder int4 5.120 > hybrid 5.189 > int3-vq 5.275; GLM 2.07 tok/s and V4-Flash 9.10-9.17 tok/s at 512 tokens; layer-major prefill 2.15x and default; MTP 1.108x only when gated at 0.8. Narrative, per-arm tables and superseded reasoning were dropped — git history holds them, and investigations/ holds the arguments.
+verdict: The measured record — one verdict per round, not a journal. Carries what cannot be re-derived without a device: the canonical 218-token prompt, the byte-identity md5s and kernel fingerprints, the recorded command forms, and the RETRACTION. Per-arm rows are in git history at `e8526bd^`; the arguments are in `investigations/`. Live state at the top.
 ---
 
 # Benchmarks
@@ -12,6 +12,12 @@ verdict: The measured record, COMPACTED 2026-08-10 from a 4,070-line journal to 
 > verdict of each round. It is **no longer append-only**: record a new result as a short
 > section, and when one is superseded, replace it and say so. The arguments live in
 > `investigations/`; the full journal lives in git history before `HEAD`.
+>
+> **Where a section states a verdict but not the rows behind it, the rows are in git history
+> at `e8526bd^`** — per-arm tables were what made this file 4,070 lines. A verdict here is
+> citable; a row you need to re-read is a `git show` away. What is NOT recoverable that way
+> is anything needing a device, so fingerprints, byte-identity hashes and recorded command
+> forms stay in the text.
 >
 > | | |
 > |---|---|
@@ -55,9 +61,9 @@ rivoli /var/db/rivoli/v4-f4-full                  -bench 512 --prompt "<the prom
 
 ## Storage: sequential ordering buys nothing at QD>=2
 
-`probes/seq_vs_random.c`, btrfs Data RAID0 across two NVMe (1.68 TiB, `ssd`, no compression),
-under the flock. Same 15.34 MB request size, 246 requests, same layer file, arm order
-alternated; mean of 4 reps, GB/s:
+`probes/seq_vs_random.c`, btrfs Data RAID0 across two NVMe (**`nvme1n1p3` + `nvme0n1p2`**,
+1.68 TiB, `ssd`, no compression), under the flock. Same 15.34 MB request size, 246 requests,
+same layer file, arm order alternated; mean of 4 reps, GB/s:
 
 | QD | rand | seq | delta |
 |---|---|---|---|
@@ -68,12 +74,6 @@ alternated; mean of 4 reps, GB/s:
 At 15.34 MB the seek is already amortised. **These are the achieved rates to reason from — the
 7.0 GB/s quoted elsewhere is a `dd iflag=direct` queue-depth-1 figure** and understates what
 the io_uring path gets.
-
-## Results — all coherent, no crashes
-
-Every cell passed the distinct-token gate. **Do not rank on that metric and do not read a low
-score as a bug**: 2026-07-27 a branch-gain sweep tripled PPL (73 -> 216) while distinct-ratio
-held. It separates a crash from a completion, nothing more.
 
 ## Bugs found and fixed
 
@@ -87,13 +87,52 @@ held. It separates a crash from a completion, nothing more.
 
 Offline `bin/replay` over three 512-token captured routing traces, one per mode — no engine
 change, so free of the decode-trajectory confound. **`top-m` is RETIRED and removed from the
-engine.** The screen is the record of why.
+engine.** The screen — the (J, M) grid, its hit/swap columns and the powered cell below — is
+the record of why.
+
+### DECISION: `top-m` ships opt-in and UNCERTIFIED
+
+The powered cell that decided the feature: `int3-vq`, **5,184 teacher-forced positions**,
+`--max-mem 100`, shared baseline, one process per cell. Baseline (lru) **PPL 4.130637**, hit
+72.25%.
+
+| cell | PPL | dPPL% | 95% CI (nats) | hit% | swap% | verdict |
+|---|---:|---:|---|---:|---:|---|
+| J=4/M=9 | 4.15252 | +0.529% | [−0.00207, +0.01263] | **77.69%** (+5.44pp) | 5.79% | **INCONCLUSIVE** — interval contains zero |
+| J=4/M=10 | 4.16786 | +0.901% | [+0.00077, +0.01717] | 81.47% (+9.22pp) | 9.80% | **COST ESTABLISHED, MAGNITUDE UNRESOLVED** |
+
+**J=4/M=9 shipped**, and INCONCLUSIVE is not "small cost confirmed": the interval contains
+zero, so no cost is established *and* it is not certified within the bar either. J=4/M=10 is
+not ship-able — its lower bound clears zero. This is the origin of the four-verdict
+vocabulary (PASS / FAIL / COST ESTABLISHED / INCONCLUSIVE) that `vulkan-port.md`'s staged
+acceptance gate reuses.
 
 ## Per-kernel round: matched A/B, `examples/dot_bench`
 
 Matched A/B on one instrument binary, three INTERLEAVED repeats (base/fix/base/fix/base/fix)
 so drift shows as within-arm spread rather than as the effect. GLM dims from the manifest:
 H=64, qk_head_dim=256. The interleaving discipline is the transferable part.
+
+### Section tokens recorded rounds invoke
+
+`examples/dot_bench` takes a section name, and rounds below are recorded by it. These tokens
+are **frozen**: `moe`, `gemv`, `v4gemv`, `v4res`, `glmi4`, `mla`, `attend`, `tail`. `v4gemv`
+and `glmi4` still carry model-derived names where the kernels they drive were renamed for
+behaviour on 2026-08-09, deliberately — a recorded command that no longer runs cannot be
+re-run to settle a question. `dot_bench.rs`'s `main` cites this section for that argument.
+
+### A fingerprint is the only instrument that shows bit-identity
+
+`assert_close` cannot tell a bit-identical restructure from a reassociating one — both pass,
+and the margin print does not separate them. `examples/dot_bench` prints an FNV-1a hash of
+each kernel's raw output bytes; the absorb restructure's claim rests on
+**`0925c147afeea3fb`**, unchanged across 14 interleaved runs of both arms.
+
+**It only works if the inputs VARY.** `run_fp8` and `run_mla` used constant `x`, `q` and
+`clat` — correct for throughput, since traffic does not depend on values, but a constant
+input leaves the output insensitive to summation order, so the fingerprint would have been
+green for a change that reassociated. The instrument and the input generator are ONE
+instrument; a fingerprint over degenerate data is a fingerprint of nothing.
 
 ## In-engine confirmation — the number a merge decision rests on
 
@@ -130,9 +169,16 @@ round were settled this way. Prescribed in `how-to-measure.md`.
 process group**, or a task reap kills the engine with it. Invisible from the code; cost a cell
 before it was understood.
 
-## A first-failure build hid a second one, and the fix caught it in the wild
+**Verify detachment rather than assuming it** — "I ran setsid" and "it is actually detached"
+are different claims, and only the second matters:
 
-Superseded by the `build.rs` entry under "Bugs found and fixed". Kept as an anchor.
+```sh
+ps -o pid,ppid,pgid,cmd -C rivoli
+# PID 2005651  PPID 2005649  PGID 2005649  -> own process group, not a harness child
+```
+
+If `PGID` equals the process's own `PID`, and `PPID` is not the harness shell, the run
+survives a reap. `tests/ppl-sweep-powered.sh` cites this check.
 
 ## Measurement caveat
 
@@ -140,12 +186,17 @@ Superseded by the `build.rs` entry under "Bugs found and fixed". Kept as an anch
 experts -> inflated hit% -> artificially FAST; the early int4 rows posted the highest tok/s
 BECAUSE they degenerated. Gate on output quality first, then read the rate.
 
+**And the distinct-token gate cannot be that quality gate.** 2026-07-27 a branch-gain sweep
+tripled PPL (**73 -> 216**) while distinct-ratio held. It separates a crash from a completion,
+nothing more — every cell of the retracted matrix passed it.
+
 ## DSA indexer round: `examples/indexer_bench`
 
 Instrument for the NPU-offload gates (`investigations/npu-offload.md` M0/M1), gfx1151 sole
 tenant, 2026-07-26. **The rig is deleted** (`77b5500:examples/indexer_bench.rs`) and its
-GPU-span figure was refuted by 27% by the engine's own indexer buckets. Rows kept as the
-record of a superseded instrument, not as a baseline.
+GPU-span figure was refuted by 27% by the engine's own indexer buckets. Recorded as a
+superseded instrument, not as a baseline — its rows, methodology and three measurement traps
+are in git history at `e8526bd^`.
 
 ### Device top-k WIRED: three-arm in-engine A/B, 2026-07-27
 
@@ -155,6 +206,15 @@ longer exists** — `device` shipped; `host`/`device-nosync`/`verify` were delet
 rows were recorded (`77b5500:src/gpu.rs` restores them). Rows recorded after 2026-07-30 carry
 no `[topk=...]` tag and no `idx_host` term, which is what makes `route` incomparable with
 older rows. Cited by `src/gpu.rs` and `investigations/npu-offload.md`.
+
+**The evidence is the match count, not the exit status**, because an earlier revision of this
+gate **exited 0 having compared zero layers** whenever the context stayed under `index_topk`.
+The repaired gate was then confirmed able to fail: `RIVOLI_TOPK=verify … -bench 4` on the
+default short prompt exits 1 with `compared 0 layers: the context never exceeded
+index_topk=2048`. Re-run on the shipped binary after the comparison loop was rewritten in
+review: **8,736 layers matched** at `-bench 32` (21 × [384 prefill + 32 decode]), all seven
+runs byte-identical (564 chars, sha256 `778387fa557c4e9d…`), coherent prose. **Not
+established:** one prompt, one context (nt ≈ 2496 mean), n = 2 per arm.
 
 ## RETRACTION: the 512->10k matrix's long-context results are invalid
 
@@ -168,18 +228,28 @@ repetition check. **Cited by `README.md` and `artifact/tokenizer.rs` as "the ret
 Bracket 44 -> 8 -> 4 -> 2 at 512/2048/4096/10000 tokens, `--max-mem 115`, one process per
 cell, ~10 h. **Invalid at 2048+ — see the RETRACTION above.** The 512-token column stands.
 
-## Speculative decode (`--mtp`): the batched verify pass LOSES 7%, and why
-
-2026-07-31, int3-vq/dense/2q, `--max-mem 115`, 128 tokens, sole tenant, no rebuild between
-arms. **UNGATED `--mtp` is a LOSS: 0.93-0.95x.** Superseded as the feature verdict by "The MTP
-confidence gate" below, which measures the gated form.
-
 ## `--mode int4` vs int3-vq — the point estimate favours int4, the test cannot confirm it
 
 2026-07-31, one binary, one session, `tests/ppl-corpus.txt` (762 teacher-forced tokens),
 2q / `--max-mem 115` / dense. `--ppl` never enters `generate`, so speculation is not a
 variable. **Point estimate favours int4; the test cannot confirm it** — 762 tokens is
 underpowered. `tests/ppl-corpus-5000.txt` exists for this reason.
+
+### int4 provenance — MEASURED, and it inverts hybrid's stated premise
+
+The int4/hybrid numbers of that era used `.i4` re-derived from **vq3**, itself a lossy 3-bit
+quantization, because colibri's own int4 was a mismatched per-row RTN (R≈0.96 against vq3,
+scales 5–9% inflated) that decoded degenerately under the fp8 router. So the chain was
+`fp8 → vq3 → int4`, and **the int4 set could not be better than the vq3 it came from, by
+construction** — which is the whole reason `bin/fp8_to_i4` exists and `bin/vq3_to_i4` is
+deleted.
+
+> **SUPERSEDED 2026-07-27 — `docs/investigations/int4-scales.md`.** Two claims here measured
+> false. The set rebuilt from fp8 is **strictly more accurate** and **8× worse end to end**
+> (PPL 73.43 vs 5.28), so the deficit was never "the arithmetic of double quantization": the
+> cause is **per-row scaling**, one scale per 6144 weights. The gs64/`pack_i4` fix this
+> section recommended was right for the wrong reason, and `int4-scales.md` re-endorses it on
+> the correct one.
 
 ## The MTP confidence gate — 1.108×, 2026-07-31
 
@@ -220,6 +290,19 @@ parameter (HB x `MLA_MIN_TILES_PER_SPLIT`) sweep roadmap #5 asked for; only HB i
 Interleaved, min-of-5, `examples/dot_bench attend`, four binaries built up front so no
 `cargo build` ran between arms.
 
+Fingerprints, because an HB sweep is bit-identical only while the split plan is unchanged —
+this is what tells the cells apart, and re-deriving it costs a device slot:
+
+| cell | µs | fp (HB) | fp (split) |
+|---|---:|---|---|
+| HB=8, MIN=4 *(was shipped)* | 226.5 | `6eb5576d…` | `91d2fa2a…` |
+| HB=8, MIN=2 | 226.4 | `6eb5576d…` | `91d2fa2a…` |
+| **HB=16, MIN=4 (shipped)** | **108.8** | `6eb5576d…` | `4c2cf2d9…` |
+| HB=16, MIN=2 | 117.9 | `faf6f182…` | `4c2cf2d9…` |
+
+MIN=2 at HB=16 is the cell that lands on a different `n_splits`, which is why its first
+column moves while the shipped cell's does not.
+
 ## Long runs are NON-DETERMINISTIC: ~40% of 5k-token scores are silently wrong — 2026-08-02
 
 **~40% of 5k-token scores are silently wrong (2026-08-02).** Confirms the "worse than the
@@ -227,12 +310,45 @@ crash" case: a NaN needs a slot that was never written, and on a warm pool the s
 a *stale* slot instead — plausible numbers, no crash. This is why `distinct` cannot be trusted
 and why long-run PPL needs a repeat.
 
-## Long-run corruption: four mechanisms eliminated, and the clue we were reading backwards — 2026-08-03
+## Long-run divergence: a RACE, not residency — INV-1 exonerated, and the first witnessed pairs — 2026-08-05
 
-Follows the entry above. **The bug is NOT found.** Four mechanisms eliminated; the clue was
-being read backwards. Superseded by the long-run divergence work in
-`reference/architecture.md` §6, which localises it to a timing race in layer L-1's MoE compute
-against layer L's attention — NOT residency (INV-1 exonerated, 0 of 388,875 records).
+**Still not root-caused** — the repo's #1 OPEN defect. Two whole classes are closed, and the
+earlier measurement was wrong in a way worth keeping.
+
+**The earlier numbers had no contention witness.** `flock /var/run/sys-gpu.lock` is
+*advisory* and another agent on this box runs GPU tests without it (observed 2026-08-04).
+The tell is general: the arms WITHOUT the extra probe ran SLOWER than the arms with it
+(2485.6/2428.9 s vs 2247.3/2301.4 s), and a probe that adds work cannot make a run faster,
+so the ordering being backwards is contention. A reproduction claim on that pair was
+**retracted**. Every pair below carries a per-arm witness log — every PID holding `/dev/kfd`
+or a render node, sampled every 20 s, minus the arm's own — and the rule was fixed before the
+data: a non-empty witness means the arm is **discarded, not interpreted**.
+
+> This puts a question mark over the `~40%` and `token 4042` / `17 nats` figures in the two
+> sections above: those runs had no witness either. Not hereby wrong, but the *rate* is
+> unestablished and a single unwitnessed pair should not be quoted as one.
+
+`--mode int3-vq --no-mtp --attn dsa --max-mem 90`, `ppl-corpus-5000`, sole-tenant, witness
+empty on both arms of both pairs:
+
+| pair | arm 1 | arm 2 | first divergence (pos, layer) |
+|---|---:|---:|---|
+| A | 4.126882 | 4.175782 | (258, 62) |
+| B | 4.848965 | 4.302220 | (265, 60) |
+
+It reproduces on a clean machine, so the fault is real. Pair B's 0.55 PPL spread is the ~0.5
+recorded originally; pair A's 0.049 is not. **The divergence POSITION moves between pairs**,
+which rules out anything deterministic about token 4042 and is the signature of a race.
+
+**INV-1 is EXONERATED by direct measurement.** `--checksum-route`
+(`--features corruption-probe`) hashes, per MoE layer, the gate logits the router SAW and the
+experts it PICKED — pure host-side, so no device traffic and no I/O during the run. Across
+**388,875 records per arm** (5185 positions × 75 MoE layers), in both pairs: **rows where the
+logits AGREE and the picks DIFFER — 0.** Where picks diverge the logits diverged first, at the
+same row: routing faithfully reflecting an already-corrupted residual. The
+`hit_pct`-tracks-output correlation that motivated the check is a symptom, not a cause, and
+`--mode int3-vq` remains output-neutral to residency. Localised in `reference/architecture.md`
+§6 to a timing race in layer *L-1*'s MoE compute against layer *L*'s attention.
 
 ## VQ_K=2048: the codebook shrink and the byte saving are the SAME item and they cancel — 2026-08-04
 
@@ -240,12 +356,6 @@ against layer L's attention — NOT residency (INV-1 exonerated, 0 of 388,875 re
 2048 gives a 16 KiB fp16 codebook that fits L1 AND an 11-bit index, but 1.189x on the MoE
 kernels costs +18.7% relFrob. Priced by two probes with no requant, because kernel speed does
 not depend on index values. Live on `perf-roadmap.md` #2, needs a real dNLL gate.
-
-## 2026-08-06 — every gate green at once, first time since `5ef1f9a`
-
-Recorded because the COMBINATION had never held, not because any number is new. CI's `host`
-job had failed at `cargo fmt --check` — step 4, before clippy and test — for **141 commits**,
-so the later steps never ran in that window.
 
 ## GLM-5.2 vs DeepSeek-V4-Flash — 512-token decode, one complex prompt (2026-08-07)
 
@@ -293,7 +403,8 @@ registered prediction (-4..-10, point -6) landed IN BAND at -5.3.
 ## V4 hcn A/B — hcn 40.7 → 5.6 ms/token, wall 168.2 → 130.7 = 7.652 tok/s, output byte-identical (2026-08-08)
 
 hcn 40.7 -> 5.6, wall 168.2 -> 130.7 = **7.652 tok/s**, byte-identical (M5) — reply prefix
-md5 `0ebcf62c20c6981b0ad7ca04ccfff270`, escape-decoding to M4's recorded 1983-byte prefix. Schedule-only:
+md5 `0ebcf62c20c6981b0ad7ca04ccfff270`, escape-decoding to the **1983-byte** reply prefix M4
+established. Schedule-only:
 `hc_pre` 256 -> 1024 threads = one wave per mix row, unroll-8. The width and unroll levers
 MULTIPLY (24x loads in flight).
 
@@ -348,6 +459,12 @@ randomises rather than adding n.
 **+12.6% (R=1) / +16.4% (R=2) / +20.1% (e_count=1)** serial rate, fingerprint-identical.
 The two adjacent negatives priced in the same round: AS1/`gu8p` typing ±0.6%, decode-removed
 ballast +0.5% — the whole gap was memory-level parallelism.
+
+**The gate is demonstrated in BOTH directions, and the red half is these hashes.** Every
+shipping arm holds row-0 fnv `b2407d1121848fd5` — stock, unroll 2, unroll 4, AS1, AS1+unroll 4
+alike. Arm **X**, deliberately reassociated, moves all three
+(`924efb78f6743e16` / `01ff6e0362de32b4` / `7de5301cb611fd2e`) while staying non-degenerate:
+proof the fingerprint can go red on a change `assert_close` would have passed.
 
 ## GLM int4-unroll engine A/B — byte-identical at --mode int4, 128 tokens, MTP active (2026-08-10)
 

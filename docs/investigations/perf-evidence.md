@@ -192,8 +192,9 @@ Grounded in the measured kernel profile.
 
    **The arithmetic said so before the device did.** The 402 MB + 100 MB in 529 µs this
    item rests on is 950 GB/s on a 256 GB/s part — 3.7× over, so it was never DRAM traffic
-   and one division would have retired the item without a device slot. See docs/measurement/benchmarks.md,
-   "Divide by the peak before you book the slot".
+   and one division would have retired the item without a device slot. **Divide by the peak
+   before you book the slot** — the arithmetic above is the whole lesson, and it needs no
+   device to redo.
 
    **What o_proj actually is: at the roofline for the traffic it cannot avoid.** The
    100.7 MB of weights it must read from DRAM is 393 µs at peak; it measures 515.7 µs
