@@ -143,9 +143,18 @@ pub fn load_config<T: ArchConfig>(dir: &str) -> Result<T> {
 /// `vq_row_bytes`/`vq_groups` and their `.f4` counterparts round up with only a
 /// `debug_assert` to catch a ragged dim, so in a RELEASE build a bad width silently
 /// truncates every expert row instead of failing. Each width is an `i_dim` for some
-/// projection — gate/up take `hidden`, down takes `moe_inter` — so one check covers both.
-fn ensure_group_aligned(hidden: usize, moe_inter: usize, group: usize, what: &str) -> Result<()> {
-    for (name, dim) in [("hidden", hidden), ("moe_inter", moe_inter)] {
+/// projection — gate/up take `expert_in`, down takes `moe_inter` — so one check covers both.
+///
+/// `expert_in` is the routed block's entry width, not `hidden_size`; see
+/// [`crate::artifact::quant::vq_expert_layout`] for why those differ on K3 and why this
+/// takes the former. GLM-5.2 and V4 pass `cfg.hidden` because for them they are equal.
+fn ensure_group_aligned(
+    expert_in: usize,
+    moe_inter: usize,
+    group: usize,
+    what: &str,
+) -> Result<()> {
+    for (name, dim) in [("expert_in", expert_in), ("moe_inter", moe_inter)] {
         ensure!(
             dim.is_multiple_of(group),
             "{name} {dim} is not a multiple of {what} {group} — expert rows would \

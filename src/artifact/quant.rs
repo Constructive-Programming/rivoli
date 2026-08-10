@@ -180,12 +180,28 @@ pub fn vq_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
 pub const VQ_ALIGN: usize = 4096;
 
 /// The three projections of one MoE expert in on-disk order, as `(o_dim, i_dim)`:
-/// gate and up map hidden→moe_inter (`i_dim = hidden`); down maps moe_inter→hidden.
-pub fn vq_expert_layout(hidden: usize, moe_inter: usize) -> [(usize, usize); 3] {
+/// gate and up map `expert_in`→`moe_inter`; down maps `moe_inter`→`expert_in`.
+///
+/// `expert_in` is the width the ROUTED EXPERT BLOCK is entered at, which is not always
+/// the model's `hidden_size`. GLM-5.2 and V4 route on the residual stream, so for them
+/// the two are the same number and every call site passes `cfg.hidden`. Kimi-K3 does
+/// not: it down-projects 7168→3584 and runs its experts in that latent space
+/// (`routed_expert_hidden_size` 3584 against `hidden_size` 7168 —
+/// `docs/reference/k3-architecture.md` §2), so its experts are `[3072,3584]`·2 +
+/// `[3584,3072]` and every geometry function here takes 3584.
+///
+/// Hence the parameter is named for the ROLE, not for `hidden`. Passing 7168 where 3584
+/// belongs computes a self-consistent layout of the wrong size, which the length checks
+/// catch — but the reverse, feeding the latent to K3's SHARED expert (a trunk-side
+/// `[7168,6144]` that stays full width), is self-consistent AND the same shape class, so
+/// it streams the wrong weights through all 92 MoE layers and fails nothing. A field
+/// called `hidden` holding 3584 is how that substitution gets made without anyone seeing
+/// it; this name is the whole defence.
+pub fn vq_expert_layout(expert_in: usize, moe_inter: usize) -> [(usize, usize); 3] {
     [
-        (moe_inter, hidden),
-        (moe_inter, hidden),
-        (hidden, moe_inter),
+        (moe_inter, expert_in),
+        (moe_inter, expert_in),
+        (expert_in, moe_inter),
     ]
 }
 
@@ -206,8 +222,8 @@ pub type ExpertProjs = [(&'static str, (usize, usize)); 3];
 /// encoder walks, in slot order. Here for the same reason `PROJ` is: the ZIP is as
 /// order-bearing as the list, and `bin/convert` and `bin/fp8_to_i4` had spelled it out
 /// identically (down to recomputing the layout once per expert inside the worker loop).
-pub fn expert_projs(hidden: usize, moe_inter: usize) -> ExpertProjs {
-    let [g, u, d] = vq_expert_layout(hidden, moe_inter);
+pub fn expert_projs(expert_in: usize, moe_inter: usize) -> ExpertProjs {
+    let [g, u, d] = vq_expert_layout(expert_in, moe_inter);
     [(PROJ[0], g), (PROJ[1], u), (PROJ[2], d)]
 }
 
@@ -243,8 +259,8 @@ pub fn expert_base(layer: usize, e: usize, n_experts: usize) -> String {
 /// Sum one format's `*_proj_bytes` over an expert's three projections. The `(o, i)` dims
 /// are format-independent, so this is the one place the "an expert is gate‖up‖down"
 /// structure is written; the three formats differ only in `proj`.
-fn expert_bytes(hidden: usize, moe_inter: usize, proj: fn(usize, usize) -> usize) -> usize {
-    vq_expert_layout(hidden, moe_inter)
+fn expert_bytes(expert_in: usize, moe_inter: usize, proj: fn(usize, usize) -> usize) -> usize {
+    vq_expert_layout(expert_in, moe_inter)
         .iter()
         .map(|&(o, i)| proj(o, i))
         .sum()
@@ -306,14 +322,14 @@ pub fn fill_expert_blocks(
 }
 
 /// Unpadded on-disk bytes of one expert (gate‖up‖down concatenated).
-pub fn vq_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
-    expert_bytes(hidden, moe_inter, vq_proj_bytes)
+pub fn vq_expert_bytes(expert_in: usize, moe_inter: usize) -> usize {
+    expert_bytes(expert_in, moe_inter, vq_proj_bytes)
 }
 
 /// Per-expert on-disk stride: [`vq_expert_bytes`] padded up to [`VQ_ALIGN`]. The
 /// fixed stride at which experts sit in a per-layer `.vq3` file.
-pub fn vq_expert_stride(hidden: usize, moe_inter: usize) -> usize {
-    expert_stride(vq_expert_bytes(hidden, moe_inter))
+pub fn vq_expert_stride(expert_in: usize, moe_inter: usize) -> usize {
+    expert_stride(vq_expert_bytes(expert_in, moe_inter))
 }
 
 /// One VQ projection borrowed from an on-disk expert block: packed 12-bit indices
@@ -345,11 +361,11 @@ impl VqProj<'_> {
 /// Slice expert `e`'s three [`VqProj`] out of a per-layer `.vq3` buffer (`n_experts`
 /// blocks at [`vq_expert_stride`]). The layout the converter writes: each expert is
 /// `gate ‖ up ‖ down`, each projection indices-then-scales.
-pub fn vq_expert(layer: &[u8], e: usize, hidden: usize, moe_inter: usize) -> [VqProj<'_>; 3] {
-    let stride = vq_expert_stride(hidden, moe_inter);
-    let blk = &layer[e * stride..e * stride + vq_expert_bytes(hidden, moe_inter)];
-    let dims = vq_expert_layout(hidden, moe_inter);
-    let off = vq_slot_offsets(hidden, moe_inter); // the single source of the layout
+pub fn vq_expert(layer: &[u8], e: usize, expert_in: usize, moe_inter: usize) -> [VqProj<'_>; 3] {
+    let stride = vq_expert_stride(expert_in, moe_inter);
+    let blk = &layer[e * stride..e * stride + vq_expert_bytes(expert_in, moe_inter)];
+    let dims = vq_expert_layout(expert_in, moe_inter);
+    let off = vq_slot_offsets(expert_in, moe_inter); // the single source of the layout
     core::array::from_fn(|k| {
         let (o_dim, i_dim) = dims[k];
         let (io, so) = (off[k * 2], off[k * 2 + 1]); // indices start, scales start
@@ -774,14 +790,14 @@ pub fn f4_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
 
 /// Unpadded on-disk bytes of one FP4 expert (w1‖w1_scale‖w3‖w3_scale‖w2‖w2_scale — see
 /// [`V4_PROJ`] for why that is gate/up/down order).
-pub fn f4_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
-    expert_bytes(hidden, moe_inter, f4_proj_bytes)
+pub fn f4_expert_bytes(expert_in: usize, moe_inter: usize) -> usize {
+    expert_bytes(expert_in, moe_inter, f4_proj_bytes)
 }
 
 /// Per-expert on-disk stride: [`f4_expert_bytes`] padded up to [`VQ_ALIGN`], so one FP4
 /// expert is a single block-aligned read (mirrors the `.vq3`/`.i4` stride).
-pub fn f4_expert_stride(hidden: usize, moe_inter: usize) -> usize {
-    expert_stride(f4_expert_bytes(hidden, moe_inter))
+pub fn f4_expert_stride(expert_in: usize, moe_inter: usize) -> usize {
+    expert_stride(f4_expert_bytes(expert_in, moe_inter))
 }
 
 /// fp8 `weight_scale_inv` tile size: 128×128 for both the GLM-5.2 checkpoint and
@@ -803,7 +819,7 @@ pub const FP8_BLOCK: usize = 128;
 /// so w3 is the UP projection and w2 is down. Storing them in gate/up/down order keeps one
 /// slot index meaning one projection across all three of this engine's formats.
 ///
-/// A `w2` in the wrong slot is caught by its shape (`[hidden, moe_inter]`, transposed from
+/// A `w2` in the wrong slot is caught by its shape (`[expert_in, moe_inter]`, transposed from
 /// the other two). A `w1`/`w3` SWAP is not: they are the same shape, and a repack that
 /// swapped them would be internally consistent and byte-clean. Only a numerical oracle
 /// against the reference can see that, which is what S1b exists for.
@@ -815,8 +831,8 @@ pub const FP8_BLOCK: usize = 128;
 pub const V4_PROJ: [&str; 3] = ["w1", "w3", "w2"];
 
 /// [`V4_PROJ`] zipped against [`vq_expert_layout`] — the V4 analogue of [`expert_projs`].
-pub fn v4_expert_projs(hidden: usize, moe_inter: usize) -> ExpertProjs {
-    let [g, u, d] = vq_expert_layout(hidden, moe_inter);
+pub fn v4_expert_projs(expert_in: usize, moe_inter: usize) -> ExpertProjs {
+    let [g, u, d] = vq_expert_layout(expert_in, moe_inter);
     [(V4_PROJ[0], g), (V4_PROJ[1], u), (V4_PROJ[2], d)]
 }
 
@@ -969,14 +985,14 @@ pub fn i4_proj_bytes(o_dim: usize, i_dim: usize) -> usize {
 
 /// Unpadded on-disk bytes of one int4 expert (gate‖gate_scale‖up‖up_scale‖down‖
 /// down_scale). Reuses [`vq_expert_layout`] — the (o,i) dims are format-independent.
-pub fn i4_expert_bytes(hidden: usize, moe_inter: usize) -> usize {
-    expert_bytes(hidden, moe_inter, i4_proj_bytes)
+pub fn i4_expert_bytes(expert_in: usize, moe_inter: usize) -> usize {
+    expert_bytes(expert_in, moe_inter, i4_proj_bytes)
 }
 
 /// Per-expert on-disk stride: [`i4_expert_bytes`] padded up to [`VQ_ALIGN`], so one
 /// int4 expert is a single block-aligned read (mirrors the `.vq3` stride).
-pub fn i4_expert_stride(hidden: usize, moe_inter: usize) -> usize {
-    expert_stride(i4_expert_bytes(hidden, moe_inter))
+pub fn i4_expert_stride(expert_in: usize, moe_inter: usize) -> usize {
+    expert_stride(i4_expert_bytes(expert_in, moe_inter))
 }
 
 /// The six byte offsets within one expert block, in expert-descriptor field order:
@@ -994,13 +1010,13 @@ pub fn i4_expert_stride(hidden: usize, moe_inter: usize) -> usize {
 /// the pair is by construction that format's `*_proj_bytes` — so these offsets and
 /// [`expert_bytes`] cannot disagree about where a block ends.
 fn slot_offsets(
-    hidden: usize,
+    expert_in: usize,
     moe_inter: usize,
     span: impl Fn(usize, usize) -> (usize, usize),
 ) -> [usize; 6] {
     let mut off = [0usize; 6];
     let mut base = 0usize;
-    for (p, &(o, i)) in vq_expert_layout(hidden, moe_inter).iter().enumerate() {
+    for (p, &(o, i)) in vq_expert_layout(expert_in, moe_inter).iter().enumerate() {
         let (packed, scales) = span(o, i);
         off[p * 2] = base;
         off[p * 2 + 1] = base + packed;
@@ -1013,8 +1029,8 @@ fn slot_offsets(
 /// `[gate.indices, gate.scales, up.indices, up.scales, down.indices, down.scales]`.
 /// The SINGLE source of the `.vq3` slot layout — [`vq_expert`] slices by it and the pin
 /// points its descriptors at it, so the two cannot disagree.
-pub fn vq_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
-    slot_offsets(hidden, moe_inter, |o, i| {
+pub fn vq_slot_offsets(expert_in: usize, moe_inter: usize) -> [usize; 6] {
+    slot_offsets(expert_in, moe_inter, |o, i| {
         (o * vq_row_bytes(i), o * vq_groups(i) * 2)
     })
 }
@@ -1023,8 +1039,8 @@ pub fn vq_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
 /// order (moe.hip's int4 interpretation of the shared `ExpertDesc` six-pointer layout).
 /// Every packed span starts 4-byte aligned (rows are `i_dim/2`, i_dim a multiple of
 /// 8; scale spans are whole f32), so `dot_i4_wave`'s dword fast path stays valid.
-pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
-    slot_offsets(hidden, moe_inter, |o, i| {
+pub fn i4_slot_offsets(expert_in: usize, moe_inter: usize) -> [usize; 6] {
+    slot_offsets(expert_in, moe_inter, |o, i| {
         (o * i4_row_bytes(i), o * i4_groups(i) * 4)
     })
 }
@@ -1039,8 +1055,8 @@ pub fn i4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
 /// `*const u16` — a `.f4` block resolved through the int4 offsets would put every
 /// projection but the first at the wrong address, and the ones it did find it would decode
 /// at group 128 against a uniform codebook.
-pub fn f4_slot_offsets(hidden: usize, moe_inter: usize) -> [usize; 6] {
-    slot_offsets(hidden, moe_inter, |o, i| {
+pub fn f4_slot_offsets(expert_in: usize, moe_inter: usize) -> [usize; 6] {
+    slot_offsets(expert_in, moe_inter, |o, i| {
         (o * f4_row_bytes(i), o * f4_groups(i))
     })
 }
@@ -1246,11 +1262,11 @@ mod tests {
     /// It was not — 100 collides, 96 and 160 do not.
     ///
     /// **And the two things it governs are not the same thing.** The six OFFSETS collide iff
-    /// `band(hidden)`; the block SIZE collides iff `band(hidden) && band(moe_inter)`.
+    /// `band(expert_in)`; the block SIZE collides iff `band(expert_in) && band(moe_inter)`.
     /// `moe_inter` reaches the scale grid only through w2, whose scale span begins AT `off[5]`
     /// and so appears in no offset — it changes `*_expert_bytes` and nothing the offset array
     /// can see. Both corrections are from 2026-08-05: the band from the coordinator
-    /// reproducing the arithmetic, the `hidden`-only part from the assertion below failing on
+    /// reproducing the arithmetic, the `expert_in`-only part from the assertion below failing on
     /// `(4096, 96)` when it was written expecting symmetry.
     ///
     /// Both models are in the band on both dims (GLM 6144/2048, V4 4096/2048), so at V4's
@@ -1272,9 +1288,9 @@ mod tests {
     /// that compares them is not vacuous everywhere, only where it matters.
     #[test]
     fn f4_slot_offsets_match_the_shipped_block_and_are_indistinguishable_from_i4() {
-        // DeepSeek-V4-Flash: hidden 4096, moe_intermediate_size 2048.
-        let (hidden, inter) = (4096usize, 2048usize);
-        let off = f4_slot_offsets(hidden, inter);
+        // DeepSeek-V4-Flash: expert_in 4096, moe_intermediate_size 2048.
+        let (expert_in, inter) = (4096usize, 2048usize);
+        let off = f4_slot_offsets(expert_in, inter);
         assert_eq!(
             off,
             [0, 4_194_304, 4_456_448, 8_650_752, 8_912_896, 13_107_200],
@@ -1282,14 +1298,17 @@ mod tests {
         );
         // The last span (w2's scales) ends exactly at the block size, and the block size is
         // the shipped file's own stride.
-        assert_eq!(off[5] + hidden * f4_groups(inter), 13_369_344);
-        assert_eq!(f4_expert_bytes(hidden, inter), 13_369_344);
+        assert_eq!(off[5] + expert_in * f4_groups(inter), 13_369_344);
+        assert_eq!(f4_expert_bytes(expert_in, inter), 13_369_344);
         assert_eq!(
-            f4_expert_stride(hidden, inter),
+            f4_expert_stride(expert_in, inter),
             13_369_344,
             "no padding at these dims"
         );
-        assert_eq!(4096 + 256 * f4_expert_stride(hidden, inter), 3_422_556_160);
+        assert_eq!(
+            4096 + 256 * f4_expert_stride(expert_in, inter),
+            3_422_556_160
+        );
 
         // Every packed span 4-byte aligned, so `dot_f4_wave_r`'s dword fast path is taken
         // rather than falling back to its scalar tail. A PERFORMANCE property, not a
@@ -1307,36 +1326,36 @@ mod tests {
         // site: at V4's dims `.f4` and `.i4` are the same layout AND the same size.
         assert_eq!(
             off,
-            i4_slot_offsets(hidden, inter),
+            i4_slot_offsets(expert_in, inter),
             "at i_dim % 128 == 0 the two nibble formats tile identically — if this ever \
              stops being true, the claim in this test's doc has to change with it"
         );
         assert_eq!(
-            f4_expert_bytes(hidden, inter),
-            i4_expert_bytes(hidden, inter)
+            f4_expert_bytes(expert_in, inter),
+            i4_expert_bytes(expert_in, inter)
         );
         // `.vq3` is genuinely a different size (12-bit indices over VQ_DIM=4), so it is the
         // one format a length check does separate.
-        assert_ne!(off, vq_slot_offsets(hidden, inter));
+        assert_ne!(off, vq_slot_offsets(expert_in, inter));
         assert_ne!(
-            f4_expert_bytes(hidden, inter),
-            vq_expert_bytes(hidden, inter)
+            f4_expert_bytes(expert_in, inter),
+            vq_expert_bytes(expert_in, inter)
         );
 
-        // **The six OFFSETS turn on `hidden` ALONE — `moe_inter` cannot separate them.**
+        // **The six OFFSETS turn on `expert_in` ALONE — `moe_inter` cannot separate them.**
         // Found by this assertion failing on `(4096, 96)`, which was written expecting the
         // band to apply symmetrically. It does not: `off[2]` and `off[4]` are sums of w1's and
-        // w3's spans, whose `i_dim` is `hidden`; `off[5]` adds w2's PACKED bytes, which are
+        // w3's spans, whose `i_dim` is `expert_in`; `off[5]` adds w2's PACKED bytes, which are
         // `i/2` in both formats. w2's scale length — the only place `moe_inter` reaches the
         // scale grid — is past `off[5]` and appears in no offset at all. So `moe_inter`
         // changes `*_expert_bytes` and nothing this array can see.
         //
-        // The offsets therefore collide iff `band(hidden)`, and the block SIZE collides iff
-        // `band(hidden) && band(moe_inter)`. Both models are in the band on both dims
+        // The offsets therefore collide iff `band(expert_in)`, and the block SIZE collides iff
+        // `band(expert_in) && band(moe_inter)`. Both models are in the band on both dims
         // (GLM 6144/2048, V4 4096/2048), so both collide completely.
         let band = |i: usize| i.div_ceil(32) == 4 * i.div_ceil(128);
         assert!(
-            band(hidden) && band(inter),
+            band(expert_in) && band(inter),
             "both of V4's dims are in the band"
         );
         for h in [100usize, 128, 4096, 6144] {
@@ -1344,7 +1363,7 @@ mod tests {
             assert_eq!(
                 f4_slot_offsets(h, inter),
                 i4_slot_offsets(h, inter),
-                "hidden {h} is in the band, so the layouts must be indistinguishable"
+                "expert_in {h} is in the band, so the layouts must be indistinguishable"
             );
         }
         for h in [96usize, 160, 64] {
@@ -1352,13 +1371,19 @@ mod tests {
             assert_ne!(
                 f4_slot_offsets(h, inter),
                 i4_slot_offsets(h, inter),
-                "hidden {h} is outside the band — if this collides, the band moved"
+                "expert_in {h} is outside the band — if this collides, the band moved"
             );
         }
         // `moe_inter` out of band moves the block SIZE and leaves every offset alone. This is
         // the pair that made the point, so it is the pair that is pinned.
-        assert_eq!(f4_slot_offsets(hidden, 96), i4_slot_offsets(hidden, 96));
-        assert_ne!(f4_expert_bytes(hidden, 96), i4_expert_bytes(hidden, 96));
+        assert_eq!(
+            f4_slot_offsets(expert_in, 96),
+            i4_slot_offsets(expert_in, 96)
+        );
+        assert_ne!(
+            f4_expert_bytes(expert_in, 96),
+            i4_expert_bytes(expert_in, 96)
+        );
         // `tests/f4_loading.rs`'s toy fixtures are out of band on BOTH, which is the only
         // reason a test can SEE an `.f4` set resolved through `.i4`'s layout at all. There is
         // no runtime check for it — that is the finding above, not an omission.
@@ -1374,16 +1399,16 @@ mod tests {
     /// can only fail when the copy drifts. These two comparisons can fail on the code.
     #[test]
     fn every_routed_format_places_each_projection_at_the_sum_of_the_ones_before_it() {
-        let (hidden, inter) = (6144usize, 2048usize);
-        let [(go, gi), (uo, ui), _] = vq_expert_layout(hidden, inter);
+        let (expert_in, inter) = (6144usize, 2048usize);
+        let [(go, gi), (uo, ui), _] = vq_expert_layout(expert_in, inter);
         for (name, off, proj) in [
             (
                 "vq3",
-                vq_slot_offsets(hidden, inter),
+                vq_slot_offsets(expert_in, inter),
                 vq_proj_bytes as fn(usize, usize) -> usize,
             ),
-            ("i4", i4_slot_offsets(hidden, inter), i4_proj_bytes),
-            ("f4", f4_slot_offsets(hidden, inter), f4_proj_bytes),
+            ("i4", i4_slot_offsets(expert_in, inter), i4_proj_bytes),
+            ("f4", f4_slot_offsets(expert_in, inter), f4_proj_bytes),
         ] {
             assert_eq!(
                 off[0], 0,
@@ -1396,16 +1421,16 @@ mod tests {
 
     #[test]
     fn i4_slot_offsets_are_contiguous_and_aligned() {
-        let (hidden, inter) = (6144usize, 2048usize);
-        let off = i4_slot_offsets(hidden, inter);
+        let (expert_in, inter) = (6144usize, 2048usize);
+        let off = i4_slot_offsets(expert_in, inter);
         assert_eq!(off[0], 0);
         for &o in &off {
             assert_eq!(o % 4, 0, "packed/scale span {o} not 4-byte aligned");
         }
         // last span (down_scale) ends exactly at i4_expert_bytes.
         assert_eq!(
-            off[5] + hidden * i4_groups(inter) * 4,
-            i4_expert_bytes(hidden, inter)
+            off[5] + expert_in * i4_groups(inter) * 4,
+            i4_expert_bytes(expert_in, inter)
         );
     }
 
@@ -1470,11 +1495,11 @@ mod tests {
         // Build a 1-expert `.vq3` block from quant_vq of synthetic gate/up/down, slice
         // it back with vq_expert, and check each projection's gemv equals matvec_vq on
         // the original arrays — the converter→loader byte contract for a whole expert.
-        let (hidden, moe_inter) = (VQ_GROUP, VQ_GROUP); // tiny but valid (one group each)
+        let (expert_in, moe_inter) = (VQ_GROUP, VQ_GROUP); // tiny but valid (one group each)
         let cb = tiny_codebook(&[[1.0, -1.0, 0.5, -0.5], [0.25, 0.5, 0.75, 1.0]]);
-        let stride = vq_expert_stride(hidden, moe_inter);
+        let stride = vq_expert_stride(expert_in, moe_inter);
         let mut layer = vec![0u8; stride]; // one expert
-        let dims = vq_expert_layout(hidden, moe_inter);
+        let dims = vq_expert_layout(expert_in, moe_inter);
         // Deterministic weights per projection; keep originals to GEMV against.
         let mut originals = Vec::new();
         let mut off = 0;
@@ -1493,7 +1518,7 @@ mod tests {
             off += vq_proj_bytes(o_dim, i_dim);
             originals.push((indices, scales, o_dim, i_dim));
         }
-        let projs = vq_expert(&layer, 0, hidden, moe_inter);
+        let projs = vq_expert(&layer, 0, expert_in, moe_inter);
         for (proj, (indices, scales, o_dim, i_dim)) in projs.iter().zip(&originals) {
             let x: Vec<f32> = (0..*i_dim).map(|k| (k + 1) as f32).collect();
             let mut y_load = vec![0.0f32; *o_dim];
@@ -1707,7 +1732,7 @@ mod tests {
 
     /// `.f4` shares `.i4`'s nibble packing but carries a one-byte scale per 32 weights
     /// instead of an f32 per 128, so its rows are wider. GLM's widths stand in for the
-    /// arithmetic; V4-Flash's own are hidden 4096 / moe_inter 2048.
+    /// arithmetic; V4-Flash's own are expert_in 4096 / moe_inter 2048.
     #[test]
     fn f4_layout_sizes() {
         assert_eq!(f4_row_bytes(2048), 1024);

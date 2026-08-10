@@ -282,7 +282,10 @@ fn main() -> Result<()> {
         let expert = |e| F4Expert {
             src: &src,
             base: v4_expert_base(l, e, ne),
-            hidden,
+            // V4 routes on the residual stream, so its experts are entered at `hidden`.
+            // K3's converter will bind `cfg.moe_latent` here instead — see
+            // `quant::vq_expert_layout`.
+            expert_in: hidden,
             moe_inter,
         };
         if !reused {

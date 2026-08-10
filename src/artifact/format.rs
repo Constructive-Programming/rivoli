@@ -546,15 +546,15 @@ impl Safetensors {
 /// what shape they must have.
 ///
 /// A struct rather than four positional arguments repeated at every entry point, for the
-/// reason `SetDims` gives: nothing about a transposed `(hidden, moe_inter)` fails a check —
-/// an expert's three projections are `(moe_inter, hidden)·2 + (hidden, moe_inter)`, so the
+/// reason `SetDims` gives: nothing about a transposed `(expert_in, moe_inter)` fails a check —
+/// an expert's three projections are `(moe_inter, expert_in)·2 + (expert_in, moe_inter)`, so the
 /// swap produces exactly the same byte count and streams the wrong weights. Named fields
 /// make the swap visible at the call site instead of invisible inside an argument list.
 pub struct F4Expert<'a> {
     pub src: &'a Safetensors,
     /// `layers.{l}.ffn.experts.{e}` — see `quant::v4_expert_base`.
     pub base: String,
-    pub hidden: usize,
+    pub expert_in: usize,
     pub moe_inter: usize,
 }
 
@@ -570,7 +570,7 @@ impl F4Expert<'_> {
     /// `f4_expert_bytes` (size) and by [`ExpertHeader`] (dims), and a wrong layout changes
     /// the file's length.
     fn spans(&self) -> Result<Vec<(usize, &[u8])>> {
-        let (hidden, moe_inter, base) = (self.hidden, self.moe_inter, &self.base);
+        let (expert_in, moe_inter, base) = (self.expert_in, self.moe_inter, &self.base);
         // The offsets come from `f4_slot_offsets` — the SAME function the streaming pool
         // points its `ExpertDescF4` at (`memory::routed::TierFmt`). This used to walk the
         // spans and accumulate `off` itself, which made the writer and the reader two
@@ -578,10 +578,10 @@ impl F4Expert<'_> {
         // read consistently by rivoli and disagreed with nothing until the kernel decoded a
         // projection against another one's exponents. Now a change to the layout moves both
         // ends or neither.
-        let off = crate::artifact::quant::f4_slot_offsets(hidden, moe_inter);
+        let off = crate::artifact::quant::f4_slot_offsets(expert_in, moe_inter);
         let mut out = Vec::with_capacity(6);
         for (p, (proj, (o_dim, i_dim))) in
-            crate::artifact::quant::v4_expert_projs(hidden, moe_inter)
+            crate::artifact::quant::v4_expert_projs(expert_in, moe_inter)
                 .into_iter()
                 .enumerate()
         {
@@ -655,7 +655,7 @@ impl F4Expert<'_> {
     /// Repack into `dst` (`f4_expert_bytes` long). A byte copy — nothing is fit, nothing
     /// is re-rounded, and no error is introduced.
     pub fn pack(&self, dst: &mut [u8]) -> Result<()> {
-        let want = crate::artifact::quant::f4_expert_bytes(self.hidden, self.moe_inter);
+        let want = crate::artifact::quant::f4_expert_bytes(self.expert_in, self.moe_inter);
         ensure!(
             dst.len() == want,
             "{}: destination is {} bytes, an expert block is {want}",
@@ -919,7 +919,7 @@ pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usiz
 /// of the file. Self-describing: a dim/version mismatch or truncation fails loud on open.
 ///
 /// **The dims are here because nothing else catches a transposition.** An expert's three
-/// projections are `(moe_inter, hidden) · 2 + (hidden, moe_inter)`, so swapping the two
+/// projections are `(moe_inter, expert_in) · 2 + (expert_in, moe_inter)`, so swapping the two
 /// widths gives a file of EXACTLY the same size that passes every length check and streams
 /// the wrong bytes. Which formats carry one, and why `.i4` does not, is
 /// [`RoutedFmt::magic`].
@@ -934,7 +934,7 @@ pub struct ExpertHeader {
     /// expert); `.f4` holds exactly `n_experts`, because V4's shared expert is fp8 e4m3
     /// and cannot share a file with FP4 blocks (see `quant::v4_expert_base`).
     pub n_experts: u32,
-    pub hidden: u32,
+    pub expert_in: u32,
     pub moe_inter: u32,
     pub stride: u64, // per-expert O_DIRECT-aligned block stride
     pub reserved: u64,
@@ -952,7 +952,7 @@ impl ExpertHeader {
         magic: [u8; 4],
         layer: usize,
         n_experts: usize,
-        hidden: usize,
+        expert_in: usize,
         moe_inter: usize,
         stride: usize,
     ) -> Self {
@@ -961,7 +961,7 @@ impl ExpertHeader {
             version: FormatMeta::VERSION,
             layer: layer as u32,
             n_experts: n_experts as u32,
-            hidden: hidden as u32,
+            expert_in: expert_in as u32,
             moe_inter: moe_inter as u32,
             stride: stride as u64,
             reserved: 0,
@@ -975,7 +975,7 @@ impl ExpertHeader {
         b[4..8].copy_from_slice(&self.version.to_le_bytes());
         b[8..12].copy_from_slice(&self.layer.to_le_bytes());
         b[12..16].copy_from_slice(&self.n_experts.to_le_bytes());
-        b[16..20].copy_from_slice(&self.hidden.to_le_bytes());
+        b[16..20].copy_from_slice(&self.expert_in.to_le_bytes());
         b[20..24].copy_from_slice(&self.moe_inter.to_le_bytes());
         b[24..32].copy_from_slice(&self.stride.to_le_bytes());
         b[32..40].copy_from_slice(&self.reserved.to_le_bytes());
@@ -1002,7 +1002,7 @@ impl ExpertHeader {
             version: u32::from_le_bytes(b[4..8].try_into()?),
             layer: u32::from_le_bytes(b[8..12].try_into()?),
             n_experts: u32::from_le_bytes(b[12..16].try_into()?),
-            hidden: u32::from_le_bytes(b[16..20].try_into()?),
+            expert_in: u32::from_le_bytes(b[16..20].try_into()?),
             moe_inter: u32::from_le_bytes(b[20..24].try_into()?),
             stride: u64::from_le_bytes(b[24..32].try_into()?),
             reserved: u64::from_le_bytes(b[32..40].try_into()?),
@@ -1094,29 +1094,29 @@ impl RoutedFmt {
     /// all `i_dim` (`ceil(i/32) == 4·ceil(i/128)`, i.e. `i mod 128 ∈ {0} ∪ {97..127}`), both
     /// models' dimensions included; `quant::f4_slot_offsets` has the arithmetic. Derived here,
     /// so the pairing is unrepresentable rather than merely warned about.
-    fn slot_offsets(self, hidden: usize, moe_inter: usize) -> [usize; 6] {
+    fn slot_offsets(self, expert_in: usize, moe_inter: usize) -> [usize; 6] {
         use crate::artifact::quant::{f4_slot_offsets, i4_slot_offsets, vq_slot_offsets};
         match self {
-            RoutedFmt::Vq3 => vq_slot_offsets(hidden, moe_inter),
-            RoutedFmt::I4 => i4_slot_offsets(hidden, moe_inter),
-            RoutedFmt::F4 => f4_slot_offsets(hidden, moe_inter),
+            RoutedFmt::Vq3 => vq_slot_offsets(expert_in, moe_inter),
+            RoutedFmt::I4 => i4_slot_offsets(expert_in, moe_inter),
+            RoutedFmt::F4 => f4_slot_offsets(expert_in, moe_inter),
         }
     }
 
     /// `(per-expert O_DIRECT-aligned stride, useful bytes in one block)`.
-    fn geometry(self, hidden: usize, moe_inter: usize) -> (usize, usize) {
+    fn geometry(self, expert_in: usize, moe_inter: usize) -> (usize, usize) {
         match self {
             RoutedFmt::Vq3 => (
-                vq_expert_stride(hidden, moe_inter),
-                vq_expert_bytes(hidden, moe_inter),
+                vq_expert_stride(expert_in, moe_inter),
+                vq_expert_bytes(expert_in, moe_inter),
             ),
             RoutedFmt::I4 => (
-                i4_expert_stride(hidden, moe_inter),
-                i4_expert_bytes(hidden, moe_inter),
+                i4_expert_stride(expert_in, moe_inter),
+                i4_expert_bytes(expert_in, moe_inter),
             ),
             RoutedFmt::F4 => (
-                f4_expert_stride(hidden, moe_inter),
-                f4_expert_bytes(hidden, moe_inter),
+                f4_expert_stride(expert_in, moe_inter),
+                f4_expert_bytes(expert_in, moe_inter),
             ),
         }
     }
@@ -1128,7 +1128,7 @@ impl RoutedFmt {
 /// `f4_source` range ([`f4_layer_range`]) rather than by `num_hidden_layers`.
 ///
 /// A struct rather than five positional `usize`s, because nothing about a transposed
-/// `(hidden, moe_inter)` fails a check: the set opens, every length matches, and it streams
+/// `(expert_in, moe_inter)` fails a check: the set opens, every length matches, and it streams
 /// the wrong bytes. Five bare `usize`s in a row is the argument list that gets transposed.
 #[derive(Clone, Copy)]
 pub struct SetDims {
@@ -1140,7 +1140,7 @@ pub struct SetDims {
     pub first_layer: usize,
     pub n_layers: usize,
     pub n_experts: usize,
-    pub hidden: usize,
+    pub expert_in: usize,
     pub moe_inter: usize,
 }
 
@@ -1149,19 +1149,19 @@ impl SetDims {
     ///
     /// Positional, against the "named fields make a transposition visible" argument above:
     /// the struct literal was character-identical at both engine call sites bar the range,
-    /// which `jscpd` refuses. Every call site passes `…hidden, …moe_inter` as named field
+    /// which `jscpd` refuses. Every call site passes `…expert_in, …moe_inter` as named field
     /// accesses, so a swap stays readable there.
     pub fn new(
         layers: std::ops::Range<usize>,
         n_experts: usize,
-        hidden: usize,
+        expert_in: usize,
         moe_inter: usize,
     ) -> Self {
         Self {
             first_layer: layers.start,
             n_layers: layers.end,
             n_experts,
-            hidden,
+            expert_in,
             moe_inter,
         }
     }
@@ -1200,14 +1200,14 @@ impl ExpertSet {
     /// ONE opener rather than one per format, because those are the entire difference and
     /// the pin chooses between them at RUNTIME — separate entry points meant writing the
     /// identical dimension list once each, and nothing about a transposed
-    /// `(hidden, moe_inter)` fails a length check: every set opens and streams the wrong
+    /// `(expert_in, moe_inter)` fails a length check: every set opens and streams the wrong
     /// bytes.
     pub fn open_routed(dir: &str, fmt: RoutedFmt, d: SetDims) -> Result<Self> {
         let SetDims {
             first_layer,
             n_layers,
             n_experts,
-            hidden,
+            expert_in,
             moe_inter,
         } = d;
         // Refused rather than left to underflow: `n_layers - first_layer` below is a
@@ -1218,7 +1218,7 @@ impl ExpertSet {
             first_layer <= n_layers,
             "layer range [{first_layer}, {n_layers}) is inverted"
         );
-        let (stride, expert_bytes) = fmt.geometry(hidden, moe_inter);
+        let (stride, expert_bytes) = fmt.geometry(expert_in, moe_inter);
         let (hbytes, has_shared) = (fmt.hbytes(), fmt.has_shared());
         // Routed blocks, plus the shared one only where the format has one. Both terms come
         // from `fmt`, so the block count and `shared_block`'s refusal cannot disagree.
@@ -1263,15 +1263,15 @@ impl ExpertSet {
                 ensure!(
                     h.layer as usize == l
                         && h.n_experts as usize == n_experts
-                        && h.hidden as usize == hidden
+                        && h.expert_in as usize == expert_in
                         && h.moe_inter as usize == moe_inter
                         && h.stride as usize == stride,
-                    "{path}: header (layer {} experts {} hidden {} moe_inter {} stride {}) \
-                     disagrees with config (layer {l} experts {n_experts} hidden {hidden} \
+                    "{path}: header (layer {} experts {} expert_in {} moe_inter {} stride {}) \
+                     disagrees with config (layer {l} experts {n_experts} expert_in {expert_in} \
                      moe_inter {moe_inter} stride {stride})",
                     h.layer,
                     h.n_experts,
-                    h.hidden,
+                    h.expert_in,
                     h.moe_inter,
                     h.stride
                 );
@@ -1288,7 +1288,7 @@ impl ExpertSet {
             hbytes,
             has_shared,
             fmt,
-            slot_offsets: fmt.slot_offsets(hidden, moe_inter),
+            slot_offsets: fmt.slot_offsets(expert_in, moe_inter),
         })
     }
 
@@ -1321,10 +1321,10 @@ impl ExpertSet {
         first_layer: usize,
         n_layers: usize,
         n_experts: usize,
-        hidden: usize,
+        expert_in: usize,
         moe_inter: usize,
     ) -> Result<Self> {
-        let d = SetDims::new(first_layer..n_layers, n_experts, hidden, moe_inter);
+        let d = SetDims::new(first_layer..n_layers, n_experts, expert_in, moe_inter);
         Self::open_routed(dir, RoutedFmt::Vq3, d)
     }
 
@@ -1443,7 +1443,7 @@ mod tests {
         assert_eq!(back.magic, VQ3_MAGIC);
         assert_eq!(back.layer, 7);
         assert_eq!(back.n_experts, 256);
-        assert_eq!(back.hidden, 6144);
+        assert_eq!(back.expert_in, 6144);
         assert_eq!(back.moe_inter, 2048);
         assert_eq!(back.stride, vq_expert_stride(6144, 2048) as u64);
         // a corrupt magic must fail
@@ -1673,7 +1673,7 @@ mod tests {
     /// show; `w1` and `w3` are given different content so a slot swap is not invisible.
     struct F4Fixture {
         dir: String,
-        hidden: usize,
+        expert_in: usize,
         moe_inter: usize,
     }
 
@@ -1688,10 +1688,11 @@ mod tests {
         fn with_scale_byte(tag: &str, poison: Option<(usize, usize, u8)>) -> Self {
             use crate::artifact::quant::{F4_GROUP, f4_groups, f4_row_bytes, v4_expert_projs};
             let dir = tmpdir(&format!("f4_{tag}"));
-            let (hidden, moe_inter) = (64, 32);
+            let (expert_in, moe_inter) = (64, 32);
             let mut w = SafeWriter::new();
-            for (slot, (proj, (o_dim, i_dim))) in
-                v4_expert_projs(hidden, moe_inter).into_iter().enumerate()
+            for (slot, (proj, (o_dim, i_dim))) in v4_expert_projs(expert_in, moe_inter)
+                .into_iter()
+                .enumerate()
             {
                 // `tag` is '1' | '3' | '2', which keeps the three projections distinct —
                 // in particular w1 != w3, which have identical shapes.
@@ -1727,7 +1728,7 @@ mod tests {
             w.write(&format!("{dir}/e.safetensors")).unwrap();
             Self {
                 dir,
-                hidden,
+                expert_in,
                 moe_inter,
             }
         }
@@ -1740,7 +1741,7 @@ mod tests {
             F4Expert {
                 src,
                 base: "e".into(),
-                hidden: self.hidden,
+                expert_in: self.expert_in,
                 moe_inter: self.moe_inter,
             }
         }
@@ -1781,7 +1782,7 @@ mod tests {
         use crate::artifact::quant::f4_expert_bytes;
         let clean = F4Fixture::new("e8m0_ok");
         let st = clean.open();
-        let n = f4_expert_bytes(clean.hidden, clean.moe_inter);
+        let n = f4_expert_bytes(clean.expert_in, clean.moe_inter);
         let mut base = vec![0u8; n];
         clean
             .expert(&st)
@@ -1816,7 +1817,7 @@ mod tests {
             .pack(&mut got)
             .expect("0x00 is 2^-127, a legal e8m0 encoding — it must NOT be refused");
         let diff: Vec<usize> = (0..n).filter(|&k| got[k] != base[k]).collect();
-        let off = crate::artifact::quant::f4_slot_offsets(fx.hidden, fx.moe_inter);
+        let off = crate::artifact::quant::f4_slot_offsets(fx.expert_in, fx.moe_inter);
         assert_eq!(
             diff,
             vec![off[3] + 5],
@@ -1863,7 +1864,7 @@ mod tests {
             want.extend_from_slice(st.typed(name, dt).unwrap().0);
         }
 
-        let mut got = vec![0u8; f4_expert_bytes(fx.hidden, fx.moe_inter)];
+        let mut got = vec![0u8; f4_expert_bytes(fx.expert_in, fx.moe_inter)];
         fx.expert(&st).pack(&mut got).unwrap();
         assert_eq!(
             got.len(),
