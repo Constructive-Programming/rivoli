@@ -22,15 +22,16 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
 - **Only the 69 KDA layers are a wholly new kernel family**, plus AttnRes. The 24
   full-attention layers are MLA + q-LoRA, GLM's own family — but rivoli caches the **fp8
   latent** where the reference caches expanded fp32, a deviation under G3's zero-tolerance
-  gate and a ~170× smaller KV budget. §3.
+  gate and a ~150x smaller KV budget. §3.
 - **Traffic is 25.83 GB/token of experts** (first-party confirmed), **plus 108.81 GB of trunk
   when it is not resident.** §4.
 - **Predicted ~0.48–0.57 tok/s** with the resident set held. §4c. This replaces an earlier
   0.27 that was computed from a queue-depth-1 disk figure.
-- **The memory budget is the binding constraint.** At `--max-mem 115` the 113.49 GB resident
+- **The memory budget is the binding constraint.** At `--max-mem 115` the 113.51 GB resident
   set leaves ≈5.7 GB; on the **auto** path the budget is `MemAvailable − 16 GiB` ≈ 107 GB and
   **the resident set does not fit at all**. §4d.
-- **Nothing converts until `SafeWriter` streams.** §S1a.
+- **`SafeWriter` streams as of 2026-08-10**, which is what unblocks conversion; the ROUTED
+  writer is still owed. §S1a item 1.
 
 ## G. The gate model
 
@@ -127,9 +128,9 @@ the SiTU form in `linalg.hip` for dense layer 0 and the shared MLP. An implement
 **No `_r2` twin** — `num_nextn_predict_layers: 0`, so nothing batches.
 
 **§3c — the MLA KV representation is a real deviation.** rivoli **absorbs** and caches the
-**fp8 latent** (`gpu.rs:943`, `mla_absorb_fp8`) at ~13.8 KB/pos across 24 layers; the reference
-caches **expanded fp32** per-head k/v at 2.37 MB/pos. ~170× smaller, and a different
-algorithm. Two consequences: the budget line is 170× smaller than a reading of the reference
+**fp8 latent** (`gpu.rs:943`, `mla_absorb_fp8`) at **15,744 B/pos** across 24 layers; the reference
+caches **expanded fp32** per-head k/v at 2.37 MB/pos. ~150x smaller, and a different
+algorithm. Two consequences: the budget line is ~150x smaller than a reading of the reference
 implies, and **G3's zero-tolerance token match is asserted across a representation rivoli does
 not implement.** Run the incremental gate first with the quantization disabled, so a mismatch
 is attributable to the recurrence rather than the cache format.
@@ -199,13 +200,13 @@ error, larger than anything S5 could hope to detect.
 ### 4d. The budget, which is the binding constraint
 
 `--max-mem 115` GiB = 123.5 GB deducts **no** OS reserve (`config.rs:110` — "the user asked
-for it"). Resident set 113.49 GB, `DeviceTier::HEADROOM` 4 GiB → **≈5.7 GB residual**, against:
+for it"). Resident set 113.51 GB, `DeviceTier::HEADROOM` 4 GiB → **≈5.7 GB residual**, against:
 
 | claimant | size |
 |---|---|
 | KDA state | 464.6 MB (69 layers) or 626 MB as the reference allocates |
 | AttnRes stack, `[T][9][7168]` fp32 | **T × 258 KB** — 1.06 GB at 4k, 2.11 at 8k, 4.2 at 16k |
-| MLA KV, rivoli's fp8 latent | ~13.8 KB/pos × 24 layers ≈ 129 MB at 8k |
+| MLA KV, rivoli's fp8 latent | 656 B/layer x 24 = **15,744 B/pos** -> 129 MB at 8k |
 | `RoutedPool` one-batch floor | 281 MB (16 × 17.55 MB) |
 | residual stream, scratch, io_uring buffers | unpriced |
 
@@ -217,7 +218,8 @@ come from a budget with these subtracted.
 
 ```
 experts   2,722,740,830,208 params × 0.53125 B = 1.4465 TB
-resident set (trunk 108.81 + embed/lm_head 4.70) = 113.49 GB
+resident set (trunk 108.81 + embed/lm_head 4.70) = 113.51 GB
+  (the C reference rounds this to 113.49; its components are what sum)
 index metadata.total_size                        = 1,560,860,324,864 B = 1.4196 TiB
 ```
 
@@ -250,7 +252,7 @@ download" never excluded metadata).
 |---|---|---|---|
 | 1 | 7168→3584 | Latent sandwich. `routed_expert_down_proj` **[3584,7168] BF16**, `up` **[7168,3584]**, `norm` **[3584]**; experts `w1` U8 **[3072,1792]** nibble-packed, `w2` U8 **[3584,1536]** | index + shard header |
 | 2 | layer map | MLA = layers carrying `kv_a_proj_with_mqa`: zero-based **[3,7,…,87,91,92]**, n=24; KDA n=69; disjoint, union 0..92 | index (weights) + `config.json` |
-| 3 | trunk dtype | **BF16.** Trunk 108.81 GB; +4.70 embed/lm_head = 113.49 resident; index total 1.4196 TiB; non-expert 114.40 GB incl. vision | index + header |
+| 3 | trunk dtype | **BF16.** Trunk 108.81 GB; +4.70 embed/lm_head = 113.51 resident; index total 1.4196 TiB; non-expert 114.40 GB incl. vision | index + header |
 | 4 | shared experts | **ONE fused MLP per layer**, `down_proj` **[7168,6144] BF16**. Not two | index + header |
 | 5a | expert byte layout | U8 packed + U8 group-32 scales reconstruct to **17,547,264 B/expert** exactly | header |
 | 5b | nibble order, `sb==255` | Low nibble = even; 255 → zero. **THIRD-PARTY, unconfirmed** — a safetensors header cannot express nibble order | `k3_ops.c` only |
@@ -278,14 +280,12 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
 
 ### S1a — artifact: config, `Arch`, naming, `.f4`
 
-1. **`SafeWriter` must stream — DONE 2026-08-10.** *(Was Tier 1, blocked everything.)* It held
-   every resident tensor as a `Vec<u8>` until `write`, sized for a ~10 GiB set, and ~113.5 GB
-   does not fit. `SafeWriter` (`format.rs:169`) now carries a `Cow` per tensor so verbatim
-   copies borrow the source mmap; host-RAM peak is the sum of the CONVERTED tensors. `write`
-   also became atomic — a borrowed payload is read at write time, so truncating a path that is
-   also a mapped source would SIGBUS. **Still owed: the ROUTED writer.**
-   `convert_v4.rs:304` buffers a whole layer through `write_atomic(&path, &buf)`, which for K3
-   is 896 x 17.55 MB = **15.7 GB** per layer file.
+1. **`SafeWriter` streams — DONE 2026-08-10.** It carries a `Cow` per tensor
+   (`format.rs:169`), so verbatim copies borrow the source mmap and host-RAM peak is the sum of
+   the CONVERTED tensors. `write` also became atomic: a borrowed payload is read at write time,
+   so truncating a path that is also a mapped source would SIGBUS.
+   **Still owed — the ROUTED writer.** `convert_v4.rs:304` buffers a whole layer through
+   `write_atomic(&path, &buf)`, which for K3 is 896 x 17.55 MB = **15.7 GB** per layer file.
 2. **Settle e8m0 `0xff`.** *(Tier 1.)* The reference maps 255 → zero; rivoli's `e8m0f` returns
    a quiet NaN and `quant.rs:748` **bails**. Item 11 settles the semantics for free; only the
    *presence* question needs bytes. Host and device must change together or the divergence is

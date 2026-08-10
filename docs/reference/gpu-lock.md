@@ -1,7 +1,7 @@
 ---
 scope: engine
 status: live
-verdict: llama-swap's pod shares /var/run/sys-gpu.lock — but only for SOME models (CORRECTED 2026-08-07, verified live 3x - whisper and the embedding model hold GTT with no lock). Until hr-fleet wraps every cmd, a GPU witness must sample mem_info_gtt_used, not just the flock and KFD.
+verdict: llama-swap's pod shares /var/run/sys-gpu.lock — but only for SOME models (CORRECTED 2026-08-07, verified live 3x - whisper and the embedding model hold GTT with no lock). Until hr-fleet wraps every cmd, a GPU witness must sample mem_info_gtt_used, not just the flock and KFD. PROBING (2026-08-10): `fuser` is BLIND to an advisory flock holder in another namespace — it prints nothing while the lock is held — so use `flock -n ... -c true` (rc 1 = held), and check GTT separately, since a tenant can hold either without the other.
 ---
 
 # GPU lock — coordinating with llama-swap on rh-anine
@@ -107,3 +107,25 @@ the lock too.
 `systemd-tmpfiles.d` rule that survives a reboot lives directly on rh-anine at
 `/etc/tmpfiles.d/sys-gpu-lock.conf` — not tracked in any repo, since it's host config, not
 application code.
+
+## Probing the lock: `fuser` is blind to it, `flock -n` is not
+
+Added 2026-08-10, after a device suite was misread as failing for ~40 minutes.
+
+**`fuser -v /var/run/sys-gpu.lock` prints nothing while the lock is held.** It reports
+processes with the file *open*; an advisory `flock(2)` holder in another mount namespace — which
+is what llama-swap's pod is — does not show up. So an empty `fuser` is not evidence the lock is
+free, and the tempting conclusion ("nobody holds it, so my failure is real") is wrong.
+
+The only reliable probe is a non-blocking acquire:
+
+```bash
+flock -n /var/run/sys-gpu.lock -c true   # rc 0 = free, rc 1 = held
+```
+
+Pair it with the GTT counter, because the two failure modes are independent: a tenant can hold
+GTT *without* the lock (the whole point of this file's verdict), and can hold the lock while
+its GTT is still small (a model mid-load). Both must be clear before a device number counts.
+
+Note the related trap recorded in `investigations/int4-moe-unroll.md`: `flock -w N` exits **1
+silently** on timeout, which looks identical to a test failure with an empty log.
