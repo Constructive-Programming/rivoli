@@ -18,10 +18,16 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
 
 ## STATE
 
-- **S0 not started.** Every number in §1 was read 2026-08-10 from the announcement, the HF
-  model card and the DFlash abstract (arXiv 2602.06036) **through a summarizing fetch layer**.
-  K3's G0 was reopened twice for exactly this class of provenance. Nothing here is
-  implementation-grade until S0 pins `config.json`, the tokenizer files and the raw paper.
+- **S0 is DONE except its one measurement; G0 is NOT MET on that alone.** The forward pass is
+  first-party-verified and lives in **`docs/reference/glimmer-architecture.md`** — raw
+  `config.json`, the safetensors headers by range request, and transformers' own
+  `modeling_muse_glimmer.py` (the repo ships no modeling code; `muse_glimmer` is native to
+  transformers 5.15.0.dev0), pinned at `f84ecc3a0ea984a4c04542a84269e3d065350a6e`. **Eight
+  load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
+  card's errors beside them. Unmet: sustained resident-GEMV bandwidth, blocked on GPU
+  contention (below). The DFlash drafter (S6) is still open and being researched.
+- **§1 below is superseded.** It is kept as written, with a correction column, because what
+  the card got wrong is the reusable lesson. Read `glimmer-architecture.md` instead.
 - **The design is inverted relative to every model this engine runs.** Glimmer is dense.
   At fp8 the whole text model is ~26 GB — resident with ~80 GB to spare. The NVMe expert
   streaming, byte arena, residency cache and Belady work are **bypassed, not ported**: a
@@ -30,8 +36,21 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
 - **The one new kernel family is attention.** rivoli is MLA-with-q-LoRA and nothing else —
   no GQA, no MHA, no per-layer RoPE, no trained sliding window (`[wt]
   docs/investigations/other-models.md` §"The attention half is not [reusable]"). Glimmer
-  needs GQA 32Q/2KV with a 2048-token ring KV on 3 of every 4 layers and full KV on the
-  fourth, a per-head sigmoid output gate, and RoPE on local layers only. §3, §S2.
+  needs GQA 32Q/2KV with a 2048-row ring KV on 3 of every 4 layers and full KV on the
+  fourth, a sigmoid output gate, and RoPE on local layers only. §3, §S2.
+- **The layer body is NOT the shape rivoli already has.** S0 found four norms per layer, not
+  two: post-norms applied to the **branch** before each residual add, in a **centered**
+  (`x*(1+w)`) form the engine has never implemented — while the final norm and two weightless
+  norms keep the plain `x*w` form. Two formulas, two eps values (1e-5 pre, 1e-8 post), and a
+  weightless QK-norm **that ships no tensor at all**. `glimmer-architecture.md` §3, §4.
+- **RoPE may cost nothing.** Glimmer uses `rotate_half`; rivoli's kernel is interleaved. A
+  row permutation of `q_proj`/`k_proj` within each head converts one to the other, and the
+  argument that it is safe at conversion time is in `glimmer-architecture.md` §6. **It is an
+  argument, not a measurement** — G1b owes it a fixture that reddens on identity.
+- **Every greedy gate is blind to the logit path.** `20*tanh(x*0.196116/20)` is
+  argmax-invariant, so greedy equality, teacher-forced argmax and byte-identical output all
+  pass with it omitted — while every probability, NLL and confidence value is wrong. G3 must
+  carry a probability-space check. This is this model's §G blind spot, and it is not layer 0.
 - **The FFN is already there.** GLM's dense layers run `gemv_fp8(gate)+gemv_fp8(up)+swiglu+
   gemv_fp8(down)` with runtime dims (`src/gpu.rs:2003-2043`); 6656→19968 is that code with
   different numbers, behind one stale load-time guard (`MAX_FUSED_INTER`, already removed
@@ -46,12 +65,18 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
   are nothing; the K3 gate model (`k3-port.md` §G — prove it can go red, name the blind
   spot) binds every gate here.
 
-## 1. Ground truth as currently believed — ALL UNVERIFIED
+## 1. Ground truth as first believed — SUPERSEDED 2026-08-10 by `reference/glimmer-architecture.md`
 
-Read 2026-08-10: announcement (`research.meta.ai/blog/introducing-muse-glimmer-open-agentic-model`),
-model card (`huggingface.co/meta-models/Muse-Glimmer-30B`), DFlash abstract
-(`arxiv.org/abs/2602.06036`). **Each row below is an S0 item: confirm against raw
-`config.json` / tokenizer files / paper PDF, record the answer and its source, or correct it.**
+> **CORRECTED 2026-08-10.** This table was built from the announcement, the HF model card and
+> the DFlash abstract, all through a summarizing fetch layer, and it is left in place because
+> the *shape* of its errors is the lesson. S0 replaced it with first-party sources. The
+> headline shapes were right; **the card omitted eight load-bearing operations entirely** —
+> QK-norm, `qk_scale_factor`, `output_multiplier`, `final_logit_softcapping`, `post_norm_eps`,
+> the sandwich-norm structure, the centered-norm formula, and the normed embedding. Two rows
+> were wrong outright: the release is **BF16, 59.553 GB** (not "~4-bit, under 20 GB" — those
+> are separate GGUFs), and the context is **exactly 131072 with no scaling scheme**, not
+> "131,072+". The full corrected specification, with the traps each of these produces, is
+> `docs/reference/glimmer-architecture.md`; its §10 tabulates card-vs-truth.
 
 | field | claimed value | consequence if true |
 |---|---|---|
@@ -121,13 +146,19 @@ some of these).
 
 ## 4. Traffic and the predicted operating point — REGISTER IN S0, NOT HERE
 
-Per-token weight traffic, undrafted, all-resident (arithmetic from §1's unverified shapes;
-carried to S0 as a template, not a prediction):
+**Superseded by measurement 2026-08-10** — the numbers below are now summed from the
+safetensors headers (`glimmer-architecture.md` §7), and the sum reconciles with the index's
+own `total_size`, which is what makes it a check rather than an estimate. The original
+estimates (~25 GB/token fp8, ~13 int4) were close; they are replaced, not corrected, because
+nothing depended on them yet.
 
-- fp8: ~23.8 GB layers + ~1.34 GB int8 lm_head ≈ **~25 GB/token**
-- int4 (group-128, `fp8_to_i4` pipeline exists): ≈ **~13 GB/token**
-- KV reads at 131k context: 13 global layers × ctx × 1 KB ≈ 1.7 GB/token — *not* negligible
-  at full context; bounded 82 MB total for all 39 locals.
+Per-token weight traffic, undrafted, all-resident: **bf16 53.020 · fp8 26.510 · int4+g128
+13.648 GB/token** (52 × 967.889 MB of layers + 2.690 GB lm_head).
+
+KV is asymmetric and the asymmetry is the interesting part: the 39 sliding layers are capped
+by the window at **81.79 MB total, forever**, while the 13 full layers read **1.745 GB/token
+at bf16** (0.872 fp8) at 131k context. At long context a quarter of the layers cost more than
+a fifth of the fp8 weight traffic.
 
 Ceiling arithmetic: at the LPDDR5X theoretical ~256 GB/s, fp8 undrafted ≤ ~10 tok/s. The
 *achieved* number is S0 item 8; register the predicted band from it and hold S5 to that band.
@@ -142,24 +173,35 @@ capacity-planned. tmpfs and contention discipline per CLAUDE.md still apply.
 
 ## Stages. K3's gate model (`k3-port.md` §G) binds: met or not met, prove each gate can go red.
 
-### S0 — ground truth. No code, no weights.
+### S0 — ground truth. No code, no weights. **DONE 2026-08-10 except item 5.**
 
-1. Pin `config.json` + tokenizer files + safetensors index from HF; resolve every §1 row.
-2. Read the DFlash paper (not the abstract): drafter interface to the target (which context
-   features, injected where), draft step arithmetic, acceptance rule.
-3. Settle NoPE-vs-scored on global layers, gate form/placement, window semantics (sink
-   tokens? inclusive boundary?), context-scaling scheme, `tie_word_embeddings`.
-4. Extract `docs/reference/glimmer-architecture.md` from first-party modeling code,
-   provenance-marked like `k3-architecture.md` (raw source, line-cited; no summarizing
-   fetches).
-5. Measure sustained resident-GEMV GB/s at Glimmer shapes on this part (benchmark kernels,
-   flock + witness). Register the §4 band from it.
-6. Layer-0 blind spot check: which layer is *least* representative here? (First global
-   layer, layer 3 if the pattern starts local — the gates of §G rule 2 must cover a local
-   layer, a global layer, a window-boundary crossing, layer 0 and layer 51.)
+1. **Done.** `config.json`, `chat_template.jinja`, `tokenizer_config.json`,
+   `generation_config.json` and the safetensors **headers** (by HTTP range request, so shapes
+   are the shards' own) pulled raw at pin `f84ecc3a0ea984a4c04542a84269e3d065350a6e`.
+2. **Done.** DFlash settled from the paper, the drafter checkpoint's own header, and
+   transformers' `models/muse_glimmer_assistant/`. §S6, `glimmer-architecture.md` §11.
+3. **Done.** NoPE confirmed as *no rotation at all* (not K3's cached-and-scored); gate is
+   `sigmoid(gate_proj(layer input))` before `o_proj`; window is `[p-2047, p]` — 2048 rows
+   inclusive of `p`, from `masking_utils.sliding_window_overlay` and its own docstring;
+   no context-scaling scheme (`rope_type: "default"`, exactly 131072);
+   `tie_word_embeddings: false` with both matrices shipped.
+4. **Done.** `docs/reference/glimmer-architecture.md`, line-cited to
+   `modeling_muse_glimmer.py`, with no summarizing fetch anywhere in the chain.
+5. **NOT DONE — blocked.** Sustained resident-GEMV GB/s at Glimmer shapes. The GPU was not
+   sole-tenant: `/var/run/sys-gpu.lock` held (`flock -w 1` → exit 1, captured not swallowed),
+   `gpu_busy_percent` 100 across six samples, llama-swap holding 41.24 GB of GTT
+   (`qwen3-embedding-4b`, `qwen3.6-medium`, `whisper`) with **zero kfd entries**. No number
+   taken in preference to one that would be discarded. Re-run under
+   `reference/gpu-lock.md`'s shared-lock contract.
+6. **Done, and it moved.** The least representative layer is **not** layer 0 — every layer is
+   structurally identical here, so the blind spot is arithmetic, not positional: the logit
+   path is argmax-invariant (§STATE). Gates must cover a sliding layer, a full layer, a
+   window-boundary crossing, layer 51 (full, and last), **and probability space**.
 
-**G0 — met when** every §1 row has a recorded answer and a first-party source, the reference
-doc exists, and the predicted band is registered from a measured number.
+**G0 — met when** every row has a recorded answer and a first-party source (**met**), the
+reference doc exists (**met**), and the predicted band is registered from a measured number
+(**NOT met — item 5**). G0 is therefore **NOT MET**, on one item, and S1 does not start
+until it is.
 
 ### S1a — artifact. No GPU.
 
@@ -247,15 +289,43 @@ G4 at the same settings.
 
 ### S6 — DFlash drafter. After G5; independently useful.
 
-1. Drafter artifact: second converter target (5 layers, own tensor names, own config
-   asserts).
-2. `MAXROW` 2→17: re-size every scratch sized off it (`ARGMAX_BYTES`, logits, row-selection
-   arrays); the verify already reads weights once for N rows — dense makes this near-free.
-3. Acceptance: longest-common-prefix walk replacing the hardwired `d == t1` (`src/gpu.rs:3067`);
-   per-block confidence gating **re-derived, not copied** from `--mtp-min-conf` (the 1.108×
-   economics were MoE-union economics; keep the gate-after-draft scoring so the histogram
-   never goes blind).
-4. Register the drafted band from measured acceptance before claiming any multiplier.
+Spec: `glimmer-architecture.md` §11, first-party-verified 2026-08-10 (checkpoint
+`meta-models/Muse-Glimmer-30B-assistant`, 2.556 B, and transformers'
+`models/muse_glimmer_assistant/`). **Neither vLLM nor SGLang wires DFlash to Glimmer** — both
+implement only the Qwen3 flavour — so there is no serving reference for this pairing.
+
+1. **Drafter artifact.** Second converter target: 5 layers, its own tensor names, its own
+   config asserts. It shares almost nothing with the target — 32Q/**8**KV, plain two-norm
+   pre-norm layers (no sandwich), **weighted** `q_norm`/`k_norm [128]` where the target's are
+   weightless — so nothing may be defaulted from `GlimmerConfig`.
+2. **The target must export 5 hidden states per accepted token** (zero-based layers
+   1/13/25/37/49), not just the last. That output path does not exist today and costs
+   **66,560 B/token**. Build it before the drafter, since G6 cannot start without it.
+3. **A bidirectional 16-row attention with two sequence lengths.** Q is the 16 draft rows;
+   K/V is `concat(projected_target_context, draft_rows)`. RoPE builds `cos/sin` over the full
+   range and Q takes the **tail slice** — off by `ctx_len` is silent quality loss. This is a
+   different kernel from S2's causal GQA, not a parameterisation of it.
+4. **Embedding must be readable raw.** The drafter embeds without the target's weightless
+   embed-norm (§5). If the converter ever folds that norm into the matrix, the drafter is
+   unusable — the first-party code carries a comment saying exactly this.
+5. `MAXROW` 2→17: re-size every scratch sized off it (`ARGMAX_BYTES`, logits, row-selection
+   arrays).
+6. Acceptance: longest-common-prefix walk replacing the hardwired `d == t1`
+   (`src/gpu.rs:3067`), plus the bonus token. Lossless by construction.
+7. Register the drafted band from **measured** acceptance before claiming any multiplier.
+
+**Why this is worth doing here when the equivalent was a loss on GLM.** A dense verify reads
+every weight once regardless of row count, so per cycle the cost is one target read plus one
+drafter read: `speedup ≈ N × 26.51/(26.51+2.56)` = `N × 0.91` at fp8, **break-even at
+N > 1.1**. GLM's 0.93× ungated `--mtp` was the *MoE union* — 2 rows costing 1.61× the experts
+— and that penalty does not exist without experts. Do not carry the `--mtp-min-conf` gate
+over on cargo: its whole purpose was to avoid paying the union on a low-confidence draft, and
+at break-even 1.1 there is little left to gate. Keep the gate-after-draft *scoring* so the
+acceptance histogram never goes blind; re-derive whether any gate is warranted from measured
+τ. Published figures are 3.1× (RTX 5090, llama.cpp, quantized both sides) and τ≈6.5 / 4.9×
+(H200, Qwen3-4B) — **neither is this hardware nor this pairing**, and the paper shows
+acceptance decaying past the drafter's ~4K training window, so a band registered on short
+prompts will not hold at 131k.
 
 **G6 — met when** drafted output is byte-identical to undrafted greedy at the same prompt,
 acceptance and tok/s are recorded, and the gate at zero acceptance degrades to exactly
