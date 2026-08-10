@@ -4028,3 +4028,24 @@ just the microbench. No wall claim is made or possible: GLM decode at this resid
 dominated by fetch exposure and 128 tokens has no resolving power; the lever's value is
 the measured serial rate (+12.6% R=1 / +16.4% R=2, benchmarks.md "GLM int4 MoE unroll
 round") arriving as recurring-cost efficiency, per the ranking rule.
+
+
+## Rename merge gate — union suite 334/0, smoke matrix 15/15, red-proof 13/13 (2026-08-10)
+
+The three gates the rename-for-behaviour branch (wt/rename-by-behaviour, rebased onto
+c92898d) ran before merging, all on the UNION tree — the renames plus the int4 unroll,
+which auto-merged in the same files and had never shared a device before this:
+
+1. **Device suite: 334 passed / 0 failed**, all 35 test binaries, `--test-threads=1`
+   under the flock, release.
+2. **`tests/smoke-matrix.sh`: all 15 cells clean** — GLM {int3-vq, int4, hybrid} x
+   {dense, streaming, dsa, misa} all PASS (12-token cells; tok/s is a liveness echo,
+   not a measurement), V4 decode PASS, and both V4 refusal cells REFUSED-AS-DOCUMENTED
+   (asserted, not skipped).
+3. **Red-proof: `RIVOLI_MAX_MEM=1 RIVOLI_MAX_MEM_V4=1` fails all 13 decode cells**
+   with the engine's real budget error while both refusal cells keep their verdict and
+   the script exits 1 — the classifier distinguishes a broken engine from a documented
+   refusal in both directions.
+
+Fleet kept evicted for the window by an unload loop against the ClusterIP (the pod IP
+died with a k3s restart, 2026-08-10); per-cell witnesses stayed authoritative.
