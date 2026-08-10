@@ -33,8 +33,9 @@ verdict: The measured record — one verdict per round, not a journal. Carries w
 >    date. `encode_chat` used to emit GLM-4's `<|role|>\n{content}` and end at
 >    `<|assistant|>\n`; this checkpoint has **no separator after the role token** and ends at
 >    `<|assistant|><think></think>`.
-> 2. **Long runs are non-deterministic** — ~40% of 5k-token scores are silently wrong. See that
->    section, and `reference/architecture.md` §6.
+> 2. **Long runs are non-deterministic** — ~40% of 5k-token scores are silently wrong, and the
+>    rate itself is unestablished (those runs had no contention witness). See "Long runs are
+>    NON-DETERMINISTIC" and "Long-run divergence" below.
 > 3. **Everything in the 512->10k matrix at 2048 tokens and above is RETRACTED** — it measured
 >    degeneration, not throughput.
 >
@@ -340,15 +341,20 @@ It reproduces on a clean machine, so the fault is real. Pair B's 0.55 PPL spread
 recorded originally; pair A's 0.049 is not. **The divergence POSITION moves between pairs**,
 which rules out anything deterministic about token 4042 and is the signature of a race.
 
-**INV-1 is EXONERATED by direct measurement.** `--checksum-route`
-(`--features corruption-probe`) hashes, per MoE layer, the gate logits the router SAW and the
+**INV-1 is EXONERATED by direct measurement** — but note the instrument is **not in this
+tree**. `--checksum-route` / `--features corruption-probe` exists only in tag
+`archive/belady-residency-bound` (`544fea7`), on a 2026-08-04 base that predates the
+`f4gpu`→`hip.rs` rename and the device-router deletion, so re-running this needs a
+forward-port first. What it did: hash, per MoE layer, the gate logits the router SAW and the
 experts it PICKED — pure host-side, so no device traffic and no I/O during the run. Across
 **388,875 records per arm** (5185 positions × 75 MoE layers), in both pairs: **rows where the
 logits AGREE and the picks DIFFER — 0.** Where picks diverge the logits diverged first, at the
 same row: routing faithfully reflecting an already-corrupted residual. The
 `hit_pct`-tracks-output correlation that motivated the check is a symptom, not a cause, and
-`--mode int3-vq` remains output-neutral to residency. Localised in `reference/architecture.md`
-§6 to a timing race in layer *L-1*'s MoE compute against layer *L*'s attention.
+`--mode int3-vq` remains output-neutral to residency. **Localised to a timing race in layer
+*L-1*'s MoE compute against layer *L*'s attention** — stated here rather than cross-referenced,
+because the `architecture.md` §6 write-up went down with `perf/belady-residency-bound` and
+§6 in this tree is the byte-arena pool.
 
 ## VQ_K=2048: the codebook shrink and the byte saving are the SAME item and they cancel — 2026-08-04
 
