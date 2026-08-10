@@ -28,13 +28,10 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli::artifact::format::{
-    Dtype, ExpertHeader, F4_MAGIC, F4Expert, FormatMeta, LAYER_WINDOW, SafeWriter, Safetensors,
-    finish_artifact, write_expert_layer,
+    Dtype, F4_NAMING_V4, FormatMeta, RoutedRepack, SafeWriter, Safetensors, finish_artifact,
 };
 use rivoli::artifact::model::{V4Config, load_config};
-use rivoli::artifact::quant::{
-    FP8_BLOCK, V4_PROJ, VQ_ALIGN, f4_expert_bytes, f4_expert_stride, v4_expert_base,
-};
+use rivoli::artifact::quant::{FP8_BLOCK, V4_PROJ, v4_expert_base};
 
 // NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
 #[derive(Parser)]
@@ -269,70 +266,22 @@ fn main() -> Result<()> {
         args.from, cfg.n_layers
     );
 
-    // 1. Routed experts → one `.f4` per layer. Pure repack.
-    let stride = f4_expert_stride(hidden, moe_inter);
-    let ebytes = f4_expert_bytes(hidden, moe_inter);
+    // 1. Routed experts → one `.f4` per layer. Pure repack. The loop itself lives in
+    // `RoutedRepack`, shared with `convert_k3` — this converter's only contribution to it is
+    // `v4_expert_base` and the fact that V4's experts are entered at `hidden`.
+    let repack = RoutedRepack {
+        tool: "convert_v4",
+        out_dir: &args.out_dir,
+        src: &src,
+        naming: &F4_NAMING_V4,
+        expert_in: hidden,
+        moe_inter,
+        n_experts: ne,
+        verify: args.verify,
+        write: !args.verify_only,
+    };
     for &l in &layers {
-        let path = format!("{}/L{l:02}.f4", args.out_dir);
-        let reused = std::fs::metadata(&path).is_ok();
-        if reused {
-            eprintln!("convert_v4: {path} exists, reusing");
-        }
-        let expert = |e| F4Expert {
-            src: &src,
-            base: v4_expert_base(l, e, ne),
-            // V4 routes on the residual stream, so its experts are entered at `hidden`.
-            // K3's converter will bind `cfg.moe_latent` here instead — see
-            // `quant::vq_expert_layout`.
-            expert_in: hidden,
-            moe_inter,
-        };
-        if !reused {
-            // One aligned block for the header, then `ne` routed blocks — and NO shared block,
-            // unlike `.vq3`/`.i4`. V4's shared expert is fp8 e4m3, a different format entirely;
-            // a block written past `ne` would be the wrong ARITHMETIC, not just wrong weights.
-            // Atomic and bounded-memory, and the `reused` skip above is why the first matters
-            // — see `write_expert_layer`.
-            let n = write_expert_layer(
-                &path,
-                &ExpertHeader::new(F4_MAGIC, l, ne, hidden, moe_inter, stride).to_bytes(),
-                stride,
-                ebytes,
-                ne,
-                LAYER_WINDOW,
-                |e, slot| expert(e).pack(slot),
-            )
-            .with_context(|| format!("write layer {l} (repack or I/O)"))?;
-            eprintln!("convert_v4: wrote {path} ({n} bytes)");
-        }
-
-        // Verification reads the FILE, and runs on a REUSED layer too. Two reasons it is
-        // not `back == buf`: that comparison could only ever pass (the buffer came from
-        // `pack`, and `diff` reads the same source spans, so `differing` could never be
-        // non-zero behind it) — a guard unable to fire dressed as a verification; and a
-        // reused layer has no `buf` at all, which is exactly the layer whose bytes nobody
-        // has ever checked. Comparing the file against the mmap'd source tests the writer's
-        // offsets, the block stride, the write, and whatever a previous run left behind.
-        if args.verify {
-            let back = std::fs::read(&path).with_context(|| format!("re-read {path}"))?;
-            ensure!(
-                back.len() == VQ_ALIGN + ne * stride,
-                "{path}: {} bytes on disk, expected {}",
-                back.len(),
-                VQ_ALIGN + ne * stride
-            );
-            let mut differing = 0usize;
-            for e in 0..ne {
-                let off = VQ_ALIGN + e * stride;
-                differing += expert(e).diff(&back[off..off + ebytes])?.len();
-            }
-            ensure!(
-                differing == 0,
-                "layer {l}: {differing} bytes differ from the source — the repack is \
-                 supposed to be a COPY"
-            );
-            eprintln!("convert_v4: verified L{l:02}.f4 — {ne} experts, 0 bytes differ");
-        }
+        repack.layer(l, |e| v4_expert_base(l, e, ne))?;
     }
 
     // A verification pass STOPS HERE. `--verify` on its own is a flag on a converter, so it

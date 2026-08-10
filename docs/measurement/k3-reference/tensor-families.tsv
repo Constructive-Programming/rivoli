@@ -1,0 +1,76 @@
+# Kimi-K3 tensor families — the checkpoint's own index, not a transliteration.
+#
+# Source: moonshotai/Kimi-K3, revision 9f62e4e9fffbd0a83ddd60e1c209d828994b3569.
+#   model.safetensors.index.json  59,764,096 B  sha256 a1c5210650ce71d2d3ae9ec5a101ac4afd3cf4b10091be589853437eb967febd
+#   497220 tensors across 96 shards, metadata.total_size 1560860324864
+# Fetched 2026-08-10. The index is 60 MB and is NOT vendored; this reduction is.
+#
+# Families are names with `.layers.<n>.` -> `.layers.{L}.`, `.experts.<n>.` -> `.experts.{E}.`,
+# `.blocks.<n>.` -> `.blocks.{B}.`. That rule is stated because the count depends on it:
+# 60 families total, 48 text-side. G0 item 10 recorded "50 families" under an unstated rule.
+#
+# dtype/shape come from three shard headers read via HTTP Range (shards 1, 2 and 4 — layer 0
+# dense + KDA, layer 1 MoE, layer 3 MLA); families whose shape reads `?` were not in those three
+# and are shape-unknown here, not shape-free.
+#
+# count	dtype	shape	family
+1	?	?	language_model.lm_head.weight
+1	?	?	language_model.model.embed_tokens.weight
+82432	U8	3072x1792	language_model.model.layers.{L}.block_sparse_moe.experts.{E}.w1.weight_packed
+82432	U8	3072x112	language_model.model.layers.{L}.block_sparse_moe.experts.{E}.w1.weight_scale
+82432	U8	3584x1536	language_model.model.layers.{L}.block_sparse_moe.experts.{E}.w2.weight_packed
+82432	U8	3584x96	language_model.model.layers.{L}.block_sparse_moe.experts.{E}.w2.weight_scale
+82432	U8	3072x1792	language_model.model.layers.{L}.block_sparse_moe.experts.{E}.w3.weight_packed
+82432	U8	3072x112	language_model.model.layers.{L}.block_sparse_moe.experts.{E}.w3.weight_scale
+92	F32	896	language_model.model.layers.{L}.block_sparse_moe.gate.e_score_correction_bias
+92	BF16	896x7168	language_model.model.layers.{L}.block_sparse_moe.gate.weight
+92	BF16	3584x7168	language_model.model.layers.{L}.block_sparse_moe.routed_expert_down_proj.weight
+92	BF16	3584	language_model.model.layers.{L}.block_sparse_moe.routed_expert_norm.weight
+92	BF16	7168x3584	language_model.model.layers.{L}.block_sparse_moe.routed_expert_up_proj.weight
+92	BF16	7168x6144	language_model.model.layers.{L}.block_sparse_moe.shared_experts.down_proj.weight
+92	BF16	6144x7168	language_model.model.layers.{L}.block_sparse_moe.shared_experts.gate_proj.weight
+92	BF16	6144x7168	language_model.model.layers.{L}.block_sparse_moe.shared_experts.up_proj.weight
+93	BF16	7168	language_model.model.layers.{L}.input_layernorm.weight
+1	BF16	7168x33792	language_model.model.layers.{L}.mlp.down_proj.weight
+1	BF16	33792x7168	language_model.model.layers.{L}.mlp.gate_proj.weight
+1	BF16	33792x7168	language_model.model.layers.{L}.mlp.up_proj.weight
+93	BF16	7168	language_model.model.layers.{L}.mlp_res_norm.weight
+93	BF16	1x7168	language_model.model.layers.{L}.mlp_res_proj.weight
+93	BF16	7168	language_model.model.layers.{L}.post_attention_layernorm.weight
+93	BF16	7168	language_model.model.layers.{L}.self_attention_res_norm.weight
+93	BF16	1x7168	language_model.model.layers.{L}.self_attention_res_proj.weight
+69	F32	128	language_model.model.layers.{L}.self_attn.A_log
+69	BF16	96x7168	language_model.model.layers.{L}.self_attn.b_proj.weight
+69	F32	12288	language_model.model.layers.{L}.self_attn.dt_bias
+69	BF16	128x7168	language_model.model.layers.{L}.self_attn.f_a_proj.weight
+69	BF16	12288x128	language_model.model.layers.{L}.self_attn.f_b_proj.weight
+93	BF16	12288x7168	language_model.model.layers.{L}.self_attn.g_proj.weight
+69	F32	12288x1x4	language_model.model.layers.{L}.self_attn.k_conv1d.weight
+69	BF16	12288x7168	language_model.model.layers.{L}.self_attn.k_proj.weight
+24	BF16	512	language_model.model.layers.{L}.self_attn.kv_a_layernorm.weight
+24	BF16	576x7168	language_model.model.layers.{L}.self_attn.kv_a_proj_with_mqa.weight
+24	BF16	24576x512	language_model.model.layers.{L}.self_attn.kv_b_proj.weight
+69	F32	128	language_model.model.layers.{L}.self_attn.o_norm.weight
+93	BF16	7168x12288	language_model.model.layers.{L}.self_attn.o_proj.weight
+24	BF16	1536	language_model.model.layers.{L}.self_attn.q_a_layernorm.weight
+24	BF16	1536x7168	language_model.model.layers.{L}.self_attn.q_a_proj.weight
+24	BF16	18432x1536	language_model.model.layers.{L}.self_attn.q_b_proj.weight
+69	F32	12288x1x4	language_model.model.layers.{L}.self_attn.q_conv1d.weight
+69	BF16	12288x7168	language_model.model.layers.{L}.self_attn.q_proj.weight
+69	F32	12288x1x4	language_model.model.layers.{L}.self_attn.v_conv1d.weight
+69	BF16	12288x7168	language_model.model.layers.{L}.self_attn.v_proj.weight
+1	?	?	language_model.model.norm.weight
+1	?	?	language_model.model.output_attn_res_norm.weight
+1	?	?	language_model.model.output_attn_res_proj.weight
+1	?	?	mm_projector.post_norm.weight
+1	?	?	mm_projector.proj.0.weight
+1	?	?	mm_projector.proj.2.weight
+27	?	?	vision_tower.encoder.blocks.{B}.mlp.fc0.weight
+27	?	?	vision_tower.encoder.blocks.{B}.mlp.fc1.weight
+27	?	?	vision_tower.encoder.blocks.{B}.norm0.weight
+27	?	?	vision_tower.encoder.blocks.{B}.norm1.weight
+27	?	?	vision_tower.encoder.blocks.{B}.wo.weight
+27	?	?	vision_tower.encoder.blocks.{B}.wqkv.weight
+1	?	?	vision_tower.encoder.final_layernorm.weight
+1	?	?	vision_tower.patch_embed.pos_emb.weight
+1	?	?	vision_tower.patch_embed.proj.weight

@@ -488,6 +488,40 @@ impl Safetensors {
         self.index.contains_key(name)
     }
 
+    /// Every indexed tensor name, **sorted**.
+    ///
+    /// The sort is not cosmetic. `index` is a `HashMap`, so iteration order varies between runs;
+    /// `SafeWriter` writes tensors in the order they were added, and a converter that enumerated
+    /// in hash order would emit a byte-different `resident.safetensors` on every run from the
+    /// same input — same tensors, same values, different layout. That defeats the one cheap check
+    /// a repack has (`sha256` two runs and compare) and it would make a re-conversion look like a
+    /// change. Sorted here rather than at each caller so there is no way to get it wrong.
+    ///
+    /// Added for `convert_k3`, whose resident pass is "copy everything that is not routed and not
+    /// vision" — driven off what the checkpoint HAS rather than off a list of names this port
+    /// believes in, because K3's trunk is entirely BF16 and later stages need tensors S1a does
+    /// not read.
+    pub fn names(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self.index.keys().map(String::as_str).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Bytes, dtype and shape, with **no dtype expectation** — for a verbatim copy.
+    ///
+    /// The only accessor here that does not check a dtype, and the only correct use is passing the
+    /// bytes through unexamined. Anything that INTERPRETS them must use [`Self::typed`] and name
+    /// the dtype it is about to assume; that check is what stopped an FNUZ fp8 tensor from being
+    /// decoded as OCP e4m3 (see [`Dtype::narrow`]), and it is not one to route around.
+    pub fn raw(&self, name: &str) -> Result<(&[u8], Dtype, &[usize])> {
+        let l = self.loc(name)?;
+        Ok((
+            &self.mmaps[l.shard][l.begin..l.begin + l.len],
+            l.dtype,
+            &l.shape,
+        ))
+    }
+
     /// Dequantize a block-scaled fp8 projection (`<name>.weight` F8E4M3 +
     /// `<name>.weight_scale_inv` F32) to row-major f32 `[o_dim, i_dim]`. The one
     /// fp8-read used by both converters (`bin/convert` → `.vq3`, `bin/fp8_to_i4` →
@@ -552,11 +586,158 @@ impl Safetensors {
 /// make the swap visible at the call site instead of invisible inside an argument list.
 pub struct F4Expert<'a> {
     pub src: &'a Safetensors,
-    /// `layers.{l}.ffn.experts.{e}` — see `quant::v4_expert_base`.
+    /// `layers.{l}.ffn.experts.{e}` — see `quant::v4_expert_base`. On K3,
+    /// `quant::k3_expert_base`, which is a longer path under `language_model.model.`.
     pub base: String,
     pub expert_in: usize,
     pub moe_inter: usize,
+    /// How THIS checkpoint spells the two tensors of a projection, and what dtypes they carry.
+    /// The `.f4` container is identical either way — only the source names differ.
+    pub naming: &'static F4Naming,
 }
+
+/// How a checkpoint spells one FP4 projection's two tensors, and what dtypes they declare.
+///
+/// **Two checkpoints ship the identical MXFP4 layout under different names and different dtype
+/// strings**, verified against both files: V4 writes `<proj>.weight` as `I8` with `<proj>.scale`
+/// as `F8_E8M0`, and K3 writes compressed-tensors' `<proj>.weight_packed` / `<proj>.weight_scale`
+/// with **both as `U8`**. The bytes are the same thing — e2m1 nibble pairs and bare e8m0
+/// exponents — so this is a naming table, not a format abstraction.
+///
+/// It is a struct rather than four more `F4Expert` fields because the four values are only
+/// correct as a SET: pairing K3's `weight_packed` with V4's `F8_E8M0` scale dtype would refuse
+/// the checkpoint, and pairing V4's `.scale` name with K3's `U8` would read the wrong tensor if
+/// one ever existed under both names.
+pub struct F4Naming {
+    pub projs: [&'static str; 3],
+    pub packed: &'static str,
+    pub scale: &'static str,
+    pub packed_dtype: Dtype,
+    pub scale_dtype: Dtype,
+}
+
+/// One `.f4` layer file's worth of work: write it if absent, then optionally prove it.
+///
+/// **Factored out when `convert_k3` became the second caller and the duplication gate refused
+/// it** — 209 tokens of the verify block alone. That is the right outcome and not a formality:
+/// the two converters differ only in how an expert's tensor prefix is spelled, and a copied
+/// verify loop is the shape where one model's converter gets a fix the other's silently does not.
+/// `docs/reference/architecture.md`'s rule holds here — everything that is not the difference
+/// between the models belongs in one place.
+pub struct RoutedRepack<'a> {
+    /// Program name for the progress lines, so the log says which converter is running.
+    pub tool: &'a str,
+    pub out_dir: &'a str,
+    pub src: &'a Safetensors,
+    pub naming: &'static F4Naming,
+    /// The width the ROUTED BLOCK is entered at — `hidden` on V4, the 3584 latent on K3. See
+    /// [`crate::artifact::quant::vq_expert_layout`].
+    pub expert_in: usize,
+    pub moe_inter: usize,
+    pub n_experts: usize,
+    /// Re-read the file and compare against the source spans.
+    pub verify: bool,
+    /// False for a verify-only pass, which must not write.
+    pub write: bool,
+}
+
+impl RoutedRepack<'_> {
+    /// Convert layer `l`. `base(e)` gives expert `e`'s source tensor prefix — the ONLY thing
+    /// that differs between the two models, which is why it is a closure and everything else
+    /// is a field.
+    ///
+    /// `Sync` on the closure because `fill_expert_blocks` packs the window's experts in parallel
+    /// and each thread calls `base` for its own expert. Both callers pass a plain `format!`, so
+    /// the bound costs them nothing — but it has to be stated, since without it the whole loop
+    /// silently becomes single-threaded-only and the compiler is the one that says so.
+    pub fn layer(&self, l: usize, base: impl Fn(usize) -> String + Sync) -> Result<()> {
+        let (ne, tool) = (self.n_experts, self.tool);
+        let stride = crate::artifact::quant::f4_expert_stride(self.expert_in, self.moe_inter);
+        let ebytes = crate::artifact::quant::f4_expert_bytes(self.expert_in, self.moe_inter);
+        let path = format!("{}/L{l:02}.f4", self.out_dir);
+        let reused = std::fs::metadata(&path).is_ok();
+        if reused {
+            eprintln!("{tool}: {path} exists, reusing");
+        }
+        let expert = |e| F4Expert {
+            src: self.src,
+            base: base(e),
+            expert_in: self.expert_in,
+            moe_inter: self.moe_inter,
+            naming: self.naming,
+        };
+        if !reused && self.write {
+            // One aligned block for the header, then `ne` routed blocks — and NO shared block,
+            // unlike `.vq3`/`.i4`. Neither model's shared expert is FP4 (V4's is fp8 e4m3, K3's
+            // is BF16 at full width), so a block written past `ne` would be the wrong
+            // ARITHMETIC, not just the wrong weights. Streamed in `LAYER_WINDOW` windows: a K3
+            // layer is 15.72 GB and buffering one would be host RAM the GPU shares.
+            let n = write_expert_layer(
+                &path,
+                &ExpertHeader::new(F4_MAGIC, l, ne, self.expert_in, self.moe_inter, stride)
+                    .to_bytes(),
+                stride,
+                ebytes,
+                ne,
+                LAYER_WINDOW,
+                |e, slot| expert(e).pack(slot),
+            )
+            .with_context(|| format!("write layer {l} (repack or I/O)"))?;
+            eprintln!("{tool}: wrote {path} ({n} bytes)");
+        }
+        // Verification reads the FILE and compares it against the mmap'd source, so it tests the
+        // writer's offsets, the block stride, the write, and whatever a previous run left behind.
+        // It runs on a REUSED layer too — that is precisely the layer whose bytes nobody has ever
+        // checked. It is deliberately NOT `back == buf`: that comparison could only ever pass,
+        // since the buffer came from `pack` and `diff` reads the same source spans, so it would be
+        // a guard unable to fire dressed as a verification.
+        if self.verify {
+            let back = std::fs::read(&path).with_context(|| format!("re-read {path}"))?;
+            ensure!(
+                back.len() == VQ_ALIGN + ne * stride,
+                "{path}: {} bytes on disk, expected {}",
+                back.len(),
+                VQ_ALIGN + ne * stride
+            );
+            let mut differing = 0usize;
+            for e in 0..ne {
+                let off = VQ_ALIGN + e * stride;
+                differing += expert(e).diff(&back[off..off + ebytes])?.len();
+            }
+            ensure!(
+                differing == 0,
+                "layer {l}: {differing} bytes differ from the source — the repack is supposed \
+                 to be a COPY"
+            );
+            eprintln!("{tool}: verified L{l:02}.f4 — {ne} experts, 0 bytes differ");
+        }
+        Ok(())
+    }
+}
+
+/// DeepSeek-V4-Flash: `w1.weight` (`I8`) + `w1.scale` (`F8_E8M0`).
+pub const F4_NAMING_V4: F4Naming = F4Naming {
+    projs: crate::artifact::quant::V4_PROJ,
+    packed: "weight",
+    scale: "scale",
+    packed_dtype: Dtype::I8,
+    scale_dtype: Dtype::F8E8M0,
+};
+
+/// Kimi-K3: `w1.weight_packed` + `w1.weight_scale`, **both `U8`**.
+///
+/// The dtype is the part worth naming. `compressed-tensors` writes the scale grid as plain `U8`
+/// rather than declaring an e8m0 type, so the checkpoint's own metadata does not say these bytes
+/// are exponents — `quantization_config.config_groups.group_0.weights.scale_dtype` does, and it
+/// says `torch.uint8`. That is why [`F4Expert::spans`] checks the SHAPE against `f4_groups`: for
+/// K3 the shape is the only evidence in the file that a byte per 32 weights is a scale.
+pub const F4_NAMING_K3: F4Naming = F4Naming {
+    projs: crate::artifact::quant::K3_PROJ,
+    packed: crate::artifact::quant::K3_PACKED,
+    scale: crate::artifact::quant::K3_SCALE,
+    packed_dtype: Dtype::U8,
+    scale_dtype: Dtype::U8,
+};
 
 impl F4Expert<'_> {
     /// This expert's six source spans, paired with their byte offset inside an `.f4`
@@ -579,11 +760,15 @@ impl F4Expert<'_> {
         // projection against another one's exponents. Now a change to the layout moves both
         // ends or neither.
         let off = crate::artifact::quant::f4_slot_offsets(expert_in, moe_inter);
+        let nm = self.naming;
         let mut out = Vec::with_capacity(6);
-        for (p, (proj, (o_dim, i_dim))) in
-            crate::artifact::quant::v4_expert_projs(expert_in, moe_inter)
-                .into_iter()
-                .enumerate()
+        for (p, (proj, (o_dim, i_dim))) in nm
+            .projs
+            .into_iter()
+            .zip(crate::artifact::quant::vq_expert_layout(
+                expert_in, moe_inter,
+            ))
+            .enumerate()
         {
             // Shapes are checked, not trusted: `[o, i/2]` and `[o, i/32]` are the only pair
             // the byte counts below are correct for, and a transposed or mis-blocked source
@@ -591,20 +776,25 @@ impl F4Expert<'_> {
             // that passes every length check and decodes to noise.
             let (w, wsh) = self
                 .src
-                .typed(&format!("{base}.{proj}.weight"), Dtype::I8)?;
+                .typed(&format!("{base}.{proj}.{}", nm.packed), nm.packed_dtype)?;
             ensure!(
                 wsh == [o_dim, i_dim / 2],
-                "{base}.{proj}.weight: shape {wsh:?} != [{o_dim},{}] (FP4 nibble pairs)",
+                "{base}.{proj}.{}: shape {wsh:?} != [{o_dim},{}] (FP4 nibble pairs)",
+                nm.packed,
                 i_dim / 2
             );
             let (sc, ssh) = self
                 .src
-                .typed(&format!("{base}.{proj}.scale"), Dtype::F8E8M0)?;
+                .typed(&format!("{base}.{proj}.{}", nm.scale), nm.scale_dtype)?;
             let groups = crate::artifact::quant::f4_groups(i_dim);
+            // **On K3 this shape check is the only evidence in the file that these bytes are
+            // scales at all** — `compressed-tensors` declares them plain `U8`, not an e8m0 type.
+            // See `F4_NAMING_K3`.
             ensure!(
                 ssh == [o_dim, groups],
-                "{base}.{proj}.scale: shape {ssh:?} != [{o_dim},{groups}] (one e8m0 per {} \
+                "{base}.{proj}.{}: shape {ssh:?} != [{o_dim},{groups}] (one e8m0 per {} \
                  weights along the input dim)",
+                nm.scale,
                 crate::artifact::quant::F4_GROUP
             );
             let wb = o_dim * crate::artifact::quant::f4_row_bytes(i_dim);
@@ -1868,6 +2058,11 @@ mod tests {
                 base: "e".into(),
                 expert_in: self.expert_in,
                 moe_inter: self.moe_inter,
+                // V4's naming, because that is what this fixture writes (`<proj>.weight` as `I8`,
+                // `<proj>.scale` as `F8_E8M0`). The K3 side of the pair is covered by
+                // `tests/k3_names.rs` against the shipped index, and end to end by the real-expert
+                // conversion in `docs/measurement/k3-reference/repack-one-expert.md`.
+                naming: &F4_NAMING_V4,
             }
         }
     }

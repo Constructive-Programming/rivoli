@@ -857,6 +857,66 @@ pub fn v4_expert_base(layer: usize, e: usize, n_experts: usize) -> String {
     }
 }
 
+// --- Kimi-K3 tensor naming ---------------------------------------------------------------
+//
+// Read off the checkpoint's own `model.safetensors.index.json` (497,220 tensors, 96 shards,
+// revision `9f62e4e9fffbd0a83ddd60e1c209d828994b3569`) on 2026-08-10, reduced to families and
+// vendored at `docs/measurement/k3-reference/tensor-families.tsv`. `tests/k3_names.rs` pins
+// every string below against that file.
+//
+// **Nothing here was inferred from the reference implementation's variable names**, which is a
+// rule this port learned the expensive way in `model.rs`: the C reference calls K3's config
+// scalars `kda_heads`/`conv_k`/`rms_eps` and the JSON calls them `num_heads`/
+// `short_conv_kernel_size`/`rms_norm_eps`, and two guessed spellings became defects that would
+// have refused every real checkpoint.
+
+/// The `language_model.model.` prefix every text-side K3 tensor carries.
+///
+/// **No document in this repo mentioned it before 2026-08-10** — the plan and the architecture
+/// doc both quote names from `layers.` onward, because the C reference's own loader does. A
+/// converter built from those docs finds zero tensors and reports a corrupt checkpoint.
+/// (`vision_tower.*` and `mm_projector.*` are siblings of `language_model`, not children, which
+/// is why skipping the vision side is a prefix test rather than a substring search.)
+pub const K3_TEXT_PREFIX: &str = "language_model.model.";
+
+/// K3's three expert projections in [`PROJ`]'s slot order — gate, up, down.
+///
+/// **The names are `w1`/`w3`/`w2`, the same three strings as [`V4_PROJ`], and the coincidence is
+/// worth stating rather than sharing a constant**: they are two different checkpoints that happen
+/// to agree, and `docs/reference/k3-architecture.md` §6 fixes K3's slot order from its own
+/// forward pass (`w1` gate, `w3` up, `w2` down) rather than from V4's. A shared constant would
+/// make one model's rename silently retarget the other's converter.
+///
+/// Shapes, from the shard header: `w1`/`w3` are `[moe_inter, expert_in]` and `w2` is
+/// `[expert_in, moe_inter]`, so a `w2` in the wrong slot is caught by its shape and a `w1`/`w3`
+/// swap is not — the same asymmetry [`V4_PROJ`] documents, and the same answer: only S1b's
+/// numerical oracle can see it.
+pub const K3_PROJ: [&str; 3] = ["w1", "w3", "w2"];
+
+/// The two tensors per projection: MXFP4 nibbles and their e8m0 group scales.
+///
+/// `compressed-tensors` names, **not** HuggingFace's `.weight`/`.weight_scale_inv`. Both are `U8`
+/// on disk — the scale tensor is raw e8m0 exponent bytes, which is why it is `weight_scale` and
+/// not `weight_scale_inv`: there is no reciprocal and no f32 anywhere.
+pub const K3_PACKED: &str = "weight_packed";
+pub const K3_SCALE: &str = "weight_scale";
+
+/// K3's tensor prefix for routed expert `e` in `layer`.
+///
+/// **There is no shared-expert arm, unlike [`v4_expert_base`]**, and that is not an omission:
+/// K3's shared expert is one fused BF16 MLP at FULL width (`shared_experts.down_proj` is
+/// `[7168, 6144]`), trunk-side, in a different dtype and a different layout from the routed
+/// experts. `.f4` holds routed experts only, and `has_shared()` is already false for F4.
+pub fn k3_expert_base(layer: usize, e: usize) -> String {
+    format!("{K3_TEXT_PREFIX}layers.{layer}.block_sparse_moe.experts.{e}")
+}
+
+/// `(packed, scale)` tensor names for slot `p` of routed expert `e` in `layer`.
+pub fn k3_expert_proj(layer: usize, e: usize, p: usize) -> (String, String) {
+    let base = format!("{}.{}", k3_expert_base(layer, e), K3_PROJ[p]);
+    (format!("{base}.{K3_PACKED}"), format!("{base}.{K3_SCALE}"))
+}
+
 // jscpd:ignore-start — the four `matvec_*` oracles' PARAMETER LISTS. `matvec_i4` and
 // `matvec_i8` take character-identical arguments (`y, x, packed, scale, o_dim, i_dim`),
 // which rustfmt expands past 100 columns into eight lines — enough to clone against each
