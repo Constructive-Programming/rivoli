@@ -4049,3 +4049,37 @@ which auto-merged in the same files and had never shared a device before this:
 
 Fleet kept evicted for the window by an unload loop against the ClusterIP (the pod IP
 died with a k3s restart, 2026-08-10); per-cell witnesses stayed authoritative.
+
+## K3 S1a SafeWriter gate — suite 324/0 on a fully-idle GPU (2026-08-10)
+
+Branch `wt/k3-s1a` rebased onto `0c5f507`. The change under test is host-side only
+(`SafeWriter` borrows verbatim tensors rather than owning them, `write` became atomic), so
+the device suite is a regression gate, not a measurement — no tok/s is claimed here.
+
+**324 passed / 0 failed** across all 26 binaries at the **dev profile** (`--features rocm`,
+`--test-threads=1`, each suite under the flock). Per-suite: lib 133, v4_oracle 33, f4_kernel
+24, kernel 23, f4_attn 15, f4_loading 11, kvcompress_kernel 10, f4_attn_host 9,
+blockindex_kernel 8, kvcompress 8, v4_encoding 6, headtail 5, indexer_kernel 5, artifact 5,
+fwd_kernel 4, hadamard_basis 4, kvcompress_probe 4, matrix 4, refactor_gates 3, docs 2,
+kernel_coverage 2, v4_artifact 2, f4_loop 1, f4_pin 1, f4_pool 1 (+1 ignored), invariants 1.
+Union features add 7 lib tests (133 → 140), so 331 on the same tree with
+`rocm,otlp,teacher-forcing,pred-probe,trace,stale-sel`.
+
+**Not the same figure as the rename gate's "union suite 334/0" above, and the difference is
+method, not regression.** That one was `--release`, union features, and *all 35 targets* —
+which counts the 7 `src/bin/*` targets this run's `--lib`/`--test` invocations never build.
+An all-targets union run here reached 280/0 across 28 binaries before the harness call
+limit cut it; it was not completed, so 334 is neither reproduced nor contradicted.
+
+**The witness is the point.** Every earlier attempt this session was discarded: the two
+`memory::device::tier_*` tests failed with the engine's own sole-tenant refusal against
+33.6–39.5 GiB of GTT held with **zero kfd entries and no flock** — the Vulkan-tenant blind
+spot `reference/gpu-lock.md` records, here llama-swap serving qwen3.6-ultra at 262k ctx.
+`fuser` cannot see an advisory flock holder, so the only reliable probe is `flock -n`;
+`flock -w N` exits **1 silently** and reads exactly like a test failure.
+
+Cleared by cordoning and draining `rh-anine.hr-home.xyz` (llama-swap is pinned to
+`hr-home.xyz/rocm=true`, the only labelled node, so it went Pending rather than migrating).
+GTT fell 39517 → **17 MiB**, kfd 0, lock free; witnesses were clean before AND after every
+suite. The node was uncordoned afterwards and all three evicted Deployments (postern,
+helmops, system-upgrade-controller) returned 1/1.
