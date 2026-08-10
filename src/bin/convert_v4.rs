@@ -291,11 +291,8 @@ fn main() -> Result<()> {
             // One aligned block for the header, then `ne` routed blocks — and NO shared block,
             // unlike `.vq3`/`.i4`. V4's shared expert is fp8 e4m3, a different format entirely;
             // a block written past `ne` would be the wrong ARITHMETIC, not just wrong weights.
-            // tmp→rename: `std::fs::write` is not atomic and a layer file is 3.4 GB, so a run
-            // killed mid-write would otherwise leave a short `L{ll}.f4` that the next run
-            // reuses and never re-reads. Streamed in bounded windows rather than buffered
-            // whole — see [`write_expert_layer`], which is also what makes K3's 896-expert
-            // layer (15.7 GB) writable at all.
+            // Atomic and bounded-memory, and the `reused` skip above is why the first matters
+            // — see `write_expert_layer`.
             let n = write_expert_layer(
                 &path,
                 &ExpertHeader::new(F4_MAGIC, l, ne, hidden, moe_inter, stride).to_bytes(),

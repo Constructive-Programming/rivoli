@@ -472,10 +472,8 @@ fn main() -> Result<()> {
         let enc = encoders.as_ref();
         let validate = args.validate;
         let blocks = d.n_experts + 1;
-        // NOT `std::fs::write`: the `continue` above skips an existing path without reading
-        // it, so a run killed mid-write would leave a short 3.7 GB `L{ll}.vq3` that re-running
-        // this command can never repair. One implementation with `convert_v4`, which windows
-        // the encode rather than buffering the whole layer — see [`write_expert_layer`].
+        // Atomic and bounded-memory, and the `continue` above is why the first matters — see
+        // `write_expert_layer`.
         write_expert_layer(
             &path,
             &ExpertHeader::new(VQ3_MAGIC, l, d.n_experts, d.hidden, d.moe_inter, stride).to_bytes(),

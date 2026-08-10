@@ -702,45 +702,6 @@ impl F4Expert<'_> {
     }
 }
 
-/// Write `bytes` to `path` via `<path>.part` + rename. Rename within one directory is
-/// atomic, so a reader sees either no file or the whole file — never a short one.
-///
-/// **Why every converter must use this, and not `std::fs::write`.** Both converters resume by
-/// SKIPPING an output path that already exists, without reading it (`bin/convert` `continue`s,
-/// `convert_v4` sets `reused`). A layer file is 3–5 GB. So a non-atomic write plus a kill
-/// leaves a short `L{ll}.{ext}` that re-running the tool can never repair — the artifact then
-/// fails at load on `open_routed`'s `ensure!(len == want)`, and the fix is a manual `rm` of a
-/// file nobody would suspect.
-///
-/// **Found 2026-08-06, and this function exists because of HOW it was found.** `convert_v4`
-/// had the tmp+rename from the day it was written and `bin/convert` did not — two hand-written
-/// copies of one per-layer loop, and the single step where they diverged was the one carrying
-/// the defect. Track G was scoped to collapse those loops for the line count; the line count
-/// is small and this was the real find. One implementation now, so they cannot drift again.
-///
-/// **The guarantee is against process death, not power loss.** There is deliberately no
-/// `fsync` here: it matches what `convert_v4` has always done, and an `fsync` per 3.5 GB layer
-/// is a real cost to buy a property no converter has ever claimed. `I4Source::stamp` DOES
-/// fsync its manifest, and that asymmetry is correct — a torn manifest is unrecoverable, a
-/// torn layer file is regenerable.
-/// **The temp name carries the pid, and that is not decoration** — self-review 2026-08-07,
-/// the same lesson `bin/ppl`, `f4_loading`, `v4_encoding` and `v4_oracle` each learned on
-/// their own scratch paths. Agents share this machine and `convert` takes no lock (it is CPU
-/// only; the GPU flock does not serialise it), so two runs into one `out_dir` are reachable.
-/// On a FIXED `<path>.part` both would `File::create` + truncate + write the same path
-/// concurrently, and the rename would then publish interleaved bytes. Interleaving two writes
-/// **of equal length** yields a file of exactly the right length, so `open_routed`'s
-/// `ensure!(len == want)` passes it — the one corruption shape that gets past the loader.
-///
-/// The cost is that a killed run leaves `L{ll}.vq3.<pid>.part` behind instead of a name the
-/// next run overwrites. That is the better failure: multi-GB debris under an obviously
-/// non-artifact name is visible, and silent wrong content is not.
-pub fn write_atomic(path: &str, bytes: &[u8]) -> Result<()> {
-    let part = format!("{path}.{}.part", std::process::id());
-    std::fs::write(&part, bytes).with_context(|| format!("write {part}"))?;
-    std::fs::rename(&part, path).with_context(|| format!("rename {part} -> {path}"))
-}
-
 /// Host memory one call to [`write_expert_layer`] may hold, regardless of the layer's size.
 ///
 /// 1 GiB, chosen against the two things it trades off. It must stay a large multiple of one
@@ -751,35 +712,56 @@ pub fn write_atomic(path: &str, bytes: &[u8]) -> Result<()> {
 /// convert runs alongside whatever else holds the arena.
 pub const LAYER_WINDOW: usize = 1 << 30;
 
-/// Write one layer's expert file — header block, then `blocks` expert blocks — in bounded
-/// host memory, published by rename exactly as [`write_atomic`] does.
+/// The header has to fit the block-0 pad it is written into. Both are compile-time constants,
+/// so this is a compile-time check — it was briefly an `ensure!` inside
+/// [`write_expert_layer`], which is a runtime test of `40 <= 4096` on every layer.
+const _: () = assert!(EXPERT_HEADER_BYTES <= VQ_ALIGN);
+
+/// Write one layer's expert file — header block, then `blocks` expert blocks — in bounded host
+/// memory, published to `path` by a rename from `<path>.<pid>.part`.
 ///
-/// **This exists because the buffered form does not scale past GLM.** Both converters used to
-/// allocate the whole file (`vec![0u8; VQ_ALIGN + blocks * stride]`), fill it, and hand it to
-/// `write_atomic`: 3.4 GB per layer for V4 and 3.7 GB for GLM, which is survivable, but
-/// **15.7 GB for Kimi-K3** (896 experts x 17.55 MB) on a box whose entire LPDDR5 is 128 GB and
-/// shared with the GPU. The buffer was pure waste at any size — every byte was written out
-/// once and never re-read.
-///
-/// Parallelism is preserved by windowing rather than by streaming one expert at a time:
+/// **Bounded, because the buffered form does not scale past GLM.** Both converters used to
+/// allocate the whole file (`vec![0u8; VQ_ALIGN + blocks * stride]`), fill it, and write it in
+/// one call: 3.4 GB per layer for V4 and 3.7 GB for GLM, survivable, but **15.7 GB for
+/// Kimi-K3** (896 experts x 17.55 MB) on a box whose entire LPDDR5 is 128 GB and shared with
+/// the GPU. The buffer was pure waste at any size — every byte was written out once and never
+/// re-read. Parallelism survives because the window is the unit, not the expert:
 /// `fill_expert_blocks` still packs each window across all threads over disjoint slices, so
-/// the only thing that changed is how much is resident at once. Serialising the pack to save
-/// memory would have traded a multi-hour convert for a buffer.
+/// serialising the pack to save memory was never on the table.
 ///
-/// Each block is `stride` bytes of which only `bytes` are ever written, and the `bytes..stride`
-/// padding must be zero for the output to be byte-identical to the buffered form — which G1a
-/// asserts. That falls out of allocating the window zeroed once; see the comment at the
-/// allocation for why re-zeroing per window is NOT needed, and how a plausible argument that
-/// it was survived until someone tried to make the test fail without it.
+/// **Atomic, because both converters resume by SKIPPING an output path that already exists,
+/// without reading it** (`bin/convert` `continue`s, `convert_v4` sets `reused`). A non-atomic
+/// write plus a kill would leave a short multi-GB `L{ll}.{ext}` that re-running the tool can
+/// never repair: the artifact fails at load on `open_routed`'s `ensure!(len == want)`, and the
+/// fix is a manual `rm` of a file nobody would suspect. Found 2026-08-06 because `convert_v4`
+/// had tmp+rename from the day it was written and `bin/convert` did not — two hand-written
+/// copies of one loop, and the single step where they diverged was the one carrying the defect.
 ///
-/// No `fsync` before the rename, matching `write_atomic` — see the paragraph above it. The
-/// failure this defends against is a killed process, which rename ordering already covers.
-/// `window` is the host-memory ceiling and both converters pass [`LAYER_WINDOW`]; it is a
-/// parameter rather than a constant read from inside because the window BOUNDARY is where this
-/// can go wrong in a way nothing else catches — one window's tail landing in the next window's
-/// inter-block padding — and a test cannot afford to allocate a gigabyte to reach it. A
-/// thin wrapper supplying the constant would be a second copy of this parameter list, which
-/// `jscpd` refuses (measured: 6 lines, 45 tokens).
+/// **The temp name carries the pid, and that is not decoration** — self-review 2026-08-07, the
+/// same lesson `bin/ppl`, `f4_loading`, `v4_encoding` and `v4_oracle` each learned on their own
+/// scratch paths. Agents share this machine and a convert takes no lock (it is CPU only; the
+/// GPU flock does not serialise it), so two runs into one `out_dir` are reachable. On a FIXED
+/// `<path>.part` both would `File::create` + truncate + write concurrently, and the rename
+/// would publish interleaved bytes. Interleaving two writes **of equal length** yields a file
+/// of exactly the right length, so `open_routed`'s length check passes it — the one corruption
+/// shape that gets past the loader. The cost is that a killed run leaves
+/// `L{ll}.{ext}.<pid>.part` behind rather than a name the next run overwrites, which is the
+/// better failure: multi-GB debris under an obviously non-artifact name is visible.
+///
+/// **No `fsync` before the rename**, deliberately: the guarantee is against process death, not
+/// power loss, and one fsync per 3.5 GB layer buys a property no converter has ever claimed.
+/// `I4Source::stamp` DOES fsync its manifest, and that asymmetry is right — a torn manifest is
+/// unrecoverable, a torn layer file is regenerable.
+///
+/// Each block is `stride` bytes of which only `bytes` are ever written, and the
+/// `bytes..stride` padding must be zero for the output to stay byte-identical to the buffered
+/// form — which G1a asserts. See the comment at the window allocation for why that needs no
+/// per-window clear.
+///
+/// `window` is the host-memory ceiling and both converters pass [`LAYER_WINDOW`]. It is a
+/// parameter rather than a constant read from inside so a test can reach the window BOUNDARY
+/// without allocating a gigabyte; a thin wrapper supplying the constant would be a second copy
+/// of this parameter list, which `jscpd` refuses (measured: 6 lines, 45 tokens).
 pub fn write_expert_layer(
     path: &str,
     header: &[u8; EXPERT_HEADER_BYTES],
@@ -790,41 +772,48 @@ pub fn write_expert_layer(
     fill: impl Fn(usize, &mut [u8]) -> Result<()> + Sync,
 ) -> Result<u64> {
     use std::io::Write;
+    // A `stride` of 0 would reach `chunks_exact_mut(0)` and PANIC rather than return, and
+    // `window / stride` would divide by zero one line further down. Refused, not clamped: the
+    // `.max(1)` this replaced turned a caller's bad dimension into a panic in someone else's
+    // function. `bytes <= stride` is `fill_expert_blocks`'s own check and is left to it.
     ensure!(
-        EXPERT_HEADER_BYTES <= VQ_ALIGN,
-        "header {EXPERT_HEADER_BYTES} B does not fit the {VQ_ALIGN} B block-0 pad"
+        stride > 0,
+        "expert stride is 0 — no block geometry to write"
     );
     let part = format!("{path}.{}.part", std::process::id());
-    let mut f = std::io::BufWriter::new(
-        std::fs::File::create(&part).with_context(|| format!("create {part}"))?,
-    );
+    // Not a `BufWriter`. Every write below is either the one `VQ_ALIGN` header block or a whole
+    // window, and `BufWriter` passes any write at or above its capacity straight through, so it
+    // would buffer nothing and its flush would guard nothing.
+    let mut f = std::fs::File::create(&part).with_context(|| format!("create {part}"))?;
     // Block 0 is the header, padded to `VQ_ALIGN` so expert 0 starts block-aligned for the
     // loader's O_DIRECT reads. Same layout the buffered writer produced.
     let mut pad = [0u8; VQ_ALIGN];
     pad[..EXPERT_HEADER_BYTES].copy_from_slice(header);
     f.write_all(&pad).with_context(|| format!("write {part}"))?;
 
-    let per = (window / stride.max(1)).clamp(1, blocks.max(1));
+    let per = (window / stride).clamp(1, blocks.max(1));
     // Zeroed ONCE, not per window, and the reuse is safe for a specific reason:
     // `fill_expert_blocks` hands each closure `&mut slot[..bytes]`, so the `bytes..stride`
     // padding is never written by anybody and stays zero for the buffer's whole life — the
-    // same way it did in the whole-layer `vec!` this replaced. A per-window `fill(0)` was
-    // here first, justified as stopping one window's tail leaking into the next window's
-    // padding; the red-proof for that showed the test stayed GREEN without it, because there
-    // is no path that dirties padding in the first place. It was a memset of up to 1 GiB per
-    // window (~16 GiB per K3 layer) defending against nothing.
+    // same way it did in the whole-layer `vec!` this replaced. A per-window `fill(0)` was here
+    // first, justified as stopping one window's tail leaking into the next window's padding;
+    // the red-proof for that showed the test stayed GREEN without it, because no path dirties
+    // padding at all. It was a memset of up to 1 GiB per window (~16 GiB per K3 layer)
+    // defending against nothing.
     let mut win = vec![0u8; per * stride];
-    let mut done = 0usize;
-    while done < blocks {
-        let take = per.min(blocks - done);
-        let span = &mut win[..take * stride];
-        crate::artifact::quant::fill_expert_blocks(span, stride, bytes, take, |j, slot| {
-            fill(done + j, slot)
-        })?;
+    for start in (0..blocks).step_by(per) {
+        let span = &mut win[..per.min(blocks - start) * stride];
+        crate::artifact::quant::fill_expert_blocks(
+            span,
+            stride,
+            bytes,
+            span.len() / stride,
+            |j, slot| fill(start + j, slot),
+        )?;
         f.write_all(span).with_context(|| format!("write {part}"))?;
-        done += take;
     }
-    f.flush().with_context(|| format!("flush {part}"))?;
+    // `File` has no user-space buffer to flush; the bytes are in the kernel by here, which is
+    // all the rename needs (see the fsync paragraph above).
     drop(f);
     std::fs::rename(&part, path).with_context(|| format!("rename {part} -> {path}"))?;
     Ok((VQ_ALIGN + blocks * stride) as u64)
@@ -2015,56 +2004,6 @@ mod tests {
         v
     }
 
-    /// [`write_atomic`] must leave the destination holding exactly the bytes given and no temp
-    /// file of its own behind — a surviving `.part` beside a 3.7 GB layer file is
-    /// indistinguishable from a run still in progress, which is the confusion it exists to end.
-    ///
-    /// **The leftover check scans for ANY `*.part`, never for one predicted name.** The first
-    /// version asserted `!exists("{path}.part")`, and when the temp gained its pid suffix that
-    /// assertion kept passing while checking a path the code no longer creates — green,
-    /// and blind to the exact thing it was written for. A directory scan cannot go stale that
-    /// way. Caught in self-review 2026-08-07, one edit after introducing it.
-    ///
-    /// The third arm is the one worth having, and the pid suffix CHANGED what it proves. It
-    /// used to say a stale `.part` is overwritten; now it says another process's debris is
-    /// **not adopted** — `write_atomic` must publish its own bytes and leave the foreign file
-    /// untouched rather than renaming it into place. Seeded longer than the payload, so
-    /// adopting it would fail on length rather than on content.
-    #[test]
-    fn write_atomic_publishes_its_own_bytes_and_never_adopts_foreign_debris() {
-        let dir = tmpdir("atomic");
-        let path = format!("{dir}/L07.vq3");
-        let strays = || {
-            walk_parts(&dir)
-                .into_iter()
-                .filter(|p| !p.contains("foreign"))
-                .collect::<Vec<_>>()
-        };
-
-        write_atomic(&path, b"first").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        assert_eq!(strays(), Vec::<String>::new(), "left a temp file behind");
-
-        write_atomic(&path, b"second").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"second", "did not replace");
-
-        // Another process's abandoned temp, in the same directory, for the same destination.
-        let foreign = format!("{path}.foreign.part");
-        std::fs::write(&foreign, vec![0xAAu8; 4096]).unwrap();
-        write_atomic(&path, b"third").unwrap();
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"third",
-            "foreign debris reached the destination"
-        );
-        assert!(
-            std::path::Path::new(&foreign).exists(),
-            "consumed another process's temp file"
-        );
-        assert_eq!(strays(), Vec::<String>::new());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Streaming a layer in windows produces the same file the whole-layer buffer did, and
     /// keeps doing so when the block count is not a multiple of the window.
     ///
@@ -2078,12 +2017,6 @@ mod tests {
     ///
     /// `blocks = 7` against `per = 2` deliberately leaves a short final window; an off-by-one
     /// there writes 8 blocks or 6, and the length assertion catches it.
-    ///
-    /// **What this test does NOT cover, established by trying:** it does not detect a window
-    /// buffer being reused without clearing. It was written believing it did, and the
-    /// red-proof — deleting the per-window `fill(0)` — left it green, which is how that memset
-    /// turned out to be defending against a path that does not exist. Recording the negative
-    /// because the next person to look at the reuse will have the same worry.
     #[test]
     fn a_windowed_expert_layer_is_byte_identical_to_the_buffered_one() {
         let dir = tmpdir("expert_layer");
@@ -2113,6 +2046,15 @@ mod tests {
         let path = format!("{dir}/L03.f4");
         let n =
             write_expert_layer(&path, &header, stride, bytes, blocks, 2 * stride, fill).unwrap();
+
+        // A zero stride is REFUSED, not clamped. It used to be `stride.max(1)`, which turned a
+        // caller's bad geometry into a panic inside `chunks_exact_mut(0)` two functions away.
+        let zero = format!("{dir}/L04.f4");
+        assert!(
+            write_expert_layer(&zero, &header, 0, 0, blocks, 2 * stride, fill).is_err(),
+            "stride 0 accepted"
+        );
+        assert!(!std::path::Path::new(&zero).exists(), "refused but created");
         let got = std::fs::read(&path).unwrap();
 
         assert_eq!(n as usize, buf.len(), "reported length");

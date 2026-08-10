@@ -154,10 +154,17 @@ fn ensure_group_aligned(
     group: usize,
     what: &str,
 ) -> Result<()> {
-    for (name, dim) in [("expert_in", expert_in), ("moe_inter", moe_inter)] {
+    // Named for the CONFIG KEY, not for the parameter. The reader of this message is holding a
+    // `config.json` and needs to know which field to look at; `expert_in 6144 is not a multiple
+    // of ...` makes them go find out what feeds `expert_in` first. Which key that is differs by
+    // model, so both candidates are named.
+    for (key, dim) in [
+        ("hidden_size / routed_expert_hidden_size", expert_in),
+        ("moe_intermediate_size", moe_inter),
+    ] {
         ensure!(
             dim.is_multiple_of(group),
-            "{name} {dim} is not a multiple of {what} {group} — expert rows would \
+            "{key} is {dim}, not a multiple of {what} {group} — expert rows would \
              silently truncate in a release build"
         );
     }

@@ -289,13 +289,8 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    (896 x 17.55 MB) on a 128 GB host whose RAM the GPU shares. `write_expert_layer`
    (`format.rs`) streams it in 1 GiB windows and keeps `fill_expert_blocks`'s thread-parallel
    pack inside each window — at K3's stride that is 61 blocks per window against ~32 threads,
-   so nothing serialises. Asserted byte-identical to the buffered form, including a short
-   final window.
-   One negative worth not re-deriving: a per-window `fill(0)`, added to stop one window's tail
-   reaching the next window's inter-block padding, is **unnecessary** — `fill_expert_blocks`
-   only ever exposes `&mut slot[..bytes]`, so padding is written by nobody and stays zero from
-   the single initial allocation. The red-proof (delete it, expect red) came back green, which
-   is the only reason we know; it was ~16 GiB of memset per K3 layer defending nothing.
+   so nothing serialises. Asserted byte-identical to the buffered form, short final window
+   covered. `write_atomic` went with it — after this there were no callers left.
 2. **Settle e8m0 `0xff`.** *(Tier 1.)* The reference maps 255 → zero; rivoli's `e8m0f` returns
    a quiet NaN and `quant.rs:748` **bails**. Item 11 settles the semantics for free; only the
    *presence* question needs bytes. Host and device must change together or the divergence is

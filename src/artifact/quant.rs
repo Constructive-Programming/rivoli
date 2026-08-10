@@ -276,12 +276,13 @@ fn expert_stride(bytes: usize) -> usize {
 /// `fill(e, &mut block[..bytes])` for each. The padding between `bytes` and `stride` is
 /// left as the caller found it.
 ///
-/// One implementation for both converters. The split is by DISJOINT `split_at_mut` slices
-/// rather than by index, so the borrow checker witnesses that no two workers can touch the
-/// same block — with indices, an off-by-one in the chunking would be an aliasing bug the
-/// compiler could not see, and the whole point of this loop is that expert `e` lands at
-/// exactly `e · stride`.
-pub fn fill_expert_blocks(
+/// Called only by `format::write_expert_layer`, which windows it — both converters reach it
+/// through there rather than filling a whole-layer buffer. The split is by DISJOINT
+/// `split_at_mut` slices rather than by index, so the borrow checker witnesses that no two
+/// workers can touch the same block — with indices, an off-by-one in the chunking would be an
+/// aliasing bug the compiler could not see, and the whole point of this loop is that expert
+/// `e` lands at exactly `e · stride`.
+pub(crate) fn fill_expert_blocks(
     buf: &mut [u8],
     stride: usize,
     bytes: usize,
