@@ -87,9 +87,9 @@ struct Args {
 /// Names are V4's own — `layers.{l}.attn.wq_a`, not `model.layers.{l}.self_attn.q_a_proj`.
 /// The artifact describes a V4 model; translating into GLM's scheme would be a second
 /// naming convention to get wrong, and the decode path has to learn V4's either way.
-fn write_layer_resident(
-    w: &mut SafeWriter,
-    src: &Safetensors,
+fn write_layer_resident<'a>(
+    w: &mut SafeWriter<'a>,
+    src: &'a Safetensors,
     cfg: &V4Config,
     l: usize,
 ) -> Result<()> {
@@ -205,7 +205,7 @@ fn write_layer_resident(
 /// `wkv`/`wgate` are bf16 on disk but `Compressor.__init__` declares them fp32 and its
 /// forward runs `x.float()` — "compression need fp32", per the reference's own comment.
 /// Widening them here is therefore the reference's arithmetic, not a choice.
-fn write_compressor(w: &mut SafeWriter, src: &Safetensors, base: &str) -> Result<()> {
+fn write_compressor<'a>(w: &mut SafeWriter<'a>, src: &'a Safetensors, base: &str) -> Result<()> {
     w.copy_verbatim(src, &format!("{base}.ape"), Dtype::F32)?;
     for t in ["norm.weight", "wgate.weight", "wkv.weight"] {
         w.add_widened(src, &format!("{base}.{t}"))?;

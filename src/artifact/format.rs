@@ -145,19 +145,55 @@ impl Dtype {
     }
 }
 
-/// Minimal safetensors writer for the resident artifact — collects tensors, then
-/// serializes `u64 header_len ‖ JSON header ‖ concatenated data`. Owns each tensor's
-/// bytes until `write` (the resident set is ~10 GiB, held once in host RAM).
-#[derive(Default)]
-pub struct SafeWriter {
-    tensors: Vec<(String, Dtype, Vec<usize>, Vec<u8>)>,
+/// Where one tensor's bytes come from.
+///
+/// `Borrowed` points into the source's mmap and costs **no host RAM**; `Owned` is for the
+/// tensors a converter actually has to compute (a widened bf16→f32 norm, an e8m0→f32 scale
+/// grid). The split exists because the resident set is not always small: GLM's is ~10 GiB
+/// and fitted in RAM, but **Kimi-K3's is 113.49 GB** — 108.81 of bf16 trunk plus 4.70 of
+/// embed and lm_head — which does not, on a 128 GB box. Every large K3 tensor is a verbatim
+/// copy, so every large K3 tensor borrows and never lands in host memory at all.
+enum Payload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
 }
 
-impl SafeWriter {
+impl Payload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Payload::Borrowed(b) => b.len(),
+            Payload::Owned(v) => v.len(),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Payload::Borrowed(b) => b,
+            Payload::Owned(v) => v,
+        }
+    }
+}
+
+/// Minimal safetensors writer for the resident artifact — collects tensor descriptors, then
+/// serializes `u64 header_len ‖ JSON header ‖ concatenated data`, streaming each tensor
+/// straight through a `BufWriter` in the order it was added.
+///
+/// **Borrows rather than owns wherever it can** ([`Payload`]): host-RAM peak is the sum of
+/// the *converted* tensors only, not of the artifact. The lifetime is the source
+/// [`Safetensors`]'s, so open the source before the writer — every converter already does.
+#[derive(Default)]
+pub struct SafeWriter<'a> {
+    tensors: Vec<(String, Dtype, Vec<usize>, Payload<'a>)>,
+}
+
+impl<'a> SafeWriter<'a> {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Add a tensor whose bytes the caller computed. There is deliberately no public
+    /// borrowing twin: the borrow paths are the `copy_*` methods below, which know the
+    /// source is a [`Safetensors`] mmap and can prove the dtype matches before borrowing.
     pub fn add(
         &mut self,
         name: impl Into<String>,
@@ -165,7 +201,8 @@ impl SafeWriter {
         shape: Vec<usize>,
         bytes: Vec<u8>,
     ) {
-        self.tensors.push((name.into(), dtype, shape, bytes));
+        self.tensors
+            .push((name.into(), dtype, shape, Payload::Owned(bytes)));
     }
 
     /// Add an fp8 weight and its f32 block scale under this engine's two resident names,
@@ -175,31 +212,33 @@ impl SafeWriter {
     fn add_fp8_pair(
         &mut self,
         name: &str,
-        weight: &[u8],
+        weight: Payload<'a>,
         shape: &[usize],
-        scale: Vec<u8>,
+        scale: Payload<'a>,
         sshape: &[usize],
     ) {
-        self.add(
-            format!("{name}.weight"),
-            Dtype::F8E4M3,
-            shape.to_vec(),
-            weight.to_vec(),
-        );
-        self.add(
-            format!("{name}.weight_scale_inv"),
-            Dtype::F32,
-            sshape.to_vec(),
-            scale,
-        );
+        for (suffix, dtype, shape, payload) in [
+            ("weight", Dtype::F8E4M3, shape, weight),
+            ("weight_scale_inv", Dtype::F32, sshape, scale),
+        ] {
+            self.tensors
+                .push((format!("{name}.{suffix}"), dtype, shape.to_vec(), payload));
+        }
     }
 
     /// Copy an fp8 tensor (`<name>.weight` F8E4M3 + `.weight_scale_inv` F32) from a
     /// reader verbatim — the resident attn/dense/indexer projections.
-    pub fn copy_fp8(&mut self, src: &Safetensors, name: &str) -> Result<()> {
+    pub fn copy_fp8(&mut self, src: &'a Safetensors, name: &str) -> Result<()> {
         let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
         let (sc, ssh) = src.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
-        self.add_fp8_pair(name, w, shape, sc.to_vec(), ssh);
+        // Both halves are already what the loader wants, so both borrow the mmap.
+        self.add_fp8_pair(
+            name,
+            Payload::Borrowed(w),
+            shape,
+            Payload::Borrowed(sc),
+            ssh,
+        );
         Ok(())
     }
 
@@ -224,7 +263,7 @@ impl SafeWriter {
     /// because that is this engine's name for "the f32 block multiplier of an fp8 weight",
     /// and it is what `dequant_fp8` and `pin.rs` read. A tensor of a different dtype under
     /// the source's name would be the more confusing of the two.
-    pub fn copy_fp8_e8m0(&mut self, src: &Safetensors, name: &str) -> Result<()> {
+    pub fn copy_fp8_e8m0(&mut self, src: &'a Safetensors, name: &str) -> Result<()> {
         let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
         let (sc, ssh) = src.typed(&format!("{name}.scale"), Dtype::F8E8M0)?;
         let block = crate::artifact::quant::FP8_BLOCK;
@@ -243,7 +282,8 @@ impl SafeWriter {
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("{name}.scale"))?
             .concat();
-        self.add_fp8_pair(name, w, shape, f32b, ssh);
+        // The weight borrows; only the widened scale grid materializes.
+        self.add_fp8_pair(name, Payload::Borrowed(w), shape, Payload::Owned(f32b), ssh);
         Ok(())
     }
 
@@ -251,15 +291,18 @@ impl SafeWriter {
     /// already what the loader wants (`attn_sink` and the `hc_*` tables are F32; `embed`
     /// and `head` stay BF16 because whether to requantize them is a QUALITY decision with
     /// a measurement attached, not a conversion detail to settle here).
-    pub fn copy_verbatim(&mut self, src: &Safetensors, name: &str, dtype: Dtype) -> Result<()> {
+    pub fn copy_verbatim(&mut self, src: &'a Safetensors, name: &str, dtype: Dtype) -> Result<()> {
         let (b, shape) = src.typed(name, dtype)?;
-        self.add(name, dtype, shape.to_vec(), b.to_vec());
+        // Borrowed, not copied: this is the path K3's 108.81 GB of bf16 trunk rides, and
+        // `.to_vec()` here was what made a K3 conversion impossible on a 128 GB host.
+        self.tensors
+            .push((name.into(), dtype, shape.to_vec(), Payload::Borrowed(b)));
         Ok(())
     }
 
     /// Add a bf16 tensor from a reader, widened to f32 (norms, router gate,
     /// weights_proj, k_norm — everything the loader reads as f32).
-    pub fn add_widened(&mut self, src: &Safetensors, name: &str) -> Result<()> {
+    pub fn add_widened(&mut self, src: &'a Safetensors, name: &str) -> Result<()> {
         let (bytes, shape) = src.typed(name, Dtype::Bf16)?;
         let f32b: Vec<u8> = bytes
             .chunks_exact(2)
@@ -273,9 +316,9 @@ impl SafeWriter {
         use std::io::Write;
         let mut hdr = serde_json::Map::new();
         let mut offset = 0usize;
-        for (name, dtype, shape, bytes) in &self.tensors {
+        for (name, dtype, shape, payload) in &self.tensors {
             let begin = offset;
-            offset += bytes.len();
+            offset += payload.len();
             hdr.insert(
                 name.clone(),
                 serde_json::json!({ "dtype": dtype.name(), "shape": shape, "data_offsets": [begin, offset] }),
@@ -286,8 +329,8 @@ impl SafeWriter {
         let mut f = std::io::BufWriter::new(file);
         f.write_all(&(hjson.len() as u64).to_le_bytes())?;
         f.write_all(&hjson)?;
-        for (_, _, _, bytes) in &self.tensors {
-            f.write_all(bytes)?;
+        for (_, _, _, payload) in &self.tensors {
+            f.write_all(payload.bytes())?;
         }
         f.flush()?;
         Ok(())
@@ -1449,6 +1492,59 @@ mod tests {
         assert_eq!(sh, &[2, 4]);
         assert!(st.typed("a", Dtype::I8).is_err()); // dtype mismatch fails loud
         assert!(!st.has("missing"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The BORROWING copy paths must produce byte-identical output to the owning one.
+    ///
+    /// `SafeWriter` stopped `to_vec()`-ing verbatim tensors so a 113.49 GB K3 resident set
+    /// could be written on a 128 GB host (see [`Payload`]). That is a pure plumbing change
+    /// and it must be invisible in the bytes — GLM's 675 GiB and V4's ~146 GiB of published
+    /// artifacts are read back by offset, so a shifted `data_offsets` or a reordered tensor
+    /// would invalidate both without any error surfacing.
+    ///
+    /// **This goes red on any of them:** a byte that fails to copy, an offset computed from
+    /// the wrong length, or the pair emitted in the other order (the header is a JSON map,
+    /// but `data_offsets` are assigned in insertion order, so swapping `weight` and
+    /// `weight_scale_inv` changes the file while keeping every name and shape intact).
+    #[test]
+    fn borrowed_and_owned_payloads_write_the_same_bytes() {
+        let dir = tmpdir("borrow_test");
+        // A source with one verbatim tensor and one fp8 pair, i.e. one tensor per borrow
+        // path: `copy_verbatim` (K3's trunk rides this) and `copy_fp8` (both halves).
+        let src_path = format!("{dir}/src.safetensors");
+        let bf16: Vec<u8> = (0..24u8).collect();
+        let w8: Vec<u8> = (0..8u8).map(|b| b | 0x38).collect();
+        let sc: Vec<u8> = (0..4u32)
+            .flat_map(|i| (i as f32 + 1.0).to_le_bytes())
+            .collect();
+        let mut s = SafeWriter::new();
+        s.add("t", Dtype::Bf16, vec![3, 4], bf16.clone());
+        s.add("p.weight", Dtype::F8E4M3, vec![2, 4], w8.clone());
+        s.add("p.weight_scale_inv", Dtype::F32, vec![1, 4], sc.clone());
+        s.write(&src_path).unwrap();
+        let src = Safetensors::open_file(&src_path).unwrap();
+
+        // Arm 1: the borrow paths.
+        let borrowed = format!("{dir}/borrowed.safetensors");
+        let mut b = SafeWriter::new();
+        b.copy_verbatim(&src, "t", Dtype::Bf16).unwrap();
+        b.copy_fp8(&src, "p").unwrap();
+        b.write(&borrowed).unwrap();
+
+        // Arm 2: the same tensors, in the same order, through the owning entry point.
+        let owned = format!("{dir}/owned.safetensors");
+        let mut o = SafeWriter::new();
+        o.add("t", Dtype::Bf16, vec![3, 4], bf16);
+        o.add("p.weight", Dtype::F8E4M3, vec![2, 4], w8);
+        o.add("p.weight_scale_inv", Dtype::F32, vec![1, 4], sc);
+        o.write(&owned).unwrap();
+
+        assert_eq!(
+            std::fs::read(&borrowed).unwrap(),
+            std::fs::read(&owned).unwrap(),
+            "borrowing changed the bytes on disk"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
