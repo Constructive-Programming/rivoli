@@ -282,7 +282,27 @@ fn moe_reference(
         let mut down = vec![0.0f32; hidden];
         mv(&mut down, &h, ex, 2, hidden, inter);
         for (o, d) in down.iter().enumerate() {
-            want[o] += we * d;
+            // THE FIXTURE'S PRECONDITION, asserted where it can name the expert. The GPU
+            // path runs every per-expert contribution through `moe_fixed`, which SATURATES
+            // at +/-MOE_ACC_MAX = 2^(58 - MOE_ACC_SHIFT) = 2^14 (common.hpp; not exported to
+            // Rust, so derived here) — this reference does not, so a fixture whose
+            // magnitudes exceed the clamp makes every comparison against it garbage in a way
+            // that reads as a kernel bug. MEASURED 2026-08-09, the hard way: the first
+            // multi-trip fixture drew weights up to +/-4 at 1280/1024, its reference peaked
+            // at 1.055e5, the GPU clamped at 1.6384e4, and the device test failed by 845x
+            // against a STOCK kernel that three other tests were passing at 1e-6 — err
+            // equalled max - 2^14 to three figures. The hazard was already written down in
+            // dot_bench.rs's `run_glm_i4` ("scales small enough that partials stay far
+            // under moe_fixed's +/-2^14 saturation") and the fixture ignored it.
+            let contrib = we * d;
+            assert!(
+                contrib.abs() < 16384.0,
+                "fixture drives moe_fixed into saturation: |{contrib:.3e}| >= 2^14 at expert \
+                 {ex} output {o} — the GPU clamps here and this reference does not, so the \
+                 comparison would fail against a CORRECT kernel. Shrink the fixture's \
+                 magnitudes; do not widen any tolerance."
+            );
+            want[o] += contrib;
         }
     }
     want
@@ -1119,8 +1139,19 @@ fn i4_multi_trip_fixture() -> I4Case {
         // disagrees. `2^(g % 3)` rather than `moe_i4_matches_reference`'s `4^g`: at
         // `i_dim = 1280` there are 10 groups and `4^9` is 2.6e5, which would put the whole
         // comparison at the mercy of one group's magnitude instead of testing indexing.
+        //
+        // The 0.02 is NOT tuning — it is what makes the comparison against the unclamped CPU
+        // reference valid at all, and it was measured in, not guessed (2026-08-09). At the
+        // first draft's +/-4 weights, sigma(gate dot) ~ 31 over 1280 columns, h ~ silu(g)*u
+        // reached O(1e4), and the down pass peaked at 1.055e5 — 6.4x past `moe_fixed`'s 2^14
+        // saturation — so the DEVICE test failed by 845x against a stock kernel while the
+        // host-only red-target test, which never crosses the GPU, passed and certified
+        // nothing about it. At 0.02 the reference peaks O(1) with four orders of headroom,
+        // and `moe_reference`'s clamp assert now makes this precondition loud instead of a
+        // comment. Quantization noise scales down with the weights, so the tolerance's
+        // relative form keeps the same discrimination.
         let wv: Vec<f32> = (0..o_dim * i_dim)
-            .map(|n| r.f() * 2f32.powi((((n % i_dim) / I4_GROUP) % 3) as i32))
+            .map(|n| r.f() * 0.02 * 2f32.powi((((n % i_dim) / I4_GROUP) % 3) as i32))
             .collect();
         quant_i4(&wv, o_dim, i_dim)
     });

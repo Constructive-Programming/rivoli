@@ -1,7 +1,7 @@
 ---
 scope: glm
 status: live
-verdict: MEASURED 2026-08-09, seven arms, two counterbalanced passes, primary rows replicated to within 1.6%, no live foreign KFD holder in any of 28 witness samples. THE fp4 LEVER TRANSFERS: `#pragma unroll 4` on `dot_i4_wave_r` is **+12.6% at R=1, +16.4% at R=2, +20.1% at e_count=1**, fingerprint-identical on BOTH token rows; unroll 2 is +11.6%/+3.0%/+15.4%. **The registered depth-2 bands both HIT** (C1: +11.6% in +10..+25, +3.0% in +0..+15); depth 4 was never banded. The plan's R=2 register-pressure worry was wrong twice: the ISA refuted the occupancy story pre-device (depth 4 at R=2 is 10 waves/SIMD, where fp4's winning arm sat, zero spill) and R=2 then gained MORE than R=1. Three further results. (1) The AS1/`flat_load` gap this investigation discovered is REAL AND FREE: arm G took `flat_load_b32` 18 -> 0 device-wide and removed the `lgkmcnt` coupling at identical VGPR/occupancy/instruction count, and moved the rate +0.2%/-0.3%/-0.6% — closed as a measured negative. GC2 is additive over C2 and G to within 1.2%, so the coupling hypothesis is UNSUPPORTED at this round's ~1.6% resolution — not refuted, which is more than n=2 at this spread can say. (2) The ballast INVERTS M11: stripping the decode and every FMA buys +0.5%/-1.1%/-1.0% here against fp4's +12.8%, so the decode is free AT THE UN-UNROLLED SCHEDULE; whether it binds at depth 4 is unmeasured (no matched-depth ballast ran). (3) That makes this stretch's own registered kill MIS-SPECIFIED — a small ballast gap means the DECODE is not the limiter, which is consistent with the DRAIN being it; firing it would have closed a stretch that had just found a +16% lever. X moved all three fingerprints while staying non-degenerate, so bit-identity is a gate demonstrated in both directions; B1's fingerprints are DEGENERATE and its four cross-arm checks passed vacuously. The 20 MB sub-MALL control read a two-pass mean 314.2 GB/s (123% of bus) against 125.9 rotating — a naive one-range harness reports this kernel 2.49x faster than it is. **This is a serial idle-device kernel rate**: M11b measured only 55-69% of an equivalent fp4 saving reaching the wall, and this plan's own point 2 (the fetch stream saturating the same controllers) is untested and OPEN. NOT MERGED, no wall claim: G4 still needs a multi-trip test at hidden=1280/inter=1024 (GLM's 24 and 8 trips are both divisible by 4, so no unroll remainder is ever entered) and a byte-identical `--mode int4` engine A/B.
+verdict: MEASURED 2026-08-09 and the pragma is APPLIED ON-BRANCH 2026-08-10; device re-verification of the G4 test and the G5 engine A/B are queued for the next grant. THE fp4 LEVER TRANSFERS: `#pragma unroll 4` on `dot_i4_wave_r` is **+12.6% at R=1, +16.4% at R=2, +20.1% at e_count=1** (seven arms, two counterbalanced passes, primary rows replicated to within 1.6%), fingerprint-identical on BOTH token rows; the registered depth-2 bands both HIT; the plan's R=2 register-pressure worry was refuted in the ISA before the device and R=2 then gained MORE than R=1. Adjacent negatives, priced so nobody re-tries them: the AS1/`flat_load` gap is real and FREE (arm G: flat_load 18->0 device-wide, +-0.6% rate; GC2 additive over C2+G, coupling hypothesis unsupported at ~1.6% resolution), and the ballast INVERTS M11 (+0.5%/-1.1% against fp4's +12.8% — the decode is free at the un-unrolled schedule, the whole gap was memory-level parallelism), which also makes this stretch's registered kill MIS-SPECIFIED (do-not-reuse note in place). G4: the multi-trip test exists at 1280/1024 (the only dims that enter the unroll epilogue; every engine dim is 0 mod 4) and its first fixture FAILED ON DEVICE against a stock kernel by 845x — root-caused by arithmetic to `moe_fixed` SATURATION (err = max - 2^14 to three figures; weights drawn 50x too hot against a hazard the author had already documented in dot_bench.rs), fixed by scaling the draw 0.02x, re-proven red-and-green on host (190x / err=0 fires), and `moe_reference` now asserts every per-expert contribution under the clamp — proven to fire on the exact defective fixture, so this class dies at the first host run and can never reach a device again. The 20 MB sub-MALL control read 2.49x the rotating rate — a naive one-range harness overstates this kernel 2.49x. Serial idle-device rates only; M11b measured 55-69% of an equivalent fp4 saving reaching the wall and GLM is ~half fetch exposure, so the G5 A/B (n=1, 128 tokens, byte-identity the binding gate, moe-span verdict moved/did-not-move/inconclusive only) decides the record, not a wall claim. NOT MERGED until the queued device work is green.
 ---
 
 # Does GLM's int4 MoE loop have the same MLP gap fp4 had?
@@ -116,6 +116,28 @@ non-degenerate, and **demonstrated red against a deliberately reassociated body*
 > flock — the known `hr-fleet` gap). It cannot explain an 845x numerical disagreement, and
 > the three control tests passed under the identical condition, but the arm is not
 > witness-clean and is recorded as such.
+
+> **ROOT-CAUSED 2026-08-10, host-only, by the fixture's author: `moe_fixed` SATURATION.**
+> The identification is arithmetic, not narrative — the GPU clamps every per-expert
+> contribution at ±`MOE_ACC_MAX` = 2^(58−44) = **16384** (`common.hpp::moe_fixed`); the CPU
+> reference does not; and the measured failure is **`err = max − 2^14` to three significant
+> figures** (1.055e5 − 1.6384e4 = 8.912e4 against the measured 8.910e4). The first fixture
+> drew weights up to ±4, which at 1280 columns puts σ(gate·x) ≈ 31, h = silu(g)·u at O(10³–10⁴),
+> and the down pass at O(10⁵) — 6.4× past the clamp. **The hazard was already written down, by
+> the same author, in `dot_bench.rs::run_glm_i4`** ("scales small enough that the partials stay
+> far under `moe_fixed`'s ±2^14 saturation") — the probe respected it and the test fixture
+> ignored it. This is also why the host red-target passed while the device test failed: the
+> red-target never crosses the GPU, so it certifies the tolerance and nothing about the launch.
+>
+> **Fixed by measurement, and double-guarded:** the fixture's weight draw is scaled by 0.02
+> (reference now peaks O(1), four orders under the clamp; the red-target re-proven at the new
+> magnitudes: `err=3.227e-1` vs `tol=1.694e-3` = **190×**, and re-proven RED with the injection
+> neutered), and `moe_reference` itself now **asserts every per-expert contribution is under
+> the clamp** — proven to fire on the exact defective fixture (`|2.124e4| >= 2^14 at expert 0
+> output 0`), so this class cannot reach a device again: it dies at the first host run.
+> `moe_i4_matches_reference`'s magnitudes pass the new guard, and its 9.766e-4 on-device error
+> is itself proof its contributions never clamped. Device re-verification of the multi-trip
+> test is queued for the next grant, alongside the broken-kernel red proof.
 
 **G4 — the shippability decision.** *[SHARPENED 2026-08-09 by the G1 correctness review, which
 went and looked at what the suite actually covers rather than assuming the fp4 precedent
@@ -551,16 +573,31 @@ arm order with n = 2 per side, `flock` with the witness either side of every arm
 with a live foreign holder discarded. Both binaries built before the device is requested and
 nothing rebuilt between arms.
 
+> **LEANED 2026-08-10 at the coordinator's instruction, and the trade is stated rather than
+> hidden: n = 1 per side at `-bench 128`, ~65 s/arm at GLM's ~2 tok/s.** Byte-identity is the
+> gate that matters here — it is binary at any n — and the span movement is reported against
+> the registered bands with the caveat that **n = 1 cannot separate a small span delta from
+> run-to-run variance** (this artifact's decode carries a known OPEN run-to-run divergence,
+> `benchmarks.md` "Long-run divergence", so a single pair's timing delta is indicative only;
+> the moe-band verdict at n = 1 is "moved / did not move / inconclusive", never a point
+> estimate with authority). Order still counterbalanced (S,U then U,S would need n = 2 — at
+> n = 1 the two arms simply run once each, order recorded). Everything else above stands.
+
 ## What G3 and G4 still need before anything ships
 
-C2 qualifies on the decision rule (fingerprint-identical AND ≥ +10%). **It is not merged**, and
-the two things standing between it and a merge are known:
-- **G4's multi-trip test does not exist yet.** At GLM's dims (24 and 8 trips, both divisible by
-  4) no unroll remainder is ever entered, so the shipped fixtures cannot see the epilogue the
-  pragma creates. The fixture is specified in G4 below: `ne = 1` at `hidden = 1280, inter = 1024`
-  (5 and 4 trips), shown RED against an injected past-the-first-trip defect.
-- **an engine A/B on `--mode int4`**, `--max-mem` and `--cache-policy` held fixed, byte-identical
-  output. No wall claim is made or implied by this round.
+*[UPDATED 2026-08-10 — the goal is now MERGE, per the coordinator. State of each item:]*
+
+C2 qualifies on the decision rule (fingerprint-identical AND ≥ +10%). **`#pragma unroll 4` is
+now APPLIED on this branch** (`kernels/common.hpp::dot_i4_wave_r`, comment carries the
+measurements; in-tree ISA re-read reproduces the C2 arm exactly — VGPR 88/123/83/95, occupancy
+16/10/16/16, zero spill). Between it and MERGE-READY:
+
+- **G4's multi-trip test EXISTS and is host-proven; its device half is QUEUED.** Fixture at
+  1280/1024, saturation root-caused and double-guarded (see the dated notes under G3/G4). The
+  next device grant must show: **green on stock**, **red on an injected `n7` break** (scratch
+  tree), **green on the unrolled kernel**, plus the full int4 suite.
+- **the G5 engine A/B on `--mode int4`**, protocol and bands registered above, leaned to
+  n = 1 / 128 tokens per the dated note.
 
 ## G1 — the probe as staged (SUPERSEDED 2026-08-09 by the measurement above; kept for the staging argument)
 

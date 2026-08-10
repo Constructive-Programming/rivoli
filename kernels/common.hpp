@@ -401,14 +401,32 @@ __device__ __forceinline__ void dot_i4_wave_r(const float* __restrict__ v, int v
     int base = 0;
     if ((((size_t)row) & 3u) == 0) {
         const unsigned int* rw = (const unsigned int*)row;
-        // NOT unrolled, and that is a gap rather than a decision. `dot_f4_wave_r` below is
-        // the identical shape and M11 measured +17.7% on it from one `#pragma unroll 2`
-        // (benchmarks.md "V4 M11 fp4 resident-kernel round"): this loop drains in-body too,
-        // one iteration of loads in flight. It is left alone because NOTHING has measured it
-        // here — this is GLM's int4/hybrid-HOT resident path, with its own residency and
-        // batching behaviour, and unlike fp4 it instantiates R = 2 for speculative decode, so
-        // the register cost of the same pragma lands differently. Do not copy the fp4 number
-        // across; measure it. Registered as the next stretch in §M11.
+        // Unrolled 2026-08-09, MEASURED, not copied from fp4. Un-pragma'd, this loop issued
+        // 4 (R=1) / 6 (R=2) loads and drained them all in-body — `vmcnt(3) lgkmcnt(0)` down
+        // to `vmcnt(0)`, one iteration in flight, M7's disease and the same gap M11 fixed on
+        // `dot_f4_wave_r` below. `dot_bench glmi4` at the artifact's dims (6144x2048, 1.083 GB
+        // rotating past the 32 MB MALL, two counterbalanced passes, benchmarks.md "GLM int4
+        // MoE unroll round"): depth 4 is **+12.6% at R=1 (169.2 -> 190.6 GB/s), +16.4% at
+        // R=2 (163.3 -> 190.1), +20.1% at e_count=1 (125.9 -> 151.3)**, fingerprint-identical
+        // on BOTH token rows; depth 2 gave +11.6%/+3.0%, so depth 4 is the rung that pays at
+        // the R=2 width speculative decode actually runs.
+        //
+        // The register cost the un-unrolled comment here worried about was measured FIRST and
+        // does not bite: depth 4 is VGPR 88/123/83/95 across the four kernels, occupancy 16
+        // everywhere except gateup_r2 at 10 waves/SIMD — exactly where fp4's winning arm sat —
+        // zero spill, zero scratch. Two adjacent negatives, priced in the same round so nobody
+        // re-tries them: AS1-typing these pointers (the fp4 `gu8p` treatment; flat_load ->
+        // global_load, the lgkmcnt coupling gone) measured +-0.6% == nothing, and a ballast
+        // with the whole nibble decode and every FMA removed measured +0.5%/-1.1% — the decode
+        // is FREE at the un-unrolled schedule, so the entire gap was memory-level parallelism.
+        //
+        // Fold order is unchanged — each accumulator stays one serial fadd chain, ascending
+        // `base` (the fingerprint gate would have caught anything else; arm X, a deliberate
+        // even/odd split, moved it and was measured doing so). Multi-trip coverage INCLUDING
+        // the remainder loop this pragma creates: tests/kernel.rs::
+        // the_i4_dword_path_matches_the_oracle_at_multiple_trips (1280/1024 = 5 and 4 trips;
+        // every engine dim is 0 mod 4, so only that fixture ever enters the epilogue).
+#pragma unroll 4
         for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
             int col = base + lane * 8;
             unsigned int w = rw[col >> 3];              // 8 nibbles = 8 consecutive columns
