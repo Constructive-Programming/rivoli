@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: Kimi-K3's forward pass, extracted from the C reference at ff11dce (2026-08-07) and precise enough to write kernels from. 93 layers: 69 KDA (linear attention, delta rule, per-key-channel decay, short causal conv k=4 with fused SiLU) + 24 gated MLA at one-based 4,8,...,88,92,93 — note 92 and 93 are ADJACENT, breaking the every-fourth pattern. NoPE throughout: the 64 rope dims exist, are cached, are SCORED, and are never rotated. Block Attention Residuals are a multi-residual-stream scheme snapshotting at zero-based layers 0,12,...,84 and mixing <=9 sources by softmax twice per layer plus once model-level. MoE routes on FULL hidden width, then down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects back, and adds ONE fused shared MLP unweighted — first-party confirmed as [7168,6144] BF16 on disk, trunk-side, one set per layer. Router bias steers selection only; weights come from the UNBIASED sigmoid, renormalised over the 16. Trunk is bf16 at 108.81 GB; 113.49 GB is trunk plus embed and lm_head, a conflation k3.h:14 is explicitly headed to prevent. Twelve named order-of-operations traps, each of which runs cleanly and produces a wrong model. VERIFIED against the checkpoint's own modeling code 2026-08-10: structure first-party via the safetensors index, and MLA/AttnRes/MoE/router/SiTU-GLU confirmed line-by-line against modeling_kimi_linear.py — with two corrections (assert the layer-array PARTITION, since the C and first-party each consume the opposite array; A_log ships [128] on disk against the modeling code's own [96]) and one divergence found IN the C reference (MLA's two LoRA norms take eps 1e-6 first-party, the C passes 1e-5). The KDA inner arithmetic and the MXFP4 unpack remain third-party — first-party delegates them to fla-core and compressed-tensors — so the S1b anchor RUNS the first-party stack rather than reading it.
+verdict: Kimi-K3's forward pass, precise enough to write kernels from — extracted from the C reference at ff11dce, then verified against the checkpoint itself (safetensors index for structure; modeling_kimi_linear.py line-by-line for MLA/AttnRes/MoE/router/SiTU-GLU). 93 layers: 69 KDA (delta rule, per-key-channel decay, short conv k=4 with fused SiLU) + 24 gated MLA at zero-based 3,7,...,87,91,92 — the last two ADJACENT. NoPE: the 64 rope dims are cached and SCORED but never rotated. AttnRes mixes <=9 residual snapshots by softmax twice per layer plus once model-level. MoE routes on FULL width, down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects, adds ONE fused shared MLP ([7168,6144] BF16, trunk-side) unweighted; router bias steers selection only and weights come from the UNBIASED sigmoid renormalised over the 16. Trunk bf16 108.81 GB (113.49 with embed/lm_head). Twelve order-of-operations traps in section 10, each of which runs cleanly and produces a wrong model. Corrections recorded inline: assert the layer-array PARTITION (the C and first-party each consume the opposite array), A_log ships [128] against the modeling code's own [96], and the C DIVERGES from first-party on the MLA LoRA-norm eps (1e-5 vs 1e-6). Still third-party: the KDA inner arithmetic (fla-core) and the MXFP4 unpack (compressed-tensors) — S1b's anchor runs the first-party stack to cover both.
 ---
 
 # Kimi-K3 — the forward pass
@@ -13,29 +13,16 @@ end"), cross-checked against the shipped `config.json`.
 This is written to be implementable, not readable. `docs/investigations/k3-port.md` is the
 plan; this is the specification it builds against.
 
-**Two separate caveats, and only one of them is now discharged.**
-
-*Transcription:* this was first extracted through a summarizing fetch layer, which is the wrong
-thing to have between a source and a spec. **It has since been re-verified against the raw
-pinned source** (downloaded and read directly, not summarized): every quoted C block matches
-real code, and six defects found in that pass are fixed here. Where a block is abridged it is
-by elision only — `k3_attn_res`'s `score[]`/`z` declarations and its max-subtracted softmax are
-elided behind a comment, and various `(size_t)` casts and guards are dropped. **No block below
-is a compilable transcript; each is faithful to the arithmetic.**
-
-*Single-sourcing:* **not discharged, and weaker than it looks.** Everything here is what **one**
-C reimplementation asserts. It claims per-layer conformance against the released model, but its
-own strongest parity evidence is **one position of the 5-token prompt `$%&'(`**, which its
-`docs/data/generations.txt` calls "synthetic junk, not text".
-
-**Structure is discharged first-party; arithmetic mostly is too, as of 2026-08-10.** The
-safetensors index confirmed every shape, dtype and tensor family (G0 item 10 — all 50 families
-map to a section, nothing unexplained). G0 item 11 then verified this document against the
-checkpoint's own `modeling_kimi_linear.py`: **MLA, AttnRes, MoE, the router and SiTU-GLU are
-first-party confirmed line-by-line.** What remains third-party: **the KDA inner arithmetic**
-(first-party delegates it to `fla-core` — see §4) and **the MXFP4 unpack** (nowhere in the
-shipped Python; it lives in the compressed-tensors library). The plan's S1b anchor — run the
-first-party stack and emit goldens — covers both.
+**Provenance, one paragraph.** First extracted through a summarizing fetch layer, then
+re-verified against the raw pinned C source (every quoted block matches; abridgements are
+elisions, marked — no block is a compilable transcript). Verified against the checkpoint
+itself 2026-08-10: **structure** via the safetensors index (all 50 tensor families map to a
+section, nothing unexplained) and **arithmetic** via `modeling_kimi_linear.py` — MLA, AttnRes,
+MoE, router and SiTU-GLU confirmed line-by-line, corrections and one C-divergence recorded
+inline at §2, §4 and §5. Still third-party: **the KDA inner arithmetic** (first-party
+delegates to `fla-core`, §4) and **the MXFP4 unpack** (compressed-tensors, §9) — and the C
+reference's own parity evidence is one position of the junk prompt `$%&'(`, so the plan's S1b
+anchor *runs* the first-party stack rather than trusting either document.
 
 ## 1. Shapes
 

@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET, and must be proven able to go red before it is trusted green. S0 IS DONE and G0 is MET (2026-08-10, third pass — reopened twice, both times by the same lesson: "no checkpoint download" never excluded metadata, and the checkpoint's ~156 KB of first-party modeling code was metadata too). Item 11 verified the architecture doc against modeling_kimi_linear.py: MLA, AttnRes, MoE, router and SiTU-GLU confirmed line-by-line; the kda_layers guidance was INVERTED (each implementation consumes the opposite array — assert the partition); A_log ships [128] on disk against the modeling code's own [96]; and the C reference itself DIVERGES from first-party on MLA's LoRA-norm eps (1e-6 vs 1e-5). The 4 KDA-arithmetic traps live in fla-core, which first-party delegates to, so S1b's mandatory anchor RUNS the first-party stack at tiny dims and emits goldens. The index already confirmed the structure first-party: latent sandwich 7168->3584->7168, MLA at zero-based 3,7,...,87,91,92 with the last two ADJACENT, ONE fused shared MLP [7168,6144] BF16, per-expert bytes exactly 17,547,264, trunk 108.81 GB bf16 (113.49 with embed and lm_head), index total 1.4196 TiB, and every tensor family maps to a documented section. TWO BANDWIDTH ERRORS, both ours and both now fixed: the reference's 3.2 GB/s is a dd QD1 figure, and so is rivoli's own 7.0 — rivoli's probes measure 12.39-14.76 GB/s at the expert-read shape, so the prediction moves from ~0.27 to ~0.48-0.57 tok/s. The trunk IS re-read every token (93 binds), but that is confirmed by the bind count, NOT by timing: the reference's device delivered 2709-5874 MB/s on bit-identical work, a 2.17x spread with a 33.1% replication noise floor, so its ladder cannot discriminate the model either way. Reuse is wider than first thought (a bf16 GEMV exists, resident.safetensors takes Bf16, the .f4 shared-block work is void, the fp4 kernels are width-parametric) and one Tier-1 blocker remains: SafeWriter buffers every resident tensor in host RAM, so nothing converts until it streams. Only the 69 KDA layers are a wholly new kernel family, plus Block Attention Residuals which the plan did not know existed.
+verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET and must be proven able to go red before it is trusted green. S0 IS DONE and G0 IS MET (2026-08-10; the corrections it produced are recorded inline in reference/k3-architecture.md, which is now first-party-verified for everything except the KDA inner arithmetic and the MXFP4 unpack — those live in fla-core and compressed-tensors, so S1b's mandatory anchor RUNS the first-party stack at tiny dims and emits goldens). Traffic is 25.83 GB/token of experts (first-party confirmed) plus 108.81 GB of trunk when not resident; predicted ~0.48-0.57 tok/s with the resident set held, from rivoli's measured 12.39-14.76 GB/s at the expert-read shape — an earlier 0.27 came from a dd QD1 figure, the same instrument-class error found in the reference's own 3.2. The memory budget is the binding constraint (~5.7 GB residual at --max-mem 115; the resident set does not fit on the auto path) and nothing converts until SafeWriter streams. Only the 69 KDA layers are a wholly new kernel family, plus AttnRes. S1-S3 run on fixtures; S4 converts and decodes real weights on /swarm; S5 needs ~200 GiB more NVMe.
 ---
 
 # Kimi-K3 — implementation plan
@@ -17,11 +17,8 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
 
 - **Six stages, six gates.** S0 ground truth → S1 artifact + harness → S2 kernels → S3 layer
   loop → S4 real weights → S5 residency. §G.
-- **G0 is MET** (2026-08-10, third pass). Item 11 read the first-party modeling code raw:
-  8 of 12 traps confirmed, 2 doc claims corrected (`kda_layers` was inverted; `A_log` ships
-  [128] against the modeling code's own [96]), and the 4 KDA-arithmetic traps are attestable
-  only against **fla-core**, which first-party delegates to — S1b's anchor is defined to cover
-  exactly that.
+- **G0 is MET** (2026-08-10). §G0 for the record; corrections live inline in
+  `k3-architecture.md`.
 - **Only the 69 KDA layers are a wholly new kernel family**, plus AttnRes. The 24
   full-attention layers are MLA + q-LoRA, GLM's own family — but rivoli caches the **fp8
   latent** where the reference caches expanded fp32, a deviation under G3's zero-tolerance
@@ -246,15 +243,8 @@ Reference pinned at **`ff11dce858a2eb8a781224facdffd33a1fa48d25`** (2026-08-07).
 vendored under `docs/measurement/k3-reference/`. Forward pass extracted to
 `docs/reference/k3-architecture.md` and re-verified against raw pinned source.
 
-### G0 — **MET 2026-08-10**, on the third pass.
-
-> Item 11 ran: the first-party modeling code was read raw and every claim in
-> `k3-architecture.md` checked against it. **8 of 12 traps first-party confirmed; 2 doc claims
-> corrected; the 4 KDA-arithmetic traps are NOT attestable from the checkpoint at all** — its
-> own `modeling_kimi_linear.py` delegates them to the external `fla-core` library
-> (`chunk_kda` / `fused_recurrent_kda` / `ShortConvolution` / `FusedRMSNormGated`). That is a
-> recorded answer with a source, not an unknown: the truth for those four lives in fla, and
-> S1b's anchor is now defined to cover exactly that gap.
+### G0 — **MET 2026-08-10** (third pass; reopened twice, both times because "no checkpoint
+download" never excluded metadata).
 
 | # | question | answer | source |
 |---|---|---|---|
@@ -271,59 +261,18 @@ vendored under `docs/measurement/k3-reference/`. Forward pass extracted to
 | 10 | first-party index | **Done.** 497,220 tensors → 50 families, **every text-side family maps to a documented section**; `g_proj`/`o_proj` on all 93 (both families gate), `o_norm` on 69 (KDA only — confirming MLA gates without a norm), `mlp.*_proj` on exactly 1. **No tensor in the checkpoint is unexplained** | index |
 | **11** | **first-party modeling code** | **DONE 2026-08-10** — results below | `modeling_kimi_linear.py` @ HF, read raw |
 
-**Item 11 — results.** ~156 KB of first-party source (`modeling_kimi_linear.py` 51.5 KB,
-`configuration_kimi_k3.py`, `encoding_k3.py`, `tokenization_kimi.py`), admitted by the same
-"metadata, not weights" argument as the index, verified line-by-line against
-`k3-architecture.md`.
+**Item 11 — results.** ~156 KB of first-party source read raw and checked line-by-line
+against `k3-architecture.md`. **8 of 12 traps confirmed** (MLA, AttnRes, MoE, router, SiTU-GLU
+— the `M:` citations are recorded inline in that doc); **2 corrected** (the layer-array
+guidance was inverted, `k3-architecture.md` §2; `A_log` ships [128] on disk against the
+modeling code's own [96], §4); **1 divergence found in the C reference itself** (MLA's LoRA
+norms: eps 1e-6 first-party vs the C's 1e-5, §5); **4 not attestable from the checkpoint** —
+the KDA inner arithmetic delegates to `fla-core` and the MXFP4 unpack to compressed-tensors
+(§4, §9), which is what S1b's anchor now exists to cover.
 
-**First-party CONFIRMS, verbatim:** MLA in full (scale `192^-0.5` at M:357; `assert
-self.use_nope` and `rotary_emb = None` at M:396/403; rope dims scored unrotated; `kv_a_norm`
-latent-only; gate-then-`o_proj` with no norm at M:470-473; the cache holds expanded per-head
-k/v). AttnRes in full (**zero-based** `layer_idx % block_size == 0`; push-then-clear;
-softmax over the raw sources at M:1080-1087; the model-level third aggregation at M:1215).
-MoE in full (route-before-down-projection; RMSNorm the aggregate; the shared MLP is **one
-`KimiMLP` with `intermediate = moe_inter × n_shared`** at M:798-801, applied to the original
-input, unweighted, after up-projection). Router in full (bias to `scores_for_choice` only at
-M:723; weights gathered from the **unbiased** sigmoid at M:750; renorm over the 16 with
-`+1e-20`; the `routed_scaling_factor` multiply kept). SiTU-GLU exactly as specified, sigmoid
-on the uncapped gate, computed at f32.
-
-**First-party CONTRADICTS, two corrections applied to the docs:**
-
-- **`kda_layers` guidance was inverted.** The C reference consumes only `full_attn_layers`;
-  first-party `is_kda_layer` (C:152) consumes **only `kda_layers`** and derives MLA as the
-  complement — the exact mirror image. Neither array is "the derived one". The port must
-  **assert the partition**: both present, disjoint, union = 1..93, counts 69/24.
-- **`A_log`: the checkpoint disagrees with its own modeling code.** `modeling_kimi_linear.py`
-  declares it `[num_heads]` = **[96]** (M:520); the shard header ships **F32 [128]**. The C
-  reference — accept either length, use the first 96 per head — matches the *disk*, which is
-  what the converter reads. Accept [128], slice to [96], assert the rest.
-
-**First-party CANNOT ATTEST (4 of 12 traps): the KDA inner arithmetic.** The forward
-delegates to `fla-core` with the whole contract in kwargs: `use_qk_l2norm_in_kernel`,
-`use_gate_in_kernel`, `use_beta_sigmoid_in_kernel`, `safe_gate`, `lower_bound`,
-`transpose_state_layout=True` (M:609-645). The decay formula, recurrence order,
-`a*(z+dt_bias)` grouping and the `d_k^-0.5` q-scale live in fla's `chunk_kda` /
-`fused_recurrent_kda`. The plumbing around them **is** confirmed (per-head `A_log`, per-channel
-`dt_bias`, the shared `f_a→f_b` pair, per-head `beta`, three `ShortConvolution(k=4,
-activation='silu')`, norm-then-gate-then-project via `FusedRMSNormGated`).
-
-**New numerics findings, recorded in `k3-architecture.md`:**
-
-- **The C reference DIVERGES from first-party on MLA's two LoRA norms**: first-party
-  `q_a_layernorm`/`kv_a_layernorm` take `KimiRMSNorm`'s default **eps 1e-6** (M:368/383,
-  no eps argument), while the C passes `rms_eps` = 1e-5. Small, real, and exactly the class
-  item 11 exists to catch.
-- `KimiRMSNorm` multiplies the weight **in bf16 after the cast** (M:232-236); AttnRes casts
-  its mixed output back to bf16 per call. The C holds fp32 throughout. Tolerance notes.
-- **Chunked prefill is the first-party default** (`self.mode = "chunk"`, M:481);
-  `fused_recurrent` only at cached q_len == 1.
-- MXFP4 dequant appears **nowhere in the shipped Python** — it lives in the quantization
-  library named by `quantization_config` (compressed-tensors). Item 5b's nibble order and
-  `sb == 255` stay third-party until checked against that library's unpack or real scale
-  bytes (S1a item 2).
-- `moe_layer_freq` (default 1) participates in the dense-vs-MoE choice; `use_full_rank_gate`
-  and `mla_use_output_gate` **default False** in code and must be asserted true from config.
+Two plan-side actions fell out: the MXFP4 `sb == 255` semantics must be settled against the
+compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_gate` /
+`mla_use_output_gate` **default False in code** — assert them true from config (§1).
 
 ## S1 — foundation. No GPU.
 
@@ -387,14 +336,11 @@ That is far less work than V4's 117 KB hand oracle, but it is **cheaper, not bet
 goldens are one implementation's output, so a misreading is in the spec, in the goldens, and in
 anything checked against them.
 
-**Item 11 changed the answer here, twice.** The anchor is **mandatory** (the reference's own
-parity evidence is one position of a junk prompt), and it cannot be a static read: the KDA
-arithmetic lives in **fla-core**, not in the checkpoint's Python. So the anchor is **run the
-first-party stack** — `modeling_kimi_linear.py` + pinned fla — at tiny dimensions, and emit
-golden activations per module. That covers the four traps no document can attest, catches the
-eps-1e-6 class of divergence item 11 already found in the C reference, and replaces both the
-hand transliteration and the trust in the reference's fixtures. Record the fla version pin
-next to the goldens; fla is the one dependency of record.
+**The anchor: run the first-party stack** — `modeling_kimi_linear.py` + pinned fla — at tiny
+dimensions, emitting golden activations per module. **Mandatory**, not optional: the
+reference's own parity evidence is one position of a junk prompt, the KDA arithmetic lives
+only in fla, and item 11 already caught one divergence (the LoRA-norm eps) that fixtures
+inherited from the C would have baked in. Record the fla version pin next to the goldens.
 
 Also unscoped: what format the tiny model is stored in (rivoli's converters read HF
 safetensors; a C fixture may be its own layout), and which converter binary K3 uses.
@@ -404,8 +350,9 @@ safetensors; a C fixture may be its own layout), and which converter binary K3 u
 - Every golden has a **recorded defect run** showing it reddens at exactly the cases the defect
   touches and stays green elsewhere. A golden without one does not count.
 - Defect runs cover a KDA layer, an MLA layer, layer 0, and layer 92.
-- The independent anchor exists and passes. **Citing the reference's own validation does not
-  satisfy this** — a source attesting to itself is not independence.
+- The independent anchor — **S1b's first-party-stack goldens, as defined above** — exists and
+  passes. Citing the reference's own validation does not satisfy this; a source attesting to
+  itself is not independence.
 
 ## S2 — kernels. Each item gates before the next.
 
