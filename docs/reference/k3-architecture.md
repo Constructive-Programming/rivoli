@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: Kimi-K3's forward pass, extracted from the C reference at ff11dce (2026-08-07) and precise enough to write kernels from. 93 layers: 69 KDA (linear attention, delta rule, per-key-channel decay, short causal conv k=4 with fused SiLU) + 24 gated MLA at one-based 4,8,...,88,92,93 — note 92 and 93 are ADJACENT, breaking the every-fourth pattern. NoPE throughout: the 64 rope dims exist, are cached, are SCORED, and are never rotated. Block Attention Residuals are a multi-residual-stream scheme snapshotting at zero-based layers 0,12,...,84 and mixing <=9 sources by softmax twice per layer plus once model-level. MoE routes on FULL hidden width, then down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects back, and adds ONE fused shared MLP unweighted — first-party confirmed as [7168,6144] BF16 on disk, trunk-side, one set per layer. Router bias steers selection only; weights come from the UNBIASED sigmoid, renormalised over the 16. Trunk is bf16 at 108.81 GB; 113.49 GB is trunk plus embed and lm_head, a conflation k3.h:14 is explicitly headed to prevent. Twelve named order-of-operations traps, each of which runs cleanly and produces a wrong model. STRUCTURE is discharged first-party (every shape, dtype and tensor family confirmed against the safetensors index); ARITHMETIC is not — it is still what one C reimplementation asserts, whose own parity evidence is one position of a junk prompt, so re-source the traps against the checkpoint's own modeling_kimi_linear.py before writing kernels.
+verdict: Kimi-K3's forward pass, extracted from the C reference at ff11dce (2026-08-07) and precise enough to write kernels from. 93 layers: 69 KDA (linear attention, delta rule, per-key-channel decay, short causal conv k=4 with fused SiLU) + 24 gated MLA at one-based 4,8,...,88,92,93 — note 92 and 93 are ADJACENT, breaking the every-fourth pattern. NoPE throughout: the 64 rope dims exist, are cached, are SCORED, and are never rotated. Block Attention Residuals are a multi-residual-stream scheme snapshotting at zero-based layers 0,12,...,84 and mixing <=9 sources by softmax twice per layer plus once model-level. MoE routes on FULL hidden width, then down-projects 7168->3584, runs top-16 of 896 MXFP4 experts in latent space, RMSNorms the AGGREGATE, up-projects back, and adds ONE fused shared MLP unweighted — first-party confirmed as [7168,6144] BF16 on disk, trunk-side, one set per layer. Router bias steers selection only; weights come from the UNBIASED sigmoid, renormalised over the 16. Trunk is bf16 at 108.81 GB; 113.49 GB is trunk plus embed and lm_head, a conflation k3.h:14 is explicitly headed to prevent. Twelve named order-of-operations traps, each of which runs cleanly and produces a wrong model. VERIFIED against the checkpoint's own modeling code 2026-08-10: structure first-party via the safetensors index, and MLA/AttnRes/MoE/router/SiTU-GLU confirmed line-by-line against modeling_kimi_linear.py — with two corrections (assert the layer-array PARTITION, since the C and first-party each consume the opposite array; A_log ships [128] on disk against the modeling code's own [96]) and one divergence found IN the C reference (MLA's two LoRA norms take eps 1e-6 first-party, the C passes 1e-5). The KDA inner arithmetic and the MXFP4 unpack remain third-party — first-party delegates them to fla-core and compressed-tensors — so the S1b anchor RUNS the first-party stack rather than reading it.
 ---
 
 # Kimi-K3 — the forward pass
@@ -28,12 +28,14 @@ C reimplementation asserts. It claims per-layer conformance against the released
 own strongest parity evidence is **one position of the 5-token prompt `$%&'(`**, which its
 `docs/data/generations.txt` calls "synthetic junk, not text".
 
-**Structure is discharged; arithmetic is not.** The first-party safetensors index confirmed
-every shape, dtype and tensor family here (plan G0 item 10 — all 50 families map to a section,
-nothing unexplained). It cannot attest to a single line of the *math*. The checkpoint also
-ships `modeling_kimi_linear.py` (51 KB of first-party source), which can — that is the plan's
-G0 item 11, and **§10's twelve traps should be re-sourced against it before any kernel is
-written**.
+**Structure is discharged first-party; arithmetic mostly is too, as of 2026-08-10.** The
+safetensors index confirmed every shape, dtype and tensor family (G0 item 10 — all 50 families
+map to a section, nothing unexplained). G0 item 11 then verified this document against the
+checkpoint's own `modeling_kimi_linear.py`: **MLA, AttnRes, MoE, the router and SiTU-GLU are
+first-party confirmed line-by-line.** What remains third-party: **the KDA inner arithmetic**
+(first-party delegates it to `fla-core` — see §4) and **the MXFP4 unpack** (nowhere in the
+shipped Python; it lives in the compressed-tensors library). The plan's S1b anchor — run the
+first-party stack and emit goldens — covers both.
 
 ## 1. Shapes
 
@@ -50,10 +52,12 @@ AttnRes: attn_res_block 12          SiTU: situ_b1 4.0, situ_b2 25.0
 
 ## 2. The layer map — explicit, not inferred
 
-`linear_attn_config` carries an **explicit `full_attn_layers` array** of 24 one-based indices.
-The reference reads only that one and derives KDA as its complement (`k3_is_kda` is
-`!k3_is_mla`), giving 69. A `kda_layers` array also appears in the config, but nothing in the
-reference consumes it — **do not rely on it**; derive the complement and assert 69 and 24.
+`linear_attn_config` carries two one-based arrays, and **the two implementations read opposite
+ones**: the C reference consumes only `full_attn_layers` and derives KDA as the complement;
+first-party `is_kda_layer` (configuration_kimi_k3.py:152) consumes only `kda_layers` and
+derives MLA as the complement. Neither is "the derived one". **Assert the partition** — both
+present, disjoint, union = 1..93, counts 69 and 24 — rather than trusting either alone.
+(CORRECTED 2026-08-10; this first said to rely on `full_attn_layers` alone.)
 
 **The one-based indexing is the off-by-one that matters**: the reference calls it out as the
 mistake that "silently swaps KDA and MLA layers".
@@ -159,8 +163,14 @@ apply to the **aggregated** `h`, never to `pref`.
 
 ## 4. KDA — 69 layers
 
-One function serves prefill and decode; the only difference is `T`. **No chunked kernel exists
-in the reference** — the released model has one (`fused_recurrent` and `chunked`, per
+One function serves prefill and decode in the C; the only difference is `T`. **First-party
+defaults to the CHUNKED kernel for prefill** (`mode = "chunk"`, fused_recurrent only at cached
+q_len == 1), and **delegates all inner arithmetic to `fla-core`** — `chunk_kda`,
+`fused_recurrent_kda`, `ShortConvolution`, `FusedRMSNormGated`, with the contract in kwargs
+(`use_qk_l2norm_in_kernel`, `use_gate_in_kernel`, `use_beta_sigmoid_in_kernel`, `safe_gate`,
+`lower_bound`, `transpose_state_layout=True`). So §10's KDA traps are C-plus-fla-sourced, not
+first-party-attested; the plan's S1b anchor covers this by RUNNING the first-party stack.
+**No chunked kernel exists in the C reference** — the released model has one (`fused_recurrent` and `chunked`, per
 `tools/verify_kda.py`, matched at 2e-4), but porting it means porting from `fla`.
 
 **Two correctness conditions belong to the chunked form and are absent here**, flagged by
@@ -176,7 +186,10 @@ for this port.
 const void  *q, *k, *v;                /* [H*D][hidden] each              */
 const float *q_conv, *k_conv, *v_conv; /* [H*D][conv_k] depthwise, fp32   */
 const void  *f_a, *f_b;                /* [D][hidden], [H*D][D]           */
-const float *A_log;                    /* [H] PER HEAD (tensor is D long) */
+const float *A_log;                    /* [H] PER HEAD. DISK ships F32 [128];
+                                          modeling code declares [96] — the
+                                          checkpoint disagrees with its own
+                                          Python. Slice to the first 96.     */
 const float *dt_bias;                  /* [H*D] per (head, channel)       */
 const void  *b;                        /* [H][hidden] -> per-head scalar  */
 const void  *g;                        /* [H*D][hidden] full-rank gate    */
@@ -249,7 +262,9 @@ const int kvd = qn + vh;              /* 256: cached per head  */
 const float scale = 1.0f / sqrtf((float)qh);   /* over 192, NOT over qk_nope */
 ```
 
-- `q_a → q_a_norm → q_b`. **One** projection `kv_a` emits the compressed latent **and** the
+- `q_a → q_a_norm → q_b`, and **both LoRA norms take eps 1e-6** (`KimiRMSNorm`'s default; no
+  eps argument at modeling M:368/383) — not the model-wide 1e-5. **The C reference passes
+  1e-5 here and DIVERGES from first-party** (G0 item 11). **One** projection `kv_a` emits the compressed latent **and** the
   shared rope slot; `kv_a_norm` covers **the latent only**, never the rope slot.
 - **NoPE, proven:** there is no cos/sin, no position term, and no `rope_theta` anywhere in the
   engine. The 64 rope dims are cached and **still scored**:
