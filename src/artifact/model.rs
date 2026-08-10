@@ -899,15 +899,40 @@ impl V4Config {
 /// [`K3TextConfig::layer_is_mla`] is the only reader that does the conversion, so there is one
 /// place to get it right.
 ///
-/// The dict's five scalars (`kda_heads`, `kda_head_dim`, `conv_k`, the gate lower bound, and
-/// one more) are **deliberately absent**: their JSON key spellings are not among the fields
-/// §1 of `docs/investigations/k3-port.md` verified against the shipped `config.json`, and
-/// declaring a guessed key would refuse the real checkpoint on a missing field. They are S2's
-/// to add, with the spellings read off the file. Nothing here reads them.
+/// **The five scalars are here too, and their spellings came off the file** (vendored at
+/// `docs/measurement/k3-reference/config.json`, revision
+/// `9f62e4e9fffbd0a83ddd60e1c209d828994b3569`, fetched 2026-08-10). An earlier version of this
+/// struct omitted them on the grounds that a guessed key refuses the real checkpoint — which was
+/// the right rule and would have fired: `k3-architecture.md` §1 names them `kda_heads`,
+/// `kda_head_dim` and `conv_k`, which are the **C reference's field names**, and the JSON calls
+/// them `num_heads`, `head_dim` and `short_conv_kernel_size`. All three guesses were wrong.
+///
+/// `use_full_rank_gate` lives HERE, not on [`K3TextConfig`] — it was declared one level up until
+/// the file was read, which would have refused every real K3 checkpoint on
+/// `missing field \`use_full_rank_gate\``. Its default in the first-party modeling code is
+/// `False` while every layer ships a `g_proj`, so the config value is the one that agrees with
+/// the weights (G0 item 11).
+///
+/// Carried whole rather than field-by-field as S2 needs them, on `V4Config`'s RoPE argument: a
+/// type exposing half a group invites the next stage to take the rest from a default that
+/// happens to agree today.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LinearAttnConfig {
     pub full_attn_layers: Vec<usize>,
     pub kda_layers: Vec<usize>,
+    /// 96 — KDA's own head count, which equals `num_attention_heads` in this checkpoint but is
+    /// a separate field and must not be read from it.
+    pub num_heads: usize,
+    /// 128, and `d_k == d_v` for KDA.
+    pub head_dim: usize,
+    /// 4 — the depthwise causal conv's kernel width (`conv_k` in the C reference).
+    pub short_conv_kernel_size: usize,
+    /// **-5.0, and NEGATIVE is correct.** It multiplies the sigmoid rather than clamping or
+    /// flooring it — trap 4 of `k3-architecture.md` §10 — so this is neither a bound nor an
+    /// epsilon, and a positivity check on it would be wrong.
+    pub gate_lower_bound: f64,
+    /// True. See the struct doc: this field's LEVEL was the bug.
+    pub use_full_rank_gate: bool,
 }
 
 /// Kimi-K3, as its `config.json` ships it: a `KimiK3ForConditionalGeneration` multimodal
@@ -985,19 +1010,27 @@ pub struct K3TextConfig {
     /// RMSNorm epsilon (1e-5 in the shipped config, and note the first-party MLA LoRA norms
     /// use 1e-6 where the C reference wrote 1e-5 — `k3-architecture.md` §5).
     ///
-    /// **The one required field whose JSON key §1 of the plan does not itself record** — its
-    /// table has no row for it, and `k3-architecture.md` spells it `rms_eps`, which is the C
-    /// reference's *field* name rather than a JSON key. It is HF-standard on both GLM and V4 so
-    /// it is almost certainly right, and it is needed, so the "omit what you cannot spell" rule
-    /// applied to `linear_attn_config`'s scalars does not reach it. If the shipped file spells
-    /// it otherwise this refuses with `missing field` — the loud direction, and the fix is to
-    /// correct the rename, never to default it.
+    /// `rms_norm_eps` was flagged in review as a key §1's table does not record — the doc spells
+    /// it `rms_eps`, the C reference's field name. **Confirmed against the shipped file**
+    /// 2026-08-10: the JSON key is `rms_norm_eps`, as on GLM and V4.
     pub rms_norm_eps: f64,
+    /// `bfloat16`. The trunk dtype, asserted rather than assumed: G0 item 3 established the
+    /// trunk is BF16, and an fp8 export of the same model read as BF16 is noise at every width.
+    pub dtype: String,
 
     // --- attention. Which layer is which comes from the partition, not from a stride.
     pub linear_attn_config: LinearAttnConfig,
+    /// The MLA head geometry, carried WHOLE for the reason `V4Config` carries all of RoPE: a
+    /// type exposing half of it invites S2 to take the rest from `ModelArgs`-style defaults and
+    /// build a wrong projection on all 24 layers. `num_key_value_heads` is 96 here — equal to
+    /// `num_attention_heads`, i.e. NOT the MQA that V4 asserts `== 1`, and `validate` pins the
+    /// equality so a copied V4 check cannot land here unnoticed.
     pub q_lora_rank: usize,
     pub kv_lora_rank: usize,
+    pub qk_nope_head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub v_head_dim: usize,
+    pub num_key_value_heads: usize,
     /// NoPE, asserted POSITIVELY. Checking only that `rope_theta` is absent cannot tell "this
     /// model applies no rotation" from "we descended into the wrong dict" — plan §3e.
     pub mla_use_nope: bool,
@@ -1007,10 +1040,10 @@ pub struct K3TextConfig {
     /// and this is a value the engine must not find. `validate` refuses `Some`.
     #[serde(default)]
     pub rope_theta: Option<f64>,
-    /// Both default to `False` in the first-party modeling code, so both must come from the
-    /// config rather than from a Rust default that happens to agree today (G0 item 11).
+    /// Defaults to `False` in the first-party modeling code, so it must come from the config
+    /// rather than from a Rust default that happens to agree today (G0 item 11). Its partner
+    /// `use_full_rank_gate` is on [`LinearAttnConfig`], one level down — see that struct.
     pub mla_use_output_gate: bool,
-    pub use_full_rank_gate: bool,
     /// AttnRes block size (12). The residual is taken across a block of layers rather than
     /// per layer — `k3-architecture.md` §3.
     pub attn_res_block_size: usize,
@@ -1021,6 +1054,13 @@ pub struct K3TextConfig {
     pub n_experts: usize,
     /// `num_experts_per_token` — note the spelling. GLM and V4 both write
     /// `num_experts_per_tok`, and this checkpoint does not.
+    ///
+    /// **The field is `top_k` here and `text_config` ALSO has a key literally named `top_k`,
+    /// which is 50 and has nothing to do with routing** — it is HuggingFace's sampling top-k,
+    /// inherited from `PretrainedConfig`. Binding this from `top_k` selects 50 experts a token
+    /// instead of 16: 3.1x the stream traffic, plausible output, no error. Noticed while reading
+    /// the shipped file 2026-08-10; the `rename` is what keeps them apart, and the pinning test
+    /// asserts the two values differ so this cannot be "simplified" later.
     #[serde(rename = "num_experts_per_token")]
     pub top_k: usize,
     /// Declared 2, but the checkpoint ships **one fused MLP** per layer (`down_proj`
@@ -1046,14 +1086,39 @@ pub struct K3TextConfig {
     /// `noaux_tc` — the first-party name for bias-on-selection-only, which is what
     /// `math::Scoring`'s sigmoid arm already implements.
     pub topk_method: String,
+    /// `sigmoid`, and independent per expert — the scores do NOT sum to 1. Asserted for the
+    /// reason `V4Config::scoring_func` is: a wrong router affinity picks plausible-but-wrong
+    /// experts and never crashes.
+    pub moe_router_activation_func: String,
+    /// 1.0 today, and the multiply is kept anyway (`k3-architecture.md` §6's router block says
+    /// so explicitly). A zero or negative scale silently zeroes or flips every routed
+    /// contribution while the shared MLP keeps working — degraded fluent text, not a crash.
+    #[serde(rename = "routed_scaling_factor")]
+    pub routed_scale: f64,
+    /// 1 — **every** layer after the dense prefix is MoE. Asserted rather than assumed: at 2
+    /// only every other layer would be, and this port's layer loop would run the routed path on
+    /// 46 layers that ship no expert tensors.
+    pub moe_layer_freq: usize,
     /// SiTU-GLU's two betas (4.0 and 25.0), fused inside the fp4 expert kernel — plan §3b.
+    ///
+    /// **The second key is `activation_situ_linear_beta`, not `activation_linear_beta`.** §1 of
+    /// the plan abbreviates the pair as "`activation_situ_beta` / `_linear_beta`", which reads as
+    /// the latter; the file says otherwise (checked 2026-08-10). Declared wrong, this refused
+    /// every real K3 checkpoint on `missing field` — the loud direction the port prefers, and it
+    /// is why the vendored config and its pinning test now exist.
     pub activation_situ_beta: f64,
+    #[serde(rename = "activation_situ_linear_beta")]
     pub activation_linear_beta: f64,
 
     // --- layer 0 is dense, and simultaneously a KDA layer and an AttnRes boundary.
     pub first_k_dense_replace: usize,
     #[serde(rename = "intermediate_size")]
     pub dense_inter: usize,
+    /// `situ`. The dense layer and the shared MLP use the same SiTU-GLU as the routed experts,
+    /// so a `silu` here would be a different activation on layer 0 and the shared path while the
+    /// routed path stayed right — `k3-architecture.md` §3b's "watches the dense path go right
+    /// and every routed expert stay wrong", in reverse.
+    pub hidden_act: String,
 
     /// 0 — no MTP head, so no speculative decode and `MAXROW` is 1. Asserted rather than
     /// assumed: a non-zero value means tensors this port does not convert.
@@ -1128,8 +1193,69 @@ impl K3TextConfig {
             // constraint down, so it is restated here.
             ("q_lora_rank", self.q_lora_rank),
             ("kv_lora_rank", self.kv_lora_rank),
+            ("qk_nope_head_dim", self.qk_nope_head_dim),
+            ("qk_rope_head_dim", self.qk_rope_head_dim),
+            ("v_head_dim", self.v_head_dim),
+            (
+                "linear_attn_config.num_heads",
+                self.linear_attn_config.num_heads,
+            ),
+            (
+                "linear_attn_config.head_dim",
+                self.linear_attn_config.head_dim,
+            ),
+            (
+                "linear_attn_config.short_conv_kernel_size",
+                self.linear_attn_config.short_conv_kernel_size,
+            ),
         ] {
             ensure!(dim > 0, "{what} is 0");
+        }
+        // Not MQA. V4 asserts `num_key_value_heads == 1` because its whole attention frontend is
+        // written against one shared KV entry; K3's MLA has one per query head, and a copied V4
+        // check would refuse this checkpoint while a copied V4 *assumption* would size the cache
+        // 96x too small. Pinned as the equality rather than as the literal 96.
+        ensure!(
+            self.num_key_value_heads == self.n_heads,
+            "num_key_value_heads {} != num_attention_heads {} — K3's MLA is not MQA; every \
+             query head has its own KV projection",
+            self.num_key_value_heads,
+            self.n_heads
+        );
+        // **Negative, and checked in f32.** `gate_lower_bound` MULTIPLIES the KDA gate's sigmoid
+        // rather than clamping or flooring it (`k3-architecture.md` §10, trap 4), so its sign is
+        // load-bearing and a positivity check on it would be exactly backwards. At 0 every gate
+        // on all 69 KDA layers is zeroed and the recurrence contributes nothing — the model goes
+        // quiet rather than wrong, which no tolerance downstream reads as an error. `-5.0` shipped.
+        let gate_lb = self.linear_attn_config.gate_lower_bound as f32;
+        ensure!(
+            gate_lb < 0.0 && gate_lb.is_finite(),
+            "linear_attn_config.gate_lower_bound {} narrows to {gate_lb} in f32; it must be \
+             negative and finite — it MULTIPLIES the KDA gate's sigmoid (trap 4), so 0 silences \
+             all {} KDA layers and a positive value inverts the decay",
+            self.linear_attn_config.gate_lower_bound,
+            self.linear_attn_config.kda_layers.len()
+        );
+        ensure!(
+            self.moe_layer_freq == 1,
+            "moe_layer_freq {} != 1 — this port's layer loop treats every layer past the dense \
+             prefix as MoE, and at 2 half of them ship no expert tensors at all",
+            self.moe_layer_freq
+        );
+        for (what, got, want) in [
+            ("dtype", &self.dtype, "bfloat16"),
+            ("hidden_act", &self.hidden_act, "situ"),
+            (
+                "moe_router_activation_func",
+                &self.moe_router_activation_func,
+                "sigmoid",
+            ),
+        ] {
+            ensure!(
+                got == want,
+                "{what} is {got:?}, not {want:?} — each of these three changes the arithmetic \
+                 without changing a single shape, so nothing downstream would refuse it"
+            );
         }
         // The other half of guard 1004, restated at the load boundary because the boundary names
         // the FIELD where the kernel names a code. 512 (this checkpoint's value) sits exactly at
@@ -1195,7 +1321,12 @@ impl K3TextConfig {
         for (what, flag) in [
             ("mla_use_nope", self.mla_use_nope),
             ("mla_use_output_gate", self.mla_use_output_gate),
-            ("use_full_rank_gate", self.use_full_rank_gate),
+            // One level down, and the label says so — the file puts it inside
+            // `linear_attn_config`, which is where it belongs: it is a KDA property.
+            (
+                "linear_attn_config.use_full_rank_gate",
+                self.linear_attn_config.use_full_rank_gate,
+            ),
             ("latent_moe_use_norm", self.latent_moe_use_norm),
             ("moe_renormalize", self.moe_renormalize),
         ] {
@@ -1231,7 +1362,10 @@ impl K3TextConfig {
         for (what, x) in [
             ("rms_norm_eps", self.rms_norm_eps),
             ("activation_situ_beta", self.activation_situ_beta),
-            ("activation_linear_beta", self.activation_linear_beta),
+            ("activation_situ_linear_beta", self.activation_linear_beta),
+            // 1.0 today. Zero silently zeroes every routed contribution while the shared MLP
+            // keeps working; negative flips them. Both are degraded fluent text, not a crash.
+            ("routed_scaling_factor", self.routed_scale),
         ] {
             let narrowed = x as f32;
             ensure!(
@@ -1816,15 +1950,40 @@ mod tests {
             .filter(|&l| l <= layers)
             .collect();
         let kda: Vec<usize> = (1..=layers).filter(|l| !mla.contains(l)).collect();
-        format!(r#"{{"full_attn_layers":{mla:?},"kda_layers":{kda:?}}}"#)
+        k3_lac(&mla, &kda)
     }
 
-    /// Kimi-K3's `text_config`, field for field, from §1 of `docs/investigations/k3-port.md`
-    /// (read off the shipped `config.json` 2026-08-09).
+    /// A `linear_attn_config` dict from two explicit arrays, with the five scalars at their
+    /// shipped values — `gate_lower_bound` NEGATIVE, which `LinearAttnConfig` explains.
     ///
-    /// There is no `k3_base_matches_the_shipped_config` twin of V4's yet, because there is no
-    /// checkpoint on this machine to pin against — the plan's G0 was met from metadata alone.
-    /// Add it when one lands; until then these values are the plan's, not the file's.
+    /// Separate from [`k3_linear_attn`] because the partition test needs arrays that are NOT a
+    /// partition, which that function cannot produce by construction. Both go through here so a
+    /// scalar added to the struct has one place to appear.
+    fn k3_lac(mla: &[usize], kda: &[usize]) -> String {
+        format!(
+            r#"{{"full_attn_layers":{mla:?},"kda_layers":{kda:?},"num_heads":96,"head_dim":128,
+                 "short_conv_kernel_size":4,"gate_lower_bound":-5.0,"use_full_rank_gate":true}}"#
+        )
+    }
+
+    /// The vendored `config.json`, the real one — `moonshotai/Kimi-K3` at revision
+    /// `9f62e4e9fffbd0a83ddd60e1c209d828994b3569`, fetched 2026-08-10, byte-for-byte.
+    ///
+    /// `include_str!` rather than a path read, so [`k3_base_matches_the_shipped_config`] runs
+    /// **always** instead of skipping when a checkpoint is absent — V4's twin skips, and this
+    /// port has no checkpoint on this machine at all. 7 KB of metadata is the cheapest gate in
+    /// this file and it is the one that caught two wrong key spellings.
+    const K3_SHIPPED: &str = include_str!("../../docs/measurement/k3-reference/config.json");
+
+    /// Kimi-K3's `text_config`, field for field. **Pinned to [`K3_SHIPPED`]** by
+    /// [`k3_base_matches_the_shipped_config`], so it cannot become a fiction only the unit tests
+    /// believe.
+    ///
+    /// Until 2026-08-10 these were §1 of the plan's values rather than the file's, and the doc
+    /// here said so. Reading the file corrected **two** of them, both of which would have made
+    /// this schema refuse every real K3 checkpoint: `activation_linear_beta` is spelled
+    /// `activation_situ_linear_beta`, and `use_full_rank_gate` lives inside `linear_attn_config`
+    /// rather than beside it.
     const K3_TEXT: &[(&str, &str)] = &[
         // The NESTED pair, which differs from the wrapper's on purpose — see
         // `Arch::from_manifest_str`.
@@ -1835,15 +1994,19 @@ mod tests {
         ("vocab_size", "163840"),
         ("num_attention_heads", "96"),
         ("rms_norm_eps", "1e-05"),
+        ("dtype", r#""bfloat16""#),
         // A placeholder: `k3_json` always overrides it with `k3_linear_attn`'s derived pair.
         // It is listed here anyway so `every_k3_field_is_required` covers the key — an
         // override with an empty value deletes it, which is what that test does.
         ("linear_attn_config", "null"),
         ("q_lora_rank", "1536"),
         ("kv_lora_rank", "512"),
+        ("qk_nope_head_dim", "128"),
+        ("qk_rope_head_dim", "64"),
+        ("v_head_dim", "128"),
+        ("num_key_value_heads", "96"),
         ("mla_use_nope", "true"),
         ("mla_use_output_gate", "true"),
-        ("use_full_rank_gate", "true"),
         ("attn_res_block_size", "12"),
         ("num_experts", "896"),
         ("num_experts_per_token", "16"),
@@ -1855,10 +2018,14 @@ mod tests {
         ("num_expert_group", "1"),
         ("topk_group", "1"),
         ("topk_method", r#""noaux_tc""#),
+        ("moe_router_activation_func", r#""sigmoid""#),
+        ("routed_scaling_factor", "1.0"),
+        ("moe_layer_freq", "1"),
         ("activation_situ_beta", "4.0"),
-        ("activation_linear_beta", "25.0"),
+        ("activation_situ_linear_beta", "25.0"),
         ("first_k_dense_replace", "1"),
         ("intermediate_size", "33792"),
+        ("hidden_act", r#""situ""#),
         ("num_nextn_predict_layers", "0"),
         ("tie_word_embeddings", "false"),
     ];
@@ -1989,7 +2156,9 @@ mod tests {
             // key the fixture does not carry rather than replacing one.
             ("rope_theta", "10000.0", "carries rope_theta"),
             ("mla_use_output_gate", "false", "output_gate is false"),
-            ("use_full_rank_gate", "false", "use_full_rank_gate is false"),
+            // `use_full_rank_gate` is NOT here — it lives inside `linear_attn_config`, so an
+            // override at this level is an unknown key and silently ignored. It is covered at the
+            // bottom of this test, where the nesting can be patched.
             ("latent_moe_use_norm", "false", "use_norm is false"),
             ("moe_renormalize", "false", "moe_renormalize is false"),
             ("topk_method", r#""greedy""#, "noaux_tc"),
@@ -2010,7 +2179,11 @@ mod tests {
             // `cfg.rms_norm_eps as f32`; it was checked in f64 alone until review.
             ("rms_norm_eps", "1e-46", "narrows to 0"),
             ("activation_situ_beta", "1e-46", "narrows to 0"),
-            ("activation_linear_beta", "1e39", "narrows to inf"),
+            // The JSON key, `activation_situ_linear_beta` — not the struct field's name. This row
+            // read `activation_linear_beta` until the shipped config was fetched, which made it
+            // an unknown key: silently ignored, baseline parse, `unwrap_err()` panic. A test that
+            // patches by JSON key catches a wrong `rename`; one that patches by field name cannot.
+            ("activation_situ_linear_beta", "1e39", "narrows to inf"),
             // Group alignment, on the LATENT width and on `moe_inter`. 3600 % 32 == 16 and
             // 3000 % 32 == 24 — neither is a multiple of `F4_GROUP`, and each `want` names its
             // own key so a transposed argument pair cannot pass both.
@@ -2045,8 +2218,43 @@ mod tests {
             ("kv_lora_rank", "500", "not a multiple of 128"),
             ("kv_lora_rank", "640", "exceeds the 512"),
         ] {
+            // **Every row's key must be one the schema actually reads.** `json_obj` will happily
+            // add a key nothing deserializes, and serde ignores unknown keys — so a row naming a
+            // stale or misspelled key patches nothing, parses the baseline clean, and dies in
+            // `k3_err`'s `unwrap_err()` rather than reporting what is wrong. That happened twice
+            // in one sitting: `use_full_rank_gate` after it moved a level down, and
+            // `activation_linear_beta` after the file showed the key is
+            // `activation_situ_linear_beta`. This assertion is the diagnosis those two needed.
+            assert!(
+                K3_TEXT.iter().any(|(t, _)| *t == key) || key == "rope_theta",
+                "{key:?} is not a key of the fixture (and not the deliberately-absent \
+                 `rope_theta`), so this row would be an unknown JSON key: ignored, and testing \
+                 nothing"
+            );
             let err = k3_err(&[(key, bad)]);
             assert!(err.contains(want), "{key}={bad}: want {want:?}, got: {err}");
+        }
+        // The two `linear_attn_config` scalars whose wrong values are arithmetic. These cannot
+        // ride the loop above, and the reason is the bug that made this block necessary: an
+        // override of `use_full_rank_gate` at `text_config` level is an UNKNOWN KEY, silently
+        // ignored, so the row parsed clean and `unwrap_err()` panicked. That is what "the field
+        // was declared one level too high" looks like from the test side.
+        let lac = k3_linear_attn(93);
+        for (from, to, want) in [
+            (
+                r#""use_full_rank_gate":true"#,
+                "false",
+                "use_full_rank_gate is false",
+            ),
+            // `gate_lower_bound` MULTIPLIES the sigmoid (trap 4), so 0.0 zeroes every KDA gate
+            // on all 69 layers — the output goes quiet rather than wrong, and nothing refuses it.
+            (r#""gate_lower_bound":-5.0"#, "0.0", "gate_lower_bound 0"),
+        ] {
+            let (key, _) = from.split_once(':').unwrap();
+            let bad = lac.replace(from, &format!("{key}:{to}"));
+            assert_ne!(bad, lac, "the {key} row no longer patches anything");
+            let err = k3_err(&[("linear_attn_config", &bad)]);
+            assert!(err.contains(want), "{key}={to}: want {want:?}, got: {err}");
         }
     }
 
@@ -2056,9 +2264,7 @@ mod tests {
     /// downstream can see: both families take `[hidden]` in and return `[hidden]`.
     #[test]
     fn k3_layer_partition_must_be_a_partition() {
-        let lac = |mla: &[usize], kda: &[usize]| {
-            format!(r#"{{"full_attn_layers":{mla:?},"kda_layers":{kda:?}}}"#)
-        };
+        let lac = k3_lac;
         let complement: Vec<usize> = (1..=93).filter(|l| !K3_MLA_ONE_BASED.contains(l)).collect();
         // **Every case but the first keeps both lengths right.** The length check runs first,
         // so a short array reports only that — and a case that trips it proves nothing about
@@ -2086,6 +2292,93 @@ mod tests {
         let small = k3_linear_attn(4);
         parse_k3(&[("linear_attn_config", &small), ("num_hidden_layers", "4")])
             .expect("1..=4 with layer 4 as the only MLA layer IS a partition");
+    }
+
+    /// **The gate that makes every other K3 test mean something.** `K3_TEXT` is a hand-copy;
+    /// this compares each of its keys against the vendored `config.json`, and then parses that
+    /// file directly.
+    ///
+    /// It earned its keep before it was even committed. The schema had two fields that would
+    /// have refused every real K3 checkpoint — `activation_linear_beta` for
+    /// `activation_situ_linear_beta`, and `use_full_rank_gate` declared one level too high — and
+    /// no amount of internal consistency between a fixture and a struct can catch that class.
+    /// Only the file can. Structural rather than a hand-listed tuple, so the check grows with
+    /// the table instead of covering whichever fields someone thought to list.
+    #[test]
+    fn k3_base_matches_the_shipped_config() {
+        let real: serde_json::Value = serde_json::from_str(K3_SHIPPED).unwrap();
+        let text = real.get("text_config").expect("no text_config");
+        for (k, v) in K3_TEXT {
+            // `linear_attn_config`'s row is the deliberate `null` placeholder; its real value is
+            // checked field-by-field below, where the nesting can be compared properly.
+            if *k == "linear_attn_config" {
+                continue;
+            }
+            let want: serde_json::Value = serde_json::from_str(v)
+                .unwrap_or_else(|e| panic!("K3_TEXT[{k}] is not valid JSON: {e}"));
+            let got = text
+                .get(*k)
+                .unwrap_or_else(|| panic!("text_config has no {k:?}"));
+            assert_eq!(
+                got, &want,
+                "K3_TEXT[{k}] has drifted from the shipped config"
+            );
+        }
+        // The nested dict, including the five scalars whose spellings this port got wrong from
+        // the C reference's field names before the file was read.
+        let lac = text
+            .get("linear_attn_config")
+            .expect("no linear_attn_config");
+        for (k, v) in [
+            ("num_heads", "96"),
+            ("head_dim", "128"),
+            ("short_conv_kernel_size", "4"),
+            ("gate_lower_bound", "-5.0"),
+            ("use_full_rank_gate", "true"),
+        ] {
+            let want: serde_json::Value = serde_json::from_str(v).unwrap();
+            assert_eq!(lac.get(k), Some(&want), "linear_attn_config.{k}");
+        }
+        // The layer arrays, against the transcribed constant rather than against themselves.
+        let mla: Vec<usize> = serde_json::from_value(lac["full_attn_layers"].clone()).unwrap();
+        assert_eq!(mla, K3_MLA_ONE_BASED, "full_attn_layers");
+        assert_eq!(lac["kda_layers"].as_array().unwrap().len(), 69);
+        // The wrapper's pair, which is the level `Arch::from_manifest_str` reads — and which
+        // differs from the nested one. Both spellings, since either alone resolves.
+        assert_eq!(real["model_type"], "kimi_k3");
+        assert_eq!(real["architectures"][0], "KimiK3ForConditionalGeneration");
+        // **`top_k` is HuggingFace's SAMPLING top-k, not the router's.** Asserted as a
+        // difference, so a later "simplification" that binds `K3TextConfig::top_k` from the key
+        // of that name — 50 experts a token instead of 16 — reddens here.
+        assert_eq!(text["top_k"], 50);
+        assert_ne!(text["top_k"], text["num_experts_per_token"]);
+        // `quantization_config` is not in the schema on purpose (item 5). Pin the two facts that
+        // decision rests on, so "do not trust this block" stays a measurement: its group size is
+        // the `F4_GROUP` the repack assumes, and its `ignore` list does NOT name the three
+        // families that ship BF16 — which is why the converter drives off `.weight_packed`.
+        let q = text
+            .get("quantization_config")
+            .expect("no quantization_config");
+        assert_eq!(q["format"], "mxfp4-pack-quantized");
+        assert_eq!(
+            q["config_groups"]["group_0"]["weights"]["group_size"],
+            crate::artifact::quant::F4_GROUP
+        );
+        let ignore = serde_json::to_string(&q["ignore"]).unwrap();
+        for missing in [
+            "routed_expert_down_proj",
+            "routed_expert_up_proj",
+            "gate.weight",
+        ] {
+            assert!(
+                !ignore.contains(missing),
+                "the ignore list now names {missing:?} — item 5's argument for driving off \
+                 `.weight_packed` was that it does NOT, so re-read the block before relying on it"
+            );
+        }
+        // ...and the whole file parses through the real schema, from the bytes rather than from
+        // the fixture. This is the assertion the two wrong spellings failed.
+        parse_config::<K3Config>(K3_SHIPPED).expect("the shipped config must parse");
     }
 
     /// A K3 config must not become a zero-filled config of either other architecture, nor

@@ -71,6 +71,27 @@ investigations here. Gates are numeric or they are nothing.
 `moonshotai/Kimi-K3/config.json`, read 2026-08-09. The text model is nested under
 `text_config`, behind a `KimiK3ForConditionalGeneration` multimodal wrapper.
 
+> **VENDORED 2026-08-10.** The file itself is now at
+> `docs/measurement/k3-reference/config.json` — `moonshotai/Kimi-K3` revision
+> `9f62e4e9fffbd0a83ddd60e1c209d828994b3569`, 7,006 bytes, sha256
+> `9710e121a58d03ac92c8d6da287a19541994319afbbe6d6202af001ffd379213` — and
+> `model.rs::k3_base_matches_the_shipped_config` pins every fixture value to it via
+> `include_str!`, so it runs always rather than skipping like V4's twin.
+>
+> **Reading it corrected three things this table had wrong or vague**, each of which had already
+> become a defect in `K3Config`: the `activation_situ_linear_beta` spelling (below);
+> `use_full_rank_gate` living **inside `linear_attn_config`**, not beside it; and the "+5 scalars"
+> hand-wave, whose real keys are `num_heads`, `head_dim`, `short_conv_kernel_size`,
+> `gate_lower_bound` and `use_full_rank_gate` — **not** the `kda_heads` / `kda_head_dim` /
+> `conv_k` that `k3-architecture.md` §1 lists, which are the C reference's field names. Two of
+> the three would have refused every real K3 checkpoint on `missing field`.
+>
+> **And one trap the table never mentioned:** `text_config` carries a key literally named
+> `top_k`, which is **50** — HuggingFace's sampling top-k, inherited from `PretrainedConfig`,
+> nothing to do with routing. Binding the router from it selects 50 experts a token instead of
+> 16: 3.1x the stream traffic, plausible output, no error. The MoE count is
+> `num_experts_per_token`.
+
 | field | value | consequence |
 |---|---|---|
 | `architectures` / `model_type` | top-level `KimiK3ForConditionalGeneration` / `kimi_k3`; **nested `text_config` says `KimiLinearForCausalLM` / `kimi_linear`** | recognise on the **top** level and assert the nested pair as a secondary check — S1a descends into `text_config`, so a recogniser that descends first will refuse the real checkpoint |
@@ -85,7 +106,7 @@ investigations here. Gates are numeric or they are nothing.
 | `mla_use_nope` | **true** | assert this **positively**; §3e |
 | `mla_use_output_gate`, `latent_moe_use_norm`, `moe_renormalize` | true | each an explicit `K3Config::validate` assertion, never a defaulted field |
 | `num_expert_group` / `topk_group` / `topk_method` | 1 / 1 / `noaux_tc` | grouped routing is **degenerate, not absent** — assert both are 1 and refuse otherwise. `noaux_tc` is the first-party name for bias-on-selection-only |
-| `activation_situ_beta` / `_linear_beta` | 4.0 / 25.0 | SiTU-GLU, fused into the fp4 kernel — §3b |
+| `activation_situ_beta` / **`activation_situ_linear_beta`** | 4.0 / 25.0 | SiTU-GLU, fused into the fp4 kernel — §3b. **CORRECTED 2026-08-10**: this row abbreviated the second key as "`_linear_beta`", which reads as `activation_linear_beta` — and that is how S1a first declared it, which would have refused every real checkpoint on `missing field`. Never abbreviate a key in this table |
 | `first_k_dense_replace` | 1 | layer 0 dense, `intermediate_size` 33792 |
 | `attn_res_block_size` | 12 | AttnRes, `k3-architecture.md` §3 |
 | `vocab_size` | 163,840 | 163,584 BPE + a 256-id reserved block; `tie_word_embeddings` false |
@@ -280,6 +301,15 @@ the KDA inner arithmetic delegates to `fla-core` and the MXFP4 unpack to compres
 Two plan-side actions fell out: the MXFP4 `sb == 255` semantics must be settled against the
 compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_gate` /
 `mla_use_output_gate` **default False in code** — assert them true from config (§1).
+
+> **BOTH DONE 2026-08-10 for the second action, with a correction.** `mla_use_output_gate` is on
+> `text_config`; **`use_full_rank_gate` is inside `linear_attn_config`**, so "assert them from
+> config" needed two different levels and the S1a code asserted both at the outer one — which
+> refused nothing, because serde ignores unknown keys, and would have refused every real
+> checkpoint on `missing field`. Both are now asserted at their real levels, and the vendored
+> config makes that permanent. Worth stating plainly: the config-vs-code disagreement this item
+> found is real and the config wins — the weights agree with it, since every layer ships a
+> `g_proj`.
 
 ## S1 — foundation. No GPU.
 

@@ -37,6 +37,25 @@ dense: first_dense 1, dense_inter 33792
 AttnRes: attn_res_block 12          SiTU: situ_b1 4.0, situ_b2 25.0
 ```
 
+**These are the C reference's FIELD names, not the config's JSON keys, and the difference has
+already cost one defect** (noted 2026-08-10). The JSON spellings are in
+`docs/measurement/k3-reference/config.json`, vendored, and pinned by
+`model.rs::k3_base_matches_the_shipped_config`. The ones that differ:
+
+| here | JSON key | where |
+|---|---|---|
+| `kda_heads` | `num_heads` | inside `linear_attn_config` |
+| `kda_head_dim` | `head_dim` | inside `linear_attn_config` |
+| `conv_k` | `short_conv_kernel_size` | inside `linear_attn_config` |
+| `gate_lb` | `gate_lower_bound` | inside `linear_attn_config` |
+| `rms_eps` | `rms_norm_eps` | `text_config` |
+| `situ_b2` | `activation_situ_linear_beta` | `text_config` |
+| `mla_out_gate` | `mla_use_output_gate` | `text_config` |
+| `routed_scale` | `routed_scaling_factor` | `text_config` |
+
+`use_full_rank_gate` is **inside `linear_attn_config`** and has no row above at all. Read a key
+off the vendored file before declaring it anywhere.
+
 ## 2. The layer map — explicit, not inferred
 
 `linear_attn_config` carries two one-based arrays, and **the two implementations read opposite
