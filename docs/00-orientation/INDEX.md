@@ -48,11 +48,12 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 
 ## investigations/ — asked, answered, closed
 
-Read the verdict. Open the file only if you are about to re-open the question. **One row is
-`live`** — an open proposal, not yet built; it moves to `closed-shipped` when it is executed.
+Read the verdict. Open the file only if you are about to re-open the question. **Two rows are
+`live`** — open proposals, not yet built; each moves to `closed-shipped` when it is executed.
 
 | doc | status | verdict |
 |---|---|---|
+| [`glimmer-port.md`](../investigations/glimmer-port.md) | live | The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — ~25 GB/token fully resident at fp8, so the ceiling is GTT bandwidth, not NVMe. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + per-head output gate is a new kernel family (rivoli is MLA-only), per-layer RoPE-on/off is new plumbing, and the DFlash block-16 drafter generalises MAXROW=2 to 17 — cheap here precisely because the model is dense, so a 17-row verify costs one weight read. S0 NOT STARTED: every §1 number is model-card provenance through a summarizing fetch, unverified — the exact trap K3's G0 was reopened for twice. |
 | [`otlp-modernization.md`](../investigations/otlp-modernization.md) | live | PARTLY BUILT. Keep OTLP — measured, no leaner path exists at 0.30 and it costs 64 crates. Run-identity labels {mode,cache_policy,attn,max_mem_gib,mtp} SHIPPED 2026-08-02, as did the §3 drops; MTP acceptance and moe-by-miss are still proposed. |
 | [`int4-scales.md`](../investigations/int4-scales.md) | closed-shipped | Why int4 was unusable and how group-128 scales fixed it: PPL 73.43 → 5.120, making int4 the best-quality mode. RESOLVED. |
 | [`vulkan-port.md`](../investigations/vulkan-port.md) | closed-shipped | Porting the engine to Vulkan across four phases — the journal, not the rules. Shipped and decoding; the live inventory AND every standing shader obligation moved to reference/vulkan-kernels.md on 2026-08-01. |
