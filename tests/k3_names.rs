@@ -60,6 +60,72 @@ fn find<'a>(fams: &'a [TsvFamily], name: &str) -> &'a TsvFamily {
         .unwrap_or_else(|| panic!("no such family in the shipped index: {name}"))
 }
 
+/// **Exactly these families have no shape, and no others — so the blind spot cannot widen.**
+///
+/// A `?` shape means no fetched shard header covered that family (the index carries neither dtype
+/// nor shape, so those come from HTTP Range reads of three shards). Recorded as unknown rather than
+/// as absent, which is right — but it is a HOLE in every shape assertion in this file, and until now
+/// an unbounded one: a re-reduction whose Range fetch failed for a shard would turn more rows into
+/// `?` and quietly widen it, with every remaining assertion still green. That is the same shape as
+/// the goldens' census, and the same fix — enumerate, so losing coverage is an edit.
+///
+/// **Five of the seventeen are IN SCOPE and therefore have no shape checked anywhere**: the
+/// embedding, the head, the final norm, and the two halves of the model-level attn-res fold. Their
+/// dims are derivable from the vendored `config.json`, and this deliberately does NOT assert a
+/// derivation — the header's claim is that this file is "the checkpoint's own index, not a
+/// transliteration", and asserting my own expectation against no ground truth is exactly the
+/// transliteration it rules out. Fetching those three shards' headers is what closes it.
+#[test]
+fn exactly_the_declared_families_have_no_shape() {
+    // File order, which is `sort`ed below rather than trusted.
+    const NO_SHAPE: [&str; 17] = [
+        "language_model.lm_head.weight",
+        "language_model.model.embed_tokens.weight",
+        "language_model.model.norm.weight",
+        "language_model.model.output_attn_res_norm.weight",
+        "language_model.model.output_attn_res_proj.weight",
+        "mm_projector.post_norm.weight",
+        "mm_projector.proj.0.weight",
+        "mm_projector.proj.2.weight",
+        "vision_tower.encoder.blocks.{B}.mlp.fc0.weight",
+        "vision_tower.encoder.blocks.{B}.mlp.fc1.weight",
+        "vision_tower.encoder.blocks.{B}.norm0.weight",
+        "vision_tower.encoder.blocks.{B}.norm1.weight",
+        "vision_tower.encoder.blocks.{B}.wo.weight",
+        "vision_tower.encoder.blocks.{B}.wqkv.weight",
+        "vision_tower.encoder.final_layernorm.weight",
+        "vision_tower.patch_embed.pos_emb.weight",
+        "vision_tower.patch_embed.proj.weight",
+    ];
+    let fams = families();
+    let mut got: Vec<&str> = fams
+        .iter()
+        .filter(|f| f.shape.is_empty())
+        .map(|f| f.name.as_str())
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<&str> = NO_SHAPE.to_vec();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "the set of shape-unknown families changed. MORE of them means a shard header went \
+         unfetched and the shape checks below cover less than they did — re-fetch rather than \
+         updating this list. FEWER means someone filled one in, which is progress: update the \
+         list and add the shape assertion that is now possible."
+    );
+    // Derived from the same list, not typed twice, so this number cannot drift from it. The
+    // model-side/vision-side boundary is a prefix test, as in the test below.
+    let in_scope = want
+        .iter()
+        .filter(|n| n.starts_with("language_model."))
+        .count();
+    assert_eq!(
+        in_scope, 5,
+        "in-scope families with no shape checked anywhere — this is the residual gap, and it \
+         shrinks only by fetching shard headers"
+    );
+}
+
 /// The reduction itself must be the file we think it is. A truncated or hand-edited TSV would
 /// make every assertion below vacuous, which is the shape a fixture-backed gate fails in.
 #[test]

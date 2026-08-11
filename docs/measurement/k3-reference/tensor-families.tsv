@@ -13,6 +13,23 @@
 # dense + KDA, layer 1 MoE, layer 3 MLA); families whose shape reads `?` were not in those three
 # and are shape-unknown here, not shape-free.
 #
+# WHAT THIS FILE DOES AND DOES NOT GUARANTEE, stated because the counts above read stronger than
+# they are (added 2026-08-11 after Muse Glimmer's port hit the same class):
+#   * CLOSED — the reduction accounts for every tensor in the index it was made from: the count
+#     column sums to 497,220, so a family lost during the reduction cannot pass
+#     (`k3_names.rs::the_vendored_reduction_is_intact`). And the set of `?` rows is now enumerated
+#     (`exactly_the_declared_families_have_no_shape`), so the shape blind spot cannot widen
+#     silently — 17 rows, of which 5 are in scope and therefore have no shape checked anywhere.
+#   * OPEN — nothing detects an UPSTREAM revision that ADDS a family. A newer checkpoint would
+#     produce a reduction that never mentions it, a names gate that never asks, and green. The
+#     index is 60 MB and not vendored, so no gate can recompute the reduction from it; the sha256
+#     above is what makes a re-fetch checkable, and nothing re-fetches. Closing this means a
+#     regeneration script that rebuilds this file from a freshly fetched index and diffs — the
+#     role `tests/k3-anchor.sh` plays for the goldens. Not written.
+#   * A byte reconciliation against `metadata.total_size` (which is what Glimmer's twin does, and
+#     is strictly stronger — it would catch a wrong shape, not just a missing row) is NOT possible
+#     while 17 shapes are `?`. It becomes possible when they are filled in, and is the reason to.
+#
 # count	dtype	shape	family
 1	?	?	language_model.lm_head.weight
 1	?	?	language_model.model.embed_tokens.weight
