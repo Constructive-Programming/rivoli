@@ -312,8 +312,14 @@ fn every_launcher_has_an_oracle() {
 ///
 /// `gpu.rs` is the GLM-5.2 decode path (`.vq3`/`.i4`); `f4gpu.rs`, `attn.rs` and
 /// `kvcompress.rs` are DeepSeek-V4-Flash-0731's (`.f4`). An empty slice asserts the launcher
-/// has NO engine caller, which is a real and interesting state — three of them are staged
-/// work, not dead code, and saying so is the point.
+/// has NO engine caller, which is a real and interesting state — those are staged work, not
+/// dead code, and saying so is the point.
+///
+/// > **CORRECTED 2026-08-11.** This said "three of them are staged work". There were **five**
+/// > before `gqa_attend` was added and six after, so the count had already drifted twice with
+/// > nothing to notice. It is dropped rather than re-counted: the rows themselves are the
+/// > record, and a hand-written tally beside a list that grows is a defect waiting for its
+/// > next edit.
 const OWNERS: &[(&str, &[&str])] = &[
     ("act_quant_f8", &["f4gpu.rs"]),
     ("act_quant_f8_prefix", &["attn.rs", "kvcompress.rs"]),
@@ -333,6 +339,10 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("gemv_i4", &[]),
     ("gemv_i8", &["gpu.rs"]),
     ("gemv_vq", &[]),
+    // Muse Glimmer's GQA attend. No engine caller yet BY CONSTRUCTION: S2 gates each kernel
+    // against the S1b goldens before S3 writes the layer loop that calls it, so this row is
+    // empty for exactly as long as that stage lasts.
+    ("gqa_attend", &[]),
     ("hc_head_collapse", &["f4gpu.rs"]),
     ("hc_post", &["f4gpu.rs"]),
     ("hc_pre", &["f4gpu.rs"]),
