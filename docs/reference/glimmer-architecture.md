@@ -22,6 +22,27 @@ from `transformers` `src/transformers/models/muse_glimmer/modeling_muse_glimmer.
 implementation. **The announcement and model card were used for nothing**: they were the
 plan's original provenance and §10 records where they were wrong.
 
+> **PINNED 2026-08-11.** `main` moves, so "on `main`" was not a citable source and every
+> `M:<line>` below was a reference to a file that could shift under it. The reference is now
+> installed and pinned at transformers commit
+> **`fe747d88a3296bd94d426db2717f232f9d4afdb7`** (`5.16.0.dev0`, one minor past the
+> `5.15.0.dev0` this was written against), in a venv at `/home/rhansen/glimmer-anchor/venv`
+> kept SEPARATE from K3's — that one is `4.56.2` and its version *is* the provenance of its
+> vendored goldens, so upgrading it in place would invalidate them while leaving every byte
+> and every gate green.
+>
+> **Re-verified against the installed file at that commit, not assumed:** the four
+> `MuseGlimmerTextCenteredRMSNorm` per layer with `rms_norm_eps` on the two pre-norms and
+> `post_norm_eps` on the two post-norms; `qk_norm` weightless with Q alone scaled by
+> `qk_scale_factor` (still `M:323`, so the line citations still resolve); `rotate_half`;
+> `attn_output * torch.sigmoid(self.gate_proj(hidden_states))` before `o_proj`; the
+> `output_multiplier` → `/ softcap` → `tanh` → `* softcap` logit path; and the weightless
+> `embed_norm`. Nothing in §1–§11 changed across the two versions.
+>
+> Torch here is **CPU** (`2.13.0+cpu`), not K3's `2.13.0+rocm7.2`. Deliberate: this reference
+> is plain PyTorch with no triton kernel behind it — K3 needed a GPU because fla's KDA ops are
+> triton-only — so a tiny-dims golden reproduces on CPU and costs the shared device nothing.
+
 ## 1. Shapes
 
 ```
