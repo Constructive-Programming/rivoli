@@ -176,13 +176,48 @@ fn the_anchor_goldens_record_what_produced_them() {
 /// **When this fails after a deliberate regeneration, update the constants and say so in
 /// `anchor.md`.** That is the intended workflow: re-vendoring is a reviewed change, not a side
 /// effect of running the driver.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// **The vendored `config.json` is the one the goldens were generated against.**
+///
+/// The goldens' metadata carries `real_config_sha256_16` of that file, and the test below pins the
+/// value — but both of those are FROZEN COPIES, so a `config.json` updated to a later HF revision
+/// leaves them agreeing with each other while no longer describing the file on disk. Nothing
+/// recomputed it. `the_tiny_configs_kept_the_real_structure` catches a revision that moved a field
+/// it reads (the layer lists, the 19 structural fields); a revision that ADDS a tensor family or a
+/// field is exactly the change it would not see.
+///
+/// FNV-1a rather than sha256, because there is no sha256 in this tree and a dev-dependency for one
+/// tripwire is not worth it — the same argument the golden bytes above are pinned by. The sha in the
+/// metadata stays as the generation-time record; this is the check that the repo file still matches
+/// it. Update the constant only alongside a deliberate re-vendor of the goldens themselves, since a
+/// config change that does not move the bytes means the config was not what the run consumed.
+///
+/// This is the hole Muse Glimmer's port found on its own side (its HF revision was a prose claim in
+/// `glimmer-architecture.md` matched by nothing) — the generalisation being that **an artifact
+/// should carry its own provenance and the gate should recompute it**, so there is no second copy to
+/// drift.
+#[test]
+fn the_vendored_real_config_is_the_one_the_goldens_saw() {
+    assert_eq!(
+        fnv1a(REAL_CONFIG.as_bytes()),
+        0xe3b0_6206_6777_6b28,
+        "docs/measurement/k3-reference/config.json has changed since the goldens were generated. \
+         Its sha256 is recorded in their metadata as `real_config_sha256_16` and that record is \
+         now false. Regenerate and re-vendor, or restore the file."
+    );
+}
+
 #[test]
 fn the_vendored_bytes_are_the_measured_ones() {
     for v in GOLDENS {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in v.bytes {
-            h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
-        }
+        let h = fnv1a(v.bytes);
         assert_eq!(v.bytes.len(), v.len, "{}: size", v.salt);
         assert_eq!(h, v.fnv, "{}: FNV-1a", v.salt);
         let g = load(v);

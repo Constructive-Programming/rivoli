@@ -395,6 +395,18 @@ largest (an expert weighted at ~0 makes its own arithmetic unscoreable), `|beta|
 asserts the two goldens' hashes differ — copying one file over the other would otherwise satisfy
 every other assertion in the file.
 
+**The vendored `config.json` is pinned by a hash the gate RECOMPUTES**, added 2026-08-11 after Muse
+Glimmer's port found the same hole on its own side (its HF revision was a prose claim matched by
+nothing). The goldens' metadata records `real_config_sha256_16` of the file the run consumed, and
+`k3_anchor.rs` pins that value — but both are frozen copies, so a `config.json` updated to a later
+revision left them agreeing with each other while no longer describing the file on disk. The
+structural test catches a revision that moves a field it reads; a revision that ADDS one is exactly
+what it cannot see, and the red-proof showed that directly — injecting a new top-level field left
+`the_tiny_configs_kept_the_real_structure` GREEN and only the new hash went red. FNV-1a rather than
+sha256, on the same argument as the golden bytes: there is no sha256 in this tree and a
+dev-dependency for one tripwire is not worth it. That the Rust hash over `include_str!` agrees with
+python's over the raw file is also a check that the include performs no transformation.
+
 ## Re-running it
 
 ```bash
