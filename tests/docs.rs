@@ -421,20 +421,37 @@ fn benchmarks_stays_compact() {
 /// `CLAUDE.md`'s jscpd-exemption count is derived here, not asserted there.
 ///
 /// The count was wrong three times in two days across two parallel branches — stale at Ten,
-/// re-derived as Fourteen, actually Thirteen. Each round the fix was to re-count by hand, and
-/// each hand-count is a fresh chance to be wrong; this is the last one.
+/// re-derived as Fourteen, then asserted as Thirteen on a reading of jscpd that turned out to be
+/// WRONG. Each round the fix was another hand-count, and each hand-count is a fresh chance to be
+/// wrong; this is the last one.
 ///
-/// **The subtlety that produced the Fourteen.** A bare `grep -rn jscpd:ignore-start` also
-/// matches `backend/hip.rs`'s doc comment *discussing* the marker by name, so that file reads
-/// as 3 regions when it has 2. A gate's marker is a word that appears in prose about the gate,
-/// so this anchors the marker at the start of a `//` line instead of searching for the string:
-/// prose about it is `///` or mid-sentence, and a real marker opens its line. It cannot be an
-/// equality test — most markers carry the exemption's justification on the same line, which is
-/// the convention this file asks for two sections down ("each carry their argument in place").
+/// **What was measured, 2026-08-11, jscpd 4.0.5, on synthetic pairs carrying a 141-token
+/// duplicate.** These are the semantics the checks below are built on, and the earlier version of
+/// this comment asserted the opposite of two of them from no measurement at all:
 ///
-/// It also checks the pairs balance per file, which is not bookkeeping: jscpd takes an
-/// `ignore-start` with no `ignore-end` as exempt to END OF FILE. That is a hole in the gate
-/// that no clone report would show you, since the effect of the hole is silence.
+/// | form | exempts? |
+/// |---|---|
+/// | `// marker` (bare) | YES — the control |
+/// | `/// marker` (doc comment) | **YES** |
+/// | `// … marker … ` mid-sentence prose | **YES** |
+/// | inside a Rust string literal | no |
+/// | a start with no matching end | **NO — one clone, same as no markers** |
+///
+/// So a marker is any COMMENT that contains the text, and prose about the gate is a live marker.
+/// `backend/hip.rs` had exactly that: a `///` line naming the marker 62 lines above the real one,
+/// pairing with the `ignore-end` 1150 lines later, so the exemption began where nobody decided it
+/// should. That is why the rule enforced here is not "count the anchored form" but **the text may
+/// appear ONLY on a bare marker line** — the one convention under which counting is unambiguous
+/// and a prose mention is a visible edit rather than a silent widening. It is why this comment
+/// says "marker" instead of spelling it.
+///
+/// A start with no end does NOT exempt to end of file, contrary to what this said before it was
+/// measured; the balance check is kept because an unpaired start means a region someone MEANT to
+/// exempt is not exempt, or a pairing crossed two regions as `hip.rs`'s did.
+///
+/// **This models an unpinned dependency.** `build.rs` runs `npx --no -- jscpd` with no version;
+/// the review that found the error measured 5.0.11 and agreed on every row above, but a 6.x could
+/// differ and nothing here would notice.
 #[test]
 fn the_jscpd_exemption_count_is_derived() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -445,22 +462,47 @@ fn the_jscpd_exemption_count_is_derived() {
     files.push(root.join("build.rs"));
     files.sort();
 
+    // Assembled rather than written out, so this file holds no prose copy of the marker either —
+    // it is scanned by jscpd like everything else, and its own doc comment above WAS a live
+    // unpaired marker until this round.
+    let (open, close) = ("jscpd:ignore-", "start");
+    let (m_start, m_end) = (format!("{open}{close}"), format!("{open}end"));
+
     let mut total = 0usize;
     let mut per_file: Vec<String> = Vec::new();
     for f in &files {
         let body = std::fs::read_to_string(f).expect("read a source file");
-        let count = |m: &str| {
-            body.lines()
-                .filter(|l| l.trim_start().starts_with(m))
-                .count()
-        };
-        let (starts, ends) = (count("// jscpd:ignore-start"), count("// jscpd:ignore-end"));
         let rel = f.strip_prefix(root).unwrap_or(f).to_string_lossy();
+        let mut starts = 0usize;
+        let mut ends = 0usize;
+        for (n, l) in body.lines().enumerate() {
+            for (marker, bare, tally) in [
+                (&m_start, format!("// {m_start}"), &mut starts),
+                (&m_end, format!("// {m_end}"), &mut ends),
+            ] {
+                if !l.contains(marker.as_str()) {
+                    continue;
+                }
+                // Any comment carrying the text is a marker to jscpd — `///` and mid-sentence
+                // included, both measured. So the text is allowed ONLY as a bare marker opening
+                // its line, and anything else is reworded rather than counted.
+                assert!(
+                    l.trim_start().starts_with(&bare),
+                    "{rel}:{} mentions the ignore marker without being one:\n  {}\nA doc comment \
+                     or mid-sentence mention IS a marker to jscpd (measured), so this silently \
+                     moves where an exemption begins — `backend/hip.rs` started one 62 lines \
+                     early that way. Reword it to name the marker without spelling it.",
+                    n + 1,
+                    l.trim()
+                );
+                *tally += 1;
+            }
+        }
         assert_eq!(
             starts, ends,
-            "{rel} has {starts} `jscpd:ignore-start` against {ends} `ignore-end`. An \
-             unterminated one exempts to END OF FILE, so the gate goes quiet over everything \
-             below it. Close the region."
+            "{rel} has {starts} start markers against {ends} end markers. An unpaired start does \
+             NOT exempt to end of file (measured), but it does mean either a region someone meant \
+             to exempt is not exempt, or a pairing crossed two regions. Close it."
         );
         if starts > 0 {
             total += starts;

@@ -171,19 +171,34 @@ the two `WMat` ones. Being a verbatim copy is the POINT in each; everywhere else
 >
 > It was stale at **Ten** (written before the glimmer port added one, and before
 > `v4compress.rs` → `kvcompress.rs` and `tests/v4_attn.rs` → `tests/f4_attn.rs` — the survivor
-> list above still named both deleted files). It was then re-derived as **Fourteen** using
-> `grep -rn jscpd:ignore-start src/ tests/ build.rs`, and it is **13**: that grep counted
-> `backend/hip.rs`'s own doc comment *discussing* the marker by name ("The note under
-> `jscpd:ignore-start` rejected…"), which gave that file 3 regions where it has 2. Re-deriving
-> was the right instinct; the command was the trap. **A gate's own marker is a word that appears
-> in prose about the gate**, so anything counting markers has to anchor the marker at the start
-> of its line, not merely find the string. That bare grep now returns **17**, because the test
-> that replaced it discusses the marker three more times — which is why the number to quote is
-> not the grep's, and why this note gives you the mechanism instead of a second command to trust.
+> list above still named both deleted files). It was then re-derived as **Fourteen** by grepping
+> for the marker text, and this file went on to assert **Thirteen** on the grounds that the
+> fourteenth hit was `backend/hip.rs`'s own doc comment merely *discussing* the marker, and
+> therefore inert.
 >
-> The same bare grep also reported 14 starts against 13 ends, which reads as an unterminated
-> exemption — one that would silently run to end-of-file. It was the prose hit a second time.
-> A real one WOULD be a hole in the gate, so the test checks that the pairs balance per file.
+> > **CORRECTED 2026-08-11, and the correction runs the other way: that mention was NOT inert.**
+> > Measured on jscpd 4.0.5 with synthetic pairs carrying a 141-token duplicate (a code review
+> > independently measured 5.0.11 and agreed on every row): a bare `// marker` exempts, **a `///`
+> > doc comment exempts, and a mid-sentence mention inside a comment exempts**; only a string
+> > literal does not. So `hip.rs`'s prose line WAS a live start, 62 lines above the real one,
+> > pairing with the `ignore-end` 1150 lines later — the exemption began where nobody decided it
+> > should, and the count of things jscpd honoured really was fourteen. **The fix was to reword
+> > the prose so it stops being a marker**, not to argue about counting it; the count is 13 again
+> > because there are now 13 markers, and jscpd still reports 0 clones either way, so nothing was
+> > being hidden. Also measured: **an unpaired start does NOT exempt to end of file** — this file
+> > and the test both said it did, from no measurement at all. It yields one clone, exactly as if
+> > no markers were present.
+> >
+> > What the test enforces now follows from the measurement rather than from a guess: **the marker
+> > text may appear ONLY on a bare marker line**, anywhere under `src/`, `tests/` or `build.rs`.
+> > That is the one convention under which counting is unambiguous and a prose mention is a
+> > visible edit instead of a silent widening — and it is why neither the test nor this paragraph
+> > spells the marker out. The pairs-balance check stays, for the reason that survived: an
+> > unpaired start means a region someone meant to exempt is not exempt, or a pairing crossed two
+> > regions the way `hip.rs`'s did.
+> >
+> > **Caveat that applies to all of the above:** `build.rs` pins no jscpd version, so the gate's
+> > marker semantics are an unpinned dependency. Two versions agree today; a third need not.
 
 > **The `WMat` pair, added 2026-08-06 with the `src/` dedup.** `WMat::Fp8` and `WMat::Fp4`
 > carry the same four fields because that IS the checkpoint's storage layout for both

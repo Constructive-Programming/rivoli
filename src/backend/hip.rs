@@ -83,7 +83,8 @@ macro_rules! abi_ty {
 ///
 /// # Why this is not the macro the exemption below argued against
 ///
-/// The note under `jscpd:ignore-start` rejected "a macro that declares each signature once"
+/// The note under the ignore-start marker below rejected "a macro that declares each signature
+/// once"
 /// on two grounds, and it was right about one of them. It observed that ~25 launchers are
 /// **different kernels that merely take the same shape** (`gemv_fp8`/`i8`/`i4`/`vq` all take
 /// `x, packed, scale, o_dim, i_dim, y`) — "there is one copy of each already and nothing to
