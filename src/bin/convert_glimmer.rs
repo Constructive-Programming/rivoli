@@ -29,6 +29,14 @@ use rivoli::artifact::model::{
 /// not optional decoration**: it carries `eos_token_id: [200001, 200008]`, and the
 /// `text_config` in `config.json` carries only the scalar `200001` (trap 13). A run that took
 /// EOS from the config would stop on one of the two.
+///
+/// > **CORRECTED 2026-08-11**, by two reviews. That paragraph asserted a guarantee the code
+/// > did not make: `finish_artifact` downgrades every aux-copy failure to
+/// > `eprintln!("WARNING: {name} not copied")` and returns `Ok(())`, so a partial clone
+/// > (`huggingface-cli download --include "*.safetensors" config.json tokenizer*` is enough)
+/// > produced an artifact whose only EOS is the scalar — trap 13, live, after a multi-hour
+/// > convert, announced by one warning line in the log. [`REQUIRED_AUX`] is the fix; the
+/// > tolerance stays for the rest, because it is shared with three other converters.
 const AUX: [&str; 4] = [
     "tokenizer.json",
     "tokenizer_config.json",
@@ -52,6 +60,17 @@ struct Args {
     out_dir: String,
 }
 
+/// The subset of [`AUX`] whose absence is a REFUSAL rather than a warning, checked before any
+/// weight is read.
+///
+/// Both carry a fact that exists nowhere else in the source tree, and both have already cost
+/// this repo a round in another model: `generation_config.json` is the only file with the
+/// two-element `eos_token_id` (trap 13), and `chat_template.jinja` is the one the memory note
+/// `artifact-drops-the-chat-template` records rivoli drifting away from for months precisely
+/// because it lived only upstream. A converter that shrugs at their absence hands the problem
+/// to whoever debugs the decode.
+const REQUIRED_AUX: [&str; 2] = ["generation_config.json", "chat_template.jinja"];
+
 fn main() -> Result<()> {
     let args = Args::parse();
     // jscpd:ignore-end
@@ -65,6 +84,16 @@ fn main() -> Result<()> {
         "out_dir and src_dir resolve to the same directory; the writer maps the source while \
          it writes, and overwriting a mapped shard is a SIGBUS rather than an error"
     );
+    for aux in REQUIRED_AUX {
+        let p = std::path::Path::new(&args.src_dir).join(aux);
+        ensure!(
+            p.is_file(),
+            "{} is missing from {}. It is not decoration — see REQUIRED_AUX — and \
+             `finish_artifact` would only WARN about it, three hours into the convert",
+            aux,
+            args.src_dir
+        );
+    }
     // Parsed, and therefore validated, before a single tensor is read: `GlimmerConfig` is
     // where the layer/RoPE pairing invariant and the width checks live, and a checkpoint that
     // fails them must not produce a half-written artifact.
@@ -79,14 +108,34 @@ fn main() -> Result<()> {
     let want = |n: &str| !is_vision(n);
     let src = Safetensors::open_indexed(&args.src_dir, want)?;
 
+    // **The skipped count comes from the INDEX, not from the opened shards.** `open_indexed`
+    // selects whole SHARDS containing at least one wanted tensor, and `want` excludes vision —
+    // so a shard holding only vision tensors is never opened and its tensors never appear in
+    // `src.names()`. Counting them there under-reports by however many such shards the
+    // checkpoint happens to have, which makes the number a function of its shard boundaries
+    // rather than of the model. The fixture is single-shard so it could not show this; review
+    // found it 2026-08-11, and the count is the whole reason `is_vision` exists as a named
+    // predicate ("an observation, not an assumption").
+    let skipped = {
+        let idx = std::fs::read_to_string(
+            std::path::Path::new(&args.src_dir).join("model.safetensors.index.json"),
+        )?;
+        let idx: serde_json::Value = serde_json::from_str(&idx)?;
+        idx["weight_map"]
+            .as_object()
+            .context("model.safetensors.index.json has no weight_map")?
+            .keys()
+            .filter(|n| is_vision(n))
+            .count()
+    };
+
     let mut w = SafeWriter::new();
-    let (mut verbatim, mut widened, mut skipped) = (0usize, 0usize, 0usize);
+    let (mut verbatim, mut widened) = (0usize, 0usize);
     let mut names: Vec<String> = src.names().iter().map(|s| s.to_string()).collect();
     names.sort();
     for name in &names {
         if is_vision(name) {
-            skipped += 1;
-            continue;
+            continue; // counted from the index above, not from whichever shards were opened
         }
         if is_norm(name) {
             w.add_widened(&src, name)?;
@@ -153,10 +202,17 @@ fn main() -> Result<()> {
 
 /// The vision tower, its adapter and its projector — **out of scope, skipped explicitly.**
 ///
-/// Explicitly rather than by omission: the text side is selected by a positive predicate
-/// below, so an unrecognised vision tensor would simply not be copied and nothing would say
-/// so. This function exists to make the *count* of skipped tensors a number the run prints,
-/// which is what turns "the vision half was excluded" from an assumption into an observation.
+/// Explicitly, and the count is printed, which is what turns "the vision half was excluded"
+/// from an assumption into an observation.
+///
+/// > **CORRECTED 2026-08-11**, by review. This said the text side is "selected by a positive
+/// > predicate below, so an unrecognised vision tensor would simply not be copied". **The
+/// > predicate is `|n| !is_vision(n)` — negative**, and the real behaviour is the inverse of
+/// > what that argued: a fourth vision prefix would be copied verbatim INTO the artifact and
+/// > counted as text. `tests/glimmer_names.rs`'s
+/// > `every_family_is_either_implemented_or_deliberately_skipped` is what actually catches
+/// > that, by restating these three prefixes and reconciling 627 + 809 against the shipped
+/// > index — so the guard exists, it is just not the one this comment claimed.
 fn is_vision(name: &str) -> bool {
     name.starts_with("model.vision_tower.")
         || name.starts_with("model.vision_adapter.")
@@ -167,7 +223,9 @@ fn is_vision(name: &str) -> bool {
 ///
 /// Every architecture in this engine reads its norm weights as f32 (`add_widened`'s doc lists
 /// them), so this follows the house convention rather than inventing one. It is also cheap:
-/// 5 norms per layer plus the final one is ~5.5 MB widened, against 55.7 GB of weights.
+/// **4** norms per layer plus the final one — 209 tensors, ~5.5 MB widened, against 55.7 GB
+/// of weights. (Said 5 until review corrected it 2026-08-11; the count that matters is
+/// asserted, as `L * 4 + 1`, by `tests/glimmer_convert.rs`.)
 ///
 /// **Matched on the tail, not on a `layers.N.` prefix**, so the model-level `norm.weight` and
 /// the four per-layer `*_layernorm.weight` take the same path — `"…layernorm.weight"` ends

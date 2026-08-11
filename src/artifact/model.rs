@@ -1645,8 +1645,14 @@ pub struct GlimmerTextConfig {
 /// the wrong tensor copies silently — `tests/k3_names.rs` exists because that failure mode
 /// already cost this repo a round.
 ///
-/// Five projections and four norms; the QK-norm is weightless and ships nothing, and there is
-/// no bias anywhere (`attention_bias` is false and asserted).
+/// **Eight projections and four norms** — five projections in the attention block (`q`, `k`,
+/// `v`, `o` and the output `gate`) and three in the MLP. The QK-norm is weightless and ships
+/// nothing, and there is no bias anywhere (`attention_bias` is false and asserted).
+///
+/// > **CORRECTED 2026-08-11**, by review. This said "five projections and four norms", which
+/// > is nine against a list of twelve — it counted the attention block and forgot the MLP.
+/// > `pin.rs`'s `GlimmerLayerPin` had it right, so the tree disagreed with itself about the
+/// > length of the one constant that exists to stop exactly that.
 pub const GLIMMER_LAYER_TENSORS: [&str; 12] = [
     "input_layernorm",
     "post_attention_layernorm",
@@ -1774,8 +1780,16 @@ impl GlimmerTextConfig {
             "self_attn.o_proj" => vec![self.hidden, q],
             "mlp.gate_proj" | "mlp.up_proj" => vec![self.inter, self.hidden],
             "mlp.down_proj" => vec![self.hidden, self.inter],
-            // All four norms, and the arm is written as a suffix rather than four literals so
-            // that a fifth norm is covered rather than silently unmatched.
+            // All four norms, as a suffix rather than four literals.
+            //
+            // > **CORRECTED 2026-08-11**, by review. This said the suffix means "a fifth norm
+            // > is covered rather than silently unmatched". Covered is not correct: the only
+            // > fifth norm this architecture could grow is the QK-norm, which is per-head and
+            // > `[head_dim]` = 128, not `[hidden]` = 6656 — so the arm would hand back a WRONG
+            // > shape where the reader was promised a `bail!`. Inert today (the QK-norm is
+            // > weightless and ships no tensor at all, `glimmer-architecture.md` §4 trap 2),
+            // > and recorded because this is the one place where "covered" and "correct"
+            // > diverge.
             t if t.ends_with("layernorm") => vec![self.hidden],
             _ => bail!(
                 "{tensor} is not a Muse Glimmer layer tensor — GLIMMER_LAYER_TENSORS and this \
@@ -3045,6 +3059,12 @@ mod tests {
                 Ok(_) => ignored.push(k.clone()),
             }
         }
+        // Sorted HERE, because `serde_json` runs with `preserve_order` and so `text.keys()`
+        // yields FILE order. It happens to equal sorted order for the vendored config, which
+        // is why the whole-list comparison held — but a re-vendor from a source that emits
+        // keys in declaration order would redden this with a diff of two identical SETS, and
+        // point the reader at a serde change that did not happen. Review, 2026-08-11.
+        ignored.sort();
         assert_eq!(
             ignored, NOT_IN_SCHEMA,
             "the set of text_config keys this schema tolerates as ABSENT has changed.\n  \

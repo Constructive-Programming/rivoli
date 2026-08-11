@@ -127,9 +127,16 @@ fn the_layer_tensor_names_match_the_checkpoint() {
 /// about, which is exactly how a checkpoint feature gets silently dropped.
 #[test]
 fn every_family_is_either_implemented_or_deliberately_skipped() {
-    // `is_vision`'s three prefixes, restated. Not imported: it lives in a binary, and a test
-    // that re-derives the predicate from the same source it is checking proves nothing. If
-    // these drift from `convert_glimmer.rs`, the counts below stop adding up.
+    // `is_vision`'s three prefixes, restated. Not imported: it lives in a binary.
+    //
+    // > **CORRECTED 2026-08-11**, by review. This said "if these drift from
+    // > `convert_glimmer.rs`, the counts below stop adding up". They do not: `text` and
+    // > `vision` are computed entirely from THIS closure, the vendored TSV and
+    // > `GLIMMER_LAYER_TENSORS` — the converter contributes nothing to either, so deleting its
+    // > `model.vision_projection` clause leaves 627/809 bit-identical. What actually catches
+    // > that drift is `tests/glimmer_convert.rs`, whose fixture ships one tensor per prefix.
+    // > The numbers below are real and are the completeness claim; the coupling this comment
+    // > asserted was not.
     let is_vision = |n: &str| {
         n.starts_with("model.vision_tower.")
             || n.starts_with("model.vision_adapter.")

@@ -22,8 +22,8 @@
 
 mod common;
 use common::{
-    GLIMMER_FIXTURE_LAYERS as L, glimmer_convert_fixture, glimmer_fixture, run_convert_glimmer,
-    write_index,
+    GLIMMER_FIXTURE_LAYERS as L, TempRoot, glimmer_convert_fixture, glimmer_fixture,
+    run_convert_glimmer, write_index,
 };
 // Module alias rather than a second flat `use` list: the converter imports the same names
 // from the same two modules, and jscpd (which normalizes identifiers) reports the matching
@@ -35,9 +35,9 @@ const DIM: usize = 8;
 
 #[test]
 fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
-    let root = std::env::temp_dir().join(format!("glimmer-conv-{}", std::process::id()));
+    let root = TempRoot::new("glimmer-conv");
     let out = root.join("out");
-    let (tensors, log) = glimmer_convert_fixture(&root, DIM);
+    let (tensors, log) = glimmer_convert_fixture(root.path(), DIM);
 
     // The counts are the observation that the vision half was excluded, rather than the
     // assumption — 3 skipped, and the 4 norms per layer plus the model-level one widened.
@@ -83,16 +83,14 @@ fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
             assert_eq!(got, &bytes[..], "{name} is not byte-identical");
         }
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The guards that fire before 55 GB is written: an incomplete checkpoint, and an output
 /// directory that is the input.
 #[test]
 fn convert_glimmer_refuses_before_it_writes() {
-    let root = std::env::temp_dir().join(format!("glimmer-refuse-{}", std::process::id()));
+    let root = TempRoot::new("glimmer-refuse");
     let (src, out) = (root.join("src"), root.join("out"));
-    let _ = std::fs::remove_dir_all(&root);
     let mut tensors = glimmer_fixture(&src, DIM);
 
     // Writing into the source directory is a SIGBUS risk, not an error — the writer maps the
@@ -100,6 +98,18 @@ fn convert_glimmer_refuses_before_it_writes() {
     let o = run_convert_glimmer(&src, &src.join("."));
     let err = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(!o.status.success() && err.contains("SIGBUS"), "{err}");
+
+    // A source missing a REQUIRED_AUX file refuses too, and refuses EARLY — before the config
+    // is even parsed. `finish_artifact` would only have warned, three hours in, and the
+    // artifact would ship with trap 13's scalar EOS as its only one.
+    std::fs::remove_file(src.join("generation_config.json")).unwrap();
+    let o = run_convert_glimmer(&src, &out);
+    let err = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(
+        !o.status.success() && err.contains("generation_config.json is missing"),
+        "{err}"
+    );
+    std::fs::write(src.join("generation_config.json"), b"{}").unwrap();
 
     // A checkpoint missing one per-layer tensor refuses by NAME, before the write.
     let dropped = format!("{}.2.mlp.up_proj.weight", gm::GLIMMER_LAYER_PREFIX);
@@ -113,5 +123,4 @@ fn convert_glimmer_refuses_before_it_writes() {
         !out.join("resident.safetensors").exists(),
         "the artifact must not exist after a refusal"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }

@@ -19,7 +19,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 mod common;
-use common::{FixtureTensor, GLIMMER_FIXTURE_LAYERS as L, glimmer_convert_fixture};
+use common::{FixtureTensor, GLIMMER_FIXTURE_LAYERS as L, TempRoot, glimmer_convert_fixture};
 use rivoli::artifact::model as gm;
 use rivoli::memory::pin::GlimmerPin;
 
@@ -27,11 +27,21 @@ const DIM: usize = 8;
 
 /// Convert the synthetic checkpoint and return `(artifact dir, config, source tensors)`.
 /// The caller owns the temp root and removes it.
-fn convert(tag: &str) -> (std::path::PathBuf, gm::GlimmerConfig, Vec<FixtureTensor>) {
-    let root = std::env::temp_dir().join(format!("glimmer-pin-{tag}-{}", std::process::id()));
-    let (tensors, _) = glimmer_convert_fixture(&root, DIM);
+fn convert(tag: &str) -> (TempRoot, gm::GlimmerConfig, Vec<FixtureTensor>) {
+    let root = TempRoot::new(&format!("glimmer-pin-{tag}"));
+    let (tensors, _) = glimmer_convert_fixture(root.path(), DIM);
     let cfg = gm::load_config(root.join("out").to_str().unwrap()).unwrap();
     (root, cfg, tensors)
+}
+
+/// The source's bf16 bytes for `name`, widened to f32 — what the converter wrote and
+/// therefore what the tier must hold.
+fn widened(src: &std::collections::HashMap<&str, &Vec<u8>>, name: &str) -> Vec<u8> {
+    src.get(name)
+        .unwrap_or_else(|| panic!("{name} is not in the fixture"))
+        .chunks_exact(2)
+        .flat_map(|c| rivoli::math::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])).to_le_bytes())
+        .collect()
 }
 
 /// Read a placement back out of the tier. Safe because the slab is host-fillable — this is
@@ -79,6 +89,18 @@ fn glimmer_pin_places_every_tensor_with_the_shape_the_config_implies() {
         "embed and head are untied"
     );
 
+    // **`final_norm`, which had no assertion at all until review found it 2026-08-11.** It is
+    // the RMSNorm before `lm_head`, it is a bare `*const f32` carrying no extent, and
+    // `place_f32` checks only the dtype — so before `place_glimmer_norm` existed it could have
+    // been wired to ANY other f32 tensor in the artifact, of any length, and every test in
+    // this branch still passed. The fixture gives each tensor a distinct blob, so comparing
+    // the bytes is what tells `model.norm` apart from four layer norms of the same shape.
+    assert_eq!(
+        slab(pin.final_norm as *const u8, cfg.text.hidden * 4),
+        widened(&src, "model.language_model.norm.weight"),
+        "final_norm is wired to the wrong tensor"
+    );
+
     for (l, layer) in pin.layers.iter().enumerate() {
         // Paired with the tensor name so the assertion below reads the shape table rather
         // than restating eight shapes — and so a field wired to the wrong name is visible as
@@ -122,23 +144,14 @@ fn glimmer_pin_places_every_tensor_with_the_shape_the_config_implies() {
             (layer.post_ffn_ln, "post_feedforward_layernorm"),
         ] {
             let full = format!("{}.{l}.{t}.weight", gm::GLIMMER_LAYER_PREFIX);
-            let want: Vec<u8> = src
-                .get(full.as_str())
-                .unwrap()
-                .chunks_exact(2)
-                .flat_map(|c| {
-                    rivoli::math::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])).to_le_bytes()
-                })
-                .collect();
             assert_eq!(
                 slab(p as *const u8, cfg.text.hidden * 4),
-                want,
+                widened(&src, &full),
                 "{full} is wired to the wrong norm"
             );
         }
     }
     drop(pin); // release the tier before the next test's `DeviceTier::new`
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// **A config that describes a different model refuses, and names the tensor.**
@@ -150,19 +163,82 @@ fn glimmer_pin_places_every_tensor_with_the_shape_the_config_implies() {
 /// `num_key_value_heads` doubled is the defect chosen because it makes the tier LARGER, so
 /// what fires is the shape check rather than a capacity bail — a smaller config would refuse
 /// for the wrong reason and this test would pass without exercising anything.
+///
+/// The norm class has its own test below: its defect has to be in the ARTIFACT rather than in
+/// the config, because every norm is checked against `hidden` and changing `hidden` trips the
+/// embed/lm_head check first.
 #[test]
 fn glimmer_pin_refuses_a_config_the_artifact_does_not_match() {
-    let (root, mut cfg, _) = convert("mismatch");
-    cfg.text.num_key_value_heads *= 2;
+    let (root, cfg, _) = convert("mismatch");
+    let mut broken = cfg.text.clone();
+    broken.num_key_value_heads *= 2;
     let e = format!(
         "{:#}",
-        GlimmerPin::build(root.join("out").to_str().unwrap(), &cfg.text)
+        GlimmerPin::build(root.join("out").to_str().unwrap(), &broken)
             .err()
             .expect("a config implying different dims must be refused")
     );
+    // Both halves separately, so which one failed is the useful half of the message: a refusal
+    // that fires without naming the tensor is nearly as unhelpful as none.
+    for (needle, must) in [
+        ("self_attn.k_proj", "NAME the offending tensor"),
+        (
+            "different models",
+            "say the config and the artifact disagree",
+        ),
+    ] {
+        assert!(e.contains(needle), "the refusal must {must}. Got: {e}");
+    }
+}
+
+/// **A norm of the wrong LENGTH is refused too** — the placement class that had no check at
+/// all until 2026-08-11, found by two independent reviews.
+///
+/// The defect is in the ARTIFACT, and that is the truer form: an adversarial review
+/// demonstrated that `convert_glimmer` accepts a short norm and **exits 0**, because
+/// `SafeWriter::add_widened` copies the source shape and the converter's completeness loop
+/// checks names only. So this is an artifact the shipped converter will really produce.
+///
+/// What the pin prevents: `place_f32` discards the shape and `GlimmerLayerPin`'s norm fields
+/// are bare `*const f32` carrying no extent, so a short norm would be placed into a tier sized
+/// for the full width and handed to S2's RMSNorm as a `hidden`-long array — reading
+/// inter-placement padding and the next tensor's bytes. In bounds of the slab, no error, a
+/// scaled-wrong residual stream on one layer's tail channels.
+#[test]
+fn glimmer_pin_refuses_a_norm_that_is_not_hidden_long() {
+    let root = TempRoot::new("glimmer-shortnorm");
+    let src = root.join("src");
+    let mut tensors = common::glimmer_fixture(&src, DIM);
+
+    // One layer norm, one element short. Nothing else is touched, so the refusal cannot be
+    // attributed to any other tensor.
+    let short = format!("{}.1.input_layernorm.weight", gm::GLIMMER_LAYER_PREFIX);
+    let t = tensors
+        .iter_mut()
+        .find(|(n, _, _)| *n == short)
+        .expect("the fixture ships this norm");
+    t.1 = vec![DIM - 1];
+    t.2.truncate((DIM - 1) * 2);
+    common::write_safetensors(&src.join("model-00001-of-00001.safetensors"), &tensors);
+    common::write_index(&src, &tensors);
+
+    let out = root.join("out");
+    let o = common::run_convert_glimmer(&src, &out);
     assert!(
-        e.contains("self_attn.k_proj") && e.contains("different models"),
-        "the refusal must name the tensor, got: {e}"
+        o.status.success(),
+        "the converter is expected to ACCEPT this — it is the gap the pin closes: {}",
+        String::from_utf8_lossy(&o.stderr)
     );
-    let _ = std::fs::remove_dir_all(&root);
+
+    let cfg: gm::GlimmerConfig = gm::load_config(out.to_str().unwrap()).unwrap();
+    let e = format!(
+        "{:#}",
+        GlimmerPin::build(out.to_str().unwrap(), &cfg.text)
+            .err()
+            .expect("a norm shorter than hidden must be refused")
+    );
+    assert!(
+        e.contains(&short),
+        "the refusal must name the norm. Got: {e}"
+    );
 }

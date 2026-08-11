@@ -973,9 +973,19 @@ pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> 
 
     write_safetensors(&dir.join("model-00001-of-00001.safetensors"), &tensors);
     write_index(dir, &tensors);
-    for aux in ["tokenizer.json", "tokenizer_config.json"] {
+    // All four of `convert_glimmer`'s AUX files, not just the two the converter tolerates
+    // missing: `generation_config.json` and `chat_template.jinja` are REQUIRED_AUX and the
+    // converter refuses without them. Until 2026-08-11 the fixture shipped two, so every green
+    // run in this branch certified the artifact shape in which trap 13 (the scalar EOS) is
+    // live — which is what review found.
+    for aux in [
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "generation_config.json",
+    ] {
         std::fs::write(dir.join(aux), b"{}").unwrap();
     }
+    std::fs::write(dir.join("chat_template.jinja"), b"{{ x }}").unwrap();
     tensors
 }
 
@@ -1006,4 +1016,35 @@ pub fn glimmer_convert_fixture(root: &std::path::Path, dim: usize) -> (Vec<Fixtu
     let log = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(o.status.success(), "converter failed: {log}");
     (tensors, log)
+}
+
+/// A temp directory that removes itself on drop.
+///
+/// **Panic-safe, which the hand-written `let _ = std::fs::remove_dir_all(&root);` at the end
+/// of a test is not** — a failing assertion skips it and leaves the fixture behind, and the
+/// next run with the same pid reuses it. It also removes the line itself from five tests
+/// across three files, which is what jscpd was reporting: the loop-close-plus-cleanup tail is
+/// the same shape everywhere, so every restructure just moved the clone somewhere else.
+///
+/// `tag` is combined with the pid so two test binaries running at once cannot collide.
+pub struct TempRoot(std::path::PathBuf);
+
+impl TempRoot {
+    pub fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        Self(p)
+    }
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    pub fn join(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

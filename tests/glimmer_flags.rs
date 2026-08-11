@@ -15,10 +15,17 @@
 //! A refusal test needs a checkpoint the binary accepts far enough to reach the refusal, and
 //! a synthetic one is the only kind available (the real model is 59.553 GB and is not here).
 
+// **Gated on the backend, and that is not because it needs one.** Nothing here touches the
+// GPU. But it runs the shipped `rivoli` binary, and a featureless build of that binary is a
+// refusal stub — `main` bails with "built with NO compute backend" before it ever reaches the
+// architecture dispatch. So without this gate every test below fails under CI's featureless
+// `cargo test --release --locked`, which is the ONE job this repo has. Caught by review
+// 2026-08-11, after the file shipped green on a `--features rocm` machine.
+#![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 mod common;
-use common::glimmer_convert_fixture;
+use common::{TempRoot, glimmer_convert_fixture};
 
 const DIM: usize = 8;
 
@@ -53,8 +60,8 @@ fn rivoli(artifact: &std::path::Path, extra: &[&str]) -> String {
 /// trap `glimmer_pin`'s refusal test hit for real on a busy GPU.
 #[test]
 fn every_flag_that_does_not_apply_is_refused_by_name() {
-    let root = std::env::temp_dir().join(format!("glimmer-flags-{}", std::process::id()));
-    let _ = glimmer_convert_fixture(&root, DIM);
+    let root = TempRoot::new("glimmer-flags");
+    let _ = glimmer_convert_fixture(root.path(), DIM);
     let art = root.join("out");
 
     // The flag, how a user sets it, and a distinctive fragment of the reason — so a message
@@ -62,7 +69,13 @@ fn every_flag_that_does_not_apply_is_refused_by_name() {
     for (flag, args, reason) in [
         ("--attn", vec!["--attn", "dense"], "fixed in the weights"),
         ("--sinks", vec!["--sinks", "8"], "there is no --attn here"),
-        ("--window", vec!["--window", "4096"], "2048 rows"),
+        (
+            "--window",
+            vec!["--window", "4096"],
+            // Not the row COUNT: the message reports this artifact's own `sliding_window`,
+            // which is 2 in the fixture and 2048 in the shipped model.
+            "property of how the weights were trained",
+        ),
         ("--misa-heads", vec!["--misa-heads", "4"], "no analogue of"),
         ("--mode", vec!["--mode", "int4"], "no second format to pick"),
         (
@@ -92,19 +105,43 @@ fn every_flag_that_does_not_apply_is_refused_by_name() {
             "{flag} must be refused with its reason, got:\n{err}"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+
+    // **The same flags again, at clap's own default value.** This is the row that could not
+    // pass before 2026-08-11: the refusals compared VALUES, so `--cache-policy 2q` on a model
+    // with no cache and `--mode hybrid` on a model with no experts were accepted — and
+    // `tests/mode-matrix.sh` passes exactly those explicitly, so it is the ordinary case, not
+    // an exotic one. "Was this flag typed" and "does it hold a non-default value" are
+    // different questions, and only the first is the one a refusal wants to ask. Found by
+    // review, in the gap between the loop above (non-default values only) and the bare run
+    // below (no flags at all).
+    for (flag, args) in [
+        ("--attn", vec!["--attn", "auto"]),
+        ("--sinks", vec!["--sinks", "4"]),
+        ("--window", vec!["--window", "8192"]),
+        ("--misa-heads", vec!["--misa-heads", "8"]),
+        ("--mode", vec!["--mode", "hybrid"]),
+        ("--cache-policy", vec!["--cache-policy", "2q"]),
+        ("--moe-gain", vec!["--moe-gain", "1.0"]),
+    ] {
+        let err = rivoli(&art, &args);
+        assert!(
+            err.contains(flag) && err.contains("does not apply"),
+            "{flag} at its DEFAULT value must still be refused — it was typed, and that is \
+             what the recorded command line will show. Got:\n{err}"
+        );
+    }
 }
 
 /// **A bare run gets past every refusal and stops at the one honest bail.**
 ///
 /// The other half of the gate, and the half that catches a refusal fired on the DEFAULT
-/// value. A table of eight `bail!`s where one compares against the wrong default refuses a
+/// value. A table of nine `bail!`s where one asks the wrong question refuses a
 /// user who passed nothing — which reads as "this model is broken" rather than "you passed a
 /// flag it cannot honour", and no test above can see it.
 #[test]
 fn a_run_with_no_flags_reaches_the_decode_bail() {
-    let root = std::env::temp_dir().join(format!("glimmer-bare-{}", std::process::id()));
-    let _ = glimmer_convert_fixture(&root, DIM);
+    let root = TempRoot::new("glimmer-bare");
+    let _ = glimmer_convert_fixture(root.path(), DIM);
     let err = rivoli(&root.join("out"), &[]);
     assert!(
         err.contains("do not decode yet") && err.contains("S2"),
@@ -121,7 +158,6 @@ fn a_run_with_no_flags_reaches_the_decode_bail() {
         err.contains("4 layers (3 sliding at window 2 / 1 full)") && err.contains("DENSE"),
         "the layer map must be reported before the bail:\n{err}"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// **A manifest contradicting a load-bearing field refuses AT STARTUP, from the binary.**
@@ -138,8 +174,8 @@ fn a_run_with_no_flags_reaches_the_decode_bail() {
 /// frequencies and decodes fluently.
 #[test]
 fn a_manifest_that_contradicts_itself_refuses_at_startup() {
-    let root = std::env::temp_dir().join(format!("glimmer-badcfg-{}", std::process::id()));
-    let _ = glimmer_convert_fixture(&root, DIM);
+    let root = TempRoot::new("glimmer-badcfg");
+    let _ = glimmer_convert_fixture(root.path(), DIM);
     let manifest = root.join("out").join("manifest.json");
 
     // Layer 0 is `sliding_attention` and therefore rotated. Zero its theta and it claims to
@@ -158,5 +194,4 @@ fn a_manifest_that_contradicts_itself_refuses_at_startup() {
         !err.contains("do not decode yet"),
         "the config refusal must come BEFORE the decode bail:\n{err}"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }

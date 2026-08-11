@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a DONE and G1a MET 2026-08-11 on tag k3-s1a — config schema, convert_glimmer (bf16-verbatim), GlimmerPin placing all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream, and run_glimmer's nine flag refusals against V4's three. G1a's blind spot: not one of its clauses evaluates arithmetic, so every gate so far would hold on a checkpoint of noise; S1b's goldens are where that changes. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
+verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a DONE and G1a MET 2026-08-11 on tag k3-s1a — config schema, convert_glimmer (bf16-verbatim), GlimmerPin placing all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream, and run_glimmer's nine flag refusals against V4's three. G1a's blind spot: not one of its clauses evaluates arithmetic, so every gate so far would hold on a checkpoint of noise; S1b's goldens are where that changes. Four reviews then found two CI breaks (both tests running the shipped binary, which is a refusal stub featureless) and one silent-wrongness class the gates could not see -- all five f32 norms were placed with no extent check, and the shipped converter accepts a short norm at exit 0. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
 ---
 
 # Muse Glimmer-30B — implementation plan
@@ -474,6 +474,41 @@ so "round-trips bit-exact" is a statement about `memcpy` — it would hold ident
 tensor in the checkpoint were noise. Nothing here can see a wrong window boundary, a rotated
 NoPE layer, a mis-broadcast KV head, or the argmax-invariant logit path. That is S1b's whole
 job, and G1a being met says only that the inputs to S1b are the ones the checkpoint ships.
+
+### The review round, 2026-08-11 — what four reviews found after G1a was declared MET
+
+Ponytail, correctness, testing and adversarial, all run against `k3-s1a..HEAD`. **Two CI
+breaks and one silent-wrongness class**, none of which any gate on this branch could see.
+
+| finding | who | what it was |
+|---|---|---|
+| **`tests/glimmer_flags.rs` had no `#![cfg(feature = "rocm")]`** | all four | It runs the shipped binary, and a featureless `rivoli` is a refusal stub — so the ONE CI job this repo has (`cargo test --release --locked`, featureless) went **3/3 red**. Verified by running it. The file's header claimed "deviceless, and that is a property of where the bail sits"; deviceless was true and featureless was not |
+| **`tests/arch_artifacts.rs` asserted `opened > 0` unconditionally** | testing, adversarial | `/var/db/rivoli` does not exist on a CI runner, so the anti-vacuity assert *was* the CI break. And "skips loudly" was false — libtest captures stdout of PASSING tests, so a run that degraded from two architectures to one looked identical to a full one. Now: no artifacts → print and return; some → `EXPECTED_PRESENT` |
+| **All five f32 norms were placed with NO extent check** | correctness, adversarial | `place_f32` discards the shape and the norm fields are bare `*const f32`. A norm shorter than `hidden` is placed into a tier sized for the full width and handed to S2's RMSNorm as a `hidden`-long array — reading inter-placement padding and the next tensor's bytes. **In bounds of the slab, no error, a scaled-wrong residual stream.** The adversarial reviewer ran the shipped converter on a `[7]`-instead-of-`[8]` norm: `exit 0`. `place_glimmer_norm` now checks it, and `glimmer_pin_refuses_a_norm_that_is_not_hidden_long` converts exactly that artifact and pins it |
+| **Nine refusals compared VALUES, so passing a default was accepted** | adversarial | `--mode hybrid --cache-policy 2q --window 8192` fired zero refusals — and `tests/mode-matrix.sh` passes mode/policy/attn explicitly, so it is the ordinary case. "Was this flag typed" and "does it hold a non-default value" are different questions and only the first is the refusal's. `parse_args` now returns clap's `ValueSource::CommandLine` set; the table asks about presence. The gap sat exactly between the two existing tests — one passed only non-defaults, the other passed nothing |
+| **`--moe-gain` was accepted and read by nothing** | testing | The one row the table missed, and the one flag with no `Config` field — so nothing downstream could have refused it. `--mode` is refused with "there are no routed experts"; this is the same argument |
+| **The refusal message claimed "hidden from --help" for four flags that were not hidden** | correctness | Fixed on the other side: `MuseGlimmer` now has its own `hidden_flags` arm with nine entries, split from the shared V4/K3 one. A flag a model cannot honour should not be advertised in that model's help |
+| **`generation_config.json` was called load-bearing while its absence was a `WARNING`** | correctness, adversarial | And the branch's own fixture shipped without it, so every green run certified the artifact shape in which **trap 13 (the scalar EOS) is live**. `REQUIRED_AUX` refuses before any weight is read; the fixture now ships all four |
+| **The skipped-vision count was a function of the checkpoint's SHARD boundaries** | testing | `open_indexed` selects whole shards, and `want` excludes vision — so a vision-only shard is never opened and its tensors never reach `names()`. The count is now taken from the index. The single-shard fixture could not have shown this |
+| two comments asserted guarantees the code did not make | ponytail, testing | `is_vision`'s doc argued from a "positive predicate" that is `!is_vision(n)` — the real behaviour is the inverse, an unrecognised vision prefix is COPIED. And `glimmer_names`' counts do not gate the converter's predicate at all |
+| the tensor count was wrong in two comments | ponytail, correctness | "Five projections and four norms" is nine against a list of twelve, and "5 norms per layer" against four. `pin.rs` had it right, so **the tree disagreed with itself about the length of the one constant that exists to stop that** |
+
+**One finding was wrong and is recorded as such.** Both ponytail and I considered replacing the
+flag bundle with `&Args`; it does not compile — `Config` moves four of that struct's `String`s
+just above the dispatch, so `a` is partially moved and `&a` will not borrow. That is the same
+constraint `run_v4`'s doc already records. (The bundle is gone anyway: presence-based refusals
+need only the id set.)
+
+**Declined, with the argument:** `quantize_fp8_block` has no production caller and ponytail
+proposed deleting it until the fp8 pass. Kept — it is inert, its three red-proofs are the
+thing that would be lost, and the plan sequenced it deliberately at item 2.
+
+**Still open, recorded rather than fixed:** nothing ties the vendored fixtures to HF revision
+`f84ecc3`, so a revision that ADDS a tensor family would be copied verbatim into the artifact,
+never placed by the pin, and every gate would stay green (adversarial). `convert_glimmer` has
+no membership test against `GLIMMER_LAYER_TENSORS` on the way in, and no provenance stamp — GLM
+has `I4Source` and Glimmer has no analogue. **That belongs in S1b**, beside the goldens that
+will also be revision-pinned.
 
 **Two things G1a did not ask for and this stage produced anyway**, both because the plan
 underestimated what a *fourth* architecture costs: the tensor-name pinning

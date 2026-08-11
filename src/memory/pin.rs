@@ -1213,6 +1213,31 @@ pub struct GlimmerPin {
     pub layers: Vec<GlimmerLayerPin>,
 }
 
+/// Place one Glimmer f32 norm, with its LENGTH checked against `hidden`.
+///
+/// **The check is the whole reason this exists rather than a bare [`place_f32`] call.**
+/// `place_f32` discards the shape, and `GlimmerLayerPin`'s norm fields are bare `*const f32`
+/// carrying no extent — so a norm shorter than `hidden` is accepted, sized into a tier that
+/// has room to spare (`resident_bytes` budgeted the full width), and handed to S2's RMSNorm as
+/// a `hidden`-long array. It then reads inter-placement padding and the next tensor's bytes:
+/// a scaled-wrong residual stream, in bounds of the slab, with no error anywhere. That is the
+/// same class `place_glimmer_proj` guards against, and the five norms were the only placements
+/// on this path with nothing at all. Found by two independent reviews, 2026-08-11.
+fn place_glimmer_norm(
+    tier: &mut DeviceTier,
+    st: &Safetensors,
+    hidden: usize,
+    name: &str,
+) -> Result<*const f32> {
+    let (bytes, shape) = st.typed(name, Dtype::F32)?;
+    ensure!(
+        shape == [hidden],
+        "{name} is {shape:?}, but this config implies [{hidden}] — the artifact and the config \
+         describe different models"
+    );
+    Ok(tier.place(bytes)? as *const f32)
+}
+
 /// Place one Glimmer layer projection, with the shape the config implies.
 ///
 /// The shape comes from [`GlimmerTextConfig::layer_tensor_shape`] rather than from the caller,
@@ -1256,12 +1281,15 @@ impl GlimmerPin {
         // under 160 KB. 1 MiB is ~6x that bound and 0.002% of the 55.7 GB it sits beside.
         const SLACK: usize = 1 << 20;
         let want = cfg.resident_bytes()?;
-        let mut tier = DeviceTier::new(want + SLACK)?;
-        // `FormatMeta` is loaded for its side effect: it is the version and VQ-parameter gate
-        // every artifact passes, and skipping it here would let an artifact written by an
-        // older converter load silently. Glimmer has no VQ tensors, so nothing is read out.
+        // **The cheap refusals first, then the 55.7 GB allocation.** `FormatMeta::load` is the
+        // version and VQ-parameter gate every artifact passes — skipping it would let one
+        // written by an older converter load silently — and `open_dir` is where a missing or
+        // malformed shard is found. Both were BELOW `DeviceTier::new` until review pointed out
+        // that this made a stale artifact pay a full-model allocation before its cheap refusal
+        // fired, which inverts the ordering the rest of this port is careful about.
         FormatMeta::load(dir)?;
         let st = Safetensors::open_dir(dir)?;
+        let mut tier = DeviceTier::new(want + SLACK)?;
 
         let embed = place_bf16(&mut tier, &st, "model.language_model.embed_tokens.weight")?;
         let head = place_bf16(&mut tier, &st, "lm_head.weight")?;
@@ -1277,12 +1305,19 @@ impl GlimmerPin {
             cfg.vocab,
             cfg.hidden
         );
-        let final_norm = place_f32(&mut tier, &st, "model.language_model.norm.weight")?;
+        let final_norm = place_glimmer_norm(
+            &mut tier,
+            &st,
+            cfg.hidden,
+            "model.language_model.norm.weight",
+        )?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
             let p = format!("{GLIMMER_LAYER_PREFIX}.{l}");
-            let norm = |tier: &mut DeviceTier, t: &str| place_f32(tier, &st, &format!("{p}.{t}"));
+            let norm = |tier: &mut DeviceTier, t: &str| {
+                place_glimmer_norm(tier, &st, cfg.hidden, &format!("{p}.{t}"))
+            };
             layers.push(GlimmerLayerPin {
                 input_ln: norm(&mut tier, "input_layernorm.weight")?,
                 post_attn_ln: norm(&mut tier, "post_attention_layernorm.weight")?,

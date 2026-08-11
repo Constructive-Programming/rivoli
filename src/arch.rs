@@ -145,9 +145,29 @@ impl Arch {
             // though K3 ships `num_nextn_predict_layers: 0` and so has no head to run: V4's
             // branch says so with an `info!` instead (its fp4 MoE kernel refuses nrow != 1),
             // and one mechanism for one fact beats two that can disagree.
-            Arch::DeepseekV4 | Arch::KimiK3 | Arch::MuseGlimmer => {
-                &["attn", "sinks", "window", "misa_heads"]
-            }
+            Arch::DeepseekV4 | Arch::KimiK3 => &["attn", "sinks", "window", "misa_heads"],
+            // **Glimmer hides four more, and they are the residency knobs.** V4 and K3 both
+            // stream routed experts, so `--mode`, `--cache-policy`, `--max-mem` and `--trace`
+            // name real things for them. Glimmer is dense: there is no pool to evict from, no
+            // remainder of the budget to grow it with, no second routed format and no
+            // routed-expert access to trace. `run_glimmer` refuses all four.
+            //
+            // Split from the shared arm 2026-08-11, by review, which found `run_glimmer`
+            // telling the user each refused flag "is hidden from this artifact's --help"
+            // while four of the eight were still listed there. Fixing the sentence was the
+            // other option and is the wrong one: a flag a model cannot honour should not be
+            // advertised in that model's help, which is what this function is for.
+            Arch::MuseGlimmer => &[
+                "attn",
+                "sinks",
+                "window",
+                "misa_heads",
+                "mode",
+                "cache_policy",
+                "max_mem",
+                "trace",
+                "moe_gain",
+            ],
         }
     }
 }

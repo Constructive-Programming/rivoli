@@ -30,19 +30,6 @@ use tracing::info;
 //
 // No `wrap_help` feature, so clap does not re-wrap: the terminal does. That also means
 // `max_term_width` would be inert, which is why it is not set.
-/// Clap's defaults for the four flags an architecture without a routed pool or an `--attn`
-/// has to REFUSE rather than ignore.
-///
-/// Named because a refusal has to compare against the same value clap defaulted to, and the
-/// alternative is the literal written twice — in the `#[arg]` attribute and in the `bail!`
-/// beside it. `run_glimmer` is the first branch to need that comparison; nothing stops the
-/// next one from reusing these. `--attn`'s own default is the string `"auto"`, already
-/// compared against by name in `run_v4`.
-const DEFAULT_SINKS: usize = 4;
-const DEFAULT_WINDOW: usize = 8192;
-const DEFAULT_MISA_HEADS: u16 = 8;
-const DEFAULT_CACHE_POLICY: &str = "2q";
-
 /// Zero-knob by design: every flag is a benchmark or diagnostic override, and a bare
 /// `rivoli <model-dir>` is a complete invocation.
 #[derive(clap::Parser, Debug)]
@@ -109,7 +96,7 @@ struct Args {
     /// Routed-expert cache policy. All three are output-neutral: routing never consults
     /// residency (see math.rs `inv_1_routing_never_consults_the_cache`), so a policy change
     /// moves throughput and hit rate, never the tokens produced.
-    #[arg(long, default_value = DEFAULT_CACHE_POLICY, value_parser = ["lru", "2q", "arc"])]
+    #[arg(long, default_value = "2q", value_parser = ["lru", "2q", "arc"])]
     cache_policy: String,
 
     /// Device budget in GiB, taken LITERALLY — no OS reserve, so it may OOM at build.
@@ -125,16 +112,16 @@ struct Args {
     attn: String,
 
     /// `--attn streaming`: the number of leading sink tokens kept.
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_SINKS)]
+    #[arg(long, value_name = "N", default_value_t = 4)]
     sinks: usize,
 
     /// `--attn streaming`: the trailing window kept.
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_WINDOW)]
+    #[arg(long, value_name = "N", default_value_t = 8192)]
     window: usize,
 
     /// `--attn misa`: how many indexer heads score tokens (the MISA paper's validated GLM
     /// setting is 8).
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_MISA_HEADS, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
     misa_heads: u16,
 
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
@@ -432,8 +419,21 @@ const BENCH_SCRIPT: [&str; 13] = [
 /// in docs/measurement/benchmarks.md, docs/reference/modes.md and tests/bench-matrix.sh uses. Rewriting the token is three
 /// lines; re-recording a year of benchmark provenance is not. Only an exact `-bench`
 /// matches, so `-b`, `--bench` and a positional path are all untouched.
-fn parse_args() -> Args {
-    use clap::Parser;
+/// The clap ids the user actually typed, as opposed to the ones clap defaulted.
+///
+/// **Needed because "was this flag passed" and "does this flag hold a non-default value" are
+/// different questions, and only the first one is the one a refusal wants to ask.** Comparing
+/// values accepts `--cache-policy 2q` on an architecture that has no cache, because 2q is what
+/// the flag would have held anyway — and `tests/mode-matrix.sh` passes mode, policy and attn
+/// explicitly, so that is the ordinary case rather than an exotic one. A recorded command line
+/// carrying a knob that was silently dropped is precisely the lie `run_glimmer` exists to stop.
+///
+/// Found by review 2026-08-11: the value-comparison version let
+/// `--mode hybrid --cache-policy 2q --window 8192` through all nine refusals.
+type Explicit = std::collections::HashSet<String>;
+
+fn parse_args() -> (Args, Explicit) {
+    use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
     let argv: Vec<String> = std::env::args()
         .map(|a| if a == "-bench" { "--bench".into() } else { a })
         .collect();
@@ -441,7 +441,18 @@ fn parse_args() -> Args {
     if artifact_resolved_help(&argv) {
         std::process::exit(0);
     }
-    Args::parse_from(argv)
+    // `get_matches_from` + `from_arg_matches` rather than `parse_from`, which discards the
+    // `ArgMatches` and with it `value_source` — the only thing that knows what was typed.
+    // Errors still exit through clap's own renderer, so `--help` and a bad value read the same
+    // as before.
+    let m = Args::command().get_matches_from(argv);
+    let explicit: Explicit = m
+        .ids()
+        .map(|id| id.as_str().to_string())
+        .filter(|id| m.value_source(id) == Some(ValueSource::CommandLine))
+        .collect();
+    let args = Args::from_arg_matches(&m).unwrap_or_else(|e| e.exit());
+    (args, explicit)
 }
 
 /// Render `--help` against the architecture of the artifact on the command line, hiding
@@ -934,7 +945,7 @@ fn run_v4(
 /// `docs/measurement/benchmarks.md` carrying `--max-mem 70` would be a claim about a
 /// constraint that never applied. That is the specific lie this function exists to prevent.
 #[cfg(feature = "rocm")]
-fn run_glimmer(cfg: &Config, attn: &str, port: Option<u16>, knobs: AttnKnobs) -> Result<()> {
+fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     use rivoli::arch::Arch;
     let arch = Arch::MuseGlimmer;
     // **Parsed BEFORE the refusals, and before the bail.** The schema is the part of this port
@@ -971,60 +982,76 @@ fn run_glimmer(cfg: &Config, attn: &str, port: Option<u16>, knobs: AttnKnobs) ->
         gt.resident_bytes()? as f64 / 1e9,
     );
 
-    // One table rather than eight `if ... bail!` blocks: eight blocks differing only in their
+    let window_note = format!(
+        "an `--attn streaming` knob. This model HAS a sliding window — {} rows, inclusive of \
+         the current position, on {sliding} of {} layers — but it comes from `sliding_window` \
+         in the config and is a property of how the weights were trained. A flag that reads \
+         as if it sets that and does not is worse than one that is merely inert",
+        gt.sliding_window, gt.n_layers
+    );
+    // One table rather than nine `if ... bail!` blocks: eight blocks differing only in their
     // string is what jscpd rejects, and a table makes "which flags does this architecture
     // refuse" answerable by reading one list. `--port` stays a separate check below because it
     // is the one refusal that is temporary rather than architectural.
     for (flag, refused, why) in [
         (
             "--attn",
-            attn != "auto",
+            explicit.contains("attn"),
             "attention is fixed in the weights; this artifact does not take the flag",
         ),
         (
             "--sinks",
-            knobs.sinks != DEFAULT_SINKS,
+            explicit.contains("sinks"),
             "an `--attn streaming` knob, and there is no --attn here",
         ),
         (
             "--window",
-            knobs.window != DEFAULT_WINDOW,
-            "an `--attn streaming` knob. This model HAS a sliding window — 2048 rows, \
-             inclusive of the current position, on 39 of 52 layers — but it comes from \
-             `sliding_window` in the config and is a property of how the weights were \
-             trained. A flag that reads as if it sets that and does not is worse than one \
-             that is merely inert",
+            explicit.contains("window"),
+            // The numbers come from THIS artifact's config, not from the shipped model's.
+            // They were literals ("2048 rows ... on 39 of 52 layers") until review pointed
+            // out the message is emitted for any Glimmer artifact — including the 4-layer
+            // test fixture whose window is 2 — so it stated a fact about a different model.
+            &window_note,
         ),
         (
             "--misa-heads",
-            knobs.misa_heads != DEFAULT_MISA_HEADS,
+            explicit.contains("misa_heads"),
             "an `--attn misa` knob; MISA scores rows with a DSA lightning indexer, which \
              this architecture has no analogue of",
         ),
         (
             "--mode",
-            cfg.mode != rivoli::artifact::config::Mode::default(),
+            explicit.contains("mode"),
             "selects a GLM routed-expert FORMAT (int3-vq / int4 / hybrid). This model is \
              dense — there are no routed experts and so no second format to pick",
         ),
         (
             "--cache-policy",
-            cfg.cache_policy != DEFAULT_CACHE_POLICY,
+            explicit.contains("cache_policy"),
             "picks an eviction policy for the routed-expert pool. A dense model streams \
              nothing, so there is no pool and nothing to evict",
         ),
         (
             "--max-mem",
-            cfg.max_mem.is_some(),
+            explicit.contains("max_mem"),
             "sizes the device budget whose remainder grows the routed pool. `GlimmerPin` \
              takes no capacity: the resident set IS the model (55.712 GB), and a device \
              that cannot hold it cannot run this artifact at any setting",
         ),
         (
             "--trace",
-            cfg.trace.is_some(),
+            explicit.contains("trace"),
             "dumps the routed-expert ACCESS trace for the offline `replay` sim. There are \
              no routed experts to access",
+        ),
+        // Found by review 2026-08-11, and it is the one this table MISSED — every other row
+        // corresponds to a `Config` field, and `moe_gain` has none, so it reached
+        // `GpuEngine::set_moe_gain` on the GLM path and nothing at all here. Accepted and
+        // dropped is exactly the lie the `--max-mem` row above argues against.
+        (
+            "--moe-gain",
+            explicit.contains("moe_gain"),
+            "scales the whole MoE branch. This model has no MoE branch to scale",
         ),
     ] {
         if refused {
@@ -1036,7 +1063,7 @@ fn run_glimmer(cfg: &Config, attn: &str, port: Option<u16>, knobs: AttnKnobs) ->
             );
         }
     }
-    if port.is_some() {
+    if explicit.contains("port") {
         bail!(
             "--port is not wired for {} yet: `serve::serve` takes a `&mut GpuEngine`, which is \
              GLM-typed. Unlike the refusals above this one is a signature, not an architectural \
@@ -1054,19 +1081,10 @@ fn run_glimmer(cfg: &Config, attn: &str, port: Option<u16>, knobs: AttnKnobs) ->
     );
 }
 
-/// The three `--attn`-shaped knobs, bundled so [`run_glimmer`] takes four parameters instead
-/// of six. They travel together because they are refused together and for one reason.
-#[cfg(feature = "rocm")]
-struct AttnKnobs {
-    sinks: usize,
-    window: usize,
-    misa_heads: u16,
-}
-
 /// A build with no compute backend cannot reach this: see the stub above.
 #[cfg(feature = "rocm")]
 fn main() -> Result<()> {
-    let a = parse_args();
+    let (a, explicit) = parse_args();
     let attn = resolve_attn(&a)?;
     // Arm the span recorder before anything can record: it anchors a monotonic clock to a
     // wall clock here, and every interval in the run is stamped as a delta from that pair.
@@ -1218,16 +1236,7 @@ fn main() -> Result<()> {
             // flag refusals and the final bail. The K3 arm above still carries its own copy of
             // the first two because it has no `run_k3` yet; when it gets one, this is the
             // shape it should take, and the comment there says so.
-            return run_glimmer(
-                &cfg,
-                &a.attn,
-                a.port,
-                AttnKnobs {
-                    sinks: a.sinks,
-                    window: a.window,
-                    misa_heads: a.misa_heads,
-                },
-            );
+            return run_glimmer(&cfg, &explicit);
         }
     }
     // (Until 2026-08-08 a bail! here refused --logit-dump/--force-tokens as "V4-only

@@ -8,9 +8,22 @@
 //! ways a new arch breaks an old one — a recogniser that now claims a manifest it should not,
 //! and a `validate` that got stricter for everybody.
 //!
-//! **Skips loudly.** These are checkpoints on one machine, not fixtures; a test that opened
-//! nothing and printed a green line is the failure mode this repo has been bitten by, so an
-//! absent artifact prints SKIP and the presence of at least one is asserted at the end.
+//! **What it does when the artifacts are not there.** These are checkpoints on one machine,
+//! not fixtures — CI's runner has none, and neither does a fresh clone. So:
+//!
+//! - **No artifact at all** → this machine cannot run the check. Print and return.
+//! - **Some present** → every one that IS present must open, *and* the count must equal
+//!   [`EXPECTED_PRESENT`].
+//!
+//! > **CORRECTED 2026-08-11**, by review, on two counts. The first version asserted
+//! > `opened > 0` unconditionally, which **reddens CI** — the only job this repo has runs
+//! > featureless on a runner where `/var/db/rivoli` does not exist. And its "skips loudly"
+//! > claim was false: libtest captures stdout and stderr of PASSING tests, so the `SKIP` line
+//! > is visible only under `--nocapture` and a run that silently degraded from two
+//! > architectures to one looked identical to a full one. `EXPECTED_PRESENT` is what makes
+//! > that degradation red, and it is a literal rather than a count of what happened to be
+//! > there, because a number derived from the run cannot disagree with the run.
+//!
 //! Paths are overridable so this is not pinned to one layout.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -33,13 +46,23 @@ const ARTIFACTS: [(&str, &str, Arch); 3] = [
     ("RIVOLI_K3_ARTIFACT", "/var/db/rivoli/k3-full", Arch::KimiK3),
 ];
 
+/// How many of [`ARTIFACTS`] exist on a machine that has any. **Two on this one: GLM and V4.**
+/// K3's converter landed at its own S1a and no `.k3` artifact has been built yet — so its row
+/// is coverage this test does not have, and the number says so rather than the prose.
+///
+/// When a K3 artifact appears, this becomes 3 and the test goes red until it does — which is
+/// the point: an architecture gaining coverage should require a deliberate edit, in the same
+/// way losing it does.
+const EXPECTED_PRESENT: usize = 2;
+
 #[test]
 fn every_architecture_still_resolves_and_validates_its_own_artifact() {
     let mut opened = 0usize;
+    let mut absent: Vec<&str> = Vec::new();
     for (var, default, want) in ARTIFACTS {
         let dir = std::env::var(var).unwrap_or_else(|_| default.to_string());
         if !std::path::Path::new(&dir).is_dir() {
-            eprintln!("SKIP {}: no artifact at {dir} (set {var})", want.name());
+            absent.push(want.name());
             continue;
         }
         opened += 1;
@@ -63,9 +86,27 @@ fn every_architecture_still_resolves_and_validates_its_own_artifact() {
             err.unwrap()
         );
     }
-    assert!(
-        opened > 0,
-        "no architecture's artifact was present — this test asserted nothing. Set one of {:?}",
-        ARTIFACTS.map(|(v, _, _)| v)
+    if opened == 0 {
+        // Not a failure: a machine with no checkpoints (CI, a fresh clone) cannot run this
+        // check at all, and reddening there would make a permanently-red gate nobody reads.
+        eprintln!(
+            "SKIP arch_artifacts: none of {:?} present — this run asserted NOTHING. Set one \
+             of {:?} to point at a real artifact.",
+            ARTIFACTS.map(|(_, d, _)| d),
+            ARTIFACTS.map(|(v, _, _)| v)
+        );
+        return;
+    }
+    // Some were present, so this machine DOES have checkpoints — and then the count is a
+    // claim about coverage. `opened > 0` would have been satisfied by one, and a run covering
+    // one architecture is indistinguishable from a run covering all of them in libtest's
+    // default output.
+    assert_eq!(
+        opened,
+        EXPECTED_PRESENT,
+        "{opened} of {} architectures' artifacts were present ({absent:?} missing). Either \
+         coverage was lost, or one arrived and EXPECTED_PRESENT needs updating — both want a \
+         deliberate edit.",
+        ARTIFACTS.len()
     );
 }
