@@ -568,10 +568,31 @@ extern "C" __global__ void hc_post(
     y[i] = rbf16(acc);  // `.type_as(x)` — the residual stream is bf16
 }
 
+// The rotation itself, shared by the two kernels below. Both compute the SAME pair rotation at
+// the same frequency; they differ only in which two elements of the segment are the pair, which
+// is what "interleaved" and "split-half" name. Double angles are the long-context arg reduction.
+static __device__ inline void rope_pair(
+    float a, float b, int j, int seg, int pos, double theta, float* lo, float* hi) {
+    double inv = pow(theta, -2.0 * (double)j / (double)seg);
+    double ang = (double)pos * inv;
+    float cs = (float)cos(ang), sn = (float)sin(ang);
+    *lo = a * cs - b * sn;
+    *hi = b * cs + a * sn;
+}
+
+// **TWO KERNELS AND NOT ONE WITH A FLAG, deliberately.** They differ by one read pattern, and
+// `common.hpp`'s `swiglu`/`swiglu_clamped_bf16` note is the precedent: when two callers want
+// different arithmetic under one name, the way to keep the wrong one from being spelled is to
+// make it unspellable THROUGH THE ENTRY POINT, not to add a parameter and hope. Here the wrong
+// spelling is `glimmer-architecture.md` §9 trap 9 — interleaved where split-half is meant —
+// which produces fluent text and no error. A `bool split_half` on one launcher would put that
+// trap one argument away from every existing GLM and V4 call site. The arithmetic is shared
+// above, so this costs a read pattern, not a copy.
+
 // Interleaved RoPE (matching attn.rs) on `count` segments of `seg` elements:
 // segment s at base[s*stride..+seg]; pair (2j,2j+1) rotates by pos·theta^(-2j/seg)
-// into (j, half+j). Double angles (long-context arg reduction); one block/segment,
-// seg/2 threads; all pairs read before any write (barrier) → race-free in place.
+// into (j, half+j). One block/segment, seg/2 threads; all pairs read before any write
+// (barrier) → race-free in place. GLM-5.2 and DeepSeek-V4-Flash.
 extern "C" __global__ void rope_interleave(
     float* __restrict__ base, int stride, int seg, int pos, double theta) {
     int s = blockIdx.x;
@@ -580,11 +601,28 @@ extern "C" __global__ void rope_interleave(
     float* v = base + (size_t)s * stride;
     float a = v[2 * j], b = v[2 * j + 1];
     __syncthreads();
-    double inv = pow(theta, -2.0 * (double)j / (double)seg);
-    double ang = (double)pos * inv;
-    float cs = (float)cos(ang), sn = (float)sin(ang);
-    v[j] = a * cs - b * sn;
-    v[half + j] = b * cs + a * sn;
+    rope_pair(a, b, j, seg, pos, theta, &v[j], &v[half + j]);
+}
+
+// Split-half RoPE — transformers' `rotate_half`, where the pair is `(x[j], x[j+half])` rather
+// than two adjacent elements. Same frequency, same output positions; only the READ moves.
+// Muse Glimmer, whose `apply_rotary_pos_emb` is this convention (`glimmer-architecture.md` §6).
+//
+// §6 proposed avoiding this kernel by permuting `q_proj`/`k_proj` rows at conversion time, and
+// `tests/glimmer_rope.rs` measured that route working at 1.41e-7. It was declined on 2026-08-12
+// for a cost the proposal did not price: the permutation forces `q_proj`/`k_proj` out of
+// `copy_verbatim`, so ~3 GB of the artifact stops being a borrowed mapping of the checkpoint and
+// G1a's "round-trips bit-exact" clause stops covering them. Four lines of kernel is the cheaper
+// side of that trade. The equivalence stays measured, and stays in that test.
+extern "C" __global__ void rope_split_half(
+    float* __restrict__ base, int stride, int seg, int pos, double theta) {
+    int s = blockIdx.x;
+    int j = threadIdx.x;
+    int half = seg / 2;
+    float* v = base + (size_t)s * stride;
+    float a = v[j], b = v[half + j];
+    __syncthreads();
+    rope_pair(a, b, j, seg, pos, theta, &v[j], &v[half + j]);
 }
 
 // VQ encode: idx[i] = argmin_k (‖c_k‖² − 2·sub_i·c_k), tie → lowest k. Matches
@@ -853,6 +891,16 @@ extern "C" int rivoli_rope_interleave(float* base, int count, int stride, int se
     if (count > 1 && stride < seg) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(rope_interleave, dim3(count), dim3(seg / 2), 0, 0, base, stride, seg, pos, theta);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// Same guards as its sibling — the launch geometry is identical and only the kernel differs.
+extern "C" int rivoli_rope_split_half(float* base, int count, int stride, int seg, int pos, double theta) {
+    if (count <= 0 || seg <= 0 || (seg & 1) || (seg / 2) > 1024) return 1001;
+    if (count > 1 && stride < seg) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(rope_split_half, dim3(count), dim3(seg / 2), 0, 0, base, stride, seg, pos, theta);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

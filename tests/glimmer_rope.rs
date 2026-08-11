@@ -48,7 +48,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
-use rivoli::backend::hip::{device_sync, launch_rope_interleave};
+use rivoli::backend::hip::{device_sync, launch_rope_interleave, launch_rope_split_half};
 
 mod common;
 use common::{back, dev, f32b, f32v};
@@ -104,12 +104,25 @@ fn permute(rows: &[f32], heads: usize, d: usize, flip: bool) -> Vec<f32> {
     out
 }
 
-/// Run `rope_interleave` over `rows` segments of `d`, one launch per query position.
+/// Which of the two rotation kernels to run. They are separate entry points on purpose — see
+/// `launch_rope_split_half`'s doc — so this fixture has to name one, which is the property being
+/// tested as much as the arithmetic is.
+#[derive(Clone, Copy, PartialEq)]
+enum Conv {
+    /// Glimmer's own: pair `(x[j], x[j+half])`. The shipped path.
+    SplitHalf,
+    /// GLM/V4's: pair `(x[2j], x[2j+1])`. Correct here ONLY on input that §6's permutation has
+    /// already rearranged — which is what `the_declined_permutation_route_computes_the_same_thing`
+    /// measures, and what trap 9 is when it is not.
+    Interleaved,
+}
+
+/// Run a rotation kernel over `rows` segments of `d`, one launch per query position.
 ///
 /// One launch per position because the launcher takes a single `pos` — every head of one row
 /// rotates by the same angle, and rows differ. At decode that is one launch; at prefill it is
 /// `tq` of them, which is what the engine will do too.
-fn rope_on_device(data: &[f32], heads: usize, d: usize, start_pos: usize) -> Vec<f32> {
+fn rope_on_device(data: &[f32], heads: usize, d: usize, start_pos: usize, conv: Conv) -> Vec<f32> {
     let buf = dev(&f32b(data));
     let rows = data.len() / (heads * d);
     for r in 0..rows {
@@ -118,9 +131,14 @@ fn rope_on_device(data: &[f32], heads: usize, d: usize, start_pos: usize) -> Vec
         // kernel's contract (all pairs are read before any write, behind a barrier).
         unsafe {
             let base = (buf.ptr() as *mut f32).add(r * heads * d);
-            launch_rope_interleave(base, heads, d, d, start_pos + r, THETA)
+            match conv {
+                Conv::SplitHalf => launch_rope_split_half(base, heads, d, d, start_pos + r, THETA),
+                Conv::Interleaved => {
+                    launch_rope_interleave(base, heads, d, d, start_pos + r, THETA)
+                }
+            }
         }
-        .expect("rope_interleave launch");
+        .expect("rope launch");
     }
     device_sync().unwrap();
     f32v(&back(&buf))
@@ -149,17 +167,26 @@ fn each_roped(mut f: impl FnMut(&Golden, usize, usize, usize)) {
 
 // ------------------------------------------------------------------------------------------
 
-/// **§6's claim, run.** Permute, rotate with the kernel rivoli already ships, compare against the
-/// reference's own rotated q and k.
-#[test]
-fn the_permutation_makes_the_existing_kernel_compute_glimmers_rope() {
-    let tol = rope_tol();
-    let (mut worst, mut cases) = (0.0f32, 0);
+/// Score one ROUTE over every roped layer of both goldens, and report the extremes.
+///
+/// A route is a (convention, permute-first) pair, and all three tests below are one of them —
+/// which is the point: the shipped path, the declined alternative and the trap differ by exactly
+/// those two bits, and writing them as three copies of this loop is what jscpd rejected. Returns
+/// `(worst, weakest, cases)`: a route that must pass is judged on its worst case, a route that
+/// must FAIL is judged on its weakest, and neither test gets to pick the flattering one.
+fn score(conv: Conv, permute_first: bool, both_tensors: bool) -> (f32, f32, usize) {
+    let (mut worst, mut weakest, mut cases) = (0.0f32, f32::INFINITY, 0);
     each_roped(|gold, t, l, _| {
         let (hq, hkv, d) = gold.dims();
         let (tq, start_pos) = gold.geometry(t);
         let p = format!("t{t}.L{l}");
-        for (what, heads) in [("q", hq), ("k", hkv)] {
+        let tensors: &[(&str, usize)] = if both_tensors {
+            &[("q", 0), ("k", 1)]
+        } else {
+            &[("q", 0)]
+        };
+        for (what, which) in tensors {
+            let heads = if *which == 0 { hq } else { hkv };
             let pre = cap(
                 gold,
                 &format!("{p}.{what}.pre_rope"),
@@ -167,55 +194,71 @@ fn the_permutation_makes_the_existing_kernel_compute_glimmers_rope() {
                 true,
             );
             let want = cap(gold, &format!("{p}.{what}.roped"), [1, heads, tq, d], true);
-            let got = rope_on_device(&permute(&pre, heads, d, false), heads, d, start_pos);
-            let r = worst_rel(&got, &want);
-            assert!(
-                r <= tol,
-                "{}: {p}.{what} worst rel {r:e} > {tol:e}",
-                gold.name
-            );
+            let input = if permute_first {
+                permute(&pre, heads, d, false)
+            } else {
+                pre
+            };
+            let r = worst_rel(&rope_on_device(&input, heads, d, start_pos, conv), &want);
             worst = worst.max(r);
+            weakest = weakest.min(r);
             cases += 1;
         }
     });
-    println!("rope: worst rel over {cases} cases: {worst:e}");
     assert!(
         cases > 0,
-        "no roped layer was scored, so this test proved nothing"
+        "no roped layer was scored, so this route proved nothing"
+    );
+    (worst, weakest, cases)
+}
+
+/// **The shipped path: `rope_split_half` on the activation as the checkpoint produces it.**
+///
+/// No permutation anywhere — not in the converter, not here. The kernel pairs `(x[j], x[j+half])`
+/// because that is what Glimmer's `apply_rotary_pos_emb` pairs.
+#[test]
+fn the_split_half_kernel_computes_glimmers_rope() {
+    let tol = rope_tol();
+    let (worst, _, cases) = score(Conv::SplitHalf, false, true);
+    println!("split-half: worst rel over {cases} cases: {worst:e} against tol {tol:e}");
+    assert!(
+        worst <= tol,
+        "worst rel {worst:e} > {tol:e} over {cases} cases"
     );
 }
 
-/// **The red proof §6 asked for.** Identity in place of `P` must not pass.
+/// **The red proof, and it is trap 9 itself.** The interleaved kernel on unpermuted input — the
+/// mistake a single flag on one launcher would have put one argument away from every GLM and V4
+/// call site.
 ///
-/// Stated as a signal rather than as "it fails": the point is that the disagreement is enormous
-/// compared to the tolerance, so no plausible widening of the bar could ever admit it. The two
-/// spellings pair the same 128 numbers differently, so this is a wrong ROTATION, not a rounding.
+/// Judged on the WEAKEST case, not the worst: a trap that is loud somewhere and silent elsewhere
+/// is a trap this fixture does not catch, and taking the maximum would hide exactly that.
 #[test]
-fn identity_in_place_of_the_permutation_is_caught() {
+fn the_interleaved_kernel_on_the_same_input_is_caught() {
     let tol = rope_tol();
-    let (mut weakest, mut cases) = (f32::INFINITY, 0);
-    each_roped(|gold, t, l, _| {
-        let (hq, _, d) = gold.dims();
-        let (tq, start_pos) = gold.geometry(t);
-        let p = format!("t{t}.L{l}");
-        let pre = cap(gold, &format!("{p}.q.pre_rope"), [1, hq, tq, d], true);
-        let want = cap(gold, &format!("{p}.q.roped"), [1, hq, tq, d], true);
-        let got = rope_on_device(&permute(&pre, hq, d, true), hq, d, start_pos);
-        let r = worst_rel(&got, &want);
-        assert!(
-            r > 1000.0 * tol,
-            "{}: {p} identity produced {r:e}, only {:.0}x the tolerance — this fixture cannot \
-             tell §6's permutation from doing nothing",
-            gold.name,
-            r / tol
-        );
-        weakest = weakest.min(r);
-        cases += 1;
-    });
-    println!("identity: weakest signal over {cases} cases: {weakest:e} against tol {tol:e}");
+    let (_, weakest, cases) = score(Conv::Interleaved, false, false);
+    println!("trap 9: weakest signal over {cases} cases: {weakest:e} against tol {tol:e}");
     assert!(
-        cases > 0,
-        "no roped layer was scored, so this proof proved nothing"
+        weakest > 1000.0 * tol,
+        "the interleaved kernel produced only {weakest:e}, {:.0}x the tolerance — this fixture \
+         cannot tell the two conventions apart",
+        weakest / tol
+    );
+}
+
+/// **§6's declined route, kept measured.** Permuting the input and running the INTERLEAVED kernel
+/// computes the same rotation. That is why choosing between them was a cost question and not a
+/// correctness one, and it is retained rather than deleted so the decision keeps its alternative
+/// checked: if giving up `copy_verbatim` ever becomes cheap, this is the evidence that the
+/// converter route works, already run. `glimmer-architecture.md` §6 carries the trade.
+#[test]
+fn the_declined_permutation_route_computes_the_same_thing() {
+    let tol = rope_tol();
+    let (worst, _, cases) = score(Conv::Interleaved, true, false);
+    println!("permutation route: worst rel over {cases} cases: {worst:e}");
+    assert!(
+        worst <= tol,
+        "worst rel {worst:e} > {tol:e} over {cases} cases"
     );
 }
 

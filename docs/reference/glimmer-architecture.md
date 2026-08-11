@@ -213,20 +213,30 @@ If this holds, item 2 of S2 collapses from a new kernel to a converter permutati
 per-layer on/off flag. **It is an argument, not a measurement**: G1b owes it a numeric
 fixture that reddens when `P` is replaced by identity.
 
-> **SETTLED 2026-08-12 — it holds, and the kernel does more of the work than this section
-> credits it with.** `rope_interleave` reads `(2j, 2j+1)` and **writes `(j, half+j)`**, so with
-> `P` on the input it produces split-half RoPE *already in split-half layout*: there is nothing
-> to undo afterwards, and half of `P` is the kernel's own write pattern. Measured against the
-> anchor's `q.roped`/`k.roped` over both draws, every roped layer, q and k — 168 cases — at
-> **1.41e-7** relative, **34x under `rope`'s fp32 floor**. The red proof this section asked for
-> was run rather than asserted: identity in place of `P` scores **9.98e-1**, four decades the
-> other side of the tolerance. `tests/glimmer_rope.rs`.
+> **SETTLED 2026-08-12 — the permutation WORKS and was DECLINED, and both halves of that matter.**
 >
-> **Still an argument: doing it at CONVERSION time.** The fixture permutes a captured
-> activation. The three reasons a weight-row permutation is equivalent (`v_proj` is never
-> rotated, `gate_proj` acts on the attention output, `qk_norm` commutes with a within-head
-> permutation) stay unmeasured until `convert_glimmer` emits a permuted checkpoint and a golden
-> scores it.
+> It works: permuting the input and running `rope_interleave` reproduces the reference's
+> `q.roped`/`k.roped` at **1.41e-7** relative over both draws, every roped layer, q and k — 34x
+> under `rope`'s fp32 floor. This section's own red proof was run rather than asserted. That
+> measurement is kept alive in `tests/glimmer_rope.rs`, not deleted with the decision.
+>
+> It was declined on a cost this section did not price: the permutation has to happen to
+> `q_proj`/`k_proj` at conversion time, which takes those two tensors out of `copy_verbatim` —
+> so ~3 GB of the artifact stops being a borrowed mapping of the checkpoint and **G1a's
+> "round-trips bit-exact" clause stops covering them**. Against that, the kernel this section
+> hoped to avoid turned out to be four lines: `rope_split_half` reads `(x[j], x[j+half])` where
+> `rope_interleave` reads `(x[2j], x[2j+1])`, and they now share their arithmetic through one
+> `__device__` helper.
+>
+> **Two entry points, not one kernel with a flag**, and that is the same argument
+> `swiglu`/`swiglu_clamped_bf16` makes in `common.hpp`: §9 trap 9 is applying one convention where
+> the other is meant, it is fluent and silent, and a `bool` parameter would put it one argument
+> away from every existing GLM and V4 call site. `tests/glimmer_rope.rs` measures the trap at
+> **9.98e-1**, four decades the other side of the tolerance.
+>
+> What this section reads as an aside is worth stating plainly, since it is why the choice was
+> close at all: `rope_interleave` already WRITES `(j, half+j)`, so half of `P` was in the kernel's
+> write pattern before anyone proposed it.
 
 ## 7. Byte accounting
 

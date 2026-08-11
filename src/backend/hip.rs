@@ -801,6 +801,27 @@ launchers! {
         theta: f64,
     );
 
+    /// Split-half RoPE in place — transformers' `rotate_half`, where the pair is
+    /// `(x[j], x[j+seg/2])` rather than two adjacent elements. Muse Glimmer's convention.
+    ///
+    /// **Same arithmetic as [`launch_rope_interleave`], different pairing, and the two are NOT
+    /// interchangeable.** Applying one where the other is meant produces fluent wrong text and no
+    /// error — `glimmer-architecture.md` §9 trap 9. They are separate entry points rather than one
+    /// with a flag precisely so that a GLM or V4 call site cannot reach this convention by
+    /// changing an argument; `kernels/linalg.hip` carries the argument, and
+    /// `swiglu`/`swiglu_clamped_bf16` is the precedent.
+    ///
+    /// # Safety
+    /// `base` is a device buffer of `count·stride` f32, live until the next [`device_sync`].
+    launch_rope_split_half -> rivoli_rope_split_half, "rope_split_half" (
+        base: *mut f32,
+        count: usize as i32,
+        stride: usize as i32,
+        seg: usize as i32,
+        pos: usize as i32,
+        theta: f64,
+    );
+
     /// Batched VQ encode (offline converter accelerator): `idx[i] = argmin_k …`.
     ///
     /// # Safety
