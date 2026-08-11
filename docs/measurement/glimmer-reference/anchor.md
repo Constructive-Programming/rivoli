@@ -201,10 +201,11 @@ rounding — relative 2⁻²⁴ = **6.0e−8**. Every non-zero floor above sits 
 is measuring arithmetic; a bucket landing near 6e−8 would be measuring the container and must not
 become a threshold until the container is widened.
 
-### The one row that exists, and why the others do not
+### The rows that exist, and why the others do not
 
-`tests/common/tolerance.rs::GLIMMER` carries **`attend` only**: floor 1.639e−5, weakest targeting
-defect 2.086e0, `Rel(1.64e-4)`. A floor is half a row — the other half is deciding which defects the
+`tests/common/tolerance.rs::GLIMMER` carries **`attend`** (floor 1.639e−5, weakest targeting defect
+2.086e0, `Rel(1.64e-4)`) and, since 2026-08-12, **`rope`** (floor 4.773e−6, weakest targeting defect
+1.811e0, `Rel(4.77e-5)`). A floor is half a row — the other half is deciding which defects the
 operator is *answerable for*, and that is per-kernel reasoning. Items 2–5 add theirs as they land;
 until then S2 compares those operators exactly, enforced from the other side by
 `tests/glimmer_tolerance.rs`, which fails on a row for an unanalysed operator.
@@ -217,6 +218,20 @@ same product, so moving the scale across the dot is invisible to this kernel **b
 caught where it is *not* equivalent — the qk-norm runs between the scale and the product, so
 `qk_norm` and `proj` see it at 2.16e0. Pricing an operator against a defect it provably cannot
 distinguish would have made this kernel exact-only on a false premise.
+
+**`rope`'s defect set, added 2026-08-12 for S2 item 2.** Two defects target the rotation and **both
+are counted** — unlike `attend`'s excluded `qk_scale_on_k`, there is no algebraic identity hiding
+either from a rope kernel. Regenerated at both salts and scored with `--by-operator` against the
+clean run:
+
+| defect | draw 1 | draw 2 | weaker |
+|---|---|---|---|
+| `rope_interleaved` (the pairing convention) | 2.505e0 | 2.214e0 | 2.214e0 |
+| `rope_on_nope_layers` (rotating the 13 θ=0 layers) | 2.011e0 | 1.811e0 | **1.811e0** |
+
+The weakest is the row's, giving a margin of **379,000×** over the floor. Both defect runs also
+re-derived the clean goldens from scratch, and those came back **byte-identical to the vendored
+`text-1`/`text-2`** — an unplanned second check of the reproducibility claim this file makes.
 
 What remains are genuine attend wrongnesses, each shown as the weaker of the two draws:
 `kv_broadcast_blocked` **2.086e0**, `window_off_by_one` 2.187e0, `full_layers_slide` 2.282e0. The

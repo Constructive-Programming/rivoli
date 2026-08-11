@@ -149,6 +149,25 @@ pub const GLIMMER: &[Tol] = &[
         weakest_defect: 2.086e0,
         policy: Policy::Rel(1.64e-4),
     },
+    // Per-layer RoPE, S2 item 2. Floor from `anchor.md`'s table, max over the two draws
+    // (4.490e-6 and this) like every row here.
+    //
+    // **Two defects target this operator and both are counted**, unlike `attend`'s excluded
+    // `qk_scale_on_k`: there is no algebraic identity hiding either of them from a rope kernel.
+    // `rope_interleaved` swaps the pairing convention (2.505e0 / 2.214e0 by draw) and
+    // `rope_on_nope_layers` rotates the 13 layers whose `layer_rope_theta` is 0 (2.011e0 /
+    // 1.811e0). Each is shown as the WEAKER of its two draws, and the weakest of those is below —
+    // a margin of 379,000x, so `Rel` is founded with room to spare.
+    //
+    // Measured 2026-08-12 by regenerating both defects at both salts and running `--by-operator`
+    // against the clean run; the fresh `None` goldens came back byte-identical to the vendored
+    // ones, which re-checks the anchor's reproducibility claim in passing.
+    Tol {
+        operator: "rope",
+        floor: 4.773e-6,
+        weakest_defect: 1.811e0,
+        policy: Policy::Rel(4.77e-5),
+    },
 ];
 
 /// The tolerance for one operator in one model's table, or `None` if that table does not cover it.

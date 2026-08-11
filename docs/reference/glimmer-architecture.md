@@ -213,6 +213,21 @@ If this holds, item 2 of S2 collapses from a new kernel to a converter permutati
 per-layer on/off flag. **It is an argument, not a measurement**: G1b owes it a numeric
 fixture that reddens when `P` is replaced by identity.
 
+> **SETTLED 2026-08-12 — it holds, and the kernel does more of the work than this section
+> credits it with.** `rope_interleave` reads `(2j, 2j+1)` and **writes `(j, half+j)`**, so with
+> `P` on the input it produces split-half RoPE *already in split-half layout*: there is nothing
+> to undo afterwards, and half of `P` is the kernel's own write pattern. Measured against the
+> anchor's `q.roped`/`k.roped` over both draws, every roped layer, q and k — 168 cases — at
+> **1.41e-7** relative, **34x under `rope`'s fp32 floor**. The red proof this section asked for
+> was run rather than asserted: identity in place of `P` scores **9.98e-1**, four decades the
+> other side of the tolerance. `tests/glimmer_rope.rs`.
+>
+> **Still an argument: doing it at CONVERSION time.** The fixture permutes a captured
+> activation. The three reasons a weight-row permutation is equivalent (`v_proj` is never
+> rotated, `gate_proj` acts on the attention output, `qk_norm` commutes with a within-head
+> permutation) stay unmeasured until `convert_glimmer` emits a permuted checkpoint and a golden
+> scores it.
+
 ## 7. Byte accounting
 
 From the shard headers, summed by hand; the total reconciles with the index's own
