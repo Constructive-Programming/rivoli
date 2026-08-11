@@ -158,13 +158,49 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
         // whose link target ends in this filename — prose mentions (the header's
         // `docs/README.md`, the scope paragraph naming npu-offload.md) matched a bare
         // `contains(name)` on the first red run of this check.
-        let row = index
+        // Collected, not `find`-ed. A doc with TWO rows is how a stale verdict survives: `find`
+        // takes the first, and the whole-file `index_norm.contains` above is satisfied by whichever
+        // one is current, so the other sits there being wrong and nothing reads it. That is not
+        // hypothetical — `k3-port.md` carried two rows with DIFFERENT verdicts from 2026-08-11
+        // (`c6469d1`, a cross-branch INDEX.md resolution that reintroduced a row instead of
+        // replacing it) until this check was written, and it was found only because a red-proof of
+        // the arm below refused to go red.
+        // Matched on the row's LINK TARGET, not on the filename appearing anywhere in the row. The
+        // first version of this used `contains("{name})")` and reported `anchor.md` as duplicated,
+        // because `k3-port.md`'s verdict cites `measurement/k3-reference/anchor.md)` in prose. The
+        // `find` this replaced had the same weakness and survived it only by ordering luck —
+        // `anchor.md`'s own row happens to come first, so the wrong match was never returned.
+        let rows: Vec<&str> = index
             .lines()
-            .find(|l| l.starts_with("| [") && l.contains(&format!("{name})")));
-        if let (Some(sc), Some(row)) = (scope, row)
-            && !row.contains(&format!("| {sc} |"))
-        {
-            scope_drift.push(format!("{f}: front matter says `{sc}`, index row lacks it"));
+            .filter(|l| l.starts_with("| ["))
+            .filter(|l| {
+                l.split_once("](")
+                    .and_then(|(_, rest)| rest.split_once(')'))
+                    .is_some_and(|(target, _)| target.rsplit('/').next() == Some(name))
+            })
+            .collect();
+        assert!(
+            rows.len() <= 1,
+            "{f} has {} rows in {INDEX}. Only the first is ever read, so the others are \
+             unverifiable prose — and the one a reader happens to scroll to decides what they \
+             believe. Delete the stale one.",
+            rows.len()
+        );
+        let row = rows.first().copied();
+        // A check that LOCATES its input by matching text has three outcomes, not two: right,
+        // wrong, and **absent** — and absent used to fall out of this `if let` as a silent skip.
+        // A doc linked only from prose passed the `linked` test above, matched no table row, and
+        // its scope went unchecked while the suite stayed green. Zero docs are in that state
+        // today, which is exactly when to close it: the hole opens the first time someone links a
+        // doc from a sentence instead of the table, and nothing would say so.
+        match (scope, row) {
+            (Some(sc), Some(row)) if !row.contains(&format!("| {sc} |")) => {
+                scope_drift.push(format!("{f}: front matter says `{sc}`, index row lacks it"));
+            }
+            (Some(_), None) => scope_drift.push(format!(
+                "{f}: linked in the index but from no `| [` table row, so nothing checks its scope"
+            )),
+            _ => {}
         }
     }
     assert!(
