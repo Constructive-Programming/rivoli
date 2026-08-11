@@ -146,12 +146,14 @@ had gained a seventh argument.
 > config-check loops, 35 tokens) and fixed by factoring, not by exempting. **Fix what `cargo fmt
 > --check` and jscpd report; neither of them is the author of what it found.**
 
-**Thirteen** regions are exempt via `jscpd:ignore-start`
-(`grep -rc jscpd:ignore-start src/ tests/ build.rs`): eight on 2026-08-06, down from fourteen,
-plus two the same day for `v4oracle/weights.rs`'s `WMat::Fp4` (see below), and three since
-(K3's and Glimmer's serde renames, `tests/f4_attn.rs`). Re-derive that number rather than
-quoting this line — a count written in prose is exactly what this file warns about two
-sections up, and it was **stale at "Ten" until 2026-08-11**. Of the six that
+**Fourteen** regions are exempt via `jscpd:ignore-start` — re-derive with
+`grep -rn jscpd:ignore-start src/ tests/ build.rs | sed 's/:.*//' | sort | uniq -c` rather than
+quoting this line, because a count written in prose is exactly what this file warns about two
+sections up, and it was **stale at "Ten" until 2026-08-11**. Today: `artifact/model.rs` 3
+(the dimension serde renames, one per architecture that shares them), `backend/hip.rs` 3 (the
+ABI wall), `v4oracle/weights.rs` 2 (`WMat::Fp8`/`Fp4`, see below), and one each in
+`artifact/quant.rs`, `bin/convert_glimmer.rs` (clap's Args/main boundary), `kvcompress.rs`,
+`math.rs`, `v4oracle/numerics.rs` and `tests/f4_attn.rs`. Of the six that
 went, two were `glsl_numerics.rs`'s and the other **four were deleted because their entire
 argument named a file the Vulkan retirement removed** — `gpustream.rs`'s `Stream::raw`
 ("mirrors `vkstream::Stream::raw`"), its `Timeline` Send/Sync twin, its INV-4 half, and
