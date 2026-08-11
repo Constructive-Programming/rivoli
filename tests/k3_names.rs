@@ -126,17 +126,59 @@ fn exactly_the_declared_families_have_no_shape() {
     );
 }
 
+/// A count the TSV's own header declares, taken as the integer immediately before `phrase`.
+///
+/// **Why the header rather than a constant here.** These three numbers used to live twice — as
+/// literals in the test and as prose in the file's header — two frozen copies agreeing with each
+/// other, so a typo in either was invisible and the header was decoration. Muse Glimmer's port hit
+/// the same shape one level up (a `metadata.total_size` transcribed into its test), which is what
+/// prompted looking here. Reading them out of the artifact leaves ONE copy and makes the header
+/// load-bearing, the same move `preflight_env` makes for the goldens' version pin.
+///
+/// Panics if the phrase moves rather than defaulting, because a header reword must be a visible
+/// edit and not a check that quietly stops checking.
+fn declared(phrase: &str) -> usize {
+    let at = FAMILIES.find(phrase).unwrap_or_else(|| {
+        panic!("the TSV header no longer says `{phrase}`; this test reads its counts from there")
+    });
+    let digits: String = FAMILIES[..at]
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits
+        .chars()
+        .rev()
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|e| panic!("no number before `{phrase}` in the TSV header: {e}"))
+}
+
 /// The reduction itself must be the file we think it is. A truncated or hand-edited TSV would
 /// make every assertion below vacuous, which is the shape a fixture-backed gate fails in.
+///
+/// Each count is compared against what the header DECLARES, so the rows and the provenance line
+/// have to agree. What this still cannot see is an upstream revision that ADDS a family: the
+/// declared totals were transcribed from a 60 MB index that is not vendored, so both sides of every
+/// comparison here are frozen together. That limitation is stated in the file's own header, under
+/// OPEN, along with what closing it would take.
 #[test]
 fn the_vendored_reduction_is_intact() {
     let fams = families();
-    assert_eq!(fams.len(), 60, "60 families were reduced from the index");
-    // 497,220 tensors, from the counts alone — so a dropped row cannot pass unnoticed.
+    let (want_fams, want_text) = (declared("families total"), declared("text-side"));
+    assert_eq!(
+        fams.len(),
+        want_fams,
+        "the header declares {want_fams} families; the rows are {}",
+        fams.len()
+    );
+    // Tensors, from the counts alone — so a dropped row cannot pass unnoticed.
     let total: usize = fams.iter().map(|f| f.count).sum();
     assert_eq!(
-        total, 497_220,
-        "family counts must sum to the index's tensor count"
+        total,
+        declared("tensors across"),
+        "family counts must sum to the tensor count the header declares"
     );
     // The vision side is a SIBLING of `language_model`, so the split is a prefix test.
     let (text, other): (Vec<&TsvFamily>, Vec<&TsvFamily>) = fams
@@ -144,8 +186,9 @@ fn the_vendored_reduction_is_intact() {
         .partition(|f| f.name.starts_with("language_model."));
     assert_eq!(
         (text.len(), other.len()),
-        (48, 12),
-        "text-side / vision-side families"
+        (want_text, want_fams - want_text),
+        "text-side / vision-side families, against the header's {want_fams} total and \
+         {want_text} text-side"
     );
     for f in other {
         assert!(

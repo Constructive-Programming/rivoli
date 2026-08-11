@@ -16,8 +16,12 @@
 # WHAT THIS FILE DOES AND DOES NOT GUARANTEE, stated because the counts above read stronger than
 # they are (added 2026-08-11 after Muse Glimmer's port hit the same class):
 #   * CLOSED — the reduction accounts for every tensor in the index it was made from: the count
-#     column sums to 497,220, so a family lost during the reduction cannot pass
-#     (`k3_names.rs::the_vendored_reduction_is_intact`). And the set of `?` rows is now enumerated
+#     column sums to the tensor count declared above, so a family lost during the reduction cannot
+#     pass (`k3_names.rs::the_vendored_reduction_is_intact`). THE NUMBERS IN THIS HEADER ARE READ BY
+#     THAT TEST, not restated in it — `declared("tensors across")`, `("families total")`,
+#     ("text-side"). So this header is load-bearing: a typo here goes red, and rewording one of
+#     those three phrases panics rather than quietly skipping the check. Edit the prose freely,
+#     but re-run `cargo test --test k3_names` after. And the set of `?` rows is now enumerated
 #     (`exactly_the_declared_families_have_no_shape`), so the shape blind spot cannot widen
 #     silently — 17 rows, of which 5 are in scope and therefore have no shape checked anywhere.
 #   * OPEN — nothing detects an UPSTREAM revision that ADDS a family. A newer checkpoint would
