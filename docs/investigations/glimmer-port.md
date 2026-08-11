@@ -1,6 +1,38 @@
 ---
 scope: glimmer
 status: live
+verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a DONE and G1a MET 2026-08-11 on tag k3-s1a — config schema, convert_glimmer (bf16-verbatim), GlimmerPin placing all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream, and run_glimmer's nine flag refusals against V4's three. G1a's blind spot: not one of its clauses evaluates arithmetic, so every gate so far would hold on a checkpoint of noise; S1b's goldens are where that changes. Four reviews then found two CI breaks (both tests running the shipped binary, which is a refusal stub featureless) and one silent-wrongness class the gates could not see -- all five f32 norms were placed with no extent check, and the shipped converter accepts a short norm at exit 0. S1b DONE and G1b MET 2026-08-11 — the anchor runs the first-party transformers stack (5.16.0.dev0 @ fe747d88, torch CPU: this reference needs NO GPU) at tiny widths but the real structure, and four goldens are vendored across two weight draws and two modes, read with no python and no device. 14 defects x 2 draws = 28 runs, each GATED on the captures it must leave bit-identical, green sets scoped to step 0 because a defect that moves the argmax contaminates every later step. THE FINDING: softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so every greedy gate in this repo is PROVABLY blind to a wrong logit scale here. Two reference behaviours found by running it: the DFlash drafter's default mask raises, and the correct mask only works with use_cache=False. S2 STARTED 2026-08-11 with item 1's precondition: the driver gained --dtype float64 and --by-operator, per-operator fp32 floors are measured for all thirteen buckets at BOTH draws (attend's is 2.1x apart between them, so a one-draw floor would have set the threshold at half what a correct kernel needs), and ONE tolerance row is tabled -- attend, floor 1.639e-5, weakest targeting defect 2.086e0, Rel(1.64e-4). qk_scale_on_k is excluded from that set because (s*q).k and q.(s*k) are the same product, so it is invisible to the attend kernel by algebra rather than by resolution; counting its 38x-the-floor signal would have forced ExactOnly on a false premise. measurement/glimmer-reference/anchor.md. S2 item 1 DONE 2026-08-11: gqa_attend (kernels/attn.hip), scored against tolerance::GLIMMER's attend row rather than a bar of its own. It is the tree's first kernel with a distinct V, more than one KV head, and a causal bound it DERIVES rather than is handed -- at 131072 context a [tq][s] mask array is larger than the model, so it takes (start_pos, win, ring_cap) and the golden's captured mask is compared AGAINST that derivation instead of being fed to it. tests/glimmer_attend.rs runs 112 golden comparisons, 72 ring cases, 8 launcher guards, and a width sweep at head_dim 40/96/128 that no golden reaches -- every capture is at 8, so only the first accumulator register had ever executed while the real model needs four. Two red proofs run and reverted: head % hkv for head / group reddens at 1.20 (trap 10, the one that decodes fluently), and pos - win for pos - win + 1 reddens the kernel at 1.07 while leaving the mask test GREEN, so trap 14 needs both halves. Two independent reviews then found what neither the goldens nor those proofs could: a launch attends the UNION of its query rows' windows, win + tq - 1 positions, so a ring of exactly win overwrites its own oldest row mid-launch for any prefill chunk -- decode is tq == 1 and unaffected, the reference hands one query row per sliding step so no golden can reach it, and the launcher now refuses it. glimmer-architecture.md trap 14 said a 2048-row ring is 'exactly right'; that is true PER QUERY ROW and is corrected in place. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
+---
+
+# Muse Glimmer-30B — implementation plan
+
+**Glimmer is a capability this engine must have.** This is the plan to get there, not an
+assessment of whether to. It is sequenced **after Kimi-K3** and builds on the `wt/k3-s1a`
+lineage (V4 + K3): `Arch`/`ArchConfig`, the streaming `SafeWriter`, per-arch converters and
+refusal-tested config parsing are assumed present, and line references marked `[wt]` are to
+that branch, not `main`.
+
+Target: `meta-models/Muse-Glimmer-30B`, **text-only** (the 1.8 B perception encoder is out of
+scope — §S6). 52 layers, ~29.6 B total incl. vision, ~26.5 B on the text decode path.
+Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash drafter.
+
+## STATE
+
+- **S0 is DONE and G0 is MET (2026-08-10).** The forward pass is
+  first-party-verified and lives in **`docs/reference/glimmer-architecture.md`** — raw
+  `config.json`, the safetensors headers by range request, and transformers' own
+  `modeling_muse_glimmer.py` (the repo ships no modeling code; `muse_glimmer` is native to
+  transformers 5.15.0.dev0), pinned at `f84ecc3a0ea984a4c04542a84269e3d065350a6e`. **Eight
+  load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
+  card's errors beside them. The DFlash drafter is settled too — §S6 and
+  `glimmer-architecture.md` §11.
+- **S1a is DONE and G1a is MET (2026-08-11)**, on tag `k3-s1a`: the config schema and a
+  refusing dispatch, `convert_glimmer` — **bf16 verbatim, correctness first** — `GlimmerPin`,
+  which places all **55,712,344,064** resident bytes and takes **no capacity parameter and no
+  cache policy** because a dense model has nothing to stream, and `run_glimmer`, whose **nine**
+  flag refusals (V4 has three) were written *before* the decode path rather than with it.
+  **G1a's blind spot: none of its four clauses evaluates arithmetic** — the artifact is
+  bf16-verbatim, so "round-trips bit-exact" would hold on a checkpoint of noise. §S1a, §G1a.
 - **S1b is DONE and G1b is MET (2026-08-11).** The anchor runs the first-party stack on CPU;
   four goldens across two draws and two modes are vendored, with 14 defect runs each gated on
   what they must leave bit-identical. §S1b, §"The anchor itself".
