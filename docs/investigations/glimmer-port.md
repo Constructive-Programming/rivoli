@@ -752,7 +752,25 @@ lm_head/logits sizing.**
    per-layer θ has no caller. The kernel takes θ as a parameter, so the per-layer table is a
    call-site concern.
 
-3. **Output gate** — K3's gated-MLA kernel pattern at the GQA site.
+3. **Output gate** — an elementwise `attn * sigmoid(gate_proj(h))` between the attend and
+   `o_proj`. `gate_proj` is an ordinary `[4096, 6656]` projection (existing GEMV); the multiply is
+   a few lines of its own or folded into `gqa_attend`'s output write.
+
+   > **CORRECTED 2026-08-12.** This said "K3's gated-MLA kernel pattern at the GQA site", which
+   > points at nothing: **Kimi-K3 is at S1b and has no kernels in the tree** — its gated MLA is
+   > item 2 of its own unwritten S2 list, and the launcher census carries zero K3 rows. The two
+   > gates are not the same operation either. K3's is a clause inside a large fused MLA kernel
+   > (`k3-port.md` §S2.2: "output gate before `o_proj` with no norm"); Glimmer's is an elementwise
+   > multiply of two `[rows][32*128]` tensors. What the two share is one sentence of spec, not a
+   > kernel shape. Same class as this stage's `Sel` prescription in item 1 — a plan prescribing
+   > reuse that does not survive contact — and it was caught by a reader asking what the phrase
+   > meant, not by writing the code.
+
+   **The trap is the operand, not the arithmetic.** §4 item 3: the gate is computed from the
+   layer input `h`, NOT from the attention output. A port that gates on `attn` has the right
+   shapes, the right tensor and the wrong model. The anchor captures `attn.gate_proj.out` and
+   `attn.o_proj.in_gated` separately, which is what makes the two distinguishable — and
+   `gate_disabled` (the gate saturated to sigmoid(20)≈1) is the defect run already in the matrix.
 4. **MLP wiring** — no new kernel; delete the guard, bind the dims.
 5. **lm_head at 202048** — existing `gemv_i8`; check `ARGMAX_BYTES`/logit scratch at
    808 KB/row × MAXROW.
