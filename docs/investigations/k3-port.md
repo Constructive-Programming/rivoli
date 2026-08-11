@@ -35,8 +35,16 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   layer. Conversion is unblocked. §S1a item 1. *(This said "the ROUTED writer is still owed"
   until 2026-08-10, contradicting item 1 in the same document; corrected after review.)*
 - **The load boundary is in and refuses**: `Arch::KimiK3`, `K3Config`, and a dispatch arm that
-  parses before it bails. §S1a items 6 and 7, and the third bullet of G1a is MET. The `.f4`
-  repack and `convert_k3` are what remain of S1a's artifact half.
+  parses before it bails. §S1a items 6 and 7.
+- **`convert_k3` exists and the repack is verified on real bytes.** Names and shapes come from the
+  checkpoint's own index (vendored reduction, `tests/k3_names.rs`); one real expert was fetched by
+  HTTP Range and converted with 0 bytes differing, re-checked independently of rivoli's code.
+  §S1a items 5 and 6, `docs/measurement/k3-reference/repack-one-expert.md`.
+- **Three of G1a's four bullets are MET** — the repack (on a one-expert sample, recipe recorded),
+  the refusal at startup, and the existing artifacts still opening byte- and offset-identically
+  with their byte accounting reproduced from the config (`tests/artifact_compat.rs`, 805 GiB in
+  0.1 s). What remains of S1a: the latent-wide accumulator drain kernel (item 4), the e8m0 `0xff`
+  decision (item 2), and the K3 pin's `MAX_BATCH` check (item 7).
 
 ## G. The gate model
 
@@ -249,7 +257,12 @@ resident set (trunk 108.81 + embed/lm_head 4.70) = 113.51 GB
 index metadata.total_size                        = 1,560,860,324,864 B = 1.4196 TiB
 ```
 
-Pool measured 2026-08-09: **1.69 TiB total, 431.72 GiB free**, GLM at 675 GiB, V4 at ~146 GiB.
+Pool measured 2026-08-09: **1.69 TiB total, 431.72 GiB free**, GLM at ~~675~~ **659.25** GiB, V4 at
+**145.97** GiB. *(CORRECTED 2026-08-11 by `tests/artifact_compat.rs`, which derives both from the
+config and confronts the disk: GLM is 76 x `.vq3` + 76 x `.i4` + 2 resident = 707,865,529,324 B =
+659.25 GiB, so the 675 was 15.75 GiB high and no directory here measures it. V4's ~146 was right —
+and a first pass that summed only its `.f4` files got 137.06 GiB and nearly reported the plan wrong
+in the other direction.)*
 Deleting both frees 1.223 TiB — **200 GiB short**. But **`/swarm/storage` has 7.7 TiB**, so the
 artifact can be stored and converted today; NFS at 154 MB/s is useless for throughput and fine
 for a bounded correctness run.
@@ -426,9 +439,21 @@ hand-transliterates that module. No gate through G3 consumes a template.
 
 ### G1a — met when
 
-- `.f4` repack **bit-exact both directions on real tensors**, asserted.
-- The existing GLM (675 GiB) and V4 (~146 GiB) artifacts still open **byte- and
-  offset-identically**, proven by a test that opens them.
+- `.f4` repack **bit-exact both directions on real tensors**, asserted. **MET 2026-08-10, on a
+  ONE-EXPERT sample.** K3 is 1.42 TiB and does not fit here, so layer 1 expert 0 (17,547,264 B) was
+  fetched by HTTP Range from the shipped shard and converted: `--verify` reports 0 bytes differ, and
+  a second pass in Python — at slot offsets recomputed from the widths alone, so it shares no code
+  with the writer — finds all six spans bit-identical, with `w3` in the up slot and `w2` in the
+  down. Two runs are byte-identical. `docs/measurement/k3-reference/repack-one-expert.md` carries
+  the byte ranges and hashes. **What is NOT covered: 4 of 82,432 experts.** A full-checkpoint pass
+  belongs to S4, where the bytes exist.
+- The existing GLM (**659.25** GiB) and V4 (**145.97** GiB) artifacts still open **byte- and
+  offset-identically**, proven by a test that opens them. **MET 2026-08-11** —
+  `tests/artifact_compat.rs` opens both full artifacts (152 layer files, all three routed formats)
+  and confronts every file length and the end layers' expert offsets with the geometry derived from
+  each model's config. It reads no weight: 805 GiB in 0.1 s, no GPU. It also pins the `has_shared`
+  fork — `.f4` has no shared block, `.vq3` and `.i4` do — and `.i4`'s headerlessness, which is the
+  case where a stray 4 KiB header would shift every offset in the artifact.
 - A config missing or contradicting any load-bearing field **refuses at startup**, proven by
   feeding it one. **MET 2026-08-10** — `mla_use_nope: false` in a hand-written manifest is
   refused by the shipped binary before it reads a dimension. That case is one of the **35** rows
@@ -436,8 +461,17 @@ hand-transliterates that module. No gate through G3 consumes a template.
   broken layer maps plus a positive control, and `every_k3_field_is_required` covers all 30
   `text_config` fields one at a time plus both arrays inside `linear_attn_config`. Three of
   those gates are red-proved by deliberate injection (a `#[serde(default)]`, an emptied
-  `hidden_flags`, and a transposed width pair). The other three bullets of this gate are open.
-- Byte accounting reproduced **from the artifact**, both halves.
+  `hidden_flags`, and a transposed width pair).
+- Byte accounting reproduced **from the artifact**, both halves. **MET 2026-08-11** — the same test
+  derives each artifact's total from its config and asserts it against the disk: V4
+  147,169,914,880 B routed + 9,557,453,182 B resident = 145.97 GiB; GLM 299,531,812,864 (`.vq3`) +
+  391,695,040,512 (`.i4`) = 643.75 GiB routed, 659.25 GiB with everything. **The plan's GLM figure
+  was 675 GiB and that was 15.75 GiB high** — corrected above and in `other-models.md`. V4's ~146
+  was right, and a first pass that summed only its `.f4` files got 137.06 GiB and nearly reported
+  the opposite.
+
+**Three of the four are MET.** The open one is the repack at full scale, which needs the
+checkpoint.
 
 ### S1b — the gate harness
 

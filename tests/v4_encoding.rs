@@ -26,7 +26,7 @@ use serde_json::Value;
 /// a passing test. `dead_code` because this is the first consumer that needs only two of
 /// its three entry points.
 #[path = "common/f4_artifact_dir.rs"]
-#[allow(dead_code)]
+// (no #[allow(dead_code)] here: the file carries one, and says why)
 mod f4_artifact_dir;
 
 /// The checkpoint's `encoding/` folder, or `None` when this machine has no checkpoint.

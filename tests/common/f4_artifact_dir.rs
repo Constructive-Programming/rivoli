@@ -9,6 +9,18 @@
 //! A free-standing file included by `#[path]` rather than an item in `common/mod.rs`:
 //! `mod common;` compiles that whole module, and `tests/f4_loading.rs` is deliberately
 //! host-only — it must not pull in the GPU-shaped helpers to borrow one path lookup.
+//!
+//! **`#![allow(dead_code)]` because `#[path]` inclusion compiles this file separately into EACH of
+//! its six including binaries**, and none of them uses every helper: `f4_loading.rs` wants the two
+//! three-layer fixtures, `artifact_compat.rs` the two full ones. Without it every binary warns
+//! about the others' helpers, in a tree whose union clippy run is expected to be silent.
+//!
+//! Here rather than at each `mod f4_artifact_dir;` — which is what `v4_encoding.rs` did, and was
+//! the right call while there were four helpers and one site that skipped some. Adding the two
+//! full-artifact helpers (2026-08-11) made every site partial, so six per-site attributes would say
+//! the same thing six times and the redundant one in `v4_encoding.rs` is now deleted. The cost is
+//! real and worth naming: a helper here that becomes genuinely dead will not be reported.
+#![allow(dead_code)]
 
 /// A V4 artifact directory, or `None` when this machine has none.
 ///
@@ -48,6 +60,34 @@ pub fn v4_artifact_l3_5(probe: &str) -> Option<String> {
     v4_artifact_at(
         "RIVOLI_V4_ARTIFACT_L3_5",
         "/var/db/rivoli/v4-f4-l3-5",
+        probe,
+    )
+}
+
+/// The FULL V4 artifact — all 43 layers, 145.97 GiB.
+///
+/// Distinct from [`v4_artifact`]'s three-layer fixture because the question it answers is
+/// different: the small ones test the loader's arithmetic, this one tests that **the artifact
+/// this machine already has still opens** after a change to the container code. K3's stage S1a
+/// renamed the expert-geometry parameter and re-typed `F4Expert`, and neither is allowed to
+/// move a byte or an offset in a 43-layer file nobody wants to rebuild.
+pub fn v4_artifact_full(probe: &str) -> Option<String> {
+    v4_artifact_at(
+        "RIVOLI_V4_ARTIFACT_FULL",
+        "/var/db/rivoli/v4-f4-full",
+        probe,
+    )
+}
+
+/// The full GLM-5.2 artifact — 76 layers of `.vq3` AND `.i4`, 659.25 GiB together.
+///
+/// The other half of the same question, and the more informative half: GLM's two formats are
+/// the ones with a SHARED block, and `.i4` is the one with no header at all, so between them
+/// they exercise every branch of `RoutedFmt::{hbytes, has_shared}` that `.f4` does not.
+pub fn glm_artifact_full(probe: &str) -> Option<String> {
+    v4_artifact_at(
+        "RIVOLI_GLM_ARTIFACT_FULL",
+        "/var/db/rivoli/glm52-vq3-full",
         probe,
     )
 }

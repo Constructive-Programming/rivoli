@@ -102,7 +102,10 @@ the layout is right). int3-vq stores 3 bits/weight plus one bf16 scale per 64 �
 0.406 B/weight, giving a **~1.03 TiB expert artifact**.
 
 The disk is btrfs RAID0 across both NVMes: **1.69 TiB total, 265 GiB free**, and the GLM-5.2
-artifact is 675 GiB of it. Deleting GLM-5.2 outright frees 940 GiB = 0.92 TiB. **Still ~115
+artifact is ~~675~~ **659.25** GiB of it (CORRECTED 2026-08-11 — measured from the artifact by
+`tests/artifact_compat.rs`; the 675 was 15.75 GiB high). Deleting GLM-5.2 outright frees ~940 GiB =
+0.92 TiB — that figure counts BOTH copies, `/var/db` 659.25 + `/swarm` 290.35 = 949.6 GiB, and is
+unaffected by the correction above. **Still ~115
 GiB short**, and that is before `resident.safetensors`. There is no third drive; the
 apparently-unformatted `nvme0n1p2` is already a member of the pool. NVMe is not substitutable
 here — O_DIRECT streaming is the design, and `/swarm/storage` is NFS.
