@@ -176,7 +176,17 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
             .filter(|l| {
                 l.split_once("](")
                     .and_then(|(_, rest)| rest.split_once(')'))
-                    .is_some_and(|(target, _)| target.rsplit('/').next() == Some(name))
+                    // Matched on the doc's PATH under `docs/`, not on its basename. Two ports now
+                    // ship an `anchor.md` — `k3-reference/` and `glimmer-reference/` — and a
+                    // basename match reported the second as a duplicate row of the first the day
+                    // it was added (2026-08-11). Worse than the false positive: it would have
+                    // handed one doc the OTHER doc's row, so the scope check below could pass by
+                    // reading a cell belonging to a different port.
+                    // `ends_with` and not `==` because the row's target is relative to
+                    // `docs/00-orientation/` while `f` carries the `docs/` prefix; stripping the
+                    // `../` leaves `measurement/glimmer-reference/anchor.md`, which is a suffix of
+                    // the path and unambiguous at that length.
+                    .is_some_and(|(target, _)| f.ends_with(target.trim_start_matches("../")))
             })
             .collect();
         assert!(
