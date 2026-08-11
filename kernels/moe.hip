@@ -223,6 +223,58 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// acc → f32 into a SEPARATE BUFFER: out[o] = gain · (acc[o] · 2^-MOE_ACC_SHIFT), acc reset.
+//
+// **The three differences from `moe_acc_drain` above, each silent-wrong if dropped.** This exists
+// for Kimi-K3, whose MoE block does not finish where the other two models' do: its routed sum is
+// produced in a 3584-wide LATENT, and the aggregate must then be RMSNormed and up-projected to 7168
+// before it can join the residual (`docs/reference/k3-architecture.md` §6, steps 4-5).
+//
+//   1. **`=`, not `+=`.** The other drain IS the residual add. This one hands back an intermediate
+//      that two more operators still have to touch, so accumulating into the destination would add
+//      whatever the buffer held from the previous layer — a wrong-but-plausible aggregate, every
+//      layer, with no error. The buffer therefore needs no zeroing by the caller, which is the
+//      other half of the same fact.
+//   2. **`n` is the LATENT width, not `hidden`.** At K3's dims those differ by 2x. `hidden` here
+//      would read 7168 entries out of a 3584-entry accumulator row — past the end on every row but
+//      the last.
+//   3. **The RMSNorm that follows is over the AGGREGATE, never per expert**, so this must run after
+//      every stream has landed, exactly like its sibling. Same contract, same reason.
+//
+// `gain` is kept rather than folded into the later norm: it carries `routed_scaling_factor`, which
+// `k3-architecture.md` §6 says to apply to the weights and which is 1.0 in the shipped config — a
+// value that must stay a multiply so that a checkpoint shipping something else is not silently
+// ignored.
+//
+// double for the convert, as above: acc reaches 2^48 and f32 would round it away.
+extern "C" __global__ void moe_acc_drain_to(float* __restrict__ out,
+                                            unsigned long long* __restrict__ acc, int n, int rows,
+                                            float gain) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n) return;
+    long long t = 0;
+    for (int r = 0; r < rows; ++r) {
+        t += (long long)acc[(size_t)r * n + o];
+        acc[(size_t)r * n + o] = 0ull;
+    }
+    out[o] = gain * (float)((double)t / (double)MOE_ACC_SCALE);
+}
+
+extern "C" int rivoli_moe_acc_drain_to_s(float* out, unsigned long long* acc, int n, int rows,
+                                         float gain, void* stream) {
+    if (n <= 0 || rows <= 0) return 1001;
+    // Refused rather than tolerated: `gain == 0` writes an all-zero aggregate, which is a MoE layer
+    // whose routed experts contributed nothing while the shared MLP kept working — degraded fluent
+    // text, not a crash. The other drain cannot make this check because there `gain == 0` leaves the
+    // residual untouched and is indistinguishable from a layer with no misses.
+    if (!(gain > 0.0f)) return 1003;
+    hipGetLastError();
+    hipLaunchKernelGGL(moe_acc_drain_to, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream,
+                       out, acc, n, rows, gain);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 // ══ FP4 MoE — DeepSeek-V4-Flash's native routed experts ══════════════════════════════
 //
 // Same two-pass skeleton as the VQ and int4 paths, and FIVE differences from them, every

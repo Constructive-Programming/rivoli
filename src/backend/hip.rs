@@ -451,6 +451,36 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// Drain the fixed-point MoE accumulator into a SEPARATE buffer:
+    /// `out[o] = gain·(Σ_r acc[r][o])·2⁻⁴⁴`, resetting `acc` for the next layer.
+    ///
+    /// **For Kimi-K3, whose MoE block does not end at the residual.** Its routed sum lives in a
+    /// 3584-wide latent that must be RMSNormed as an AGGREGATE and up-projected to 7168 before it
+    /// can be added to anything — so the sum has to be intercepted, not folded in.
+    /// [`launch_moe_acc_drain`] is the right kernel for GLM and V4 and the wrong one here; the three
+    /// differences (`=` vs `+=`, the latent width, and the ordering the norm imposes) are argued at
+    /// `kernels/moe.hip`'s `moe_acc_drain_to`.
+    ///
+    /// `n` is the **latent** width. Passing `hidden` reads past the end of every accumulator row but
+    /// the last, and at K3's dims those two numbers differ by exactly 2x.
+    ///
+    /// A `gain` of 0 is REFUSED (guard 1003), unlike in the sibling: here it would write an all-zero
+    /// aggregate — a layer whose routed experts contributed nothing while the shared MLP kept
+    /// working, which is degraded fluent text rather than an error.
+    ///
+    /// # Safety
+    /// `out` holds `n` f32 and `acc` holds `rows·n` u64; EVERY stream that accumulated into `acc`
+    /// must already have completed. `out` must not alias `acc`, and — unlike the sibling — it does
+    /// NOT need to be zeroed first, because this assigns.
+    launch_moe_acc_drain_to -> rivoli_moe_acc_drain_to_s, "moe_acc_drain_to" (
+        out: *mut f32,
+        acc: *mut u64,
+        n: usize as i32,
+        rows: usize as i32,
+        gain: f32,
+        stream: *mut c_void,
+    );
+
     /// fp8-e4m3 block-scaled GEMV `y = W·x` (attention/dense projections).
     ///
     /// `nrow` token rows (1 or 2) share ONE read of the weights: `x[r·i_dim + i]` →

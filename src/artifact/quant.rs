@@ -767,6 +767,26 @@ pub const F4_LUT: [f32; 16] = [
 /// Decode one e8m0 scale byte: a bare exponent, value `2^(b - 127)`. `0xFF` is the
 /// format's NaN and must not appear in weights — a scale that is NaN poisons a whole
 /// 32-weight block, so it is worth failing on rather than propagating.
+///
+/// > **SETTLED 2026-08-11 — Kimi-K3's `sb == 255` question (plan S1a item 2).** K3's C reference
+/// > maps 255 to **zero** where this bails, and the plan flagged the disagreement as needing a
+/// > decision because host and device must move together: `moe_fixed`'s saturating clamp would
+/// > launder a device-side NaN into a finite ±2^14, so a divergence here is silent.
+/// >
+/// > **The bail stays**, on two grounds. First, measurement: 4,128,768 real K3 scale bytes (every
+/// > scale tensor of experts 0-3, layer 1) hold **11 distinct codes in `0x70..=0x7a`, zero `0xFF`
+/// > and zero `0x00`** — the same shape V4's shipped set showed, so the reference's 255 path is
+/// > defensive rather than exercised. That is a 0.005% sample and settles nothing by itself.
+/// > Second, and this is what settles it: **the repack is the only path that reads every scale
+/// > byte.** At decode they DMA from NVMe straight into a pool slot and the host never sees them,
+/// > so `F4Expert::spans`'s check either passes over the whole checkpoint at conversion time or
+/// > names the exact tensor, row and group that fails. `convert_k3` inherits that check through
+/// > `RoutedRepack`, so no `.f4` artifact can contain a byte this function would reject.
+/// >
+/// > Mapping 255 to zero instead would be adopting a rule for values the format forbids and this
+/// > engine's own artifacts cannot contain — and it would have to be adopted in `common.hpp`'s
+/// > `e8m0f` too, where nothing can report it. `docs/measurement/k3-reference/repack-one-expert.md`
+/// > carries the distribution.
 pub fn e8m0(b: u8) -> anyhow::Result<f32> {
     if b == 0xFF {
         anyhow::bail!("e8m0 scale byte 0xFF is NaN");

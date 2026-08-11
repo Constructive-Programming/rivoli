@@ -8,7 +8,7 @@ use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8,
-    launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_expert_range,
+    launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_acc_drain_to, launch_moe_expert_range,
     launch_moe_expert_range_i4, launch_rope_interleave, launch_swiglu, launch_vadd,
     launch_vq_encode,
 };
@@ -2102,4 +2102,111 @@ fn gemv_i4_matches_oracle() {
     // 1e-5 relative: 25x above the measured 4e-7, and still far tighter than a wrong
     // group-scale index or a dropped `-8` nibble bias, both of which are O(1).
     assert_rel(&want, &f32v(&back(&yb)), "gemv_i4", 1e-5);
+}
+
+/// `moe_acc_drain_to` — the latent-width drain Kimi-K3 needs, against `moe_acc_drain`.
+///
+/// The two kernels are nine lines apart in `moe.hip` and differ in three ways, every one of which
+/// is silent-wrong if it is dropped. This test is built so each difference reddens on its own:
+///
+/// 1. **`=` not `+=`.** The destination is pre-filled with a poison value. The sibling would add to
+///    it; this must overwrite it. That is what makes K3's aggregate correct — it goes on to be
+///    RMSNormed and up-projected, so a stale addend from the previous layer would be a plausible
+///    wrong aggregate on every layer, forever, with nothing finite to notice.
+/// 2. **The accumulator is RESET.** Same load-bearing reason as the sibling's: steady-state decode
+///    does no memset before a layer's experts, so a drain that forgot would double-count from the
+///    next layer on.
+/// 3. **`n` is the LATENT width.** Asserted by giving the accumulator MORE rows than the drain is
+///    told to read at a width that is not the buffer's whole span, so a kernel that walked the
+///    wrong extent would either read a row it was not given or leave one dirty.
+///
+/// Also the `gain == 0` refusal, which the sibling deliberately does not have: there a zero gain
+/// leaves the residual untouched and is indistinguishable from a layer with no misses, while here
+/// it would write an all-zero aggregate — routed experts contributing nothing while the shared MLP
+/// keeps working, which is degraded fluent text rather than an error.
+///
+/// Fixed-point in, exact out: `MOE_ACC_SHIFT` is 44, and every value here is a small multiple of
+/// `2^-44` scaled by a power of two, so the expected result is exact in f32 and this is
+/// `assert_bits` rather than a tolerance.
+#[test]
+fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
+    // A latent narrower than the accumulator's full span, and two rows — one per stream, which is
+    // what `rows` counts. 3584 is K3's real latent; 8 keeps the readback small while staying a
+    // multiple of nothing in particular, so an off-by-one in the block math would show.
+    let (n, rows) = (8usize, 2usize);
+    const SCALE: f64 = (1u64 << 44) as f64; // MOE_ACC_SHIFT, mirrored from kernels/moe.hip
+    // Row r contributes (o + 1) · (r + 1) · 2^44, so every output is an exact small integer and
+    // the two rows are distinguishable — a drain that read only row 0 gives half the answer.
+    let acc: Vec<u64> = (0..rows)
+        .flat_map(|r| (0..n).map(move |o| ((o + 1) * (r + 1)) as u64 * (1u64 << 44)))
+        .collect();
+    let gain = 0.5f32;
+    let want: Vec<f32> = (0..n)
+        .map(|o| {
+            let t: u64 = (0..rows).map(|r| ((o + 1) * (r + 1)) as u64).sum::<u64>() * (1u64 << 44);
+            gain * (t as f64 / SCALE) as f32
+        })
+        .collect();
+
+    let mut accb = dev(&acc
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<u8>>());
+    // POISON, not zeros: this is difference 1, and a destination of zeros would make `=` and `+=`
+    // indistinguishable — which is exactly the mistake a reader porting from the sibling makes.
+    let poison = -1234.5f32;
+    let mut outb = dev(&f32b(&vec![poison; n]));
+    let stream = HipStream::new().expect("stream");
+
+    // SAFETY: `outb` is `n` f32, `accb` is `rows·n` u64, and nothing else is using either; the
+    // stream is live for the call and synced below.
+    unsafe {
+        launch_moe_acc_drain_to(
+            outb.ptr_mut() as *mut f32,
+            accb.ptr_mut() as *mut u64,
+            n,
+            rows,
+            gain,
+            stream.raw(),
+        )
+    }
+    .expect("moe_acc_drain_to");
+    device_sync().expect("sync");
+
+    let got = f32v(&outb.copy_out().expect("out"));
+    assert_bits(&want, &got, "moe_acc_drain_to");
+    assert!(
+        !got.contains(&poison),
+        "the destination still holds its poison value — this kernel must ASSIGN, not accumulate"
+    );
+    assert!(
+        accb.copy_out().expect("acc").iter().all(|&b| b == 0),
+        "moe_acc_drain_to left the accumulator dirty — steady-state decode does no memset, so \
+         the next layer would double-count"
+    );
+
+    // The guards. `gain == 0` and a non-positive `n`/`rows`, each by code rather than by is_err.
+    for (bad_n, bad_rows, bad_gain, code) in [
+        (n, rows, 0.0f32, 1003u32),
+        (n, rows, -1.0, 1003),
+        (0, rows, gain, 1001),
+        (n, 0, gain, 1001),
+    ] {
+        // SAFETY: the launcher rejects before it dereferences anything.
+        let r = unsafe {
+            launch_moe_acc_drain_to(
+                outb.ptr_mut() as *mut f32,
+                accb.ptr_mut() as *mut u64,
+                bad_n,
+                bad_rows,
+                bad_gain,
+                stream.raw(),
+            )
+        };
+        assert_guard(
+            r,
+            Some(code),
+            &format!("n={bad_n} rows={bad_rows} gain={bad_gain}"),
+        );
+    }
 }

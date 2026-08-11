@@ -349,6 +349,14 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("mla_absorb_fp8", &["gpu.rs"]),
     ("mla_value_fp8", &["gpu.rs"]),
     ("moe_acc_drain", &["gpu.rs", "f4gpu.rs"]),
+    // **No engine caller yet, and that is the interesting part.** Kimi-K3's MoE block is the only
+    // one whose routed sum is intercepted in a latent rather than folded into the residual, so this
+    // kernel exists ahead of the layer loop that will call it (S1a item 4, S3 wires it). The empty
+    // slice is the assertion — see this table's header: it says "no engine caller" out loud rather
+    // than letting the absence read as an oversight. Its oracle is
+    // `tests/kernel.rs::moe_acc_drain_to_writes_the_latent_aggregate_and_resets`, which is what
+    // keeps a staged kernel from being an unexecuted one.
+    ("moe_acc_drain_to", &[]),
     ("moe_expert_range", &["gpu.rs"]),
     ("moe_expert_range_f4", &["f4gpu.rs"]),
     ("moe_expert_range_i4", &["gpu.rs"]),

@@ -2398,6 +2398,51 @@ mod tests {
         parse_config::<K3Config>(K3_SHIPPED).expect("the shipped config must parse");
     }
 
+    /// **K3 fits the routed pool's batch scratch only at ONE row**, and this is the arithmetic that
+    /// says so — written before the K3 pin exists, because the pin's obvious first draft is a copy
+    /// of GLM's line and that copy is wrong.
+    ///
+    /// `RoutedPool::submit` has a fixed `MAX_BATCH`-slot hit scratch, and a batched forward submits
+    /// the UNION of every token row's picks: `top_k · rows + n_shared`. At K3's shipped scalars
+    /// that is `16 · rows + 2`, so rows=1 needs 18 of 32 and **rows=2 needs 34 — two over**.
+    ///
+    /// K3's row count IS 1, and not by luck: `num_nextn_predict_layers` is 0, there is no MTP head,
+    /// and `validate` already refuses a config that says otherwise. So the two assertions together
+    /// are the safety argument — this one would fail if someone raised `top_k`, and that one if a
+    /// checkpoint arrived with a draft head. A K3 pin that reached for `crate::gpu::MAXROW` (2,
+    /// fixed by GLM's acceptance measurements) would refuse every K3 artifact at load; one that
+    /// reached for it after someone raised `MAX_BATCH` would silently size a batched pass K3 has no
+    /// kernel for, since `num_nextn_predict_layers: 0` means nothing to draft with.
+    ///
+    /// Gated on `rocm` because `memory::routed` is — the constant lives with the pool that owns it,
+    /// and CI's featureless `cargo test` must still compile.
+    #[cfg(feature = "rocm")]
+    #[test]
+    fn k3_fits_the_routed_batch_scratch_at_one_row_and_not_at_two() {
+        use crate::memory::routed::MAX_BATCH;
+        let c = parse_k3(&[]).unwrap().text;
+        let batch = |rows: usize| c.top_k * rows + c.n_shared;
+        assert_eq!(
+            (c.top_k, c.n_shared),
+            (16, 2),
+            "the shipped scalars this bound is about"
+        );
+        assert!(
+            batch(1) <= MAX_BATCH,
+            "K3 needs {} slots at one row, and the scratch has {MAX_BATCH}",
+            batch(1)
+        );
+        // The half that matters: K3 does NOT fit a two-row pass. Asserted so that raising
+        // `MAX_BATCH` to 34+ is a deliberate act with this comment attached, rather than something
+        // that quietly makes a batched K3 pin look legal.
+        assert!(
+            batch(crate::gpu::MAXROW) > MAX_BATCH,
+            "K3 now fits a {}-row pass ({} slots). If that is intended it needs a drafting head —              `num_nextn_predict_layers` is 0 — and a batched fp4 MoE kernel, which the tree does              not have (`kernels/moe.hip` instantiates R=1 only).",
+            crate::gpu::MAXROW,
+            batch(crate::gpu::MAXROW)
+        );
+    }
+
     /// A K3 config must not become a zero-filled config of either other architecture, nor
     /// the reverse. Same defect as [`each_config_refuses_the_other_architecture`], third hat:
     /// K3's wrapper is the only one of the three whose dimensions are not at the top level, so

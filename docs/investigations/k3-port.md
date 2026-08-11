@@ -43,8 +43,13 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
 - **Three of G1a's four bullets are MET** — the repack (on a one-expert sample, recipe recorded),
   the refusal at startup, and the existing artifacts still opening byte- and offset-identically
   with their byte accounting reproduced from the config (`tests/artifact_compat.rs`, 805 GiB in
-  0.1 s). What remains of S1a: the latent-wide accumulator drain kernel (item 4), the e8m0 `0xff`
-  decision (item 2), and the K3 pin's `MAX_BATCH` check (item 7).
+  0.1 s).
+- **S1a's host work is DONE.** Item 2 settled (the e8m0 `0xff` bail stays — the repack is the only
+  path that reads every scale byte); item 4's `moe_acc_drain_to` written, compiled and oracled, with
+  the device run **pending a free GPU**; item 7's `MAX_BATCH` arithmetic settled and asserted —
+  **K3 fits the routed batch scratch at ONE row and not at two** (18 of 32 against 34). What is left
+  needs the device or the layer loop: executing the drain oracle, and the refusal inside a K3 pin
+  that S3 will write.
 
 ## G. The gate model
 
@@ -339,10 +344,20 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    pack inside each window — at K3's stride that is 61 blocks per window against ~32 threads,
    so nothing serialises. Asserted byte-identical to the buffered form, short final window
    covered. `write_atomic` went with it — after this there were no callers left.
-2. **Settle e8m0 `0xff`.** *(Tier 1.)* The reference maps 255 → zero; rivoli's `e8m0f` returns
-   a quiet NaN and `quant.rs:748` **bails**. Item 11 settles the semantics for free; only the
-   *presence* question needs bytes. Host and device must change together or the divergence is
-   silent — `moe_fixed`'s clamp launders NaN into a finite ±2^14.
+2. **Settle e8m0 `0xff` — SETTLED 2026-08-11: the bail STAYS.** The reference maps 255 → zero;
+   rivoli's `e8m0f` returns a quiet NaN and `quant::e8m0` **bails**. Host and device must move
+   together or the divergence is silent — `moe_fixed`'s clamp launders NaN into a finite ±2^14.
+   **Two grounds, and the second is the one that decides it.** Measurement: 4,128,768 real K3 scale
+   bytes (every scale tensor of experts 0-3, layer 1) hold 11 distinct codes in `0x70..=0x7a`, zero
+   `0xff`, zero `0x00` — the same shape V4's shipped set showed, so the reference's 255 path is
+   defensive rather than exercised. That is a **0.005% sample and settles nothing alone.** What
+   settles it: **the repack is the only path that reads every scale byte** — at decode they DMA from
+   NVMe into a pool slot and the host never sees them — so `F4Expert::spans`'s existing check either
+   passes over the whole checkpoint at conversion or names the exact tensor, row and group. Every
+   `.f4` writer goes through it, `convert_k3` included. Adopting 255 → zero would mean adopting a
+   rule for values the format forbids and this engine's artifacts cannot contain, in
+   `common.hpp::e8m0f` as well, where nothing can report it. Recorded at `quant::e8m0` and in
+   `docs/measurement/k3-reference/repack-one-expert.md`.
 3. **Thread `moe_latent` (3584) separately from `hidden` (7168).** *(Tier 1. Host half DONE
    2026-08-10.)* The fp4 kernels already take the widths as runtime arguments
    (`moe.hip:300`) and `ACT_QUANT_BLOCK=128` divides both 3584 and 3072, so the work is
@@ -370,10 +385,23 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    Note for K3: `ensure_group_aligned(latent, moe_inter, …)` stops covering the trunk widths,
    so its "one check covers both" comment no longer holds there. No practical hole — 7168 and
    6144 are multiples of both 32 and 64 — but the comment needs the caveat when K3 lands.
-4. **The MoE accumulator drains into the residual.** `moe_acc_drain` fuses de-fixed-point into
-   the residual add at one width; K3 needs the aggregate intercepted **in latent space** for
-   the RMSNorm and up-projection first. That is a new drain-to-buffer kernel with its own
-   launcher, guards and `tests/kernel_coverage.rs` oracle.
+4. **The MoE accumulator drains into the residual — kernel WRITTEN 2026-08-11, device run
+   PENDING.** `moe_acc_drain` fuses de-fixed-point into the residual add at one width; K3 needs the
+   aggregate intercepted **in latent space** for the RMSNorm and up-projection first.
+   `moe_acc_drain_to` (`kernels/moe.hip`) is that kernel: `out[o] = gain·(Σ_r acc[r][o])·2⁻⁴⁴`,
+   accumulator reset, with `launch_moe_acc_drain_to` and a `gain <= 0` refusal the sibling
+   deliberately does not have (there a zero gain leaves the residual untouched and is
+   indistinguishable from a miss-free layer; here it writes an all-zero aggregate). Three
+   differences from the sibling, each silent-wrong if dropped — `=` not `+=`, the LATENT width, and
+   the ordering the aggregate RMSNorm imposes — argued at the kernel and pinned by
+   `tests/kernel.rs::moe_acc_drain_to_writes_the_latent_aggregate_and_resets`, whose destination is
+   pre-filled with a poison value so `=` and `+=` are distinguishable.
+   **NOT YET EXECUTED.** It compiles (hipcc, symbol in `moe.o`) and both `kernel_coverage` censuses
+   accept it — including an `OWNERS` row of `&[]`, which asserts out loud that no engine path calls
+   it yet, since S3 wires it. The device run needs a free GPU: at the time of writing another
+   tenant held 35.7 GB of GTT with zero KFD entries and the flock was held (`flock -E 66` → 66).
+   **`kernel_coverage` green means the oracle EXISTS, not that it ran** — that file's own header
+   says so, and this is the case it was describing.
 5. **Converter naming.** Expert tensors are `.weight_packed` / `.weight_scale`
    (compressed-tensors), *not* `.weight` / `.weight_scale_inv`. And **`quantization_config`
    mis-declares its own scope**: `targets: ["Linear"]` with an `ignore` list that omits
@@ -430,8 +458,20 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    absent because their JSON key *spellings* are not among the fields §1 verified against the
    shipped file, and a guessed key on a required field refuses the real checkpoint. So is
    `quantization_config`, for the opposite reason — item 5 says not to trust it.
-   **Still to do:** the K3 pin's own `top_k * rows + n_shared <= MAX_BATCH` check —
-   `pin.rs:409` exists only on GLM's path, and there is no K3 pin yet.
+   **The `MAX_BATCH` bound — arithmetic SETTLED 2026-08-11, and it is binding.**
+   `RoutedPool::submit`'s hit scratch is a fixed 32 slots, and a batched forward submits the UNION of
+   every row's picks: `top_k · rows + n_shared`. At K3's scalars that is `16 · rows + 2` — **rows=1
+   needs 18, rows=2 needs 34, two over.** K3 fits at one row and only at one row, which it has
+   because `num_nextn_predict_layers` is 0. `pin.rs:409` is GLM's copy of this check and reaches for
+   the global `crate::gpu::MAXROW` (2, fixed by GLM's own acceptance measurements): a K3 pin that
+   copies that line refuses every K3 artifact at load, and one that copies it after someone raises
+   `MAX_BATCH` silently sizes a batched pass K3 has no kernel for (`kernels/moe.hip` instantiates
+   R=1 only). **Both directions** are asserted by
+   `model.rs::k3_fits_the_routed_batch_scratch_at_one_row_and_not_at_two` — red-proved by raising
+   `MAX_BATCH` to 64, which makes it name the missing draft head and the missing kernel — written
+   before the pin so its author meets the constraint instead of discovering it.
+   **Still to do:** the refusal inside the K3 pin, when S3 writes one. The test above is the
+   arithmetic; it is not a load-time check.
 
 Tokenizer work defers to S4: **there is no `chat_template`** in `tokenizer_config.json`;
 rendering lives in `encoding_k3.py` with an XML-ish `<message role=...>` framing, so the port
