@@ -44,6 +44,28 @@ print('\n'.join(sorted(d)))")
 SALTS=(glimmer-anchor-1 glimmer-anchor-2)
 
 mkdir -p "$OUT"
+
+# **The env is checked ONCE, here, and not on every one of the 28 runs.**
+#
+# The driver's own `preflight_env` compares this interpreter against the versions recorded in a
+# vendored golden, and that is right for a bare invocation. Per-run it is wrong twice over: it is
+# 28 identical checks, and on a deliberate re-pin — where the vendored bytes are stale BY
+# DEFINITION, because replacing them is the point — it refuses the very run that would replace
+# them. An earlier version exempted one cell of the matrix and left the other 27 to refuse, which
+# is a recipe that works until the day you need it.
+#
+# `GLIMMER_ANCHOR_REPIN=1` skips the check entirely. Re-vendoring is a reviewed change, so it
+# should take a deliberate word rather than happening because a run was spelled slightly
+# differently.
+if [ -n "${GLIMMER_ANCHOR_REPIN:-}" ]; then
+    echo "== GLIMMER_ANCHOR_REPIN set: not checking this env against the vendored goldens"
+else
+    "$PY" -c "
+import sys; sys.path.insert(0, '$ROOT/tests')
+from glimmer_anchor_driver import preflight_env
+preflight_env()"
+fi
+
 echo "== regenerating into $OUT"
 fail=0
 
@@ -53,12 +75,9 @@ for salt in "${SALTS[@]}"; do
         if [ "$mode" = text ]; then defects=("${TEXT_DEFECTS[@]}"); else defects=("${DRAFT_DEFECTS[@]}"); fi
         for defect in "${defects[@]}"; do
             out=$OUT/$mode-$n-$defect.bin
-            # `--no-preflight` only on the clean run of salt 1, which is the file preflight would
-            # compare against: on a deliberate re-pin the vendored bytes are stale by definition and
-            # the check would refuse the very run that replaces them. Every other run keeps it.
-            pf=""
-            if [ "$defect" = None ] && [ "$n" = 1 ] && [ "$mode" = text ]; then pf=--no-preflight; fi
-            "$PY" "$DRIVER" --mode "$mode" --salt "$salt" --defect "$defect" --out "$out" $pf >/dev/null
+            # The env was checked once above, so every run here skips it.
+            "$PY" "$DRIVER" --mode "$mode" --salt "$salt" --defect "$defect" --out "$out" \
+                --no-preflight >/dev/null
         done
 
         clean=$OUT/$mode-$n-None.bin
