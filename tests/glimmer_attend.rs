@@ -24,8 +24,9 @@
 //! comparison: the bound is restated in Rust there, so neither half alone covers it.
 //!
 //! **The tolerance is not bit-exactness and cannot be.** The kernel reduces the score with
-//! `__shfl_down` in a ladder; torch sums sequentially. `MAX_ABS` is 10x the measured worst case
-//! over every layer and step of both goldens, at the tiny widths — see its comment.
+//! `__shfl_down` in a ladder; torch sums sequentially. The bar is `tolerance::GLIMMER`'s `attend`
+//! row — `Rel(1.64e-4)` over a floor measured at double precision BEFORE this kernel existed — and
+//! the metric is that row's metric, `max|Δ| / max|reference|`. See `attend_tol()`.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
@@ -34,6 +35,9 @@ use serde_json::Value;
 
 mod common;
 use common::{back, dev, f32b, f32v, zeros};
+
+#[path = "common/tolerance.rs"]
+mod tolerance;
 
 // `GoldenSet` is spelled `golden_read::GoldenSet` below rather than imported: with it in this
 // list, the include preamble matched `glimmer_anchor.rs`'s for 18 tokens and jscpd rejected the
@@ -51,29 +55,53 @@ const TEXT: [(&str, &[u8]); 2] = [
     ("text-2", include_bytes!("glimmer-anchor-text-2.bin")),
 ];
 
-/// The re-association floor, measured 2026-08-11 over both goldens, all 8 layers, all 7 steps:
+/// The bar this kernel is scored against, **measured before it existed**.
 ///
-/// | | worst absolute difference from the reference |
-/// |---|---|
-/// | this kernel, cache indexed by position | **6.56e-7** |
-/// | this kernel, ring-indexed | 3.95e-7 |
-/// | the host oracle in this file | 4.47e-7 |
+/// `tolerance::GLIMMER`'s `attend` row: floor `1.639e-5`, weakest targeting defect `2.086e0`,
+/// `Rel(1.64e-4)`. Not a number this file chose — a number chosen after seeing a kernel's output is
+/// not a measurement, and the whole apparatus (`--dtype float64`, `--by-operator`, the two-draw
+/// max, the `qk_scale_on_k` exclusion) exists so that this one is. `tests/glimmer_tolerance.rs`
+/// gates the row itself; this file only asks it for the value.
 ///
-/// The bar is 10x the largest of them. It is a floor, not a quality budget: the kernel reduces
-/// each score with `__shfl_down` in a ladder while torch sums sequentially, so a difference of
-/// this size is the summation order and nothing else. Every defect this gate exists to catch
-/// moves the output by O(1) instead — see `WRONG_SIGNAL`.
-const MAX_ABS: f32 = 6.6e-6;
+/// **The metric here is the row's metric, exactly.** `Policy::Rel` is defined as
+/// `max|a-b| / max|b|`, which is what `glimmer_anchor_driver.py::by_operator` computes to produce
+/// the floor — so the number this file measures and the number the floor was measured with are the
+/// same quantity. An earlier revision of this file scored an ABSOLUTE difference against a bar it
+/// invented, which was defensible in isolation and incomparable to everything else in the port.
+fn attend_tol() -> f32 {
+    match tolerance::tolerance(tolerance::GLIMMER, "attend") {
+        Some(tolerance::Policy::Rel(t)) => *t,
+        // `ExactOnly` would be a real answer — it is `mla`'s on the K3 table — and this kernel
+        // cannot honour it: it re-associates the score reduction by construction. If the row ever
+        // becomes exact-only, that is a decision about THIS kernel and it has to be read, not
+        // silently reinterpreted as some default.
+        Some(tolerance::Policy::ExactOnly) => {
+            panic!(
+                "attend's policy is now ExactOnly, which this fixture cannot honour: the kernel \
+                    re-associates its score reduction by construction, so it cannot be bit-exact \
+                    with the reference. That is a decision about THIS kernel and has to be read."
+            )
+        }
+        None => panic!("tolerance::GLIMMER has no `attend` row, so nothing here is scored at all"),
+    }
+}
 
-/// What a wrong answer actually looks like here, so the two are never confused.
-///
-/// The smallest signal the interleaved KV broadcast produced over those same 112 cases was
-/// **0.335** — five orders of magnitude above the floor above. This constant sits between them
-/// at 1e-2: far enough above `MAX_ABS` that rounding can never reach it, far enough below the
-/// measured signal that a defect cannot slip under it. A gate whose pass and fail differ by
-/// 5 decades is worth more than a tight one, and this records that the gap was measured rather
-/// than hoped for.
-const WRONG_SIGNAL: f32 = 1e-2;
+// What this kernel actually measures against that bar, recorded 2026-08-12 so a future change
+// that moves it is visible as a change rather than as a still-passing test:
+//
+// | | `max|Δ| / max|reference|` |
+// |---|---|
+// | 112 golden cases, cache indexed by position | **8.93e-7** |
+// | 72 ring cases | 3.77e-7 |
+// | the host oracle in this file | 4.24e-7 |
+// | the interleaved KV broadcast, for contrast | **5.62e-1** |
+//
+// So the kernel sits **18x under the floor** and 184x under the tolerance, while the defect the
+// gate exists to catch is six decades the other side of it. Being under the floor is the expected
+// shape and not a suspicious one: the floor is what the REFERENCE's own fp32 rounding costs
+// against a double-precision run of itself, and an independent fp32 implementation cannot beat
+// that bound but can easily sit well inside it — especially at tiny widths, where there are 8
+// terms in a dot rather than 128.
 
 struct Golden {
     name: &'static str,
@@ -298,21 +326,29 @@ fn attend_host(c: &Case, block: bool) -> Vec<f32> {
     out
 }
 
-/// Largest ABSOLUTE difference.
+/// `max|got - want| / max|want|` — **the same formula `by_operator` used to measure the floor**,
+/// so this number and `attend_tol()` are comparable quantities rather than two ideas of "close".
 ///
-/// Not relative, and that is a decision rather than laziness: this output is a convex
-/// combination of V rows, so every component is bounded by `max|V|` and an absolute bar means
-/// the same thing everywhere in the tensor. A relative bar does not — a component of the
-/// average can legitimately be ~0, and the ratio then divides one rounding error by another.
-/// The first version of this file used `|g-w| / max(|w|, 1e-3)`, which is an absolute measure
-/// wearing a relative name: every "3.7e-5 relative" it reported was a 3.7e-8 difference against
-/// the 1e-3 floor.
-fn worst_abs(got: &[f32], want: &[f32]) -> f32 {
+/// Scaled by the reference side's own magnitude, once per tensor, not per element: a per-element
+/// ratio divides one rounding error by another wherever the reference is near zero, which is how
+/// this file's first metric ended up being an absolute measure with a relative name.
+fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
     assert_eq!(got.len(), want.len(), "length");
+    let scale = want.iter().copied().fold(0.0f32, |m, w| m.max(w.abs()));
+    // A reference tensor of all zeros has no scale to divide by; any difference at all is then
+    // infinitely relative, and reporting infinity is more honest than dividing by an epsilon.
+    if scale == 0.0 {
+        return if got.iter().all(|g| *g == 0.0) {
+            0.0
+        } else {
+            f32::INFINITY
+        };
+    }
     got.iter()
         .zip(want)
         .map(|(g, w)| (g - w).abs())
         .fold(0.0, f32::max)
+        / scale
 }
 
 /// Every (golden, step, layer) the goldens carry, with the window of that layer.
@@ -437,10 +473,11 @@ fn expected() -> (usize, usize) {
 /// > **CORRECTED 2026-08-11**, by review, same day it was written: this said "19 steps ... =
 /// > 304 comparisons" and "18 decoded positions". One conflation of steps with positions, made
 /// > arithmetically self-consistent, which is exactly what lets a wrong number survive a read.
-/// > 112 is what `WRONG_SIGNAL` above, the commit message and `glimmer-port.md` all say, and
+/// > 112 is what the commit message and `glimmer-port.md` both say, and
 /// > `expected()` below now derives it rather than restating it.
 #[test]
 fn the_kernel_matches_the_anchor_at_every_layer_and_step() {
+    let tol = attend_tol();
     let mut worst: f32 = 0.0;
     let mut cases = 0;
     each_case(|gold, t, l, win| {
@@ -449,10 +486,10 @@ fn the_kernel_matches_the_anchor_at_every_layer_and_step() {
         // which `fixture` has already accounted for in `geom`.
         let got = run(&f.case(), 0);
 
-        let r = worst_abs(&got, &f.want);
+        let r = worst_rel(&got, &f.want);
         assert!(
-            r <= MAX_ABS,
-            "{}: t{t}.L{l} (win {win}, geom {:?}, kv_offset {}) worst abs {r:e} > {MAX_ABS:e}",
+            r <= tol,
+            "{}: t{t}.L{l} (win {win}, geom {:?}, kv_offset {}) worst rel {r:e} > {tol:e}",
             gold.name,
             f.geom,
             f.kv_offset
@@ -462,7 +499,7 @@ fn the_kernel_matches_the_anchor_at_every_layer_and_step() {
     });
     // Anti-vacuity: an empty `layer_is_sliding` or a metadata rename would make the loop above
     // pass over nothing at all.
-    println!("kernel: worst abs over {cases} cases: {worst:e}");
+    println!("kernel: worst rel over {cases} cases: {worst:e}");
     assert_eq!(
         cases,
         expected().0,
@@ -539,6 +576,7 @@ fn the_derived_bound_reproduces_the_captured_mask() {
 /// claim.
 #[test]
 fn the_goldens_separate_the_two_kv_broadcast_mappings() {
+    let tol = attend_tol();
     let (mut separated, mut worst, mut sep_min) = (0, 0.0f32, f32::INFINITY);
     each_case(|gold, t, l, win| {
         let (hq, hkv, _) = gold.dims();
@@ -549,24 +587,24 @@ fn the_goldens_separate_the_two_kv_broadcast_mappings() {
         let f = fixture(gold, t, l, win);
         let right = attend_host(&f.case(), true);
         let wrong = attend_host(&f.case(), false);
-        let right_err = worst_abs(&right, &f.want);
+        let right_err = worst_rel(&right, &f.want);
         assert!(
-            right_err <= MAX_ABS,
+            right_err <= tol,
             "{}: t{t}.L{l} the host oracle does not reproduce the reference, so it cannot prove \
              anything about the wrong mapping",
             gold.name
         );
         assert!(
-            worst_abs(&wrong, &f.want) > WRONG_SIGNAL,
+            worst_rel(&wrong, &f.want) > 100.0 * tol,
             "{}: t{t}.L{l} the interleaved broadcast produced the SAME output as the block one \
              — this fixture is blind to trap 10",
             gold.name
         );
         worst = worst.max(right_err);
-        sep_min = sep_min.min(worst_abs(&wrong, &f.want));
+        sep_min = sep_min.min(worst_rel(&wrong, &f.want));
         separated += 1;
     });
-    println!("oracle: worst abs {worst:e}; smallest wrong-mapping signal {sep_min:e}");
+    println!("oracle: worst rel {worst:e}; smallest wrong-mapping signal {sep_min:e}");
     assert_eq!(
         separated,
         expected().0,
@@ -583,6 +621,7 @@ fn the_goldens_separate_the_two_kv_broadcast_mappings() {
 /// two runs differ in nothing but the indexing.
 #[test]
 fn a_ring_cache_attends_the_same_rows_as_a_linear_one() {
+    let tol = attend_tol();
     let (mut ran, mut worst) = (0, 0.0f32);
     each_case(|gold, t, l, win| {
         // Only meaningful on a sliding layer, and only once the ring has wrapped. `tq != 1` is
@@ -620,12 +659,8 @@ fn a_ring_cache_attends_the_same_rows_as_a_linear_one() {
             geom,
         };
         let got = run(&case, win);
-        let r = worst_abs(&got, &f.want);
-        assert!(
-            r <= MAX_ABS,
-            "{}: t{t}.L{l} ring worst abs {r:e}",
-            gold.name
-        );
+        let r = worst_rel(&got, &f.want);
+        assert!(r <= tol, "{}: t{t}.L{l} ring worst rel {r:e}", gold.name);
         worst = worst.max(r);
         ran += 1;
     });
@@ -634,7 +669,7 @@ fn a_ring_cache_attends_the_same_rows_as_a_linear_one() {
         expected().1,
         "the ring loop did not cover every sliding layer at decode"
     );
-    println!("ring: worst abs over {ran} cases: {worst:e}");
+    println!("ring: worst rel over {ran} cases: {worst:e}");
 }
 
 /// One row of the guard table: `(hq, hkv, head_dim, win, ring_cap, expected code, what)`, where
@@ -816,13 +851,14 @@ fn the_accumulator_holds_at_widths_no_golden_reaches() {
         };
         let got = run(&case, 0);
         let want = attend_host(&case, true);
-        let r = worst_abs(&got, &want);
-        // Ten times the golden-measured bar: this sums up to 128 terms per dot against the
-        // goldens' 8, and the wave-reduction ladder diverges further from a sequential sum the
-        // more terms it folds. Still five decades under WRONG_SIGNAL.
+        let r = worst_rel(&got, &want);
+        // The SAME bar as the golden cases. It sums up to 128 terms per dot against the goldens'
+        // 8, so the ladder diverges further from a sequential sum here — if that ever puts a
+        // correct kernel over `attend`'s tolerance, the honest response is to record the width
+        // dependence in the row, not to widen the bar locally for the widths nobody measured.
         assert!(
-            r <= 10.0 * MAX_ABS,
-            "d {d}, tq {tq}, win {win}: worst abs {r:e}"
+            r <= attend_tol(),
+            "d {d}, tq {tq}, win {win}: worst rel {r:e}"
         );
         ran += 1;
     }
