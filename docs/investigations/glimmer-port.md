@@ -277,6 +277,30 @@ name files K3 will have moved.
 2. `src/bin/convert_glimmer.rs`: BF16 → fp8-block resident artifact via streaming
    `SafeWriter`; skip `vision_tower`/projector explicitly; copy tokenizer +
    `generation_config`. No expert files; `FormatMeta` gains its nullable VQ section.
+
+   **The quantizer landed first (2026-08-11): `quant::quantize_fp8_block`.** Writing it
+   surfaced something the plan had assumed away — **rivoli has never quantized a checkpoint
+   before.** GLM ships fp8, V4 ships fp8 + e8m0, K3 ships mxfp4; every existing converter
+   *copies* a decision the publisher made, and `quant.rs` accordingly had `dequant_fp8_block`
+   and no inverse. Glimmer ships BF16 and nothing else, so **the scale per tile is our
+   choice** — a quality decision with no upstream to defer to. Two consequences, both new:
+
+   - **S5 owes a dNLL gate the other three ports did not.** "Is fp8 good enough for Glimmer"
+     is now a question about *rivoli's* quantizer, not about the checkpoint. Single format, so
+     the A/B is safe (no hybrid-residency hazard) — `bin/ppl` on the 5000-token corpus against
+     a bf16 artifact as the reference arm.
+   - **A bf16 resident artifact is the honest fallback**, and worth pricing before the fp8
+     path is assumed. `Dtype::Bf16` is already accepted, the converter becomes a near-verbatim
+     copy — which makes `SafeWriter`'s owned-bytes problem disappear with it — and there is no
+     quantization question at all. It costs 53.02 GB/token against 26.51 and runs on the slow
+     bf16 GEMV. Correctness first, then earn the halving with the gate above.
+
+   Gates on the quantizer: round-trip bounded by e4m3's **half-ULP relative to each value**
+   (the loose form, against the tile amax, would pass a quantizer that collapsed every small
+   value in a tile to zero); an all-zero tile takes scale 1.0, since 0.0 makes the encode
+   `0/0` and `f32_to_e4m3(NaN)` is a finite-looking `0x7f`; non-finite inputs refuse rather
+   than encode. Proven able to go red on three defects — halved scale, transposed scale grid,
+   zero-scale zero-tile — each reddening the cases it touches and staying green elsewhere.
 3. `GlimmerPin`: own type (per the V4/K3 precedent — shares nothing with the pool); int8
    embed/lm_head placement reused; its own tensor-name table (V4's §7 records what
    assuming HF-style naming cost).
