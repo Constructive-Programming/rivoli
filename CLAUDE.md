@@ -146,11 +146,11 @@ had gained a seventh argument.
 > config-check loops, 35 tokens) and fixed by factoring, not by exempting. **Fix what `cargo fmt
 > --check` and jscpd report; neither of them is the author of what it found.**
 
-**Fourteen** regions are exempt via `jscpd:ignore-start` — re-derive with
-`grep -rn jscpd:ignore-start src/ tests/ build.rs | sed 's/:.*//' | sort | uniq -c` rather than
-quoting this line, because a count written in prose is exactly what this file warns about two
-sections up, and it was **stale at "Ten" until 2026-08-11**. Today: `artifact/model.rs` 3
-(the dimension serde renames, one per architecture that shares them), `backend/hip.rs` 3 (the
+**Thirteen (13)** regions are exempt via `jscpd:ignore-start`, and
+`tests/docs.rs::the_jscpd_exemption_count_is_derived` derives that number and goes red when
+this line drifts from it — so read the count here and do NOT hand-count it; the note below
+says why the obvious `grep` gets it wrong. Today: `artifact/model.rs` 3
+(the dimension serde renames, one per architecture that shares them), `backend/hip.rs` 2 (the
 ABI wall), `v4oracle/weights.rs` 2 (`WMat::Fp8`/`Fp4`, see below), and one each in
 `artifact/quant.rs`, `bin/convert_glimmer.rs` (clap's Args/main boundary), `kvcompress.rs`,
 `math.rs`, `v4oracle/numerics.rs` and `tests/f4_attn.rs`. Of the six that
@@ -161,10 +161,27 @@ argument named a file the Vulkan retirement removed** — `gpustream.rs`'s `Stre
 suppressing nothing. **A stale exemption is a hole in the gate** — when the justification
 names a deleted file, delete the exemption rather than rewording it. The survivors each carry
 their argument in place: the HIP ABI wall (`backend/hip.rs`, two regions), `math.rs`'s frozen
-`route_into_pre` oracle, `v4oracle/numerics.rs`'s transliterations, `v4compress.rs`'s three
+`route_into_pre` oracle, `v4oracle/numerics.rs`'s transliterations, `kvcompress.rs`'s three
 functions restated from the oracle, `artifact/model.rs`'s serde renames, `artifact/quant.rs`'s
-`matvec_*` parameter lists, `tests/v4_attn.rs`, and the two `WMat` ones. Being a verbatim copy
-is the POINT in each; everywhere else, factor it.
+`matvec_*` parameter lists, `bin/convert_glimmer.rs`'s clap boundary, `tests/f4_attn.rs`, and
+the two `WMat` ones. Being a verbatim copy is the POINT in each; everywhere else, factor it.
+
+> **CORRECTED 2026-08-11.** This count has now been wrong three times in two days, which is
+> why it is a test and no longer a prescription to re-grep.
+>
+> It was stale at **Ten** (written before the glimmer port added one, and before
+> `v4compress.rs` → `kvcompress.rs` and `tests/v4_attn.rs` → `tests/f4_attn.rs` — the survivor
+> list above still named both deleted files). It was then re-derived as **Fourteen** using
+> `grep -rn jscpd:ignore-start src/ tests/ build.rs`, and it is **Thirteen**: that grep counts
+> `backend/hip.rs`'s own doc comment *discussing* the marker by name ("The note under
+> `jscpd:ignore-start` rejected…"), which gives that file 3 regions where it has 2. Re-deriving
+> was the right instinct; the command was the trap. **A gate's own marker is a word that appears
+> in prose about the gate**, so anything counting markers has to anchor on the marker (`^\s*//
+> jscpd:ignore-start$`), not merely find the string.
+>
+> The same bare grep also reported 14 starts against 13 ends, which reads as an unterminated
+> exemption — one that would silently run to end-of-file. It was the prose hit a second time.
+> A real one WOULD be a hole in the gate, so the test checks that the pairs balance per file.
 
 > **The `WMat` pair, added 2026-08-06 with the `src/` dedup.** `WMat::Fp8` and `WMat::Fp4`
 > carry the same four fields because that IS the checkpoint's storage layout for both

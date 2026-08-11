@@ -381,3 +381,63 @@ fn benchmarks_stays_compact() {
          time to work out which one is current."
     );
 }
+
+/// `CLAUDE.md`'s jscpd-exemption count is derived here, not asserted there.
+///
+/// The count was wrong three times in two days across two parallel branches — stale at Ten,
+/// re-derived as Fourteen, actually Thirteen. Each round the fix was to re-count by hand, and
+/// each hand-count is a fresh chance to be wrong; this is the last one.
+///
+/// **The subtlety that produced the Fourteen.** A bare `grep -rn jscpd:ignore-start` also
+/// matches `backend/hip.rs`'s doc comment *discussing* the marker by name, so that file reads
+/// as 3 regions when it has 2. A gate's marker is a word that appears in prose about the gate,
+/// so this anchors the marker at the start of a `//` line instead of searching for the string:
+/// prose about it is `///` or mid-sentence, and a real marker opens its line. It cannot be an
+/// equality test — most markers carry the exemption's justification on the same line, which is
+/// the convention this file asks for two sections down ("each carry their argument in place").
+///
+/// It also checks the pairs balance per file, which is not bookkeeping: jscpd takes an
+/// `ignore-start` with no `ignore-end` as exempt to END OF FILE. That is a hole in the gate
+/// that no clone report would show you, since the effect of the hole is silence.
+#[test]
+fn the_jscpd_exemption_count_is_derived() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<PathBuf> = ["src", "tests"]
+        .iter()
+        .flat_map(|d| common::walk(&root.join(d), "rs"))
+        .collect();
+    files.push(root.join("build.rs"));
+    files.sort();
+
+    let mut total = 0usize;
+    let mut per_file: Vec<String> = Vec::new();
+    for f in &files {
+        let body = std::fs::read_to_string(f).expect("read a source file");
+        let count = |m: &str| {
+            body.lines()
+                .filter(|l| l.trim_start().starts_with(m))
+                .count()
+        };
+        let (starts, ends) = (count("// jscpd:ignore-start"), count("// jscpd:ignore-end"));
+        let rel = f.strip_prefix(root).unwrap_or(f).to_string_lossy();
+        assert_eq!(
+            starts, ends,
+            "{rel} has {starts} `jscpd:ignore-start` against {ends} `ignore-end`. An \
+             unterminated one exempts to END OF FILE, so the gate goes quiet over everything \
+             below it. Close the region."
+        );
+        if starts > 0 {
+            total += starts;
+            per_file.push(format!("`{rel}` {starts}"));
+        }
+    }
+
+    let claude = std::fs::read_to_string(root.join("CLAUDE.md")).expect("read CLAUDE.md");
+    let want = format!("({total})** regions are exempt");
+    assert!(
+        claude.contains(&want),
+        "CLAUDE.md does not say `({total})` regions are exempt, but {total} is what `src/`, \
+         `tests/` and `build.rs` carry. Update the line and its per-file list, which is: {}",
+        per_file.join(", ")
+    );
+}
