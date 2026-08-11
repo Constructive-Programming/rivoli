@@ -18,14 +18,22 @@ const MAGIC: &[u8; 8] = b"RIVV4GLD";
 //
 // **The layout below is model-agnostic; only the magic is not.** K3's goldens come out of the
 // reference's own PyTorch stack rather than out of a transliteration, so there is no K3
-// counterpart to `super::forward` to hang this on, and duplicating 60 lines of length-prefixed
+// counterpart to `v4oracle::forward` to hang this on, and duplicating 60 lines of length-prefixed
 // reader into `tests/` to avoid an eight-byte constant would be the worse trade — it is also
-// exactly what `build.rs`'s jscpd gate rejects. If a third model arrives, move this file up out
-// of `v4oracle/` rather than adding a third magic.
+// exactly what `build.rs`'s jscpd gate rejects.
 //
-// Private, like `MAGIC`: `read_k3` is the only thing that needs it, and a `pub` const is API
-// surface no dead-code lint can ever question.
+// Private, like `MAGIC`: [`GoldenSet::read_anchor`] is the only thing that needs it, and a `pub`
+// const is API surface no dead-code lint can ever question.
 const MAGIC_K3: &[u8; 8] = b"RIVK3GLD";
+
+// Muse Glimmer's S1b anchor (`tests/glimmer_anchor_driver.py`), same container again.
+//
+// This is the third model, and the note that used to sit above said to MOVE THE FILE rather than
+// grow a third magic under a `v4oracle::` path. That move happened first (2026-08-11) — see the
+// module's doc in `lib.rs`. The magic itself is not the thing that was wrong: two anchor files
+// with the same bytes and different meanings are exactly what it exists to tell apart, and the
+// usual mistake is a gate reaching for the wrong model's fixture.
+const MAGIC_GLIMMER: &[u8; 8] = b"RIVGLGLD";
 
 /// The metadata key `v4-oracle emit` records its `--defect` under -- one constant, because
 /// the writer (the bin) and the readers below must agree on the spelling or the check
@@ -65,20 +73,31 @@ impl GoldenSet {
     }
 
     /// A Kimi-K3 anchor golden.
+    pub fn read_k3(r: &mut impl Read) -> Result<Self> {
+        Self::read_anchor(r, MAGIC_K3)
+    }
+
+    /// A Muse Glimmer anchor golden.
+    pub fn read_glimmer(r: &mut impl Read) -> Result<Self> {
+        Self::read_anchor(r, MAGIC_GLIMMER)
+    }
+
+    /// A python-produced S1b anchor golden, of whichever model `want` names.
     ///
     /// Requires [`DEFECT_KEY`], where [`GoldenSet::read`] tolerates its absence. That tolerance is
     /// a V4-only concession to files emitted before 2026-08-07 by a binary that could only run
-    /// `Defect::None` — [`GoldenSet::defect`] spells the argument out. **No such K3 file exists**:
-    /// `tests/k3_anchor_driver.py` has written the key unconditionally since the first run, so
+    /// `Defect::None` — [`GoldenSet::defect`] spells the argument out. **No such anchor file
+    /// exists**: both drivers have written the key unconditionally since their first run, so
     /// absence here is a truncated or hand-edited file, and reading it as `"None"` would let a
     /// perturbed golden pass [`GoldenSet::expect_defect`] — the one thing that contract exists to
-    /// stop. Review found the fail-open 2026-08-11.
-    pub fn read_k3(r: &mut impl Read) -> Result<Self> {
-        let set = Self::read_magic(r, MAGIC_K3)?;
+    /// stop. Review found the fail-open 2026-08-11, on the K3 half, before there was a second one.
+    fn read_anchor(r: &mut impl Read, want: &[u8; 8]) -> Result<Self> {
+        let set = Self::read_magic(r, want)?;
         if set.meta_get(DEFECT_KEY).is_none() {
+            let who = String::from_utf8_lossy(want);
             bail!(
-                "this K3 golden carries no `{DEFECT_KEY}` metadata; every emit writes it, so \
-                 absence means the file was truncated or edited — refusing to assume `None`"
+                "this {who} anchor golden carries no `{DEFECT_KEY}` metadata; every emit writes \
+                 it, so absence means the file was truncated or edited — refusing to assume `None`"
             );
         }
         Ok(set)

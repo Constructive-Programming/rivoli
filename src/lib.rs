@@ -44,6 +44,14 @@ pub mod math;
 /// the name and none of the structure — no `wk`, no `k_norm`, its own nested `Compressor`.
 pub mod kvcompress;
 
+/// The on-disk golden container, shared by every model's fixtures.
+///
+/// Lived under `v4oracle/` until 2026-08-11, and its own doc said to move it here "if a third
+/// model arrives" rather than grow a third magic under a name that says V4. Muse Glimmer is that
+/// third model. The layout is model-agnostic; only the eight-byte magic is not, and a module named
+/// for the model that happened to introduce it is the naming defect this repo has now hit twice.
+pub mod golden;
+
 pub mod telemetry;
 /// The DeepSeek-V4-Flash numerical oracle (S1b of `docs/investigations/v4-flash-port.md`).
 ///

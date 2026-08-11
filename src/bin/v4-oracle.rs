@@ -32,10 +32,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::{Context, Result, bail};
+use rivoli::golden::{GoldenSet, diff};
 use rivoli::v4oracle::forward::{
     Capture, CompressorW, Defect, ExpertW, HeadTailW, IndexerW, LayerCtx, LayerW, Oracle,
 };
-use rivoli::v4oracle::golden::{GoldenSet, diff};
 use rivoli::v4oracle::numerics::{bf16_decode, bf16_encode};
 use rivoli::v4oracle::weights::{Checkpoint, V4Config, WMat, fixed_bf16};
 use std::collections::HashMap;
@@ -511,7 +511,7 @@ fn emit(
     let meta = vec![
         // Written for EVERY emit, `None` included: a reader must be able to distinguish
         // "declared unperturbed" from "predates the flag" without guessing.
-        (rivoli::v4oracle::golden::DEFECT_KEY.into(), name),
+        (rivoli::golden::DEFECT_KEY.into(), name),
         ("model".into(), model.display().to_string()),
         ("prompt".into(), PROMPT.to_string()),
         ("prompt_ids".into(), format!("{ids:?}")),

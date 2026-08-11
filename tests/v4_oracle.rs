@@ -34,8 +34,8 @@
 mod common;
 use common::residual_probe;
 
+use rivoli::golden::{Diff, GoldenSet, diff, identical};
 use rivoli::v4oracle::forward::{Capture, Defect, HeadTailW, LayerCtx, Oracle, splitk_fold};
-use rivoli::v4oracle::golden::{Diff, GoldenSet, diff, identical};
 use rivoli::v4oracle::numerics::{
     FP4_MAX, FP8_MAX, act_quant_inplace, bf16_decode, bf16_encode, e2m1_decode, e2m1_encode,
     e4m3_decode, e4m3_encode, e8m0_decode, fast_round_scale, fp4_act_quant_inplace,

@@ -46,7 +46,6 @@
 //! than borrowed from `src/artifact/`.
 
 pub mod forward;
-pub mod golden;
 pub mod numerics;
 pub mod toy;
 pub mod weights;
