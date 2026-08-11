@@ -376,7 +376,10 @@ flock with a per-minute GTT+KFD witness, both arms clean.
 | expert hit (decode) | 67.7%, 180.4 miss/tok, 1.44 ms/miss | **~98.1%**, 4.96 miss/tok |
 | output | 512/512, coherent, on-task | 512/512, coherent, on-task |
 
-reply md5 `bc71afa745d980be7d21860f70ad96aa`. **CORRECTED 2026-08-07:** the V4 "17.0 miss/tok"
+prompt md5 `bc71afa745d980be7d21860f70ad96aa`. **CORRECTED 2026-08-11:** this said *reply* md5.
+It is the md5 of the 1065-byte canonical **prompt** (no trailing newline) — recomputed from the
+prompt file 2026-08-11, it matches. So **no reply md5 was ever recorded for this pair**, and the
+`output` row above is the only claim about what either model emitted. **CORRECTED 2026-08-07:** the V4 "17.0 miss/tok"
 and "95.4% hit" originally printed here divided TOTAL misses (prefill included) by decode
 tokens; decode-only is 4.96 miss/token, and "V4's ~0.23 GB/token" becomes ~0.07.
 
