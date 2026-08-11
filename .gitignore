@@ -11,3 +11,7 @@ target/
 .claude/*
 !.claude/skills/
 .snapshot_path
+
+# python bytecode from `tests/k3_anchor_driver.py` when it is imported as a module (the
+# `--compare` path does that). `build.rs` scans `tests/`, so committed .pyc would be scanned.
+__pycache__/

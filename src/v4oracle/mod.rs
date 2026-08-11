@@ -9,6 +9,17 @@
 //! Read `forward.rs`'s module doc first: it states what is reproduced exactly, what is
 //! reproduced only up to summation order, and what is out of scope.
 //!
+//! > **AMENDED 2026-08-11.** One file here is no longer V4-only: `golden.rs` is the shared
+//! > container, and it gained `read_k3` for Kimi-K3's S1b anchor goldens
+//! > (`docs/measurement/k3-reference/anchor.md`). The argument above still holds for everything
+//! > else — `forward.rs`, `numerics.rs`, `weights.rs` and `toy.rs` ARE a V4 transliteration and
+//! > are named for what they measure against. `golden.rs` is not; it is a length-prefixed tensor
+//! > file with a per-model magic, and K3's producer is the reference's own PyTorch, not a
+//! > transliteration at all. It lives here on cost — moving it would touch this module, the
+//! > `v4-oracle` bin, `tests/f4_loop.rs` and a probe script that asserts the magic bytes — and
+//! > review is right that the reasoning bit at the SECOND model rather than a third. If that move
+//! > is ever paid for, `golden.rs` is what goes.
+//!
 //! # Why this exists before the thing it judges
 //!
 //! Every defect in a V4 port is silent-wrong. A missing QK-norm, RoPE on the wrong dims, an

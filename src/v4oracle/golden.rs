@@ -14,6 +14,19 @@ use std::io::{Read, Write};
 // format to fix a name, the same argument `eval.rs` records for `b"V4LT"`.
 const MAGIC: &[u8; 8] = b"RIVV4GLD";
 
+// The same container, written by Kimi-K3's S1b anchor (`tests/k3_anchor_driver.py`).
+//
+// **The layout below is model-agnostic; only the magic is not.** K3's goldens come out of the
+// reference's own PyTorch stack rather than out of a transliteration, so there is no K3
+// counterpart to `super::forward` to hang this on, and duplicating 60 lines of length-prefixed
+// reader into `tests/` to avoid an eight-byte constant would be the worse trade — it is also
+// exactly what `build.rs`'s jscpd gate rejects. If a third model arrives, move this file up out
+// of `v4oracle/` rather than adding a third magic.
+//
+// Private, like `MAGIC`: `read_k3` is the only thing that needs it, and a `pub` const is API
+// surface no dead-code lint can ever question.
+const MAGIC_K3: &[u8; 8] = b"RIVK3GLD";
+
 /// The metadata key `v4-oracle emit` records its `--defect` under -- one constant, because
 /// the writer (the bin) and the readers below must agree on the spelling or the check
 /// silently degrades to "every file is legacy".
@@ -48,10 +61,40 @@ impl GoldenSet {
     }
 
     pub fn read(r: &mut impl Read) -> Result<Self> {
+        Self::read_magic(r, MAGIC)
+    }
+
+    /// A Kimi-K3 anchor golden.
+    ///
+    /// Requires [`DEFECT_KEY`], where [`GoldenSet::read`] tolerates its absence. That tolerance is
+    /// a V4-only concession to files emitted before 2026-08-07 by a binary that could only run
+    /// `Defect::None` — [`GoldenSet::defect`] spells the argument out. **No such K3 file exists**:
+    /// `tests/k3_anchor_driver.py` has written the key unconditionally since the first run, so
+    /// absence here is a truncated or hand-edited file, and reading it as `"None"` would let a
+    /// perturbed golden pass [`GoldenSet::expect_defect`] — the one thing that contract exists to
+    /// stop. Review found the fail-open 2026-08-11.
+    pub fn read_k3(r: &mut impl Read) -> Result<Self> {
+        let set = Self::read_magic(r, MAGIC_K3)?;
+        if set.meta_get(DEFECT_KEY).is_none() {
+            bail!(
+                "this K3 golden carries no `{DEFECT_KEY}` metadata; every emit writes it, so \
+                 absence means the file was truncated or edited — refusing to assume `None`"
+            );
+        }
+        Ok(set)
+    }
+
+    fn read_magic(r: &mut impl Read, want: &[u8; 8]) -> Result<Self> {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic).context("reading golden magic")?;
-        if &magic != MAGIC {
-            bail!("not a rivoli V4 golden file");
+        if &magic != want {
+            // Names both, because the two files are otherwise indistinguishable and the usual
+            // cause is a consumer reaching for the wrong model's golden.
+            bail!(
+                "not a {} golden file: magic is {:?}",
+                String::from_utf8_lossy(want),
+                String::from_utf8_lossy(&magic)
+            );
         }
         let mut meta = Vec::new();
         for _ in 0..get_u64(r)? {
@@ -308,6 +351,67 @@ mod tests {
         );
         g.expect_defect("RopeHalfSplit")
             .expect("the declared match must pass");
+    }
+
+    /// A K3 golden with an empty tensor section and whatever metadata is asked for.
+    ///
+    /// Hand-built rather than round-tripped through [`GoldenSet::write`], which can only write the
+    /// V4 magic — and the point here is the K3 reader's own precondition.
+    fn k3_file(meta: &[(&str, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC_K3);
+        put_u64(&mut buf, meta.len() as u64).expect("write");
+        for (k, v) in meta {
+            put_str(&mut buf, k).expect("write");
+            put_str(&mut buf, v).expect("write");
+        }
+        // Zero float tensors, zero int tensors.
+        put_u64(&mut buf, 0).expect("write");
+        put_u64(&mut buf, 0).expect("write");
+        buf
+    }
+
+    /// [`GoldenSet::read_k3`] refuses a file with no `defect` key, where [`GoldenSet::read`]
+    /// tolerates it.
+    ///
+    /// The V4 fallback is a dated concession to files a pre-2026-08-07 binary produced; no such K3
+    /// file exists, so absence there means truncation or hand-editing, and reading it as `"None"`
+    /// would let a perturbed golden satisfy [`GoldenSet::expect_defect`] — the exact fail-open that
+    /// contract exists to prevent. Review found it 2026-08-11 and this is the proof it is shut.
+    #[test]
+    fn a_k3_golden_with_no_defect_key_is_refused() {
+        let err = GoldenSet::read_k3(&mut k3_file(&[("mode", "decode")]).as_slice())
+            .err()
+            .expect("a K3 golden with no defect key must not load");
+        assert!(err.to_string().contains(DEFECT_KEY), "{err}");
+        let ok = GoldenSet::read_k3(&mut k3_file(&[(DEFECT_KEY, "None")]).as_slice())
+            .expect("with the key it loads");
+        ok.expect_defect("None").expect("and scores as None");
+    }
+
+    /// Neither reader accepts the other's file, and the message says which was expected.
+    ///
+    /// The two containers are byte-identical apart from eight bytes, so a consumer reaching for the
+    /// wrong model's golden gets a diagnosis rather than a parse error somewhere downstream.
+    #[test]
+    fn the_two_magics_do_not_cross() {
+        let k3 = k3_file(&[(DEFECT_KEY, "None")]);
+        let err = GoldenSet::read(&mut k3.as_slice())
+            .err()
+            .expect("V4 must refuse a K3 file");
+        assert!(err.to_string().contains("RIVV4GLD"), "{err}");
+        let mut v4 = Vec::new();
+        GoldenSet {
+            meta: vec![],
+            floats: vec![],
+            ints: vec![],
+        }
+        .write(&mut v4)
+        .expect("write");
+        let err = GoldenSet::read_k3(&mut v4.as_slice())
+            .err()
+            .expect("K3 must refuse a V4 file");
+        assert!(err.to_string().contains("RIVK3GLD"), "{err}");
     }
 
     #[test]

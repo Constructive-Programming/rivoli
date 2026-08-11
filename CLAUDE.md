@@ -55,6 +55,14 @@ tests/feature-matrix.sh                      # every feature combo compiles (34 
 tests/mode-matrix.sh <artifact>              # mode x policy x attn, 36 cells, all decode (~90 min, GPU)
 tests/smoke-matrix.sh                        # BOTH models x settings, 12 tokens/cell + V4 refusal asserts (~30 min, GPU)
 
+# REGENERATES a vendored fixture; not part of any cargo run. Needs a pinned python env
+# (K3_ANCHOR_VENV) and a GPU, because Kimi-K3's KDA ops are triton kernels with no CPU path.
+# It gates each defect run: reddened nothing, or reddened a layer UPSTREAM of itself, is a
+# failure. `cargo test --test k3_anchor` then reads the vendored bytes with no device — but it
+# is a fixture-INTEGRITY gate, not a correctness gate: it compares no rivoli output to
+# anything, because at S1b there is no K3 kernel to score.
+tests/k3-anchor.sh                           # K3's first-party goldens + 11 defect runs (~15 min, GPU)
+
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.
 cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace,stale-sel --all-targets
@@ -124,8 +132,21 @@ left the build script's fingerprint stale. (The observation is direct; the finge
 mechanism is the reporter's diagnosis and is not independently confirmed.) The lesson does
 not depend on the cause: **clippy-green is not duplication-green.** Run something that
 actually re-runs `build.rs` before claiming a change is clone-free. The same reporter hit it
-twice more, both times on real clones **rustfmt had created** by reflowing calls that gained
-a seventh argument — so a mechanical formatting pass can manufacture duplication. **Ten**
+twice more, both times on real clones that appeared only after `cargo fmt` reflowed calls which
+had gained a seventh argument.
+
+> **CORRECTED 2026-08-11.** This said the clones were ones "**rustfmt had created**", and
+> concluded "a mechanical formatting pass can manufacture duplication". **It cannot.** The
+> duplication was already written; reflowing only brought the two blocks over `minTokens` so the
+> tokenizer could see them. `build.rs` has said so in place since 2026-08-06 and this file
+> contradicted it: *"Nothing was added — the formatter let the tokenizer see what was already
+> there."* The wording matters because it decides what you do next — "the formatter did this"
+> invites reverting the format or exempting the region, and the only correct response is to
+> **factor the duplication out**. Hit a third time 2026-08-11 (`tests/k3_anchor.rs`'s two
+> config-check loops, 35 tokens) and fixed by factoring, not by exempting. **Fix what `cargo fmt
+> --check` and jscpd report; neither of them is the author of what it found.**
+
+**Ten**
 regions are exempt via `jscpd:ignore-start`: eight on 2026-08-06, down from fourteen, plus
 two added the same day for `v4oracle/weights.rs`'s `WMat::Fp4` (see below). Of the six that
 went, two were `glsl_numerics.rs`'s and the other **four were deleted because their entire

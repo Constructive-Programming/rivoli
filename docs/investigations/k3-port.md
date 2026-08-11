@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET and must be proven able to go red before it is trusted green. S0 IS DONE and G0 IS MET (2026-08-10; the corrections it produced are recorded inline in reference/k3-architecture.md, which is now first-party-verified for everything except the KDA inner arithmetic and the MXFP4 unpack — those live in fla-core and compressed-tensors, so S1b's mandatory anchor RUNS the first-party stack at tiny dims and emits goldens). Traffic is 25.83 GB/token of experts (first-party confirmed) plus 108.81 GB of trunk when not resident; predicted ~0.48-0.57 tok/s with the resident set held, from rivoli's measured 12.39-14.76 GB/s at the expert-read shape — an earlier 0.27 came from a dd QD1 figure, the same instrument-class error found in the reference's own 3.2. The memory budget is the binding constraint (~5.7 GB residual at --max-mem 115; the resident set does not fit on the auto path) and nothing converts until SafeWriter streams. Only the 69 KDA layers are a wholly new kernel family, plus AttnRes. S1-S3 run on fixtures; S4 converts and decodes real weights on /swarm; S5 needs ~200 GiB more NVMe.
+verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET and must be proven able to go red before it is trusted green. S0 IS DONE and G0 IS MET (2026-08-10; the corrections it produced are recorded inline in reference/k3-architecture.md, which is now first-party-verified for everything except the KDA inner arithmetic and the MXFP4 unpack — those live in fla-core and compressed-tensors, and S1b's mandatory anchor now COVERS both by running the first-party stack on gfx1151 over a tiny config that keeps the real 93-layer structure — ELEVEN defect runs, each GATED on the layers it must leave bit-identical, and the C reference's MLA LoRA-norm eps divergence priced at 2.2e-5 relative; measurement/k3-reference/anchor.md). Traffic is 25.83 GB/token of experts (first-party confirmed) plus 108.81 GB of trunk when not resident; predicted ~0.48-0.57 tok/s with the resident set held, from rivoli's measured 12.39-14.76 GB/s at the expert-read shape — an earlier 0.27 came from a dd QD1 figure, the same instrument-class error found in the reference's own 3.2. The memory budget is the binding constraint (~5.7 GB residual at --max-mem 115; the resident set does not fit on the auto path) and nothing converts until SafeWriter streams. Only the 69 KDA layers are a wholly new kernel family, plus AttnRes. S1-S3 run on fixtures; S4 converts and decodes real weights on /swarm; S5 needs ~200 GiB more NVMe.
 ---
 
 # Kimi-K3 — implementation plan
@@ -50,8 +50,16 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   rows** (it took a `gain` and a second guard for one day; see item 4 for why both went); item 7's `MAX_BATCH`
   arithmetic settled and asserted, **K3 fits the routed batch scratch at ONE row and not at two**
   (18 of 32 against 34). The whole device sweep passed in the same window (`kernel` 24/24,
-  `f4_kernel` 24/24, `kvcompress_kernel` 10/10, `--lib` 141/141). What remains is S1b's harness and,
-  for the pin, S3's layer loop.
+  `f4_kernel` 24/24, `kvcompress_kernel` 10/10, `--lib` 141/141).
+- **S1b's ANCHOR exists and runs, 2026-08-11** — the first-party stack (`modeling_kimi_linear.py` at
+  the pinned revision, fla-core 0.5.2, transformers 4.56.2) executed on gfx1151 over a tiny config
+  that keeps the **real 93-layer structure**, with ELEVEN defect runs, each GATED on the layers it
+  must leave bit-identical rather than merely on having changed something. The decode golden is
+  vendored (286 KiB) and read with no GPU, no
+  python and no network. `docs/measurement/k3-reference/anchor.md`. **The MLA LoRA-norm eps
+  divergence is now PRICED: 2.2e-5 relative** — real, and far below what a tolerance-based fixture
+  would have caught. What remains of S1b is the operator fixtures' own tolerances and G1b's
+  remaining bookkeeping; S3's layer loop remains for the pin.
 
 ## G. The gate model
 
@@ -543,17 +551,72 @@ reference's own parity evidence is one position of a junk prompt, the KDA arithm
 only in fla, and item 11 already caught one divergence (the LoRA-norm eps) that fixtures
 inherited from the C would have baked in. Record the fla version pin next to the goldens.
 
-Also unscoped: what format the tiny model is stored in (rivoli's converters read HF
-safetensors; a C fixture may be its own layout), and which converter binary K3 uses.
+> **DONE 2026-08-11.** `tests/k3_anchor_driver.py` runs it, `tests/k3-anchor.sh` reproduces it,
+> `tests/k3-anchor-decode.bin` is the vendored decode golden, `tests/k3_anchor.rs` is the gate that
+> reads it, and `docs/measurement/k3-reference/anchor.md` is the record — including the four
+> declared deviations and why the goldens are vendored rather than regenerated.
+>
+> **Two things this settled that were guesses here.** *The tiny model is stored in nothing*: the
+> weights are generated deterministically from a per-parameter-NAME seed, so there is no fixture
+> format to choose and no converter in the loop — a global seed would have made every golden depend
+> on module construction order. And *KDA cannot run on CPU at all*: fla's ops are triton kernels,
+> and its pure-torch `naive_recurrent_kda` takes **none** of the seven kwargs the model passes
+> (`A_log`, `dt_bias`, the qk l2-norm, the beta sigmoid, the gate flag, `safe_gate`,
+> `lower_bound`), because all of that moved *inside* the kernel. Substituting it would have meant
+> hand-transliterating the exact arithmetic the anchor exists to not transliterate.
+>
+> **The eps divergence is priced at 2.2e-5 relative** — which is the argument for the anchor made
+> concrete: a fixture with any ordinary tolerance would have passed the C reference's value.
+>
+> **AttnRes had no fixture for a day, and it is S2 item 1.** `_apply_attn_res` reads
+> `proj.weight`/`norm.weight` inline and never calls either module, so forward hooks on them fired
+> zero times while three comments claimed the fold was captured. The fold is now captured by
+> wrapping the reference's free function, and the driver asserts every registered hook fired —
+> which caught five more dead hooks immediately. **Anything in this plan that assumes a module hook
+> sees an operator should be checked against how the reference actually invokes it.**
+>
+> **A width that collapses a distinction the real config keeps is not "only widths shrink".** The
+> first tiny config made `kv_lora_rank == qk_nope_head_dim`, `2·moe_inter == latent`,
+> `hidden == intermediate` and `hidden == KDA projection` — four pairs the real config separates —
+> so a port reading the KV latent width off `qk_nope_head_dim`, or the shared expert's width off the
+> latent instead of `num_shared_experts · moe_inter` (§1's own trap), produced a **bit-identical**
+> fixture. Fixed before any kernel was scored. Every future fixture in this port inherits the rule.
+
+Also unscoped: which converter binary K3 uses. *(The other half of this — what format the tiny
+model is stored in — is answered above: none.)*
 
 ### G1b — met when
 
 - Every golden has a **recorded defect run** showing it reddens at exactly the cases the defect
   touches and stays green elsewhere. A golden without one does not count.
+  > **Met for the anchor's goldens, with one reading fixed 2026-08-11.** "Stays green elsewhere"
+  > can only mean **upstream**: the goldens come from one forward pass, so a perturbation at layer
+  > 3 reaches layer 92 by construction, and a defect that reddened *nothing* downstream would mean
+  > the capture was disconnected. `anchor.md` carries the matrix for all eleven defects.
+  >
+  > **The green half is now GATED, not read.** Until the same day, `tests/k3-anchor.sh` asserted only
+  > that a defect changed *something* — so a regression that broke the localisation would have
+  > printed a matrix nobody reads and exited 0. Each defect now declares the layers it must leave
+  > bit-identical (`EXPECT_GREEN` in the driver) and `--compare` fails if one of them reddens. That
+  > is the load-bearing half of §G rule 1, and it was decoration for a day.
 - Defect runs cover a KDA layer, an MLA layer, layer 0, and layer 92.
+  > **Met 2026-08-11** — captured layers are 0, 1, 12 (KDA), 3, 91, 92 (MLA), and
+  > `DenseMlpGateUpSwap` exists specifically so a defect touches layer 0 alone at first.
 - The independent anchor — **S1b's first-party-stack goldens, as defined above** — exists and
   passes. Citing the reference's own validation does not satisfy this; a source attesting to
   itself is not independence.
+  > **Met 2026-08-11.** `anchor.md`. **Eleven defects**, including all four of the fla kernel kwargs
+  > that exist only inside triton (`use_qk_l2norm_in_kernel`, the −5.0 gate `lower_bound`, the
+  > state's axis order, `use_beta_sigmoid_in_kernel`) — the arithmetic this anchor exists for, and
+  > un-red-proved until review asked for it. Against §10's twelve traps this covers 6, 8, and trap 4
+  > in part.
+  >
+  > Still owed for G1b as a whole: the **per-operator tolerances**. The anchor gives exact bytes from
+  > one implementation, **in fp32 while the checkpoint is bf16**, on one GPU; what a HIP kernel is
+  > allowed to differ by is a separate decision and is not made yet. Also open, and disclosed rather
+  > than fixed: the golden is **one salt at one position**, so a bug degenerate at these particular
+  > values (a zero crossing in `beta`, a tie in the top-2) is invisible. A second golden at a
+  > different `--salt` is the cheap mitigation when S2 needs it.
 
 ## S2 — kernels. Each item gates before the next.
 
