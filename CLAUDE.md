@@ -62,6 +62,10 @@ tests/smoke-matrix.sh                        # BOTH models x settings, 12 tokens
 # is a fixture-INTEGRITY gate, not a correctness gate: it compares no rivoli output to
 # anything, because at S1b there is no K3 kernel to score.
 tests/k3-anchor.sh                           # K3's goldens + 11 defects x 2 salts (~25 min, GPU)
+# Muse Glimmer's equivalent, and it takes NO GPU and no lock — that reference is plain PyTorch
+# with a CPU path for every operator, unlike K3's triton-only KDA. Same contract otherwise:
+# a defect run that reddens nothing, or reddens outside its declared green set, is a failure.
+GLIMMER_ANCHOR_VENV=/home/rhansen/glimmer-anchor/venv tests/glimmer-anchor.sh   # 14 defects x 2 salts x 2 modes (~10 min, CPU)
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.

@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a DONE and G1a MET 2026-08-11 on tag k3-s1a — config schema, convert_glimmer (bf16-verbatim), GlimmerPin placing all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream, and run_glimmer's nine flag refusals against V4's three. G1a's blind spot: not one of its clauses evaluates arithmetic, so every gate so far would hold on a checkpoint of noise; S1b's goldens are where that changes. Four reviews then found two CI breaks (both tests running the shipped binary, which is a refusal stub featureless) and one silent-wrongness class the gates could not see -- all five f32 norms were placed with no extent check, and the shipped converter accepts a short norm at exit 0. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
+verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a DONE and G1a MET 2026-08-11 on tag k3-s1a — config schema, convert_glimmer (bf16-verbatim), GlimmerPin placing all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream, and run_glimmer's nine flag refusals against V4's three. G1a's blind spot: not one of its clauses evaluates arithmetic, so every gate so far would hold on a checkpoint of noise; S1b's goldens are where that changes. Four reviews then found two CI breaks (both tests running the shipped binary, which is a refusal stub featureless) and one silent-wrongness class the gates could not see -- all five f32 norms were placed with no extent check, and the shipped converter accepts a short norm at exit 0. S1b DONE and G1b MET 2026-08-11 — the anchor runs the first-party transformers stack (5.16.0.dev0 @ fe747d88, torch CPU: this reference needs NO GPU) at tiny widths but the real structure, and four goldens are vendored across two weight draws and two modes, read with no python and no device. 14 defects x 2 draws = 28 runs, each GATED on the captures it must leave bit-identical, green sets scoped to step 0 because a defect that moves the argmax contaminates every later step. THE FINDING: softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so every greedy gate in this repo is PROVABLY blind to a wrong logit scale here. Two reference behaviours found by running it: the DFlash drafter's default mask raises, and the correct mask only works with use_cache=False. No tolerances yet — S2 must measure the fp32 floors before choosing any. measurement/glimmer-reference/anchor.md. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
 ---
 
 # Muse Glimmer-30B — implementation plan
@@ -578,6 +578,75 @@ have caught it** — there is no rocm job, so nothing runs it at all; it took a 
 machine and an unrelated benchmark. `run_glimmer` now has no budget check, which is correct
 only while it bails before allocating: when S3 gives it a pin build, the check belongs at the
 top of that build, after the refusals and before the 55.7 GB.
+
+#### The anchor itself. **DONE 2026-08-11. G1b MET.** No GPU — this reference is plain PyTorch.
+
+`docs/measurement/glimmer-reference/anchor.md` is the record; `tests/glimmer_anchor_driver.py`
+produced the goldens, `tests/glimmer-anchor.sh` reproduces them, `tests/glimmer_anchor.rs` reads
+them with no python, no venv, no network and no device.
+
+**Every fixture this stage asked for exists**, and one the plan did not name: the two weightless
+norms, which ship no tensor and are therefore the two a port can omit without the checkpoint
+complaining. GQA attend dense and windowed (layers 3 and 7 full against 0-2, 4-6 sliding); ring-KV
+append and evict at the window boundary — recorded as a *shape*, since a sliding layer's cache
+holds exactly `sliding_window` rows from the first decode step while a full layer's grows 12→18;
+the per-layer RoPE table with q and k captured on both sides of the rotation, on rotated layers
+only; the output gate and the gated value entering `o_proj` separately, so the gate's POSITION is
+pinned and not just its value; the SwiGLU; and one full DFlash draft step.
+
+**G1b's clauses, each met by a recorded run:** 14 defects × 2 weight draws = 28 runs, every one
+gated on the captures it must leave bit-identical. A local layer (`full_layers_slide` holds layers
+0-2 entirely), a global layer (`rope_on_nope_layers` and `window_off_by_one` both localise onto 3
+and 7), a window-boundary crossing (`window_off_by_one`, at window 4 across 18 positions), layer 0
+(green in nine of the fourteen), and the last layer (7 here, standing for 51 — chosen so the
+`[w,w,w,full]` rule puts a full layer both at the end and not at the end).
+
+**The finding.** `softcap_off` moves 7 of 1103 captures and leaves `emitted.ids` bit-identical. The
+argmax-invariance of `T*tanh(x*mult/T)` stops being an argument in §9 of the architecture doc and
+becomes a measurement — **every greedy decode gate in this repo is provably blind to a wrong logit
+scale on this model**, and nothing but a value-level fixture will ever catch it.
+
+**Two reference behaviours found by running it, neither visible by reading.** The DFlash drafter's
+default attention mask is built from `noise_embeds` and is block-wide while K/V span
+context+block, so the reference raises; and supplying the correct 2D mask only works with
+`use_cache=False`, because the mask builder takes `kv_length` from `past_key_values` and a fresh
+`DFlashCache` reports 0. Both are recorded in `anchor.md` and in the driver at the call site. A
+port's first draft call hits both.
+
+**Green sets are scoped to step 0, and that is a fact about the model, not caution.** A defect that
+shifts the argmax changes the token fed into step 1, so from t1 onward even layer 0 differs for a
+reason unrelated to where the defect lives. Only the prefill can localise. The first version of the
+matrix declared unscoped green sets and all of them failed at t6 on exactly this.
+
+**Three defects in the harness, found by the harness.** Rope captures were first numbered by CALL
+index, which counts only rotated layers — so six rotated layers of eight were labelled L0..L5 and
+every NoPE golden was mislabelled; the layer index now comes from the attention module, which is
+the only place it is in scope. The weightless-norm tap was a patched class method, so
+`qk_norm_off` and `embed_norm_off` deleted their own evidence and died in the tap census instead of
+reddening anything; they are forward hooks now, which fire around whatever `forward` currently is.
+And `draft_causal` first set `self_attn.is_causal = True` and moved **zero** captures, because
+`eager_attention_forward` never reads that flag — causality is entirely in the mask.
+
+**What this does NOT establish.** No tolerances: K3's anchor measured per-operator fp32 rounding
+floors and derived thresholds from them, and this one has not, because there is no Glimmer kernel
+yet to need them. S2 must measure the floors the same way before choosing any threshold — a
+tolerance picked to make a kernel pass is not a tolerance. And no real weights: every number is a
+deterministic draw at toy widths.
+
+#### Three things this stage changed outside its own files
+
+- **`src/v4oracle/golden.rs` → `src/golden.rs`.** Its own doc said to move it out of `v4oracle/`
+  "if a third model arrives" rather than grow a third magic under a name that says V4. Muse Glimmer
+  is that third model. `read_k3` and `read_glimmer` are now one `read_anchor` behind two names.
+- **`tests/common/golden_read.rs`.** `float`/`shape_of`/`fnv1a` and the `Vendored` byte-pin were
+  written in `k3_anchor.rs`, and the jscpd gate rejected the second copy — which is how it surfaced
+  that `f4_loop.rs` had been carrying a **third** all along. All three now share one facade, which
+  re-exports `GoldenSet` so the module preambles stop being identical too.
+- **`tests/docs.rs` identified docs by BASENAME.** Two ports now ship an `anchor.md`, and the
+  duplicate-row check reported the new one as a duplicate of K3's on the day it was added. The
+  false positive was the visible half; the dangerous half is that it would have handed one doc the
+  OTHER doc's row, so a scope check could pass by reading a cell belonging to a different port. It
+  matches on the path under `docs/` now, and was red-proved both ways.
 
 ### S2 — kernels. Each item gates before the next.
 
