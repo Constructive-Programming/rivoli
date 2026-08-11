@@ -327,8 +327,22 @@ name files K3 will have moved.
    the writer maps the source while it writes). Proven red on two defects: un-skipped vision,
    and norms copied verbatim instead of widened. **What it does not establish is tensor
    NAMES** — the fixture is built from the same list the converter checks, so a name wrong in
-   both is wrong in both. Glimmer has no vendored index reduction yet; that is the
-   `k3_names.rs`-shaped gap and it is owed before S4.
+   both is wrong in both.
+
+   **That gap is now closed, and the demonstration is worth keeping.**
+   `tests/glimmer_names.rs` pins every name against the shipped
+   `model.safetensors.index.json`, reduced to 40 families and vendored at
+   `docs/measurement/glimmer-reference/tensor-families.tsv` (sha256 in its header; dtype and
+   shape are the shard headers' own, by HTTP Range). It asserts the reduction is of the real
+   checkpoint (1436 tensors, all BF16, summing to `metadata.total_size` 59,553,253,376), that
+   every name and shape matches — `q_proj`/`gate_proj` share `[4096, 6656]` and `k_proj`/
+   `v_proj` share `[256, 6656]`, so those two pairs are separable only by NAME — and that
+   **every family is either implemented or deliberately skipped** (627 text / 809 vision),
+   which is what makes "we skip the vision half" a measurement rather than an assumption.
+
+   Red-proof: mis-transliterating `self_attn.gate_proj` as `self_attn.output_gate` fails
+   `glimmer_names` twice with precise messages **while `glimmer_convert` stays green** — the
+   two tests are not redundant, and this is the evidence.
 3. `GlimmerPin`: own type (per the V4/K3 precedent — shares nothing with the pool); int8
    embed/lm_head placement reused; its own tensor-name table (V4's §7 records what
    assuming HF-style naming cost).

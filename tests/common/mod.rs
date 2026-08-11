@@ -808,3 +808,39 @@ pub fn absent<S: AsRef<str>>(names: &[S], present: impl Fn(&str) -> bool) -> Vec
         .filter(|n| !present(n))
         .collect()
 }
+
+/// One row of a vendored `tensor-families.tsv`: a checkpoint's `model.safetensors.index.json`
+/// reduced to `count \t dtype \t shape \t family`, where a family collapses `.layers.<n>.`
+/// (and friends) to `{L}`.
+///
+/// Shared by `k3_names` and `glimmer_names`, which had a copy each until jscpd reported the
+/// parser as a 143-token clone (2026-08-11). That is this module's whole reason for existing,
+/// stated in its header: the copies had already started to drift.
+pub struct TsvFamily {
+    pub count: usize,
+    pub dtype: String,
+    /// Empty when the row's shape is `?` — a family none of the fetched shard headers
+    /// covered, recorded as UNKNOWN rather than as absent, so callers must opt in.
+    pub shape: Vec<usize>,
+    pub name: String,
+}
+
+/// Parse a vendored `tensor-families.tsv`. Dimensions are `x`-separated.
+pub fn tsv_families(src: &str) -> Vec<TsvFamily> {
+    src.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            assert_eq!(f.len(), 4, "malformed row: {l:?}");
+            TsvFamily {
+                count: f[0].parse().expect("count"),
+                dtype: f[1].to_string(),
+                shape: match f[2] {
+                    "?" => Vec::new(),
+                    s => s.split('x').map(|d| d.parse().expect("dim")).collect(),
+                },
+                name: f[3].to_string(),
+            }
+        })
+        .collect()
+}

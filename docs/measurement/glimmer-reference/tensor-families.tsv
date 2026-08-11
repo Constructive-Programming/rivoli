@@ -1,0 +1,53 @@
+# Muse Glimmer-30B tensor families — the checkpoint's own index, not a transliteration.
+#
+# Source: meta-models/Muse-Glimmer-30B, revision f84ecc3a0ea984a4c04542a84269e3d065350a6e.
+#   model.safetensors.index.json  132674 B  sha256 7d817b4dccb1b123fc6c1939356c65cee3a0ad462a5b821ac88280990a27d1ba
+#   1436 tensors across 2 shards, metadata.total_size 59553253376
+# Fetched 2026-08-11. dtype/shape are the SHARD HEADERS' own, read by HTTP Range
+# (8-byte LE length, then that many bytes) — not the index's, which carries neither.
+#
+# Families are names with `.layers.<n>.` -> `.layers.{L}.`. That rule is stated because
+# the count depends on it: 40 families total, of which the text side is what this
+# port implements and `model.vision_*` is out of scope.
+#
+# count	dtype	shape	family
+1	BF16	202048x6656	lm_head.weight
+1	BF16	202048x6656	model.language_model.embed_tokens.weight
+52	BF16	6656	model.language_model.layers.{L}.input_layernorm.weight
+52	BF16	6656x19968	model.language_model.layers.{L}.mlp.down_proj.weight
+52	BF16	19968x6656	model.language_model.layers.{L}.mlp.gate_proj.weight
+52	BF16	19968x6656	model.language_model.layers.{L}.mlp.up_proj.weight
+52	BF16	6656	model.language_model.layers.{L}.post_attention_layernorm.weight
+52	BF16	6656	model.language_model.layers.{L}.post_feedforward_layernorm.weight
+52	BF16	6656	model.language_model.layers.{L}.pre_feedforward_layernorm.weight
+52	BF16	4096x6656	model.language_model.layers.{L}.self_attn.gate_proj.weight
+52	BF16	256x6656	model.language_model.layers.{L}.self_attn.k_proj.weight
+52	BF16	6656x4096	model.language_model.layers.{L}.self_attn.o_proj.weight
+52	BF16	4096x6656	model.language_model.layers.{L}.self_attn.q_proj.weight
+52	BF16	256x6656	model.language_model.layers.{L}.self_attn.v_proj.weight
+1	BF16	6656	model.language_model.norm.weight
+1	BF16	4096x6144	model.vision_adapter.fc1.weight
+1	BF16	4096x4096	model.vision_adapter.fc2.weight
+1	BF16	6656x4096	model.vision_projection.weight
+50	BF16	1536	model.vision_tower.layers.{L}.attn.k_proj.bias
+50	BF16	1536x1536	model.vision_tower.layers.{L}.attn.k_proj.weight
+50	BF16	1536	model.vision_tower.layers.{L}.attn.proj.bias
+50	BF16	1536x1536	model.vision_tower.layers.{L}.attn.proj.weight
+50	BF16	1536	model.vision_tower.layers.{L}.attn.q_proj.bias
+50	BF16	1536x1536	model.vision_tower.layers.{L}.attn.q_proj.weight
+50	BF16	1536	model.vision_tower.layers.{L}.attn.v_proj.bias
+50	BF16	1536x1536	model.vision_tower.layers.{L}.attn.v_proj.weight
+50	BF16	8960	model.vision_tower.layers.{L}.mlp.fc1.bias
+50	BF16	8960x1536	model.vision_tower.layers.{L}.mlp.fc1.weight
+50	BF16	1536	model.vision_tower.layers.{L}.mlp.fc2.bias
+50	BF16	1536x8960	model.vision_tower.layers.{L}.mlp.fc2.weight
+50	BF16	1536	model.vision_tower.layers.{L}.norm1.bias
+50	BF16	1536	model.vision_tower.layers.{L}.norm1.weight
+50	BF16	1536	model.vision_tower.layers.{L}.norm2.bias
+50	BF16	1536	model.vision_tower.layers.{L}.norm2.weight
+1	BF16	1536	model.vision_tower.ln_post.bias
+1	BF16	1536	model.vision_tower.ln_post.weight
+1	BF16	1536	model.vision_tower.ln_pre.bias
+1	BF16	1536	model.vision_tower.ln_pre.weight
+1	BF16	1536x1176	model.vision_tower.patch_embedder.patch_embedding.weight
+1	BF16	1024x1536	model.vision_tower.patch_embedder.position_embedding_table.weight

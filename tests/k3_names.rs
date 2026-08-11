@@ -18,6 +18,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
+mod common;
+use common::{TsvFamily, tsv_families};
 use rivoli::artifact::quant::{
     K3_PACKED, K3_PROJ, K3_SCALE, K3_TEXT_PREFIX, f4_expert_bytes, f4_groups, f4_row_bytes,
     k3_expert_base,
@@ -26,33 +28,8 @@ use rivoli::artifact::quant::{
 const FAMILIES: &str = include_str!("../docs/measurement/k3-reference/tensor-families.tsv");
 
 /// One row of the vendored reduction.
-struct Family {
-    count: usize,
-    dtype: String,
-    shape: Vec<usize>,
-    name: String,
-}
-
-fn families() -> Vec<Family> {
-    FAMILIES
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
-            assert_eq!(f.len(), 4, "malformed row: {l:?}");
-            Family {
-                count: f[0].parse().expect("count"),
-                dtype: f[1].to_string(),
-                // `?` marks a family none of the three fetched shard headers covered — recorded
-                // as unknown rather than as absent. An empty vec, so callers must opt in.
-                shape: match f[2] {
-                    "?" => Vec::new(),
-                    s => s.split('x').map(|d| d.parse().expect("dim")).collect(),
-                },
-                name: f[3].to_string(),
-            }
-        })
-        .collect()
+fn families() -> Vec<TsvFamily> {
+    tsv_families(FAMILIES)
 }
 
 /// `(hidden, expert_in, moe_inter)` read from the **vendored `config.json`**, the same file
@@ -77,7 +54,7 @@ fn shipped_dims() -> (usize, usize, usize) {
     )
 }
 
-fn find<'a>(fams: &'a [Family], name: &str) -> &'a Family {
+fn find<'a>(fams: &'a [TsvFamily], name: &str) -> &'a TsvFamily {
     fams.iter()
         .find(|f| f.name == name)
         .unwrap_or_else(|| panic!("no such family in the shipped index: {name}"))
@@ -96,7 +73,7 @@ fn the_vendored_reduction_is_intact() {
         "family counts must sum to the index's tensor count"
     );
     // The vision side is a SIBLING of `language_model`, so the split is a prefix test.
-    let (text, other): (Vec<&Family>, Vec<&Family>) = fams
+    let (text, other): (Vec<&TsvFamily>, Vec<&TsvFamily>) = fams
         .iter()
         .partition(|f| f.name.starts_with("language_model."));
     assert_eq!(
