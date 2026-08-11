@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a items 1-3 DONE 2026-08-11 on tag k3-s1a — the shipped binary parses the unmodified config.json and refuses to decode, convert_glimmer writes a bf16-verbatim artifact, and GlimmerPin places all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream; item 4 (run_glimmer's flag refusals) is open. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
+verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a DONE and G1a MET 2026-08-11 on tag k3-s1a — config schema, convert_glimmer (bf16-verbatim), GlimmerPin placing all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream, and run_glimmer's nine flag refusals against V4's three. G1a's blind spot: not one of its clauses evaluates arithmetic, so every gate so far would hold on a checkpoint of noise; S1b's goldens are where that changes. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
 ---
 
 # Muse Glimmer-30B — implementation plan
@@ -26,12 +26,16 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
   load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
   card's errors beside them. The DFlash drafter is settled too — §S6 and
   `glimmer-architecture.md` §11.
-- **S1a items 1-3 are DONE (2026-08-11)**, on tag `k3-s1a`: the config schema and a refusing
-  dispatch, `convert_glimmer` — **bf16 verbatim, correctness first** — and `GlimmerPin`, which
-  places all **55,712,344,064** resident bytes and takes **no capacity parameter and no cache
-  policy**, because a dense model has nothing to stream and a device that cannot hold it
-  cannot run it at any setting. Item 4, `run_glimmer`'s hand-written flag refusals, is open.
-  §S1a.
+- **S1a is DONE and G1a is MET (2026-08-11)**, on tag `k3-s1a`: the config schema and a
+  refusing dispatch, `convert_glimmer` — **bf16 verbatim, correctness first** — `GlimmerPin`,
+  which places all **55,712,344,064** resident bytes and takes **no capacity parameter and no
+  cache policy** because a dense model has nothing to stream, and `run_glimmer`, whose **nine**
+  flag refusals (V4 has three) were written *before* the decode path rather than with it.
+  **G1a's blind spot: none of its four clauses evaluates arithmetic** — the artifact is
+  bf16-verbatim, so "round-trips bit-exact" would hold on a checkpoint of noise. §S1a, §G1a.
+- **Next is S1b**, the gate harness: tiny-model goldens from the first-party HF modeling code.
+  That is where the sandwich norms, the window boundary and the argmax-invariant logit path
+  first meet a number.
 - **rivoli had never quantized a checkpoint before, and Glimmer is where it must.** GLM, V4
   and K3 all ship pre-quantized and every converter *copies*; `quant.rs` had a
   `dequant_fp8_block` and no inverse. `quantize_fp8_block` now exists — but choosing its
@@ -239,7 +243,7 @@ is in progress on `wt/k3-s1a`. Building that seam here would collide with it. Wh
 lands, re-verify §3's reuse table against the merged tree before starting — several rows
 name files K3 will have moved.
 
-### S1a — artifact. **Items 1–3 DONE 2026-08-11; item 4 open.** No GPU except item 3's gate.
+### S1a — artifact. **DONE 2026-08-11**, all four items. No GPU except item 3's gate.
 
 1. **DONE.** `Arch::MuseGlimmer` + recogniser tests both directions; `GlimmerConfig` /
    `GlimmerTextConfig` with no defaulted fields; `main.rs` dispatch that parses and then
@@ -409,14 +413,72 @@ name files K3 will have moved.
    lying. (The tenant was llama-swap's `qwen3-embedding-4b`, holding 5.3 GiB with **zero**
    `/sys/class/kfd/kfd/proc/` entries — the blind spot `kfd-blind-to-vulkan-tenants` records,
    found again here. `GET /unload` freed it; the flock alone would not have.)
-4. `run_glimmer` dispatch with hand-written refusals for every flag that doesn't apply
-   (`--cache-policy`, `--mode`, `--attn dsa/misa`, `--hint-*` descendants) — V4's bespoke
-   bails are the template; omitting them compiles clean and silently accepts.
+4. **DONE 2026-08-11.** `run_glimmer` — the config parse, the layer-map log, nine flag
+   refusals and the decode bail, all in one function; the dispatch arm is now a call.
+
+   **The refusals are written BEFORE the decode path, which inverts the order V4 and K3
+   set.** `run_v4`'s bails were written alongside its decode and K3's comment predicts the
+   same for `run_k3`. That order is what the failure needs: `Arch::hidden_flags` is consumed
+   only for clap's `.hide(true)`, so the parser still accepts every flag it hides, and a
+   branch that omits a refusal compiles clean, passes clippy, and silently takes a knob it
+   cannot honour.
+
+   **A dense model refuses more than V4 does, and the extra two are the residency knobs.**
+   `--cache-policy` picks an eviction policy for a pool that does not exist, and `--max-mem`
+   sized the budget whose remainder GREW that pool — `GlimmerPin::build` takes no capacity at
+   all. Accepted, both would be read by nothing, and a line in `benchmarks.md` carrying
+   `--max-mem 70` would be a claim about a constraint that never applied. `--trace` joins
+   them: it dumps the routed-expert *access* trace. Nine total, against V4's three.
+
+   `--window` is the one that is dangerous rather than merely inert. This model HAS a sliding
+   window — 2048 rows on 39 of 52 layers — but it comes from `sliding_window` in the config
+   and is a property of how the weights were trained. A flag that reads as if it sets that
+   and does not is worse than one that names nothing.
+
+   Incidental: clap's defaults for `--sinks`/`--window`/`--misa-heads`/`--cache-policy` are
+   now named constants, because a refusal has to compare against the same value clap
+   defaulted to and the alternative is the literal written twice.
+
+   Gate: `tests/glimmer_flags.rs`, which runs the **shipped binary** over the converted
+   fixture — the only thing that can tell a hidden flag from a rejected one. Three tests, and
+   the second is the one that earns its place: **a bare run must reach the decode bail with
+   no refusal firing.** A table of nine `bail!`s where one compares against the wrong default
+   refuses a user who passed nothing, which reads as "this model is broken", and the
+   per-flag test cannot see it. Both halves proven red — deleting the `--cache-policy`
+   condition reddens the first test only; comparing `--window` against 2048 instead of its
+   default reddens **both**, the bare-run test being the one that says why.
+
+   Two findings from the first run, neither predictable from reading the code: **`--port` and
+   `--bench` are mutually exclusive in clap**, so a refusal test that passes `-bench` can
+   never reach the `--port` bail (it dies in the parser); and `tracing`'s fmt layer writes to
+   **stdout** while `anyhow`'s report goes to stderr, so the layer-map log and the bail that
+   follows it land on different streams. A test reading one stream gets half the run.
 
 **G1a — met when** conversion round-trips bit-exact on sampled tensors; GLM/V4/K3 artifacts
 still open byte-identically (test opens them); a config missing or contradicting any
 load-bearing field refuses at startup, proven by feeding it one; resident byte accounting
 reproduced from the artifact.
+
+### G1a — **MET 2026-08-11.** Clause by clause, with what backs each
+
+| clause | met by | note |
+|---|---|---|
+| conversion round-trips bit-exact **on sampled tensors** | `glimmer_convert` | stronger than asked: **every** verbatim tensor is compared byte for byte, and every widened norm by *value* rather than by length — a length check passes on a zeroed tensor |
+| GLM/V4/K3 artifacts still open (test opens them) | `arch_artifacts` | `arch_of_artifact` **and** the full `load_config`, so a `validate` that tightened for everybody fails here. GLM and V4 open on this machine; **K3 SKIPs — no artifact exists yet** — and the test asserts at least one was present, so it cannot go green having opened nothing |
+| a config contradicting a load-bearing field refuses **at startup**, proven by feeding it one | `glimmer_flags` | the *binary*, not the type. The 26-row defect run proves it about `GlimmerConfig`; this proves the dispatch parses before it bails, which was a comment and is now a gate. The defect fed is the pairing invariant, the one no downstream shape check could catch |
+| resident byte accounting reproduced from the artifact | `glimmer_names` | **55,712,344,064**, computed from the vendored index's own shapes rather than written down |
+
+**The blind spot, named as the gate model requires.** Every one of these is about *bytes and
+names*, and not one of them evaluates an arithmetic expression. The artifact is bf16-verbatim,
+so "round-trips bit-exact" is a statement about `memcpy` — it would hold identically if every
+tensor in the checkpoint were noise. Nothing here can see a wrong window boundary, a rotated
+NoPE layer, a mis-broadcast KV head, or the argmax-invariant logit path. That is S1b's whole
+job, and G1a being met says only that the inputs to S1b are the ones the checkpoint ships.
+
+**Two things G1a did not ask for and this stage produced anyway**, both because the plan
+underestimated what a *fourth* architecture costs: the tensor-name pinning
+(`glimmer_names`, against the shipped index — a name wrong in both converter and test is
+wrong in both), and the flag refusals arriving before the decode path rather than with it.
 
 ### S1b — gate harness. No GPU. Must not touch kernels.
 

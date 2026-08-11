@@ -30,6 +30,19 @@ use tracing::info;
 //
 // No `wrap_help` feature, so clap does not re-wrap: the terminal does. That also means
 // `max_term_width` would be inert, which is why it is not set.
+/// Clap's defaults for the four flags an architecture without a routed pool or an `--attn`
+/// has to REFUSE rather than ignore.
+///
+/// Named because a refusal has to compare against the same value clap defaulted to, and the
+/// alternative is the literal written twice — in the `#[arg]` attribute and in the `bail!`
+/// beside it. `run_glimmer` is the first branch to need that comparison; nothing stops the
+/// next one from reusing these. `--attn`'s own default is the string `"auto"`, already
+/// compared against by name in `run_v4`.
+const DEFAULT_SINKS: usize = 4;
+const DEFAULT_WINDOW: usize = 8192;
+const DEFAULT_MISA_HEADS: u16 = 8;
+const DEFAULT_CACHE_POLICY: &str = "2q";
+
 /// Zero-knob by design: every flag is a benchmark or diagnostic override, and a bare
 /// `rivoli <model-dir>` is a complete invocation.
 #[derive(clap::Parser, Debug)]
@@ -96,7 +109,7 @@ struct Args {
     /// Routed-expert cache policy. All three are output-neutral: routing never consults
     /// residency (see math.rs `inv_1_routing_never_consults_the_cache`), so a policy change
     /// moves throughput and hit rate, never the tokens produced.
-    #[arg(long, default_value = "2q", value_parser = ["lru", "2q", "arc"])]
+    #[arg(long, default_value = DEFAULT_CACHE_POLICY, value_parser = ["lru", "2q", "arc"])]
     cache_policy: String,
 
     /// Device budget in GiB, taken LITERALLY — no OS reserve, so it may OOM at build.
@@ -112,16 +125,16 @@ struct Args {
     attn: String,
 
     /// `--attn streaming`: the number of leading sink tokens kept.
-    #[arg(long, value_name = "N", default_value_t = 4)]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_SINKS)]
     sinks: usize,
 
     /// `--attn streaming`: the trailing window kept.
-    #[arg(long, value_name = "N", default_value_t = 8192)]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_WINDOW)]
     window: usize,
 
     /// `--attn misa`: how many indexer heads score tokens (the MISA paper's validated GLM
     /// setting is 8).
-    #[arg(long, value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(long, value_name = "N", default_value_t = DEFAULT_MISA_HEADS, value_parser = clap::value_parser!(u16).range(1..))]
     misa_heads: u16,
 
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
@@ -903,6 +916,153 @@ fn run_v4(
     Ok(())
 }
 
+/// Muse Glimmer: validate the manifest, report the layer map, refuse every flag that does not
+/// apply, and then refuse the run.
+///
+/// **The refusals exist before the decode path, on purpose.** `run_v4`'s bespoke `bail!`s were
+/// written alongside its decode and `run_k3`'s comment predicts the same order; the failure
+/// that order invites is that omitting one compiles clean and silently ACCEPTS a knob the
+/// branch cannot honour. `Arch::hidden_flags` does not help — it is consumed only for
+/// `.hide(true)`, so clap still parses every flag it hides, and `--help` hiding a flag is not
+/// the parser rejecting it. Writing them now means the decode path lands into a branch where
+/// the refusals are already gated by `tests/glimmer_flags.rs`.
+///
+/// **A dense model refuses more than V4 does, and the extra ones are the residency knobs.**
+/// `--cache-policy` picks an eviction policy for a pool that does not exist here, and
+/// `--max-mem` sized the budget whose remainder GREW that pool — `GlimmerPin::build` takes no
+/// capacity at all. Both would be accepted and then read by nothing, and a benchmark line in
+/// `docs/measurement/benchmarks.md` carrying `--max-mem 70` would be a claim about a
+/// constraint that never applied. That is the specific lie this function exists to prevent.
+#[cfg(feature = "rocm")]
+fn run_glimmer(cfg: &Config, attn: &str, port: Option<u16>, knobs: AttnKnobs) -> Result<()> {
+    use rivoli::arch::Arch;
+    let arch = Arch::MuseGlimmer;
+    // **Parsed BEFORE the refusals, and before the bail.** The schema is the part of this port
+    // that exists, and G1a asks that a manifest omitting or contradicting a load-bearing field
+    // refuse HERE, at startup. Bailing first would leave it reachable only from unit tests,
+    // which is how a load boundary rots. The wrapper is kept rather than shed for its `.text`,
+    // for the reason `GlimmerConfig`'s own doc gives.
+    let g: rivoli::artifact::model::GlimmerConfig =
+        rivoli::artifact::model::load_config(&cfg.model)?;
+    let gt = &g.text;
+    // Counted from the array directly. The obvious `layer_is_sliding(i).unwrap_or(false)` is
+    // the silent "full attention" that method's doc exists to forbid, and it is what this call
+    // site wrote on the first try — see that doc, and the 2026-08-11 reviews.
+    let sliding = gt
+        .layer_types
+        .iter()
+        .filter(|k| **k == rivoli::artifact::model::LayerKind::SlidingAttention)
+        .count();
+    info!(
+        "model: {} ({}) — {} layers ({} sliding at window {} / {} full), hidden {}, inter {}, \
+         {} heads x {} kv (dim {}), vocab {}, DENSE (no experts), resident {:.3} GB",
+        arch.name(),
+        arch.summary(),
+        gt.n_layers,
+        sliding,
+        gt.sliding_window,
+        gt.n_layers - sliding,
+        gt.hidden,
+        gt.inter,
+        gt.n_heads,
+        gt.num_key_value_heads,
+        gt.head_dim,
+        gt.vocab,
+        gt.resident_bytes()? as f64 / 1e9,
+    );
+
+    // One table rather than eight `if ... bail!` blocks: eight blocks differing only in their
+    // string is what jscpd rejects, and a table makes "which flags does this architecture
+    // refuse" answerable by reading one list. `--port` stays a separate check below because it
+    // is the one refusal that is temporary rather than architectural.
+    for (flag, refused, why) in [
+        (
+            "--attn",
+            attn != "auto",
+            "attention is fixed in the weights; this artifact does not take the flag",
+        ),
+        (
+            "--sinks",
+            knobs.sinks != DEFAULT_SINKS,
+            "an `--attn streaming` knob, and there is no --attn here",
+        ),
+        (
+            "--window",
+            knobs.window != DEFAULT_WINDOW,
+            "an `--attn streaming` knob. This model HAS a sliding window — 2048 rows, \
+             inclusive of the current position, on 39 of 52 layers — but it comes from \
+             `sliding_window` in the config and is a property of how the weights were \
+             trained. A flag that reads as if it sets that and does not is worse than one \
+             that is merely inert",
+        ),
+        (
+            "--misa-heads",
+            knobs.misa_heads != DEFAULT_MISA_HEADS,
+            "an `--attn misa` knob; MISA scores rows with a DSA lightning indexer, which \
+             this architecture has no analogue of",
+        ),
+        (
+            "--mode",
+            cfg.mode != rivoli::artifact::config::Mode::default(),
+            "selects a GLM routed-expert FORMAT (int3-vq / int4 / hybrid). This model is \
+             dense — there are no routed experts and so no second format to pick",
+        ),
+        (
+            "--cache-policy",
+            cfg.cache_policy != DEFAULT_CACHE_POLICY,
+            "picks an eviction policy for the routed-expert pool. A dense model streams \
+             nothing, so there is no pool and nothing to evict",
+        ),
+        (
+            "--max-mem",
+            cfg.max_mem.is_some(),
+            "sizes the device budget whose remainder grows the routed pool. `GlimmerPin` \
+             takes no capacity: the resident set IS the model (55.712 GB), and a device \
+             that cannot hold it cannot run this artifact at any setting",
+        ),
+        (
+            "--trace",
+            cfg.trace.is_some(),
+            "dumps the routed-expert ACCESS trace for the offline `replay` sim. There are \
+             no routed experts to access",
+        ),
+    ] {
+        if refused {
+            bail!(
+                "{flag} does not apply to a {} artifact: {why}. It is hidden from this \
+                 artifact's --help, which is not the same as the parser rejecting it — hence \
+                 this message.",
+                arch.name()
+            );
+        }
+    }
+    if port.is_some() {
+        bail!(
+            "--port is not wired for {} yet: `serve::serve` takes a `&mut GpuEngine`, which is \
+             GLM-typed. Unlike the refusals above this one is a signature, not an architectural \
+             fact — it goes away when the decode path lands.",
+            arch.name()
+        );
+    }
+
+    bail!(
+        "{} artifacts do not decode yet — S1a is done (config schema, converter, pin, and \
+         these refusals), and the GQA attention family with its sliding window and sigmoid \
+         output gate is S2. Everything above this line ran: see \
+         docs/investigations/glimmer-port.md.",
+        arch.name()
+    );
+}
+
+/// The three `--attn`-shaped knobs, bundled so [`run_glimmer`] takes four parameters instead
+/// of six. They travel together because they are refused together and for one reason.
+#[cfg(feature = "rocm")]
+struct AttnKnobs {
+    sinks: usize,
+    window: usize,
+    misa_heads: u16,
+}
+
 /// A build with no compute backend cannot reach this: see the stub above.
 #[cfg(feature = "rocm")]
 fn main() -> Result<()> {
@@ -1054,59 +1214,19 @@ fn main() -> Result<()> {
             );
         }
         rivoli::arch::Arch::MuseGlimmer => {
-            use rivoli::arch::Arch;
-            // Parsed before the refusal, on exactly K3's argument above: the schema is the
-            // part of this port that exists, and G1a asks that a manifest omitting or
-            // contradicting a load-bearing field refuse HERE, at startup. Bailing first would
-            // leave it reachable only from unit tests, which is how a load boundary rots.
-            // The `GlimmerConfig` is kept rather than shed for its `.text`, for the reason
-            // that type's doc gives.
-            let g = rivoli::artifact::model::load_config::<rivoli::artifact::model::GlimmerConfig>(
-                &cfg.model,
-            )?;
-            let gt = &g.text; // read-only view; the validated wrapper above stays in scope
-            // Counted from the array directly. The obvious `layer_is_sliding(i).unwrap_or(false)`
-            // is the silent "full attention" that method's doc exists to forbid, and it is what
-            // this call site wrote on the first try — see that doc, and the 2026-08-11 reviews.
-            let sliding = gt
-                .layer_types
-                .iter()
-                .filter(|k| **k == rivoli::artifact::model::LayerKind::SlidingAttention)
-                .count();
-            let arch = Arch::MuseGlimmer;
-            info!(
-                "model: {} ({}) — {} layers ({} sliding at window {} / {} full), hidden {}, \
-                 inter {}, {} heads x {} kv (dim {}), vocab {}, DENSE (no experts)",
-                arch.name(),
-                arch.summary(),
-                gt.n_layers,
-                sliding,
-                gt.sliding_window,
-                gt.n_layers - sliding,
-                gt.hidden,
-                gt.inter,
-                gt.n_heads,
-                gt.num_key_value_heads,
-                gt.head_dim,
-                gt.vocab
-            );
-            // No `run_glimmer` yet, and no flag refusals either — an unconditional bail
-            // refuses every flag by refusing the run. **When the decode path lands,
-            // `run_glimmer` must hand-write them**. Take the list from
-            // `Arch::hidden_flags` rather than from this comment — it is the machine-readable
-            // statement of which knobs do not apply, and two prose lists in two dispatch arms
-            // have already drifted (K3's names three flags, this one named five). Note
-            // `hidden_flags` is consumed only for `.hide(true)`, so clap still ACCEPTS every
-            // flag it hides: a `run_glimmer` that omits the bails compiles clean and silently
-            // takes knobs it cannot honour. Dense adds residency knobs to the list —
-            // `--cache-policy` and `--max-mem`'s pool half stream nothing here — and a
-            // benchmark recorded with those in its command line would be a lie about what ran.
-            bail!(
-                "{} artifacts do not decode yet — S1a item 1 validates the config (this \
-                 message), the converter is item 2, and the GQA attention family with its \
-                 sigmoid output gate is S2. The config parsed, which is what this stage \
-                 promises: see docs/investigations/glimmer-port.md.",
-                arch.name()
+            // Everything is inside `run_glimmer` — the config parse, the layer-map log, the
+            // flag refusals and the final bail. The K3 arm above still carries its own copy of
+            // the first two because it has no `run_k3` yet; when it gets one, this is the
+            // shape it should take, and the comment there says so.
+            return run_glimmer(
+                &cfg,
+                &a.attn,
+                a.port,
+                AttnKnobs {
+                    sinks: a.sinks,
+                    window: a.window,
+                    misa_heads: a.misa_heads,
+                },
             );
         }
     }
