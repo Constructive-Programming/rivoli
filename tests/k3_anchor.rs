@@ -28,29 +28,25 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::v4oracle::golden::GoldenSet;
+use rivoli::golden::GoldenSet;
 use serde_json::Value;
 
+#[path = "common/golden_read.rs"]
+mod golden_read;
 #[path = "common/k3_tolerance.rs"]
 mod k3_tolerance;
 
-/// One vendored golden, with the two facts that pin its bytes.
-struct Vendored {
-    salt: &'static str,
-    bytes: &'static [u8],
-    len: usize,
-    fnv: u64,
-}
+use golden_read::{Vendored, float, shape_of};
 
 const GOLDENS: &[Vendored] = &[
     Vendored {
-        salt: "k3-anchor-1",
+        name: "k3-anchor-1",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-1.bin"),
         len: 292_781,
         fnv: 0xab97_8ba4_78e1_78ca,
     },
     Vendored {
-        salt: "k3-anchor-2",
+        name: "k3-anchor-2",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-2.bin"),
         len: 292_781,
         fnv: 0xf104_1475_321f_40f6,
@@ -62,7 +58,7 @@ const REAL_CONFIG: &str = include_str!("../docs/measurement/k3-reference/config.
 
 fn load(v: &Vendored) -> GoldenSet {
     GoldenSet::read_k3(&mut &v.bytes[..])
-        .unwrap_or_else(|e| panic!("the vendored {} golden must load: {e:#}", v.salt))
+        .unwrap_or_else(|e| panic!("the vendored {} golden must load: {e:#}", v.name))
 }
 
 /// The tiny config a golden was produced from.
@@ -80,27 +76,6 @@ fn attn_field(c: &Value, key: &str) -> usize {
     c["linear_attn_config"][key]
         .as_u64()
         .unwrap_or_else(|| panic!("linear_attn_config.{key} is not an integer")) as usize
-}
-
-/// One float tensor's shape and values, by name. Panics with the file's own contents, because "not
-/// found" is almost always a renamed capture and the next question is always "then what IS in
-/// there".
-fn float<'g>(g: &'g GoldenSet, name: &str) -> (&'g [usize], &'g [f32]) {
-    g.floats
-        .iter()
-        .find(|(n, _, _)| n == name)
-        .map(|(_, s, v)| (s.as_slice(), v.as_slice()))
-        .unwrap_or_else(|| {
-            let some: Vec<&String> = g.floats.iter().take(3).map(|(n, _, _)| n).collect();
-            panic!(
-                "{name} is not in the golden; it holds {} float tensors, e.g. {some:?}",
-                g.floats.len()
-            )
-        })
-}
-
-fn shape_of(g: &GoldenSet, name: &str) -> Vec<usize> {
-    float(g, name).0.to_vec()
 }
 
 /// One structural field: the driver must have asserted it, and it must equal the real config's.
@@ -135,7 +110,7 @@ fn the_anchor_goldens_record_what_produced_them() {
         let g = load(v);
         g.expect_defect("None")
             .expect("the vendored goldens are unperturbed runs");
-        assert_eq!(g.meta_get("salt"), Some(v.salt), "salt");
+        assert_eq!(g.meta_get("salt"), Some(v.name), "salt");
         for (key, want) in [
             ("mode", "decode"),
             ("seq", "8"),
@@ -161,7 +136,7 @@ fn the_anchor_goldens_record_what_produced_them() {
             ("ref_config_sha256_16", "735eb9ebe593e17d"),
             ("real_config_sha256_16", "9710e121a58d03ac"),
         ] {
-            assert_eq!(g.meta_get(key), Some(want), "{}: metadata {key}", v.salt);
+            assert_eq!(g.meta_get(key), Some(want), "{}: metadata {key}", v.name);
         }
     }
 }
@@ -176,13 +151,9 @@ fn the_anchor_goldens_record_what_produced_them() {
 /// **When this fails after a deliberate regeneration, update the constants and say so in
 /// `anchor.md`.** That is the intended workflow: re-vendoring is a reviewed change, not a side
 /// effect of running the driver.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h = (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
+/// Moved to `tests/common/golden_read.rs` 2026-08-11, when Muse Glimmer's anchor became a second
+/// caller and `build.rs`'s jscpd gate rejected the second copy. The doc above still applies.
+pub use golden_read::fnv1a;
 
 /// **The vendored `config.json` is the one the goldens were generated against.**
 ///
@@ -217,12 +188,10 @@ fn the_vendored_real_config_is_the_one_the_goldens_saw() {
 #[test]
 fn the_vendored_bytes_are_the_measured_ones() {
     for v in GOLDENS {
-        let h = fnv1a(v.bytes);
-        assert_eq!(v.bytes.len(), v.len, "{}: size", v.salt);
-        assert_eq!(h, v.fnv, "{}: FNV-1a", v.salt);
+        v.check_bytes();
         let g = load(v);
-        assert_eq!(g.floats.len(), 223, "{}: float tensors", v.salt);
-        assert_eq!(g.ints.len(), 5, "{}: int tensors", v.salt);
+        assert_eq!(g.floats.len(), 223, "{}: float tensors", v.name);
+        assert_eq!(g.ints.len(), 5, "{}: int tensors", v.name);
     }
     // The two draws must not be the same draw — compared on VALUES, not on the files.
     //
@@ -509,7 +478,7 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
         assert!(
             a_log.iter().all(|x| (0.0..=16f32.ln()).contains(x)),
             "{}: A_log must be log(uniform(1,16)): {a_log:?}",
-            v.salt
+            v.name
         );
         // The range alone accepts an ALL-ZEROS A_log, since log(1) = 0 is in it — and this test
         // exists so that a golden of zeros cannot pass. `A_log` gates the decay per head, so a
@@ -519,14 +488,14 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
         assert!(
             a_log.iter().any(|x| *x != a_log[0]),
             "{}: A_log is constant at {} — every head would decay identically",
-            v.salt,
+            v.name,
             a_log[0]
         );
         let (_, dt) = float(&g, &format!("{kda}.in.dt_bias"));
         assert!(
             dt.iter().all(|x| (-4.0..=1.0).contains(x)),
             "{}: dt_bias out of its draw range",
-            v.salt
+            v.name
         );
         // `beta` reaches the kernel PRE-sigmoid, so a draw far out in either tail would pin the
         // delta-rule update at 0 or 1 and hide whatever the update does. +-8 is where
@@ -535,18 +504,18 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
         assert!(
             beta.iter().all(|x| x.abs() < 8.0),
             "{}: a beta saturates the gate: {beta:?}",
-            v.salt
+            v.name
         );
         let (_, logits) = float(&g, "logits");
         assert!(
             logits.iter().all(|x| x.is_finite()),
             "{}: logits must be finite",
-            v.salt
+            v.name
         );
         assert!(
             logits.iter().any(|x| *x != logits[0]),
             "{}: all {} logits are identical — the forward pass collapsed",
-            v.salt,
+            v.name,
             logits.len()
         );
 
@@ -564,13 +533,13 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
         assert!(
             idx.iter().all(|&e| (e as usize) < n_experts),
             "{}: expert id out of range: {idx:?}",
-            v.salt
+            v.name
         );
         assert_eq!(
             idx.iter().collect::<std::collections::BTreeSet<_>>().len(),
             top_k,
             "{}: top-{top_k} selected the same expert twice: {idx:?}",
-            v.salt
+            v.name
         );
         // The gate WEIGHTS, which are what `--defect RouterBiasInWeight` moves and which nothing
         // named before. Their sum pins the renormalisation AND `routed_scaling_factor`, read from
@@ -581,7 +550,7 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
         assert!(
             (sum - scale).abs() < 1e-5,
             "{}: top-k weights sum to {sum}, not the renormalised {scale}",
-            v.salt
+            v.name
         );
         // And no weight may vanish: an expert weighted at ~0 contributes nothing, so a bug in that
         // expert's arithmetic would be invisible in this fixture. 5% of the largest is the floor.
@@ -589,7 +558,7 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
         assert!(
             w.iter().all(|x| *x >= biggest * 0.05),
             "{}: a routed weight is degenerate ({w:?}) — that expert's arithmetic is unscoreable",
-            v.salt
+            v.name
         );
     }
 }
@@ -624,7 +593,7 @@ fn exactly_the_declared_layers_were_captured() {
         assert_eq!(
             seen, declared,
             "{}: captured layers must be exactly the declared ones",
-            v.salt
+            v.name
         );
     }
 }

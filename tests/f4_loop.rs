@@ -320,7 +320,10 @@ use rivoli::artifact::model::{V4Config, load_config};
 use rivoli::f4gpu::F4Engine;
 use rivoli::math::f32_to_bf16;
 use rivoli::memory::pin::F4Pin;
-use rivoli::v4oracle::golden::GoldenSet;
+#[path = "common/golden_read.rs"]
+mod golden_read;
+
+use rivoli::golden::GoldenSet;
 
 #[path = "common/f4_artifact_dir.rs"]
 mod f4_artifact_dir;
@@ -558,24 +561,18 @@ fn report() {
 
 /// One golden tensor by name. Fails loudly on a miss: a typo'd name silently comparing nothing
 /// is how a gate passes vacuously.
+///
+/// Both delegate to `tests/common/golden_read.rs` since 2026-08-11 — Muse Glimmer's anchor made
+/// these a THIRD copy and `build.rs`'s jscpd gate rejected them, which is how it was noticed that
+/// `k3_anchor.rs` had been carrying the same two lookups all along. The names stay because the
+/// call sites here read better with them. One behaviour changed: the miss message now names three
+/// tensors and the count instead of every name in the file, because a Glimmer golden holds 1099.
 fn golden_i64<'g>(gs: &'g GoldenSet, name: &str) -> &'g [i64] {
-    gs.ints
-        .iter()
-        .find(|(n, _, _)| n == name)
-        .map(|(_, _, v)| v.as_slice())
-        .unwrap_or_else(|| panic!("no int golden named {name:?}"))
+    golden_read::ints(gs, name)
 }
 
 fn golden<'g>(gs: &'g GoldenSet, name: &str) -> &'g [f32] {
-    gs.floats
-        .iter()
-        .find(|(n, _, _)| n == name)
-        .map(|(_, _, v)| v.as_slice())
-        .unwrap_or_else(|| {
-            let mut have: Vec<&str> = gs.floats.iter().map(|(n, _, _)| n.as_str()).collect();
-            have.sort_unstable();
-            panic!("no golden named {name:?}. The file holds: {have:?}")
-        })
+    golden_read::float(gs, name).1
 }
 
 fn meta<'g>(gs: &'g GoldenSet, key: &str) -> &'g str {
