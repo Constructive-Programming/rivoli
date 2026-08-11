@@ -32,14 +32,25 @@ use rivoli::arch::Arch;
 use rivoli::artifact::model as gm;
 
 /// `(env override, default path, the architecture it must resolve to)`.
+///
+/// **The names and defaults are `tests/common/f4_artifact_dir.rs`'s, not new ones.** This file
+/// first invented `RIVOLI_GLM_ARTIFACT` and `RIVOLI_V4_ARTIFACT` for the same two directories —
+/// which were already taken, by that module, for DIFFERENT artifacts (`RIVOLI_V4_ARTIFACT` is
+/// the 3-layer `v4-f4-l0-2`, not the 43-layer full set). Two tests reading one variable with
+/// two meanings is a trap that fires only for whoever sets it, and it fired here on the rebase
+/// onto `wt/k3-s1a`: `f4_loading` treats an explicitly-set-but-unresolvable value as a FAILURE
+/// rather than a skip — deliberately, for the same libtest-captures-stderr reason this file
+/// records — so pointing the name at nothing to simulate CI broke a test that was not mine.
+///
+/// K3's row is the only new name, and there is no artifact for it yet.
 const ARTIFACTS: [(&str, &str, Arch); 3] = [
     (
-        "RIVOLI_GLM_ARTIFACT",
+        "RIVOLI_GLM_ARTIFACT_FULL",
         "/var/db/rivoli/glm52-vq3-full",
         Arch::GlmMoeDsa,
     ),
     (
-        "RIVOLI_V4_ARTIFACT",
+        "RIVOLI_V4_ARTIFACT_FULL",
         "/var/db/rivoli/v4-f4-full",
         Arch::DeepseekV4,
     ),
