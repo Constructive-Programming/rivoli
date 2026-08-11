@@ -33,8 +33,8 @@ use serde_json::Value;
 
 #[path = "common/golden_read.rs"]
 mod golden_read;
-#[path = "common/k3_tolerance.rs"]
-mod k3_tolerance;
+#[path = "common/tolerance.rs"]
+mod tolerance;
 
 use golden_read::{Vendored, float, shape_of};
 
@@ -600,13 +600,13 @@ fn exactly_the_declared_layers_were_captured() {
 
 /// **The per-operator tolerances G1b owed, and the gate on them.**
 ///
-/// `common/k3_tolerance.rs` carries the table; this asserts that every row's policy still follows
-/// from its two measured numbers. The one that matters: `mla` is `ExactOnly` because the C
+/// `common/tolerance.rs` carries the table — shared with Muse Glimmer since its S2 measured its own
+/// floors — and this asserts that every row's policy still follows from its two measured numbers. The one that matters: `mla` is `ExactOnly` because the C
 /// reference's LoRA-norm eps moves it by only **1.3x its own fp32 rounding floor**, so no threshold
 /// admits a correct kernel and rejects that eps. Widening it to a `Rel` fails here.
 #[test]
 fn the_tolerance_table_is_supported_by_its_measurements() {
-    k3_tolerance::tolerances_leave_room();
+    tolerance::tolerances_leave_room(tolerance::K3);
     // These six are the operators whose floor was MEASURED, and the spelling S2 will look a row up
     // by — so a rename or a swapped row is caught here, which a count of rows would not catch.
     //
@@ -625,23 +625,5 @@ fn the_tolerance_table_is_supported_by_its_measurements() {
         "kda_op",
         "dense_mlp",
     ];
-    for op in MEASURED {
-        assert!(
-            k3_tolerance::tolerance(op).is_some(),
-            "no tolerance row for {op}"
-        );
-    }
-    // And nothing else has one. A row for an operator whose floor was never measured is a number
-    // that arrived from somewhere other than a measurement, which is the whole failure this table
-    // exists to prevent.
-    assert_eq!(
-        k3_tolerance::TOLERANCES.len(),
-        MEASURED.len(),
-        "the table has a row for an operator outside the measured six: {:?}",
-        k3_tolerance::TOLERANCES
-            .iter()
-            .map(|t| t.operator)
-            .filter(|o| !MEASURED.contains(o))
-            .collect::<Vec<_>>()
-    );
+    tolerance::table_covers_exactly(tolerance::K3, &MEASURED);
 }

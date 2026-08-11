@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: data
-verdict: The S1b anchor exists and runs — Muse Glimmer's own first-party stack (transformers 5.16.0.dev0 at commit fe747d88, torch 2.13.0+cpu, python 3.14.6) executed at tiny widths but the REAL structure, and it needs NO GPU because this reference is plain PyTorch with a CPU path for every operator. FOUR files are vendored (tests/glimmer-anchor-{text,draft}-{1,2}.bin; text 643,957 B, draft 72,145 B), two weight draws x two modes, each reproduced byte-for-byte on a later run, and read by tests/glimmer_anchor.rs with no python, no venv, no network and no device. FOURTEEN defect runs are scored at both draws, 28 runs in all, and each is GATED on the captures it must leave bit-identical rather than merely on having changed something. THE FINDING THAT ONLY THIS CAN SEE - softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so the argmax-invariant logit path is not an argument but a measurement, and every greedy gate in this repo is provably blind to it. Two reference behaviours were discovered by running it: the DFlash drafter's default mask is block-wide against context+block K/V and RAISES, and passing the correct 2D mask only works with use_cache=False because a fresh DFlashCache reports kv_length 0. The green sets are scoped to step 0 because a defect that shifts the argmax contaminates every later step through the token it feeds back - localisation is only possible on the prefill. Five deviations are declared in the metadata and pinned by the test - eager attention, fp32 against a bf16 checkpoint, the ForConditionalGeneration wrapper (the softcap lives only there), shrunk special-token ids, and output_multiplier kept at the released value rather than recomputed.
+verdict: The S1b anchor exists and runs — Muse Glimmer's own first-party stack (transformers 5.16.0.dev0 at commit fe747d88, torch 2.13.0+cpu, python 3.14.6) executed at tiny widths but the REAL structure, and it needs NO GPU because this reference is plain PyTorch with a CPU path for every operator. FOUR files are vendored (tests/glimmer-anchor-{text,draft}-{1,2}.bin; text 643,957 B, draft 72,145 B), two weight draws x two modes, each reproduced byte-for-byte on a later run, and read by tests/glimmer_anchor.rs with no python, no venv, no network and no device. FOURTEEN defect runs are scored at both draws, 28 runs in all, and each is GATED on the captures it must leave bit-identical rather than merely on having changed something. THE FINDING THAT ONLY THIS CAN SEE - softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so the argmax-invariant logit path is not an argument but a measurement, and every greedy gate in this repo is provably blind to it. Two reference behaviours were discovered by running it: the DFlash drafter's default mask is block-wide against context+block K/V and RAISES, and passing the correct 2D mask only works with use_cache=False because a fresh DFlashCache reports kv_length 0. The green sets are scoped to step 0 because a defect that shifts the argmax contaminates every later step through the token it feeds back - localisation is only possible on the prefill. Five deviations are declared in the metadata and pinned by the test - eager attention, fp32 against a bf16 checkpoint, the ForConditionalGeneration wrapper (the softcap lives only there), shrunk special-token ids, and output_multiplier kept at the released value rather than recomputed. TOLERANCES ADDED 2026-08-11 for S2 item 1: per-operator fp32 floors for all thirteen buckets, from --dtype float64 (the whole model in double, no island needed) against each fp32 golden, measured at BOTH draws because attend's floor is 2.1x apart between them - 7.819e-6 and 1.639e-5 - so a one-draw floor would have set the threshold at half what a correct kernel needs. ONE row is tabled, attend: floor 1.639e-5, weakest targeting defect 2.086e0 (kv_broadcast_blocked), Rel(1.64e-4). qk_scale_on_k is EXCLUDED from that set at 6.232e-4 (38x the floor, which would have forced ExactOnly) because (s*q).k and q.(s*k) are the same product - the defect is invisible to this kernel by algebra, not by resolution, and is caught in qk_norm/proj instead. The other twelve buckets have floors and no row: a floor is half a row, and S2 compares them exactly until the other half is reasoned through.
 ---
 
 # The Muse Glimmer S1b anchor
@@ -152,12 +152,87 @@ Each is in the goldens' own metadata and pinned by the test:
 5. `output_multiplier` kept at the released 0.19611613513818404 rather than `1/sqrt(hidden/256)`
    recomputed at hidden 72 — it is a config value the port reads, not a formula it evaluates.
 
+## Tolerances — the fp32 floors, measured 2026-08-11 for S2
+
+Added when S2 item 1 (the GQA attend kernel) came to need a threshold. **Measured before the kernel
+existed**, which is the only order in which the number means anything.
+
+```bash
+# The floor: run the identical reference in double and diff it against the fp32 golden.
+tests/glimmer_anchor_driver.py --mode text --defect None --salt glimmer-anchor-1 \
+    --dtype float64 --out fp64-1.bin
+tests/glimmer_anchor_driver.py --by-operator fp64-1.bin tests/glimmer-anchor-text-1.bin
+# The signal a threshold must stay under: the same report, clean against each defect run.
+tests/glimmer_anchor_driver.py --by-operator target/glimmer-anchor/text-1-None.bin \
+    target/glimmer-anchor/text-1-kv_broadcast_blocked.bin
+```
+
+**`--dtype float64` is the whole model in double, with no island.** K3's anchor has to hold every
+fla module at fp32 because its KDA ops are triton kernels that refuse double; this reference is
+plain PyTorch, so one flag covers every operator at once. Weights are untouched by it —
+`init_weights` draws into an explicit f32 buffer and widens — so an fp64 run sees numerically
+identical weights and differs *only* in accumulation, which is the property being measured.
+
+**Floors, max over both draws** (`--mode text`; the draft mode has no floors yet):
+
+| operator | draw 1 | draw 2 | floor |
+|---|---|---|---|
+| `attend` | 7.819e−6 | 1.639e−5 | **1.639e−5** |
+| `o_proj` | 7.643e−6 | 8.293e−6 | 8.293e−6 |
+| `qk_norm` | 7.845e−6 | 6.295e−6 | 7.845e−6 |
+| `norm` | 6.082e−6 | 7.701e−6 | 7.701e−6 |
+| `proj` | 3.307e−6 | 4.779e−6 | 4.779e−6 |
+| `rope` | 4.490e−6 | 4.773e−6 | 4.773e−6 |
+| `mlp` | 4.532e−6 | 4.744e−6 | 4.744e−6 |
+| `logits` | 3.061e−6 | 3.520e−6 | 3.520e−6 |
+| `gate` | 3.408e−6 | 3.501e−6 | 3.501e−6 |
+| `final_norm` | 3.045e−6 | 3.496e−6 | 3.496e−6 |
+| `embed_norm`, `rope_table`, `ids` | 0 | 0 | below what the container can see |
+
+**A floor measured at one draw is not a floor.** `attend` came out **2.1× apart** between the two
+draws — same arithmetic, different numbers for the softmax to round. Taking draw 1 alone would have
+placed the threshold at half what a correct kernel can need, and that failure mode is a *correct*
+kernel that cannot pass. Every floor above is the max over both. (K3's table was measured at one
+salt and is not known to be draw-robust; that is now an open item against it.)
+
+**The three zeros are "below the container", not "exact".** `Capture.add` stores f32 because the
+golden container does, so an fp64 run is rounded on the way out and every comparison carries one f32
+rounding — relative 2⁻²⁴ = **6.0e−8**. Every non-zero floor above sits 50–130× clear of that, so it
+is measuring arithmetic; a bucket landing near 6e−8 would be measuring the container and must not
+become a threshold until the container is widened.
+
+### The one row that exists, and why the others do not
+
+`tests/common/tolerance.rs::GLIMMER` carries **`attend` only**: floor 1.639e−5, weakest targeting
+defect 2.086e0, `Rel(1.64e-4)`. A floor is half a row — the other half is deciding which defects the
+operator is *answerable for*, and that is per-kernel reasoning. Items 2–5 add theirs as they land;
+until then S2 compares those operators exactly, enforced from the other side by
+`tests/glimmer_tolerance.rs`, which fails on a row for an unanalysed operator.
+
+**`qk_scale_on_k` is excluded from `attend`'s defect set, and the exclusion decided the policy.** It
+moves `attend` by only 6.232e−4, just 38× the floor — under the 297× a `Rel` tolerance needs, so
+counting it would have forced `attend` to `ExactOnly`. It must not: `(s·q)·k` and `q·(s·k)` are the
+same product, so moving the scale across the dot is invisible to this kernel **by algebra**, and
+6.232e−4 is the rounding difference between two spellings of one number. The defect is real and is
+caught where it is *not* equivalent — the qk-norm runs between the scale and the product, so
+`qk_norm` and `proj` see it at 2.16e0. Pricing an operator against a defect it provably cannot
+distinguish would have made this kernel exact-only on a false premise.
+
+What remains are genuine attend wrongnesses, each shown as the weaker of the two draws:
+`kv_broadcast_blocked` **2.086e0**, `window_off_by_one` 2.187e0, `full_layers_slide` 2.282e0. The
+weakest is the row's `weakest_defect`, giving a margin of 127,000× — `Rel` is comfortably founded.
+
+Three defects change the capture set or a mask's shape (`window_off_by_one` and `full_layers_slide`
+resize masks, `rope_on_nope_layers` adds 56 captures), and `--by-operator` **skips and counts** those
+rather than refusing the pair. It refused at first, which silently dropped exactly the two rows
+`attend` needed — the sweep printed no `attend` line for them at all, which reads as "the window
+defect leaves attention alone".
+
 ## What this does NOT establish
 
-- **No tolerances.** K3's anchor measured per-operator fp32 rounding floors and derived thresholds;
-  this one has not, because there is no Glimmer kernel yet to need them. When S2 writes one, the
-  floors have to be measured the same way before any threshold is chosen — a tolerance picked to
-  make a kernel pass is not a tolerance.
+- **Tolerances for twelve of the thirteen buckets.** Their floors are measured and tabled above, but
+  a floor alone is not a threshold, and no row exists for them. Compare them exactly.
+- **No draft-mode floors.** Both `--dtype float64` runs were `--mode text`.
 - **No real weights.** Every number here comes from a deterministic draw at toy widths. The
   checkpoint's own arithmetic — bf16 accumulation, the real 6656/19968 shapes — is untouched.
 - **Nothing about the conversion path.** The safetensors reduction is gated separately by
