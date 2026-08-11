@@ -61,7 +61,7 @@ tests/smoke-matrix.sh                        # BOTH models x settings, 12 tokens
 # failure. `cargo test --test k3_anchor` then reads the vendored bytes with no device — but it
 # is a fixture-INTEGRITY gate, not a correctness gate: it compares no rivoli output to
 # anything, because at S1b there is no K3 kernel to score.
-tests/k3-anchor.sh                           # K3's first-party goldens + 11 defect runs (~15 min, GPU)
+tests/k3-anchor.sh                           # K3's goldens + 11 defects x 2 salts (~25 min, GPU)
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.

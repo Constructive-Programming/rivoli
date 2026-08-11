@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET and must be proven able to go red before it is trusted green. S0 IS DONE and G0 IS MET (2026-08-10; the corrections it produced are recorded inline in reference/k3-architecture.md, which is now first-party-verified for everything except the KDA inner arithmetic and the MXFP4 unpack — those live in fla-core and compressed-tensors, and S1b's mandatory anchor now COVERS both by running the first-party stack on gfx1151 over a tiny config that keeps the real 93-layer structure — ELEVEN defect runs, each GATED on the layers it must leave bit-identical, and the C reference's MLA LoRA-norm eps divergence priced at 2.2e-5 relative; measurement/k3-reference/anchor.md). Traffic is 25.83 GB/token of experts (first-party confirmed) plus 108.81 GB of trunk when not resident; predicted ~0.48-0.57 tok/s with the resident set held, from rivoli's measured 12.39-14.76 GB/s at the expert-read shape — an earlier 0.27 came from a dd QD1 figure, the same instrument-class error found in the reference's own 3.2. The memory budget is the binding constraint (~5.7 GB residual at --max-mem 115; the resident set does not fit on the auto path) and nothing converts until SafeWriter streams. Only the 69 KDA layers are a wholly new kernel family, plus AttnRes. S1-S3 run on fixtures; S4 converts and decodes real weights on /swarm; S5 needs ~200 GiB more NVMe.
+verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET and must be proven able to go red before it is trusted green. S0 IS DONE and G0 IS MET (2026-08-10; the corrections it produced are recorded inline in reference/k3-architecture.md, which is now first-party-verified for everything except the KDA inner arithmetic and the MXFP4 unpack — those live in fla-core and compressed-tensors, and S1b's mandatory anchor now COVERS both by running the first-party stack on gfx1151 over a tiny config that keeps the real 93-layer structure — ELEVEN defect runs, each GATED on the layers it must leave bit-identical, at TWO weight draws, and per-operator tolerances MEASURED: the C reference's MLA LoRA-norm eps divergence is priced at 2.2e-5 relative, which is only 1.3x that operator's own fp32 rounding floor, so MLA is exact-only and the eps must be pinned structurally rather than numerically; measurement/k3-reference/anchor.md). Traffic is 25.83 GB/token of experts (first-party confirmed) plus 108.81 GB of trunk when not resident; predicted ~0.48-0.57 tok/s with the resident set held, from rivoli's measured 12.39-14.76 GB/s at the expert-read shape — an earlier 0.27 came from a dd QD1 figure, the same instrument-class error found in the reference's own 3.2. The memory budget is the binding constraint (~5.7 GB residual at --max-mem 115; the resident set does not fit on the auto path) and nothing converts until SafeWriter streams. Only the 69 KDA layers are a wholly new kernel family, plus AttnRes. S1-S3 run on fixtures; S4 converts and decodes real weights on /swarm; S5 needs ~200 GiB more NVMe.
 ---
 
 # Kimi-K3 — implementation plan
@@ -54,12 +54,14 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
 - **S1b's ANCHOR exists and runs, 2026-08-11** — the first-party stack (`modeling_kimi_linear.py` at
   the pinned revision, fla-core 0.5.2, transformers 4.56.2) executed on gfx1151 over a tiny config
   that keeps the **real 93-layer structure**, with ELEVEN defect runs, each GATED on the layers it
-  must leave bit-identical rather than merely on having changed something. The decode golden is
-  vendored (286 KiB) and read with no GPU, no
-  python and no network. `docs/measurement/k3-reference/anchor.md`. **The MLA LoRA-norm eps
-  divergence is now PRICED: 2.2e-5 relative** — real, and far below what a tolerance-based fixture
-  would have caught. What remains of S1b is the operator fixtures' own tolerances and G1b's
-  remaining bookkeeping; S3's layer loop remains for the pin.
+  must leave bit-identical rather than merely on having changed something, at TWO independent weight
+  draws. Both decode goldens are vendored (286 KiB each) and read with no GPU, no
+  python and no network. `docs/measurement/k3-reference/anchor.md`.
+- **The per-operator TOLERANCES are measured and gated**, `tests/common/k3_tolerance.rs`. The MLA
+  LoRA-norm eps divergence is priced at 2.2e-5 relative, which is only **1.3x that operator's own
+  fp32 rounding floor** — so **no tolerance can separate it and the eps must be pinned
+  structurally**, by reading the constant. Every other operator has 90,000x to 7M x of room and is
+  set at 10x its floor. **S1b IS DONE**; S3's layer loop remains for the pin.
 
 ## G. The gate model
 
@@ -611,12 +613,27 @@ model is stored in — is answered above: none.)*
   > un-red-proved until review asked for it. Against §10's twelve traps this covers 6, 8, and trap 4
   > in part.
   >
-  > Still owed for G1b as a whole: the **per-operator tolerances**. The anchor gives exact bytes from
-  > one implementation, **in fp32 while the checkpoint is bf16**, on one GPU; what a HIP kernel is
-  > allowed to differ by is a separate decision and is not made yet. Also open, and disclosed rather
-  > than fixed: the golden is **one salt at one position**, so a bug degenerate at these particular
-  > values (a zero crossing in `beta`, a tie in the top-2) is invisible. A second golden at a
-  > different `--salt` is the cheap mitigation when S2 needs it.
+  > **The per-operator TOLERANCES are measured, 2026-08-11** — `tests/common/k3_tolerance.rs`, which
+  > S2's kernel tests and the anchor's own gate share. Each row's policy is *derived* from two
+  > measured numbers (the fp32 rounding floor, and the weakest defect targeting that operator) and
+  > `tests/k3_anchor.rs` fails if the numbers stop supporting it.
+  >
+  > **MLA came out exact-only, and it changes an S2/S3 action.** The C reference's LoRA-norm eps moves
+  > that operator by 2.22e-5 against its own fp32 rounding floor of 1.70e-5 — a margin of **1.3×**, so
+  > no threshold admits a correct kernel and rejects that eps. **The eps must be pinned structurally:
+  > read the constant and assert it.** `KimiMLAAttention` constructs both LoRA norms without passing
+  > `config.rms_norm_eps`, so 1e-6 is `KimiRMSNorm`'s own default and that is a fact about the source,
+  > not about any output. Downstream the same defect sits at 0.3–0.9× the floor — *below* the
+  > reference's own rounding error — so no tolerance-based fixture could have caught it anywhere,
+  > which is the retrospective case for this anchor being exact bytes. Every other operator has
+  > 90,000× to 7M× of room.
+  > **The one-draw limit is closed**: two salts are vendored, all eleven defects are scored against
+  > both, and salt 2 reproduces salt 1's green cells exactly — so the localisation is a property of
+  > the arithmetic, not of the numbers it landed on. Degeneracy is asserted per draw (no routed
+  > weight under 5% of the largest, `|beta| < 8`) rather than hoped for.
+  >
+  > Still open, and disclosed rather than fixed: the anchor is **fp32 while the checkpoint is bf16**.
+  > The tolerances above are fp32-vs-fp32 numbers; what bf16 accumulation costs is an S4 question.
 
 ## S2 — kernels. Each item gates before the next.
 

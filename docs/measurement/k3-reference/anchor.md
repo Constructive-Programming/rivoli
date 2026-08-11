@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: data
-verdict: The S1b anchor exists and runs — Kimi-K3's own first-party stack (modeling_kimi_linear.py at the pinned revision + fla-core 0.5.2 + transformers 4.56.2 + torch 2.13.0+rocm7.2) executed on gfx1151 at tiny widths but the REAL 93-layer structure, emitting 228 named activations; the decode golden is vendored at tests/k3-anchor-decode.bin (286 KiB, reproduced byte-for-byte on a later independent run) and read by tests/k3_anchor.rs with no GPU, no python and no network. Eleven defect runs, each GATED on the layers it must leave bit-identical rather than merely on having changed something: MlaLoraEps1e5 (the C reference's 1e-5 against first-party 1e-6) costs 2.2e-5 relative and reddens nothing before the first MLA layer; MlaScaleFromNope, KdaNoQkL2Norm, KdaGateLowerBoundOff, KdaStateLayout, KdaBetaSigmoidOutside, ExpertW1W3Swap, DenseMlpGateUpSwap, RouterBiasInWeight, LatentNormAfterUp and AttnResNormalisedValues each redden from their own first layer on. Four deviations are declared in the golden's metadata and pinned by the test: attention is eager (the reference's __init__ force-overwrites the field to flash_attention_2, so the driver overrides it after construction), the routed experts are plain nn.Linear (MXFP4 is anchored on real bytes by repack-one-expert.md instead), the text model runs without the vision wrapper, and the reference runs in fp32 while the checkpoint is bf16 — which is where S2's tolerance decision starts. KDA cannot run on CPU at all — fla's chunk_kda/fused_recurrent_kda are triton kernels and its pure-torch naive twin takes none of the seven kwargs the model passes — which is why the goldens are GENERATED on a GPU once and vendored rather than regenerated in a gate.
+verdict: The S1b anchor exists and runs, and its per-operator TOLERANCES are measured — Kimi-K3's own first-party stack (modeling_kimi_linear.py at the pinned revision + fla-core 0.5.2 + transformers 4.56.2 + torch 2.13.0+rocm7.2) executed on gfx1151 at tiny widths but the REAL 93-layer structure. TWO independent weight draws are vendored (tests/k3-anchor-decode-k3-anchor-{1,2}.bin, 292,781 B each, each reproduced byte-for-byte on a later run) and read by tests/k3_anchor.rs with no GPU, no python and no network; eleven defect runs are scored against both and each is GATED on the layers it must leave bit-identical. THE TOLERANCE FINDING: MLA is exact-only, because the C reference's LoRA-norm eps moves that operator by 2.22e-5 while its own fp32 rounding floor is 1.70e-5 — a margin of 1.3x, so no threshold admits a correct kernel and rejects that eps, and the eps must be pinned structurally instead. Downstream it sits at 0.3-0.9x the floor, i.e. BELOW the reference's own rounding error, so a tolerance-based fixture could not have seen it anywhere — which is why this anchor is exact bytes. Every other operator has 90,000x to 7M x of room and is set at 10x its floor: attn_res 1.6e-4, moe_latent 2.9e-4, moe_route 2.5e-4, kda_op 6.3e-4, dense_mlp 9.4e-6. Floors come from running the same reference in fp64 with all 276 fla modules held at fp32 (a plain model.double() dies in triton), except kda_op's, which is chunk_kda against fused_recurrent_kda over 69 layers because fla returns an fp32 recurrent state whatever the input dtype. Four deviations are declared in the metadata and pinned by the test: eager attention, unquantized experts, no vision wrapper, fp32 against the checkpoint's bf16.
 ---
 
 # The S1b anchor: goldens from Kimi-K3's own stack
@@ -257,14 +257,96 @@ it did not create it, and the fix was to factor the loops into one function. (CL
 opposite until 2026-08-11 and is corrected in place.)
 
 **What this does NOT reject.** `tests/k3_anchor.rs` is a fixture-*integrity* gate: it compares no
-rivoli output to the golden, because at S1b there is no K3 kernel to score. G1b's remaining owed
-item is the per-operator **tolerances** — the anchor gives exact bytes from one implementation, in
-fp32, on one GPU, and what a HIP kernel may differ by is undecided.
+rivoli output to a golden, because at S1b there is no K3 kernel to score.
 
-One residual limit, disclosed rather than fixed: the vendored golden is **one salt and one
-position**. A kernel bug degenerate at these particular values — a zero crossing in `beta`, a tie in
-the top-2 selection — is invisible to it. The cheap mitigation, when S2 needs it, is a second decode
-golden at a different `--salt`.
+## The per-operator tolerances
+
+**Measured 2026-08-11, not chosen.** The table lives in `tests/common/k3_tolerance.rs` so S2's kernel
+tests and the anchor's own gate share one copy, and each row's *policy* is derived from two measured
+numbers rather than written down. `tests/k3_anchor.rs` fails if a row's numbers stop supporting its
+policy — which is what stops a tolerance being widened the first time a kernel disagrees.
+
+**The floor: what a correct implementation cannot beat.** Run the identical reference at double
+precision and diff it against the fp32 run; the difference is the fp32 run's own rounding error, and
+an independent correct kernel in fp32 that associates its sums differently lands in the same
+neighbourhood.
+
+```bash
+tests/k3_anchor_driver.py --mode decode --defect None --dtype float64 --out fp64.bin ...
+tests/k3_anchor_driver.py --by-operator fp64.bin tests/k3-anchor-decode-k3-anchor-1.bin
+```
+
+`--dtype float64` is not a mode anyone ships; it exists to produce that number. It required work:
+**a plain `model.double()` dies inside triton** with `fp_downcast_rounding should be set only for
+truncating fp conversions`, and not only in the KDA op — `ShortConvolution` and `FusedRMSNormGated`
+are fla modules too, and all three refuse fp64. So the run holds **276 fla modules at fp32** while
+the rest of the model is double. What survives is a genuine fp64 reference for AttnRes, MLA, the
+latent sandwich, SiTU/MoE, the norms and the head: four of S2's five items.
+
+**KDA needs its own floor**, and would have even if fp64 had worked: the kernel returns an **fp32
+recurrent state whatever the input dtype**. So its floor is the disagreement between the two paths
+fla itself ships for the same recurrence — `chunk_kda` over eight positions at once against
+`fused_recurrent_kda` one position at a time, same weights, same tokens, worst of all **69** KDA
+layers:
+
+```bash
+tests/k3_anchor_driver.py --mode kda-equiv ...     # writes nothing; prints one number per layer
+```
+
+**The ceiling: the weakest defect the tolerance must still catch.** Per operator, the smallest signal
+among the defect runs that *target* it — another operator's defect leaking downstream is not what
+this operator's tolerance is for.
+
+| operator | fp32 floor | weakest own defect | margin | policy |
+|---|---|---|---|---|
+| `attn_res` | 1.57e−5 | 1.80e+0 `AttnResNormalisedValues` | 114,000× | `Rel(1.6e-4)` |
+| **`mla`** | **1.70e−5** | **2.22e−5 `MlaLoraEps1e5`** | **1.3×** | **exact only** |
+| `moe_latent` | 2.85e−5 | 2.05e+2 `LatentNormAfterUp` | 7.2M× | `Rel(2.9e-4)` |
+| `moe_route` | 2.47e−5 | 2.23e+0 `RouterBiasInWeight` | 90,000× | `Rel(2.5e-4)` |
+| `kda_op` | 6.30e−5 | 1.75e+0 `KdaBetaSigmoidOutside` | 27,700× | `Rel(6.3e-4)` |
+| `dense_mlp` | 9.37e−7 | 1.28e+0 `DenseMlpGateUpSwap` | 1.4M× | `Rel(9.4e-6)` |
+
+**MLA is the finding.** The C reference's LoRA-norm eps moves that operator by 2.22e−5 while the
+operator's own fp32 rounding floor is 1.70e−5 — a margin of **1.3×**. There is no threshold that
+admits a correct kernel and rejects that eps, so **the eps cannot be settled numerically at all.**
+Two consequences, both for S2/S3:
+
+* MLA's fixture is scored **bit-exactly**, and `Policy::ExactOnly` says so in code.
+* The eps has to be pinned **structurally** — read the constant and assert it — because no amount of
+  numerical care will detect it. `KimiMLAAttention` constructs both LoRA norms *without* passing
+  `config.rms_norm_eps`, so the right value is `KimiRMSNorm`'s own 1e-6 default, and that is a fact
+  about the source rather than about any output.
+
+It is also the retrospective justification for this anchor being exact bytes: **had S1b shipped
+tolerance-based fixtures, the divergence G0 item 11 found would have been invisible to its own
+gate.** Measured downstream, the same defect sits at 0.3–0.9× the floor on every other operator —
+i.e. *below* the reference's own rounding error — so nothing outside MLA could have seen it either.
+
+Every other operator has four to seven orders of magnitude of room, so the tolerances are set at
+10× the floor and the gate requires 30× of clearance under the defect. Three red-proofs on
+2026-08-11: marking `mla` as a `Rel` fails ("no Rel tolerance is defensible"), setting a tolerance
+within 30× of its defect fails, and setting one below its own floor fails.
+
+## Two salts, because one draw proves less than it looks like
+
+The residual limit was that the golden is **one weight draw at one position**: a kernel bug
+degenerate at those particular values — a routed weight near zero, a `beta` saturating the gate —
+hides completely, and one draw cannot show that a defect's localisation is a property of the
+arithmetic rather than of the numbers it landed on.
+
+So **two goldens are vendored** (`--salt k3-anchor-1` and `-2`, 292,781 B each — identical shapes,
+independent values), `tests/k3-anchor.sh` scores all eleven defects against both, and every test in
+`tests/k3_anchor.rs` loops over both. The salt-2 matrix reproduces salt-1's green cells exactly:
+`MlaLoraEps1e5` and `MlaScaleFromNope` leave layers 0 and 1 bit-identical, `ExpertW1W3Swap`,
+`RouterBiasInWeight` and `LatentNormAfterUp` leave layer 0 bit-identical. The localisation is a fact
+about the arithmetic.
+
+Degeneracy is now **asserted rather than hoped for**, on each draw: no routed weight below 5% of the
+largest (an expert weighted at ~0 makes its own arithmetic unscoreable), `|beta| < 8` (beyond that
+`sigmoid` is within 4e-4 of its limits and the delta-rule update is pinned), `A_log` inside
+`log(uniform(1,16))`, `dt_bias` inside its draw range, logits finite and not all equal. A test also
+asserts the two goldens' hashes differ — copying one file over the other would otherwise satisfy
+every other assertion in the file.
 
 ## Re-running it
 

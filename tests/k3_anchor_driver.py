@@ -608,9 +608,32 @@ def wrap_kda_ops(mod, cap, ctx, layers):
     def wrap(fn, tag):
         def inner(**kw):
             kw = dict(kw, **ctx["kda_kwargs"])
-            out = fn(**kw)
+            if ctx["kda_fp32_island"]:
+                # **fla's KDA kernel cannot be compiled for fp64 at all** — it raises
+                # `fp_downcast_rounding should be set only for truncating fp conversions` on an
+                # internal fp32->fp64 conversion (measured 2026-08-11). So `--dtype float64` runs
+                # the whole model in double EXCEPT this operator, which stays fp32 with its inputs
+                # cast down and its outputs cast back. That makes the fp64 run a rounding-floor
+                # reference for every operator but this one; KDA's own floor comes from
+                # `--mode kda-equiv` instead, and would have needed a separate measurement anyway
+                # because the kernel returns an fp32 state whatever the input dtype.
+                dt = next(v.dtype for v in kw.values() if hasattr(v, "dtype"))
+                kw = {
+                    k: (v.float() if hasattr(v, "dtype") and v.is_floating_point() else v)
+                    for k, v in kw.items()
+                }
+                out = fn(**kw)
+                out = tuple(o.to(dt) if o is not None else None for o in out)
+            else:
+                out = fn(**kw)
             if ctx.get("kda_transpose_out_state") and out[1] is not None:
                 out = (out[0], out[1].transpose(-1, -2).contiguous())
+            sink = ctx.get("equiv_sink")
+            if sink is not None:
+                which_all = ctx["kda_layer_ids"][ctx["kda_calls"]]
+                ctx["kda_calls"] += 1
+                sink.setdefault((tag, which_all), []).append(out[0].detach().float().cpu())
+                return out
             if ctx["capturing"]:
                 # The nth KDA call of the capture pass is the nth KDA layer in index order, which
                 # the model guarantees by iterating `self.layers` in order.
@@ -689,6 +712,181 @@ def read_golden(path):
     return dict(meta), sections[0], sections[1]
 
 
+# **Which operator each captured tensor belongs to.** Layer numbers alone cannot say: `self_attn`
+# is MLA on 24 layers and KDA on 69, so the classifier has to read the partition out of the
+# golden's own `tiny_config`. Used only by `--by-operator`, which is how the per-operator
+# tolerances in `anchor.md` are derived — a tolerance is a property of an OPERATOR, and a per-layer
+# report cannot state one.
+def operator_of(name, kda_layers):
+    if name.startswith("model.layers."):
+        parts = name.split(".")
+        layer, rest = int(parts[2]), ".".join(parts[3:])
+        kda = layer in kda_layers
+        if rest.startswith("kda."):
+            return "kda_op"
+        if rest.startswith("self_attn"):
+            return "kda_trunk" if kda else "mla"
+        if rest.startswith(("self_attention_res", "mlp_res")):
+            return "attn_res"
+        if rest.startswith("block_sparse_moe.routed_expert"):
+            return "moe_latent"
+        if rest.startswith("block_sparse_moe"):
+            return "moe_route"
+        if rest.startswith("mlp"):
+            return "dense_mlp"
+        if "layernorm" in rest:
+            return "norm"
+        return "residual"
+    if name.startswith("model.output_attn_res"):
+        return "attn_res"
+    if name == "model.norm":
+        return "norm"
+    return "head"
+
+
+def _score(items_a, items_b, key_of):
+    """Group two tensor sections by `key_of(name)` and score each group.
+
+    One scorer for both reports: `compare` groups by layer to ask about localisation,
+    `by_operator` groups by operator to ask about tolerance, and the arithmetic is identical.
+    """
+    per = {}
+    for name, (shape, y, raw_b) in items_b.items():
+        key = key_of(name)
+        n, diff, rel = per.get(key, (0, 0, 0.0))
+        shape_a, x, raw_a = items_a[name]
+        assert shape_a == shape, f"{name}: shape {shape_a} vs {shape}"
+        scale = max((abs(v) for v in y if math.isfinite(v)), default=0.0) or 1e-30
+        # Non-finite pairs are skipped rather than folded: python's `max` silently discards a NaN
+        # unless it comes first, which would read as agreement.
+        d = max(
+            (abs(p - q) for p, q in zip(x, y) if math.isfinite(p) and math.isfinite(q)),
+            default=0.0,
+        )
+        per[key] = (n + 1, diff + int(raw_a != raw_b), max(rel, d / scale))
+    return per
+
+
+def _both_sections(a_path, b_path):
+    """Load two goldens and refuse a tensor-set mismatch, which is a harness bug either way."""
+    ma, fa, ia = read_golden(a_path)
+    mb, fb, ib = read_golden(b_path)
+    if set(fa) != set(fb) or set(ia) != set(ib):
+        only = (set(fa) ^ set(fb)) | (set(ia) ^ set(ib))
+        raise SystemExit(
+            f"{a_path} and {b_path} capture different tensors ({len(only)} on one side only, "
+            f"e.g. {sorted(only)[:3]}) -- the harness is wrong, not the reference",
+        )
+    return (ma, mb), ((fa, fb), (ia, ib))
+
+
+def by_operator(a_path, b_path):
+    """Per-OPERATOR agreement between two goldens -- the shape a tolerance has to be stated in.
+
+    Two uses, and the tolerance table needs both: `fp32 vs fp64` gives the floor an independent
+    correct implementation cannot beat, and `None vs <defect>` gives the signal a tolerance has to
+    stay under. `anchor.md`'s table is these two numbers per operator.
+    """
+    (ma, mb), sections = _both_sections(a_path, b_path)
+    kda = _kda_zero_based(json.loads(ma["tiny_config"]))
+    per = {}
+    for items_a, items_b in sections:
+        for k, v in _score(items_a, items_b, lambda n: operator_of(n, kda)).items():
+            n, diff, rel = per.get(k, (0, 0, 0.0))
+            per[k] = (n + v[0], diff + v[1], max(rel, v[2]))
+    print(f"# {mb.get('defect')}/{mb.get('dtype')} vs {ma.get('defect')}/{ma.get('dtype')}")
+    print("operator\ttensors\tdiffering\tmax_rel")
+    for k in sorted(per):
+        n, diff, rel = per[k]
+        print(f"{k}\t{n}\t{diff}\t{rel:.3e}")
+
+
+# Every fla module in the KDA path, by class name so this file need not import fla. All three are
+# triton-backed and all three refuse fp64 — `ShortConvolution` and `FusedRMSNormGated` as much as
+# the KDA ops themselves — which is why `--dtype float64` cannot simply be "the model in double".
+FLA_MODULES = ("ShortConvolution", "FusedRMSNormGated")
+
+
+def fp32_island(model):
+    """Make every fla module compute in fp32 while the rest of the model runs in fp64.
+
+    Measured 2026-08-11: a plain `model.double()` dies in triton with
+    `fp_downcast_rounding should be set only for truncating fp conversions`, from inside
+    `ShortConvolution` — so the island has to cover each fla boundary, not just the KDA op. What
+    survives is a genuine fp64 reference for **AttnRes, MLA, the latent sandwich, SiTU/MoE, the
+    norms and the head**: four of S2's five items. KDA's floor is `--mode kda-equiv`.
+    """
+    n = 0
+    for m in model.modules():
+        if type(m).__name__ not in FLA_MODULES:
+            continue
+        orig = m.forward
+
+        def shim(*a, _orig=orig, **kw):
+            down = lambda x: (  # noqa: E731
+                x.float() if hasattr(x, "dtype") and x.is_floating_point() else x
+            )
+            out = _orig(*[down(x) for x in a], **{k: down(v) for k, v in kw.items()})
+            if isinstance(out, tuple):
+                return tuple(o.double() if hasattr(o, "dtype") and o.is_floating_point() else o for o in out)
+            return out.double() if hasattr(out, "dtype") else out
+
+        m.forward = shim
+        n += 1
+    return n
+
+
+def kda_equiv(model, mdl_mod, ctx, seq, device, vocab):
+    """**KDA's tolerance floor, measured against fla's own second implementation of it.**
+
+    fp64 cannot serve here (see `wrap_kda_ops`), so the floor comes from the two paths fla ships
+    for the same recurrence: `chunk_kda` over T positions at once, and `fused_recurrent_kda` one
+    position at a time. They are the same mathematics by the same authors, so their disagreement is
+    exactly what "a correct implementation in fp32, associating differently" costs — which is the
+    number a HIP kernel's tolerance has to sit above.
+
+    Reported over EVERY KDA layer, not just the captured six: a tolerance is a bound, and a bound
+    wants the worst case.
+    """
+    chunk, steps = {}, {}
+    with torch.no_grad():
+        ctx["equiv_sink"], ctx["kda_calls"] = chunk, 0
+        ids = torch.arange(1, seq + 1, device=device).unsqueeze(0) % vocab
+        model(input_ids=ids, use_cache=True)
+        ctx["equiv_sink"], ctx["kda_calls"] = steps, 0
+        past = None
+        for i in range(seq):
+            one = torch.tensor([[(i + 1) % vocab]], device=device)
+            out = model(input_ids=one, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            ctx["kda_calls"] = 0
+    ctx["equiv_sink"] = None
+
+    worst, rows = 0.0, []
+    for (tag, layer), got in sorted(chunk.items(), key=lambda kv: kv[0][1]):
+        assert tag == "chunk_kda", f"prefill went through {tag}"
+        c = got[0]                                    # [1, T, H, D]
+        r = steps.get(("fused_recurrent_kda", layer))
+        assert r is not None and len(r) == seq, f"layer {layer}: {r and len(r)} steps for {seq}"
+        rel = 0.0
+        for i, step in enumerate(r):
+            a, b = c[:, i].reshape(-1), step.reshape(-1)
+            scale = max(abs(float(v)) for v in b) or 1e-30
+            rel = max(rel, max(abs(float(x) - float(y)) for x, y in zip(a, b)) / scale)
+        rows.append((layer, rel))
+        worst = max(worst, rel)
+    print("# chunk_kda vs fused_recurrent_kda, same weights, same tokens")
+    print(f"kda layers\t{len(rows)}\nworst max_rel\t{worst:.3e}")
+    print("layer\tmax_rel")
+    for layer, rel in rows[:6]:
+        print(f"{layer}\t{rel:.3e}")
+
+
+def _kda_zero_based(cfg):
+    """`kda_layers` is 1-based on disk (`is_kda_layer` tests `layer_idx + 1`)."""
+    return {i - 1 for i in cfg["linear_attn_config"]["kda_layers"]}
+
+
 def compare(a_path, b_path):
     """Score one defect run against the `None` golden, per captured layer, and GATE it.
 
@@ -705,29 +903,13 @@ def compare(a_path, b_path):
     individually, four of five defects reported `inf` for most layers because a moved routing
     fires a different set of expert modules.
     """
-    ma, fa, ia = read_golden(a_path)
-    mb, fb, ib = read_golden(b_path)
-    if set(fa) != set(fb) or set(ia) != set(ib):
-        only = (set(fa) ^ set(fb)) | (set(ia) ^ set(ib))
-        raise SystemExit(
-            f"{a_path} and {b_path} capture different tensors ({len(only)} on one side only, "
-            f"e.g. {sorted(only)[:3]}) -- the harness is wrong, not the reference",
-        )
+    (ma, mb), sections = _both_sections(a_path, b_path)
     per = {}
-    for items_a, items_b in ((fa, fb), (ia, ib)):
-        for name, (shape, y, raw_b) in items_b.items():
-            layer = name.split(".")[2] if name.startswith("model.layers.") else "model"
-            n, diff, rel = per.get(layer, (0, 0, 0.0))
-            shape_a, x, raw_a = items_a[name]
-            assert shape_a == shape, f"{name}: shape {shape_a} vs {shape}"
-            scale = max((abs(v) for v in y if math.isfinite(v)), default=0.0) or 1e-30
-            # Non-finite pairs are skipped rather than folded: python's `max` silently discards a
-            # NaN unless it comes first, which would read as agreement.
-            d = max(
-                (abs(p - q) for p, q in zip(x, y) if math.isfinite(p) and math.isfinite(q)),
-                default=0.0,
-            )
-            per[layer] = (n + 1, diff + int(raw_a != raw_b), max(rel, d / scale))
+    layer_of = lambda n: n.split(".")[2] if n.startswith("model.layers.") else "model"  # noqa: E731
+    for items_a, items_b in sections:
+        for k, v in _score(items_a, items_b, layer_of).items():
+            n, diff, rel = per.get(k, (0, 0, 0.0))
+            per[k] = (n + v[0], diff + v[1], max(rel, v[2]))
     defect = mb.get("defect")
     print(f"# {defect} vs {ma.get('defect')}  mode={ma.get('mode')}")
     print("layer\ttensors\tdiffering\tmax_rel")
@@ -805,7 +987,7 @@ def main():
     ap.add_argument("--config", help="the vendored real config.json")
     ap.add_argument("--out")
     ap.add_argument("--defect", default="None", choices=sorted(DEFECTS))
-    ap.add_argument("--mode", default="decode", choices=("prefill", "decode"))
+    ap.add_argument("--mode", default="decode", choices=("prefill", "decode", "kda-equiv"))
     ap.add_argument("--seq", type=int, default=8, help="prefill length")
     # Kept although every recorded run is `cuda`: `--device cpu` gets a build error out of the
     # config, the weight init and the hooks in seconds, without taking the GPU lock, and that is
@@ -813,10 +995,23 @@ def main():
     # in triton -- which is the point.
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--salt", default="k3-anchor-1", help="weight-init salt; part of the record")
+    # fp64 is not a mode anyone ships; it is how the TOLERANCE floor is measured. Running the same
+    # reference at double precision and diffing gives the fp32 run's own rounding error, which is
+    # the bound an independent correct kernel cannot beat. See `anchor.md`'s tolerance table.
+    ap.add_argument("--dtype", default="float32", choices=("float32", "float64"))
+    ap.add_argument(
+        "--by-operator",
+        nargs=2,
+        metavar=("BASE", "OTHER"),
+        help="score two goldens per OPERATOR instead of per layer, and exit; no GPU, no torch",
+    )
     args = ap.parse_args()
 
     if args.compare:
         compare(*args.compare)
+        return
+    if args.by_operator:
+        by_operator(*args.by_operator)
         return
     for req in ("ref", "config", "out"):
         if getattr(args, req) is None:
@@ -837,12 +1032,20 @@ def main():
     model.eval()
     init_weights(model, args.salt)
     model.to(args.device)
+    if args.dtype == "float64":
+        # AFTER `init_weights`, so the drawn values are identical to the fp32 run's to the bit and
+        # the only difference measured is arithmetic. Every fla module stays fp32 (see
+        # `fp32_island`): all three are triton-backed and none compiles for fp64, and the KDA
+        # kernel returns an fp32 recurrent state whatever the input dtype anyway.
+        model.double()
+        print(f"k3-anchor: fp64 with {fp32_island(model)} fla modules held at fp32")
 
     ctx = {
         "kda_layer_ids": [i for i in range(cfg.num_hidden_layers) if cfg.is_kda_layer(i)],
         "kda_kwargs": {},
         "kda_calls": 0,
         "capturing": False,
+        "kda_fp32_island": args.dtype == "float64",
     }
     DEFECTS[args.defect](model, ctx)
 
@@ -852,6 +1055,12 @@ def main():
     wrap_kda_ops(mdl_mod, cap, ctx, CAPTURE_LAYERS)
     wrap_attn_res(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
     ids = torch.arange(1, args.seq + 1, device=args.device).unsqueeze(0) % cfg.vocab_size
+
+    if args.mode == "kda-equiv":
+        # A measurement, not a golden: it writes nothing, because what it produces is one number
+        # per KDA layer rather than a fixture anything scores against.
+        kda_equiv(model, mdl_mod, ctx, args.seq, args.device, cfg.vocab_size)
+        return
 
     with torch.no_grad():
         if args.mode == "prefill":

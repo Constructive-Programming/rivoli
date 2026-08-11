@@ -19,8 +19,8 @@
 # the same argument. `${VAR:?}` below makes a missing one fail loudly, which is stronger than a
 # flag's default would be.
 #
-# Writes `target/k3-anchor/gold-<mode>-<defect>.bin` and the reddening matrix to stdout, and
-# compares the fresh `None` decode golden against the vendored bytes.
+# Writes `target/k3-anchor/gold-<mode>-<salt>-<defect>.bin` and the reddening matrix to stdout, and
+# `cmp`s each fresh `None` decode golden against its vendored twin.
 set -euo pipefail
 
 VENV=${K3_ANCHOR_VENV:?set K3_ANCHOR_VENV to the venv holding torch+fla+transformers}
@@ -28,7 +28,6 @@ REF=${K3_ANCHOR_REF:?set K3_ANCHOR_REF to the dir holding the pinned reference .
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$ROOT/target/k3-anchor
 CONFIG=$ROOT/docs/measurement/k3-reference/config.json
-VENDORED=$ROOT/tests/k3-anchor-decode.bin
 PY=$VENV/bin/python
 DRIVER=$ROOT/tests/k3_anchor_driver.py
 # The repo's spelling, shared with `mode-matrix.sh`, `smoke-matrix.sh` and
@@ -46,9 +45,15 @@ DEFECTS=(
     AttnResNormalisedValues
 )
 MODES=(${K3_ANCHOR_MODES:-decode prefill})
+# TWO independent weight draws, and both are vendored. One draw cannot show that a defect's
+# localisation is a property of the arithmetic rather than of the particular numbers it landed on,
+# and a kernel bug that is degenerate at one draw's values — a vanishing top-k weight, a `beta` that
+# saturates the gate — hides completely. Every defect below is scored against both.
+SALTS=(${K3_ANCHOR_SALTS:-k3-anchor-1 k3-anchor-2})
 
 mkdir -p "$OUT"
 
+for salt in "${SALTS[@]}"; do
 for mode in "${MODES[@]}"; do
     for d in "${DEFECTS[@]}"; do
         # One flock per invocation, not one around the loop: an arm that holds the device across
@@ -56,27 +61,33 @@ for mode in "${MODES[@]}"; do
         # independent. `-E 66` so "never acquired the lock" is distinguishable from "the driver
         # failed" — `flock -w` exits 1 on timeout, which is also what python exits on a traceback.
         flock -w 900 -E 66 "$LOCK" "$PY" "$DRIVER" \
-            --ref "$REF" --config "$CONFIG" --mode "$mode" --defect "$d" \
-            --out "$OUT/gold-$mode-$d.bin" >/dev/null
+            --ref "$REF" --config "$CONFIG" --mode "$mode" --defect "$d" --salt "$salt" \
+            --out "$OUT/gold-$mode-$salt-$d.bin" >/dev/null
     done
-    echo "=== $mode ==="
+    echo "=== $mode $salt ==="
     # ONE `--compare` per defect, printing the matrix that was gated. It exits non-zero if the
     # defect changed nothing, if it reddened a layer upstream of itself, or if the two runs
     # captured different tensors — see the driver's `compare`. Two invocations (one to print, one
     # to gate) would be two independent scorings whose agreement is assumed.
     for d in "${DEFECTS[@]:1}"; do
-        "$PY" "$DRIVER" --compare "$OUT/gold-$mode-None.bin" "$OUT/gold-$mode-$d.bin"
+        "$PY" "$DRIVER" --compare "$OUT/gold-$mode-$salt-None.bin" "$OUT/gold-$mode-$salt-$d.bin"
     done
+done
 done
 
 # The vendored bytes are the whole point of generating these on a GPU once, so a regeneration
 # that no longer reproduces them is the thing most worth knowing. `cmp` rather than a human
 # diffing the paths the header used to print.
-if [[ -f $OUT/gold-decode-None.bin ]]; then
-    if cmp -s "$OUT/gold-decode-None.bin" "$VENDORED"; then
-        echo "vendored decode golden reproduced byte-for-byte"
+rc=0
+for salt in "${SALTS[@]}"; do
+    fresh=$OUT/gold-decode-$salt-None.bin
+    vendored=$ROOT/tests/k3-anchor-decode-$salt.bin
+    [[ -f $fresh && -f $vendored ]] || continue
+    if cmp -s "$fresh" "$vendored"; then
+        echo "vendored $salt decode golden reproduced byte-for-byte"
     else
-        echo "DIFFERS from $VENDORED — re-vendor deliberately, or find out why it moved" >&2
-        exit 1
+        echo "DIFFERS from $vendored — re-vendor deliberately, or find out why it moved" >&2
+        rc=1
     fi
-fi
+done
+exit $rc
