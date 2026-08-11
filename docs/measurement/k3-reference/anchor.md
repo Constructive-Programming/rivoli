@@ -139,15 +139,16 @@ is `K3_ANCHOR_MODES=prefill tests/k3-anchor.sh`.
 Six layers, chosen for what each one *is* — `0` (KDA, the only dense `mlp`, an attn-res block
 start), `1` (first MoE layer), `3` (first MLA layer, 1-based 4), `12` (an attn-res block start that
 is not layer 0), `91` and `92` (the two **adjacent** MLA layers the real map ends with) — plus the
-model-level tail. Every submodule output of those layers, **223 float and 5 int tensors** in the
-decode golden (220 + 5 in prefill, which has no incoming recurrent state), plus two operator
-boundaries no forward hook can see:
+model-level tail. Every submodule output of those layers, **235 float and 5 int tensors** in the
+decode golden (232 + 5 in prefill, which has no incoming recurrent state), plus two operator boundaries no forward hook can see:
 
 * **KDA** — `q`/`k`/`v` after the short convolutions, the log-space gate, `beta`, `A_log`,
   `dt_bias`, the incoming recurrent state, and both outputs. Everything between those two points
   lives in fla's triton kernel and in no document. This IS the S2 KDA fixture.
-* **AttnRes** — `prefix_sum`, the accumulated `block_residual` stack and the fold's output, for
-  both per-layer folds and the model-level one.
+* **AttnRes** — `prefix_sum`, the accumulated `block_residual` stack, **the fold** and the fold's
+  output, for both per-layer folds and the model-level one. Twelve folds: two per captured layer
+  plus the model-level one, minus layer 0's `self_attention_res`, which §3's layer loop guards on a
+  non-empty block stack.
 
 > **AttnRes was missing entirely until review 2026-08-11**, and it is S2's *first* kernel.
 > `_apply_attn_res` reads `proj.weight.squeeze(0)`, `norm.weight` and `norm.variance_epsilon`
@@ -159,6 +160,27 @@ boundaries no forward hook can see:
 > registered hook fired at least once** — which is the check that would have caught it. That
 > assertion earned itself on its first run, by catching five more dead hooks on the `experts`
 > `ModuleList`.
+>
+> **CORRECTED 2026-08-11, same day, by S2 item 1 trying to use it.** The fix above captured
+> `in.prefix_sum`, `in.block_residual` and `out` — and **not the scoring vector**, which left the
+> fixture unusable for the exact purpose it had just been created for. AttnRes is the one operator
+> here whose inputs do not determine its output: `out` is
+> `softmax(<RMSNorm(v), norm.weight * proj.weight>) @ v`, and neither weight was in the file, so
+> there was no way to get from the captured inputs to the captured output. The kernel could not be
+> scored against it. `wrap_attn_res` now also captures `{tag}.fold`, taking the golden from 223 to
+> **235** float tensors and forcing a re-vendor.
+>
+> The **product**, not the two factors. `fold[i] = norm[i] * proj[i]` is a load-time collapse the
+> port does in its loader, so the kernel never sees the factors; a fixture carrying them would be
+> scoring an elementwise multiply no kernel performs. The eps is deliberately NOT captured — it is
+> `config.rms_norm_eps`, which `the_tiny_configs_kept_the_real_structure` already pins against the
+> real checkpoint, and `tests/k3_attn_res.rs` reads it from the golden's own `tiny_config` rather
+> than from a literal.
+>
+> The generalisable form: **a fixture is only usable if its captures span the operator's whole
+> boundary**, and "inputs and outputs" is not that boundary whenever a weight sits between them.
+> Three reviewers found the missing hook; none noticed the fixture it produced could not be used,
+> because nothing had tried to use one yet.
 
 Two things are deliberately not captured. The **individual routed experts** are excluded — not for
 size but because `moe_infer` only calls experts that won tokens, so which expert modules fire is
@@ -197,19 +219,32 @@ key, and sorting the whole key set by `int` raises on it.
 Decode, `--seq 8`, one step. `differing` is out of the layer's captured tensor count; `max_rel` is
 the **row maximum** of `max|a−b|` over the tensor's own scale:
 
+> **Denominators re-derived 2026-08-11** when S2 item 1 added the twelve `.fold` captures: 38→39,
+> 47→49, 30→32, 6→7, summing to the +12. **Every numerator is unchanged**, and that is the useful
+> half — the folds are weights no defect perturbs, so they land green everywhere and no defect's
+> localisation moved. Confirmed structurally as well: the regenerated goldens are bit-identical to
+> the old ones on all 223 pre-existing captures and on every metadata field, so the driver change
+> is provably additive rather than merely believed to be.
+>
+> **Scope of that re-derivation: salt-1 decode only.** The salt-2 and both prefill matrices were
+> not re-run — the regeneration lost the GPU flock at 19 of 48 runs (`-E 66`, 900 s) to another
+> tenant. Their numerators are unaffected by the same argument, but their denominators as printed
+> by a fresh `--compare` will be the grown ones, not the numbers a reader would derive from this
+> table. Re-run `tests/k3-anchor.sh` when the device is free and this note goes away.
+
 | defect | 0 | 1 | 3 | 12 | 91 | 92 | model | max_rel |
 |---|---|---|---|---|---|---|---|---|
-| `MlaLoraEps1e5` | **0/38** | **0/47** | 20/30 | 43/47 | 29/30 | 29/30 | 6/6 | 2.2e−5 |
-| `MlaScaleFromNope` | **0/38** | **0/47** | 16/30 | 43/47 | 30/30 | 29/30 | 6/6 | 1.3e+0 |
-| `ExpertW1W3Swap` | **0/38** | 4/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 3.0e+0 |
-| `RouterBiasInWeight` | **0/38** | 5/47 | 26/30 | 44/47 | 30/30 | 30/30 | 6/6 | 2.4e+0 |
-| `LatentNormAfterUp` | **0/38** | 4/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 2.0e+2 |
-| `DenseMlpGateUpSwap` | 6/38 | 42/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 2.3e+0 |
-| `AttnResNormalisedValues` | 8/38 | 42/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 1.8e+0 |
-| `KdaNoQkL2Norm` | 15/38 | 42/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 4.2e+1 |
-| `KdaGateLowerBoundOff` | 15/38 | 42/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 3.3e+0 |
-| `KdaStateLayout` | 15/38 | 42/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 3.3e+0 |
-| `KdaBetaSigmoidOutside` | 15/38 | 42/47 | 27/30 | 44/47 | 30/30 | 30/30 | 6/6 | 7.0e+0 |
+| `MlaLoraEps1e5` | **0/39** | **0/49** | 20/32 | 43/49 | 29/32 | 29/32 | 6/7 | 2.2e−5 |
+| `MlaScaleFromNope` | **0/39** | **0/49** | 16/32 | 43/49 | 30/32 | 29/32 | 6/7 | 1.3e+0 |
+| `ExpertW1W3Swap` | **0/39** | 4/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 3.0e+0 |
+| `RouterBiasInWeight` | **0/39** | 5/49 | 26/32 | 44/49 | 30/32 | 30/32 | 6/7 | 2.4e+0 |
+| `LatentNormAfterUp` | **0/39** | 4/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 2.0e+2 |
+| `DenseMlpGateUpSwap` | 6/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 2.3e+0 |
+| `AttnResNormalisedValues` | 8/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 1.8e+0 |
+| `KdaNoQkL2Norm` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 4.2e+1 |
+| `KdaGateLowerBoundOff` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 3.3e+0 |
+| `KdaStateLayout` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 3.3e+0 |
+| `KdaBetaSigmoidOutside` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 7.0e+0 |
 
 Every bold cell is asserted. Read the rows:
 
@@ -402,6 +437,39 @@ say *where* a defect landed. So **S2 must not score those four against a thresho
 exactly, or measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
 `k3_anchor.rs` now asserts the table holds exactly the measured six in both directions, so a row for
 an unmeasured operator is a visible edit rather than a number that arrived from nowhere.
+
+## The width blind spot every fixture built on this inherits
+
+**Every capture here is at the tiny model's widths, and for a kernel that is not merely a smaller
+version of the real thing — it can be a structurally different code path.** Found 2026-08-11 while
+gating S2 item 1, and credited to the Muse Glimmer port, which hit the identical shape in its own
+attend fixture (all captures at `head_dim` 8 against a real 128, so a per-lane accumulator only ever
+exercised its first register).
+
+For `attn_res` the numbers are stark. `hidden` is **192** here and **7168** in the real model, and
+the kernel launches 256 threads — so in every golden-backed case the strided loop
+`for (i = t; i < n; i += blockDim.x)` runs **at most one iteration**, and 64 of the 256 threads run
+none. At the real width each thread runs 28. Separately, every AttnRes capture is one token, so
+`blockIdx.x`'s strides into `src` and `out` are multiplied by zero throughout — while layer-major
+prefill, the default, passes the whole prompt at once.
+
+Both gaps were then demonstrated rather than argued. `tests/k3_attn_res.rs` carries a synthetic
+sweep — `n` in {192, 257, 1000, 7168} × `nsrc` in {2, 9} × `tokens` in {1, 3}, scored against the
+same f64 host oracle the golden tests validate — and two deliberate kernel breaks were caught by
+**that sweep alone**, with all twelve folds across both draws staying green:
+
+| break | golden suite | width sweep |
+|---|---|---|
+| `out` ignores `blockIdx` — every token writes block 0 | green | **red** |
+| score reduction truncated after one pass — `n > 256` silently dropped | green | **red** |
+
+**This is a property of anchoring on a tiny model, not a defect in this anchor**, and shrinking
+widths remains the right trade: depth and structure are where the traps live, and width is what
+costs. But it means **a golden-backed fixture is necessary and not sufficient for any kernel whose
+loop structure depends on a width**, which is most of them. Every remaining S2 item — MLA over 192
+head dims, the latent sandwich at 3584, the MoE at 7168, KDA's 96 heads × 128 — owes the same
+synthetic sweep beside its golden fixture. Score it against a host oracle the goldens have already
+validated, so the sweep inherits the reference's evidence instead of asserting a fresh claim.
 
 ## Two salts, because one draw proves less than it looks like
 

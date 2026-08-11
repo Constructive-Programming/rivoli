@@ -641,9 +641,25 @@ model is stored in — is answered above: none.)*
 **Order: AttnRes → MLA → latent sandwich → SiTU/MoE → KDA.** Specs and the twelve traps are in
 `k3-architecture.md`; **each trap is a G2 defect-run candidate.**
 
-1. **AttnRes** — a ≤9-source softmax mixture, twice per layer plus once model-level.
-   Arithmetically trivial; the work is the `[T][9][7168]` stack and its **prefill** sizing
-   (§4d). First, because it is structural. Note the tensors ship **BF16** and are named
+1. **AttnRes** — **DONE 2026-08-11, G2 met for this item.** `kernels/linalg.hip::attn_res` plus
+   `launch_attn_res`, scored by `tests/k3_attn_res.rs` against all twelve folds of both draws:
+   worst **3.08e-7**, against a 1.571e-5 floor and a 1.6e-4 tolerance, several folds bit-exact.
+   The defect run is the second test — mixing the NORMALISED sources fails the fixture — and the
+   kernel is red-proved four ways (uniform weights, no fold in the score, source 0 only, eps
+   outside the mean).
+
+   Two things it cost, both recorded in `measurement/k3-reference/anchor.md`: the anchor had
+   **no fold weights**, so the operator's inputs did not determine its output and no fixture was
+   writeable until `wrap_attn_res` captured `norm.weight * proj.weight` (223 → 235 tensors, both
+   goldens re-vendored). And the fixture is ~50x TIGHTER than the operator tolerance, because it
+   feeds the kernel the reference's own inputs while the floor was measured on whole-model runs
+   carrying upstream drift — so it also carries a regression tripwire at 10x the observed worst,
+   marked as not being the contract.
+
+   **Still open, and deliberately not done here:** the `[T][9][7168]` stack and its **prefill**
+   sizing (§4d), and the layer loop's push/reset bookkeeping. The kernel takes an assembled stack;
+   `every_fold_mixes_the_depth_the_layer_loop_implies` pins the depth each fold should see, but
+   nothing yet builds it. That is S3's. Note the tensors ship **BF16** and are named
    `self_attention_res_*`, not `attn_res_*`.
 2. **Gated MLA** — RoPE removed but the 64 rope dims **still cached and still scored**, softmax
    scale over **192**, output gate **before `o_proj` with no norm**.

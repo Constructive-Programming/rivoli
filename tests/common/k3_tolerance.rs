@@ -34,6 +34,11 @@
 //! Included by `#[path]` (this repo's pattern, cf. `common/f4_artifact_dir.rs`) so S2's kernel tests
 //! and `k3_anchor.rs` share one table.
 
+// Included by `#[path]` into more than one test binary, each using a subset. Without this, every
+// binary warns about what it does not happen to reference — noise that says nothing about whether
+// the module is dead, since deadness here is a per-binary accident.
+#![allow(dead_code)]
+
 /// How a kernel's output may be compared against the golden for one operator.
 pub enum Policy {
     /// Relative difference, `max|a-b| / max|b|`, must not exceed this.

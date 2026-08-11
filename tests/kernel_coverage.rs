@@ -319,6 +319,11 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("act_quant_f8_prefix", &["attn.rs", "kvcompress.rs"]),
     ("act_quant_f4_rotated", &["kvcompress.rs"]),
     ("append_kv", &["gpu.rs"]),
+    // Kimi-K3's Block Attention Residual fold, S2 item 1. **Empty on purpose**: the kernel and its
+    // fixture (`tests/k3_attn_res.rs`) landed before there is a K3 engine path to call it from —
+    // `k3gpu.rs` is S3. This is the "staged work, not dead code" state the doc above names, and it
+    // becomes `&["k3gpu.rs"]` the moment the layer loop exists.
+    ("attn_res", &[]),
     ("argmax", &["gpu.rs", "f4gpu.rs"]),
     ("attend", &["gpu.rs"]),
     ("embed_bf16_row_bcast", &["f4gpu.rs"]),

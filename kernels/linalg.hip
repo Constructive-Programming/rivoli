@@ -361,6 +361,97 @@ extern "C" __global__ void rmsnorm_single(
     for (int i = t; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
 }
 
+// **Block Attention Residuals** — Kimi-K3's multi-residual-stream mixture, `k3-architecture.md`
+// §3. `out = softmax(score) @ src`, where `score_s = <RMSNorm(src_s), fold>`.
+//
+// USED BY: Kimi-K3 only, twice per layer plus once model-level. GLM-5.2 and DeepSeek-V4-Flash
+// have a plain residual and never reach this.
+//
+// **The softmax mixes the UNNORMALISED sources.** Normalisation exists only to score, and
+// `--defect AttnResNormalisedValues` is the run that prices mixing `k` instead of `v` — it moves
+// this operator by 1.80e0 against a 1.571e-5 fp32 floor, so the two readings are not close.
+// `fold[i] = norm.weight[i] * proj.weight[i]`, collapsed at load time because the reference
+// applies them consecutively and nothing between them depends on either alone.
+//
+// One block per token, `blockIdx.x` indexing `src`'s outer axis. Decode passes T=1; layer-major
+// prefill keeps the whole prompt live (`architecture.md` §14) and passes all of it at once, which
+// is the sizing §3 flags as a port decision rather than an inherited one.
+//
+// **`ss` and the dot product are reduced in ONE pass, and the scale applied once at the end.**
+// The reference spells it `acc += (v[i] * inv) * fold[i]`, scaling every element before
+// accumulating; `inv` is a scalar, so `inv * Σ(v·fold)` is the same number with one multiply
+// instead of `n` — and strictly the more accurate of the two in fp32, since it rounds once rather
+// than per element. It is NOT bitwise identical to the reference, which accumulates this loop in
+// double regardless; that difference is what the operator's tolerance is for.
+#define ATTN_RES_MAX_SRC 16
+
+extern "C" __global__ void attn_res(const float* __restrict__ src, const float* __restrict__ fold,
+                                    int nsrc, int n, float eps, float* __restrict__ out) {
+    __shared__ float red_ss[256];
+    __shared__ float red_dot[256];
+    __shared__ float prob[ATTN_RES_MAX_SRC];
+    const int t = threadIdx.x;
+    const float* v0 = src + (size_t)blockIdx.x * (size_t)nsrc * (size_t)n;
+
+    for (int s = 0; s < nsrc; s++) {
+        const float* v = v0 + (size_t)s * (size_t)n;
+        float ss = 0.0f, dot = 0.0f;
+        for (int i = t; i < n; i += blockDim.x) {
+            const float x = v[i];
+            ss += x * x;
+            dot += x * fold[i];
+        }
+        red_ss[t] = ss;
+        red_dot[t] = dot;
+        __syncthreads();
+        for (int k = blockDim.x / 2; k > 0; k >>= 1) {
+            if (t < k) {
+                red_ss[t] += red_ss[t + k];
+                red_dot[t] += red_dot[t + k];
+            }
+            __syncthreads();
+        }
+        // The score, not yet the probability — `prob` holds both in turn to spend one LDS array.
+        if (t == 0) prob[s] = red_dot[0] / sqrtf(red_ss[0] / (float)n + eps);
+        __syncthreads();
+    }
+
+    // Max-subtracted softmax over at most nine scores, computed redundantly by every thread. A
+    // reduction for nine values would cost more in barriers than the arithmetic it saves, and
+    // every thread needs every probability in the mixing loop below anyway.
+    float m = prob[0];
+    for (int s = 1; s < nsrc; s++) m = fmaxf(m, prob[s]);
+    float z = 0.0f;
+    for (int s = 0; s < nsrc; s++) z += expf(prob[s] - m);
+    float p[ATTN_RES_MAX_SRC];
+    for (int s = 0; s < nsrc; s++) p[s] = expf(prob[s] - m) / z;
+
+    float* o = out + (size_t)blockIdx.x * (size_t)n;
+    for (int i = t; i < n; i += blockDim.x) {
+        float acc = 0.0f;
+        // `v0`, the RAW source. Re-read rather than kept from the scoring pass: the stack is
+        // nsrc*n floats (at the real width, 9*7168) and does not fit in LDS.
+        for (int s = 0; s < nsrc; s++) acc += p[s] * v0[(size_t)s * (size_t)n + i];
+        o[i] = acc;
+    }
+}
+
+// One block per token. `nsrc` is REFUSED above ATTN_RES_MAX_SRC (1003) rather than clamped: the
+// stack is one snapshot per `attn_res_block_size` layers plus the running prefix sum, so 93 layers
+// at block 12 gives at most 9, and a larger value means the caller's block bookkeeping is wrong
+// rather than that this kernel should grow. `nsrc == 0` is refused too — the reference's
+// layer-level fold is guarded by an emptiness check on the caller's side (§3's layer loop), so an
+// empty stack reaching here is that guard having gone missing, not a case to define away.
+extern "C" int rivoli_attn_res(const float* src, const float* fold, int tokens, int nsrc, int n,
+                               float eps, float* out) {
+    if (n <= 0 || tokens <= 0) return 1001;
+    if (nsrc <= 0 || nsrc > ATTN_RES_MAX_SRC) return 1003;
+    hipGetLastError();
+    hipLaunchKernelGGL(attn_res, dim3(tokens), dim3(256), 0, 0, src, fold, nsrc, n, eps, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 // `kernel.py::act_quant(x, 128, "ue8m0", …, inplace=True)` over `n_rows × row_len` f32,
 // IN PLACE — the fused quantize-then-dequantize DeepSeek-V4 puts in front of EVERY
 // quantized `Linear`, fp4-weight ones included (`model.py::linear` line 120).

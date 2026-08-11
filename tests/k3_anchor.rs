@@ -31,6 +31,10 @@
 use rivoli::v4oracle::golden::GoldenSet;
 use serde_json::Value;
 
+#[path = "common/k3_golden.rs"]
+mod k3_golden;
+use k3_golden::{float, shape_of};
+
 #[path = "common/k3_tolerance.rs"]
 mod k3_tolerance;
 
@@ -46,14 +50,14 @@ const GOLDENS: &[Vendored] = &[
     Vendored {
         salt: "k3-anchor-1",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-1.bin"),
-        len: 292_781,
-        fnv: 0xab97_8ba4_78e1_78ca,
+        len: 302_765,
+        fnv: 0x24f0_db67_238f_9411,
     },
     Vendored {
         salt: "k3-anchor-2",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-2.bin"),
-        len: 292_781,
-        fnv: 0xf104_1475_321f_40f6,
+        len: 302_765,
+        fnv: 0x823d_5f7d_6747_f46b,
     },
 ];
 
@@ -80,27 +84,6 @@ fn attn_field(c: &Value, key: &str) -> usize {
     c["linear_attn_config"][key]
         .as_u64()
         .unwrap_or_else(|| panic!("linear_attn_config.{key} is not an integer")) as usize
-}
-
-/// One float tensor's shape and values, by name. Panics with the file's own contents, because "not
-/// found" is almost always a renamed capture and the next question is always "then what IS in
-/// there".
-fn float<'g>(g: &'g GoldenSet, name: &str) -> (&'g [usize], &'g [f32]) {
-    g.floats
-        .iter()
-        .find(|(n, _, _)| n == name)
-        .map(|(_, s, v)| (s.as_slice(), v.as_slice()))
-        .unwrap_or_else(|| {
-            let some: Vec<&String> = g.floats.iter().take(3).map(|(n, _, _)| n).collect();
-            panic!(
-                "{name} is not in the golden; it holds {} float tensors, e.g. {some:?}",
-                g.floats.len()
-            )
-        })
-}
-
-fn shape_of(g: &GoldenSet, name: &str) -> Vec<usize> {
-    float(g, name).0.to_vec()
 }
 
 /// One structural field: the driver must have asserted it, and it must equal the real config's.
@@ -221,7 +204,9 @@ fn the_vendored_bytes_are_the_measured_ones() {
         assert_eq!(v.bytes.len(), v.len, "{}: size", v.salt);
         assert_eq!(h, v.fnv, "{}: FNV-1a", v.salt);
         let g = load(v);
-        assert_eq!(g.floats.len(), 223, "{}: float tensors", v.salt);
+        // 235, up from 223 when S2 item 1 added the twelve `.fold` captures — see
+        // `the_operator_fixtures_s2_needs_are_present`.
+        assert_eq!(g.floats.len(), 235, "{}: float tensors", v.salt);
         assert_eq!(g.ints.len(), 5, "{}: int tensors", v.salt);
     }
     // The two draws must not be the same draw — compared on VALUES, not on the files.
@@ -447,6 +432,14 @@ fn the_operator_fixtures_s2_needs_are_present() {
         // function, because `_apply_attn_res` reads `proj.weight` and `norm.weight` DIRECTLY and
         // never calls either module — so forward hooks on them fired zero times and this operator,
         // S2's FIRST, had no fixture at all until review 2026-08-11.
+        //
+        // **The `.fold` capture was added 2026-08-11 when S2 item 1 went to write the kernel and
+        // found it could not.** Inputs and an output do not determine this operator: `out` depends
+        // on `softmax(<RMSNorm(v), norm.weight * proj.weight>)`, and neither factor was in the
+        // file, so there was no way to get from one to the other. The PRODUCT is captured, not the
+        // two factors, because collapsing them is a load-time step the port does in its loader
+        // (`k3-architecture.md` §3) — a fixture carrying the factors would be scoring an
+        // elementwise multiply that no kernel performs.
         for tag in [
             "model.layers.1.self_attention_res",
             "model.layers.1.mlp_res",
@@ -456,6 +449,9 @@ fn the_operator_fixtures_s2_needs_are_present() {
                 vec![1, hidden]
             );
             assert_eq!(shape_of(&g, &format!("{tag}.out")), vec![1, hidden]);
+            // `[hidden]`, not `[1, hidden]`: `_proj` really is a single scoring VECTOR, and the
+            // fold inherits that. A port reading it as a matrix is the misreading §3 calls out.
+            assert_eq!(shape_of(&g, &format!("{tag}.fold")), vec![hidden]);
             let br = shape_of(&g, &format!("{tag}.in.block_residual"));
             assert_eq!(
                 (br[0], br[2]),
@@ -480,6 +476,22 @@ fn the_operator_fixtures_s2_needs_are_present() {
             "one block residual per attn-res block"
         );
         assert_eq!(shape_of(&g, "model.output_attn_res.out"), vec![1, hidden]);
+        assert_eq!(shape_of(&g, "model.output_attn_res.fold"), vec![hidden]);
+        // Every fold the port will score, counted — twelve, and layer 0's `self_attention_res` is
+        // NOT among them because §3's layer loop guards that fold on a non-empty block stack and
+        // nothing has been pushed at layer 0. A count catches a fold appearing or vanishing; the
+        // per-tag assertions above cannot, since they only look at the tags they name.
+        let folds = g
+            .floats
+            .iter()
+            .filter(|(n, _, _)| n.ends_with(".fold"))
+            .count();
+        assert_eq!(
+            folds, 12,
+            "{}: two folds per captured layer plus the model-level one, minus layer 0's guarded \
+             attention fold",
+            v.salt
+        );
 
         assert_eq!(shape_of(&g, "model.norm"), vec![1, 1, hidden]);
         assert_eq!(shape_of(&g, "logits"), vec![1, 1, field(&c, "vocab_size")]);

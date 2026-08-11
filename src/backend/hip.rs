@@ -788,6 +788,31 @@ launchers! {
         y: *mut f32,
     );
 
+    /// Kimi-K3's Block Attention Residual fold: `out = softmax(<RMSNorm(src_s), fold>) @ src`.
+    ///
+    /// `src` is `[tokens][nsrc][n]` and `out` is `[tokens][n]`. The softmax mixes the sources
+    /// **unnormalised** — `kernels/linalg.hip` carries the argument and the defect that prices it.
+    ///
+    /// `nsrc` outside `1..=16` is refused (1003) rather than clamped, because a stack larger than
+    /// one snapshot per `attn_res_block_size` layers plus the prefix sum means the caller's block
+    /// bookkeeping is wrong, and an EMPTY stack means §3's layer-level emptiness guard went
+    /// missing. Neither is a case this kernel should quietly define.
+    ///
+    /// # Safety
+    /// `src` is `tokens·nsrc·n` f32, `fold` is `n` f32 and `out` is `tokens·n` f32, all live until
+    /// the next [`device_sync`]. `out` must NOT alias `src`: every thread reads all `nsrc` sources
+    /// for its column after the block has already written scores, and a caller aliasing them would
+    /// have the mixing loop read values it has itself overwritten.
+    launch_attn_res -> rivoli_attn_res, "attn_res" (
+        src: *const f32,
+        fold: *const f32,
+        tokens: usize as i32,
+        nsrc: usize as i32,
+        n: usize as i32,
+        eps: f32,
+        out: *mut f32,
+    );
+
     /// Interleaved RoPE in place over `count` segments of `seg` at `stride`.
     ///
     /// # Safety

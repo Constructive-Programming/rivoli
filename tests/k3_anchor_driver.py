@@ -579,6 +579,19 @@ def wrap_attn_res(mod, model, cap, ctx, layers):
         if tag is not None and ctx["capturing"]:
             cap.add(f"{tag}.in.prefix_sum", prefix_sum)
             cap.add(f"{tag}.in.block_residual", block_residual)
+            # **The fold, without which the other three are unscoreable.** The scoring vector is
+            # the only *weight* this harness captures, and it is captured because AttnRes is the
+            # one operator whose inputs alone do not determine its output: `out` depends on
+            # `softmax(<RMSNorm(v), norm.weight * proj.weight>)`, and nothing in the golden
+            # carried those two. S2 item 1 went to write the kernel, found inputs and an output
+            # and no way to get from one to the other, and came back here (2026-08-11).
+            #
+            # The PRODUCT rather than the two factors: `fold[i] = norm[i] * proj[i]` is a
+            # load-time collapse the port does in the loader (`k3-architecture.md` §3), so the
+            # kernel never sees the factors and a fixture that carried them would be scoring the
+            # elementwise multiply. `.float()` because the checkpoint ships these BF16 while the
+            # reference holds them fp32 — this records what the arithmetic used.
+            cap.add(f"{tag}.fold", norm.weight.float() * proj.weight.squeeze(0).float())
             cap.add(f"{tag}.out", out)
         return out
 
