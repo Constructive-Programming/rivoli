@@ -224,11 +224,45 @@ fn the_vendored_bytes_are_the_measured_ones() {
         assert_eq!(g.floats.len(), 223, "{}: float tensors", v.salt);
         assert_eq!(g.ints.len(), 5, "{}: int tensors", v.salt);
     }
-    // The two draws must not be the same draw. A copy-paste of one file over the other would pass
-    // every other assertion in this file.
-    assert_ne!(
-        GOLDENS[0].fnv, GOLDENS[1].fnv,
-        "the two salts produced identical bytes — that is one draw, not two"
+    // The two draws must not be the same draw — compared on VALUES, not on the files.
+    //
+    // This was `assert_ne!(GOLDENS[0].fnv, GOLDENS[1].fnv)`, which a review showed carries no
+    // information: each golden embeds its own `salt` string in its metadata, so the two files are
+    // guaranteed to differ whatever the weights did. A driver refactor that passed a literal
+    // `"k3-anchor-1"` to `init_weights`, or an `_gen` that stopped mixing the salt into its seed,
+    // would put bit-identical tensors in both files and pass every assertion here — while the
+    // fixture claimed the second draw whose whole purpose is that a bug degenerate at one draw's
+    // values cannot hide. Compared per tensor, over every float the goldens share.
+    let (a, b) = (load(&GOLDENS[0]), load(&GOLDENS[1]));
+    let mut shared = 0usize;
+    let mut identical: Vec<&str> = Vec::new();
+    for (name, _, va) in &a.floats {
+        let Some((_, _, vb)) = b.floats.iter().find(|(n, _, _)| n == name) else {
+            continue;
+        };
+        shared += 1;
+        // `to_bits`, because `-0.0 == 0.0` and `NaN != NaN` would each lie here in one direction.
+        if va
+            .iter()
+            .map(|x| x.to_bits())
+            .eq(vb.iter().map(|x| x.to_bits()))
+        {
+            identical.push(name);
+        }
+    }
+    assert!(
+        shared > 200,
+        "only {shared} float tensors are common to the two goldens — the draws should differ in \
+         VALUES, not in which tensors they hold"
+    );
+    assert!(
+        identical.is_empty(),
+        "{} of {shared} shared float tensors are bit-identical across the two salts, e.g. {:?}. \
+         Weights are drawn from `sha256(salt/parameter-name)`, so EVERY tensor must differ; any \
+         that do not mean the salt stopped reaching the draw and the second golden is the first \
+         one wearing a different label.",
+        identical.len(),
+        &identical[..identical.len().min(3)]
     );
 }
 
@@ -428,7 +462,14 @@ fn the_operator_fixtures_s2_needs_are_present() {
                 (1, hidden),
                 "block residual is [tokens, blocks, hidden]"
             );
-            assert!(br[1] >= 1, "layer 1 mixes at least the layer-0 snapshot");
+            // `== 1`, not `>= 1`. The layer-level fold at layer 1 mixes exactly the layer-0
+            // snapshot, and `>=` also accepted the model-level fold's 8-block stack — so the
+            // assertion could only have failed on an empty stack, which is not what it claimed to
+            // pin. The distinction is the whole point of capturing both folds separately.
+            assert_eq!(
+                br[1], 1,
+                "the layer-level fold at layer 1 mixes exactly the layer-0 snapshot, not a stack"
+            );
         }
         // The model-level fold, whose accumulated stack is one block per `attn_res_block_size`
         // layers.
@@ -469,6 +510,17 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
             a_log.iter().all(|x| (0.0..=16f32.ln()).contains(x)),
             "{}: A_log must be log(uniform(1,16)): {a_log:?}",
             v.salt
+        );
+        // The range alone accepts an ALL-ZEROS A_log, since log(1) = 0 is in it — and this test
+        // exists so that a golden of zeros cannot pass. `A_log` gates the decay per head, so a
+        // constant one makes every head decay identically and a kernel that ignored the term
+        // entirely would still match. Only the FNV pin caught that before. Measured draws span
+        // [1.41, 2.53] (salt-1) and [1.78, 2.60] (salt-2), so "not all equal" is far inside them.
+        assert!(
+            a_log.iter().any(|x| *x != a_log[0]),
+            "{}: A_log is constant at {} — every head would decay identically",
+            v.salt,
+            a_log[0]
         );
         let (_, dt) = float(&g, &format!("{kda}.in.dt_bias"));
         assert!(

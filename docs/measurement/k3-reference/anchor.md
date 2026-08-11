@@ -181,6 +181,19 @@ runs captured different tensors. Until 2026-08-11 the only automated check was "
 non-zero", so a regression that broke the localisation would have printed a matrix nobody reads and
 exited 0 — review found that, and it was the load-bearing half of §G rule 1.
 
+A second review the same day found **both directions of that gate still had a hole**, and they are
+closed. A declared-green layer that was never CAPTURED scored as green, because an absent layer read
+as zero differing tensors — so dropping a layer from `CAPTURE_LAYERS`, or naming one outside it,
+would have rested the localisation claim on an empty set. And the positive half was only "something,
+somewhere, differs": nothing asserted the first captured layer PAST the green boundary actually
+reddened, so a perturbation that missed its operator and merely disturbed something downstream read
+as a localised, detected defect while the arithmetic the cell prices went unexercised. Both are
+asserted now, and all eleven recorded rows satisfy the second (checked against the matrix above
+before it was added, so it gates rather than merely passing). The gate arms were exercised without a
+GPU by rebuilding synthetic defect goldens from the vendored bytes through the driver's own reader
+and writer — which is how a crash in the new arm was found: `per` also holds the model-level `model`
+key, and sorting the whole key set by `int` raises on it.
+
 Decode, `--seq 8`, one step. `differing` is out of the layer's captured tensor count; `max_rel` is
 the **row maximum** of `max|a−b|` over the tensor's own scale:
 
@@ -365,6 +378,22 @@ Every other operator has four to seven orders of magnitude of room, so the toler
 2026-08-11: marking `mla` as a `Rel` fails ("no Rel tolerance is defensible"), setting a tolerance
 within 30× of its defect fails, and setting one below its own floor fails.
 
+> **CORRECTED 2026-08-11 by review: the gate on this table could not express most of the ratio
+> line.** The constants were `tol >= floor*9.9`, `tol <= defect/30`, and `ExactOnly` iff
+> `margin < 3.0` — but a `Rel` value satisfying the first two exists only when
+> `margin >= 9.9*30 = 297`, so **every margin in `[3.0, 297)` had no admissible policy at all**, and
+> the two error messages each told the author to do what the other refused. An operator at floor
+> 1e-5 and defect 1e-3 (margin 100) needed `t >= 9.9e-5` and `t <= 3.33e-5` simultaneously. Nothing
+> was in that band — `mla` is 1.31× and the rest above 27,000× — so the gate was green while being
+> unusable for the next operator measured, which is precisely what the paragraph below tells S2 to
+> do. The `ExactOnly` boundary is now DERIVED from the other two constants rather than written by
+> hand, so the branches partition the line with no gap. Two smaller ones from the same review: the
+> tolerances are 10× the floor **within two-significant-figure rounding** (they run 9.998× for
+> `kda_op` to 10.185× for `attn_res`, because each is written to 2 s.f. against a floor recorded to
+> 4) — an undocumented `9.9` was the only thing admitting `kda_op` while four comments claimed a
+> flat 10× — and the upper side of that rule was unbounded, so `Rel(5.0e-2)` on `attn_res`, 3183×
+> its floor, passed. Both are bounded and stated now.
+
 **Six operators have a row; the driver classifies TEN — and the four without one are a GAP, not a
 decision.** `operator_of` also emits `kda_trunk` (a KDA layer's projections and norms, as opposed to
 the recurrence itself), `norm`, `residual` and `head`. Nobody measured a floor for those: the six
@@ -391,9 +420,19 @@ about the arithmetic.
 Degeneracy is now **asserted rather than hoped for**, on each draw: no routed weight below 5% of the
 largest (an expert weighted at ~0 makes its own arithmetic unscoreable), `|beta| < 8` (beyond that
 `sigmoid` is within 4e-4 of its limits and the delta-rule update is pinned), `A_log` inside
-`log(uniform(1,16))`, `dt_bias` inside its draw range, logits finite and not all equal. A test also
-asserts the two goldens' hashes differ — copying one file over the other would otherwise satisfy
-every other assertion in the file.
+`log(uniform(1,16))`, `dt_bias` inside its draw range, logits finite and not all equal.
+
+Two of those were weaker than they read, both corrected 2026-08-11 by review. **`A_log`'s range
+check accepted an ALL-ZEROS vector**, since `log(1) = 0` is inside `log(uniform(1,16))` — and a
+constant `A_log` makes every head decay identically, so a kernel ignoring the term would match;
+only the FNV pin stood between that and a pass. It must now also be non-constant. And **the
+"two independent draws" claim was checked by comparing the two FILES' hashes**, which carries no
+information: each golden embeds its own `salt` string in its metadata, so the bytes differ whatever
+the weights did. A driver refactor that passed a literal salt to `init_weights`, or an `_gen` that
+stopped mixing the salt into its seed, would put bit-identical tensors in both files and pass
+everything — while the fixture claimed the second draw whose entire purpose is that a bug degenerate
+at one draw's values cannot hide. It is now compared per tensor, on `to_bits` over all 223 floats the
+two goldens share, and all 223 must differ.
 
 **The vendored `config.json` is pinned by a hash the gate RECOMPUTES**, added 2026-08-11 after Muse
 Glimmer's port found the same hole on its own side (its HF revision was a prose claim matched by

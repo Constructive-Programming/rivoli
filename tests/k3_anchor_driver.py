@@ -626,7 +626,17 @@ def wrap_kda_ops(mod, cap, ctx, layers):
                 # reference for every operator but this one; KDA's own floor comes from
                 # `--mode kda-equiv` instead, and would have needed a separate measurement anyway
                 # because the kernel returns an fp32 state whatever the input dtype.
-                dt = next(v.dtype for v in kw.values() if hasattr(v, "dtype"))
+                # `q` by name, not "the first kwarg with a dtype". That took whatever the reference
+                # happened to pass first -- today `q`, but a revision putting `cu_seqlens` or a
+                # position index earlier would cast every KDA output to an INTEGER dtype, and the
+                # only symptom would be a wrong floor in a measurement nobody re-derives.
+                q = kw.get("q")
+                assert q is not None and q.is_floating_point(), (
+                    f"the fp32 island reads its dtype from `q`; got {type(q).__name__}. The "
+                    f"reference calls this op with all-keyword arguments, so a rename upstream "
+                    f"lands here rather than silently picking another kwarg's dtype."
+                )
+                dt = q.dtype
                 kw = {
                     k: (v.float() if hasattr(v, "dtype") and v.is_floating_point() else v)
                     for k, v in kw.items()
@@ -932,13 +942,41 @@ def compare(a_path, b_path):
         raise SystemExit(f"--defect {defect} has no EXPECT_GREEN entry; add one, even if empty")
     if not any(diff for _, diff, _ in per.values()):
         raise SystemExit(f"--defect {defect} changed NOTHING; that is not a defect run")
-    reddened = [
-        layer for layer in map(str, EXPECT_GREEN[defect]) if per.get(layer, (0, 0, 0))[1]
-    ]
+
+    # A declared-green layer that was never CAPTURED used to score as green, because
+    # `per.get(layer, (0, 0, 0))[1]` reads an absent layer as zero differing tensors. The
+    # localisation claim would then rest on an empty set: drop a layer from CAPTURE_LAYERS, or name a
+    # layer outside it in EXPECT_GREEN, and the matrix prints, finds nothing reddened, and exits 0.
+    # Found by review 2026-08-11.
+    green = list(map(str, EXPECT_GREEN[defect]))
+    absent = [layer for layer in green if layer not in per]
+    if absent:
+        raise SystemExit(
+            f"--defect {defect} declares layer(s) {absent} green, but nothing captured them -- "
+            f"captured: {sorted(per)}. An uncaptured layer is not evidence of localisation.",
+        )
+    reddened = [layer for layer in green if per[layer][1]]
     if reddened:
         raise SystemExit(
             f"--defect {defect} reddened layer(s) {reddened}, which are upstream of it and must "
             f"stay bit-identical -- the localisation this golden claims is gone",
+        )
+
+    # And the POSITIVE half, which was only "something, somewhere, differs". EXPECT_GREEN encodes a
+    # boundary, so the first captured layer PAST it must actually redden -- otherwise a perturbation
+    # that missed its operator and only disturbed something downstream reads as a localised,
+    # detected defect while the arithmetic the cell prices was never exercised.
+    # Numeric keys only: `per` also holds "model" for the model-level fold, and sorting the whole
+    # key set by `int` raises on it. This arm had never executed when it was written -- every
+    # exercise of the comparator tripped an earlier gate first -- which is how the crash was found.
+    downstream = [
+        layer for layer in sorted((k for k in per if k.isdigit()), key=int) if layer not in green
+    ]
+    if downstream and not per[downstream[0]][1]:
+        raise SystemExit(
+            f"--defect {defect} left layer {downstream[0]} bit-identical, the first captured layer "
+            f"it does NOT declare green -- so whatever it changed, it was not this operator here. "
+            f"Either the perturbation missed, or EXPECT_GREEN names the wrong boundary.",
         )
 
 
