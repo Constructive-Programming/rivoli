@@ -777,11 +777,21 @@ pub const F4_LUT: [f32; 16] = [
 /// > scale tensor of experts 0-3, layer 1) hold **11 distinct codes in `0x70..=0x7a`, zero `0xFF`
 /// > and zero `0x00`** — the same shape V4's shipped set showed, so the reference's 255 path is
 /// > defensive rather than exercised. That is a 0.005% sample and settles nothing by itself.
-/// > Second, and this is what settles it: **the repack is the only path that reads every scale
-/// > byte.** At decode they DMA from NVMe straight into a pool slot and the host never sees them,
-/// > so `F4Expert::spans`'s check either passes over the whole checkpoint at conversion time or
-/// > names the exact tensor, row and group that fails. `convert_k3` inherits that check through
+/// > Second, and this is what settles it: **the repack is the only path that reads every ROUTED
+/// > scale byte.** At decode they DMA from NVMe straight into a pool slot and the host never sees
+/// > them, so `F4Expert::spans`'s check either passes over the whole checkpoint at conversion time
+/// > or names the exact tensor, row and group that fails. `convert_k3` inherits that check through
 /// > `RoutedRepack`, so no `.f4` artifact can contain a byte this function would reject.
+/// >
+/// > **The word ROUTED is load-bearing and was missing until review 2026-08-11.** There is a second
+/// > exhaustive host reader — `SafeWriter::copy_fp8_e8m0` maps this function over every byte of every
+/// > fp8 tensor's `.scale` grid. It does not weaken the conclusion (it is also conversion-time and
+/// > also fails loudly) but it is weaker evidence: it names the tensor and not the row or the group.
+/// > `F4Expert::spans`'s own comment had the qualifier right and this doc dropped it.
+/// >
+/// > **And there are THREE decoders with three behaviours, not two.** This one bails,
+/// > `common.hpp::e8m0f` returns a quiet NaN, and `v4oracle::numerics::e8m0_decode` returns
+/// > `f32::NAN` outright. A future decision to adopt 255 → zero has three sites to move.
 /// >
 /// > Mapping 255 to zero instead would be adopting a rule for values the format forbids and this
 /// > engine's own artifacts cannot contain — and it would have to be adopted in `common.hpp`'s

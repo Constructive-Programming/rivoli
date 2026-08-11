@@ -45,7 +45,9 @@ pub fn v4_artifact_at(var: &str, default: &str, probe: &str) -> Option<String> {
         named.is_none(),
         "{var}={dir} has no {probe} — refusing to pass by skipping"
     );
-    eprintln!("SKIP: no V4 artifact at {dir} (set RIVOLI_V4_ARTIFACT)");
+    // `var`, not a hardcoded name: three of the four callers are not V4 (the GLM full artifact
+    // among them), and this is the one line whose whole purpose is telling a reader what to set.
+    eprintln!("SKIP: no artifact at {dir} (set {var})");
     None
 }
 

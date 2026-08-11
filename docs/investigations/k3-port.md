@@ -44,12 +44,13 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   the refusal at startup, and the existing artifacts still opening byte- and offset-identically
   with their byte accounting reproduced from the config (`tests/artifact_compat.rs`, 805 GiB in
   0.1 s).
-- **S1a's host work is DONE.** Item 2 settled (the e8m0 `0xff` bail stays — the repack is the only
-  path that reads every scale byte); item 4's `moe_acc_drain_to` written, compiled and oracled, with
-  the device run **pending a free GPU**; item 7's `MAX_BATCH` arithmetic settled and asserted —
-  **K3 fits the routed batch scratch at ONE row and not at two** (18 of 32 against 34). What is left
-  needs the device or the layer loop: executing the drain oracle, and the refusal inside a K3 pin
-  that S3 will write.
+- **S1a IS DONE.** Item 2 settled (the e8m0 `0xff` bail stays — the repack is the only path that
+  reads every ROUTED scale byte); item 4's `moe_acc_drain_to` written, templated against its sibling,
+  and **executed on gfx1151 — 8 elements bit-identical, every guard refused**; item 7's `MAX_BATCH`
+  arithmetic settled and asserted, **K3 fits the routed batch scratch at ONE row and not at two**
+  (18 of 32 against 34). The whole device sweep passed in the same window (`kernel` 24/24,
+  `f4_kernel` 24/24, `kvcompress_kernel` 10/10, `--lib` 141/141). What remains is S1b's harness and,
+  for the pin, S3's layer loop.
 
 ## G. The gate model
 
@@ -396,12 +397,20 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    the ordering the aggregate RMSNorm imposes — argued at the kernel and pinned by
    `tests/kernel.rs::moe_acc_drain_to_writes_the_latent_aggregate_and_resets`, whose destination is
    pre-filled with a poison value so `=` and `+=` are distinguishable.
-   **NOT YET EXECUTED.** It compiles (hipcc, symbol in `moe.o`) and both `kernel_coverage` censuses
-   accept it — including an `OWNERS` row of `&[]`, which asserts out loud that no engine path calls
-   it yet, since S3 wires it. The device run needs a free GPU: at the time of writing another
-   tenant held 35.7 GB of GTT with zero KFD entries and the flock was held (`flock -E 66` → 66).
-   **`kernel_coverage` green means the oracle EXISTS, not that it ran** — that file's own header
-   says so, and this is the case it was describing.
+   **EXECUTED AND PASSING 2026-08-11** on gfx1151: 8 elements bit-identical, guards 1006/1001 all
+   refused as expected. The GPU was freed by cordoning and draining this k3s node (`rh-anine`), which
+   evicted the `ai/llama-swap` tenant — the only node carrying `hr-home.xyz/rocm=true`, so the AI
+   service was down for the window and was restored by `kubectl uncordon`. The full device sweep ran
+   in the same window: `kernel` 24/24, `f4_kernel` 24/24, `kvcompress_kernel` 10/10, `headtail` 5/5,
+   `f4_pin`/`f4_pool`/`f4_loading`, and `--lib` 141/141 — including the two `DeviceTier` tests that
+   fail under contention.
+   **Caveat on the exclusivity, recorded because it changes how to do this next time:** the drain did
+   NOT hold the node empty. The ReplicaSet re-scheduled `llama-swap` onto the cordoned node within
+   seconds (a scheduler-cache race — its tolerations do not cover `unschedulable`), so sole tenancy
+   was not guaranteed for the whole window. It was guaranteed per test START, because
+   `DeviceTier::new` refuses to allocate while another tenant holds GPU memory and every suite
+   passed; llama-swap is a model *swapper* and holds nothing until a model is loaded. **Scale the
+   deployment to 0 rather than draining** if a durable window is wanted.
 5. **Converter naming.** Expert tensors are `.weight_packed` / `.weight_scale`
    (compressed-tensors), *not* `.weight` / `.weight_scale_inv`. And **`quantization_config`
    mis-declares its own scope**: `targets: ["Linear"]` with an `ignore` list that omits
@@ -466,10 +475,12 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    the global `crate::gpu::MAXROW` (2, fixed by GLM's own acceptance measurements): a K3 pin that
    copies that line refuses every K3 artifact at load, and one that copies it after someone raises
    `MAX_BATCH` silently sizes a batched pass K3 has no kernel for (`kernels/moe.hip` instantiates
-   R=1 only). **Both directions** are asserted by
-   `model.rs::k3_fits_the_routed_batch_scratch_at_one_row_and_not_at_two` — red-proved by raising
-   `MAX_BATCH` to 64, which makes it name the missing draft head and the missing kernel — written
-   before the pin so its author meets the constraint instead of discovering it.
+   R=1 only for the f4 path; the VQ and int4 paths do instantiate R=2). **Both directions** are
+   asserted by `model.rs::k3_fits_the_routed_batch_scratch_at_one_row_and_not_at_two` — red-proved by
+   raising `MAX_BATCH` to 64 — written before the pin so its author meets the constraint instead of
+   discovering it. The second assertion uses a LITERAL 2 rather than `crate::gpu::MAXROW`: review
+   caught that pinning it to the global would make it fire on exactly the change K3 needs (a
+   per-model row count of 1), contradicting the first assertion.
    **Still to do:** the refusal inside the K3 pin, when S3 writes one. The test above is the
    arithmetic; it is not a load-time check.
 

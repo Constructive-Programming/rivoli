@@ -160,8 +160,9 @@ macro_rules! launchers {
 //
 // > **MEASURED 2026-08-06, correcting the inherited claim.** The original note said "roughly 25
 // > are DIFFERENT kernels that merely take the same shape — `gemv_fp8`/`i8`/`i4`/`vq` all take
-// > `x, packed, scale, o_dim, i_dim, y`". Counted rather than asserted: the 41 declarations
-// > below have **41 distinct parameter lists — zero exact duplicates**, and exactly one PAIR
+// > `x, packed, scale, o_dim, i_dim, y`". Counted rather than asserted: the **46** declarations
+// > below (41 when this was written; 46 as of 2026-08-11, and the count was already four stale
+// > before `launch_moe_acc_drain_to` was added) have zero exact duplicates, and **two** PAIRS
 // > shares even a type sequence under different names (`act_quant_f8` and `act_quant_f4_rotated`,
 // > both `*mut f32, i32, i32, *mut c_void`). The `gemv` family does not actually agree:
 // > `gemv_vq` takes seven parameters (`indices`, `scales`, `codebook`), `gemv_i4` takes six.
@@ -457,16 +458,25 @@ launchers! {
     /// **For Kimi-K3, whose MoE block does not end at the residual.** Its routed sum lives in a
     /// 3584-wide latent that must be RMSNormed as an AGGREGATE and up-projected to 7168 before it
     /// can be added to anything — so the sum has to be intercepted, not folded in.
-    /// [`launch_moe_acc_drain`] is the right kernel for GLM and V4 and the wrong one here; the three
-    /// differences (`=` vs `+=`, the latent width, and the ordering the norm imposes) are argued at
-    /// `kernels/moe.hip`'s `moe_acc_drain_to`.
+    /// (This and [`launch_moe_acc_drain`] are the second of the two type-sequence pairs the jscpd
+    /// exemption above counts: `*mut f32, *mut u64, usize, usize, f32, *mut c_void` both, differing
+    /// only in `x` against `out` — which is exactly the confusion the docs here exist to prevent.)
     ///
-    /// `n` is the **latent** width. Passing `hidden` reads past the end of every accumulator row but
-    /// the last, and at K3's dims those two numbers differ by exactly 2x.
+    /// [`launch_moe_acc_drain`] is the right kernel for GLM and V4 and the wrong one here. The ONE
+    /// difference the code cannot show — `=` against `+=` — is argued at `kernels/moe.hip`; the two
+    /// kernels now share a templated body, so the rest is not a difference at all.
     ///
-    /// A `gain` of 0 is REFUSED (guard 1003), unlike in the sibling: here it would write an all-zero
-    /// aggregate — a layer whose routed experts contributed nothing while the shared MLP kept
-    /// working, which is degraded fluent text rather than an error.
+    /// `n` is the accumulator's row width — `nrow · latent`, and K3's `nrow` is 1. Passing `hidden`
+    /// overruns on the LAST row, not the first: with `MOE_ACC_ROWS = 2` and a 3584-wide latent, a
+    /// `n = 7168` reads `[0, 7168)` for `r = 0`, which is exactly the whole buffer and in bounds,
+    /// then `[7168, 14336)` for `r = 1`, which is entirely outside it. That 2x coincidence between
+    /// `hidden/latent` and `rows` is what makes the bug survive the first row. (This said "past the
+    /// end of every accumulator row but the last" until review 2026-08-11 — inverted.)
+    ///
+    /// A `gain` of 0 or `+inf` is REFUSED (guard **1006**, the non-positive-float class), unlike in
+    /// the sibling — `kernels/moe.hip` carries the argument. **Pass 1.0.** `routed_scaling_factor`
+    /// does NOT belong here: it multiplies the router weights inside the sum, and a scalar applied to
+    /// the aggregate is eaten by the RMSNorm that immediately follows.
     ///
     /// # Safety
     /// `out` holds `n` f32 and `acc` holds `rows·n` u64; EVERY stream that accumulated into `acc`

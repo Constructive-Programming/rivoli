@@ -582,17 +582,11 @@ impl Safetensors {
 /// It exists to pair the six spans that `spans`, [`Self::pack`] and [`Self::diff`] all walk in
 /// the same order, so the writer and the verifier cannot disagree about the layout.
 ///
-/// > **CORRECTED 2026-08-11.** This said the struct existed "rather than four positional
-/// > arguments repeated at every entry point", so that a transposed `(expert_in, moe_inter)`
-/// > would be visible at the call site. That justification stopped holding when
-/// > [`RoutedRepack`] landed: there is now exactly ONE construction site outside the tests, and
-/// > it copies `RoutedRepack`'s own already-named fields, so the transposition it guarded
-/// > against is guarded there instead. The swap is still the hazard the sentence described —
-/// > an expert's three projections are `(moe_inter, expert_in)·2 + (expert_in, moe_inter)`, so a
-/// > transposition produces the same byte count and streams the wrong weights — it is just no
-/// > longer this type's job to prevent it. Flagged by review; the type could now be folded into
-/// > `RoutedRepack` (~20 lines) and was left alone because the split by cardinality, one per
-/// > layer against one per expert, still reads correctly.
+/// > **CORRECTED 2026-08-11.** This justified itself by "four positional arguments repeated at every
+/// > entry point"; after [`RoutedRepack`] there is one construction site outside the tests and it
+/// > copies already-named fields, so the transposition hazard — an expert's three projections are
+/// > `(moe_inter, expert_in)·2 + (expert_in, moe_inter)`, and a swap keeps the byte count — is
+/// > guarded there now, not here.
 pub struct F4Expert<'a> {
     pub src: &'a Safetensors,
     /// `layers.{l}.ffn.experts.{e}` — see `quant::v4_expert_base`. On K3,
@@ -1206,13 +1200,9 @@ impl I4Source {
 /// `tool` and `chain` are for a human reading a manifest six months later — two `.f4` sets built
 /// from different checkpoints are byte-indistinguishable on disk. `src` is the checkpoint path.
 ///
-/// **`chain` is fixed rather than a parameter, and it is accurate for both producers.** Each was
-/// passing its own string — `"fp4->fp4 (repack)"` and `"mxfp4->fp4 (repack)"` — which rustfmt then
-/// reflowed into two six-line calls differing only in two literals: a jscpd clone, and the
-/// "formatting manufactured duplication" case `CLAUDE.md` records. Collapsing it is not a
-/// concession to the gate: V4's routed experts and K3's are the SAME encoding, OCP MX e2m1 nibbles
-/// with e8m0 group scales, so both really are `fp4 -> fp4`, and the `tool` field already
-/// distinguishes which converter ran.
+/// `chain` is a literal rather than a parameter because both producers' sources are the SAME
+/// encoding — OCP MX e2m1 nibbles with e8m0 group scales — so both really are `fp4 -> fp4`, and
+/// `tool` already says which converter ran.
 pub fn f4_source(tool: &str, src_dir: &str, layers: std::ops::Range<usize>) -> serde_json::Value {
     serde_json::json!({
         "tool": tool,

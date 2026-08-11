@@ -13,9 +13,13 @@
 //! and `.i4` has no header at all, so between them they exercise every branch of
 //! `RoutedFmt::{hbytes, has_shared}` that `.f4` leaves untested.
 //!
-//! **Nothing here reads a weight.** Both tests stat file lengths and ask `read_spec` for offsets;
-//! the largest read is one 4 KiB header. Opening 152 layer files is a few thousand syscalls, so
-//! this runs in about a second against 659 GiB and needs no GPU.
+//! **What this actually reads**, corrected 2026-08-11 after review called the earlier claim
+//! ("nothing here reads a weight … the largest read is one 4 KiB header") false on both counts. It
+//! stats 195 file lengths and asks `read_spec` for offsets — no weight there — but
+//! `set.shared_block(l)` does a full-stride O_DIRECT read, so the GLM half pulls
+//! `2·15,335,424 + 2·20,054,016 = 70,778,880 B` (67.5 MiB) of real expert bytes, uncached. The
+//! header read is 40 bytes (`EXPERT_HEADER_BYTES`), not 4 KiB. Still cheap and still no GPU; the
+//! numbers matter because this is the paragraph someone will cite when deciding to run it in a loop.
 //!
 //! Absent artifacts SKIP; an explicitly-pointed env var that does not resolve FAILS — the rule
 //! `common/f4_artifact_dir.rs` states, for the reason it gives: libtest hides stderr on a passing
@@ -147,9 +151,11 @@ fn the_full_v4_artifact_still_opens_byte_and_offset_identically() {
     );
     // Byte accounting, derived and confronted with the disk: 43 x (4096 + 256 x 13,369,344).
     // Measured 2026-08-11 — 147,169,914,880 B of `.f4` plus a 9,557,453,182 B resident set is
-    // 156,733,738,580 B = 145.97 GiB, which is the "~146 GiB" the plan carries. Correct, and I
-    // nearly reported otherwise by summing only the `.f4` files (137.06 GiB) and reading the
-    // difference as a GB/GiB mislabel.
+    // **156,727,368,062 B**; the whole directory is 156,733,738,580, the extra 6,370,518 being
+    // `tokenizer.json` and three small json files. Either way 145.97 GiB, which is the "~146 GiB"
+    // the plan carries. (The two-term sum was written as the four-term total until review; it
+    // rounded the same, which is how it hid.) Correct — and I nearly reported the plan wrong by
+    // summing only the `.f4` files (137.06 GiB) and reading the difference as a GB/GiB mislabel.
     assert_eq!(routed, 147_169_914_880, "total .f4 bytes");
     let resident = std::fs::metadata(format!("{dir}/resident.safetensors"))
         .unwrap()
@@ -175,9 +181,24 @@ fn the_full_glm_artifact_still_opens_byte_and_offset_identically() {
     // The range the ENGINE uses, taken from `pin.rs` rather than invented here: the dense prefix is
     // skipped, and the MTP head is one layer PAST `n_layers` and carries experts like any other. On
     // this artifact that is 3..79 — 76 files, which is what is on disk.
-    let mtp = std::fs::metadata(format!("{dir}/L{}.vq3", cfg.n_layers)).is_ok();
+    // `L{:02}`, the one naming rule this file and `open_routed` both depend on. It was `L{}` until
+    // review: harmless at 78, but for any `n_layers < 10` it probes `L3.vq3`, never finds `L03.vq3`,
+    // silently concludes there is no MTP head, and then fails on the layer count instead.
+    let mtp = std::fs::metadata(format!("{dir}/L{:02}.vq3", cfg.n_layers)).is_ok();
     let layers = cfg.dense_layers..(cfg.n_layers + usize::from(mtp));
-    assert_eq!(layers.len(), 76, "the shipped GLM set is 76 layer files");
+    // **This is a property of the CONFIG, not of the disk** — unlike the V4 half, which reads
+    // `f4_source` and can say so. A GLM artifact holding only 3..40 still computes 76 here, passes,
+    // and fails deeper with a bare "no such file". Said in the message rather than strengthened,
+    // because GLM artifacts carry no range to read: the honest fix is the diagnosis, not a stronger
+    // assert.
+    assert_eq!(
+        layers.len(),
+        76,
+        "the config implies 76 layer files ({}..{}); if this artifact holds a narrower range the \
+         failure below will be a missing file, not a wrong length",
+        layers.start,
+        layers.end
+    );
 
     let dims = (cfg.n_experts, cfg.hidden, cfg.moe_inter);
     let vq = check_set(&dir, RoutedFmt::Vq3, layers.clone(), dims);
@@ -190,11 +211,10 @@ fn the_full_glm_artifact_still_opens_byte_and_offset_identically() {
     // **The plan said 675 GiB, which is 15.75 GiB high.** No directory on this machine measures
     // 675, and this artifact is complete — layers 3..78 contiguous, the same set in both formats.
     // Corrected in `k3-port.md` and `other-models.md`; this is what will notice if it drifts again.
+    // No GiB range check here, unlike the V4 half: `vq + i4` is a function of two values pinned to
+    // exact literals on the lines above, so a range over it is entailed and could never fire. V4's
+    // twin is not dead — it is the only bound on `resident`, which nothing else constrains. That
+    // asymmetry is the tell, and review found it.
     assert_eq!(vq, 299_531_812_864, "total .vq3 bytes");
     assert_eq!(i4, 391_695_040_512, "total .i4 bytes");
-    let gib = (vq + i4) as f64 / 1024f64.powi(3);
-    assert!(
-        (643.0..645.0).contains(&gib),
-        "GLM routed set is {gib:.2} GiB, expected ~643.75"
-    );
 }

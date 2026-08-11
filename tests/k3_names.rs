@@ -149,8 +149,11 @@ fn the_k3_names_are_the_checkpoints_own() {
             // 92 MoE layers x 896 experts. Read off the TSV, and it is the one count that proves
             // these families cover the dense layer's ABSENCE as well as the MoE layers' presence:
             // 93 layers would be 83,328.
+            // No `assert_ne!(got.count, 93 * 896)` beside this: once the equality holds, 82,432 is
+            // not 83,328 and the inequality cannot fire. It was here until review 2026-08-11 —
+            // the same identity-over-constants shape this commit series has now deleted three times,
+            // laundered through a field read. The comment above carries the fact.
             assert_eq!(got.count, 92 * 896, "{fam}");
-            assert_ne!(got.count, 93 * 896, "{fam}: layer 0 has no experts");
             assert_eq!(
                 got.dtype, "U8",
                 "{fam}: MXFP4 nibbles and e8m0 scales are both U8"

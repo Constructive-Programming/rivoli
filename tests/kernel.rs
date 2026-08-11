@@ -2116,9 +2116,13 @@ fn gemv_i4_matches_oracle() {
 /// 2. **The accumulator is RESET.** Same load-bearing reason as the sibling's: steady-state decode
 ///    does no memset before a layer's experts, so a drain that forgot would double-count from the
 ///    next layer on.
-/// 3. **`n` is the LATENT width.** Asserted by giving the accumulator MORE rows than the drain is
-///    told to read at a width that is not the buffer's whole span, so a kernel that walked the
-///    wrong extent would either read a row it was not given or leave one dirty.
+/// 3. ~~`n` is the LATENT width.~~ **Not asserted here, and it cannot be.** An earlier version of
+///    this list claimed the fixture gave the accumulator "MORE rows than the drain is told to read";
+///    it does not — `acc` is exactly `rows · n`. And `n` is a CALLER contract, not a kernel
+///    property: the kernel treats `n` exactly as its sibling does. The width is guarded where it is
+///    chosen, at `launch_moe_acc_drain_to`'s doc and at whatever K3 layer loop S3 writes. Removed
+///    2026-08-11 rather than papered over, because a doc that promises coverage it does not have is
+///    worse than a shorter doc.
 ///
 /// Also the `gain == 0` refusal, which the sibling deliberately does not have: there a zero gain
 /// leaves the residual untouched and is indistinguishable from a layer with no misses, while here
@@ -2130,13 +2134,16 @@ fn gemv_i4_matches_oracle() {
 /// `assert_bits` rather than a tolerance.
 #[test]
 fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
-    // A latent narrower than the accumulator's full span, and two rows — one per stream, which is
-    // what `rows` counts. 3584 is K3's real latent; 8 keeps the readback small while staying a
-    // multiple of nothing in particular, so an off-by-one in the block math would show.
+    // Two rows — one per stream, which is what `rows` counts. 8 keeps the readback small and
+    // readable. It does NOT exercise the multi-block path: `(8 + 255) / 256` is 1, and so is every
+    // +/-1 perturbation of that expression, so only a truncating `n / 256` would redden. Said plainly
+    // because an earlier draft claimed "an off-by-one in the block math would show" and it would
+    // not; the grid math is covered by the real widths at decode, not here.
     let (n, rows) = (8usize, 2usize);
     const SCALE: f64 = (1u64 << 44) as f64; // MOE_ACC_SHIFT, mirrored from kernels/moe.hip
     // Row r contributes (o + 1) · (r + 1) · 2^44, so every output is an exact small integer and
-    // the two rows are distinguishable — a drain that read only row 0 gives half the answer.
+    // the two rows are distinguishable — a drain that read only row 0 returns a THIRD of the
+    // answer (1·(o+1) of 3·(o+1)), not half.
     let acc: Vec<u64> = (0..rows)
         .flat_map(|r| (0..n).map(move |o| ((o + 1) * (r + 1)) as u64 * (1u64 << 44)))
         .collect();
@@ -2174,11 +2181,12 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
     device_sync().expect("sync");
 
     let got = f32v(&outb.copy_out().expect("out"));
+    // `assert_bits` is bit-exact over every element and every `want` is positive, so it already
+    // fails — naming the index — on a `+=` kernel (`poison + want`), on a no-write kernel (`poison`),
+    // and on a transposition. A follow-up `!got.contains(&poison)` was here until 2026-08-11 and
+    // could not fire: there is no input where the bits match and the poison survives. The poison
+    // FILL stays, because it is what makes `=` and `+=` distinguishable at all.
     assert_bits(&want, &got, "moe_acc_drain_to");
-    assert!(
-        !got.contains(&poison),
-        "the destination still holds its poison value — this kernel must ASSIGN, not accumulate"
-    );
     assert!(
         accb.copy_out().expect("acc").iter().all(|&b| b == 0),
         "moe_acc_drain_to left the accumulator dirty — steady-state decode does no memset, so \
@@ -2186,9 +2194,15 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
     );
 
     // The guards. `gain == 0` and a non-positive `n`/`rows`, each by code rather than by is_err.
+    // 1006 is the non-positive-FLOAT class in `moe.hip`, 1001 the dimension class; the gain guard
+    // used 1003 until review pointed out that code already means "unsupported nrow" twice in the
+    // same file. `f32::INFINITY` is a row because float-to-float `as` saturates, so an overflowing
+    // host value arrives here as `+inf` — it passes any bare `> 0.0` test and would write an all-inf
+    // aggregate for the following RMSNorm to turn into NaN.
     for (bad_n, bad_rows, bad_gain, code) in [
-        (n, rows, 0.0f32, 1003u32),
-        (n, rows, -1.0, 1003),
+        (n, rows, 0.0f32, 1006u32),
+        (n, rows, -1.0, 1006),
+        (n, rows, f32::INFINITY, 1006),
         (0, rows, gain, 1001),
         (n, 0, gain, 1001),
     ] {
