@@ -21,8 +21,8 @@ measured, kept; the result is in the engine. `closed-mixed` — parts of both, b
 `data` — measurements and instruments, not prose.
 
 **`scope:` values — whose evidence backs the verdict.** `glm` — measured on GLM-5.2 only;
-`v4` — the DeepSeek-V4 port; `k3` — the Kimi-K3 port; `engine` — model-independent (tooling,
-method, infra). **A closed verdict rules its question out only for its scope.** Added 2026-08-07 after
+`v4` — the DeepSeek-V4 port; `k3` — the Kimi-K3 port; `glimmer` — the Muse Glimmer-30B port;
+`engine` — model-independent (tooling, method, infra). **A closed verdict rules its question out only for its scope.** Added 2026-08-07 after
 `npu-offload.md`'s GLM-only closed-negative was read as engine-wide; a `glm`-scoped closure
 says nothing about V4 and must be re-evaluated there before it forecloses anything.
 

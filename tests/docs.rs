@@ -32,7 +32,7 @@ const STATUSES: [&str; 5] = [
 // Whose evidence backs the verdict. A closed verdict rules its question out only for its
 // scope: npu-offload.md's closed-negative was measured on GLM-5.2 and says nothing about
 // the V4 port (2026-08-07, the correction that motivated this field).
-const SCOPES: [&str; 4] = ["glm", "v4", "k3", "engine"];
+const SCOPES: [&str; 5] = ["glm", "v4", "k3", "engine", "glimmer"];
 
 fn docs_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("docs")
