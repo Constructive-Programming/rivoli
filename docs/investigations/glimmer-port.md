@@ -527,6 +527,58 @@ RoPE table, output gate, SwiGLU at 6656/19968, and the DFlash draft step.
 touches, covering: a local layer, a global layer, a window-boundary crossing, layer 0,
 layer 51.
 
+#### Item 0 — the vendored index. **DONE 2026-08-11.** No GPU, no venv, no network at test time.
+
+Not in the plan as written; it arrived from K3's side of a cross-session exchange and it had
+to come first, because every later golden is compared against a tensor set this port believes
+in. `model.safetensors.index.json` is now vendored whole (132674 B, sha256 `7d817b4d…`,
+verified against the live fetch *before* pinning) beside the reduction it produced.
+
+**What was wrong.** `tensor-families.tsv` is a hand reduction, and
+`glimmer_names.rs` checked it against three constants — `40` families, `1436` tensors,
+`59_553_253_376` bytes — each of which the TSV's own header already declared, taken from an
+index that was not in the tree. Two frozen copies agreeing with each other while neither
+described anything on disk. **A structural test catches a field that MOVED; one that was
+ADDED is precisely what it cannot see**, so an upstream revision growing a tensor family gave
+a TSV that never mentioned it, a test that never asked, and green. K3 found the same shape
+three times in two days (`k3-port.md`); this is the fourth.
+
+**What it is now.** Families and counts are derived from the vendored index and diffed against
+the checked-in TSV, both directions named. The byte total is read from the index and compared
+against a sum over TSV *shapes* — which came from the shard headers by HTTP Range, since the
+index carries neither dtype nor shape. **The TSV deliberately stays a checked-in artifact
+rather than becoming a cache of the derivation**: derive both sides and the comparison
+degenerates into testing `product()`, and the hand-transcription errors it currently catches
+stop being covered.
+
+Four red-proofs, each restored: an added family (`self_attn.qk_norm` injected into the index)
+names the family; a per-family count drift names the row; a shape drift fires the byte
+cross-check, proving it is not a tautology; and **`metadata.total_size` deleted PANICS** rather
+than defaulting to 0 against an empty sum, which would have been a gate that reads as coverage
+and is zero.
+
+Vendoring is available here only because the file is 132 KB. K3's is 60 MB and can only diff
+against a fresh fetch — that is a size accident, not a better design, and the note in
+`glimmer_names.rs` says so where someone might copy it.
+
+#### Ordering defect found in passing, and fixed — the budget check preceded the refusals
+
+`tests/glimmer_flags.rs` failed all three cases while a sibling agent held ~100 GB of GTT for a
+benchmark: `check_budget` sat above the architecture dispatch, so a Glimmer artifact given
+`--attn dsa` reported *"only 12.9 GB available; need more than the 17 GB OS reserve"* instead
+of saying the flag does not apply. **Whether a flag applies is a fact about argv and the
+manifest and cannot depend on free RAM**, and the wrong message points the reader at the
+machine rather than at their command line. The check now runs after the arch is known and
+Muse Glimmer skips it. Proven both directions under real load, at **1–2 GB available**:
+`glimmer_flags` 3/3 green where it had been 3/3 red, and V4 and GLM artifacts still refuse
+with the OS-reserve message.
+
+That suite called itself deviceless and was in fact load-dependent. **No CI here would ever
+have caught it** — there is no rocm job, so nothing runs it at all; it took a contended
+machine and an unrelated benchmark. `run_glimmer` now has no budget check, which is correct
+only while it bails before allocating: when S3 gives it a pin build, the check belongs at the
+top of that build, after the refusals and before the 55.7 GB.
+
 ### S2 — kernels. Each item gates before the next.
 
 Order: **ring/dense GQA attend → per-layer RoPE → output gate → wire the existing MLP →

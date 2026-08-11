@@ -3,6 +3,12 @@
 # Source: meta-models/Muse-Glimmer-30B, revision f84ecc3a0ea984a4c04542a84269e3d065350a6e.
 #   model.safetensors.index.json  132674 B  sha256 7d817b4dccb1b123fc6c1939356c65cee3a0ad462a5b821ac88280990a27d1ba
 #   1436 tensors across 2 shards, metadata.total_size 59553253376
+#
+# THAT INDEX IS VENDORED BESIDE THIS FILE (2026-08-11) and is the ground truth, not this.
+# `tests/glimmer_names.rs` derives the families and counts below from it and diffs, so the
+# numbers on the two lines above are provenance rather than the thing being checked — and a
+# family this reduction never mentions can no longer hide, which is what they could not catch.
+# Re-reduce by re-deriving from the vendored index; do not hand-edit a row.
 # Fetched 2026-08-11. dtype/shape are the SHARD HEADERS' own, read by HTTP Range
 # (8-byte LE length, then that many bytes) — not the index's, which carries neither.
 #
