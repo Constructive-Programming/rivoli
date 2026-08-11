@@ -1637,6 +1637,36 @@ pub struct GlimmerTextConfig {
     pub attention_bias: bool,
 }
 
+/// The twelve tensors every Muse Glimmer decoder layer ships, as `<layer prefix>.{}.weight`.
+///
+/// **One statement of this fact, read by both the converter and its test.** They had a copy
+/// each until jscpd reported it 2026-08-11, and a shared list of *names* is exactly the thing
+/// that must not be duplicated: two copies can disagree, and a name that exists but points at
+/// the wrong tensor copies silently — `tests/k3_names.rs` exists because that failure mode
+/// already cost this repo a round.
+///
+/// Five projections and four norms; the QK-norm is weightless and ships nothing, and there is
+/// no bias anywhere (`attention_bias` is false and asserted).
+pub const GLIMMER_LAYER_TENSORS: [&str; 12] = [
+    "input_layernorm",
+    "post_attention_layernorm",
+    "pre_feedforward_layernorm",
+    "post_feedforward_layernorm",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "self_attn.gate_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+];
+
+/// The prefix Glimmer's text-side tensors carry. The `language_model.` segment is the
+/// multimodal wrapper's, and it is on every text tensor — K3's port records the same shape as
+/// a name nothing in its documentation mentioned.
+pub const GLIMMER_LAYER_PREFIX: &str = "model.language_model.layers";
+
 /// What a Glimmer layer's attention attends over. One entry per layer in
 /// [`GlimmerTextConfig::layer_types`].
 ///

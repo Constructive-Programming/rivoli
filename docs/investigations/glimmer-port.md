@@ -26,14 +26,18 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
   load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
   card's errors beside them. The DFlash drafter is settled too — §S6 and
   `glimmer-architecture.md` §11.
-- **S1a item 1 is DONE (2026-08-11)**: the config schema, the `Arch` arm and a refusing
-  dispatch, on top of tag `k3-s1a`. Items 2–4 — the converter, the pin, and `run_glimmer`'s
-  hand-written flag refusals — are open. §S1a.
-- **`SafeWriter` borrows but does not stream, and that is item 2's first problem.** K3's S1a
-  changed it to hold `Cow<'a, [u8]>`, which solves the *verbatim* tensor case by borrowing
-  from the mapped source. Glimmer's converter quantizes bf16 → fp8 and so produces **owned**
-  bytes: every payload stays in host RAM until `write`, ~26 GB of it. Re-price before writing
-  the converter; the two-pass shape K3's plan specified may still be owed.
+- **S1a items 1 and 2 are DONE (2026-08-11)**, on tag `k3-s1a`: the config schema and a
+  refusing dispatch, then `convert_glimmer` — **bf16 verbatim, correctness first**. Items 3
+  and 4, the pin and `run_glimmer`'s hand-written flag refusals, are open. §S1a.
+- **rivoli had never quantized a checkpoint before, and Glimmer is where it must.** GLM, V4
+  and K3 all ship pre-quantized and every converter *copies*; `quant.rs` had a
+  `dequant_fp8_block` and no inverse. `quantize_fp8_block` now exists — but choosing its
+  scales is **our** quality decision with no upstream to defer to, so the shipped converter
+  writes bf16 and S5 owes a dNLL gate the other three ports did not. §S1a item 2.
+- **The `SafeWriter` owned-bytes problem is deferred, not solved.** `copy_verbatim` borrows
+  the mapped source, so a 55.7 GB bf16 set streams through with no host copy. An fp8 pass
+  produces **owned** bytes — ~26 GB resident until `write` — and that is when the two-pass
+  shape K3's plan specified comes due.
 - **§1 below is superseded.** It is kept as written, with a correction column, because what
   the card got wrong is the reusable lesson. Read `glimmer-architecture.md` instead.
 - **The design is inverted relative to every model this engine runs.** Glimmer is dense.
@@ -301,6 +305,30 @@ name files K3 will have moved.
    `0/0` and `f32_to_e4m3(NaN)` is a finite-looking `0x7f`; non-finite inputs refuse rather
    than encode. Proven able to go red on three defects — halved scale, transposed scale grid,
    zero-scale zero-tile — each reddening the cases it touches and staying green elsewhere.
+   **`convert_glimmer` landed 2026-08-11, bf16 verbatim.** It quantizes nothing: norms widen
+   to f32 (the house convention every arch follows), everything else is `copy_verbatim` at
+   BF16, and the three vision families are skipped by an explicit predicate whose *count* the
+   run prints — so their exclusion is an observation, not an assumption. `SafeWriter` borrows,
+   so the 55.7 GB set streams through with no host copy and **the owned-bytes problem is
+   deferred rather than solved**; it returns with the fp8 pass.
+
+   Two plan items turned out to be work nothing needed. **`FormatMeta` needs no nullable VQ
+   section** — `current()` stamps the compiled-in VQ constants and `load()` compares them
+   against the same constants, so they always agree and are inert on an artifact with no VQ
+   tensors. And the tensor-name list is now **one** constant (`GLIMMER_LAYER_TENSORS`) read by
+   both converter and test, after jscpd caught the second copy: a duplicated list of *names*
+   is precisely what `tests/k3_names.rs` exists to prevent.
+
+   Gate: `tests/glimmer_convert.rs` runs the real binary over a synthetic four-layer
+   checkpoint — byte-identity per verbatim tensor, correct *values* (not just lengths) for
+   every widened norm, vision absent, the artifact re-opening as the same model through
+   `load_config` + `FormatMeta::load`, and the two refusals that must fire before 55 GB is
+   written (incomplete checkpoint by name; out_dir == src_dir, which is a SIGBUS risk because
+   the writer maps the source while it writes). Proven red on two defects: un-skipped vision,
+   and norms copied verbatim instead of widened. **What it does not establish is tensor
+   NAMES** — the fixture is built from the same list the converter checks, so a name wrong in
+   both is wrong in both. Glimmer has no vendored index reduction yet; that is the
+   `k3_names.rs`-shaped gap and it is owed before S4.
 3. `GlimmerPin`: own type (per the V4/K3 precedent — shares nothing with the pool); int8
    embed/lm_head placement reused; its own tensor-name table (V4's §7 records what
    assuming HF-style naming cost).
