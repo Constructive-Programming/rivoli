@@ -501,9 +501,16 @@ extern "C" int rivoli_gather_attn_shared_kv(const float* q, const float* kv, con
 // `[row][head][dim]`, NOT the reference's heads-first `[b][head][row][dim]` — the caller
 // transposes, and `attn.rs` names that deviation at its call site.
 //
-// `#pragma clang fp contract(off)` from the V4 section above is still in effect and is
-// wanted here for the same reason: the dot below folds in the same order as the reference's,
-// so the goldens measure `expf` and the wave reduction and nothing else.
+// `#pragma clang fp contract(off)`, so no FMA fusion enters and the goldens measure the two
+// things that remain: `expf`, and the fact that this dot does NOT fold in the reference's
+// order — lane `l` owns columns i ≡ l (mod 32) and the partials meet in a `__shfl_down`
+// ladder, against torch's sequential sum. That re-association is the whole 6.56e-7 residual
+// `tests/glimmer_attend.rs` measures. (An earlier revision of this comment claimed the folds
+// DID match, which is the V4 section's situation two hundred lines up, not this one.) The
+// pragma is already in effect from that section and is restated below anyway: it is
+// idempotent, and inheriting it silently means a kernel inserted between the two sections
+// could carry contraction back in with nothing to notice.
+#pragma clang fp contract(off)
 //
 // ponytail: one subgroup per (query row, Q head) — grid (hq, tq) is 32 blocks at decode
 // against 40 CUs, and the whole KV sweep is serialised inside each. Correctness first;
@@ -511,7 +518,11 @@ extern "C" int rivoli_gather_attn_shared_kv(const float* q, const float* kv, con
 // heads per block (all 16 of a group share one KV head, so the LDS tile is read once for
 // the group rather than once per head) and split the row range with a combine pass.
 #define GQA_THREADS 32   // one wave32 subgroup owns one (query row, Q head)
-#define GQA_TILE 16      // KV rows staged into LDS per step; LDS = 2*GQA_TILE*d floats
+// KV rows staged into LDS per step; LDS = 2*GQA_TILE*d floats, so 16 KB per block at
+// Glimmer's head_dim 128. **UNSWEPT.** Correctness is independent of it, and unlike `HB` and
+// `TILE` above — which carry a measured dNLL interval — nothing here has been priced. It is
+// an occupancy input and belongs in S5's sweep with the block count, not in a guess now.
+#define GQA_TILE 16
 // Lane-private accumulator/query registers. Lane `l` owns columns i ≡ l (mod GQA_THREADS),
 // so this CAPS head_dim at GQA_THREADS*GQA_ACC = 256 — Glimmer is 128, and §9 trap 15
 // records that head_dim is NOT hidden/heads (128, not 208), so the cap is checked rather
@@ -592,10 +603,14 @@ extern "C" __global__ void gqa_attend(
         __syncthreads();  // tile consumed before the next load overwrites it
     }
 
-    // `l` is at least exp(0) = 1 for every reachable query, because item 2 puts `pos` in
-    // its own window and the causal bound puts it in the prefix — a query here always
-    // attends to at least itself. 0 rather than 0/0 if a caller ever wires `lo > pos`.
-    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    // **Unguarded, and that is `gather_attn_shared_kv`'s argument 250 lines up applied here:**
+    // a query that attended to nothing should poison its output, not return a plausible 0.
+    // `l` is at least exp(0) = 1 for every reachable query — item 2 puts `pos` inside its own
+    // window and the causal bound puts it in the prefix, so a query always attends to at least
+    // itself — which makes `lo > pos` a wiring mistake in the CALLER, exactly the case where
+    // an inf is worth more than a zero. An earlier revision returned 0 here and had this file
+    // arguing both sides of the same question.
+    const float inv = 1.0f / l;
     float* orow = out + ((size_t)row * hq + head) * d;
 #pragma unroll
     for (int c = 0; c < GQA_ACC; ++c) {
@@ -619,12 +634,26 @@ extern "C" int rivoli_gqa_attend(const float* q, const float* k, const float* v,
     // does not tile the subgroup is fine and is NOT rejected: the goldens are emitted at 8.
     if (d > GQA_THREADS * GQA_ACC) return 1002;
     // Item 3: a ring on a global layer drops the prefix past `ring_cap` with no error.
-    // A ring shorter than the window is the same bug one step later — the oldest rows the
-    // window still wants have already been overwritten.
     if (win == 0 && ring_cap != 0) return 1005;
-    if (ring_cap != 0 && ring_cap < win) return 1005;
+    // **`win + tq - 1`, not `win`.** The rows this launch attends are the UNION over its `tq`
+    // queries: row 0 wants back to `start_pos - win + 1` and row `tq-1` wants up to
+    // `start_pos + tq - 1`, so `win + tq - 1` distinct positions must be live at once. At
+    // `ring_cap == win` and `tq == 2` the slot holding `start_pos - win + 1` is the slot
+    // `start_pos + 1` was written to — the kernel reads a row overwritten within its own
+    // batch, with every shape right and no error. Found by review 2026-08-11, not by the
+    // gate: `a_ring_cache_attends_the_same_rows_as_a_linear_one` skips `tq != 1` because the
+    // reference's own sliding cache only ever hands us one query row at a time, so the
+    // multi-row ring is unreachable from the goldens and this guard is what stands in for it.
+    if (ring_cap != 0 && ring_cap < win + tq - 1) return 1005;
+    // No runtime LDS guard, because there cannot be a reachable one: `d` is already capped at
+    // GQA_THREADS*GQA_ACC = 256 above, which bounds this at 32 KB against gfx1151's 64 KB. A
+    // `return 1006` sat here and was DEAD — unreachable, untestable, and reading as coverage of
+    // a bound something else was enforcing. A static assertion is the honest form: it holds the
+    // same invariant against a future GQA_TILE or GQA_ACC tune, and fails the BUILD rather than
+    // a launch nobody makes.
+    static_assert(2 * GQA_TILE * (GQA_THREADS * GQA_ACC) * sizeof(float) <= 65536,
+                  "GQA_TILE/GQA_ACC now allow an LDS request past gfx1151's 64 KB");
     const size_t lds = 2 * (size_t)GQA_TILE * (size_t)d * sizeof(float);
-    if (lds > 65536) return 1006;
     hipGetLastError();
     hipLaunchKernelGGL(gqa_attend, dim3((unsigned)hq, (unsigned)tq), dim3(GQA_THREADS),
                        (unsigned)lds, (hipStream_t)stream, q, k, v, hq, hkv, d, start_pos, win,

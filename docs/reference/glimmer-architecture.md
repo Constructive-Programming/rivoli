@@ -294,6 +294,16 @@ repeated block.
     attends to **`[p-2047, p]` — exactly 2048 rows, inclusive of `p` itself**. The library's
     own docstring confirms it: at `sliding_window=3`, row 4 sees `{2,3,4}`. A 2048-row ring
     buffer is therefore exactly right, and the current token's own K/V must be in it.
+
+    > **CORRECTED 2026-08-11 — "exactly right" is true PER QUERY ROW, and a ring is not sized
+    > per row.** A launch covering `T` query rows dereferences the union of their windows,
+    > `[p₀-2047, p₀+T-1]`, which is **2047 + T** distinct positions. At 2048 slots and `T = 2`
+    > the oldest row the first query still wants has already been overwritten by the newest —
+    > inside one launch, with every shape right and no error. Decode is `T = 1` and unaffected;
+    > a **prefill chunk is not**, and layer-major prefill is this engine's default. Found by
+    > two independent reviews of S2 item 1 the day the kernel landed, not by its gate: the
+    > reference hands one query row per sliding step, so no golden can reach the case.
+    > `rivoli_gqa_attend` now refuses `ring_cap < win + tq - 1`.
 15. Assuming `head_dim == hidden / n_heads` (128 vs 208).
 
 ## 10. Where the model card was wrong

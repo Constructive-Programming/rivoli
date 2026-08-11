@@ -1018,10 +1018,20 @@ launchers! {
     ///
     /// Q head `i` reads KV head `i / (hq / hkv)`, which is a per-head BLOCK and not an
     /// interleave; `win > 0` bounds each query to `[pos - win + 1, pos]` INCLUSIVE of its own
-    /// position; `win == 0` is a global layer and attends the whole causal prefix. `ring_cap`
-    /// maps position to slot for a ring cache, or `0` when the cache is indexed by position.
-    /// No mask is taken — the bound is derived, because Glimmer's 131072 context makes a
-    /// `[tq][s]` mask larger than the model. The kernel comment carries the four traps.
+    /// position; `win == 0` is a global layer and attends the whole causal prefix. No mask is
+    /// taken — the bound is derived, because Glimmer's 131072 context makes a `[tq][s]` mask
+    /// larger than the model. The kernel comment carries the four traps.
+    ///
+    /// **`start_pos` is the absolute position of query row 0, and the cache must be indexed to
+    /// match — the two modes index it differently.** With `ring_cap != 0`, slot is
+    /// `position % ring_cap`, so `start_pos` stays absolute and the ring may hold any window of
+    /// history. With `ring_cap == 0` the slot IS the position, so the cache must run from
+    /// position 0: a caller that trims a linear cache to its last `win` rows and leaves
+    /// `start_pos` absolute reads past the end, and one that trims without also shifting
+    /// `start_pos` attends the wrong rows fluently. `tests/glimmer_attend.rs` does exactly that
+    /// shift, deliberately, because the reference hands it a trimmed cache — see `Fixture`.
+    /// Both engine paths avoid the question: a global layer holds the whole prefix, a sliding
+    /// layer uses the ring.
     ///
     /// # Safety
     /// Device pointers must outlive `stream`'s completion: `q` (`tq * hq * d` f32), `k` and `v`
@@ -1029,6 +1039,12 @@ launchers! {
     /// `start_pos + tq` without), `out` (`tq * hq * d` f32), none aliasing another (every
     /// kernel parameter is `__restrict__`). `stream` is a live `hipStream_t`, or null for the
     /// default stream.
+    ///
+    /// A ring must be at least `win + tq - 1` slots, which the launcher enforces: one launch
+    /// dereferences the UNION of its rows' windows, so `tq` query rows need `win + tq - 1`
+    /// positions live at once and a `win`-slot ring overwrites its own oldest row mid-launch.
+    /// Decode (`tq == 1`) is the case where `ring_cap == win` suffices, and it is the only case
+    /// the goldens can reach.
     launch_gqa_attend -> rivoli_gqa_attend, "gqa_attend" (
         q: *const f32,
         k: *const f32,

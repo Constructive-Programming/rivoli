@@ -20,8 +20,8 @@
 //! **The mask is not fed to the kernel, it is compared against it.** At Glimmer's 131072
 //! context a `[tq][s]` mask array is larger than the model, so the kernel derives the bound
 //! from `(start_pos, win)`; `the_derived_bound_reproduces_the_captured_mask` is what makes that
-//! derivation a checked claim rather than a comment. Trap 14's off-by-one lives entirely in
-//! that one test.
+//! derivation a checked claim rather than a comment. Trap 14 needs that test AND the kernel
+//! comparison: the bound is restated in Rust there, so neither half alone covers it.
 //!
 //! **The tolerance is not bit-exactness and cannot be.** The kernel reduces the score with
 //! `__shfl_down` in a ladder; torch sums sequentially. `MAX_ABS` is 10x the measured worst case
@@ -164,6 +164,17 @@ fn cap(gold: &Golden, name: &str, want: [usize; 4], transpose: bool) -> Vec<f32>
     } else {
         vals.to_vec()
     }
+}
+
+/// Whether a capture is present at all.
+///
+/// `shape_of` cannot answer this: `float` PANICS on an absent name, deliberately — a missing
+/// capture is nearly always a rename, and the next question is always "then what IS in there".
+/// So the `shape_of(..).is_empty()` this file used to branch on was dead code twice over: an
+/// absent mask would have aborted the test instead of skipping it, and a present one is never
+/// empty.
+fn present(gold: &Golden, name: &str) -> bool {
+    gold.g.floats.iter().any(|(n, _, _)| n == name)
 }
 
 /// How many rows a cache capture actually holds.
@@ -378,16 +389,36 @@ impl Fixture {
     }
 }
 
-/// How many cases `each_case` must produce, and how many of those the ring test keeps —
-/// computed from the goldens' own metadata rather than written down, because the failure this
-/// guards against is a loop that silently covers less than it claims. Returns
-/// `(all, sliding-at-decode)`.
+/// How many cases `each_case` must produce and how many of those the ring test keeps — computed
+/// from the goldens' metadata, because the failure this guards against is a loop that silently
+/// covers less than it claims. Returns `(all, sliding-at-decode)`.
+///
+/// **The layer count and the step count are cross-checked against an INDEPENDENT source, and
+/// that is the whole point.** The first version derived `all` from `layer_is_sliding.len()` and
+/// compared it to a loop over the same tensor: an empty `layer_is_sliding` gave zero cases and
+/// an expectation of zero, so `assert_eq!(0, 0)` passed while the suite tested nothing and
+/// printed "worst abs over 0 cases". `num_hidden_layers` comes out of `tiny_config`, which the
+/// driver writes separately, so the two can disagree — and a zero of either is now refused
+/// outright rather than multiplied through.
 fn expected() -> (usize, usize) {
     let (mut all, mut ring) = (0, 0);
     for gold in &goldens() {
         let (_, steps) = gold.steps();
         let sliding = ints(&gold.g, "layer_is_sliding").to_vec();
-        all += (steps + 1) * sliding.len();
+        let layers = gold.n("num_hidden_layers");
+        assert_eq!(
+            sliding.len(),
+            layers,
+            "{}: layer_is_sliding has {} entries against num_hidden_layers {layers}",
+            gold.name,
+            sliding.len()
+        );
+        assert!(
+            layers > 0 && steps > 0,
+            "{}: {layers} layers, {steps} decode steps",
+            gold.name
+        );
+        all += (steps + 1) * layers;
         ring += steps * sliding.iter().filter(|s| **s != 0).count();
     }
     (all, ring)
@@ -397,11 +428,17 @@ fn expected() -> (usize, usize) {
 
 /// The kernel against the reference, over every layer and every step of both goldens.
 ///
-/// This is 8 layers x 19 steps x 2 goldens = 304 comparisons, and it is deliberately not
-/// narrowed to a representative few: a local layer, a global layer, layer 0, the last layer and
-/// every window-boundary crossing are all in here by construction, which is exactly the
-/// coverage G1b names. The tiny `sliding_window` of 4 against 18 decoded positions is what
-/// makes the crossings dense rather than incidental.
+/// This is 8 layers x 7 steps (a 12-token prefill and 6 decoded) x 2 goldens = **112**
+/// comparisons, and it is deliberately not narrowed to a representative few: a local layer, a
+/// global layer, layer 0, the last layer and every window-boundary crossing are all in here by
+/// construction, which is exactly the coverage G1b names. The tiny `sliding_window` of 4
+/// against a sequence that reaches 18 is what makes the crossings dense rather than incidental.
+///
+/// > **CORRECTED 2026-08-11**, by review, same day it was written: this said "19 steps ... =
+/// > 304 comparisons" and "18 decoded positions". One conflation of steps with positions, made
+/// > arithmetically self-consistent, which is exactly what lets a wrong number survive a read.
+/// > 112 is what `WRONG_SIGNAL` above, the commit message and `glimmer-port.md` all say, and
+/// > `expected()` below now derives it rather than restating it.
 #[test]
 fn the_kernel_matches_the_anchor_at_every_layer_and_step() {
     let mut worst: f32 = 0.0;
@@ -451,10 +488,17 @@ fn the_derived_bound_reproduces_the_captured_mask() {
     each_case(|gold, t, l, win| {
         let (tq, start_pos) = gold.geometry(t);
         let name = format!("t{t}.L{l}.attend.mask");
-        // A global layer at t=0 may carry no mask at all — a full causal prefill needs none.
-        if shape_of(&gold.g, &name).is_empty() {
-            return;
-        }
+        // **Every case has a mask, and that is asserted rather than tolerated.** An earlier
+        // revision skipped an absent one, on the theory that a global layer's prefill needs
+        // none — and that skip was dead code twice over: `shape_of` PANICS on an absent capture
+        // rather than returning an empty shape, and eager attention materialises a mask for
+        // every call anyway. If transformers ever stops emitting one, this fails with the case
+        // named instead of quietly covering less. Found by review 2026-08-11.
+        assert!(
+            present(gold, &name),
+            "{}: {name} is absent, so nothing checks its bound",
+            gold.name
+        );
         let (ms, mv) = float(&gold.g, &name);
         // The mask spans the CACHE, not the sequence, and on a sliding layer at decode those
         // differ — `get_mask_sizes` returns `kv_length = window - 1 + query_length`. Column `j`
@@ -479,7 +523,11 @@ fn the_derived_bound_reproduces_the_captured_mask() {
         }
         checked += 1;
     });
-    assert!(checked >= 100, "only {checked} masks compared");
+    assert_eq!(
+        checked,
+        expected().0,
+        "the mask loop did not cover every step and layer"
+    );
 }
 
 /// **The red proof for trap 10.** `i / group` and `i % hkv` are both attention over the same
@@ -501,8 +549,9 @@ fn the_goldens_separate_the_two_kv_broadcast_mappings() {
         let f = fixture(gold, t, l, win);
         let right = attend_host(&f.case(), true);
         let wrong = attend_host(&f.case(), false);
+        let right_err = worst_abs(&right, &f.want);
         assert!(
-            worst_abs(&right, &f.want) <= MAX_ABS,
+            right_err <= MAX_ABS,
             "{}: t{t}.L{l} the host oracle does not reproduce the reference, so it cannot prove \
              anything about the wrong mapping",
             gold.name
@@ -513,7 +562,7 @@ fn the_goldens_separate_the_two_kv_broadcast_mappings() {
              — this fixture is blind to trap 10",
             gold.name
         );
-        worst = worst.max(worst_abs(&right, &f.want));
+        worst = worst.max(right_err);
         sep_min = sep_min.min(worst_abs(&wrong, &f.want));
         separated += 1;
     });
@@ -536,7 +585,10 @@ fn the_goldens_separate_the_two_kv_broadcast_mappings() {
 fn a_ring_cache_attends_the_same_rows_as_a_linear_one() {
     let (mut ran, mut worst) = (0, 0.0f32);
     each_case(|gold, t, l, win| {
-        // Only meaningful on a sliding layer, and only once the ring has wrapped.
+        // Only meaningful on a sliding layer, and only once the ring has wrapped. `tq != 1` is
+        // excluded because a `win`-row ring cannot serve a 12-row prefill at all — so THE RING
+        // PATH IS EXERCISED ONLY AT DECODE here, and the multi-row case is held by the
+        // launcher's `ring_cap < win + tq - 1` guard instead of by a golden.
         let (tq, start_pos) = gold.geometry(t);
         let s_len = start_pos + tq;
         if win == 0 || s_len <= win || tq != 1 {
@@ -588,10 +640,22 @@ fn a_ring_cache_attends_the_same_rows_as_a_linear_one() {
 /// One row of the guard table: `(hq, hkv, head_dim, win, ring_cap, expected code, what)`, where
 /// the code is `None` for a call that must be ACCEPTED.
 ///
+/// `tq` is a field because the ring bound DEPENDS on it — `win + tq - 1` rows must be live at
+/// once — and a table that hard-coded `tq = 1` could not express the case that motivated it.
+///
 /// An alias rather than a bare tuple because clippy rejects the literal type as too complex, and
 /// rather than a struct because a struct literal per row made six near-identical field lists that
 /// jscpd then rejected as clones. Both gates are right; a named tuple is what satisfies them.
-type GuardCase = (usize, usize, usize, usize, usize, Option<i32>, &'static str);
+type GuardCase = (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    Option<i32>,
+    &'static str,
+);
 
 /// Each argument guard rejects before any launch, so a bad call is an error code and not a
 /// fault in someone else's kernel three launches later.
@@ -608,27 +672,72 @@ fn the_launcher_refuses_what_it_cannot_compute() {
     let (p, scratch_out) = (b.ptr() as *const f32, b.ptr() as *mut f32);
     // `want` is asserted as a CODE, not merely as "an error": a launch that failed for some
     // other reason would satisfy `is_err` and leave the guard it claims to exercise untested.
-    let cases: [GuardCase; 6] = [
-        (0, 2, 8, 4, 0, Some(1001), "zero Q heads"),
-        (7, 2, 8, 4, 0, Some(1003), "hq not a multiple of hkv"),
-        (6, 2, 512, 4, 0, Some(1002), "head_dim past the accumulator"),
-        (6, 2, 8, 0, 4, Some(1005), "a ring on a global layer"),
-        (6, 2, 8, 8, 4, Some(1005), "a ring shorter than the window"),
+    let cases: [GuardCase; 8] = [
+        (0, 2, 8, 1, 4, 0, Some(1001), "zero Q heads"),
+        (7, 2, 8, 1, 4, 0, Some(1003), "hq not a multiple of hkv"),
+        (
+            6,
+            2,
+            512,
+            1,
+            4,
+            0,
+            Some(1002),
+            "head_dim past the accumulator",
+        ),
+        (6, 2, 8, 1, 0, 4, Some(1005), "a ring on a global layer"),
         (
             6,
             2,
             8,
+            1,
+            8,
+            4,
+            Some(1005),
+            "a ring shorter than the window",
+        ),
+        (
+            6,
+            2,
+            8,
+            1,
             4,
             4,
             None,
-            "a ring exactly the window, which is legal",
+            "a ring exactly the window at one query row, which is legal",
+        ),
+        // The two rows review added on 2026-08-11. A `win`-row ring cannot serve two query
+        // rows: the union they attend is `win + tq - 1` positions, so the oldest is overwritten
+        // by the newest inside this same launch — every shape right, no error, wrong rows. The
+        // goldens cannot reach it (the reference hands one query row per sliding step), which
+        // is precisely why it has to be a guard.
+        (
+            6,
+            2,
+            8,
+            2,
+            4,
+            4,
+            Some(1005),
+            "a ring exactly the window at TWO query rows",
+        ),
+        (
+            6,
+            2,
+            8,
+            2,
+            4,
+            5,
+            None,
+            "a ring of win + tq - 1, which is the smallest legal one",
         ),
     ];
-    for (hq, hkv, d, win, ring_cap, want, what) in cases {
-        // SAFETY: the five rejected calls return before `hipLaunchKernelGGL`, so no pointer is
-        // dereferenced. The sixth does launch, at 6 heads x 1 row x head_dim 8 — 48 f32 in and
-        // 48 out, well inside the 4096-byte buffer every argument points into. It is nonsense
-        // arithmetic over aliased inputs, which is fine: this test reads the return code.
+    for (hq, hkv, d, tq, win, ring_cap, want, what) in cases {
+        // SAFETY: the six rejected calls return before `hipLaunchKernelGGL`, so no pointer is
+        // dereferenced. The two accepted ones do launch, at 6 heads x at most 2 rows x head_dim
+        // 8 — 96 f32 in and 96 out, well inside the 4096-byte buffer every argument points
+        // into. It is nonsense arithmetic over aliased inputs, which is fine: this test reads
+        // the return code and nothing else.
         let got = unsafe {
             launch_gqa_attend(
                 p,
@@ -637,7 +746,7 @@ fn the_launcher_refuses_what_it_cannot_compute() {
                 hq,
                 hkv,
                 d,
-                1,
+                tq,
                 0,
                 win,
                 ring_cap,
@@ -658,4 +767,64 @@ fn the_launcher_refuses_what_it_cannot_compute() {
         }
     }
     device_sync().unwrap();
+}
+
+/// **head_dim past one accumulator register, which no golden reaches.**
+///
+/// Every capture in the anchor is at `head_dim` 8, so `nacc` is 1 and register `c = 0` is the
+/// only one ever live. Glimmer's real head_dim is **128** — four registers — and the kernel
+/// spends nine lines justifying a lane mapping that no test had exercised beyond its first
+/// step. The guard table's large-`d` row is REJECTED before launch, so it covers the guard and
+/// not the accumulator.
+///
+/// The reference here is `attend_host`, which the goldens have already validated at 6.56e-7 —
+/// so this is not a second oracle, it is the same one carried to widths the reference cannot
+/// emit. 40 is deliberately NOT a multiple of 32: it puts 8 lanes on `c = 1` and idles 24,
+/// which is the divergent tail the kernel comment argues for and `mla_latent_attend` refuses.
+#[test]
+fn the_accumulator_holds_at_widths_no_golden_reaches() {
+    // A cheap deterministic fill. Values in [-1, 1] with no period that divides the head width,
+    // so a dropped or doubled column changes the answer rather than cancelling.
+    let fill = |n: usize, salt: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let x = ((i * 2_654_435_761 + salt * 40_503) % 65_536) as f32 / 32_768.0;
+                x - 1.0
+            })
+            .collect()
+    };
+    let mut ran = 0;
+    for (d, tq, start_pos, win) in [
+        (40, 1, 63, 16),
+        (128, 1, 63, 16),
+        (128, 4, 0, 0),
+        (96, 3, 0, 8),
+    ] {
+        let (hq, hkv) = (32, 2);
+        let rows = start_pos + tq;
+        let (q, k, v) = (
+            fill(tq * hq * d, 1),
+            fill(rows * hkv * d, 2),
+            fill(rows * hkv * d, 3),
+        );
+        let case = Case {
+            q: &q,
+            k: &k,
+            v: &v,
+            dims: (hq, hkv, d),
+            geom: (tq, start_pos, win),
+        };
+        let got = run(&case, 0);
+        let want = attend_host(&case, true);
+        let r = worst_abs(&got, &want);
+        // Ten times the golden-measured bar: this sums up to 128 terms per dot against the
+        // goldens' 8, and the wave-reduction ladder diverges further from a sequential sum the
+        // more terms it folds. Still five decades under WRONG_SIGNAL.
+        assert!(
+            r <= 10.0 * MAX_ABS,
+            "d {d}, tq {tq}, win {win}: worst abs {r:e}"
+        );
+        ran += 1;
+    }
+    assert_eq!(ran, 4, "the width sweep did not run every case");
 }
