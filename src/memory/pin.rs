@@ -21,7 +21,7 @@ use crate::artifact::config::Mode;
 use crate::artifact::format::{
     Dtype, ExpertSet, FormatMeta, RoutedFmt, Safetensors, SetDims, f4_layer_range, load_codebooks,
 };
-use crate::artifact::model::{ModelConfig, V4Config};
+use crate::artifact::model::{GLIMMER_LAYER_PREFIX, GlimmerTextConfig, ModelConfig, V4Config};
 use crate::artifact::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
 };
@@ -1149,6 +1149,162 @@ impl F4Pin {
                     self.range.start, self.range.end
                 )
             })
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Muse Glimmer. Dense, so this is the whole model — there is no second half.
+// ---------------------------------------------------------------------------------------
+
+/// One Muse Glimmer decoder layer's resident weights.
+///
+/// **Every layer, in full, and that is the architectural difference this port turns on.**
+/// [`Pin`] and [`F4Pin`] both split a layer into a resident part and a routed part that
+/// streams, because 256 experts do not fit; Glimmer is dense, so there is nothing to stream,
+/// no pool, no cache policy and no residency decision. The entire model is this struct, 52
+/// times, plus three model-level tensors.
+///
+/// Twelve tensors, matching [`crate::artifact::model::GLIMMER_LAYER_TENSORS`]: four norms
+/// (widened to f32 by the converter) and eight bf16 projections. **Five projections in the
+/// attention block, not four** — `self_attn.gate_proj` is a per-head output gate applied
+/// before `o_proj`, it is the same shape as `q_proj`, and it is the one an HF-shaped port
+/// drops on the floor.
+pub struct GlimmerLayerPin {
+    /// Pre-attention, `rms_norm_eps`.
+    pub input_ln: *const f32,
+    /// **Post-attention, `post_norm_eps` — a different eps, by three orders of magnitude.**
+    /// The two post-norms sit on the BRANCH, before the residual add (sandwich norms), which
+    /// is why they are separate fields rather than a `[*const f32; 4]` a loop indexes.
+    pub post_attn_ln: *const f32,
+    /// Pre-MLP, `rms_norm_eps`.
+    pub pre_ffn_ln: *const f32,
+    /// Post-MLP, `post_norm_eps`.
+    pub post_ffn_ln: *const f32,
+    /// `[n_heads·head_dim, hidden]` = `[4096, 6656]`. **Not square**, and not derivable from
+    /// `hidden / n_heads`.
+    pub q: Bf16Weight,
+    /// `[kv_heads·head_dim, hidden]` = `[256, 6656]`. GQA at 16 query heads per KV head.
+    pub k: Bf16Weight,
+    /// Same shape as [`Self::k`], and separable from it only by NAME.
+    pub v: Bf16Weight,
+    /// `[hidden, n_heads·head_dim]` — the transposed one.
+    pub o: Bf16Weight,
+    /// `self_attn.gate_proj`, same shape as [`Self::q`] and likewise separable only by name.
+    pub attn_gate: Bf16Weight,
+    pub mlp_gate: Bf16Weight,
+    pub mlp_up: Bf16Weight,
+    /// `[hidden, inter]` — the other transposed one.
+    pub mlp_down: Bf16Weight,
+}
+
+/// The Muse Glimmer resident weight set. All of it.
+pub struct GlimmerPin {
+    #[allow(dead_code)] // RAII owner of the slab every pointer below points into.
+    tier: DeviceTier,
+    /// `[vocab, hidden]` bf16, 2.690 GB.
+    pub embed: Bf16Weight,
+    /// `lm_head.weight`, `[vocab, hidden]` bf16 — a second 2.690 GB, because
+    /// `tie_word_embeddings` is false and both tensors ship.
+    pub head: Bf16Weight,
+    pub final_norm: *const f32,
+    /// Indexed by ABSOLUTE layer id, unlike [`F4Pin::layers`]. `convert_glimmer` refuses a
+    /// checkpoint missing any layer's tensors, so there is no partial artifact to offset for
+    /// and therefore no accessor to hide an offset behind.
+    pub layers: Vec<GlimmerLayerPin>,
+}
+
+/// Place one Glimmer layer projection, with the shape the config implies.
+///
+/// The shape comes from [`GlimmerTextConfig::layer_tensor_shape`] rather than from the caller,
+/// so the twelve call sites below cannot each get it slightly wrong, and so the one table
+/// `tests/glimmer_names.rs` validates against the shipped checkpoint is the one used here.
+fn place_glimmer_proj(
+    tier: &mut DeviceTier,
+    st: &Safetensors,
+    cfg: &GlimmerTextConfig,
+    prefix: &str,
+    tensor: &str,
+) -> Result<Bf16Weight> {
+    let want = cfg.layer_tensor_shape(tensor)?;
+    let w = place_bf16(tier, st, &format!("{prefix}.{tensor}.weight"))?;
+    // Checked AFTER placing, which is safe and not merely tolerable: the tier is sized from
+    // `resident_bytes`, so a tensor larger than its declared shape bails inside `place` on
+    // capacity instead, and either way the pin refuses before a decode ever runs. Checking
+    // first would mean reading the header twice for the sake of which error message fires.
+    ensure!(
+        [w.o_dim, w.i_dim] == want[..],
+        "{prefix}.{tensor}.weight is [{}, {}], but this config implies {want:?} — the \
+         artifact and the config describe different models",
+        w.o_dim,
+        w.i_dim
+    );
+    Ok(w)
+}
+
+impl GlimmerPin {
+    /// Build the whole resident set from artifact directory `dir`.
+    ///
+    /// **No `capacity` parameter, and no cache policy.** Both exist on [`Pin`] and [`F4Pin`]
+    /// to divide a budget between a resident tier and a streaming pool. There is no pool
+    /// here: the resident set is the model, its size is a function of the config alone
+    /// ([`GlimmerTextConfig::resident_bytes`]), and a device that cannot hold it cannot run
+    /// the model at any setting. Taking a budget would imply otherwise —
+    /// `DeviceTier::new` already refuses what does not fit, and it names the shortfall.
+    pub fn build(dir: &str, cfg: &GlimmerTextConfig) -> Result<Self> {
+        // Alignment slack. `DeviceTier::place` starts every reservation at a 256-byte
+        // boundary, and this pin makes `3 + 12·n_layers` = 627 placements, so the padding is
+        // under 160 KB. 1 MiB is ~6x that bound and 0.002% of the 55.7 GB it sits beside.
+        const SLACK: usize = 1 << 20;
+        let want = cfg.resident_bytes()?;
+        let mut tier = DeviceTier::new(want + SLACK)?;
+        // `FormatMeta` is loaded for its side effect: it is the version and VQ-parameter gate
+        // every artifact passes, and skipping it here would let an artifact written by an
+        // older converter load silently. Glimmer has no VQ tensors, so nothing is read out.
+        FormatMeta::load(dir)?;
+        let st = Safetensors::open_dir(dir)?;
+
+        let embed = place_bf16(&mut tier, &st, "model.language_model.embed_tokens.weight")?;
+        let head = place_bf16(&mut tier, &st, "lm_head.weight")?;
+        ensure!(
+            [embed.o_dim, embed.i_dim] == [cfg.vocab, cfg.hidden]
+                && [head.o_dim, head.i_dim] == [cfg.vocab, cfg.hidden],
+            "embed_tokens is [{}, {}] and lm_head is [{}, {}]; this config implies [{}, {}] \
+             for both",
+            embed.o_dim,
+            embed.i_dim,
+            head.o_dim,
+            head.i_dim,
+            cfg.vocab,
+            cfg.hidden
+        );
+        let final_norm = place_f32(&mut tier, &st, "model.language_model.norm.weight")?;
+
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for l in 0..cfg.n_layers {
+            let p = format!("{GLIMMER_LAYER_PREFIX}.{l}");
+            let norm = |tier: &mut DeviceTier, t: &str| place_f32(tier, &st, &format!("{p}.{t}"));
+            layers.push(GlimmerLayerPin {
+                input_ln: norm(&mut tier, "input_layernorm.weight")?,
+                post_attn_ln: norm(&mut tier, "post_attention_layernorm.weight")?,
+                pre_ffn_ln: norm(&mut tier, "pre_feedforward_layernorm.weight")?,
+                post_ffn_ln: norm(&mut tier, "post_feedforward_layernorm.weight")?,
+                q: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.q_proj")?,
+                k: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.k_proj")?,
+                v: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.v_proj")?,
+                o: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.o_proj")?,
+                attn_gate: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.gate_proj")?,
+                mlp_gate: place_glimmer_proj(&mut tier, &st, cfg, &p, "mlp.gate_proj")?,
+                mlp_up: place_glimmer_proj(&mut tier, &st, cfg, &p, "mlp.up_proj")?,
+                mlp_down: place_glimmer_proj(&mut tier, &st, cfg, &p, "mlp.down_proj")?,
+            });
+        }
+        Ok(Self {
+            tier,
+            embed,
+            head,
+            final_norm,
+            layers,
+        })
     }
 }
 

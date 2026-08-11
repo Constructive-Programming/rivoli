@@ -844,3 +844,166 @@ pub fn tsv_families(src: &str) -> Vec<TsvFamily> {
         })
         .collect()
 }
+
+// --- Muse Glimmer's synthetic checkpoint -------------------------------------------------
+
+/// The vendored `config.json`, at HF revision `f84ecc3`.
+pub const GLIMMER_SHIPPED_CONFIG: &str =
+    include_str!("../../docs/measurement/glimmer-reference/config.json");
+
+/// One period of Glimmer's `[sliding, sliding, sliding, full]` layer pattern.
+pub const GLIMMER_FIXTURE_LAYERS: usize = 4;
+
+/// bf16 bytes for `n` values, distinct per `seed` so a mixed-up copy is visible as a wrong
+/// VALUE rather than as a right length.
+pub fn bf16_blob(seed: u16, n: usize) -> Vec<u8> {
+    (0..n)
+        .flat_map(|i| (seed.wrapping_mul(37).wrapping_add(i as u16 * 7) | 0x3c00).to_le_bytes())
+        .collect()
+}
+
+/// Write a minimal safetensors file: `u64` header length, header JSON, then the data block.
+pub fn write_safetensors(path: &std::path::Path, tensors: &[FixtureTensor]) {
+    let mut header = serde_json::Map::new();
+    let mut offset = 0usize;
+    for (name, shape, bytes) in tensors {
+        let end = offset + bytes.len();
+        header.insert(
+            name.clone(),
+            serde_json::json!({"dtype": "BF16", "shape": shape, "data_offsets": [offset, end]}),
+        );
+        offset = end;
+    }
+    let hjson = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+    let mut out = (hjson.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&hjson);
+    for (_, _, b) in tensors {
+        out.extend_from_slice(b);
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// The single-shard index mapping every tensor to the one file [`write_safetensors`] wrote.
+pub fn write_index(dir: &std::path::Path, tensors: &[FixtureTensor]) {
+    let map: serde_json::Map<String, serde_json::Value> = tensors
+        .iter()
+        .map(|(n, _, _)| (n.clone(), "model-00001-of-00001.safetensors".into()))
+        .collect();
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({ "weight_map": map })).unwrap(),
+    )
+    .unwrap();
+}
+
+/// A [`GLIMMER_FIXTURE_LAYERS`]-layer Muse Glimmer source checkpoint at `dim`-wide dims, plus
+/// the three vision families the converter must skip. Returns what it wrote.
+///
+/// **Shared by `glimmer_convert` and `glimmer_pin`, and shaped by what the second needs.** The
+/// converter's test only ever needed 1-D tensors of one length; the pin checks every shape
+/// against `GlimmerTextConfig::layer_tensor_shape`, so the fixture has to be dimensionally
+/// consistent with the config it writes beside itself. Both read the same one, which is the
+/// point — a pin test on a differently-shaped fixture would prove nothing about the artifact
+/// the converter actually produces.
+///
+/// `dim` sets `hidden_size`; the rest derive from it exactly as the shipped config's do, so
+/// `head_dim * num_attention_heads != hidden_size` holds here too. That inequality is the
+/// model's trap 15 and a fixture that lost it would let a derived-head-dim port pass.
+pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> {
+    use rivoli::artifact::model as gm;
+    std::fs::create_dir_all(dir).unwrap();
+    let l = GLIMMER_FIXTURE_LAYERS;
+    let (heads, kv_heads, head_dim) = (2, 1, dim);
+    let (inter, vocab) = (dim * 2, dim + 4);
+
+    let mut cfg: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED_CONFIG).unwrap();
+    let t = cfg["text_config"].as_object_mut().unwrap();
+    for (k, v) in [
+        ("num_hidden_layers", l),
+        ("hidden_size", dim),
+        ("intermediate_size", inter),
+        ("vocab_size", vocab),
+        ("num_attention_heads", heads),
+        ("num_key_value_heads", kv_heads),
+        ("head_dim", head_dim),
+        ("sliding_window", 2),
+    ] {
+        t[k] = serde_json::json!(v);
+    }
+    // Truncated, not regenerated: the pairing invariant (`sliding IFF rotated`) is the
+    // hardest thing `validate` checks, and a prefix of the shipped arrays still satisfies it.
+    t["layer_types"] = serde_json::json!(t["layer_types"].as_array().unwrap()[..l]);
+    t["layer_rope_theta"] = serde_json::json!(t["layer_rope_theta"].as_array().unwrap()[..l]);
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
+
+    let text: gm::GlimmerTextConfig =
+        serde_json::from_value(cfg["text_config"].clone()).expect("fixture text_config");
+    let mut tensors: Vec<FixtureTensor> = Vec::new();
+    let mut push = |name: String, shape: Vec<usize>| {
+        let seed = tensors.len() as u16 + 1;
+        let n: usize = shape.iter().product();
+        tensors.push((name, shape, bf16_blob(seed, n)));
+    };
+    push("lm_head.weight".into(), vec![vocab, dim]);
+    push(
+        "model.language_model.embed_tokens.weight".into(),
+        vec![vocab, dim],
+    );
+    push("model.language_model.norm.weight".into(), vec![dim]);
+    for i in 0..l {
+        for name in gm::GLIMMER_LAYER_TENSORS {
+            let shape = text.layer_tensor_shape(name).expect("fixture shape");
+            push(
+                format!("{}.{i}.{name}.weight", gm::GLIMMER_LAYER_PREFIX),
+                shape,
+            );
+        }
+    }
+    for v in [
+        "model.vision_tower.layers.0.attn.q_proj.weight",
+        "model.vision_adapter.fc1.weight",
+        "model.vision_projection.weight",
+    ] {
+        push(v.into(), vec![dim]);
+    }
+
+    write_safetensors(&dir.join("model-00001-of-00001.safetensors"), &tensors);
+    write_index(dir, &tensors);
+    for aux in ["tokenizer.json", "tokenizer_config.json"] {
+        std::fs::write(dir.join(aux), b"{}").unwrap();
+    }
+    tensors
+}
+
+/// Run the real `convert_glimmer` binary, so the gate exercises what ships rather than a
+/// library entry point the binary might not use.
+pub fn run_convert_glimmer(src: &std::path::Path, out: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_convert_glimmer"))
+        .arg(src)
+        .arg(out)
+        .output()
+        .expect("run convert_glimmer")
+}
+
+/// One synthetic tensor: `(name, shape, bytes)`. Named because the fixture builders pass
+/// vectors of it across four signatures.
+pub type FixtureTensor = (String, Vec<usize>, Vec<u8>);
+
+/// Build the Glimmer fixture at `root/src` and convert it into `root/out`, asserting the run
+/// succeeded. Returns the SOURCE tensors and the converter's stderr.
+///
+/// Shared by `glimmer_convert` and `glimmer_pin` because jscpd reported the two copies as a
+/// 136-token clone — and it should be shared anyway: the pin test's whole claim is about the
+/// artifact the converter produces, so the two must go through the same call.
+pub fn glimmer_convert_fixture(root: &std::path::Path, dim: usize) -> (Vec<FixtureTensor>, String) {
+    let _ = std::fs::remove_dir_all(root);
+    let tensors = glimmer_fixture(&root.join("src"), dim);
+    let o = run_convert_glimmer(&root.join("src"), &root.join("out"));
+    let log = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(o.status.success(), "converter failed: {log}");
+    (tensors, log)
+}

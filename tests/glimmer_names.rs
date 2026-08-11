@@ -18,13 +18,34 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 mod common;
-use common::{TsvFamily, tsv_families};
+use common::{GLIMMER_SHIPPED_CONFIG, TsvFamily, tsv_families};
 use rivoli::artifact::model as gm;
 
 const FAMILIES: &str = include_str!("../docs/measurement/glimmer-reference/tensor-families.tsv");
 
 fn families() -> Vec<TsvFamily> {
     tsv_families(FAMILIES)
+}
+
+/// Every family the port places: the twelve per-layer tensors plus the three model-level ones.
+fn implemented_families() -> Vec<String> {
+    gm::GLIMMER_LAYER_TENSORS
+        .iter()
+        .map(|t| format!("{}.{{L}}.{}.weight", gm::GLIMMER_LAYER_PREFIX, t))
+        .chain([
+            "lm_head.weight".to_string(),
+            "model.language_model.embed_tokens.weight".to_string(),
+            "model.language_model.norm.weight".to_string(),
+        ])
+        .collect()
+}
+
+/// The shipped config, at full dims — so the shapes checked below are the model's, not a
+/// fixture's.
+fn shipped() -> gm::GlimmerTextConfig {
+    serde_json::from_str::<gm::GlimmerConfig>(GLIMMER_SHIPPED_CONFIG)
+        .expect("the vendored config parses")
+        .text
 }
 
 /// The vendored reduction is of the real checkpoint, and says so in numbers the header can be
@@ -49,33 +70,30 @@ fn the_reduction_is_of_the_shipped_checkpoint() {
     assert_eq!(bytes, 59_553_253_376, "summed bytes vs metadata.total_size");
 }
 
-/// **Every name the converter and the pin will ask for exists, with the shape the spec
-/// records.** This is the half that catches a transliteration error.
+/// **Every name the converter and the pin will ask for exists, with the shape the config
+/// implies.** This is the half that catches a transliteration error.
+///
+/// It is also what validates [`gm::GlimmerTextConfig::layer_tensor_shape`], the one table the
+/// pin checks its placements against and `resident_bytes` sizes the tier from. That table is
+/// arithmetic over config keys; here it meets the shipped `model.safetensors.index.json`, so
+/// it is confronted with the checkpoint rather than believed.
 #[test]
 fn the_layer_tensor_names_match_the_checkpoint() {
     let fams = families();
+    let cfg = shipped();
     let by_name = |n: &str| fams.iter().find(|f| f.name == n);
-    let (hidden, inter, heads_dim, kv_dim, vocab) = (6656, 19968, 4096, 256, 202_048);
+    let (hidden, vocab) = (cfg.hidden, cfg.vocab);
 
     for t in gm::GLIMMER_LAYER_TENSORS {
         let n = format!("{}.{{L}}.{}.weight", gm::GLIMMER_LAYER_PREFIX, t);
         let f = by_name(&n).unwrap_or_else(|| {
             panic!("{n} is not a family in the checkpoint — the name is wrong, not the model")
         });
-        assert_eq!(f.count, 52, "{n}: one per layer");
-        // Shapes from `glimmer-architecture.md` §1. Asserted per family rather than as a
-        // total, because a q/gate mix-up (both [4096, 6656]) and a k/v mix-up (both
-        // [256, 6656]) are the two that a byte total cannot see — those pairs are checked by
-        // NAME above and are distinguishable only there.
-        let want: Vec<usize> = match t {
-            "self_attn.q_proj" | "self_attn.gate_proj" => vec![heads_dim, hidden],
-            "self_attn.k_proj" | "self_attn.v_proj" => vec![kv_dim, hidden],
-            "self_attn.o_proj" => vec![hidden, heads_dim],
-            "mlp.gate_proj" | "mlp.up_proj" => vec![inter, hidden],
-            "mlp.down_proj" => vec![hidden, inter],
-            _ => vec![hidden], // the four norms
-        };
-        assert_eq!(f.shape, want, "{n} shape");
+        assert_eq!(f.count, cfg.n_layers, "{n}: one per layer");
+        // Asserted per family rather than as a total, because a q/gate mix-up (both
+        // [4096, 6656]) and a k/v mix-up (both [256, 6656]) are the two that a byte total
+        // cannot see — those pairs are distinguishable only by NAME, which is the loop key.
+        assert_eq!(f.shape, cfg.layer_tensor_shape(t).unwrap(), "{n} shape");
     }
 
     for (n, want) in [
@@ -117,15 +135,7 @@ fn every_family_is_either_implemented_or_deliberately_skipped() {
             || n.starts_with("model.vision_adapter.")
             || n.starts_with("model.vision_projection")
     };
-    let implemented: Vec<String> = gm::GLIMMER_LAYER_TENSORS
-        .iter()
-        .map(|t| format!("{}.{{L}}.{}.weight", gm::GLIMMER_LAYER_PREFIX, t))
-        .chain([
-            "lm_head.weight".to_string(),
-            "model.language_model.embed_tokens.weight".to_string(),
-            "model.language_model.norm.weight".to_string(),
-        ])
-        .collect();
+    let implemented = implemented_families();
 
     let (mut text, mut vision) = (0usize, 0usize);
     for f in families() {
@@ -144,4 +154,32 @@ fn every_family_is_either_implemented_or_deliberately_skipped() {
     assert_eq!(text, 627, "text-side tensors");
     assert_eq!(vision, 809, "vision-side tensors");
     assert_eq!(text + vision, 1436);
+}
+
+/// **The resident byte accounting, reproduced from the checkpoint's own shapes** — G1a's
+/// fourth clause, and it needs no device.
+///
+/// `GlimmerTextConfig::resident_bytes` sizes the tier, so an under-count is a mid-placement
+/// bail on a 55.7 GB load and an over-count is device memory nothing can use. It is derived
+/// from `layer_tensor_shape`, which the test above pins to this same index — so what is left
+/// to establish is the *dtype* arithmetic, which the index alone decides: bf16 everywhere
+/// except the norms, which `convert_glimmer` widens to f32.
+///
+/// The expectation is computed from the vendored families rather than written down, so the
+/// 55.712 GB below is a reconciliation and not a second assertion of the same belief. It is
+/// 2.782 MB above the checkpoint's own text half — 209 norms x 6656 x 2 extra bytes — and
+/// that difference is exactly what the `shape.len() == 1` arm accounts for.
+#[test]
+fn the_resident_byte_accounting_reproduces_the_checkpoint() {
+    let implemented = implemented_families();
+    let want: usize = families()
+        .iter()
+        .filter(|f| implemented.contains(&f.name))
+        .map(|f| {
+            let n: usize = f.shape.iter().product::<usize>() * f.count;
+            n * if f.shape.len() == 1 { 4 } else { 2 }
+        })
+        .sum();
+    assert_eq!(shipped().resident_bytes().unwrap(), want);
+    assert_eq!(want, 55_712_344_064, "55.712 GB resident");
 }

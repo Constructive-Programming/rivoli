@@ -1833,7 +1833,7 @@ mod tests {
     fn fp8_block_quantize_refuses_what_would_look_like_weights() {
         // An all-zero tile must take scale 1.0, not 0.0. At 0.0 the encode is 0/0 = NaN and
         // `f32_to_e4m3(NaN)` is 0x7f, so the tile would come back as NaNs.
-        let (packed, scale) = quantize_fp8_block(&vec![0.0f32; 4], [2, 2], 2).unwrap();
+        let (packed, scale) = quantize_fp8_block(&[0.0f32; 4], [2, 2], 2).unwrap();
         assert_eq!(scale, [1.0], "an all-zero tile must not take a zero scale");
         assert!(packed.iter().all(|&b| b == 0));
         assert!(

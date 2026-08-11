@@ -118,7 +118,7 @@ fn main() -> Result<()> {
     for l in 0..g.n_layers {
         for t in GLIMMER_LAYER_TENSORS {
             let n = format!("{GLIMMER_LAYER_PREFIX}.{l}.{t}.weight");
-            ensure!(names.iter().any(|x| *x == n), "the checkpoint has no {n}");
+            ensure!(names.contains(&n), "the checkpoint has no {n}");
         }
     }
 

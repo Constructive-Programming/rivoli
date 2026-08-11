@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a item 1 DONE 2026-08-11 on tag k3-s1a — the shipped binary parses the unmodified config.json and refuses to decode; items 2-4 (converter, pin, run_glimmer's flag refusals) are open. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
+verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a items 1-3 DONE 2026-08-11 on tag k3-s1a — the shipped binary parses the unmodified config.json and refuses to decode, convert_glimmer writes a bf16-verbatim artifact, and GlimmerPin places all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream; item 4 (run_glimmer's flag refusals) is open. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
 ---
 
 # Muse Glimmer-30B — implementation plan
@@ -26,9 +26,12 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
   load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
   card's errors beside them. The DFlash drafter is settled too — §S6 and
   `glimmer-architecture.md` §11.
-- **S1a items 1 and 2 are DONE (2026-08-11)**, on tag `k3-s1a`: the config schema and a
-  refusing dispatch, then `convert_glimmer` — **bf16 verbatim, correctness first**. Items 3
-  and 4, the pin and `run_glimmer`'s hand-written flag refusals, are open. §S1a.
+- **S1a items 1-3 are DONE (2026-08-11)**, on tag `k3-s1a`: the config schema and a refusing
+  dispatch, `convert_glimmer` — **bf16 verbatim, correctness first** — and `GlimmerPin`, which
+  places all **55,712,344,064** resident bytes and takes **no capacity parameter and no cache
+  policy**, because a dense model has nothing to stream and a device that cannot hold it
+  cannot run it at any setting. Item 4, `run_glimmer`'s hand-written flag refusals, is open.
+  §S1a.
 - **rivoli had never quantized a checkpoint before, and Glimmer is where it must.** GLM, V4
   and K3 all ship pre-quantized and every converter *copies*; `quant.rs` had a
   `dequant_fp8_block` and no inverse. `quantize_fp8_block` now exists — but choosing its
@@ -236,7 +239,7 @@ is in progress on `wt/k3-s1a`. Building that seam here would collide with it. Wh
 lands, re-verify §3's reuse table against the merged tree before starting — several rows
 name files K3 will have moved.
 
-### S1a — artifact. No GPU. **Item 1 DONE 2026-08-11; items 2–4 open.**
+### S1a — artifact. **Items 1–3 DONE 2026-08-11; item 4 open.** No GPU except item 3's gate.
 
 1. **DONE.** `Arch::MuseGlimmer` + recogniser tests both directions; `GlimmerConfig` /
    `GlimmerTextConfig` with no defaulted fields; `main.rs` dispatch that parses and then
@@ -343,9 +346,69 @@ name files K3 will have moved.
    Red-proof: mis-transliterating `self_attn.gate_proj` as `self_attn.output_gate` fails
    `glimmer_names` twice with precise messages **while `glimmer_convert` stays green** — the
    two tests are not redundant, and this is the evidence.
-3. `GlimmerPin`: own type (per the V4/K3 precedent — shares nothing with the pool); int8
-   embed/lm_head placement reused; its own tensor-name table (V4's §7 records what
-   assuming HF-style naming cost).
+3. **DONE 2026-08-11.** `GlimmerPin` / `GlimmerLayerPin`, its own type per the V4/K3
+   precedent, in `memory/pin.rs` beside `Pin` and `F4Pin` so the four private placers
+   (`place_bf16`, `place_f32`, `dims2`) stay private.
+
+   **`build` takes no `capacity` and no cache policy, and that absence is the port.** Both
+   parameters exist on the other two pins to divide a budget between a resident tier and a
+   streaming pool. There is no pool: the resident set *is* the model, its size is a function
+   of the config alone, and a device that cannot hold it cannot run Glimmer at any setting.
+   `DeviceTier::new` already refuses what does not fit and names the shortfall.
+
+   Two corrections to this item as planned:
+
+   - **"int8 embed/lm_head placement reused" was wrong** — that is GLM's, and it presumes an
+     int8-quantized artifact. `convert_glimmer` writes bf16 verbatim (item 2, "correctness
+     first"), so the reuse is V4's `place_bf16`/`Bf16Weight`. The int8 question returns only
+     if the fp8 pass also quantizes the embedding, which it need not.
+   - **"its own tensor-name table" would have been a third copy.** The names were already one
+     constant; what the pin additionally needed was *shapes*, and `tests/glimmer_names.rs`
+     had its own copy of those. Both now read
+     `GlimmerTextConfig::layer_tensor_shape` — one table, and the names test is what
+     validates it, since it resolves every entry against the shipped
+     `model.safetensors.index.json`. So the table the pin checks placements against is not a
+     belief about the checkpoint; it is confronted with it.
+
+   `GlimmerTextConfig::resident_bytes` is derived from that same table and **sizes the tier**,
+   which is what makes it load-bearing rather than documentation: under-count it and
+   `DeviceTier::place` bails partway through a 55.7 GB load. **55,712,344,064 bytes**, and
+   `tests/glimmer_names.rs` reproduces it from the vendored index's own shapes — G1a's fourth
+   clause, met without a device. It is 2.782 MB above the checkpoint's text half because the
+   209 norms widen bf16→f32.
+
+   Gates: `tests/glimmer_pin.rs`, a **GPU arm** (own file, so `glimmer_convert`'s two
+   deviceless tests stay runnable in CI, which has no rocm job). It converts the shared
+   fixture and then pins it, which is the point of sharing — a pin test on its own checkpoint
+   would establish nothing about the pipeline. It asserts **the bytes arrived**, not only the
+   dims: the tier is a host-fillable VMM allocation, so every pointer the pin hands out is
+   readable from the test, and every tensor in the fixture carries a distinct blob. That is
+   what separates `q_proj` from `self_attn.gate_proj` and `k_proj` from `v_proj` — within
+   each pair the shapes are identical, so a field wired to the wrong name is a *value*
+   failure and nothing else can see it. Plus the refusal: a config implying different dims
+   must name the tensor, and the defect chosen (`num_key_value_heads` doubled) makes the tier
+   LARGER on purpose, so what fires is the shape check rather than a capacity bail.
+
+   One drift guard the pin cannot derive: it names all twelve per-layer tensors as struct
+   fields, so a thirteenth entry in `GLIMMER_LAYER_TENSORS` would be placed by nothing. The
+   test asserts the count is 12 and says why.
+
+   **Proven red on three defects, each reddening only its own test:**
+
+   | defect | reddens | and this is the point |
+   |---|---|---|
+   | `attn_gate` placed from `self_attn.q_proj`'s name | the placement test, on VALUES | the shape check passed — both are `[4096, 6656]`, so nothing but the bytes can see it |
+   | the shape `ensure!` deleted | the refusal test only | "a config implying different dims must be refused" |
+   | `resident_bytes` counting norms at bf16 | the accounting test, deviceless | 55,709,575,168 against 55,712,344,064 — the 2.782 MB of widening, exactly |
+
+   And one accidental red worth keeping, because it says something about the refusal test's
+   shape. The first run failed with *"the refusal must name the tensor, got: refusing to
+   start: 5.3 GiB GPU memory already in use by another tenant"* — `GlimmerPin::build` did
+   return `Err`, so an `is_err()` assertion would have passed **vacuously on a machine with a
+   busy GPU**. It asserts on the message instead, and that is why it failed rather than
+   lying. (The tenant was llama-swap's `qwen3-embedding-4b`, holding 5.3 GiB with **zero**
+   `/sys/class/kfd/kfd/proc/` entries — the blind spot `kfd-blind-to-vulkan-tenants` records,
+   found again here. `GET /unload` freed it; the flock alone would not have.)
 4. `run_glimmer` dispatch with hand-written refusals for every flag that doesn't apply
    (`--cache-policy`, `--mode`, `--attn dsa/misa`, `--hint-*` descendants) — V4's bespoke
    bails are the template; omitting them compiles clean and silently accepts.

@@ -1749,6 +1749,66 @@ impl GlimmerTextConfig {
         Ok(*kind == LayerKind::SlidingAttention)
     }
 
+    /// The shape of one [`GLIMMER_LAYER_TENSORS`] entry, derived from this config. `[o, i]`
+    /// for a projection, `[hidden]` for a norm.
+    ///
+    /// **One shape table, because the alternatives were three.** The pin needs it to check
+    /// what it places, [`Self::resident_bytes`] needs it to size the tier, and
+    /// `tests/glimmer_names.rs` needs it to compare against the shipped checkpoint — and the
+    /// third is what makes the other two trustworthy: that test resolves every entry here
+    /// against `model.safetensors.index.json`, so this table is not a belief about the
+    /// checkpoint, it is checked against it.
+    ///
+    /// The pairs matter more than the individual entries. `q_proj` and `self_attn.gate_proj`
+    /// are both `[n_heads·head_dim, hidden]` and `k_proj`/`v_proj` are both
+    /// `[kv_heads·head_dim, hidden]`, so within each pair a shape check proves nothing and
+    /// only the NAME separates them; `o_proj` is the one that is transposed, and `down_proj`
+    /// the other. Reading `hidden` for `n_heads·head_dim` — 6656 for 4096 — is the mistake
+    /// this exists to make impossible, since `head_dim` is not `hidden / n_heads` here.
+    pub fn layer_tensor_shape(&self, tensor: &str) -> Result<Vec<usize>> {
+        let q = self.n_heads * self.head_dim;
+        let kv = self.num_key_value_heads * self.head_dim;
+        Ok(match tensor {
+            "self_attn.q_proj" | "self_attn.gate_proj" => vec![q, self.hidden],
+            "self_attn.k_proj" | "self_attn.v_proj" => vec![kv, self.hidden],
+            "self_attn.o_proj" => vec![self.hidden, q],
+            "mlp.gate_proj" | "mlp.up_proj" => vec![self.inter, self.hidden],
+            "mlp.down_proj" => vec![self.hidden, self.inter],
+            // All four norms, and the arm is written as a suffix rather than four literals so
+            // that a fifth norm is covered rather than silently unmatched.
+            t if t.ends_with("layernorm") => vec![self.hidden],
+            _ => bail!(
+                "{tensor} is not a Muse Glimmer layer tensor — GLIMMER_LAYER_TENSORS and this \
+                 table disagree, which means one of them was extended and the other was not"
+            ),
+        })
+    }
+
+    /// Bytes the resident set occupies **in the artifact's dtypes** — bf16 projections, f32
+    /// norms — from the config alone. 55.712 GB for the shipped model.
+    ///
+    /// Sized from [`Self::layer_tensor_shape`] rather than restating the shapes, so the number
+    /// and the checks the pin makes cannot drift apart. It is what sizes the tier, which is
+    /// what makes it load-bearing rather than documentation: under-count it and
+    /// `DeviceTier::place` bails partway through the placement.
+    ///
+    /// **The norms are f32 here and bf16 in the checkpoint** — `convert_glimmer` widens them,
+    /// the house convention every architecture follows — so this is 2.782 MB larger than the
+    /// text half of the checkpoint. `tests/glimmer_names.rs` reproduces it from the shipped
+    /// index's own shapes, which is where that 2.782 MB is accounted for rather than asserted.
+    pub fn resident_bytes(&self) -> Result<usize> {
+        let mut per_layer = 0usize;
+        for t in GLIMMER_LAYER_TENSORS {
+            let shape = self.layer_tensor_shape(t)?;
+            let n: usize = shape.iter().product();
+            per_layer += n * if shape.len() == 1 { 4 } else { 2 };
+        }
+        // `embed_tokens` and `lm_head`, both `[vocab, hidden]` bf16 and both shipped —
+        // `tie_word_embeddings` is false, so this is 2x2.690 GB and not one of them.
+        let global = 2 * self.vocab * self.hidden * 2 + self.hidden * 4;
+        Ok(global + self.n_layers * per_layer)
+    }
+
     /// Cross-field checks. Each guards a failure that produces text rather than an error.
     fn validate(&self) -> Result<()> {
         // The descent check. `parse_config` matched the WRAPPER's pair; this is the nested
