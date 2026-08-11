@@ -1103,7 +1103,7 @@ impl F4Pin {
         // between different strides here.
         let tier_fmt = TierFmt::new(&f4)?;
         // `top_k` and not a `MAXROW` union: V4's FP4 MoE kernel refuses `nrow != 1`
-        // (`kernels/moe.hip:409`), so a V4 decode is structurally single-row — and there is
+        // (`kernels/moe.hip`), so a V4 decode is structurally single-row — and there is
         // no folded shared expert either, because V4's is fp8 and RESIDENT rather than a
         // routed-format block.
         let routed = RoutedPool::new(

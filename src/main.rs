@@ -738,7 +738,7 @@ fn run_v4(
     if !no_mtp {
         info!(
             "speculative decode OFF for {}: the fp4 MoE kernel refuses nrow != 1 \
-             (kernels/moe.hip:409, guard 1003 — only R = 1 is instantiated, and the 1.108x that \
+             (kernels/moe.hip, guard 1003 — only R = 1 is instantiated, and the 1.108x that \
              justifies R = 2 for GLM's VQ/int4 kernels has no V4 measurement behind it), so a V4 \
              decode is structurally single-row and a batched verify pass has no kernel.",
             arch.name()

@@ -496,7 +496,7 @@ fn indexer_topk_never_cuts_at_the_emit_prompt() {
 /// emitted — agrees with the positional one on every sequence that visits every position in
 /// order. That is the sequence a smoke test walks, so a green run over it proves nothing.
 /// The divergence needs a SKIPPED step. Requirement 2 names speculative decode as the way
-/// one arises, and on V4 that mechanism is NOT currently reachable — `kernels/moe.hip:409`
+/// one arises, and on V4 that mechanism is NOT currently reachable — `kernels/moe.hip`
 /// refuses `nrow != 1` — so this walks the skip directly rather than claiming a caller that
 /// cannot exist yet. Below, positions 3 and 11 emit; the
 /// positional placer puts them at rows `win + 0` and `win + 2`, the appending one at

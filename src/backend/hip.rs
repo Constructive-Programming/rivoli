@@ -160,12 +160,17 @@ macro_rules! launchers {
 //
 // > **MEASURED 2026-08-06, correcting the inherited claim.** The original note said "roughly 25
 // > are DIFFERENT kernels that merely take the same shape — `gemv_fp8`/`i8`/`i4`/`vq` all take
-// > `x, packed, scale, o_dim, i_dim, y`". Counted rather than asserted: the **46** declarations
-// > below (41 when this was written; 46 as of 2026-08-11, and the count was already four stale
-// > before `launch_moe_acc_drain_to` was added) have zero exact duplicates, and **two** PAIRS
-// > shares even a type sequence under different names (`act_quant_f8` and `act_quant_f4_rotated`,
-// > both `*mut f32, i32, i32, *mut c_void`). The `gemv` family does not actually agree:
-// > `gemv_vq` takes seven parameters (`indices`, `scales`, `codebook`), `gemv_i4` takes six.
+// > `x, packed, scale, o_dim, i_dim, y`". Counted rather than asserted: the declarations below have
+// > zero exact duplicates, and exactly ONE PAIR shares even a type sequence under different names
+// > (`act_quant_f8` and `act_quant_f4_rotated`, both `*mut f32, i32, i32, *mut c_void`). The `gemv`
+// > family does not actually agree: `gemv_vq` takes seven parameters (`indices`, `scales`,
+// > `codebook`), `gemv_i4` takes six.
+// >
+// > **No count of the declarations here, deliberately** (it said "46, 41 when this was written").
+// > It went four stale in silence, a fifth the day `launch_moe_acc_drain_to` landed, and a sixth
+// > when that kernel's `gain` was deleted — while the argument this marker rests on, below, never
+// > depended on it. A hand-maintained tally of the file it sits in bills a line of upkeep to every
+// > commit that touches the file and catches nothing.
 //
 // What jscpd matches is a shared PREFIX, not a shared list. `moe_expert_range` and
 // `moe_expert_range_i4` agree on `x, hidden, inter, e_start, e_count, descs` and then diverge.
@@ -453,30 +458,26 @@ launchers! {
     );
 
     /// Drain the fixed-point MoE accumulator into a SEPARATE buffer:
-    /// `out[o] = gain·(Σ_r acc[r][o])·2⁻⁴⁴`, resetting `acc` for the next layer.
+    /// `out[o] = (Σ_r acc[r][o])·2⁻⁴⁴`, resetting `acc` for the next layer.
     ///
     /// **For Kimi-K3, whose MoE block does not end at the residual.** Its routed sum lives in a
     /// 3584-wide latent that must be RMSNormed as an AGGREGATE and up-projected to 7168 before it
     /// can be added to anything — so the sum has to be intercepted, not folded in.
-    /// (This and [`launch_moe_acc_drain`] are the second of the two type-sequence pairs the jscpd
-    /// exemption above counts: `*mut f32, *mut u64, usize, usize, f32, *mut c_void` both, differing
-    /// only in `x` against `out` — which is exactly the confusion the docs here exist to prevent.)
     ///
     /// [`launch_moe_acc_drain`] is the right kernel for GLM and V4 and the wrong one here. The ONE
     /// difference the code cannot show — `=` against `+=` — is argued at `kernels/moe.hip`; the two
     /// kernels now share a templated body, so the rest is not a difference at all.
     ///
+    /// **No `gain`, and the sibling's is not an oversight to copy**: a positive scalar applied to
+    /// this buffer is erased by the RMSNorm that immediately follows it, so the parameter could not
+    /// be used correctly — `kernels/moe.hip` carries the arithmetic. `routed_scaling_factor` is not
+    /// it either; that multiplies the router weights inside the sum.
+    ///
     /// `n` is the accumulator's row width — `nrow · latent`, and K3's `nrow` is 1. Passing `hidden`
     /// overruns on the LAST row, not the first: with `MOE_ACC_ROWS = 2` and a 3584-wide latent, a
     /// `n = 7168` reads `[0, 7168)` for `r = 0`, which is exactly the whole buffer and in bounds,
     /// then `[7168, 14336)` for `r = 1`, which is entirely outside it. That 2x coincidence between
-    /// `hidden/latent` and `rows` is what makes the bug survive the first row. (This said "past the
-    /// end of every accumulator row but the last" until review 2026-08-11 — inverted.)
-    ///
-    /// A `gain` of 0 or `+inf` is REFUSED (guard **1006**, the non-positive-float class), unlike in
-    /// the sibling — `kernels/moe.hip` carries the argument. **Pass 1.0.** `routed_scaling_factor`
-    /// does NOT belong here: it multiplies the router weights inside the sum, and a scalar applied to
-    /// the aggregate is eaten by the RMSNorm that immediately follows.
+    /// `hidden/latent` and `rows` is what makes the bug survive the first row.
     ///
     /// # Safety
     /// `out` holds `n` f32 and `acc` holds `rows·n` u64; EVERY stream that accumulated into `acc`
@@ -487,7 +488,6 @@ launchers! {
         acc: *mut u64,
         n: usize as i32,
         rows: usize as i32,
-        gain: f32,
         stream: *mut c_void,
     );
 

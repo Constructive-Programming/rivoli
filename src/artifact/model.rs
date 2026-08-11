@@ -1278,15 +1278,21 @@ impl K3TextConfig {
             self.kv_lora_rank
         );
         self.validate_layer_partition()?;
+        // TWO checks rather than one conjunction, for the reason `kv_lora_rank`'s pair above gives:
+        // a refusal names which bound was crossed, and each test row proves its own half.
         ensure!(
-            self.first_k_dense_replace > 0 && self.first_k_dense_replace < self.n_layers,
-            "first_k_dense_replace {} is not in 1..{} — at 0 layer 0 would run the routed MoE \
-             path, and this checkpoint ships no expert tensors for it (only the dense \
-             `intermediate_size` {} pair, which would go unused); at n_layers every layer \
-             would be dense and no routed expert would ever run",
-            self.first_k_dense_replace,
-            self.n_layers,
+            self.first_k_dense_replace > 0,
+            "first_k_dense_replace is 0, so layer 0 would run the routed MoE path — and this \
+             checkpoint ships no expert tensors for it, only the dense `intermediate_size` {} \
+             pair, which would then go unused",
             self.dense_inter
+        );
+        ensure!(
+            self.first_k_dense_replace < self.n_layers,
+            "first_k_dense_replace {} is not below n_layers {} — every layer would be dense and \
+             no routed expert would ever run",
+            self.first_k_dense_replace,
+            self.n_layers
         );
         ensure!(
             self.top_k > 0 && self.top_k <= self.n_experts,
@@ -2187,8 +2193,10 @@ mod tests {
             ("num_experts_per_token", "900", "not in 1..="),
             ("num_experts_per_token", "0", "not in 1..="),
             ("num_shared_experts", "0", "always-on MLP"),
+            // The two halves of one bound, each needle matching only its own — which is what the
+            // split into two `ensure!`s buys and what a conjunction could not prove.
             ("first_k_dense_replace", "93", "every layer would be dense"),
-            ("first_k_dense_replace", "0", "is not in 1..93"),
+            ("first_k_dense_replace", "0", "so layer 0 would run the"),
             // The three f64 -> f32 narrowing failures. `1e-46` underflows to `0.0f32`; `1e39`
             // saturates to infinity, which passes any bare `> 0.0` test — that is the silent
             // direction and the reason the check is `is_finite()` rather than a bound.
@@ -2411,12 +2419,6 @@ mod tests {
     /// GLM ships a draft head — and would therefore refuse every K3 artifact at load. That is loud,
     /// not silent; what this test adds is the arithmetic in front of whoever writes the K3 pin.
     ///
-    /// > **Two corrections from review 2026-08-11.** The second assertion used `crate::gpu::MAXROW`
-    /// > rather than a literal 2, which meant it would go red on exactly the change K3 needs: make
-    /// > the row count per-model, let the global become 1, and `batch(1) = 18 ≤ 32` fires with "K3
-    /// > now fits a 1-row pass" — contradicting the first assertion three lines above. And the doc
-    /// > claimed the second assert would fire "if a checkpoint arrived with a draft head"; no term in
-    /// > it depends on `num_nextn_predict_layers`, which `validate` refuses on its own.
     #[cfg(feature = "rocm")]
     #[test]
     fn k3_fits_the_routed_batch_scratch_at_one_row_and_not_at_two() {

@@ -1569,7 +1569,7 @@ impl F4Engine {
     /// The routed experts for token row `t`, accumulated onto `sub[t]`.
     ///
     /// One row at a time, and that is structural rather than a simplification:
-    /// `kernels/moe.hip:409` refuses `nrow != 1` (guard 1003, only `R = 1` instantiated). So a
+    /// `kernels/moe.hip` refuses `nrow != 1` (guard 1003, only `R = 1` instantiated). So a
     /// prefill of `s` tokens performs `s` MoE dispatches per layer, while attention runs once
     /// over the whole prompt — attention is the only op with a cross-token dependency.
     ///
@@ -1934,7 +1934,7 @@ impl F4Engine {
             // prompt longer than two tokens, with `gemv_f32: argument guard rejected (1004)`, so
             // no decode and no golden comparison could ever have run. Found by review before any
             // device did. `nrow == 2` is reachable and deliberately unused: V4 is structurally
-            // single-row (`kernels/moe.hip:409`), so pairing rows here would buy one fewer
+            // single-row (`kernels/moe.hip`), so pairing rows here would buy one fewer
             // launch of a 256x4096 GEMV against a second index space to get wrong. The loop is
             // NOT a null-stream artefact: the guard is on `nrow`, so it survives the rebase.
             let logits = self.gate_logits.ptr_mut().cast::<f32>();
@@ -2648,7 +2648,7 @@ impl F4Engine {
     /// Prefill, then greedy decode. Returns the generated ids.
     ///
     /// **Speculative decode is not available on this path and cannot be.**
-    /// `kernels/moe.hip:409` refuses `nrow != 1` (guard 1003; only `R = 1` is instantiated, and
+    /// `kernels/moe.hip` refuses `nrow != 1` (guard 1003; only `R = 1` is instantiated, and
     /// its comment records that the `1.108x` measurement justifying `R = 2` for GLM's VQ and
     /// int4 kernels does not exist for V4 — the S1b oracle is `bsz = 1` only, so a two-row FP4
     /// kernel could not be scored). So there is no `mtp` argument here to switch off; `main` says

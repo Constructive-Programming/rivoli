@@ -15,7 +15,8 @@
 //!
 //! **What this actually reads**, corrected 2026-08-11 after review called the earlier claim
 //! ("nothing here reads a weight … the largest read is one 4 KiB header") false on both counts. It
-//! stats 195 file lengths and asks `read_spec` for offsets — no weight there — but
+//! stats the length of each of 195 layer files — twice each, once in `open_routed` and once in
+//! `check_set`, so ~390 calls — and asks `read_spec` for offsets, no weight in either. But
 //! `set.shared_block(l)` does a full-stride O_DIRECT read, so the GLM half pulls
 //! `2·15,335,424 + 2·20,054,016 = 70,778,880 B` (67.5 MiB) of real expert bytes, uncached. The
 //! header read is 40 bytes (`EXPERT_HEADER_BYTES`), not 4 KiB. Still cheap and still no GPU; the
@@ -111,9 +112,12 @@ fn check_set(
                 header + e * stride,
                 "{dir} L{l:02} expert {e} offset"
             );
+            // Not an EOF check — `begin` is pinned above, so this reduces to
+            // `expert_bytes <= stride`, i.e. that the geometry pads UP to `VQ_ALIGN`. It binds the
+            // two functions to each other, which is the only thing left to bind here.
             assert!(
                 begin + useful <= want,
-                "{dir} L{l:02} expert {e} reads past EOF"
+                "{dir} L{l:02} expert {e}: {useful} useful bytes do not fit the {stride} stride"
             );
         }
         // The `has_shared` fork, asserted rather than assumed: block `n_experts` is the shared
@@ -186,11 +190,8 @@ fn the_full_glm_artifact_still_opens_byte_and_offset_identically() {
     // silently concludes there is no MTP head, and then fails on the layer count instead.
     let mtp = std::fs::metadata(format!("{dir}/L{:02}.vq3", cfg.n_layers)).is_ok();
     let layers = cfg.dense_layers..(cfg.n_layers + usize::from(mtp));
-    // **This is a property of the CONFIG, not of the disk** — unlike the V4 half, which reads
-    // `f4_source` and can say so. A GLM artifact holding only 3..40 still computes 76 here, passes,
-    // and fails deeper with a bare "no such file". Said in the message rather than strengthened,
-    // because GLM artifacts carry no range to read: the honest fix is the diagnosis, not a stronger
-    // assert.
+    // A property of the CONFIG, not of the disk — GLM artifacts carry no range to read, unlike the
+    // V4 half's `f4_source`, so the honest fix is the diagnosis in the message below.
     assert_eq!(
         layers.len(),
         76,

@@ -442,7 +442,7 @@ pub fn should_compress(kind: LayerKind, seqlen: usize, start_pos: usize) -> bool
 ///
 /// **The usual example is not currently reachable on V4, and saying otherwise would be the
 /// load-bearing lie.** Requirement 2 motivates this with "speculative decode skips steps by
-/// construction", which is true of rivoli's GLM path — but `kernels/moe.hip:409` refuses
+/// construction", which is true of rivoli's GLM path — but `kernels/moe.hip` refuses
 /// `nrow != 1` (guard 1003, only `R = 1` instantiated), so a V4 decode is structurally
 /// single-row and no verify pass can advance `start_pos` by two. The rule is still right and
 /// still worth having: a skipped step is not exclusive to speculation, and the day the fp4

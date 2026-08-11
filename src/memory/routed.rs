@@ -47,10 +47,11 @@ pub const TRACE_WINDOW: usize = 32;
 ///
 /// It sizes exactly one thing: `submit`'s own `[bool; MAX_BATCH]` hit scratch, which is why
 /// `submit` `ensure!`s against it rather than trusting a caller. `gpu.rs` sizes its
-/// descriptor buffer from a RUNTIME `top_k · MAXROW + n_shared` (17 for GLM: top_k 8 x MAXROW 2 + 1 shared; 18 for K3 at its single row), not from this;
+/// descriptor buffer from a RUNTIME `top_k · MAXROW + n_shared` (17 for GLM: 8 · 2 + 1), not from
+/// this;
 /// `Pin::build` checks that value against this one at startup so the friendly message
 /// arrives before the run rather than during it. V4's demand is `top_k` — its FP4 kernel
-/// refuses `nrow != 1` (`kernels/moe.hip:409`), so there is no batched union.
+/// refuses `nrow != 1` (`kernels/moe.hip`), so there is no batched union.
 pub const MAX_BATCH: usize = 32;
 
 /// One projection's two addresses inside an expert's pool slot.

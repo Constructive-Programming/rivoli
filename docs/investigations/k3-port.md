@@ -46,7 +46,8 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   0.1 s).
 - **S1a IS DONE.** Item 2 settled (the e8m0 `0xff` bail stays — the repack is the only path that
   reads every ROUTED scale byte); item 4's `moe_acc_drain_to` written, templated against its sibling,
-  and **executed on gfx1151 — 8 elements bit-identical, every guard refused**; item 7's `MAX_BATCH`
+  and **executed on gfx1151 — 8 elements bit-identical, its `1001` dimension guard refusing both
+  rows** (it took a `gain` and a second guard for one day; see item 4 for why both went); item 7's `MAX_BATCH`
   arithmetic settled and asserted, **K3 fits the routed batch scratch at ONE row and not at two**
   (18 of 32 against 34). The whole device sweep passed in the same window (`kernel` 24/24,
   `f4_kernel` 24/24, `kvcompress_kernel` 10/10, `--lib` 141/141). What remains is S1b's harness and,
@@ -112,7 +113,7 @@ investigations here. Gates are numeric or they are nothing.
 | `num_hidden_layers` | 93 | 1 dense + 92 MoE |
 | `linear_attn_config` | dict: `full_attn_layers` (24, one-based) + `kda_layers` (69) + 5 scalars | 24 + 69 = 93. §2 |
 | `num_experts` / `num_experts_per_token` | 896 / **16** | the traffic figure, §4 |
-| `num_shared_experts` | 2 | one **fused** MLP on disk, §3 |
+| `num_shared_experts` | 2 | one **fused** MLP on disk, §3. **The 2 is load-bearing for a SHAPE and only a test knows it**: `shared_experts.down_proj` is `[hidden, 2·moe_inter]` = `[7168, 6144]`, pinned by `tests/k3_names.rs`, while `validate` accepts any positive value. Nothing is wrong today — no shared-expert code exists — but S3 inherits an unchecked coupling, so read the width from `n_shared · moe_inter` rather than from 6144 |
 | `routed_expert_hidden_size` | **3584** | the latent, **not** `hidden_size` 7168. §2 |
 | `moe_intermediate_size` | 3072 | |
 | `hidden_size` / `num_attention_heads` | 7168 / 96 | |
@@ -386,31 +387,33 @@ compressed-tensors unpack or real scale bytes (S1a item 2), and `use_full_rank_g
    Note for K3: `ensure_group_aligned(latent, moe_inter, …)` stops covering the trunk widths,
    so its "one check covers both" comment no longer holds there. No practical hole — 7168 and
    6144 are multiples of both 32 and 64 — but the comment needs the caveat when K3 lands.
-4. **The MoE accumulator drains into the residual — kernel WRITTEN 2026-08-11, device run
-   PENDING.** `moe_acc_drain` fuses de-fixed-point into the residual add at one width; K3 needs the
-   aggregate intercepted **in latent space** for the RMSNorm and up-projection first.
-   `moe_acc_drain_to` (`kernels/moe.hip`) is that kernel: `out[o] = gain·(Σ_r acc[r][o])·2⁻⁴⁴`,
-   accumulator reset, with `launch_moe_acc_drain_to` and a `gain <= 0` refusal the sibling
-   deliberately does not have (there a zero gain leaves the residual untouched and is
-   indistinguishable from a miss-free layer; here it writes an all-zero aggregate). Three
-   differences from the sibling, each silent-wrong if dropped — `=` not `+=`, the LATENT width, and
-   the ordering the aggregate RMSNorm imposes — argued at the kernel and pinned by
-   `tests/kernel.rs::moe_acc_drain_to_writes_the_latent_aggregate_and_resets`, whose destination is
-   pre-filled with a poison value so `=` and `+=` are distinguishable.
-   **EXECUTED AND PASSING 2026-08-11** on gfx1151: 8 elements bit-identical, guards 1006/1001 all
-   refused as expected. The GPU was freed by cordoning and draining this k3s node (`rh-anine`), which
-   evicted the `ai/llama-swap` tenant — the only node carrying `hr-home.xyz/rocm=true`, so the AI
-   service was down for the window and was restored by `kubectl uncordon`. The full device sweep ran
-   in the same window: `kernel` 24/24, `f4_kernel` 24/24, `kvcompress_kernel` 10/10, `headtail` 5/5,
-   `f4_pin`/`f4_pool`/`f4_loading`, and `--lib` 141/141 — including the two `DeviceTier` tests that
-   fail under contention.
-   **Caveat on the exclusivity, recorded because it changes how to do this next time:** the drain did
-   NOT hold the node empty. The ReplicaSet re-scheduled `llama-swap` onto the cordoned node within
-   seconds (a scheduler-cache race — its tolerations do not cover `unschedulable`), so sole tenancy
-   was not guaranteed for the whole window. It was guaranteed per test START, because
-   `DeviceTier::new` refuses to allocate while another tenant holds GPU memory and every suite
-   passed; llama-swap is a model *swapper* and holds nothing until a model is loaded. **Scale the
-   deployment to 0 rather than draining** if a durable window is wanted.
+4. **The MoE accumulator drains into the residual — kernel DONE, executed on hardware.**
+   `moe_acc_drain` fuses de-fixed-point into the residual add at one width; K3 needs the aggregate
+   intercepted **in latent space** for the RMSNorm and up-projection first. `moe_acc_drain_to`
+   (`kernels/moe.hip`) is that kernel: `out[o] = (Σ_r acc[r][o])·2⁻⁴⁴`, accumulator reset, with
+   `launch_moe_acc_drain_to`. The two kernels share ONE templated body and differ in exactly one
+   line, `=` against `+=` — the one difference the code cannot make visible, so it is argued at the
+   kernel and pinned by `tests/kernel.rs::moe_acc_drain_to_writes_the_latent_aggregate_and_resets`,
+   whose destination is pre-filled with a poison value.
+   **It takes no `gain`, and that is the S3 trap this item exists to spell out.** It had one, with a
+   guard, for a day. A positive scalar applied to this buffer is erased by the RMSNorm that
+   immediately follows it, so the parameter could not be used correctly and an inert knob is worse
+   than no knob (review 2026-08-11). `routed_scaling_factor` is not a candidate either: it
+   multiplies the ROUTER WEIGHTS inside the sum, which is where S3 must put it.
+   **EXECUTED AND PASSING 2026-08-11** on gfx1151: 8 elements bit-identical, guard 1001 refusing
+   both non-positive dimensions. The full device sweep ran in the same window: `kernel` 24/24,
+   `f4_kernel` 24/24, `kvcompress_kernel` 10/10, `headtail` 5/5, `f4_pin`/`f4_pool`/`f4_loading`,
+   and `--lib` 141/141 — including the two `DeviceTier` tests that fail under contention. **Deleting
+   the `gain` changed the kernel's ABI, so both device suites were re-run the same day: `kernel`
+   24/24 (179.41 s), `f4_kernel` 24/24 (16.17 s), sole tenant, 0 KFD holders at start.**
+   The GPU was freed by **unloading the `ai/llama-swap` models over its ClusterIP**
+   (`POST http://10.43.48.47:8080/unload`, 41.4 GB of GTT → 174 MB), which is reversible — they
+   reload on demand and the service never went down. That is the procedure; the two heavier ones are
+   worse. **A `kubectl cordon` + `drain` does NOT hold the node empty**: tried 2026-08-11, the
+   ReplicaSet re-scheduled onto the cordoned node within seconds because its tolerations do not cover
+   `unschedulable`, so a run that looks sole-tenant is not. Scaling the deployment to 0 does work but
+   takes the AI service down for the window. `CLAUDE.md`'s measurement-discipline list now carries
+   this, because it is where someone hunting for GPU tenancy will look.
 5. **Converter naming.** Expert tensors are `.weight_packed` / `.weight_scale`
    (compressed-tensors), *not* `.weight` / `.weight_scale_inv`. And **`quantization_config`
    mis-declares its own scope**: `targets: ["Linear"]` with an `ignore` list that omits

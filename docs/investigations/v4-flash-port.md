@@ -776,7 +776,7 @@ was deleted.
 | owed | cost until paid |
 |---|---|
 | `Io` built by something that takes `LayerKind` and calls `rope_for_layer` itself | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate |
-| the compressor's placer computing `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees`.** Two corrections earned while this row stood: the indexer's nested compressor needs `window_size = 0` (model.py:405/:415), which this formula does not admit; and the skip is a general one, since speculative decode is unreachable on V4 (`kernels/moe.hip:409`). Still no production caller |
+| the compressor's placer computing `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + `tests/v4_compress.rs::compress_dst_is_positional_and_an_appending_placer_disagrees`.** Two corrections earned while this row stood: the indexer's nested compressor needs `window_size = 0` (model.py:405/:415), which this formula does not admit; and the skip is a general one, since speculative decode is unreachable on V4 (`kernels/moe.hip`). Still no production caller |
 
 **And the compressed-layer end-to-end test is still unwritten.** `tests/v4_attn.rs` pins
 `LAYER` to ratio-0, so the `io.cache` tail layout and compressed columns reaching
@@ -1166,7 +1166,7 @@ helper to discharge a debt created by deleting a callerless helper is a loop, no
 | owed | until then |
 |---|---|
 | `Io` built by something that takes `LayerKind` and calls `v4compress::rope_for_layer` itself, so the two-table selection has ONE site | nothing detects `Defect::RopeNoYarn`, on the one cell measured invisible to the numeric gate (`ratio4/decode`, sep 8 against `RESOLVABLE` 64) |
-| whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + its test.** Two corrections to this row while it stood: speculative decode is NOT reachable on V4 (`kernels/moe.hip:409` refuses `nrow != 1`), so the motivating skip is a general one rather than that one; and the indexer's nested compressor takes `window_size = 0`, which this row's formula does not admit |
+| whoever places the compressor's output computing the decode slot as `window + start_pos / ratio`, with a test | **PAID 2026-08-05 — `v4compress::compress_dst` + its test.** Two corrections to this row while it stood: speculative decode is NOT reachable on V4 (`kernels/moe.hip` refuses `nrow != 1`), so the motivating skip is a general one rather than that one; and the indexer's nested compressor takes `window_size = 0`, which this row's formula does not admit |
 
 > **PARTLY DISCHARGED 2026-08-05 by the compressed-layer cell, and one entry is corrected.**
 > Both rules now have a *caller* and a *test*, in `tests/v4_attn.rs`: `Gpu::new` builds the
@@ -1421,7 +1421,7 @@ threading a stream through six launchers today adds a parameter whose only possi
 every call site is null. It should be paid *with* the pool, all six at once, and the
 requirement should say six.
 
-**6. The fp4 MoE kernel refuses `nrow != 1`** (`kernels/moe.hip:409`, guard 1003; only `R = 1`
+**6. The fp4 MoE kernel refuses `nrow != 1`** (`kernels/moe.hip`, guard 1003; only `R = 1`
 is instantiated, "no measurement exists for V4"). So a V4 decode is **structurally
 single-row** — speculative decode cannot be enabled on this path at all, whatever the MTP
 scope cut says. The plan's §"Scope cut" removes DSpark as a *modelling* decision; this is the
@@ -2006,7 +2006,7 @@ every number below is a prediction and is labelled as one.
 hc_post`, twice, in `Block.forward`'s order including the SECOND `residual = h`. Prefill is ONE
 `attention` call over the whole prompt (both the ring seeding and the compressor's block pooling
 are whole-prompt by construction) with the MoE run **per token**, because
-`kernels/moe.hip:409` refuses `nrow != 1`. Attention is the only op with a cross-token dependency,
+`kernels/moe.hip` refuses `nrow != 1`. Attention is the only op with a cross-token dependency,
 so that split is forced rather than chosen.
 
 **Debt 1 is PAID.** `RopeTables::for_layer` is the single site that resolves a layer's rotary

@@ -568,7 +568,7 @@ equal across arms).
 > |---|---|
 > | profile-summary | `v4gpu.rs` contains the string `summary` **zero** times. GLM has `Profile`/`ProfileSummary`; V4 has none |
 > | prefill | GLM runs a layer-major schedule (`layer_major_schedule`, its own two tests); V4 is ONE `forward(prompt, 0)` — whole-prompt by construction, because `attention`'s and `compress`'s prefill arms both are |
-> | argmax | GLM's is multi-row (`argmax_rows(n)`, `MAXROW`) because MTP verifies several rows per pass; V4's is single-row and **cannot** be otherwise — `kernels/moe.hip:409` refuses `nrow != 1` |
+> | argmax | GLM's is multi-row (`argmax_rows(n)`, `MAXROW`) because MTP verifies several rows per pass; V4's is single-row and **cannot** be otherwise — `kernels/moe.hip` refuses `nrow != 1` |
 > | decode loop | GLM's `generate` is **412 lines** (speculation, confidence gating, followups, profile, watchdog, checksum probes); V4's is **56** |
 > | EOS | genuinely common — and it is one `eos.contains(&cur)` |
 >

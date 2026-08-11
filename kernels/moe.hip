@@ -173,11 +173,18 @@ __device__ __forceinline__ void moe_acc_drain_impl(float* __restrict__ out,
         t += (long long)acc[(size_t)r * n + o];
         acc[(size_t)r * n + o] = 0ull;
     }
-    float v = gain * (float)((double)t / (double)MOE_ACC_SCALE);
+    float f = (float)((double)t / (double)MOE_ACC_SCALE);
+    // The multiply stays INSIDE each arm so the `+=` one is character-for-character the expression
+    // it was before templating. Hoisting it to a `float v` rounds the product before the add, and
+    // `build.rs` passes hipcc only `-O3 -fPIC` — contraction is therefore at the compiler's
+    // default, which for HIP device code may fuse a multiply into a following add, or may not once
+    // a store to a local separates them. That is a 1-ULP difference in GLM's and V4's residual add,
+    // invisible to oracles that compare with tolerances, on a path whose output this repo elsewhere
+    // requires to be byte-identical. Not a risk worth carrying for one saved line.
     if (ASSIGN) {
-        out[o] = v;
+        out[o] = gain * f;
     } else {
-        out[o] += v;
+        out[o] += gain * f;
     }
 }
 
@@ -241,7 +248,7 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-// acc → f32 into a SEPARATE BUFFER: out[o] = gain · (acc[o] · 2^-MOE_ACC_SHIFT), acc reset.
+// acc → f32 into a SEPARATE BUFFER: out[o] = acc[o] · 2^-MOE_ACC_SHIFT, acc reset.
 //
 // For Kimi-K3, whose MoE block does not finish where the other two models' do: its routed sum is
 // produced in a latent that must be RMSNormed as an AGGREGATE and up-projected before it can join
@@ -253,45 +260,28 @@ extern "C" int rivoli_moe_acc_drain_s(float* x, unsigned long long* acc, int n, 
 // every layer, with no error. The buffer therefore needs no zeroing by the caller, which is the
 // other half of the same fact.
 //
-// > **CORRECTED 2026-08-11, and this is the paragraph that would have cost S3 a silent bug.** An
-// > earlier version of this comment said `gain` "carries `routed_scaling_factor` … a value that
-// > must stay a multiply so that a checkpoint shipping something else is not silently ignored".
-// > That is backwards twice over. `routed_scale` is applied to the ROUTER WEIGHTS, inside the sum
-// > (`gpu.rs`'s `*wi *= cfg.routed_scale`, `f4gpu.rs`'s `routed_scale / sum`), and `gain` here is
-// > the `--moe-gain` debug knob on GLM and a literal 1.0 on V4. More to the point: a positive
-// > scalar applied HERE is exactly what WOULD be silently ignored, because
-// > `RMSNorm(g·v) == RMSNorm(v)` up to `eps/g²` and step 4 norms this buffer immediately. That is
-// > *why* the scale belongs on the weights. K3's caller should pass 1.0; anything else it passes
-// > will be eaten by the next operator and look like it worked.
+// **There is no `gain` here, unlike the sibling, and that is a decision rather than an omission:
+// a scalar at this point cannot do anything.** `RMSNorm(g·v) == RMSNorm(v)` up to `eps/g²`, and
+// step 4 norms this very buffer, so any value a caller passed would be eaten by the next operator
+// and look like it had worked — an inert knob is worse than no knob. `routed_scaling_factor` is
+// not a candidate either: `routed_scale` multiplies the ROUTER WEIGHTS inside the sum (`gpu.rs`'s
+// `*wi *= cfg.routed_scale`, `f4gpu.rs`'s `routed_scale / sum`), which is *why* it belongs there
+// and not on the aggregate. The sibling's `gain` is GLM's `--moe-gain` debug knob and a literal
+// 1.0 on V4, and it is meaningful there only because that kernel's output IS the residual.
 //
-// The two things this shares with its sibling, stated as shared rather than as differences: `n` is
-// the accumulator's row width — `nrow · latent` for K3, whose `nrow` is 1 — and every stream that
-// accumulated must have completed first. The earlier comment listed both as "differences", and one
-// of them refuted itself in its own second sentence.
+// The two things this shares with its sibling: `n` is the accumulator's row width — `nrow · latent`
+// for K3, whose `nrow` is 1 — and every stream that accumulated must have completed first.
 extern "C" __global__ void moe_acc_drain_to(float* __restrict__ out,
-                                            unsigned long long* __restrict__ acc, int n, int rows,
-                                            float gain) {
-    moe_acc_drain_impl<true>(out, acc, n, rows, gain);
+                                            unsigned long long* __restrict__ acc, int n, int rows) {
+    moe_acc_drain_impl<true>(out, acc, n, rows, 1.0f);
 }
 
 extern "C" int rivoli_moe_acc_drain_to_s(float* out, unsigned long long* acc, int n, int rows,
-                                         float gain, void* stream) {
+                                         void* stream) {
     if (n <= 0 || rows <= 0) return 1001;
-    // Refused rather than tolerated: `gain == 0` writes an all-zero aggregate — a MoE layer whose
-    // routed experts contributed nothing while the shared MLP kept working, which is degraded
-    // fluent text rather than a crash. The sibling cannot make this check, because there a zero
-    // gain leaves the residual untouched and is indistinguishable from a layer with no misses.
-    //
-    // `1006`, not `1003`: this file already uses 1003 for an unsupported `nrow` (twice) and 1006
-    // for the non-positive-float class, which is what this is. And `!(gain > 0.0f && gain <
-    // INFINITY)` rather than `!(gain > 0.0f)`, matching `moe_gateup_f4`'s guard and for its
-    // documented reason — float-to-float `as` SATURATES, so an overflowing host value arrives as
-    // `+inf`, passes any bare positivity test, and here writes an all-inf aggregate that the
-    // following RMSNorm turns into NaN.
-    if (!(gain > 0.0f && gain < INFINITY)) return 1006;
     hipGetLastError();
     hipLaunchKernelGGL(moe_acc_drain_to, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream,
-                       out, acc, n, rows, gain);
+                       out, acc, n, rows);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

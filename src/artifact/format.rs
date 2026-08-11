@@ -582,11 +582,11 @@ impl Safetensors {
 /// It exists to pair the six spans that `spans`, [`Self::pack`] and [`Self::diff`] all walk in
 /// the same order, so the writer and the verifier cannot disagree about the layout.
 ///
-/// > **CORRECTED 2026-08-11.** This justified itself by "four positional arguments repeated at every
-/// > entry point"; after [`RoutedRepack`] there is one construction site outside the tests and it
-/// > copies already-named fields, so the transposition hazard — an expert's three projections are
-/// > `(moe_inter, expert_in)·2 + (expert_in, moe_inter)`, and a swap keeps the byte count — is
-/// > guarded there now, not here.
+/// One construction site outside the tests ([`RoutedRepack::layer`]) — which is why folding it
+/// into that struct was considered and declined: the split by cardinality (per-layer state there,
+/// per-expert layout here) still reads correctly, and this type is `pub` with three methods. The
+/// hazard the shape checks in [`Self::spans`] exist for is transposition: the three projections
+/// are `(moe_inter, expert_in)·2 + (expert_in, moe_inter)`, and a swap keeps the byte count.
 pub struct F4Expert<'a> {
     pub src: &'a Safetensors,
     /// `layers.{l}.ffn.experts.{e}` — see `quant::v4_expert_base`. On K3,
@@ -713,18 +713,31 @@ impl RoutedRepack<'_> {
         // checked. It is deliberately NOT `back == buf`: that comparison could only ever pass,
         // since the buffer came from `pack` and `diff` reads the same source spans, so it would be
         // a guard unable to fire dressed as a verification.
+        //
+        // It reads ONE expert's window at a time rather than the file. This was `fs::read`,
+        // inherited from `convert_v4` where the whole layer is 3.42 GB and survivable; against
+        // K3's 896 experts the same line is a **15.72 GB allocation per layer** on a box whose
+        // 128 GB LPDDR5 is shared with the GPU — the exact figure `write_expert_layer`'s doc uses
+        // to justify bounding the WRITE side, promoted to the read side by sharing this loop
+        // (review 2026-08-11). The one-expert measurement in
+        // `docs/measurement/k3-reference/repack-one-expert.md` could not have caught it: at
+        // `ne = 1` the buffer is 17.5 MB. `diff` only ever looks at `ebytes` bytes at `off`.
         if self.verify {
-            let back = std::fs::read(&path).with_context(|| format!("re-read {path}"))?;
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::File::open(&path).with_context(|| format!("re-read {path}"))?;
+            let len = f.metadata()?.len();
             ensure!(
-                back.len() == VQ_ALIGN + ne * stride,
-                "{path}: {} bytes on disk, expected {}",
-                back.len(),
+                len == (VQ_ALIGN + ne * stride) as u64,
+                "{path}: {len} bytes on disk, expected {}",
                 VQ_ALIGN + ne * stride
             );
             let mut differing = 0usize;
+            let mut win = vec![0u8; ebytes];
             for e in 0..ne {
                 let off = VQ_ALIGN + e * stride;
-                differing += expert(e).diff(&back[off..off + ebytes])?.len();
+                f.read_exact_at(&mut win, off as u64)
+                    .with_context(|| format!("{path}: expert {e}'s block at byte {off}"))?;
+                differing += expert(e).diff(&win)?.len();
             }
             ensure!(
                 differing == 0,
@@ -845,11 +858,18 @@ impl F4Expert<'_> {
             // subnormal); refusing it would be inventing a rule the format does not have.
             // The reason it is worth a sentence is that `b << 23` WOULD hand back +0, which
             // is why both decoders special-case it.
+            //
+            // `nm.scale`, not a literal `.scale`: this message's whole value is that it names
+            // the exact tensor, row and group that fails, and on K3 the tensor is
+            // `…w1.weight_scale`. It WAS a literal, so a K3 refusal would have named a tensor no
+            // K3 checkpoint contains — caught by review 2026-08-11, and only visible because the
+            // fixture below now runs both naming tables.
             if let Some(k) = sc.iter().position(|&b| b == 0xff) {
                 bail!(
-                    "{base}.{proj}.scale[{}][{}] is 0xff — the e8m0 NaN. The FP4 kernels \
+                    "{base}.{proj}.{}[{}][{}] is 0xff — the e8m0 NaN. The FP4 kernels \
                      cannot reject it and `moe_fixed`'s clamp turns it into a finite \
                      ±2^14, so a whole {}-weight group would decode to plausible garbage.",
+                    nm.scale,
                     k / groups,
                     k % groups,
                     crate::artifact::quant::F4_GROUP,
@@ -2043,6 +2063,7 @@ mod tests {
         dir: String,
         expert_in: usize,
         moe_inter: usize,
+        naming: &'static F4Naming,
     }
 
     impl F4Fixture {
@@ -2054,12 +2075,24 @@ mod tests {
         /// `b` — the one-field perturbation the e8m0 cases below need, so the control and
         /// the break differ in exactly one byte and nothing else.
         fn with_scale_byte(tag: &str, poison: Option<(usize, usize, u8)>) -> Self {
-            use crate::artifact::quant::{F4_GROUP, f4_groups, f4_row_bytes, v4_expert_projs};
+            Self::named(tag, poison, &F4_NAMING_V4)
+        }
+
+        /// **Parameterised over the naming table, because that is the only way `F4_NAMING_K3`
+        /// is exercised through [`F4Expert::spans`] at all.** Added 2026-08-11 after review
+        /// observed that every fixture here was V4-named, so K3's four names and two dtypes —
+        /// the set `F4_NAMING_K3`'s doc says is "only correct as a SET" — would first be tested
+        /// against the 1.42 TiB checkpoint. It immediately paid: the e8m0 refusal was naming a
+        /// literal `.scale`, a tensor no K3 shard contains.
+        fn named(tag: &str, poison: Option<(usize, usize, u8)>, nm: &'static F4Naming) -> Self {
+            use crate::artifact::quant::{F4_GROUP, f4_groups, f4_row_bytes, vq_expert_layout};
             let dir = tmpdir(&format!("f4_{tag}"));
             let (expert_in, moe_inter) = (64, 32);
             let mut w = SafeWriter::new();
-            for (slot, (proj, (o_dim, i_dim))) in v4_expert_projs(expert_in, moe_inter)
+            for (slot, (proj, (o_dim, i_dim))) in nm
+                .projs
                 .into_iter()
+                .zip(vq_expert_layout(expert_in, moe_inter))
                 .enumerate()
             {
                 // `tag` is '1' | '3' | '2', which keeps the three projections distinct —
@@ -2081,14 +2114,14 @@ mod tests {
                     scale[k] = b;
                 }
                 w.add(
-                    format!("e.{proj}.weight"),
-                    Dtype::I8,
+                    format!("e.{proj}.{}", nm.packed),
+                    nm.packed_dtype,
                     vec![o_dim, i_dim / 2],
                     weight,
                 );
                 w.add(
-                    format!("e.{proj}.scale"),
-                    Dtype::F8E8M0,
+                    format!("e.{proj}.{}", nm.scale),
+                    nm.scale_dtype,
                     vec![o_dim, i_dim / F4_GROUP],
                     scale,
                 );
@@ -2098,6 +2131,7 @@ mod tests {
                 dir,
                 expert_in,
                 moe_inter,
+                naming: nm,
             }
         }
 
@@ -2111,11 +2145,9 @@ mod tests {
                 base: "e".into(),
                 expert_in: self.expert_in,
                 moe_inter: self.moe_inter,
-                // V4's naming, because that is what this fixture writes (`<proj>.weight` as `I8`,
-                // `<proj>.scale` as `F8_E8M0`). The K3 side of the pair is covered by
-                // `tests/k3_names.rs` against the shipped index, and end to end by the real-expert
-                // conversion in `docs/measurement/k3-reference/repack-one-expert.md`.
-                naming: &F4_NAMING_V4,
+                // Whichever table WROTE the fixture — reading it back under the other one is a
+                // different test (and would fail on the tensor name, not the dtype).
+                naming: self.naming,
             }
         }
     }
@@ -2163,22 +2195,27 @@ mod tests {
             .expect("a fixture with no 0xff must pack");
 
         // One `0xff` per projection, at a byte that is not the first — a guard that only
-        // looked at scale[0] would pass a first-byte-only test.
-        for slot in 0..3 {
-            let fx = F4Fixture::with_scale_byte(&format!("e8m0_nan{slot}"), Some((slot, 5, 0xff)));
-            let st = fx.open();
-            let e = format!(
-                "{:#}",
-                fx.expert(&st)
-                    .pack(&mut vec![0u8; n])
-                    .err()
-                    .unwrap_or_else(|| panic!("slot {slot}: a 0xff scale byte must be refused"))
-            );
-            let proj = crate::artifact::quant::V4_PROJ[slot];
-            assert!(
-                e.contains(&format!("{proj}.scale[")) && e.contains("0xff"),
-                "slot {slot}: the refusal must name the projection and the byte, got: {e}"
-            );
+        // looked at scale[0] would pass a first-byte-only test. And under BOTH naming tables,
+        // because the value of this refusal is that it names the tensor the checkpoint AT HAND
+        // contains: with the literal `.scale` it once had, the V4 half stays green and the K3
+        // half fails on the name. That asymmetry is the bug, so the loop has to be the outer one.
+        for nm in [&F4_NAMING_V4, &F4_NAMING_K3] {
+            for slot in 0..3 {
+                let tag = format!("e8m0_nan_{}_{slot}", nm.scale);
+                let fx = F4Fixture::named(&tag, Some((slot, 5, 0xff)), nm);
+                let st = fx.open();
+                let e = format!(
+                    "{:#}",
+                    fx.expert(&st)
+                        .pack(&mut vec![0u8; n])
+                        .err()
+                        .unwrap_or_else(|| panic!("{tag}: a 0xff scale byte must be refused"))
+                );
+                assert!(
+                    e.contains(&format!("{}.{}[", nm.projs[slot], nm.scale)) && e.contains("0xff"),
+                    "{tag}: the refusal must name the projection and the byte, got: {e}"
+                );
+            }
         }
 
         // `0x00` passes, and changes exactly the byte it was written into. Two assertions,
@@ -2256,6 +2293,52 @@ mod tests {
             bad[k] ^= 0xFF;
             assert_eq!(e.diff(&bad).unwrap(), vec![k], "diff missed a flip at {k}");
         }
+    }
+
+    /// **A written layer verifies, and `--verify-only` over a layer nobody converted REFUSES
+    /// instead of writing it.**
+    ///
+    /// The refusal is a deliberate behaviour change made when this loop was factored out of
+    /// `convert_v4` (2026-08-11): the old inline form was `if !reused { write… }` with no
+    /// verify-only guard, so a `--verify-only` run over an unconverted layer silently CONVERTED
+    /// it, against that flag's own `--help`. Nothing asserted it until review asked, and a
+    /// behaviour change with no test is indistinguishable from a regression later.
+    ///
+    /// The first half is not filler. It is the only automated exercise of [`RoutedRepack::layer`]
+    /// at all, and it walks the per-expert windowed read that replaced a whole-file `fs::read` —
+    /// the path whose absence of a test is why that allocation reached K3's 15.72 GB scale before
+    /// anyone noticed.
+    #[test]
+    fn a_verify_only_pass_refuses_a_layer_that_was_never_converted() {
+        let fx = F4Fixture::new("repack_layer");
+        let st = fx.open();
+        let out = tmpdir("f4_repack_out");
+        let repack = |write: bool| RoutedRepack {
+            tool: "test",
+            out_dir: &out,
+            src: &st,
+            naming: &F4_NAMING_V4,
+            expert_in: fx.expert_in,
+            moe_inter: fx.moe_inter,
+            n_experts: 1,
+            verify: true,
+            write,
+        };
+        // Layer 7, not 0: the path is `L{l:02}.f4`, and a zero would hide a formatting slip.
+        repack(true)
+            .layer(7, |_| "e".into())
+            .expect("write, then verify what was written");
+        // Same directory, a layer that was never written — so `reused` is false and `write` is off.
+        let e = format!("{:#}", repack(false).layer(9, |_| "e".into()).unwrap_err());
+        assert!(
+            e.contains("L09.f4") && e.contains("never been converted"),
+            "verify-only must refuse by name, got: {e}"
+        );
+        assert!(
+            std::fs::metadata(format!("{out}/L09.f4")).is_err(),
+            "verify-only WROTE the layer it was supposed to refuse"
+        );
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     /// A truncated shard — a download in flight, an interrupted copy — must be refused by

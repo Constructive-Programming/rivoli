@@ -783,11 +783,10 @@ pub const F4_LUT: [f32; 16] = [
 /// > or names the exact tensor, row and group that fails. `convert_k3` inherits that check through
 /// > `RoutedRepack`, so no `.f4` artifact can contain a byte this function would reject.
 /// >
-/// > **The word ROUTED is load-bearing and was missing until review 2026-08-11.** There is a second
-/// > exhaustive host reader — `SafeWriter::copy_fp8_e8m0` maps this function over every byte of every
-/// > fp8 tensor's `.scale` grid. It does not weaken the conclusion (it is also conversion-time and
-/// > also fails loudly) but it is weaker evidence: it names the tensor and not the row or the group.
-/// > `F4Expert::spans`'s own comment had the qualifier right and this doc dropped it.
+/// > **ROUTED is load-bearing, because there is a second exhaustive host reader.**
+/// > `SafeWriter::copy_fp8_e8m0` maps this function over every byte of every fp8 tensor's `.scale`
+/// > grid. That does not weaken the conclusion — it is also conversion-time and also fails loudly —
+/// > but it is weaker evidence, because it names the tensor and not the row or the group.
 /// >
 /// > **And there are THREE decoders with three behaviours, not two.** This one bails,
 /// > `common.hpp::e8m0f` returns a quiet NaN, and `v4oracle::numerics::e8m0_decode` returns

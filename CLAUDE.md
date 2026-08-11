@@ -63,9 +63,16 @@ cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace,sta
 **Develop on the dev profile. Use `--release` for benchmarks and performance evaluation
 only.** `[profile.release]` sets `lto` and `opt-level` and **no `debug-assertions`**, and no
 `.cargo/config.toml` overrides it — so under `--release` every `debug_assert!` in `src/` is
-compiled out. There are **32**, and the two in `v4compress.rs` are described by their own doc
-as "what ENFORCES the bsz=1 scope cut". Under `--release` they enforce nothing. Measured
-2026-08-05; the distribution is in `docs/investigations/v4-flash-port.md`.
+compiled out. There are **43** across 13 files (`grep -ro 'debug_assert[_a-z]*!' src/ | wc -l`;
+23 of them bare), and the two in `kvcompress.rs` are described by their own doc as "what
+ENFORCES the bsz=1 scope cut". Under `--release` they enforce nothing. The distribution as of
+2026-08-05 is in `docs/investigations/v4-flash-port.md`.
+
+> **CORRECTED 2026-08-11.** This said "**32**" and named `v4compress.rs` — a path `0f39cc4`
+> renamed to `kvcompress.rs`, so the one worked example pointed at a file that does not exist.
+> That is the exact rot this file warns about two sections down for jscpd exemptions. The
+> command is given above because a count of the tree written in prose is a number nothing
+> checks: re-derive it rather than quoting this line.
 
 That is not a defect in the release profile — it is what every number in
 `docs/measurement/benchmarks.md` was measured under, and putting bounds and overflow checks
@@ -175,6 +182,18 @@ A featureless build compiles to a refusal stub — that is deliberate, not break
 
 - **The GPU is sole-tenant.** Never run two benchmarks at once. This also breaks *tests*:
   `DeviceTier::new` fails to allocate while a decode holds the budget.
+- **The other tenant is Kubernetes, and you evict it by UNLOADING, not by draining.**
+  `ai/llama-swap` runs on this node (`rh-anine`, the only one labelled
+  `hr-home.xyz/rocm=true`). `POST http://10.43.48.47:8080/unload` — the ClusterIP, never a pod
+  IP — frees it reversibly; models reload on demand and the service stays up (measured
+  2026-08-11: 41.4 GB of GTT → 174 MB, three models). **`kubectl cordon` + `drain` looks like
+  it works and does not**: the ReplicaSet re-scheduled onto the cordoned node within seconds,
+  because its tolerations do not cover `unschedulable`, so the run that follows is not
+  sole-tenant. Scaling the deployment to 0 does work and takes the AI service down for the
+  window. And the tenant can be invisible to KFD — llama-swap has held 1.6 GB of GTT with
+  **zero** `/sys/class/kfd/kfd/proc/` entries — so read `mem_info_gtt_used` too, not just the
+  holder count. It does take the flock when a model loads through `gpu-lock-wait.sh`, so
+  `flock -w N -E 66` blocking is a legitimate reading, not a bug.
 - **Always `-- --test-threads=1` on any suite that touches the device.** The "intermittent
   `gpustream` hang" recorded here for months is **not intermittent** — diagnosed 2026-08-05.
   libtest runs `#[test]`s in parallel, and each device test builds its own tier, pool and

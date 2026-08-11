@@ -2106,28 +2106,20 @@ fn gemv_i4_matches_oracle() {
 
 /// `moe_acc_drain_to` — the latent-width drain Kimi-K3 needs, against `moe_acc_drain`.
 ///
-/// The two kernels are nine lines apart in `moe.hip` and differ in three ways, every one of which
-/// is silent-wrong if it is dropped. This test is built so each difference reddens on its own:
+/// The two share ONE templated body in `moe.hip` and differ in exactly one line — `=` against `+=`
+/// — which is also the only difference the code cannot make visible. Two things are asserted here:
 ///
 /// 1. **`=` not `+=`.** The destination is pre-filled with a poison value. The sibling would add to
 ///    it; this must overwrite it. That is what makes K3's aggregate correct — it goes on to be
 ///    RMSNormed and up-projected, so a stale addend from the previous layer would be a plausible
 ///    wrong aggregate on every layer, forever, with nothing finite to notice.
-/// 2. **The accumulator is RESET.** Same load-bearing reason as the sibling's: steady-state decode
-///    does no memset before a layer's experts, so a drain that forgot would double-count from the
-///    next layer on.
-/// 3. ~~`n` is the LATENT width.~~ **Not asserted here, and it cannot be.** An earlier version of
-///    this list claimed the fixture gave the accumulator "MORE rows than the drain is told to read";
-///    it does not — `acc` is exactly `rows · n`. And `n` is a CALLER contract, not a kernel
-///    property: the kernel treats `n` exactly as its sibling does. The width is guarded where it is
-///    chosen, at `launch_moe_acc_drain_to`'s doc and at whatever K3 layer loop S3 writes. Removed
-///    2026-08-11 rather than papered over, because a doc that promises coverage it does not have is
-///    worse than a shorter doc.
+/// 2. **The accumulator is RESET.** Shared with the sibling and load-bearing for the same reason:
+///    steady-state decode does no memset before a layer's experts, so a drain that forgot would
+///    double-count from the next layer on. It lives in the shared body, so this covers both.
 ///
-/// Also the `gain == 0` refusal, which the sibling deliberately does not have: there a zero gain
-/// leaves the residual untouched and is indistinguishable from a layer with no misses, while here
-/// it would write an all-zero aggregate — routed experts contributing nothing while the shared MLP
-/// keeps working, which is degraded fluent text rather than an error.
+/// `n` is NOT asserted and cannot be: it is a CALLER contract — the kernel treats it exactly as its
+/// sibling does — guarded where the width is chosen, at `launch_moe_acc_drain_to`'s doc and at
+/// whatever K3 layer loop S3 writes.
 ///
 /// Fixed-point in, exact out: `MOE_ACC_SHIFT` is 44, and every value here is a small multiple of
 /// `2^-44` scaled by a power of two, so the expected result is exact in f32 and this is
@@ -2147,11 +2139,10 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
     let acc: Vec<u64> = (0..rows)
         .flat_map(|r| (0..n).map(move |o| ((o + 1) * (r + 1)) as u64 * (1u64 << 44)))
         .collect();
-    let gain = 0.5f32;
     let want: Vec<f32> = (0..n)
         .map(|o| {
             let t: u64 = (0..rows).map(|r| ((o + 1) * (r + 1)) as u64).sum::<u64>() * (1u64 << 44);
-            gain * (t as f64 / SCALE) as f32
+            (t as f64 / SCALE) as f32
         })
         .collect();
 
@@ -2173,7 +2164,6 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
             accb.ptr_mut() as *mut u64,
             n,
             rows,
-            gain,
             stream.raw(),
         )
     }
@@ -2183,9 +2173,8 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
     let got = f32v(&outb.copy_out().expect("out"));
     // `assert_bits` is bit-exact over every element and every `want` is positive, so it already
     // fails — naming the index — on a `+=` kernel (`poison + want`), on a no-write kernel (`poison`),
-    // and on a transposition. A follow-up `!got.contains(&poison)` was here until 2026-08-11 and
-    // could not fire: there is no input where the bits match and the poison survives. The poison
-    // FILL stays, because it is what makes `=` and `+=` distinguishable at all.
+    // and on a transposition. No `!got.contains(&poison)` follow-up: there is no input where the
+    // bits match and the poison survives.
     assert_bits(&want, &got, "moe_acc_drain_to");
     assert!(
         accb.copy_out().expect("acc").iter().all(|&b| b == 0),
@@ -2193,19 +2182,11 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
          the next layer would double-count"
     );
 
-    // The guards. `gain == 0` and a non-positive `n`/`rows`, each by code rather than by is_err.
-    // 1006 is the non-positive-FLOAT class in `moe.hip`, 1001 the dimension class; the gain guard
-    // used 1003 until review pointed out that code already means "unsupported nrow" twice in the
-    // same file. `f32::INFINITY` is a row because float-to-float `as` saturates, so an overflowing
-    // host value arrives here as `+inf` — it passes any bare `> 0.0` test and would write an all-inf
-    // aggregate for the following RMSNorm to turn into NaN.
-    for (bad_n, bad_rows, bad_gain, code) in [
-        (n, rows, 0.0f32, 1006u32),
-        (n, rows, -1.0, 1006),
-        (n, rows, f32::INFINITY, 1006),
-        (0, rows, gain, 1001),
-        (n, 0, gain, 1001),
-    ] {
+    // The dimension guard, by CODE rather than by is_err: 1001 is `moe.hip`'s non-positive-dimension
+    // class. There is no float guard to test — the kernel takes no scalar, which is the point argued
+    // at `launch_moe_acc_drain_to`. It briefly took a `gain` with a 1006 guard against `0`, `-1` and
+    // `+inf`; deleting the parameter deleted the only way to reach any of them.
+    for (bad_n, bad_rows) in [(0, rows), (n, 0)] {
         // SAFETY: the launcher rejects before it dereferences anything.
         let r = unsafe {
             launch_moe_acc_drain_to(
@@ -2213,14 +2194,9 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
                 accb.ptr_mut() as *mut u64,
                 bad_n,
                 bad_rows,
-                bad_gain,
                 stream.raw(),
             )
         };
-        assert_guard(
-            r,
-            Some(code),
-            &format!("n={bad_n} rows={bad_rows} gain={bad_gain}"),
-        );
+        assert_guard(r, Some(1001), &format!("n={bad_n} rows={bad_rows}"));
     }
 }

@@ -19,8 +19,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 use rivoli::artifact::quant::{
-    F4_GROUP, K3_PACKED, K3_PROJ, K3_SCALE, K3_TEXT_PREFIX, f4_expert_bytes, f4_groups,
-    f4_row_bytes, k3_expert_base,
+    K3_PACKED, K3_PROJ, K3_SCALE, K3_TEXT_PREFIX, f4_expert_bytes, f4_groups, f4_row_bytes,
+    k3_expert_base,
 };
 
 const FAMILIES: &str = include_str!("../docs/measurement/k3-reference/tensor-families.tsv");
@@ -149,10 +149,6 @@ fn the_k3_names_are_the_checkpoints_own() {
             // 92 MoE layers x 896 experts. Read off the TSV, and it is the one count that proves
             // these families cover the dense layer's ABSENCE as well as the MoE layers' presence:
             // 93 layers would be 83,328.
-            // No `assert_ne!(got.count, 93 * 896)` beside this: once the equality holds, 82,432 is
-            // not 83,328 and the inequality cannot fire. It was here until review 2026-08-11 —
-            // the same identity-over-constants shape this commit series has now deleted three times,
-            // laundered through a field read. The comment above carries the fact.
             assert_eq!(got.count, 92 * 896, "{fam}");
             assert_eq!(
                 got.dtype, "U8",
@@ -246,10 +242,11 @@ fn the_shipped_expert_layout_is_already_rivolis() {
         );
         total += o_dim * f4_row_bytes(i_dim) + o_dim * f4_groups(i_dim);
     }
-    assert_eq!(
-        F4_GROUP, 32,
-        "the checkpoint's quantization_config says group_size 32"
-    );
+    // No `assert_eq!(F4_GROUP, 32)`: the scale-shape assertion above already pins it. The TSV gives
+    // `w1.weight_scale` as `3072x112` against an input dim of 3584, and `div_ceil(3584, g) = 112`
+    // holds for `g = 32` alone (`g` must be `>= 32` and `< 32.29`). So the shape assertion fires
+    // first on any change to `F4_GROUP`, and this one would be a constant restated behind it.
+    //
     // ...and the whole expert, against the geometry the artifact writer uses.
     assert_eq!(total, f4_expert_bytes(expert_in, moe_inter));
     assert_eq!(
