@@ -1100,7 +1100,9 @@ fn main() -> Result<()> {
     // The one run-identity attribute the OTLP root span cannot read back off `cfg`, since
     // `attn` is moved into it below and `AttnMode` has no Display.
     let a_attn = format!("{attn:?}").to_lowercase();
-    rivoli::artifact::config::check_budget(a.max_mem)?;
+    // Read before `a.model` is moved into `cfg`; the budget check itself now runs after the
+    // architecture is known, at the match below.
+    let max_mem = a.max_mem;
     // The flags ARE the config. This was `Config::discover`, a nine-argument passthrough
     // (carrying an `#[allow(clippy::too_many_arguments)]`) whose only work was the budget
     // check above — after which `main` overwrote two of the fields it had just defaulted.
@@ -1154,7 +1156,29 @@ fn main() -> Result<()> {
     // `arch.rs`'s header states why: a flag naming the architecture is a flag that can disagree
     // with the weights, and disagreeing launches the wrong attention path and produces fluent
     // wrong text rather than crashing.
-    match rivoli::artifact::model::arch_of_artifact(&cfg.model)? {
+    let arch = rivoli::artifact::model::arch_of_artifact(&cfg.model)?;
+
+    // **The host-memory check runs AFTER the architecture is known, and Muse Glimmer skips
+    // it.** It used to be the line above `let cfg`, which put a measurement of the machine in
+    // front of `run_glimmer`'s refusal table — so on a loaded box `--attn dsa` against a
+    // Glimmer artifact reported "only 12.9 GB available; need more than the 17 GB OS reserve"
+    // instead of saying the flag does not apply. Whether a flag applies is a fact about argv
+    // and the manifest and cannot depend on free RAM; the wrong message also points the reader
+    // at the machine rather than at their command line.
+    //
+    // Found 2026-08-11 by `tests/glimmer_flags.rs` failing all three of its cases while a
+    // sibling agent held ~100 GB of GTT for a benchmark — that suite calls itself deviceless
+    // and was in fact load-dependent, which is a property no CI here would ever have caught
+    // (there is no rocm job, so nothing runs it at all).
+    //
+    // **`run_glimmer` therefore has no budget check, which is correct only while it bails
+    // before allocating.** When S3 gives it a pin build, the check belongs at the top of that
+    // build — after the refusals, before the 55.7 GB — not back here.
+    if arch != rivoli::arch::Arch::MuseGlimmer {
+        rivoli::artifact::config::check_budget(max_mem)?;
+    }
+
+    match arch {
         rivoli::arch::Arch::GlmMoeDsa => {}
         rivoli::arch::Arch::DeepseekV4 => {
             // One struct rather than two more cfg'd parameters: `run_v4` already forks on
