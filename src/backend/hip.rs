@@ -1014,6 +1014,37 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// Grouped-query attention with a derived causal bound — Muse Glimmer's 32Q/2KV layers.
+    ///
+    /// Q head `i` reads KV head `i / (hq / hkv)`, which is a per-head BLOCK and not an
+    /// interleave; `win > 0` bounds each query to `[pos - win + 1, pos]` INCLUSIVE of its own
+    /// position; `win == 0` is a global layer and attends the whole causal prefix. `ring_cap`
+    /// maps position to slot for a ring cache, or `0` when the cache is indexed by position.
+    /// No mask is taken — the bound is derived, because Glimmer's 131072 context makes a
+    /// `[tq][s]` mask larger than the model. The kernel comment carries the four traps.
+    ///
+    /// # Safety
+    /// Device pointers must outlive `stream`'s completion: `q` (`tq * hq * d` f32), `k` and `v`
+    /// (each `hkv * d` f32 per slot, so at least `ring_cap` slots with a ring and
+    /// `start_pos + tq` without), `out` (`tq * hq * d` f32), none aliasing another (every
+    /// kernel parameter is `__restrict__`). `stream` is a live `hipStream_t`, or null for the
+    /// default stream.
+    launch_gqa_attend -> rivoli_gqa_attend, "gqa_attend" (
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        hq: usize as i32,
+        hkv: usize as i32,
+        d: usize as i32,
+        tq: usize as i32,
+        start_pos: usize as i32,
+        win: usize as i32,
+        ring_cap: usize as i32,
+        scale: f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// `out[m, n] = x[m, k] · w[n, k]^T` with `w` in **bf16** — the un-quantized `F.linear`
     /// path, which is the one `Compressor.wkv`/`wgate` take (`Linear(..., dtype=float32)`,
     /// model.py:302).

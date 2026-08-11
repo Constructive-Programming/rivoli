@@ -463,3 +463,172 @@ extern "C" int rivoli_gather_attn_shared_kv(const float* q, const float* kv, con
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════
+// Grouped-query attention with an optional sliding-window ring
+// ═══════════════════════════════════════════════════════════════════════════════════
+//
+// Used by Muse Glimmer (32 Q heads / 2 KV heads, head_dim 128, window 2048 on 3 of every
+// 4 layers) — S2 item 1 of docs/investigations/glimmer-port.md. Nothing above fits it:
+// `mla_latent_attend` has ONE latent row per position that is simultaneously key and
+// value, and `gather_attn_shared_kv` is MQA over an explicit index list. This is the
+// first kernel in the tree with a distinct V, more than one KV head, and a causal bound
+// it derives instead of being handed.
+//
+//     out[i][h] = Σ_j softmax_j( q[i][h] · k[j][h/group] · scale ) · v[j][h/group]
+//
+// Four things about it are load-bearing, each recorded in
+// docs/reference/glimmer-architecture.md §4/§9 as a defect that decodes FLUENTLY:
+//
+//  1. `kvh = head / group`, NOT `head % hkv`. The reference's `repeat_kv` is
+//     `expand(b, hkv, group, s, d).reshape(b, hkv*group, s, d)` (M:249), which is a
+//     per-head BLOCK, so Q heads 0..15 share KV head 0. Both mappings type-check, both
+//     produce the right shapes, and `% hkv` interleaves them instead — trap 10.
+//  2. The window is INCLUSIVE of the query's own position: `j ∈ [p-win+1, p]`, exactly
+//     `win` rows. transformers' `sliding_window_overlay` is `kv_idx > q_idx - win`
+//     and-ed with causal `kv_idx <= q_idx`; at win=3 row 4 sees {2,3,4}. Off-by-one
+//     here is trap 14 and it is why `lo` is `p - win + 1` and not `p - win`.
+//  3. `win == 0` means a GLOBAL layer — the whole causal prefix, no ring. A ring on a
+//     global layer would silently drop everything older than `ring_cap`, so the two are
+//     mutually exclusive and the launcher rejects the combination rather than picking one.
+//  4. No mask array is taken. At Glimmer's 131072 context a [tq][s] mask is 68 GB of
+//     nothing, so the bound is DERIVED from (start_pos, win) — and the S1b golden's
+//     captured `attend.mask` is what proves the derivation, rather than being fed to it.
+//
+// Q must arrive POST-`qk_norm`, POST-`qk_scale_factor` and POST-rope, K the same minus the
+// scale (§4: the 3.87 multiplies Q only, and the cache holds post-norm post-rope K); this
+// kernel applies only `scale`, which stays `head_dim**-0.5`. Layout is the engine's
+// `[row][head][dim]`, NOT the reference's heads-first `[b][head][row][dim]` — the caller
+// transposes, and `attn.rs` names that deviation at its call site.
+//
+// `#pragma clang fp contract(off)` from the V4 section above is still in effect and is
+// wanted here for the same reason: the dot below folds in the same order as the reference's,
+// so the goldens measure `expf` and the wave reduction and nothing else.
+//
+// ponytail: one subgroup per (query row, Q head) — grid (hq, tq) is 32 blocks at decode
+// against 40 CUs, and the whole KV sweep is serialised inside each. Correctness first;
+// `mla_latent_attend`'s two levers are the upgrade path when S5 prices this — tile HB Q
+// heads per block (all 16 of a group share one KV head, so the LDS tile is read once for
+// the group rather than once per head) and split the row range with a combine pass.
+#define GQA_THREADS 32   // one wave32 subgroup owns one (query row, Q head)
+#define GQA_TILE 16      // KV rows staged into LDS per step; LDS = 2*GQA_TILE*d floats
+// Lane-private accumulator/query registers. Lane `l` owns columns i ≡ l (mod GQA_THREADS),
+// so this CAPS head_dim at GQA_THREADS*GQA_ACC = 256 — Glimmer is 128, and §9 trap 15
+// records that head_dim is NOT hidden/heads (128, not 208), so the cap is checked rather
+// than assumed. The launcher rejects a larger head_dim instead of dropping its tail.
+#define GQA_ACC 8
+extern "C" __global__ void gqa_attend(
+    const float* __restrict__ q,   // [tq*hq*d]   post-norm, post-scale, post-rope
+    const float* __restrict__ k,   // [cap*hkv*d] cache: post-norm, post-rope
+    const float* __restrict__ v,   // [cap*hkv*d]
+    int hq, int hkv, int d, int start_pos, int win, int ring_cap, float scale,
+    float* __restrict__ out) {     // [tq*hq*d]
+    extern __shared__ float smem[];
+    float* Kt = smem;                     // [GQA_TILE*d] staged key tile
+    float* Vt = Kt + GQA_TILE * d;        // [GQA_TILE*d] staged value tile
+
+    const int lane = (int)threadIdx.x;
+    const int head = (int)blockIdx.x, row = (int)blockIdx.y;
+    const int kvh = head / (hq / hkv);    // item 1 above — a block repeat, not an interleave
+    const int pos = start_pos + row;      // absolute position of this query row
+    // Item 2: inclusive of `pos` itself, so exactly `win` rows once the window has filled.
+    const int lo = (win > 0 && pos >= win) ? pos - win + 1 : 0;
+    // Rounded UP, and every access below is guarded by `i < d`, so a head_dim that does not
+    // tile the subgroup runs correctly with the tail lanes idle. `mla_latent_attend` refuses
+    // exactly this and bounds on a wave-uniform `nacc` instead, because there the divergent
+    // form cost more than the LDS traffic it saved — a measured decision on the hot path, at
+    // one fixed width. Here it buys the thing that matters more: the S1b goldens are emitted
+    // at head_dim 8, so a kernel that demanded a multiple of 32 could not be gated by its own
+    // fixture at all. `gather_attn_shared_kv` takes the same guarded form for the same reason.
+    const int nacc = (d + GQA_THREADS - 1) / GQA_THREADS;
+
+    const float* qrow = q + ((size_t)row * hq + head) * d;
+    float qv[GQA_ACC];
+#pragma unroll
+    for (int c = 0; c < GQA_ACC; ++c) {
+        const int i = lane + c * GQA_THREADS;
+        qv[c] = (c < nacc && i < d) ? qrow[i] : 0.0f;
+    }
+
+    float acc[GQA_ACC] = {0};
+    float m = -INFINITY, l = 0.0f;
+
+    for (int j0 = lo; j0 <= pos; j0 += GQA_TILE) {
+        const int cnt = min(GQA_TILE, pos - j0 + 1);
+        // Cooperative tile load. `ring_cap` maps an absolute position to its slot; 0 means
+        // the cache is indexed by position directly (global layers, and any caller that
+        // holds the whole prefix). K and V share the slot, so one index serves both.
+        for (int idx = lane; idx < cnt * d; idx += GQA_THREADS) {
+            const int tt = idx / d, c = idx - tt * d;
+            const int j = j0 + tt;
+            const size_t slot = ring_cap ? (size_t)(j % ring_cap) : (size_t)j;
+            const size_t at = (slot * (size_t)hkv + (size_t)kvh) * (size_t)d + (size_t)c;
+            Kt[idx] = k[at];
+            Vt[idx] = v[at];
+        }
+        __syncthreads();
+
+        for (int tt = 0; tt < cnt; ++tt) {
+            float part = 0.0f;
+#pragma unroll
+            for (int c = 0; c < GQA_ACC; ++c) {
+                const int i = lane + c * GQA_THREADS;
+                if (c < nacc && i < d) part += qv[c] * Kt[tt * d + i];
+            }
+            for (int off = GQA_THREADS / 2; off > 0; off >>= 1)
+                part += __shfl_down(part, off, GQA_THREADS);
+            const float s = __shfl(part, 0, GQA_THREADS) * scale;
+
+            const float mx = fmaxf(m, s);
+            const float rescale = expf(m - mx), w = expf(s - mx);
+#pragma unroll
+            for (int c = 0; c < GQA_ACC; ++c) {
+                const int i = lane + c * GQA_THREADS;
+                if (c < nacc && i < d) acc[c] = acc[c] * rescale + w * Vt[tt * d + i];
+            }
+            l = l * rescale + w;
+            m = mx;
+        }
+        __syncthreads();  // tile consumed before the next load overwrites it
+    }
+
+    // `l` is at least exp(0) = 1 for every reachable query, because item 2 puts `pos` in
+    // its own window and the causal bound puts it in the prefix — a query here always
+    // attends to at least itself. 0 rather than 0/0 if a caller ever wires `lo > pos`.
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    float* orow = out + ((size_t)row * hq + head) * d;
+#pragma unroll
+    for (int c = 0; c < GQA_ACC; ++c) {
+        const int i = lane + c * GQA_THREADS;
+        if (c < nacc && i < d) orow[i] = acc[c] * inv;
+    }
+}
+
+// Takes a STREAM, like the V4 launchers above. Return codes: 0 = success, POSITIVE = arg
+// guard, NEGATIVE = -(hipError_t).
+extern "C" int rivoli_gqa_attend(const float* q, const float* k, const float* v, int hq,
+                                 int hkv, int d, int tq, int start_pos, int win, int ring_cap,
+                                 float scale, float* out, void* stream) {
+    if (hq <= 0 || hkv <= 0 || d <= 0 || tq <= 0 || start_pos < 0 || win < 0 || ring_cap < 0)
+        return 1001;
+    // The group must be exact: `hq/group` truncating would send the tail of the Q heads to
+    // a KV head that does not exist, and `head/group` is computed from the truncated value.
+    if (hq % hkv) return 1003;
+    // 1002 is the size-bound code this tree uses. Past the accumulator the tail of every head
+    // is silently never written — no error, no fault, just wrong columns. A head_dim that
+    // does not tile the subgroup is fine and is NOT rejected: the goldens are emitted at 8.
+    if (d > GQA_THREADS * GQA_ACC) return 1002;
+    // Item 3: a ring on a global layer drops the prefix past `ring_cap` with no error.
+    // A ring shorter than the window is the same bug one step later — the oldest rows the
+    // window still wants have already been overwritten.
+    if (win == 0 && ring_cap != 0) return 1005;
+    if (ring_cap != 0 && ring_cap < win) return 1005;
+    const size_t lds = 2 * (size_t)GQA_TILE * (size_t)d * sizeof(float);
+    if (lds > 65536) return 1006;
+    hipGetLastError();
+    hipLaunchKernelGGL(gqa_attend, dim3((unsigned)hq, (unsigned)tq), dim3(GQA_THREADS),
+                       (unsigned)lds, (hipStream_t)stream, q, k, v, hq, hkv, d, start_pos, win,
+                       ring_cap, scale, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
