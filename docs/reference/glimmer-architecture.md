@@ -365,7 +365,21 @@ a *quantized* drafter) and 1.5–1.8× on Apple M4/M5 Max via ExecuTorch. The pa
 with context beyond the drafter's ~4K training window unless long-context fine-tuned — so any
 band registered from short prompts will not hold at 131k.
 
-## 12. Still open
+## 12. Two keys the schema does not bind, recorded so they are not rediscovered
+
+- **`out_hidden_size: 6144` (wrapper level).** Not the text model's `hidden_size` 6656, and
+  not mentioned anywhere else in this doc. It belongs to the vision path — `vision_adapter`
+  /`vision_projection` project the tower's 1536 through `projector_hidden_size` 4096 — so it
+  is out of scope here. Recorded because a reader who finds a second "hidden size" in the
+  config and assumes it is the trunk's will build every projection 512 too narrow. Flagged by
+  review 2026-08-11 as absent from this doc.
+- **`text_config.eos_token_id` is the scalar `200001`**, while `generation_config.json` lists
+  **two** ids, `[200001, 200008]`. That is trap 13 sitting live in the shipped files. The
+  schema deliberately does **not** bind the `text_config` key: EOS comes from the tokenizer's
+  `generation_config`, and binding the scalar here is precisely how a port comes to stop on
+  one of the two.
+
+## 13. Still open
 
 - **Sustained resident-GEMV bandwidth at these shapes on gfx1151.** BLOCKED 2026-08-10, and
   the block is the protocol working, not a fault: `/var/run/sys-gpu.lock` was **held**

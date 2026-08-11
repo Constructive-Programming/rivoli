@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1 is blocked on K3's S1a landing the Arch seam, not on anything here. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
+verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a item 1 DONE 2026-08-11 on tag k3-s1a — the shipped binary parses the unmodified config.json and refuses to decode; items 2-4 (converter, pin, run_glimmer's flag refusals) are open. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
 ---
 
 # Muse Glimmer-30B — implementation plan
@@ -252,10 +252,23 @@ name files K3 will have moved.
      `hidden / n_heads`, so a later simplification to the derived form builds 208-wide heads.
      Asserted as `head_dim != hidden / n_heads` so it reddens for that reason.
 
-   Gate: a 20-row defect run over the vendored config, each row asserted on its own refusal
-   *message*, proven able to go red (neutering the pairing check fails it; restoring passes).
-   `output_multiplier` and `final_logit_softcapping` are checked here **because** they are
-   argmax-invariant — no greedy gate downstream can see them wrong, so this is the only place.
+   Gates: a **26-row defect run** over the vendored config plus an inserted-key assertion,
+   each row asserted on its own refusal *message*; and `every_glimmer_field_is_required`,
+   which compares the whole set of keys whose removal is refused against the set tolerated as
+   absent, so a field that stops being required moves between them. Both proven able to go
+   red. `output_multiplier` and `final_logit_softcapping` are checked at the load boundary
+   **because** they are argmax-invariant — no greedy gate downstream can see them wrong.
+
+   Two things the red-proofs corrected, which is the argument for running them rather than
+   asserting a gate is sound:
+
+   - `every_glimmer_field_is_required` **does not** redden on a `#[serde(default)]` for
+     `head_dim` — the default 0 is caught by `validate`'s width loop, so the checkpoint is
+     still refused and no defect exists. It reddens on `attention_bias`, where the default is
+     the acceptable value. The doc originally claimed the `head_dim` case and was wrong.
+   - Two defect rows drafted from the review were themselves wrong and were cut: `/dtype` set
+     to `bfloat16` is a no-op, and `rope_parameters.rope_theta = 0` trips the pairing check
+     before it can reach the narrowing check it was meant to exercise.
 
    Incidental: jscpd caught the f32-narrowing loop against K3's, factored to
    `ensure_f32_positive` rather than exempted — one rule about the hardware, unlike the

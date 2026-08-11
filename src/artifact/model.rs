@@ -1503,6 +1503,24 @@ pub struct GlimmerConfig {
     /// "approximately 4-bit precision, under 20 GB" describes separate GGUF releases; reading
     /// an fp8 or 4-bit export as BF16 is noise at every width, so this is asserted.
     pub dtype: String,
+    /// Must be **absent**. `Option` for the reason `K3TextConfig::rope_theta` is one: what this
+    /// module bans is a default standing in for a value the engine needs, and this is a value
+    /// the engine must not find.
+    ///
+    /// **`dtype` alone does not prove the weights are unquantized**, which is the whole reason
+    /// this field exists. The counter-example is vendored in this tree: K3's `config.json`
+    /// declares `dtype: "bfloat16"` *and* a `quantization_config` with
+    /// `format: "mxfp4-pack-quantized"`, `num_bits: 4`. Without this field serde would ignore
+    /// such a block, and a packed Glimmer export would parse clean and be read as BF16 at
+    /// every width — exactly what the `dtype` message above claims to prevent. Found by
+    /// review 2026-08-11.
+    ///
+    /// Untyped `Value` on purpose: nothing may act on its contents. K3's schema records why a
+    /// `quantization_config` is not trustworthy even when present — its `targets`/`ignore`
+    /// lists mis-declare their own scope — so the only claim supported here is the negative
+    /// one, that this converter reads unquantized checkpoints.
+    #[serde(default)]
+    pub quantization_config: Option<serde_json::Value>,
 }
 
 /// The `text_config` dict — Muse Glimmer's text model.
@@ -1512,11 +1530,18 @@ pub struct GlimmerConfig {
 /// [`GlimmerConfig`], not this** — same argument as `K3TextConfig`'s, which see.
 ///
 /// The fields here are not the interesting part; what is absent is. Eight load-bearing
-/// operations appear in no marketing surface and only two of them are visible as a config
-/// key at all (`qk_scale_factor`, `post_norm_eps`) — the weightless QK-norm, the centered
-/// `x*(1+w)` norm form, the sandwich-norm placement and the normed embedding are code-only
-/// facts. `glimmer-architecture.md` §9 lists all fifteen traps; a config schema can only
-/// guard the ones that have a key, so the rest are S1b's fixtures.
+/// operations appear in no marketing surface. **Four have a config key and are therefore
+/// guardable here** — `qk_scale_factor`, `post_norm_eps`, `output_multiplier`,
+/// `final_logit_softcapping`, and `validate` checks all four. The other four are code-only
+/// facts no schema can see: the weightless QK-norm, the centered `x*(1+w)` norm form, the
+/// sandwich-norm placement, and the normed embedding. Those are S1b's fixtures.
+/// `glimmer-architecture.md` §9 lists all fifteen traps.
+///
+/// > **CORRECTED 2026-08-11**, by review. This said "only two of them are visible as a config
+/// > key at all (`qk_scale_factor`, `post_norm_eps`)" and routed "the rest" to S1b — which
+/// > sent to a fixture the two fields `validate` deliberately checks HERE, and for the
+/// > sharpest reason in this port: `output_multiplier` and `final_logit_softcapping` are
+/// > argmax-invariant, so no greedy gate downstream can ever see them wrong.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GlimmerTextConfig {
     /// The NESTED spelling, `muse_glimmer_text`. Carried so `validate` can assert the descent
@@ -1533,9 +1558,15 @@ pub struct GlimmerTextConfig {
     // Exempted on exactly the argument the K3 block above states, and it is now a fourth
     // instance of it: four architectures agreeing on four JSON names is a coincidence of the
     // checkpoints, not a shared contract, and a shared struct becomes the attractor for a
-    // FIFTH field that is not shared. Glimmer is the proof again — it agrees on these four and
-    // then needs `head_dim` as a FIRST-CLASS field, which none of the other three carry,
-    // because 32 heads x 128 is 4096 and `hidden_size` is 6656.
+    // FIFTH field that is not shared — `num_key_value_heads`, `head_dim`, `layer_types` and
+    // `sliding_window` are each carried by some of these four and not others.
+    //
+    // > **CORRECTED 2026-08-11**, by review. This said Glimmer "needs `head_dim` as a
+    // > FIRST-CLASS field, which none of the other three carry". **`V4Config` carries one**
+    // > (`head_dim`, this file), and V4's is non-derivable for the same reason Glimmer's is:
+    // > its pinned dims are hidden 4096 / 64 heads / head_dim **512**, and 4096/64 = 64.
+    // > The wrong version invited a reader to "simplify" V4's field to `hidden / n_heads`,
+    // > which is Glimmer's own trap 15 landed on V4.
     #[serde(rename = "num_hidden_layers")]
     pub n_layers: usize,
     #[serde(rename = "hidden_size")]
@@ -1577,11 +1608,16 @@ pub struct GlimmerTextConfig {
     /// 2048, on the `sliding_attention` layers only. The window is inclusive of the current
     /// position: `[p-2047, p]`, exactly 2048 rows.
     pub sliding_window: usize,
-    /// 52 entries, each `sliding_attention` or `full_attention`. **Consumed as the array, never
-    /// re-derived from a stride** — the `[s,s,s,full]` period is a fact about this checkpoint,
-    /// not a rule, and a port that computes `i % 4 == 3` produces a model that is right until
-    /// the first checkpoint whose pattern differs.
-    pub layer_types: Vec<String>,
+    /// 52 entries. **Consumed as the array, never re-derived from a stride** — the
+    /// `[s,s,s,full]` period is a fact about this checkpoint, not a rule, and a port that
+    /// computes `i % 4 == 3` produces a model that is right until the first checkpoint whose
+    /// pattern differs.
+    ///
+    /// Typed rather than `Vec<String>` so an unknown spelling is refused by **serde**, at
+    /// deserialize time and unconditionally, instead of by a `validate` that a caller holding
+    /// this struct directly can skip. The realistic wrong value is one dict away: this file's
+    /// own `vision_config.layer_types` is `["window_attention", …]`.
+    pub layer_types: Vec<LayerKind>,
     /// 52 entries: 500000.0 on sliding layers, **0 on full ones**.
     ///
     /// Read as a BOOLEAN, not as a per-layer base. The first-party code builds ONE cos/sin
@@ -1599,6 +1635,24 @@ pub struct GlimmerTextConfig {
     pub hidden_activation: String,
     /// False. No projection in the attention block carries a bias, and none ships.
     pub attention_bias: bool,
+}
+
+/// What a Glimmer layer's attention attends over. One entry per layer in
+/// [`GlimmerTextConfig::layer_types`].
+///
+/// An enum rather than the checkpoint's raw string so that an unrecognised spelling cannot
+/// reach the engine at all: serde refuses it while deserializing, which is before `validate`
+/// and therefore not skippable. As `Vec<String>` a typo in any ONE of the three comparison
+/// sites read as "not sliding" — i.e. as a positive claim of full attention over the whole
+/// prefix, on a layer trained with a 2048 window. That is fluent wrong text, and the kind
+/// this port cannot otherwise see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerKind {
+    /// Attends over `[p-2047, p]` — exactly `sliding_window` rows, inclusive of `p`.
+    SlidingAttention,
+    /// Attends over the whole prefix, and carries no rotation (`layer_rope_theta` is 0).
+    FullAttention,
 }
 
 /// Glimmer's `rope_parameters`. Distinct from GLM's private [`RopeParameters`] above rather
@@ -1627,19 +1681,42 @@ impl ArchConfig for GlimmerConfig {
              card advertises are separate GGUF releases and are not what this converter reads",
             self.dtype
         );
+        // The other half of that claim. `dtype` says how the tensors are TYPED; this says they
+        // are not additionally packed. K3 ships both at once, so neither check implies the
+        // other and the `dtype` message would otherwise promise more than it delivers.
+        ensure!(
+            self.quantization_config.is_none(),
+            "this config carries a quantization_config, so its weights are packed rather than \
+             plain BF16 — `dtype: \"bfloat16\"` does not exclude that (Kimi-K3's checkpoint \
+             declares both). This converter reads the unquantized release"
+        );
         self.text.validate()
     }
 }
 
 impl GlimmerTextConfig {
-    /// True when layer `i` attends over a sliding window rather than the whole prefix.
+    /// True when layer `layer` attends over a sliding window rather than the whole prefix.
     ///
-    /// Reads the config's own array. `validate` has already established that it has one entry
-    /// per layer and that every entry is one of the two known spellings, so an out-of-range
-    /// `i` is a caller bug rather than a checkpoint one — hence the `Option` rather than a
-    /// silent `false`, which would claim "full attention" about a layer that does not exist.
-    pub fn layer_is_sliding(&self, layer: usize) -> Option<bool> {
-        Some(self.layer_types.get(layer)? == "sliding_attention")
+    /// **`Result`, not `Option`, and the difference is not taste.** An absent answer here has
+    /// to be an error the caller must handle, because every ergonomic way to collapse an
+    /// `Option<bool>` — `unwrap_or(false)`, `unwrap_or_default()`, `matches!(_, Some(true))` —
+    /// yields `false`, which is a *positive claim of full attention* about a layer that does
+    /// not exist. `unwrap()` is not the escape hatch either: `Cargo.toml` denies
+    /// `unwrap_used`. So the shape steered its only caller into the silently-wrong branch, and
+    /// it did: `main.rs` wrote `.unwrap_or(false)` on the first try.
+    ///
+    /// `Result` collapses to `?` instead, which is what `K3TextConfig::layer_is_mla` does and
+    /// for the identical reason recorded there. Flagged by both standing reviews 2026-08-11 —
+    /// latent today (`validate` pins the length and the loop is `0..n_layers`), and it is the
+    /// line S2's layer loop copies.
+    pub fn layer_is_sliding(&self, layer: usize) -> Result<bool> {
+        let kind = self.layer_types.get(layer).with_context(|| {
+            format!(
+                "layer {layer} is out of range: this model has {} layers",
+                self.layer_types.len()
+            )
+        })?;
+        Ok(*kind == LayerKind::SlidingAttention)
     }
 
     /// Cross-field checks. Each guards a failure that produces text rather than an error.
@@ -1677,8 +1754,10 @@ impl GlimmerTextConfig {
         // type-check, both decode fluently, and only one is this model. The divisibility is
         // what makes `j / groups` well-defined at all.
         ensure!(
-            self.num_key_value_heads <= self.n_heads
-                && self.n_heads.is_multiple_of(self.num_key_value_heads),
+            // No `kv <= n_heads` conjunct: the zero loop above guarantees both are positive,
+            // and for `0 < n_heads < kv` the multiple test is already false. A conjunct that
+            // can never be the sole cause of a refusal makes the message ambiguous for free.
+            self.n_heads.is_multiple_of(self.num_key_value_heads),
             "num_attention_heads {} is not a positive multiple of num_key_value_heads {} — \
              GQA needs a whole number of query heads per KV head",
             self.n_heads,
@@ -1710,14 +1789,20 @@ impl GlimmerTextConfig {
         // This is the strongest statement the config alone can make, so it is made here rather
         // than left to a fixture. If a future Glimmer ships a rotated full layer, this refuses
         // it — correctly, because this port's attention would not implement it.
-        for i in 0..self.n_layers {
-            let (kind, theta) = (&self.layer_types[i], self.layer_rope_theta[i]);
-            ensure!(
-                kind == "sliding_attention" || kind == "full_attention",
-                "layer_types[{i}] is {kind:?} — expected \"sliding_attention\" or \
-                 \"full_attention\""
-            );
-            let sliding = kind == "sliding_attention";
+        // `zip` + `enumerate` rather than `0..n_layers` and two index expressions: the indices
+        // are in bounds only by the statement order of the length check above, and nothing in
+        // `Cargo.toml`'s lint table denies `indexing_slicing`. Iterating the pair is total, so
+        // reordering this function cannot turn it into a panic.
+        //
+        // An unknown layer kind needs no check here — `LayerKind` refuses it at deserialize
+        // time, which is earlier and not skippable.
+        for (i, (kind, &theta)) in self
+            .layer_types
+            .iter()
+            .zip(self.layer_rope_theta.iter())
+            .enumerate()
+        {
+            let sliding = *kind == LayerKind::SlidingAttention;
             ensure!(
                 sliding == (theta != 0.0),
                 "layer {i} is {kind:?} with layer_rope_theta {theta} — in this architecture a \
@@ -2795,29 +2880,102 @@ mod tests {
     const GLIMMER_SHIPPED: &str =
         include_str!("../../docs/measurement/glimmer-reference/config.json");
 
-    /// The shipped config with one value replaced, addressed by JSON pointer.
+    /// The refusal message for the shipped config with one value replaced, or a panic naming
+    /// the mutation that was wrongly ACCEPTED. The panic is the point: a refusal test whose
+    /// subject silently parses is the false green this whole file exists to prevent.
     ///
-    /// Returns the document as text so it goes through [`parse_config`] — the same entry the
-    /// binary uses. A test that constructed a `GlimmerTextConfig` literal would skip both the
-    /// architecture check and `validate`, which are the two things being tested.
-    fn glimmer_with(pointer: &str, value: serde_json::Value) -> String {
+    /// Goes through [`parse_config`] — the same entry the binary uses. A test that constructed
+    /// a `GlimmerTextConfig` literal would skip both the architecture check and `validate`,
+    /// which are the two things under test.
+    fn glimmer_err(pointer: &str, value: serde_json::Value) -> String {
         let mut doc: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED).unwrap();
         let slot = doc
             .pointer_mut(pointer)
             .unwrap_or_else(|| panic!("{pointer} is not a path in the shipped config"));
         *slot = value;
-        doc.to_string()
-    }
-
-    /// The refusal message for a mutated config, or a panic naming the mutation that was
-    /// wrongly ACCEPTED. The panic is the point: a refusal test whose subject silently parses
-    /// is the false green this whole file exists to prevent.
-    fn glimmer_err(pointer: &str, value: serde_json::Value) -> String {
-        let text = glimmer_with(pointer, value);
-        match parse_config::<GlimmerConfig>(&text) {
+        match parse_config::<GlimmerConfig>(&doc.to_string()) {
             Ok(_) => panic!("{pointer} was mutated to a wrong value and the config still parsed"),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    /// **Every field the schema declares is REQUIRED — enforced, not just claimed.**
+    ///
+    /// `V4Config` and `K3TextConfig` each have this test and `GlimmerTextConfig` did not,
+    /// while its doc made the identical claim across 22 fields. V4's twin records why a weaker
+    /// `is_err()` check is insufficient: an injected `#[serde(default)]` on `index_topk` left
+    /// it passing unchanged.
+    ///
+    /// Driven off the SHIPPED document rather than a list of field names, and asserted in
+    /// **both** directions: deleting a key the schema needs must refuse, and deleting one it
+    /// does not carry must still parse. The sets are compared whole, so a field that stops
+    /// being required moves between them and reddens.
+    ///
+    /// **What it does and does not catch, measured 2026-08-11 rather than assumed.** The
+    /// property is "removing this key is refused" — by serde *or* by `validate`, which is the
+    /// property that actually matters, since either way the checkpoint is rejected. So:
+    ///
+    /// - `#[serde(default)]` on `attention_bias` **reddens** (default `false` is the
+    ///   acceptable value, so the config would parse and run).
+    /// - `#[serde(default)]` on `head_dim` **does not** — the default 0 is caught by the width
+    ///   loop in `validate`, so the config is still refused and no defect exists. An earlier
+    ///   draft of this doc named `head_dim` as the worked example and was wrong; the red-proof
+    ///   run is what corrected it.
+    ///
+    /// The gap that leaves: a defaulted field whose default is both *acceptable to `validate`*
+    /// and *wrong for this checkpoint*. Every such field here is a `bool` or `String` the
+    /// shipped config pins, and each is asserted by value in
+    /// [`glimmer_shipped_config_parses_and_matches_the_reference_doc`].
+    #[test]
+    fn every_glimmer_field_is_required() {
+        // The `text_config` keys this schema does NOT bind. Everything else in the dict must
+        // be load-bearing; a key added to the struct without being removed from here fails.
+        // Sorted, because the comparison below is on the whole list. `top_k` was in here on
+        // the first draft — it is K3's sampling key and Glimmer's `text_config` has none, and
+        // this test caught it the first time it ran, which is the argument for the test.
+        const NOT_IN_SCHEMA: [&str; 6] = [
+            "attention_dropout",
+            "bos_token_id",
+            "eos_token_id", // EOS comes from `generation_config`, which lists TWO ids (trap 13)
+            "initializer_range",
+            "pad_token_id",
+            "use_cache",
+        ];
+        let doc: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED).unwrap();
+        let text = doc["text_config"]
+            .as_object()
+            .expect("the shipped config's text_config is not an object");
+        let keys: Vec<String> = text.keys().cloned().collect();
+        let (mut required, mut ignored) = (Vec::new(), Vec::new());
+        for k in &keys {
+            let mut d = doc.clone();
+            d["text_config"].as_object_mut().unwrap().remove(k);
+            match parse_config::<GlimmerConfig>(&d.to_string()) {
+                Err(_) => required.push(k.clone()),
+                Ok(_) => ignored.push(k.clone()),
+            }
+        }
+        assert_eq!(
+            ignored, NOT_IN_SCHEMA,
+            "the set of text_config keys this schema tolerates as ABSENT has changed.\n  \
+             required: {required:?}\n  If a field gained #[serde(default)] it moved into the \
+             tolerated set, which is the silent-wrong-text case this test exists for."
+        );
+        // The wrapper's own fields. `quantization_config` is deliberately absent from the
+        // shipped file, so it is the one key whose ABSENCE is correct — asserted separately
+        // below rather than folded in here.
+        for k in ["text_config", "dtype"] {
+            let mut d = doc.clone();
+            d.as_object_mut().unwrap().remove(k);
+            assert!(
+                parse_config::<GlimmerConfig>(&d.to_string()).is_err(),
+                "removing the wrapper's {k:?} must refuse"
+            );
+        }
+        assert!(
+            doc.get("quantization_config").is_none(),
+            "the shipped config must NOT carry a quantization_config — the schema refuses one"
+        );
     }
 
     /// The shipped config parses, and every value this port acts on is what
@@ -2848,33 +3006,22 @@ mod tests {
         assert!(!t.attention_bias);
         assert_eq!(t.hidden_activation, "silu");
 
-        // **`head_dim` is not derivable, and this asserts the difference rather than the
-        // value.** A later "simplification" that drops the field and computes
-        // `hidden / n_heads` gets 208 where the checkpoint says 128, and every projection
-        // shape it derives is wrong. Written as the inequality so it fails for that reason.
-        assert_ne!(
-            t.head_dim,
-            t.hidden / t.n_heads,
-            "head_dim must stay a first-class field: hidden/n_heads is {} here, not {}",
-            t.hidden / t.n_heads,
-            t.head_dim
-        );
+        // `head_dim` is NOT `hidden / n_heads` here (6656/32 = 208, against 128), and it is
+        // not unique in that: `V4Config` carries its own for the same reason. The guard
+        // against "drop the field and derive it" is that removing it fails to COMPILE, which
+        // is stronger than any assertion — an `assert_ne!` over these three already-pinned
+        // constants was deleted by review 2026-08-11 as unable to fail independently.
 
         // The layer map, counted from the arrays rather than from the [s,s,s,full] period —
-        // the period is a fact about this checkpoint, and the arrays are the contract.
-        let sliding: Vec<usize> = (0..t.n_layers)
-            .filter(|&i| t.layer_is_sliding(i).unwrap())
-            .collect();
+        // the period is a fact about this checkpoint, the arrays are the contract. The exact
+        // array equality below implies both the 39/13 split and that the LAST layer is full
+        // (a named gate blind spot), so neither is asserted separately.
         let full: Vec<usize> = (0..t.n_layers)
             .filter(|&i| !t.layer_is_sliding(i).unwrap())
             .collect();
-        assert_eq!(sliding.len(), 39);
         assert_eq!(full, [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51]);
-        // The last layer is FULL, which is the one every "the pattern starts and ends the same
-        // way" assumption gets wrong, and it is a gate blind spot named in the plan.
-        assert_eq!(*full.last().unwrap(), t.n_layers - 1);
-        // Out of range is `None`, not a silent "full" — see `layer_is_sliding`.
-        assert_eq!(t.layer_is_sliding(t.n_layers), None);
+        // Out of range is an ERROR, not a silent "full" — see `layer_is_sliding`.
+        assert!(t.layer_is_sliding(t.n_layers).is_err());
     }
 
     /// **The defect run.** Every load-bearing field, mutated one at a time, must refuse — and
@@ -2929,12 +3076,37 @@ mod tests {
                 json!(3),
                 "whole number of query heads",
             ),
-            ("/text_config/head_dim", json!(0), "head_dim is 0"),
+            // **One row per entry of the width table**, so deleting any entry reddens exactly
+            // one row. Three of the nine were sampled until review 2026-08-11 pointed out the
+            // rest were free — K3's equivalent carries the same correction, which makes this a
+            // repeat of a known finding rather than a fresh one.
             ("/text_config/hidden_size", json!(0), "hidden_size is 0"),
+            (
+                "/text_config/intermediate_size",
+                json!(0),
+                "intermediate_size is 0",
+            ),
+            ("/text_config/vocab_size", json!(0), "vocab_size is 0"),
+            (
+                "/text_config/num_attention_heads",
+                json!(0),
+                "num_attention_heads is 0",
+            ),
+            (
+                "/text_config/num_key_value_heads",
+                json!(0),
+                "num_key_value_heads is 0",
+            ),
+            ("/text_config/head_dim", json!(0), "head_dim is 0"),
             (
                 "/text_config/sliding_window",
                 json!(0),
                 "sliding_window is 0",
+            ),
+            (
+                "/text_config/max_position_embeddings",
+                json!(0),
+                "max_position_embeddings is 0",
             ),
             // Scaling schemes and tying: both silently unimplemented rather than refused.
             (
@@ -2957,11 +3129,17 @@ mod tests {
                 json!(0.0),
                 "narrows to 0",
             ),
-            (
-                "/text_config/output_multiplier",
-                json!(-0.5),
-                "output_multiplier",
-            ),
+            // "narrows to", not the field name: `:2472` records a review finding where two
+            // rows shared a `want` substring and transposing an argument left both green.
+            ("/text_config/output_multiplier", json!(-0.5), "narrows to"),
+            ("/text_config/post_norm_eps", json!(0.0), "narrows to"),
+            ("/text_config/qk_scale_factor", json!(0.0), "narrows to"),
+            // NOT a row: `rope_parameters.rope_theta`. Its `ensure_f32_positive` entry is
+            // unreachable by any SINGLE mutation — the pairing loop runs first and refuses
+            // ("read and then ignored") as soon as the global base stops matching the 39
+            // sliding layers' own. It is reachable only by mutating the global base and all
+            // 39 together, which this one-pointer helper cannot express. Recorded rather than
+            // asserted, so the gap is visible instead of looking like coverage.
             // The wrapper-level dtype: a 4-bit or fp8 export read as BF16 is noise at every
             // width, and the model card advertises exactly such a release.
             ("/dtype", json!("float8_e4m3fn"), "BF16 throughout"),
@@ -2973,6 +3151,29 @@ mod tests {
                  wanted the message to contain: {want}\n  got: {err}"
             );
         }
+
+        // **A packed export must refuse even though its `dtype` is honest.** Not a table row
+        // because the helper replaces an existing value and this key must be INSERTED — the
+        // shipped file has none, which is the correct state and is asserted by
+        // `every_glimmer_field_is_required`.
+        //
+        // The block below is K3's own, copied from its vendored config: `bfloat16` alongside
+        // 4-bit packed weights. Before this guard existed, serde ignored it and the document
+        // parsed clean.
+        let mut doc: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED).unwrap();
+        doc.as_object_mut().unwrap().insert(
+            "quantization_config".into(),
+            serde_json::json!({ "format": "mxfp4-pack-quantized", "num_bits": 4 }),
+        );
+        let err = format!(
+            "{:#}",
+            parse_config::<GlimmerConfig>(&doc.to_string()).unwrap_err()
+        );
+        assert!(
+            err.contains("unquantized release"),
+            "a config carrying a quantization_config must refuse even with dtype bfloat16, \
+             which is exactly how Kimi-K3's checkpoint ships: {err}"
+        );
     }
 
     /// The architecture check fires before serde reads a dimension, and it fires in both

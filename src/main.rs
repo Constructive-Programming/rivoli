@@ -1065,8 +1065,13 @@ fn main() -> Result<()> {
                 &cfg.model,
             )?;
             let gt = &g.text; // read-only view; the validated wrapper above stays in scope
-            let sliding = (0..gt.n_layers)
-                .filter(|&i| gt.layer_is_sliding(i).unwrap_or(false))
+            // Counted from the array directly. The obvious `layer_is_sliding(i).unwrap_or(false)`
+            // is the silent "full attention" that method's doc exists to forbid, and it is what
+            // this call site wrote on the first try — see that doc, and the 2026-08-11 reviews.
+            let sliding = gt
+                .layer_types
+                .iter()
+                .filter(|k| **k == rivoli::artifact::model::LayerKind::SlidingAttention)
                 .count();
             let arch = Arch::MuseGlimmer;
             info!(
@@ -1087,21 +1092,21 @@ fn main() -> Result<()> {
             );
             // No `run_glimmer` yet, and no flag refusals either — an unconditional bail
             // refuses every flag by refusing the run. **When the decode path lands,
-            // `run_glimmer` must hand-write them**, and it has MORE to write than K3 did:
-            // `--port`, `--mode` and `--attn` are bespoke `bail!`s in `run_v4`, not match
-            // arms, and on top of those every residency knob (`--cache-policy`, `--max-mem`'s
-            // pool half) is meaningless here because a dense model streams nothing. A
-            // `run_glimmer` that omits them compiles clean and silently ACCEPTS knobs it
-            // cannot honour; `arch.rs` hiding a flag from `--help` is not the parser
-            // rejecting it.
+            // `run_glimmer` must hand-write them**. Take the list from
+            // `Arch::hidden_flags` rather than from this comment — it is the machine-readable
+            // statement of which knobs do not apply, and two prose lists in two dispatch arms
+            // have already drifted (K3's names three flags, this one named five). Note
+            // `hidden_flags` is consumed only for `.hide(true)`, so clap still ACCEPTS every
+            // flag it hides: a `run_glimmer` that omits the bails compiles clean and silently
+            // takes knobs it cannot honour. Dense adds residency knobs to the list —
+            // `--cache-policy` and `--max-mem`'s pool half stream nothing here — and a
+            // benchmark recorded with those in its command line would be a lie about what ran.
             bail!(
-                "{} artifacts do not decode yet — S1a is the config and the converter, and \
-                 the GQA attention family ({} sliding + {} full layers, with the sigmoid \
-                 output gate) is S2. The config parsed, which is what this stage promises: \
-                 see docs/investigations/glimmer-port.md.",
-                arch.name(),
-                sliding,
-                gt.n_layers - sliding
+                "{} artifacts do not decode yet — S1a item 1 validates the config (this \
+                 message), the converter is item 2, and the GQA attention family with its \
+                 sigmoid output gate is S2. The config parsed, which is what this stage \
+                 promises: see docs/investigations/glimmer-port.md.",
+                arch.name()
             );
         }
     }
