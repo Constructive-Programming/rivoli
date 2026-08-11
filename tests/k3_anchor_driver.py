@@ -56,6 +56,7 @@ import hashlib
 import importlib
 import json
 import math
+import os
 import pathlib
 import struct
 import sys
@@ -983,6 +984,59 @@ def sha_of(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()[:16]
 
 
+def preflight_env():
+    """Refuse to generate under a python env other than the one the vendored goldens were made in.
+
+    A second venv now exists on this machine: Muse Glimmer's S1b needs `muse_glimmer`, which is
+    native to transformers **5.15.0.dev0**, while these goldens are transformers **4.56.2** — and
+    `K3_ANCHOR_VENV` pointing at the wrong one is a two-character mistake. Without this check the
+    symptom is a `cmp` mismatch at the END of a ~25 min GPU-locked regeneration, reported as
+    "DIFFERS ... find out why it moved", which invites suspecting the driver.
+
+    THE PIN IS READ OUT OF THE VENDORED GOLDEN, not restated here. Those bytes already carry the
+    versions that produced them and `k3_anchor.rs` already asserts them, so a copy in this file
+    would be a third statement of the same fact -- exactly the shape that made CLAUDE.md's
+    exemption count wrong three times. A deliberate re-pin therefore needs no edit here: regenerate
+    with the override, re-vendor, and the new bytes become the new pin.
+
+    Not checked: the GPU name, which `k3_anchor.rs` pins on the bytes and which `--device cpu` runs
+    legitimately do not have. This is about the venv, which is the resource two ports now share.
+    """
+    import fla
+    import transformers
+    import triton
+
+    vendored = sorted(pathlib.Path(__file__).parent.glob("k3-anchor-decode-*.bin"))
+    if not vendored:
+        print("k3-anchor: no vendored golden to check this env against", file=sys.stderr)
+        return
+    pinned = read_golden(vendored[0])[0]
+    live = {
+        "torch": torch.__version__,
+        "transformers": transformers.__version__,
+        "fla": fla.__version__,
+        "triton": triton.__version__,
+    }
+    drift = [
+        f"{k}: golden says {pinned.get(k)!r}, this env has {v!r}"
+        for k, v in live.items()
+        if pinned.get(k) != v
+    ]
+    if not drift:
+        return
+    msg = f"this python env is not the one that produced {vendored[0].name}:\n  " + "\n  ".join(
+        drift
+    )
+    if os.environ.get("K3_ANCHOR_ALLOW_ENV_DRIFT"):
+        print(f"k3-anchor: WARNING, {msg}\n  (ALLOW_ENV_DRIFT set, continuing)", file=sys.stderr)
+        return
+    raise SystemExit(
+        f"k3-anchor: {msg}\n"
+        "  Fix K3_ANCHOR_VENV, or set K3_ANCHOR_ALLOW_ENV_DRIFT=1 to re-pin deliberately -- which\n"
+        "  means re-vendoring the bytes AND updating the versions k3_anchor.rs asserts."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -1027,6 +1081,9 @@ def main():
 
     global torch
     import torch
+
+    # Before `load_reference` and before any weight is drawn: a wrong venv should cost seconds.
+    preflight_env()
 
     cfg_mod, mdl_mod = load_reference(args.ref)
     cfg = build_config(cfg_mod, args.config)

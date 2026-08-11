@@ -407,6 +407,19 @@ for f in configuration_kimi_k3.py modeling_kimi_linear.py; do
 K3_ANCHOR_VENV=$PWD/venv K3_ANCHOR_REF=$PWD/ref tests/k3-anchor.sh
 ```
 
+**The venv is a shared resource, and the driver now refuses to generate in the wrong one.** As of
+2026-08-11 a second env exists on this machine for Muse Glimmer's S1b, at transformers
+**5.15.0.dev0** — `muse_glimmer` is native to that version, so it is not a choice on their side —
+while these goldens are **4.56.2**. `K3_ANCHOR_VENV` pointing at the wrong one is a two-character
+mistake, and without a check the symptom is a `cmp` mismatch at the *end* of a ~25 min GPU-locked
+regeneration, reported as "DIFFERS … find out why it moved", which invites suspecting the driver.
+`preflight_env()` runs before the reference is even loaded and names the drifted package. The
+versions it compares against are **read out of the vendored golden**, not restated in the driver —
+those bytes already carry what produced them and `k3_anchor.rs` already asserts it, so a third copy
+is the shape that made CLAUDE.md's exemption count wrong three times over. A deliberate re-pin
+therefore needs no edit to the driver: `K3_ANCHOR_ALLOW_ENV_DRIFT=1`, regenerate, re-vendor, and the
+new bytes are the new pin — plus the version strings in `k3_anchor.rs`, which is the gate on them.
+
 The install is ~6.2 GB of ROCm wheels and does not belong in `/tmp` — that is 63 GB of tmpfs *in
 RAM* on this box, and filling it shrinks `--max-mem auto` silently before anything fails loudly.
 `--device cpu` gets a config, weight-init or defect-injection error out of the driver in seconds
