@@ -26,10 +26,14 @@ Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash dr
   load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
   card's errors beside them. The DFlash drafter is settled too — §S6 and
   `glimmer-architecture.md` §11.
-- **S1 is blocked on Kimi-K3, by design, not on anything here.** The `Arch`/`ArchConfig`
-  seam, the streaming `SafeWriter` and the per-arch converter shape all arrive with K3's S1a,
-  in progress on `wt/k3-s1a`. Re-verify §3's reuse table against the merged tree before
-  starting — several rows name files K3 will have moved.
+- **S1a item 1 is DONE (2026-08-11)**: the config schema, the `Arch` arm and a refusing
+  dispatch, on top of tag `k3-s1a`. Items 2–4 — the converter, the pin, and `run_glimmer`'s
+  hand-written flag refusals — are open. §S1a.
+- **`SafeWriter` borrows but does not stream, and that is item 2's first problem.** K3's S1a
+  changed it to hold `Cow<'a, [u8]>`, which solves the *verbatim* tensor case by borrowing
+  from the mapped source. Glimmer's converter quantizes bf16 → fp8 and so produces **owned**
+  bytes: every payload stays in host RAM until `write`, ~26 GB of it. Re-price before writing
+  the converter; the two-pass shape K3's plan specified may still be owed.
 - **§1 below is superseded.** It is kept as written, with a correction column, because what
   the card got wrong is the reusable lesson. Read `glimmer-architecture.md` instead.
 - **The design is inverted relative to every model this engine runs.** Glimmer is dense.
@@ -228,12 +232,35 @@ is in progress on `wt/k3-s1a`. Building that seam here would collide with it. Wh
 lands, re-verify §3's reuse table against the merged tree before starting — several rows
 name files K3 will have moved.
 
-### S1a — artifact. No GPU.
+### S1a — artifact. No GPU. **Item 1 DONE 2026-08-11; items 2–4 open.**
 
-1. `Arch::MuseGlimmer` arm + recogniser test (both directions); `GlimmerConfig: ArchConfig`
-   with **no defaulted fields** — `head_dim`, `num_key_value_heads`, the layer-pattern
-   descriptor and window size are asserted, not inferred (`hidden/n_heads` ≠ 128 here; any
-   code that still assumes that identity must fail loudly at parse, not at decode).
+1. **DONE.** `Arch::MuseGlimmer` + recogniser tests both directions; `GlimmerConfig` /
+   `GlimmerTextConfig` with no defaulted fields; `main.rs` dispatch that parses and then
+   refuses. The shipped binary reads the unmodified `config.json` and reports the layer map
+   before bailing. Config vendored at `docs/measurement/glimmer-reference/config.json`
+   (HF revision `f84ecc3`) and the schema is pinned to it by a test that always runs.
+
+   Two things this produced that were not in the plan:
+
+   - **The pairing invariant is enforced at the load boundary.** `layer_types` and
+     `layer_rope_theta` are independent arrays and a layer slides IFF it is rotated; they can
+     disagree, and a disagreement is not a shape error anywhere downstream. It is the
+     strongest claim the config alone can make, so it is made where the file is read rather
+     than left to an S1b fixture.
+   - **`head_dim` had to become a first-class field, and a test asserts the inequality.**
+     32 × 128 = 4096 against `hidden_size` 6656 — the only config here whose head dim is not
+     `hidden / n_heads`, so a later simplification to the derived form builds 208-wide heads.
+     Asserted as `head_dim != hidden / n_heads` so it reddens for that reason.
+
+   Gate: a 20-row defect run over the vendored config, each row asserted on its own refusal
+   *message*, proven able to go red (neutering the pairing check fails it; restoring passes).
+   `output_multiplier` and `final_logit_softcapping` are checked here **because** they are
+   argmax-invariant — no greedy gate downstream can see them wrong, so this is the only place.
+
+   Incidental: jscpd caught the f32-narrowing loop against K3's, factored to
+   `ensure_f32_positive` rather than exempted — one rule about the hardware, unlike the
+   dimension serde renames beside it where the shared text is a coincidence of four
+   checkpoints.
 2. `src/bin/convert_glimmer.rs`: BF16 → fp8-block resident artifact via streaming
    `SafeWriter`; skip `vision_tower`/projector explicitly; copy tokenizer +
    `generation_config`. No expert files; `FormatMeta` gains its nullable VQ section.
