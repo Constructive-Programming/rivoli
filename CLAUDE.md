@@ -25,7 +25,8 @@ Layout: `reference/` = true today · `measurement/` = how to measure and what wa
 
 `tests/docs.rs` enforces that every doc declares `status:`/`scope:`/`verdict:` and that the
 index agrees. If you change a verdict, change both; the test will tell you which one you
-forgot. `scope:` (`glm` | `v4` | `k3` | `engine`) names whose evidence backs the verdict — **a
+forgot. `scope:` (`glm` | `v4` | `k3` | `glimmer` | `engine`) names whose evidence backs the
+verdict — **a
 closed verdict rules its question out only for its scope**; a GLM-only closure has already
 been misread as engine-wide once (npu-offload, 2026-08-07).
 

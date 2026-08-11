@@ -140,6 +140,27 @@ pub fn load_config<T: ArchConfig>(dir: &str) -> Result<T> {
     parse_config(&text).with_context(|| format!("parse {path}"))
 }
 
+/// Every f64 a kernel narrows to f32, checked in the **f32 domain** rather than only in the
+/// f64 the JSON carries — the narrowing pair `V4Config`'s `swiglu_limit` documents at length.
+/// Underflow (`x <= 2^-150` -> `0.0f32`) collapses the value; overflow (`x > ~3.4e38` ->
+/// `inf`, which passes any bare `> 0.0` test) is the silent one. A `1e-46` eps passes an f64
+/// positivity test and reaches every RMSNorm as `0.0f32`.
+///
+/// Shared by `K3TextConfig` and `GlimmerTextConfig` because it is one rule about the hardware,
+/// not a coincidence of two checkpoints — which is what separates it from the dimension serde
+/// renames above, where the shared text IS a coincidence and stays exempted rather than
+/// factored. Factored 2026-08-11 when Glimmer's arrival made jscpd report it.
+fn ensure_f32_positive(items: &[(&str, f64)]) -> Result<()> {
+    for &(what, x) in items {
+        let narrowed = x as f32;
+        ensure!(
+            narrowed > 0.0 && narrowed.is_finite(),
+            "{what} {x} narrows to {narrowed} in f32, the domain the kernels work in"
+        );
+    }
+    Ok(())
+}
+
 /// Both of an expert's input widths must divide the group-scale span exactly.
 ///
 /// `vq_row_bytes`/`vq_groups` and their `.f4` counterparts round up with only a
@@ -1365,20 +1386,14 @@ impl K3TextConfig {
         // `V4Config::hc_eps`'s own doc already said so ("the kernels narrow to f32 at the call,
         // as `rms_norm_eps` already does") — so the same check was being done two ways six lines
         // apart. A `1e-46` eps passes an f64 positivity test and reaches every RMSNorm as `0.0f32`.
-        for (what, x) in [
+        ensure_f32_positive(&[
             ("rms_norm_eps", self.rms_norm_eps),
             ("activation_situ_beta", self.activation_situ_beta),
             ("activation_situ_linear_beta", self.activation_linear_beta),
             // 1.0 today. Zero silently zeroes every routed contribution while the shared MLP
             // keeps working; negative flips them. Both are degraded fluent text, not a crash.
             ("routed_scaling_factor", self.routed_scale),
-        ] {
-            let narrowed = x as f32;
-            ensure!(
-                narrowed > 0.0 && narrowed.is_finite(),
-                "{what} {x} narrows to {narrowed} in f32, the domain the kernels work in"
-            );
-        }
+        ])?;
         // The routed experts' widths, and ONLY those: `expert_in` is the latent 3584, so this
         // says nothing about the trunk's 7168 or the shared MLP's 6144. Both of those happen
         // to be multiples of 32, so there is no hole today — but it is an accident of this
@@ -1470,6 +1485,301 @@ impl K3TextConfig {
     /// missing id would read as "KDA", which is a positive claim about arithmetic.
     pub fn layer_is_dense(&self, layer: usize) -> bool {
         layer < self.first_k_dense_replace
+    }
+}
+
+/// Muse Glimmer-30B, as its `config.json` ships it: a `MuseGlimmerForConditionalGeneration`
+/// wrapper around the text model, with a sibling `vision_config` this port does not implement.
+///
+/// Same nesting as [`K3Config`], carried for the same reasons — see that type. `dtype` sits at
+/// the WRAPPER level here rather than inside `text_config`, which is the one structural
+/// difference and the reason this is not a copy of K3's shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlimmerConfig {
+    #[serde(rename = "text_config")]
+    pub text: GlimmerTextConfig,
+    /// `bfloat16`. The whole checkpoint is BF16 — 59.553 GB across two shards, reconciled
+    /// against the index's own `total_size` (`glimmer-architecture.md` §7). The model card's
+    /// "approximately 4-bit precision, under 20 GB" describes separate GGUF releases; reading
+    /// an fp8 or 4-bit export as BF16 is noise at every width, so this is asserted.
+    pub dtype: String,
+}
+
+/// The `text_config` dict — Muse Glimmer's text model.
+///
+/// **Every field is REQUIRED**, as in [`V4Config`] and [`K3TextConfig`], and for the same
+/// reason: a defaulted dimension does not crash, it produces fluent wrong text. **Hold a
+/// [`GlimmerConfig`], not this** — same argument as `K3TextConfig`'s, which see.
+///
+/// The fields here are not the interesting part; what is absent is. Eight load-bearing
+/// operations appear in no marketing surface and only two of them are visible as a config
+/// key at all (`qk_scale_factor`, `post_norm_eps`) — the weightless QK-norm, the centered
+/// `x*(1+w)` norm form, the sandwich-norm placement and the normed embedding are code-only
+/// facts. `glimmer-architecture.md` §9 lists all fifteen traps; a config schema can only
+/// guard the ones that have a key, so the rest are S1b's fixtures.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlimmerTextConfig {
+    /// The NESTED spelling, `muse_glimmer_text`. Carried so `validate` can assert the descent
+    /// landed in the text dict rather than in `vision_config` — which is a sibling, declares
+    /// `muse_glimmer_vision`, and has a `hidden_size` and a `num_attention_heads` of its own.
+    /// That last point is why this check is not decoration: the vision dict would parse
+    /// several of the fields below and refuse only on the ones it lacks.
+    pub model_type: String,
+
+    // jscpd:ignore-start — the four dimension serde renames, which coincide with
+    // `K3TextConfig`'s, `V4Config`'s and `ModelConfig`'s because all four checkpoints declare
+    // these under the SAME HuggingFace-standard JSON names.
+    //
+    // Exempted on exactly the argument the K3 block above states, and it is now a fourth
+    // instance of it: four architectures agreeing on four JSON names is a coincidence of the
+    // checkpoints, not a shared contract, and a shared struct becomes the attractor for a
+    // FIFTH field that is not shared. Glimmer is the proof again — it agrees on these four and
+    // then needs `head_dim` as a FIRST-CLASS field, which none of the other three carry,
+    // because 32 heads x 128 is 4096 and `hidden_size` is 6656.
+    #[serde(rename = "num_hidden_layers")]
+    pub n_layers: usize,
+    #[serde(rename = "hidden_size")]
+    pub hidden: usize,
+    #[serde(rename = "vocab_size")]
+    pub vocab: usize,
+    #[serde(rename = "num_attention_heads")]
+    pub n_heads: usize,
+    // jscpd:ignore-end
+    /// GQA: 2, against 32 query heads — 16 query heads per KV head.
+    pub num_key_value_heads: usize,
+    /// **128, and NOT `hidden / n_heads`.** 32 x 128 = 4096 while `hidden_size` is 6656, so
+    /// `q_proj` is `[4096, 6656]` and is not square. Every other config here can derive a head
+    /// dim and this one cannot; a port that derives it builds a 208-wide head and indexes past
+    /// the end of every projection.
+    pub head_dim: usize,
+    #[serde(rename = "intermediate_size")]
+    pub inter: usize,
+    /// 1e-5, on `input_layernorm` and `pre_feedforward_layernorm` — and on the weightless
+    /// QK-norm and embedding norm.
+    pub rms_norm_eps: f64,
+    /// **1e-8, and a different value on purpose**: the two POST norms
+    /// (`post_attention_layernorm`, `post_feedforward_layernorm`) use this. Three orders of
+    /// magnitude apart and assigned by position, so one eps for all four norms is wrong in a
+    /// way nothing downstream reads as an error.
+    pub post_norm_eps: f64,
+    /// 3.87, multiplying **Q only** and applied AFTER the weightless QK-norm. It does not
+    /// replace the `head_dim^-0.5` softmax scale; both apply.
+    pub qk_scale_factor: f64,
+    /// 1/sqrt(26). Pre-multiplies the logits before the tanh softcap below.
+    pub output_multiplier: f64,
+    /// 20.0. `logits = T * tanh(logits * output_multiplier / T)`.
+    ///
+    /// **Argmax-invariant, which makes it this model's gate blind spot** rather than a
+    /// routine field: `tanh` is strictly increasing and `output_multiplier` is positive, so
+    /// omitting both cannot change a greedy pick. Every probability, NLL and confidence value
+    /// is wrong regardless. `glimmer-architecture.md` §5.
+    pub final_logit_softcapping: f64,
+    /// 2048, on the `sliding_attention` layers only. The window is inclusive of the current
+    /// position: `[p-2047, p]`, exactly 2048 rows.
+    pub sliding_window: usize,
+    /// 52 entries, each `sliding_attention` or `full_attention`. **Consumed as the array, never
+    /// re-derived from a stride** — the `[s,s,s,full]` period is a fact about this checkpoint,
+    /// not a rule, and a port that computes `i % 4 == 3` produces a model that is right until
+    /// the first checkpoint whose pattern differs.
+    pub layer_types: Vec<String>,
+    /// 52 entries: 500000.0 on sliding layers, **0 on full ones**.
+    ///
+    /// Read as a BOOLEAN, not as a per-layer base. The first-party code builds ONE cos/sin
+    /// table from `rope_parameters.rope_theta` and passes it or `None` per layer, so a port
+    /// that builds 52 tables is doing arithmetic nobody asked for — and one that reads the
+    /// top-level theta and applies it everywhere rotates the 13 NoPE layers.
+    pub layer_rope_theta: Vec<f64>,
+    pub rope_parameters: GlimmerRope,
+    pub max_position_embeddings: usize,
+    /// False — `lm_head.weight` and `embed_tokens.weight` both ship, 2.690 GB each. The
+    /// first-party class declares a tied-weights mapping that this checkpoint does not use, so
+    /// the class is not evidence and the config is.
+    pub tie_word_embeddings: bool,
+    /// `silu`. Named `hidden_activation` here, where GLM and K3 say `hidden_act`.
+    pub hidden_activation: String,
+    /// False. No projection in the attention block carries a bias, and none ships.
+    pub attention_bias: bool,
+}
+
+/// Glimmer's `rope_parameters`. Distinct from GLM's private [`RopeParameters`] above rather
+/// than an extension of it, on this module's one-type-per-architecture rule: GLM's carries
+/// theta alone, and adding a `rope_type` there would either be a required field GLM's config
+/// need not have or a defaulted one — and a default standing in for a scaling scheme is
+/// exactly what this asserts against.
+///
+/// `rope_type` is asserted `default` rather than ignored: a scaling scheme silently
+/// unimplemented is the V4 port's `Defect::RopeNoYarn`, where the frequencies stay plausible
+/// at every scale and the text stays fluent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GlimmerRope {
+    pub rope_theta: f64,
+    pub rope_type: String,
+}
+
+impl ArchConfig for GlimmerConfig {
+    const ARCH: Arch = Arch::MuseGlimmer;
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.dtype == "bfloat16",
+            "dtype is {:?}, not \"bfloat16\" — this checkpoint is BF16 throughout (59.553 GB, \
+             reconciled against the index's own total_size). The 4-bit artifacts the model \
+             card advertises are separate GGUF releases and are not what this converter reads",
+            self.dtype
+        );
+        self.text.validate()
+    }
+}
+
+impl GlimmerTextConfig {
+    /// True when layer `i` attends over a sliding window rather than the whole prefix.
+    ///
+    /// Reads the config's own array. `validate` has already established that it has one entry
+    /// per layer and that every entry is one of the two known spellings, so an out-of-range
+    /// `i` is a caller bug rather than a checkpoint one — hence the `Option` rather than a
+    /// silent `false`, which would claim "full attention" about a layer that does not exist.
+    pub fn layer_is_sliding(&self, layer: usize) -> Option<bool> {
+        Some(self.layer_types.get(layer)? == "sliding_attention")
+    }
+
+    /// Cross-field checks. Each guards a failure that produces text rather than an error.
+    fn validate(&self) -> Result<()> {
+        // The descent check. `parse_config` matched the WRAPPER's pair; this is the nested
+        // spelling, and it is what separates "descended into text_config" from "descended into
+        // vision_config" — a sibling dict that carries its own `hidden_size`,
+        // `num_attention_heads`, `layer_types` and `rope_parameters`, and would therefore
+        // satisfy a good fraction of the schema above before failing on the rest.
+        ensure!(
+            self.model_type == "muse_glimmer_text",
+            "text_config declares model_type {:?} — a Muse Glimmer wrapper's text model is \
+             \"muse_glimmer_text\". Either this is not the dict we think we descended into, or \
+             (the case worth naming) it is `vision_config`, which carries several of the same \
+             keys",
+            self.model_type
+        );
+        // A zero width passes every divisibility check below and then sizes a projection, a
+        // KV row or a GEMV `dim` to nothing.
+        for (what, dim) in [
+            ("hidden_size", self.hidden),
+            ("intermediate_size", self.inter),
+            ("vocab_size", self.vocab),
+            ("num_attention_heads", self.n_heads),
+            ("num_key_value_heads", self.num_key_value_heads),
+            ("head_dim", self.head_dim),
+            ("num_hidden_layers", self.n_layers),
+            ("sliding_window", self.sliding_window),
+            ("max_position_embeddings", self.max_position_embeddings),
+        ] {
+            ensure!(dim > 0, "{what} is 0");
+        }
+        // GQA, and the direction of the broadcast is the trap. 32 query heads share 2 KV
+        // heads, so query head j reads KV head `j / 16` — NOT `j % 2`. Both mappings
+        // type-check, both decode fluently, and only one is this model. The divisibility is
+        // what makes `j / groups` well-defined at all.
+        ensure!(
+            self.num_key_value_heads <= self.n_heads
+                && self.n_heads.is_multiple_of(self.num_key_value_heads),
+            "num_attention_heads {} is not a positive multiple of num_key_value_heads {} — \
+             GQA needs a whole number of query heads per KV head",
+            self.n_heads,
+            self.num_key_value_heads
+        );
+        // **The two per-layer arrays must both be exactly n_layers long**, and this is the
+        // load-bearing length check of the whole schema: everything downstream indexes them by
+        // layer id. A short array is an out-of-bounds panic at best; a LONG one is worse,
+        // because the extra entries are silently ignored and the file that was meant to
+        // describe a different model parses cleanly.
+        for (what, got) in [
+            ("layer_types", self.layer_types.len()),
+            ("layer_rope_theta", self.layer_rope_theta.len()),
+        ] {
+            ensure!(
+                got == self.n_layers,
+                "{what} has {got} entries but num_hidden_layers is {} — this array is indexed \
+                 by layer id and is the only statement of which layers slide and which rotate",
+                self.n_layers
+            );
+        }
+        // The pairing invariant, and it is the reason both arrays are carried rather than one.
+        // In this checkpoint a layer is sliding IFF it is rotated: `layer_rope_theta[i] == 0`
+        // exactly on the `full_attention` layers. The two arrays are independent in the file,
+        // so they CAN disagree — and a disagreement is not a shape error anywhere downstream.
+        // It is a model that attends over the wrong rows or rotates a layer that must not be
+        // rotated, and either one is fluent.
+        //
+        // This is the strongest statement the config alone can make, so it is made here rather
+        // than left to a fixture. If a future Glimmer ships a rotated full layer, this refuses
+        // it — correctly, because this port's attention would not implement it.
+        for i in 0..self.n_layers {
+            let (kind, theta) = (&self.layer_types[i], self.layer_rope_theta[i]);
+            ensure!(
+                kind == "sliding_attention" || kind == "full_attention",
+                "layer_types[{i}] is {kind:?} — expected \"sliding_attention\" or \
+                 \"full_attention\""
+            );
+            let sliding = kind == "sliding_attention";
+            ensure!(
+                sliding == (theta != 0.0),
+                "layer {i} is {kind:?} with layer_rope_theta {theta} — in this architecture a \
+                 layer is rotated IFF it slides. The arrays disagreeing is not a shape error \
+                 downstream: it is a layer attending over the wrong rows, or rotated when it \
+                 must not be, and both produce fluent text"
+            );
+            // Every rotated layer must share the one base the table is built from. The
+            // first-party code builds a SINGLE cos/sin table from `rope_parameters.rope_theta`
+            // and selects per layer, so a per-layer base that differed from it would be
+            // silently ignored rather than honoured.
+            ensure!(
+                !sliding || theta == self.rope_parameters.rope_theta,
+                "layer {i} asks for rope theta {theta} but rope_parameters.rope_theta is {} — \
+                 one table is built for the whole model, so a differing per-layer base would \
+                 be read and then ignored",
+                self.rope_parameters.rope_theta
+            );
+        }
+        ensure!(
+            self.rope_parameters.rope_type == "default",
+            "rope_parameters.rope_type is {:?}, not \"default\" — this port builds an \
+             unscaled table, and an unimplemented scaling scheme keeps every frequency \
+             plausible and the text fluent (the V4 port's `Defect::RopeNoYarn`)",
+            self.rope_parameters.rope_type
+        );
+        ensure!(
+            !self.tie_word_embeddings,
+            "tie_word_embeddings is true — this port reads `lm_head.weight` and \
+             `embed_tokens.weight` as two separate 2.690 GB tensors, and the shipped \
+             checkpoint declares them untied"
+        );
+        ensure!(
+            !self.attention_bias,
+            "attention_bias is true — no projection in this port's attention block reads a \
+             bias tensor, and none ships in the checkpoint"
+        );
+        // SwiGLU with a different activation changes the arithmetic without changing one
+        // shape, so nothing downstream would refuse it.
+        ensure!(
+            self.hidden_activation == "silu",
+            "hidden_activation is {:?}, not \"silu\" — the MLP is SwiGLU and the gate's \
+             activation is not a shape",
+            self.hidden_activation
+        );
+        // Narrowed to f32, the domain the kernels work in, for the reason K3's block states:
+        // an f64 positivity test passes values that reach every kernel as 0.0f32.
+        //
+        // `output_multiplier` and `final_logit_softcapping` are here even though both are
+        // argmax-invariant (see the field docs). That is exactly why they need a load-boundary
+        // check: no greedy gate downstream can see them being wrong.
+        ensure_f32_positive(&[
+            ("rms_norm_eps", self.rms_norm_eps),
+            ("post_norm_eps", self.post_norm_eps),
+            ("qk_scale_factor", self.qk_scale_factor),
+            ("output_multiplier", self.output_multiplier),
+            ("final_logit_softcapping", self.final_logit_softcapping),
+            (
+                "rope_parameters.rope_theta",
+                self.rope_parameters.rope_theta,
+            ),
+        ])
     }
 }
 
@@ -2468,5 +2778,222 @@ mod tests {
                 "must refuse on the architecture, not on the missing nesting: {err}"
             );
         }
+    }
+
+    // ── Muse Glimmer ────────────────────────────────────────────────────────────────────
+    //
+    // These parse the SHIPPED config directly rather than assembling a base from transcribed
+    // constants the way the K3 block above does. The K3 shape exists because its `config.json`
+    // has to be reachable field-by-field to check five nested spellings the C reference got
+    // wrong; Glimmer's schema has no such history, and a transcribed base is one more place
+    // for the file's values to drift out of. Mutating the real document is also the stronger
+    // gate: every refusal test below starts from a document that is known to parse.
+
+    /// `include_str!` for the reason [`K3_SHIPPED`] gives — this port has no checkpoint on
+    /// this machine, so a path read would skip rather than run. 5 KB, pinned at the HF
+    /// revision `f84ecc3a0ea984a4c04542a84269e3d065350a6e`.
+    const GLIMMER_SHIPPED: &str =
+        include_str!("../../docs/measurement/glimmer-reference/config.json");
+
+    /// The shipped config with one value replaced, addressed by JSON pointer.
+    ///
+    /// Returns the document as text so it goes through [`parse_config`] — the same entry the
+    /// binary uses. A test that constructed a `GlimmerTextConfig` literal would skip both the
+    /// architecture check and `validate`, which are the two things being tested.
+    fn glimmer_with(pointer: &str, value: serde_json::Value) -> String {
+        let mut doc: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED).unwrap();
+        let slot = doc
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("{pointer} is not a path in the shipped config"));
+        *slot = value;
+        doc.to_string()
+    }
+
+    /// The refusal message for a mutated config, or a panic naming the mutation that was
+    /// wrongly ACCEPTED. The panic is the point: a refusal test whose subject silently parses
+    /// is the false green this whole file exists to prevent.
+    fn glimmer_err(pointer: &str, value: serde_json::Value) -> String {
+        let text = glimmer_with(pointer, value);
+        match parse_config::<GlimmerConfig>(&text) {
+            Ok(_) => panic!("{pointer} was mutated to a wrong value and the config still parsed"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    /// The shipped config parses, and every value this port acts on is what
+    /// `glimmer-architecture.md` §1 records. Pinned against the FILE, so the doc and the
+    /// schema cannot drift apart silently.
+    #[test]
+    fn glimmer_shipped_config_parses_and_matches_the_reference_doc() {
+        let cfg: GlimmerConfig = parse_config(GLIMMER_SHIPPED).unwrap();
+        assert_eq!(cfg.dtype, "bfloat16");
+        let t = &cfg.text;
+        assert_eq!(t.model_type, "muse_glimmer_text");
+        assert_eq!(t.n_layers, 52);
+        assert_eq!(t.hidden, 6656);
+        assert_eq!(t.inter, 19968);
+        assert_eq!(t.vocab, 202_048);
+        assert_eq!(t.n_heads, 32);
+        assert_eq!(t.num_key_value_heads, 2);
+        assert_eq!(t.head_dim, 128);
+        assert_eq!(t.sliding_window, 2048);
+        assert_eq!(t.max_position_embeddings, 131_072);
+        assert_eq!(t.rope_parameters.rope_theta, 500_000.0);
+        assert_eq!(t.rope_parameters.rope_type, "default");
+        assert_eq!(t.final_logit_softcapping, 20.0);
+        assert_eq!(t.qk_scale_factor, 3.87);
+        assert_eq!(t.rms_norm_eps, 1e-5);
+        assert_eq!(t.post_norm_eps, 1e-8);
+        assert!(!t.tie_word_embeddings);
+        assert!(!t.attention_bias);
+        assert_eq!(t.hidden_activation, "silu");
+
+        // **`head_dim` is not derivable, and this asserts the difference rather than the
+        // value.** A later "simplification" that drops the field and computes
+        // `hidden / n_heads` gets 208 where the checkpoint says 128, and every projection
+        // shape it derives is wrong. Written as the inequality so it fails for that reason.
+        assert_ne!(
+            t.head_dim,
+            t.hidden / t.n_heads,
+            "head_dim must stay a first-class field: hidden/n_heads is {} here, not {}",
+            t.hidden / t.n_heads,
+            t.head_dim
+        );
+
+        // The layer map, counted from the arrays rather than from the [s,s,s,full] period —
+        // the period is a fact about this checkpoint, and the arrays are the contract.
+        let sliding: Vec<usize> = (0..t.n_layers)
+            .filter(|&i| t.layer_is_sliding(i).unwrap())
+            .collect();
+        let full: Vec<usize> = (0..t.n_layers)
+            .filter(|&i| !t.layer_is_sliding(i).unwrap())
+            .collect();
+        assert_eq!(sliding.len(), 39);
+        assert_eq!(full, [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51]);
+        // The last layer is FULL, which is the one every "the pattern starts and ends the same
+        // way" assumption gets wrong, and it is a gate blind spot named in the plan.
+        assert_eq!(*full.last().unwrap(), t.n_layers - 1);
+        // Out of range is `None`, not a silent "full" — see `layer_is_sliding`.
+        assert_eq!(t.layer_is_sliding(t.n_layers), None);
+    }
+
+    /// **The defect run.** Every load-bearing field, mutated one at a time, must refuse — and
+    /// the assertion is on the MESSAGE, so a refusal that happens to fire for an unrelated
+    /// reason does not count as this row passing.
+    ///
+    /// G1a asks that a config missing or contradicting a load-bearing field refuse at startup,
+    /// "proven by feeding it one". This is that proof. Each row is a value that changes the
+    /// arithmetic without changing a shape, which is the failure class this model is full of:
+    /// nothing downstream crashes on any of them.
+    #[test]
+    fn glimmer_refuses_the_silently_wrong_settings() {
+        use serde_json::json;
+        for (pointer, value, want) in [
+            // The descent. `vision_config` is a sibling carrying several of the same keys, so
+            // landing in it is the realistic wrong-dict case rather than a hypothetical one.
+            (
+                "/text_config/model_type",
+                json!("muse_glimmer_vision"),
+                "muse_glimmer_text",
+            ),
+            // The two per-layer arrays are indexed by layer id everywhere downstream.
+            (
+                "/text_config/layer_types",
+                json!(["sliding_attention"]),
+                "1 entries",
+            ),
+            ("/text_config/num_hidden_layers", json!(51), "52 entries"),
+            // An unknown layer kind, which would otherwise read as "not sliding" = full.
+            (
+                "/text_config/layer_types/0",
+                json!("chunked_attention"),
+                "expected",
+            ),
+            // **The pairing invariant, in BOTH directions** — the strongest claim the config
+            // alone can make. Layer 0 is sliding and rotated; layer 3 is full and not.
+            ("/text_config/layer_rope_theta/0", json!(0), "rotated IFF"),
+            (
+                "/text_config/layer_rope_theta/3",
+                json!(500_000.0),
+                "rotated IFF",
+            ),
+            // A rotated layer asking for a base the single shared table is not built from.
+            (
+                "/text_config/layer_rope_theta/0",
+                json!(10_000.0),
+                "read and then ignored",
+            ),
+            // GQA: 32 query heads do not divide into 3 KV heads.
+            (
+                "/text_config/num_key_value_heads",
+                json!(3),
+                "whole number of query heads",
+            ),
+            ("/text_config/head_dim", json!(0), "head_dim is 0"),
+            ("/text_config/hidden_size", json!(0), "hidden_size is 0"),
+            (
+                "/text_config/sliding_window",
+                json!(0),
+                "sliding_window is 0",
+            ),
+            // Scaling schemes and tying: both silently unimplemented rather than refused.
+            (
+                "/text_config/rope_parameters/rope_type",
+                json!("yarn"),
+                "RopeNoYarn",
+            ),
+            (
+                "/text_config/tie_word_embeddings",
+                json!(true),
+                "declares them untied",
+            ),
+            ("/text_config/attention_bias", json!(true), "none ships"),
+            ("/text_config/hidden_activation", json!("gelu"), "SwiGLU"),
+            // f32 narrowing. `1e-46` passes any f64 positivity test and reaches every RMSNorm
+            // as `0.0f32`; the softcap at 0 is a divide-by-zero the greedy path cannot see.
+            ("/text_config/rms_norm_eps", json!(1e-46), "narrows to 0"),
+            (
+                "/text_config/final_logit_softcapping",
+                json!(0.0),
+                "narrows to 0",
+            ),
+            (
+                "/text_config/output_multiplier",
+                json!(-0.5),
+                "output_multiplier",
+            ),
+            // The wrapper-level dtype: a 4-bit or fp8 export read as BF16 is noise at every
+            // width, and the model card advertises exactly such a release.
+            ("/dtype", json!("float8_e4m3fn"), "BF16 throughout"),
+        ] {
+            let err = glimmer_err(pointer, value.clone());
+            assert!(
+                err.contains(want),
+                "{pointer} = {value} refused, but not for the reason under test\n  \
+                 wanted the message to contain: {want}\n  got: {err}"
+            );
+        }
+    }
+
+    /// The architecture check fires before serde reads a dimension, and it fires in both
+    /// directions — a Glimmer document must not parse as another schema either. Without the
+    /// second half this passes on a `parse_config` that refuses everything.
+    #[test]
+    fn glimmer_and_the_other_architectures_do_not_cross_parse() {
+        // A Glimmer document, read as each other schema.
+        assert!(parse_config::<ModelConfig>(GLIMMER_SHIPPED).is_err());
+        assert!(parse_config::<V4Config>(GLIMMER_SHIPPED).is_err());
+        assert!(parse_config::<K3Config>(GLIMMER_SHIPPED).is_err());
+        // ...and K3's document read as Glimmer's. Both are `*ForConditionalGeneration`
+        // wrappers with a `text_config`, which is what makes this pair worth asserting: the
+        // shapes are similar enough that only the discriminant separates them.
+        let err = format!(
+            "{:#}",
+            parse_config::<GlimmerConfig>(K3_SHIPPED).unwrap_err()
+        );
+        assert!(
+            err.contains("MuseGlimmer") && err.contains("kimi_k3"),
+            "must refuse on the architecture, naming both sides: {err}"
+        );
     }
 }

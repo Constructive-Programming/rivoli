@@ -1053,6 +1053,57 @@ fn main() -> Result<()> {
                 k3.n_layers
             );
         }
+        rivoli::arch::Arch::MuseGlimmer => {
+            use rivoli::arch::Arch;
+            // Parsed before the refusal, on exactly K3's argument above: the schema is the
+            // part of this port that exists, and G1a asks that a manifest omitting or
+            // contradicting a load-bearing field refuse HERE, at startup. Bailing first would
+            // leave it reachable only from unit tests, which is how a load boundary rots.
+            // The `GlimmerConfig` is kept rather than shed for its `.text`, for the reason
+            // that type's doc gives.
+            let g = rivoli::artifact::model::load_config::<rivoli::artifact::model::GlimmerConfig>(
+                &cfg.model,
+            )?;
+            let gt = &g.text; // read-only view; the validated wrapper above stays in scope
+            let sliding = (0..gt.n_layers)
+                .filter(|&i| gt.layer_is_sliding(i).unwrap_or(false))
+                .count();
+            let arch = Arch::MuseGlimmer;
+            info!(
+                "model: {} ({}) — {} layers ({} sliding at window {} / {} full), hidden {}, \
+                 inter {}, {} heads x {} kv (dim {}), vocab {}, DENSE (no experts)",
+                arch.name(),
+                arch.summary(),
+                gt.n_layers,
+                sliding,
+                gt.sliding_window,
+                gt.n_layers - sliding,
+                gt.hidden,
+                gt.inter,
+                gt.n_heads,
+                gt.num_key_value_heads,
+                gt.head_dim,
+                gt.vocab
+            );
+            // No `run_glimmer` yet, and no flag refusals either — an unconditional bail
+            // refuses every flag by refusing the run. **When the decode path lands,
+            // `run_glimmer` must hand-write them**, and it has MORE to write than K3 did:
+            // `--port`, `--mode` and `--attn` are bespoke `bail!`s in `run_v4`, not match
+            // arms, and on top of those every residency knob (`--cache-policy`, `--max-mem`'s
+            // pool half) is meaningless here because a dense model streams nothing. A
+            // `run_glimmer` that omits them compiles clean and silently ACCEPTS knobs it
+            // cannot honour; `arch.rs` hiding a flag from `--help` is not the parser
+            // rejecting it.
+            bail!(
+                "{} artifacts do not decode yet — S1a is the config and the converter, and \
+                 the GQA attention family ({} sliding + {} full layers, with the sigmoid \
+                 output gate) is S2. The config parsed, which is what this stage promises: \
+                 see docs/investigations/glimmer-port.md.",
+                arch.name(),
+                sliding,
+                gt.n_layers - sliding
+            );
+        }
     }
     // (Until 2026-08-08 a bail! here refused --logit-dump/--force-tokens as "V4-only
     // instruments" — both now work on a GLM artifact too, armed further down once the

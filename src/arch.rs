@@ -27,6 +27,10 @@ pub enum Arch {
     /// Kimi-K3: 69 KDA (linear-attention) layers interleaved with 24 gated MLA layers, and
     /// routed experts that run in a 3584-wide LATENT rather than at `hidden_size` 7168.
     KimiK3,
+    /// Muse Glimmer-30B: the first DENSE model here — no experts, no routing, nothing
+    /// streamed. 52 layers of GQA 32Q/2KV with a sigmoid output gate, three sliding-window
+    /// (2048) layers to every full one, and RoPE on the sliding layers only.
+    MuseGlimmer,
 }
 
 impl Arch {
@@ -45,11 +49,17 @@ impl Arch {
     /// either: `KimiLinear` names a family, not this checkpoint, and admitting it would let a
     /// foreign member of that family resolve as K3. `K3Config::validate` asserts the nested
     /// spelling as a secondary check, where it can quote the key it descended through.
+    ///
+    /// **Muse Glimmer has the same wrapper shape and is recognised the same way** — top level
+    /// only. Its `text_config` declares `muse_glimmer_text`, which is deliberately NOT accepted
+    /// here: it names the text half of this checkpoint, so admitting it would let a bare text
+    /// dict resolve as the whole model. `GlimmerTextConfig::validate` asserts it instead.
     pub fn from_manifest_str(s: &str) -> Option<Self> {
         match s {
             "GlmMoeDsaForCausalLM" | "glm_moe_dsa" => Some(Arch::GlmMoeDsa),
             "DeepseekV4ForCausalLM" | "deepseek_v4" => Some(Arch::DeepseekV4),
             "KimiK3ForConditionalGeneration" | "kimi_k3" => Some(Arch::KimiK3),
+            "MuseGlimmerForConditionalGeneration" | "muse_glimmer" => Some(Arch::MuseGlimmer),
             _ => None,
         }
     }
@@ -60,6 +70,7 @@ impl Arch {
             Arch::GlmMoeDsa => "glm-moe-dsa",
             Arch::DeepseekV4 => "deepseek-v4",
             Arch::KimiK3 => "kimi-k3",
+            Arch::MuseGlimmer => "muse-glimmer",
         }
     }
 
@@ -69,6 +80,7 @@ impl Arch {
             Arch::GlmMoeDsa => "MLA + q-LoRA, DSA lightning indexer",
             Arch::DeepseekV4 => "shared-K=V MQA, sliding window + per-layer KV compression",
             Arch::KimiK3 => "69 KDA + 24 gated MLA (NoPE), latent-space routed experts",
+            Arch::MuseGlimmer => "dense GQA 32Q/2KV, gated, 3 sliding (2048) per full layer",
         }
     }
 
@@ -83,10 +95,16 @@ impl Arch {
     /// and which is gated MLA is a *partition declared in the config* (`linear_attn_config`)
     /// and confirmed by which layers ship `kv_a_proj_with_mqa`. A KDA layer has no row set to
     /// select from at all — it carries a recurrent state, not a KV cache.
+    ///
+    /// Muse Glimmer is `None` for the third distinct reason, and it is the most literal: the
+    /// config ships a 52-entry `layer_types` array naming each layer `sliding_attention` or
+    /// `full_attention`, and a matching `layer_rope_theta`. The window is 2048 because the
+    /// weights were trained that way. `--attn streaming` would be offering to re-derive, at
+    /// runtime and differently, a row set the checkpoint already states.
     pub fn attn_modes(self) -> Option<&'static [&'static str]> {
         match self {
             Arch::GlmMoeDsa => Some(&["auto", "dense", "streaming", "dsa", "misa"]),
-            Arch::DeepseekV4 | Arch::KimiK3 => None,
+            Arch::DeepseekV4 | Arch::KimiK3 | Arch::MuseGlimmer => None,
         }
     }
 
@@ -104,6 +122,11 @@ impl Arch {
                  layers into 69 KDA and 24 gated MLA; a KDA layer keeps a recurrent state, \
                  not a KV cache, so there are no rows to select)"
             }
+            Arch::MuseGlimmer => {
+                "attention is fixed by the weights (`layer_types` names each of the 52 layers \
+                 sliding or full, `layer_rope_theta` says which are rotated, and the sliding \
+                 window is 2048 because that is what was trained)"
+            }
         }
     }
 
@@ -117,12 +140,14 @@ impl Arch {
     pub fn hidden_flags(self) -> &'static [&'static str] {
         match self {
             Arch::GlmMoeDsa => &[],
-            // Every one of these is a `--attn streaming`/`misa` knob, and neither V4 nor K3
-            // has an `--attn`. The MTP flags are deliberately NOT hidden on either, even
+            // Every one of these is a `--attn streaming`/`misa` knob, and none of V4, K3 or
+            // Glimmer has an `--attn`. The MTP flags are deliberately NOT hidden on any, even
             // though K3 ships `num_nextn_predict_layers: 0` and so has no head to run: V4's
             // branch says so with an `info!` instead (its fp4 MoE kernel refuses nrow != 1),
             // and one mechanism for one fact beats two that can disagree.
-            Arch::DeepseekV4 | Arch::KimiK3 => &["attn", "sinks", "window", "misa_heads"],
+            Arch::DeepseekV4 | Arch::KimiK3 | Arch::MuseGlimmer => {
+                &["attn", "sinks", "window", "misa_heads"]
+            }
         }
     }
 }
@@ -149,7 +174,12 @@ mod tests {
         // fail if `hidden_flags` and this list drift — see `arch_help_matches_the_parser` for
         // the same idea against the parser.
         const ATTN_KNOBS: [&str; 4] = ["attn", "sinks", "window", "misa_heads"];
-        for arch in [Arch::GlmMoeDsa, Arch::DeepseekV4, Arch::KimiK3] {
+        for arch in [
+            Arch::GlmMoeDsa,
+            Arch::DeepseekV4,
+            Arch::KimiK3,
+            Arch::MuseGlimmer,
+        ] {
             let name = arch.name();
             assert!(
                 !name.is_empty() && name == name.to_lowercase() && !name.contains(' '),
@@ -203,6 +233,11 @@ mod tests {
             // asserted — with the key it descended through available to quote.
             "KimiLinearForCausalLM",
             "kimi_linear",
+            // Glimmer's NESTED spelling, on the same argument: it names this checkpoint's
+            // text half, and `GlimmerTextConfig::validate` is where it is asserted. Also the
+            // vision half's, which must never resolve as a decode path at all.
+            "muse_glimmer_text",
+            "muse_glimmer_vision",
         ] {
             assert_eq!(Arch::from_manifest_str(s), None, "{s:?} must not resolve");
         }
@@ -220,6 +255,9 @@ mod tests {
         // Both of K3's TOP-level spellings, since the wrapper is the level that names it.
         for s in ["KimiK3ForConditionalGeneration", "kimi_k3"] {
             assert_eq!(Arch::from_manifest_str(s), Some(Arch::KimiK3), "{s:?}");
+        }
+        for s in ["MuseGlimmerForConditionalGeneration", "muse_glimmer"] {
+            assert_eq!(Arch::from_manifest_str(s), Some(Arch::MuseGlimmer), "{s:?}");
         }
     }
 
