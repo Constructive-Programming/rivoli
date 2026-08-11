@@ -1,45 +1,16 @@
 ---
 scope: glimmer
 status: live
-verdict: The implementation plan for Muse Glimmer-30B, the fourth model, sequenced after K3. A DENSE 52-layer port that bypasses the streaming machinery entirely — 26.51 GB/token fully resident at fp8 (measured from the shard headers), so the ceiling is GTT bandwidth, not NVMe, and the residency stage is deleted outright. S0 DONE and G0 MET 2026-08-10; the spec is reference/glimmer-architecture.md. S1a DONE and G1a MET 2026-08-11 on tag k3-s1a — config schema, convert_glimmer (bf16-verbatim), GlimmerPin placing all 55,712,344,064 resident bytes with no budget parameter because a dense model has nothing to stream, and run_glimmer's nine flag refusals against V4's three. G1a's blind spot: not one of its clauses evaluates arithmetic, so every gate so far would hold on a checkpoint of noise; S1b's goldens are where that changes. Four reviews then found two CI breaks (both tests running the shipped binary, which is a refusal stub featureless) and one silent-wrongness class the gates could not see -- all five f32 norms were placed with no extent check, and the shipped converter accepts a short norm at exit 0. S1b DONE and G1b MET 2026-08-11 — the anchor runs the first-party transformers stack (5.16.0.dev0 @ fe747d88, torch CPU: this reference needs NO GPU) at tiny widths but the real structure, and four goldens are vendored across two weight draws and two modes, read with no python and no device. 14 defects x 2 draws = 28 runs, each GATED on the captures it must leave bit-identical, green sets scoped to step 0 because a defect that moves the argmax contaminates every later step. THE FINDING: softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so every greedy gate in this repo is PROVABLY blind to a wrong logit scale here. Two reference behaviours found by running it: the DFlash drafter's default mask raises, and the correct mask only works with use_cache=False. S2 STARTED 2026-08-11 with item 1's precondition: the driver gained --dtype float64 and --by-operator, per-operator fp32 floors are measured for all thirteen buckets at BOTH draws (attend's is 2.1x apart between them, so a one-draw floor would have set the threshold at half what a correct kernel needs), and ONE tolerance row is tabled -- attend, floor 1.639e-5, weakest targeting defect 2.086e0, Rel(1.64e-4). qk_scale_on_k is excluded from that set because (s*q).k and q.(s*k) are the same product, so it is invisible to the attend kernel by algebra rather than by resolution; counting its 38x-the-floor signal would have forced ExactOnly on a false premise. measurement/glimmer-reference/anchor.md. Reuse is high everywhere except attention: GQA 32Q/2KV + sliding-window locals + the sigmoid output gate is a new kernel family (rivoli is MLA-only), and S0 added a second body of work the card hid — four sandwich norms per layer in a CENTERED x*(1+w) form the engine has never implemented, plus a weightless QK-norm that ships no tensor. RoPE may cost nothing: a q/k row permutation converts split-half to rivoli's interleaved kernel, argued but unproven. DFlash break-even is N>1.1 accepted tokens because dense verification reads each weight once — the inverse of GLM's MoE-union economics, where ungated MTP was a 0.93x loss.
----
-
-# Muse Glimmer-30B — implementation plan
-
-**Glimmer is a capability this engine must have.** This is the plan to get there, not an
-assessment of whether to. It is sequenced **after Kimi-K3** and builds on the `wt/k3-s1a`
-lineage (V4 + K3): `Arch`/`ArchConfig`, the streaming `SafeWriter`, per-arch converters and
-refusal-tested config parsing are assumed present, and line references marked `[wt]` are to
-that branch, not `main`.
-
-Target: `meta-models/Muse-Glimmer-30B`, **text-only** (the 1.8 B perception encoder is out of
-scope — §S6). 52 layers, ~29.6 B total incl. vision, ~26.5 B on the text decode path.
-Apache 2.0, BF16 safetensors on HF, plus a separately-released 5-layer DFlash drafter.
-
-## STATE
-
-- **S0 is DONE and G0 is MET (2026-08-10).** The forward pass is
-  first-party-verified and lives in **`docs/reference/glimmer-architecture.md`** — raw
-  `config.json`, the safetensors headers by range request, and transformers' own
-  `modeling_muse_glimmer.py` (the repo ships no modeling code; `muse_glimmer` is native to
-  transformers 5.15.0.dev0), pinned at `f84ecc3a0ea984a4c04542a84269e3d065350a6e`. **Eight
-  load-bearing facts appear in no marketing surface** and are recorded there at §10 with the
-  card's errors beside them. The DFlash drafter is settled too — §S6 and
-  `glimmer-architecture.md` §11.
-- **S1a is DONE and G1a is MET (2026-08-11)**, on tag `k3-s1a`: the config schema and a
-  refusing dispatch, `convert_glimmer` — **bf16 verbatim, correctness first** — `GlimmerPin`,
-  which places all **55,712,344,064** resident bytes and takes **no capacity parameter and no
-  cache policy** because a dense model has nothing to stream, and `run_glimmer`, whose **nine**
-  flag refusals (V4 has three) were written *before* the decode path rather than with it.
-  **G1a's blind spot: none of its four clauses evaluates arithmetic** — the artifact is
-  bf16-verbatim, so "round-trips bit-exact" would hold on a checkpoint of noise. §S1a, §G1a.
 - **S1b is DONE and G1b is MET (2026-08-11).** The anchor runs the first-party stack on CPU;
   four goldens across two draws and two modes are vendored, with 14 defect runs each gated on
   what they must leave bit-identical. §S1b, §"The anchor itself".
-- **Next is S2**, the kernels. Item 1's precondition is done: the per-operator fp32 floors are
-  measured (`anchor.md` §tolerances) and `attend` has the port's first tolerance row. **This
-  bullet said "Next is S1b" for a day after S1b landed** — the front-matter verdict was updated
-  and the STATE block was not, which is the one place a reader looks first.
+- **S2 item 1 is DONE (2026-08-12)**: `gqa_attend` and `tests/glimmer_attend.rs`, scored against
+  the `attend` tolerance row that was measured **before the kernel existed** (`anchor.md`
+  §tolerances). §S2 item 1 carries what it measured, what two reviews found in it, and what it
+  still does not cover. **Next is S2 item 2, per-layer RoPE.**
+- **This block said "Next is S1b" for a day after S1b landed** — the front-matter verdict was
+  updated and the STATE block was not, which is the one place a reader looks first. Both of us
+  corrected it independently on the same day, from opposite branches.
 - **rivoli had never quantized a checkpoint before, and Glimmer is where it must.** GLM, V4
   and K3 all ship pre-quantized and every converter *copies*; `quant.rs` had a
   `dequant_fp8_block` and no inverse. `quantize_fp8_block` now exists — but choosing its
@@ -657,12 +628,46 @@ deterministic draw at toy widths.
 Order: **ring/dense GQA attend → per-layer RoPE → output gate → wire the existing MLP →
 lm_head/logits sizing.**
 
-1. **GQA attend** — the new family. **Scored against `tolerance::GLIMMER`'s `attend` row,
-   `Rel(1.64e-4)`, measured before the kernel existed** (`anchor.md` §tolerances). One kernel,
-   two row-sources: full cache (global) or ring window (local). KV is 2 heads × 128; 16 Q heads share each KV head — the broadcast
-   is the correctness trap (a transposed group mapping decodes fluently). Borrow V4's `Sel`
-   descriptor and ring bookkeeping; the fp8/bf16 KV dtype decision comes from S0's traffic
-   arithmetic.
+1. **GQA attend** — the new family. **DONE 2026-08-12**: `gqa_attend` in `kernels/attn.hip`,
+   gated by `tests/glimmer_attend.rs` and scored against `tolerance::GLIMMER`'s `attend` row,
+   **`Rel(1.64e-4)`, measured before the kernel existed** (`anchor.md` §tolerances). One kernel,
+   two row-sources as planned (`ring_cap = 0` is a cache indexed by position, `ring_cap = win`
+   is the ring), and the broadcast trap is the thing the gate is built around.
+
+   **The bound is DERIVED, and no `Sel` was borrowed.** The plan said to take V4's descriptor;
+   at 131072 context a `[tq][s]` mask array is larger than the model, so the kernel takes
+   `(start_pos, win, ring_cap)` and computes `j ∈ [pos - win + 1, pos]` itself. The golden's
+   captured mask is then compared **against** that derivation rather than fed to it —
+   `the_derived_bound_reproduces_the_captured_mask`.
+
+   **What it measured**, over both goldens, all 8 layers, all 7 steps (112 cases, plus 72 ring
+   cases and 6 launcher guards): worst absolute re-association error **6.56e-7**, smallest
+   wrong-mapping signal **0.335**. Five decades apart, so `MAX_ABS` is 10× the floor and there
+   is no judgement call in it. This is the first Glimmer tolerance and it answers the
+   front matter's "no tolerances yet" for this operator only.
+
+   **Two red proofs, run and reverted** (both recorded in the commit and the test's comments):
+   `head % hkv` for `head / group` reddens the kernel and ring tests at **1.20** and 1.03 —
+   that is trap 10, and it is the one that decodes fluently. `pos - win` for `pos - win + 1`
+   reddens the kernel at **1.07** and leaves the mask test **green**, because the mask test
+   restates the rule in Rust: trap 14 needs both halves and neither alone is the trap.
+
+   **Two reference behaviours the plan did not name**, both found by running the gate:
+   `attend.out` is captured after transformers' own `attn_output.transpose(1, 2)`, so it is
+   already `[rows, heads, dim]` while `q`/`k_cache`/`v_cache` are `[heads, rows, dim]` — and at
+   6 heads against 12 rows, reading it heads-first does not fail a shape check by accident.
+   And `DynamicSlidingWindowLayer` keeps the last `window - 1` rows and returns
+   `cat(kept, new)`, so **a sliding layer's decode cache is the WINDOW, not the sequence**; the
+   offset is derived from the capture's own shape. A port that assumes the reference stores
+   modulo-indexed rows misreads every sliding golden.
+
+   **Still open here.** The fp8/bf16 KV dtype decision is untouched — the kernel takes f32 K/V
+   and S0's traffic arithmetic has not been applied to it. The occupancy is deliberate and
+   marked: one subgroup per (query row, Q head) is 32 blocks at decode against 40 CUs, with the
+   whole KV sweep serialised inside each. `mla_latent_attend`'s two levers — HB head-tiling
+   (all 16 Q heads of a group share one KV head, so the LDS tile would be read once per group
+   rather than once per head) and split-KV with a combine pass — are the upgrade path, and S5
+   is where they get priced rather than guessed.
 2. **Per-layer RoPE** — table with θ=500k applied on locals only; the global-layer rule is
    whatever S0 settled, asserted positively (K3's `mla_use_nope` lesson: assert the flag,
    never default it).
