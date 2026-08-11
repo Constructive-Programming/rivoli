@@ -78,16 +78,41 @@ done
 # The vendored bytes are the whole point of generating these on a GPU once, so a regeneration
 # that no longer reproduces them is the thing most worth knowing. `cmp` rather than a human
 # diffing the paths the header used to print.
+#
+# Enumerated from the VENDORED files rather than from `SALTS`, and it reports a census. Driving
+# the loop from `SALTS` made a narrowed run (`K3_ANCHOR_SALTS=k3-anchor-1`, which halves a ~25 min
+# GPU-locked regeneration) print one cheerful "reproduced byte-for-byte" and exit 0 — while the
+# other vendored golden went unchecked and looked, from the output, exactly like a full pass. The
+# skip is legitimate; being quiet about it is not.
 rc=0
-for salt in "${SALTS[@]}"; do
+verified=0
+unverified=()
+shopt -s nullglob
+vendored_goldens=("$ROOT"/tests/k3-anchor-decode-*.bin)
+shopt -u nullglob
+for vendored in "${vendored_goldens[@]}"; do
+    salt=$(basename "$vendored" .bin); salt=${salt#k3-anchor-decode-}
     fresh=$OUT/gold-decode-$salt-None.bin
-    vendored=$ROOT/tests/k3-anchor-decode-$salt.bin
-    [[ -f $fresh && -f $vendored ]] || continue
-    if cmp -s "$fresh" "$vendored"; then
+    if [[ ! -f $fresh ]]; then
+        unverified+=("$salt")
+    elif cmp -s "$fresh" "$vendored"; then
         echo "vendored $salt decode golden reproduced byte-for-byte"
+        verified=$((verified + 1))
     else
         echo "DIFFERS from $vendored — re-vendor deliberately, or find out why it moved" >&2
         rc=1
     fi
 done
+echo "vendored goldens verified: $verified of ${#vendored_goldens[@]}"
+if ((${#unverified[@]})); then
+    echo "NOT VERIFIED by this run (no fresh decode golden): ${unverified[*]}" >&2
+    echo "  Their bytes are still FNV-pinned by tests/k3_anchor.rs, so they cannot drift" >&2
+    echo "  unnoticed — but nothing here re-derived them from the reference." >&2
+fi
+# A regeneration that reproduces NOTHING is the failure this whole check exists to catch, and it
+# is what an empty `$OUT` or a wrong `--out` path looks like from the outside.
+if ((verified == 0 && rc == 0)); then
+    echo "no vendored golden was reproduced at all — did the driver write to \$OUT?" >&2
+    rc=1
+fi
 exit $rc

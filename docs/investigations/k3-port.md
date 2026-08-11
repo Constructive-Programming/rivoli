@@ -554,7 +554,8 @@ only in fla, and item 11 already caught one divergence (the LoRA-norm eps) that 
 inherited from the C would have baked in. Record the fla version pin next to the goldens.
 
 > **DONE 2026-08-11.** `tests/k3_anchor_driver.py` runs it, `tests/k3-anchor.sh` reproduces it,
-> `tests/k3-anchor-decode.bin` is the vendored decode golden, `tests/k3_anchor.rs` is the gate that
+> `tests/k3-anchor-decode-k3-anchor-{1,2}.bin` are the vendored decode goldens (two independent
+> weight draws), `tests/k3_anchor.rs` is the gate that
 > reads it, and `docs/measurement/k3-reference/anchor.md` is the record — including the four
 > declared deviations and why the goldens are vendored rather than regenerated.
 >

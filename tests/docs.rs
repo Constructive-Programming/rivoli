@@ -432,11 +432,15 @@ fn the_jscpd_exemption_count_is_derived() {
         }
     }
 
+    // Matched as a DIGIT and the count is written only once. It first read `**Thirteen (13)**`,
+    // with the test checking the parenthesised digits — which passes `**Thirteen (14)**` green, two
+    // copies of a number with one of them unchecked, i.e. the very defect this test exists to
+    // close. Spelling it out in words costs a word table and buys nothing a digit does not.
     let claude = std::fs::read_to_string(root.join("CLAUDE.md")).expect("read CLAUDE.md");
-    let want = format!("({total})** regions are exempt");
+    let want = format!("**{total}** regions are exempt");
     assert!(
         claude.contains(&want),
-        "CLAUDE.md does not say `({total})` regions are exempt, but {total} is what `src/`, \
+        "CLAUDE.md does not say `**{total}**` regions are exempt, but {total} is what `src/`, \
          `tests/` and `build.rs` carry. Update the line and its per-file list, which is: {}",
         per_file.join(", ")
     );

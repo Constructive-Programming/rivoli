@@ -551,19 +551,41 @@ fn exactly_the_declared_layers_were_captured() {
 #[test]
 fn the_tolerance_table_is_supported_by_its_measurements() {
     k3_tolerance::tolerances_leave_room();
-    // Every operator the anchor produces a fixture for has a row. A missing row would let S2 score
-    // an operator against no declared tolerance at all.
-    for op in [
+    // These six are the operators whose floor was MEASURED, and the spelling S2 will look a row up
+    // by — so a rename or a swapped row is caught here, which a count of rows would not catch.
+    //
+    // This comment previously said "every operator the anchor produces a fixture for", which was
+    // false and worth correcting rather than deleting: the driver's `operator_of` classifies TEN,
+    // and `kda_trunk`, `norm`, `residual` and `head` deliberately have no row. That is a GAP, not a
+    // decision — nobody measured a floor for them, because the six here are the distinct kernels
+    // S2 and S3 write and the other four are buckets the comparator uses to localise. **S2 must
+    // not score those four against a threshold until one is measured**; compare them exactly, or
+    // measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
+    const MEASURED: [&str; 6] = [
         "attn_res",
         "mla",
         "moe_latent",
         "moe_route",
         "kda_op",
         "dense_mlp",
-    ] {
+    ];
+    for op in MEASURED {
         assert!(
             k3_tolerance::tolerance(op).is_some(),
             "no tolerance row for {op}"
         );
     }
+    // And nothing else has one. A row for an operator whose floor was never measured is a number
+    // that arrived from somewhere other than a measurement, which is the whole failure this table
+    // exists to prevent.
+    assert_eq!(
+        k3_tolerance::TOLERANCES.len(),
+        MEASURED.len(),
+        "the table has a row for an operator outside the measured six: {:?}",
+        k3_tolerance::TOLERANCES
+            .iter()
+            .map(|t| t.operator)
+            .filter(|o| !MEASURED.contains(o))
+            .collect::<Vec<_>>()
+    );
 }

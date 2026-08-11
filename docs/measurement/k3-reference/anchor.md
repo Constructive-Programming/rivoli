@@ -119,7 +119,16 @@ regeneration is a deliberate, reviewed change rather than a silent one. `tests/k
 printed **"vendored decode golden reproduced byte-for-byte"**. That is a statement about this GPU,
 this driver and these versions, not a cross-machine contract.
 
-**Only the decode golden is vendored** (292,781 B = 286 KiB, `tests/k3-anchor-decode.bin`). The
+That check **enumerates the vendored files and prints a census** (`verified: N of M`), rather than
+looping over the salts it was asked to run. Driving it from `SALTS` meant a narrowed run —
+`K3_ANCHOR_SALTS=k3-anchor-1`, which halves a ~25 min GPU-locked regeneration and is a reasonable
+thing to want — printed one cheerful "reproduced byte-for-byte" and exited 0 while the other
+vendored golden went unchecked, output indistinguishable from a full pass. The skip is legitimate;
+being quiet about it was the defect. A run that reproduces **nothing** now fails outright, since
+that is what an empty `$OUT` or a mistyped `--out` looks like from outside.
+
+**Only the decode golden is vendored** (292,781 B = 286 KiB each, `tests/k3-anchor-decode-k3-anchor-1.bin`
+and `-2.bin`). The
 prefill golden is **1,299,802 B = 1.24 MiB** — every per-token tensor is eight times wider at
 `--seq 8` — and its consumer does not exist: S2 item 5 defers chunked prefill outright ("no chunked
 prefill exists in the reference"), so vendoring it now would be 1.24 MiB nothing reads. Its recipe
@@ -200,6 +209,16 @@ Every bold cell is asserted. Read the rows:
   The rope dims NoPE never rotates are still scored, so they still count in the scale. Same green
   cells as the eps defect and five orders of magnitude louder, which gives the MLA fixture a second
   witness at a completely different magnitude.
+
+  > **A review asked to delete this one, 2026-08-11, and the argument is good enough to record
+  > rather than dismiss.** Its green set is identical to `MlaLoraEps1e5`'s, it sets no tolerance
+  > ceiling (1.3e+0 against that defect's 2.22e-5), and "a second witness at a different magnitude"
+  > is undercut by MLA turning out to be scored **bit-exactly**, where magnitude does not enter. It
+  > was kept because deleting it is only free if its 16 reddened tensors at layer 3 are a SUBSET of
+  > the eps defect's 20 — the matrix above shows counts, not sets, so nothing here proves that, and
+  > a defect whose red set is merely smaller still localises something the other does not. The check
+  > is `--compare` on the two defect goldens against each other rather than against `None`, and it
+  > needs a GPU because only the `None` goldens are vendored. **Do that before cutting it.**
 * **`ExpertW1W3Swap`** — gate and up swapped in every routed expert, the one repack error that is
   byte-clean; `repack-one-expert.md` could only pin that `w2` is not in the up slot, and this is the
   numerical oracle `V4_PROJ`'s doc says is needed. Layer 0 untouched — it has no routed experts —
@@ -223,6 +242,25 @@ Every bold cell is asserted. Read the rows:
   the earliest a defect can localise here. Without these runs nothing showed the goldens were
   sensitive to that arithmetic at all; a kernel that omitted the gate bound entirely could have
   matched.
+
+> **CORRECTED 2026-08-11, and it is the useful correction of this round.** The bullet above and
+> `defect_kda_gate_lower_bound_off`'s docstring both said the gate bound's *form* — multiply, not
+> clamp — is arithmetic "nothing outside fla's kernel attests to". **fla's own docstring attests to
+> it**, at `fla/ops/kda/chunk.py:250-256`, and gives both forms explicitly: with `lower_bound` set
+> and `safe_gate=True` the activation changes from `-exp(A_log) * softplus(g + dt_bias)` to
+> `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`, "which naturally clamps the output to
+> `[lower_bound, 0)`". So **S2 has a written reference for this term and should port from it**,
+> rather than inferring the shape of the expression from a red cell. What the defect run still buys
+> is unchanged and still needed: proof that the golden is *sensitive* to the term, since a docstring
+> can be stale in a way bytes cannot.
+>
+> Two facts from the same source that a port needs. **The defect cannot isolate `lower_bound`**: fla
+> raises `ValueError` unless `lower_bound` is set whenever `safe_gate=True and use_gate_in_kernel`
+> (`chunk.py:394`), so dropping the bound forces `safe_gate=False` in the same run and the cell
+> attests to the PAIR. A kernel that got the bound right and the clamp wrong is not distinguished
+> here. And fla range-checks `-5 <= lower_bound < 0`, so the real config's **−5.0 sits exactly on
+> the inclusive end of its own safe range** — a port that treats the bound as exclusive, or that
+> nudges it for stability, is out of the range fla will accept.
 
 `KdaStateLayout` transposes the state the wrapper *returns* rather than flipping
 `transpose_state_layout`, which is the kwarg that names the choice. That was the first
@@ -326,6 +364,15 @@ Every other operator has four to seven orders of magnitude of room, so the toler
 10× the floor and the gate requires 30× of clearance under the defect. Three red-proofs on
 2026-08-11: marking `mla` as a `Rel` fails ("no Rel tolerance is defensible"), setting a tolerance
 within 30× of its defect fails, and setting one below its own floor fails.
+
+**Six operators have a row; the driver classifies TEN — and the four without one are a GAP, not a
+decision.** `operator_of` also emits `kda_trunk` (a KDA layer's projections and norms, as opposed to
+the recurrence itself), `norm`, `residual` and `head`. Nobody measured a floor for those: the six
+are the distinct kernels S2 and S3 will write, and the other four are buckets the comparator uses to
+say *where* a defect landed. So **S2 must not score those four against a threshold** — compare them
+exactly, or measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
+`k3_anchor.rs` now asserts the table holds exactly the measured six in both directions, so a row for
+an unmeasured operator is a visible edit rather than a number that arrived from nowhere.
 
 ## Two salts, because one draw proves less than it looks like
 

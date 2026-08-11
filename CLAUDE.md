@@ -146,7 +146,7 @@ had gained a seventh argument.
 > config-check loops, 35 tokens) and fixed by factoring, not by exempting. **Fix what `cargo fmt
 > --check` and jscpd report; neither of them is the author of what it found.**
 
-**Thirteen (13)** regions are exempt via `jscpd:ignore-start`, and
+**13** regions are exempt via `jscpd:ignore-start`, and
 `tests/docs.rs::the_jscpd_exemption_count_is_derived` derives that number and goes red when
 this line drifts from it — so read the count here and do NOT hand-count it; the note below
 says why the obvious `grep` gets it wrong. Today: `artifact/model.rs` 3
@@ -172,12 +172,14 @@ the two `WMat` ones. Being a verbatim copy is the POINT in each; everywhere else
 > It was stale at **Ten** (written before the glimmer port added one, and before
 > `v4compress.rs` → `kvcompress.rs` and `tests/v4_attn.rs` → `tests/f4_attn.rs` — the survivor
 > list above still named both deleted files). It was then re-derived as **Fourteen** using
-> `grep -rn jscpd:ignore-start src/ tests/ build.rs`, and it is **Thirteen**: that grep counts
+> `grep -rn jscpd:ignore-start src/ tests/ build.rs`, and it is **13**: that grep counted
 > `backend/hip.rs`'s own doc comment *discussing* the marker by name ("The note under
-> `jscpd:ignore-start` rejected…"), which gives that file 3 regions where it has 2. Re-deriving
+> `jscpd:ignore-start` rejected…"), which gave that file 3 regions where it has 2. Re-deriving
 > was the right instinct; the command was the trap. **A gate's own marker is a word that appears
-> in prose about the gate**, so anything counting markers has to anchor on the marker (`^\s*//
-> jscpd:ignore-start$`), not merely find the string.
+> in prose about the gate**, so anything counting markers has to anchor the marker at the start
+> of its line, not merely find the string. That bare grep now returns **17**, because the test
+> that replaced it discusses the marker three more times — which is why the number to quote is
+> not the grep's, and why this note gives you the mechanism instead of a second command to trust.
 >
 > The same bare grep also reported 14 starts against 13 ends, which reads as an unterminated
 > exemption — one that would silently run to end-of-file. It was the prose hit a second time.

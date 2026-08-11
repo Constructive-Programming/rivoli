@@ -13,16 +13,22 @@
 //! * **`weakest_defect`** — the smallest signal among the defect runs that TARGET this operator.
 //!   Another operator's defect leaking downstream is not what this operator's tolerance is for.
 //!
-//! A tolerance is only meaningful in the gap between them, so [`Policy`] is derived from the ratio
-//! rather than written down, and [`tolerances_leave_room`] fails if a row's numbers stop supporting
-//! its policy. **A tolerance nobody can justify from a measurement is a number that will be widened
-//! the first time a kernel disagrees.**
+//! A tolerance is only meaningful in the gap between them. Stated precisely, because the looser
+//! wording here previously overclaimed: the CHOICE between [`Policy::Rel`] and
+//! [`Policy::ExactOnly`] follows from the ratio and nothing else, and each `Rel` value is a rule
+//! rather than a fourth measurement — **10x the floor**, which is where it sits for all five.
+//! [`tolerances_leave_room`] checks both halves, so a row whose numbers stop supporting its policy
+//! goes red, and so does one whose value drifts off that rule in either direction. The two are
+//! kept as separate statements that must agree, rather than the value being computed from the
+//! floor: a typo that makes a `floor` too LARGE is then caught by its own tolerance, and marking
+//! `mla` as a `Rel` stays expressible so the gate can be proven able to reject it.
+//! **A tolerance nobody can justify from a measurement is a number that will be widened the first
+//! time a kernel disagrees.**
 //!
 //! Included by `#[path]` (this repo's pattern, cf. `common/f4_artifact_dir.rs`) so S2's kernel tests
 //! and `k3_anchor.rs` share one table.
 
 /// How a kernel's output may be compared against the golden for one operator.
-#[derive(Debug, PartialEq)]
 pub enum Policy {
     /// Relative difference, `max|a-b| / max|b|`, must not exceed this.
     Rel(f32),

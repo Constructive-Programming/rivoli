@@ -371,12 +371,20 @@ def defect_kda_no_qk_l2norm(model, ctx):
 
 
 def defect_kda_gate_lower_bound_off(model, ctx):
-    """Drop `lower_bound` (-5.0 from the real config) -- trap 4.
+    """Drop `lower_bound` (-5.0 from the real config) AND `safe_gate` -- trap 4.
 
-    The bound MULTIPLIES the gate's sigmoid; it is not a clamp and not an additive floor. Nothing
-    outside fla's kernel attests to which, and `gate_lower_bound` is inherited from the real
-    config into the tiny one, so without this run nothing shows the golden is sensitive to it at
-    all — a kernel that omitted the term entirely could match.
+    The bound MULTIPLIES the gate's sigmoid rather than clamping it, and fla's own docstring says
+    so — `fla/ops/kda/chunk.py:250-256` writes out both forms. An earlier version of this comment
+    claimed nothing outside the kernel attested to it; that was wrong, and `anchor.md` carries the
+    correction. **S2 should port the term from that docstring**, not infer its shape from a red
+    cell. What this run buys is the other thing: proof the golden is SENSITIVE to the term, since a
+    docstring can be stale in a way bytes cannot, and `gate_lower_bound` is inherited from the real
+    config into the tiny one.
+
+    THE TWO KWARGS MOVE TOGETHER BECAUSE FLA REFUSES TO SEPARATE THEM. `chunk.py:394` raises
+    unless `lower_bound` is set whenever `safe_gate=True and use_gate_in_kernel`, so no run drops
+    only the bound. This cell attests to the PAIR: a kernel with the right bound and the wrong
+    clamp is not distinguished by it.
     """
     ctx["kda_kwargs"]["lower_bound"] = None
     ctx["kda_kwargs"]["safe_gate"] = False
