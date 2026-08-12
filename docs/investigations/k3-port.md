@@ -766,11 +766,43 @@ model is stored in — is answered above: none.)*
      fixture's own tripwire catches it by 2,800x. True at the old 2.5e-4 too (16x), so it is a
      property of the shared expert's small `moe_intermediate_size`, not of this round's loosening.
 
-   **4b, still owed:** a `moe_gateup_f4` variant with `situ_glu` fused in place of
-   `swiglu_clamped`, and no `swiglu_limit`. The routed experts have **no anchor fixture and cannot
-   get one** — `.experts` is unhooked on purpose because which expert fires is routing-dependent —
-   so 4b must be scored against a host oracle composed of the fp4 unpack (anchored on real bytes by
-   `repack-one-expert.md`) and the activation 4a has now pinned against the reference.
+   **4b, still owed — and BIGGER than this item said.** §3b scoped it as "a new `moe_gateup_f4`
+   variant", i.e. one activation swap in pass 1. Reading the reference to write it found a second,
+   structural difference, in the pass §3b does not mention.
+
+   > **K3 applies the routing weight AFTER the down projection; rivoli's fp4 path folds it in
+   > BEFORE.** Found 2026-08-12. `moe_infer` ends
+   > `new_x.view(...).type(topk_weight.dtype).mul_(topk_weight.unsqueeze(-1)).sum(dim=1)`
+   > (reference `:867-874`), which is §6's `accL[i] += wt[j] * edn[i]` — `edn` is the expert's `w2`
+   > output. V4's `Expert.forward` instead does `weights * x` and THEN `x.to(dtype)` in front of
+   > `w2`, which is why `moe_gateup_f4_impl` stores `rbf16(sw * w)` and `moe_down_f4_impl`
+   > "takes no `wexpert` — one source of truth for the routing, and no way for a mask to disagree
+   > with the data".
+   >
+   > `w2` is linear, so `w2(w·h)` and `w·w2(h)` agree in exact arithmetic and the fold looks free.
+   > **It is not free here**, for two reasons that are both in the existing kernels' own comments:
+   > there is a **bf16 store between the two** (`rbf16` in pass 1), and pass 2 accumulates in
+   > **fixed point** (`MOE_ACC_SHIFT 44`). Rounding `bf16(sw·w)` is not rounding `bf16(sw)` and
+   > scaling afterwards. So K3 needs a variant of the DOWN pass too, and pass 1 must round without
+   > the weight.
+   >
+   > **The `w == 0` NaN launder moves with it.** Pass 1 currently enforces `w == 0.0f ? 0.0f : ...`
+   > because a `w1` dot at `-inf` gives `silu = -inf · 0 = NaN` and `NaN · 0` is NaN, which
+   > `moe_fixed` then turns into a finite extreme — silent corruption of a row that never asked for
+   > this expert. With the weight applied in pass 2 the same hazard sits at the same multiply in a
+   > different kernel, and SiTU-GLU's own bound (`|y| <= 100`) does not remove it: the dot feeding
+   > it is unbounded. Whatever 4b does here has to be argued, not inherited.
+
+   The routed experts have **no anchor fixture and cannot get one** — `.experts` is unhooked on
+   purpose, because `moe_infer` calls only the experts that won tokens, so which modules fire is
+   routing-dependent and any defect that moved the routing would change the golden's tensor SET.
+   So 4b is scored against a host oracle composed of three parts that are each already pinned
+   elsewhere: `WMat::Fp4`'s decode for the unpack (§9's low-nibble-even convention, which that
+   type's own comment confirms is shared with K3), `repack-one-expert.md`'s real-byte verification
+   for the layout, and `host_situ` for the activation, which 4a has now pinned against the
+   reference at both draws. **`Oracle::expert` is NOT reusable** — it is V4's, with
+   `swiglu_clamped`, V4's three bf16 roundings and V4's weight placement — and parameterising a
+   frozen oracle to serve two models is the refactor `common.hpp` warns against, one level up.
 5. **KDA** — the new family and the bulk of the stage. **Decompose into units with their own
    G2 sub-gates.** Heads are independent and head-parallel is bit-identical in the reference,
    so one block per head maps directly; `S` is 64 KB/head and will not sit in LDS, so **fusing
