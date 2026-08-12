@@ -50,12 +50,15 @@ fn rivoli(artifact: &std::path::Path, extra: &[&str]) -> String {
     String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
 }
 
-/// **Each inapplicable flag is refused, by name, with a reason.**
+/// **`--max-mem` is ACCEPTED, and the partition it implies is REPORTED.**
 ///
-/// Asserted on the MESSAGE and not on `is_err`: the run fails for many reasons on this
-/// artifact — it fails unconditionally, in fact, since Glimmer does not decode — so an
-/// exit-code check would pass on every row without any refusal existing. That is the same
-/// trap `glimmer_pin`'s refusal test hit for real on a busy GPU.
+/// The opposite assertion to the table below, and a separate test because "is refused, naming
+/// its reason" and "is accepted, and the run then reports and reaches the honest bail" are
+/// different shapes.
+///
+/// The `residency:` assertion is the half review found missing: the first version checked only
+/// that the flag parsed, so nothing in the tree asserted that `run_glimmer` prints the split —
+/// which is the one thing R1 gives an operator.
 #[test]
 fn max_mem_is_accepted_and_reports_the_partition() {
     // **`--max-mem` moved from refused to ACCEPTED at R1**, so this asserts the OPPOSITE of
@@ -77,8 +80,18 @@ fn max_mem_is_accepted_and_reports_the_partition() {
         err.contains("do not decode yet"),
         "with --max-mem accepted the run must reach the honest decode bail, got:\n{err}"
     );
+    assert!(
+        err.contains("residency:") && err.contains("layers pinned"),
+        "the run must report the partition the budget implies, got:\n{err}"
+    );
 }
 
+/// **Each inapplicable flag is refused, by name, with a reason.**
+///
+/// Asserted on the MESSAGE and not on `is_err`: the run fails for many reasons on this
+/// artifact — it fails unconditionally, in fact, since Glimmer does not decode — so an
+/// exit-code check would pass on every row without any refusal existing. That is the same
+/// trap `glimmer_pin`'s refusal test hit for real on a busy GPU.
 #[test]
 fn every_flag_that_does_not_apply_is_refused_by_name() {
     let root = TempRoot::new("glimmer-flags");

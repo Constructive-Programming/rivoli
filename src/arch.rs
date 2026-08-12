@@ -157,6 +157,10 @@ impl Arch {
             // while four of the eight were still listed there. Fixing the sentence was the
             // other option and is the wrong one: a flag a model cannot honour should not be
             // advertised in that model's help, which is what this function is for.
+            // `max_mem` was in this list until 2026-08-12 (R1) and is deliberately NOT any
+            // more: it is now the ONLY knob that decides how much of this model is resident, so
+            // hiding it violated this function's own rule in the other direction — a flag the
+            // model DOES honour, absent from its help. Two reviews found it.
             Arch::MuseGlimmer => &[
                 "attn",
                 "sinks",
@@ -164,7 +168,6 @@ impl Arch {
                 "misa_heads",
                 "mode",
                 "cache_policy",
-                "max_mem",
                 "trace",
                 "moe_gain",
             ],

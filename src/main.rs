@@ -938,12 +938,16 @@ fn run_v4(
 /// the parser rejecting it. Writing them now means the decode path lands into a branch where
 /// the refusals are already gated by `tests/glimmer_flags.rs`.
 ///
-/// **A dense model refuses more than V4 does, and the extra ones are the residency knobs.**
-/// `--cache-policy` picks an eviction policy for a pool that does not exist here, and
-/// `--max-mem` sized the budget whose remainder GREW that pool — `GlimmerPin::build` takes no
-/// capacity at all. Both would be accepted and then read by nothing, and a benchmark line in
-/// `docs/measurement/benchmarks.md` carrying `--max-mem 70` would be a claim about a
-/// constraint that never applied. That is the specific lie this function exists to prevent.
+/// **`--max-mem` is ACCEPTED and `--cache-policy` is not, and the asymmetry is the point.**
+///
+/// > Until 2026-08-12 this said both were refused, because "`GlimmerPin::build` takes no
+/// > capacity at all ... a benchmark line carrying `--max-mem 70` would be a claim about a
+/// > constraint that never applied". R1 gave the pin a budget (`principles.md` P6), so that
+/// > paragraph became the lie it was written to prevent. Review found it still here, three
+/// > lines above the code that computes the partition.
+///
+/// `--cache-policy` stays refused because on a dense model the policy question has one answer,
+/// not because nothing streams — the refusal message carries the argument.
 #[cfg(feature = "rocm")]
 fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     use rivoli::arch::Arch;
@@ -980,31 +984,6 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
         gt.head_dim,
         gt.vocab,
         gt.resident_bytes()? as f64 / 1e9,
-    );
-
-    // **The partition, reported before any refusal — R1.** `--max-mem` is ACCEPTED for this
-    // architecture (it was refused until 2026-08-12 on the grounds that "the resident set IS
-    // the model"; `principles.md` P6 says the pin is a function of free memory, and a dense
-    // model that reads every weight every token is the case where that matters most). Reported
-    // rather than merely computed, because this line is the only thing that tells an operator
-    // how much of the model their budget actually pinned — and it comes from
-    // `GlimmerPin::partition`, the same arithmetic the pin uses, so it cannot disagree with it.
-    let budget = device_budget(cfg.max_mem)?;
-    let (n_pinned, _) = gt.partition(Some(budget))?;
-    let layer_gb = gt.layer_bytes()? as f64 / 1e9;
-    info!(
-        "residency: {n_pinned} of {} layers pinned ({:.3} GB), {} streaming through {} slots \
-         ({:.3} GB/layer); floor for this artifact is {:.3} GB of weights",
-        gt.n_layers,
-        n_pinned as f64 * layer_gb + gt.global_bytes() as f64 / 1e9,
-        gt.n_layers - n_pinned,
-        if n_pinned == gt.n_layers {
-            0
-        } else {
-            rivoli::artifact::model::GLIMMER_STREAM_SLOTS
-        },
-        layer_gb,
-        gt.floor_bytes()? as f64 / 1e9,
     );
 
     let window_note = format!(
@@ -1097,6 +1076,38 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
             arch.name()
         );
     }
+
+    // **The partition, reported AFTER every refusal — R1.** `--max-mem` is ACCEPTED for this
+    // architecture (it was refused until 2026-08-12 on the grounds that "the resident set IS the
+    // model"; `principles.md` P6 says the pin is a function of free memory, and a dense model
+    // that reads every weight every token is the case where that matters most). It comes from
+    // `GlimmerTextConfig::partition`, the same arithmetic the pin uses, so the line an operator
+    // reads cannot disagree with the split the pin made.
+    //
+    // > **Ordered after the refusals by review, 2026-08-12.** It was above them, and
+    // > `device_budget` reads `hipMemGetInfo` — so on a box whose free GTT is under the 16 GiB
+    // > OS reserve the budget saturates toward 0, `partition` refuses on the floor, and `?`
+    // > propagates: `--mode int4` would then be rejected for a MEMORY reason instead of the
+    // > architectural one. That also made `tests/glimmer_flags.rs` a GPU arm without saying so,
+    // > while its own header claimed to be deviceless. An architectural refusal must not be
+    // > preempted by a transient measurement.
+    let budget = device_budget(cfg.max_mem)?;
+    let (n_pinned, _) = gt.partition(Some(budget))?;
+    let layer_gb = gt.layer_bytes()? as f64 / 1e9;
+    info!(
+        "residency: {n_pinned} of {} layers pinned ({:.3} GB), {} streaming through {} slots \
+         ({:.3} GB/layer); floor for this artifact is {:.3} GB of weights",
+        gt.n_layers,
+        n_pinned as f64 * layer_gb + gt.global_bytes() as f64 / 1e9,
+        gt.n_layers - n_pinned,
+        if n_pinned == gt.n_layers {
+            0
+        } else {
+            rivoli::artifact::model::GLIMMER_STREAM_SLOTS
+        },
+        layer_gb,
+        gt.floor_bytes()? as f64 / 1e9,
+    );
 
     bail!(
         "{} artifacts do not decode yet — S1a is done (config schema, converter, pin, and \

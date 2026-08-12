@@ -1653,25 +1653,6 @@ pub struct GlimmerTextConfig {
 /// > is nine against a list of twelve — it counted the attention block and forgot the MLP.
 /// > `pin.rs`'s `GlimmerLayerPin` had it right, so the tree disagreed with itself about the
 /// > length of the one constant that exists to stop exactly that.
-/// How many streaming slots a budgeted `GlimmerPin` keeps for the layers it could not pin.
-///
-/// **Two, and the number is a correctness requirement rather than a tuning choice.** A launch
-/// reads layer `l` while the next fill targets `l+1`, so one slot would overwrite weights a
-/// kernel is still reading — the read-outlives-its-slot class this repo has open on the GLM
-/// arena path. Two is the minimum that separates them; more buys prefetch DEPTH, which is worth
-/// nothing until the fill is asynchronous (R1's is a synchronous host memcpy — see
-/// `GlimmerPin::layer`) and would cost `GLIMMER_STREAM_SLOTS × 967.889 MB` of residency.
-///
-/// Here beside the byte arithmetic rather than in `memory::pin` because
-/// [`GlimmerTextConfig::floor_bytes`] needs it and that module is `rocm`-gated.
-pub const GLIMMER_STREAM_SLOTS: usize = 2;
-
-/// Alignment slack in a `GlimmerPin`'s tier request. `DeviceTier::place` starts every
-/// reservation at a 256-byte boundary and the pin makes at most `3 + 12·n_layers` = 627
-/// placements, so the padding is under 160 KB; 1 MiB is ~6x that bound and 0.002% of the 55.7
-/// GB it can sit beside.
-pub const GLIMMER_PIN_SLACK: usize = 1 << 20;
-
 pub const GLIMMER_LAYER_TENSORS: [&str; 12] = [
     "input_layernorm",
     "post_attention_layernorm",
@@ -1686,6 +1667,33 @@ pub const GLIMMER_LAYER_TENSORS: [&str; 12] = [
     "mlp.up_proj",
     "mlp.down_proj",
 ];
+
+/// How many streaming slots a budgeted `GlimmerPin` keeps for the layers it could not pin.
+///
+/// **ONE at R1, and the number is NOT a correctness property — that was the first version's
+/// mistake.** It said "two, and the number is a correctness requirement rather than a tuning
+/// choice", arguing that one slot would be refilled while a kernel still read it. Two reviews
+/// independently showed the argument does not work: kernel launches are ASYNCHRONOUS, so a host
+/// that runs two layers ahead overwrites slot 0 under a live kernel with two slots exactly as
+/// with one. **No finite slot count establishes write-after-read ordering; only a dependency
+/// does** — `VmmBuf::ptr_mut`'s own contract covers the fill-then-read direction and names
+/// `device_sync` as the mechanism for slot reuse on the analogous io_uring path.
+///
+/// So the count is purely how far a caller may run ahead, and R1's fill is SYNCHRONOUS: it
+/// buys no overlap, so a second slot buys nothing and costs one extra streamed layer forever.
+/// The arithmetic, at the shipped widths: `floor` charges every slot unconditionally, so each
+/// one pins one layer fewer, and a streamed layer is **967.942 MB of host memcpy per token**.
+///
+/// **S5 raises this and adds the dependency in the same change**, because raising it alone
+/// widens the window the dependency exists to close. The invariant a caller owes today is
+/// stated on [`GlimmerPin::layer`].
+pub const GLIMMER_STREAM_SLOTS: usize = 1;
+
+/// Alignment slack in a `GlimmerPin`'s tier request. `DeviceTier::place` starts every
+/// reservation at a 256-byte boundary and the pin makes at most `3 + 12·n_layers` = 627
+/// placements, so the padding is under 160 KB; 1 MiB is ~6x that bound and 0.002% of the 55.7
+/// GB it can sit beside.
+pub const GLIMMER_PIN_SLACK: usize = 1 << 20;
 
 /// The prefix Glimmer's text-side tensors carry. The `language_model.` segment is the
 /// multimodal wrapper's, and it is on every text tensor — K3's port records the same shape as
@@ -1833,7 +1841,14 @@ impl GlimmerTextConfig {
         Ok(self.global_bytes() + self.n_layers * self.layer_bytes()?)
     }
 
-    /// Bytes ONE layer's twelve tensors occupy — 967.889 MB for the shipped model.
+    /// Bytes ONE layer's twelve tensors occupy — **967.942 MB** for the shipped model.
+    ///
+    /// > Written as 967.889 MB until 2026-08-12. That is the figure with the four norms at
+    /// > bf16, which is the CHECKPOINT's dtype — `convert_glimmer` widens them, so the artifact's
+    /// > layer is 53,248 bytes larger. `resident_bytes`' own doc has always said so ("2.782 MB
+    /// > larger"), and its 55.712 GB total only reconciles with the f32 figure, so the file
+    /// > contradicted itself. Inherited from `glimmer-architecture.md` section 7, which is
+    /// > describing the checkpoint and is right about it.
     ///
     /// Split out of [`Self::resident_bytes`] for `GlimmerPin`'s budget arithmetic: how many
     /// layers a budget pins is `(budget - globals - slots·this) / this`, and a second spelling
@@ -1917,20 +1932,26 @@ impl GlimmerTextConfig {
             (GLIMMER_STREAM_SLOTS * layer) as f64 / 1e9,
         );
         // Integer division, so the remainder stays unspent rather than pinning a layer the
-        // budget cannot hold.
-        let pinned = usize::min((b - floor) / layer, self.n_layers);
-        // **Ask for what the partition USES, never for the whole budget.** `b` includes the two
-        // slots' worth of room, and a budget that turns out to pin every layer allocates no
-        // slots — so returning `b` there would reserve `2 x 967.889 MB` of tier that nothing
-        // ever writes to. `DeviceTier::new` allocates its capacity, so this is a real 1.9 GB,
-        // not a ceiling. Caught by the featureless gate on 2026-08-12, where 1 MiB of alignment
-        // slack dwarfs the whole tiny model and made the arithmetic visible.
-        let used = if pinned == self.n_layers {
-            want + GLIMMER_PIN_SLACK
-        } else {
-            b
-        };
-        Ok((pinned, usize::min(b, used)))
+        // budget cannot hold. `pinned < n_layers` ALWAYS here: pinning every layer needs
+        // `floor + n_layers·layer` = `want + SLACK + SLOTS·layer`, which the filter above already
+        // sent to the early return.
+        let pinned = (b - floor) / layer;
+        // **Ask for what the partition USES, never for the whole budget.** `DeviceTier::new`
+        // allocates its capacity rather than treating it as a ceiling, AND feeds
+        // `guard_capacity`, so an over-request both wastes GTT and can turn a workable budget
+        // into a refusal. The waste is up to a whole layer — 967.942 MB on the shipped model,
+        // at `b = want + SLACK - 1`, which pins 49 of 52 and uses `global + 51·layer`.
+        //
+        // > **CORRECTED 2026-08-12 by two independent reviews, and the first version of this
+        // > comment described a bug that could not happen.** It read "a budget that turns out to
+        // > pin every layer allocates no slots — so returning `b` there would reserve 2 x
+        // > 967.889 MB", and guarded it with `if pinned == self.n_layers`. That branch is
+        // > UNREACHABLE by the arithmetic above, so the guard was dead and the real
+        // > over-allocation — this one, on the streaming path — went unfixed. The commit message
+        // > for R1 claims the dead version as a fix; it was not one.
+        let used =
+            self.global_bytes() + (pinned + GLIMMER_STREAM_SLOTS) * layer + GLIMMER_PIN_SLACK;
+        Ok((pinned, used))
     }
 
     /// Cross-field checks. Each guards a failure that produces text rather than an error.

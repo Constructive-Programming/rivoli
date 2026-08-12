@@ -241,28 +241,35 @@ mod tier {
             Ok(dst)
         }
 
-        /// Overwrite `len` bytes at `base + off` with `bytes` — a REFILL of memory this tier
-        /// already placed, for a caller that recycles one region across many tensors.
+        /// Overwrite a placed region with `bytes` — a REFILL, for a caller that recycles one
+        /// placement across many tensors.
         ///
-        /// **This is the only sanctioned second write to a placed region, and it exists so the
-        /// unified-addressing assumption stays in one file.** [`Self::place`]'s doc says the
-        /// device pointer and the host address coincide under HIP, that the coincidence is not
-        /// portable, and that callers must not depend on it — so `GlimmerPin`'s streaming slots
-        /// (which memcpy a layer's weights over the previous layer's, once per visit) call this
-        /// rather than dereferencing the pointer `place` handed back. A backend where the two
-        /// addresses differ changes this function and nothing else.
+        /// **It exists so the unified-addressing assumption stays in one file.** [`Self::place`]'s
+        /// doc says the device pointer and the host address coincide under HIP, that the
+        /// coincidence is not portable, and that callers must not depend on it — so `GlimmerPin`'s
+        /// streaming slots (which memcpy a layer's weights over the previous layer's, once per
+        /// visit) call this rather than dereferencing the pointer `place` handed back.
+        ///
+        /// > **The offset parameter went 2026-08-12, by review, and so did a contract nothing
+        /// > could satisfy.** This was `write_at(base, off, bytes)` and required `off +
+        /// > bytes.len()` to lie inside "that same placement's reservation" — but its only caller
+        /// > passed the FIRST tensor's address as `base` and offsets reaching eleven placements
+        /// > past it, so every call but one violated the stated contract while being perfectly
+        /// > sound (the provenance is the whole slab). A contract no caller satisfies cannot be
+        /// > used to audit a caller, which on an `unsafe` boundary is the whole point of writing
+        /// > one. Taking the destination directly makes the contract true and the arithmetic
+        /// > disappear.
         ///
         /// # Safety
-        /// `base` must be a pointer this tier returned from [`Self::place`], and
-        /// `off + bytes.len()` must lie inside that same placement's reservation. Neither is
-        /// checkable here — the tier does not retain per-placement extents — so the caller
-        /// derives both from its own placement (see `Slot::new`, which subtracts the addresses
-        /// `place` returned rather than predicting them).
-        pub unsafe fn write_at(base: *mut u8, off: usize, bytes: &[u8]) {
+        /// `dst` must be a pointer this tier returned from [`Self::place`], and `bytes.len()`
+        /// must not exceed that placement's extent. The tier does not retain per-placement
+        /// extents, so the caller supplies it (see `Slot::fill`, which checks the incoming
+        /// tensor against the length its own placement was made with).
+        pub unsafe fn write_to(dst: *mut u8, bytes: &[u8]) {
             // SAFETY: the caller's contract above; source and destination cannot overlap (one
             // is the mmap'd artifact, the other the device slab).
             unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(off), bytes.len());
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
             }
         }
 

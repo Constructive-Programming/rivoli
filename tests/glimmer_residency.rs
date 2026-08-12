@@ -14,9 +14,11 @@
 //! > partition to the tensor instead of to the run. S3 still owes the end-to-end version,
 //! > because a loop can consume correct bytes in the wrong ORDER and only a decode sees that.
 //!
-//! **A GPU arm** — `DeviceTier::new` allocates — except for the partition arithmetic, which is
-//! pure and gated in `the_partition_arithmetic_holds_at_every_boundary` with no device. That
-//! test is the one that still runs in CI, which has no rocm job.
+//! **A GPU arm** — `DeviceTier::new` allocates — except the two partition-arithmetic tests,
+//! which are pure and run with no device. Those are what CI covers, and CI has no rocm job:
+//! `..._at_every_boundary` at the fixture's widths, `..._at_the_shipped_widths` at the real ones,
+//! because review showed several fixture-width assertions cannot fail there (1 MiB of alignment
+//! slack is 99.6% of every fixture budget).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
@@ -33,12 +35,11 @@ use rivoli::artifact::model as gm;
 const DIM: usize = fx::GLIMMER_FIXTURE_DIM;
 const L: usize = fx::GLIMMER_FIXTURE_LAYERS;
 
-/// The fixture's config, without converting anything — for the deviceless arithmetic test.
+/// The fixture's config — for the deviceless arithmetic test.
 ///
-/// Built by hand from the same shape the fixture uses rather than by loading a converted
-/// artifact, so the partition arithmetic stays testable on a machine with no GPU: converting
-/// needs no device, but this way the test needs no temp directory either and cannot fail for a
-/// reason that is not about arithmetic.
+/// Converting needs no device, which is what keeps the partition arithmetic testable on a
+/// machine with no GPU. (This doc claimed the test "needs no temp directory either", describing
+/// a rejected draft that built the config by hand; the body has always converted. Review, 2026-08-12.)
 fn tiny_cfg() -> gm::GlimmerTextConfig {
     let root = TempRoot::new("glimmer-residency-cfg");
     let _ = glimmer_convert_fixture(root.path(), DIM);
@@ -61,11 +62,11 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     let layer = cfg.layer_bytes().unwrap();
     let floor = cfg.floor_bytes().unwrap();
     assert_eq!(cfg.n_layers, L, "the fixture's layer count moved");
-    // The globals dominate the floor at every real width, and the floor must leave room for
-    // the two slots — a floor that forgot them would pass every test below and then OOM.
+    // Kept for shape, but it is the SHIPPED-widths twin that can fail: at 416-byte globals and
+    // 1,920-byte layers a floor charging zero slots is still 1,048,992 > 2,336. Review, 2026-08-12.
     assert!(
-        floor > cfg.global_bytes() + layer,
-        "the floor must cover the globals AND more than one slot"
+        floor > cfg.global_bytes(),
+        "the floor must cover the globals"
     );
 
     assert_eq!(
@@ -83,10 +84,9 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     for b in [all_resident, all_resident * 4] {
         let (pinned, capacity) = cfg.partition(Some(b)).unwrap();
         assert_eq!(pinned, L, "a budget of {b} must pin every layer");
-        // And it must not ASK for more than the all-resident set: a partition that pinned
-        // everything allocates no slots, so requesting `b` would reserve two slots' worth of
-        // tier nothing writes to — 1.9 GB at the real widths, since `DeviceTier::new` allocates
-        // its capacity rather than treating it as a ceiling.
+        // And it must not ASK for more than the all-resident set. `DeviceTier::new` allocates
+        // its capacity rather than treating it as a ceiling, and also feeds `guard_capacity`, so
+        // an over-request both wastes GTT and can turn a workable budget into a refusal.
         assert_eq!(
             capacity, all_resident,
             "an over-generous budget must request only what it uses"
@@ -117,9 +117,9 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     // **Only up to the crossover, and the crossover is a property rather than an exception.**
     // `floor + k·layer` = globals + (SLOTS + k)·layer + slack, while pinning EVERY layer costs
     // globals + n_layers·layer + slack and needs no slots at all. So once `k + SLOTS >= n_layers`
-    // the same budget buys the whole model, and the partition correctly stops streaming — at the
-    // fixture's L=4 with 2 slots that happens at k=2. A loop that expected `k` there would be
-    // asserting that the pin declines free residency; it went red on exactly that.
+    // the same budget buys the whole model and the partition correctly stops streaming. A loop
+    // that expected `k` there would be asserting that the pin declines free residency; it went
+    // red on exactly that. Derived from the constant, so it follows a change to the slot count.
     let crossover = L - gm::GLIMMER_STREAM_SLOTS;
     for k in 1..crossover {
         assert_eq!(
@@ -201,12 +201,15 @@ fn every_budget_resolves_every_layer_to_the_same_bytes() {
         // A streamed layer must actually have been filled: `fills` counts slot writes, and a
         // partition that quietly pinned everything would report zero and pass every byte
         // comparison above for the wrong reason.
+        // **Bounded above as well as below.** `> 0` alone passes for a map that thrashes, and
+        // thrash is invisible to the byte comparison (which reads after the fill). With one slot
+        // and two ascending passes over L layers, every visit to a streamed layer is a miss, so
+        // the exact count is derivable — review found the unbounded version.
         let (_, fills) = pin.slot_stats();
-        assert!(
-            fills > 0,
-            "budget pinning {k} of {L} streams {} layers but filled no slot — every byte \
-             comparison above then passed for the wrong reason",
-            L - k
+        assert_eq!(
+            fills,
+            ((L - k) * 2) as u64,
+            "budget pinning {k} of {L}: expected one fill per streamed layer per pass"
         );
     }
     // Anti-vacuity, and derived from a DIFFERENT quantity than the loop bound: the sweep must
@@ -258,79 +261,80 @@ fn tensors_of(p: &rivoli::memory::pin::GlimmerLayerPin) -> Vec<Vec<u8>> {
     ]
 }
 
-/// **The red proof for the slot map, run as arithmetic rather than by breaking the pin.**
+/// **The partition at PRODUCTION widths, with no device — where the fixture's arithmetic lies.**
 ///
-/// The map is `(l - pinned) % SLOT_COUNT`. What makes it correct is that it is INJECTIVE over
-/// any window of `SLOT_COUNT` consecutive streamed layers — otherwise a fill lands on the slot
-/// a kernel is still reading, which is the read-outlives-its-slot defect this repo has open on
-/// the GLM arena path and which no byte comparison above could see (the comparison reads after
-/// the fill, so it agrees).
+/// Two reviews found that every boundary assertion above is checked at widths where the 1 MiB
+/// alignment slack is 99.6% of the budget, so several of them cannot fail there. The worked
+/// example: `assert!(floor > global + layer)` is documented as catching "a floor that forgot the
+/// slots", and at the fixture's 416-byte globals and 1,920-byte layers a floor charging ZERO
+/// slots is still 1,048,992 > 2,336 — it passes. At the shipped widths it would go red.
 ///
-/// The two wrong maps this asserts against are the two anyone would actually write: a single
-/// slot (`% 1`, i.e. always 0) and an off-by-one that reuses the slot the previous layer holds.
-/// Neither is reachable in the shipped code — `SLOT_COUNT` is 2 and the map is one line — so
-/// this proves the PROPERTY that makes the constant defensible, and it goes red if someone
-/// "optimises" `SLOT_COUNT` to 1.
+/// So this runs the same arithmetic against the real config. Deviceless and therefore the second
+/// thing CI covers, which matters because CI has no rocm job at all.
 #[test]
-fn the_slot_map_never_lands_on_the_slot_in_use() {
-    // The shipped constant, restated here because it is private — and asserted below to be the
-    // value that makes the property hold, so a change to it reddens this rather than silently
-    // widening what the test permits.
-    const SLOTS: usize = 2;
-    const {
+fn the_partition_arithmetic_holds_at_the_shipped_widths() {
+    let cfg: gm::GlimmerConfig = serde_json::from_str(fx::GLIMMER_SHIPPED_CONFIG).unwrap();
+    let cfg = cfg.text;
+    let layer = cfg.layer_bytes().unwrap();
+    let global = cfg.global_bytes();
+    let want = cfg.resident_bytes().unwrap();
+    let floor = cfg.floor_bytes().unwrap();
+
+    // Re-derived by hand from config.json, not quoted from any doc — the figure in this repo's
+    // prose was 967.889 MB in four places, which is the CHECKPOINT's bf16-norm arithmetic; the
+    // artifact widens the four norms to f32, so a layer is 53,248 bytes larger. Both reviews
+    // caught it, and `resident_bytes`' 55.712 GB only reconciles with this value.
+    assert_eq!(layer, 967_942_144, "per-layer bytes at the shipped widths");
+    assert_eq!(global, 5_379_352_576, "embed + lm_head + final norm");
+    assert_eq!(want, 55_712_344_064, "the whole text side");
+    assert_eq!(cfg.n_layers, 52);
+
+    // The floor assertion that is vacuous at fixture widths and load-bearing here.
+    assert!(
+        floor > global + layer,
+        "the floor must cover the globals and more than one layer: {floor} vs {}",
+        global + layer
+    );
+    // Every budget in the band below all-resident must pin fewer than every layer, and must ask
+    // for what it uses rather than for the whole budget — the over-allocation review found.
+    for b in [floor, floor + layer, want, want - 1] {
+        let (pinned, capacity) = cfg.partition(Some(b)).unwrap();
+        assert!(pinned < cfg.n_layers, "{b} must leave something streaming");
         assert!(
-            SLOTS >= 2,
-            "one slot cannot hold both the layer being read and the next"
-        )
-    };
-    let map = |l: usize, pinned: usize, slots: usize| (l - pinned) % slots;
-    for pinned in 0..L {
-        for l in pinned..L.saturating_sub(1) {
-            assert_ne!(
-                map(l, pinned, SLOTS),
-                map(l + 1, pinned, SLOTS),
-                "layers {l} and {} share a slot: the fill for {} would overwrite bytes {l} is \
-                 still being read from",
-                l + 1,
-                l + 1
-            );
-            // The red proof: one slot collides on every consecutive pair, which is what the
-            // assertion above would catch if `SLOT_COUNT` were reduced.
-            assert_eq!(
-                map(l, pinned, 1),
-                map(l + 1, pinned, 1),
-                "a single slot must collide — if it does not, this proof is not proving anything"
-            );
-        }
+            capacity <= b,
+            "budget {b} asked for {capacity}, more than it was given"
+        );
+        assert_eq!(
+            capacity,
+            global + (pinned + gm::GLIMMER_STREAM_SLOTS) * layer + 1_048_576,
+            "budget {b} must request exactly the globals, its {pinned} pinned layers, its slots \
+             and the alignment slack"
+        );
     }
 }
 
-/// **A single tensor larger than `i32::MAX` BYTES, allocated and copied.**
+/// **A single tensor larger than `i32::MAX` BYTES, through the allocator the PIN uses.**
 ///
 /// `lm_head.weight` is `[202048, 6656]` bf16 = **2,689,662,976 bytes = 1.252x `i32::MAX`**, and
-/// R1 is where it first gets placed for real. `DeviceBuf::new` and `copy_in_at` were read and
-/// are `usize`/`size_t` throughout — but nothing in this tree had ever allocated or copied past
-/// 2 GiB, so that was a code reading rather than a measurement, and a truncating cast anywhere
-/// on the path would show up as a wrong model rather than as an error.
+/// R1 is where a budgeted pin first has to place it beside a partition.
 ///
-/// Sentinels at both ends and at the 2 GiB and 4 GiB boundaries: a 32-bit truncation of the
-/// LENGTH copies a prefix and leaves the tail untouched, and a truncation of an OFFSET wraps to
-/// the start — the two are distinguishable only by checking past the boundary.
+/// > **Repointed 2026-08-12 by review, and the first version tested the wrong allocator.** It
+/// > exercised `DeviceBuf::new` + `copy_in_at` + `copy_out` — `hipMalloc` and `hipMemcpy`. The pin
+/// > places every tensor through `DeviceTier::place`, which bump-allocates inside a `VmmBuf`
+/// > (`rivoli_vmm_alloc`) and fills it with `ptr::copy_nonoverlapping`. Not one of those three
+/// > calls is on the pin's path, so 2.69 GB of GTT was being spent proving something about code
+/// > R1 does not run, under a doc that said "R1 is where it first gets placed for real".
+///
+/// Sentinels straddle `i32::MAX` in both directions: a 32-bit truncation of a LENGTH copies a
+/// prefix and leaves the tail untouched, a truncation of an OFFSET wraps to the start, and the
+/// two are distinguishable only by probing on both sides of the boundary.
 #[test]
 #[cfg(feature = "rocm")]
-#[ignore = "allocates 2.69 GB of GTT; run explicitly under the GPU flock"]
-fn a_tensor_past_i32_max_bytes_survives_the_round_trip() {
+#[ignore = "allocates 2.69 GB of GTT; run explicitly under the GPU flock with --ignored"]
+fn a_tensor_past_i32_max_bytes_survives_the_placement() {
     const N: usize = 202_048 * 6656 * 2;
-    assert!(N > i32::MAX as usize, "the point of this test is the size");
+    const { assert!(N > i32::MAX as usize, "the point of this test is the size") };
     let mut host = vec![0u8; N];
-    // Distinct byte at each probe so a wrapped write is visible as the WRONG value rather than
-    // as a zero that could also mean "never written". Straddling `i32::MAX` (2,147,483,647) is
-    // the whole point: the byte just under it, the byte just over, and the two ends.
-    //
-    // `3 << 30` was in this list and is 3 GiB — PAST the 2.69 GB tensor, so the first run
-    // panicked on an out-of-bounds host index before reaching the device at all. Every probe is
-    // now asserted in range, because a probe list is exactly the sort of thing that silently
-    // stops covering what it claims.
     let probes = [
         0usize,
         (i32::MAX as usize) - 1,
@@ -348,21 +352,25 @@ fn a_tensor_past_i32_max_bytes_survives_the_round_trip() {
         probes.iter().any(|&p| p > i32::MAX as usize),
         "at least one probe must sit past i32::MAX or this test checks nothing"
     );
-    let mut buf = rivoli::memory::device::DeviceBuf::new(N).unwrap();
-    buf.copy_in_at(0, &host).unwrap();
-    let back = buf.copy_out().unwrap();
-    assert_eq!(back.len(), N, "copy_out returned a different length");
+
+    // The pin's own path: one tier, one `place`, read back through the returned pointer.
+    let mut tier = rivoli::memory::device::DeviceTier::new(N + (1 << 20)).unwrap();
+    let ptr = tier.place(&host).unwrap();
+    // Safe for the reason `glimmer_pin.rs` gives: the tier is a host-fillable VMM mapping, so the
+    // pointer `place` returns is readable here — which is also exactly why `Slot::fill` can write
+    // through it.
+    let back = unsafe { std::slice::from_raw_parts(ptr as *const u8, N) };
     for (i, &p) in probes.iter().enumerate() {
         assert_eq!(
             back[p],
             (i + 1) as u8,
-            "byte at offset {p} ({:.3} GB in) did not survive — a 32-bit cast on this path \
-             would look exactly like this",
+            "byte at offset {p} ({:.3} GB in) did not survive `DeviceTier::place` — a 32-bit cast \
+             anywhere on that path would look exactly like this",
             p as f64 / 1e9
         );
     }
     println!(
-        "{N} bytes ({:.3} GB) round-tripped, {} probes",
+        "{N} bytes ({:.3} GB) placed and read back through DeviceTier, {} probes",
         N as f64 / 1e9,
         probes.len()
     );

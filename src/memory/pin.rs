@@ -1160,22 +1160,31 @@ impl F4Pin {
 
 /// One Muse Glimmer decoder layer's resident weights.
 ///
-/// **Every layer, in full, and that is the architectural difference this port turns on.**
-/// [`Pin`] and [`F4Pin`] both split a layer into a resident part and a routed part that
-/// streams, because 256 experts do not fit; Glimmer is dense, so there is nothing to stream,
-/// no pool, no cache policy and no residency decision. The entire model is this struct, 52
-/// times, plus three model-level tensors.
+/// **One layer, resolved — whether the budget pinned it or a slot holds it.**
+///
+/// > This said "Glimmer is dense, so there is nothing to stream, no pool, no cache policy and
+/// > no residency decision. The entire model is this struct, 52 times." R1 replaced that
+/// > premise (see [`GlimmerPin`]) and review found this copy of it surviving eight lines above
+/// > the replacement, 2026-08-12. [`Pin`] and [`F4Pin`] split a layer into a resident part and
+/// > a routed part because 256 experts do not fit; Glimmer splits at WHOLE LAYERS because 52
+/// > of them do not fit either.
 ///
 /// Twelve tensors, matching [`crate::artifact::model::GLIMMER_LAYER_TENSORS`]: four norms
 /// (widened to f32 by the converter) and eight bf16 projections. **Five projections in the
 /// attention block, not four** — `self_attn.gate_proj` is a per-head output gate applied
 /// before `o_proj`, it is the same shape as `q_proj`, and it is the one an HF-shaped port
 /// drops on the floor.
-/// **Deliberately NOT `Copy`, unlike every other pin struct here.** A copy of a streamed
-/// layer's addresses stays valid-looking after the slot behind it has been refilled with
-/// another layer — the read-outlives-its-slot shape that is still an open defect on the GLM
-/// arena path. Borrowing from [`GlimmerPin::layer`] (which takes `&mut self`) is what makes
-/// holding a stale one a compile error instead of a wrong answer.
+/// **Deliberately NOT `Copy`, unlike every other pin struct here** — but that buys less than
+/// the first version of this note claimed, and the gap matters.
+///
+/// A copy of a streamed layer's addresses stays valid-looking after its slot has been refilled
+/// with another layer — the read-outlives-its-slot shape still open on the GLM arena path — and
+/// borrowing from [`GlimmerPin::layer`] (`&mut self`) makes holding the whole struct across a
+/// refill a compile error. **What it does NOT stop is extracting a field:** [`Bf16Weight`] is
+/// `Copy` and the four norms are bare pointers, so `let q = pin.layer(5)?.q;` yields a handle
+/// that outlives the borrow, and `tests/glimmer_residency.rs::tensors_of` does exactly that.
+/// Review found this 2026-08-12. The type narrows the mistake; it does not forbid it, and the
+/// invariant on [`GlimmerPin::layer`] is what a caller actually has to honour.
 pub struct GlimmerLayerPin {
     /// Pre-attention, `rms_norm_eps`.
     pub input_ln: *const f32,
@@ -1207,10 +1216,16 @@ pub struct GlimmerLayerPin {
 impl GlimmerLayerPin {
     /// The twelve device addresses, in [`GLIMMER_LAYER_TENSORS`] order.
     ///
-    /// Exists so [`Slot`] can derive its fill offsets by SUBTRACTING addresses rather than by
-    /// predicting how the tier aligned them. The order is asserted against that constant by
-    /// `glimmer_residency.rs` — a permutation here would make a streamed layer a permutation
-    /// of a pinned one, every tensor the right shape and the model silently wrong.
+    /// Exists so [`Slot::fill`] can write to each tensor's own address instead of computing an
+    /// offset. A permutation here would make a streamed layer a permutation of a pinned one —
+    /// every tensor the right shape, the model silently wrong.
+    ///
+    /// **Nothing asserts the order directly, and this doc claimed otherwise until 2026-08-12**
+    /// ("asserted against that constant by `glimmer_residency.rs`" — that file never names
+    /// either). What DOES cover it is transitive: the fixture gives every tensor distinct bytes,
+    /// so any swap of two same-length entries reddens the byte-identity gate, and a swap of
+    /// different-length entries fails `Slot::fill`'s length check. Weaker than the assertion the
+    /// doc promised, and worth knowing which one you have.
     fn addrs(&self) -> [*const u8; GLIMMER_LAYER_TENSORS.len()] {
         [
             self.input_ln as *const u8,
@@ -1229,7 +1244,7 @@ impl GlimmerLayerPin {
     }
 }
 
-use crate::artifact::model::{GLIMMER_PIN_SLACK, GLIMMER_STREAM_SLOTS as SLOT_COUNT};
+use crate::artifact::model::GLIMMER_STREAM_SLOTS;
 
 /// The Muse Glimmer weight set: what the budget pinned, plus slots for the rest.
 ///
@@ -1244,7 +1259,7 @@ use crate::artifact::model::{GLIMMER_PIN_SLACK, GLIMMER_STREAM_SLOTS as SLOT_COU
 /// > §R1.
 ///
 /// Layers `0..pinned.len()` live in the tier for the run; the rest cycle through
-/// [`SLOT_COUNT`] slots. **Which one a caller got is not observable** — [`Self::layer`] returns
+/// [`GLIMMER_STREAM_SLOTS`] slots. **Which one a caller got is not observable** — [`Self::layer`] returns
 /// the same `GlimmerLayerPin` shape either way, and `glimmer_residency.rs` gates that the
 /// BYTES behind it are identical at every budget. That indistinguishability is P4 (the budget
 /// trades speed, never text) expressed as a type rather than as a convention.
@@ -1290,11 +1305,10 @@ pub struct GlimmerPin {
 /// from under an in-flight read (`docs` — arena relocation, still open there).
 struct Slot {
     pin: GlimmerLayerPin,
-    /// Device base of the slot, and the per-tensor `(offset, len)` a fill writes to. In the
-    /// order of [`GLIMMER_LAYER_TENSORS`], so the fill loop and the placement loop cannot
-    /// disagree about which tensor goes where.
-    base: *mut u8,
-    spans: Vec<(usize, usize)>,
+    /// Each tensor's byte length, in [`GLIMMER_LAYER_TENSORS`] order — the extent of the
+    /// placement the matching address in `pin.addrs()` points at. A refill checks the incoming
+    /// tensor against this, which is what bounds the write to its own placement.
+    lens: [usize; GLIMMER_LAYER_TENSORS.len()],
 }
 
 /// Place one Glimmer f32 norm, with its LENGTH checked against `hidden`.
@@ -1405,21 +1419,23 @@ impl Slot {
     /// are overwritten by the first [`Self::fill`]; what survives is the geometry.
     fn new(tier: &mut DeviceTier, st: &Safetensors, cfg: &GlimmerTextConfig) -> Result<Self> {
         let pin = place_glimmer_layer(tier, st, cfg, 0)?;
-        // **The spans come from the PIN's own addresses, not from restated alignment
-        // arithmetic.** The first draft recomputed `next_multiple_of(256)` per tensor to
-        // predict where `place` had put things — a second copy of `bump`, correct only while
-        // it happened to agree. Subtracting the pointers makes "the fill writes where the pin
-        // points" true by construction, and it needs no knowledge of how the tier aligns.
-        let addrs = pin.addrs();
-        let base = addrs[0] as *mut u8;
-        let mut spans = Vec::with_capacity(GLIMMER_LAYER_TENSORS.len());
-        for (name, &p) in glimmer_layer_names(0).iter().zip(&addrs) {
-            // SAFETY-adjacent, and it is arithmetic rather than a dereference: every address
-            // came from one `place` call on one slab, so the difference is an offset within it.
-            let off = (p as usize) - (base as usize);
-            spans.push((off, st.raw(name)?.0.len()));
+        // **A refill's destination is the PIN'S OWN ADDRESS — there is no offset arithmetic at
+        // all.** Two earlier shapes were worse. The first recomputed `next_multiple_of(256)` per
+        // tensor to predict where `place` had put things: a second copy of `bump`, correct only
+        // while it agreed. The second stored `base = addrs[0]` plus per-tensor offsets obtained
+        // by subtracting pointers — which worked, but rested on the first placement being the
+        // LOWEST address (true for a bump allocator, promised by nothing), and would have
+        // underflowed into `base.add(huge)` if that ever changed, silently under `--release`
+        // where overflow checks are off. Reviews found both, 2026-08-12.
+        //
+        // Writing to each address directly needs no ordering assumption and no subtraction, and
+        // each write is bounded by the extent of the placement it targets — which is what `lens`
+        // records and `fill` enforces.
+        let mut lens = [0usize; GLIMMER_LAYER_TENSORS.len()];
+        for (len, name) in lens.iter_mut().zip(glimmer_layer_names(0)) {
+            *len = st.raw(&name)?.0.len();
         }
-        Ok(Self { pin, base, spans })
+        Ok(Self { pin, lens })
     }
 
     /// Overwrite this slot with layer `l`'s bytes.
@@ -1439,18 +1455,24 @@ impl Slot {
     /// page cache is doing the caching, which S5 must account for before quoting any
     /// bytes-from-disk number.
     fn fill(&mut self, st: &Safetensors, l: usize) -> Result<()> {
-        for (name, &(off, len)) in glimmer_layer_names(l).iter().zip(&self.spans) {
-            let bytes = st.raw(name)?.0;
+        for ((&dst, &len), name) in self
+            .pin
+            .addrs()
+            .iter()
+            .zip(&self.lens)
+            .zip(glimmer_layer_names(l))
+        {
+            let bytes = st.raw(&name)?.0;
             ensure!(
                 bytes.len() == len,
                 "{name} is {} bytes but layer 0's was {len} — every Glimmer layer is the same \
                  shape, so this artifact is not the one this slot was laid out for",
                 bytes.len()
             );
-            // SAFETY: `base + off + len` is inside the region `Slot::new` reserved (the spans
-            // were derived from that reservation and checked against it), and the source is a
-            // live mmap slice that cannot overlap the device slab.
-            unsafe { DeviceTier::write_at(self.base, off, bytes) };
+            // SAFETY: `dst` is the address `DeviceTier::place` returned for this tensor of layer
+            // 0, and `bytes.len() == len` is that placement's own extent (checked immediately
+            // above), so the write stays inside the placement it targets.
+            unsafe { DeviceTier::write_to(dst as *mut u8, bytes) };
         }
         Ok(())
     }
@@ -1462,7 +1484,7 @@ impl GlimmerPin {
     /// `budget` is `None` for "pin everything" — the all-resident case, which is a BUDGET
     /// VALUE and not a separate code path (see the struct's note on why that distinction is
     /// load-bearing). `Some(bytes)` partitions: model-level tensors first, then whole layers
-    /// in ascending order while they fit, then [`SLOT_COUNT`] slots for the remainder.
+    /// in ascending order while they fit, then [`GLIMMER_STREAM_SLOTS`] slots for the remainder.
     ///
     /// **The partition is a fixed PREFIX, and that is the optimal policy rather than a
     /// simplification.** A dense model reads its layers in fixed cyclic order, which is
@@ -1505,6 +1527,43 @@ impl GlimmerPin {
             "model.language_model.norm.weight",
         )?;
 
+        // **Every layer's headers are checked, whether or not the budget pins it.**
+        //
+        // > **Found by review 2026-08-12, and it was a correctness regression this diff
+        // > introduced.** Before the budget existed, `build` placed all 52 layers, so all 52
+        // > went through `place_glimmer_norm` (dtype F32 + extent `[hidden]`) and
+        // > `place_glimmer_proj` (shape from `layer_tensor_shape`). Afterwards only the PINNED
+        // > prefix did, and a streamed layer's only check was `Slot::fill`'s byte length against
+        // > layer 0's — so **which checks a layer received became a function of `--max-mem`**.
+        // > That is not a theoretical gap: `tests/glimmer_pin.rs` builds the artifact
+        // > `convert_glimmer` provably emits at exit 0 with a SHORT norm and asserts the pin
+        // > refuses it; at a low budget the same artifact loaded clean and died mid-token with
+        // > "not the one this slot was laid out for", diagnosis gone. Worse, a `q_proj` stored
+        // > `[6656, 4096]` instead of `[4096, 6656]` is byte-identical in length and was
+        // > accepted outright — a transposed matrix, fluent wrong text, no error.
+        //
+        // Headers only: this reads the index, not the bytes, so it costs 12 lookups per layer
+        // and no device memory. It also restores the ordering this function argues for above —
+        // the cheap refusals before the big allocation.
+        for l in n_pinned..cfg.n_layers {
+            let p = format!("{GLIMMER_LAYER_PREFIX}.{l}");
+            for t in GLIMMER_LAYER_TENSORS {
+                let name = format!("{p}.{t}.weight");
+                let want = cfg.layer_tensor_shape(t)?;
+                let (_, dtype, shape) = st.raw(&name)?;
+                let want_dtype = if want.len() == 1 {
+                    Dtype::F32
+                } else {
+                    Dtype::Bf16
+                };
+                ensure!(
+                    *shape == want[..] && dtype == want_dtype,
+                    "{name} is {shape:?} {dtype:?}, but this config implies {want:?} \
+                     {want_dtype:?} — the artifact and the config describe different models"
+                );
+            }
+        }
+
         let mut pinned = Vec::with_capacity(n_pinned);
         for l in 0..n_pinned {
             pinned.push(place_glimmer_layer(&mut tier, &st, cfg, l)?);
@@ -1512,7 +1571,7 @@ impl GlimmerPin {
         // Slots only when something streams. `n_pinned == n_layers` allocates none, so the
         // all-resident partition costs exactly what it did before this budget existed.
         let n_slots = if n_pinned < cfg.n_layers {
-            SLOT_COUNT
+            GLIMMER_STREAM_SLOTS
         } else {
             0
         };
@@ -1540,15 +1599,32 @@ impl GlimmerPin {
     /// `&mut self` because a miss fills a slot. That is the honest signature: a caller cannot
     /// hold two layers' pins at once, which is exactly the aliasing a slot reuse would break.
     ///
-    /// **The fill is SYNCHRONOUS, and there is deliberately no ticket.** Under HIP's unified
-    /// addressing the tier is host-writable, so a fill is a host `memcpy` (the same operation
-    /// `DeviceTier::place` performs) and it has completed by the time this returns — there is
-    /// no dependency for a caller to await. Handing back an always-satisfied ticket would be a
-    /// second, host-side encoding of "is this ready?" that cannot ever disagree with reality,
-    /// and `fetch/asyncfetch.rs`'s `Ticket` doc records what that cost the GLM path when the
-    /// `hit: Vec<bool>` mask silently won. **When S5 makes the fill asynchronous it must add a
-    /// real ticket here and every call site must enqueue its wait** — that is the one change
-    /// this signature is shaped to accept.
+    /// # THE INVARIANT A CALLER OWES, which no type here enforces
+    ///
+    /// **Before requesting a layer that maps to slot `s`, the caller must have retired every
+    /// kernel still reading slot `s`'s previous occupant.** A fill is a host `memcpy` with no
+    /// synchronization of any kind, and kernel launches are asynchronous — so a host that runs
+    /// even one layer ahead of the device can overwrite weights a live GEMV is streaming. The
+    /// symptom is position-dependent, nondeterministic wrong text: this repo's arena-relocation
+    /// signature. `device_sync` at the end of each layer is what GLM's loop already does and is
+    /// what makes this safe today.
+    ///
+    /// > **Two reviews rejected the first version of this section, and they were right.** It
+    /// > argued: "a fill is a host memcpy ... it has completed by the time this returns — there
+    /// > is no dependency for a caller to await." That covers fill-then-read (the caller does
+    /// > not need to wait for the fill) and says nothing about read-then-refill, which is the
+    /// > direction that corrupts. The claim that this is "valid for the same reason as
+    /// > `DeviceTier::place`" was the tell: `place` runs before any kernel exists.
+    /// > `VmmBuf::ptr_mut`'s own contract covers only the same one direction and names
+    /// > `device_sync` as the mechanism for slot reuse on the io_uring path.
+    ///
+    /// **There is still deliberately no ticket**, for a different and narrower reason than the
+    /// first version gave: a ticket expresses fill-then-read, the dependency that genuinely does
+    /// not exist while the fill is synchronous, and an always-satisfied one is the
+    /// `hit: Vec<bool>` mistake `fetch/asyncfetch.rs`'s `Ticket` doc records. The dependency that
+    /// DOES exist is the opposite one and belongs in an event or a `device_sync`, not a ticket.
+    /// **S5 owes both**: a real ticket when the fill goes async, and the write-after-read fence
+    /// in the same change as any increase to [`GLIMMER_STREAM_SLOTS`].
     ///
     /// `ponytail:` a synchronous fill blocks the decode thread for a layer's worth of memcpy
     /// and buys no overlap. Deliberate at R1, whose gates are about WHAT the bytes are, not
@@ -1562,7 +1638,7 @@ impl GlimmerPin {
         if l < self.pinned.len() {
             return Ok(&self.pinned[l]);
         }
-        // Round-robin over the streamed suffix. Injective across any `SLOT_COUNT` consecutive
+        // Round-robin over the streamed suffix. Injective across any `GLIMMER_STREAM_SLOTS` consecutive
         // layers, which is what stops a fill landing on the slot a kernel is still reading —
         // `glimmer_residency.rs` runs the wrong map as a red proof.
         let s = (l - self.pinned.len()) % self.slots.len();
@@ -1570,6 +1646,13 @@ impl GlimmerPin {
             self.hits += 1;
             return Ok(&self.slots[s].pin);
         }
+        // **Invalidated BEFORE the fill, not after it.** `fill` writes tensor-by-tensor and can
+        // bail in the middle, at which point the slot holds a prefix of layer `l` and a suffix of
+        // its previous occupant. Assigning only on success left the flag claiming the OLD layer,
+        // so a caller that handled the error and re-requested that old layer took the hit path
+        // and got the mixture, silently. Review finding, 2026-08-12: a flag set in the success
+        // path and not cleared in the failure path.
+        self.slot_layer[s] = None;
         self.slots[s].fill(&self.src, l)?;
         self.slot_layer[s] = Some(l);
         self.fills += 1;
