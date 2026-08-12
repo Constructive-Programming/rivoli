@@ -224,7 +224,7 @@ unanalysed operator.
 bucket is exactly the four sandwich norms: **224 tensors = 4 norms x 8 layers x 7 steps**, with
 `final_norm` (7) and `qk_norm` (112) as separate buckets and separate call sites. That separation is
 load-bearing, because **this model carries two norm formulas** — the four sandwich norms are
-CENTERED, `x*(1+w)`, while the final norm and the two weightless norms are plain `x*w` (§4).
+CENTERED, `x*(1+w)`, while the final norm and the two weightless norms are plain `x*w` (§5); the four norms and their two eps are §3.
 
 | defect | draw 1 | draw 2 | weaker |
 |---|---|---|---|

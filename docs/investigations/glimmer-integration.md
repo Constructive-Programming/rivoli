@@ -159,7 +159,7 @@ alloc+copy test exists and passes** — `lm_head` is 2,689,662,976 bytes = 1.25�
 > `SLOT_COUNT` to 1 reddens it" was false. It was then deleted rather than repaired, because
 > finding 1 above dissolved the premise: the slot count is not what makes slot reuse safe, so
 > there is no schedule property here to gate. **What replaces it is the invariant on `layer()`
-> plus S5's obligation to add the fence** — and a real gate is possible without a decode (a
+> plus the fence, which is now S3 item 0** — and a real gate is possible without a decode (a
 > long-running kernel over a slot's span, a host refill, assert the readback is clean), which S3
 > should carry.
 >
@@ -189,10 +189,48 @@ What the loop must get right, each with its gate:
    moves to a layer mapping to an occupied slot; GLM's loop already syncs per layer, so the cost
    is likely nil at R1's synchronous fill — measure it rather than assume.
    **Gate, and it needs no decode:** launch a long-running kernel reading a slot's span, refill
-   that slot from the host, assert the kernel's output is unpolluted. It goes red today, which
-   is the point of writing it first.
+   that slot from the host, assert the kernel's output is unpolluted. A gate of that shape WOULD go red today —
+   `Slot::fill` writes through a plain `copy_nonoverlapping` with no stream, event or sync — but
+   that is a mechanical argument, not a run, and nothing has been written yet. Item 1's kernel
+   landed first; this is owed before the loop, not before item 1.
 
-1. **Sandwich norms — the missing kernel.** Four per layer, post-norms on the BRANCH before
+1. **Sandwich norms — the missing kernel. DONE 2026-08-12, with one gate OWED.**
+   `rmsnorm_centered_single` (`kernels/linalg.hip`), using `common.hpp::block_sum_lds` rather than
+   a hand-rolled ladder — the first draft factored a helper OUT of `rmsnorm_single` instead, which
+   was a fourth spelling of that helper and put a hand on GLM's live decode path; reverted, and
+   GLM's kernel is byte-identical to before. Scored against the `norm` row measured before it
+   existed: **1.179e-7 / 1.172e-7** at the two eps, width 6656.
+
+   **The row's defect only has power at the right activation scale, and finding that out is the
+   result here.** Two reviews independently computed that at unit activations (mean(x²) ≈ 1/3) the
+   eps substitution the row was priced on moves the output by 1.5e-5 — **0.19x the row's own
+   7.70e-5 tolerance.** The fixture drew `x` there, so it was scoring the kernel in a regime where
+   the row's defect is invisible; a test asserting the two eps were separable went red on exactly
+   that and was deleted, which was the wrong call. The reference's real post-norm inputs sit at
+   mean(x²) = 1.14e-3 … 6.39e-3 (recovered from the goldens), so the fixture now stands at 8.3e-4
+   and the defect measures **5.95e-3 — 77x the tolerance**. This is the `logits` row's lesson one
+   operator later: a threshold measured on the reference means nothing against a fixture standing
+   somewhere else.
+
+   **§5's "crashes into garbage" is false and the anchor disproves it.** The centered-weight-through-
+   the-plain-kernel substitution leaves **zero non-finite values across all 1103 captures**, scales
+   the branch by 0.15x, and emits seven tokens normally. §9 trap 5 has it right ("runs clean and
+   produces a wrong model") and §5 contradicts itself; three code comments had propagated the wrong
+   half. The two-entry-point design stands on neither direction announcing itself.
+
+   > **OWED, and it is the gate this item should have had.** Both reviews found three EXACT
+   > input→output chains in the goldens — `embed_norm.out` → `L0.input_layernorm.out`,
+   > `attn.o_proj.out` → `post_attention_layernorm.out`, `mlp.down_proj.out` →
+   > `post_feedforward_layernorm.out` — verified by recovering `1+w` per row and confirming it is
+   > constant across all 18 rows to ~3e-7. So the kernel CAN be scored against reference bytes:
+   > recover the weight from one row, predict the rest, compare under the `norm` row. It would
+   > redden at 25–45x on `post_norm_eps_shared` and would run at hidden **72**, where 184 of 256
+   > threads contribute nothing to the ladder — a regime no value check in the tree touches. The
+   > fixture header had argued no gate was possible; that argument covers only the FORM (recovering
+   > `1+w` and feeding it to a plain kernel reproduces the output), and was used to skip the
+   > arithmetic and eps gates too. **Write this before S3's loop consumes the kernel.**
+
+1. **Sandwich norms — the original prescription, kept for what it asked:** Four per layer, post-norms on the BRANCH before
    the residual add, and they are CENTERED: `x*(1+w)` — **no kernel in the tree computes
    that form** (`rmsnorm_single`/`batch` are plain `x*w`). One new kernel (or a flag-free
    second entry point, the `rope_split_half` precedent — a wrong-form call site must not be

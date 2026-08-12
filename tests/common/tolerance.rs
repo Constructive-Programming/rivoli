@@ -185,31 +185,11 @@ pub const GLIMMER: &[Tol] = &[
         weakest_defect: 3.688e0,
         policy: Policy::Rel(8.29e-5),
     },
-    // The logit path, S2 item 5 — and the one Glimmer operator this anchor CANNOT price.
-    //
-    // `softcap_off` moves `logits` by 4.993e-5 / 4.879e-5 by draw, so the weaker is below: only
-    // **13.9x** the floor, far under the 297x a `Rel` policy needs. Hence `ExactOnly`, and the
-    // reason is not insufficient resolution — it is the TINY MODEL. The softcap is
-    // `20*tanh(x*0.196/20)`, and at untrained weights the logits are small enough that `tanh` is
-    // in its linear region, where the operation is very nearly the identity. At vocab 202048 with
-    // trained weights it bites much harder. So this row says "the anchor cannot separate a correct
-    // softcap from an omitted one", NOT "the softcap barely matters".
-    //
-    // `ids` moves by **exactly 0.000e0** at both draws, which is §5's argmax-invariance stated as
-    // a measurement: every greedy gate in this repo is provably blind here.
-    //
-    // What follows for S2 item 5: its kernel is scored against a host `tanh` at magnitudes
-    // where the function has shape, not against these goldens. **Nothing catches the omission
-    // in a decode** — an S3 head path that never calls the kernel leaves every gate in the tree
-    // green, which is why `glimmer-port.md` §G3 owes a probability-space check. (This sentence
-    // said "the omission is caught structurally" until 2026-08-12; the claim had no referent —
-    // `kernel_coverage`'s empty-owners row can only notice a caller APPEARING, never demand one
-    // exist.) S4 is where trained logits can price it.
     // Muse Glimmer's FOUR SANDWICH NORMS, S3 item 1 — and the bucket is exactly them: 224
     // tensors = 4 norms x 8 layers x 7 steps. `final_norm` (7) and `qk_norm` (112) are their own
     // buckets and their own call sites, which matters because **this model carries two norm
     // formulas**: the four sandwich norms are CENTERED, `x*(1+w)`, while the final norm and the
-    // two weightless norms are plain `x*w` (`glimmer-architecture.md` section 4).
+    // two weightless norms are plain `x*w` (`glimmer-architecture.md` sections 3 and 5).
     //
     // **Measured 2026-08-12, BEFORE the kernel exists** — the S2 discipline, and the only order
     // in which the number means anything. Both defects that target this operator are counted and
@@ -233,6 +213,26 @@ pub const GLIMMER: &[Tol] = &[
         weakest_defect: 2.024e-2,
         policy: Policy::Rel(7.70e-5),
     },
+    // The logit path, S2 item 5 — and the one Glimmer operator this anchor CANNOT price.
+    //
+    // `softcap_off` moves `logits` by 4.993e-5 / 4.879e-5 by draw, so the weaker is below: only
+    // **13.9x** the floor, far under the 297x a `Rel` policy needs. Hence `ExactOnly`, and the
+    // reason is not insufficient resolution — it is the TINY MODEL. The softcap is
+    // `20*tanh(x*0.196/20)`, and at untrained weights the logits are small enough that `tanh` is
+    // in its linear region, where the operation is very nearly the identity. At vocab 202048 with
+    // trained weights it bites much harder. So this row says "the anchor cannot separate a correct
+    // softcap from an omitted one", NOT "the softcap barely matters".
+    //
+    // `ids` moves by **exactly 0.000e0** at both draws, which is §5's argmax-invariance stated as
+    // a measurement: every greedy gate in this repo is provably blind here.
+    //
+    // What follows for S2 item 5: its kernel is scored against a host `tanh` at magnitudes
+    // where the function has shape, not against these goldens. **Nothing catches the omission
+    // in a decode** — an S3 head path that never calls the kernel leaves every gate in the tree
+    // green, which is why `glimmer-port.md` §G3 owes a probability-space check. (This sentence
+    // said "the omission is caught structurally" until 2026-08-12; the claim had no referent —
+    // `kernel_coverage`'s empty-owners row can only notice a caller APPEARING, never demand one
+    // exist.) S4 is where trained logits can price it.
     Tol {
         operator: "logits",
         floor: 3.520e-6,

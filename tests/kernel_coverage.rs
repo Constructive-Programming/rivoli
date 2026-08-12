@@ -372,6 +372,9 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("moe_expert_range_i4", &["gpu.rs"]),
     ("qk_norm", &["attn.rs"]),
     ("rmsnorm_batch", &["attn.rs", "f4gpu.rs"]),
+    // Muse Glimmer's CENTERED sandwich norm, empty for the same reason `rope_split_half` is:
+    // S3 gates the kernel before the layer loop that will call it exists.
+    ("rmsnorm_centered_single", &[]),
     ("rmsnorm_single", &["gpu.rs"]),
     ("rope_adjacent", &["attn.rs"]),
     ("rope_interleave", &["gpu.rs"]),

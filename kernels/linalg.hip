@@ -361,6 +361,42 @@ extern "C" __global__ void rmsnorm_single(
     for (int i = t; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
 }
 
+// y[i] = x[i]·(1/sqrt(mean(x²)+eps))·(1 + w[i]) — the CENTERED RMSNorm, one row.
+//
+// USED BY: Muse Glimmer's four per-layer sandwich norms, and nothing else in the tree.
+//
+// **`(1 + w)`, not `w` — and this model ships BOTH forms.** The four sandwich norms are centered
+// with `w` initialised to ZEROS (§3); the final norm, the weightless qk_norm and the embedding
+// norm are plain with `w` ones (§5). Substituting either way RUNS: a centered weight through the
+// plain kernel scales the residual by ~0.15x and a plain weight through this one scales by ~2 —
+// and BOTH run clean. §5 says the first "crashes into garbage"; §9 trap 5 says it "runs clean and
+// produces a wrong model", and the anchor settles it: `norm_not_centered` leaves ZERO non-finite
+// values across 1103 captures and emits seven tokens normally (measured 2026-08-12 by review).
+// **Neither direction is self-announcing**, which is the actual case for a separate entry
+// point rather than a flag, for the reason `rope_pair` gives below; here the wrong form is the
+// silent one, so a bool would put it one argument from every GLM and V4 call site.
+//
+// **`block_sum_lds` rather than a hand-rolled ladder, and `rmsnorm_single` above keeps its own.**
+// `headtail.hip`'s note states the rule — re-implementing the ladder would be another copy of a
+// helper `kernels/` has no duplication gate to catch — and `mla.hip` already spells this exact
+// line. The first draft of this kernel instead factored a `rms_inv_row` helper OUT of
+// `rmsnorm_single`, which was a fourth spelling of `block_sum_lds` and put a hand on GLM's live
+// decode path to share ten lines; review found both, 2026-08-12. Converting `rmsnorm_single` is
+// declined separately: `block_sum_lds` carries a trailing barrier that spelling lacks, and
+// `common.hpp` prices that as UNMEASURED on the decode path.
+//
+// `tests/glimmer_norm.rs` scores it against `tolerance::GLIMMER`'s `norm` row, measured before
+// this existed.
+extern "C" __global__ void rmsnorm_centered_single(
+    const float* __restrict__ x, const float* __restrict__ w, int n, float eps,
+    float* __restrict__ y) {
+    __shared__ float red[256];
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) local += x[i] * x[i];
+    float inv = 1.0f / sqrtf(block_sum_lds(local, red) / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * (1.0f + w[i]);
+}
+
 // `kernel.py::act_quant(x, 128, "ue8m0", …, inplace=True)` over `n_rows × row_len` f32,
 // IN PLACE — the fused quantize-then-dequantize DeepSeek-V4 puts in front of EVERY
 // quantized `Linear`, fp4-weight ones included (`model.py::linear` line 120).
@@ -819,6 +855,25 @@ extern "C" int rivoli_rmsnorm_single(const float* x, const float* w, int n, floa
     if (n <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(rmsnorm_single, dim3(1), dim3(256), 0, 0, x, w, n, eps, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// The centered form, one row. `stream` is trailing and nullptr is the null stream, the
+// `rivoli_swiglu` contract — this sits INSIDE a layer between two stream-ordered launches from
+// the day S3 writes the loop, so taking it now costs nothing and adding it later is the
+// unordered-activation bug `rivoli_swiglu_clamped_bf16` describes.
+//
+// `eps` is refused unless positive and finite — this model has two eps three decades apart (§3),
+// so it is never a constant here, and a zero or a NaN comes from a config never read. Spelled as
+// one compare to match `rivoli_swiglu_clamped_bf16`'s `limit` guard 30 lines up.
+extern "C" int rivoli_rmsnorm_centered_single(
+    const float* x, const float* w, int n, float eps, float* y, void* stream) {
+    if (n <= 0) return 1001;
+    if (!(eps > 0.0f && eps < INFINITY)) return 1002;
+    hipGetLastError();
+    hipLaunchKernelGGL(rmsnorm_centered_single, dim3(1), dim3(256), 0, (hipStream_t)stream, x, w,
+                       n, eps, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

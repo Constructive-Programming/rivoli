@@ -805,6 +805,36 @@ launchers! {
         y: *mut f32,
     );
 
+    /// `y[i] = x[i]·(1/sqrt(mean(x²)+eps))·(1 + w[i])` — Muse Glimmer's CENTERED RMSNorm, one row.
+    ///
+    /// **The `(1 + w)` is the whole difference from [`launch_rmsnorm_single`], and this model uses
+    /// BOTH forms.** Glimmer's four per-layer sandwich norms are centered with `w` initialised to
+    /// ZEROS; its final norm, weightless qk_norm and embedding norm are the plain form with `w`
+    /// ones (`glimmer-architecture.md` §5). NEITHER substitution announces itself — the anchor's
+    /// `norm_not_centered` run leaves zero non-finite values and decodes on, so §5's "crashes into
+    /// garbage" is wrong and §9 trap 5's "runs clean" is right. Two entry points rather than a flag, the
+    /// `launch_rope_split_half` argument: the wrong form is silent in one direction (a plain weight
+    /// through here scales by ≈2 and stays fluent) and a bool would put it one argument from every
+    /// GLM and V4 call site.
+    ///
+    /// `eps` is refused unless positive and finite (code 1002). Glimmer's four norms carry TWO eps
+    /// three orders of magnitude apart, and passing one where the other belongs is the anchor
+    /// defect that sets this operator's tolerance row.
+    ///
+    /// # Safety
+    /// `x`, `w` and `y` are each `n` live f32 — `x`/`w` readable, `y` writable — until the next
+    /// [`device_sync`]; `y` may alias `x` (each thread reads and writes only index `i` after the
+    /// block-wide reduction has completed). `stream` is null or a live stream ordering every
+    /// producer of `x` and `w`.
+    launch_rmsnorm_centered_single -> rivoli_rmsnorm_centered_single, "rmsnorm_centered_single" (
+        x: *const f32,
+        w: *const f32,
+        n: usize as i32,
+        eps: f32,
+        y: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// Interleaved RoPE in place over `count` segments of `seg` at `stride`.
     ///
     /// # Safety

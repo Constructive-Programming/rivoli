@@ -302,6 +302,55 @@ pub fn sync_read(b: &rivoli::memory::device::DeviceBuf) -> Vec<f32> {
 // the same reason `sync_read` does: a launch wrapper is three lines of pointer casts where a
 // mistake is a wrong answer rather than a compile error, and one copy is one place to be right.
 
+/// The one place `launch_rmsnorm_centered_single` is spelled, returning its `Result`.
+///
+/// Two spellings — the wrapper below and `glimmer_norm.rs`'s guard table — were a jscpd clone,
+/// which is the gate being right about the substance too: a guard test and a scoring test must
+/// drive the SAME call, or the guard is proving something about a second launch nobody uses.
+///
+/// # Safety
+/// `x` and `w` must be `n` readable f32 and `y` `n` writable f32, all live until the next
+/// `device_sync` — except when the call is expected to be REFUSED, where the guard returns
+/// before any launch and nothing is dereferenced.
+pub unsafe fn rmsnorm_launch(
+    x: *const f32,
+    w: *const f32,
+    n: usize,
+    eps: f32,
+    y: *mut f32,
+) -> anyhow::Result<()> {
+    // SAFETY: the caller's contract above. Null stream: every caller launches one kernel and
+    // then joins, so there is nothing to order against.
+    unsafe {
+        rivoli::backend::hip::launch_rmsnorm_centered_single(x, w, n, eps, y, std::ptr::null_mut())
+    }
+}
+
+/// One row through Muse Glimmer's CENTERED RMSNorm: `y = x · rsqrt(mean(x²)+eps) · (1 + w)`.
+///
+/// Here rather than in `glimmer_norm.rs` because jscpd matched the launch block against the
+/// wrappers already in this file. It briefly took a `centered: bool` and dispatched to
+/// `rmsnorm_single` for the plain form — deleted 2026-08-12 when review pointed out the test's
+/// only plain comparison belongs on the HOST anyway, so there was never a second device form to
+/// select and the bool was pure surface.
+pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    let (xb, wb) = (dev(&f32b(x)), dev(&f32b(w)));
+    let y = zeros(x.len() * 4);
+    // SAFETY: three distinct allocations of exactly `x.len()` live f32, `y` writable, all three
+    // outliving the sync inside `sync_read`.
+    unsafe {
+        rmsnorm_launch(
+            xb.ptr() as *const f32,
+            wb.ptr() as *const f32,
+            x.len(),
+            eps,
+            y.ptr() as *mut f32,
+        )
+    }
+    .expect("rmsnorm_centered_single launch");
+    sync_read(&y)
+}
+
 /// A cheap deterministic fill in `[-scale, scale)`. The period must not divide any width these
 /// fixtures use, or a transposed or strided read lands on an equal value and passes.
 ///

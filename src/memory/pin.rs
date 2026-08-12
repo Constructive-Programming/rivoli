@@ -1638,9 +1638,12 @@ impl GlimmerPin {
         if l < self.pinned.len() {
             return Ok(&self.pinned[l]);
         }
-        // Round-robin over the streamed suffix. Injective across any `GLIMMER_STREAM_SLOTS` consecutive
-        // layers, which is what stops a fill landing on the slot a kernel is still reading —
-        // `glimmer_residency.rs` runs the wrong map as a red proof.
+        // Round-robin over the streamed suffix. **At `GLIMMER_STREAM_SLOTS` = 1 this maps every
+        // streamed layer to slot 0, so it separates nothing** — and the first version of this
+        // comment claimed injectivity across consecutive
+        // layers "which is what stops a fill landing on the slot a kernel is still reading".
+        // Nothing here stops that; only a fence does (S3 item 0), and review found this comment
+        // sending a reader to the wrong place. 2026-08-12.
         let s = (l - self.pinned.len()) % self.slots.len();
         if self.slot_layer[s] == Some(l) {
             self.hits += 1;
