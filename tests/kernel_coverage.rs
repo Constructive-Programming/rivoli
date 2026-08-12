@@ -376,6 +376,10 @@ const OWNERS: &[(&str, &[&str])] = &[
     // S3 gates the kernel before the layer loop that will call it exists.
     ("rmsnorm_centered_single", &[]),
     ("rmsnorm_single", &["gpu.rs"]),
+    // Muse Glimmer's WEIGHTLESS qk-norm plus Q's 3.87, empty for the same reason the row above is.
+    // Named for what it does, not for the model: `mla.hip::qk_norm` already holds the name and is a
+    // different kernel (bf16 statistic, DeepSeek-V4's), which is why this one spells its contract.
+    ("rmsnorm_weightless_batch", &[]),
     ("rope_adjacent", &["attn.rs"]),
     ("rope_interleave", &["gpu.rs"]),
     // Muse Glimmer's rotation convention. Empty for the same reason `gqa_attend` is: S2 gates

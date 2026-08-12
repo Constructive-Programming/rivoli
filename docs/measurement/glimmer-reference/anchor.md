@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: data
-verdict: The S1b anchor exists and runs — Muse Glimmer's own first-party stack (transformers 5.16.0.dev0 at commit fe747d88, torch 2.13.0+cpu, python 3.14.6) executed at tiny widths but the REAL structure, and it needs NO GPU because this reference is plain PyTorch with a CPU path for every operator. FOUR files are vendored (tests/glimmer-anchor-{text,draft}-{1,2}.bin; text 643,957 B, draft 72,145 B), two weight draws x two modes, each reproduced byte-for-byte on a later run, and read by tests/glimmer_anchor.rs with no python, no venv, no network and no device. FOURTEEN defect runs are scored at both draws, 28 runs in all, and each is GATED on the captures it must leave bit-identical rather than merely on having changed something. THE FINDING THAT ONLY THIS CAN SEE - softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so the argmax-invariant logit path is not an argument but a measurement, and every greedy gate in this repo is provably blind to it. Two reference behaviours were discovered by running it: the DFlash drafter's default mask is block-wide against context+block K/V and RAISES, and passing the correct 2D mask only works with use_cache=False because a fresh DFlashCache reports kv_length 0. The green sets are scoped to step 0 because a defect that shifts the argmax contaminates every later step through the token it feeds back - localisation is only possible on the prefill. Five deviations are declared in the metadata and pinned by the test - eager attention, fp32 against a bf16 checkpoint, the ForConditionalGeneration wrapper (the softcap lives only there), shrunk special-token ids, and output_multiplier kept at the released value rather than recomputed. TOLERANCES ADDED 2026-08-11 for S2 item 1: per-operator fp32 floors for all thirteen buckets, from --dtype float64 (the whole model in double, no island needed) against each fp32 golden, measured at BOTH draws because attend's floor is 2.1x apart between them - 7.819e-6 and 1.639e-5 - so a one-draw floor would have set the threshold at half what a correct kernel needs. ONE row is tabled, attend: floor 1.639e-5, weakest targeting defect 2.086e0 (kv_broadcast_blocked), Rel(1.64e-4). qk_scale_on_k is EXCLUDED from that set at 6.232e-4 (38x the floor, which would have forced ExactOnly) because (s*q).k and q.(s*k) are the same product - the defect is invisible to this kernel by algebra, not by resolution, and is caught in qk_norm/proj instead. The other twelve buckets have floors and no row: a floor is half a row, and S2 compares them exactly until the other half is reasoned through.
+verdict: The S1b anchor exists and runs — Muse Glimmer's own first-party stack (transformers 5.16.0.dev0 at commit fe747d88, torch 2.13.0+cpu, python 3.14.6) executed at tiny widths but the REAL structure, and it needs NO GPU because this reference is plain PyTorch with a CPU path for every operator. FOUR files are vendored (tests/glimmer-anchor-{text,draft}-{1,2}.bin; text 643,957 B, draft 72,145 B), two weight draws x two modes, each reproduced byte-for-byte on a later run, and read by tests/glimmer_anchor.rs with no python, no venv, no network and no device. FOURTEEN defect runs are scored at both draws, 28 runs in all, and each is GATED on the captures it must leave bit-identical rather than merely on having changed something. THE FINDING THAT ONLY THIS CAN SEE - softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so the argmax-invariant logit path is not an argument but a measurement, and every greedy gate in this repo is provably blind to it. Two reference behaviours were discovered by running it: the DFlash drafter's default mask is block-wide against context+block K/V and RAISES, and passing the correct 2D mask only works with use_cache=False because a fresh DFlashCache reports kv_length 0. The green sets are scoped to step 0 because a defect that shifts the argmax contaminates every later step through the token it feeds back - localisation is only possible on the prefill. Five deviations are declared in the metadata and pinned by the test - eager attention, fp32 against a bf16 checkpoint, the ForConditionalGeneration wrapper (the softcap lives only there), shrunk special-token ids, and output_multiplier kept at the released value rather than recomputed. TOLERANCES ADDED 2026-08-11 for S2 item 1: per-operator fp32 floors for all thirteen buckets, from --dtype float64 (the whole model in double, no island needed) against each fp32 golden, measured at BOTH draws because attend's floor is 2.1x apart between them - 7.819e-6 and 1.639e-5 - so a one-draw floor would have set the threshold at half what a correct kernel needs. SIX rows are tabled as of 2026-08-12 -- attend, rope, o_proj, logits, norm and qk_norm; attend's is floor 1.639e-5, weakest targeting defect 2.086e0 (kv_broadcast_blocked), Rel(1.64e-4). (This said "ONE row is tabled" through five more landing; the count is stated once here and gated by glimmer_tolerance.rs, nowhere else.) qk_scale_on_k is EXCLUDED from that set at 6.232e-4 (38x the floor, which would have forced ExactOnly) because (s*q).k and q.(s*k) are the same product - the defect is invisible to this kernel by algebra, not by resolution. CORRECTED 2026-08-12: this said it "is caught in qk_norm/proj instead" at 2.16e0, and measuring it for S3 item 2's row showed all of that false -- qk_norm moves 4.324e-4/2.825e-4 and proj 4.185e-4/2.449e-4, the 2.16e0 was qk_norm_off's attend figure off the wrong row, and the defect is caught NOWHERE at Rel strength because it scales k_proj's output UPSTREAM of a scale-invariant norm and so does not implement trap 3 at all. The other twelve buckets have floors and no row: a floor is half a row, and S2 compares them exactly until the other half is reasoned through.
 ---
 
 # The Muse Glimmer S1b anchor
@@ -203,8 +203,10 @@ become a threshold until the container is widened.
 
 ### The rows that exist, and why the others do not
 
-**Four rows exist as of 2026-08-12** — `attend`, `rope`, `o_proj` and `logits`, the last of them
-`ExactOnly`. `softcap_off` moves `logits` by 4.993e-5 / 4.879e-5 by draw, only **13.9x** the floor
+**Six rows exist as of 2026-08-12** — `attend`, `rope`, `o_proj`, `logits`, `norm` and `qk_norm`;
+`logits` is `ExactOnly`. (This said "Four" through two more landing. The set is gated by
+`glimmer_tolerance.rs::table_covers_exactly` and by nothing else, so a count in prose is a number
+that rots — this is the third place it had to be corrected in one round.) `softcap_off` moves `logits` by 4.993e-5 / 4.879e-5 by draw, only **13.9x** the floor
 against the 297x a `Rel` policy needs, and the reason is the TINY MODEL rather than the instrument:
 at untrained weights the logits sit in `tanh`'s linear region where `20*tanh(x*0.196/20)` is nearly
 the identity. **This anchor therefore cannot price the logit path**; S4's trained weights can.
@@ -249,10 +251,27 @@ norm. Pricing this operator against them would be the leak this file's own toler
 moves `attend` by only 6.232e−4, just 38× the floor — under the 297× a `Rel` tolerance needs, so
 counting it would have forced `attend` to `ExactOnly`. It must not: `(s·q)·k` and `q·(s·k)` are the
 same product, so moving the scale across the dot is invisible to this kernel **by algebra**, and
-6.232e−4 is the rounding difference between two spellings of one number. The defect is real and is
-caught where it is *not* equivalent — the qk-norm runs between the scale and the product, so
-`qk_norm` and `proj` see it at 2.16e0. Pricing an operator against a defect it provably cannot
-distinguish would have made this kernel exact-only on a false premise.
+6.232e−4 is the rounding difference between two spellings of one number. Pricing an operator against
+a defect it provably cannot distinguish would have made this kernel exact-only on a false premise.
+
+> **CORRECTED 2026-08-12, by running `--by-operator` for S3 item 2's row.** This closed with "the
+> defect is real and is caught where it is *not* equivalent — the qk-norm runs between the scale and
+> the product, so `qk_norm` and `proj` see it at 2.16e0." **All three claims are false.** Measured,
+> `qk_scale_on_k` moves `qk_norm` by 4.324e−4 / 2.825e−4 and `proj` by 4.185e−4 / 2.449e−4 — not
+> 2.16e0, which appears to be `qk_norm_off`'s `attend` figure (2.153e0) read off the wrong row.
+>
+> **So this defect is caught NOWHERE at `Rel` strength**: its largest movement anywhere is `attend`'s
+> 6.232e−4, 38× that floor. The exclusion above still stands on the algebra, but the consoling clause
+> does not, and an exclusion justified by "it is caught elsewhere" needs the elsewhere to exist.
+>
+> **The reason is that the defect does not implement the trap it is named for.** `defect_qk_scale_on_k`
+> multiplies `k_proj`'s OUTPUT by 3.87 — upstream of the weightless qk-norm, which is scale-invariant
+> but for its eps, so the norm removes it and the model is barely perturbed. The residue is the eps
+> term alone: `(eps/2)/mean(k²)·(1−1/3.87²)` at mean(k²) ≈ 0.016 predicts 2.9e−4, which is what came
+> out at both draws. §9 trap 3's damaging form is the MIRROR of what Q gets — `qk_norm(k) * 3.87`,
+> after the norm — and that has no defect run, so **nothing in this anchor gates trap 3**. Fixing it
+> means re-vendoring, which is a reviewed change and is left as an open item rather than folded into
+> S3 item 2.
 
 **`rope`'s defect set, added 2026-08-12 for S2 item 2.** Two defects target the rotation and **both
 are counted** — unlike `attend`'s excluded `qk_scale_on_k`, there is no algebraic identity hiding
@@ -277,6 +296,30 @@ resize masks, `rope_on_nope_layers` adds 56 captures), and `--by-operator` **ski
 rather than refusing the pair. It refused at first, which silently dropped exactly the two rows
 `attend` needed — the sweep printed no `attend` line for them at all, which reads as "the window
 defect leaves attention alone".
+
+**`qk_norm`'s defect set, added 2026-08-12 for S3 item 2.** Two defects touch the bucket and only
+one of them TARGETS it. Regenerated at both salts (the clean runs again came back byte-identical to
+the vendored goldens, a third independent check of the reproducibility claim) and scored with
+`--by-operator`:
+
+| defect | draw 1 | draw 2 | weaker |
+|---|---|---|---|
+| `qk_norm_off` — the norm skipped, §9 trap 2 | 1.575e0 | 1.483e0 | **1.483e0** |
+| `qk_scale_on_k` — EXCLUDED, see above | 4.324e−4 | 2.825e−4 | 2.825e−4 |
+
+Floor **7.845e−6**, weakest **1.483e0**, margin **189,000×** — `Rel(7.85e-5)`.
+
+**The exclusion is by LOCALITY, not by algebra, and the distinction matters.** `attend` excludes the
+same defect because `(s·q)·k` and `q·(s·k)` are one product — an identity. Here the scale is applied
+to `k_proj`'s output, i.e. to this operator's INPUT, and a correct norm reproduces the reference from
+whatever input it is given. An operator cannot be priced against a defect upstream of it. Counting it
+would have forced `ExactOnly` at 36× the floor, which is the same false-premise trap `attend`'s row
+records — arrived at twice, by two different routes.
+
+**What this row does NOT cover: the 3.87 scale itself.** `qk_norm.q` is captured BEFORE it, so no
+tensor in this bucket can see it. It is visible one capture later, in `q.pre_rope` (the `proj`
+bucket), which the driver takes on entry to `apply_rotary_pos_emb` — after norm and after scale. A
+port that omits the scale, or folds it into the softmax scale instead, reddens there and not here.
 
 ## What this does NOT establish
 

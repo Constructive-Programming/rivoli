@@ -835,6 +835,26 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// Muse Glimmer's weightless QK-norm over `rows` heads of `d`, in place, times `scale`.
+    ///
+    /// Q passes `qk_scale_factor` (3.87) and K passes 1.0 — the scale is Q's alone
+    /// (`glimmer-architecture.md` trap 3), and it is folded here rather than given a second pass
+    /// over the tensor. **Not `rmsnorm_batch`** (which multiplies a learned weight and stores bf16)
+    /// **and not `mla.hip::qk_norm`** (whose statistic is bf16 by DeepSeek-V4's reference); the
+    /// kernel's own comment carries both arguments.
+    ///
+    /// # Safety
+    /// `x` is a device buffer of `rows · d` live f32, written in place, live until the next
+    /// [`device_sync`]. `stream` is null or a live stream ordering every producer of `x`.
+    launch_rmsnorm_weightless_batch -> rivoli_rmsnorm_weightless_batch, "rmsnorm_weightless_batch" (
+        x: *mut f32,
+        rows: usize as i32,
+        d: usize as i32,
+        eps: f32,
+        scale: f32,
+        stream: *mut c_void,
+    );
+
     /// Interleaved RoPE in place over `count` segments of `seg` at `stride`.
     ///
     /// # Safety

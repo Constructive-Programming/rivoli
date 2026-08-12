@@ -749,3 +749,135 @@ fn the_drafter_does_not_share_the_targets_attention_shape() {
         16
     );
 }
+
+/// **The weightless QK-norm's AXIS, from the goldens' own bytes.**
+///
+/// A weightless RMS over `d` leaves `mean(y²) = mean(x²)/(mean(x²)+eps)`, i.e. 1 to within
+/// `eps/mean(x²)`. So every contiguous `head_dim` run of every `qk_norm.*` capture must have unit
+/// mean square — and that is a property only of a norm taken over THAT axis. A reference (or a port)
+/// normalising over the whole hidden state, over rows, or over the head COUNT leaves runs whose mean
+/// square is anything else, and every shape check still passes.
+///
+/// **Here rather than beside the kernel, because it needs no device.** `tests/glimmer_qk_norm.rs` is
+/// `#![cfg(feature = "rocm")]` end to end, and the only automated job in this repo is the FEATURELESS
+/// `host` one — so a golden-property check parked in that file is checked exactly as often as
+/// someone runs a GPU build by hand. Review, 2026-08-12.
+///
+/// **MEASURED: 2,304 head rows, worst |mean(y²) − 1| = 8.106e-4**, which is the eps term and nothing
+/// else at the reference's own activation scale.
+#[test]
+fn the_qk_norm_captures_are_normalised_over_head_dim_per_head() {
+    let (mut worst, mut runs) = (0.0f64, 0usize);
+    each_text(|v, g, c, (_, heads, kv, hd)| {
+        let layers = num(c, "num_hidden_layers");
+        let steps = meta_usize(g, "decode_steps");
+        for t in 0..=steps {
+            for l in 0..layers {
+                for (side, h) in [("q", heads), ("k", kv)] {
+                    let name = format!("t{t}.L{l}.qk_norm.{side}");
+                    let (shape, vals) = golden_read::float(g, &name);
+                    assert_eq!(shape[1], h, "{}: {name} head count", v.name);
+                    assert_eq!(shape[3], hd, "{}: {name} head_dim", v.name);
+                    for row in vals.chunks(hd) {
+                        let m =
+                            row.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / hd as f64;
+                        worst = worst.max((m - 1.0).abs());
+                        runs += 1;
+                    }
+                }
+            }
+        }
+    });
+    println!("{runs} head rows, worst |mean(y^2) - 1| = {worst:e}");
+    // The bound is the eps term itself, not a tolerance: a run's mean square falls below 1 by at
+    // most eps/mean(x²), which is ~1e-3 at these activations. 1e-2 leaves an order of margin while
+    // rejecting any other axis by orders.
+    assert!(
+        worst < 1e-2,
+        "a head_dim run has mean(y^2) off 1 by {worst:e} — the reference did not normalise over \
+         this axis"
+    );
+    assert!(runs > 0, "no captures were checked");
+}
+
+/// **Trap 3, refuted by the reference's own bytes: Q is scaled by 3.87 and K is not.**
+///
+/// `q.pre_rope` is captured on entry to `apply_rotary_pos_emb`, i.e. after the norm AND after the
+/// scale, while `qk_norm.q` is the norm's output before it — so their ratio is `qk_scale_factor`
+/// elementwise. `k.pre_rope` must be BIT-IDENTICAL to `qk_norm.k`.
+///
+/// **What each half is worth is NOT the same, and review corrected the framing.** The Q ratio is
+/// genuinely informative: it falls out of two DIFFERENT tensors and would break if the scale moved or
+/// changed value. The K assert is a tautology over these bytes — `modeling_muse_glimmer.py:342`
+/// normalises K and line 347 is the next statement touching it, so the forward hook's `out` and the
+/// rope tap's `k` are the SAME tensor object serialised twice. It cannot distinguish "the reference
+/// does not scale K" from "the harness captured one tensor under two names". Kept, because what it
+/// CAN catch is real: **a re-vendor where a future transformers release inserts any op between those
+/// two lines.** Call it a tripwire, not a gate.
+///
+/// **And it constrains the reference, not rivoli.** Trap 3 is a port-side defect; nothing here stops
+/// a caller passing 3.87 for K, the anchor has no defect run for that form, and until the layer loop
+/// lands there is no call site to gate. `kernels/linalg.hip` says so at the kernel. The
+/// `qk_scale_on_k` defect that exists scales `k_proj`'s output, upstream of a scale-invariant norm,
+/// and moves nothing anywhere by more than 6.2e-4 — measured and corrected in `anchor.md`
+/// 2026-08-12.
+///
+/// **MEASURED: the ratio over 10,368 elements is [3.8699996, 3.8700001]** — f32 rounding on one
+/// multiply, not a tolerance — **and 3,456 K elements are unchanged, across 28 roped cases.**
+#[test]
+fn the_reference_scales_q_by_qk_scale_factor_and_leaves_k_alone() {
+    let want = real()["qk_scale_factor"].as_f64().expect("qk_scale_factor") as f32;
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut pairs, mut k_elems, mut skipped) = (0usize, 0usize, 0usize);
+    each_text(|v, g, c, _| {
+        let layers = num(c, "num_hidden_layers");
+        let steps = meta_usize(g, "decode_steps");
+        let roped = ints(g, "layer_is_roped").to_vec();
+        for t in 0..=steps {
+            for l in 0..layers {
+                // **NoPE layers have no `pre_rope` capture at all** — they skip the rotation (§8)
+                // and both captures are taken inside its wrapper. Reading the name unconditionally
+                // is how this first ran, and `float()` panicked, which is the gate working.
+                if roped[l] == 0 {
+                    skipped += 1;
+                    continue;
+                }
+                let (_, qn) = golden_read::float(g, &format!("t{t}.L{l}.qk_norm.q"));
+                let (_, qs) = golden_read::float(g, &format!("t{t}.L{l}.q.pre_rope"));
+                assert_eq!(qn.len(), qs.len(), "{}: t{t}.L{l} q lengths", v.name);
+                for (n, s) in qn.iter().zip(qs) {
+                    // Exact zeros carry no ratio, and a zero norm output means the whole head was
+                    // zero — which says nothing about the scale.
+                    if *n != 0.0 {
+                        let r = s / n;
+                        lo = lo.min(r);
+                        hi = hi.max(r);
+                        pairs += 1;
+                    }
+                }
+                let (_, kn) = golden_read::float(g, &format!("t{t}.L{l}.qk_norm.k"));
+                let (_, kp) = golden_read::float(g, &format!("t{t}.L{l}.k.pre_rope"));
+                assert_eq!(
+                    kn, kp,
+                    "{}: t{t}.L{l} K changed between the norm and the rotation — nothing may \
+                     scale K (trap 3)",
+                    v.name
+                );
+                k_elems += kn.len();
+            }
+        }
+    });
+    println!(
+        "q ratio over {pairs} elements: [{lo:.7}, {hi:.7}]; {k_elems} K elements unchanged; {skipped} NoPE cases skipped"
+    );
+    assert!(
+        (lo - want).abs() < 1e-5 && (hi - want).abs() < 1e-5,
+        "Q's post-norm scale is [{lo}, {hi}], not the config's {want}"
+    );
+    // Both kinds of layer must occur, or the skip above is quietly covering everything.
+    assert!(
+        pairs > 0 && k_elems > 0 && skipped > 0,
+        "{pairs} q pairs, {k_elems} k elements, {skipped} skipped — the goldens must carry both \
+         roped and NoPE layers"
+    );
+}

@@ -385,6 +385,7 @@ extern "C" __global__ void rmsnorm_single(
 // declined separately: `block_sum_lds` carries a trailing barrier that spelling lacks, and
 // `common.hpp` prices that as UNMEASURED on the decode path.
 //
+
 // Safe in place (`y` may alias `x`), and the argument needs one more clause than `swiglu`'s above.
 // There, each thread reads its own index and writes its own, so the write depending on the read is
 // the whole proof. Here loop 1 reads OTHER threads' indices — so the `__syncthreads()` inside
@@ -406,6 +407,51 @@ extern "C" __global__ void rmsnorm_centered_single(
     for (int i = threadIdx.x; i < n; i += blockDim.x) local += x[i] * x[i];
     float inv = 1.0f / sqrtf(block_sum_lds(local, red) / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * (1.0f + w[i]);
+}
+
+// Muse Glimmer's WEIGHTLESS QK-norm, over `d` = head_dim, one block per (row, head), IN PLACE —
+// and the `scale` that follows it, folded in. `glimmer-architecture.md` sections 7 and 9:
+//
+//     q = qk_norm(q) * qk_scale_factor      # 3.87, Q ALONE            M:341
+//     k = qk_norm(k)                        # normed, NOT scaled       M:342
+//
+// So Q passes `qk_scale_factor` and K passes `1.0f`. The scale is folded rather than given its own
+// pass because a second pass over q is a second full read of the tensor, which section 7's
+// bytes-per-token budget spends for nothing. It costs one association change against the reference,
+// which applies the scale to the norm's OUTPUT: `x*(s*rs)` here against `(x*rs)*s` there, one
+// rounding apart at ~6e-8 — four decades under this operator's row.
+//
+// **NOTHING GATES A CALLER THAT PASSES 3.87 FOR K, which is section 9's trap 3.** An earlier version
+// of this comment said `tests/glimmer_qk_norm.rs` reddens on it; that is false and review caught it.
+// Every scoring path there passes the SAME scale to the kernel and to the oracle, so no test can
+// observe which one a caller chose, and there is no engine call site yet to be wrong. What the
+// goldens DO settle is that the reference leaves K unscaled
+// (`glimmer_anchor.rs::the_reference_scales_q_by_qk_scale_factor_and_leaves_k_alone`) — a fact about
+// the reference, not a constraint on this caller. The anchor has no defect run for the damaging form
+// either. **The gate belongs to the wiring item, and until it lands this argument is unguarded.**
+//
+// **The near-miss a reader will reach for first is twenty lines above: `rmsnorm_centered_single`.**
+// With `w` all zeros — the form Glimmer's sandwich norms actually ship — its arithmetic IS this
+// one's. What it cannot do is the geometry: `dim3(1)`, one statistic per launch, out of place, no
+// scale. Thirty-two Q heads per row would be thirty-two launches.
+//
+// The two distant ones fail on arithmetic instead. `rmsnorm_batch` multiplies a learned weight and
+// STORES bf16 — there is no weight here (`with_scale=False`, trap 2) and a bf16 store is 2^-9 of
+// systematic scale, 25x this operator's tolerance. `mla.hip::qk_norm` is exactly this shape but
+// rounds through bf16 at four points, deliberately, on an inference `mla.hip` marks INHERITED,
+// because DeepSeek-V4's reference does; Glimmer's is f32 throughout.
+//
+// One block per row, `block_sum_lds` for the ladder (the rule `headtail.hip` states), and
+// `1.0f/sqrtf` rather than `rsqrtf` for `rmsnorm_batch`'s reason: this factor multiplies a whole
+// head, so a hardware approximation is a systematic scale rather than a rounding difference.
+extern "C" __global__ void rmsnorm_weightless_batch(float* __restrict__ x, int d, float eps,
+                                                    float scale) {
+    __shared__ float red[256];
+    float* row = x + (size_t)blockIdx.x * d;
+    float p = 0.0f;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) p += row[i] * row[i];
+    float rs = scale / sqrtf(block_sum_lds(p, red) / (float)d + eps);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) row[i] *= rs;
 }
 
 // `kernel.py::act_quant(x, 128, "ue8m0", …, inplace=True)` over `n_rows × row_len` f32,
@@ -885,6 +931,24 @@ extern "C" int rivoli_rmsnorm_centered_single(
     hipGetLastError();
     hipLaunchKernelGGL(rmsnorm_centered_single, dim3(1), dim3(256), 0, (hipStream_t)stream, x, w,
                        n, eps, y);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// `rows` heads of `d` f32, normed in place and scaled, on `stream`.
+//
+// Three guards, and `scale` earns its place for `eps`'s reason: it comes from a config field
+// (`qk_scale_factor`), and a zero or non-finite one silently multiplies every Q head by nothing or
+// by garbage. **They reject the unusable, not the implausible** — `eps` = 1e30 and `scale` = 1e-45
+// both pass, and a numeric range that rejected them would be the guard restating the config.
+extern "C" int rivoli_rmsnorm_weightless_batch(float* x, int rows, int d, float eps, float scale,
+                                               void* stream) {
+    if (rows <= 0 || d <= 0) return 1001;
+    if (!(eps > 0.0f && eps < INFINITY)) return 1002;
+    if (!(scale > 0.0f && scale < INFINITY)) return 1003;
+    hipGetLastError();
+    hipLaunchKernelGGL(rmsnorm_weightless_batch, dim3((unsigned)rows), dim3(256), 0,
+                       (hipStream_t)stream, x, d, eps, scale);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

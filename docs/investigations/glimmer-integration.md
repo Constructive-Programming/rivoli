@@ -322,8 +322,46 @@ What the loop must get right, each with its gate:
    second entry point, the `rope_split_half` precedent — a wrong-form call site must not be
    one bool away), tolerance row measured from the anchor's norm buckets BEFORE it exists,
    S2-style.
-2. **Weightless QK-norm + `qk_scale_factor` 3.87 on Q alone** — trap 2's territory; scored
-   against `q_norm.out`/`k_norm.out` captures.
+2. **Weightless QK-norm + `qk_scale_factor` 3.87 on Q alone. DONE 2026-08-12.**
+   `rmsnorm_weightless_batch` (`kernels/linalg.hip`), one block per (row, head) over `head_dim`, in
+   place, with the scale FOLDED — Q passes 3.87, K passes 1.0. Neither near-miss kernel would do:
+   `rmsnorm_batch` multiplies a learned weight and stores bf16 (2^-9 of systematic scale, 25x this
+   row's tolerance) and `mla.hip::qk_norm` computes the whole statistic in bf16, deliberately,
+   because DeepSeek-V4's reference does. Scored against the `qk_norm` row at head_dim **128**, which
+   no golden reaches: **worst 1.410519e-7 over six widths** — 128 at both scales plus ragged
+   257/300/512/1000 — at width 1000 and scale 3.87, against the row's 7.85e-5 and a second, tighter
+   bar of 2.0e-6 against this kernel's own measurement. That single worst is what the test PRINTS;
+   the three separate figures first recorded here (unscaled / at 3.87 / ragged) came from a draft
+   that reported per-case and are no longer derivable from any run, which is why they are gone
+   rather than corrected. Trap 2 (skipping a norm that ships no tensor) reddens at **7.775e-1,
+   9,905x** — printed, where this line first said 9,903x from no run I can find. A one-off red proof
+   dropping the scale reddens Q and leaves K untouched; it was reverted, so its magnitudes are not
+   quoted here.
+
+   **The row was measured FIRST, and measuring it found three doc defects.** Floor 7.845e-6, weakest
+   targeting defect `qk_norm_off` 1.483e0, margin 189,000x, `Rel(7.85e-5)`. `qk_scale_on_k` is
+   EXCLUDED by LOCALITY (it perturbs `k_proj`'s output, upstream of this operator, and an RMS norm
+   is scale-invariant but for eps) — a different argument from `attend`'s exclusion of the same
+   defect by algebra, and counting it would have forced `ExactOnly` at 36x the floor on a false
+   premise, which is the trap `attend`'s row already records.
+
+   > **The measurement overturned three claims in `anchor.md`, which owns the correction and carries
+   > it in full.** In short: `qk_scale_on_k` is caught NOWHERE at `Rel` strength, and it does not
+   > implement the trap it is named for. What is new HERE is the consequence — **trap 3 is gated from
+   > the goldens' own bytes instead**: `q.pre_rope / qk_norm.q` is 3.87 over 10,368 elements and
+   > `k.pre_rope` is bit-identical to `qk_norm.k` over 3,456, in `glimmer_anchor.rs`, deviceless so
+   > CI runs it. That gates the REFERENCE; nothing yet gates a rivoli caller passing 3.87 for K,
+   > and that gap belongs to the wiring item.
+
+   **What the goldens cannot do here: score the norm's arithmetic.** Its input is not captured —
+   there is no `q_proj.out`, and nothing upstream of `qk_norm.*` exists — so unlike the sandwich
+   norms there is no chain, and the arithmetic goes against a host oracle as the MLP's did. What
+   they DO pin is the AXIS: 2,304 head rows all have mean(y²) within 8.106e-4 of 1, which is true
+   only of a norm over head_dim per head. Two of this port's assumptions died running it — NoPE
+   layers have no `pre_rope` capture at all (the rotation is skipped, and both captures live inside
+   its wrapper), and the norm is NOT idempotent at this eps (re-norming moves a normed vector 9.6e-5,
+   comparable to the row), so the reason a capture cannot serve as this kernel's input is a ratio
+   argument and not an identity.
 3. **The gate operand.** S2 proved the kernel and explicitly not the wiring; the anchor
    captures both `input_layernorm.out` and `attn.gate_proj.out` per (step, layer), so the
    loop is scored against `gate_proj.out` directly — the realistic trap-4 miswiring

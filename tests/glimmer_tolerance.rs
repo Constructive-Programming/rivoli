@@ -21,7 +21,7 @@ mod tolerance;
 /// **Every row's policy still follows from the two numbers behind it.**
 ///
 /// The rows that do NOT exist carry as much of the meaning. Thirteen operator buckets have measured
-/// fp32 floors recorded in `anchor.md`; one has a row here. A floor is only half of a tolerance —
+/// fp32 floors recorded in `anchor.md`; six have a row here. A floor is only half of a tolerance —
 /// the other half is deciding which defects the operator is answerable for, and that is per-kernel
 /// reasoning rather than a number a sweep produces. `attend`'s row exists because S2 item 1 did
 /// that reasoning, including the exclusion that decided its policy (`qk_scale_on_k` is invisible to
@@ -37,6 +37,6 @@ fn every_glimmer_row_follows_from_its_measurements() {
     // nothing happening at all.
     tolerance::table_covers_exactly(
         tolerance::GLIMMER,
-        &["attend", "rope", "o_proj", "logits", "norm"],
+        &["attend", "rope", "o_proj", "logits", "norm", "qk_norm"],
     );
 }

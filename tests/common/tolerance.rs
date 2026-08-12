@@ -118,7 +118,9 @@ pub const K3: &[Tol] = &[
 /// Muse Glimmer, measured 2026-08-11 on CPU (this reference needs no device), `--mode text`, **both
 /// weight draws**. Re-derive with the two commands in `glimmer-reference/anchor.md`.
 ///
-/// Five rows, one per item that earned one — four from S2 and `norm` measured for S3 item 1
+/// One row per item that earned one — four from S2, `norm` for S3 item 1 and `qk_norm` for item 2.
+/// (The count was spelled out here and went stale twice; `glimmer_tolerance.rs`'s gate is what
+/// actually pins the set, so the number is gone rather than corrected a third time.)
 /// before its kernel existed (this doc said "One row, and that is deliberate" until 2026-08-12,
 /// having been left behind by three items that landed rows). Floors are measured for
 /// all thirteen buckets and recorded in `anchor.md`, but a floor is half a row — the other half
@@ -212,6 +214,45 @@ pub const GLIMMER: &[Tol] = &[
         floor: 7.701e-6,
         weakest_defect: 2.024e-2,
         policy: Policy::Rel(7.70e-5),
+    },
+    // Muse Glimmer's WEIGHTLESS QK-norm, S3 item 2 — 112 tensors, `qk_norm.q` and `qk_norm.k` at
+    // every (step, layer), captured BEFORE the 3.87 scale so the golden separates the norm from it.
+    //
+    // **Measured 2026-08-12, BEFORE the kernel exists.** Two defects touch this bucket and only one
+    // of them targets it:
+    //
+    // | defect | draw 1 | draw 2 | weaker |
+    // |---|---|---|---|
+    // | `qk_norm_off` — the norm skipped, which is trap 2 (it ships no tensor) | 1.575e0 | 1.483e0 | **1.483e0** |
+    // | `qk_scale_on_k` — `qk_scale_factor` on K too | 4.324e-4 | 2.825e-4 | 2.825e-4 |
+    //
+    // **`qk_scale_on_k` is EXCLUDED, and for a different reason than `attend`'s exclusion of the
+    // same defect.** There it was an algebraic identity: `(s*q).k` and `q.(s*k)` are one product.
+    // Here the driver applies the scale to `k_proj`'s OUTPUT, i.e. to this operator's input, and an
+    // RMS norm cancels a scalar on its input but for the eps — so a correct kernel handed the scaled
+    // input reproduces the perturbed reference exactly, and no kernel-vs-golden comparison could
+    // ever produce this signal. Counting it would have forced `ExactOnly` at 36x the floor, on a
+    // false premise — the trap the `attend` row records.
+    //
+    // > **Two corrections review made to this paragraph, 2026-08-12.** (1) It said "an operator
+    // > cannot be priced against a defect in its INPUT", which is too broad and contradicts this
+    // > anchor's own bucketing — `operator_of` files `attend.q` and both caches, all inputs, into
+    // > `attend`, and that row is priced on them. The narrow true form is the one above: a defect
+    // > this operator provably CANCELS is not one it can be priced against. (2) It said the
+    // > 2.825e-4 residue "is the eps term alone", with `mean(k²) ≈ 0.016` back-solved from the
+    // > answer — a fitted identity, not a check. The axis measurement in the same round bounds it:
+    // > `1 − mean(y²) = eps/(m+eps)` and the worst run is 8.106e-4, so the smallest `m` anywhere is
+    // > 1.233e-2, which caps the eps residue at **3.771e-4** — under draw 1's 4.324e-4. So part of
+    // > that figure is cross-layer contamination reaching the `qk_norm.q` captures, the very
+    // > category this table's other rows refuse to price on. The exclusion is right twice over; the
+    // > sentence explaining it was right once.
+    //
+    // Margin 1.483e0 / 7.845e-6 = **189,000x**, against the 297x a `Rel` policy needs.
+    Tol {
+        operator: "qk_norm",
+        floor: 7.845e-6,
+        weakest_defect: 1.483e0,
+        policy: Policy::Rel(7.85e-5),
     },
     // The logit path, S2 item 5 — and the one Glimmer operator this anchor CANNOT price.
     //
