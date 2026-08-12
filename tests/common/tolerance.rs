@@ -184,6 +184,28 @@ pub const GLIMMER: &[Tol] = &[
         weakest_defect: 3.688e0,
         policy: Policy::Rel(8.29e-5),
     },
+    // The logit path, S2 item 5 — and the one Glimmer operator this anchor CANNOT price.
+    //
+    // `softcap_off` moves `logits` by 4.993e-5 / 4.879e-5 by draw, so the weaker is below: only
+    // **13.9x** the floor, far under the 297x a `Rel` policy needs. Hence `ExactOnly`, and the
+    // reason is not insufficient resolution — it is the TINY MODEL. The softcap is
+    // `20*tanh(x*0.196/20)`, and at untrained weights the logits are small enough that `tanh` is
+    // in its linear region, where the operation is very nearly the identity. At vocab 202048 with
+    // trained weights it bites much harder. So this row says "the anchor cannot separate a correct
+    // softcap from an omitted one", NOT "the softcap barely matters".
+    //
+    // `ids` moves by **exactly 0.000e0** at both draws, which is §5's argmax-invariance stated as
+    // a measurement: every greedy gate in this repo is provably blind here.
+    //
+    // What follows for S2 item 5: its kernel is scored against a host `tanh` at magnitudes where
+    // the function has shape, not against these goldens, and the omission is caught structurally.
+    // S4 is where trained logits can price it.
+    Tol {
+        operator: "logits",
+        floor: 3.520e-6,
+        weakest_defect: 4.879e-5,
+        policy: Policy::ExactOnly,
+    },
 ];
 
 /// The tolerance for one operator in one model's table, or `None` if that table does not cover it.

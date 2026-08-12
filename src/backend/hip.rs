@@ -826,6 +826,36 @@ launchers! {
     /// # Safety
     /// `x` is `n` writable f32 and `g` is `n` readable f32, both live until the next
     /// [`device_sync`], and they must not alias — both are `__restrict__`.
+    /// `x[i] = cap * tanh(x[i] * mult / cap)` — Muse Glimmer's logit path, applied to the head's
+    /// output. `mult` is `output_multiplier`, `cap` is `final_logit_softcapping`.
+    ///
+    /// **Every greedy gate in this repo is provably blind to omitting this.** `mult > 0` and `tanh`
+    /// is strictly increasing, so it cannot move an argmax — the anchor measured `softcap_off`
+    /// leaving `emitted.ids` bit-identical while the logits moved. It changes every probability,
+    /// so its evidence must come from logits and never from what was decoded.
+    ///
+    /// # Safety
+    /// `x` is `n` writable f32, live until the next [`device_sync`].
+    launch_logit_softcap -> rivoli_logit_softcap, "logit_softcap" (
+        x: *mut f32,
+        n: usize as i32,
+        mult: f32,
+        cap: f32,
+    );
+
+    /// `x[i] *= sigmoid(g[i])` — Muse Glimmer's attention output gate, applied between the attend
+    /// and `o_proj`.
+    ///
+    /// **`g` must be `gate_proj(LAYER INPUT)`, not anything derived from `x`.** The reference
+    /// computes the gate from the post-`input_layernorm` activation (`glimmer-architecture.md`
+    /// §4 item 3); gating on the attention output has the right shapes and the wrong model, and no
+    /// signature can prevent it — `tests/glimmer_gate.rs` is what holds a caller to it.
+    ///
+    /// Not [`launch_swiglu`]: that is `silu(g)*u`, which carries an extra factor of `g`.
+    ///
+    /// # Safety
+    /// `x` is `n` writable f32 and `g` is `n` readable f32, both live until the next
+    /// [`device_sync`], and they must not alias — both are `__restrict__`.
     launch_sigmoid_gate -> rivoli_sigmoid_gate, "sigmoid_gate" (
         x: *mut f32,
         g: *const f32,

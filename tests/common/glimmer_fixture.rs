@@ -269,3 +269,74 @@ pub fn sync_read(b: &rivoli::memory::device::DeviceBuf) -> Vec<f32> {
     rivoli::backend::hip::device_sync().unwrap();
     f32v(&back(b))
 }
+
+// ---- device-op wrappers -------------------------------------------------------------------
+//
+// The S2 fixtures kept spelling these, and jscpd kept rejecting the next copy. They live here for
+// the same reason `sync_read` does: a launch wrapper is three lines of pointer casts where a
+// mistake is a wrong answer rather than a compile error, and one copy is one place to be right.
+
+/// A cheap deterministic fill in `[-scale, scale)`. The period must not divide any width these
+/// fixtures use, or a transposed or strided read lands on an equal value and passes.
+pub fn fill(n: usize, salt: usize, scale: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let u = ((i.wrapping_mul(2_654_435_761).wrapping_add(salt * 40_503)) % 65_536) as f32;
+            (u / 32_768.0 - 1.0) * scale
+        })
+        .collect()
+}
+
+/// bf16 truncation, matching what a bf16 checkpoint holds. A host reference MUST see these values
+/// and not the f32 originals, or the comparison measures the fixture's rounding instead of the
+/// kernel's arithmetic.
+pub fn to_bf16(v: &[f32]) -> Vec<u16> {
+    v.iter().map(|x| (x.to_bits() >> 16) as u16).collect()
+}
+
+pub fn from_bf16(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+/// `out[j] = Σ_i x[i] · w[j][i]` for one activation row, via `gemm_bf16`.
+pub fn gemv_bf16(x: &[f32], w: &[u16], n: usize, k: usize) -> Vec<f32> {
+    assert_eq!(x.len(), k, "activation width");
+    assert_eq!(w.len(), n * k, "weight elements");
+    let xb = dev(&f32b(x));
+    let wb = dev(&w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
+    let ob = zeros(n * 4);
+    // SAFETY: `x` is `k` live f32, `w` is `n*k` live u16, `out` is `n` writable f32, none aliasing
+    // another, all live until the sync in `sync_read`. m = 1: one activation row.
+    unsafe {
+        rivoli::backend::hip::launch_gemm_bf16(
+            xb.ptr() as *const f32,
+            wb.ptr() as *const u16,
+            ob.ptr() as *mut f32,
+            1,
+            n,
+            k,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("gemm_bf16 launch");
+    sync_read(&ob)
+}
+
+/// `h = silu(g) * u` via `swiglu`.
+pub fn swiglu(g: &[f32], u: &[f32]) -> Vec<f32> {
+    assert_eq!(g.len(), u.len(), "swiglu operands");
+    let (gb, ub) = (dev(&f32b(g)), dev(&f32b(u)));
+    let hb = zeros(g.len() * 4);
+    // SAFETY: three distinct live buffers of `g.len()` f32 each, all outliving the sync below.
+    unsafe {
+        rivoli::backend::hip::launch_swiglu(
+            gb.ptr() as *const f32,
+            ub.ptr() as *const f32,
+            g.len(),
+            hb.ptr() as *mut f32,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("swiglu launch");
+    sync_read(&hb)
+}

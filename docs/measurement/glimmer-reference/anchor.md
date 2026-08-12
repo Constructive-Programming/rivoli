@@ -203,6 +203,17 @@ become a threshold until the container is widened.
 
 ### The rows that exist, and why the others do not
 
+**Four rows exist as of 2026-08-12** — `attend`, `rope`, `o_proj` and `logits`, the last of them
+`ExactOnly`. `softcap_off` moves `logits` by 4.993e-5 / 4.879e-5 by draw, only **13.9x** the floor
+against the 297x a `Rel` policy needs, and the reason is the TINY MODEL rather than the instrument:
+at untrained weights the logits sit in `tanh`'s linear region where `20*tanh(x*0.196/20)` is nearly
+the identity. **This anchor therefore cannot price the logit path**; S4's trained weights can.
+`ids` moves by exactly 0.000e0 at both draws, which is section 5's argmax-invariance as a
+measurement. `o_proj`'s row comes from `gate_disabled` at 3.759e0 / 3.688e0 (weakest 3.688e0,
+margin 444,700x) and `rope`'s from `rope_interleaved` / `rope_on_nope_layers` (weakest 1.811e0,
+margin 379,000x).
+
+The original note, kept because the reasoning is the reusable part:
 `tests/common/tolerance.rs::GLIMMER` carries **`attend`** (floor 1.639e−5, weakest targeting defect
 2.086e0, `Rel(1.64e-4)`) and, since 2026-08-12, **`rope`** (floor 4.773e−6, weakest targeting defect
 1.811e0, `Rel(4.77e-5)`). A floor is half a row — the other half is deciding which defects the

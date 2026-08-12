@@ -35,5 +35,5 @@ fn every_glimmer_row_follows_from_its_measurements() {
     // The spelling S2's fixtures look a row up by. A rename goes red here rather than silently
     // returning `None`, which a caller would experience as "no tolerance applies" — i.e. as
     // nothing happening at all.
-    tolerance::table_covers_exactly(tolerance::GLIMMER, &["attend", "rope", "o_proj"]);
+    tolerance::table_covers_exactly(tolerance::GLIMMER, &["attend", "rope", "o_proj", "logits"]);
 }

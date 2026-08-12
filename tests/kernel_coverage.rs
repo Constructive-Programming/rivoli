@@ -379,6 +379,7 @@ const OWNERS: &[(&str, &[&str])] = &[
     // each kernel against the S1b goldens before S3 writes the layer loop that calls it.
     ("rope_split_half", &[]),
     // Muse Glimmer's attention output gate. Empty for the same reason as its two siblings.
+    ("logit_softcap", &[]),
     ("sigmoid_gate", &[]),
     ("swiglu", &["gpu.rs", "f4gpu.rs"]),
     ("swiglu_clamped_bf16", &[]),

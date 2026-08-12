@@ -36,11 +36,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
-use rivoli::backend::hip::{launch_gemm_bf16, launch_swiglu};
-
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
-use fixture::{dev, f32b, sync_read, worst_rel, zeros};
+use fixture::{fill, from_bf16, gemv_bf16, swiglu, to_bf16, worst_rel};
 
 /// Glimmer's text-side MLP shape, from `glimmer-architecture.md` §1 and the config this port
 /// vendors. Not read from the tiny config: the tiny config deliberately shrinks these, and the
@@ -54,71 +52,6 @@ const INTER: usize = 19968;
 /// tests the same arithmetic. 64 covers the first row, the last, and the tail past every power of
 /// two where an indexing bug would live.
 const SPOT: usize = 64;
-
-/// A cheap deterministic fill in [-1, 1). Values must not repeat with a period that divides the
-/// width, or a transposed or strided read would land on an equal value and pass.
-fn fill(n: usize, salt: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| {
-            ((i.wrapping_mul(2_654_435_761).wrapping_add(salt * 40_503)) % 65_536) as f32 / 32_768.0
-                - 1.0
-        })
-        .collect()
-}
-
-/// bf16 truncation, matching what a bf16 checkpoint holds: the kernel reads `u16` and widens, so
-/// the host reference has to see the SAME values or the comparison measures the rounding of the
-/// fixture rather than the arithmetic of the kernel.
-fn to_bf16(v: &[f32]) -> Vec<u16> {
-    v.iter().map(|x| (x.to_bits() >> 16) as u16).collect()
-}
-
-fn from_bf16(b: u16) -> f32 {
-    f32::from_bits((b as u32) << 16)
-}
-
-/// `out[j] = Σ_i x[i] · w[j][i]` for one row, computed on the device by `gemm_bf16`.
-fn gemv(x: &[f32], w: &[u16], n: usize, k: usize) -> Vec<f32> {
-    assert_eq!(x.len(), k, "activation width");
-    assert_eq!(w.len(), n * k, "weight elements");
-    let xb = dev(&f32b(x));
-    let wb = dev(&w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    let ob = zeros(n * 4);
-    // SAFETY: `x` is `k` live f32, `w` is `n*k` live u16, `out` is `n` writable f32, none aliasing
-    // another, all live until the `device_sync` below. m = 1: one activation row.
-    unsafe {
-        launch_gemm_bf16(
-            xb.ptr() as *const f32,
-            wb.ptr() as *const u16,
-            ob.ptr() as *mut f32,
-            1,
-            n,
-            k,
-            std::ptr::null_mut(),
-        )
-    }
-    .expect("gemm_bf16 launch");
-    sync_read(&ob)
-}
-
-/// `h = silu(g) * u` on the device.
-fn swiglu(g: &[f32], u: &[f32]) -> Vec<f32> {
-    assert_eq!(g.len(), u.len(), "swiglu operands");
-    let (gb, ub) = (dev(&f32b(g)), dev(&f32b(u)));
-    let hb = zeros(g.len() * 4);
-    // SAFETY: three distinct live buffers of `g.len()` f32 each, all outliving the sync below.
-    unsafe {
-        launch_swiglu(
-            gb.ptr() as *const f32,
-            ub.ptr() as *const f32,
-            g.len(),
-            hb.ptr() as *mut f32,
-            std::ptr::null_mut(),
-        )
-    }
-    .expect("swiglu launch");
-    sync_read(&hb)
-}
 
 /// Spot indices spread across `n`: the two ends, then a stride that is coprime with every power of
 /// two so the sample does not sit on one alignment.
@@ -149,10 +82,10 @@ fn the_projections_run_at_glimmers_real_widths() {
     // evidence behind it, and saying so is better than a round number that looks principled.
     let bar = 1e-4_f32;
     for (label, n, k) in [("gate/up", INTER, HIDDEN), ("down", HIDDEN, INTER)] {
-        let x = fill(k, 1);
-        let wf = fill(n * k, 2);
+        let x = fill(k, 1, 1.0);
+        let wf = fill(n * k, 2, 1.0);
         let w = to_bf16(&wf);
-        let got = gemv(&x, &w, n, k);
+        let got = gemv_bf16(&x, &w, n, k);
         assert_eq!(got.len(), n, "{label}: output width");
         assert!(
             got.iter().all(|v| v.is_finite()),
@@ -185,10 +118,10 @@ fn the_projections_run_at_glimmers_real_widths() {
 /// projections have identical dimensions so nothing about the types objects.
 #[test]
 fn the_composition_matches_a_host_mlp_and_the_operand_order_matters() {
-    let x = fill(HIDDEN, 5);
-    let wg = to_bf16(&fill(INTER * HIDDEN, 6));
-    let wu = to_bf16(&fill(INTER * HIDDEN, 7));
-    let wd = to_bf16(&fill(HIDDEN * INTER, 8));
+    let x = fill(HIDDEN, 5, 1.0);
+    let wg = to_bf16(&fill(INTER * HIDDEN, 6, 1.0));
+    let wu = to_bf16(&fill(INTER * HIDDEN, 7, 1.0));
+    let wd = to_bf16(&fill(HIDDEN * INTER, 8, 1.0));
 
     let host = |gate_first: bool| -> Vec<f32> {
         let dot = |w: &[u16], j: usize, k: usize, v: &[f32]| -> f32 {
@@ -208,9 +141,9 @@ fn the_composition_matches_a_host_mlp_and_the_operand_order_matters() {
             .collect()
     };
 
-    let g = gemv(&x, &wg, INTER, HIDDEN);
-    let u = gemv(&x, &wu, INTER, HIDDEN);
-    let out = gemv(&swiglu(&g, &u), &wd, HIDDEN, INTER);
+    let g = gemv_bf16(&x, &wg, INTER, HIDDEN);
+    let u = gemv_bf16(&x, &wu, INTER, HIDDEN);
+    let out = gemv_bf16(&swiglu(&g, &u), &wd, HIDDEN, INTER);
     let sampled: Vec<f32> = spots(HIDDEN).iter().map(|&j| out[j]).collect();
 
     let right = host(true);

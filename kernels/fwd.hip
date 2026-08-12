@@ -119,6 +119,31 @@ extern "C" __global__ void sigmoid_gate(
     if (i < n) x[i] *= 1.0f / (1.0f + expf(-g[i]));
 }
 
+// x[i] = cap * tanh(x[i] * mult / cap)  — Muse Glimmer's logit path, S2 item 5 of
+// docs/investigations/glimmer-port.md. `mult` is `output_multiplier` and `cap` is
+// `final_logit_softcapping`, both from the config and both PARAMETERS: a wrong multiplier is
+// fluent, and hard-coding either would put this model's constants in a kernel the next model
+// would reuse (glimmer-architecture.md §5).
+//
+// **THIS IS THE OPERATION EVERY GREEDY GATE IN THIS REPO IS PROVABLY BLIND TO.** `mult` > 0 and
+// `tanh` is strictly increasing, so the composition cannot change which token an argmax picks:
+// greedy equality, teacher-forced argmax and byte-identical output all pass with this kernel
+// omitted entirely. It changes every PROBABILITY — NLL, perplexity, sampling, any confidence
+// gate. The anchor measured exactly that: `softcap_off` moves 7 of 1103 captures and leaves
+// `emitted.ids` identical (§9 trap 12, `glimmer-reference/anchor.md`). So this kernel's evidence
+// has to come from the logits themselves, never from what was decoded.
+//
+// A separate launch from the head GEMV, for the reason the gate above is separate: folding it in
+// would make the head's fixture stop meaning "the projection is right", and the fusion is worth
+// one pass over 202048 floats that nobody has priced.
+extern "C" __global__ void logit_softcap(
+    float* __restrict__ x, int n, float mult, float cap) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // `tanhf`, not a `1 - 2/(exp(2z)+1)` rewrite: the reference calls `torch.tanh`, and a
+    // rewrite would be a second approximation to price against a tolerance measured on the first.
+    if (i < n) x[i] = cap * tanhf(x[i] * mult / cap);
+}
+
 // Greedy argmax over `logits[0..n]`, reproducing the host fold in gpu.rs::argmax
 // EXACTLY: best=0, bv=-inf; for i: if logits[i] > bv { bv=logits[i]; best=i }. The
 // combine below is associative + commutative and yields the SAME result set as
@@ -216,6 +241,17 @@ extern "C" int rivoli_sigmoid_gate(float* x, const float* g, int n) {
 
 // Single-block argmax reduction (256 threads, grid-stride). `out_idx`/`out_val`
 // are one device word each (the caller's 8-byte result buffer). Launch-only.
+extern "C" int rivoli_logit_softcap(float* x, int n, float mult, float cap) {
+    if (n <= 0) return 1001;
+    // `cap` divides, and `mult <= 0` would break the monotonicity the whole argmax-invariance
+    // argument rests on — both are config values, so a zero here means the config was not read.
+    if (!(cap > 0.0f) || !(mult > 0.0f)) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(logit_softcap, dim3((n + 255) / 256), dim3(256), 0, 0, x, n, mult, cap);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 extern "C" int rivoli_argmax(
     const float* logits, int n, int* out_idx, float* out_val) {
     if (n <= 0) return 1001;
