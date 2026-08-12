@@ -38,10 +38,14 @@ use rivoli::backend::hip::{device_sync, launch_argmax, launch_logit_softcap};
 
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
-use fixture::{dev, f32b, fill, from_bf16, gemv_bf16, sync_read, to_bf16, worst_rel, zeros};
+use fixture::{
+    GLIMMER_SHIPPED_CONFIG, dev, f32b, fill, from_bf16, gemv_bf16, sync_read, to_bf16, worst_rel,
+    zeros,
+};
 
 /// Glimmer's text vocabulary and the two logit-path constants, from `glimmer-architecture.md`
 /// §1/§5 — not read from the tiny config, which shrinks the vocabulary that is the whole subject.
+/// `the_constants_match_the_shipped_config` pins all three to the vendored `config.json`.
 ///
 /// The hidden width is deliberately absent: this file checks the head's OUTPUT dim, and
 /// `glimmer_mlp.rs` covers a 6656-wide reduction. See the projection test for why the product of
@@ -50,14 +54,28 @@ const VOCAB: usize = 202_048;
 const MULT: f32 = 0.196_116_14;
 const CAP: f32 = 20.0;
 
-/// What one row of logits costs: `202048 * 4` = **808,192 B**. The plan's "808 KB/row" figure,
-/// re-derived here rather than quoted, so a vocabulary change moves it.
+/// What one row of logits costs: `202048 * 4` = **808,192 B**, printed by the projection test.
 const LOGIT_BYTES: usize = VOCAB * 4;
+
+/// The three constants above against the vendored `config.json`, because a review found
+/// `output_multiplier` was the ONE logit-path constant with no value assertion anywhere in the
+/// tree — `validate` narrows it to positive-and-finite, which `0.5` passes — and this file
+/// otherwise hands its transcription to both sides of every comparison, so a wrong copy would
+/// be structurally invisible on the one operation every greedy gate is blind to.
+#[test]
+fn the_constants_match_the_shipped_config() {
+    let c: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED_CONFIG).unwrap();
+    let t = &c["text_config"];
+    assert_eq!(t["vocab_size"].as_u64().unwrap() as usize, VOCAB);
+    assert_eq!(t["final_logit_softcapping"].as_f64().unwrap() as f32, CAP);
+    assert_eq!(t["output_multiplier"].as_f64().unwrap() as f32, MULT);
+}
 
 fn softcap_on_device(x: &[f32], mult: f32, cap: f32) -> Vec<f32> {
     let b = dev(&f32b(x));
     // SAFETY: `b` holds exactly `x.len()` live f32 and outlives the sync inside `sync_read`.
-    unsafe { launch_logit_softcap(b.ptr() as *mut f32, x.len(), mult, cap) }
+    // Null stream: one kernel, then a join — nothing to order against.
+    unsafe { launch_logit_softcap(b.ptr() as *mut f32, x.len(), mult, cap, std::ptr::null_mut()) }
         .expect("logit_softcap launch");
     sync_read(&b)
 }
@@ -77,7 +95,9 @@ fn the_softcap_matches_a_host_tanh_where_tanh_has_shape() {
         let got = softcap_on_device(&x, MULT, CAP);
         let want: Vec<f32> = x.iter().map(|v| CAP * (v * MULT / CAP).tanh()).collect();
         let r = worst_rel(&got, &want);
-        // f32 in, f32 out, one `tanhf` apart. MEASURED 2026-08-12 — see the printout.
+        // f32 in, f32 out, one `tanhf` apart — device tanhf vs host libm across 404,096 samples.
+        // MEASURED 2026-08-12: 9.54e-8 at scale 400, where the reference magnitude ~19.98 has an
+        // f32 ulp of 1.9e-6, so the bar admits ~10 ulps of divergence between the two libms.
         assert!(r <= 1e-6, "scale {scale}: worst rel {r:e}");
         // The property that survives any scale, and the reason the omission is invisible to a
         // greedy gate: nothing leaves the band.
@@ -85,12 +105,19 @@ fn the_softcap_matches_a_host_tanh_where_tanh_has_shape() {
             got.iter().all(|v| v.abs() <= CAP),
             "scale {scale}: a logit escaped the cap"
         );
+        // Each arm asserts ITS regime — the saturation census in both directions, so the scale-1
+        // arm is the linear-region CONTRAST rather than a loop pass with nothing to prove.
         let saturated = got.iter().filter(|v| v.abs() > 0.9 * CAP).count();
         if scale > 100.0 {
             assert!(
                 saturated > VOCAB / 100,
                 "only {saturated} of {VOCAB} logits reached 90% of the cap at scale {scale}, so \
                  this case is still measuring tanh's linear region"
+            );
+        } else {
+            assert_eq!(
+                saturated, 0,
+                "logits saturated at scale {scale}, so the linear-region arm is not one"
             );
         }
         println!("softcap at scale {scale}: worst rel {r:e}, {saturated} logits past 0.9*cap");
@@ -165,6 +192,72 @@ fn the_argmax_reduction_holds_at_the_full_vocabulary() {
     println!("argmax over {VOCAB} found the planted maximum at {idx}");
 }
 
+/// The launcher's guards, driven — every clause, because an unexercised guard is how item 1's
+/// ring bound sat wrong until review. `!(cap > 0.0f)` is spelled that way in the kernel to
+/// reject NaN as well as non-positive, and the NaN rows are what hold that spelling: rewritten
+/// as `cap <= 0.0f`, a NaN sails through and the two rows below go red. The `isfinite` rows
+/// hold the other half (`!(x > 0)` ADMITS +Inf, which NaNs every logit through `Inf * 0`), and
+/// the 1002 row holds the transposition guard — swapped constants are a hard sign-quantiser
+/// that every greedy gate passes, and the two parameters are adjacent same-typed scalars.
+#[test]
+fn the_launcher_refuses_what_it_cannot_compute() {
+    let b = dev(&f32b(&fill(8, 6, 1.0)));
+    let x = b.ptr() as *mut f32;
+    let cases: [(usize, f32, f32, Option<i32>, &str); 9] = [
+        (0, MULT, CAP, Some(1001), "zero logits"),
+        (8, 0.0, CAP, Some(1001), "a zero multiplier"),
+        (8, MULT, 0.0, Some(1001), "a zero cap, which divides"),
+        (8, f32::NAN, CAP, Some(1001), "a NaN multiplier"),
+        (8, MULT, f32::NAN, Some(1001), "a NaN cap"),
+        (8, f32::INFINITY, CAP, Some(1001), "an infinite multiplier"),
+        (8, MULT, f32::INFINITY, Some(1001), "an infinite cap"),
+        (8, CAP, MULT, Some(1002), "the constants TRANSPOSED"),
+        (8, MULT, CAP, None, "the real constants, which must pass"),
+    ];
+    for (n, mult, cap, want, what) in cases {
+        // SAFETY: the rejected calls return before any launch; the accepted one writes 8 f32
+        // into a live 8-f32 buffer.
+        fixture::expect_guard(
+            unsafe { launch_logit_softcap(x, n, mult, cap, std::ptr::null_mut()) },
+            want,
+            what,
+        );
+    }
+    device_sync().unwrap();
+}
+
+/// **The omission red proof, and the non-finite pass-through.**
+///
+/// Omission is the defect this operator's whole story is about — every greedy gate passes with
+/// the kernel gone — so the fixture proves ITS metric sees it: unsoftcapped logits at scale 400
+/// score ~19 against a 1e-6 bar. And ±Inf must come back ±Inf: `tanhf(±Inf)` is ±1, so the
+/// naive kernel maps an overflowed logit to exactly ±cap — finite — one launch before `argmax`'s
+/// non-finite bail, which is the engine's only detector for a fault after the last layer.
+/// NaN must stay NaN for the same reason.
+#[test]
+fn omission_is_loud_and_non_finites_survive() {
+    let x = fill(4096, 7, 400.0);
+    let want: Vec<f32> = x.iter().map(|v| CAP * (v * MULT / CAP).tanh()).collect();
+    let r = worst_rel(&x, &want);
+    assert!(
+        r > 1.0,
+        "omitting the softcap moved this metric by only {r:e}, so the metric cannot see the one \
+         defect this operator is about"
+    );
+    println!("softcap omission scores {r:e} against the 1e-6 bar");
+
+    let probe = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 0.0, 400.0];
+    let got = softcap_on_device(&probe, MULT, CAP);
+    assert_eq!(got[0], f32::INFINITY, "+Inf was laundered to {}", got[0]);
+    assert_eq!(got[1], f32::NEG_INFINITY, "-Inf was laundered to {}", got[1]);
+    assert!(got[2].is_nan(), "NaN was laundered to {}", got[2]);
+    assert_eq!(got[3], 0.0, "zero must map to zero");
+    assert!(
+        got[4].is_finite() && got[4].abs() <= CAP,
+        "a finite logit must still be capped"
+    );
+}
+
 /// The head projection's OUTPUT width, which is the dim item 5 is about.
 ///
 /// **`k` is deliberately small here and that is not laziness.** The full head weight is
@@ -183,8 +276,6 @@ fn the_head_projection_writes_every_one_of_the_202048_outputs() {
     // with this fill no true dot product is.
     let got = gemv_bf16(&x, &w, VOCAB, K);
 
-    assert_eq!(got.len(), VOCAB, "logit row width");
-    assert_eq!(LOGIT_BYTES, 808_192, "the logit row is not 808 KB any more");
     let unwritten = got.iter().filter(|v| **v == 0.0).count();
     assert_eq!(
         unwritten, 0,

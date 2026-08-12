@@ -195,6 +195,23 @@ macro_rules! launchers {
 // inside the change that was supposed to prevent it. This one is anchored to the macro
 // invocation, so anything added outside it is gated.
 //
+// **What it costs, measured the hard way 2026-08-12.** A live exemption is a hole in the gate
+// too, and the doc comments are inside this one. The Glimmer port added `logit_softcap` and
+// `sigmoid_gate` here by inserting each item ABOVE an existing one, which detached that item's
+// doc; clippy's `missing_safety_doc` caught the orphan both times, and both times it was
+// "fixed" by pasting a fresh copy of the doc below rather than by noticing the old one was
+// still sitting above the wrong item. Net result, until a review found it: **25 duplicated
+// comment lines**, `launch_rope_split_half`'s doc present twice differing by one word, and
+// `launch_logit_softcap` carrying THREE concatenated docs with THREE `# Safety` sections — the
+// first two describing a `base`/`count`/`stride` buffer and a non-aliasing `g` operand that
+// function does not have. A launcher whose stated safety contract belongs to two other kernels
+// is worse than one with no comment, because it reads as authority.
+//
+// Neither gate could see it. jscpd is excluded by this marker; clippy only asks whether a
+// `# Safety` section EXISTS. **So inside this region, review is the only duplication gate** —
+// and when adding a launcher, put the item immediately under its own doc and re-read the
+// launcher above it, because that is the one an insertion breaks.
+//
 // ── WHICH MODEL USES WHICH KERNEL ───────────────────────────────────────────────────────
 //
 // Kernels are named for what they DO, not for the model that introduced them. Until
@@ -801,46 +818,29 @@ launchers! {
         theta: f64,
     );
 
-    /// Split-half RoPE in place — transformers' `rotate_half`, where the pair is
-    /// `(x[j], x[j+seg/2])` rather than two adjacent elements. Muse Glimmer's convention.
-    ///
-    /// **Same arithmetic as [`launch_rope_interleave`], different pairing, and the two are NOT
-    /// interchangeable.** Applying one where the other is meant produces fluent wrong text and no
-    /// error — `glimmer-architecture.md` §9 trap 9. They are separate entry points rather than one
-    /// with a flag precisely so that a GLM or V4 call site cannot reach this convention by
-    /// changing an argument; `kernels/linalg.hip` carries the argument, and
-    /// `swiglu`/`swiglu_clamped_bf16` is the precedent.
-    ///
-    /// # Safety
-    /// `base` is a device buffer of `count·stride` f32, live until the next [`device_sync`].
-    /// `x[i] *= sigmoid(g[i])` — Muse Glimmer's attention output gate, applied between the
-    /// attend and `o_proj`.
-    ///
-    /// **`g` must be `gate_proj(LAYER INPUT)`, not anything derived from `x`.** The reference
-    /// computes the gate from the post-`input_layernorm` activation (`glimmer-architecture.md`
-    /// §4 item 3); gating on the attention output has the right shapes and the wrong model, and
-    /// no signature can prevent it — `tests/glimmer_gate.rs` is what holds a caller to it.
-    ///
-    /// Not [`launch_swiglu`]: that is `silu(g)*u`, which carries an extra factor of `g`.
-    ///
-    /// # Safety
-    /// `x` is `n` writable f32 and `g` is `n` readable f32, both live until the next
-    /// [`device_sync`], and they must not alias — both are `__restrict__`.
     /// `x[i] = cap * tanh(x[i] * mult / cap)` — Muse Glimmer's logit path, applied to the head's
-    /// output. `mult` is `output_multiplier`, `cap` is `final_logit_softcapping`.
+    /// output. `mult` is `output_multiplier`, `cap` is `final_logit_softcapping`; the launcher
+    /// refuses a transposed pair (`mult >= cap`, code 1002) because the swap is a silent
+    /// sign-quantiser, and refuses non-finite or non-positive values of either (1001).
     ///
     /// **Every greedy gate in this repo is provably blind to omitting this.** `mult > 0` and `tanh`
     /// is strictly increasing, so it cannot move an argmax — the anchor measured `softcap_off`
     /// leaving `emitted.ids` bit-identical while the logits moved. It changes every probability,
     /// so its evidence must come from logits and never from what was decoded.
     ///
+    /// **A non-finite logit passes through unchanged.** The naive form maps ±Inf to exactly ±cap,
+    /// which would launder an overflowed head output into a finite argmax winner one launch
+    /// before the engine's ONLY post-final-layer fault detector (`argmax`'s non-finite bail).
+    ///
     /// # Safety
-    /// `x` is `n` writable f32, live until the next [`device_sync`].
+    /// `x` is `n` writable f32, live until the next [`device_sync`]; `stream` is null or a live
+    /// stream ordering the head GEMV that produced `x`.
     launch_logit_softcap -> rivoli_logit_softcap, "logit_softcap" (
         x: *mut f32,
         n: usize as i32,
         mult: f32,
         cap: f32,
+        stream: *mut c_void,
     );
 
     /// `x[i] *= sigmoid(g[i])` — Muse Glimmer's attention output gate, applied between the attend
@@ -853,13 +853,20 @@ launchers! {
     ///
     /// Not [`launch_swiglu`]: that is `silu(g)*u`, which carries an extra factor of `g`.
     ///
+    /// A `g` of ±Inf gates by the LIMIT (exactly 1 or 0) — finite output from non-finite input,
+    /// a reviewed decision recorded on the kernel.
+    ///
     /// # Safety
     /// `x` is `n` writable f32 and `g` is `n` readable f32, both live until the next
-    /// [`device_sync`], and they must not alias — both are `__restrict__`.
+    /// [`device_sync`], and they must not alias — both are `__restrict__`. `stream` is null or a
+    /// live stream ordering every producer of `x` and `g` — this kernel runs BETWEEN the attend
+    /// and the o_proj GEMV, so at any stream-ordered call site null is the unordered-read bug,
+    /// not a default.
     launch_sigmoid_gate -> rivoli_sigmoid_gate, "sigmoid_gate" (
         x: *mut f32,
         g: *const f32,
         n: usize as i32,
+        stream: *mut c_void,
     );
 
     /// Split-half RoPE in place — transformers' `rotate_half`, where the pair is

@@ -550,16 +550,7 @@ fn the_launcher_refuses_what_it_cannot_compute() {
                 std::ptr::null_mut(),
             )
         };
-        match want {
-            Some(code) => {
-                let e = got.expect_err(what).to_string();
-                assert!(
-                    e.contains(&format!("argument guard rejected ({code})")),
-                    "{what}: expected guard {code}, got {e:?}"
-                );
-            }
-            None => got.unwrap_or_else(|e| panic!("{what}: {e:#}")),
-        }
+        fixture::expect_guard(got, want, what);
     }
     device_sync().unwrap();
 }
@@ -578,16 +569,10 @@ fn the_launcher_refuses_what_it_cannot_compute() {
 /// which is the divergent tail the kernel comment argues for and `mla_latent_attend` refuses.
 #[test]
 fn the_accumulator_holds_at_widths_no_golden_reaches() {
-    // A cheap deterministic fill. Values in [-1, 1] with no period that divides the head width,
-    // so a dropped or doubled column changes the answer rather than cancelling.
-    let fill = |n: usize, salt: usize| -> Vec<f32> {
-        (0..n)
-            .map(|i| {
-                let x = ((i * 2_654_435_761 + salt * 40_503) % 65_536) as f32 / 32_768.0;
-                x - 1.0
-            })
-            .collect()
-    };
+    // `fixture::fill` — this test kept a value-identical local closure after the consolidation,
+    // spelled just differently enough (bare `*`/`+` vs `wrapping_`) that jscpd could not pair
+    // them, which is exactly the drift the shared fixture exists to prevent.
+    let fill = |n: usize, salt: usize| -> Vec<f32> { fixture::fill(n, salt, 1.0) };
     let mut ran = 0;
     for (d, tq, start_pos, win) in [
         (40, 1, 63, 16),

@@ -108,6 +108,11 @@ extern "C" __global__ void vadd(float* __restrict__ x, const float* __restrict__
 //
 // Not `swiglu`: that is `silu(g)*u` = `g*sigmoid(g)*u`, which carries an extra factor of `g`.
 // The two are one `* g` apart and neither is spellable as the other.
+// A `g` of ±Inf yields the LIMIT (gate exactly 1 or exactly 0) — finite output from a
+// non-finite input, so an overflowed `gate_proj` is invisible to `flag_nonfinite` on the
+// residual. Reviewed 2026-08-12 and left as-is: the limits are what sigmoid converges to, a
+// NaN `g` still propagates, and the softcap keeps the terminal detector. Recorded so the
+// choice is a decision and not an accident.
 extern "C" __global__ void sigmoid_gate(
     float* __restrict__ x, const float* __restrict__ g, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -139,9 +144,17 @@ extern "C" __global__ void sigmoid_gate(
 extern "C" __global__ void logit_softcap(
     float* __restrict__ x, int n, float mult, float cap) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    // `tanhf`, not a `1 - 2/(exp(2z)+1)` rewrite: the reference calls `torch.tanh`, and a
-    // rewrite would be a second approximation to price against a tolerance measured on the first.
-    if (i < n) x[i] = cap * tanhf(x[i] * mult / cap);
+    if (i < n) {
+        float v = x[i];
+        // Non-finite passes THROUGH, deliberately (review, 2026-08-12). `tanhf(±Inf)` is ±1, so
+        // the plain form maps an overflowed logit to exactly ±cap — FINITE — and the engine's
+        // only detector for a fault after the last layer is `argmax` returning a non-finite top
+        // value (gpu.rs's bail). This is the last kernel before that check: laundering ±Inf here
+        // deletes the detector, and the emitted token is whichever vocab entry overflowed first.
+        // `tanhf`, not a `1 - 2/(exp(2z)+1)` rewrite: the reference calls `torch.tanh`, and a
+        // rewrite would be a second approximation to price against a tolerance measured on the first.
+        x[i] = isfinite(v) ? cap * tanhf(v * mult / cap) : v;
+    }
 }
 
 // Greedy argmax over `logits[0..n]`, reproducing the host fold in gpu.rs::argmax
@@ -231,27 +244,48 @@ extern "C" int rivoli_vadd(float* x, const float* y, int n) {
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_sigmoid_gate(float* x, const float* g, int n) {
+// `stream` is trailing and nullptr is the null stream, the `rivoli_swiglu` contract. Not
+// optional for this kernel (review, 2026-08-12): it sits between `gqa_attend` and the o_proj
+// GEMV, both stream-parameterised, and rivoli's streams are `hipStreamNonBlocking` — a
+// null-stream product between two stream-ordered launches reads its operands before they are
+// written, a silent wrong no S2 fixture can see (each launches one kernel and joins).
+extern "C" int rivoli_sigmoid_gate(float* x, const float* g, int n, void* stream) {
     if (n <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(sigmoid_gate, dim3((n + 255) / 256), dim3(256), 0, 0, x, g, n);
+    hipLaunchKernelGGL(sigmoid_gate, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream, x,
+                       g, n);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// `stream` is trailing and nullptr is the null stream, the `rivoli_swiglu` contract — this sits
+// between the head GEMV and `argmax`, and the head tail moving onto a stream is exactly the
+// moment `f4gpu.rs`'s note says a null-stream member becomes an unordered read.
+extern "C" int rivoli_logit_softcap(float* x, int n, float mult, float cap, void* stream) {
+    if (n <= 0) return 1001;
+    // `cap` divides, and `mult <= 0` would break the monotonicity the whole argmax-invariance
+    // argument rests on — both are config values, so a zero here means the config was not read.
+    // `!(x > 0)` rather than `x <= 0` is what rejects NaN; the finiteness check is what rejects
+    // +Inf, which `!(x > 0)` admits (a +Inf cap NaNs every logit, a +Inf mult sign-quantises
+    // them). `__builtin_isfinite` because this is HOST code in a .hip TU, where HIP's cmath
+    // shim drops the float overload of `isfinite` (substitution failure, measured llvm-22).
+    if (!(cap > 0.0f) || !(mult > 0.0f) || !__builtin_isfinite(cap) || !__builtin_isfinite(mult))
+        return 1001;
+    // The two scalars are adjacent, same-typed and TRANSPOSABLE, and swapping them is silent —
+    // `0.196*tanh(102·x)` is a hard sign-quantiser every greedy gate still passes (this repo has
+    // shipped a transposed-argument pair before: model.rs:2472's review record). For any model
+    // with a softcap the pre-multiplier is a 1/sqrt(d)-scale value and the cap is O(10), so
+    // order is checkable: refuse `mult >= cap` as its own code.
+    if (mult >= cap) return 1002;
+    hipGetLastError();
+    hipLaunchKernelGGL(logit_softcap, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream, x,
+                       n, mult, cap);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
 
 // Single-block argmax reduction (256 threads, grid-stride). `out_idx`/`out_val`
 // are one device word each (the caller's 8-byte result buffer). Launch-only.
-extern "C" int rivoli_logit_softcap(float* x, int n, float mult, float cap) {
-    if (n <= 0) return 1001;
-    // `cap` divides, and `mult <= 0` would break the monotonicity the whole argmax-invariance
-    // argument rests on — both are config values, so a zero here means the config was not read.
-    if (!(cap > 0.0f) || !(mult > 0.0f)) return 1001;
-    hipGetLastError();
-    hipLaunchKernelGGL(logit_softcap, dim3((n + 255) / 256), dim3(256), 0, 0, x, n, mult, cap);
-    hipError_t e = hipGetLastError();
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
 extern "C" int rivoli_argmax(
     const float* logits, int n, int* out_idx, float* out_val) {
     if (n <= 0) return 1001;

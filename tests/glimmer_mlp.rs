@@ -18,10 +18,19 @@
 //! copy of a check that exists — and the first draft of this file did exactly that for `swiglu`,
 //! until jscpd matched its host silu against `tests/kernel.rs`'s and refused the build. The
 //! composition test below runs `swiglu` at 19968 as part of the pipeline, which is the width
-//! evidence; the arithmetic evidence already existed. What is new is 6656/19968: a launcher guard that refuses these
-//! dims, an index that overflows i32 at `19968*6656 = 132,913,152` elements, or an LDS/occupancy
-//! assumption that only holds at small `k`, would all be invisible to every existing fixture and
-//! to the tiny-width goldens both.
+//! evidence; the arithmetic evidence already existed. What is new is 6656/19968: a launcher
+//! guard that refuses these dims, a 19968-term reduction (no golden reduces past 72), a 12.9
+//! M-thread grid, or an LDS/occupancy assumption that only holds at small `k` would all be
+//! invisible to every existing fixture and to the tiny-width goldens both.
+//!
+//! > **CORRECTED 2026-08-12, by review.** This paragraph claimed the widths catch "an index
+//! > that overflows i32 at `19968*6656 = 132,913,152` elements". Both halves were false: the
+//! > product is **132,907,008** (the stated figure was off by exactly 6,144 — GLM's hidden
+//! > size, a copy-paste tell), and it is BELOW 2^27 and 16.2x under `i32::MAX`, so no i32
+//! > index overflows at these dims — `kvcompress.hip` casts its offsets through `size_t`
+//! > besides. The overflow that DOES exist at Glimmer's widths is the one tensor this file
+//! > deliberately does not build: `lm_head` at 202048 x 6656 bf16 is 2.69 GB, 1.25x
+//! > `i32::MAX` BYTES, untested at every stage until S3 allocates it.
 //!
 //! # What this canNOT do, and why item 4 has no golden
 //!
@@ -53,16 +62,22 @@ const INTER: usize = 19968;
 /// two where an indexing bug would live.
 const SPOT: usize = 64;
 
-/// Spot indices spread across `n`: the two ends, then a stride that is coprime with every power of
-/// two so the sample does not sit on one alignment.
+/// Spot indices spread across `n`: the two ends, then an ODD stride so the sample hits both
+/// parities. The first draft's stride came out even at BOTH widths (106 at 6656, 314 at 19968),
+/// so 63 of 64 samples were even-indexed — a defect confined to odd offsets, the shape a bf16
+/// packing bug takes, was invisible to a comment claiming the opposite. The distinctness assert
+/// is here because `checked == SPOT` upstream could not fail (the loop returns SPOT elements by
+/// construction); what CAN vary is collisions, and a collision silently shrinks coverage.
 fn spots(n: usize) -> Vec<usize> {
     let mut v = vec![0, n - 1];
-    let stride = n / SPOT + 1;
+    let stride = (n / SPOT) | 1;
     let mut i = 1usize;
     while v.len() < SPOT {
-        v.push((i * stride + i) % n);
+        v.push((i * stride) % n);
         i += 1;
     }
+    let distinct: std::collections::HashSet<usize> = v.iter().copied().collect();
+    assert_eq!(distinct.len(), v.len(), "spot indices collided at n = {n}");
     v
 }
 
@@ -70,43 +85,47 @@ fn spots(n: usize) -> Vec<usize> {
 
 /// The three projections at Glimmer's real widths, spot-checked against a host dot product.
 ///
-/// **`132,913,152` elements per weight matrix is the number that matters here.** It is past 2^27,
-/// so any index arithmetic that stays in `i32` through a multiply is fine but a `int` product of
-/// two dims is not; the launcher takes `n` and `k` separately for that reason and this is what
-/// notices if one of them stops being enough.
+/// The number that matters here is the REDUCTION: no golden reduces past 72 terms, and these
+/// dots run 6656 and 19968 — plus a 19968-row launch whose grid no fixture had sized.
 #[test]
 fn the_projections_run_at_glimmers_real_widths() {
-    // MEASURED 2026-08-12: 3.27e-6 for gate/up and 5.17e-6 for down. The bar is ~20x the worse
-    // of them. It is not derived from an anchor floor — the anchor has no captures at these
+    // MEASURED 2026-08-12: 2.03e-6 for gate/up and 2.06e-6 for down (re-measured the same day
+    // after the fill's row-aliasing fix — the first figures, 3.27e-6/5.17e-6, were taken on a
+    // fill whose weight matrices held only 128 distinct rows). The bar is ~24x the worse of
+    // them. It is not derived from an anchor floor — the anchor has no captures at these
     // widths, which is the whole reason this file exists — so the measurement is the only
     // evidence behind it, and saying so is better than a round number that looks principled.
-    let bar = 1e-4_f32;
+    let bar = 5e-5_f32;
     for (label, n, k) in [("gate/up", INTER, HIDDEN), ("down", HIDDEN, INTER)] {
         let x = fill(k, 1, 1.0);
         let wf = fill(n * k, 2, 1.0);
         let w = to_bf16(&wf);
         let got = gemv_bf16(&x, &w, n, k);
-        assert_eq!(got.len(), n, "{label}: output width");
         assert!(
             got.iter().all(|v| v.is_finite()),
             "{label}: non-finite output"
         );
 
-        // Re-derive only `SPOT` of the outputs. Each is the same dot at the same width, so this
-        // tests the arithmetic; what it cannot see is an output the kernel never wrote, which is
-        // why the two ends are always in the sample and the length is asserted above.
-        let (mut worst, mut checked) = (0.0f32, 0);
-        for j in spots(n) {
-            let want: f32 = (0..k).map(|i| x[i] * from_bf16(w[j * k + i])).sum();
-            worst = worst.max((got[j] - want).abs() / want.abs().max(1.0));
-            checked += 1;
-        }
-        assert_eq!(checked, SPOT, "{label}: the spot sample was short");
+        // Re-derive only `SPOT` of the outputs, and score them in `worst_rel` — the port's ONE
+        // metric. The first draft used a per-element ratio with a 1.0 floor, which was STRICTER
+        // (denominator |want| ~ 27 rather than max|want| ~ 130) but incomparable with every
+        // other number in the port; a bar defended in a metric nobody else reports is the
+        // absolute-metric mistake this port already corrected once, wearing new clothes.
+        let idx = spots(n);
+        let sampled: Vec<f32> = idx.iter().map(|&j| got[j]).collect();
+        let want: Vec<f32> = idx
+            .iter()
+            .map(|&j| (0..k).map(|i| x[i] * from_bf16(w[j * k + i])).sum())
+            .collect();
+        let worst = worst_rel(&sampled, &want);
         assert!(
             worst <= bar,
             "{label}: worst spot error {worst:e} > {bar:e}"
         );
-        println!("{label} [{n} x {k}]: worst spot error over {checked} outputs: {worst:e}");
+        println!(
+            "{label} [{n} x {k}]: worst rel over {} outputs: {worst:e}",
+            idx.len()
+        );
     }
 }
 
@@ -123,13 +142,16 @@ fn the_composition_matches_a_host_mlp_and_the_operand_order_matters() {
     let wu = to_bf16(&fill(INTER * HIDDEN, 7, 1.0));
     let wd = to_bf16(&fill(HIDDEN * INTER, 8, 1.0));
 
+    let dot = |w: &[u16], j: usize, k: usize, v: &[f32]| -> f32 {
+        (0..k).map(|i| v[i] * from_bf16(w[j * k + i])).sum()
+    };
+    // The two projections once, OUTSIDE the closure: they do not depend on the operand order,
+    // and the first draft recomputed both per call — 266 M scalar MACs paid twice for no new
+    // information, on the dev profile where this suite lives.
+    let hg: Vec<f32> = (0..INTER).map(|j| dot(&wg, j, HIDDEN, &x)).collect();
+    let hu: Vec<f32> = (0..INTER).map(|j| dot(&wu, j, HIDDEN, &x)).collect();
     let host = |gate_first: bool| -> Vec<f32> {
-        let dot = |w: &[u16], j: usize, k: usize, v: &[f32]| -> f32 {
-            (0..k).map(|i| v[i] * from_bf16(w[j * k + i])).sum()
-        };
-        let g: Vec<f32> = (0..INTER).map(|j| dot(&wg, j, HIDDEN, &x)).collect();
-        let u: Vec<f32> = (0..INTER).map(|j| dot(&wu, j, HIDDEN, &x)).collect();
-        let (a, b) = if gate_first { (&g, &u) } else { (&u, &g) };
+        let (a, b) = if gate_first { (&hg, &hu) } else { (&hu, &hg) };
         let h: Vec<f32> = a
             .iter()
             .zip(b.iter())
@@ -147,18 +169,26 @@ fn the_composition_matches_a_host_mlp_and_the_operand_order_matters() {
     let sampled: Vec<f32> = spots(HIDDEN).iter().map(|&j| out[j]).collect();
 
     let right = host(true);
-    let wrong = host(false);
     let r = worst_rel(&sampled, &right);
     println!("mlp composition: worst rel over {SPOT} outputs: {r:e}");
-    // MEASURED 2026-08-12 at 4.94e-6 — three chained reductions over 6656 and 19968 terms, each
-    // summed in a different order on the two sides. The first draft guessed 5e-2 from "bf16 is
-    // three decimal digits", which is four decades of slack nobody would have noticed spending.
+    // MEASURED 2026-08-12 at 4.04e-6 (post fill fix) — three chained reductions over 6656 and
+    // 19968 terms, each summed in a different order on the two sides. The first draft guessed
+    // 5e-2 from "bf16 is three decimal digits", four decades of slack nobody would have noticed.
     assert!(r <= 1e-4, "worst rel {r:e}");
-    let swapped = worst_rel(&wrong, &right);
+
+    // **The red proof runs on the DEVICE.** The first draft compared `host(false)` to
+    // `host(true)` — two host computations, which proves the METRIC discriminates the operand
+    // order and says nothing about the subject: a device `swiglu` that ignored its operand
+    // order would have passed it. So the swapped arm is the device pipeline with `u` and `g`
+    // exchanged, scored against the straight host reference.
+    let swapped_out = gemv_bf16(&swiglu(&u, &g), &wd, HIDDEN, INTER);
+    let swapped_sampled: Vec<f32> = spots(HIDDEN).iter().map(|&j| swapped_out[j]).collect();
+    let swapped = worst_rel(&swapped_sampled, &right);
     assert!(
         swapped > 100.0 * r,
-        "silu(gate)*up and silu(up)*gate differ by only {swapped:e}, so this fixture cannot tell \
-         the operand order — the two projections have identical shapes and nothing else would"
+        "the DEVICE silu(up)*gate differs from silu(gate)*up by only {swapped:e}, so this \
+         fixture cannot tell the operand order — the two projections have identical shapes and \
+         nothing else would"
     );
-    println!("operand order: swapping gate and up moves the output by {swapped:e}");
+    println!("operand order: swapping gate and up on the device moves the output by {swapped:e}");
 }

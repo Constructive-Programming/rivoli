@@ -47,10 +47,26 @@ fn gate_on_device(x: &[f32], g: &[f32]) -> Vec<f32> {
     let xb = dev(&f32b(x));
     let gb = dev(&f32b(g));
     // SAFETY: both buffers hold exactly `x.len()` live f32, they are distinct allocations (the
-    // kernel's parameters are `__restrict__`), and both outlive the `device_sync` below.
-    unsafe { launch_sigmoid_gate(xb.ptr() as *mut f32, gb.ptr() as *const f32, x.len()) }
-        .expect("sigmoid_gate launch");
+    // kernel's parameters are `__restrict__`), and both outlive the `device_sync` below. Null
+    // stream: this fixture launches one kernel and joins, so there is nothing to order against.
+    unsafe {
+        launch_sigmoid_gate(
+            xb.ptr() as *mut f32,
+            gb.ptr() as *const f32,
+            x.len(),
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("sigmoid_gate launch");
     sync_read(&xb)
+}
+
+/// The quantity trap-4 detectability actually rides on. The kernel multiplies by `sigmoid(g)`,
+/// so two operands separate the gated outputs by how far apart their SIGMOIDS are — `|g - a|`
+/// diverges from that without bound as magnitudes grow (g=20 vs a=14 is 0.43 apart raw and
+/// 8.3e-7 apart through the sigmoid, four decades the wrong side of the bar).
+fn sigmoids(v: &[f32]) -> Vec<f32> {
+    v.iter().map(|g| 1.0 / (1.0 + (-g).exp())).collect()
 }
 
 /// The three tensors this stage needs, at one (step, layer): the attend output flattened to the
@@ -104,6 +120,12 @@ fn the_gate_reproduces_the_reference() {
         fixture::expected().0,
         "the loop did not cover every step and layer"
     );
+    // A second, tighter bar against this kernel's OWN measurement (1.58e-7, 2026-08-12), at the
+    // usual ~20x. The anchor row is 8.29e-5 because the o_proj BUCKET's floor is dominated by
+    // the projection's accumulation — 525x above what one multiply produces — so the row alone
+    // cannot see this kernel regress by two decades, and the `expf`-not-`__expf` decision the
+    // kernel comment insists on would otherwise be ungated.
+    assert!(worst <= 3.2e-6, "worst rel {worst:e} > 20x the 2026-08-12 measurement");
 }
 
 /// **Trap 4, run.** Gating on the attention output instead of the layer input's projection.
@@ -124,6 +146,9 @@ fn gating_on_the_attention_output_is_caught() {
         cases += 1;
     });
     println!("trap 4: weakest signal over {cases} cases: {weakest:e} against tol {tol:e}");
+    // Census BEFORE the judgment: `weakest` is INFINITY-seeded, so an empty case set would
+    // otherwise pass this red proof vacuously (the fixture header records the 0 == 0 incident).
+    assert_eq!(cases, fixture::expected().0, "the trap ran over nothing");
     assert!(
         weakest > 100.0 * tol,
         "gating on the attention output produced only {weakest:e}, {:.0}x the tolerance",
@@ -135,22 +160,50 @@ fn gating_on_the_attention_output_is_caught() {
 ///
 /// The gate projection is not a function of the attend output — it is a different matrix applied
 /// to a different tensor — so no amount of scoring `in_gated` can tell the engine WHERE its `g`
-/// came from. What it can say is that the two are numerically far apart everywhere, which is why
-/// the test above has a signal at all. Stated as its own check so the limit is a measured claim
-/// rather than a caveat in prose: if `gate_proj.out` ever tracked `attend.out` closely, trap 4
-/// would stop being detectable here and this would go red first.
+/// came from. What it can say is that the two are far apart everywhere IN THE QUANTITY THE
+/// KERNEL CONSUMES, which is why the test above has a signal at all. Stated as its own check so
+/// the limit is a measured claim rather than a caveat in prose: if `sigmoid(gate_proj.out)` ever
+/// tracked `sigmoid(attend.out)` closely, trap 4 would stop being detectable here and this would
+/// go red first.
+///
+/// **Sigmoid space, corrected 2026-08-12 — the first draft compared the RAW tensors, which is a
+/// different claim in exactly the regime production moves toward.** `|g - a|` and
+/// `|sigmoid(g) - sigmoid(a)|` diverge without bound as magnitudes grow: at g=20 vs a=14 the raw
+/// separation is 0.43 (green by 4x) while the trap-4 signal is 8.3e-7 — four decades under the
+/// red proof's bar. The goldens sit at |g| <= 1.6 where the two agree to ~2.7x (raw closest
+/// 8.92e-1, sigmoid closest measured this date at ~3e-1), so the raw form passed while
+/// guaranteeing nothing. The tolerance row's own `gate_disabled` defect models sigmoid(20) —
+/// saturation is the reference's expected regime, not a corner.
 #[test]
 fn the_gate_operand_is_not_recoverable_from_the_attend_output() {
     let (mut closest, mut cases) = (f32::INFINITY, 0);
     each_case(|gold, t, l, _win| {
         let (attn, gate, _) = tensors(gold, t, l);
-        closest = closest.min(worst_rel(&gate, &attn));
+        closest = closest.min(worst_rel(&sigmoids(&gate), &sigmoids(&attn)));
         cases += 1;
     });
-    println!("operand separation: closest over {cases} cases: {closest:e}");
+    println!("operand separation (sigmoid space): closest over {cases} cases: {closest:e}");
+    // Same census, same reason: `closest` is INFINITY-seeded.
+    assert_eq!(cases, fixture::expected().0, "the separation ran over nothing");
     assert!(
         closest > 0.1,
-        "gate_proj(h) and the attend output agree to {closest:e} somewhere, so trap 4 is not \
-         reliably visible from `in_gated` alone"
+        "sigmoid(gate_proj(h)) and sigmoid(attend.out) agree to {closest:e} somewhere, so trap 4 \
+         is not reliably visible from `in_gated` alone"
+    );
+}
+
+/// The launcher's one guard, driven — `n == 0` must be a code, not a zero-block launch.
+#[test]
+fn the_launcher_refuses_an_empty_row() {
+    let b = dev(&f32b(&[1.0f32; 4]));
+    let (x, g) = (b.ptr() as *mut f32, b.ptr() as *const f32);
+    // SAFETY: the call must return before any launch — that is what is being asserted — so the
+    // aliased pointers are never dereferenced.
+    let e = unsafe { launch_sigmoid_gate(x, g, 0, std::ptr::null_mut()) }
+        .expect_err("an empty row must be refused")
+        .to_string();
+    assert!(
+        e.contains("argument guard rejected (1001)"),
+        "expected guard 1001, got {e:?}"
     );
 }

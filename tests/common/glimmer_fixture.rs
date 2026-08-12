@@ -22,7 +22,7 @@ mod golden_read;
 // twice, and folding the includes into one is the fix that keeps working as fixtures are added.
 #[path = "mod.rs"]
 mod device;
-pub use device::{back, dev, f32b, f32v, zeros};
+pub use device::{GLIMMER_SHIPPED_CONFIG, back, dev, f32b, f32v, zeros};
 
 #[path = "tolerance.rs"]
 pub mod tolerance;
@@ -231,6 +231,14 @@ pub fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
             f32::INFINITY
         };
     }
+    // A non-finite `got` is INFINITY, checked BEFORE the max — `f32::max` returns the other
+    // argument when one side is NaN, so the fold below silently discards every NaN difference
+    // and an all-NaN kernel output would otherwise score 0.0, a perfect match. That is not
+    // hypothetical: a broken kernel in this repo once passed 9 of 9 comparisons that way
+    // (2026-08-05), and a review found this helper reintroducing the trap on 2026-08-12.
+    if got.iter().any(|g| !g.is_finite()) {
+        return f32::INFINITY;
+    }
     got.iter()
         .zip(want)
         .map(|(g, w)| (g - w).abs())
@@ -258,15 +266,33 @@ pub fn rel_tolerance(operator: &str) -> f32 {
     }
 }
 
-/// Join the device and read a buffer back as f32.
+/// One row of a launcher-guard table, judged: `Some(code)` must be exactly that guard code —
+/// a launch failing for any OTHER reason would satisfy a bare `is_err` and leave the guard it
+/// claims to exercise untested — and `None` must be accepted.
 ///
-/// The three-line epilogue every launch helper in this port had ended with. jscpd rejected the
-/// third copy, and it was right in the way that matters: `device_sync().unwrap()` is the line that
-/// makes the read valid, and a helper that forgot it would return whatever was in the buffer
-/// before the launch — which, in a test that seeds its output with zeros, reads as a kernel that
-/// wrote nothing rather than as a missing barrier.
+/// Here because the second guard-table fixture (`glimmer_head.rs`) copied the first's match
+/// verbatim and jscpd rejected the build; a third table is inevitable and this is its one copy.
+pub fn expect_guard(got: anyhow::Result<()>, want: Option<i32>, what: &str) {
+    match want {
+        Some(code) => {
+            let e = got.expect_err(what).to_string();
+            assert!(
+                e.contains(&format!("argument guard rejected ({code})")),
+                "{what}: expected guard {code}, got {e:?}"
+            );
+        }
+        None => got.unwrap_or_else(|e| panic!("{what}: {e:#}")),
+    }
+}
+
+/// Read a buffer back as f32 — one spelling of `f32v(&back(b))`, kept because jscpd rejected
+/// the third copy of the epilogue.
+///
+/// The barrier lives in `back` itself, which opens with `device_sync`. This helper's first
+/// draft added a second sync and justified the whole helper with it ("the line that makes the
+/// read valid") — a comment claiming to enforce something the callee already enforced, this
+/// repo's most-cited finding shape, caught by review 2026-08-12.
 pub fn sync_read(b: &rivoli::memory::device::DeviceBuf) -> Vec<f32> {
-    rivoli::backend::hip::device_sync().unwrap();
     f32v(&back(b))
 }
 
@@ -278,10 +304,19 @@ pub fn sync_read(b: &rivoli::memory::device::DeviceBuf) -> Vec<f32> {
 
 /// A cheap deterministic fill in `[-scale, scale)`. The period must not divide any width these
 /// fixtures use, or a transposed or strided read lands on an equal value and passes.
+///
+/// **The mixing xor is load-bearing — the linear form failed its own contract (found
+/// 2026-08-12).** As `(31153·i + salt·40503) mod 65536` the flat period was 65536, which
+/// divides no width here, but a 2-D read cares about `gcd(row_stride, 65536)`: at stride 6656
+/// (= 2^9·13) rows repeat every 65536/512 = **128 rows**, so a [19968 x 6656] weight held 128
+/// distinct rows and a kernel reading row c+128 for row c passed bit-identically. Folding bits
+/// 13..28 into the low 16 makes row equality need `(j-j')·stride ≡ 0 (mod 2^29)` — a period of
+/// 2^20 rows at these strides, past any width in the tree.
 pub fn fill(n: usize, salt: usize, scale: f32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let u = ((i.wrapping_mul(2_654_435_761).wrapping_add(salt * 40_503)) % 65_536) as f32;
+            let h = i.wrapping_mul(2_654_435_761).wrapping_add(salt.wrapping_mul(40_503));
+            let u = ((h ^ (h >> 13)) % 65_536) as f32;
             (u / 32_768.0 - 1.0) * scale
         })
         .collect()

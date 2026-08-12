@@ -213,13 +213,12 @@ measurement. `o_proj`'s row comes from `gate_disabled` at 3.759e0 / 3.688e0 (wea
 margin 444,700x) and `rope`'s from `rope_interleaved` / `rope_on_nope_layers` (weakest 1.811e0,
 margin 379,000x).
 
-The original note, kept because the reasoning is the reusable part:
-`tests/common/tolerance.rs::GLIMMER` carries **`attend`** (floor 1.639e−5, weakest targeting defect
-2.086e0, `Rel(1.64e-4)`) and, since 2026-08-12, **`rope`** (floor 4.773e−6, weakest targeting defect
-1.811e0, `Rel(4.77e-5)`). A floor is half a row — the other half is deciding which defects the
-operator is *answerable for*, and that is per-kernel reasoning. Items 2–5 add theirs as they land;
-until then S2 compares those operators exactly, enforced from the other side by
-`tests/glimmer_tolerance.rs`, which fails on a row for an unanalysed operator.
+The original note's reasoning, kept because it is the reusable part (its two-row inventory went
+stale the day the table above reached four and is dropped): a floor is half a row — the other
+half is deciding which defects the operator is *answerable for*, and that is per-kernel
+reasoning. An operator earns its row when its item lands; until then S2 compares it exactly,
+enforced from the other side by `tests/glimmer_tolerance.rs`, which fails on a row for an
+unanalysed operator.
 
 **`qk_scale_on_k` is excluded from `attend`'s defect set, and the exclusion decided the policy.** It
 moves `attend` by only 6.232e−4, just 38× the floor — under the 297× a `Rel` tolerance needs, so

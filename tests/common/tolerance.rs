@@ -118,11 +118,11 @@ pub const K3: &[Tol] = &[
 /// Muse Glimmer, measured 2026-08-11 on CPU (this reference needs no device), `--mode text`, **both
 /// weight draws**. Re-derive with the two commands in `glimmer-reference/anchor.md`.
 ///
-/// One row, and that is deliberate: `attend` is S2 item 1 and the only operator whose defect set has
-/// been reasoned through. Floors are measured for all thirteen buckets and recorded in `anchor.md`,
-/// but a floor is half a row — the other half is deciding which defects TARGET the operator, and
-/// that decision is per-kernel work. Items 2-5 add their rows as they land. **Do not score an
-/// operator with no row against a threshold**; compare it exactly.
+/// Four rows, one per S2 item that earned one (this doc said "One row, and that is deliberate"
+/// until 2026-08-12 — three items landed rows and left the sentence). Floors are measured for
+/// all thirteen buckets and recorded in `anchor.md`, but a floor is half a row — the other half
+/// is deciding which defects TARGET the operator, and that decision is per-kernel work. **Do not
+/// score an operator with no row against a threshold**; compare it exactly.
 pub const GLIMMER: &[Tol] = &[
     // GQA attend, S2 item 1. Floor is the max over the two draws — 7.819e-6 at draw 1 and this at
     // draw 2, 2.1x apart because the softmax's rounding follows where the scores landed.
@@ -197,9 +197,13 @@ pub const GLIMMER: &[Tol] = &[
     // `ids` moves by **exactly 0.000e0** at both draws, which is §5's argmax-invariance stated as
     // a measurement: every greedy gate in this repo is provably blind here.
     //
-    // What follows for S2 item 5: its kernel is scored against a host `tanh` at magnitudes where
-    // the function has shape, not against these goldens, and the omission is caught structurally.
-    // S4 is where trained logits can price it.
+    // What follows for S2 item 5: its kernel is scored against a host `tanh` at magnitudes
+    // where the function has shape, not against these goldens. **Nothing catches the omission
+    // in a decode** — an S3 head path that never calls the kernel leaves every gate in the tree
+    // green, which is why `glimmer-port.md` §G3 owes a probability-space check. (This sentence
+    // said "the omission is caught structurally" until 2026-08-12; the claim had no referent —
+    // `kernel_coverage`'s empty-owners row can only notice a caller APPEARING, never demand one
+    // exist.) S4 is where trained logits can price it.
     Tol {
         operator: "logits",
         floor: 3.520e-6,

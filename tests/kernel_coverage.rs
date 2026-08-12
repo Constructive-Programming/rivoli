@@ -378,7 +378,11 @@ const OWNERS: &[(&str, &[&str])] = &[
     // Muse Glimmer's rotation convention. Empty for the same reason `gqa_attend` is: S2 gates
     // each kernel against the S1b goldens before S3 writes the layer loop that calls it.
     ("rope_split_half", &[]),
-    // Muse Glimmer's attention output gate. Empty for the same reason as its two siblings.
+    // Muse Glimmer's logit softcap and attention output gate, empty for the same reason as
+    // `rope_split_half` above. (The comment sat on the wrong row until 2026-08-12 — it called
+    // `logit_softcap` "the attention output gate", the third orphaned-comment insertion of the
+    // same commit. OWNERS is the tree's checked model-affiliation authority, the one place a
+    // mis-attribution matters most.)
     ("logit_softcap", &[]),
     ("sigmoid_gate", &[]),
     ("swiglu", &["gpu.rs", "f4gpu.rs"]),
