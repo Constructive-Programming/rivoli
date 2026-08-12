@@ -928,6 +928,71 @@ launchers! {
         out: *mut f32,
     );
 
+    /// **One decode step of Kimi-K3's KDA short convolution**, `k3-architecture.md` §4 step 2 —
+    /// depthwise over time, SiLU fused into the output, the window advanced in place.
+    ///
+    /// `cur` and `out` are `channels` f32; `w` is `[channels][taps]`; `win` is `[channels][taps]` —
+    /// **shifted left and appended to in place**, so on return it is the window the NEXT token
+    /// convolves and is directly comparable with the reference's returned conv cache.
+    ///
+    /// **Three things a caller can get wrong and the shape cannot express.** The taps run
+    /// oldest→newest, so the LAST one multiplies the current token; the window stores pre-conv,
+    /// pre-SiLU inputs, so it is not the previous output; and the SiLU is on the accumulated value,
+    /// so there is no separate activation to run afterwards. All three are §4 step 2's and all three
+    /// are red-proved in `tests/k3_kernels.rs`.
+    ///
+    /// **`win` is `taps` wide, not `taps - 1`, and that is measured rather than inferred.** The
+    /// reference's cache already contains the current token — its last slot is bit-identical to this
+    /// token's projection — so a caller sized from §4's C snippet, which keeps `hist` and `cur` in
+    /// separate buffers, would allocate one slot per channel too few and run off the end of every
+    /// window. This kernel's first draft did exactly that.
+    ///
+    /// `taps` outside `2..=16` is refused (1002): below 2 the window is one element and the operator
+    /// is a per-channel scale, which means the caller read `short_conv_kernel_size` wrong.
+    ///
+    /// # Safety
+    /// Every pointer is a device buffer of the size above, live until `stream` completes. `win` is
+    /// written and must not alias `cur`, `w` or `out`; `out` may not alias `cur` (each thread reads
+    /// its own channel and writes it, so aliasing is safe by index, but both are `__restrict__`).
+    launch_short_conv_silu_f32 -> rivoli_short_conv_silu_f32, "short_conv_silu_f32" (
+        cur: *const f32,
+        w: *const f32,
+        channels: usize as i32,
+        taps: usize as i32,
+        win: *mut f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// **Kimi-K3's fused gated head norm**, `k3-architecture.md` §4 steps 8-9:
+    /// `out = o · rsqrt(mean(o²) + eps) · weight · sigmoid(gate)`, per head.
+    ///
+    /// `o`, `gate` and `out` are `[heads][head_dim]`; `weight` is `[head_dim]`, shared across heads.
+    ///
+    /// **NORM THEN GATE, which is trap 10.** MLA gates with no norm — [`launch_sigmoid_gate`] after
+    /// [`launch_mha_attend`] — and KDA norms first. The two families must not share a kernel on the
+    /// strength of both having a gate. Fused because the reference fuses it
+    /// (`FusedRMSNormGated(head_dim, activation='sigmoid')` called as `o_norm(o, g)`), so the
+    /// intermediate is unobservable and the anchor can only score the composition.
+    ///
+    /// `eps` is the caller's, read from the config rather than hardcoded, and it goes on the MEAN —
+    /// unlike [`launch_gated_delta_recurrent_f32`]'s L2 norm, which adds its own eps to the SUM.
+    /// Negative, NaN and infinite `eps` are refused (1006); zero is legal and exact.
+    ///
+    /// # Safety
+    /// Every pointer is a device buffer of the size above, live until `stream` completes, and none
+    /// may alias another — all four are `__restrict__` in the kernel.
+    launch_rmsnorm_gate_heads_f32 -> rivoli_rmsnorm_gate_heads_f32, "rmsnorm_gate_heads_f32" (
+        o: *const f32,
+        gate: *const f32,
+        weight: *const f32,
+        heads: usize as i32,
+        head_dim: usize as i32,
+        eps: f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// **One decode step of the gated delta rule** — the recurrence inside Kimi-K3's 69 KDA layers,
     /// `k3-architecture.md` §4 steps 3-7. `kernels/recurrent.hip` carries the arithmetic and the
     /// argument for its two-pass shape.

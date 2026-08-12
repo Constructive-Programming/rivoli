@@ -69,21 +69,29 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   taken before item 2 captured the attention core; re-measured over both draws and with `mla_attend`
   split out, the margin fell to 0.33x — a stronger form of the same finding, and `anchor.md`
   §"Re-measured on both draws" carries the numbers.)*
-- **S2 items 1-4 and 5a are DONE, each gated before the next** (2026-08-11/12): `attn_res`, the
+- **S2 items 1-4, 5a, 5b and 5c are DONE, each gated before the next** (2026-08-11/12): `attn_res`, the
   gated MLA core (`mha_attend` + `sigmoid_gate`), the latent sandwich, SiTU-GLU + the fused fp4
-  expert, and the gated delta recurrence (`gated_delta_recurrent_f32`). `tests/k3_kernels.rs`,
-  26 tests.
+  expert, the gated delta recurrence (`gated_delta_recurrent_f32`), the short convolution with its
+  fused SiLU (`short_conv_silu_f32`) and the fused gated head norm (`rmsnorm_gate_heads_f32`).
+  `tests/k3_kernels.rs`, 38 tests.
   **Each of the first three found the anchor could not score its operator, and only by trying to write
   the fixture** — the fold weights, the attention core and `o_proj`'s input, the expert aggregate and
-  the norm weight. Goldens re-vendored three times, now at **272** tensors. Item 3 also found the
+  the norm weight. Goldens re-vendored four times, now at **287** tensors. Item 3 also found the
   first place the anchor's fp32-vs-bf16 deviation bites: an operator whose rivoli kernel rounds to
   bf16 cannot be scored against this anchor at the anchor's own tolerance. **5a found that fla's
   recurrent-state BUFFER is `[value][key]` and that rivoli's kernel should not follow it** — measured
   at six orders of separation, and declined because the state starts at zero and never leaves the
   device. Note whose convention that is: `k3-architecture.md` §4 step 7 names the axes and AGREES
   with rivoli, so what was declined is the anchor stack's buffer order and not the reference's
-  arithmetic. **5b and 5c are next and share ONE regeneration** (the conv taps and `o_norm.weight`);
-  then 5d's tolerance row, item 6 (the router) and item 7 (trunk GEMV speed).
+  arithmetic. **5b and 5c shared ONE regeneration** (the conv taps and `o_norm`'s input + weight, +15
+  tensors) and were the fifth and sixth instance of the same missing-weight gap — both **predicted
+  from the generalisation rather than found by a failed fixture**, which is the first time that
+  pattern paid rather than just being recorded. They also needed the anchor to tell them one thing no
+  shape could: `ShortConvolution`'s returned cache is the full `taps`-wide window with the current
+  token in the LAST slot, not the `taps-1` history before it. And each got **its own tolerance bucket
+  and its own defect run** (`KdaConvTapsReversed`, `KdaGateBeforeNorm`), because `kda_trunk` has a
+  floor and no ceiling — item 2's `mla_attend` precedent. Next: 5d's tolerance row, item 6 (the
+  router) and item 7 (trunk GEMV speed).
 - **All seven reviews of items 3-5a triaged 2026-08-12**: 45 findings applied, 3 rejected, 4 recorded
   as OPEN. The four that mattered were **numbers nothing checked** — a `11.4x` that was `5.2x` against
   the tolerance its own change had replaced, a tolerance-room range that disagreed with the INDEX
@@ -625,7 +633,7 @@ model is stored in — is answered above: none.)*
   > **Met for the anchor's goldens, with one reading fixed 2026-08-11.** "Stays green elsewhere"
   > can only mean **upstream**: the goldens come from one forward pass, so a perturbation at layer
   > 3 reaches layer 92 by construction, and a defect that reddened *nothing* downstream would mean
-  > the capture was disconnected. `anchor.md` carries the matrix for all eleven defects.
+  > the capture was disconnected. `anchor.md` carries the matrix for all thirteen defects.
   >
   > **The green half is now GATED, not read.** Until the same day, `tests/k3-anchor.sh` asserted only
   > that a defect changed *something* — so a regression that broke the localisation would have
@@ -658,7 +666,7 @@ model is stored in — is answered above: none.)*
   > reference's own rounding error — so no tolerance-based fixture could have caught it anywhere,
   > which is the retrospective case for this anchor being exact bytes. Every other operator has
   > 90,000× to 7M× of room.
-  > **The one-draw limit is closed**: two salts are vendored, all eleven defects are scored against
+  > **The one-draw limit is closed**: two salts are vendored, all thirteen defects are scored against
   > both, and salt 2 reproduces salt 1's green cells exactly — so the localisation is a property of
   > the arithmetic, not of the numbers it landed on. Degeneracy is asserted per draw (no routed
   > weight under 5% of the largest, `|beta| < 8`) rather than hoped for.
@@ -887,8 +895,8 @@ model is stored in — is answered above: none.)*
    | unit | §4 steps | anchor boundary | fixture today |
    |---|---|---|---|
    | **5a recurrence** | 3-7 | `kda.fused_recurrent_kda.in.{q,k,v,g,beta,A_log,dt_bias,initial_state}` → `.out.{o,state}` | **DONE 2026-08-12** |
-   | **5b ShortConv+SiLU** | 2 | `self_attn.{q,k,v}_proj` → `self_attn.{q,k,v}_conv1d.{0,1}` | needs the conv **weights** |
-   | **5c fused norm+gate** | 8-9 | `.out.o` + `self_attn.g_proj` → `self_attn.o_norm` | needs **`o_norm.weight`** |
+   | **5b ShortConv+SiLU** | 2 | `self_attn.{q,k,v}_proj` + `.weight` → `self_attn.{q,k,v}_conv1d.{0,1}` | **DONE 2026-08-12** |
+   | **5c fused norm+gate** | 8-9 | `.out.o` + `self_attn.g_proj` + `o_norm.{in,weight}` → `self_attn.o_norm` | **DONE 2026-08-12** |
    | **5d projections** | 1, 10 | `self_attn.{q,k,v,b,f_a,f_b,g,o}_proj` | complete, but see the tolerance note |
 
    **Do 5a FIRST, and not only because the plan said "decode recurrence first".** It is the one unit
@@ -996,6 +1004,27 @@ model is stored in — is answered above: none.)*
    first-party defaults to `chunk_kda` for prefill. Porting the chunked form is the throughput item
    this section's header flags, and it must reinstate the two conditions §4 names.
 
+   > **BOTH DONE 2026-08-12, and the prediction below held exactly.** The captures went in as one
+   > regeneration (+15 tensors, goldens at 287), each operator got its own tolerance bucket AND its own
+   > defect run — `kda_conv` `Rel(6.6e-5)` under `KdaConvTapsReversed`, `kda_gate_norm` `Rel(1.1e-4)`
+   > under `KdaGateBeforeNorm` — and `kernels/recurrent.hip` gained `short_conv_silu_f32` and
+   > `rmsnorm_gate_heads_f32`. **The cache semantics were the one thing the shapes could not settle**,
+   > and the paragraph below guessed at it: `.1` is the full `taps`-wide window with the CURRENT token
+   > in the last slot, not the `taps-1` history before it. Measured against the golden, and the kernel,
+   > the launcher doc and the fixture were all corrected together.
+   >
+   > **Three findings from the review after that, all of the class this file keeps recording.** The
+   > conv's 18 `window` comparison sites read exactly 0.0 and a comment called that strong agreement —
+   > it is a ROUND-TRIP on the fixture's own reconstruction, since `win_in` is `want_win`
+   > right-shifted and `cur` is its last slot, so the identity holds whatever the taps say. It does
+   > prove the shift's direction and slot placement; it proves nothing about tap order, which never
+   > touches the window. The guard test **could not reach `head_dim > 1024` at all** — every case hit
+   > an earlier guard first, and `assert!(..is_err())` cannot tell which one fired; fixed tree-wide by
+   > `common::refused(r, code, what)`, which matches the launcher's own wording so a HIP failure
+   > cannot satisfy a guard assertion either. And **5b/5c were the only S2 items with no real-width
+   > test**, which `anchor.md` had prescribed for every item in a closing paragraph that nothing
+   > enforced — at 128 channels the conv is one block, so the goldens never launch a grid at all.
+
    **5b and 5c each need ONE more capture, and both are parameters.** Same shape of gap as the
    AttnRes fold and the latent norm: an input and an output do not determine an operator when a
    weight sits between them. `ShortConvolution`'s depthwise taps are `[channels][k]` (§4 step 2 —
@@ -1018,9 +1047,13 @@ model is stored in — is answered above: none.)*
    must not score against a threshold — compare them exactly, or measure the floor the same way and
    add a row". The fp64 island runs from item 3 already contain it: **7.680e-6 on draw 1, 2.292e-5
    on draw 2**, so the floor is 2.292e-5 and a `Rel(2.3e-4)` row is one `--by-operator` away from
-   being defensible. Its weakest targeting defect is the open question — no defect in the eleven
-   targets a KDA projection — so 5d may have to stay exact-only for want of a ceiling, which would
-   be the second `ExactOnly` in the table and for a different reason than `mla`'s.
+   being defensible. Its weakest targeting defect is the open question — **none of the thirteen targets
+   a KDA projection**, and 5b/5c did not change that: they took the conv and the head norm out of
+   `kda_trunk` with defects of their own, which narrows the bucket to the projections alone and leaves
+   it exactly as ceilingless as before. So 5d may still have to stay exact-only for want of a ceiling,
+   which would be the second `ExactOnly` in the table and for a different reason than `mla`'s. The
+   cheap alternative now visible: a fourteenth defect that perturbs one projection — the same shape as
+   `KdaConvTapsReversed`, which cost one function in the driver.
 6. **Router** — sigmoid, bias on selection only, weights from the **unbiased** score,
    renormalised over the 16.
 7. **Trunk GEMV, for speed.** `gemm_bf16` is correct and carries S2/S3 unchanged. Its inner loop is

@@ -41,6 +41,7 @@ DEFECTS=(
     None
     MlaLoraEps1e5 MlaScaleFromNope
     KdaNoQkL2Norm KdaGateLowerBoundOff KdaStateLayout KdaBetaSigmoidOutside
+    KdaConvTapsReversed KdaGateBeforeNorm
     ExpertW1W3Swap DenseMlpGateUpSwap RouterBiasInWeight LatentNormAfterUp
     AttnResNormalisedValues
 )

@@ -391,6 +391,62 @@ def defect_kda_gate_lower_bound_off(model, ctx):
     ctx["kda_kwargs"]["safe_gate"] = False
 
 
+def defect_kda_conv_taps_reversed(model, ctx):
+    """Reverse `ShortConvolution`'s depthwise taps -- S2 item 5b's own defect.
+
+    §4 step 2 says the taps run oldest->newest, so the LAST one multiplies the current token. Nothing
+    outside that sentence attests to it: the weight is `[channels][1][kernel]` either way, the shapes
+    are identical, and a reversed filter is still a causal convolution over the same window. It is
+    also **invisible in one step's output only if the window is symmetric**, which a real draw never
+    is -- so this run is what shows the golden is sensitive to the order at all.
+
+    **Why this defect exists when the four `Kda*` ones did not cover it.** Those are kwargs of fla's
+    recurrence and reach the conv not at all; the conv's own arithmetic had NO defect run, which left
+    `kda_trunk` -- the bucket `operator_of` puts it in -- with a floor and no ceiling, i.e. no
+    defensible tolerance. Item 5b could then only have been scored against a bar the anchor does not
+    set, which `anchor.md` explicitly tells S2 not to do.
+
+    Reverses the weight in place rather than wrapping `forward`, so the module's own arithmetic runs
+    and the golden's tensor SET is unchanged.
+    """
+    import torch
+
+    for layer in model.model.layers:
+        attn = getattr(layer, "self_attn", None)
+        for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
+            conv = getattr(attn, name, None)
+            if conv is not None:
+                with torch.no_grad():
+                    conv.weight.copy_(conv.weight.flip(-1))
+
+
+def defect_kda_gate_before_norm(model, ctx):
+    """Gate BEFORE the head norm instead of after -- S2 item 5c's own defect, and trap 10's other half.
+
+    §4 steps 8-9 are norm THEN gate, and MLA is the opposite (gate, no norm at all). `o_norm` is
+    `FusedRMSNormGated`, so the order lives inside one module call and no capture can see the
+    intermediate -- which is exactly why the composition needs a defect run rather than a fixture
+    boundary. Gating first changes the RMS the norm divides by, so it is not a permutation of two
+    elementwise multiplies: it is a different function.
+
+    Replaces the module's `forward` with the swapped order at the same signature, so the hooked name,
+    the tensor set and every shape stay put and only the values move.
+    """
+    import torch
+
+    for layer in model.model.layers:
+        norm = getattr(getattr(layer, "self_attn", None), "o_norm", None)
+        if norm is None:
+            continue
+
+        def swapped(x, g, _n=norm):
+            z = x * torch.sigmoid(g)
+            rms = z.pow(2).mean(-1, keepdim=True).add(_n.eps).rsqrt()
+            return z * rms * _n.weight
+
+        norm.forward = swapped
+
+
 def defect_kda_state_layout(model, ctx):
     """Store the recurrent state with its last two axes swapped -- the (K,V)-vs-(V,K) order.
 
@@ -428,6 +484,8 @@ DEFECTS = {
     "LatentNormAfterUp": defect_latent_norm_after_up,
     "AttnResNormalisedValues": defect_attn_res_normalised_values,
     "KdaNoQkL2Norm": defect_kda_no_qk_l2norm,
+    "KdaConvTapsReversed": defect_kda_conv_taps_reversed,
+    "KdaGateBeforeNorm": defect_kda_gate_before_norm,
     "KdaGateLowerBoundOff": defect_kda_gate_lower_bound_off,
     "KdaStateLayout": defect_kda_state_layout,
     "KdaBetaSigmoidOutside": defect_kda_beta_sigmoid_outside,
@@ -453,6 +511,12 @@ EXPECT_GREEN = {
     "KdaGateLowerBoundOff": [],
     "KdaStateLayout": [],
     "KdaBetaSigmoidOutside": [],
+    # Layer 0 is a KDA layer, so both of these touch it: the conv taps are the FIRST thing its
+    # `self_attn` does after the projections, and the gated norm the last. Empty for the same reason
+    # the four above are — there is no captured layer upstream of a defect that fires in every KDA
+    # layer, and the localisation those runs buy is per-TENSOR within layer 0 rather than per layer.
+    "KdaConvTapsReversed": [],
+    "KdaGateBeforeNorm": [],
 }
 
 
@@ -674,7 +738,7 @@ def wrap_mla_attention(mod, model, cap, ctx, layers):
     return orig
 
 
-def pre_hook_inputs(model, cap, ctx, layers, ends, suffix, params=()):
+def pre_hook_inputs(model, cap, ctx, layers, ends, suffix, params=(), capture_input=True):
     """Capture the INPUT of every captured-layer module whose name ends with `ends`.
 
     A forward hook gives a module's output. Three of this port's operators are fed a value that
@@ -683,6 +747,13 @@ def pre_hook_inputs(model, cap, ctx, layers, ends, suffix, params=()):
     and for those the input IS the fixture. `params` additionally records named parameters of the
     module, for the same reason `wrap_attn_res` records the fold: a kernel fed an input and asked
     for an output cannot be scored without the weights in between.
+
+    `capture_input=False` records the parameters ONLY, and it exists because a forward pre-hook is
+    handed the POSITIONAL args: `ShortConvolution` is called `self.q_conv1d(x=..., cache=...,
+    output_final_state=..., cu_seqlens=...)` — every argument by keyword — so `inp` is the empty
+    tuple and `inp[0]` raises. Found by this hook crashing the first regeneration that used it
+    (2026-08-12). `with_kwargs=True` would reach the value, and it is not needed: the conv's input is
+    `q_proj`'s output, which the golden already holds under its own name.
 
     Returns the module names hooked, so the caller can assert a census rather than trust that a
     suffix matched anything. A hook that never fires is silent, and that silence cost this harness
@@ -698,7 +769,8 @@ def pre_hook_inputs(model, cap, ctx, layers, ends, suffix, params=()):
         def fire(mod_, inp, _n=name):
             if not ctx["capturing"]:
                 return
-            cap.add(f"{_n}{suffix}", inp[0])
+            if capture_input:
+                cap.add(f"{_n}{suffix}", inp[0])
             for p in params:
                 cap.add(f"{_n}.{p}", getattr(mod_, p))
 
@@ -766,10 +838,19 @@ def wrap_kda_params(model, cap, ctx, layers):
     Returns the hooked names per suffix so `main` can assert a census against the KDA layer count
     rather than trusting that four suffixes matched something.
     """
-    return {
-        ends: pre_hook_inputs(model, cap, ctx, layers, ends, ".in", params=("weight",))
-        for ends in (".q_conv1d", ".k_conv1d", ".v_conv1d", ".o_norm")
+    # The convs record their WEIGHT only — see `pre_hook_inputs`'s `capture_input`: they are called
+    # with every argument by keyword, so a pre-hook's positional tuple is empty. `o_norm` is called
+    # positionally and keeps its input, which is the cross-check described above.
+    hooked = {
+        ends: pre_hook_inputs(
+            model, cap, ctx, layers, ends, ".in", params=("weight",), capture_input=False
+        )
+        for ends in (".q_conv1d", ".k_conv1d", ".v_conv1d")
     }
+    hooked[".o_norm"] = pre_hook_inputs(
+        model, cap, ctx, layers, ".o_norm", ".in", params=("weight",)
+    )
+    return hooked
 
 
 def wrap_kda_ops(mod, cap, ctx, layers):
@@ -923,6 +1004,16 @@ def operator_of(name, kda_layers):
             # fixture cannot be bit-exact with torch in any case. Two different questions do not
             # share a threshold.
             return "mla_attend"
+        # **Split out 2026-08-12 for S2 items 5b and 5c, on item 2's precedent.** Both used to fall
+        # into `kda_trunk`, which has a measured floor and NO ceiling — no defect among the eleven
+        # targeted a KDA projection, the conv or the norm — so neither item could have been scored
+        # against a row the anchor sets. Each now has its own bucket AND its own defect run
+        # (`KdaConvTapsReversed`, `KdaGateBeforeNorm`), which is what makes a `Rel` defensible.
+        # `kda_trunk` keeps the projections and keeps the gap, which is 5d's to close.
+        if kda and rest.startswith("self_attn.") and "_conv1d" in rest:
+            return "kda_conv"
+        if kda and rest.startswith("self_attn.o_norm"):
+            return "kda_gate_norm"
         if rest.startswith("self_attn"):
             return "kda_trunk" if kda else "mla"
         if rest.startswith(("self_attention_res", "mlp_res")):
@@ -1401,7 +1492,10 @@ def main():
             f"{len(hooked)} `{ends}` pre-hooks for {len(kda_layers)} KDA capture layers "
             f"{kda_layers} -- expected one each"
         )
-        for suffix in (".in", ".weight"):
+        # `.in` for `o_norm` only — the convs take keyword-only arguments, so their input is not
+        # reachable from a pre-hook and is already in the golden as `{q,k,v}_proj`.
+        suffixes = (".in", ".weight") if ends == ".o_norm" else (".weight",)
+        for suffix in suffixes:
             got = sum(1 for s in cap.seen if s.endswith(f"{ends}{suffix}"))
             assert got == len(kda_layers), (
                 f"{got} captures of {ends}{suffix} for {len(kda_layers)} KDA layers"

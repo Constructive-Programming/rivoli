@@ -195,3 +195,123 @@ extern "C" int rivoli_gated_delta_recurrent_f32(const float* q, const float* k, 
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// ============================ Kimi-K3's KDA short convolution — §4 step 2 ============================
+
+// One decode step of the depthwise causal convolution that precedes the recurrence, with SiLU
+// fused into the output and the history advanced in place.
+//
+//   win[c] = [win[c][1..], cur[c]]                     shift the window, current goes LAST
+//   acc    = sum_j w[c][j] * win[c][j]                  taps OLDEST -> NEWEST
+//   y[c]   = acc * sigmoid(acc)                         SiLU, fused (§4 step 2)
+//
+// **`win` is `taps` wide, not `taps - 1`, and it holds PRE-conv, PRE-SiLU values.** Measured from the
+// anchor rather than inferred: `ShortConvolution` returns a `[batch][channels][kernel_size]` cache
+// whose LAST slot is bit-identical to this token's `q_proj`, and `silu(w · cache_out)` reproduces
+// the module's output to 8.2e-8 while the reversed taps give 1.8e0 and dropping the SiLU gives 9.2e-1.
+// The first draft of this kernel carried a `taps - 1` history on the strength of §4 step 2's C
+// snippet, which keeps `hist` and `cur` apart — the same arithmetic, a different buffer, and a
+// caller that allocated three slots per channel would have run off the end of every window.
+//
+// The tap order and the pre-conv history are both invisible in ONE step's output — the window is
+// what carries them into the next token — which is why `tests/k3_kernels.rs` red-proves each.
+//
+// One thread per channel: at the real widths that is 3 x 12288 channels of 4 taps, so this kernel is
+// 3 x 196 KB per token against the recurrence's 12 MB and is not where the time goes. No reduction,
+// no LDS, no cross-thread anything — the whole operator is a shift and four multiplies.
+//
+// USED BY: Kimi-K3 (S3's layer loop; no engine caller yet — see `tests/kernel_coverage.rs`).
+extern "C" __global__ void short_conv_silu_f32(const float* __restrict__ cur,
+                                               const float* __restrict__ w, int channels, int taps,
+                                               float* __restrict__ win,
+                                               float* __restrict__ out) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float* wc = w + (size_t)c * taps;
+    float* wn = win + (size_t)c * taps;
+    // Shift FIRST, then convolve the whole window — the reference's cache after a step already
+    // contains the current token, so this in-place update leaves `win` exactly what `.1` holds and
+    // the next token needs no fixing up.
+    for (int j = 0; j < taps - 1; ++j) wn[j] = wn[j + 1];
+    wn[taps - 1] = cur[c];
+    float acc = 0.0f;
+    for (int j = 0; j < taps; ++j) acc += wc[j] * wn[j];
+    // SiLU on the accumulated value, not on the input — the activation is fused into the conv's
+    // output, so there is no separate elementwise kernel to run after this one.
+    out[c] = acc * (1.0f / (1.0f + expf(-acc)));
+}
+
+extern "C" int rivoli_short_conv_silu_f32(const float* cur, const float* w, int channels, int taps,
+                                         float* win, float* out, void* stream) {
+    if (channels <= 0) return 1001;
+    // `taps < 2` leaves a window of one, which is not a causal convolution — it is a per-channel
+    // scale, and a caller that reached it read `short_conv_kernel_size` wrong. The upper bound is
+    // this signature's window stride rather than a hardware limit.
+    if (taps < 2 || taps > 16) return 1002;
+    hipGetLastError();
+    hipLaunchKernelGGL(short_conv_silu_f32, dim3((unsigned)((channels + 255) / 256)), dim3(256), 0,
+                       (hipStream_t)stream, cur, w, channels, taps, win, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// ======================= Kimi-K3's fused gated head norm — §4 steps 8-9 =======================
+
+// Head-wise RMSNorm with a learnable weight shared across heads, then the sigmoid gate:
+//
+//   y[h][i] = o[h][i] * rsqrt(mean_i(o[h][i]^2) + eps) * weight[i] * sigmoid(gate[h][i])
+//
+// **NORM THEN GATE, and that ordering is trap 10.** MLA gates with no norm at all
+// (`linalg.hip::sigmoid_gate` after `mha_attend`); KDA norms first and then gates, and the two
+// layer families must not share a kernel on the strength of both "having a gate". §4 steps 8-9.
+//
+// **Fused because the reference fuses it and the intermediate is therefore unobservable.** fla ships
+// this as `FusedRMSNormGated(head_dim, activation='sigmoid')` called `o_norm(o, g)`, so the anchor
+// can attest to the COMPOSITION and not to the order inside it — which is why the order here comes
+// from the reference's source, as MLA's did, and why splitting this into `rmsnorm` + `sigmoid_gate`
+// would buy a boundary no fixture can score while costing a second pass over `o`.
+//
+// `eps` is the caller's: the reference reads `variance_epsilon`, and a kernel hardcoding it would
+// agree with itself if the config ever moved.
+//
+// One block per head, `head_dim` threads, one LDS reduction — `rmsnorm_single`'s shape, per head.
+// NOT `mla.hip::rmsnorm_batch`, which rounds its store to bf16 because V4's `RMSNorm.forward` does;
+// against this reference that store is arithmetic nobody performs, measured at 3.299e-3
+// (`tests/k3_kernels.rs::the_batch_rmsnorm_would_fail_this_fixture` prices exactly that mistake one
+// operator over).
+//
+// USED BY: Kimi-K3 (S3's layer loop; no engine caller yet — see `tests/kernel_coverage.rs`).
+extern "C" __global__ void rmsnorm_gate_heads_f32(const float* __restrict__ o,
+                                                  const float* __restrict__ gate,
+                                                  const float* __restrict__ weight, float eps,
+                                                  float* __restrict__ out) {
+    extern __shared__ float red[];
+    const int d = (int)blockDim.x;
+    const size_t off = (size_t)blockIdx.x * d + threadIdx.x;
+    const float x = o[off];
+    // `eps` on the MEAN, which is RMSNorm's convention and NOT the recurrence's L2 norm above —
+    // that one adds it to the SUM (§4 step 3). Two different conventions in one layer, and the
+    // reason each is spelled out where it is used rather than shared.
+    const float inv = 1.0f / sqrtf(block_sum_lds(x * x, red) / (float)d + eps);
+    const float g = gate[off];
+    out[off] = x * inv * weight[threadIdx.x] * (1.0f / (1.0f + expf(-g)));
+}
+
+extern "C" int rivoli_rmsnorm_gate_heads_f32(const float* o, const float* gate,
+                                            const float* weight, int heads, int head_dim,
+                                            float eps, float* out, void* stream) {
+    if (heads <= 0 || head_dim <= 0) return 1001;
+    if (head_dim > 1024) return 1002;
+    // `block_sum_lds` halves the block, so a non-power-of-two drops elements — the same guard and
+    // the same code as the recurrence above, for the same reason.
+    if (head_dim & (head_dim - 1)) return 1003;
+    // A non-finite or negative `eps` is refused rather than folded in: `rsqrt` of a negative
+    // variance is NaN for the whole head, and zero is legal (it is what an exact RMSNorm is) so the
+    // bound is one-sided.
+    if (!(eps >= 0.0f && eps < INFINITY)) return 1006;
+    hipGetLastError();
+    hipLaunchKernelGGL(rmsnorm_gate_heads_f32, dim3((unsigned)heads), dim3((unsigned)head_dim),
+                       head_dim * sizeof(float), (hipStream_t)stream, o, gate, weight, eps, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}

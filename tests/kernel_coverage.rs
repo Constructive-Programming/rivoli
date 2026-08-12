@@ -344,6 +344,12 @@ const OWNERS: &[(&str, &[&str])] = &[
     // `tests/k3_kernels.rs::the_gated_delta_recurrence_matches_the_anchor_at_every_kda_layer`,
     // which scores BOTH of its outputs against the reference at both weight draws.
     ("gated_delta_recurrent_f32", &[]),
+    // Kimi-K3's KDA short convolution and its fused gated head norm, S2 items 5b and 5c — the other
+    // two of the three boundaries fla fuses §4's ten steps into. Empty for the same reason as the
+    // four above, and their oracles are in `tests/k3_kernels.rs`, scored against the conv taps and
+    // `o_norm.weight` the 2026-08-12 regeneration added to the goldens.
+    ("short_conv_silu_f32", &[]),
+    ("rmsnorm_gate_heads_f32", &[]),
     ("argmax", &["gpu.rs", "f4gpu.rs"]),
     ("attend", &["gpu.rs"]),
     ("embed_bf16_row_bcast", &["f4gpu.rs"]),
@@ -487,7 +493,7 @@ fn the_staged_launchers_are_counted() {
         .collect();
     assert_eq!(
         empty.len(),
-        11,
+        13,
         "the set of launchers with no engine caller changed to {empty:?}. That is expected as S3 \
          wires K3's layer loop — update this number and say which way it moved, rather than \
          deleting the assertion."

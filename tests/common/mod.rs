@@ -212,6 +212,31 @@ pub fn ok<T>(r: anyhow::Result<T>, what: &str) -> T {
     r.unwrap_or_else(|e| panic!("{what} refused the launch: {e:#}"))
 }
 
+/// The mirror of [`ok`]: assert a launch was refused **by the guard we meant**.
+///
+/// `assert!(launch(..).is_err())` is the spelling this replaces, and it is weaker than it reads.
+/// Guards run in order, so a case aimed at a later one passes while an earlier one fires — and the
+/// test still goes green with the intended guard never executed. Found 2026-08-12 in the K3 gated
+/// head norm's guard test, where NOTHING reached the `head_dim > 1024` bound: every case there hit
+/// 1001 or 1003 first, and an `is_err()` assert could not tell.
+///
+/// Matches on the launcher's own wording, so a HIP failure (`HIP error N`) cannot satisfy a guard
+/// assertion — that pairing is the other half of the same hole.
+#[cfg(feature = "rocm")]
+pub fn refused<T>(r: anyhow::Result<T>, code: i32, what: &str) {
+    let want = format!("argument guard rejected ({code})");
+    match r {
+        Ok(_) => panic!("{what} was ACCEPTED; guard {code} should have refused it"),
+        Err(e) => {
+            let got = format!("{e:#}");
+            assert!(
+                got.contains(&want),
+                "{what} was refused, but not by guard {code}: {got}"
+            );
+        }
+    }
+}
+
 /// Join the device, then read a buffer back. The join is HERE rather than at each call
 /// site because forgetting it reads the destination before the kernel has written it,
 /// which fails as a wrong ANSWER rather than as a missing sync — the most expensive

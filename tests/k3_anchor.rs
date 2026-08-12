@@ -50,14 +50,14 @@ const GOLDENS: &[Vendored] = &[
     Vendored {
         salt: "k3-anchor-1",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-1.bin"),
-        len: 332_009,
-        fnv: 0xcfb2_7d75_ec6b_ff03,
+        len: 353_638,
+        fnv: 0x9e78_5b62_c58c_cd26,
     },
     Vendored {
         salt: "k3-anchor-2",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-2.bin"),
-        len: 332_009,
-        fnv: 0xd2a7_cb83_4ea2_d39d,
+        len: 353_638,
+        fnv: 0x0cdf_19bd_8ff2_42af,
     },
 ];
 
@@ -204,11 +204,13 @@ fn the_vendored_bytes_are_the_measured_ones() {
         assert_eq!(v.bytes.len(), v.len, "{}: size", v.salt);
         assert_eq!(h, v.fnv, "{}: FNV-1a", v.salt);
         let g = load(v);
-        // 272: 223 originally, +12 `.fold` for S2 item 1, +21 MLA attention-core and +6
+        // 287: 223 originally, +12 `.fold` for S2 item 1, +21 MLA attention-core and +6
         // `o_proj.in_gated` for item 2, +10 for item 3 (the latent sandwich's one open end — the
-        // expert aggregate and the norm weight, across the five MoE capture layers). Each addition
-        // is recorded in `anchor.md`. See `the_operator_fixtures_s2_needs_are_present`.
-        assert_eq!(g.floats.len(), 272, "{}: float tensors", v.salt);
+        // expert aggregate and the norm weight, across the five MoE capture layers), and +15 for
+        // items 5b/5c (three conv tap sets plus `o_norm`'s input and weight, across the three KDA
+        // capture layers). Each addition is recorded in `anchor.md`. See
+        // `the_operator_fixtures_s2_needs_are_present`.
+        assert_eq!(g.floats.len(), 287, "{}: float tensors", v.salt);
         assert_eq!(g.ints.len(), 5, "{}: int tensors", v.salt);
     }
     // The two draws must not be the same draw — compared on VALUES, not on the files.
@@ -411,6 +413,29 @@ fn the_operator_fixtures_s2_needs_are_present() {
         let state = vec![1, nh, hd, hd];
         assert_eq!(shape_of(&g, &format!("{kda}.in.initial_state")), state);
         assert_eq!(shape_of(&g, &format!("{kda}.out.state")), state);
+
+        // Items 5b and 5c's weights, on the same KDA layer. The conv weight is `[channels][1][taps]`
+        // — a depthwise `Conv1d`'s shape, with the singleton input-channel axis torch keeps — and
+        // `channels` is the KDA projection width, NOT `hidden`: they are 12288 and 7168 in the real
+        // model and the tiny config keeps them apart on purpose.
+        let taps = c["linear_attn_config"]["short_conv_kernel_size"]
+            .as_u64()
+            .expect("short_conv_kernel_size") as usize;
+        for which in ["q", "k", "v"] {
+            let n = format!("model.layers.0.self_attn.{which}_conv1d");
+            assert_eq!(shape_of(&g, &format!("{n}.weight")), vec![nh * hd, 1, taps]);
+            // The returned cache is `taps` wide and NOT `taps - 1`: it already contains the current
+            // token. A port sizing its conv window from `k3-architecture.md` §4 step 2's C snippet,
+            // which keeps `hist` and `cur` in separate buffers, allocates one slot per channel too
+            // few — measured 2026-08-12 when this port's first conv kernel did exactly that.
+            assert_eq!(shape_of(&g, &format!("{n}.1")), vec![1, nh * hd, taps]);
+            assert_eq!(shape_of(&g, &format!("{n}.0")), vec![1, 1, nh * hd]);
+        }
+        // `o_norm`'s weight is `[head_dim]`, shared across heads, and its INPUT is the recurrence's
+        // own output — the free cross-check that the module hook and the operator wrapper agree.
+        let on = "model.layers.0.self_attn.o_norm";
+        assert_eq!(shape_of(&g, &format!("{on}.weight")), vec![hd]);
+        assert_eq!(shape_of(&g, &format!("{on}.in")), vec![1, 1, nh, hd]);
 
         // MLA, on the first MLA layer (1-based 4). The KV latent path is `kv_lora_rank + rope`,
         // which is NOT `q_head_dim` — the two were accidentally equal until the widths were fixed,
@@ -706,23 +731,32 @@ fn exactly_the_declared_layers_were_captured() {
 fn the_tolerance_table_is_supported_by_its_measurements() {
     k3_tolerance::tolerances_leave_room();
     k3_tolerance::the_floor_band_admits_every_rule_following_row();
-    // These six are the operators whose floor was MEASURED, and the spelling S2 will look a row up
-    // by — so a rename or a swapped row is caught here, which a count of rows would not catch.
+    // These are the operators whose floor was MEASURED, and the spelling S2 will look a row up by —
+    // so a rename or a swapped row is caught here, which a count of rows would not catch.
     //
     // This comment previously said "every operator the anchor produces a fixture for", which was
-    // false and worth correcting rather than deleting: the driver's `operator_of` classifies TEN,
-    // and `kda_trunk`, `norm`, `residual` and `head` deliberately have no row. That is a GAP, not a
-    // decision — nobody measured a floor for them, because the six here are the distinct kernels
-    // S2 and S3 write and the other four are buckets the comparator uses to localise. **S2 must
-    // not score those four against a threshold until one is measured**; compare them exactly, or
-    // measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
-    const MEASURED: [&str; 7] = [
+    // false and worth correcting rather than deleting: the driver's `operator_of` now classifies
+    // TWELVE, and `kda_trunk`, `norm`, `residual` and `head` deliberately have no row. That is a
+    // GAP, not a decision — nobody measured a floor for them, because the rows here are the distinct
+    // kernels S2 and S3 write and the other four are buckets the comparator uses to localise. **S2
+    // must not score those four against a threshold until one is measured**; compare them exactly,
+    // or measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
+    //
+    // **`kda_conv` and `kda_gate_norm` are what following that instruction looks like** (2026-08-12,
+    // items 5b and 5c). Both were inside `kda_trunk`, so both were in the no-row gap; each was split
+    // out with a floor from the fp64 island at BOTH draws and a ceiling from a defect run written for
+    // it (`KdaConvTapsReversed`, `KdaGateBeforeNorm`), because a bucket with a floor and no ceiling
+    // cannot carry a defensible `Rel`. `kda_trunk` keeps the projections and keeps the gap — it has
+    // a floor (2.292e-5) and still no defect that targets it, which is item 5d's to close.
+    const MEASURED: [&str; 9] = [
         "attn_res",
         "mla",
         "mla_attend",
         "moe_latent",
         "moe_route",
         "kda_op",
+        "kda_conv",
+        "kda_gate_norm",
         "dense_mlp",
     ];
     for op in MEASURED {
@@ -737,7 +771,7 @@ fn the_tolerance_table_is_supported_by_its_measurements() {
     assert_eq!(
         k3_tolerance::TOLERANCES.len(),
         MEASURED.len(),
-        "the table has a row for an operator outside the measured six: {:?}",
+        "the table has a row for an operator whose floor was never measured: {:?}",
         k3_tolerance::TOLERANCES
             .iter()
             .map(|t| t.operator)

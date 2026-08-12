@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: data
-verdict: The S1b anchor exists and runs, and its per-operator TOLERANCES are measured — Kimi-K3's own first-party stack (modeling_kimi_linear.py at the pinned revision + fla-core 0.5.2 + transformers 4.56.2 + torch 2.13.0+rocm7.2) executed on gfx1151 at tiny widths but the REAL 93-layer structure. TWO independent weight draws are vendored (tests/k3-anchor-decode-k3-anchor-{1,2}.bin, 332,009 B each, each reproduced byte-for-byte on a later run) and read by tests/k3_anchor.rs with no GPU, no python and no network; eleven defect runs are scored against both and each is GATED on the layers it must leave bit-identical. THE TOLERANCE FINDING: MLA is exact-only, because the C reference's LoRA-norm eps moves that operator by 1.92e-5 while its own fp32 rounding floor is 5.74e-5 — a margin of 0.33x — the eps sits BELOW the floor — so no threshold admits a correct kernel and rejects that eps, and the eps must be pinned structurally instead. Downstream it sits at 0.3-0.9x the floor, i.e. BELOW the reference's own rounding error, so a tolerance-based fixture could not have seen it anywhere — which is why this anchor is exact bytes. Every other operator has 16,000x to 3.3M x of room and is set at 10x its floor, where the floor is the MAX over both draws: attn_res 7.1e-4, mla_attend 4.1e-4, moe_latent 6.3e-4, moe_route 6.0e-4, kda_op 6.3e-4, dense_mlp 9.4e-6. Floors come from running the same reference in fp64 with all 276 fla modules held at fp32 (a plain model.double() dies in triton), except kda_op's, which is chunk_kda against fused_recurrent_kda over 69 layers because fla returns an fp32 recurrent state whatever the input dtype. Four deviations are declared in the metadata and pinned by the test: eager attention, unquantized experts, no vision wrapper, fp32 against the checkpoint's bf16.
+verdict: The S1b anchor exists and runs, and its per-operator TOLERANCES are measured — Kimi-K3's own first-party stack (modeling_kimi_linear.py at the pinned revision + fla-core 0.5.2 + transformers 4.56.2 + torch 2.13.0+rocm7.2) executed on gfx1151 at tiny widths but the REAL 93-layer structure. TWO independent weight draws are vendored (tests/k3-anchor-decode-k3-anchor-{1,2}.bin, 353,638 B each, each reproduced byte-for-byte on a later run) and read by tests/k3_anchor.rs with no GPU, no python and no network; thirteen defect runs are scored against both and each is GATED on the layers it must leave bit-identical. THE TOLERANCE FINDING: MLA is exact-only, because the C reference's LoRA-norm eps moves that operator by 1.92e-5 while its own fp32 rounding floor is 5.74e-5 — a margin of 0.33x — the eps sits BELOW the floor — so no threshold admits a correct kernel and rejects that eps, and the eps must be pinned structurally instead. Downstream it sits at 0.3-0.9x the floor, i.e. BELOW the reference's own rounding error, so a tolerance-based fixture could not have seen it anywhere — which is why this anchor is exact bytes. Every other operator has 16,000x to 3.3M x of room and is set at 10x its floor, where the floor is the MAX over both draws: attn_res 7.1e-4, mla_attend 4.1e-4, moe_latent 6.3e-4, moe_route 6.0e-4, kda_op 6.3e-4, kda_conv 6.6e-5, kda_gate_norm 1.1e-4, dense_mlp 9.4e-6. Floors come from running the same reference in fp64 with all 276 fla modules held at fp32 (a plain model.double() dies in triton), except kda_op's, which is chunk_kda against fused_recurrent_kda over 69 layers because fla returns an fp32 recurrent state whatever the input dtype. Four deviations are declared in the metadata and pinned by the test: eager attention, unquantized experts, no vision wrapper, fp32 against the checkpoint's bf16.
 ---
 
 # The S1b anchor: goldens from Kimi-K3's own stack
@@ -127,7 +127,7 @@ vendored golden went unchecked, output indistinguishable from a full pass. The s
 being quiet about it was the defect. A run that reproduces **nothing** now fails outright, since
 that is what an empty `$OUT` or a mistyped `--out` looks like from outside.
 
-**Only the decode golden is vendored** (332,009 B = 324 KiB each, `tests/k3-anchor-decode-k3-anchor-1.bin`
+**Only the decode golden is vendored** (353,638 B = 345 KiB each, `tests/k3-anchor-decode-k3-anchor-1.bin`
 and `-2.bin`). The
 prefill golden is **1,299,802 B = 1.24 MiB** — every per-token tensor is eight times wider at
 `--seq 8` — and its consumer does not exist: S2 item 5 defers chunked prefill outright ("no chunked
@@ -139,7 +139,7 @@ is `K3_ANCHOR_MODES=prefill tests/k3-anchor.sh`.
 Six layers, chosen for what each one *is* — `0` (KDA, the only dense `mlp`, an attn-res block
 start), `1` (first MoE layer), `3` (first MLA layer, 1-based 4), `12` (an attn-res block start that
 is not layer 0), `91` and `92` (the two **adjacent** MLA layers the real map ends with) — plus the
-model-level tail. Every submodule output of those layers, **272 float and 5 int tensors** in the
+model-level tail. Every submodule output of those layers, **287 float and 5 int tensors** in the
 decode golden, plus the operator boundaries no forward hook can see:
 
 > **CORRECTED 2026-08-12.** This line said **235**, which was true for about a day. Item 2 added 27
@@ -147,13 +147,16 @@ decode golden, plus the operator boundaries no forward hook can see:
 > 37 while `tests/k3_anchor.rs` asserted the real number — the count is gated there, and was right
 > throughout. The arithmetic, so the next addition has somewhere to attach: 223 originally, +12
 > `.fold` (item 1), +21 MLA attention-core and +6 `o_proj.in_gated` (item 2), +10 latent-norm input
-> and weight (item 3). **Prefill's count is no longer restated here**: it was given as "232 + 5" and
+> and weight (item 3), +15 conv taps and the `o_norm` sandwich (items 5b/5c, 2026-08-12).
+> **Prefill's count is no longer restated here**: it was given as "232 + 5" and
 > that too was a snapshot of one day's driver. It differs from decode by the incoming recurrent
 > state, which is the durable fact.
 
 * **KDA** — `q`/`k`/`v` after the short convolutions, the log-space gate, `beta`, `A_log`,
   `dt_bias`, the incoming recurrent state, and both outputs. Everything between those two points
-  lives in fla's triton kernel and in no document. This IS the S2 KDA fixture.
+  lives in fla's triton kernel and in no document. This IS the S2 KDA fixture. Added 2026-08-12 for
+  items 5b/5c: the three `{q,k,v}_conv1d.weight` tap sets, and `o_norm`'s input beside its `weight`
+  — see below for why an input and an output were not enough in either case.
 * **The MLA attention CORE** — `q`, `k`, `v`, the additive `mask`, the **`scaling` as a value**, the
   output and the softmax `probs`, for each of the three captured MLA layers. `eager_attention_forward`
   is a module-level free function, so no hook fired for it and the golden held the projections
@@ -270,6 +273,32 @@ something needs the reference's particular matrix.
 > batch kernel on the grounds that it is already width-generic; it is, and the width was never the
 > problem.
 
+### A fifth and sixth time, and both were recognised before the fixture failed (2026-08-12, S2 items 5b/5c)
+
+**The short convolution's taps and the head norm's weight.** The KDA bullet above says the golden
+holds `q`/`k`/`v` *after* the short convolutions — which it did, along with the pre-conv projections,
+so both ends of `ShortConvolution` were present and the operator between them still could not be
+scored: a depthwise convolution's output is not determined by its input without the `[channels][taps]`
+kernel. `o_norm` was the same gap wearing the same hat — input, output, no `weight`. By this point the
+pattern above was load-bearing rather than retrospective: **both were predicted from the generalisation
+and neither cost a failed fixture attempt.** `wrap_kda_params` captures the three conv weights as
+parameters and `o_norm`'s input alongside its weight, +15 tensors across the three KDA capture layers.
+
+**The conv cache's width was the one thing the reference had to tell us.** `ShortConvolution` returns
+a `[1][channels][taps]` cache, and whether the *current* token occupies the last slot or the cache is
+the `taps-1` history *before* it is not inferable from shapes — both readings type-check and the
+kernel's window size differs by one. Measured against the golden: the returned cache is the full
+`taps`-wide window with the current token in the **last** slot, so a `taps-1` ring plus a separate
+current value is the wrong shape and was corrected in the kernel, the launcher's doc and the fixture
+together. `the_conv_window_discards_only_its_oldest_slot` pins it by poisoning the slot that must fall
+out and asserting the output does not move.
+
+**`o_norm`'s output and `o_proj.in_gated` are the same tensor under two names**, and the pair is a
+free cross-check between the module hook and the pre-hook — the module's output must equal what the
+next module is handed. It also means `kda_gate_norm` and `kda_trunk` attain the *same* floor at both
+draws by construction, which is recorded at the row in `tests/common/k3_tolerance.rs` because two rows
+sharing a number is what reads as a transcription slip a month later.
+
 Two things are deliberately not captured. The **individual routed experts** are excluded — not for
 size but because `moe_infer` only calls experts that won tokens, so which expert modules fire is
 routing-dependent, and any defect that moves the routing changes the golden's tensor *set*. The
@@ -307,32 +336,38 @@ key, and sorting the whole key set by `int` raises on it.
 Decode, `--seq 8`, one step. `differing` is out of the layer's captured tensor count; `max_rel` is
 the **row maximum** of `max|a−b|` over the tensor's own scale:
 
-> **Denominators re-derived 2026-08-11** when S2 item 1 added the twelve `.fold` captures: 38→39,
-> 47→49, 30→32, 6→7, summing to the +12. **Every numerator is unchanged**, and that is the useful
-> half — the folds are weights no defect perturbs, so they land green everywhere and no defect's
-> localisation moved. Confirmed structurally as well: the regenerated goldens are bit-identical to
-> the old ones on all 223 pre-existing captures and on every metadata field, so the driver change
-> is provably additive rather than merely believed to be.
+> **RE-MEASURED IN FULL 2026-08-12** with items 5b/5c's regeneration, which ran all 13 defects x 2
+> salts x 2 modes under one lock. Every cell below is from that run — denominators and numerators
+> both — so the partial re-derivations this note used to carry are gone rather than annotated. The
+> two previous notes said the denominators had been re-derived for **salt-1 decode only**, the other
+> three matrices having lost the GPU flock to another tenant at 19 of 48 runs; that gap is closed.
 >
-> **Scope of that re-derivation: salt-1 decode only.** The salt-2 and both prefill matrices were
-> not re-run — the regeneration lost the GPU flock at 19 of 48 runs (`-E 66`, 900 s) to another
-> tenant. Their numerators are unaffected by the same argument, but their denominators as printed
-> by a fresh `--compare` will be the grown ones, not the numbers a reader would derive from this
-> table. Re-run `tests/k3-anchor.sh` when the device is free and this note goes away.
+> The order is the driver's `DEFECTS` order, not the old table's, so a row's position now tells you
+> where it sits in a `--compare` run's output.
 
 | defect | 0 | 1 | 3 | 12 | 91 | 92 | model | max_rel |
 |---|---|---|---|---|---|---|---|---|
-| `MlaLoraEps1e5` | **0/40** | **0/50** | 26/40 | 44/50 | 35/40 | 35/40 | 6/7 | 2.2e−5 |
-| `MlaScaleFromNope` | **0/40** | **0/50** | 20/40 | 44/50 | 37/40 | 36/40 | 6/7 | 1.3e+0 |
-| `ExpertW1W3Swap` | **0/40** | 4/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 3.0e+0 |
-| `RouterBiasInWeight` | **0/40** | 5/50 | 32/40 | 45/50 | 36/40 | 36/40 | 6/7 | 2.4e+0 |
-| `LatentNormAfterUp` | **0/40** | 4/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 2.0e+2 |
-| `DenseMlpGateUpSwap` | 6/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 2.3e+0 |
-| `AttnResNormalisedValues` | 8/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 1.8e+0 |
-| `KdaNoQkL2Norm` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 4.2e+1 |
-| `KdaGateLowerBoundOff` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 3.3e+0 |
-| `KdaStateLayout` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 3.3e+0 |
-| `KdaBetaSigmoidOutside` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 7.0e+0 |
+| `MlaLoraEps1e5` | **0/45** | **0/57** | 27/42 | 46/57 | 36/42 | 36/42 | 6/7 | 3.0e−5 |
+| `MlaScaleFromNope` | **0/45** | **0/57** | 21/42 | 46/57 | 38/42 | 37/42 | 6/7 | 1.3e+0 |
+| `KdaNoQkL2Norm` | 17/45 | 45/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 4.2e+1 |
+| `KdaGateLowerBoundOff` | 17/45 | 45/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 3.3e+0 |
+| `KdaStateLayout` | 17/45 | 45/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 3.3e+0 |
+| `KdaBetaSigmoidOutside` | 17/45 | 45/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 7.0e+0 |
+| `KdaConvTapsReversed` | 26/45 | 48/57 | 34/42 | 50/57 | 37/42 | 37/42 | 6/7 | 7.3e+0 |
+| `KdaGateBeforeNorm` | 13/45 | 44/57 | 33/42 | 46/57 | 37/42 | 37/42 | 6/7 | 2.1e+0 |
+| `ExpertW1W3Swap` | **0/45** | 5/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 3.0e+0 |
+| `DenseMlpGateUpSwap` | 6/45 | 45/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 2.3e+0 |
+| `RouterBiasInWeight` | **0/45** | 6/57 | 33/42 | 47/57 | 37/42 | 37/42 | 6/7 | 2.4e+0 |
+| `LatentNormAfterUp` | **0/45** | 4/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 2.0e+2 |
+| `AttnResNormalisedValues` | 8/45 | 45/57 | 34/42 | 47/57 | 37/42 | 37/42 | 6/7 | 1.8e+0 |
+
+> **The two new rows have NO bold cell, and that is honest rather than a weakness to hide.** Layer 0
+> is a KDA layer, so a conv or head-norm perturbation reaches it immediately and there is no captured
+> layer upstream of the defect to stay green. `EXPECT_GREEN` is `[]` for both, which the compare gate
+> accepts — but it means **these two runs contribute SENSITIVITY evidence and no localisation
+> evidence.** Every other row buys both. Worth stating because the matrix's whole argument elsewhere
+> is what stays bit-identical, and a reader scanning for bold would otherwise read two empty rows as
+> two weak defects. They are not weak: 7.3e+0 and 2.1e+0, against tolerances of 6.6e−5 and 1.1e−4.
 
 Every bold cell is asserted. Read the rows:
 
@@ -361,7 +396,7 @@ Every bold cell is asserted. Read the rows:
   and layer 1 reddens 5 of 52: its MoE block and what follows, not its attention.
 * **`RouterBiasInWeight`** — takes the routing weight from the biased score instead of the unbiased
   one (trap 6). Layer 1 reddens 6 of 52 at 3.5e-2, and `topk_idx` does **not** move: the bias steers
-  selection only, so a wrong weight is a small, silent error. The most easily-missed of the eleven.
+  selection only, so a wrong weight is a small, silent error. The most easily-missed of the thirteen.
 * **`LatentNormAfterUp`** — RMSNorm the latent sandwich's output *after* the up projection instead
   of the aggregate before it. Shape-valid in both directions because a norm is width-generic, and
   the **loudest defect in the set at 2.0e+2**.
@@ -374,10 +409,23 @@ Every bold cell is asserted. Read the rows:
 * **The four KDA kwargs** — `use_qk_l2norm_in_kernel`, `lower_bound` (the −5.0 gate bound, trap 4:
   it *multiplies* the sigmoid rather than clamping), the stored state's (K,V)-vs-(V,K) axis order,
   and `use_beta_sigmoid_in_kernel`. These are the arithmetic that exists only inside fla's kernel,
-  and each reddens 16 of layer 0's 40 tensors while leaving the 24 upstream of the KDA op alone —
+  and each reddens 17 of layer 0's 45 tensors while leaving the 28 upstream of the KDA op alone —
   the earliest a defect can localise here. Without these runs nothing showed the goldens were
   sensitive to that arithmetic at all; a kernel that omitted the gate bound entirely could have
   matched.
+* **`KdaConvTapsReversed`** — flips `{q,k,v}_conv1d.weight` along its tap axis, in place, so the
+  module's own arithmetic still runs and the tensor set is unchanged. §4 step 2 says the taps run
+  oldest→newest and **nothing outside that sentence attests to it**: the weight is
+  `[channels][1][kernel]` either way and a reversed filter is still a causal convolution over the
+  same window. Reddens 26 of layer 0's 45 — nine more than the recurrence kwargs, because the conv
+  sits upstream of the recurrence and takes `q`/`k`/`v` with it. Added 2026-08-12 for S2 item 5b,
+  and it is what gives `kda_conv` a ceiling.
+* **`KdaGateBeforeNorm`** — gates before the head norm instead of after, by replacing `o_norm.forward`
+  at the same signature so the hook, the tensor set and every shape stay put. Trap 10's other half,
+  and **not a permutation of two elementwise multiplies**: gating first changes the RMS the norm
+  divides by. The weakest of the four KDA-family defects at layer 0 (13 of 45, 5.9e−2) precisely
+  because it is the last operator in the layer — which is what makes it the right ceiling for
+  `kda_gate_norm` and the wrong one for anything upstream. Added 2026-08-12 for S2 item 5c.
 
 > **CORRECTED 2026-08-11, and it is the useful correction of this round.** The bullet above and
 > `defect_kda_gate_lower_bound_off`'s docstring both said the gate bound's *form* — multiply, not
@@ -600,12 +648,37 @@ within 30× of its defect fails, and setting one below its own floor fails.
 > > `MlaLoraEps1e5` moves this bucket by, so **the bucket-level gate provably cannot see that eps.**
 > > Correct for the fixture, wrong to generalise — S3 must pin the eps by reading the constant.
 
-**Seven operators have a row; the driver classifies ELEVEN — and the four without one are a GAP, not a
-decision.** `operator_of` also emits `kda_trunk` (a KDA layer's projections and norms, as opposed to
-the recurrence itself), `norm`, `residual` and `head`. Nobody measured a floor for those: the six
-are the distinct kernels S2 and S3 will write, and the other four are buckets the comparator uses to
-say *where* a defect landed. So **S2 must not score those four against a threshold** — compare them
-exactly, or measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
+> **RE-MEASURED 2026-08-12 for S2 items 5b/5c, which added two rows and two defect runs.** Both
+> operators used to fall inside `kda_trunk` — a bucket with a floor and **no ceiling**, because none of
+> the eleven original defects targets a KDA projection, a conv or the head norm. Following item 2's
+> `mla_attend` precedent, each got its own bucket *and* its own targeting defect rather than being
+> scored against a fixture tripwire alone, which is what the paragraph below tells S2 not to do.
+>
+> | operator | floor draw 1 | floor draw 2 | floor | weakest targeting defect | policy |
+> |---|---|---|---|---|---|
+> | `kda_conv` | 4.208e−6 | **6.641e−6** | 6.641e−6 | `KdaConvTapsReversed` 2.012e0 | Rel(6.6e−5) |
+> | `kda_gate_norm` | 7.680e−6 | **1.076e−5** | 1.076e−5 | `KdaGateBeforeNorm` 4.365e−1 | Rel(1.1e−4) |
+>
+> **These are the first two rows whose ceiling was measured with the defect rather than after it** —
+> the run was written in the same change as the kernel, so neither policy is a number chosen and then
+> justified. The margins are 303,000× and 40,600×, inside the 16,000×–3.3M× band every other `Rel`
+> row sits in. Draw 2 is again the larger floor, by 1.6× and 1.4× — a fifth and sixth row where the
+> one-draw reading would have been optimistic.
+>
+> **`kda_gate_norm`'s floor equals `kda_trunk`'s at draw 1 (7.680e−6) and not at draw 2** (1.076e−5
+> against 2.292e−5). That is the expected shape, not an inconsistency: `o_norm`'s output and
+> `o_proj.in_gated` are one tensor under two names, so it sits in both buckets and `kda_trunk`'s max
+> can only ever be ≥ `kda_gate_norm`'s. At draw 1 that shared tensor happens to *be* `kda_trunk`'s
+> worst; at draw 2 something else in the trunk is worse, and `kda_trunk` coincides with `kda_op`
+> instead. Stated because two buckets printing the same number invites a transcription-slip reading.
+
+**Nine operators have a row; the driver classifies THIRTEEN — and the four without one are a GAP, not
+a decision.** `operator_of` also emits `kda_trunk` (a KDA layer's projections, as opposed to the
+recurrence, the convolutions or the head norm), `norm`, `residual` and `head`. Nobody measured a floor
+for those: the nine are the distinct kernels S2 and S3 will write, and the other four are buckets the
+comparator uses to say *where* a defect landed. So **S2 must not score those four against a
+threshold** — compare them exactly, or measure the floor the same way (`--dtype float64`, then
+`--by-operator`) and add a row.
 `k3_anchor.rs` now asserts the table holds exactly the measured six in both directions, so a row for
 an unmeasured operator is a visible edit rather than a number that arrived from nowhere.
 
@@ -642,6 +715,26 @@ head dims, the latent sandwich at 3584, the MoE at 7168, KDA's 96 heads × 128 �
 synthetic sweep beside its golden fixture. Score it against a host oracle the goldens have already
 validated, so the sweep inherits the reference's evidence instead of asserting a fresh claim.
 
+> **The debt was paid by every item except 5b and 5c, and that was found by review 2026-08-12 rather
+> than by the paragraph above.** A rule stated once at the bottom of a doc is not a gate. The two
+> gaps were of the exact kind this section describes:
+>
+> | operator | anchor geometry | real geometry | what the goldens never launch |
+> |---|---|---|---|
+> | `kda_conv` | 128 channels | **12,288** | ONE block of 256, so `blockIdx.x` is always 0 |
+> | `kda_gate_norm` | `head_dim` 32 | **128** | a 5-level `block_sum_lds` ladder against 7, on ¼ the LDS |
+>
+> `the_conv_and_gated_norm_hold_at_real_widths` closes both, scored against the same f64 host oracles
+> as the golden-backed tests. It carries `257` channels deliberately — two blocks whose second holds
+> one live thread, where an off-by-one in the grid and one in the tail guard disagree — and both
+> power-of-two extremes the norm's guards still admit.
+>
+> One measured result worth keeping, because it contradicts the obvious model: the conv's separation
+> DOES grow with reduction depth (1.2–1.5e−7 at 4 taps, 2.8e−7 at 16), and the gated norm's does
+> **not** — its worst is the real 96×128 at 1.913e−7, above the 1024-wide case's 1.543e−7 on a ladder
+> two levels deeper. "Deeper reduction, larger disagreement" is a reasonable prediction and it was
+> wrong for one of the two; both bounds are set from the measurement.
+
 ## Two salts, because one draw proves less than it looks like
 
 The residual limit was that the golden is **one weight draw at one position**: a kernel bug
@@ -649,8 +742,8 @@ degenerate at those particular values — a routed weight near zero, a `beta` sa
 hides completely, and one draw cannot show that a defect's localisation is a property of the
 arithmetic rather than of the numbers it landed on.
 
-So **two goldens are vendored** (`--salt k3-anchor-1` and `-2`, 332,009 B each — identical shapes,
-independent values), `tests/k3-anchor.sh` scores all eleven defects against both, and every test in
+So **two goldens are vendored** (`--salt k3-anchor-1` and `-2`, 353,638 B each — identical shapes,
+independent values), `tests/k3-anchor.sh` scores all thirteen defects against both, and every test in
 `tests/k3_anchor.rs` loops over both. The salt-2 matrix reproduces salt-1's green cells exactly:
 `MlaLoraEps1e5` and `MlaScaleFromNope` leave layers 0 and 1 bit-identical, `ExpertW1W3Swap`,
 `RouterBiasInWeight` and `LatentNormAfterUp` leave layer 0 bit-identical. The localisation is a fact

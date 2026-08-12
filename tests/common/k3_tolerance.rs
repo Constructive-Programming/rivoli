@@ -223,6 +223,42 @@ pub const TOLERANCES: &[Tol] = &[
         weakest_defect: 1.75e0,
         policy: Policy::Rel(6.3e-4),
     },
+    // **The KDA short convolution, S2 item 5b — and the first row measured WITH its own defect run
+    // rather than after one.** Both this and `kda_gate_norm` below used to fall inside `kda_trunk`,
+    // which has a floor and no ceiling because none of the eleven original defects targeted a KDA
+    // projection, a conv or the norm. Two new runs fix that: `KdaConvTapsReversed` reverses the
+    // depthwise taps in place (§4 step 2 says oldest→newest and nothing outside that sentence
+    // attests to it — the weight shape is identical either way), and it is this row's ceiling at the
+    // WEAKER of its two draws.
+    //
+    // Split on item 2's precedent, which took `mla_attend` out of `mla` for exactly this reason: an
+    // operator whose bucket has no targeting defect cannot be given a defensible `Rel`, and scoring
+    // it against a fixture's own tripwire instead is what `anchor.md` tells S2 not to do.
+    Tol {
+        operator: "kda_conv",
+        floor: 6.641e-6,
+        weakest_defect: 2.012e0,
+        policy: Policy::Rel(6.6e-5),
+    },
+    // The fused gated head norm, S2 item 5c. Its defect is `KdaGateBeforeNorm` — trap 10's other
+    // half, gating before the norm instead of after, which is not a permutation of two elementwise
+    // multiplies because it changes the RMS the norm divides by.
+    //
+    // **Its floor equals `kda_trunk`'s at draw 1 — 7.680e-6 — and that is not a transcription
+    // error.** `o_norm`'s output and `o_proj.in_gated` are the same tensor under two names
+    // (`anchor.md` records the pair as a free cross-check between the module hook and the pre-hook),
+    // so identical values sit in both buckets and `kda_trunk`'s max can only be >= this row's. At
+    // draw 1 that shared tensor is also `kda_trunk`'s worst; at draw 2 it is not (1.076e-5 here
+    // against 2.292e-5 there, where `kda_trunk` coincides with `kda_op` instead). Stated because
+    // two buckets printing one number is exactly what reads as a copy-paste slip later — and
+    // because the coincidence holding at only one of the two draws is the part that would look
+    // like the slip.
+    Tol {
+        operator: "kda_gate_norm",
+        floor: 1.076e-5,
+        weakest_defect: 4.365e-1,
+        policy: Policy::Rel(1.1e-4),
+    },
     Tol {
         operator: "dense_mlp",
         floor: 9.374e-7,
