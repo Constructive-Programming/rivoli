@@ -98,9 +98,23 @@ pub const TOLERANCES: &[Tol] = &[
     // `MlaScaleFromNope` at the weaker draw — the softmax scale over `qk_nope` instead of the full
     // head width, §5's own trap.
     //
-    // **`MlaLoraEps1e5` is excluded, and for a sharper reason than judgement**: it moves this
-    // bucket by 3.031e-5, which is BELOW the 4.103e-5 floor. Counting it would price this operator
-    // against a signal indistinguishable from its own rounding.
+    // **`MlaLoraEps1e5` is excluded on PROVENANCE, not on magnitude** — and the distinction was
+    // forced by an adversarial review 2026-08-12. The first version of this comment excluded it
+    // because its 3.031e-5 signal sits below the 4.103e-5 floor. That rule is not survivable:
+    // applied to `mla` it would drop `MlaLoraEps1e5` from that row's set too (1.923e-5 under a
+    // 5.742e-5 floor), leaving `mla` with no targeting defect and turning its ExactOnly into a
+    // `Rel`. Two rows cannot read the same evidence shape and reach opposite conclusions.
+    //
+    // The rule that does survive is the one this module's doc already states: the weakest signal
+    // among the defects that TARGET this operator. `MlaLoraEps1e5` perturbs the LoRA norms, which
+    // are UPSTREAM of the attention; it reaches this bucket only by changing the q/k/v the
+    // attention is handed. A fixture feeds the reference's own q/k/v, so the defect cannot reach
+    // the kernel under test at all. It is excluded because it does not target this operator —
+    // that it is also below the floor is corroboration, not the reason.
+    //
+    // Stated plainly because it cuts the other way too: `Rel(4.10e-4)` is 13.5x above what
+    // `MlaLoraEps1e5` moves this BUCKET by, so the bucket-level gate provably cannot see the eps.
+    // That is correct for the fixture and wrong to generalise — S3 must pin the eps by reading it.
     Tol {
         operator: "mla_attend",
         floor: 4.103e-5,
@@ -153,8 +167,8 @@ pub fn tolerance(operator: &str) -> Option<&'static Policy> {
 /// with the reference. `None` means the row was renamed and NOTHING is being scored, which an
 /// `unwrap_or(default)` would turn into silence.
 ///
-/// Factored here rather than written per fixture: `k3_attn_res.rs` had it first, and jscpd would
-/// have rejected the second copy the moment `k3_mla.rs` wanted one.
+/// Factored here rather than written per fixture: `k3_kernels.rs` had it first, and jscpd would
+/// have rejected the second copy the moment `k3_kernels.rs` wanted one.
 pub fn rel_tolerance(operator: &str) -> f32 {
     match tolerance(operator) {
         Some(Policy::Rel(t)) => *t,

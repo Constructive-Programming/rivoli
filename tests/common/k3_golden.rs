@@ -1,6 +1,6 @@
 //! Readers shared by the tests that consume the K3 anchor goldens.
 //!
-//! `k3_anchor.rs` asks whether the vendored bytes are the ones the doc describes; `k3_attn_res.rs`
+//! `k3_anchor.rs` asks whether the vendored bytes are the ones the doc describes; `k3_kernels.rs`
 //! runs a kernel over them. Different questions, same three lines of lookup — and `build.rs`'s
 //! jscpd gate rejected the second copy of `float` at 114 tokens the moment S2 item 1 wrote one.
 //! Factored rather than exempted, which is this repo's standing answer.

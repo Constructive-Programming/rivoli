@@ -839,6 +839,11 @@ launchers! {
     /// `src` is `[tokens][nsrc][n]` and `out` is `[tokens][n]`. The softmax mixes the sources
     /// **unnormalised** — `kernels/linalg.hip` carries the argument and the defect that prices it.
     ///
+    /// **`src_stride` is the element distance between tokens in `src`, and it is NOT `nsrc·n`.**
+    /// `k3-architecture.md` §3 sizes the arena at `[T][9][hidden]` — nine slots per token whatever
+    /// the current depth — so a caller with that layout passes `9·n` while the live stack is
+    /// `nsrc·n`. A stride below `nsrc·n` is refused (1005): it would overlap consecutive tokens.
+    ///
     /// `nsrc` outside `1..=16` is refused (1003) rather than clamped, because a stack larger than
     /// one snapshot per `attn_res_block_size` layers plus the prefix sum means the caller's block
     /// bookkeeping is wrong, and an EMPTY stack means §3's layer-level emptiness guard went
@@ -855,6 +860,7 @@ launchers! {
         tokens: usize as i32,
         nsrc: usize as i32,
         n: usize as i32,
+        src_stride: usize,
         eps: f32,
         out: *mut f32,
     );

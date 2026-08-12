@@ -160,18 +160,39 @@ fn stack(g: &GoldenSet, tag: &str) -> (Vec<f32>, usize, usize) {
 /// The reference's fold, transliterated, in `f64` — the host oracle the device is scored against.
 ///
 /// `f64` because the reference accumulates every long reduction in double (`k3-architecture.md`
-/// §10's closing note), so this reproduces the reference's own arithmetic rather than a second
-/// fp32 implementation of it. Scoring the kernel against an fp32 host would measure the two
-/// fp32 implementations' disagreement, which is a different and much smaller number than the one
+/// §10's closing note), so this reproduces the reference's own arithmetic rather than a second fp32
+/// implementation of it. Scoring the kernel against an fp32 host would measure two fp32
+/// implementations disagreeing, which is a different and much smaller number than the one
 /// `attn_res`'s tolerance was measured for.
-fn host_fold(
-    src: &[f32],
+///
+/// Split into `host_probs` and `host_fold` because three places need the probabilities and only one
+/// needs the mixture — and because a review found the same f64 softmax written out three times in
+/// this file, which jscpd could not see (the surrounding code differs) and which is the one place
+/// factoring genuinely paid.
+///
+/// Returns the softmax probabilities and each source's RMSNorm scale, since the
+/// `AttnResNormalisedValues` defect needs the latter to mix the scored vector instead of the raw
+/// one.
+/// Max-subtracted softmax in `f64`. Both oracles ended with these four lines; jscpd caught it.
+fn softmax64(score: &[f64]) -> Vec<f64> {
+    let m = score.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let ex: Vec<f64> = score.iter().map(|s| (s - m).exp()).collect();
+    let z: f64 = ex.iter().sum();
+    ex.into_iter().map(|e| e / z).collect()
+}
+
+/// One AttnRes fold's inputs. Bundled for the same reason as `AttnIn`: `host_probs` and
+/// `host_fold` take the same five things and the duplicate parameter list is a clone.
+struct FoldIn<'a> {
+    src: &'a [f32],
     nsrc: usize,
     n: usize,
-    fold: &[f32],
+    fold: &'a [f32],
     eps: f32,
-    normalised: bool,
-) -> Vec<f32> {
+}
+
+fn host_probs(f: &FoldIn) -> (Vec<f64>, Vec<f64>) {
+    let (src, nsrc, n, fold, eps) = (f.src, f.nsrc, f.n, f.fold, f.eps);
     let mut score = vec![0.0f64; nsrc];
     let mut inv = vec![0.0f64; nsrc];
     for s in 0..nsrc {
@@ -184,26 +205,62 @@ fn host_fold(
             .map(|(x, f)| (f64::from(*x) * inv[s]) * f64::from(*f))
             .sum();
     }
-    let m = score.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let ex: Vec<f64> = score.iter().map(|s| (s - m).exp()).collect();
-    let z: f64 = ex.iter().sum();
-    let mut out = vec![0.0f32; n];
+    (softmax64(&score), inv)
+}
+
+fn host_fold(f: &FoldIn, normalised: bool) -> Vec<f32> {
+    let (src, nsrc, n) = (f.src, f.nsrc, f.n);
+    let (p, inv) = host_probs(f);
+    let mut out = vec![0.0f64; n];
     for s in 0..nsrc {
-        let p = ex[s] / z;
         let v = &src[s * n..(s + 1) * n];
         // `normalised` is the `AttnResNormalisedValues` body: mix `k`, the scored vector, instead
         // of the raw source. One substitution, the same shape as the driver's own defect.
         let scale = if normalised { inv[s] } else { 1.0 };
-        for i in 0..n {
-            out[i] += (p * f64::from(v[i]) * scale) as f32;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o += p[s] * f64::from(v[i]) * scale;
         }
     }
-    out
+    // Cast ONCE at the end. This accumulated in f32 until review 2026-08-12 pointed out the doc
+    // above promised f64 throughout and the mixture did not honour it — ~9 roundings, three orders
+    // under the tolerance, but this oracle is the only thing behind the sweep's real-width cells.
+    out.into_iter().map(|x| x as f32).collect()
 }
 
 /// Relative difference the way `--by-operator` measures it, so the number compared here is the
 /// number the tolerance was measured in.
+impl Attend {
+    /// This layer's boundary as an attention call. One constructor, so the two tests that launch
+    /// over it cannot disagree about which buffers go where.
+    fn inputs(&self) -> AttnIn<'_> {
+        AttnIn {
+            q: &self.q,
+            k: &self.k,
+            v: &self.v,
+            mask: &self.mask,
+            dims: self.dims,
+            scale: self.scale,
+        }
+    }
+}
+
 fn rel(a: &[f32], b: &[f32]) -> f32 {
+    // **Non-finite is INFINITY, not zero, and this is the most important line in the file.**
+    //
+    // `f32::max` is documented to return the OTHER operand when one is NaN, so the obvious fold
+    // `m.max((x - y).abs())` silently skips every NaN difference and an all-NaN output scores
+    // exactly 0.0 — indistinguishable from a perfect match. Measured, not reasoned:
+    // `rel(&[NaN; 3], &[1.0, 2.0, 3.0])` returned 0. Every scoring site in this file goes through
+    // here, so a kernel emitting NaN passed all four golden-backed fixtures AND the regression
+    // tripwire.
+    //
+    // Found by two independent reviews 2026-08-12. The tell was already in the tree: the width
+    // sweep carries its own `is_finite` assert, added after red-proofing found `mha_attend` could
+    // produce NaN — one call site was patched instead of the shared helper, which is exactly the
+    // shape that leaves the other five exposed.
+    if a.iter().chain(b).any(|x| !x.is_finite()) {
+        return f32::INFINITY;
+    }
     let scale = b.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-30);
     a.iter()
         .zip(b)
@@ -260,7 +317,15 @@ fn score(f: &Fold, got: &[f32]) -> f32 {
 /// no golden and therefore no `Fold` — and jscpd rejected the second copy of the launch block at
 /// 34 tokens, which is the correct outcome: one launcher call site means one place where the
 /// argument order can be wrong.
-fn device(src: &[f32], fold: &[f32], tokens: usize, nsrc: usize, n: usize, eps: f32) -> Vec<f32> {
+fn device(
+    src: &[f32],
+    fold: &[f32],
+    tokens: usize,
+    nsrc: usize,
+    n: usize,
+    stride: usize,
+    eps: f32,
+) -> Vec<f32> {
     let (sb, fb) = (dev(&f32b(src)), dev(&f32b(fold)));
     let mut ob = zeros(tokens * n * 4);
     // SAFETY: `src` is `tokens·nsrc·n` f32, `fold` is `n` f32 and `out` is `tokens·n` f32, all
@@ -273,6 +338,7 @@ fn device(src: &[f32], fold: &[f32], tokens: usize, nsrc: usize, n: usize, eps: 
                 tokens,
                 nsrc,
                 n,
+                stride,
                 eps,
                 ob.ptr_mut() as *mut f32,
             )
@@ -286,7 +352,18 @@ fn device(src: &[f32], fold: &[f32], tokens: usize, nsrc: usize, n: usize, eps: 
 #[test]
 fn attn_res_matches_the_anchor_at_every_fold() {
     for_each_fold(|f| {
-        let r = score(&f, &device(&f.c.src, &f.c.fold, 1, f.c.nsrc, f.c.n, f.eps));
+        let r = score(
+            &f,
+            &device(
+                &f.c.src,
+                &f.c.fold,
+                1,
+                f.c.nsrc,
+                f.c.n,
+                f.c.nsrc * f.c.n,
+                f.eps,
+            ),
+        );
         // **A second, much tighter bound — a regression tripwire, NOT the operator's tolerance.**
         //
         // The kernel agrees with the golden to 3.08e-7 worst over both draws (several folds are
@@ -379,14 +456,21 @@ fn every_fold_mixes_the_depth_the_layer_loop_implies() {
 fn mixing_the_normalised_sources_goes_red() {
     for_each_fold(|f| {
         let c = &f.c;
-        let clean = score(&f, &host_fold(&c.src, c.nsrc, c.n, &c.fold, f.eps, false));
+        let fin = FoldIn {
+            src: &c.src,
+            nsrc: c.nsrc,
+            n: c.n,
+            fold: &c.fold,
+            eps: f.eps,
+        };
+        let clean = score(&f, &host_fold(&fin, false));
         assert!(
             clean <= f.tol,
             "{} {}: the host oracle itself is {clean:e} from the golden",
             f.salt,
             f.tag
         );
-        let defect = score(&f, &host_fold(&c.src, c.nsrc, c.n, &c.fold, f.eps, true));
+        let defect = score(&f, &host_fold(&fin, true));
         assert!(
             defect > f.tol,
             "{} {}: mixing the normalised sources differs by only {defect:e}, inside the {:e} \
@@ -427,23 +511,64 @@ fn attn_res_at_real_widths_and_multiple_tokens() {
     // rather than to the width; 257 wraps the loop exactly once with a one-thread tail; 1000 wraps
     // it unevenly; 7168 is the real hidden. 3 tokens because 2 cannot distinguish "stride applied
     // once" from "stride applied per block".
-    for (n, tokens) in [(192, 1), (257, 1), (1000, 3), (7168, 1), (7168, 3)] {
+    // `(n, tokens, slots)` — `slots` is the arena's per-token capacity. `slots > nsrc` is §3's
+    // real `[T][9][hidden]` layout, where the live stack is shorter than the slot count at every
+    // layer below 84; `slots == nsrc` is the packed case the goldens happen to have. Both are
+    // launched, because the kernel took the packed one as an assumption until 2026-08-12.
+    for (n, tokens, slots) in [
+        (192, 1, 0),
+        (257, 1, 0),
+        (1000, 3, 0),
+        (7168, 1, 0),
+        (7168, 3, 0),
+        (1000, 3, 9),
+        (192, 4, 9),
+    ] {
         for nsrc in [2, 9] {
-            let src: Vec<f32> = (0..tokens * nsrc * n).map(|_| r.f()).collect();
-            let fold: Vec<f32> = (0..n).map(|_| r.f()).collect();
+            let cap = if slots == 0 { nsrc } else { slots.max(nsrc) };
+            let stride = cap * n;
+            // The arena is `tokens * cap * n`; only the first `nsrc` slots of each token are the
+            // live stack. The rest are filled with a LOUD sentinel rather than zeros — a kernel
+            // reading the wrong token's slots picks up 9.0e9 and cannot produce a plausible
+            // mixture, so the failure is unmistakable rather than merely numerical.
+            let mut src: Vec<f32> = vec![9.0e9; tokens * stride];
+            for t in 0..tokens {
+                for e in 0..nsrc * n {
+                    src[t * stride + e] = r.f();
+                }
+            }
+            // **Scaled by 1/sqrt(n), and without this the sweep tested a copy.** `attn_res`'s
+            // score has no width normaliser, so with a unit-magnitude fold the score spread grows
+            // as ~0.577*sqrt(n): 8 at n=192 but 49 at n=7168, where the softmax collapses onto one
+            // source. Measured by two reviews independently — max probability 1.0000000000 in all
+            // five cells at 7168, runner-up down at 4e-40. The mixing loop was bitwise a copy at
+            // exactly the width the sweep exists to reach. Scaling the fold keeps the scores O(1)
+            // at every width; `assert_mixes` below refuses a draw that degenerates anyway.
+            let fold: Vec<f32> = (0..n).map(|_| r.f() / (n as f32).sqrt()).collect();
             let eps = 1e-5f32;
 
-            let got = device(&src, &fold, tokens, nsrc, n, eps);
+            let got = device(&src, &fold, tokens, nsrc, n, stride, eps);
 
+            // Anti-vacuity: a mixture that has collapsed onto one source tests argmax and a copy,
+            // not mixing. Asserted per token rather than hoped for, because it is a property of the
+            // DRAW and a future seed or width could re-degenerate it silently.
             for t in 0..tokens {
-                let want = host_fold(
-                    &src[t * nsrc * n..(t + 1) * nsrc * n],
+                let stack = &src[t * stride..t * stride + nsrc * n];
+                let fin = FoldIn {
+                    src: stack,
                     nsrc,
                     n,
-                    &fold,
+                    fold: &fold,
                     eps,
-                    false,
+                };
+                let (p, _) = host_probs(&fin);
+                let pmax = p.iter().copied().fold(0.0f64, f64::max);
+                assert!(
+                    pmax < 0.9,
+                    "n={n} nsrc={nsrc} slots={cap} token {t}: one-hot (max p = {pmax:.6}), so \
+                     the mixing loop is a copy and this cell tests nothing it claims to"
                 );
+                let want = host_fold(&fin, false);
                 let d = rel(&got[t * n..(t + 1) * n], &want);
                 assert!(
                     d <= tol,
@@ -581,8 +706,21 @@ fn attend(g: &GoldenSet, layer: usize) -> Attend {
 /// Takes the pieces rather than an `Attend`, because the synthetic sweep at the bottom of this file
 /// has no golden and therefore no `Attend` — and jscpd rejected the second copy of the launch block
 /// at 73 tokens. One launcher call site is also one place where the argument order can be wrong.
-fn device_attend(q: &[f32], k: &[f32], v: &[f32], mask: &[f32], n: Dims, scale: f32) -> Vec<f32> {
-    let Dims { heads, kv, d, dv } = n;
+/// One attention call's inputs. Bundled because `device_attend` and `host_attn` take exactly the
+/// same six things and jscpd rejected the second parameter list — the same lesson `Dims` taught one
+/// level down, and the same answer: quantities that always travel together are one type.
+struct AttnIn<'a> {
+    q: &'a [f32],
+    k: &'a [f32],
+    v: &'a [f32],
+    mask: &'a [f32],
+    dims: Dims,
+    scale: f32,
+}
+
+fn device_attend(a: &AttnIn) -> Vec<f32> {
+    let (q, k, v, mask, scale) = (a.q, a.k, a.v, a.mask, a.scale);
+    let Dims { heads, kv, d, dv } = a.dims;
     let (qb, kb, vb, mb) = (
         dev(&f32b(q)),
         dev(&f32b(k)),
@@ -625,13 +763,61 @@ fn for_each_mla(mut f: impl FnMut(&str, usize, Attend)) {
     }
 }
 
+/// The reference's attention, in `f64`, over the first `width` dims of each head.
+///
+/// `width` is the whole point: `d` reproduces the operator, `nope` reproduces §5's silent bug of
+/// dropping the unrotated rope dims from the score. Writing it once makes
+/// `the_unrotated_rope_dims_are_still_scored` self-evidently "the same oracle at a narrower width",
+/// which is exactly its claim.
+///
+/// Factored after review 2026-08-12 found this softmax written out three times in this file —
+/// duplication jscpd cannot see, because the surrounding code differs each time.
+fn host_attn(a: &AttnIn, head: usize, width: usize) -> (Vec<f64>, Vec<f32>) {
+    let (q, k, v, mask, scale) = (a.q, a.k, a.v, a.mask, a.scale);
+    let Dims { kv, d, dv, .. } = a.dims;
+    let qh = &q[head * d..head * d + width];
+    let mut sc = vec![0.0f64; kv];
+    for (s, x) in sc.iter_mut().enumerate() {
+        let ks = &k[(head * kv + s) * d..(head * kv + s) * d + width];
+        let dot: f64 = qh
+            .iter()
+            .zip(ks)
+            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            .sum();
+        *x = dot * f64::from(scale) + f64::from(mask[s]);
+    }
+    let probs = softmax64(&sc);
+    let out: Vec<f32> = (0..dv)
+        .map(|j| {
+            probs
+                .iter()
+                .enumerate()
+                .map(|(s, p)| p * f64::from(v[(head * kv + s) * dv + j]))
+                .sum::<f64>() as f32
+        })
+        .collect();
+    (probs, out)
+}
+
 /// **The attention core reproduces the reference at every MLA layer, at both draws.**
 #[test]
 fn mha_attend_matches_the_anchor() {
     let tol = k3_tolerance::rel_tolerance("mla_attend");
     for_each_mla(|salt, layer, a| {
-        let got = device_attend(&a.q, &a.k, &a.v, &a.mask, a.dims, a.scale);
+        let got = device_attend(&a.inputs());
         let r = rel(&got, &a.out);
+        // The twin of `attn_res`'s tripwire, added after review 2026-08-12 pointed out that item 1
+        // learned this lesson and item 2 did not. Same argument: the operator tolerance is a
+        // whole-model floor carrying upstream drift, so against it alone a two-order degradation
+        // in this kernel passes in silence. Measured worst over both draws and all three MLA
+        // layers, then given 10x of room.
+        const MLA_OBSERVED_WORST: f32 = 2.0e-7;
+        assert!(
+            r <= MLA_OBSERVED_WORST * 10.0,
+            "{salt} layer {layer}: {r:e} is far above the {MLA_OBSERVED_WORST:e} this kernel \
+             achieves. Still inside the {tol:e} operator tolerance, so this is a REGRESSION \
+             tripwire — re-measure and move the constant only if the new value is defensible."
+        );
         assert!(
             r <= tol,
             "{salt} layer {layer}: {r:e} exceeds {tol:e} at {:?}",
@@ -674,31 +860,42 @@ fn the_softmax_scale_is_over_the_full_head_width() {
 /// output, so only a comparison against the reference's own probabilities proves the term was in.
 #[test]
 fn the_unrotated_rope_dims_are_still_scored() {
+    let tol = k3_tolerance::rel_tolerance("mla_attend");
     for_each_mla(|salt, layer, a| {
+        let inp = a.inputs();
+        // **The oracle is checked against the reference's own probabilities before it is used to
+        // judge anything.** Only the final output was compared until review 2026-08-12 observed
+        // that a compensating error — a wrong softmax cancelled by a wrong value reduction —
+        // survives an output-only comparison. The captured `probs` are the intermediate that makes
+        // the two separable, and they were captured for exactly this and then not used.
+        for h in 0..a.dims.heads {
+            let (p, _) = host_attn(&inp, h, a.dims.d);
+            let got: Vec<f32> = p.iter().map(|x| *x as f32).collect();
+            let want = &a.probs[h * a.dims.kv..(h + 1) * a.dims.kv];
+            let r = rel(&got, want);
+            assert!(
+                r <= tol,
+                "{salt} layer {layer} head {h}: the host oracle's softmax differs from the \
+                 reference's captured probs by {r:e}"
+            );
+        }
         let mut worst = 0.0f32;
         for h in 0..a.dims.heads {
-            let qh = &a.q[h * a.dims.d..(h + 1) * a.dims.d];
-            let mut nope_only = vec![0.0f64; a.dims.kv];
-            for (s, sc) in nope_only.iter_mut().enumerate() {
-                let ks = &a.k[(h * a.dims.kv + s) * a.dims.d..(h * a.dims.kv + s + 1) * a.dims.d];
-                let dot: f64 = qh[..a.nope]
-                    .iter()
-                    .zip(&ks[..a.nope])
-                    .map(|(x, y)| f64::from(*x) * f64::from(*y))
-                    .sum();
-                *sc = dot * f64::from(a.scale) + f64::from(a.mask[s]);
-            }
-            let m = nope_only.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let ex: Vec<f64> = nope_only.iter().map(|x| (x - m).exp()).collect();
-            let z: f64 = ex.iter().sum();
-            for (s, e) in ex.iter().enumerate() {
-                worst = worst.max((a.probs[h * a.dims.kv + s] - (e / z) as f32).abs());
-            }
+            // The same oracle at a narrower width: `a.nope` drops the rope dims from the score.
+            let (_, nope_out) = host_attn(&inp, h, a.nope);
+            let want = &a.out[h * a.dims.dv..(h + 1) * a.dims.dv];
+            worst = worst.max(rel(&nope_out, want));
         }
+        // **Scored in the operator's own units against the operator's own threshold**, rather than
+        // against a magic constant. Review 2026-08-12: this asserted an ABSOLUTE probability
+        // difference exceeded 1e-3, while the correctness test it underwrites is a RELATIVE output
+        // difference against `Rel(4.10e-4)` — two units with nothing connecting them. Recomputing
+        // the OUTPUT says the thing the doc claims: a kernel that dropped the rope dims would fail
+        // `mha_attend_matches_the_anchor`, and by this margin.
         assert!(
-            worst > 1e-3,
-            "{salt} layer {layer}: dropping the rope dims moves the softmax by only {worst:e} — \
-             this fixture cannot see §5's silent bug"
+            worst > tol,
+            "{salt} layer {layer}: dropping the rope dims moves the output by only {worst:e}, \
+             inside the {tol:e} tolerance — this fixture cannot see §5's silent bug"
         );
     });
 }
@@ -813,30 +1010,18 @@ fn mha_attend_at_real_widths_masks_and_magnitudes() {
             .collect();
         let scale = 1.0 / (d as f32).sqrt();
 
-        let got = device_attend(&q, &k, &v, &mask, Dims { heads, kv, d, dv }, scale);
+        let inp = AttnIn {
+            q: &q,
+            k: &k,
+            v: &v,
+            mask: &mask,
+            dims: Dims { heads, kv, d, dv },
+            scale,
+        };
+        let got = device_attend(&inp);
 
         for h in 0..heads {
-            let qh = &q[h * d..(h + 1) * d];
-            let mut sc = vec![0.0f64; kv];
-            for (s, x) in sc.iter_mut().enumerate() {
-                let ks = &k[(h * kv + s) * d..(h * kv + s + 1) * d];
-                let dot: f64 = qh
-                    .iter()
-                    .zip(ks)
-                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
-                    .sum();
-                *x = dot * f64::from(scale) + f64::from(mask[s]);
-            }
-            let m = sc.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let ex: Vec<f64> = sc.iter().map(|x| (x - m).exp()).collect();
-            let z: f64 = ex.iter().sum();
-            let want: Vec<f32> = (0..dv)
-                .map(|j| {
-                    (0..kv)
-                        .map(|s| ex[s] / z * f64::from(v[(h * kv + s) * dv + j]))
-                        .sum::<f64>() as f32
-                })
-                .collect();
+            let (_, want) = host_attn(&inp, h, d);
             let d_rel = rel(&got[h * dv..(h + 1) * dv], &want);
             assert!(
                 got[h * dv..(h + 1) * dv].iter().all(|x| x.is_finite()),

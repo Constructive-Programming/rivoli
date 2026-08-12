@@ -178,7 +178,7 @@ decode golden (232 + 5 in prefill, which has no incoming recurrent state), plus 
 > port does in its loader, so the kernel never sees the factors; a fixture carrying them would be
 > scoring an elementwise multiply no kernel performs. The eps is deliberately NOT captured — it is
 > `config.rms_norm_eps`, which `the_tiny_configs_kept_the_real_structure` already pins against the
-> real checkpoint, and `tests/k3_attn_res.rs` reads it from the golden's own `tiny_config` rather
+> real checkpoint, and `tests/k3_kernels.rs` reads it from the golden's own `tiny_config` rather
 > than from a literal.
 >
 > The generalisable form: **a fixture is only usable if its captures span the operator's whole
@@ -523,7 +523,7 @@ none. At the real width each thread runs 28. Separately, every AttnRes capture i
 `blockIdx.x`'s strides into `src` and `out` are multiplied by zero throughout — while layer-major
 prefill, the default, passes the whole prompt at once.
 
-Both gaps were then demonstrated rather than argued. `tests/k3_attn_res.rs` carries a synthetic
+Both gaps were then demonstrated rather than argued. `tests/k3_kernels.rs` carries a synthetic
 sweep — `n` in {192, 257, 1000, 7168} × `nsrc` in {2, 9} × `tokens` in {1, 3}, scored against the
 same f64 host oracle the golden tests validate — and two deliberate kernel breaks were caught by
 **that sweep alone**, with all twelve folds across both draws staying green:

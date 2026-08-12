@@ -109,17 +109,10 @@ static inline size_t mla_attend_lds(int kvl, int rope) {
     return ((size_t)TILE * kvl + (size_t)TILE * rope) * sizeof(float);
 }
 
-// grid = (⌈H/HB⌉, n_splits) blocks; block = HB*SUBW threads; dynamic LDS holds the
-// current L/R token tile (the per-head accumulators are in registers, see
-// MLA_ACC_REGS). `blockIdx.y` is the split:
-// this block attends only rows [y*tps*TILE, min(nr, (y+1)*tps*TILE)). When
-// `partial` is null (n_splits==1) the block owns every row and writes the
-// normalised result straight to `clat`. Otherwise it writes its UNNORMALISED
-// accumulator plus its (m, l) to `partial`, and mla_attend_combine merges.
 // **Dense multi-head attention over an EXPLICIT per-head K and V.** One block per head.
 //
 // USED BY: Kimi-K3's gated MLA layers (`k3-architecture.md` §5), after `kv_b` has expanded the
-// latent into per-head keys and values. NOT the same operator as `mla_latent_attend` above, which
+// latent into per-head keys and values. NOT the same operator as `mla_latent_attend` below, which
 // is DeepSeek-V4-Flash's *absorbed* form: that one attends in latent space against an fp8 latent
 // cache with the roped key scored separately, and never materialises a per-head K. K3 caches the
 // EXPANDED k/v deliberately (§5: re-expanding through `kv_b` per cached position is far slower),
@@ -174,11 +167,18 @@ extern "C" __global__ void mha_attend(const float* __restrict__ q,    // [H][d]
         if (t < j) red[t] = fmaxf(red[t], red[t + j]);
         __syncthreads();
     }
-    // A fully masked row would leave `m = -inf` and make every `expf` a NaN. The reference cannot
-    // produce one — causality always admits position 0 — so this is a guard on the CALLER, not a
-    // case to define: `0` keeps the row finite and the output zero, which is visibly wrong rather
-    // than quietly NaN-propagating into the next layer.
-    const float m = isfinite(red[0]) ? red[0] : 0.0f;
+    // **A fully masked row yields NaN, and nothing here prevents that.** An earlier version
+    // substituted `0` for a non-finite max and claimed that produced a zero output — it does not,
+    // and the claim was wrong in a way worth recording rather than quietly deleting. Trace it:
+    // `m = 0` makes every `expf(-inf - 0)` zero, so `ls` is zero, `inv_z` is `+inf`, and the
+    // accumulator's `0 * inf` is NaN. Leaving `m = -inf` gives `expf(-inf - -inf)` = `expf(NaN)`,
+    // also NaN. The guard changed nothing on the only input that could reach it.
+    //
+    // So there is no guard, deliberately. §5's causality is unconditional and always admits
+    // position 0, so the reference cannot produce a fully masked row; defining behaviour for one
+    // would be inventing a case the model does not have. NaN is the loud answer, and the caller
+    // owes the invariant.
+    const float m = red[0];
     __syncthreads();
 
     // Pass 2 — exponentiate in place and sum.
@@ -245,6 +245,13 @@ extern "C" int rivoli_sigmoid_gate(const float* attn, const float* gate, int n, 
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// grid = (⌈H/HB⌉, n_splits) blocks; block = HB*SUBW threads; dynamic LDS holds the
+// current L/R token tile (the per-head accumulators are in registers, see
+// MLA_ACC_REGS). `blockIdx.y` is the split:
+// this block attends only rows [y*tps*TILE, min(nr, (y+1)*tps*TILE)). When
+// `partial` is null (n_splits==1) the block owns every row and writes the
+// normalised result straight to `clat`. Otherwise it writes its UNNORMALISED
+// accumulator plus its (m, l) to `partial`, and mla_attend_combine merges.
 extern "C" __global__ void mla_latent_attend(
     const float* __restrict__ qabs,         // [H*kvl]
     const float* __restrict__ qrope,        // [H*rope]

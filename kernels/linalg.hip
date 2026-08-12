@@ -386,12 +386,20 @@ extern "C" __global__ void rmsnorm_single(
 #define ATTN_RES_MAX_SRC 16
 
 extern "C" __global__ void attn_res(const float* __restrict__ src, const float* __restrict__ fold,
-                                    int nsrc, int n, float eps, float* __restrict__ out) {
+                                    int nsrc, int n, size_t src_stride, float eps,
+                                    float* __restrict__ out) {
     __shared__ float red_ss[256];
     __shared__ float red_dot[256];
     __shared__ float prob[ATTN_RES_MAX_SRC];
     const int t = threadIdx.x;
-    const float* v0 = src + (size_t)blockIdx.x * (size_t)nsrc * (size_t)n;
+    // **`src_stride`, not `nsrc * n`.** §3's arena is `[T][9][hidden]` — NINE slots per token
+    // whatever the current depth — so a token stride of `nsrc * n` reads token 1's stack out of
+    // token 0's unused slots at every layer below 84, folding stale data into a plausible-looking
+    // output. The kernel assumed the packed layout until an adversarial review 2026-08-12 traced
+    // it against the spec; both fixtures built packed stacks, so nothing here could see it.
+    // Passing the stride makes the arena shape the CALLER's statement and something a test can
+    // vary, which is the only reason this is now checkable.
+    const float* v0 = src + (size_t)blockIdx.x * src_stride;
 
     for (int s = 0; s < nsrc; s++) {
         const float* v = v0 + (size_t)s * (size_t)n;
@@ -443,11 +451,14 @@ extern "C" __global__ void attn_res(const float* __restrict__ src, const float* 
 // layer-level fold is guarded by an emptiness check on the caller's side (§3's layer loop), so an
 // empty stack reaching here is that guard having gone missing, not a case to define away.
 extern "C" int rivoli_attn_res(const float* src, const float* fold, int tokens, int nsrc, int n,
-                               float eps, float* out) {
+                               size_t src_stride, float eps, float* out) {
     if (n <= 0 || tokens <= 0) return 1001;
     if (nsrc <= 0 || nsrc > ATTN_RES_MAX_SRC) return 1003;
+    // A stride shorter than the live stack would make consecutive tokens overlap.
+    if (src_stride < (size_t)nsrc * (size_t)n) return 1005;
     hipGetLastError();
-    hipLaunchKernelGGL(attn_res, dim3(tokens), dim3(256), 0, 0, src, fold, nsrc, n, eps, out);
+    hipLaunchKernelGGL(attn_res, dim3(tokens), dim3(256), 0, 0, src, fold, nsrc, n, src_stride,
+                       eps, out);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

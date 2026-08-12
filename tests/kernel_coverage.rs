@@ -320,12 +320,12 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("act_quant_f4_rotated", &["kvcompress.rs"]),
     ("append_kv", &["gpu.rs"]),
     // Kimi-K3's Block Attention Residual fold, S2 item 1. **Empty on purpose**: the kernel and its
-    // fixture (`tests/k3_attn_res.rs`) landed before there is a K3 engine path to call it from —
+    // fixture (`tests/k3_kernels.rs`) landed before there is a K3 engine path to call it from —
     // `k3gpu.rs` is S3. This is the "staged work, not dead code" state the doc above names, and it
     // becomes `&["k3gpu.rs"]` the moment the layer loop exists.
     ("attn_res", &[]),
     // Kimi-K3's gated MLA core and its output gate, S2 item 2. Empty for the same reason as
-    // `attn_res` above: staged work, gated by `tests/k3_mla.rs`, with no K3 engine path to call
+    // `attn_res` above: staged work, gated by `tests/k3_kernels.rs`, with no K3 engine path to call
     // them from until S3 writes `k3gpu.rs`.
     ("mha_attend", &[]),
     ("sigmoid_gate", &[]),

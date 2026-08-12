@@ -642,7 +642,7 @@ model is stored in — is answered above: none.)*
 `k3-architecture.md`; **each trap is a G2 defect-run candidate.**
 
 1. **AttnRes** — **DONE 2026-08-11, G2 met for this item.** `kernels/linalg.hip::attn_res` plus
-   `launch_attn_res`, scored by `tests/k3_attn_res.rs` against all twelve folds of both draws:
+   `launch_attn_res`, scored by `tests/k3_kernels.rs` against all twelve folds of both draws:
    worst **3.08e-7**, against a 1.571e-5 floor and a 1.6e-4 tolerance, several folds bit-exact.
    The defect run is the second test — mixing the NORMALISED sources fails the fixture — and the
    kernel is red-proved four ways (uniform weights, no fold in the score, source 0 only, eps
