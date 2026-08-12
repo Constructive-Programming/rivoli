@@ -31,11 +31,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
-use rivoli::backend::hip::{device_sync, launch_sigmoid_gate};
+use rivoli::backend::hip::launch_sigmoid_gate;
 
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
-use fixture::{back, cap, dev, each_case, f32b, f32v, worst_rel};
+use fixture::{cap, dev, each_case, f32b, sync_read, worst_rel};
 
 /// `x *= sigmoid(g)` on the device, returning the product.
 fn gate_on_device(x: &[f32], g: &[f32]) -> Vec<f32> {
@@ -50,8 +50,7 @@ fn gate_on_device(x: &[f32], g: &[f32]) -> Vec<f32> {
     // kernel's parameters are `__restrict__`), and both outlive the `device_sync` below.
     unsafe { launch_sigmoid_gate(xb.ptr() as *mut f32, gb.ptr() as *const f32, x.len()) }
         .expect("sigmoid_gate launch");
-    device_sync().unwrap();
-    f32v(&back(&xb))
+    sync_read(&xb)
 }
 
 /// The three tensors this stage needs, at one (step, layer): the attend output flattened to the

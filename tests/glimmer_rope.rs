@@ -48,11 +48,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
-use rivoli::backend::hip::{device_sync, launch_rope_interleave, launch_rope_split_half};
+use rivoli::backend::hip::{launch_rope_interleave, launch_rope_split_half};
 
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
-use fixture::{Golden, back, cap, dev, each_case, f32b, f32v, goldens, present, worst_rel};
+use fixture::{Golden, cap, dev, each_case, f32b, goldens, present, sync_read, worst_rel};
 
 /// Glimmer's rope theta. The REAL value at the tiny widths — the anchor keeps it rather than
 /// shrinking it, because a wrong theta is fluent and a small one hides the long-context arg
@@ -117,8 +117,7 @@ fn rope_on_device(data: &[f32], heads: usize, d: usize, start_pos: usize, conv: 
         }
         .expect("rope launch");
     }
-    device_sync().unwrap();
-    f32v(&back(&buf))
+    sync_read(&buf)
 }
 
 /// Every (golden, step, layer) that carries a rotation, with q's and k's head counts.

@@ -38,7 +38,7 @@ use rivoli::backend::hip::{device_sync, launch_gqa_attend};
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
 use fixture::{
-    Golden, back, cap, cap_rows, dev, each_case, expected, f32b, f32v, float, present, worst_rel,
+    Golden, cap, cap_rows, dev, each_case, expected, f32b, float, present, sync_read, worst_rel,
     zeros,
 };
 
@@ -103,8 +103,7 @@ fn run(c: &Case, ring_cap: usize) -> Vec<f32> {
         )
     }
     .expect("gqa_attend launch");
-    device_sync().unwrap();
-    f32v(&back(&ob))
+    sync_read(&ob)
 }
 
 /// The window's lower bound for a query at absolute position `pos`: `[pos - win + 1, pos]`,

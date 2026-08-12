@@ -788,7 +788,38 @@ lm_head/logits sizing.**
    > kernel shape. Same class as item 1's `Sel` prescription — a plan prescribing reuse that does
    > not survive contact — and it was caught by a reader asking what the phrase meant.
 
-4. **MLP wiring** — no new kernel; delete the guard, bind the dims.
+4. **MLP wiring** — **DONE 2026-08-12, and two of its three clauses were already true.**
+   `MAX_FUSED_INTER` was deleted before this stage began (`artifact/model.rs` carries a test
+   asserting there is no intermediate ceiling any more), and the kernels exist: `gemm_bf16` for
+   all three bf16 projections and `swiglu` for the activation, which is `silu(g)*u` unclamped —
+   Glimmer's config has no `swiglu_limit`, so V4's `swiglu_clamped_bf16` is the WRONG kernel and
+   is one call away.
+
+   **What was missing is that nothing ran them at 6656/19968.** Every golden is at the tiny
+   widths, so `132,913,152` elements per weight matrix had never been touched — the same hole
+   item 1 had at head_dim 8 against a production 128. `tests/glimmer_mlp.rs` spot-checks 64
+   outputs per projection against host dot products at the real widths, and runs the composition:
+
+   | | `max|Δ| / max|reference|` |
+   |---|---:|
+   | `gate`/`up` `[19968 x 6656]` | 3.27e-6 |
+   | `down` `[6656 x 19968]` | 5.17e-6 |
+   | the composition | 4.94e-6 |
+   | swapping `gate` and `up` — the red proof | 1.19e0 |
+
+   The bars are ~20× the measured worst and are **not** derived from an anchor floor: the anchor
+   has no captures at these widths, which is the reason the file exists. The first draft guessed
+   `5e-2` from "bf16 is three decimal digits" — four decades of slack nobody would have noticed
+   spending.
+
+   **Item 4 cannot have a golden, and that is a finding rather than a shortcut.** The anchor
+   captures `pre_feedforward_layernorm.out` and `mlp.down_proj.out` but neither the intermediate
+   activations nor the WEIGHTS, which exist only as a deterministic draw inside the driver's
+   python. Scoring the composition against the reference would mean re-implementing that draw in
+   Rust — a second copy of a generator — or teaching the driver to export weights and re-vendoring
+   goldens whose bytes and FNV are pinned. The composition is S3's business, where the layer loop
+   meets `mlp.down_proj.out` with a real checkpoint behind it.
+
 5. **lm_head at 202048** — existing `gemv_i8`; check `ARGMAX_BYTES`/logit scratch at
    808 KB/row × MAXROW.
 

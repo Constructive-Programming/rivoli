@@ -257,3 +257,15 @@ pub fn rel_tolerance(operator: &str) -> f32 {
         None => panic!("tolerance::GLIMMER has no `{operator}` row, so nothing here is scored"),
     }
 }
+
+/// Join the device and read a buffer back as f32.
+///
+/// The three-line epilogue every launch helper in this port had ended with. jscpd rejected the
+/// third copy, and it was right in the way that matters: `device_sync().unwrap()` is the line that
+/// makes the read valid, and a helper that forgot it would return whatever was in the buffer
+/// before the launch — which, in a test that seeds its output with zeros, reads as a kernel that
+/// wrote nothing rather than as a missing barrier.
+pub fn sync_read(b: &rivoli::memory::device::DeviceBuf) -> Vec<f32> {
+    rivoli::backend::hip::device_sync().unwrap();
+    f32v(&back(b))
+}
