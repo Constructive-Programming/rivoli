@@ -41,10 +41,23 @@ const L: usize = fx::GLIMMER_FIXTURE_LAYERS;
 /// machine with no GPU. (This doc claimed the test "needs no temp directory either", describing
 /// a rejected draft that built the config by hand; the body has always converted. Review, 2026-08-12.)
 fn tiny_cfg() -> gm::GlimmerTextConfig {
-    let root = TempRoot::new("glimmer-residency-cfg");
-    let _ = glimmer_convert_fixture(root.path(), DIM);
-    let cfg: gm::GlimmerConfig = gm::load_config(root.join("out").to_str().unwrap()).unwrap();
-    cfg.text
+    converted("glimmer-residency-cfg", DIM).2
+}
+
+/// A converted Glimmer artifact at `dim`: its temp root, its `out` directory, and its text config.
+///
+/// **The `TempRoot` is RETURNED, not dropped**: it owns the directory the returned path names, so a
+/// caller that binds it to `_` deletes the artifact it is about to open.
+fn converted(tag: &str, dim: usize) -> (TempRoot, String, gm::GlimmerTextConfig) {
+    let root = TempRoot::new(tag);
+    let _ = glimmer_convert_fixture(root.path(), dim);
+    let dir = root
+        .join("out")
+        .to_str()
+        .expect("utf-8 temp path")
+        .to_string();
+    let cfg: gm::GlimmerConfig = gm::load_config(&dir).unwrap();
+    (root, dir, cfg.text)
 }
 
 /// **The partition, at every boundary, with no device.**
@@ -158,11 +171,8 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
 #[cfg(feature = "rocm")]
 fn every_budget_resolves_every_layer_to_the_same_bytes() {
     use rivoli::memory::pin::GlimmerPin;
-    let root = TempRoot::new("glimmer-residency-bytes");
-    let _ = glimmer_convert_fixture(root.path(), DIM);
-    let dir = root.join("out");
-    let dir = dir.to_str().unwrap();
-    let cfg = gm::load_config::<gm::GlimmerConfig>(dir).unwrap().text;
+    let (_root, dir, cfg) = converted("glimmer-residency-bytes", DIM);
+    let dir = dir.as_str();
     let layer = cfg.layer_bytes().unwrap();
     let floor = cfg.floor_bytes().unwrap();
 
@@ -374,4 +384,257 @@ fn a_tensor_past_i32_max_bytes_survives_the_placement() {
         N as f64 / 1e9,
         probes.len()
     );
+}
+
+// ---- S3 item 0: the write-after-read fence -------------------------------------------------
+
+/// The width this one fixture runs at, and it is not [`DIM`].
+///
+/// At `DIM` = 8 the largest matrix in a layer is **16x8**, and a gemm that small retires before the
+/// host has finished the `write_bytes` behind it — so the hazard this test exists to catch could
+/// not be made to happen at any row count. **Width buys kernel DURATION, and only duration keeps
+/// the disturbance inside a live kernel**; [`FENCE_ROWS`] buys the same thing along the other axis
+/// and neither substitutes for the other, which the first design got wrong. At 256, `q` is [512, 256] and a
+/// layer is **1,839,104 bytes** (six 262,144-byte projections, two 131,072-byte KV ones, four f32
+/// norms — re-derived from `layer_bytes`, not estimated; an earlier "~1.3 MB" here was neither).
+///
+/// The fixture is fully parametric in `dim` (`glimmer_fixture`: heads 2, kv 1, head_dim = dim,
+/// inter = 2·dim), so this costs one wider temp checkpoint (~5 MB) and one more `convert_glimmer`
+/// subprocess, which three other tests in this file already pay.
+#[cfg(feature = "rocm")]
+const FENCE_DIM: usize = 256;
+
+/// How many output rows ONE gemm computes while the slot is overwritten under it.
+///
+/// > **This was `FENCE_LAUNCHES`, 4096 separate launches, and that design was a COIN FLIP — measured
+/// > 2026-08-12.** The idea was that enqueueing many launches leaves some pending when the host
+/// > writes. It does not: a `[512, 256]` gemm costs the device about what a `hipLaunchKernel` costs
+/// > the host, so the queue never grows and whether anything is still in flight at the moment of the
+/// > write is scheduling noise. Two runs of the SAME binary gave 2732 of 4096 and **0 of 4096** — the
+/// > second one tripping the very assert that exists to catch a red proof that stopped proving.
+/// >
+/// > One launch with `m` rows fixes it by construction: the host returns from the launch in
+/// > microseconds and the kernel then runs for **4-6.5 ms, measured**, so the write lands inside a
+/// > live kernel rather than hopefully — `polluted_rows` asserts that with a timestamp. (A first
+/// > version justified "milliseconds" with "~1 GB of weight traffic", which is the cache-blind
+/// > upper bound: `q` is 262 KB and fits in cache, so DRAM traffic is ~256 KB and the figure
+/// > supported nothing. Review, 2026-08-12.)
+/// > **A racing gate has to be made deterministic, not made likely** — this repo's rule that a proof
+/// > which refuses to go red is itself evidence cuts both ways, and a proof that goes red at random
+/// > is worth no more than one that never does.
+#[cfg(feature = "rocm")]
+const FENCE_ROWS: usize = 4096;
+
+/// One gemm computing `FENCE_ROWS` rows against layer 0's `q`, then `disturb` while it runs, then a
+/// sync and a count of how many rows differ from a reference taken with nothing else in flight.
+///
+/// One launch, not one per row — [`FENCE_ROWS`] carries that argument and the measurement behind it.
+///
+/// **The arms share everything a shared function can make them share, and NOT their timing.** An
+/// earlier version of this doc claimed they "differ only in `disturb`"; review showed that is false
+/// in two ways. Arm A's `pin.layer(0)` here is a HIT (the test body already resolved layer 0) while
+/// arm B's is a MISS with a full twelve-tensor fill in front of it, and arm A's disturbance is one
+/// `write_bytes` issued the instant the launch returns while arm B's walks a bounds check, the slot
+/// map, the sync under test, and four norm memcpys before it reaches `q` — the fifth tensor in
+/// `GLIMMER_LAYER_TENSORS`.
+///
+/// That difference matters: **arm A does not evidence that arm B's window is open.** What does is
+/// the no-fence column of the table below, where arm B corrupts all 4096 rows — a measurement of arm
+/// B's own latency profile, on this machine. Arm A's job is narrower and still worth its lines: it
+/// shows the FIXTURE can produce the hazard at all, which is the thing that decays silently.
+#[cfg(feature = "rocm")]
+fn polluted_rows(
+    pin: &mut rivoli::memory::pin::GlimmerPin,
+    x: &rivoli::memory::device::DeviceBuf,
+    out: &rivoli::memory::device::DeviceBuf,
+    delay: std::time::Duration,
+    disturb: impl FnOnce(&mut rivoli::memory::pin::GlimmerPin, &rivoli::memory::pin::Bf16Weight),
+) -> (usize, std::time::Duration) {
+    let q = pin.layer(0).unwrap().q;
+    let o_dim = q.o_dim;
+    let (xp, op) = (x.ptr() as *const f32, out.ptr() as *mut f32);
+    let gemm = |rows: usize| {
+        // SAFETY: `x` is `rows * i_dim` live f32, `q.packed` is `o_dim * i_dim` live u16 inside the
+        // tier, `out` is `rows * o_dim` writable f32, none aliasing another. Null stream: this
+        // test's subject is what happens when nothing orders the HOST against a launch.
+        unsafe {
+            fx::gemm_bf16_launch(xp, q.packed, op, rows, o_dim, q.i_dim, std::ptr::null_mut())
+        };
+    };
+    // The reference, one row, synced before anything can move.
+    gemm(1);
+    rivoli::backend::hip::device_sync().unwrap();
+    let want = fx::f32v(&fx::back(out))[..o_dim].to_vec();
+    // All-zero and no overwrite can change it; NON-FINITE and every `!=` below is true regardless,
+    // which is how this gate first went red on a fixture that could not produce a finite product at
+    // all. See `bf16_blob`.
+    assert!(
+        want.iter().all(|v| v.is_finite()) && want.iter().any(|v| *v != 0.0),
+        "the reference product is all-zero or non-finite, so the comparisons below cannot mean \
+         what they claim"
+    );
+
+    // Time the launch so the claims about WHEN the disturbance lands are measurements. A launch
+    // that retires before `disturb` runs makes arm A a write-BEFORE-read, which corrupts the same
+    // bytes but does not exercise the ordering the fence is about — review found the first version
+    // asserting "inside a live kernel by construction" with nothing timing it (2026-08-12).
+    let t0 = std::time::Instant::now();
+    gemm(FENCE_ROWS);
+    let launched = t0.elapsed();
+    std::thread::sleep(delay);
+    disturb(pin, &q);
+    let disturbed = t0.elapsed();
+    rivoli::backend::hip::device_sync().unwrap();
+    let total = t0.elapsed();
+    println!(
+        "  launch returned at {launched:?}, disturbance done at {disturbed:?}, kernel drained at \
+         {total:?}"
+    );
+    // **The discriminator, and it is a timestamp rather than an argument.** A total divergence count
+    // cannot tell "the write landed inside a live kernel" from "the write landed on an idle device
+    // because the kernel had already retired" — different events, same number. This settles it:
+    // the disturbance must complete before the kernel drains. Review found the first version
+    // asserting the property in prose ("inside a live kernel by construction") with nothing timing
+    // it, 2026-08-12. Measured on gfx1151: launch returns at ~27 µs, the raw write is done by ~35 µs,
+    // the kernel drains at ~6.5 ms — the write lands 0.5% into the kernel's life.
+    assert!(
+        disturbed < total,
+        "the disturbance finished at {disturbed:?} but the kernel had already drained by {total:?} \
+         — this arm measured a write to an IDLE device, not the write-after-read hazard"
+    );
+    let got = fx::f32v(&fx::back(out));
+    let bad = (0..FENCE_ROWS)
+        .filter(|i| got[i * o_dim..(i + 1) * o_dim] != want[..])
+        .count();
+    (bad, total)
+}
+
+/// **The hazard `GlimmerPin::layer`'s invariant describes, made to happen — and then closed.**
+///
+/// A slot refill is a host `memcpy` and kernel launches are asynchronous, so a host that runs one
+/// layer ahead of the device overwrites weights a live GEMV is still reading. The symptom is
+/// position-dependent nondeterministic wrong text, this repo's arena-relocation signature, and no
+/// finite slot count prevents it — only a dependency does. `GLIMMER_STREAM_SLOTS` was cut from 2 to
+/// 1 on exactly that argument, which left the fence owed and is what this pays.
+///
+/// **Two arms, and arm A is why arm B's green means anything.**
+///
+/// * **Arm A writes the slot from the HOST directly**, through the same tier pointers `tensors_of`
+///   reads, while the gemm runs — an unfenced fill, spelled out. It asserts the outputs DIVERGE.
+///   That is a standing red proof: it fires every run, and if it ever stops firing it says so
+///   instead of letting arm B pass for the wrong reason.
+/// * **Arm B goes through `pin.layer()`**, the shipped path, and asserts NOTHING diverges. Without a
+///   fence inside `layer` this arm is arm A with extra steps.
+///
+/// An arm-B-only test is the false-green this repo keeps writing: passing could mean "the fence
+/// works" or "the race did not fire". An arm A that fires only sometimes is no better, which is what
+/// [`FENCE_ROWS`] records.
+///
+/// **MEASURED 2026-08-12 on gfx1151, both directions, from two binaries differing only in the fence:**
+///
+/// | | arm A (raw host write) | arm B (`layer()` refill) | |
+/// |---|---|---|---|
+/// | fence removed | 4096 of 4096 | **4096 of 4096**, disturbance at 233 µs of a 3.84 ms kernel | FAILED |
+/// | fence present | 4096 of 4096 | **0 of 4096**, 2 fills | ok |
+///
+/// **The fenced run's timestamps are the fence's own fingerprint**, better evidence than the row
+/// count: with it, arm B's disturbance completes at **3.8796 ms** against a kernel draining at
+/// **3.87995 ms** — 0.35 µs apart, because `layer()` spent that entire 3.88 ms inside `device_sync`
+/// waiting for the launch. Without it the same disturbance finishes at 233 µs and the kernel runs on
+/// for another 3.6 ms with its weights already zeroed.
+///
+/// The no-fence column is what makes arm B's zero a measurement rather than a hope: the identical
+/// sequence, on the identical fixture, differing only by one `device_sync` in `GlimmerPin::layer`,
+/// corrupts every row.
+#[test]
+#[cfg(feature = "rocm")]
+fn a_slot_refill_cannot_land_under_a_live_kernel() {
+    use rivoli::memory::pin::GlimmerPin;
+    use std::time::Duration;
+    let (_root, dir, cfg) = converted("glimmer-fence", FENCE_DIM);
+    let dir = dir.as_str();
+
+    // The floor pins ZERO layers, so every layer streams and layers 0 and 1 map to the same slot.
+    // That is the configuration the hazard needs and the one a tight budget produces.
+    let floor = cfg.floor_bytes().unwrap();
+    let mut pin = GlimmerPin::build(dir, &cfg, Some(floor)).unwrap();
+    // **Both of these are load-bearing, not sanity checks.** If the floor pinned layer 0, `q` would
+    // be a PINNED pointer, `layer(1)` would refill a slot in unrelated memory, and every arm below
+    // would report 0 while looking healthy — the margin is only 1.75x (1 MiB of slack against a
+    // 1,839,104-byte layer), so a smaller FENCE_DIM crosses it. And every claim here about layers 0
+    // and 1 sharing a slot is a consequence of the slot COUNT: at 2 they land on different slots and
+    // arm B goes silently vacuous. Both were residual risks a review had to point out rather than
+    // read off the test (2026-08-12).
+    assert_eq!(pin.pinned_layers(), 0, "the floor must pin nothing");
+    assert!(L >= 2, "the hazard needs two layers to map to one slot");
+    assert_eq!(
+        gm::GLIMMER_STREAM_SLOTS,
+        1,
+        "this gate's premise is that layers 0 and 1 share a slot, which holds only at one slot"
+    );
+    let (o_dim, i_dim) = {
+        let q = pin.layer(0).unwrap().q;
+        (q.o_dim, q.i_dim)
+    };
+    // `x` carries FENCE_ROWS identical activation rows: the gemm reads `x + r*k` per row, so a
+    // single row would read past the allocation for every r > 0.
+    let x = fx::dev(&fx::f32b(&vec![1.0f32; FENCE_ROWS * i_dim]));
+    let out = fx::zeros(FENCE_ROWS * o_dim * 4);
+
+    // ---- arm A: the unfenced fill, spelled out, twice ----
+    // The raw write, byte-for-byte what `Slot::fill` does to `q` — same mapping, no synchronization
+    // of any kind.
+    // SAFETY (both uses): `q.packed` is `o_dim * i_dim` live u16 in a host-fillable VMM mapping
+    // owned by the pin, which outlives the write.
+    let zap = |_: &mut GlimmerPin, q: &rivoli::memory::pin::Bf16Weight| {
+        unsafe { std::ptr::write_bytes(q.packed as *mut u16, 0, q.o_dim * q.i_dim) };
+    };
+    let (diverged, kernel) = polluted_rows(&mut pin, &x, &out, Duration::ZERO, zap);
+    println!("arm A: {diverged} of {FENCE_ROWS} rows, kernel drained in {kernel:?}");
+    assert!(
+        diverged > 0,
+        "an unsynchronized host write during a live {FENCE_ROWS}-row gemm changed NOTHING. FIRST \
+         CHECK `AMD_SERIALIZE_KERNEL` and `HIP_LAUNCH_BLOCKING` — either makes the launch block, \
+         which defeats this gate and no fixture size can fix it. Otherwise the fixture can no \
+         longer produce the hazard and arm B proves nothing: raise FENCE_ROWS or FENCE_DIM rather \
+         than deleting this assert"
+    );
+
+    // > **The window is the kernel's FIRST FETCH, not its lifetime — measured 2026-08-12 and it
+    // > refuted the model this gate was built on.** An arm A2 was added on review's suggestion:
+    // > delay the same write to the kernel's midpoint and assert a STRICTLY PARTIAL count, which
+    // > only a mid-kernel write could produce. It measured **0 of 4096 after a 3.24 ms delay into a
+    // > 6.47 ms kernel** — a write halfway through changes nothing at all. The reason is coherence,
+    // > not scheduling: `q` is 262 KB, the GPU pulls it into cache in the kernel's first microseconds
+    // > and never re-reads it, so a host write after that point is invisible to the launch. The
+    // > premise both review and I were reasoning from — that waves fetch weights progressively
+    // > across the kernel's life, so the corrupted fraction tracks the write's position — is simply
+    // > false here.
+    // >
+    // > So the arm was deleted rather than kept green by relaxing its assert: what it would test is
+    // > a cache property of one GPU, and the question it existed to settle (is the kernel LIVE when
+    // > the write lands?) is answered deterministically by the timestamp assert above. The practical
+    // > consequence is worth carrying: the hazard window is tens of microseconds wide and its
+    // > consequence is total, which is why "it will probably have finished by then" is not a defence
+    // > anywhere in S3's loop.
+
+    // ---- arm B: the shipped path ----
+    // A fresh pin: the arms above left the slot zeroed, and `slot_layer` still claims layer 0, so
+    // reusing one would take the hit path and score against zeros.
+    drop(pin);
+    let mut pin = GlimmerPin::build(dir, &cfg, Some(floor)).unwrap();
+    let (bad, _) = polluted_rows(&mut pin, &x, &out, Duration::ZERO, |p, _| {
+        // Layer 1 maps to the same slot, so this is a refill — the one `layer` must fence.
+        let _ = p.layer(1).unwrap();
+    });
+    assert_eq!(
+        bad, 0,
+        "{bad} of {FENCE_ROWS} rows read weights that `layer()` overwrote under them"
+    );
+    // **Exactly two**, not `>= 2`: this file's neighbour records the review that established the
+    // rule, because `> 0` also passes for a slot map that thrashes. Both fills are derivable —
+    // `polluted_rows`' own `layer(0)` on the fresh pin, and `disturb`'s `layer(1)`.
+    let (_, fills) = pin.slot_stats();
+    assert_eq!(fills, 2, "expected exactly two slot fills, got {fills}");
+    println!("arm B: {FENCE_ROWS} rows, 0 polluted, {fills} fills");
 }

@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: What is LEFT of the Muse Glimmer-30B integration, re-planned 2026-08-12 against reference/principles.md after the owner corrected the port's central assumption — the pin is a function of free memory, so S1a's all-resident GlimmerPin ("a dense model has nothing to stream") violates P6 and dense makes streaming MORE load-bearing, not less: every weight is read every token (53.02 GB bf16 / 26.51 fp8 / 13.65 int4), there is no routed union to hide behind, and the resident fraction times bandwidth IS the tok/s model. Four stages remain: R1 residency contract + budget-aware pin (cyclic access makes LRU pathological — hit rate 0 at any deficit — and Belady degenerates to a STATIC prefix partition, so the policy axis collapses; output across budgets gated identical at zero tolerance on the tiny model), S3 layer loop against that contract from day one (sandwich norms x*(1+w) now have rmsnorm_centered_single, scored against the goldens' three EXACT input->output chains at 612 rows / hidden 72 / worst 3.238e-7 with the eps census as its standing red proof (41.8-56.6x on the two post-norm chains, 0.1x on the pre-norm one, which stands at mean(x2) 1); gate operand scored vs gate_proj.out captures; streams passed, not null; G3 owes the softcap probability-space check nothing at S2 could make), S4 real weights (chat template byte-pinned, dNLL ladder per format, the 2.69 GB lm_head is 1.25x i32::MAX bytes and untested at every stage), S5 performance (speculative decode DIVIDES weight traffic by accepted length — the biggest single lever on a bandwidth-bound dense model; prefetch is PERFECT because the schedule is known before the run; NPU re-opened per P3, the closure is GLM-scoped). R1 IMPLEMENTED 2026-08-12 and then substantially corrected by three reviews: the contract is GlimmerPin::layer(l), one shape whether pinned or streamed, gated at 24 (budget, layer, pass) resolutions all byte-identical to all-resident; --max-mem is ACCEPTED and no longer hidden, and run_glimmer reports the partition AFTER every refusal (above them, device_budget's hipMemGetInfo let a low free-GTT reading preempt every architectural refusal with a memory error, and made the flag suite a GPU arm silently). THE REVIEWS OVERTURNED TWO OF MY ARGUMENTS, not just my code. GLIMMER_STREAM_SLOTS is 1, not 2, and the slot count is NOT a correctness property: kernel launches are asynchronous, so no finite slot count establishes write-after-read ordering -- only a dependency does -- and with a synchronous fill a second slot buys no overlap while costing one extra streamed layer (967.942 MB) every token, because the floor charges every slot unconditionally. The invariant a caller owes is now stated on layer() and S5 must add the fence in the same change as any slot increase. Second, R1 had introduced a real regression: only the PINNED prefix got the dtype and shape checks, so which invariants a layer received became a function of --max-mem, and a q_proj stored transposed is byte-identical in length and was accepted under a low budget while refused at full residency; every layer's headers are now validated at build. Also: partition asks for what it uses (the version first recorded as a fix guarded an unreachable branch and left the real streaming-path over-allocation); Slot writes to each tensor's own address, dropping a base-is-lowest assumption that would have wrapped under --release; the per-layer figure is 967.942 MB, not the checkpoint's bf16-norm 967.889 MB, and is now pinned by a shipped-widths test; the >2 GiB gate tested DeviceBuf/hipMemcpy while the pin places through DeviceTier/VmmBuf and now runs the pin's path; and G-R1(b) was WITHDRAWN rather than repaired, because its test re-implemented the slot map as a local closure and its premise dissolved. Still open: the attention-weights pin-vs-slot decision, which needs a decode to measure. Supersedes glimmer-port.md's S3+ sections ON SWITCH-OVER, which is the owner's call; S0-S2 records stay where they are.
+verdict: What is LEFT of the Muse Glimmer-30B integration, re-planned 2026-08-12 against reference/principles.md after the owner corrected the port's central assumption — the pin is a function of free memory, so S1a's all-resident GlimmerPin ("a dense model has nothing to stream") violates P6 and dense makes streaming MORE load-bearing, not less: every weight is read every token (53.02 GB bf16 / 26.51 fp8 / 13.65 int4), there is no routed union to hide behind, and the resident fraction times bandwidth IS the tok/s model. Four stages remain: R1 residency contract + budget-aware pin (cyclic access makes LRU pathological — hit rate 0 at any deficit — and Belady degenerates to a STATIC prefix partition, so the policy axis collapses; output across budgets gated identical at zero tolerance on the tiny model), S3 layer loop against that contract from day one (sandwich norms x*(1+w) now have rmsnorm_centered_single, scored against the goldens' three EXACT input->output chains at 612 rows / hidden 72 / worst 3.238e-7 with the eps census as its standing red proof (41.8-56.6x on the two post-norm chains, 0.1x on the pre-norm one, which stands at mean(x2) 1); gate operand scored vs gate_proj.out captures; streams passed, not null; G3 owes the softcap probability-space check nothing at S2 could make), S4 real weights (chat template byte-pinned, dNLL ladder per format, the 2.69 GB lm_head is 1.25x i32::MAX bytes and untested at every stage), S5 performance (speculative decode DIVIDES weight traffic by accepted length — the biggest single lever on a bandwidth-bound dense model; prefetch is PERFECT because the schedule is known before the run; NPU re-opened per P3, the closure is GLM-scoped). R1 IMPLEMENTED 2026-08-12 and then substantially corrected by three reviews: the contract is GlimmerPin::layer(l), one shape whether pinned or streamed, gated at 24 (budget, layer, pass) resolutions all byte-identical to all-resident; --max-mem is ACCEPTED and no longer hidden, and run_glimmer reports the partition AFTER every refusal (above them, device_budget's hipMemGetInfo let a low free-GTT reading preempt every architectural refusal with a memory error, and made the flag suite a GPU arm silently). THE REVIEWS OVERTURNED TWO OF MY ARGUMENTS, not just my code. GLIMMER_STREAM_SLOTS is 1, not 2, and the slot count is NOT a correctness property: kernel launches are asynchronous, so no finite slot count establishes write-after-read ordering -- only a dependency does -- and with a synchronous fill a second slot buys no overlap while costing one extra streamed layer (967.942 MB) every token, because the floor charges every slot unconditionally. layer() performs the write-after-read fence ITSELF (a device_sync before every refill, S3 item 0, 2026-08-12), gated red-and-green from two binaries differing only in that line -- with it removed, all 4096 rows of a live gemm read the overwritten bytes; what S5 still owes is the async fill, and the fence's scope excludes pointers captured ACROSS a layer() call, which Copy makes possible. Second, R1 had introduced a real regression: only the PINNED prefix got the dtype and shape checks, so which invariants a layer received became a function of --max-mem, and a q_proj stored transposed is byte-identical in length and was accepted under a low budget while refused at full residency; every layer's headers are now validated at build. Also: partition asks for what it uses (the version first recorded as a fix guarded an unreachable branch and left the real streaming-path over-allocation); Slot writes to each tensor's own address, dropping a base-is-lowest assumption that would have wrapped under --release; the per-layer figure is 967.942 MB, not the checkpoint's bf16-norm 967.889 MB, and is now pinned by a shipped-widths test; the >2 GiB gate tested DeviceBuf/hipMemcpy while the pin places through DeviceTier/VmmBuf and now runs the pin's path; and G-R1(b) was WITHDRAWN rather than repaired, because its test re-implemented the slot map as a local closure and its premise dissolved. Still open: the attention-weights pin-vs-slot decision, which needs a decode to measure. Supersedes glimmer-port.md's S3+ sections ON SWITCH-OVER, which is the owner's call; S0-S2 records stay where they are.
 ---
 
 # Muse Glimmer — what is left, planned against the principles
@@ -93,14 +93,22 @@ access makes LRU evict exactly the layer needed next and Belady degenerates to a
    as with one. **No finite slot count establishes write-after-read ordering — only a dependency
    does.** With R1's synchronous fill a second slot buys no overlap and costs one extra streamed
    layer every token (967.942 MB), because `floor_bytes` charges every slot unconditionally and
-   each one pins one layer fewer. **S5 raises the count and adds the fence in the same change.**
-2. **The invariant a caller owes is now stated on `layer()`**: before requesting a layer that maps
-   to slot `s`, retire every kernel reading `s`'s previous occupant. There is still no ticket, but
-   for a narrower reason than first given — a ticket expresses fill-then-read, which is the
-   dependency that genuinely does not exist while the fill is synchronous; the one that DOES exist
-   runs the other way and belongs in an event or a `device_sync`. The original argument ("valid for
-   the same reason as `DeviceTier::place`") was false, and `place`'s running before any kernel
-   exists was the tell.
+   each one pins one layer fewer. **CORRECTED 2026-08-12: "S5 raises the count and adds the fence in
+   the same change" — the fence went first, at S3 item 0.** What raising the count still waits on is
+   the async fill, without which a second slot buys no overlap.
+2. **`layer()` performs the fence itself**, a `device_sync` before every refill — so a caller owes
+   nothing in this direction, which is the only version of the contract a loop cannot get wrong.
+   **This line said "the invariant a caller owes is now stated on `layer()`: before requesting a
+   layer that maps to slot `s`, retire every kernel reading `s`'s previous occupant", and that is no
+   longer true**; a maintainer reading it would either duplicate the barrier in S3's loop or delete
+   the one in `layer()` as redundant with a contract documented as mandatory. There is still no
+   ticket, but for a narrower reason than first given — a ticket expresses fill-then-read, which is
+   the dependency that genuinely does not exist while the fill is synchronous; the one that DOES
+   exist runs the other way and is the sync. The original argument ("valid for the same reason as
+   `DeviceTier::place`") was false, and `place`'s running before any kernel exists was the tell.
+   **The fence's scope is narrower than "the hazard is closed"**: it orders the refill after kernels
+   already ENQUEUED, and `Bf16Weight` is `Copy`, so a caller that captures layer `l`'s pointers,
+   calls `layer(l+1)`, then launches, still reads the wrong weights. S3's loop must not do that.
 3. **Every layer's headers are validated at build, pinned or not.** This was a real regression R1
    introduced: only the pinned prefix went through the dtype and shape checks two reviews added on
    2026-08-11, so **which invariants a layer received became a function of `--max-mem`**. A
@@ -189,10 +197,38 @@ What the loop must get right, each with its gate:
    moves to a layer mapping to an occupied slot; GLM's loop already syncs per layer, so the cost
    is likely nil at R1's synchronous fill — measure it rather than assume.
    **Gate, and it needs no decode:** launch a long-running kernel reading a slot's span, refill
-   that slot from the host, assert the kernel's output is unpolluted. A gate of that shape WOULD go red today —
-   `Slot::fill` writes through a plain `copy_nonoverlapping` with no stream, event or sync — but
-   that is a mechanical argument, not a run, and nothing has been written yet. Item 1's kernel
-   landed first; this is owed before the loop, not before item 1.
+   that slot from the host, assert the kernel's output is unpolluted.
+
+   > **DONE 2026-08-12. `glimmer_residency.rs::a_slot_refill_cannot_land_under_a_live_kernel`, and
+   > the fence is one `device_sync` in `GlimmerPin::layer` before the fill.** Measured from two
+   > binaries differing only in that line:
+   >
+   > | | arm A (raw host write) | arm B (`layer()` refill) | |
+   > |---|---|---|---|
+   > | fence removed | 4096 of 4096 | **4096 of 4096**, disturbance at 233 µs of a 3.84 ms kernel | FAILED |
+   > | fence present | 4096 of 4096 | **0 of 4096**, 2 fills | ok |
+   >
+   > The fenced run's timestamps are the better evidence: arm B's disturbance completes at 3.8796 ms
+   > against a kernel draining at 3.87995 ms — 0.35 µs apart, because `layer()` spent that whole
+   > 3.88 ms inside `device_sync`. **And the window is the kernel's FIRST FETCH, not its lifetime**:
+   > the same write delayed to the midpoint changes NOTHING (0 of 4096 at 3.24 ms into 6.47 ms),
+   > because 262 KB of weight is cached in the opening microseconds and never re-read. The hazard is
+   > tens of microseconds wide and total, so "it will probably have finished by then" is not a
+   > defence anywhere in S3's loop.
+   >
+   > Arm A performs the unfenced write BY HAND, through the same tier pointers, and asserts the rows
+   > diverge — a standing red proof, so arm B's zero cannot be the race failing to fire. That
+   > structure earned its keep twice in one round: it caught a false RED and a false GREEN, and
+   > neither would have been visible without it.
+   >
+   > **The gate was wrong twice before it was right, and both times it was the gate rather than the
+   > fence.** Its first red proof was FALSE (a fixture emitting NaN, where `[f32] != [f32]` is always
+   > true) and its first design was a COIN FLIP (2732 of 4096 on one run, 0 on the next). The
+   > arguments live at `bf16_blob` and `FENCE_ROWS`; what belongs here is that **arm A's
+   > anti-vacuity assert is what caught both**, and that a racing gate has to be made deterministic
+   > rather than made likely. It also surfaced two latent defects in the shared fixture, both
+   > invisible at `GLIMMER_FIXTURE_DIM` = 8: an integer overflow for any tensor of 9,364 elements or more,
+   > and NaN weights at one value in sixteen.
 
 1. **Sandwich norms — the missing kernel. DONE 2026-08-12, with one gate OWED.**
    `rmsnorm_centered_single` (`kernels/linalg.hip`), using `common.hpp::block_sum_lds` rather than

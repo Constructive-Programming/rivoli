@@ -484,7 +484,7 @@ pub fn gemv_bf16(x: &[f32], w: &[u16], n: usize, k: usize) -> Vec<f32> {
     // SAFETY: `x` is `k` live f32, `w` is `n*k` live u16, `out` is `n` writable f32, none aliasing
     // another, all live until the sync in `sync_read`. m = 1: one activation row.
     unsafe {
-        rivoli::backend::hip::launch_gemm_bf16(
+        device::gemm_bf16_launch(
             xb.ptr() as *const f32,
             wb.ptr() as *const u16,
             ob.ptr() as *mut f32,
@@ -493,8 +493,7 @@ pub fn gemv_bf16(x: &[f32], w: &[u16], n: usize, k: usize) -> Vec<f32> {
             k,
             std::ptr::null_mut(),
         )
-    }
-    .expect("gemm_bf16 launch");
+    };
     sync_read(&ob)
 }
 

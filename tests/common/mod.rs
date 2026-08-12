@@ -194,6 +194,38 @@ pub fn zeros(n: usize) -> rivoli::memory::device::DeviceBuf {
     dev(&vec![0u8; n])
 }
 
+/// One `gemm_bf16` launch, and the one place its seven pointer-and-dim arguments are spelled.
+///
+/// `glimmer_fixture.rs`'s `gemv_bf16` and `glimmer_residency.rs`'s fence gate both drive this
+/// kernel and jscpd matched their call blocks (2026-08-12). The gate is right about the substance
+/// too: seven positional arguments where `n` and `k` are both bare `usize` is a place a mistake is a
+/// wrong answer rather than a compile error.
+///
+/// > **Two things were tried first and are recorded so they are not tried again.** Hoisting it here
+/// > UNGATED is an `E0433` on the featureless build — this module compiles into `docs` and
+/// > `invariants`, which are GPU-free, and `rivoli::backend` is `rocm`-gated; that is the exact
+/// > failure the module header above predicts, and it reached a review rather than a run.
+/// > Hoisting the CASTS at the call site instead, to make the two blocks structurally unalike and
+/// > delete this helper, does NOT satisfy jscpd — measured, still 29 tokens matched.
+///
+/// # Safety
+/// `x` is `m * k` live f32, `w` is `n * k` live u16, `out` is `m * n` writable f32, none aliasing
+/// another, all live until the caller's next `device_sync`.
+#[cfg(feature = "rocm")]
+pub unsafe fn gemm_bf16_launch(
+    x: *const f32,
+    w: *const u16,
+    out: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: *mut std::ffi::c_void,
+) {
+    // SAFETY: the caller's contract above.
+    unsafe { rivoli::backend::hip::launch_gemm_bf16(x, w, out, m, n, k, stream) }
+        .expect("gemm_bf16 launch");
+}
+
 /// A launch that must succeed, with the launcher named.
 ///
 /// Every oracle here passes dims the kernel's own guards accept, so an `Err` is a guard that
@@ -864,11 +896,46 @@ pub const GLIMMER_FIXTURE_LAYERS: usize = 4;
 /// describe. `glimmer_convert.rs` already carries a note about the import-block half of this.
 pub const GLIMMER_FIXTURE_DIM: usize = 8;
 
-/// bf16 bytes for `n` values, distinct per `seed` so a mixed-up copy is visible as a wrong
-/// VALUE rather than as a right length.
+/// bf16 bytes for `n` values, distinct per `seed` so a mixed-up copy is visible as a wrong VALUE
+/// rather than as a right length. Every value is finite, non-zero, and signed.
+///
+/// The bit construction, because two of its three parts are load-bearing: bit 15 is a sign taken
+/// from the mix, bits 14..10 are forced to `01111` so the exponent lands in `0x78..0x7F` and can
+/// never be `0x00` or `0xFF`, and bits 9..0 come from the mix. Values therefore live in
+/// `±[2^-7, 2)`.
+///
+/// > **Three defects, all found 2026-08-12 by the first caller to build a fixture wider than
+/// > `GLIMMER_FIXTURE_DIM` = 8, and all invisible below it.**
+/// >
+/// > 1. **Overflow.** `i as u16 * 7` panicked on the dev profile at index 9,363 (9,362 x 7 = 65,534
+/// >    still fits), so any `n >= 9364`. The `seed` arithmetic was already `wrapping_*`; the index
+/// >    was not.
+/// > 2. **NaN and Inf.** `0x3c00` was OR-ed into the whole word, so any index reaching the exponent
+/// >    field could set it to `0xFF`: 8,192 of 131,072 values were non-finite, and at k = 256 that
+/// >    is essentially every dot product. It made a gate go RED for the wrong reason — `[f32] !=
+/// >    [f32]` is true whenever either side is NaN — which is the mirror of this repo's `f32::max`
+/// >    trap and cost exactly as much.
+/// > 3. **Period collapse, introduced by the fix for (2) and caught by review the same day.**
+/// >    Masking the index to ten bits made the value depend only on `i mod 1024`, so at k = 256 the
+/// >    rows of a `[512, 256]` weight repeated every 4 — four distinct rows out of 512, and a kernel
+/// >    reading row `c+4` for row `c` would have passed bit-identically. That is precisely the
+/// >    defect `glimmer_fixture.rs::fill` documents and fixed on the same day, re-introduced next
+/// >    door. The xor-fold below is that helper's remedy: `(h ^ (h >> 13))` makes row equality need
+/// >    `(j-j')·stride ≡ 0 (mod 2^29)`, past any width here. The masked version also cleared bit 15,
+/// >    making every fixture value POSITIVE and silently retiring any sign coverage the tree had.
 pub fn bf16_blob(seed: u16, n: usize) -> Vec<u8> {
     (0..n)
-        .flat_map(|i| (seed.wrapping_mul(37).wrapping_add(i as u16 * 7) | 0x3c00).to_le_bytes())
+        .flat_map(|i| {
+            let h = i
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add((seed as usize).wrapping_mul(40_503));
+            let mix = (h ^ (h >> 13)) as u16;
+            // Sign from bit 10 of the mix rather than bit 15 of the word: bits 15..10 of `mix` are
+            // otherwise discarded by the mask below, so taking the sign from one of them costs
+            // nothing and keeps the low ten bits fully available to the mantissa and low exponent.
+            let sign = (mix & 0x0400) << 5;
+            (sign | 0x3c00 | (mix & 0x03ff)).to_le_bytes()
+        })
         .collect()
 }
 

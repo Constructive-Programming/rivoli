@@ -122,3 +122,53 @@ fn convert_glimmer_refuses_before_it_writes() {
         "the artifact must not exist after a refusal"
     );
 }
+
+/// **The fixture's own value generator, which nothing else checks and which had three defects.**
+///
+/// `bf16_blob` feeds every Glimmer fixture in the tree, and until 2026-08-12 its contract ("distinct
+/// per seed", finite, non-zero) was enforced by nothing — so it overflowed on the dev profile past
+/// 9,363 indices, emitted NaN for one value in sixteen, and then, in the fix for that, collapsed to
+/// a period of 1,024. Each was invisible at `GLIMMER_FIXTURE_DIM` = 8 and each broke a gate one
+/// width up. This runs at a width no fixture uses, deliberately, and it needs no device.
+#[test]
+fn the_fixture_generator_produces_finite_signed_values_with_no_short_period() {
+    // 131,072 = the element count of a [512, 256] weight, the first size that reached all three
+    // defects. Well past the 9,363 that used to panic.
+    const N: usize = 131_072;
+    const K: usize = 256;
+    let bytes = common::bf16_blob(1, N);
+    assert_eq!(bytes.len(), N * 2, "two bytes per bf16 value");
+    let words: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let vals: Vec<f32> = words
+        .iter()
+        .map(|w| f32::from_bits((*w as u32) << 16))
+        .collect();
+
+    assert!(
+        vals.iter().all(|v| v.is_finite() && *v != 0.0),
+        "a non-finite or zero fixture value makes every comparison against it meaningless"
+    );
+    assert!(
+        vals.iter().any(|v| *v < 0.0) && vals.iter().any(|v| *v > 0.0),
+        "both signs must occur, or the fixture cannot catch a sign or abs defect"
+    );
+    // The period, at the stride that matters: a weight is read row-major at `K`, and two equal rows
+    // let a kernel read the wrong one and pass bit-identically. Checked as ROWS rather than as a
+    // distinct-value count, because it is row equality the readers can be fooled by — the masked
+    // version had 1,024 distinct values AND only four distinct rows.
+    let rows: std::collections::HashSet<&[u16]> = words.chunks_exact(K).collect();
+    assert_eq!(
+        rows.len(),
+        N / K,
+        "the generator repeats a whole {K}-wide row, so a strided misread would pass"
+    );
+    // Distinctness across seeds, its other stated contract.
+    assert_ne!(
+        common::bf16_blob(1, K),
+        common::bf16_blob(2, K),
+        "two seeds produced identical bytes"
+    );
+}

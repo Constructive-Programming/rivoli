@@ -1599,15 +1599,31 @@ impl GlimmerPin {
     /// `&mut self` because a miss fills a slot. That is the honest signature: a caller cannot
     /// hold two layers' pins at once, which is exactly the aliasing a slot reuse would break.
     ///
-    /// # THE INVARIANT A CALLER OWES, which no type here enforces
+    /// # THE WRITE-AFTER-READ HAZARD, and who closes it
     ///
-    /// **Before requesting a layer that maps to slot `s`, the caller must have retired every
-    /// kernel still reading slot `s`'s previous occupant.** A fill is a host `memcpy` with no
-    /// synchronization of any kind, and kernel launches are asynchronous — so a host that runs
-    /// even one layer ahead of the device can overwrite weights a live GEMV is streaming. The
-    /// symptom is position-dependent, nondeterministic wrong text: this repo's arena-relocation
-    /// signature. `device_sync` at the end of each layer is what GLM's loop already does and is
-    /// what makes this safe today.
+    /// **Before this refills a slot, every kernel still reading that slot's previous occupant must
+    /// have retired.** A fill is a host `memcpy` with no synchronization of any kind, and kernel
+    /// launches are asynchronous — so a host that runs even one layer ahead of the device can
+    /// overwrite weights a live GEMV is streaming. The symptom is position-dependent,
+    /// nondeterministic wrong text: this repo's arena-relocation signature.
+    ///
+    /// > **CORRECTED 2026-08-12: this is no longer an invariant a CALLER owes.** The section below
+    /// > read "the caller must have retired every kernel" and "S5 owes … the write-after-read fence
+    /// > in the same change as any increase to `GLIMMER_STREAM_SLOTS`". S3 item 0 paid it instead,
+    /// > because S3's loop is the first code that could violate it: **this function now performs the
+    /// > `device_sync` itself**, on every miss, and
+    /// > `glimmer_residency.rs::a_slot_refill_cannot_land_under_a_live_kernel` gates both directions
+    /// > — with the fence removed, all 4096 rows of a live gemm read the overwritten bytes. A caller
+    /// > owes nothing here now, which is the only version of this contract a loop cannot get wrong.
+    ///
+    /// **SCOPE, and it is narrower than "the hazard is closed".** The sync orders the refill after
+    /// every kernel ALREADY ENQUEUED when this is called. It cannot help the other order:
+    /// [`Bf16Weight`] is `Copy` and every field of [`GlimmerLayerPin`] is a raw pointer, so the
+    /// `&mut self` borrow that serialises these calls ends the moment a caller copies one out — and
+    /// a caller that captures layer `l`'s pointers, calls `layer(l+1)` (which fences and refills),
+    /// and only THEN launches the `l`-th kernel reads `l+1`'s weights as `l`'s. Nothing here can see
+    /// that. **Do not launch from pointers captured across a `layer()` call**; the failure is the
+    /// same silent position-dependent wrong text, and review named it 2026-08-12.
     ///
     /// > **Two reviews rejected the first version of this section, and they were right.** It
     /// > argued: "a fill is a host memcpy ... it has completed by the time this returns — there
@@ -1622,9 +1638,10 @@ impl GlimmerPin {
     /// first version gave: a ticket expresses fill-then-read, the dependency that genuinely does
     /// not exist while the fill is synchronous, and an always-satisfied one is the
     /// `hit: Vec<bool>` mistake `fetch/asyncfetch.rs`'s `Ticket` doc records. The dependency that
-    /// DOES exist is the opposite one and belongs in an event or a `device_sync`, not a ticket.
-    /// **S5 owes both**: a real ticket when the fill goes async, and the write-after-read fence
-    /// in the same change as any increase to [`GLIMMER_STREAM_SLOTS`].
+    /// DOES exist is the opposite one, and it is the `device_sync` in the body.
+    /// **S5 still owes the ticket** — when the fill goes async, fill-then-read becomes a real
+    /// dependency and the sync below becomes the wrong instrument for it (an event on the fetch
+    /// stream, not a whole-device join).
     ///
     /// `ponytail:` a synchronous fill blocks the decode thread for a layer's worth of memcpy
     /// and buys no overlap. Deliberate at R1, whose gates are about WHAT the bytes are, not
@@ -1649,6 +1666,17 @@ impl GlimmerPin {
             self.hits += 1;
             return Ok(&self.slots[s].pin);
         }
+        // **THE WRITE-AFTER-READ FENCE** — the hazard is on this function's doc; this is what closes
+        // it. `glimmer_residency.rs::a_slot_refill_cannot_land_under_a_live_kernel` gates it.
+        //
+        // **Unconditional on a miss, not conditional on `slot_layer[s].is_some()`.** The narrower
+        // version reads as tighter and is wrong: a fill that failed halfway leaves `slot_layer[s]`
+        // at `None` over a slot whose previous occupant's pointers WERE handed out, so it would skip
+        // the fence exactly when the slot is least trustworthy.
+        //
+        // Cost is one sync per streamed layer, which GLM's loop already pays per layer — EXPECTED to
+        // be free on the decode path, not measured, because no Glimmer loop exists to measure it on.
+        crate::backend::hip::device_sync()?;
         // **Invalidated BEFORE the fill, not after it.** `fill` writes tensor-by-tensor and can
         // bail in the middle, at which point the slot holds a prefix of layer `l` and a suffix of
         // its previous occupant. Assigning only on success left the flag claiming the OLD layer,

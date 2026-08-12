@@ -1684,9 +1684,13 @@ pub const GLIMMER_LAYER_TENSORS: [&str; 12] = [
 /// The arithmetic, at the shipped widths: `floor` charges every slot unconditionally, so each
 /// one pins one layer fewer, and a streamed layer is **967.942 MB of host memcpy per token**.
 ///
-/// **S5 raises this and adds the dependency in the same change**, because raising it alone
-/// widens the window the dependency exists to close. The invariant a caller owes today is
-/// stated on [`GlimmerPin::layer`].
+/// **The dependency landed 2026-08-12 (S3 item 0), so raising this is no longer gated on writing
+/// it.** [`GlimmerPin::layer`] performs a `device_sync` before every refill, and
+/// `glimmer_residency.rs::a_slot_refill_cannot_land_under_a_live_kernel` gates it in both
+/// directions. What raising the count still needs is the OTHER half: a synchronous fill buys no
+/// overlap, so a second slot is only worth its extra streamed layer once the fill is async — and
+/// that swap replaces the whole-device join here with an event on the fetch stream. This said "S5
+/// raises this and adds the dependency in the same change"; the dependency went first.
 pub const GLIMMER_STREAM_SLOTS: usize = 1;
 
 /// Alignment slack in a `GlimmerPin`'s tier request. `DeviceTier::place` starts every
