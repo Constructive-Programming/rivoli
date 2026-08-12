@@ -65,18 +65,47 @@ pub const TOLERANCES: &[Tol] = &[
         weakest_defect: 1.80e0,
         policy: Policy::Rel(1.6e-4),
     },
-    // **MLA is EXACT-ONLY, and this is the load-bearing finding of the whole tolerance exercise.**
-    // The C reference's LoRA-norm eps (1e-5 against first-party 1e-6) shifts this operator by
-    // 2.22e-5 while the operator's own fp32 rounding floor is 1.70e-5 — a margin of **1.3x**. There
-    // is no threshold that admits a correct kernel and rejects that eps, so the eps cannot be
-    // settled numerically AT ALL: S2/S3 must pin the constant by reading it, and MLA's fixture is
-    // scored bit-exactly. Had S1b shipped tolerance fixtures instead of exact bytes, the divergence
-    // G0 item 11 found would have been invisible to its own gate.
+    // **MLA is EXACT-ONLY, and the finding got STRONGER when it was measured properly.**
+    //
+    // The C reference's LoRA-norm eps (1e-5 against first-party 1e-6) was recorded as shifting this
+    // operator by 2.22e-5 against a 1.70e-5 floor — a margin of 1.3x, i.e. no threshold admits a
+    // correct kernel and rejects that eps.
+    //
+    // **RE-MEASURED 2026-08-11 across BOTH draws, with the bucket S2 item 2 gave it.** Two things
+    // changed. The bucket now contains `o_proj.in_gated`, and the floor is the max over draws
+    // rather than draw 1 alone — and the two draws are **3.2x apart** (1.801e-5 and 5.742e-5),
+    // which is the same one-draw trap Muse Glimmer's `attend` floor exposed. The defect is the
+    // weaker of its two draws, 1.923e-5.
+    //
+    // So the margin is **0.33x**: the eps divergence now sits BELOW the operator's own fp32
+    // rounding floor. That is not "no threshold separates them" — it is "the defect is
+    // indistinguishable from rounding at all", which is strictly stronger and points the same way.
+    // The eps must be pinned by READING it (S2/S3), and no numeric gate of any kind can stand in
+    // for that. The old 1.3x was single-draw and optimistic.
     Tol {
         operator: "mla",
-        floor: 1.697e-5,
-        weakest_defect: 2.22e-5,
+        floor: 5.742e-5,
+        weakest_defect: 1.923e-5,
         policy: Policy::ExactOnly,
+    },
+    // The MLA attention CORE, S2 item 2 — split from `mla` because they answer different
+    // questions. `mla` covers the projections and the LoRA norms, where the eps lives; this covers
+    // `eager_attention_forward`'s boundary, which a fixture feeds the reference's OWN q/k/v. The
+    // eps cannot reach it there, and a GPU reduction can never be bit-exact with torch anyway, so
+    // inheriting `mla`'s ExactOnly would have made item 2 ungateable.
+    //
+    // Floor is the max over draws (2.320e-5 and 4.103e-5, 1.8x apart). The targeting defect is
+    // `MlaScaleFromNope` at the weaker draw — the softmax scale over `qk_nope` instead of the full
+    // head width, §5's own trap.
+    //
+    // **`MlaLoraEps1e5` is excluded, and for a sharper reason than judgement**: it moves this
+    // bucket by 3.031e-5, which is BELOW the 4.103e-5 floor. Counting it would price this operator
+    // against a signal indistinguishable from its own rounding.
+    Tol {
+        operator: "mla_attend",
+        floor: 4.103e-5,
+        weakest_defect: 6.578e-1,
+        policy: Policy::Rel(4.10e-4),
     },
     Tol {
         operator: "moe_latent",
@@ -114,6 +143,28 @@ pub fn tolerance(operator: &str) -> Option<&'static Policy> {
         .iter()
         .find(|t| t.operator == operator)
         .map(|t| &t.policy)
+}
+
+/// The `Rel` threshold for an operator, with the two failures kept distinct.
+///
+/// They are not the same and must not share a message. `ExactOnly` means someone decided no
+/// threshold can separate a correct implementation from a known defect, and a kernel fixture
+/// cannot honour that — a GPU reduction reassociates by construction and will never be bit-exact
+/// with the reference. `None` means the row was renamed and NOTHING is being scored, which an
+/// `unwrap_or(default)` would turn into silence.
+///
+/// Factored here rather than written per fixture: `k3_attn_res.rs` had it first, and jscpd would
+/// have rejected the second copy the moment `k3_mla.rs` wanted one.
+pub fn rel_tolerance(operator: &str) -> f32 {
+    match tolerance(operator) {
+        Some(Policy::Rel(t)) => *t,
+        Some(Policy::ExactOnly) => panic!(
+            "{operator} is tabled ExactOnly, so it must be compared bit-exactly; a kernel fixture \
+             reassociates the reduction and cannot be. Either the row is wrong for this \
+             sub-operator, or the operator needs its own measured floor."
+        ),
+        None => panic!("no `{operator}` row in the tolerance table — nothing would be scored"),
+    }
 }
 
 /// A `Rel` tolerance is placed at **10x the floor**, and admitted within two-significant-figure

@@ -661,8 +661,27 @@ model is stored in — is answered above: none.)*
    `every_fold_mixes_the_depth_the_layer_loop_implies` pins the depth each fold should see, but
    nothing yet builds it. That is S3's. Note the tensors ship **BF16** and are named
    `self_attention_res_*`, not `attn_res_*`.
-2. **Gated MLA** — RoPE removed but the 64 rope dims **still cached and still scored**, softmax
-   scale over **192**, output gate **before `o_proj` with no norm**.
+2. **Gated MLA** — **DONE 2026-08-11, G2 met for this item.** `kernels/attn.hip::mha_attend` (dense
+   MHA over the per-head k/v `kv_b` expands — NOT the absorbed `mla_latent_attend`, which is V4's
+   and shares no arithmetic) plus `sigmoid_gate`, scored by `tests/k3_kernels.rs` at all three MLA
+   layers of both draws. Red-proved seven ways.
+
+   **The anchor could score none of it.** `eager_attention_forward` is a free function, so the
+   golden held the projections either side of the attention and nothing from within it — the
+   192-scale, the still-scored rope dims and causality were all unscoreable. And `o_proj`'s input
+   was uncaptured, so trap 10 sat in a gap. Both fixed (`wrap_mla_attention`, plus a
+   `register_forward_pre_hook`); goldens re-vendored at **262** tensors. `scaling` is now a captured
+   VALUE, which is what lets the fixture see `MlaScaleFromNope` rather than trust a comment.
+
+   **`mla_attend` is its own tolerance row**, floor 4.103e-5 / defect 6.578e-1 / `Rel(4.10e-4)`,
+   split from `mla` because the eps that makes `mla` ExactOnly cannot reach an operator fed the
+   reference's own q/k/v. Re-measuring `mla` across both draws moved its margin from 1.3x to
+   **0.33x** — the eps now sits BELOW its own floor, which is stronger than the original finding.
+
+   **Two blind spots the goldens could not have caught**, both found by red-proofing and both now
+   covered by a synthetic sweep: the decode masks are **all zero**, so causality masks nothing and
+   a kernel ignoring `mask` stayed green; and the softmax's max-subtraction is unobservable at these
+   magnitudes. Plus the width gap — 4 heads of 24/16 against a real 96 of 192/128.
 3. **The latent sandwich** — two bf16 trunk GEMVs plus `rmsnorm_batch` (`mla.hip:346`, already width-generic),
    with the accumulator interception of S1a.4.
 4. **SiTU-GLU + fp4 MoE** — §3b.

@@ -50,14 +50,14 @@ const GOLDENS: &[Vendored] = &[
     Vendored {
         salt: "k3-anchor-1",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-1.bin"),
-        len: 302_765,
-        fnv: 0x24f0_db67_238f_9411,
+        len: 327_253,
+        fnv: 0xb766_c482_975a_0baf,
     },
     Vendored {
         salt: "k3-anchor-2",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-2.bin"),
-        len: 302_765,
-        fnv: 0x823d_5f7d_6747_f46b,
+        len: 327_253,
+        fnv: 0x28c7_5284_f17c_9774,
     },
 ];
 
@@ -204,9 +204,10 @@ fn the_vendored_bytes_are_the_measured_ones() {
         assert_eq!(v.bytes.len(), v.len, "{}: size", v.salt);
         assert_eq!(h, v.fnv, "{}: FNV-1a", v.salt);
         let g = load(v);
-        // 235, up from 223 when S2 item 1 added the twelve `.fold` captures — see
+        // 262: 223 originally, +12 `.fold` for S2 item 1, +21 MLA attention-core and +6
+        // `o_proj.in_gated` for item 2. Each addition is recorded in `anchor.md`. See
         // `the_operator_fixtures_s2_needs_are_present`.
-        assert_eq!(g.floats.len(), 235, "{}: float tensors", v.salt);
+        assert_eq!(g.floats.len(), 262, "{}: float tensors", v.salt);
         assert_eq!(g.ints.len(), 5, "{}: int tensors", v.salt);
     }
     // The two draws must not be the same draw — compared on VALUES, not on the files.
@@ -218,27 +219,60 @@ fn the_vendored_bytes_are_the_measured_ones() {
     // would put bit-identical tensors in both files and pass every assertion here — while the
     // fixture claimed the second draw whose whole purpose is that a bug degenerate at one draw's
     // values cannot hide. Compared per tensor, over every float the goldens share.
+    // **Two classes of capture, and conflating them made this test wrong.** Almost everything here
+    // is downstream of `sha256(salt/parameter-name)` and MUST differ between the draws. But S2 item
+    // 2's captures introduced a second class: the attention `mask` is causal STRUCTURE (all zero at
+    // a decode step) and `scaling` is a config constant, `1/sqrt(qk_nope + qk_rope)`. Neither is
+    // drawn, so both are bit-identical across salts by construction — and this test failed on them
+    // the moment they were added.
+    //
+    // Loosening the check to "most tensors differ" would have been the wrong repair. These are
+    // asserted to be IDENTICAL instead, which is the stronger statement: a `scaling` that varied
+    // between draws would mean it had stopped being a config constant, and a mask that varied
+    // would mean causality depended on the weights.
+    const SALT_INDEPENDENT: [&str; 2] = [".attend.in.mask", ".attend.in.scaling"];
     let (a, b) = (load(&GOLDENS[0]), load(&GOLDENS[1]));
     let mut shared = 0usize;
-    let mut identical: Vec<&str> = Vec::new();
+    let (mut identical, mut varied): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
     for (name, _, va) in &a.floats {
         let Some((_, _, vb)) = b.floats.iter().find(|(n, _, _)| n == name) else {
             continue;
         };
         shared += 1;
         // `to_bits`, because `-0.0 == 0.0` and `NaN != NaN` would each lie here in one direction.
-        if va
+        let same = va
             .iter()
             .map(|x| x.to_bits())
-            .eq(vb.iter().map(|x| x.to_bits()))
-        {
-            identical.push(name);
+            .eq(vb.iter().map(|x| x.to_bits()));
+        let structural = SALT_INDEPENDENT.iter().any(|k| name.contains(k));
+        match (structural, same) {
+            (false, true) => identical.push(name),
+            (true, false) => varied.push(name),
+            _ => {}
         }
     }
     assert!(
         shared > 200,
         "only {shared} float tensors are common to the two goldens — the draws should differ in \
          VALUES, not in which tensors they hold"
+    );
+    assert!(
+        varied.is_empty(),
+        "{varied:?} differ between the two draws, but they are structure rather than draws: the \
+         attention mask is causality and `scaling` is a config constant. One varying means it has \
+         stopped being either."
+    );
+    // The exemption must not be dead: if nothing matches `SALT_INDEPENDENT`, the list is naming
+    // captures that no longer exist and is silently exempting nothing — the stale-exemption
+    // failure this repo has been bitten by elsewhere.
+    let structural = a
+        .floats
+        .iter()
+        .filter(|(n, _, _)| SALT_INDEPENDENT.iter().any(|k| n.contains(k)))
+        .count();
+    assert_eq!(
+        structural, 6,
+        "the salt-independent list should match exactly the three masks and three scalings"
     );
     assert!(
         identical.is_empty(),
@@ -660,9 +694,10 @@ fn the_tolerance_table_is_supported_by_its_measurements() {
     // S2 and S3 write and the other four are buckets the comparator uses to localise. **S2 must
     // not score those four against a threshold until one is measured**; compare them exactly, or
     // measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
-    const MEASURED: [&str; 6] = [
+    const MEASURED: [&str; 7] = [
         "attn_res",
         "mla",
+        "mla_attend",
         "moe_latent",
         "moe_route",
         "kda_op",

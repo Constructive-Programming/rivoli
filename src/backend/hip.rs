@@ -788,6 +788,52 @@ launchers! {
         y: *mut f32,
     );
 
+    /// Dense multi-head attention over explicit per-head K and V: Kimi-K3's gated MLA core.
+    ///
+    /// `q` is `[heads][d]`, `k` is `[heads][kv][d]`, `v` is `[heads][kv][dv]`, `out` is
+    /// `[heads][dv]`. `mask` is an additive `[kv]` row or null. **Not** [`launch_attend`], which is
+    /// DeepSeek-V4-Flash's absorbed latent form against an fp8 cache — different cache, different
+    /// arithmetic, and K3 caches the expanded k/v on purpose (`k3-architecture.md` §5).
+    ///
+    /// `scale` is the caller's, and it is a trap: §5 takes it over the **full** head width (192),
+    /// not over `qk_nope`. The 64 rope dims are unrotated but still scored, so they are part of
+    /// `d` — this signature has no rope argument because the caller concatenates.
+    ///
+    /// `kv` above 8192 is refused (1004) rather than truncated: scores are staged in LDS. That
+    /// bound is the kernel's ceiling and its upgrade path is written at the definition.
+    ///
+    /// # Safety
+    /// `q` is `heads·d` f32, `k` is `heads·kv·d`, `v` is `heads·kv·dv`, `out` is `heads·dv`, and
+    /// `mask` — if non-null — is `kv` f32. All live until the next [`device_sync`], and `out` must
+    /// not alias any input.
+    launch_mha_attend -> rivoli_mha_attend, "mha_attend" (
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        mask: *const f32,
+        heads: usize as i32,
+        kv: usize as i32,
+        d: usize as i32,
+        dv: usize as i32,
+        scale: f32,
+        out: *mut f32,
+    );
+
+    /// `out[i] = attn[i] · sigmoid(gate[i])`, Kimi-K3's MLA output gate.
+    ///
+    /// Separate from the attend because the ORDER is trap 10: MLA gates with **no norm**, KDA norms
+    /// and then gates. Not [`launch_swiglu`], which is `(g·sigmoid(g))·u` — a factor of `g` apart.
+    ///
+    /// # Safety
+    /// `attn`, `gate` and `out` are each `n` f32, live until the next [`device_sync`]. `out` may
+    /// alias either input: every thread reads both at `i` and then writes `i`.
+    launch_sigmoid_gate -> rivoli_sigmoid_gate, "sigmoid_gate" (
+        attn: *const f32,
+        gate: *const f32,
+        n: usize as i32,
+        out: *mut f32,
+    );
+
     /// Kimi-K3's Block Attention Residual fold: `out = softmax(<RMSNorm(src_s), fold>) @ src`.
     ///
     /// `src` is `[tokens][nsrc][n]` and `out` is `[tokens][n]`. The softmax mixes the sources

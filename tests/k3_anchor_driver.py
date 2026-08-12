@@ -613,6 +613,75 @@ def _fold_mixing_normalised(prefix_sum, block_residual, proj, norm):
     return torch.matmul(probs, k).squeeze(1).to(v.dtype)
 
 
+def wrap_mla_attention(mod, model, cap, ctx, layers):
+    """Capture the MLA attention CORE, which no forward hook can see.
+
+    `KimiMLAAttention.forward` resolves `eager_attention_forward` from module globals at call time
+    (`attention_interface: Callable = eager_attention_forward`) and the driver forces `eager`, so a
+    single module-level setattr catches every MLA layer -- the same mechanism `wrap_attn_res` uses,
+    and for the same reason: a free function is not a `Module`, so `register_forward_hook` never
+    fires for it.
+
+    **Without this, S2 item 2's three worst traps have no fixture at all.** The projections and
+    norms around the attention are captured as module outputs, but the scores, the softmax and the
+    weighted sum are not, so nothing in the golden could distinguish:
+
+      * a softmax scale taken over `qk_nope` instead of the full 192 (`--defect MlaScaleFromNope`);
+      * the unrotated 64 rope dims being DROPPED from the score rather than kept -- `k3-architecture.md`
+        §5 calls this "the silent bug", and it is silent precisely because the projections either
+        side of it are unchanged;
+      * causality, which is unconditional here and lives entirely in `attention_mask`.
+
+    `scaling` is captured as a one-element tensor rather than left in metadata: it is the trap, so
+    it should be a VALUE a fixture reads, not prose a reader trusts. `probs` is captured too --
+    the softmax is where a mask error shows up as a distribution rather than as a wrong number,
+    and a port that attends across the causal boundary produces a plausible output and an obviously
+    wrong row of probabilities.
+
+    Named by the owning module's position in the tree, resolved through `module.layer_idx`, so the
+    tag matches the rest of the layer's captures without depending on call order.
+    """
+    orig = mod.eager_attention_forward
+    wanted = set(layers)
+
+    def inner(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
+        out, probs = orig(module, query, key, value, attention_mask, scaling, dropout, **kw)
+        idx = getattr(module, "layer_idx", None)
+        if idx in wanted and ctx["capturing"]:
+            tag = f"model.layers.{idx}.self_attn.attend"
+            cap.add(f"{tag}.in.q", query)
+            cap.add(f"{tag}.in.k", key)
+            cap.add(f"{tag}.in.v", value)
+            if attention_mask is not None:
+                cap.add(f"{tag}.in.mask", attention_mask[:, :, :, : key.shape[-2]])
+            cap.add(f"{tag}.in.scaling", torch.tensor([scaling], dtype=torch.float32))
+            cap.add(f"{tag}.out", out)
+            cap.add(f"{tag}.probs", probs)
+        return out, probs
+
+    mod.eager_attention_forward = inner
+
+    # **The gated value entering `o_proj`, by PRE-hook.** Trap 10 is an ORDER -- MLA gates with no
+    # norm, KDA norms and then gates -- and an order is only attestable if both sides of it are in
+    # the file. `attend.out` is the pre-gate value and `o_proj`'s OUTPUT is post-projection, so
+    # without this the gate sits in a gap between two captures, and a port that normed before
+    # gating, or skipped the gate entirely, would match every tensor here.
+    #
+    # A pre-hook rather than another free-function wrap, because `o_proj` IS a module and its input
+    # is exactly the quantity wanted. `register_forward_hook` gives the output, which is already
+    # captured and is a different claim.
+    for name, m in model.named_modules():
+        if not name.endswith(".self_attn.o_proj"):
+            continue
+        if not any(name.startswith(f"model.layers.{i}.") for i in layers):
+            continue
+        tag = f"{name}.in_gated"
+        m.register_forward_pre_hook(
+            lambda _m, inp, _t=tag: cap.add(_t, inp[0]) if ctx["capturing"] else None
+        )
+    return orig
+
+
 def wrap_kda_ops(mod, cap, ctx, layers):
     """Record the KDA operator's own inputs and outputs, which no module hook can see.
 
@@ -756,6 +825,14 @@ def operator_of(name, kda_layers):
         kda = layer in kda_layers
         if rest.startswith("kda."):
             return "kda_op"
+        if rest.startswith("self_attn.attend"):
+            # **Its own bucket, split out 2026-08-11 for S2 item 2.** `mla` was measured before the
+            # attention core was captured at all, and it is tabled ExactOnly on the strength of a
+            # defect that lives in the LoRA NORMS -- the C reference's eps, 1.3x the bucket floor.
+            # The core takes the reference's own q/k/v, so that eps cannot reach it, and a kernel
+            # fixture cannot be bit-exact with torch in any case. Two different questions do not
+            # share a threshold.
+            return "mla_attend"
         if rest.startswith("self_attn"):
             return "kda_trunk" if kda else "mla"
         if rest.startswith(("self_attention_res", "mlp_res")):
@@ -1170,6 +1247,7 @@ def main():
     # too; `ctx["capturing"]` is what decides whether a call is recorded.
     wrap_kda_ops(mdl_mod, cap, ctx, CAPTURE_LAYERS)
     wrap_attn_res(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
+    wrap_mla_attention(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
     ids = torch.arange(1, args.seq + 1, device=args.device).unsqueeze(0) % cfg.vocab_size
 
     if args.mode == "kda-equiv":

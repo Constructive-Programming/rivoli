@@ -116,6 +116,135 @@ static inline size_t mla_attend_lds(int kvl, int rope) {
 // `partial` is null (n_splits==1) the block owns every row and writes the
 // normalised result straight to `clat`. Otherwise it writes its UNNORMALISED
 // accumulator plus its (m, l) to `partial`, and mla_attend_combine merges.
+// **Dense multi-head attention over an EXPLICIT per-head K and V.** One block per head.
+//
+// USED BY: Kimi-K3's gated MLA layers (`k3-architecture.md` §5), after `kv_b` has expanded the
+// latent into per-head keys and values. NOT the same operator as `mla_latent_attend` above, which
+// is DeepSeek-V4-Flash's *absorbed* form: that one attends in latent space against an fp8 latent
+// cache with the roped key scored separately, and never materialises a per-head K. K3 caches the
+// EXPANDED k/v deliberately (§5: re-expanding through `kv_b` per cached position is far slower),
+// so its attention is the textbook operator and shares no arithmetic with the absorbed one.
+//
+// **The 64 rope dims are part of `d`, unrotated and still scored.** K3 is NoPE — there is no cos/
+// sin anywhere — but the rope slot is carried in the key and contributes to the score, and §5
+// names dropping that term as "the silent bug". This kernel therefore takes ONE key width and no
+// rope argument: the caller concatenates, and the trap cannot be spelled here. What can be spelled
+// here is the scale, and `scale` is `1/sqrt(d)` over the FULL width — the caller passes it, and
+// `--defect MlaScaleFromNope` is the run that prices passing `1/sqrt(qk_nope)` instead.
+//
+// Causality is the caller's, in `mask`: §5's causality is unconditional (`s <= p`), and the
+// reference puts it entirely in an additive mask, so a kernel deriving its own bound would be
+// asserting something the reference does not.
+//
+// ponytail: scores are staged in LDS, so `kv` is bounded by `ATTEND_MAX_KV` and the launcher
+// REFUSES past it rather than silently truncating. That is the ceiling; the upgrade path is the
+// flash-style online softmax — running max and rescaled accumulator, tiled over `kv` — which needs
+// no score array at all. Not done here because S2 is a correctness stage and item 7 is where the
+// speed work is scheduled; a fixture that cannot be run is worth less than a kernel that is slow.
+#define ATTEND_MAX_KV 8192
+
+extern "C" __global__ void mha_attend(const float* __restrict__ q,    // [H][d]
+                                      const float* __restrict__ k,    // [H][kv][d]
+                                      const float* __restrict__ v,    // [H][kv][dv]
+                                      const float* __restrict__ mask, // [kv] additive, or null
+                                      int kv, int d, int dv, float scale,
+                                      float* __restrict__ out) { // [H][dv]
+    extern __shared__ float sc[]; // [kv]
+    const int t = threadIdx.x;
+    const int head = blockIdx.x;
+    const float* qh = q + (size_t)head * d;
+    const float* kh = k + (size_t)head * kv * d;
+    const float* vh = v + (size_t)head * kv * dv;
+
+    // Pass 1 — one thread per position, scoring the whole width alone. Strided so a `kv` below the
+    // block size simply leaves threads idle rather than changing the answer.
+    float local = -INFINITY;
+    for (int s = t; s < kv; s += blockDim.x) {
+        const float* ks = kh + (size_t)s * d;
+        float acc = 0.0f;
+        for (int i = 0; i < d; i++) acc += qh[i] * ks[i];
+        acc = acc * scale + (mask ? mask[s] : 0.0f);
+        sc[s] = acc;
+        local = fmaxf(local, acc);
+    }
+    __shared__ float red[256];
+    red[t] = local;
+    __syncthreads();
+    for (int j = blockDim.x / 2; j > 0; j >>= 1) {
+        if (t < j) red[t] = fmaxf(red[t], red[t + j]);
+        __syncthreads();
+    }
+    // A fully masked row would leave `m = -inf` and make every `expf` a NaN. The reference cannot
+    // produce one — causality always admits position 0 — so this is a guard on the CALLER, not a
+    // case to define: `0` keeps the row finite and the output zero, which is visibly wrong rather
+    // than quietly NaN-propagating into the next layer.
+    const float m = isfinite(red[0]) ? red[0] : 0.0f;
+    __syncthreads();
+
+    // Pass 2 — exponentiate in place and sum.
+    float ls = 0.0f;
+    for (int s = t; s < kv; s += blockDim.x) {
+        const float e = expf(sc[s] - m);
+        sc[s] = e;
+        ls += e;
+    }
+    red[t] = ls;
+    __syncthreads();
+    for (int j = blockDim.x / 2; j > 0; j >>= 1) {
+        if (t < j) red[t] += red[t + j];
+        __syncthreads();
+    }
+    const float inv_z = 1.0f / red[0];
+    __syncthreads();
+
+    // Pass 3 — one thread per OUTPUT column, so the accumulator is thread-private and no atomic or
+    // second reduction is needed. This is why the scores are staged rather than recomputed: the
+    // split changes axis between pass 1 and here.
+    for (int j = t; j < dv; j += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < kv; s++) acc += sc[s] * vh[(size_t)s * dv + j];
+        out[(size_t)head * dv + j] = acc * inv_z;
+    }
+}
+
+// `out[i] = attn[i] * sigmoid(gate[i])` over `n` elements.
+//
+// USED BY: Kimi-K3's gated MLA (§5), between the attend and `o_proj`. **Its own kernel, and its own
+// name, because the ORDER is trap 10**: MLA gates with NO norm, while KDA norms and then gates —
+// same word, opposite order. Folding this into `mha_attend`'s epilogue would have made the two
+// indistinguishable at the call site, which is exactly where the trap is read.
+//
+// Not `swiglu`: that is `(g·sigmoid(g))·u`, a SiLU of the gate times the other operand. This is a
+// plain sigmoid of the gate times the value, and the two differ by a factor of `g`.
+extern "C" __global__ void sigmoid_gate(const float* __restrict__ attn,
+                                        const float* __restrict__ gate, int n,
+                                        float* __restrict__ out) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        out[i] = attn[i] / (1.0f + expf(-gate[i]));
+    }
+}
+
+extern "C" int rivoli_mha_attend(const float* q, const float* k, const float* v, const float* mask,
+                                 int heads, int kv, int d, int dv, float scale, float* out) {
+    if (heads <= 0 || d <= 0 || dv <= 0) return 1001;
+    if (kv <= 0 || kv > ATTEND_MAX_KV) return 1004;
+    hipGetLastError();
+    hipLaunchKernelGGL(mha_attend, dim3(heads), dim3(256), (size_t)kv * sizeof(float), 0, q, k, v,
+                       mask, kv, d, dv, scale, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_sigmoid_gate(const float* attn, const float* gate, int n, float* out) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    int blocks = (n + 255) / 256;
+    if (blocks > 65535) blocks = 65535;
+    hipLaunchKernelGGL(sigmoid_gate, dim3(blocks), dim3(256), 0, 0, attn, gate, n, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 extern "C" __global__ void mla_latent_attend(
     const float* __restrict__ qabs,         // [H*kvl]
     const float* __restrict__ qrope,        // [H*rope]

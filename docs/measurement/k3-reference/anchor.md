@@ -145,6 +145,10 @@ decode golden (232 + 5 in prefill, which has no incoming recurrent state), plus 
 * **KDA** — `q`/`k`/`v` after the short convolutions, the log-space gate, `beta`, `A_log`,
   `dt_bias`, the incoming recurrent state, and both outputs. Everything between those two points
   lives in fla's triton kernel and in no document. This IS the S2 KDA fixture.
+* **The MLA attention CORE** — `q`, `k`, `v`, the additive `mask`, the **`scaling` as a value**, the
+  output and the softmax `probs`, for each of the three captured MLA layers. `eager_attention_forward`
+  is a module-level free function, so no hook fired for it and the golden held the projections
+  around the attention with nothing from inside it. Added 2026-08-11 for S2 item 2 — see below.
 * **AttnRes** — `prefix_sum`, the accumulated `block_residual` stack, **the fold** and the fold's
   output, for both per-layer folds and the model-level one. Twelve folds: two per captured layer
   plus the model-level one, minus layer 0's `self_attention_res`, which §3's layer loop guards on a
@@ -181,6 +185,42 @@ decode golden (232 + 5 in prefill, which has no incoming recurrent state), plus 
 > boundary**, and "inputs and outputs" is not that boundary whenever a weight sits between them.
 > Three reviewers found the missing hook; none noticed the fixture it produced could not be used,
 > because nothing had tried to use one yet.
+
+### The same gap, twice more, found by S2 item 2 (2026-08-11)
+
+**The MLA attention core had no fixture at all**, and it hid the three traps §5 spends most of its
+words on. `eager_attention_forward` is a module-level free function — `KimiMLAAttention.forward`
+resolves it from module globals at call time — so `register_forward_hook` never fired and the golden
+carried the projections either side of the attention and nothing from within it. No scores, no
+softmax, no pre-gate output. Unscoreable: the softmax scale over the full 192 rather than
+`qk_nope`; the unrotated rope dims still being scored, which §5 names "the silent bug"; and
+causality, which lives entirely in the additive mask.
+
+Fixed by `wrap_mla_attention`, the same setattr `wrap_attn_res` uses. **`scaling` is captured as a
+one-element tensor rather than left in metadata**, which is the difference between a trap a fixture
+reads and one a reader has to remember: 0.20412 = 1/sqrt(24) against 0.25 for the nope-only
+misreading.
+
+**And the gate sat in a gap one level down.** `o_proj`'s OUTPUT was captured, its INPUT was not — so
+trap 10 (MLA gates with no norm; KDA norms then gates) had nothing on either side of it, and a port
+that normed before gating would have matched every tensor in the file. A
+`register_forward_pre_hook` on `o_proj` takes the input; a forward hook cannot, because it hands
+you the output. It fires on the KDA layers too, which is better than intended — both sides of the
+contrast are now in one file.
+
+> **A wrong assumption caught by its own fixture.** The first version of
+> `the_gate_ordering_is_the_one_mla_uses` asserted that a KDA layer has no output-gate projection.
+> It went red immediately: KDA has a `g_proj` too, 128 wide. Trap 10 is not "one gates and the other
+> does not" — **both gate, and the difference is the order**. KDA carries an `o_norm` and normalises
+> first; MLA has no norm on that path at all, and the presence or absence of `o_norm` is the
+> contrast that is actually in the file. What no fixture here can reach is KDA's *intermediate*:
+> its norm and gate are fused inside fla's `FusedRMSNormGated`, so proving the order directly is
+> S2 item 5's, on the KDA operator boundary.
+
+**The generalisation, now that it has happened three times:** any operator whose input is a DERIVED
+value rather than another module's captured output has no fixture, and a forward hook cannot give
+it one. Free functions need a setattr wrap; module inputs need a pre-hook. Both were found the same
+way — by trying to write the kernel and discovering there was nothing to launch with.
 
 Two things are deliberately not captured. The **individual routed experts** are excluded — not for
 size but because `moe_infer` only calls experts that won tokens, so which expert modules fire is
@@ -234,17 +274,17 @@ the **row maximum** of `max|a−b|` over the tensor's own scale:
 
 | defect | 0 | 1 | 3 | 12 | 91 | 92 | model | max_rel |
 |---|---|---|---|---|---|---|---|---|
-| `MlaLoraEps1e5` | **0/39** | **0/49** | 20/32 | 43/49 | 29/32 | 29/32 | 6/7 | 2.2e−5 |
-| `MlaScaleFromNope` | **0/39** | **0/49** | 16/32 | 43/49 | 30/32 | 29/32 | 6/7 | 1.3e+0 |
-| `ExpertW1W3Swap` | **0/39** | 4/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 3.0e+0 |
-| `RouterBiasInWeight` | **0/39** | 5/49 | 26/32 | 44/49 | 30/32 | 30/32 | 6/7 | 2.4e+0 |
-| `LatentNormAfterUp` | **0/39** | 4/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 2.0e+2 |
-| `DenseMlpGateUpSwap` | 6/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 2.3e+0 |
-| `AttnResNormalisedValues` | 8/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 1.8e+0 |
-| `KdaNoQkL2Norm` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 4.2e+1 |
-| `KdaGateLowerBoundOff` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 3.3e+0 |
-| `KdaStateLayout` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 3.3e+0 |
-| `KdaBetaSigmoidOutside` | 15/39 | 42/49 | 27/32 | 44/49 | 30/32 | 30/32 | 6/7 | 7.0e+0 |
+| `MlaLoraEps1e5` | **0/40** | **0/50** | 26/40 | 44/50 | 35/40 | 35/40 | 6/7 | 2.2e−5 |
+| `MlaScaleFromNope` | **0/40** | **0/50** | 20/40 | 44/50 | 37/40 | 36/40 | 6/7 | 1.3e+0 |
+| `ExpertW1W3Swap` | **0/40** | 4/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 3.0e+0 |
+| `RouterBiasInWeight` | **0/40** | 5/50 | 32/40 | 45/50 | 36/40 | 36/40 | 6/7 | 2.4e+0 |
+| `LatentNormAfterUp` | **0/40** | 4/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 2.0e+2 |
+| `DenseMlpGateUpSwap` | 6/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 2.3e+0 |
+| `AttnResNormalisedValues` | 8/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 1.8e+0 |
+| `KdaNoQkL2Norm` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 4.2e+1 |
+| `KdaGateLowerBoundOff` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 3.3e+0 |
+| `KdaStateLayout` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 3.3e+0 |
+| `KdaBetaSigmoidOutside` | 16/40 | 43/50 | 33/40 | 45/50 | 36/40 | 36/40 | 6/7 | 7.0e+0 |
 
 Every bold cell is asserted. Read the rows:
 
@@ -429,7 +469,37 @@ within 30× of its defect fails, and setting one below its own floor fails.
 > flat 10× — and the upper side of that rule was unbounded, so `Rel(5.0e-2)` on `attn_res`, 3183×
 > its floor, passed. Both are bounded and stated now.
 
-**Six operators have a row; the driver classifies TEN — and the four without one are a GAP, not a
+> **RE-MEASURED 2026-08-11 for S2 item 2, and one row changed materially.**
+>
+> The attention core is now captured, so `operator_of` splits **`mla_attend`** out of `mla`: they
+> answer different questions. `mla` covers the projections and the LoRA norms, where the eps
+> divergence lives; `mla_attend` covers `eager_attention_forward`'s boundary, which a fixture feeds
+> the reference's OWN q/k/v — so the eps cannot reach it, and a GPU reduction can never be
+> bit-exact with torch in any case. Inheriting `mla`'s `ExactOnly` would have made item 2
+> ungateable for a reason that does not apply to it.
+>
+> | operator | floor draw 1 | floor draw 2 | floor | weakest targeting defect | policy |
+> |---|---|---|---|---|---|
+> | `mla` | 1.801e−5 | **5.742e−5** | 5.742e−5 | `MlaLoraEps1e5` 1.923e−5 | ExactOnly |
+> | `mla_attend` | 2.320e−5 | **4.103e−5** | 4.103e−5 | `MlaScaleFromNope` 6.578e−1 | Rel(4.10e−4) |
+>
+> **`mla`'s finding got stronger, and the old number was optimistic.** It was recorded as floor
+> 1.697e−5 against a 2.22e−5 defect — a margin of 1.3×, i.e. "no threshold admits a correct kernel
+> and rejects that eps". Both numbers were single-draw. Measured across BOTH draws, with the bucket
+> the new captures give it, the margin is **0.33×**: the eps divergence sits *below* the operator's
+> own fp32 rounding floor. That is strictly stronger than un-thresholdable — it is
+> **indistinguishable from rounding** — and it points the same way: the eps must be pinned by
+> reading it, and no numeric gate can stand in for that.
+>
+> The two draws are **3.2× apart** for `mla` and 1.8× for `mla_attend`. That is the same one-draw
+> trap Muse Glimmer's `attend` floor exposed, hit again on a different model — a floor is the max
+> over draws or it is not a floor.
+>
+> **`MlaLoraEps1e5` is excluded from `mla_attend`'s defect set** for a sharper reason than
+> judgement: it moves that bucket by 3.031e−5, which is *below* the 4.103e−5 floor. Pricing an
+> operator against a signal indistinguishable from its own rounding is not a tolerance.
+
+**Seven operators have a row; the driver classifies ELEVEN — and the four without one are a GAP, not a
 decision.** `operator_of` also emits `kda_trunk` (a KDA layer's projections and norms, as opposed to
 the recurrence itself), `norm`, `residual` and `head`. Nobody measured a floor for those: the six
 are the distinct kernels S2 and S3 will write, and the other four are buckets the comparator uses to

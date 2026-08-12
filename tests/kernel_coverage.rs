@@ -324,6 +324,11 @@ const OWNERS: &[(&str, &[&str])] = &[
     // `k3gpu.rs` is S3. This is the "staged work, not dead code" state the doc above names, and it
     // becomes `&["k3gpu.rs"]` the moment the layer loop exists.
     ("attn_res", &[]),
+    // Kimi-K3's gated MLA core and its output gate, S2 item 2. Empty for the same reason as
+    // `attn_res` above: staged work, gated by `tests/k3_mla.rs`, with no K3 engine path to call
+    // them from until S3 writes `k3gpu.rs`.
+    ("mha_attend", &[]),
+    ("sigmoid_gate", &[]),
     ("argmax", &["gpu.rs", "f4gpu.rs"]),
     ("attend", &["gpu.rs"]),
     ("embed_bf16_row_bcast", &["f4gpu.rs"]),

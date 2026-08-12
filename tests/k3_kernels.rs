@@ -33,7 +33,7 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli::backend::hip::launch_attn_res;
+use rivoli::backend::hip::{launch_attn_res, launch_mha_attend, launch_sigmoid_gate};
 use rivoli::v4oracle::golden::GoldenSet;
 
 mod common;
@@ -218,13 +218,7 @@ fn rel(a: &[f32], b: &[f32]) -> f32 {
 /// alive exactly as long as the cases it lends out, which is what the borrow checker wants here
 /// and what a collected Vec would force into an owned copy of every capture.
 fn for_each_fold(mut f: impl FnMut(Fold)) {
-    let tol = match k3_tolerance::tolerance("attn_res").expect("attn_res has a measured tolerance")
-    {
-        k3_tolerance::Policy::Rel(t) => *t,
-        k3_tolerance::Policy::ExactOnly => {
-            panic!("attn_res is tabled ExactOnly; this fixture scores it with a threshold")
-        }
-    };
+    let tol = k3_tolerance::rel_tolerance("attn_res");
     for (salt, bytes) in GOLDENS {
         let g = load(bytes);
         let eps = eps(&g);
@@ -427,11 +421,7 @@ fn mixing_the_normalised_sources_goes_red() {
 /// at widths the reference never produced.
 #[test]
 fn attn_res_at_real_widths_and_multiple_tokens() {
-    let tol = match k3_tolerance::tolerance("attn_res").expect("attn_res has a measured tolerance")
-    {
-        k3_tolerance::Policy::Rel(t) => *t,
-        k3_tolerance::Policy::ExactOnly => panic!("attn_res is tabled ExactOnly"),
-    };
+    let tol = k3_tolerance::rel_tolerance("attn_res");
     let mut r = common::Lcg(0xA77E);
     // 192 reproduces the goldens' width so a failure here is attributable to the synthetic data
     // rather than to the width; 257 wraps the loop exactly once with a one-thread tail; 1000 wraps
@@ -472,6 +462,392 @@ fn attn_res_at_real_widths_and_multiple_tokens() {
                      not being applied"
                 );
             }
+        }
+    }
+}
+
+/// The captured layers the real map makes MLA — zero-based 3, 91 and 92.
+///
+/// **91 and 92 are ADJACENT**, which the every-fourth pattern does not predict: 93 layers do not
+/// divide by 4, so the map ends with two MLA layers in a row. `k3_anchor.rs` pins the partition
+/// itself; this list exists so a fixture that silently stopped covering one of them is visible.
+const MLA_LAYERS: [usize; 3] = [3, 91, 92];
+
+/// The four widths an attend is shaped by. One type because they always travel together — and
+/// because jscpd rejected them appearing once as `Attend`'s fields and once as `device_attend`'s
+/// parameters, which is the gate noticing the same thing.
+#[derive(Clone, Copy)]
+struct Dims {
+    heads: usize,
+    kv: usize,
+    d: usize,
+    dv: usize,
+}
+
+/// One MLA layer's attention boundary, as the reference computed it.
+struct Attend {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    mask: Vec<f32>,
+    scale: f32,
+    out: Vec<f32>,
+    probs: Vec<f32>,
+    dims: Dims,
+    /// The two halves of `d`, read from the golden's own `tiny_config`. Carried on the struct
+    /// rather than re-extracted per test: two tests need them, and jscpd rejected the second copy
+    /// of the extraction at 86 tokens.
+    nope: usize,
+    rope: usize,
+    /// The output gate and the value that reached `o_proj` — the two halves of trap 10. On the
+    /// struct because `Attend` claims to be the layer's whole boundary, and because the gate test
+    /// otherwise had to re-open the golden, which jscpd caught at 61 tokens.
+    gate: Vec<f32>,
+    gated: Vec<f32>,
+}
+
+fn attend(g: &GoldenSet, layer: usize) -> Attend {
+    let tag = format!("model.layers.{layer}.self_attn.attend");
+    let (qs, q) = float(g, &format!("{tag}.in.q"));
+    let (ks, k) = float(g, &format!("{tag}.in.k"));
+    let (vs, v) = float(g, &format!("{tag}.in.v"));
+    let (ms, mask) = float(g, &format!("{tag}.in.mask"));
+    let (_, scale) = float(g, &format!("{tag}.in.scaling"));
+    let (os, out) = float(g, &format!("{tag}.out"));
+    let (ps, probs) = float(g, &format!("{tag}.probs"));
+
+    // `[b, heads, q_len, d]`. The decode step is one query row, and the kernel's contract is that
+    // row — asserted rather than assumed, because a q_len > 1 golden would silently make every
+    // comparison below read the first row of a stack.
+    assert_eq!(qs[0], 1, "batch");
+    assert_eq!(qs[2], 1, "the decode fixture is one query row");
+    let (heads, d) = (qs[1], qs[3]);
+    let (kv, dv) = (ks[2], vs[3]);
+    // `repeat_kv` runs INSIDE the reference's attention, so what is captured is pre-broadcast. The
+    // kernel takes fully expanded per-head K/V, which is what K3 caches (§5 stores the expanded
+    // k/v deliberately). Equal head counts here means the two agree; unequal would mean the kernel
+    // is being handed something it does not implement, and passing anyway would be the bug.
+    assert_eq!(ks[1], heads, "K head count must already be per-head");
+    assert_eq!(vs[1], heads, "V head count must already be per-head");
+    assert_eq!(
+        ks[3], d,
+        "K width must equal Q width — the rope dims ride in both"
+    );
+    assert_eq!(vs[2], kv, "V must have as many rows as K");
+    assert_eq!(
+        ms,
+        &[1, 1, 1, kv],
+        "mask is one additive row per key position"
+    );
+    assert_eq!(os, &[1, 1, heads, dv], "out is [b, q_len, heads, dv]");
+    assert_eq!(ps, &[1, heads, 1, kv], "probs is [b, heads, q_len, kv]");
+
+    let cfg: serde_json::Value =
+        serde_json::from_str(g.meta_get("tiny_config").expect("tiny_config")).unwrap();
+    let nope = cfg["qk_nope_head_dim"].as_u64().unwrap() as usize;
+    let rope = cfg["qk_rope_head_dim"].as_u64().unwrap() as usize;
+    assert_eq!(nope + rope, d, "the head width is qk_nope + qk_rope");
+
+    let (_, gate) = float(g, &format!("model.layers.{layer}.self_attn.g_proj"));
+    let (_, gated) = float(
+        g,
+        &format!("model.layers.{layer}.self_attn.o_proj.in_gated"),
+    );
+    assert_eq!(gate.len(), heads * dv, "one gate value per output element");
+    assert_eq!(
+        gated.len(),
+        gate.len(),
+        "the gated value is the gate's shape"
+    );
+
+    Attend {
+        q: q.to_vec(),
+        k: k.to_vec(),
+        v: v.to_vec(),
+        mask: mask.to_vec(),
+        scale: scale[0],
+        out: out.to_vec(),
+        probs: probs.to_vec(),
+        dims: Dims { heads, kv, d, dv },
+        nope,
+        rope,
+        gate: gate.to_vec(),
+        gated: gated.to_vec(),
+    }
+}
+
+/// Run `mha_attend` over an already-flattened boundary.
+///
+/// Takes the pieces rather than an `Attend`, because the synthetic sweep at the bottom of this file
+/// has no golden and therefore no `Attend` — and jscpd rejected the second copy of the launch block
+/// at 73 tokens. One launcher call site is also one place where the argument order can be wrong.
+fn device_attend(q: &[f32], k: &[f32], v: &[f32], mask: &[f32], n: Dims, scale: f32) -> Vec<f32> {
+    let Dims { heads, kv, d, dv } = n;
+    let (qb, kb, vb, mb) = (
+        dev(&f32b(q)),
+        dev(&f32b(k)),
+        dev(&f32b(v)),
+        dev(&f32b(mask)),
+    );
+    let mut ob = zeros(heads * dv * 4);
+    // SAFETY: `q` is `heads·d` f32, `k` is `heads·kv·d`, `v` is `heads·kv·dv`, `mask` is `kv`, and
+    // `out` is `heads·dv` — all live for the call and mutually non-aliasing.
+    ok(
+        unsafe {
+            launch_mha_attend(
+                qb.ptr() as *const f32,
+                kb.ptr() as *const f32,
+                vb.ptr() as *const f32,
+                mb.ptr() as *const f32,
+                heads,
+                kv,
+                d,
+                dv,
+                scale,
+                ob.ptr_mut() as *mut f32,
+            )
+        },
+        "mha_attend",
+    );
+    f32v(&back(&ob))
+}
+
+/// Every (draw, MLA layer) pair with its boundary assembled — the same shape as `for_each_fold`,
+/// and factored for the same reason: three tests opened with the identical traversal and jscpd
+/// rejected the copies.
+fn for_each_mla(mut f: impl FnMut(&str, usize, Attend)) {
+    for (salt, bytes) in GOLDENS {
+        let g = load(bytes);
+        for layer in MLA_LAYERS {
+            let a = attend(&g, layer);
+            f(salt, layer, a);
+        }
+    }
+}
+
+/// **The attention core reproduces the reference at every MLA layer, at both draws.**
+#[test]
+fn mha_attend_matches_the_anchor() {
+    let tol = k3_tolerance::rel_tolerance("mla_attend");
+    for_each_mla(|salt, layer, a| {
+        let got = device_attend(&a.q, &a.k, &a.v, &a.mask, a.dims, a.scale);
+        let r = rel(&got, &a.out);
+        assert!(
+            r <= tol,
+            "{salt} layer {layer}: {r:e} exceeds {tol:e} at {:?}",
+            (a.dims.heads, a.dims.kv, a.dims.d, a.dims.dv)
+        );
+    });
+}
+
+/// **The captured scale is over the full head width, and the fixture can tell.**
+///
+/// Not a restatement of the spec: it is the arithmetic check `--defect MlaScaleFromNope` would have
+/// to defeat. The captured value is compared against BOTH readings, and the second assertion is the
+/// one carrying information — if `qk_nope` happened to equal the full width, this says so instead
+/// of passing vacuously.
+#[test]
+fn the_softmax_scale_is_over_the_full_head_width() {
+    for_each_mla(|salt, layer, a| {
+        assert!(a.rope > 0, "{salt}: a zero rope width makes this vacuous");
+        let full = 1.0 / (a.dims.d as f32).sqrt();
+        let nope_only = 1.0 / (a.nope as f32).sqrt();
+        assert!(
+            (a.scale - full).abs() < 1e-6,
+            "{salt} layer {layer}: scale {} is not 1/sqrt({})",
+            a.scale,
+            a.dims.d
+        );
+        assert!(
+            (a.scale - nope_only).abs() > 1e-3,
+            "{salt} layer {layer}: the two readings of the scale are indistinguishable at these \
+             widths, so this fixture cannot see MlaScaleFromNope"
+        );
+    });
+}
+
+/// **The unrotated rope dims are present in the key and are actually scored.**
+///
+/// §5's "silent bug" is dropping the second term of the score. This shows the fixture can see it:
+/// recomputing the scores WITHOUT the rope dims produces a different softmax from the captured
+/// `probs`. That is the half that matters — a kernel ignoring those dims still produces plausible
+/// output, so only a comparison against the reference's own probabilities proves the term was in.
+#[test]
+fn the_unrotated_rope_dims_are_still_scored() {
+    for_each_mla(|salt, layer, a| {
+        let mut worst = 0.0f32;
+        for h in 0..a.dims.heads {
+            let qh = &a.q[h * a.dims.d..(h + 1) * a.dims.d];
+            let mut nope_only = vec![0.0f64; a.dims.kv];
+            for (s, sc) in nope_only.iter_mut().enumerate() {
+                let ks = &a.k[(h * a.dims.kv + s) * a.dims.d..(h * a.dims.kv + s + 1) * a.dims.d];
+                let dot: f64 = qh[..a.nope]
+                    .iter()
+                    .zip(&ks[..a.nope])
+                    .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                    .sum();
+                *sc = dot * f64::from(a.scale) + f64::from(a.mask[s]);
+            }
+            let m = nope_only.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let ex: Vec<f64> = nope_only.iter().map(|x| (x - m).exp()).collect();
+            let z: f64 = ex.iter().sum();
+            for (s, e) in ex.iter().enumerate() {
+                worst = worst.max((a.probs[h * a.dims.kv + s] - (e / z) as f32).abs());
+            }
+        }
+        assert!(
+            worst > 1e-3,
+            "{salt} layer {layer}: dropping the rope dims moves the softmax by only {worst:e} — \
+             this fixture cannot see §5's silent bug"
+        );
+    });
+}
+
+/// **The gate is applied to the attention output, before `o_proj`, with no norm.**
+///
+/// Trap 10 read off the file rather than from the spec: `o_proj`'s captured INPUT must equal
+/// `attend.out * sigmoid(g_proj)`, computed by the kernel that will do it in the engine. If the
+/// reference normed first, or gated after the projection, this does not hold.
+#[test]
+fn the_gate_ordering_is_the_one_mla_uses() {
+    let tol = k3_tolerance::rel_tolerance("mla_attend");
+    for_each_mla(|salt, layer, a| {
+        let (ab, gb) = (dev(&f32b(&a.out)), dev(&f32b(&a.gate)));
+        let mut ob = zeros(a.gate.len() * 4);
+        // SAFETY: three live buffers of `n` f32, mutually non-aliasing.
+        ok(
+            unsafe {
+                launch_sigmoid_gate(
+                    ab.ptr() as *const f32,
+                    gb.ptr() as *const f32,
+                    a.gate.len(),
+                    ob.ptr_mut() as *mut f32,
+                )
+            },
+            "sigmoid_gate",
+        );
+        let r = rel(&f32v(&back(&ob)), &a.gated);
+        assert!(
+            r <= tol,
+            "{salt} layer {layer}: the gated value differs by {r:e} — MLA gates the attention \
+             output with no norm, before o_proj"
+        );
+    });
+    // **The KDA contrast, and it is not the one this test first asserted.**
+    //
+    // The first version claimed a KDA layer has no output-gate projection. It went red on the
+    // first run: KDA has a `g_proj` too, 128 wide. Trap 10 is not "one gates and the other does
+    // not" — both gate, and the difference is the ORDER. KDA carries an `o_norm` and normalises
+    // before gating; MLA has no norm on that path at all.
+    //
+    // So the contrast that IS in the file is the presence of `o_norm`, and asserting it both ways
+    // is what makes it a contrast rather than an observation about one layer.
+    //
+    // **What this cannot reach**: KDA's norm and gate are fused inside fla's `FusedRMSNormGated`,
+    // so the intermediate between them is not captured and no fixture here can show the order
+    // directly. It is S2 item 5's to prove, on the KDA operator boundary. What is established
+    // here is that the two paths are structurally different in the way §5 and §4 describe.
+    let g = load(GOLDENS[0].1);
+    let has = |n: &str| g.floats.iter().any(|(k, _, _)| k == n);
+    assert!(
+        has("model.layers.1.self_attn.o_norm"),
+        "a KDA layer norms before it gates, so it must carry an o_norm"
+    );
+    assert!(
+        has("model.layers.1.self_attn.g_proj"),
+        "a KDA layer gates too — the difference from MLA is the order, not the gate"
+    );
+    assert!(
+        !has("model.layers.3.self_attn.o_norm"),
+        "MLA gates with NO norm (trap 10); an o_norm on an MLA layer means the two paths have \
+         converged and the trap is gone"
+    );
+}
+
+/// **What the MLA goldens structurally cannot reach: real widths, a mask that masks, and
+/// magnitudes where the softmax's stability device matters.**
+///
+/// Found by red-proofing, and both gaps were silent. Breaking the kernel two ways left every
+/// golden-backed test above GREEN:
+///
+/// * **ignoring `mask` entirely.** The decode captures' masks are ALL ZERO — the last position
+///   attends to everything, so causality masks nothing at a single decode step. §5's "causality is
+///   unconditional" lives in the mask, and the fixture could not see it being dropped.
+/// * **removing the max-subtraction** from the softmax. At the goldens' magnitudes `exp` never
+///   comes close to overflowing, so the stability device is unobservable — until it is not.
+///
+/// The widths are the third gap, the same one item 1 hit: the goldens are 4 heads of 24/16 against
+/// a real 96 of 192/128, and `kv` is 9 against a real context.
+///
+/// Scored against an f64 host oracle. That oracle is not an independent claim — the golden tests
+/// above show the same arithmetic agreeing with the reference at the widths the reference produced.
+#[test]
+fn mha_attend_at_real_widths_masks_and_magnitudes() {
+    let tol = k3_tolerance::rel_tolerance("mla_attend");
+    let mut r = common::Lcg(0x11A5);
+    // `(heads, kv, d, dv, masked, gain)`. 96/192/128 are the real model's. kv 1024 wraps the
+    // per-position loop well past one block; kv 9 reproduces the goldens' shape. `gain` scales q
+    // and k so the raw scores reach ~1e2, where `expf` without a max-subtraction overflows to inf
+    // and the output becomes NaN — the case the goldens cannot produce.
+    for &(heads, kv, d, dv, masked, gain) in &[
+        (96usize, 64usize, 192usize, 128usize, false, 1.0f32),
+        (4, 1024, 192, 128, true, 1.0),
+        (8, 300, 24, 16, true, 1.0),
+        (2, 33, 192, 128, false, 40.0),
+        (2, 33, 192, 128, true, 40.0),
+    ] {
+        let q: Vec<f32> = (0..heads * d).map(|_| r.f() * gain).collect();
+        let k: Vec<f32> = (0..heads * kv * d).map(|_| r.f() * gain).collect();
+        let v: Vec<f32> = (0..heads * kv * dv).map(|_| r.f()).collect();
+        // A mask that actually masks: the second half of the keys is forbidden. Not a causal
+        // triangle, because at one query row a causal mask IS all-zero — which is exactly how the
+        // golden ended up unable to test this.
+        let mask: Vec<f32> = (0..kv)
+            .map(|s| {
+                if masked && s >= kv / 2 {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let scale = 1.0 / (d as f32).sqrt();
+
+        let got = device_attend(&q, &k, &v, &mask, Dims { heads, kv, d, dv }, scale);
+
+        for h in 0..heads {
+            let qh = &q[h * d..(h + 1) * d];
+            let mut sc = vec![0.0f64; kv];
+            for (s, x) in sc.iter_mut().enumerate() {
+                let ks = &k[(h * kv + s) * d..(h * kv + s + 1) * d];
+                let dot: f64 = qh
+                    .iter()
+                    .zip(ks)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum();
+                *x = dot * f64::from(scale) + f64::from(mask[s]);
+            }
+            let m = sc.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let ex: Vec<f64> = sc.iter().map(|x| (x - m).exp()).collect();
+            let z: f64 = ex.iter().sum();
+            let want: Vec<f32> = (0..dv)
+                .map(|j| {
+                    (0..kv)
+                        .map(|s| ex[s] / z * f64::from(v[(h * kv + s) * dv + j]))
+                        .sum::<f64>() as f32
+                })
+                .collect();
+            let d_rel = rel(&got[h * dv..(h + 1) * dv], &want);
+            assert!(
+                got[h * dv..(h + 1) * dv].iter().all(|x| x.is_finite()),
+                "heads={heads} kv={kv} d={d} gain={gain} head {h}: non-finite output — the \
+                 softmax lost its max-subtraction"
+            );
+            assert!(
+                d_rel <= tol,
+                "heads={heads} kv={kv} d={d} dv={dv} masked={masked} gain={gain} head {h}: \
+                 {d_rel:e} exceeds {tol:e}"
+            );
         }
     }
 }
