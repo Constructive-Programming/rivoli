@@ -61,7 +61,7 @@ tests/smoke-matrix.sh                        # BOTH models x settings, 12 tokens
 # failure. `cargo test --test k3_anchor` then reads the vendored bytes with no device — but it
 # is a fixture-INTEGRITY gate, not a correctness gate: it compares no rivoli output to
 # anything, because at S1b there is no K3 kernel to score.
-tests/k3-anchor.sh                           # K3's goldens + 11 defects x 2 salts (~25 min, GPU)
+tests/k3-anchor.sh                           # K3's goldens + 13 defects x 2 salts (~25 min, GPU)
 
 cargo clippy --release --features rocm --all-targets
 # Before you claim a change compiles, ALSO run the union — see below.
@@ -109,6 +109,23 @@ command passed, because nothing built it. Add the union run to any change that t
 > |---|---|
 > | `host` | `cargo fmt --check`; a proof that the jscpd gate is *armed*; `clippy --release --locked --all-targets`; `clippy --features otlp,teacher-forcing,pred-probe,trace --all-targets`; `cargo test --release --locked` — all **featureless** |
 >
+> **CORRECTED 2026-08-12. The sentence below was FALSE WHEN WRITTEN, and it is the second time
+> this section has mis-stated CI in the same direction.** There are TWO workflows.
+> `.github/workflows/release.yml` has existed since **2026-08-02** (`5df5c3f`) — four days BEFORE
+> the 2026-08-06 note above — and it runs `on: push: tags:` against
+> `runs-on: [self-hosted, linux, rocm, gfx1151]`, building `--features rocm --offload-arch=gfx1151`
+> and then running `cargo test --release --locked --features rocm -- --test-threads=1` **on the
+> device, under the shared flock**. So there IS a GPU arm; it is tag-triggered rather than
+> PR-triggered, which is a much narrower claim than "none at all" and a materially different one for
+> anyone deciding where a gate belongs. Found while scoping quality tooling, by an agent that read
+> the workflows instead of this file — which is the point: **"there is no CI" → "there is one job" →
+> "there are two workflows" is a doc that has been re-derived from memory three times and re-measured
+> once.** The rule this file states elsewhere applies to itself: re-derive the count from
+> `ls .github/workflows/`, do not quote this paragraph.
+>
+> What stays true, and is the useful half: **no PR-triggered job builds `--features rocm`.** A gate
+> that needs the backend runs on a tag, or when someone runs it here, and nowhere else.
+
 > So **there is no `rocm` arm and no GPU arm at all.** Every `--features rocm` build, every
 > HIP kernel, and every device test is checked exactly as often as someone runs it here. The
 > featureless union step does cover `mod otlp` (gated on its own feature, with no backend in
