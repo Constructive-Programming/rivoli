@@ -66,15 +66,19 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   taken before item 2 captured the attention core; re-measured over both draws and with `mla_attend`
   split out, the margin fell to 0.33x — a stronger form of the same finding, and `anchor.md`
   §"Re-measured on both draws" carries the numbers.)*
-- **S2 items 1-4 are DONE, each gated before the next** (2026-08-11/12): `attn_res`, the gated
-  MLA core (`mha_attend` + `sigmoid_gate`), the latent sandwich, and SiTU-GLU + the fused fp4
-  expert. `tests/k3_kernels.rs`, 21 tests.
-  **Each of the three found the anchor could not score its operator, and only by trying to write the
-  fixture** — the fold weights, the attention core and `o_proj`'s input, the expert aggregate and
+- **S2 items 1-4 and 5a are DONE, each gated before the next** (2026-08-11/12): `attn_res`, the
+  gated MLA core (`mha_attend` + `sigmoid_gate`), the latent sandwich, SiTU-GLU + the fused fp4
+  expert, and the gated delta recurrence (`gated_delta_recurrent_f32`). `tests/k3_kernels.rs`,
+  26 tests.
+  **Each of the first three found the anchor could not score its operator, and only by trying to write
+  the fixture** — the fold weights, the attention core and `o_proj`'s input, the expert aggregate and
   the norm weight. Goldens re-vendored three times, now at **272** tensors. Item 3 also found the
   first place the anchor's fp32-vs-bf16 deviation bites: an operator whose rivoli kernel rounds to
-  bf16 cannot be scored against this anchor at the anchor's own tolerance. **Item 5 (KDA) is next
-  and is the bulk of the stage**; item 6 (the router) and item 7 (trunk GEMV speed) remain.
+  bf16 cannot be scored against this anchor at the anchor's own tolerance. **5a found that the
+  reference stores its recurrent state `[value][key]` and that rivoli should NOT** — the first
+  reference convention this port measured and then declined, at no cost, because the state never
+  leaves the device. **5b and 5c are next and share ONE regeneration** (the conv taps and
+  `o_norm.weight`); then 5d's tolerance row, item 6 (the router) and item 7 (trunk GEMV speed).
 
 ## G. The gate model
 
@@ -849,7 +853,7 @@ model is stored in — is answered above: none.)*
 
    | unit | §4 steps | anchor boundary | fixture today |
    |---|---|---|---|
-   | **5a recurrence** | 3-7 | `kda.fused_recurrent_kda.in.{q,k,v,g,beta,A_log,dt_bias,initial_state}` → `.out.{o,state}` | **COMPLETE. No regen.** |
+   | **5a recurrence** | 3-7 | `kda.fused_recurrent_kda.in.{q,k,v,g,beta,A_log,dt_bias,initial_state}` → `.out.{o,state}` | **DONE 2026-08-12** |
    | **5b ShortConv+SiLU** | 2 | `self_attn.{q,k,v}_proj` → `self_attn.{q,k,v}_conv1d.{0,1}` | needs the conv **weights** |
    | **5c fused norm+gate** | 8-9 | `.out.o` + `self_attn.g_proj` → `self_attn.o_norm` | needs **`o_norm.weight`** |
    | **5d projections** | 1, 10 | `self_attn.{q,k,v,b,f_a,f_b,g,o}_proj` | complete, but see the tolerance note |
@@ -860,6 +864,52 @@ model is stored in — is answered above: none.)*
    `KdaBetaSigmoidOutside`) price exactly this boundary's arithmetic, each reddening 16 of layer 0's
    40 tensors while leaving the 24 upstream alone. It is also the largest kernel in the port. Four
    items in a row began with a regeneration; this one does not need one.
+
+   **5a as built: `gated_delta_recurrent_f32`, in a new `kernels/recurrent.hip`.** One block per
+   head, thread `t` owning value channel `t` for the whole kernel, which makes the decay fold into
+   the `u = Sᵀk` reduction and the rank-one update fold into the `o = Sᵀq` reduction — **two passes
+   over `S` instead of the C's four, and no cross-thread reduction in the recurrence at all**
+   (each column's two sums are private to its thread; the only block reductions are the two L2
+   norms). That is the HIP win this item was predicted to have, and it is bigger than "fuse the four
+   passes": the fusion falls out of the thread mapping rather than being arranged.
+
+   Named for the arithmetic, not the block. `kda`/`fused_recurrent_kda` are Kimi's and fla's names
+   for it; what it computes is the gated delta rule, and this tree has a rule against a model's name
+   on a kernel. The file is named for the family so 5b and 5c land beside it.
+
+   > **THE FINDING: the reference stores the state `[value][key]`, and this kernel deliberately does
+   > not.** `transpose_state_layout=True` is in the driver's kwargs and names the choice, but the
+   > state is SQUARE at the tiny widths (32) and at the real ones (128), so no shape assertion can
+   > see it and §4's `S[i][j]` is prose either way. Scoring both interpretations of the anchor's own
+   > `initial_state` settles it: with the transpose the recurrence agrees to **2.5e-7**, without it
+   > to **2.2e-1 – 5.6e-1**, unanimously across three layers and both draws.
+   >
+   > The port keeps `[key][value]` regardless, and pays nothing for it: rivoli's state starts at zero
+   > and never leaves the device, so nothing forces the reference's axis order on it, while
+   > `S[i*d + t]` is what makes consecutive threads read consecutive addresses. The transpose is a
+   > FIXTURE boundary — three lines, once per case — and `KdaStateLayout`'s red-proof is what shows
+   > the fixture can tell the two apart. **This is the first item where a reference convention was
+   > measured and then declined**, rather than measured and adopted.
+
+   Everything else in §4 steps 3-7 confirmed exactly as written, by the same six-site sweep: the L2
+   norm on q and k only with `eps` on the SUM, `beta = sigmoid(b_proj)`, `alpha =
+   exp(lb·sigmoid(exp(A_log)·(g + dt_bias)))` with the bound MULTIPLYING the sigmoid, the decay on
+   the KEY axis, the `d^-0.5` on q alone, and `o` read from the UPDATED state. Worth stating because
+   the alternative to each was tried in the same sweep and each lands two to six orders away.
+
+   Red-proved against the DEVICE six ways, six reds — the four `Kda*` defect runs plus the two steps
+   no defect covers (`o` read before the update, and the `d^-0.5`). The host oracle carries the same
+   five variants, so the fixture's sensitivity and its connectedness are proved separately.
+
+   **What 5a does NOT cover, and it is the same gap AttnRes has**: the fixture runs ONE step from a
+   supplied `initial_state`. That 69 states stay alive across a sequence and are never reset
+   mid-decode is S3's, and no anchor capture can gate it — the golden holds one step of one decode.
+
+   **The launcher takes no token count, and that is a scope cut with a price.** It is one step, so a
+   KDA prefill is `T` launches of it — 69 layers x T, each a 2-pass sweep of the whole state. That is
+   correct and it is what the reference's `fused_recurrent` path does at `q_len == 1`; it is also why
+   first-party defaults to `chunk_kda` for prefill. Porting the chunked form is the throughput item
+   this section's header flags, and it must reinstate the two conditions §4 names.
 
    **5b and 5c each need ONE more capture, and both are parameters.** Same shape of gap as the
    AttnRes fold and the latent norm: an input and an output do not determine an operator when a

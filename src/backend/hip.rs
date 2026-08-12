@@ -915,6 +915,53 @@ launchers! {
         out: *mut f32,
     );
 
+    /// **One decode step of the gated delta rule** — the recurrence inside Kimi-K3's 69 KDA layers,
+    /// `k3-architecture.md` §4 steps 3-7. `kernels/recurrent.hip` carries the arithmetic and the
+    /// argument for its two-pass shape.
+    ///
+    /// `q`, `k`, `v` and `g` are each `[heads][head_dim]`, `beta_pre` and `a_log` are `[heads]`,
+    /// `dt_bias` is `[heads][head_dim]`, `state` is `[heads][head_dim][head_dim]` **updated in
+    /// place**, and `out` is `[heads][head_dim]`.
+    ///
+    /// **The inputs are RAW, and each one is a trap this signature cannot express.** `q` and `k`
+    /// arrive pre-L2-norm (`v` is never normed), `beta_pre` arrives pre-sigmoid, and `g` is the bare
+    /// gate projection with `a_log`, `dt_bias`, the sigmoid and `lower_bound` all unapplied — the
+    /// kernel does every one of those, because fla does and the anchor's captures are taken at fla's
+    /// boundary. A caller that pre-normalises anything here gets a silently different recurrence.
+    ///
+    /// `state` is `[key][value]`, and the axis order is NOT visible in the shape — `head_k_dim ==
+    /// head_dim` in the tiny anchor (32) and in the real model (128), so a transposed state is
+    /// square and every dimension check passes. It is pinned by measurement instead:
+    /// `tests/k3_kernels.rs` scores both interpretations of the anchor's own `initial_state` and only
+    /// this one reproduces the reference's output.
+    ///
+    /// `head_dim` is the block width, so it must be a power of two (guard 1003 — the L2-norm
+    /// reduction halves it) and at most 1024 (guard 1002). `lower_bound` outside fla's own
+    /// `-5 <= lb < 0` range is refused (1006), NaN included: a NaN bound makes every decay NaN and
+    /// nothing downstream would attribute it here.
+    ///
+    /// # Safety
+    /// Every pointer is a device buffer of the size above and must outlive `stream`'s completion.
+    /// `state` is read and written by the same thread per column and must not alias any other
+    /// argument; `out` must not alias `q`, `k`, `v` or `g`, which are read after the state passes
+    /// begin. `stream` is a live `hipStream_t`, or null for the default stream.
+    launch_gated_delta_recurrent_f32 -> rivoli_gated_delta_recurrent_f32,
+    "gated_delta_recurrent_f32" (
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta_pre: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        heads: usize as i32,
+        head_dim: usize as i32,
+        lower_bound: f32,
+        state: *mut f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// Kimi-K3's Block Attention Residual fold: `out = softmax(<RMSNorm(src_s), fold>) @ src`.
     ///
     /// `src` is `[tokens][nsrc][n]` and `out` is `[tokens][n]`. The softmax mixes the sources

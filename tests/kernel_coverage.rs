@@ -329,6 +329,11 @@ const OWNERS: &[(&str, &[&str])] = &[
     // them from until S3 writes `k3gpu.rs`.
     ("mha_attend", &[]),
     ("sigmoid_gate", &[]),
+    // Kimi-K3's gated delta recurrence, S2 item 5a — the arithmetic inside fla's
+    // `fused_recurrent_kda`. Empty for the same reason as the three above, and its oracle is
+    // `tests/k3_kernels.rs::the_gated_delta_recurrence_matches_the_anchor_at_every_kda_layer`,
+    // which scores BOTH of its outputs against the reference at both weight draws.
+    ("gated_delta_recurrent_f32", &[]),
     ("argmax", &["gpu.rs", "f4gpu.rs"]),
     ("attend", &["gpu.rs"]),
     ("embed_bf16_row_bcast", &["f4gpu.rs"]),

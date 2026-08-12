@@ -45,6 +45,7 @@ fn main() {
         "kvcompress",
         "blockindex",
         "headtail",
+        "recurrent",
     ];
     let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
     // ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes (e.g.

@@ -40,8 +40,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 use rivoli::backend::hip::{
-    launch_attn_res, launch_gemm_bf16, launch_mha_attend, launch_moe_expert_range_f4_situ,
-    launch_rmsnorm_batch, launch_rmsnorm_single, launch_sigmoid_gate, launch_situ_glu_f32,
+    launch_attn_res, launch_gated_delta_recurrent_f32, launch_gemm_bf16, launch_mha_attend,
+    launch_moe_expert_range_f4_situ, launch_rmsnorm_batch, launch_rmsnorm_single,
+    launch_sigmoid_gate, launch_situ_glu_f32,
 };
 use rivoli::v4oracle::golden::GoldenSet;
 
@@ -103,9 +104,18 @@ fn load(bytes: &[u8]) -> GoldenSet {
 /// moved. `k3_anchor.rs` separately pins the tiny config's `rms_norm_eps` against the real
 /// checkpoint's, so the two together say this is the model's eps and not merely the file's.
 fn eps(g: &GoldenSet) -> f32 {
-    let cfg: serde_json::Value =
-        serde_json::from_str(g.meta_get("tiny_config").expect("tiny_config")).unwrap();
-    cfg["rms_norm_eps"].as_f64().expect("rms_norm_eps") as f32
+    tiny(g)["rms_norm_eps"].as_f64().expect("rms_norm_eps") as f32
+}
+
+/// The config the reference was built from, as the golden itself carries it.
+///
+/// Three readers now (`eps`, `betas`, `lower_bound`) and one parse, because a third copy of the
+/// `meta_get`/`from_str` pair is what jscpd is for — and because every one of them is making the
+/// same argument: a constant this fixture hardcoded would agree with itself if the reference's
+/// value ever moved. `k3_anchor.rs` pins the tiny config's structural fields against the real
+/// checkpoint's, so reading them here says "the model's value", not "the file's".
+fn tiny(g: &GoldenSet) -> serde_json::Value {
+    serde_json::from_str(g.meta_get("tiny_config").expect("tiny_config")).unwrap()
 }
 
 /// One fold: the assembled stack, its scoring vector, and the output the reference produced.
@@ -1401,8 +1411,7 @@ const SITU_OBSERVED_WORST: f32 = 1.454e-7;
 /// `activation_situ_linear_beta`; abbreviating it to `activation_linear_beta` is a mistake this port
 /// has already made once, in `S1a`, where it would have refused every real checkpoint.
 fn betas(g: &GoldenSet) -> (f32, f32) {
-    let c: serde_json::Value =
-        serde_json::from_str(g.meta_get("tiny_config").expect("tiny_config")).unwrap();
+    let c = tiny(g);
     let f = |k: &str| c[k].as_f64().unwrap_or_else(|| panic!("{k} missing")) as f32;
     (f("activation_situ_beta"), f("activation_situ_linear_beta"))
 }
@@ -2124,4 +2133,502 @@ fn the_k3_expert_betas_are_guarded() {
     assert_betas_guarded("moe_expert_range_f4_situ", |b1, b2| {
         expert_launch(&c, false, b1, b2).is_err()
     });
+}
+
+// ========================= S2 item 5a — the gated delta recurrence =========================
+//
+// **The largest kernel in the port, and the one whose fixture was already complete.** fla fuses §4's
+// ten KDA steps into three observable boundaries and this is the middle one: `fused_recurrent_kda`
+// takes q/k/v/g/beta plus `A_log`, `dt_bias` and the incoming state, and returns `o` and the outgoing
+// state. `wrap_kda_ops` captures every one of those on both sides, so unlike the four items before it
+// this one needed no regeneration — checked by enumerating the vendored bytes rather than assumed.
+//
+// Everything the recurrence does that no document outside fla attests to is INSIDE that boundary, and
+// that is what makes the fixture worth having: the q/k L2 norm, the beta sigmoid, the gate's lower
+// bound and the state's axis order are all arithmetic the reference performs after the last thing a
+// module hook can see. The four `Kda*` defect runs price exactly this boundary — each reddens 16 of
+// layer 0's 40 tensors and leaves the 24 upstream bit-identical — and the tests below reproduce each
+// of them against the host oracle, so a kernel that got any of the four wrong fails here rather than
+// in S3's first decode.
+//
+// **What this fixture cannot say** is that the state PERSISTS correctly. It is handed one
+// `initial_state`, runs one step, and compares one `out.state`; whether the layer loop keeps 69 of
+// them alive across a sequence and never resets them mid-decode is S3's, exactly as the AttnRes stack
+// is.
+//
+// Red-proved against the DEVICE six ways, six reds: the `d^-0.5` dropped from q, the state's two axes
+// swapped, `o` read from the pre-update state, `beta` taken pre-sigmoid, the gate bound written as a
+// clamp, and the q/k L2 norm removed. That is each of the four `Kda*` defect runs plus the two §4
+// steps no defect covers, checked by breaking the kernel rather than by breaking the oracle — the
+// host variants below prove the fixture is SENSITIVE, and these prove it is connected.
+
+/// The captured layers the real map makes KDA — zero-based 0, 1 and 12.
+///
+/// The complement of [`MLA_LAYERS`] over the five captured layers, and the two lists together are
+/// what `k3_anchor.rs`'s partition check means in this file: a fixture that silently stopped covering
+/// one is visible here rather than in a tensor count.
+const KDA_LAYERS: [usize; 3] = [0, 1, 12];
+
+/// The worst relative difference the recurrence shows against the anchor, over both draws, all three
+/// KDA layers and BOTH outputs: **2.265e-7**, at salt 1 layer 12 on `o`.
+///
+/// `o` is the worse of the two outputs at four of the six sites and the state at the other two
+/// (1.07e-7 and 1.09e-7, both salt 2), which is close enough to say the two are the same size rather
+/// than that either leads. They are scored against different denominators — the state's values are
+/// ~0.04 while `o` is order 1 — so the comparison between the two columns says less than each column
+/// says about itself.
+const KDA_OBSERVED_WORST: f32 = 2.265e-7;
+
+/// One KDA layer's recurrence boundary: every input fla's kernel takes, and both things it returns.
+///
+/// **Every number a caller could get wrong is RAW here.** `q` and `k` are pre-L2-norm, `beta` is
+/// pre-sigmoid, and `g` is the bare projection with neither `a_log` nor `dt_bias` applied. That is not
+/// this struct's choice — it is where `wrap_kda_ops` sits, because fla takes
+/// `use_qk_l2norm_in_kernel`, `use_beta_sigmoid_in_kernel` and `use_gate_in_kernel` and does all of it
+/// internally.
+///
+/// The two state fields are the ONE exception: they are transposed out of the reference's layout into
+/// the kernel's on the way in — see [`transpose_heads`], which carries the measurement that
+/// established the difference.
+struct Kda {
+    heads: usize,
+    head_dim: usize,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    g: Vec<f32>,
+    beta: Vec<f32>,
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    state: Vec<f32>,
+    want_o: Vec<f32>,
+    want_state: Vec<f32>,
+}
+
+/// `-5.0`, read off the golden's own config rather than written down.
+///
+/// It lives in `linear_attn_config.gate_lower_bound` and is in the driver's
+/// `STRUCTURAL_LINEAR_ATTN`, so `k3_anchor.rs` pins the tiny config's value against the real
+/// checkpoint's and this reads the model's number. fla range-checks `-5 <= lower_bound < 0`, so the
+/// shipped value sits exactly on the inclusive end of its own accepted range — which is why the
+/// launcher's guard is `>= -5.0` and not `> -5.0`.
+fn lower_bound(g: &GoldenSet) -> f32 {
+    tiny(g)["linear_attn_config"]["gate_lower_bound"]
+        .as_f64()
+        .expect("gate_lower_bound") as f32
+}
+
+fn kda(g: &GoldenSet, layer: usize) -> Kda {
+    let m = format!("model.layers.{layer}.kda.fused_recurrent_kda");
+    let get = |n: &str| {
+        let (s, v) = float(g, &format!("{m}.{n}"));
+        (s.to_vec(), v.to_vec())
+    };
+    // `[1, 1, heads, head_dim]`, and the widths come from the capture rather than from the config so
+    // that a fixture cannot disagree with the tensor it is scoring.
+    let (qs, q) = get("in.q");
+    let (heads, head_dim) = (qs[2], qs[3]);
+    let (ss, state) = get("in.initial_state");
+    assert_eq!(
+        ss,
+        vec![1, heads, head_dim, head_dim],
+        "{m}: the state is one square matrix per head — which is exactly why its axis order \
+         cannot be checked here and is measured instead"
+    );
+    let (os, want_o) = get("out.o");
+    assert_eq!(os, qs, "{m}: the recurrence is width-preserving");
+    let t = |v: Vec<f32>| transpose_heads(&v, heads, head_dim);
+    Kda {
+        heads,
+        head_dim,
+        q,
+        k: get("in.k").1,
+        v: get("in.v").1,
+        g: get("in.g").1,
+        beta: get("in.beta").1,
+        a_log: get("in.A_log").1,
+        dt_bias: get("in.dt_bias").1,
+        state: t(state),
+        want_o,
+        want_state: t(get("out.state").1),
+    }
+}
+
+/// Swap each head's two state axes.
+///
+/// # The reference stores the state `[value][key]` and this kernel stores it `[key][value]`
+///
+/// **Measured, not chosen.** §4 writes the recurrence as `S[i][j]` with `i` the key channel, and the
+/// state is square at both the tiny widths (32) and the real ones (128), so no shape assertion can
+/// see which axis the reference's BUFFER puts first. Scoring both interpretations of the anchor's own
+/// `initial_state` against its `out.o` settles it: with the transpose the recurrence agrees to
+/// 2.5e-7, without it to 2.2e-1 to 5.6e-1 — three sites' worth of separation, at both draws. That is
+/// `transpose_state_layout=True` in the driver's kwargs doing exactly what its name says.
+///
+/// **The port does not inherit that layout, and does not pay a transpose either.** rivoli's state is
+/// its own: it starts at zero and never leaves the device, so nothing forces the reference's axis
+/// order on it, and `[key][value]` is the order that makes `S[i*d + t]` consecutive across the
+/// threads of a wave — which is the whole reason `kernels/recurrent.hip` is a two-pass kernel rather
+/// than four. So the transpose is a FIXTURE boundary, applied once here to compare two conventions,
+/// and `KdaAs::StateValueMajor` is the red-proof that this fixture can tell them apart.
+fn transpose_heads(v: &[f32], heads: usize, dim: usize) -> Vec<f32> {
+    assert_eq!(v.len(), heads * dim * dim, "not a per-head square");
+    (0..heads)
+        .flat_map(|h| (0..dim).flat_map(move |i| (0..dim).map(move |j| (h, i, j))))
+        .map(|(h, i, j)| v[h * dim * dim + j * dim + i])
+        .collect()
+}
+
+/// Every (draw, KDA layer) pair with its boundary assembled, its tolerance and its gate bound.
+fn for_each_kda(mut f: impl FnMut(&str, usize, f32, f32, Kda)) {
+    let tol = k3_tolerance::rel_tolerance("kda_op");
+    for (salt, bytes) in GOLDENS {
+        let g = load(bytes);
+        let lb = lower_bound(&g);
+        for layer in KDA_LAYERS {
+            f(salt, layer, tol, lb, kda(&g, layer));
+        }
+    }
+}
+
+/// The reference's recurrence, or one documented variant of it. **The variants are the defects.**
+///
+/// One body with one `form` rather than six functions, which is the shape `host_fold`'s `normalised`
+/// and `host_situ`'s `capped_sigmoid` already settled in this file twice: a defect run is the correct
+/// oracle with exactly one thing changed, and writing it out separately is how the two drift into
+/// differing by something nobody intended. Here it also matters that the five variants are the
+/// anchor's own — four of them have a `--defect` run behind them and each is named for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KdaAs {
+    Reference,
+    /// `KdaNoQkL2Norm`: q and k used as projected.
+    NoQkL2Norm,
+    /// `KdaGateLowerBoundOff`: fla's OTHER gate form, where the bound clamps instead of multiplying.
+    GateClamped,
+    /// `KdaBetaSigmoidOutside`: `beta` taken as the projection produced it.
+    BetaPreSigmoid,
+    /// `KdaStateLayout`: the state buffer read and written with its two axes swapped — which is
+    /// precisely the port that took the reference's `[value][key]` bytes at face value.
+    StateValueMajor,
+    /// **No anchor defect prices this one**, and it is the delta rule's defining ordering: `o` read
+    /// from the decayed state instead of the updated one. §4 step 7 puts the read last, so a kernel
+    /// that hoisted it above the rank-one update would be one line different and one token behind.
+    OutputBeforeUpdate,
+}
+
+/// §4 steps 3-7 in f64, over one decode step.
+fn host_kda(c: &Kda, lb: f32, form: KdaAs) -> (Vec<f32>, Vec<f32>) {
+    let dim = c.head_dim;
+    let lb = f64::from(lb);
+    let mut state: Vec<f64> = c.state.iter().copied().map(f64::from).collect();
+    let mut out = vec![0f32; c.heads * dim];
+    // `d_k^-0.5` on q only, after the norm (§4 step 6). fla's `scale` defaults to this and the
+    // reference passes no override, which is why the kernel computes it rather than taking it.
+    let scale = 1.0 / (dim as f64).sqrt();
+    for h in 0..c.heads {
+        let base = h * dim;
+        // L2Norm per head with `eps` added to the SUM of squares rather than to the mean (§4 step
+        // 3) — a different convention from every RMSNorm in this tree, and applied to q and k only.
+        let l2 = |v: &[f32]| -> Vec<f64> {
+            let s: f64 = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+            let inv = if form == KdaAs::NoQkL2Norm {
+                1.0
+            } else {
+                1.0 / (s + 1e-6).sqrt()
+            };
+            v.iter().map(|&x| f64::from(x) * inv).collect()
+        };
+        let qn: Vec<f64> = l2(&c.q[base..base + dim])
+            .iter()
+            .map(|x| x * scale)
+            .collect();
+        let kn = l2(&c.k[base..base + dim]);
+        let a = f64::from(c.a_log[h]).exp(); // PER HEAD
+        let alpha: Vec<f64> = (0..dim)
+            .map(|i| {
+                // `dt_bias` goes on BEFORE the scale, and `a` multiplies inside the sigmoid.
+                let z = f64::from(c.g[base + i]) + f64::from(c.dt_bias[base + i]);
+                if form == KdaAs::GateClamped {
+                    // fla's `safe_gate=False` activation, verbatim from its docstring
+                    // (`fla/ops/kda/chunk.py:250-256`): `-exp(A_log)·softplus(g + dt_bias)`, with
+                    // `lower_bound` as a floor. Both forms are bounded below by `lb` and monotone
+                    // in `z`, which is what makes this the plausible wrong one rather than an
+                    // obviously broken one.
+                    lb.max(-a * z.exp().ln_1p()).exp()
+                } else {
+                    (lb / (1.0 + (-(a * z)).exp())).exp()
+                }
+            })
+            .collect();
+        let bp = f64::from(c.beta[h]);
+        let beta = if form == KdaAs::BetaPreSigmoid {
+            bp
+        } else {
+            1.0 / (1.0 + (-bp).exp())
+        };
+        let vm = form == KdaAs::StateValueMajor;
+        let at = |i: usize, j: usize| h * dim * dim + if vm { j * dim + i } else { i * dim + j };
+        // Decay the rows by the per-key-channel gate, and read `u = S^T k` off the DECAYED state.
+        let mut u = vec![0f64; dim];
+        for i in 0..dim {
+            for j in 0..dim {
+                let s = alpha[i] * state[at(i, j)];
+                state[at(i, j)] = s;
+                u[j] += kn[i] * s;
+            }
+        }
+        for j in 0..dim {
+            // The prediction error, gated by beta. `v` is never normed.
+            let dv = beta * (f64::from(c.v[base + j]) - u[j]);
+            let mut o = 0.0;
+            for i in 0..dim {
+                let pre = state[at(i, j)];
+                state[at(i, j)] = pre + kn[i] * dv;
+                o += qn[i]
+                    * if form == KdaAs::OutputBeforeUpdate {
+                        pre
+                    } else {
+                        state[at(i, j)]
+                    };
+            }
+            out[base + j] = o as f32;
+        }
+    }
+    (out, state.iter().map(|&x| x as f32).collect())
+}
+
+/// One launch, returning the launcher's own `Result` and both of the kernel's outputs.
+///
+/// `state` is updated IN PLACE, so the case's copy is uploaded fresh here on every call — a fixture
+/// that reused one device buffer across two launches would be scoring the second step of a
+/// two-token sequence against a one-token golden.
+fn kda_launch(c: &Kda, lb: f32) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    let [q, k, v, g, beta, a_log, dt] =
+        [&c.q, &c.k, &c.v, &c.g, &c.beta, &c.a_log, &c.dt_bias].map(|x| dev(&f32b(x)));
+    let mut sb = dev(&f32b(&c.state));
+    let mut ob = zeros(c.heads * c.head_dim * 4);
+    // SAFETY: every buffer is the size the launcher documents, all live for the call, and none
+    // aliases another — `state` and `out` are separate allocations.
+    unsafe {
+        launch_gated_delta_recurrent_f32(
+            q.ptr() as *const f32,
+            k.ptr() as *const f32,
+            v.ptr() as *const f32,
+            g.ptr() as *const f32,
+            beta.ptr() as *const f32,
+            a_log.ptr() as *const f32,
+            dt.ptr() as *const f32,
+            c.heads,
+            c.head_dim,
+            lb,
+            sb.ptr_mut() as *mut f32,
+            ob.ptr_mut() as *mut f32,
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok((f32v(&back(&ob)), f32v(&back(&sb))))
+}
+
+fn device_kda(c: &Kda, lb: f32) -> (Vec<f32>, Vec<f32>) {
+    ok(kda_launch(c, lb), "gated_delta_recurrent_f32")
+}
+
+/// A synthetic case at arbitrary widths, for the two things the goldens cannot reach: the real
+/// geometry, and the launcher's refusals.
+///
+/// The gate input is drawn WIDE on purpose (`±12` before `dt_bias`), because `alpha` is the one
+/// quantity in this kernel with a saturating range the anchor never visits: at the tiny widths every
+/// decay lands mid-scale, while `alpha == 1.0` exactly is legitimate saturation the reference
+/// documents and `e^-5` is the other end.
+fn synthetic_kda(heads: usize, head_dim: usize, seed: u64) -> Kda {
+    let mut r = common::Lcg(seed);
+    let n = heads * head_dim;
+    let mut draw = |len: usize, gain: f32| (0..len).map(|_| r.f() * gain).collect::<Vec<f32>>();
+    Kda {
+        heads,
+        head_dim,
+        q: draw(n, 1.0),
+        k: draw(n, 1.0),
+        v: draw(n, 1.0),
+        g: draw(n, 12.0),
+        beta: draw(heads, 4.0),
+        // `log(uniform(1, 16))` is the anchor's own range for `A_log`, and it must not be constant:
+        // a constant makes every head decay identically and a kernel ignoring the term would match.
+        a_log: draw(heads, 1.0)
+            .iter()
+            .map(|x| (1.0 + 15.0 * x.abs()).ln())
+            .collect(),
+        dt_bias: draw(n, 2.0),
+        state: draw(n * head_dim, 1.0),
+        want_o: Vec::new(),
+        want_state: Vec::new(),
+    }
+}
+
+/// **The kernel reproduces the reference's recurrence — both outputs, both draws, all three KDA
+/// layers.**
+#[test]
+fn the_gated_delta_recurrence_matches_the_anchor_at_every_kda_layer() {
+    for_each_kda(|salt, layer, tol, lb, c| {
+        let (o, state) = device_kda(&c, lb);
+        // Both outputs, because a kernel that produces the right `o` from the wrong state agrees
+        // for exactly one token — `k3_anchor.rs` says so where it pins the state's shape, and this
+        // is the fixture that acts on it.
+        for (what, got, want) in [("o", &o, &c.want_o), ("state", &state, &c.want_state)] {
+            let r = rel(got, want);
+            let at = format!("{salt} layer {layer} {what}");
+            assert!(r <= tol, "{at}: {r:e} exceeds {tol:e}");
+            tripwire(r, KDA_OBSERVED_WORST, tol, &at);
+        }
+    });
+}
+
+/// **The host oracle is the same function**, which is what lets the five variants below mean
+/// anything.
+///
+/// Every red-proof in this section perturbs the ORACLE and asserts the perturbation moves the
+/// result. That argument is empty unless the unperturbed oracle agrees with the reference to the
+/// same order the kernel does, so it is asserted separately rather than assumed — and it is also the
+/// one comparison here that is device-free, so a failure separates "the arithmetic is wrong" from
+/// "the kernel is wrong".
+#[test]
+fn the_kda_host_oracle_agrees_with_the_anchor() {
+    for_each_kda(|salt, layer, tol, lb, c| {
+        let (o, state) = host_kda(&c, lb, KdaAs::Reference);
+        for (what, got, want) in [("o", &o, &c.want_o), ("state", &state, &c.want_state)] {
+            let r = rel(got, want);
+            assert!(
+                r <= tol,
+                "{salt} layer {layer} {what}: {r:e} exceeds {tol:e}"
+            );
+        }
+    });
+}
+
+/// **Each of the four things that live only inside fla's kernel is a separate function, and the
+/// anchor can see all four.**
+///
+/// One test over five variants rather than five tests, because they make the identical argument
+/// about different lines and five copies of it is what jscpd exists to reject. The bar is the
+/// tripwire cleared by the table's own `DEFECT_MARGIN` of 30x — the same construction
+/// `the_situ_sigmoid_takes_the_uncapped_gate` uses, and for the reason it found: an operator
+/// tolerance is a whole-model floor and can be too loose to price a defect the fixture itself
+/// catches easily.
+///
+/// **`StateValueMajor` is the one that settles a question rather than confirming an answer.** The
+/// state is square at both the tiny and the real widths, so no shape assertion can see its axis
+/// order and §4's `S[i][j]` naming is prose. This asserts that reading the anchor's own
+/// `initial_state` the other way round changes the result — so the kernel's `[key][value]` is
+/// measured against the reference rather than inherited from a document.
+#[test]
+fn the_recurrence_arithmetic_inside_flas_kernel_is_all_priced() {
+    for_each_kda(|salt, layer, tol, lb, c| {
+        let bar = KDA_OBSERVED_WORST * 10.0 * 30.0;
+        for form in [
+            KdaAs::NoQkL2Norm,
+            KdaAs::GateClamped,
+            KdaAs::BetaPreSigmoid,
+            KdaAs::StateValueMajor,
+            KdaAs::OutputBeforeUpdate,
+        ] {
+            let (o, state) = host_kda(&c, lb, form);
+            // The WORSE of the two outputs, not the mean: a variant that left `o` untouched while
+            // corrupting the state is still caught by this fixture, and one that moved neither
+            // would not be.
+            let moved = rel(&o, &c.want_o).max(rel(&state, &c.want_state));
+            assert!(
+                moved > bar,
+                "{salt} layer {layer} {}: moved the recurrence by only {moved:e}, under the \
+                 {bar:e} this fixture's tripwire needs cleared by the table's 30x — so the \
+                 agreement above says nothing about which form the kernel implements. (The \
+                 operator tolerance is {tol:e}.)",
+                kda_as_name(form)
+            );
+        }
+    });
+}
+
+/// The variant names, for the message above. A `Debug` derive would print the same text with none
+/// of the pointer to the run that prices it.
+fn kda_as_name(form: KdaAs) -> &'static str {
+    match form {
+        KdaAs::Reference => "the reference",
+        KdaAs::NoQkL2Norm => "dropping the q/k L2 norm (--defect KdaNoQkL2Norm)",
+        KdaAs::GateClamped => "clamping the gate instead of scaling it (KdaGateLowerBoundOff)",
+        KdaAs::BetaPreSigmoid => "taking beta pre-sigmoid (KdaBetaSigmoidOutside)",
+        KdaAs::StateValueMajor => "swapping the state's two axes (KdaStateLayout)",
+        KdaAs::OutputBeforeUpdate => "reading o from the pre-update state (no anchor defect)",
+    }
+}
+
+/// **The recurrence at K3's real geometry, and at decays the goldens never reach.**
+///
+/// Three gaps the anchor leaves. Width: 96 heads of 128 against the tiny 4 of 32, which is the case
+/// where the state is 64 KB per head and the two-pass shape is the reason this kernel exists.
+/// Saturation: the anchor's gate inputs all land mid-scale, while `alpha == 1.0` exactly is
+/// legitimate perfect retention and `e^-5` is the other end of the bound. And a `heads = 1` case,
+/// where a grid-mapping error has nowhere to hide.
+#[test]
+fn the_recurrence_holds_at_real_widths_and_saturated_decays() {
+    for &(heads, head_dim) in &[(96usize, 128usize), (4, 128), (1, 32)] {
+        let c = synthetic_kda(heads, head_dim, 0x5A_11 + heads as u64);
+        let (o, state) = device_kda(&c, -5.0);
+        let (wo, ws) = host_kda(&c, -5.0, KdaAs::Reference);
+        // 10x the 5.465e-7 measured over these cases (96x128, `o`) — 2.4x looser than the
+        // golden-backed sites above and legitimately so: at head_dim 128 each `o` is a 128-term
+        // reduction against the anchor's 32, and the device sums it in a different order from the
+        // host's f64 walk. The state moves much less (9.67e-8 worst) because each of its elements
+        // is two operations deep whatever the width.
+        for (what, got, want) in [("o", &o, &wo), ("state", &state, &ws)] {
+            let d = rel(got, want);
+            assert!(d <= 5.5e-6, "heads={heads} dim={head_dim} {what}: {d:e}");
+        }
+        // `alpha` is `exp(lb·sigmoid(...))`, so it is bounded by construction — but only if the
+        // bound multiplies the sigmoid. A clamped form would be bounded too; an unbounded gate
+        // would not, and that is a NaN in S3 rather than a wrong number here.
+        assert!(
+            state.iter().all(|x| x.is_finite()) && o.iter().all(|x| x.is_finite()),
+            "heads={heads} dim={head_dim}: the recurrence produced a non-finite value at a \
+             saturated decay"
+        );
+    }
+}
+
+/// **The launcher refuses what it cannot compute.**
+///
+/// Two guards, and each rejects a case that would otherwise be quiet. A `head_dim` that is not a
+/// power of two makes the L2-norm's halving reduction drop elements, which is a slightly-wrong norm
+/// rather than a crash. A `lower_bound` outside fla's own `-5 <= lb < 0` is worse: NaN makes every
+/// decay NaN, `0` removes the decay entirely, and a positive bound makes the state GROW each step —
+/// a divergence that would present in S3 as fluent wrong text a hundred tokens later.
+#[test]
+fn the_recurrence_guards_its_width_and_its_gate_bound() {
+    let c = synthetic_kda(2, 32, 0x5A_11_60);
+    for lb in [
+        0.0,
+        -5.001,
+        -6.0,
+        1.0,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ] {
+        assert!(
+            kda_launch(&c, lb).is_err(),
+            "lower_bound {lb} was accepted, and fla's own range check is -5 <= lb < 0"
+        );
+    }
+    // The two ends of that range are IN it, and the shipped value is the lower one — so a guard
+    // written `> -5.0` would refuse the model. This is the half of the test that keeps the seven
+    // refusals above from being a guard that rejects everything.
+    for lb in [-5.0, -0.5] {
+        assert!(kda_launch(&c, lb).is_ok(), "lower_bound {lb} was refused");
+    }
+    // 96 is not a power of two, and it is a plausible value rather than a silly one: it is K3's
+    // HEAD COUNT, so transposing the launcher's two width arguments lands exactly here.
+    let odd = synthetic_kda(2, 96, 0x5A_11_60);
+    assert!(
+        kda_launch(&odd, -5.0).is_err(),
+        "head_dim 96 was accepted, and the L2-norm reduction would have dropped elements"
+    );
 }

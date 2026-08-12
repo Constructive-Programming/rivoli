@@ -405,6 +405,17 @@ is one nobody re-runs. The state's axis order is invisible to any shape assertio
 `head_k_dim == head_dim` in the tiny model *and* in the real one (128 == 128), so only its values
 can carry it.
 
+> **MEASURED 2026-08-12 by S2 item 5a, which had to know: the state these goldens carry is
+> `[value][key]`.** `transpose_state_layout=True` names the choice and this is what it does. Scoring
+> both interpretations of `in.initial_state` against `out.o` through the recurrence separates them by
+> six orders — 2.5e-7 with the transpose against 2.2e-1 to 5.6e-1 without, unanimous over layers 0, 1
+> and 12 at both draws. So the kwarg's effect is now attested by the bytes and not only by its name,
+> which is what `KdaStateLayout` was for; and the ambiguity was real rather than theoretical, since
+> `k3-architecture.md` §4 writes the recurrence as `S[key][value]` and a port reading that as the
+> stored layout gets an order-1 error with every shape check green. **rivoli's kernel keeps
+> `[key][value]` and transposes in the fixture instead** — the reason is coalescing and it is argued
+> at `kernels/recurrent.hip`.
+
 Prefill (`--seq 8`, `chunk_kda`) gives the same green cells with the same localisation. Row maxima
 differ as expected — `KdaNoQkL2Norm` reaches 4.8e+1 and `MlaLoraEps1e5` 3.8e-5, both larger because
 the chunked path compounds over eight positions — and `KdaStateLayout` is *smaller* at 1.2e+0, since
