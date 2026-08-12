@@ -348,6 +348,55 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// **Kimi-K3's routed expert range** — the fp4 pair with SiTU-GLU fused and the routing weight
+    /// applied AFTER `w2`. `k3-architecture.md` §6, plan §3b.
+    ///
+    /// Four differences from [`launch_moe_expert_range_f4`], each of which passes every length
+    /// check if it is got wrong, and each argued at the kernel it lives in:
+    ///
+    /// 1. **`situ_glu`, not `swiglu_clamped`** — and no `swiglu_limit`, because SiTU-GLU's
+    ///    saturation is `tanh` inside the function rather than a parameter. The two **betas** are
+    ///    refused instead (1006): `<= 0`, NaN and `+/-inf` all fail quietly, `+inf` most quietly of
+    ///    all, since `b·tanh(x/b) -> x`.
+    /// 2. **The routing weight is applied in pass 2**, to the bf16 `w2` output — `rbf16(dv)·w`, not
+    ///    `rbf16(dv·w)`. The reference is `moe_infer`'s
+    ///    `.type(topk_weight.dtype).mul_(topk_weight).sum(dim=1)` on the expert's full output.
+    ///    `w2` is linear, so this looks like a free reassociation of V4's fold; it is not, because a
+    ///    bf16 store sits between the passes and pass 2 sums in fixed point.
+    /// 3. **TWO launches, not three.** No `act_quant_f8` between the passes: K3's `w2` takes a plain
+    ///    fp32 activation (§6's `k3_matmul_mxfp4(edn, act, ...)`), where V4's fp8 `Linear`
+    ///    quantizes its own input. Quantizing here would add an error the reference does not have.
+    /// 4. **`expert_in` is the LATENT width** (3584), not `cfg.hidden` (7168) — the experts run in
+    ///    latent space, and it is both `w1`/`w3`'s reduction dim and `w2`'s output dim. S1a item 3
+    ///    renamed the Rust expert-geometry layer to `expert_in` for this distinction; a caller
+    ///    binding `cfg.hidden` positionally here computes a wrong row and is refused by nothing.
+    ///
+    /// `acc` is the latent-wide accumulator [`launch_moe_acc_drain_to`] drains, not the residual.
+    ///
+    /// # Safety
+    /// `x` is `expert_in` live f32 and **16-byte aligned** (an unchecked obligation of the `float4`
+    /// loads in `dot_f4_wave_r`, exactly as the fp8 twin requires). `descs` is `n_desc`
+    /// `ExpertDescF4`, whose spans must cover `inter x expert_in` fp4 weights and their group-32
+    /// scales. `wexpert` is `>= e_start + e_count` f32, `h` is `>= (e_start + e_count) * inter` f32,
+    /// `acc` is `expert_in` u64. All outlive `stream`'s completion; `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
+    launch_moe_expert_range_f4_situ -> rivoli_moe_expert_range_f4_situ, "moe_expert_range_f4_situ" (
+        x: *const f32,
+        expert_in: usize as i32,
+        inter: usize as i32,
+        e_start: usize as i32,
+        e_count: usize as i32,
+        n_desc: usize as i32,
+        descs: *const ExpertDescF4,
+        wexpert: *const f32,
+        b1: f32,
+        b2: f32,
+        h: *mut f32,
+        acc: *mut u64,
+        nrow: usize as i32,
+        stream: *mut c_void,
+    );
+
     /// `kernel.py::act_quant(v, 128, "ue8m0", inplace=True)` over `n_rows x row_len` f32, in
     /// place — the fp8 activation quantization V4 performs in front of every quantized
     /// `Linear`, fp4-weight ones included.

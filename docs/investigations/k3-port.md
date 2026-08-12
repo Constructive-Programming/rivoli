@@ -66,14 +66,15 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   taken before item 2 captured the attention core; re-measured over both draws and with `mla_attend`
   split out, the margin fell to 0.33x — a stronger form of the same finding, and `anchor.md`
   §"Re-measured on both draws" carries the numbers.)*
-- **S2 items 1, 2 and 3 are DONE, each gated before the next** (2026-08-11/12): `attn_res`, the
-  gated MLA core (`mha_attend` + `sigmoid_gate`), and the latent sandwich. `tests/k3_kernels.rs`.
+- **S2 items 1-4 are DONE, each gated before the next** (2026-08-11/12): `attn_res`, the gated
+  MLA core (`mha_attend` + `sigmoid_gate`), the latent sandwich, and SiTU-GLU + the fused fp4
+  expert. `tests/k3_kernels.rs`, 21 tests.
   **Each of the three found the anchor could not score its operator, and only by trying to write the
   fixture** — the fold weights, the attention core and `o_proj`'s input, the expert aggregate and
   the norm weight. Goldens re-vendored three times, now at **272** tensors. Item 3 also found the
   first place the anchor's fp32-vs-bf16 deviation bites: an operator whose rivoli kernel rounds to
-  bf16 cannot be scored against this anchor at the anchor's own tolerance. Item 4 (SiTU/MoE) is
-  next; item 5 (KDA) is the bulk.
+  bf16 cannot be scored against this anchor at the anchor's own tolerance. **Item 5 (KDA) is next
+  and is the bulk of the stage**; item 6 (the router) and item 7 (trunk GEMV speed) remain.
 
 ## G. The gate model
 
@@ -736,8 +737,7 @@ model is stored in — is answered above: none.)*
    `moe_infer`'s return, which is a method call rather than a module call, so no forward hook could
    see it — the fourth instance of the pattern `anchor.md` now states as a rule. `wrap_latent_sandwich`
    captures the aggregate and the norm weight by pre-hook; goldens re-vendored at **272** tensors.
-4. **SiTU-GLU + fp4 MoE** — §3b. **Half done 2026-08-12: 4a (the activation) is DONE and G2-clean;
-   4b (the fused fp4 expert variant) is NOT started.** The split is §3b's own: the activation has
+4. **SiTU-GLU + fp4 MoE** — §3b. **DONE 2026-08-12, G2 met for both halves.** The split is §3b's own: the activation has
    two call sites, `linalg.hip` for the dense layer 0 and the shared MLP, and `moe.hip` fused inside
    the fp4 expert kernel because there is no separate activation launch on the `.f4` path.
 
@@ -793,16 +793,50 @@ model is stored in — is answered above: none.)*
    > different kernel, and SiTU-GLU's own bound (`|y| <= 100`) does not remove it: the dot feeding
    > it is unbounded. Whatever 4b does here has to be argued, not inherited.
 
+   **4b as built:** `moe_gateup_f4_situ`, `moe_down_f4_weighted` and
+   `rivoli_moe_expert_range_f4_situ`. Pass 2 is ONE templated body with the existing kernel,
+   `WEIGHTED` deciding a single line — `moe_acc_drain`/`moe_acc_drain_to`'s pattern, for its reason:
+   one difference the code cannot make visible, two names, both bodies readable side by side. **Two
+   launches, not three:** no `act_quant_f8` between the passes, because K3's `w2` takes a plain fp32
+   activation (§6's `k3_matmul_mxfp4(edn, act, ...)`) where V4's fp8 `Linear` quantizes its own
+   input — quantizing here would add an error the reference does not have, in the one place the
+   reference is exact. The group-alignment guard is `F4_GROUP` (32), not the inherited
+   `ACT_QUANT_BLOCK` (128); the tighter check would never have fired, since 3584 and 3072 are both 0
+   mod 128, so keeping it would have been a constraint nothing measured.
+
    The routed experts have **no anchor fixture and cannot get one** — `.experts` is unhooked on
    purpose, because `moe_infer` calls only the experts that won tokens, so which modules fire is
    routing-dependent and any defect that moved the routing would change the golden's tensor SET.
-   So 4b is scored against a host oracle composed of three parts that are each already pinned
-   elsewhere: `WMat::Fp4`'s decode for the unpack (§9's low-nibble-even convention, which that
-   type's own comment confirms is shared with K3), `repack-one-expert.md`'s real-byte verification
-   for the layout, and `host_situ` for the activation, which 4a has now pinned against the
-   reference at both draws. **`Oracle::expert` is NOT reusable** — it is V4's, with
+   So 4b is scored against a host oracle composed of parts pinned elsewhere:
+   `v4oracle::numerics::{e2m1_decode, e8m0_decode}` for the codes, `repack-one-expert.md`'s
+   real-byte verification for the layout, and `host_situ` for the activation, which 4a pinned
+   against the reference at both draws. **`Oracle::expert` is NOT reusable** — it is V4's, with
    `swiglu_clamped`, V4's three bf16 roundings and V4's weight placement — and parameterising a
    frozen oracle to serve two models is the refactor `common.hpp` warns against, one level up.
+
+   Red-proved six ways, six reds: the weight folded into pass 1, pass 2 rounding AFTER the weight,
+   pass 2 dropping the weight, `swiglu_clamped` in place of `situ_glu`, gate/up swapped, the beta
+   guard removed. **The second of those is the one this item exists for** — `rbf16(dv)·w` against
+   `rbf16(dv·w)` is invisible in exact arithmetic, and the fixture sees it.
+
+   > **How it is scored, because neither obvious bar works.** `common/mod.rs::assert_bitwise` records
+   > that a correct wave-reduced kernel differs from its oracle on **~0.08% of bf16 elements at dim
+   > 4096** — the f32 and f64 dots land on opposite sides of a bf16 boundary. So a tight bound
+   > rejects correct code (two of three cases here are BIT-EXACT and the third is 2.59e-11, which is
+   > luck, not a contract), and a loose one sees nothing (one crossing is a whole bf16 ulp, ~3.9e-3,
+   > so admitting it admits 3.9e-3 of anything else). The gate is both: **no element differs by more
+   > than one bf16 ulp, and no more than `2 + len/100` differ at all.** A pure percentage was tried
+   > and FAILED at `expert_in = 64` on 1 element in 64 — a rate bound is unusable at small n, and
+   > small n is where the index-error case lives, so the absolute allowance is what keeps that case
+   > runnable. At the real widths 2 of 3584 is 0.06%, under the measured crossing rate, so the
+   > fraction still binds where it matters.
+   >
+   > **The real geometry is not run and that is deliberate.** The host oracle is ~220M f64 operations
+   > at 3584x3072; on the dev profile this repo prescribes for correctness work, one case took over
+   > ten minutes before it was abandoned. Each pass's REDUCTION is at its real depth instead — one
+   > case at `expert_in = 3584`, one at `inter = 3072` — because that is what the arithmetic depends
+   > on, while the row counts only exercise the grid mapping. Anyone who needs the full shape should
+   > reach for `--release`.
 5. **KDA** — the new family and the bulk of the stage. **Decompose into units with their own
    G2 sub-gates.** Heads are independent and head-parallel is bit-identical in the reference,
    so one block per head maps directly; `S` is 64 KB/head and will not sit in LDS, so **fusing

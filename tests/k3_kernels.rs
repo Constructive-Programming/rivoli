@@ -40,8 +40,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 use rivoli::backend::hip::{
-    launch_attn_res, launch_gemm_bf16, launch_mha_attend, launch_rmsnorm_batch,
-    launch_rmsnorm_single, launch_sigmoid_gate, launch_situ_glu_f32,
+    launch_attn_res, launch_gemm_bf16, launch_mha_attend, launch_moe_expert_range_f4_situ,
+    launch_rmsnorm_batch, launch_rmsnorm_single, launch_sigmoid_gate, launch_situ_glu_f32,
 };
 use rivoli::v4oracle::golden::GoldenSet;
 
@@ -1598,6 +1598,38 @@ fn situ_glu_saturates_at_the_product_of_its_betas() {
     }
 }
 
+/// The beta pairs every SiTU launcher must refuse, and each is quiet in its own way — the argument
+/// is at `rivoli_situ_glu_f32`. `NaN` makes `tanh(x/b)` NaN for every element; `0` saturates to ±1
+/// except exactly at `x == 0`, where it is NaN; `+inf` is the silent spelling of "no saturation",
+/// since `b·tanh(x/b) -> x`; negative flips the saturating branch.
+const BAD_BETAS: [(f32, f32, &str); 7] = [
+    (0.0, 25.0, "b1 = 0"),
+    (4.0, 0.0, "b2 = 0"),
+    (-4.0, 25.0, "b1 negative"),
+    (f32::NAN, 25.0, "b1 NaN"),
+    (4.0, f32::NAN, "b2 NaN"),
+    (f32::INFINITY, 25.0, "b1 +inf"),
+    (4.0, f32::INFINITY, "b2 +inf"),
+];
+
+/// Hold one launcher to `BAD_BETAS`, and to accepting the shipped pair.
+///
+/// **One function for both launchers**, which is stronger than two copies as well as shorter: their
+/// comments each claim to use "the same code AND the same expression" as the other, and this is what
+/// makes that claim checkable rather than aspirational. jscpd rejected the second copy at 123
+/// tokens.
+fn assert_betas_guarded(launcher: &str, mut refused: impl FnMut(f32, f32) -> bool) {
+    for (b1, b2, case) in BAD_BETAS {
+        assert!(refused(b1, b2), "{launcher}: {case} was accepted");
+    }
+    // Not refusing everything, which is how a refusal test passes vacuously.
+    assert!(
+        !refused(4.0, 25.0),
+        "{launcher}: the shipped betas were refused, so the guard rejects everything and the seven \
+         assertions above carry no information"
+    );
+}
+
 /// **Both betas must be finite and positive — every other value is refused, not clamped.**
 ///
 /// Four failure modes, each quiet in its own way, argued at the launcher. This is the only test in
@@ -1605,21 +1637,491 @@ fn situ_glu_saturates_at_the_product_of_its_betas() {
 /// their guards untested and said so.
 #[test]
 fn the_situ_betas_are_guarded() {
-    for (b1, b2, what) in [
-        (0.0f32, 25.0f32, "b1 = 0"),
-        (4.0, 0.0, "b2 = 0"),
-        (-4.0, 25.0, "b1 negative"),
-        (f32::NAN, 25.0, "b1 NaN"),
-        (4.0, f32::NAN, "b2 NaN"),
-        (f32::INFINITY, 25.0, "b1 +inf"),
-        (4.0, f32::INFINITY, "b2 +inf"),
-    ] {
+    assert_betas_guarded("situ_glu_f32", |b1, b2| {
+        situ_launch(&[1.0, 2.0], &[3.0, 4.0], b1, b2).is_err()
+    });
+}
+
+// ============================== S2 item 4b — the fused fp4 expert ==============================
+//
+// The routed experts, and **the one operator in this port with no anchor fixture and no way to get
+// one.** `.experts` is unhooked in the driver on purpose: `moe_infer` calls only the experts that
+// won tokens, so which modules fire is routing-dependent, and any defect that moved the routing
+// would change the golden's tensor SET rather than its numbers. The first defect matrix reported
+// `inf` for most layers for exactly that reason.
+//
+// So this is scored against a host oracle, and the oracle is composed of parts that are each pinned
+// somewhere else rather than asserted here:
+//
+//   * the fp4 **layout** — `repack-one-expert.md` converted one real K3 expert by HTTP Range with 0
+//     bytes differing, re-checked independently of rivoli's code;
+//   * the fp4 **codes** — `v4oracle::numerics::{e2m1_decode, e8m0_decode}`, the transliterations
+//     that file keeps a jscpd exemption for, shared with the V4 path that scores against DeepSeek's
+//     own reference;
+//   * the **activation** — `host_situ`, which item 4a scored against the first-party reference at
+//     both weight draws and six MLPs.
+//
+// What is left for this fixture to check is what 4b actually wrote: that the two passes compose in
+// the reference's order, with the routing weight where the reference puts it. `Oracle::expert` is
+// NOT reusable for it — that is V4's, with `swiglu_clamped`, V4's three bf16 roundings and V4's
+// weight placement — and parameterising a frozen oracle to serve two models is the refactor
+// `common.hpp` warns against, one level up.
+
+/// One synthetic routed expert's fp4 bytes: `w1`/`w3` `[inter][expert_in]`, `w2`
+/// `[expert_in][inter]`, each with its own group-32 e8m0 scale row per output.
+struct F4Expert {
+    gate: (Vec<u8>, Vec<u8>),
+    up: (Vec<u8>, Vec<u8>),
+    down: (Vec<u8>, Vec<u8>),
+}
+
+/// Packed nibbles and scales for one `[rows][cols]` fp4 matrix.
+///
+/// Codes are drawn rather than quantized from floats: the fixture's question is what the kernel does
+/// with a given set of codes, and going through an encoder would make a wrong encoder look like a
+/// right kernel. Scales stay in a narrow exponent band around 2^0 — the real K3 scale bytes measured
+/// in `repack-one-expert.md` hold 11 distinct codes in `0x70..=0x7a`, so this is the shipped range
+/// and not a convenient one.
+fn f4_matrix(r: &mut common::Lcg, rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
+    let groups = cols / 32;
+    let bytes = (0..rows * cols / 2)
+        .map(|_| ((r.f() * 0.5 + 0.5) * 255.0) as u8)
+        .collect();
+    // 0x70..=0x7a, the band the real checkpoint uses. `e8m0_decode` maps 0x7f to 2^0.
+    let scales = (0..rows * groups)
+        .map(|_| 0x70u8 + (((r.f() * 0.5 + 0.5) * 10.99) as u8).min(10))
+        .collect();
+    (bytes, scales)
+}
+
+/// `w[row][k]` decoded from the packed nibbles and the group scale, per §9.
+///
+/// **LOW nibble is the EVEN k.** Not a convention this port gets to pick, and not one any statistic
+/// can check: getting it backwards is a permutation INSIDE each 32-element scale group, so group
+/// boundaries, the amax/scale relation and the code histogram are all invariant under it. §9 states
+/// it, `WMat::Fp4`'s decode has the same line, and `the_fp4_nibble_order_is_the_even_low_one`
+/// red-proves that this fixture can see it.
+fn f4_row(m: &(Vec<u8>, Vec<u8>), row: usize, cols: usize, swap_nibbles: bool) -> Vec<f64> {
+    let (bytes, scales) = m;
+    let (groups, rb) = (cols / 32, cols / 2);
+    (0..cols)
+        .map(|k| {
+            let byte = bytes[row * rb + k / 2];
+            let even = if swap_nibbles { byte >> 4 } else { byte & 0x0f };
+            let nib = if k % 2 == 1 {
+                if swap_nibbles { byte & 0x0f } else { byte >> 4 }
+            } else {
+                even
+            };
+            f64::from(rivoli::v4oracle::numerics::e2m1_decode(nib))
+                * f64::from(rivoli::v4oracle::numerics::e8m0_decode(
+                    scales[row * groups + k / 32],
+                ))
+        })
+        .collect()
+}
+
+/// Where the routing weight is applied. **A named enum, not a bool**, because the two are
+/// references rather than settings and a call site has to say which model it is talking about.
+#[derive(Clone, Copy, PartialEq)]
+enum WeightAt {
+    /// Kimi-K3: `moe_infer` ends `.type(topk_weight.dtype).mul_(topk_weight).sum(dim=1)` on the
+    /// expert's full output — the weight multiplies the **bf16 `w2` output**. §6's
+    /// `accL[i] += wt[j] * edn[i]`.
+    AfterW2,
+    /// DeepSeek-V4: `Expert.forward` does `weights * x` and THEN `x.to(dtype)` in front of `w2`, so
+    /// the weight is inside the bf16 store that feeds the down projection. What rivoli's
+    /// `moe_gateup_f4_impl` computes, correctly, for V4.
+    FoldedIntoH,
+}
+
+/// The reference's expert, in f64 where it can be and at the kernel's rounding points where it
+/// must be.
+///
+/// §6, and every step is a placement the port could get wrong:
+/// `g = w1·x`, `u = w3·x` (f64 dots over decoded fp4) → `h = bf16(situ(g, u))` → `dv = w2·h` (f64)
+/// → `bf16(dv)` → **times the routing weight** → fixed point at `2^-44`.
+///
+/// The three `bf16` points are the reference's dtype boundaries, not rivoli's choices: the
+/// projections are bf16 `Linear`s, so `w2` is handed a bf16 activation, and `w2`'s own output is
+/// bf16 before `moe_infer` casts it to the weight's dtype and multiplies. The fixed point is
+/// rivoli's declared deviation (`MOE_ACC_SHIFT 44`, associative so the sum stops depending on stream
+/// order), emulated here rather than compared around because pass 2's atomic add is where it lands.
+///
+/// **`at` is the defect flag**, and it is the shape `host_fold`'s `normalised` and `host_situ`'s
+/// `capped_sigmoid` already use in this file: a defect run is the correct oracle with ONE thing
+/// changed. This was first written as a second function and jscpd rejected it at 98 tokens — which
+/// was the gate being right and the "two references, not one with an option" argument being wrong,
+/// since the file had already settled that question twice.
+fn host_expert_f4(
+    e: &F4Expert,
+    x: &[f32],
+    inter: usize,
+    weight: f32,
+    at: WeightAt,
+    swap_nibbles: bool,
+    acc: &mut [i64],
+) {
+    let expert_in = x.len();
+    let dot = |w: &[f64]| -> f32 {
+        w.iter()
+            .zip(x)
+            .map(|(&wi, &xi)| wi * f64::from(xi))
+            .sum::<f64>() as f32
+    };
+    let folded = at == WeightAt::FoldedIntoH;
+    let h: Vec<f32> = (0..inter)
+        .map(|j| {
+            let g = dot(&f4_row(&e.gate, j, expert_in, swap_nibbles));
+            let u = dot(&f4_row(&e.up, j, expert_in, swap_nibbles));
+            let y = situ1(g, u);
+            // The fold happens BEFORE this bf16 store when it happens at all — V4's `weights * x`
+            // then `x.to(dtype)`. That is the whole difference, and it is one multiply's worth of
+            // position.
+            bf16(if folded { y * weight } else { y })
+        })
+        .collect();
+    for (o, slot) in acc.iter_mut().enumerate() {
+        let row = f4_row(&e.down, o, inter, swap_nibbles);
+        let dv: f64 = row
+            .iter()
+            .zip(&h)
+            .map(|(&wi, &hi)| wi * f64::from(hi))
+            .sum();
+        // `bf16(dv)` THEN the weight, for K3 — `w2`'s output is bf16 and the multiply comes after.
+        let y = bf16(dv as f32);
+        *slot += fixed44(if folded { y } else { y * weight });
+    }
+}
+
+/// The whole expert range summed into one fixed-point accumulator, the way the launcher does.
+///
+/// Three tests opened with this identical five-line loop and jscpd rejected the third at 83 tokens.
+fn host_acc(c: &F4Case, at: WeightAt, swap_nibbles: bool) -> Vec<i64> {
+    let mut acc = vec![0i64; c.x.len()];
+    for (e, &w) in c.experts.iter().zip(&c.weights) {
+        host_expert_f4(e, &c.x, c.inter, w, at, swap_nibbles, &mut acc);
+    }
+    acc
+}
+
+/// `common.hpp::rbf16` on the host: round-to-nearest-even into bf16, back to f32.
+fn bf16(x: f32) -> f32 {
+    rivoli::math::bf16_to_f32(rivoli::math::f32_to_bf16(x))
+}
+
+/// One element of SiTU-GLU at the shipped betas, sharing `host_situ`'s arithmetic.
+///
+/// Routed through `host_situ` rather than restated, so 4a's anchor-scored oracle is the one this
+/// fixture uses. A second copy of three lines is how the routed path and the dense path would come
+/// to disagree about the activation — the exact failure §3b warns about, one level up in the test.
+fn situ1(g: f32, u: f32) -> f32 {
+    host_situ(
+        &Situ {
+            gate: vec![g],
+            up: vec![u],
+            want: Vec::new(),
+        },
+        4.0,
+        25.0,
+        false,
+    )[0]
+}
+
+/// `common.hpp::moe_fixed` on the host — saturate, then `llrintf` at scale `2^44`.
+fn fixed44(v: f32) -> i64 {
+    const MAX: f32 = (1u64 << 14) as f32; // 2^(58 - 44), the clamp that keeps 16 terms in an i64
+    (f64::from(v.clamp(-MAX, MAX)) * f64::from((1u64 << 44) as f32)).round() as i64
+}
+
+/// Upload one expert set and run `moe_expert_range_f4_situ` over all of it, returning the
+/// fixed-point accumulator.
+///
+/// The accumulator is read as raw `u64` and reinterpreted, NOT drained through
+/// `moe_acc_drain_to`: draining is a second kernel with its own `2^-44` multiply, and folding it in
+/// would make a pass-2 placement error and a drain error indistinguishable. `moe_acc_drain_to` has
+/// its own oracle in `tests/kernel.rs`.
+fn device_expert_f4(c: &F4Case, swap_nibbles: bool) -> Vec<i64> {
+    ok(
+        expert_launch(c, swap_nibbles, 4.0, 25.0),
+        "moe_expert_range_f4_situ",
+    )
+}
+
+/// One launch, returning the launcher's own `Result` and the betas as arguments.
+///
+/// The scoring path and the guard test go through here for `situ_launch`'s reason: the guard test
+/// must exercise the entry point callers use, not a second spelling of it.
+fn expert_launch(c: &F4Case, swap_nibbles: bool, b1: f32, b2: f32) -> anyhow::Result<Vec<i64>> {
+    let (experts, x, inter, weights) = (&c.experts, &c.x, c.inter, &c.weights);
+    let expert_in = x.len();
+    let mut parts = Vec::new();
+    let mut descs: Vec<rivoli::backend::hip::ExpertDescF4> = Vec::new();
+    for e in experts {
+        // Addresses taken BEFORE the buffers move into `parts`, for the reason `f4_kernel.rs`'s
+        // twin spells out: recovering them by index works until someone adds a third buffer, and
+        // then a descriptor silently points at another projection's weights.
+        let mut push = |m: &(Vec<u8>, Vec<u8>)| {
+            let w = if swap_nibbles {
+                dev(&m.0.iter().map(|b| b.rotate_left(4)).collect::<Vec<u8>>())
+            } else {
+                dev(&m.0)
+            };
+            let s = dev(&m.1);
+            let a = (w.ptr(), s.ptr());
+            parts.push(w);
+            parts.push(s);
+            a
+        };
+        let (gp, gs) = push(&e.gate);
+        let (up, us) = push(&e.up);
+        let (dp, ds) = push(&e.down);
+        descs.push(rivoli::backend::hip::ExpertDescF4 {
+            gate_packed: gp,
+            gate_scale: gs,
+            up_packed: up,
+            up_scale: us,
+            down_packed: dp,
+            down_scale: ds,
+        });
+    }
+    // SAFETY: `ExpertDescF4` is six plain addresses, so the span is exactly the slice's bytes.
+    let raw = unsafe {
+        std::slice::from_raw_parts(
+            descs.as_ptr() as *const u8,
+            std::mem::size_of_val(&descs[..]),
+        )
+    };
+    let db = dev(raw);
+    let (xb, wb) = (dev(&f32b(x)), dev(&f32b(weights)));
+    let mut hb = zeros(experts.len() * inter * 4);
+    let mut ab = zeros(expert_in * 8);
+    // SAFETY: every span is sized as the launcher's `# Safety` requires — `x` is `expert_in` f32
+    // (16-byte aligned: `dev` allocates from the device pool), `descs` holds `experts.len()`
+    // entries whose spans cover `inter x expert_in` fp4 and their group-32 scales, `wexpert` is one
+    // f32 per expert, `h` is `experts.len() * inter` f32 and `acc` is `expert_in` u64. None alias.
+    unsafe {
+        launch_moe_expert_range_f4_situ(
+            xb.ptr() as *const f32,
+            expert_in,
+            inter,
+            0,
+            experts.len(),
+            experts.len(),
+            db.ptr() as *const rivoli::backend::hip::ExpertDescF4,
+            wb.ptr() as *const f32,
+            b1,
+            b2,
+            hb.ptr_mut() as *mut f32,
+            ab.ptr_mut() as *mut u64,
+            1,
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok(back(&ab)
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect())
+}
+
+/// One synthetic expert set, its input, and its routing weights.
+///
+/// A struct because `host_acc` and `device_expert_f4` took the identical four parameters and jscpd
+/// rejected the second list at 40 tokens — the same thing `Dims`, `AttnIn` and `FoldIn` were each
+/// forced into one level up, and the same answer: quantities that always travel together are a type.
+struct F4Case {
+    experts: Vec<F4Expert>,
+    x: Vec<f32>,
+    inter: usize,
+    weights: Vec<f32>,
+}
+
+/// One synthetic expert set plus its input and routing weights, at a chosen geometry.
+///
+/// `weights` deliberately includes a **zero**: a row that did not route to an expert is the case
+/// pass 2's `w != 0.0f` skip exists for, and it is the one an "every expert contributes" fixture
+/// never reaches.
+fn f4_case(seed: u64, n_experts: usize, expert_in: usize, inter: usize) -> F4Case {
+    let mut r = common::Lcg(seed);
+    let experts: Vec<F4Expert> = (0..n_experts)
+        .map(|_| F4Expert {
+            gate: f4_matrix(&mut r, inter, expert_in),
+            up: f4_matrix(&mut r, inter, expert_in),
+            down: f4_matrix(&mut r, expert_in, inter),
+        })
+        .collect();
+    let x: Vec<f32> = (0..expert_in).map(|_| r.f()).collect();
+    let weights: Vec<f32> = (0..n_experts)
+        .map(|i| if i == 1 { 0.0 } else { 0.5 + 0.5 * r.f() })
+        .collect();
+    F4Case {
+        experts,
+        x,
+        inter,
+        weights,
+    }
+}
+
+/// **The fused fp4 expert pair reproduces the reference's composition, at K3's real widths.**
+#[test]
+fn the_fp4_expert_pair_matches_the_host_oracle() {
+    // `(n_experts, expert_in, inter)`, and the geometries are chosen to put each pass's REDUCTION
+    // at its real depth without paying for the full matrix.
+    //
+    // The real expert is `expert_in = 3584` (the latent width) by `inter = 3072`
+    // (`moe_intermediate_size`), top-16 of 896. Running that whole shape here was tried and
+    // ABANDONED: the host oracle is ~220M f64 operations at it, which on the dev profile this repo
+    // prescribes for correctness work took over ten minutes for one case. The depths are what the
+    // kernel's arithmetic depends on — pass 1 reduces over `expert_in`, pass 2 over `inter`, and
+    // each output element is an independent wave either way — so one case per real depth covers the
+    // reassociation, and the row counts only exercise the grid mapping.
+    //
+    //   (2, 3584,   32) — pass 1 at the real reduction depth
+    //   (2,   64, 3072) — pass 2 at the real reduction depth
+    //   (3,   64,   32) — the smallest legal pair, one F4_GROUP each, where an index error presents
+    //                     as an index error rather than as a small number
+    //
+    // Stated rather than quietly sampled: the full shape is NOT run, and a reader who needs it run
+    // should reach for `--release`, where the oracle is a different proposition.
+    for &(ne, expert_in, inter) in &[(2usize, 3584usize, 32usize), (2, 64, 3072), (3, 64, 32)] {
+        let c = f4_case(0xF4_51_70, ne, expert_in, inter);
+        let got = device_expert_f4(&c, false);
+        let want = host_acc(&c, WeightAt::AfterW2, false);
+        // The accumulator is INTEGER and the sum is exact in it, so the only slack is the f32 dots
+        // reassociating against f64 ones before they are rounded to bf16.
+        let (gf, wf): (Vec<f32>, Vec<f32>) = (
+            got.iter()
+                .map(|&v| v as f32 / (1u64 << 44) as f32)
+                .collect(),
+            want.iter()
+                .map(|&v| v as f32 / (1u64 << 44) as f32)
+                .collect(),
+        );
+        // **Scored as "how MANY elements disagree", not as one relative bound, and the choice is
+        // forced by a measurement this repo already has.** `common/mod.rs::assert_bitwise` records
+        // that a correct wave-reduced kernel differs from its oracle on **~0.08% of bf16 elements at
+        // dim 4096**, because the kernel's f32 dot and the oracle's f64 one occasionally land on
+        // opposite sides of a bf16 rounding boundary. So neither obvious bar is right on its own:
+        //
+        //   * a **tight bound rejects correct code** the first time a draw puts an element on a
+        //     boundary. Measured here: two of the three cases are BIT-EXACT and the third is
+        //     2.59e-11, so a 2.6e-10 bound passes today — that is luck, not a contract;
+        //   * a **loose bound sees nothing.** One boundary crossing is a whole bf16 ulp, ~3.9e-3
+        //     relative, so admitting it admits 3.9e-3 of anything else — including a routing weight
+        //     folded into the wrong pass on a handful of elements.
+        //
+        // Both together are discriminating: no element may differ by more than ONE bf16 ulp, and
+        // the number that differ at all stays inside `2 + len/100`. A folded weight, a swapped
+        // nibble order or a rounding at the wrong point moves essentially EVERY element and fails
+        // the count; a boundary crossing moves ~0.08% and fails neither.
+        //
+        // **The `2 +` is not padding and a pure percentage was tried first.** It failed here, at
+        // `expert_in = 64`, on **1 differing element out of 64** — 1.6%, over a 1% rule, while
+        // 0.08% of 64 is 0.05 elements. A rate bound is unusable at small n, and small n is exactly
+        // where the index-error case lives, so the absolute allowance is what keeps that case
+        // runnable. It costs nothing at the real widths: 2 of 3584 is 0.06%, under the measured
+        // crossing rate, so the fraction is still what binds where it matters.
+        const BF16_ULP: f32 = 1.0 / 256.0; // 2^-8 — bf16 carries 8 mantissa bits
+        let differing = gf.iter().zip(&wf).filter(|(a, b)| a != b).count();
+        let d = rel(&gf, &wf);
         assert!(
-            situ_launch(&[1.0, 2.0], &[3.0, 4.0], b1, b2).is_err(),
-            "{what} was accepted"
+            d <= BF16_ULP,
+            "ne={ne} expert_in={expert_in} inter={inter}: {d:e} exceeds one bf16 ulp \
+             ({BF16_ULP:e}), which is larger than a rounding-boundary crossing can be — so this is \
+             a composition error, not reassociation"
+        );
+        assert!(
+            differing <= 2 + gf.len() / 100,
+            "ne={ne} expert_in={expert_in} inter={inter}: {differing} of {} elements differ. Each \
+             is inside a bf16 ulp, so no single one is wrong — but a boundary crossing is ~0.08% of \
+             elements and this is {:.1}%, above the {} this case allows: the shape of a SYSTEMATIC \
+             difference, i.e. a folded routing weight, a swapped nibble order, or a rounding at the \
+             wrong point.",
+            gf.len(),
+            100.0 * differing as f64 / gf.len() as f64,
+            2 + gf.len() / 100
         );
     }
-    // And the guard is not simply refusing everything, which is the way a refusal test passes
-    // vacuously. The shipped pair must go through.
-    assert_eq!(device_situ(&[1.0, 2.0], &[3.0, 4.0], 4.0, 25.0).len(), 2);
+}
+
+/// **The routing weight belongs AFTER `w2`, and folding it in before is a different function.**
+///
+/// The whole reason 4b needed a down-pass variant. `w2` is linear, so `w2(w·h)` and `w·w2(h)` agree
+/// in exact arithmetic and the fold reads as a free reassociation of V4's arrangement. It is not
+/// free, and this measures by how much: there is a **bf16 store between the two passes** and pass 2
+/// sums in **fixed point**, so `bf16(sw·w)` is not `bf16(sw)` scaled afterwards.
+///
+/// Computed on the host both ways, because the device has only the correct one — which is the point.
+/// A defect run that needed a second kernel would be pricing a kernel nobody will ship.
+#[test]
+fn folding_the_routing_weight_before_w2_is_not_the_same_function() {
+    let (ne, expert_in, inter) = (3usize, 64usize, 32usize);
+    let c = f4_case(0xF4_51_70, ne, expert_in, inter);
+    let after = host_acc(&c, WeightAt::AfterW2, false);
+    // The same composition with the weight folded into `h` before the bf16 store — V4's order.
+    let before = host_acc(&c, WeightAt::FoldedIntoH, false);
+    let (a, b): (Vec<f32>, Vec<f32>) = (
+        after.iter().map(|&v| v as f32).collect(),
+        before.iter().map(|&v| v as f32).collect(),
+    );
+    let differing = a.iter().zip(&b).filter(|(p, q)| p != q).count();
+    // Two claims, and the second is the one that matters. The values differ — but if they differed
+    // on one element out of 64 this would be a rounding accident and the fold would be defensible.
+    // A MAJORITY differing is what makes the placement a property of the arithmetic.
+    assert!(
+        differing * 2 > a.len(),
+        "folding the routing weight before `w2` changed only {differing} of {} accumulator slots, \\
+         so at this geometry the two placements are within rounding of each other and this test is \\
+         not pricing the difference 4b was written for",
+        a.len()
+    );
+    assert!(
+        rel(&b, &a) > 1.0e-4,
+        "the two weight placements agree to {:e} — see above",
+        rel(&b, &a)
+    );
+}
+
+/// **The low nibble is the EVEN element, and no statistic can tell.**
+///
+/// §9 states it and `WMat::Fp4`'s decode has the same line. Swapping it is a permutation INSIDE each
+/// 32-element scale group, so group boundaries, the amax/scale relation and the code histogram are
+/// all invariant — which is why this needs an end-to-end fixture rather than a check on the bytes.
+/// Run against the DEVICE with swapped bytes, so what is proved is that this fixture would catch a
+/// kernel that decoded the other way, not merely that two host functions differ.
+#[test]
+fn the_fp4_nibble_order_is_the_even_low_one() {
+    let (ne, expert_in, inter) = (3usize, 64usize, 32usize);
+    let c = f4_case(0xF4_51_70, ne, expert_in, inter);
+    let want = host_acc(&c, WeightAt::AfterW2, false);
+    // Every weight byte's nibbles exchanged on the way to the device. The kernel decodes as it
+    // always does, so the observed output is what a kernel with the opposite convention would
+    // produce from the original bytes.
+    let got = device_expert_f4(&c, true);
+    let (g, w): (Vec<f32>, Vec<f32>) = (
+        got.iter().map(|&v| v as f32).collect(),
+        want.iter().map(|&v| v as f32).collect(),
+    );
+    let differing = g.iter().zip(&w).filter(|(a, b)| a != b).count();
+    assert!(
+        differing * 2 > g.len(),
+        "exchanging every weight byte's nibbles changed only {differing} of {} slots — so this \\
+         fixture cannot see the one property of the fp4 layout that no statistic can check",
+        g.len()
+    );
+}
+
+/// **The K3 expert launcher refuses what it cannot compute, rather than computing it wrongly.**
+///
+/// Its own guards, not `rivoli_moe_expert_range_f4`'s: the betas (1006) where that one takes a
+/// `swiglu_limit`, and `F4_GROUP` alignment (1002) where that one requires `ACT_QUANT_BLOCK`. The
+/// looser alignment check is the interesting one — **the tighter inherited check would never have
+/// fired**, since K3's 3584 and 3072 are both 0 mod 128, so keeping it would have been a constraint
+/// nothing measured and nothing needed.
+#[test]
+fn the_k3_expert_betas_are_guarded() {
+    let c = f4_case(0xF4_51_70, 2, 64, 32);
+    assert_betas_guarded("moe_expert_range_f4_situ", |b1, b2| {
+        expert_launch(&c, false, b1, b2).is_err()
+    });
 }

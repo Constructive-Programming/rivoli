@@ -420,10 +420,37 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
 //
 // `h` must have been re-quantized to fp8 between the passes: `w2` is a quantized `Linear`
 // like any other and quantizes its own input.
-template <int R>
+// **`WEIGHTED` is Kimi-K3's half and it is ONE line, so it is argued here rather than left to
+// the code.** `if (WEIGHTED)` is a template bool, so each instantiation compiles to exactly the
+// arithmetic below it and the unweighted arm is bit-identical to what it was before the split.
+// This is `moe_acc_drain`/`moe_acc_drain_to`'s pattern for the same reason: one difference the
+// code cannot make visible, two names, both bodies readable side by side.
+//
+// **Why K3 needs the other arm at all.** DeepSeek-V4's `Expert.forward` applies the routing
+// weight and THEN stores bf16 in front of `w2` (`weights * x`, then `x.to(dtype)`), so its pass 1
+// folds `w` into `h` and this pass takes no `wexpert`. Kimi-K3 does the opposite: `moe_infer` ends
+// `new_x.type(topk_weight.dtype).mul_(topk_weight).sum(dim=1)` on the expert's FULL output
+// (reference `:867-874`, and `k3-architecture.md` §6's `accL[i] += wt[j] * edn[i]`, where `edn` is
+// the `w2` output). `w2` is linear, so `w2(w·h)` and `w·w2(h)` agree in exact arithmetic and the
+// fold looks free — it is not, because there is a **bf16 store between them** and this pass
+// accumulates in **fixed point**. `bf16(sw·w)` is not `bf16(sw)` scaled afterwards.
+//
+// So the order here is `rbf16(dv) * w`, NOT `rbf16(dv * w)`: the reference's `w2` produces bf16,
+// and only then is the routing weight applied and summed. The VQ pass 2 above has the weight in
+// the same place and no `rbf16` at all, which is its own reference's shape — the three paths agree
+// on none of this and each one's comment says which.
+//
+// The `w != 0.0f` skip is the VQ twin's, verbatim in argument: `0 * non-finite` is NaN and
+// `moe_fixed`'s clamp turns NaN into a FINITE extreme, so it is silent corruption of a row that
+// never asked for this expert, and skipping is bit-identical because adding zero to an integer
+// accumulator is a no-op. **It is still needed here even though SiTU-GLU is bounded.** `situ_glu`
+// maps ±inf to ±b1·b2 and only propagates a NaN it was given, so `h` cannot be the source — but
+// `dv` is a fresh dot over `inter` terms of `h` against fp4 weights, and nothing bounds that.
+template <int R, bool WEIGHTED>
 __device__ __forceinline__ void moe_down_f4_impl(
     int hidden, int inter, int e_start, int e_count, const ExpertDescF4* __restrict__ descs,
-    const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
+    const float* __restrict__ h_in, const float* __restrict__ wexpert,
+    unsigned long long* __restrict__ acc) {
     int lane = threadIdx.x & (WAVE - 1);
     size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
     if (r >= (size_t)e_count * hidden) return;
@@ -437,8 +464,15 @@ __device__ __forceinline__ void moe_down_f4_impl(
                      (gu8p)d.down_scale + (size_t)o * ng, inter, lane, dv);
     if (lane == 0) {
 #pragma unroll
-        for (int t = 0; t < R; ++t)
-            atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(rbf16(dv[t])));
+        for (int t = 0; t < R; ++t) {
+            const float y = rbf16(dv[t]);
+            if (WEIGHTED) {
+                const float w = wexpert[(size_t)e * R + t];
+                if (w != 0.0f) atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(y * w));
+            } else {
+                atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(y));
+            }
+        }
     }
 }
 
@@ -449,10 +483,61 @@ extern "C" __global__ void moe_gateup_f4(
     moe_gateup_f4_impl<1>(x, hidden, inter, e_start, e_count, descs, wexpert, limit, h_out);
 }
 
+// **Kimi-K3's pass 1.** `situ_glu` in place of `swiglu_clamped`, and NO routing weight — §3b said
+// "a new `moe_gateup_f4` variant", and the activation is the half it named. Three more differences
+// it did not, each of which would pass every length check:
+//
+//  1. **No `wexpert` and no `w == 0` launder.** The weight belongs to pass 2 here
+//     (`moe_down_f4_weighted`), so `h` is written for every expert in the range whether the row
+//     routed to it or not. That is safe in a way V4's arrangement is not: `situ_glu` maps ±inf to
+//     ±b1·b2 = ±100 and only propagates a NaN it was handed, so `h` is bounded even when a gate dot
+//     overflows. The hazard moves to pass 2's multiply, where its guard is.
+//  2. **No `limit`, and nothing to refuse.** SiTU-GLU has no clamp to disable — saturation is
+//     `tanh`, which is in the function rather than in a parameter. The betas are refused instead,
+//     at the launcher, and for the same class of reason.
+//  3. **The store is `rbf16(y)` with no weight folded in**, which is the reference's
+//     `KimiBlockSparseMLP.forward` handing `w2` a bf16 activation. V4 stores `rbf16(sw · w)`; those
+//     are different values, not the same value written in a different order.
+//
+// `expert_in`, not `hidden` — for K3 this is the latent 3584 (§6). Same argument as
+// `moe_down_f4_weighted`'s.
+extern "C" __global__ void moe_gateup_f4_situ(
+    const float* __restrict__ x, int expert_in, int inter, int e_start, int e_count,
+    const ExpertDescF4* __restrict__ descs, float b1, float b2, float* __restrict__ h_out) {
+    int lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)e_count * inter) return;
+    int e = e_start + (int)(r / inter);
+    int j = (int)(r % inter);
+    const ExpertDescF4 d = descs[e];
+    size_t rb = (size_t)(expert_in / 2), ng = f4_ng(expert_in);
+    float g[1], u[1];
+    dot_f4_wave_r<1>(x, expert_in, (gu8p)d.gate_packed + (size_t)j * rb,
+                     (gu8p)d.gate_scale + (size_t)j * ng, expert_in, lane, g);
+    dot_f4_wave_r<1>(x, expert_in, (gu8p)d.up_packed + (size_t)j * rb,
+                     (gu8p)d.up_scale + (size_t)j * ng, expert_in, lane, u);
+    if (lane == 0) h_out[(size_t)e * inter + j] = rbf16(situ_glu(g[0], u[0], b1, b2));
+}
+
 extern "C" __global__ void moe_down_f4(
     int hidden, int inter, int e_start, int e_count, const ExpertDescF4* __restrict__ descs,
     const float* __restrict__ h_in, unsigned long long* __restrict__ acc) {
-    moe_down_f4_impl<1>(hidden, inter, e_start, e_count, descs, h_in, acc);
+    moe_down_f4_impl<1, false>(hidden, inter, e_start, e_count, descs, h_in, nullptr, acc);
+}
+
+// **Kimi-K3's pass 2**: the same fp4 down dot, with the routing weight applied to the bf16 `w2`
+// output instead of having been folded into `h`. See the impl's `WEIGHTED` note.
+//
+// `expert_out` rather than `hidden`, because for K3 this dimension is the **latent** 3584 and not
+// `cfg.hidden` 7168 — the experts run in latent space (§6). The shared kernel above calls the same
+// parameter `hidden` because for GLM and V4 it is, and S1a item 3 renamed the Rust side of this
+// distinction to `expert_in` for exactly this reason. A K3 caller binding `cfg.hidden` here passes
+// every length check and computes a wrong row.
+extern "C" __global__ void moe_down_f4_weighted(
+    int expert_out, int inter, int e_start, int e_count, const ExpertDescF4* __restrict__ descs,
+    const float* __restrict__ h_in, const float* __restrict__ wexpert,
+    unsigned long long* __restrict__ acc) {
+    moe_down_f4_impl<1, true>(expert_out, inter, e_start, e_count, descs, h_in, wexpert, acc);
 }
 
 // gate/up + the `h` re-quantization + down for the descriptor range
@@ -516,6 +601,58 @@ extern "C" int rivoli_moe_expert_range_f4(
     dim3 grid_b(((size_t)e_count * hidden + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
     hipLaunchKernelGGL(moe_down_f4, grid_b, dim3(256), 0, s, hidden, inter, e_start, e_count, d, h,
                        acc);
+    e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// **Kimi-K3's routed expert range — TWO launches, not three.**
+//
+// `rivoli_moe_expert_range_f4` runs `act_quant_f8` between its passes and its comment insists that
+// is "not an optimisation, it is `w2`'s own input quantization". True for DeepSeek-V4, whose `w2` is
+// an fp8-quantized `Linear` that quantizes what it is handed. **K3's `w2` is not**: the routed
+// expert weights are MXFP4 and the activation reaching them is plain fp32 —
+// `k3_matmul_mxfp4(edn, act, q.p2, q.s2, I, L, ...)` takes `act` directly (§6). Quantizing it here
+// would introduce an error the reference does not have, in the one place the reference is exact.
+// The fourth thing §3b did not say about this item.
+//
+// `expert_in` is the reduction dim of `w1`/`w3` AND the output dim of `w2` — 3584 for K3, both
+// times, because the experts run in latent space and `[3072][3584]` transposes to `[3584][3072]`.
+// One parameter is correct here and would not be for a model whose expert was not square in that
+// sense; the name says which quantity it is rather than which config field a caller reached for.
+//
+// `acc` is the LATENT-wide accumulator `moe_acc_drain_to` drains (S1a item 4), not the residual —
+// K3 norms and up-projects the aggregate before it becomes a residual at all.
+extern "C" int rivoli_moe_expert_range_f4_situ(
+    const float* x, int expert_in, int inter, int e_start, int e_count, int n_desc,
+    const void* descs, const float* wexpert, float b1, float b2, float* h,
+    unsigned long long* acc, int nrow, void* stream) {
+    if (expert_in <= 0 || inter <= 0 || e_count <= 0 || e_start < 0 || n_desc <= 0) return 1001;
+    // Both reduction dims must be whole F4_GROUPs — the scale rows are laid out per group and a
+    // ragged tail would read past the last one. NOT `ACT_QUANT_BLOCK` as the fp8-activation twin
+    // requires: nothing here quantizes an activation, so 128 is not a constraint this path has.
+    // Both of K3's widths satisfy it either way (3584 and 3072 are 0 mod 128), which is exactly
+    // why this needed stating rather than inheriting — the tighter check would never have fired.
+    if (expert_in % F4_GROUP || inter % F4_GROUP) return 1002;
+    // ONLY R=1, matching the fp8 twin: `num_nextn_predict_layers: 0`, so K3 has no speculative
+    // decode and nothing batches (§3b). The guard earns its keep the way the int4 one did — by
+    // failing loudly at token 1 rather than silently computing a short row.
+    if (nrow != 1) return 1003;
+    if (e_start + e_count > n_desc) return 1004;
+    // The betas, refused rather than clamped — `linalg.hip::rivoli_situ_glu_f32` carries the full
+    // argument for all four rejected values. SiTU-GLU has no `swiglu_limit` and never should: it
+    // has no clamp to disable, so there is nothing for a sentinel to spell.
+    if (!(b1 > 0.0f && b1 < INFINITY) || !(b2 > 0.0f && b2 < INFINITY)) return 1006;
+    const ExpertDescF4* d = (const ExpertDescF4*)descs;
+    hipStream_t s = (hipStream_t)stream;
+    hipGetLastError();
+    dim3 grid_a(((size_t)e_count * inter + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    hipLaunchKernelGGL(moe_gateup_f4_situ, grid_a, dim3(256), 0, s, x, expert_in, inter, e_start,
+                       e_count, d, b1, b2, h);
+    hipError_t e = hipGetLastError();
+    if (e != hipSuccess) return -(int)e;
+    dim3 grid_b(((size_t)e_count * expert_in + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    hipLaunchKernelGGL(moe_down_f4_weighted, grid_b, dim3(256), 0, s, expert_in, inter, e_start,
+                       e_count, d, h, wexpert, acc);
     e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

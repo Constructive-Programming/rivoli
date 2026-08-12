@@ -369,6 +369,12 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("moe_acc_drain_to", &[]),
     ("moe_expert_range", &["gpu.rs"]),
     ("moe_expert_range_f4", &["f4gpu.rs"]),
+    // **No engine caller yet** — the declaration `moe_acc_drain_to` and `situ_glu_f32` also carry,
+    // and for the same reason: Kimi-K3's routed expert pair exists ahead of the layer loop that
+    // will call it (S3). Its oracle is `tests/k3_kernels.rs`'s fp4 expert fixture, which composes
+    // three things pinned elsewhere — `WMat::Fp4`'s decode, `repack-one-expert.md`'s real-byte
+    // layout check, and the activation S2 item 4a scored against the first-party reference.
+    ("moe_expert_range_f4_situ", &[]),
     ("moe_expert_range_i4", &["gpu.rs"]),
     ("qk_norm", &["attn.rs"]),
     ("rmsnorm_batch", &["attn.rs", "f4gpu.rs"]),
