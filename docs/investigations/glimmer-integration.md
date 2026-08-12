@@ -179,6 +179,19 @@ written so that "all resident" is a budget value, never a code path.
 
 What the loop must get right, each with its gate:
 
+0. **The write-after-read fence — REASSIGNED FROM S5 TO HERE, 2026-08-12.** R1's slot refill is
+   a host `memcpy` with no synchronization, and kernel launches are asynchronous, so the first
+   loop that calls `layer(l)` and launches on a stream can have a later refill land under a live
+   kernel. The invariant is stated on `GlimmerPin::layer` and S5 was given the fence because
+   that is where the fill goes async — **but S3 is the first code that can violate it**, so the
+   obligation belongs before the loop, not after. Cheapest correct version: `device_sync` (or an
+   event recorded after the layer's launches and waited before the refill) at the point the loop
+   moves to a layer mapping to an occupied slot; GLM's loop already syncs per layer, so the cost
+   is likely nil at R1's synchronous fill — measure it rather than assume.
+   **Gate, and it needs no decode:** launch a long-running kernel reading a slot's span, refill
+   that slot from the host, assert the kernel's output is unpolluted. It goes red today, which
+   is the point of writing it first.
+
 1. **Sandwich norms — the missing kernel.** Four per layer, post-norms on the BRANCH before
    the residual add, and they are CENTERED: `x*(1+w)` — **no kernel in the tree computes
    that form** (`rmsnorm_single`/`batch` are plain `x*w`). One new kernel (or a flag-free
@@ -195,11 +208,13 @@ What the loop must get right, each with its gate:
 4. **Streams, not null.** `sigmoid_gate` and `logit_softcap` take the trailing stream now;
    the loop passes its compute stream at both call sites. A null there is the unordered-read
    bug `linalg.hip`'s swiglu note describes, and no fixture can see it — review round 2's
-   finding, standing S3 contract.
+   finding, standing S3 contract. Item 0 is the same hazard one level up: streams order the
+   kernels against each other, and nothing but a fence orders a HOST write against them.
 5. **NoPE pattern [L,L,L,G]**, window 2048 ring on sliding layers, **two EOS ids**
    (`[200001, 200008]` — a scalar-EOS port stops on one), softcap present in the tail.
 
-**G3 — met when** teacher forcing, greedy decode, and incremental-with-KV match the tiny
+**G3 — met when** the slot-reuse fence gate above is red before the fence and green after;
+teacher forcing, greedy decode, and incremental-with-KV match the tiny
 model at **zero tolerance**; a decode crossing position 2048 matches a from-scratch prefill
 (the ring's first eviction); a pattern-shift defect reddens global layers only; **the
 probability-space softcap check exists** — S2 proved argmax-invariance means no greedy gate
@@ -239,7 +254,7 @@ paired-dNLL row whose interval does not straddle zero (or is recorded inconclusi
 | lever | why it is plausibly large | what decides it |
 |---|---|---|
 | **speculative decode (DFlash)** | dense verification reads each weight ONCE per pass, so N accepted tokens **divide weight traffic by N** — on a bandwidth-bound model that is a direct tok/s multiplier; break-even N>1.1 (arch §11), the inverse of GLM's MoE-union economics | port the 2.556 B drafter (separate checkpoint, 5-layer bidirectional cross-attn, borrows embed UNNORMED + lm_head); measure accepted-N on real prompts |
-| **prefetch overlap** | the schedule is perfect (R1), so streamed bytes should hide entirely behind compute until NVMe saturates | measure ms/layer streamed vs pinned at fixed budget; the gap is the unhidden remainder |
+| **prefetch overlap** | the schedule is perfect (R1), so streamed bytes should hide entirely behind compute until NVMe saturates | measure ms/layer streamed vs pinned at fixed budget; the gap is the unhidden remainder. **Raising `GLIMMER_STREAM_SLOTS` above 1 happens HERE and only with the async fill** — the fence itself moved to S3 item 0, since S3 can already violate it |
 | **format per residency class** | P2's hybrid lever, deterministic per budget: resident layers int4 (cheap compute), streamed layers a smaller format (bandwidth-bound side) | decide against P4 FIRST — output would vary across budgets, hybrid's documented defect in milder form; if taken, document as a mode, never a default |
 | **NPU** | dense decode is one long sequential GEMV stream — the NPU-shaped workload; the npu-offload closure is **GLM-scoped by its own `scope:` field** | its own measurement, `scope: glimmer`, using the closure's method |
 | **fusion** (gate into attend, softcap into head GEMV) | one pass over [rows][4096] / 202048 floats each | price AFTER the fixtures exist to catch a fused wrong answer; S2 refused both for exactly that reason |

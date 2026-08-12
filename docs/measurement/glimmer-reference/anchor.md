@@ -220,6 +220,31 @@ reasoning. An operator earns its row when its item lands; until then S2 compares
 enforced from the other side by `tests/glimmer_tolerance.rs`, which fails on a row for an
 unanalysed operator.
 
+**`norm`'s defect set, added 2026-08-12 for S3 item 1 — measured BEFORE the kernel existed.** The
+bucket is exactly the four sandwich norms: **224 tensors = 4 norms x 8 layers x 7 steps**, with
+`final_norm` (7) and `qk_norm` (112) as separate buckets and separate call sites. That separation is
+load-bearing, because **this model carries two norm formulas** — the four sandwich norms are
+CENTERED, `x*(1+w)`, while the final norm and the two weightless norms are plain `x*w` (§4).
+
+| defect | draw 1 | draw 2 | weaker |
+|---|---|---|---|
+| `norm_not_centered` — `x*w` where `x*(1+w)` belongs, i.e. the FORM | 1.139e0 | 1.131e0 | 1.131e0 |
+| `post_norm_eps_shared` — `rms_norm_eps` where `post_norm_eps` belongs | 2.571e−2 | 2.024e−2 | **2.024e−2** |
+
+Floor **7.701e−6**, weakest **2.024e−2**, margin **2,628×** against the 297× a `Rel` policy needs,
+so `Rel(7.70e-5)`.
+
+**Both are counted and neither is excluded — the opposite call to `attend`'s.** There the excluded
+defect was invisible to the kernel *by algebra*. Here the eps defect is 56× weaker than the form
+defect and it is still one this operator is answerable for: the two eps differ by three orders of
+magnitude (1e-5 against 1e-8) and a kernel handed the wrong one computes a genuinely different
+value. It is also the conservative choice, since it is the number that sets the row.
+
+Worth recording for whoever writes the kernel: `norm_not_centered` also moves `qk_norm` (2.434e0 /
+2.201e0), `embed_norm` (1.995e0 / 1.962e0) and `final_norm` (1.738e0 / 1.695e0) — those are
+**downstream contamination, not targeting**, since a contaminated hidden state reaches every later
+norm. Pricing this operator against them would be the leak this file's own tolerance rule forbids.
+
 **`qk_scale_on_k` is excluded from `attend`'s defect set, and the exclusion decided the policy.** It
 moves `attend` by only 6.232e−4, just 38× the floor — under the 297× a `Rel` tolerance needs, so
 counting it would have forced `attend` to `ExactOnly`. It must not: `(s·q)·k` and `q·(s·k)` are the

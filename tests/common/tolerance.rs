@@ -118,8 +118,9 @@ pub const K3: &[Tol] = &[
 /// Muse Glimmer, measured 2026-08-11 on CPU (this reference needs no device), `--mode text`, **both
 /// weight draws**. Re-derive with the two commands in `glimmer-reference/anchor.md`.
 ///
-/// Four rows, one per S2 item that earned one (this doc said "One row, and that is deliberate"
-/// until 2026-08-12 — three items landed rows and left the sentence). Floors are measured for
+/// Five rows, one per item that earned one — four from S2 and `norm` measured for S3 item 1
+/// before its kernel existed (this doc said "One row, and that is deliberate" until 2026-08-12,
+/// having been left behind by three items that landed rows). Floors are measured for
 /// all thirteen buckets and recorded in `anchor.md`, but a floor is half a row — the other half
 /// is deciding which defects TARGET the operator, and that decision is per-kernel work. **Do not
 /// score an operator with no row against a threshold**; compare it exactly.
@@ -204,6 +205,34 @@ pub const GLIMMER: &[Tol] = &[
     // said "the omission is caught structurally" until 2026-08-12; the claim had no referent —
     // `kernel_coverage`'s empty-owners row can only notice a caller APPEARING, never demand one
     // exist.) S4 is where trained logits can price it.
+    // Muse Glimmer's FOUR SANDWICH NORMS, S3 item 1 — and the bucket is exactly them: 224
+    // tensors = 4 norms x 8 layers x 7 steps. `final_norm` (7) and `qk_norm` (112) are their own
+    // buckets and their own call sites, which matters because **this model carries two norm
+    // formulas**: the four sandwich norms are CENTERED, `x*(1+w)`, while the final norm and the
+    // two weightless norms are plain `x*w` (`glimmer-architecture.md` section 4).
+    //
+    // **Measured 2026-08-12, BEFORE the kernel exists** — the S2 discipline, and the only order
+    // in which the number means anything. Both defects that target this operator are counted and
+    // neither is excluded:
+    //
+    // | defect | draw 1 | draw 2 | weaker |
+    // |---|---|---|---|
+    // | `norm_not_centered` — `x*w` for `x*(1+w)`, the form itself | 1.139e0 | 1.131e0 | 1.131e0 |
+    // | `post_norm_eps_shared` — `rms_norm_eps` where `post_norm_eps` belongs | 2.571e-2 | 2.024e-2 | **2.024e-2** |
+    //
+    // The eps defect is the weaker by 56x and it is the one that sets the row. **Counted rather
+    // than excluded, unlike `attend`'s `qk_scale_on_k`**: there the defect was invisible to the
+    // kernel by ALGEBRA — `(s*q).k` and `q.(s*k)` are the same product — whereas the two eps
+    // differ by three orders of magnitude (1e-5 against 1e-8) and a kernel handed the wrong one
+    // computes a genuinely different value. So it is a defect this operator is answerable for.
+    //
+    // Margin 2.024e-2 / 7.701e-6 = **2,628x**, against the 297x a `Rel` policy needs.
+    Tol {
+        operator: "norm",
+        floor: 7.701e-6,
+        weakest_defect: 2.024e-2,
+        policy: Policy::Rel(7.70e-5),
+    },
     Tol {
         operator: "logits",
         floor: 3.520e-6,
