@@ -7,10 +7,25 @@
 //! Provenance is NOT re-checked here. `glimmer_anchor.rs` gates the bytes, their length and their
 //! FNV; a second frozen copy of those numbers agreeing with the first is not a check.
 
-#![allow(dead_code)] // included by `#[path]` into several binaries; each uses part of it
+// Included by `#[path]` into several test binaries, each of which uses PART of this module. Both
+// lints below are per-binary accidents rather than statements about the module: a helper no
+// binary happens to call is dead in that binary, and a re-export no binary happens to name is
+// unused in it.
+#![allow(dead_code, unused_imports)]
 
 #[path = "golden_read.rs"]
 mod golden_read;
+
+// The device helpers, re-exported so a fixture needs ONE `#[path]` include and not three. Rust
+// gives test binaries no way to share a module except by each spelling an include, so every
+// spelling a fixture must repeat is a jscpd clone waiting — this preamble has now been rejected
+// twice, and folding the includes into one is the fix that keeps working as fixtures are added.
+#[path = "mod.rs"]
+mod device;
+pub use device::{back, dev, f32b, f32v, zeros};
+
+#[path = "tolerance.rs"]
+pub mod tolerance;
 pub use golden_read::{float, shape_of};
 
 use serde_json::Value;
@@ -104,7 +119,15 @@ pub fn to_engine(v: &[f32], heads: usize, rows: usize, dim: usize) -> Vec<f32> {
 /// `attn_output.transpose(1, 2)` and is therefore already `[1, rows, heads, dim]` — the engine's
 /// layout. Reading `out` as heads-first transposes a square-ish tensor into fluent nonsense, and
 /// at the tiny widths (6 heads, 12 rows) it does not even fail a shape check by accident.
-pub fn cap(gold: &Golden, name: &str, want: [usize; 4], transpose: bool) -> Vec<f32> {
+pub fn cap(gold: &Golden, name: &str, want: &[usize], transpose: bool) -> Vec<f32> {
+    // `&[usize]` and not `[usize; 4]`: the captures are NOT all four-dimensional. `attend.*` is
+    // `[1, heads, rows, dim]`, but `attn.gate_proj.out` and `attn.o_proj.in_gated` are
+    // `[1, rows, heads*dim]` — three. The fixed-width version made a caller pad with a trailing 1
+    // to typecheck, which asserted a shape the golden never had.
+    assert!(
+        !transpose || want.len() == 4,
+        "{name}: only a 4-D capture has a layout to transpose"
+    );
     let (shape, vals) = float(&gold.g, name);
     assert_eq!(shape, want, "{}: {name} shape", gold.name);
     if transpose {
@@ -213,4 +236,24 @@ pub fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
         .map(|(g, w)| (g - w).abs())
         .fold(0.0, f32::max)
         / scale
+}
+
+/// The `Rel` tolerance for one operator, or a panic saying which of the two ways it was absent.
+///
+/// Every S2 fixture asks for its row through here rather than matching on the policy itself:
+/// three copies of that `match` was a jscpd clone, and — the reason the gate rejects it — three
+/// copies would drift on what `ExactOnly` and `None` mean. They are NOT the same failure.
+/// `ExactOnly` is a decision that the operator cannot be scored under a tolerance at all, and
+/// none of these kernels can honour it (each re-associates or derives a transcendental, so none
+/// will ever be bit-equal with torch). `None` means the row was renamed and the fixture is
+/// scoring against nothing.
+pub fn rel_tolerance(operator: &str) -> f32 {
+    match tolerance::tolerance(tolerance::GLIMMER, operator) {
+        Some(tolerance::Policy::Rel(t)) => *t,
+        Some(tolerance::Policy::ExactOnly) => panic!(
+            "{operator} is ExactOnly, which no S2 kernel can honour — it would have to be \
+             bit-equal with torch. That is a decision about this operator and has to be read."
+        ),
+        None => panic!("tolerance::GLIMMER has no `{operator}` row, so nothing here is scored"),
+    }
 }

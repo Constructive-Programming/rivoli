@@ -50,32 +50,9 @@
 
 use rivoli::backend::hip::{device_sync, launch_rope_interleave, launch_rope_split_half};
 
-mod common;
-use common::{back, dev, f32b, f32v};
-
-#[path = "common/tolerance.rs"]
-mod tolerance;
-
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
-use fixture::{Golden, cap, each_case, goldens, present, worst_rel};
-
-/// `tolerance::GLIMMER`'s `rope` row, measured 2026-08-12 before this fixture ran — floor
-/// 4.773e-6, weakest targeting defect 1.811e0, `Rel(4.77e-5)`. Same metric as everywhere else in
-/// the port: `max|Δ| / max|reference|`.
-fn rope_tol() -> f32 {
-    match tolerance::tolerance(tolerance::GLIMMER, "rope") {
-        Some(tolerance::Policy::Rel(t)) => *t,
-        // The kernel computes `cos`/`sin` from `pow` in double and rounds to f32, while the
-        // reference builds a table in torch. Those cannot be bit-equal, so an exact-only policy
-        // here would not be a stricter version of this test — it would be an unpassable one.
-        Some(tolerance::Policy::ExactOnly) => panic!(
-            "rope is ExactOnly, which this kernel cannot honour: it derives cos/sin itself rather \
-             than reading the reference's table"
-        ),
-        None => panic!("tolerance::GLIMMER has no `rope` row, so nothing here is scored"),
-    }
-}
+use fixture::{Golden, back, cap, dev, each_case, f32b, f32v, goldens, present, worst_rel};
 
 /// Glimmer's rope theta. The REAL value at the tiny widths — the anchor keeps it rather than
 /// shrinking it, because a wrong theta is fluent and a small one hides the long-context arg
@@ -190,10 +167,10 @@ fn score(conv: Conv, permute_first: bool, both_tensors: bool) -> (f32, f32, usiz
             let pre = cap(
                 gold,
                 &format!("{p}.{what}.pre_rope"),
-                [1, heads, tq, d],
+                &[1, heads, tq, d],
                 true,
             );
-            let want = cap(gold, &format!("{p}.{what}.roped"), [1, heads, tq, d], true);
+            let want = cap(gold, &format!("{p}.{what}.roped"), &[1, heads, tq, d], true);
             let input = if permute_first {
                 permute(&pre, heads, d, false)
             } else {
@@ -218,7 +195,7 @@ fn score(conv: Conv, permute_first: bool, both_tensors: bool) -> (f32, f32, usiz
 /// because that is what Glimmer's `apply_rotary_pos_emb` pairs.
 #[test]
 fn the_split_half_kernel_computes_glimmers_rope() {
-    let tol = rope_tol();
+    let tol = fixture::rel_tolerance("rope");
     let (worst, _, cases) = score(Conv::SplitHalf, false, true);
     println!("split-half: worst rel over {cases} cases: {worst:e} against tol {tol:e}");
     assert!(
@@ -235,7 +212,7 @@ fn the_split_half_kernel_computes_glimmers_rope() {
 /// is a trap this fixture does not catch, and taking the maximum would hide exactly that.
 #[test]
 fn the_interleaved_kernel_on_the_same_input_is_caught() {
-    let tol = rope_tol();
+    let tol = fixture::rel_tolerance("rope");
     let (_, weakest, cases) = score(Conv::Interleaved, false, false);
     println!("trap 9: weakest signal over {cases} cases: {weakest:e} against tol {tol:e}");
     assert!(
@@ -253,7 +230,7 @@ fn the_interleaved_kernel_on_the_same_input_is_caught() {
 /// converter route works, already run. `glimmer-architecture.md` §6 carries the trade.
 #[test]
 fn the_declined_permutation_route_computes_the_same_thing() {
-    let tol = rope_tol();
+    let tol = fixture::rel_tolerance("rope");
     let (worst, _, cases) = score(Conv::Interleaved, true, false);
     println!("permutation route: worst rel over {cases} cases: {worst:e}");
     assert!(

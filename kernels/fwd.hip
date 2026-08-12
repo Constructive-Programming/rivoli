@@ -89,6 +89,36 @@ extern "C" __global__ void vadd(float* __restrict__ x, const float* __restrict__
     if (i < n) x[i] += y[i];
 }
 
+// x[i] *= sigmoid(g[i])  — Muse Glimmer's attention output gate, S2 item 3 of
+// docs/investigations/glimmer-port.md. `x` is the attend output flattened to
+// [rows][n_heads*head_dim] and `g` is `gate_proj(h)` at the same width; the product runs
+// BEFORE `o_proj` (glimmer-architecture.md §4 item 3, M:369).
+//
+// **`g` IS NOT DERIVED FROM `x`, and that is the whole trap.** `gate_proj` consumes the LAYER
+// INPUT — the post-`input_layernorm` activation — not the attention output. A port that gates on
+// `x` has the right shapes, the right tensor and the wrong model (§9 trap 4). Nothing about this
+// kernel can enforce that; it takes two pointers and multiplies. What holds the caller to it is
+// `tests/glimmer_gate.rs`, which feeds the golden's own `attn.gate_proj.out` and compares against
+// `attn.o_proj.in_gated` — two captures the anchor deliberately keeps apart for this reason.
+//
+// A separate launch rather than folded into `gqa_attend`'s output write. Folding saves one pass
+// over [rows][4096] and is an optimisation with no measurement behind it; it would also put a
+// second operand inside a kernel currently gated as pure attention, so its fixture would stop
+// meaning "the attention is right". S5 prices the fusion if it is worth anything.
+//
+// Not `swiglu`: that is `silu(g)*u` = `g*sigmoid(g)*u`, which carries an extra factor of `g`.
+// The two are one `* g` apart and neither is spellable as the other.
+extern "C" __global__ void sigmoid_gate(
+    float* __restrict__ x, const float* __restrict__ g, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // `1/(1+exp(-v))` rather than a `tanh`-based form: it is what `torch.sigmoid` computes, and
+    // the reference applies it in fp32 exactly here. **`expf`, not `__expf`** — the fast
+    // intrinsic is a different function with its own error, and taking it here would price the
+    // gate's tolerance against an approximation nobody measured. It is an S5 option, not a
+    // correctness-stage default.
+    if (i < n) x[i] *= 1.0f / (1.0f + expf(-g[i]));
+}
+
 // Greedy argmax over `logits[0..n]`, reproducing the host fold in gpu.rs::argmax
 // EXACTLY: best=0, bv=-inf; for i: if logits[i] > bv { bv=logits[i]; best=i }. The
 // combine below is associative + commutative and yields the SAME result set as
@@ -172,6 +202,14 @@ extern "C" int rivoli_vadd(float* x, const float* y, int n) {
     if (n <= 0) return 1001;
     hipGetLastError();
     hipLaunchKernelGGL(vadd, dim3((n + 255) / 256), dim3(256), 0, 0, x, y, n);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+extern "C" int rivoli_sigmoid_gate(float* x, const float* g, int n) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(sigmoid_gate, dim3((n + 255) / 256), dim3(256), 0, 0, x, g, n);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

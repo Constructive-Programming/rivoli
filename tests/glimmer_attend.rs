@@ -26,55 +26,21 @@
 //! **The tolerance is not bit-exactness and cannot be.** The kernel reduces the score with
 //! `__shfl_down` in a ladder; torch sums sequentially. The bar is `tolerance::GLIMMER`'s `attend`
 //! row — `Rel(1.64e-4)` over a floor measured at double precision BEFORE this kernel existed — and
-//! the metric is that row's metric, `max|Δ| / max|reference|`. See `attend_tol()`.
+//! the metric is that row's metric, `max|Δ| / max|reference|`. See `fixture::rel_tolerance("attend")`.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
 use rivoli::backend::hip::{device_sync, launch_gqa_attend};
-
-mod common;
-use common::{back, dev, f32b, f32v, zeros};
-
-#[path = "common/tolerance.rs"]
-mod tolerance;
 
 // The goldens, their config and the shapes every S2 fixture reads them in live in
 // `common/glimmer_fixture.rs` — `glimmer_rope.rs` needs the same six things, and jscpd rejects
 // a second copy at 15 tokens. What stays here is what is specific to scoring THIS kernel.
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
-use fixture::{Golden, cap, cap_rows, each_case, expected, float, present, worst_rel};
-
-/// The bar this kernel is scored against, **measured before it existed**.
-///
-/// `tolerance::GLIMMER`'s `attend` row: floor `1.639e-5`, weakest targeting defect `2.086e0`,
-/// `Rel(1.64e-4)`. Not a number this file chose — a number chosen after seeing a kernel's output is
-/// not a measurement, and the whole apparatus (`--dtype float64`, `--by-operator`, the two-draw
-/// max, the `qk_scale_on_k` exclusion) exists so that this one is. `tests/glimmer_tolerance.rs`
-/// gates the row itself; this file only asks it for the value.
-///
-/// **The metric here is the row's metric, exactly.** `Policy::Rel` is defined as
-/// `max|a-b| / max|b|`, which is what `glimmer_anchor_driver.py::by_operator` computes to produce
-/// the floor — so the number this file measures and the number the floor was measured with are the
-/// same quantity. An earlier revision of this file scored an ABSOLUTE difference against a bar it
-/// invented, which was defensible in isolation and incomparable to everything else in the port.
-fn attend_tol() -> f32 {
-    match tolerance::tolerance(tolerance::GLIMMER, "attend") {
-        Some(tolerance::Policy::Rel(t)) => *t,
-        // `ExactOnly` would be a real answer — it is `mla`'s on the K3 table — and this kernel
-        // cannot honour it: it re-associates the score reduction by construction. If the row ever
-        // becomes exact-only, that is a decision about THIS kernel and it has to be read, not
-        // silently reinterpreted as some default.
-        Some(tolerance::Policy::ExactOnly) => {
-            panic!(
-                "attend's policy is now ExactOnly, which this fixture cannot honour: the kernel \
-                    re-associates its score reduction by construction, so it cannot be bit-exact \
-                    with the reference. That is a decision about THIS kernel and has to be read."
-            )
-        }
-        None => panic!("tolerance::GLIMMER has no `attend` row, so nothing here is scored at all"),
-    }
-}
+use fixture::{
+    Golden, back, cap, cap_rows, dev, each_case, expected, f32b, f32v, float, present, worst_rel,
+    zeros,
+};
 
 // What this kernel actually measures against that bar, recorded 2026-08-12 so a future change
 // that moves it is visible as a change rather than as a still-passing test:
@@ -223,20 +189,20 @@ fn fixture(gold: &Golden, t: usize, l: usize, win: usize) -> Fixture {
         )
     });
     Fixture {
-        q: cap(gold, &format!("{p}.attend.q"), [1, hq, tq, d], true),
+        q: cap(gold, &format!("{p}.attend.q"), &[1, hq, tq, d], true),
         k: cap(
             gold,
             &format!("{p}.attend.k_cache"),
-            [1, hkv, rows, d],
+            &[1, hkv, rows, d],
             true,
         ),
         v: cap(
             gold,
             &format!("{p}.attend.v_cache"),
-            [1, hkv, rows, d],
+            &[1, hkv, rows, d],
             true,
         ),
-        want: cap(gold, &format!("{p}.attend.out"), [1, tq, hq, d], false),
+        want: cap(gold, &format!("{p}.attend.out"), &[1, tq, hq, d], false),
         dims: (hq, hkv, d),
         geom: (tq, start_pos - kv_offset, win),
         kv_offset,
@@ -272,7 +238,7 @@ impl Fixture {
 /// > `expected()` below now derives it rather than restating it.
 #[test]
 fn the_kernel_matches_the_anchor_at_every_layer_and_step() {
-    let tol = attend_tol();
+    let tol = fixture::rel_tolerance("attend");
     let mut worst: f32 = 0.0;
     let mut cases = 0;
     each_case(|gold, t, l, win| {
@@ -371,7 +337,7 @@ fn the_derived_bound_reproduces_the_captured_mask() {
 /// claim.
 #[test]
 fn the_goldens_separate_the_two_kv_broadcast_mappings() {
-    let tol = attend_tol();
+    let tol = fixture::rel_tolerance("attend");
     let (mut separated, mut worst, mut sep_min) = (0, 0.0f32, f32::INFINITY);
     each_case(|gold, t, l, win| {
         let (hq, hkv, _) = gold.dims();
@@ -416,7 +382,7 @@ fn the_goldens_separate_the_two_kv_broadcast_mappings() {
 /// two runs differ in nothing but the indexing.
 #[test]
 fn a_ring_cache_attends_the_same_rows_as_a_linear_one() {
-    let tol = attend_tol();
+    let tol = fixture::rel_tolerance("attend");
     let (mut ran, mut worst) = (0, 0.0f32);
     each_case(|gold, t, l, win| {
         // Only meaningful on a sliding layer, and only once the ring has wrapped. `tq != 1` is
@@ -652,7 +618,7 @@ fn the_accumulator_holds_at_widths_no_golden_reaches() {
         // correct kernel over `attend`'s tolerance, the honest response is to record the width
         // dependence in the row, not to widen the bar locally for the widths nobody measured.
         assert!(
-            r <= attend_tol(),
+            r <= fixture::rel_tolerance("attend"),
             "d {d}, tq {tq}, win {win}: worst rel {r:e}"
         );
         ran += 1;

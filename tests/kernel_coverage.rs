@@ -378,6 +378,8 @@ const OWNERS: &[(&str, &[&str])] = &[
     // Muse Glimmer's rotation convention. Empty for the same reason `gqa_attend` is: S2 gates
     // each kernel against the S1b goldens before S3 writes the layer loop that calls it.
     ("rope_split_half", &[]),
+    // Muse Glimmer's attention output gate. Empty for the same reason as its two siblings.
+    ("sigmoid_gate", &[]),
     ("swiglu", &["gpu.rs", "f4gpu.rs"]),
     ("swiglu_clamped_bf16", &[]),
     ("vadd", &["gpu.rs"]),

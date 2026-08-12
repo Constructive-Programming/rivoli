@@ -168,6 +168,22 @@ pub const GLIMMER: &[Tol] = &[
         weakest_defect: 1.811e0,
         policy: Policy::Rel(4.77e-5),
     },
+    // The attention output gate, S2 item 3. The bucket is `o_proj` because that is where
+    // `--by-operator` files `attn.o_proj.in_gated` — the gated value BEFORE the projection, which
+    // is exactly what the gate kernel produces and what its fixture compares.
+    //
+    // **One defect targets it: `gate_disabled`** (the gate saturated to sigmoid(20) ~ 1), at
+    // 3.759e0 / 3.688e0 by draw, so the weaker is below. Everything upstream also moves `o_proj` —
+    // it is late in the layer — but a defect that reaches it by leaking downstream is not what
+    // this operator's tolerance is for, which is the same rule `attend`'s row states.
+    //
+    // Floor 8.293e-6 from `anchor.md`, max over both draws. Margin 444,700x.
+    Tol {
+        operator: "o_proj",
+        floor: 8.293e-6,
+        weakest_defect: 3.688e0,
+        policy: Policy::Rel(8.29e-5),
+    },
 ];
 
 /// The tolerance for one operator in one model's table, or `None` if that table does not cover it.

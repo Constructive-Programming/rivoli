@@ -813,6 +813,37 @@ launchers! {
     ///
     /// # Safety
     /// `base` is a device buffer of `count·stride` f32, live until the next [`device_sync`].
+    /// `x[i] *= sigmoid(g[i])` — Muse Glimmer's attention output gate, applied between the
+    /// attend and `o_proj`.
+    ///
+    /// **`g` must be `gate_proj(LAYER INPUT)`, not anything derived from `x`.** The reference
+    /// computes the gate from the post-`input_layernorm` activation (`glimmer-architecture.md`
+    /// §4 item 3); gating on the attention output has the right shapes and the wrong model, and
+    /// no signature can prevent it — `tests/glimmer_gate.rs` is what holds a caller to it.
+    ///
+    /// Not [`launch_swiglu`]: that is `silu(g)*u`, which carries an extra factor of `g`.
+    ///
+    /// # Safety
+    /// `x` is `n` writable f32 and `g` is `n` readable f32, both live until the next
+    /// [`device_sync`], and they must not alias — both are `__restrict__`.
+    launch_sigmoid_gate -> rivoli_sigmoid_gate, "sigmoid_gate" (
+        x: *mut f32,
+        g: *const f32,
+        n: usize as i32,
+    );
+
+    /// Split-half RoPE in place — transformers' `rotate_half`, where the pair is
+    /// `(x[j], x[j+seg/2])` rather than two adjacent elements. Muse Glimmer's convention.
+    ///
+    /// **Same arithmetic as [`launch_rope_interleave`], different pairing, and the two are NOT
+    /// interchangeable.** Applying one where the other is meant produces fluent wrong text and no
+    /// error — `glimmer-architecture.md` §9 trap 9. They are separate entry points rather than one
+    /// with a flag precisely so a GLM or V4 call site cannot reach this convention by changing an
+    /// argument; `kernels/linalg.hip` carries the argument, and `swiglu`/`swiglu_clamped_bf16` is
+    /// the precedent.
+    ///
+    /// # Safety
+    /// `base` is a device buffer of `count·stride` f32, live until the next [`device_sync`].
     launch_rope_split_half -> rivoli_rope_split_half, "rope_split_half" (
         base: *mut f32,
         count: usize as i32,
