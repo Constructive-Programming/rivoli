@@ -776,6 +776,38 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// **SiTU-GLU over a gate/up pair — Kimi-K3's activation**, `k3-architecture.md` §8:
+    /// `y = (b1·tanh(g/b1)·sigmoid(g)) · (b2·tanh(u/b2))`, so `|y| <= b1·b2` (100 at the shipped
+    /// 4 and 25). The arithmetic is `kernels/common.hpp::situ_glu` and is argued there.
+    ///
+    /// **Not [`launch_swiglu_clamped_bf16`] with different constants.** The sigmoid takes the
+    /// UNCAPPED gate, `up` is transformed rather than clamped, neither operand is bf16-rounded,
+    /// and the store is f32. Merging the two behind a parameter is the refactor `common.hpp`
+    /// warns against for `swiglu`/`swiglu_clamped` — the same hazard, one model over.
+    ///
+    /// **This is the DENSE path only** — layer 0's MLP and the shared MLP. The routed experts
+    /// fuse the same helper inside `moe.hip`'s fp4 expert kernel and never come through here, so
+    /// a change made here alone leaves every routed expert wrong (plan §3b).
+    ///
+    /// Both betas must be finite and positive; `<= 0`, NaN and `+/-inf` are refused (1006, the
+    /// same code the `swiglu_limit` guards return for the same shape of check). A zero or NaN
+    /// beta does not degrade gracefully — it makes `tanh(x/b)` saturate or go NaN for every
+    /// element, which no magnitude check on the output would catch.
+    ///
+    /// # Safety
+    /// `g`, `u` and `h` are each `n` f32 and must outlive `stream`'s completion. `h` may alias
+    /// `g` or `u` — every thread reads both, then writes once, and that write depends on both
+    /// reads. `stream` is a live `hipStream_t`, or null for the default stream.
+    launch_situ_glu_f32 -> rivoli_situ_glu_f32, "situ_glu_f32" (
+        g: *const f32,
+        u: *const f32,
+        n: usize as i32,
+        b1: f32,
+        b2: f32,
+        h: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// RMSNorm `y = x·rsqrt(mean(x²)+eps)·w`.
     ///
     /// # Safety

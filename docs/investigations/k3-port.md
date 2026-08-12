@@ -736,7 +736,41 @@ model is stored in — is answered above: none.)*
    `moe_infer`'s return, which is a method call rather than a module call, so no forward hook could
    see it — the fourth instance of the pattern `anchor.md` now states as a rule. `wrap_latent_sandwich`
    captures the aggregate and the norm weight by pre-hook; goldens re-vendored at **272** tensors.
-4. **SiTU-GLU + fp4 MoE** — §3b.
+4. **SiTU-GLU + fp4 MoE** — §3b. **Half done 2026-08-12: 4a (the activation) is DONE and G2-clean;
+   4b (the fused fp4 expert variant) is NOT started.** The split is §3b's own: the activation has
+   two call sites, `linalg.hip` for the dense layer 0 and the shared MLP, and `moe.hip` fused inside
+   the fp4 expert kernel because there is no separate activation launch on the `.f4` path.
+
+   **4a — `common.hpp::situ_glu` + `linalg.hip::situ_glu_f32`.** The helper lives in `common.hpp`
+   for `swiglu_clamped`'s own reason: the two call sites must agree bit for bit and `kernels/` is
+   not scanned by jscpd, so a second copy would drift unseen. Scored by `tests/k3_kernels.rs`
+   against all six captured MLPs of both draws — worst **1.454e-7**, against a 9.4e-6 tolerance at
+   layer 0's dense MLP. Red-proved five ways (capped sigmoid, betas swapped, `up` clamped instead of
+   `tanh`'d, plain silu, guard removed), plus real widths, the `|y| <= b1·b2 = 100` bound §8 states,
+   and a beta-guard test — the first refusal-code test in this file, the other three items having
+   left theirs untested and said so.
+
+   **The fixture needed NO regeneration, and that is worth recording.** `SituAndMul` is an
+   `nn.Module`, so `hook_model` had been capturing its output as `<mlp>.act_fn` all along, and its
+   input is `torch.cat([gate_proj(x), up_proj(x)])` — both halves separately captured. Four items in
+   a row found the anchor could not score their operator; the fifth found it already could. Checking
+   what is in the file is cheaper than a 25-minute GPU-locked regeneration.
+
+   **Two limits found while scoring it, both recorded at the tests:**
+   * `operator_of` buckets the shared experts as **`moe_route`**, the ROUTER's tolerance, because
+     the name prefix does not separate them. A classification artifact, not a judgement; the fix
+     belongs with item 6, the other occupant.
+   * At those shared experts the capped-sigmoid defect separates by only **4.10e-3 against
+     `moe_route`'s 6.0e-4 — 6.8x**, under the 30x `DEFECT_MARGIN` the table requires of a `Rel`
+     policy. So **the bucket tolerance could not be relied on to catch that defect there**; the
+     fixture's own tripwire catches it by 2,800x. True at the old 2.5e-4 too (16x), so it is a
+     property of the shared expert's small `moe_intermediate_size`, not of this round's loosening.
+
+   **4b, still owed:** a `moe_gateup_f4` variant with `situ_glu` fused in place of
+   `swiglu_clamped`, and no `swiglu_limit`. The routed experts have **no anchor fixture and cannot
+   get one** — `.experts` is unhooked on purpose because which expert fires is routing-dependent —
+   so 4b must be scored against a host oracle composed of the fp4 unpack (anchored on real bytes by
+   `repack-one-expert.md`) and the activation 4a has now pinned against the reference.
 5. **KDA** — the new family and the bulk of the stage. **Decompose into units with their own
    G2 sub-gates.** Heads are independent and head-parallel is bit-identical in the reference,
    so one block per head maps directly; `S` is 64 KB/head and will not sit in LDS, so **fusing

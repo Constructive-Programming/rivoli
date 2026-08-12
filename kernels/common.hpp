@@ -188,6 +188,50 @@ __device__ __forceinline__ float swiglu_clamped(float g, float u, float limit) {
     return gt * (1.0f / (1.0f + expf(-gt))) * ut;
 }
 
+// **SiTU-GLU — Kimi-K3's activation**, `k3-architecture.md` §8 and the reference's
+// `SituAndMul.forward`:
+//
+//     a = b1 · tanh(gate / b1) · sigmoid(gate)      b1 = activation_situ_beta        = 4
+//     u = b2 · tanh(up   / b2)                      b2 = activation_situ_linear_beta = 25
+//     y = a · u                                     so |y| <= b1·b2 = 100
+//
+// USED BY: Kimi-K3 only, and by all three of its MLP shapes — the dense layer 0, the shared
+// MLP, and every routed expert. GLM-5.2 and DeepSeek-V4-Flash use `swiglu_clamped` above and
+// never reach this.
+//
+// It lives HERE, next to `swiglu_clamped`, for that helper's own reason: `linalg.hip`'s dense
+// launcher and `moe.hip`'s fused fp4 expert kernel must run the identical arithmetic, and
+// `kernels/` is not watched by `build.rs`'s jscpd gate, so a second copy would drift in
+// silence. The plan says the same thing from the other end — "an implementer who changes
+// `linalg.hip` alone watches the dense path go right and every routed expert stay wrong".
+//
+// **It is NOT `swiglu_clamped` with different constants, and the merge that parameterises one
+// into the other must never happen** — the identical hazard that entry already carries. Four
+// differences, each of which is a defect a fixture can name:
+//
+//  1. **The sigmoid takes the UNCAPPED gate.** `tanh(g/b1)` bounds the first factor and
+//     `sigmoid(g)` is handed the raw dot, so the two factors saturate at different rates.
+//     Feeding the capped value to the sigmoid is smooth, plausible and wrong everywhere the
+//     gate is large.
+//  2. **`up` is transformed, not clamped.** `b2·tanh(up/b2)` saturates smoothly; a clamp is
+//     piecewise-linear with a corner. They agree only near zero.
+//  3. **Neither operand is bf16-rounded here.** `swiglu_clamped` rounds first because V4's
+//     `Expert.forward` reads its operands back from a bf16 `Linear` store explicitly. K3's
+//     `SituAndMul` does `.to(torch.float32)`, which is a widening no-op — whatever rounding
+//     the real model does happened at the projection, and rivoli's trunk carries f32
+//     activations throughout. Rounding here would be a step the reference does not take.
+//  4. **The product is returned UNROUNDED**, matching `swiglu_clamped` point 4 and for the
+//     same reason: the fp4 caller folds the routing weight in and rounds `bf16(y·w)` where
+//     the reference rounds, while the dense and shared callers have no routing weight.
+//
+// `1.0f/(1.0f+expf(-g))` and not a multiply form: `torch.sigmoid` is the division form, and
+// unlike `F.silu` there is no `x·sigmoid(x)` idiom here to match — the sigmoid's argument is
+// not the factor it multiplies.
+__device__ __forceinline__ float situ_glu(float g, float u, float b1, float b2) {
+    const float a = b1 * tanhf(g / b1) * (1.0f / (1.0f + expf(-g)));
+    return a * (b2 * tanhf(u / b2));
+}
+
 // fp8-e4m3 → f32 (matches math.rs::e4m3_to_f32). 1 sign / 4 exp (bias 7) / 3 mant;
 // exp==0 subnormal = sign·(m/8)·2^-6; (exp==15, mant==7) = NaN.
 __device__ __forceinline__ float e4m3f(unsigned char b) {

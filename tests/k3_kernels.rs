@@ -41,7 +41,7 @@
 
 use rivoli::backend::hip::{
     launch_attn_res, launch_gemm_bf16, launch_mha_attend, launch_rmsnorm_batch,
-    launch_rmsnorm_single, launch_sigmoid_gate,
+    launch_rmsnorm_single, launch_sigmoid_gate, launch_situ_glu_f32,
 };
 use rivoli::v4oracle::golden::GoldenSet;
 
@@ -253,6 +253,31 @@ impl Attend {
     }
 }
 
+/// **The regression tripwire every item in this file carries, in one place.**
+///
+/// `k3_tolerance`'s operator tolerances are WHOLE-MODEL floors: they were measured on fp32-vs-fp64
+/// runs carrying upstream drift, while these fixtures hand each kernel the reference's OWN inputs.
+/// Every kernel here therefore lands one to three orders under its tolerance — and against the
+/// tolerance alone, a change that degraded a kernel by two orders would pass in silence. So each
+/// site also pins the worst it actually measures and gets 10x of room: close enough to catch a
+/// regression, far enough not to fire on a reassociated sum.
+///
+/// **The tolerance is still the contract.** This is not a second one; it is a smoke alarm on a
+/// number that has no business moving. Moving a constant is allowed and re-measuring is how — what
+/// is not allowed is loosening one to make a red run green without knowing why it moved.
+///
+/// One function rather than four copies. jscpd rejected the fourth at 135 tokens, which is the gate
+/// noticing that four sites were making the same argument in the same words; the better shape is
+/// that they can no longer disagree about what the tripwire means.
+fn tripwire(r: f32, observed_worst: f32, tol: f32, at: &str) {
+    assert!(
+        r <= observed_worst * 10.0,
+        "{at}: {r:e} is far above the {observed_worst:e} this kernel achieves. Still inside the \
+         {tol:e} operator tolerance, so this is a REGRESSION tripwire — re-measure and move the \
+         constant only if the new value is defensible."
+    );
+}
+
 fn rel(a: &[f32], b: &[f32]) -> f32 {
     // **Non-finite is INFINITY, not zero, and this is the most important line in the file.**
     //
@@ -385,21 +410,8 @@ fn attn_res_matches_the_anchor_at_every_fold() {
         // turned out to be draw 1's alone. The kernel's own 3.08e-7 did not move — only what it is
         // being compared against did, which is exactly why the tripwire below is the real gate.)*
         //
-        // The tolerance is still the contract — it is what S3 will need once upstream drift is
-        // real. But against it alone, a change that degraded this kernel by two orders of
-        // magnitude would pass in silence. 10x the observed worst is close enough to catch that
-        // and far enough not to fire on a reassociated sum.
-        const OBSERVED_WORST: f32 = 3.08e-7;
-        assert!(
-            r <= OBSERVED_WORST * 10.0,
-            "{} {}: {r:e} is far above the {:e} this kernel actually achieves. Still inside the \
-             {:e} operator tolerance, so this is a REGRESSION tripwire, not a correctness \
-             failure — if the new value is defensible, re-measure and move the constant.",
-            f.salt,
-            f.tag,
-            OBSERVED_WORST,
-            f.tol
-        );
+        // The generic half of this argument now lives on `tripwire`, which all four items call.
+        tripwire(r, 3.08e-7, f.tol, &format!("{} {}", f.salt, f.tag));
         assert!(
             r <= f.tol,
             "{} {}: relative difference {r:e} exceeds the measured tolerance {:e} (nsrc={}, \
@@ -832,13 +844,7 @@ fn mha_attend_matches_the_anchor() {
         // whole-model floor carrying upstream drift, so against it alone a two-order degradation
         // in this kernel passes in silence. Measured worst over both draws and all three MLA
         // layers, then given 10x of room.
-        const MLA_OBSERVED_WORST: f32 = 2.0e-7;
-        assert!(
-            r <= MLA_OBSERVED_WORST * 10.0,
-            "{salt} layer {layer}: {r:e} is far above the {MLA_OBSERVED_WORST:e} this kernel \
-             achieves. Still inside the {tol:e} operator tolerance, so this is a REGRESSION \
-             tripwire — re-measure and move the constant only if the new value is defensible."
-        );
+        tripwire(r, 2.0e-7, tol, &format!("{salt} layer {layer}"));
         assert!(
             r <= tol,
             "{salt} layer {layer}: {r:e} exceeds {tol:e} at {:?}",
@@ -1195,13 +1201,7 @@ fn the_latent_norm_matches_the_anchor_at_every_moe_layer() {
         // aggregate, this kernel does far better, and against `tol` alone a THREE-order degradation
         // would pass in silence — `tol` is 6.3e-4 and this kernel lands at 1.3e-7. Measured worst
         // over both draws and all five layers, then 10x. Three of the ten cells are BIT-EXACT.
-        const OBSERVED_WORST: f32 = 1.307e-7;
-        assert!(
-            r <= OBSERVED_WORST * 10.0,
-            "{salt} layer {layer}: {r:e} is far above the {OBSERVED_WORST:e} this kernel achieves. \
-             Still inside the {tol:e} operator tolerance, so this is a REGRESSION tripwire — \
-             re-measure and move the constant only if the new value is defensible."
-        );
+        tripwire(r, 1.307e-7, tol, &format!("{salt} layer {layer}"));
     });
 }
 
@@ -1352,4 +1352,274 @@ fn norming_after_the_up_projection_is_a_different_sandwich() {
         "norming after the up projection moved the output by only {moved:e}, so the two orders are \
          not separated here and the agreement above proves nothing"
     );
+}
+
+// ============================== S2 item 4a — SiTU-GLU ==============================
+//
+// **The first item whose fixture needed no regeneration.** `SituAndMul` is an `nn.Module`, so
+// `hook_model` was already capturing its output as `<mlp>.act_fn`, and its input is
+// `torch.cat([gate_proj(x), up_proj(x)])` — both halves separately captured. Inputs and output were
+// in the file all along. Recorded because the four items before this one each found the opposite,
+// and "check what is already there" is cheaper than a 25-minute GPU-locked regeneration.
+
+/// Every MLP the anchor captures that runs SiTU-GLU, as `(layer, module)`.
+///
+/// Layer 0's is the DENSE one — `first_k_dense_replace` is 1, so it is the only `mlp` in the file —
+/// and the other five are the shared experts, which every MoE layer has. **The routed experts are
+/// deliberately absent and cannot be added**: `moe_infer` calls only the experts that won tokens, so
+/// which expert modules fire is routing-dependent and any defect that moved the routing would
+/// change the golden's tensor SET rather than its numbers. That is the gap `k3-port.md` item 4b
+/// closes a different way — the fp4 kernel is scored against a host oracle, not against this file.
+/// **The third field is the tolerance bucket, and it is NOT the same for all six.**
+/// `k3_anchor_driver.py::operator_of` buckets `model.layers.N.mlp.*` as `dense_mlp` and everything
+/// under `block_sparse_moe` that is not `routed_expert*` as `moe_route` — so the shared experts are
+/// scored against the ROUTER's tolerance. That is a classification artifact rather than a judgement:
+/// the shared expert is an MLP and the router is a router, and they share a bucket only because the
+/// name prefix does not separate them. Flagged rather than worked around, because the fix belongs
+/// with item 6 (the router), which is the other occupant. Scoring all six against `dense_mlp`'s
+/// tighter 9.4e-6 would pass — this fixture lands two orders under either — but it would be
+/// asserting a bar the anchor does not set for five of them.
+const SITU_MLPS: [(usize, &str, &str); 6] = [
+    (0, "mlp", "dense_mlp"),
+    (1, "block_sparse_moe.shared_experts", "moe_route"),
+    (3, "block_sparse_moe.shared_experts", "moe_route"),
+    (12, "block_sparse_moe.shared_experts", "moe_route"),
+    (91, "block_sparse_moe.shared_experts", "moe_route"),
+    (92, "block_sparse_moe.shared_experts", "moe_route"),
+];
+
+/// The worst relative difference `situ_glu_f32` shows against the anchor, over both draws and all
+/// six MLPs: salt 2, layer 12. Named rather than inlined because two tests need it — the fixture
+/// as its tripwire, and the defect run as the bar a defect has to clear.
+const SITU_OBSERVED_WORST: f32 = 1.454e-7;
+
+/// The two SiTU betas, read off the golden's own `tiny_config`.
+///
+/// Not literals. `k3_anchor.rs::the_tiny_configs_kept_the_real_structure` pins both against the real
+/// checkpoint's — they are in `STRUCTURAL`, so the tiny config cannot have shrunk them — and a
+/// fixture that hardcoded 4 and 25 would agree with itself if either ever moved. The second key is
+/// `activation_situ_linear_beta`; abbreviating it to `activation_linear_beta` is a mistake this port
+/// has already made once, in `S1a`, where it would have refused every real checkpoint.
+fn betas(g: &GoldenSet) -> (f32, f32) {
+    let c: serde_json::Value =
+        serde_json::from_str(g.meta_get("tiny_config").expect("tiny_config")).unwrap();
+    let f = |k: &str| c[k].as_f64().unwrap_or_else(|| panic!("{k} missing")) as f32;
+    (f("activation_situ_beta"), f("activation_situ_linear_beta"))
+}
+
+/// One MLP's activation boundary: the two projections in, what `SituAndMul` made of them.
+struct Situ {
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    want: Vec<f32>,
+}
+
+fn situ(g: &GoldenSet, layer: usize, module: &str) -> Situ {
+    let m = format!("model.layers.{layer}.{module}");
+    let (gs, gate) = float(g, &format!("{m}.gate_proj"));
+    let (us, up) = float(g, &format!("{m}.up_proj"));
+    let (os, want) = float(g, &format!("{m}.act_fn"));
+    assert_eq!(gs, us, "{m}: the two projections are the same width");
+    assert_eq!(
+        os, gs,
+        "{m}: SiTU-GLU is width-preserving over one half of its input"
+    );
+    let [gate, up, want] = [gate, up, want].map(<[f32]>::to_vec);
+    Situ { gate, up, want }
+}
+
+fn for_each_situ(mut f: impl FnMut(&str, usize, f32, (f32, f32), Situ)) {
+    for (salt, bytes) in GOLDENS {
+        let g = load(bytes);
+        let b = betas(&g);
+        for (layer, module, operator) in SITU_MLPS {
+            f(
+                salt,
+                layer,
+                k3_tolerance::rel_tolerance(operator),
+                b,
+                situ(&g, layer, module),
+            );
+        }
+    }
+}
+
+/// `SituAndMul.forward` in f64 — `(b1·tanh(g/b1)·sigmoid(g)) · (b2·tanh(u/b2))`.
+///
+/// The sigmoid takes `g`, NOT `b1·tanh(g/b1)`: the two factors saturate at different rates and
+/// feeding the capped value to the sigmoid is the smooth, plausible, wrong version. `situ_glu_gets`
+/// -`_the_uncapped_gate` is the run that prices it.
+fn host_situ(s: &Situ, b1: f32, b2: f32, capped_sigmoid: bool) -> Vec<f32> {
+    let (b1, b2) = (f64::from(b1), f64::from(b2));
+    s.gate
+        .iter()
+        .zip(&s.up)
+        .map(|(&g, &u)| {
+            let (g, u) = (f64::from(g), f64::from(u));
+            let t = b1 * (g / b1).tanh();
+            // The ONE flag, and it is the defect. `host_fold` one operator up takes its
+            // `normalised` the same way and for the same reason: a defect run is the correct
+            // oracle with one thing changed, and writing it as a second function is how the two
+            // drift into differing by something nobody intended.
+            let sig = if capped_sigmoid { t } else { g };
+            (t * (1.0 / (1.0 + (-sig).exp())) * (b2 * (u / b2).tanh())) as f32
+        })
+        .collect()
+}
+
+/// One launch, returning the launcher's own `Result`.
+///
+/// Both the scoring path and the guard test go through here — they were two copies of the same
+/// eight-argument unsafe block and jscpd rejected the second at 42 tokens. It is also the shape
+/// that makes the guard test meaningful: it exercises the entry point callers use, not a
+/// second spelling of it.
+fn situ_launch(gate: &[f32], up: &[f32], b1: f32, b2: f32) -> anyhow::Result<Vec<f32>> {
+    let (gb, ub) = (dev(&f32b(gate)), dev(&f32b(up)));
+    let mut hb = zeros(gate.len() * 4);
+    // SAFETY: `g`, `u` and `h` are each `n` live f32 and do not alias here (the launcher permits
+    // aliasing; this fixture does not use it). All outlive the default stream, which `back` syncs.
+    unsafe {
+        launch_situ_glu_f32(
+            gb.ptr() as *const f32,
+            ub.ptr() as *const f32,
+            gate.len(),
+            b1,
+            b2,
+            hb.ptr_mut() as *mut f32,
+            std::ptr::null_mut(),
+        )
+    }?;
+    Ok(f32v(&back(&hb)))
+}
+
+fn device_situ(gate: &[f32], up: &[f32], b1: f32, b2: f32) -> Vec<f32> {
+    ok(situ_launch(gate, up, b1, b2), "situ_glu_f32")
+}
+
+/// **The kernel reproduces every SiTU-GLU the anchor captured, at both draws.**
+#[test]
+fn situ_glu_matches_the_anchor_at_every_mlp() {
+    for_each_situ(|salt, layer, tol, (b1, b2), s| {
+        let r = rel(&device_situ(&s.gate, &s.up, b1, b2), &s.want);
+        assert!(r <= tol, "{salt} layer {layer}: {r:e} exceeds {tol:e}");
+        // Measured worst over both draws and all six MLPs: 1.454e-7, at salt 2 layer 12. That is
+        // 65x under `dense_mlp`'s 9.4e-6 — the tightest tolerance in the table, and the one that
+        // binds the only cell here the anchor actually buckets that way.
+        tripwire(
+            r,
+            SITU_OBSERVED_WORST,
+            tol,
+            &format!("{salt} layer {layer}"),
+        );
+    });
+}
+
+/// **The sigmoid takes the UNCAPPED gate, and the capped version is a different function.**
+///
+/// The one trap in three lines of arithmetic. `a = b1·tanh(g/b1)·sigmoid(g)`: the first factor
+/// saturates at `±b1`, the second at `0`/`1`, and they saturate on different scales. Feeding
+/// `b1·tanh(g/b1)` to the sigmoid instead is smooth, monotone, bounded and wrong — and at the
+/// shipped `b1 = 4` it agrees to three figures near zero, which is where a spot check looks.
+///
+/// Scored on the anchor's own values rather than synthetically, so the separation is the one the
+/// real activations produce and not one a chosen input manufactures.
+#[test]
+fn the_situ_sigmoid_takes_the_uncapped_gate() {
+    // Per SITE — a single worst-over-all would be carried by whichever MLP separates best and
+    // would say nothing about the other five. Scored against the bar this fixture ENFORCES, the
+    // tripwire, rather than against the operator tolerance; `DEFECT_MARGIN`'s 30x is the table's
+    // own rule for "a bar must clear the defect it catches", applied to the bar in use.
+    //
+    // > **And the distinction is not academic here — it is the finding of this test.** At layer 0's
+    // > dense MLP the separation is 3.38e-2 against `dense_mlp`'s 9.4e-6, a margin of 3,600x, so
+    // > the bucket tolerance catches this comfortably. At the SHARED experts it is 4.10e-3 against
+    // > `moe_route`'s 6.0e-4 — only **6.8x**, well under the 30x the table requires of a `Rel`
+    // > policy. So **the bucket-level tolerance could not be relied on to catch a capped-sigmoid
+    // > SiTU at the shared experts**; the tripwire can, by 2,800x. That was true before this item
+    // > loosened `moe_route` (at the old 2.5e-4 the margin was 16x, still under 30) and it is a
+    // > property of the shared expert's small `moe_intermediate_size`, not of the loosening.
+    for_each_situ(|salt, layer, tol, (b1, b2), s| {
+        let moved = rel(&host_situ(&s, b1, b2, true), &s.want);
+        let bar = SITU_OBSERVED_WORST * 10.0;
+        assert!(
+            moved > bar * 30.0,
+            "{salt} layer {layer}: capping the sigmoid's argument moved the activation by only \
+             {moved:e}, under the {:e} this fixture would need to clear its own {bar:e} tripwire \
+             by the table's 30x — so it does not price the one trap SiTU-GLU has, and the \
+             agreement above says nothing about which form the kernel implements. (The operator \
+             tolerance here is {tol:e}.)",
+            bar * 30.0
+        );
+    });
+}
+
+/// **SiTU-GLU at K3's real widths, and at magnitudes the goldens cannot reach.**
+///
+/// Three gaps the anchor leaves. Width: `moe_intermediate_size` is 24 here against a real 3072, and
+/// `intermediate_size` 256 against 33792. Magnitude: these activations are ~1, so neither `tanh`
+/// saturates and `expf(-g)` never overflows — the whole point of the two betas is what happens when
+/// they do. And the BOUND: `|y| <= b1·b2 = 100` is the property §8 states, and nothing in the
+/// goldens comes near it.
+#[test]
+fn situ_glu_saturates_at_the_product_of_its_betas() {
+    let (b1, b2) = (4.0f32, 25.0f32);
+    let mut r = common::Lcg(0x517A);
+    for &(n, gain) in &[
+        (3072usize, 1.0f32),
+        (33792, 1.0),
+        (3072, 40.0),
+        (3072, 400.0),
+        (1, 1.0),
+    ] {
+        let gate: Vec<f32> = (0..n).map(|_| r.f() * gain).collect();
+        let up: Vec<f32> = (0..n).map(|_| r.f() * gain).collect();
+        let s = Situ {
+            gate: gate.clone(),
+            up: up.clone(),
+            want: Vec::new(),
+        };
+        let got = device_situ(&gate, &up, b1, b2);
+        let d = rel(&got, &host_situ(&s, b1, b2, false));
+        // 10x the 1.721e-7 measured over these cases. `tanhf` and `expf` are the device's own
+        // against Rust's `f64` ones, so this is the one fixture here whose bound is a libm
+        // difference rather than a reassociated sum.
+        //
+        // The `gain = 400` case measures SMALLER (7.6e-8), not larger: both `tanh`s are hard
+        // against ±1 there and the sigmoid against 0 or 1, so the saturated regime is the easy one
+        // and the interesting magnitudes are the ones in between. Stated because "we tested the
+        // extreme" reads as coverage and here it is the opposite.
+        assert!(d <= 1.72e-6, "n={n} gain={gain}: {d:e}");
+        assert!(
+            got.iter().all(|y| y.abs() <= b1 * b2),
+            "n={n} gain={gain}: SiTU-GLU exceeded |b1·b2| = {}, which §8 states as a property of \
+             the function rather than of its inputs",
+            b1 * b2
+        );
+    }
+}
+
+/// **Both betas must be finite and positive — every other value is refused, not clamped.**
+///
+/// Four failure modes, each quiet in its own way, argued at the launcher. This is the only test in
+/// this file that exercises a refusal code, and it exists because the other three items each left
+/// their guards untested and said so.
+#[test]
+fn the_situ_betas_are_guarded() {
+    for (b1, b2, what) in [
+        (0.0f32, 25.0f32, "b1 = 0"),
+        (4.0, 0.0, "b2 = 0"),
+        (-4.0, 25.0, "b1 negative"),
+        (f32::NAN, 25.0, "b1 NaN"),
+        (4.0, f32::NAN, "b2 NaN"),
+        (f32::INFINITY, 25.0, "b1 +inf"),
+        (4.0, f32::INFINITY, "b2 +inf"),
+    ] {
+        assert!(
+            situ_launch(&[1.0, 2.0], &[3.0, 4.0], b1, b2).is_err(),
+            "{what} was accepted"
+        );
+    }
+    // And the guard is not simply refusing everything, which is the way a refusal test passes
+    // vacuously. The shipped pair must go through.
+    assert_eq!(device_situ(&[1.0, 2.0], &[3.0, 4.0], 4.0, 25.0).len(), 2);
 }

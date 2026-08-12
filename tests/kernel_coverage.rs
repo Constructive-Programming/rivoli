@@ -375,6 +375,15 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("rmsnorm_single", &["gpu.rs"]),
     ("rope_adjacent", &["attn.rs"]),
     ("rope_interleave", &["gpu.rs"]),
+    // **No engine caller yet**, and the empty slice says so rather than letting the absence read as
+    // an oversight — same declaration `moe_acc_drain_to` carries above. Kimi-K3's activation, for
+    // the dense layer 0 and the shared MLP; S3's layer loop is what will call it. Its oracle is
+    // `tests/k3_kernels.rs::situ_glu_matches_the_anchor_at_every_mlp`, scored against the
+    // first-party reference at both weight draws, so this is a staged kernel and not an unexecuted
+    // one. The routed experts do NOT come through it — `moe.hip` fuses the same `common.hpp` helper
+    // (plan §3b), which is why one activation has two entries in this file's world view and only
+    // one of them is here.
+    ("situ_glu_f32", &[]),
     ("swiglu", &["gpu.rs", "f4gpu.rs"]),
     ("swiglu_clamped_bf16", &[]),
     ("vadd", &["gpu.rs"]),

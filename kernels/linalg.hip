@@ -326,6 +326,39 @@ extern "C" __global__ void swiglu_clamped_bf16(
     h[i] = rbf16(swiglu_clamped(g[i], u[i], limit));
 }
 
+// **SiTU-GLU over a gate/up pair, Kimi-K3's dense layer 0 and shared MLP.** The arithmetic is
+// `common.hpp::situ_glu`; everything interesting is argued there.
+//
+// USED BY: Kimi-K3 only. The routed experts do NOT come through here — `moe.hip` fuses the
+// same helper inside the fp4 expert kernel, because there is no separate activation launch on
+// the `.f4` path. Both call sites exist on purpose and the plan (§3b) says why: change one and
+// the dense path goes right while every routed expert stays wrong.
+//
+// **`_f32` names the STORE, extending the `_bf16` convention rather than adding a sense to it**
+// (`common.hpp`'s naming note). It is spelled out because which store a kernel performs is
+// precisely what this port got wrong once already: `mla.hip::rmsnorm_batch` was named for K3's
+// latent norm on the strength of being width-generic, and its bf16 store put it 11.4x outside
+// that operator's tolerance (S2 item 3, 2026-08-12). An unmarked name invites the same reading.
+// K3's `SituAndMul` returns `.to(x.dtype)`, a no-op against the fp32 anchor, and rivoli's trunk
+// carries f32 activations throughout.
+//
+// `g` and `u` as separate pointers, not one `[gate|up]` buffer. §8 describes the concatenated
+// layout because that is what the reference's `SituAndMul` is handed — `torch.cat` of two
+// projections it is about to split again — and a port with two projection outputs already has
+// them apart. Taking them apart makes the split point an argument instead of an implied stride,
+// which is the half of this that a caller can get wrong.
+//
+// `h` may alias `g`: every thread reads exactly its own two elements before writing, so the
+// overwrite is unobservable. `swiglu_clamped_bf16` above documents the same aliasing for the
+// same reason, and it is what saves a scratch buffer per layer.
+extern "C" __global__ void situ_glu_f32(const float* __restrict__ g,
+                                        const float* __restrict__ u, int n, float b1, float b2,
+                                        float* __restrict__ h) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    h[i] = situ_glu(g[i], u[i], b1, b2);
+}
+
 // y[i] = x[i]·(1/sqrt(mean(x²)+eps))·w[i] — RMSNorm, matching math.rs. One block
 // reduces Σx² in LDS (tree order), then every thread scales.
 //
@@ -836,6 +869,31 @@ extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h, vo
 // not implicitly order against them, and this runs between two `rivoli_gemv_fp8_bf16` launches
 // that are now stream-parameterised. A null-stream combine between two stream-ordered GEMVs
 // reads `g`/`u` before they are written — an unordered activation, which is a silent wrong.
+// **Both betas must be finite and POSITIVE**, refused as 1006 rather than clamped — the same
+// code AND the same expression as the two `swiglu_limit` guards, on the same argument, so a
+// reader who learned it there gets it here. `!(b > 0.0f && b < INFINITY)` covers all four
+// rejected values at once, and each one fails differently and quietly:
+//
+//   * `NaN` — `tanhf(x/NaN)` is NaN for every element, a silently dead activation. `b <= 0.0f`
+//     would ADMIT it, which is why the negated-positive form is the one used.
+//   * `0` — `tanhf(g/0)` is `tanhf(±inf) = ±1` for `g != 0` and NaN exactly at `g == 0`, so a
+//     zero beta corrupts the elements a magnitude check would look at last.
+//   * `+inf` — the quiet spelling of "no saturation": `b·tanh(x/b) -> x` as `b -> inf`, so the
+//     activation degrades to a plain product with nothing to notice. This is the value the
+//     `swiglu_limit` guard was found admitting on 2026-08-05 after its first fix closed the
+//     `<= 0` case and left the one beside it open.
+//   * negative — flips the sign of the saturating branch.
+extern "C" int rivoli_situ_glu_f32(const float* g, const float* u, int n, float b1, float b2,
+                                   float* h, void* stream) {
+    if (n <= 0) return 1001;
+    if (!(b1 > 0.0f && b1 < INFINITY) || !(b2 > 0.0f && b2 < INFINITY)) return 1006;
+    hipGetLastError();
+    hipLaunchKernelGGL(situ_glu_f32, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
+                       (hipStream_t)stream, g, u, n, b1, b2, h);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
 extern "C" int rivoli_swiglu_clamped_bf16(const float* g, const float* u, int n, float limit,
                                           float* h, void* stream) {
     if (n <= 0) return 1001;
