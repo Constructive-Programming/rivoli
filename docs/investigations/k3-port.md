@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: live
-verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET and must be proven able to go red before it is trusted green. S0 IS DONE and G0 IS MET (2026-08-10; the corrections it produced are recorded inline in reference/k3-architecture.md, which is now first-party-verified for everything except the KDA inner arithmetic and the MXFP4 unpack — those live in fla-core and compressed-tensors, and S1b's mandatory anchor now COVERS both by running the first-party stack on gfx1151 over a tiny config that keeps the real 93-layer structure — ELEVEN defect runs, each GATED on the layers it must leave bit-identical, at TWO weight draws, and per-operator tolerances MEASURED: the C reference's MLA LoRA-norm eps divergence is priced at 2.2e-5 relative, which is only 1.3x that operator's own fp32 rounding floor, so MLA is exact-only and the eps must be pinned structurally rather than numerically; measurement/k3-reference/anchor.md). Traffic is 25.83 GB/token of experts (first-party confirmed) plus 108.81 GB of trunk when not resident; predicted ~0.48-0.57 tok/s with the resident set held, from rivoli's measured 12.39-14.76 GB/s at the expert-read shape — an earlier 0.27 came from a dd QD1 figure, the same instrument-class error found in the reference's own 3.2. The memory budget is the binding constraint (~5.7 GB residual at --max-mem 115; the resident set does not fit on the auto path) and nothing converts until SafeWriter streams. Only the 69 KDA layers are a wholly new kernel family, plus AttnRes. S1-S3 run on fixtures; S4 converts and decodes real weights on /swarm; S5 needs ~200 GiB more NVMe.
+verdict: The implementation plan for Kimi-K3, a required capability. Six stages behind six correctness gates; a gate is MET or NOT MET and must be proven able to go red before it is trusted green. S0 IS DONE and G0 IS MET (2026-08-10; the corrections it produced are recorded inline in reference/k3-architecture.md, which is now first-party-verified for everything except the KDA inner arithmetic and the MXFP4 unpack — those live in fla-core and compressed-tensors, and S1b's mandatory anchor now COVERS both by running the first-party stack on gfx1151 over a tiny config that keeps the real 93-layer structure — ELEVEN defect runs, each GATED on the layers it must leave bit-identical, at TWO weight draws, and per-operator tolerances MEASURED: the C reference's MLA LoRA-norm eps divergence is priced at 1.9e-5 relative, which is BELOW that operator's own fp32 rounding floor (0.33x), so MLA is exact-only and the eps must be pinned structurally rather than numerically; measurement/k3-reference/anchor.md). Traffic is 25.83 GB/token of experts (first-party confirmed) plus 108.81 GB of trunk when not resident; predicted ~0.48-0.57 tok/s with the resident set held, from rivoli's measured 12.39-14.76 GB/s at the expert-read shape — an earlier 0.27 came from a dd QD1 figure, the same instrument-class error found in the reference's own 3.2. The memory budget is the binding constraint (~5.7 GB residual at --max-mem 115; the resident set does not fit on the auto path) and nothing converts until SafeWriter streams. Only the 69 KDA layers are a wholly new kernel family, plus AttnRes. S1-S3 run on fixtures; S4 converts and decodes real weights on /swarm; S5 needs ~200 GiB more NVMe.
 ---
 
 # Kimi-K3 — implementation plan
@@ -55,13 +55,25 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   the pinned revision, fla-core 0.5.2, transformers 4.56.2) executed on gfx1151 over a tiny config
   that keeps the **real 93-layer structure**, with ELEVEN defect runs, each GATED on the layers it
   must leave bit-identical rather than merely on having changed something, at TWO independent weight
-  draws. Both decode goldens are vendored (286 KiB each) and read with no GPU, no
+  draws. Both decode goldens are vendored (324 KiB each) and read with no GPU, no
   python and no network. `docs/measurement/k3-reference/anchor.md`.
 - **The per-operator TOLERANCES are measured and gated**, `tests/common/k3_tolerance.rs`. The MLA
-  LoRA-norm eps divergence is priced at 2.2e-5 relative, which is only **1.3x that operator's own
-  fp32 rounding floor** — so **no tolerance can separate it and the eps must be pinned
-  structurally**, by reading the constant. Every other operator has 90,000x to 7M x of room and is
-  set at 10x its floor. **S1b IS DONE**; S3's layer loop remains for the pin.
+  LoRA-norm eps divergence sits at **0.33x that operator's own fp32 rounding floor** — *below* it —
+  so **no tolerance can separate it and the eps must be pinned structurally**, by reading the
+  constant. Every other operator has 90,000x to 7M x of room and is set at 10x its floor.
+  **S1b IS DONE**; S3's layer loop remains for the pin.
+  *(This read "2.2e-5 relative, which is only 1.3x" until 2026-08-12. That was the ONE-DRAW reading
+  taken before item 2 captured the attention core; re-measured over both draws and with `mla_attend`
+  split out, the margin fell to 0.33x — a stronger form of the same finding, and `anchor.md`
+  §"Re-measured on both draws" carries the numbers.)*
+- **S2 items 1, 2 and 3 are DONE, each gated before the next** (2026-08-11/12): `attn_res`, the
+  gated MLA core (`mha_attend` + `sigmoid_gate`), and the latent sandwich. `tests/k3_kernels.rs`.
+  **Each of the three found the anchor could not score its operator, and only by trying to write the
+  fixture** — the fold weights, the attention core and `o_proj`'s input, the expert aggregate and
+  the norm weight. Goldens re-vendored three times, now at **272** tensors. Item 3 also found the
+  first place the anchor's fp32-vs-bf16 deviation bites: an operator whose rivoli kernel rounds to
+  bf16 cannot be scored against this anchor at the anchor's own tolerance. Item 4 (SiTU/MoE) is
+  next; item 5 (KDA) is the bulk.
 
 ## G. The gate model
 
@@ -643,7 +655,9 @@ model is stored in — is answered above: none.)*
 
 1. **AttnRes** — **DONE 2026-08-11, G2 met for this item.** `kernels/linalg.hip::attn_res` plus
    `launch_attn_res`, scored by `tests/k3_kernels.rs` against all twelve folds of both draws:
-   worst **3.08e-7**, against a 1.571e-5 floor and a 1.6e-4 tolerance, several folds bit-exact.
+   worst **3.08e-7**, against a 7.052e-5 floor and a 7.1e-4 tolerance, several folds bit-exact.
+   *(Floor and tolerance restated 2026-08-12: both were one-draw readings. The measured 3.08e-7 is
+   unchanged and the tripwire at 10x it is what actually binds — `k3_tolerance.rs` header.)*
    The defect run is the second test — mixing the NORMALISED sources fails the fixture — and the
    kernel is red-proved four ways (uniform weights, no fold in the score, source 0 only, eps
    outside the mean).
@@ -682,8 +696,46 @@ model is stored in — is answered above: none.)*
    covered by a synthetic sweep: the decode masks are **all zero**, so causality masks nothing and
    a kernel ignoring `mask` stayed green; and the softmax's max-subtraction is unobservable at these
    magnitudes. Plus the width gap — 4 heads of 24/16 against a real 96 of 192/128.
-3. **The latent sandwich** — two bf16 trunk GEMVs plus `rmsnorm_batch` (`mla.hip:346`, already width-generic),
-   with the accumulator interception of S1a.4.
+3. **The latent sandwich** — two bf16 trunk GEMVs plus a norm, with the accumulator interception of
+   S1a.4. Scored by `tests/k3_kernels.rs`.
+
+   > **CORRECTED 2026-08-12.** This item read "plus `rmsnorm_batch` (`mla.hip:346`, already
+   > width-generic)". It is width-generic, and **the width was never the problem.** Its last line is
+   > `row[i] = rbf16(w[i] * (row[i] * rs))` — it rounds its store to bf16, because V4's
+   > `RMSNorm.forward` stores bf16 and that kernel is V4's. `KimiRMSNorm.forward` is
+   > `self.weight * x.to(dtype)`, and against this fp32 anchor `to(dtype)` is a no-op, so the bf16
+   > step is arithmetic the reference does not perform: **measured 3.299e-3 against the 6.3e-4
+   > tolerance, 11.4× over**. **The kernel is `linalg.hip::rmsnorm_single`** (f32 store, out-of-place),
+   > correct at decode's one row. `the_batch_rmsnorm_would_fail_this_fixture` asserts the failure
+   > rather than leaving it as a comment, because a claim that one of two interchangeable kernels is
+   > wrong is exactly the claim that rots.
+   >
+   > **Prefill needs a third kernel and does not have one.** `rmsnorm_single` is `dim3(1)` — one
+   > statistic over whatever it is handed, which at `T` tokens is `Defect::HeadNormOverAllTokens`
+   > and invisible at `T == 1`. `rmsnorm_batch` is row-wise and rounds. K3's latent norm at prefill
+   > wants row-wise **and** f32-store, which is neither. Deliberately not written here: S2 is
+   > decode-first, and an unused third variant is a variant nothing scores.
+
+   **The projections are `gemm_bf16`, and the anchor cannot score them.** Not for want of captures —
+   because the anchor runs fp32 (a declared deviation) while these weights are bf16, so any such
+   comparison is dominated by a ~2⁻⁹ quantisation the reference never applied. What is left to check
+   is the part that is genuinely the kernel's, the `wave_sum` shuffle ladder re-associating a
+   7168-term sum, and `the_trunk_gemv_matches_an_f64_dot_at_k3_widths` scores exactly that at
+   `7168→3584` and `3584→7168` against an f64 dot on the same bf16 codes. **That closes half of item
+   7's complaint** — `gemm_bf16` was verified only at vocab 1024 / dim 512 and now has a stated
+   bound at K3's real trunk widths. Its bound is the test's own and is NOT a `k3_tolerance` row:
+   every number in that table derives from the anchor's floor-vs-defect pair, and this one cannot.
+
+   The ordering trap gets a fixture-level twin of `--defect LatentNormAfterUp`
+   (`norming_after_the_up_projection_is_a_different_sandwich`), built the same way the defect is —
+   the norm weight collapsed to its own mean so it applies at `hidden` width — so it asks about the
+   ORDER and not about the values. Synthetic, because the projection weights are deliberately absent
+   from the goldens; `anchor.md` carries that argument and the ~4× file growth it declines.
+
+   **The anchor gap this one cost:** `routed_expert_norm` had an output and no input. It is fed
+   `moe_infer`'s return, which is a method call rather than a module call, so no forward hook could
+   see it — the fourth instance of the pattern `anchor.md` now states as a rule. `wrap_latent_sandwich`
+   captures the aggregate and the norm weight by pre-hook; goldens re-vendored at **272** tensors.
 4. **SiTU-GLU + fp4 MoE** — §3b.
 5. **KDA** — the new family and the bulk of the stage. **Decompose into units with their own
    G2 sub-gates.** Heads are independent and head-parallel is bit-identical in the reference,
@@ -693,10 +745,15 @@ model is stored in — is answered above: none.)*
    conditions (`k3-architecture.md` §4).
 6. **Router** — sigmoid, bias on selection only, weights from the **unbiased** score,
    renormalised over the 16.
-7. **Trunk GEMV, for speed.** `gemm_bf16` is correct and carries S2/S3 unchanged — but
-   it is **verified only at vocab 1024 / dim 512** (`f4gpu.rs:2253` says so outright), so it is
-   an oracle that itself needs a tolerance before it can settle one. Its inner loop is one wave
-   per output *element* with scalar u16 loads; at 108.81 GB/token that loop is the decode.
+7. **Trunk GEMV, for speed.** `gemm_bf16` is correct and carries S2/S3 unchanged. Its inner loop is
+   one wave per output *element* with scalar u16 loads; at 108.81 GB/token that loop is the decode.
+
+   > **UPDATED 2026-08-12 by item 3.** This said it is "verified only at vocab 1024 / dim 512
+   > (`f4gpu.rs:2253` says so outright), so it is an oracle that itself needs a tolerance before it
+   > can settle one". The accuracy half is now answered:
+   > `the_trunk_gemv_matches_an_f64_dot_at_k3_widths` scores it at `7168→3584` and `3584→7168`
+   > against an f64 dot on the same bf16 codes, so it has a stated bound at the widths K3 runs it
+   > at. **The speed half stands unchanged** — that is what this item is for.
 
 ### G2 — met when
 

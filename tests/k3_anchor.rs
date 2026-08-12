@@ -50,14 +50,14 @@ const GOLDENS: &[Vendored] = &[
     Vendored {
         salt: "k3-anchor-1",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-1.bin"),
-        len: 327_253,
-        fnv: 0xb766_c482_975a_0baf,
+        len: 332_009,
+        fnv: 0xcfb2_7d75_ec6b_ff03,
     },
     Vendored {
         salt: "k3-anchor-2",
         bytes: include_bytes!("k3-anchor-decode-k3-anchor-2.bin"),
-        len: 327_253,
-        fnv: 0x28c7_5284_f17c_9774,
+        len: 332_009,
+        fnv: 0xd2a7_cb83_4ea2_d39d,
     },
 ];
 
@@ -204,10 +204,11 @@ fn the_vendored_bytes_are_the_measured_ones() {
         assert_eq!(v.bytes.len(), v.len, "{}: size", v.salt);
         assert_eq!(h, v.fnv, "{}: FNV-1a", v.salt);
         let g = load(v);
-        // 262: 223 originally, +12 `.fold` for S2 item 1, +21 MLA attention-core and +6
-        // `o_proj.in_gated` for item 2. Each addition is recorded in `anchor.md`. See
-        // `the_operator_fixtures_s2_needs_are_present`.
-        assert_eq!(g.floats.len(), 262, "{}: float tensors", v.salt);
+        // 272: 223 originally, +12 `.fold` for S2 item 1, +21 MLA attention-core and +6
+        // `o_proj.in_gated` for item 2, +10 for item 3 (the latent sandwich's one open end — the
+        // expert aggregate and the norm weight, across the five MoE capture layers). Each addition
+        // is recorded in `anchor.md`. See `the_operator_fixtures_s2_needs_are_present`.
+        assert_eq!(g.floats.len(), 272, "{}: float tensors", v.salt);
         assert_eq!(g.ints.len(), 5, "{}: int tensors", v.salt);
     }
     // The two draws must not be the same draw — compared on VALUES, not on the files.
@@ -448,6 +449,26 @@ fn the_operator_fixtures_s2_needs_are_present() {
         assert_eq!(
             shape_of(&g, &format!("{moe}.routed_expert_up_proj")),
             vec![1, hidden]
+        );
+        // **The OPEN END, added 2026-08-12 when S2 item 3 went to write the kernel.** Same shape of
+        // gap as items 1 and 2: three module outputs were captured and the value BETWEEN two of
+        // them was not, so the sandwich could be observed and not reproduced. `routed_expert_norm`
+        // is fed `moe_infer`'s return — not a module call, and `.experts` is unhooked on purpose
+        // because which expert fires depends on the routing — so the one operator here that is
+        // neither a plain matmul nor shared with another model had no input at all. Its weight goes
+        // with it, for the reason `.fold` did: an input and an output do not determine an operator.
+        //
+        // The two projections' inputs are deliberately absent, both because the file already holds
+        // them: `routed_expert_up_proj`'s is `routed_expert_norm`'s output, and
+        // `routed_expert_down_proj`'s is `post_attention_layernorm`'s (reference `:964-966`). A
+        // second copy under a second name would read as corroboration and be a tautology.
+        assert_eq!(
+            shape_of(&g, &format!("{moe}.routed_expert_norm.in")),
+            vec![1, latent]
+        );
+        assert_eq!(
+            shape_of(&g, &format!("{moe}.routed_expert_norm.weight")),
+            vec![latent]
         );
         // The shared expert's width, DERIVED — `num_shared_experts * moe_intermediate_size`, the
         // `[hidden, 2*moe_inter]` coupling `validate` cannot see. This assertion was a literal and

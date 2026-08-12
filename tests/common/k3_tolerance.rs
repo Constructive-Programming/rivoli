@@ -55,15 +55,40 @@ pub struct Tol {
     pub policy: Policy,
 }
 
-/// Measured 2026-08-11 on gfx1151, decode, `--salt k3-anchor-1`. Re-derive with the two commands in
+/// Measured on gfx1151, decode, over **BOTH** draws. Re-derive with the two commands in
 /// `anchor.md`; these are not transcribed from anywhere else.
+///
+/// > **CORRECTED 2026-08-12, and it is the correction this table most needed.** The header said
+/// > "`--salt k3-anchor-1`", and three rows were exactly that: a ONE-DRAW floor. `mla` and
+/// > `mla_attend` were re-measured over both draws on 2026-08-11 with the lesson stated in place —
+/// > *a floor is the max over draws or it is not a floor* — and the other five rows were left as
+/// > they were. Re-running the fp64 island on draw 2 (item 3, 2026-08-12) found draw 2's floor
+/// > LARGER for every operator, by 2.5-5x:
+/// >
+/// > | operator | was (draw 1) | draw 2 | now |
+/// > |---|---|---|---|
+/// > | `attn_res` | 1.571e-5 | **7.052e-5** | 7.052e-5 |
+/// > | `moe_latent` | 2.851e-5 | **6.287e-5** | 6.287e-5 |
+/// > | `moe_route` | 2.472e-5 | **5.956e-5** | 5.956e-5 |
+/// >
+/// > `dense_mlp` was already the max (9.374e-7 against draw 2's 9.163e-7) and `kda_op`'s floor comes
+/// > from a different measurement entirely. **The `weakest_defect` column was right by luck**: it
+/// > wants the MIN over draws, and draw 1 happened to give the smaller signal for every row — so the
+/// > one-draw habit understated the floors and left the defects correct. Checked, not assumed.
+/// >
+/// > Not caused by item 3's captures: the `moe_latent` floor is 2.851e-5 / 6.287e-5 whether or not
+/// > the two new tensors are included, measured both ways.
 pub const TOLERANCES: &[Tol] = &[
     // AttnRes, the S2 item 1 fold. Floor is dominated by the softmax over the block axis.
+    // **Loosened 2026-08-12** from `Rel(1.6e-4)` when the floor turned out to be a one-draw reading
+    // — see the header. The fixture is unaffected in practice: `attn_res` measures 3.08e-7 against
+    // either number, and `tests/k3_kernels.rs` gates it on a 10x-observed tripwire, which is the
+    // bar that actually binds there.
     Tol {
         operator: "attn_res",
-        floor: 1.571e-5,
-        weakest_defect: 1.80e0,
-        policy: Policy::Rel(1.6e-4),
+        floor: 7.052e-5,
+        weakest_defect: 1.796e0,
+        policy: Policy::Rel(7.1e-4),
     },
     // **MLA is EXACT-ONLY, and the finding got STRONGER when it was measured properly.**
     //
@@ -121,17 +146,28 @@ pub const TOLERANCES: &[Tol] = &[
         weakest_defect: 6.578e-1,
         policy: Policy::Rel(4.10e-4),
     },
+    // The MoE latent sandwich — S2 item 3. **`LatentNormAfterUp` is the targeting defect, not
+    // `ExpertW1W3Swap`**, which scores a much weaker 1.650e0 on this bucket and would set the row if
+    // it counted. It does not: it targets the routed expert MLP (item 4), an operator with no bucket
+    // of its own because `.experts` is deliberately unhooked, and it reaches this one only through
+    // the aggregate it feeds. That is the downstream leak the methodology excludes.
+    //
+    // **Worth flagging for item 4**, because item 3 made it sharper rather than softer: this bucket
+    // now literally CONTAINS that aggregate (`routed_expert_norm.in`), so the leak lands inside the
+    // bucket instead of merely propagating through it. The classification is unchanged — the rule is
+    // about what a defect targets, not where it lands — but if item 4 gives the expert MLP a bucket,
+    // `.norm.in` belongs in it, since it is that operator's output and not this one's.
     Tol {
         operator: "moe_latent",
-        floor: 2.851e-5,
-        weakest_defect: 2.05e2,
-        policy: Policy::Rel(2.9e-4),
+        floor: 6.287e-5,
+        weakest_defect: 2.046e2,
+        policy: Policy::Rel(6.3e-4),
     },
     Tol {
         operator: "moe_route",
-        floor: 2.472e-5,
-        weakest_defect: 2.23e0,
-        policy: Policy::Rel(2.5e-4),
+        floor: 5.956e-5,
+        weakest_defect: 2.233e0,
+        policy: Policy::Rel(6.0e-4),
     },
     // `kda_op`'s floor is 6.301e-5 from chunk-vs-recurrent, an order of magnitude above the 5.99e-6
     // the fp64 island reports — and the larger number is the honest one. The island measures the

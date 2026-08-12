@@ -1,7 +1,7 @@
 ---
 scope: k3
 status: data
-verdict: The S1b anchor exists and runs, and its per-operator TOLERANCES are measured — Kimi-K3's own first-party stack (modeling_kimi_linear.py at the pinned revision + fla-core 0.5.2 + transformers 4.56.2 + torch 2.13.0+rocm7.2) executed on gfx1151 at tiny widths but the REAL 93-layer structure. TWO independent weight draws are vendored (tests/k3-anchor-decode-k3-anchor-{1,2}.bin, 292,781 B each, each reproduced byte-for-byte on a later run) and read by tests/k3_anchor.rs with no GPU, no python and no network; eleven defect runs are scored against both and each is GATED on the layers it must leave bit-identical. THE TOLERANCE FINDING: MLA is exact-only, because the C reference's LoRA-norm eps moves that operator by 2.22e-5 while its own fp32 rounding floor is 1.70e-5 — a margin of 1.3x, so no threshold admits a correct kernel and rejects that eps, and the eps must be pinned structurally instead. Downstream it sits at 0.3-0.9x the floor, i.e. BELOW the reference's own rounding error, so a tolerance-based fixture could not have seen it anywhere — which is why this anchor is exact bytes. Every other operator has 90,000x to 7M x of room and is set at 10x its floor: attn_res 1.6e-4, moe_latent 2.9e-4, moe_route 2.5e-4, kda_op 6.3e-4, dense_mlp 9.4e-6. Floors come from running the same reference in fp64 with all 276 fla modules held at fp32 (a plain model.double() dies in triton), except kda_op's, which is chunk_kda against fused_recurrent_kda over 69 layers because fla returns an fp32 recurrent state whatever the input dtype. Four deviations are declared in the metadata and pinned by the test: eager attention, unquantized experts, no vision wrapper, fp32 against the checkpoint's bf16.
+verdict: The S1b anchor exists and runs, and its per-operator TOLERANCES are measured — Kimi-K3's own first-party stack (modeling_kimi_linear.py at the pinned revision + fla-core 0.5.2 + transformers 4.56.2 + torch 2.13.0+rocm7.2) executed on gfx1151 at tiny widths but the REAL 93-layer structure. TWO independent weight draws are vendored (tests/k3-anchor-decode-k3-anchor-{1,2}.bin, 332,009 B each, each reproduced byte-for-byte on a later run) and read by tests/k3_anchor.rs with no GPU, no python and no network; eleven defect runs are scored against both and each is GATED on the layers it must leave bit-identical. THE TOLERANCE FINDING: MLA is exact-only, because the C reference's LoRA-norm eps moves that operator by 1.92e-5 while its own fp32 rounding floor is 5.74e-5 — a margin of 0.33x — the eps sits BELOW the floor — so no threshold admits a correct kernel and rejects that eps, and the eps must be pinned structurally instead. Downstream it sits at 0.3-0.9x the floor, i.e. BELOW the reference's own rounding error, so a tolerance-based fixture could not have seen it anywhere — which is why this anchor is exact bytes. Every other operator has 16,000x to 3.3M x of room and is set at 10x its floor, where the floor is the MAX over both draws: attn_res 7.1e-4, mla_attend 4.1e-4, moe_latent 6.3e-4, moe_route 6.0e-4, kda_op 6.3e-4, dense_mlp 9.4e-6. Floors come from running the same reference in fp64 with all 276 fla modules held at fp32 (a plain model.double() dies in triton), except kda_op's, which is chunk_kda against fused_recurrent_kda over 69 layers because fla returns an fp32 recurrent state whatever the input dtype. Four deviations are declared in the metadata and pinned by the test: eager attention, unquantized experts, no vision wrapper, fp32 against the checkpoint's bf16.
 ---
 
 # The S1b anchor: goldens from Kimi-K3's own stack
@@ -127,7 +127,7 @@ vendored golden went unchecked, output indistinguishable from a full pass. The s
 being quiet about it was the defect. A run that reproduces **nothing** now fails outright, since
 that is what an empty `$OUT` or a mistyped `--out` looks like from outside.
 
-**Only the decode golden is vendored** (292,781 B = 286 KiB each, `tests/k3-anchor-decode-k3-anchor-1.bin`
+**Only the decode golden is vendored** (332,009 B = 324 KiB each, `tests/k3-anchor-decode-k3-anchor-1.bin`
 and `-2.bin`). The
 prefill golden is **1,299,802 B = 1.24 MiB** — every per-token tensor is eight times wider at
 `--seq 8` — and its consumer does not exist: S2 item 5 defers chunked prefill outright ("no chunked
@@ -139,8 +139,17 @@ is `K3_ANCHOR_MODES=prefill tests/k3-anchor.sh`.
 Six layers, chosen for what each one *is* — `0` (KDA, the only dense `mlp`, an attn-res block
 start), `1` (first MoE layer), `3` (first MLA layer, 1-based 4), `12` (an attn-res block start that
 is not layer 0), `91` and `92` (the two **adjacent** MLA layers the real map ends with) — plus the
-model-level tail. Every submodule output of those layers, **235 float and 5 int tensors** in the
-decode golden (232 + 5 in prefill, which has no incoming recurrent state), plus two operator boundaries no forward hook can see:
+model-level tail. Every submodule output of those layers, **272 float and 5 int tensors** in the
+decode golden, plus the operator boundaries no forward hook can see:
+
+> **CORRECTED 2026-08-12.** This line said **235**, which was true for about a day. Item 2 added 27
+> captures and item 3 ten more without it being touched, so the file understated its own contents by
+> 37 while `tests/k3_anchor.rs` asserted the real number — the count is gated there, and was right
+> throughout. The arithmetic, so the next addition has somewhere to attach: 223 originally, +12
+> `.fold` (item 1), +21 MLA attention-core and +6 `o_proj.in_gated` (item 2), +10 latent-norm input
+> and weight (item 3). **Prefill's count is no longer restated here**: it was given as "232 + 5" and
+> that too was a snapshot of one day's driver. It differs from decode by the incoming recurrent
+> state, which is the durable fact.
 
 * **KDA** — `q`/`k`/`v` after the short convolutions, the log-space gate, `beta`, `A_log`,
   `dt_bias`, the incoming recurrent state, and both outputs. Everything between those two points
@@ -222,6 +231,43 @@ value rather than another module's captured output has no fixture, and a forward
 it one. Free functions need a setattr wrap; module inputs need a pre-hook. Both were found the same
 way — by trying to write the kernel and discovering there was nothing to launch with.
 
+### A fourth time, and the generalisation predicted it (2026-08-12, S2 item 3)
+
+**The latent sandwich's aggregate.** §6's order is `down(x)` → experts in latent space → RMSNorm the
+**aggregate** → `up(...)`, and the golden held the three module outputs and nothing between them.
+`routed_expert_norm` is fed `moe_infer`'s return — a method call, not a module call — and `.experts`
+is unhooked on purpose, so the one operator in this sandwich whose arithmetic is neither a plain
+matmul nor shared with another model had **no input at all**. Its weight went missing with it, for
+the reason `.fold` did: an input and an output do not determine an operator when a weight sits
+between them. `wrap_latent_sandwich` captures both, by pre-hook, +10 tensors.
+
+Two inputs are deliberately **not** captured, both because the file already holds them:
+`routed_expert_up_proj`'s is `routed_expert_norm`'s output, and `routed_expert_down_proj`'s is
+`post_attention_layernorm`'s (reference `:964-966`, `:1035-1037` — the block is called on the normed
+hidden state and on nothing else). A second copy under a second name reads as corroboration and is a
+tautology.
+
+**The two projection WEIGHTS are also not captured, and that is a decision.** At `[96,192]` and
+`[192,96]` they are 36,864 floats per MoE layer against the whole golden's ~70,000, so capturing
+them at the five MoE layers would roughly quadruple both vendored files. What they would buy is an
+anchor-scored GEMV, and that comparison is weak where it is not free: rivoli's trunk matmul is
+`gemm_bf16`, whose weights are **bf16**, while this reference runs fp32 — one of the four declared
+deviations at the top of this file. A bf16 weight is ~2⁻⁹ off its fp32 twin, **1.95e−3 against
+`moe_latent`'s 2.9e−4 tolerance**, so the fixture could only be stated seven times looser than the
+operator's own bar, and it would still be at hidden 192 rather than 7168.
+`tests/k3_kernels.rs::the_trunk_gemv_matches_an_f64_dot_at_k3_widths` scores that kernel against an
+f64 dot at the **real** widths instead, which is both cheaper and wider. Revisit this only if
+something needs the reference's particular matrix.
+
+> **This is the first item where the anchor's fp32-vs-bf16 deviation bit**, and it is worth stating
+> as a rule for the rest of S2: **an operator whose rivoli kernel rounds to bf16 cannot be scored
+> against this anchor at the anchor's own tolerance.** Items 1 and 2 were unaffected because
+> `attn_res` and `mha_attend` are f32 throughout. Item 3 is affected twice — once for the GEMVs
+> above, and once for the norm, which is why it uses `linalg.hip::rmsnorm_single` (f32 store) and
+> not `mla.hip::rmsnorm_batch` (bf16 store, V4's `RMSNorm.forward`). `k3-port.md` item 3 named the
+> batch kernel on the grounds that it is already width-generic; it is, and the width was never the
+> problem.
+
 Two things are deliberately not captured. The **individual routed experts** are excluded — not for
 size but because `moe_infer` only calls experts that won tokens, so which expert modules fire is
 routing-dependent, and any defect that moves the routing changes the golden's tensor *set*. The
@@ -302,23 +348,23 @@ Every bold cell is asserted. Read the rows:
   > rather than dismiss.** Its green set is identical to `MlaLoraEps1e5`'s, it sets no tolerance
   > ceiling (1.3e+0 against that defect's 2.22e-5), and "a second witness at a different magnitude"
   > is undercut by MLA turning out to be scored **bit-exactly**, where magnitude does not enter. It
-  > was kept because deleting it is only free if its 16 reddened tensors at layer 3 are a SUBSET of
-  > the eps defect's 20 — the matrix above shows counts, not sets, so nothing here proves that, and
+  > was kept because deleting it is only free if its 21 reddened tensors at layer 3 are a SUBSET of
+  > the eps defect's 27 — the matrix above shows counts, not sets, so nothing here proves that, and
   > a defect whose red set is merely smaller still localises something the other does not. The check
   > is `--compare` on the two defect goldens against each other rather than against `None`, and it
   > needs a GPU because only the `None` goldens are vendored. **Do that before cutting it.**
 * **`ExpertW1W3Swap`** — gate and up swapped in every routed expert, the one repack error that is
   byte-clean; `repack-one-expert.md` could only pin that `w2` is not in the up slot, and this is the
   numerical oracle `V4_PROJ`'s doc says is needed. Layer 0 untouched — it has no routed experts —
-  and layer 1 reddens 4 of 47: its MoE block and what follows, not its attention.
+  and layer 1 reddens 5 of 52: its MoE block and what follows, not its attention.
 * **`RouterBiasInWeight`** — takes the routing weight from the biased score instead of the unbiased
-  one (trap 6). Layer 1 reddens 5 of 47 at 3.5e-2, and `topk_idx` does **not** move: the bias steers
+  one (trap 6). Layer 1 reddens 6 of 52 at 3.5e-2, and `topk_idx` does **not** move: the bias steers
   selection only, so a wrong weight is a small, silent error. The most easily-missed of the eleven.
 * **`LatentNormAfterUp`** — RMSNorm the latent sandwich's output *after* the up projection instead
   of the aggregate before it. Shape-valid in both directions because a norm is width-generic, and
   the **loudest defect in the set at 2.0e+2**.
 * **`DenseMlpGateUpSwap`** — the same gate/up swap in the single dense layer, so a defect exists
-  that touches **layer 0 alone** at first: 6 of 38 there, everything after by propagation.
+  that touches **layer 0 alone** at first: 6 of 40 there, everything after by propagation.
 * **`AttnResNormalisedValues`** — mixes the *normalised* sources instead of the raw concatenation.
   `_apply_attn_res` normalises `v` only to score it and then mixes `v_float`; mixing `k` is a
   one-character slip that leaves every shape intact. Reddens 8 of layer 0's 38 — layer 0's MLP fold
@@ -326,7 +372,7 @@ Every bold cell is asserted. Read the rows:
 * **The four KDA kwargs** — `use_qk_l2norm_in_kernel`, `lower_bound` (the −5.0 gate bound, trap 4:
   it *multiplies* the sigmoid rather than clamping), the stored state's (K,V)-vs-(V,K) axis order,
   and `use_beta_sigmoid_in_kernel`. These are the arithmetic that exists only inside fla's kernel,
-  and each reddens 15 of layer 0's 38 tensors while leaving the 23 upstream of the KDA op alone —
+  and each reddens 16 of layer 0's 40 tensors while leaving the 24 upstream of the KDA op alone —
   the earliest a defect can localise here. Without these runs nothing showed the goldens were
   sensitive to that arithmetic at all; a kernel that omitted the gate bound entirely could have
   matched.
@@ -423,10 +469,31 @@ tests/k3_anchor_driver.py --mode kda-equiv ...     # writes nothing; prints one 
 among the defect runs that *target* it — another operator's defect leaking downstream is not what
 this operator's tolerance is for.
 
+**This table is the ONE-DRAW reading and FIVE of its rows have since moved.** `mla` was re-measured
+across both draws and split in two when item 2 captured the attention core; **`attn_res`,
+`moe_latent` and `moe_route` were left one-draw until item 3 re-ran the fp64 island on draw 2
+(2026-08-12) and found every operator's floor LARGER there, by 2.5-5×.** The superseding numbers are
+in *"Re-measured on both draws"* below, and `tests/common/k3_tolerance.rs` is what the tests read.
+Kept here because the change — a 1.3× margin becoming 0.33× — is the finding, and deleting the
+before makes the after unreadable.
+
+| operator | one-draw floor (below) | draw 2 | now, and policy |
+|---|---|---|---|
+| `attn_res` | 1.571e−5 | **7.052e−5** | 7.052e−5, `Rel(7.1e-4)` |
+| `moe_latent` | 2.851e−5 | **6.287e−5** | 6.287e−5, `Rel(6.3e-4)` |
+| `moe_route` | 2.472e−5 | **5.956e−5** | 5.956e−5, `Rel(6.0e-4)` |
+
+`dense_mlp` was already the max and `kda_op`'s floor is a different measurement. **The
+`weakest own defect` column was right by luck** — it wants the MIN over draws, and draw 1 gave the
+smaller signal on every row, so the one-draw habit understated the floors and left the defects
+correct. Checked rather than assumed. And **not caused by item 3's new captures**: the `moe_latent`
+floor is 2.851e−5 / 6.287e−5 whether or not the two new tensors are in the bucket, measured both
+ways.
+
 | operator | fp32 floor | weakest own defect | margin | policy |
 |---|---|---|---|---|
 | `attn_res` | 1.57e−5 | 1.80e+0 `AttnResNormalisedValues` | 114,000× | `Rel(1.6e-4)` |
-| **`mla`** | **1.70e−5** | **2.22e−5 `MlaLoraEps1e5`** | **1.3×** | **exact only** |
+| **`mla`** *(superseded)* | **1.70e−5** | **2.22e−5 `MlaLoraEps1e5`** | **1.3×** | **exact only** |
 | `moe_latent` | 2.85e−5 | 2.05e+2 `LatentNormAfterUp` | 7.2M× | `Rel(2.9e-4)` |
 | `moe_route` | 2.47e−5 | 2.23e+0 `RouterBiasInWeight` | 90,000× | `Rel(2.5e-4)` |
 | `kda_op` | 6.30e−5 | 1.75e+0 `KdaBetaSigmoidOutside` | 27,700× | `Rel(6.3e-4)` |
@@ -495,9 +562,24 @@ within 30× of its defect fails, and setting one below its own floor fails.
 > trap Muse Glimmer's `attend` floor exposed, hit again on a different model — a floor is the max
 > over draws or it is not a floor.
 >
-> **`MlaLoraEps1e5` is excluded from `mla_attend`'s defect set** for a sharper reason than
-> judgement: it moves that bucket by 3.031e−5, which is *below* the 4.103e−5 floor. Pricing an
-> operator against a signal indistinguishable from its own rounding is not a tolerance.
+> **`MlaLoraEps1e5` is excluded from `mla_attend`'s defect set** on PROVENANCE. It perturbs the
+> LoRA norms, which are *upstream* of the attention; it reaches this bucket only by changing the
+> q/k/v the attention is handed, and a fixture feeds the reference's own q/k/v, so the defect cannot
+> reach the kernel under test at all. It is excluded because it does not target this operator.
+>
+> > **CORRECTED 2026-08-12.** This excluded it "for a sharper reason than judgement: it moves that
+> > bucket by 3.031e−5, which is *below* the 4.103e−5 floor." **That rule does not survive being
+> > applied twice.** On the `mla` row the same defect moves 1.923e−5 under a 5.742e−5 floor — also
+> > below — so a magnitude rule would drop it there too, leaving `mla` with no targeting defect and
+> > turning its ExactOnly into a `Rel`. Two rows cannot read the same evidence shape and reach
+> > opposite conclusions. The provenance argument above is the one this file's own methodology
+> > already states (*the weakest signal among the defects that TARGET this operator*); that the
+> > signal is also below the floor is corroboration, not the reason. Found by adversarial review;
+> > `tests/common/k3_tolerance.rs` carries the same correction at the row itself.
+> >
+> > Stated plainly because it cuts the other way too: `Rel(4.10e-4)` is 13.5× above what
+> > `MlaLoraEps1e5` moves this bucket by, so **the bucket-level gate provably cannot see that eps.**
+> > Correct for the fixture, wrong to generalise — S3 must pin the eps by reading the constant.
 
 **Seven operators have a row; the driver classifies ELEVEN — and the four without one are a GAP, not a
 decision.** `operator_of` also emits `kda_trunk` (a KDA layer's projections and norms, as opposed to
@@ -548,7 +630,7 @@ degenerate at those particular values — a routed weight near zero, a `beta` sa
 hides completely, and one draw cannot show that a defect's localisation is a property of the
 arithmetic rather than of the numbers it landed on.
 
-So **two goldens are vendored** (`--salt k3-anchor-1` and `-2`, 292,781 B each — identical shapes,
+So **two goldens are vendored** (`--salt k3-anchor-1` and `-2`, 332,009 B each — identical shapes,
 independent values), `tests/k3-anchor.sh` scores all eleven defects against both, and every test in
 `tests/k3_anchor.rs` loops over both. The salt-2 matrix reproduces salt-1's green cells exactly:
 `MlaLoraEps1e5` and `MlaScaleFromNope` leave layers 0 and 1 bit-identical, `ExpertW1W3Swap`,
@@ -569,8 +651,21 @@ information: each golden embeds its own `salt` string in its metadata, so the by
 the weights did. A driver refactor that passed a literal salt to `init_weights`, or an `_gen` that
 stopped mixing the salt into its seed, would put bit-identical tensors in both files and pass
 everything — while the fixture claimed the second draw whose entire purpose is that a bug degenerate
-at one draw's values cannot hide. It is now compared per tensor, on `to_bits` over all 223 floats the
-two goldens share, and all 223 must differ.
+at one draw's values cannot hide. It is now compared per tensor, on `to_bits` over every float the
+two goldens share, and all of them must differ — **except a named structural class**, which must be
+bit-identical instead. That class exists because item 2's captures introduced values that are not
+drawn at all: the attention `mask` is causality (all zero at a decode step) and `scaling` is the
+config constant `1/sqrt(qk_nope + qk_rope)`. Asserting them EQUAL is the stronger statement — a
+`scaling` that varied between draws would mean it had stopped being a config constant. The
+exemption list is itself checked for being non-empty, so it cannot go stale into exempting nothing.
+Item 3's two captures are ordinary draws: the aggregate is downstream of the weights and the norm
+weight is drawn from `sha256(salt/name)` like every other parameter.
+
+> **CORRECTED 2026-08-12.** This said "all 223 floats … and all 223 must differ", a count that was
+> stale by 49 and, more importantly, described a test that had already been rewritten: a flat
+> "everything differs" rule went red the moment `mask` and `scaling` were captured. The count is
+> deliberately not restated here — `tests/k3_anchor.rs` asserts it and this file quoting it is how
+> it went wrong twice.
 
 **The vendored `config.json` is pinned by a hash the gate RECOMPUTES**, added 2026-08-11 after Muse
 Glimmer's port found the same hole on its own side (its HF revision was a prose claim matched by

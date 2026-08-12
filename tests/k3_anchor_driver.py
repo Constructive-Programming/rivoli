@@ -670,16 +670,77 @@ def wrap_mla_attention(mod, model, cap, ctx, layers):
     # A pre-hook rather than another free-function wrap, because `o_proj` IS a module and its input
     # is exactly the quantity wanted. `register_forward_hook` gives the output, which is already
     # captured and is a different claim.
-    for name, m in model.named_modules():
-        if not name.endswith(".self_attn.o_proj"):
-            continue
-        if not any(name.startswith(f"model.layers.{i}.") for i in layers):
-            continue
-        tag = f"{name}.in_gated"
-        m.register_forward_pre_hook(
-            lambda _m, inp, _t=tag: cap.add(_t, inp[0]) if ctx["capturing"] else None
-        )
+    pre_hook_inputs(model, cap, ctx, layers, ".self_attn.o_proj", ".in_gated")
     return orig
+
+
+def pre_hook_inputs(model, cap, ctx, layers, ends, suffix, params=()):
+    """Capture the INPUT of every captured-layer module whose name ends with `ends`.
+
+    A forward hook gives a module's output. Three of this port's operators are fed a value that
+    no module produced -- the gated activation entering `o_proj`, the block's hidden state
+    entering `routed_expert_down_proj`, and the expert aggregate entering `routed_expert_norm` --
+    and for those the input IS the fixture. `params` additionally records named parameters of the
+    module, for the same reason `wrap_attn_res` records the fold: a kernel fed an input and asked
+    for an output cannot be scored without the weights in between.
+
+    Returns the module names hooked, so the caller can assert a census rather than trust that a
+    suffix matched anything. A hook that never fires is silent, and that silence cost this harness
+    its AttnRes coverage for a day.
+    """
+    hooked = []
+    for name, m in model.named_modules():
+        if not name.endswith(ends) or not any(
+            name.startswith(f"model.layers.{i}.") for i in layers
+        ):
+            continue
+
+        def fire(mod_, inp, _n=name):
+            if not ctx["capturing"]:
+                return
+            cap.add(f"{_n}{suffix}", inp[0])
+            for p in params:
+                cap.add(f"{_n}.{p}", getattr(mod_, p))
+
+        m.register_forward_pre_hook(fire)
+        hooked.append(name)
+    return hooked
+
+
+def wrap_latent_sandwich(model, cap, ctx, layers):
+    """The MoE latent sandwich's two open ends -- S2 item 3.
+
+    `k3-architecture.md` §6 is `down(x) -> experts in latent space -> RMSNorm the AGGREGATE ->
+    up(...)`, and the golden held only the three module OUTPUTS. Two values a fixture needs were
+    therefore absent:
+
+    * **the aggregate**, `routed_expert_norm`'s input. It is `moe_infer`'s return, which is not a
+      module call, and `.experts` is deliberately unhooked because which expert fires is
+      routing-dependent. So the RMSNorm -- the one operator in this sandwich whose arithmetic is
+      neither a plain matmul nor shared with another model -- had no input at all.
+    * **the norm's weight**, drawn per-parameter from `sha256(salt/name)` and so not reproducible
+      outside this file.
+
+    The other two inputs are NOT captured, and in both cases because the file already holds them:
+    `routed_expert_up_proj`'s input is `routed_expert_norm`'s output, and
+    `routed_expert_down_proj`'s is `post_attention_layernorm`'s (reference `:964-966`, `:1035-1037`
+    -- the block is called on the normed hidden state and on nothing else). A second copy under a
+    second name would read as corroboration and be a tautology.
+
+    **The two projection WEIGHTS are also not captured, and that is a decision rather than an
+    oversight.** They are `[96,192]` and `[192,96]` here -- 36,864 floats per MoE layer against
+    the whole golden's ~70,000 -- so capturing them at the five MoE layers would roughly quadruple
+    both vendored files. What they would buy is an anchor-scored GEMV, and that comparison is weak
+    where it is not free: rivoli's trunk matmul is `gemm_bf16`, whose weights are bf16, while this
+    reference runs fp32 (one of the anchor's four declared deviations). A bf16 weight is ~2^-9
+    relative off its fp32 twin -- 1.95e-3 against `moe_latent`'s 2.9e-4 tolerance -- so the
+    fixture could only be stated at a tolerance seven times looser than the operator's, and it
+    would still be at hidden 192 rather than 7168. `tests/k3_kernels.rs` scores `gemm_bf16`
+    against an f64 host dot at K3's REAL widths instead, which is both cheaper and wider.
+    """
+    return pre_hook_inputs(
+        model, cap, ctx, layers, ".routed_expert_norm", ".in", params=("weight",)
+    )
 
 
 def wrap_kda_ops(mod, cap, ctx, layers):
@@ -1248,6 +1309,7 @@ def main():
     wrap_kda_ops(mdl_mod, cap, ctx, CAPTURE_LAYERS)
     wrap_attn_res(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
     wrap_mla_attention(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
+    latent = wrap_latent_sandwich(model, cap, ctx, CAPTURE_LAYERS)
     ids = torch.arange(1, args.seq + 1, device=args.device).unsqueeze(0) % cfg.vocab_size
 
     if args.mode == "kda-equiv":
@@ -1288,6 +1350,18 @@ def main():
     for tag in ("self_attention_res", "mlp_res"):
         assert any(f".{tag}.out" in s for s in cap.seen), f"no {tag} fold was captured"
     assert any("output_attn_res.out" in s for s in cap.seen), "no model-level fold was captured"
+    # The latent sandwich's pre-hooks get a COUNT, not an `any`. `first_k_dense_replace` decides
+    # which captured layers own a `block_sparse_moe` at all, so a suffix that matched nothing and a
+    # config that made layer 0 dense are the same shape of silence -- and one of them is correct.
+    # Deriving the expected number from the config is what separates them.
+    moe_layers = [i for i in CAPTURE_LAYERS if i >= cfg.first_k_dense_replace]
+    assert len(latent) == len(moe_layers), (
+        f"{len(latent)} latent-sandwich pre-hooks for {len(moe_layers)} MoE capture layers "
+        f"{moe_layers} -- expected one `routed_expert_norm` each"
+    )
+    for tag in (".routed_expert_norm.in", ".routed_expert_norm.weight"):
+        got = sum(1 for s in cap.seen if s.endswith(tag))
+        assert got == len(moe_layers), f"{got} captures of {tag} for {len(moe_layers)} MoE layers"
 
     import fla
     import transformers
