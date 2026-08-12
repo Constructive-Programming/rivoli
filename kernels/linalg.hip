@@ -337,7 +337,7 @@ extern "C" __global__ void swiglu_clamped_bf16(
 // **`_f32` names the STORE, extending the `_bf16` convention rather than adding a sense to it**
 // (`common.hpp`'s naming note). It is spelled out because which store a kernel performs is
 // precisely what this port got wrong once already: `mla.hip::rmsnorm_batch` was named for K3's
-// latent norm on the strength of being width-generic, and its bf16 store put it 11.4x outside
+// latent norm on the strength of being width-generic, and its bf16 store put it 5.2x outside
 // that operator's tolerance (S2 item 3, 2026-08-12). An unmarked name invites the same reading.
 // K3's `SituAndMul` returns `.to(x.dtype)`, a no-op against the fp32 anchor, and rivoli's trunk
 // carries f32 activations throughout.

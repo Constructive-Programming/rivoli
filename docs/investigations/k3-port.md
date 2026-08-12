@@ -60,7 +60,10 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
 - **The per-operator TOLERANCES are measured and gated**, `tests/common/k3_tolerance.rs`. The MLA
   LoRA-norm eps divergence sits at **0.33x that operator's own fp32 rounding floor** — *below* it —
   so **no tolerance can separate it and the eps must be pinned structurally**, by reading the
-  constant. Every other operator has 90,000x to 7M x of room and is set at 10x its floor.
+  constant. Every other operator has **16,000x to 3.3M x** of room and is set at 10x its floor.
+  *(That range said "90,000x to 7M x" until 2026-08-12 — a pre-re-measurement figure this same
+  change left standing while rewriting the INDEX row to the correct one. Derived from the table:
+  16,033x at `mla_attend`, 3.25M x at `moe_latent`.)*
   **S1b IS DONE**; S3's layer loop remains for the pin.
   *(This read "2.2e-5 relative, which is only 1.3x" until 2026-08-12. That was the ONE-DRAW reading
   taken before item 2 captured the attention core; re-measured over both draws and with `mla_attend`
@@ -74,11 +77,21 @@ measurements it cites are vendored under **`docs/measurement/k3-reference/`**.
   the fixture** — the fold weights, the attention core and `o_proj`'s input, the expert aggregate and
   the norm weight. Goldens re-vendored three times, now at **272** tensors. Item 3 also found the
   first place the anchor's fp32-vs-bf16 deviation bites: an operator whose rivoli kernel rounds to
-  bf16 cannot be scored against this anchor at the anchor's own tolerance. **5a found that the
-  reference stores its recurrent state `[value][key]` and that rivoli should NOT** — the first
-  reference convention this port measured and then declined, at no cost, because the state never
-  leaves the device. **5b and 5c are next and share ONE regeneration** (the conv taps and
-  `o_norm.weight`); then 5d's tolerance row, item 6 (the router) and item 7 (trunk GEMV speed).
+  bf16 cannot be scored against this anchor at the anchor's own tolerance. **5a found that fla's
+  recurrent-state BUFFER is `[value][key]` and that rivoli's kernel should not follow it** — measured
+  at six orders of separation, and declined because the state starts at zero and never leaves the
+  device. Note whose convention that is: `k3-architecture.md` §4 step 7 names the axes and AGREES
+  with rivoli, so what was declined is the anchor stack's buffer order and not the reference's
+  arithmetic. **5b and 5c are next and share ONE regeneration** (the conv taps and `o_norm.weight`);
+  then 5d's tolerance row, item 6 (the router) and item 7 (trunk GEMV speed).
+- **All seven reviews of items 3-5a triaged 2026-08-12**: 45 findings applied, 3 rejected, 4 recorded
+  as OPEN. The four that mattered were **numbers nothing checked** — a `11.4x` that was `5.2x` against
+  the tolerance its own change had replaced, a tolerance-room range that disagreed with the INDEX
+  row, a separation misattributed to the wrong MLP, and item 5a's saturation claim being backwards —
+  plus **five gates that could not go red**: `rel(x, &[])` scoring 0.0, the fp4 range never launched
+  at an offset, the KDA host oracle missing the tripwire its device twin has, both real-width sweeps
+  gated only at an operator tolerance, and `FLOOR_MULT`'s band fitted to five samples rather than
+  derived (it would have rejected a rule-following row, and 5d's floor passes it by luck).
 
 ## G. The gate model
 
@@ -704,13 +717,16 @@ model is stored in — is answered above: none.)*
 3. **The latent sandwich** — two bf16 trunk GEMVs plus a norm, with the accumulator interception of
    S1a.4. Scored by `tests/k3_kernels.rs`.
 
-   > **CORRECTED 2026-08-12.** This item read "plus `rmsnorm_batch` (`mla.hip:346`, already
+   > **CORRECTED 2026-08-12.** This item read "plus `rmsnorm_batch` (`mla.hip::rmsnorm_batch`, already
    > width-generic)". It is width-generic, and **the width was never the problem.** Its last line is
    > `row[i] = rbf16(w[i] * (row[i] * rs))` — it rounds its store to bf16, because V4's
    > `RMSNorm.forward` stores bf16 and that kernel is V4's. `KimiRMSNorm.forward` is
    > `self.weight * x.to(dtype)`, and against this fp32 anchor `to(dtype)` is a no-op, so the bf16
    > step is arithmetic the reference does not perform: **measured 3.299e-3 against the 6.3e-4
-   > tolerance, 11.4× over**. **The kernel is `linalg.hip::rmsnorm_single`** (f32 store, out-of-place),
+   > tolerance, 5.2× over** *(this said 11.4×, which is the ratio against `moe_latent`'s superseded
+   > 2.9e-4 — the tolerance moved in this same change and the multiplier did not, here and in two
+   > other files; corrected 2026-08-12)*. **The kernel is `linalg.hip::rmsnorm_single`** (f32 store,
+   > out-of-place),
    > correct at decode's one row. `the_batch_rmsnorm_would_fail_this_fixture` asserts the failure
    > rather than leaving it as a comment, because a claim that one of two interchangeable kernels is
    > wrong is exactly the claim that rots.
@@ -797,6 +813,23 @@ model is stored in — is answered above: none.)*
    > different kernel, and SiTU-GLU's own bound (`|y| <= 100`) does not remove it: the dot feeding
    > it is unbounded. Whatever 4b does here has to be argued, not inherited.
 
+   > **OPEN, and it is the one live NUMERICAL question these reviews found (2026-08-12).** Three
+   > places disagree about where bf16 rounding happens on this path: `moe.hip`'s pass-1 comment says
+   > the reference hands `w2` a **bf16** activation (and the kernel rounds its output accordingly),
+   > `launch_moe_expert_range_f4_situ`'s doc says K3's `w2` takes a **plain fp32** activation (§6's
+   > `k3_matmul_mxfp4(edn, act, ...)`, which is why there is no `act_quant_f8` between the passes),
+   > and `common.hpp::situ_glu` point 3 says neither of its OPERANDS is bf16-rounded because
+   > "whatever rounding the real model does happened at the projection" — while the kernel that
+   > rounds the output IS that projection. The kernel rounds its output and not its inputs, and on
+   > real bf16 weights first-party's `g`/`u` come out of the same MXFP4 `Linear`s, so one of the
+   > three is wrong by ~2^-9 on every one of 896 experts × 92 layers.
+   >
+   > **No fixture here can settle it.** The anchor runs fp32 (a declared deviation) so it cannot see
+   > a bf16 boundary at all, and `host_expert_f4` reproduces the kernel's rounding points BY
+   > CONSTRUCTION — on this one question the oracle is a tautology. It needs real bf16 weights or a
+   > bf16 anchor run, so it belongs to **S4**, and the three comments should be made to agree the
+   > moment it is settled rather than before.
+
    **4b as built:** `moe_gateup_f4_situ`, `moe_down_f4_weighted` and
    `rivoli_moe_expert_range_f4_situ`. Pass 2 is ONE templated body with the existing kernel,
    `WEIGHTED` deciding a single line — `moe_acc_drain`/`moe_acc_drain_to`'s pattern, for its reason:
@@ -877,19 +910,40 @@ model is stored in — is answered above: none.)*
    for it; what it computes is the gated delta rule, and this tree has a rule against a model's name
    on a kernel. The file is named for the family so 5b and 5c land beside it.
 
-   > **THE FINDING: the reference stores the state `[value][key]`, and this kernel deliberately does
-   > not.** `transpose_state_layout=True` is in the driver's kwargs and names the choice, but the
-   > state is SQUARE at the tiny widths (32) and at the real ones (128), so no shape assertion can
-   > see it and §4's `S[i][j]` is prose either way. Scoring both interpretations of the anchor's own
-   > `initial_state` settles it: with the transpose the recurrence agrees to **2.5e-7**, without it
-   > to **2.2e-1 – 5.6e-1**, unanimously across three layers and both draws.
+   > **THE FINDING: fla's recurrent-state BUFFER is `[value][key]`, and this kernel keeps
+   > `[key][value]`.** `transpose_state_layout=True` is in the driver's kwargs and names the choice,
+   > but the state is SQUARE at the tiny widths (32) and at the real ones (128), so no shape assertion
+   > can see it. Scoring both interpretations of the anchor's own `initial_state` settles it: the
+   > correct one agrees to **2.481e-7** (the host oracle's worst over three layers and both draws; the
+   > device kernel's own is 2.265e-7) and reading the same buffer the other way round moves the result
+   > by **7.567e-1** — six orders, unanimous across all six sites. Both numbers are named constants in
+   > `tests/k3_kernels.rs` and asserted per defect form, because they were quoted here and nothing
+   > checked them.
    >
-   > The port keeps `[key][value]` regardless, and pays nothing for it: rivoli's state starts at zero
-   > and never leaves the device, so nothing forces the reference's axis order on it, while
-   > `S[i*d + t]` is what makes consecutive threads read consecutive addresses. The transpose is a
-   > FIXTURE boundary — three lines, once per case — and `KdaStateLayout`'s red-proof is what shows
-   > the fixture can tell the two apart. **This is the first item where a reference convention was
-   > measured and then declined**, rather than measured and adopted.
+   > **Whose convention it is matters, and an earlier version of this paragraph got it wrong.** It
+   > said "the reference stores the state `[value][key]`" and that "§4's `S[i][j]` is prose either
+   > way". `k3-architecture.md` §4 step 7 writes `S[i][j]` with **`i` the key channel and `j` the
+   > value channel** — it names both axes, it is C-reference-sourced, and it AGREES with this kernel.
+   > What was declined is the anchor stack's buffer order. Corrected 2026-08-12 by an adversarial
+   > review whose point was sharp: a reader following the old wording would "correct" the one
+   > axis-order statement in `k3-architecture.md` that is currently right.
+   >
+   > The port keeps `[key][value]` because `S[i*d + t]` is what makes consecutive threads read
+   > consecutive addresses, and nothing forces fla's order on a state that starts at zero and never
+   > leaves the device. **"At no cost" was too strong, and both costs are real.** (1) At S3, a live
+   > state dumped and diffed against the anchor's will load, shape-check and disagree by 2.2e-1 to
+   > 5.6e-1 — which these docs file as the signature of `--defect KdaStateLayout`, so the
+   > misdiagnosis is pre-baited; naming the transpose in `src/` is the cheap mitigation. (2) A chunked
+   > prefill can only be ported from fla, whose buffer is the other order, so transliterating its
+   > index math against `[key][value]` is wrong with every shape check green.
+   >
+   > A performance review also priced the stated REASON and found it the weaker half: with a
+   > per-thread row the DRAM traffic is the same and the request-count penalty is a small multiple,
+   > not 16x — while the transposed layout would permit a `float4` per-thread row, 4x the bytes in
+   > flight on the axis this tree has twice measured as the limiter. `[key][value]` is the only
+   > layout that can be simultaneously vectorized AND coalesced, and it pulls ahead once a thread
+   > owns four consecutive value channels, which this kernel does not yet do. Corrected in place at
+   > `kernels/recurrent.hip`.
 
    Everything else in §4 steps 3-7 confirmed exactly as written, by the same six-site sweep: the L2
    norm on q and k only with `eps` on the SUM, `beta = sigmoid(b_proj)`, `alpha =
@@ -904,6 +958,37 @@ model is stored in — is answered above: none.)*
    **What 5a does NOT cover, and it is the same gap AttnRes has**: the fixture runs ONE step from a
    supplied `initial_state`. That 69 states stay alive across a sequence and are never reset
    mid-decode is S3's, and no anchor capture can gate it — the golden holds one step of one decode.
+
+   **OPEN from the reviews, and both are numerical rather than structural.**
+
+   * **The KDA L2-norm eps `1e-6` is a literal in the kernel AND in its oracle**, so no comparison
+     between them can move it — and it is an fla internal default, absent from the tiny config, so
+     the anchor cannot attest to it the way it attests to `gate_lower_bound`. Same class as the MLA
+     LoRA eps this port already concluded must be pinned by READING. **But the golden does see it**,
+     which one review claimed it could not and another measured: a 10x-wrong eps moves the anchor
+     comparison by **1.775e-4 to 4.184e-4**, caught by the 2.265e-6 tripwire with 100x to spare and
+     invisible to the 6.3e-4 `kda_op` tolerance at all six sites. Both are right about different
+     widths — at the real 128 the effect is ~5e-9 and nothing sees it — so what is owed at S3 is a
+     read of fla 0.5.2's default, and the regime that matters is a head whose `|q|²` approaches eps.
+   * **`common.hpp`'s fixed-point overflow argument is a GLM/V4 measurement** (`|v| <= 15.25` over
+     21.5M samples). K3 is the first model to use the full 16-term budget, its `h` is bounded ±100 by
+     SiTU-GLU rather than by `swiglu_limit`, and pass 2 reduces over 3072. Nothing overflows that a
+     correctness review could see, and the 1074x margin quoted there is not a K3 number.
+
+   **Two performance items DEFERRED with their arithmetic**, from a review that could not measure
+   (the GPU is shared) and that priced this kernel at **~8-80 ms/token, 0.4-4.6% of a token**,
+   depending entirely on memory-level parallelism:
+
+   * **Template on `head_dim` ∈ {32, 128}** so the trip count is constant. The stated benefit rests
+     on whether ROCm's range metadata carries `blockDim.x >= 1` through to pass 2's store/load
+     disambiguation, which is an ISA question and not a source one — settle it by reading the
+     emitted ISA when there is a caller, not now.
+   * **The redesign: key-split ×4, four consecutive value channels per thread, and the state column
+     held in registers.** That is 60% occupancy against today's 15% (96 blocks × 128 threads = 384
+     wave32s against gfx1151's 2,560 slots), 512 B in flight per wave-instruction against 128 B, and
+     **1R/1W instead of 2R/2W — exactly, with no re-association**, because `o` still accumulates off
+     the updated value in the write loop. Traffic 1.736 → 0.868 GB/token. It needs a microbench and
+     a caller, and both are S3's.
 
    **The launcher takes no token count, and that is a scope cut with a price.** It is one step, so a
    KDA prefill is `T` launches of it — 69 layers x T, each a 2-pass sweep of the whole state. That is

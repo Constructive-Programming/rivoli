@@ -380,6 +380,19 @@ launchers! {
     /// scales. `wexpert` is `>= e_start + e_count` f32, `h` is `>= (e_start + e_count) * inter` f32,
     /// `acc` is `expert_in` u64. All outlive `stream`'s completion; `stream` is a live
     /// `hipStream_t`, or null for the default stream.
+    ///
+    /// **`h` must be 16-byte aligned too, and it is the one a caller is likely to get wrong.** Pass
+    /// 2 issues the same `float4` loads on `h_in + e * inter`, so a caller that sub-slices `h` out
+    /// of a shared per-layer scratch arena at an unaligned offset faults inside `dot_f4_wave_r`
+    /// rather than falling back to the scalar tail — and only at the real widths, where
+    /// `inter >= 256` enters the fast path. `x` and `h` must also **not alias**: both are
+    /// `__restrict__` in the kernel. Both sentences are in the fp8 twin's doc and were dropped from
+    /// this one; restored 2026-08-12 by review, and no fixture allocates `h` unaligned, so neither
+    /// has a negative test.
+    ///
+    /// `nrow` must be 1 (guard 1003) — K3 has no speculative decode (`num_nextn_predict_layers` is
+    /// 0), and pass 1 is the one kernel of the pair that is NOT row-templated, so `nrow > 1` is a
+    /// two-kernel change rather than a parameter.
     launch_moe_expert_range_f4_situ -> rivoli_moe_expert_range_f4_situ, "moe_expert_range_f4_situ" (
         x: *const f32,
         expert_in: usize as i32,
@@ -942,9 +955,13 @@ launchers! {
     ///
     /// # Safety
     /// Every pointer is a device buffer of the size above and must outlive `stream`'s completion.
-    /// `state` is read and written by the same thread per column and must not alias any other
-    /// argument; `out` must not alias `q`, `k`, `v` or `g`, which are read after the state passes
-    /// begin. `stream` is a live `hipStream_t`, or null for the default stream.
+    /// **Every one is `__restrict__` in the kernel, so none may alias another** — that is the whole
+    /// requirement and it is why the reason matters less than it looks. (This said `out` must not
+    /// alias `q`, `k`, `v` or `g` "which are read after the state passes begin". Only `v` is: `q`
+    /// and `k` are read at the top and `g` before the barrier, all before the first state pass.
+    /// Corrected 2026-08-12 by review — the requirement was right and stricter than the index
+    /// arithmetic needs, and the reason given for it was wrong, which invites relaxing it.)
+    /// `stream` is a live `hipStream_t`, or null for the default stream.
     launch_gated_delta_recurrent_f32 -> rivoli_gated_delta_recurrent_f32,
     "gated_delta_recurrent_f32" (
         q: *const f32,

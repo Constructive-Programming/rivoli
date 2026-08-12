@@ -1,9 +1,19 @@
-//! **Kimi-K3's kernels on the device, scored against the S1b anchor.** S2 items 1, 2 and 3 of
-//! `docs/investigations/k3-port.md` — AttnRes, the gated MLA core, and the MoE latent sandwich.
+//! **Kimi-K3's kernels on the device, scored against the S1b anchor.** S2 items 1-4 and 5a of
+//! `docs/investigations/k3-port.md` — AttnRes, the gated MLA core, the MoE latent sandwich, SiTU-GLU
+//! and the fused fp4 expert, and the gated delta recurrence. Each has a `// ====` banner.
 //!
-//! One file rather than three because they share every helper that matters: the two vendored draws,
-//! the `rel` scorer, and the tolerance table. Three files meant three copies of each, and jscpd
-//! rejected the second of them.
+//! One file rather than five because the shared helpers are local to it: the two vendored draws,
+//! `load`, `rel`, `tripwire`, `device` and the `#[path]` tolerance table are read from every section,
+//! and keeping the tripwire argument in one place is what stops five sites disagreeing about what it
+//! means.
+//!
+//! > **CORRECTED 2026-08-12 by review.** This said "three files meant three copies of each, and
+//! > jscpd rejected the second of them" — and the file's own `#[path]` includes disprove it. A
+//! > `#[path]`-included module is ONE file on disk however many binaries compile it, which is
+//! > exactly how `common/k3_tolerance.rs` is shared with `k3_anchor.rs`. So the honest cost of
+//! > splitting is locality, plus an `#![allow(dead_code)]` per shared module, not duplication. The
+//! > single file is still the better shape at five items; the reason it was given was not the real
+//! > one, and it is the reason the next author would be handed when 5b and 5c arrive.
 //!
 //! # Item 1 — AttnRes
 //!
@@ -55,6 +65,10 @@ use k3_golden::float;
 
 #[path = "common/k3_tolerance.rs"]
 mod k3_tolerance;
+
+// ==================================== S2 item 1 — AttnRes ====================================
+//
+// The fold itself; the `[T][9][hidden]` stack that feeds it is S3's. Argued in the module doc above.
 
 /// Both vendored draws. A kernel bug degenerate at one draw's values hides completely, and the
 /// softmax is exactly the sort of arithmetic that has a degenerate case — a stack whose scores
@@ -176,22 +190,6 @@ fn stack(g: &GoldenSet, tag: &str) -> (Vec<f32>, usize, usize) {
     (v, blocks + 1, hidden)
 }
 
-/// The reference's fold, transliterated, in `f64` — the host oracle the device is scored against.
-///
-/// `f64` because the reference accumulates every long reduction in double (`k3-architecture.md`
-/// §10's closing note), so this reproduces the reference's own arithmetic rather than a second fp32
-/// implementation of it. Scoring the kernel against an fp32 host would measure two fp32
-/// implementations disagreeing, which is a different and much smaller number than the one
-/// `attn_res`'s tolerance was measured for.
-///
-/// Split into `host_probs` and `host_fold` because three places need the probabilities and only one
-/// needs the mixture — and because a review found the same f64 softmax written out three times in
-/// this file, which jscpd could not see (the surrounding code differs) and which is the one place
-/// factoring genuinely paid.
-///
-/// Returns the softmax probabilities and each source's RMSNorm scale, since the
-/// `AttnResNormalisedValues` defect needs the latter to mix the scored vector instead of the raw
-/// one.
 /// Max-subtracted softmax in `f64`. Both oracles ended with these four lines; jscpd caught it.
 fn softmax64(score: &[f64]) -> Vec<f64> {
     let m = score.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -210,6 +208,25 @@ struct FoldIn<'a> {
     eps: f32,
 }
 
+/// The reference's fold, transliterated, in `f64` — the host oracle the device is scored against.
+///
+/// `f64` because the reference accumulates every long reduction in double (`k3-architecture.md`
+/// §10's closing note), so this reproduces the reference's own arithmetic rather than a second fp32
+/// implementation of it. Scoring the kernel against an fp32 host would measure two fp32
+/// implementations disagreeing, which is a different and much smaller number than the one
+/// `attn_res`'s tolerance was measured for.
+///
+/// Split into `host_probs` and `host_fold` because three places need the probabilities and only one
+/// needs the mixture — and because a review found the same f64 softmax written out three times in
+/// this file, which jscpd could not see (the surrounding code differs) and which is the one place
+/// factoring genuinely paid.
+///
+/// Returns the softmax probabilities and each source's RMSNorm scale, since the
+/// `AttnResNormalisedValues` defect needs the latter to mix the scored vector instead of the raw one.
+///
+/// (This block documented `host_probs` while sitting on `softmax64` until 2026-08-12 — one of three
+/// orphans an earlier dedup pass left behind, and the kind a reader believes because it is
+/// well-written and in doc position.)
 fn host_probs(f: &FoldIn) -> (Vec<f64>, Vec<f64>) {
     let (src, nsrc, n, fold, eps) = (f.src, f.nsrc, f.n, f.fold, f.eps);
     let mut score = vec![0.0f64; nsrc];
@@ -246,8 +263,6 @@ fn host_fold(f: &FoldIn, normalised: bool) -> Vec<f32> {
     out.into_iter().map(|x| x as f32).collect()
 }
 
-/// Relative difference the way `--by-operator` measures it, so the number compared here is the
-/// number the tolerance was measured in.
 impl Attend {
     /// This layer's boundary as an attention call. One constructor, so the two tests that launch
     /// over it cannot disagree about which buffers go where.
@@ -276,10 +291,29 @@ impl Attend {
 /// number that has no business moving. Moving a constant is allowed and re-measuring is how — what
 /// is not allowed is loosening one to make a red run green without knowing why it moved.
 ///
-/// One function rather than four copies. jscpd rejected the fourth at 135 tokens, which is the gate
-/// noticing that four sites were making the same argument in the same words; the better shape is
-/// that they can no longer disagree about what the tripwire means.
+/// One function rather than a copy per site. jscpd rejected the fourth at 135 tokens, which is the
+/// gate noticing that several sites were making the same argument in the same words; the better
+/// shape is that they can no longer disagree about what the tripwire means. Every item in this file
+/// calls it.
 fn tripwire(r: f32, observed_worst: f32, tol: f32, at: &str) {
+    // **The tripwire must be TIGHTER than the operator tolerance, or it is decoration.** Nothing
+    // related the two before 2026-08-12, and the message below invites moving the constant — so a
+    // hand-widened `observed_worst` could sail past `tol` and leave the site with no bar at all.
+    // Measured payoff, from the review that found it: a 10x-wrong KDA L2-norm eps moves the anchor
+    // comparison by 1.775e-4 to 4.184e-4, which this tripwire catches with 100x to spare and the
+    // 6.3e-4 `kda_op` tolerance does not see at any of the six sites.
+    //
+    // Only the LOWER direction can be checked uniformly. The gap between the two bars runs from
+    // 6.5x (`dense_mlp`, tolerance 9.4e-6 against a 1.454e-6 tripwire) to 4,800x (`moe_latent`),
+    // because an operator tolerance is a whole-model floor and a tripwire is this fixture's own
+    // measurement — so an upper backstop in the table's 30x style would reject the tightest row.
+    assert!(
+        observed_worst * 10.0 <= tol,
+        "{at}: the {observed_worst:e} tripwire admits {:e}, which is ABOVE the {tol:e} operator \
+         tolerance — so this site has no effective bar. Re-measure the kernel rather than the \
+         constant.",
+        observed_worst * 10.0
+    );
     assert!(
         r <= observed_worst * 10.0,
         "{at}: {r:e} is far above the {observed_worst:e} this kernel achieves. Still inside the \
@@ -288,6 +322,19 @@ fn tripwire(r: f32, observed_worst: f32, tol: f32, at: &str) {
     );
 }
 
+/// The worst the two real-width sweeps measure against their f64 oracles, over every cell.
+///
+/// Two correct implementations disagreeing, so these are three orders under the operator tolerances
+/// those sweeps used to be gated on alone (7.1e-4 and 4.10e-4).
+const ATTN_RES_SWEEP_WORST: f32 = 6.775e-8;
+const MLA_SWEEP_WORST: f32 = 3.634e-7;
+
+/// Relative difference the way `--by-operator` measures it, so the number compared here is the
+/// number the tolerance was measured in.
+///
+/// (Its doc line sat on `impl Attend` 40 lines up until 2026-08-12 — one of three orphaned blocks an
+/// earlier dedup pass left attached to the wrong item. Well-written comments in doc position are the
+/// ones a reader believes.)
 fn rel(a: &[f32], b: &[f32]) -> f32 {
     // **Non-finite is INFINITY, not zero, and this is the most important line in the file.**
     //
@@ -303,6 +350,17 @@ fn rel(a: &[f32], b: &[f32]) -> f32 {
     // produce NaN — one call site was patched instead of the shared helper, which is exactly the
     // shape that leaves the other five exposed.
     if a.iter().chain(b).any(|x| !x.is_finite()) {
+        return f32::INFINITY;
+    }
+    // **A length mismatch is INFINITY for the same reason, and it is the same hole.** `zip` stops
+    // at the shorter operand and `scale` floors at 1e-30, so `rel(anything, &[])` folds nothing and
+    // returns 0.0 — a perfect match. Two constructors in this file hand out exactly that:
+    // `synthetic_kda` and the SiTU width sweep both build cases whose `want` is `Vec::new()`
+    // because they score against a host oracle instead. Neither is mis-wired today; the point is
+    // that ~30 sites here slice `got[h*dv..(h+1)*dv]` by hand, and a mis-derived length would
+    // score as a pass. Found by review 2026-08-12, on the argument the NaN note above makes: the
+    // shared helper is where this belongs, not one call site.
+    if a.len() != b.len() {
         return f32::INFINITY;
     }
     let scale = b.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-30);
@@ -609,6 +667,13 @@ fn attn_res_at_real_widths_and_multiple_tokens() {
                     d <= tol,
                     "n={n} tokens={tokens} nsrc={nsrc} token {t}: {d:e} exceeds {tol:e}"
                 );
+                // **And the tripwire, added 2026-08-12.** This sweep had no bar but `tol` — and
+                // `attn_res`'s row was LOOSENED 4.4x by item 3 (1.6e-4 to 7.1e-4) on evidence about
+                // the anchor-scored fixture, whose comment says the tripwire "is the bar that
+                // actually binds there". True there, false here: this scores two correct
+                // implementations against each other, so its realised difference is ~1e-7 and the
+                // tolerance was three orders of slack that moved when an unrelated floor did.
+                tripwire(d, ATTN_RES_SWEEP_WORST, tol, "the attn_res width sweep");
             }
             // Anti-vacuity: with `tokens > 1` a kernel that wrote only block 0 would leave the
             // rest of `out` at zero, and a per-token comparison against a host fold of the RIGHT
@@ -625,6 +690,12 @@ fn attn_res_at_real_widths_and_multiple_tokens() {
         }
     }
 }
+
+// ================================ S2 item 2 — the gated MLA core ================================
+//
+// `mha_attend` over the reference's own q/k/v, plus `sigmoid_gate` for the output gate. The two are
+// separate kernels because §5's order is attend-then-gate with NO norm between them, which is trap
+// 10's other half — KDA norms first, and item 5c is where that half becomes checkable.
 
 /// The captured layers the real map makes MLA — zero-based 3, 91 and 92.
 ///
@@ -1065,6 +1136,9 @@ fn mha_attend_at_real_widths_masks_and_magnitudes() {
                 "heads={heads} kv={kv} d={d} gain={gain} head {h}: non-finite output — the \
                  softmax lost its max-subtraction"
             );
+            // Same argument as the AttnRes sweep's tripwire: `tol` here is `mla_attend`'s
+            // whole-model floor and this cell is kernel-versus-f64-oracle, three orders tighter.
+            tripwire(d_rel, MLA_SWEEP_WORST, tol, "the mha_attend width sweep");
             assert!(
                 d_rel <= tol,
                 "heads={heads} kv={kv} d={d} dv={dv} masked={masked} gain={gain} head {h}: \
@@ -1217,13 +1291,21 @@ fn the_latent_norm_matches_the_anchor_at_every_moe_layer() {
 
 /// **`rmsnorm_batch` would fail the fixture above, and that is why this item does not use it.**
 ///
-/// `docs/investigations/k3-port.md` named `mla.hip:346` for this operator on the grounds that it is
+/// `docs/investigations/k3-port.md` named `mla.hip::rmsnorm_batch` for this operator on the grounds
+/// that it is
 /// already width-generic. It is — and the width was never the problem. Its last line is
 /// `row[i] = rbf16(w[i] * (row[i] * rs))`: it rounds its store to bf16, because V4's
 /// `RMSNorm.forward` stores bf16 and that kernel is V4's. `KimiRMSNorm.forward` is
 /// `self.weight * x.to(dtype)`, and in this fp32 reference `to(dtype)` is a no-op — so the whole
-/// bf16 step is arithmetic the reference does not perform. Measured: **3.299e-3 against the
-/// 6.3e-4 tolerance, 11.4x over** — this is not a marginal call.
+/// bf16 step is arithmetic the reference does not perform. Measured: **3.299e-3 against the 6.3e-4
+/// tolerance**, and the assert below prints both, so the ratio is not restated here.
+///
+/// > **CORRECTED 2026-08-12.** This said "11.4x over". 3.299e-3 / 6.3e-4 is **5.24x**; 11.4x is the
+/// > ratio against `moe_latent`'s pre-2026-08-12 tolerance of 2.9e-4, which item 3 replaced when it
+/// > re-measured the floor over both draws — the tolerance moved and the multiplier did not, in
+/// > three files. The margin on the one test here that proves a kernel WRONG halved in that commit
+/// > while the prose recorded it as unchanged, and since the assert is only `worst > tol`, nothing
+/// > could ever have gone red on it.
 ///
 /// Asserted as a FAILURE rather than left as a comment: a claim that one of two interchangeable
 /// kernels is wrong is exactly the claim that rots, and this one goes red the day someone changes
@@ -1369,7 +1451,7 @@ fn norming_after_the_up_projection_is_a_different_sandwich() {
 // **The first item whose fixture needed no regeneration.** `SituAndMul` is an `nn.Module`, so
 // `hook_model` was already capturing its output as `<mlp>.act_fn`, and its input is
 // `torch.cat([gate_proj(x), up_proj(x)])` — both halves separately captured. Inputs and output were
-// in the file all along. Recorded because the four items before this one each found the opposite,
+// in the file all along. Recorded because the items before this one each found the opposite,
 // and "check what is already there" is cheaper than a 25-minute GPU-locked regeneration.
 
 /// Every MLP the anchor captures that runs SiTU-GLU, as `(layer, module)`.
@@ -1410,6 +1492,16 @@ const SITU_OBSERVED_WORST: f32 = 1.454e-7;
 /// fixture that hardcoded 4 and 25 would agree with itself if either ever moved. The second key is
 /// `activation_situ_linear_beta`; abbreviating it to `activation_linear_beta` is a mistake this port
 /// has already made once, in `S1a`, where it would have refused every real checkpoint.
+/// The pair the config ships, for the SYNTHETIC cases only.
+///
+/// The distinction matters and was unstated until 2026-08-12: `betas()` reads the golden's own
+/// config because a golden-scored fixture that hardcoded the pair would agree with itself if the
+/// reference's value moved. The synthetic cases — 4a's width/magnitude sweep and 4b's whole oracle —
+/// take the betas as ARGUMENTS to a function under test rather than as a property of a captured
+/// output, so pinning the shipped pair is the right thing there. One symbol so the two conventions
+/// are visible instead of being a literal at three sites.
+const SHIPPED_BETAS: (f32, f32) = (4.0, 25.0);
+
 fn betas(g: &GoldenSet) -> (f32, f32) {
     let c = tiny(g);
     let f = |k: &str| c[k].as_f64().unwrap_or_else(|| panic!("{k} missing")) as f32;
@@ -1458,33 +1550,57 @@ fn for_each_situ(mut f: impl FnMut(&str, usize, f32, (f32, f32), Situ)) {
 /// The sigmoid takes `g`, NOT `b1·tanh(g/b1)`: the two factors saturate at different rates and
 /// feeding the capped value to the sigmoid is the smooth, plausible, wrong version. `situ_glu_gets`
 /// -`_the_uncapped_gate` is the run that prices it.
-fn host_situ(s: &Situ, b1: f32, b2: f32, capped_sigmoid: bool) -> Vec<f32> {
+fn situ1(g: f32, u: f32, b1: f32, b2: f32, capped_sigmoid: bool) -> f32 {
     let (b1, b2) = (f64::from(b1), f64::from(b2));
-    s.gate
-        .iter()
-        .zip(&s.up)
-        .map(|(&g, &u)| {
-            let (g, u) = (f64::from(g), f64::from(u));
-            let t = b1 * (g / b1).tanh();
-            // The ONE flag, and it is the defect. `host_fold` one operator up takes its
-            // `normalised` the same way and for the same reason: a defect run is the correct
-            // oracle with one thing changed, and writing it as a second function is how the two
-            // drift into differing by something nobody intended.
-            let sig = if capped_sigmoid { t } else { g };
-            (t * (1.0 / (1.0 + (-sig).exp())) * (b2 * (u / b2).tanh())) as f32
-        })
+    let (g, u) = (f64::from(g), f64::from(u));
+    let t = b1 * (g / b1).tanh();
+    // The ONE flag, and it is the defect. `host_fold` one operator up takes its `normalised` the
+    // same way and for the same reason: a defect run is the correct oracle with one thing changed,
+    // and writing it as a second function is how the two drift into differing by something nobody
+    // intended.
+    let sig = if capped_sigmoid { t } else { g };
+    (t * (1.0 / (1.0 + (-sig).exp())) * (b2 * (u / b2).tanh())) as f32
+}
+
+/// The same arithmetic over two slices — 4a's scoring oracle.
+///
+/// **This direction round, and it was the other way until 2026-08-12.** `host_situ` took a `&Situ`
+/// and item 4b reached it through a `situ1` that built two one-element `Vec`s and a dummy `want` per
+/// element, inside `host_expert_f4`'s per-`inter` loop. That is most of why 4b's full-width oracle
+/// was abandoned as too slow, which had been recorded as an f64 OPERATION count. Elementwise
+/// primitive, map over it: the arithmetic is still in exactly one place, which is §3b's argument.
+fn host_situ(gate: &[f32], up: &[f32], b1: f32, b2: f32, capped_sigmoid: bool) -> Vec<f32> {
+    gate.iter()
+        .zip(up)
+        .map(|(&g, &u)| situ1(g, u, b1, b2, capped_sigmoid))
         .collect()
 }
 
-/// One launch, returning the launcher's own `Result`.
+/// One launch, returning the launcher's own `Result`. `alias_h` points `h` at `g` instead of at its
+/// own buffer — the contract the launcher documents and S3 is invited to rely on.
 ///
-/// Both the scoring path and the guard test go through here — they were two copies of the same
-/// eight-argument unsafe block and jscpd rejected the second at 42 tokens. It is also the shape
-/// that makes the guard test meaningful: it exercises the entry point callers use, not a
-/// second spelling of it.
-fn situ_launch(gate: &[f32], up: &[f32], b1: f32, b2: f32) -> anyhow::Result<Vec<f32>> {
-    let (gb, ub) = (dev(&f32b(gate)), dev(&f32b(up)));
-    let mut hb = zeros(gate.len() * 4);
+/// Every path goes through here: the scoring path, the guard test and the aliasing test. They were
+/// copies of the same eight-argument unsafe block and jscpd rejected the second at 42 tokens and the
+/// third at 43. It is also the shape that makes the guard and aliasing tests mean anything — they
+/// exercise the entry point callers use, not a second spelling of it. The `alias_h` bool rather than
+/// a second function for the same reason `host_situ` takes `capped_sigmoid`: one difference, and a
+/// separate body is how the two drift.
+/// The betas travel as the PAIR here, which is how `betas()` and `SHIPPED_BETAS` already carry them
+/// — and it is also what keeps this signature from being `host_situ`'s four leading parameters
+/// again, which jscpd reported at 37 tokens the moment both existed.
+fn situ_launch(
+    gate: &[f32],
+    up: &[f32],
+    (b1, b2): (f32, f32),
+    alias_h: bool,
+) -> anyhow::Result<Vec<f32>> {
+    let (mut gb, ub) = (dev(&f32b(gate)), dev(&f32b(up)));
+    let mut hb = zeros(gate.len().max(1) * 4);
+    let h = if alias_h {
+        gb.ptr_mut() as *mut f32
+    } else {
+        hb.ptr_mut() as *mut f32
+    };
     // SAFETY: `g`, `u` and `h` are each `n` live f32 and do not alias here (the launcher permits
     // aliasing; this fixture does not use it). All outlive the default stream, which `back` syncs.
     unsafe {
@@ -1494,22 +1610,21 @@ fn situ_launch(gate: &[f32], up: &[f32], b1: f32, b2: f32) -> anyhow::Result<Vec
             gate.len(),
             b1,
             b2,
-            hb.ptr_mut() as *mut f32,
+            h,
             std::ptr::null_mut(),
         )
     }?;
-    Ok(f32v(&back(&hb)))
-}
-
-fn device_situ(gate: &[f32], up: &[f32], b1: f32, b2: f32) -> Vec<f32> {
-    ok(situ_launch(gate, up, b1, b2), "situ_glu_f32")
+    Ok(f32v(&back(if alias_h { &gb } else { &hb })))
 }
 
 /// **The kernel reproduces every SiTU-GLU the anchor captured, at both draws.**
 #[test]
 fn situ_glu_matches_the_anchor_at_every_mlp() {
     for_each_situ(|salt, layer, tol, (b1, b2), s| {
-        let r = rel(&device_situ(&s.gate, &s.up, b1, b2), &s.want);
+        let r = rel(
+            &ok(situ_launch(&s.gate, &s.up, (b1, b2), false), "situ_glu_f32"),
+            &s.want,
+        );
         assert!(r <= tol, "{salt} layer {layer}: {r:e} exceeds {tol:e}");
         // Measured worst over both draws and all six MLPs: 1.454e-7, at salt 2 layer 12. That is
         // 65x under `dense_mlp`'s 9.4e-6 — the tightest tolerance in the table, and the one that
@@ -1540,15 +1655,19 @@ fn the_situ_sigmoid_takes_the_uncapped_gate() {
     // own rule for "a bar must clear the defect it catches", applied to the bar in use.
     //
     // > **And the distinction is not academic here — it is the finding of this test.** At layer 0's
-    // > dense MLP the separation is 3.38e-2 against `dense_mlp`'s 9.4e-6, a margin of 3,600x, so
-    // > the bucket tolerance catches this comfortably. At the SHARED experts it is 4.10e-3 against
+    // > dense MLP the separation is 2.11e-2 (draw 1) and 1.72e-2 (draw 2) against `dense_mlp`'s
+    // > 9.4e-6 — margins of 2,243x and 1,834x — so the bucket tolerance catches this comfortably.
+    // > (CORRECTED 2026-08-12 by review, which re-derived all twelve cells: this said **3.38e-2, a
+    // > margin of 3,600x**, which is draw 1's layer-92 SHARED EXPERT — the MAX over the six sites,
+    // > i.e. the single worst-over-all this test is written not to use. The two numbers the argument
+    // > turns on were and are correct.) At the SHARED experts it is 4.10e-3 against
     // > `moe_route`'s 6.0e-4 — only **6.8x**, well under the 30x the table requires of a `Rel`
     // > policy. So **the bucket-level tolerance could not be relied on to catch a capped-sigmoid
     // > SiTU at the shared experts**; the tripwire can, by 2,800x. That was true before this item
     // > loosened `moe_route` (at the old 2.5e-4 the margin was 16x, still under 30) and it is a
     // > property of the shared expert's small `moe_intermediate_size`, not of the loosening.
     for_each_situ(|salt, layer, tol, (b1, b2), s| {
-        let moved = rel(&host_situ(&s, b1, b2, true), &s.want);
+        let moved = rel(&host_situ(&s.gate, &s.up, b1, b2, true), &s.want);
         let bar = SITU_OBSERVED_WORST * 10.0;
         assert!(
             moved > bar * 30.0,
@@ -1571,7 +1690,7 @@ fn the_situ_sigmoid_takes_the_uncapped_gate() {
 /// goldens comes near it.
 #[test]
 fn situ_glu_saturates_at_the_product_of_its_betas() {
-    let (b1, b2) = (4.0f32, 25.0f32);
+    let (b1, b2) = SHIPPED_BETAS;
     let mut r = common::Lcg(0x517A);
     for &(n, gain) in &[
         (3072usize, 1.0f32),
@@ -1582,13 +1701,8 @@ fn situ_glu_saturates_at_the_product_of_its_betas() {
     ] {
         let gate: Vec<f32> = (0..n).map(|_| r.f() * gain).collect();
         let up: Vec<f32> = (0..n).map(|_| r.f() * gain).collect();
-        let s = Situ {
-            gate: gate.clone(),
-            up: up.clone(),
-            want: Vec::new(),
-        };
-        let got = device_situ(&gate, &up, b1, b2);
-        let d = rel(&got, &host_situ(&s, b1, b2, false));
+        let got = ok(situ_launch(&gate, &up, (b1, b2), false), "situ_glu_f32");
+        let d = rel(&got, &host_situ(&gate, &up, b1, b2, false));
         // 10x the 1.721e-7 measured over these cases. `tanhf` and `expf` are the device's own
         // against Rust's `f64` ones, so this is the one fixture here whose bound is a libm
         // difference rather than a reassociated sum.
@@ -1639,15 +1753,54 @@ fn assert_betas_guarded(launcher: &str, mut refused: impl FnMut(f32, f32) -> boo
     );
 }
 
+/// **`h` may alias `g`, and S3's layer loop is invited to rely on it.**
+///
+/// Both the kernel comment and the launcher doc promise the aliasing — it saves a scratch buffer per
+/// layer — and `situ_launch` says outright that the fixture does not use it. So the one property S3
+/// is being offered was the one property untested (review 2026-08-12). Every thread reads both
+/// operands at `i` and then writes `i`, so the write depends only on reads that thread has already
+/// made; that is the argument, and this is the check.
+#[test]
+fn the_situ_output_may_alias_its_gate() {
+    let (b1, b2) = SHIPPED_BETAS;
+    let mut r = common::Lcg(0x51_7A_A1);
+    let n = 3072;
+    let gate: Vec<f32> = (0..n).map(|_| r.f() * 4.0).collect();
+    let up: Vec<f32> = (0..n).map(|_| r.f() * 4.0).collect();
+    let separate = ok(situ_launch(&gate, &up, (b1, b2), false), "situ_glu_f32");
+    let aliased = ok(
+        situ_launch(&gate, &up, (b1, b2), true),
+        "situ_glu_f32 aliased",
+    );
+    assert_eq!(
+        aliased, separate,
+        "aliasing `h` onto `g` changed the result, so the launcher's documented contract is false \
+         and S3 must not take it"
+    );
+}
+
+/// **A zero-length launch is refused (1001), not silently successful.**
+#[test]
+fn the_situ_launcher_refuses_an_empty_range() {
+    let (b1, b2) = SHIPPED_BETAS;
+    assert!(
+        situ_launch(&[], &[], (b1, b2), false).is_err(),
+        "n = 0 was accepted: a launch of nothing that returns success is the shape `moe_acc_drain`'s \
+         own guard note calls out, because the caller cannot tell it from work done"
+    );
+}
+
 /// **Both betas must be finite and positive — every other value is refused, not clamped.**
 ///
-/// Four failure modes, each quiet in its own way, argued at the launcher. This is the only test in
-/// this file that exercises a refusal code, and it exists because the other three items each left
-/// their guards untested and said so.
+/// Four failure modes, each quiet in its own way, argued at the launcher. **Each item's launcher
+/// guards get their own refusal test**, and `assert_betas_guarded` is shared by both SiTU launchers —
+/// which is what makes their "same code, same expression" claims checkable rather than aspirational.
+/// (This said it was "the only test in this file that exercises a refusal code", which stopped being
+/// true two items later and would have told a reader the later guard tests did not exist.)
 #[test]
 fn the_situ_betas_are_guarded() {
     assert_betas_guarded("situ_glu_f32", |b1, b2| {
-        situ_launch(&[1.0, 2.0], &[3.0, 4.0], b1, b2).is_err()
+        situ_launch(&[1.0, 2.0], &[3.0, 4.0], (b1, b2), false).is_err()
     });
 }
 
@@ -1710,18 +1863,21 @@ fn f4_matrix(r: &mut common::Lcg, rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>
 /// boundaries, the amax/scale relation and the code histogram are all invariant under it. §9 states
 /// it, `WMat::Fp4`'s decode has the same line, and `the_fp4_nibble_order_is_the_even_low_one`
 /// red-proves that this fixture can see it.
-fn f4_row(m: &(Vec<u8>, Vec<u8>), row: usize, cols: usize, swap_nibbles: bool) -> Vec<f64> {
+///
+/// **The host decodes one way only, and the swapped convention is red-proved on the DEVICE
+/// instead** — `the_fp4_nibble_order_is_the_even_low_one` exchanges every uploaded byte's nibbles
+/// and lets the kernel decode as it always does, which proves the fixture would catch a kernel with
+/// the opposite convention rather than merely that two host functions differ. A `swap_nibbles`
+/// parameter threaded through here and through `host_expert_f4`/`host_acc` was deleted 2026-08-12:
+/// every host call site passed `false`, so it was three functions carrying a branch nothing took,
+/// and the branch was the hardest arithmetic in the item to read.
+fn f4_row(m: &(Vec<u8>, Vec<u8>), row: usize, cols: usize) -> Vec<f64> {
     let (bytes, scales) = m;
     let (groups, rb) = (cols / 32, cols / 2);
     (0..cols)
         .map(|k| {
             let byte = bytes[row * rb + k / 2];
-            let even = if swap_nibbles { byte >> 4 } else { byte & 0x0f };
-            let nib = if k % 2 == 1 {
-                if swap_nibbles { byte & 0x0f } else { byte >> 4 }
-            } else {
-                even
-            };
+            let nib = if k % 2 == 1 { byte >> 4 } else { byte & 0x0f };
             f64::from(rivoli::v4oracle::numerics::e2m1_decode(nib))
                 * f64::from(rivoli::v4oracle::numerics::e8m0_decode(
                     scales[row * groups + k / 32],
@@ -1768,7 +1924,6 @@ fn host_expert_f4(
     inter: usize,
     weight: f32,
     at: WeightAt,
-    swap_nibbles: bool,
     acc: &mut [i64],
 ) {
     let expert_in = x.len();
@@ -1781,9 +1936,9 @@ fn host_expert_f4(
     let folded = at == WeightAt::FoldedIntoH;
     let h: Vec<f32> = (0..inter)
         .map(|j| {
-            let g = dot(&f4_row(&e.gate, j, expert_in, swap_nibbles));
-            let u = dot(&f4_row(&e.up, j, expert_in, swap_nibbles));
-            let y = situ1(g, u);
+            let g = dot(&f4_row(&e.gate, j, expert_in));
+            let u = dot(&f4_row(&e.up, j, expert_in));
+            let y = situ1(g, u, SHIPPED_BETAS.0, SHIPPED_BETAS.1, false);
             // The fold happens BEFORE this bf16 store when it happens at all — V4's `weights * x`
             // then `x.to(dtype)`. That is the whole difference, and it is one multiply's worth of
             // position.
@@ -1791,7 +1946,7 @@ fn host_expert_f4(
         })
         .collect();
     for (o, slot) in acc.iter_mut().enumerate() {
-        let row = f4_row(&e.down, o, inter, swap_nibbles);
+        let row = f4_row(&e.down, o, inter);
         let dv: f64 = row
             .iter()
             .zip(&h)
@@ -1803,13 +1958,18 @@ fn host_expert_f4(
     }
 }
 
-/// The whole expert range summed into one fixed-point accumulator, the way the launcher does.
+/// One descriptor RANGE summed into a fixed-point accumulator, the way the launcher does.
 ///
 /// Three tests opened with this identical five-line loop and jscpd rejected the third at 83 tokens.
-fn host_acc(c: &F4Case, at: WeightAt, swap_nibbles: bool) -> Vec<i64> {
+///
+/// The range is a parameter rather than "all of them" because the launcher's whole reason for
+/// existing is that S3 calls it with an OFFSET, and every call site here pinned `e_start` to 0 until
+/// 2026-08-12 — so `moe_gateup_f4_situ`'s `e = e_start + r / inter`, its `descs[e]` and its
+/// `h_out[e * inter + j]` were exercised only in their degenerate form. Found by review.
+fn host_acc(c: &F4Case, at: WeightAt, r: std::ops::Range<usize>) -> Vec<i64> {
     let mut acc = vec![0i64; c.x.len()];
-    for (e, &w) in c.experts.iter().zip(&c.weights) {
-        host_expert_f4(e, &c.x, c.inter, w, at, swap_nibbles, &mut acc);
+    for e in r {
+        host_expert_f4(&c.experts[e], &c.x, c.inter, c.weights[e], at, &mut acc);
     }
     acc
 }
@@ -1819,28 +1979,16 @@ fn bf16(x: f32) -> f32 {
     rivoli::math::bf16_to_f32(rivoli::math::f32_to_bf16(x))
 }
 
-/// One element of SiTU-GLU at the shipped betas, sharing `host_situ`'s arithmetic.
-///
-/// Routed through `host_situ` rather than restated, so 4a's anchor-scored oracle is the one this
-/// fixture uses. A second copy of three lines is how the routed path and the dense path would come
-/// to disagree about the activation — the exact failure §3b warns about, one level up in the test.
-fn situ1(g: f32, u: f32) -> f32 {
-    host_situ(
-        &Situ {
-            gate: vec![g],
-            up: vec![u],
-            want: Vec::new(),
-        },
-        4.0,
-        25.0,
-        false,
-    )[0]
-}
-
 /// `common.hpp::moe_fixed` on the host — saturate, then `llrintf` at scale `2^44`.
+///
+/// The scale is `as f64`, and the round trip through f32 it used to take was a no-op (2^44 is
+/// exactly representable) that read as deliberate mirroring of `MOE_ACC_SCALE`'s `(float)` cast. It
+/// mirrors only the CONSTANT: the kernel does the clamp, the multiply and `llrintf` in f32 while
+/// this does the multiply in f64, and that difference is the systematic low-bit disagreement the
+/// f32 projection at the device-vs-host scoring sites absorbs.
 fn fixed44(v: f32) -> i64 {
     const MAX: f32 = (1u64 << 14) as f32; // 2^(58 - 44), the clamp that keeps 16 terms in an i64
-    (f64::from(v.clamp(-MAX, MAX)) * f64::from((1u64 << 44) as f32)).round() as i64
+    (f64::from(v.clamp(-MAX, MAX)) * ((1u64 << 44) as f64)).round() as i64
 }
 
 /// Upload one expert set and run `moe_expert_range_f4_situ` over all of it, returning the
@@ -1850,9 +1998,9 @@ fn fixed44(v: f32) -> i64 {
 /// `moe_acc_drain_to`: draining is a second kernel with its own `2^-44` multiply, and folding it in
 /// would make a pass-2 placement error and a drain error indistinguishable. `moe_acc_drain_to` has
 /// its own oracle in `tests/kernel.rs`.
-fn device_expert_f4(c: &F4Case, swap_nibbles: bool) -> Vec<i64> {
+fn device_expert_f4(c: &F4Case, r: std::ops::Range<usize>, swap_nibbles: bool) -> Vec<i64> {
     ok(
-        expert_launch(c, swap_nibbles, 4.0, 25.0),
+        expert_launch(c, r, swap_nibbles, SHIPPED_BETAS.0, SHIPPED_BETAS.1),
         "moe_expert_range_f4_situ",
     )
 }
@@ -1861,7 +2009,13 @@ fn device_expert_f4(c: &F4Case, swap_nibbles: bool) -> Vec<i64> {
 ///
 /// The scoring path and the guard test go through here for `situ_launch`'s reason: the guard test
 /// must exercise the entry point callers use, not a second spelling of it.
-fn expert_launch(c: &F4Case, swap_nibbles: bool, b1: f32, b2: f32) -> anyhow::Result<Vec<i64>> {
+fn expert_launch(
+    c: &F4Case,
+    r: std::ops::Range<usize>,
+    swap_nibbles: bool,
+    b1: f32,
+    b2: f32,
+) -> anyhow::Result<Vec<i64>> {
     let (experts, x, inter, weights) = (&c.experts, &c.x, c.inter, &c.weights);
     let expert_in = x.len();
     let mut parts = Vec::new();
@@ -1914,8 +2068,8 @@ fn expert_launch(c: &F4Case, swap_nibbles: bool, b1: f32, b2: f32) -> anyhow::Re
             xb.ptr() as *const f32,
             expert_in,
             inter,
-            0,
-            experts.len(),
+            r.start,
+            r.len(),
             experts.len(),
             db.ptr() as *const rivoli::backend::hip::ExpertDescF4,
             wb.ptr() as *const f32,
@@ -1931,6 +2085,25 @@ fn expert_launch(c: &F4Case, swap_nibbles: bool, b1: f32, b2: f32) -> anyhow::Re
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
         .collect())
+}
+
+/// Two fixed-point accumulators as f32, with the number of slots that differ.
+///
+/// **The f32 projection is load-bearing at the device-vs-host sites and inert at the host-vs-host
+/// one**, which is why the count is taken HERE, after it: the kernel multiplies and rounds in f32
+/// where `fixed44` does it in f64, so a systematic low-bit disagreement would otherwise put every
+/// slot in the count. Near 2^44 the projection merges ~2^20 distinct `i64` values, so it can only
+/// ever lower a count — the host-vs-host test compares the `i64`s directly for that reason.
+///
+/// Three sites, one body: jscpd rejected the third at 134 tokens, which is the gate noticing that
+/// two new tests had copied a scoring convention rather than shared it.
+fn slot_diff(got: &[i64], want: &[i64], scale: f32) -> (Vec<f32>, Vec<f32>, usize) {
+    let (g, w): (Vec<f32>, Vec<f32>) = (
+        got.iter().map(|&v| v as f32 * scale).collect(),
+        want.iter().map(|&v| v as f32 * scale).collect(),
+    );
+    let d = g.iter().zip(&w).filter(|(a, b)| a != b).count();
+    (g, w, d)
 }
 
 /// One synthetic expert set, its input, and its routing weights.
@@ -1950,8 +2123,11 @@ struct F4Case {
 /// `weights` deliberately includes a **zero**: a row that did not route to an expert is the case
 /// pass 2's `w != 0.0f` skip exists for, and it is the one an "every expert contributes" fixture
 /// never reaches.
-fn f4_case(seed: u64, n_experts: usize, expert_in: usize, inter: usize) -> F4Case {
-    let mut r = common::Lcg(seed);
+fn f4_case(n_experts: usize, expert_in: usize, inter: usize) -> F4Case {
+    // One draw for every case, because nothing here sweeps draws — the seed was a parameter with a
+    // single value at every call site until 2026-08-12. `synthetic_kda` one item down DOES vary its
+    // seed, which is why that one keeps the parameter.
+    let mut r = common::Lcg(0xF4_51_70);
     let experts: Vec<F4Expert> = (0..n_experts)
         .map(|_| F4Expert {
             gate: f4_matrix(&mut r, inter, expert_in),
@@ -1993,19 +2169,13 @@ fn the_fp4_expert_pair_matches_the_host_oracle() {
     // Stated rather than quietly sampled: the full shape is NOT run, and a reader who needs it run
     // should reach for `--release`, where the oracle is a different proposition.
     for &(ne, expert_in, inter) in &[(2usize, 3584usize, 32usize), (2, 64, 3072), (3, 64, 32)] {
-        let c = f4_case(0xF4_51_70, ne, expert_in, inter);
-        let got = device_expert_f4(&c, false);
-        let want = host_acc(&c, WeightAt::AfterW2, false);
+        let c = f4_case(ne, expert_in, inter);
+        let got = device_expert_f4(&c, 0..ne, false);
+        let want = host_acc(&c, WeightAt::AfterW2, 0..ne);
         // The accumulator is INTEGER and the sum is exact in it, so the only slack is the f32 dots
         // reassociating against f64 ones before they are rounded to bf16.
-        let (gf, wf): (Vec<f32>, Vec<f32>) = (
-            got.iter()
-                .map(|&v| v as f32 / (1u64 << 44) as f32)
-                .collect(),
-            want.iter()
-                .map(|&v| v as f32 / (1u64 << 44) as f32)
-                .collect(),
-        );
+        // Scaled back out of fixed point, so the ulp bound below is in the units bf16 rounds in.
+        let (gf, wf, differing) = slot_diff(&got, &want, 1.0 / (1u64 << 44) as f32);
         // **Scored as "how MANY elements disagree", not as one relative bound, and the choice is
         // forced by a measurement this repo already has.** `common/mod.rs::assert_bitwise` records
         // that a correct wave-reduced kernel differs from its oracle on **~0.08% of bf16 elements at
@@ -2031,7 +2201,6 @@ fn the_fp4_expert_pair_matches_the_host_oracle() {
         // runnable. It costs nothing at the real widths: 2 of 3584 is 0.06%, under the measured
         // crossing rate, so the fraction is still what binds where it matters.
         const BF16_ULP: f32 = 1.0 / 256.0; // 2^-8 — bf16 carries 8 mantissa bits
-        let differing = gf.iter().zip(&wf).filter(|(a, b)| a != b).count();
         let d = rel(&gf, &wf);
         assert!(
             d <= BF16_ULP,
@@ -2065,22 +2234,25 @@ fn the_fp4_expert_pair_matches_the_host_oracle() {
 #[test]
 fn folding_the_routing_weight_before_w2_is_not_the_same_function() {
     let (ne, expert_in, inter) = (3usize, 64usize, 32usize);
-    let c = f4_case(0xF4_51_70, ne, expert_in, inter);
-    let after = host_acc(&c, WeightAt::AfterW2, false);
+    let c = f4_case(ne, expert_in, inter);
+    let after = host_acc(&c, WeightAt::AfterW2, 0..ne);
     // The same composition with the weight folded into `h` before the bf16 store — V4's order.
-    let before = host_acc(&c, WeightAt::FoldedIntoH, false);
+    let before = host_acc(&c, WeightAt::FoldedIntoH, 0..ne);
+    // **The `i64`s, not their f32 projection.** Both sides are host results, so nothing here needs
+    // the projection that the device-vs-host sites do — and near 2^44 an f32 collapses ~2^20
+    // distinct accumulator values onto one, which can only LOWER this count. Review 2026-08-12.
+    let differing = after.iter().zip(&before).filter(|(p, q)| p != q).count();
     let (a, b): (Vec<f32>, Vec<f32>) = (
         after.iter().map(|&v| v as f32).collect(),
         before.iter().map(|&v| v as f32).collect(),
     );
-    let differing = a.iter().zip(&b).filter(|(p, q)| p != q).count();
     // Two claims, and the second is the one that matters. The values differ — but if they differed
     // on one element out of 64 this would be a rounding accident and the fold would be defensible.
     // A MAJORITY differing is what makes the placement a property of the arithmetic.
     assert!(
         differing * 2 > a.len(),
-        "folding the routing weight before `w2` changed only {differing} of {} accumulator slots, \\
-         so at this geometry the two placements are within rounding of each other and this test is \\
+        "folding the routing weight before `w2` changed only {differing} of {} accumulator slots, \
+         so at this geometry the two placements are within rounding of each other and this test is \
          not pricing the difference 4b was written for",
         a.len()
     );
@@ -2088,6 +2260,11 @@ fn folding_the_routing_weight_before_w2_is_not_the_same_function() {
         rel(&b, &a) > 1.0e-4,
         "the two weight placements agree to {:e} — see above",
         rel(&b, &a)
+    );
+    assert!(
+        after.iter().any(|&v| v != 0) && before.iter().any(|&v| v != 0),
+        "one of the two placements produced an all-zero accumulator, which would satisfy the \
+         majority-differ count above without either oracle having computed anything"
     );
 }
 
@@ -2101,22 +2278,89 @@ fn folding_the_routing_weight_before_w2_is_not_the_same_function() {
 #[test]
 fn the_fp4_nibble_order_is_the_even_low_one() {
     let (ne, expert_in, inter) = (3usize, 64usize, 32usize);
-    let c = f4_case(0xF4_51_70, ne, expert_in, inter);
-    let want = host_acc(&c, WeightAt::AfterW2, false);
+    let c = f4_case(ne, expert_in, inter);
+    let want = host_acc(&c, WeightAt::AfterW2, 0..ne);
     // Every weight byte's nibbles exchanged on the way to the device. The kernel decodes as it
     // always does, so the observed output is what a kernel with the opposite convention would
     // produce from the original bytes.
-    let got = device_expert_f4(&c, true);
-    let (g, w): (Vec<f32>, Vec<f32>) = (
-        got.iter().map(|&v| v as f32).collect(),
-        want.iter().map(|&v| v as f32).collect(),
-    );
-    let differing = g.iter().zip(&w).filter(|(a, b)| a != b).count();
+    let got = device_expert_f4(&c, 0..ne, true);
+    let (g, _w, differing) = slot_diff(&got, &want, 1.0);
     assert!(
         differing * 2 > g.len(),
-        "exchanging every weight byte's nibbles changed only {differing} of {} slots — so this \\
+        "exchanging every weight byte's nibbles changed only {differing} of {} slots — so this \
          fixture cannot see the one property of the fp4 layout that no statistic can check",
         g.len()
+    );
+    // **A kernel that wrote NOTHING would satisfy the count above**, since `want` is non-zero and
+    // every zero slot then counts as differing. That is only ruled out by
+    // `the_fp4_expert_pair_matches_the_host_oracle` passing in the same binary — a correct pairing,
+    // but this test should carry its own anti-vacuity clause the way `assert_betas_guarded` does.
+    // Review 2026-08-12.
+    assert!(
+        got.iter().any(|&v| v != 0),
+        "the swapped-nibble launch produced an all-zero accumulator, so the count above is \
+         measuring an absent kernel rather than a decoded one"
+    );
+}
+
+/// **The descriptor range is an OFFSET range, and every other test here starts it at zero.**
+///
+/// `moe_gateup_f4_situ` is a hand-written kernel body rather than an instantiation of the shared
+/// `moe_gateup_f4_impl`, and it re-derives all three of `e = e_start + r / inter`, `descs[e]` and
+/// `h_out[e * inter + j]`. With `e_start` pinned to 0 those agree with the wrong arithmetic — an
+/// offset dropped, or applied to the descriptors but not to `h` — and S3 is exactly the caller that
+/// will pass an offset, since the whole point of a `_range` entry point is a window into 896
+/// experts. Found by review 2026-08-12; the fixture had five call sites and one value between them.
+#[test]
+fn the_expert_range_is_a_window_and_not_the_whole_set() {
+    let (ne, expert_in, inter) = (4usize, 64usize, 32usize);
+    let c = f4_case(ne, expert_in, inter);
+    // Skip the first descriptor. `weights[1]` is the deliberate zero, so this window also keeps the
+    // `w != 0.0f` skip in play rather than testing only weighted experts.
+    let (got, want) = (
+        device_expert_f4(&c, 1..ne, false),
+        host_acc(&c, WeightAt::AfterW2, 1..ne),
+    );
+    let (g, w, differing) = slot_diff(&got, &want, 1.0);
+    assert!(
+        rel(&g, &w) <= 1.0 / 256.0 && differing <= 2 + g.len() / 100,
+        "the offset range disagrees with its oracle: {:e} over {differing} of {} slots",
+        rel(&g, &w),
+        g.len()
+    );
+    // And the window is not the whole set: scoring it against ALL FOUR experts must FAIL, or the
+    // test above would pass for a kernel that ignored `e_start` entirely.
+    let all = host_acc(&c, WeightAt::AfterW2, 0..ne);
+    let a: Vec<f32> = all.iter().map(|&v| v as f32).collect();
+    assert!(
+        rel(&g, &a) > 1.0 / 256.0,
+        "experts 1..{ne} sum to the same accumulator as 0..{ne}, so this fixture cannot tell a \
+         window from the whole set and says nothing about `e_start`"
+    );
+}
+
+/// **The alignment guard the doc below argues hardest for, exercised.**
+///
+/// `expert_in % F4_GROUP || inter % F4_GROUP` (1002). 48 is not a multiple of 32 and is a plausible
+/// wrong value rather than a silly one — it is a multiple of 16, which is what the packed-nibble
+/// stride alone would need. Added 2026-08-12: the guard was argued at length by
+/// `the_k3_expert_betas_are_guarded` and exercised by nothing, so it could have been deleted with
+/// every test still green.
+#[test]
+fn the_expert_group_alignment_is_guarded() {
+    for (expert_in, inter) in [(48usize, 32usize), (64, 48)] {
+        let c = f4_case(2, expert_in, inter);
+        assert!(
+            expert_launch(&c, 0..2, false, SHIPPED_BETAS.0, SHIPPED_BETAS.1).is_err(),
+            "expert_in={expert_in} inter={inter} was accepted, and `f4_ng`'s ceil-vs-floor \
+             agreement with `WMat::Fp4::row` depends on both being 0 mod F4_GROUP"
+        );
+    }
+    // Not refusing everything: the shipped alignment is accepted.
+    let ok_case = f4_case(2, 64, 32);
+    assert!(
+        expert_launch(&ok_case, 0..2, false, SHIPPED_BETAS.0, SHIPPED_BETAS.1).is_ok(),
+        "a 32-aligned geometry was refused, so the two refusals above carry no information"
     );
 }
 
@@ -2129,9 +2373,9 @@ fn the_fp4_nibble_order_is_the_even_low_one() {
 /// nothing measured and nothing needed.
 #[test]
 fn the_k3_expert_betas_are_guarded() {
-    let c = f4_case(0xF4_51_70, 2, 64, 32);
+    let c = f4_case(2, 64, 32);
     assert_betas_guarded("moe_expert_range_f4_situ", |b1, b2| {
-        expert_launch(&c, false, b1, b2).is_err()
+        expert_launch(&c, 0..2, false, b1, b2).is_err()
     });
 }
 
@@ -2140,7 +2384,7 @@ fn the_k3_expert_betas_are_guarded() {
 // **The largest kernel in the port, and the one whose fixture was already complete.** fla fuses §4's
 // ten KDA steps into three observable boundaries and this is the middle one: `fused_recurrent_kda`
 // takes q/k/v/g/beta plus `A_log`, `dt_bias` and the incoming state, and returns `o` and the outgoing
-// state. `wrap_kda_ops` captures every one of those on both sides, so unlike the four items before it
+// state. `wrap_kda_ops` captures every one of those on both sides, so unlike the earlier items
 // this one needed no regeneration — checked by enumerating the vendored bytes rather than assumed.
 //
 // Everything the recurrence does that no document outside fla attests to is INSIDE that boundary, and
@@ -2179,6 +2423,21 @@ const KDA_LAYERS: [usize; 3] = [0, 1, 12];
 /// says about itself.
 const KDA_OBSERVED_WORST: f32 = 2.265e-7;
 
+/// The MINIMUM separation each defect form reaches, over both draws and all three KDA layers.
+///
+/// These exist because the docs quote this item's separations and nothing checked them, so the
+/// "six orders" claim rested on a 6.8e-5 bar three orders weaker. `k3_tolerance`'s own standard
+/// applies: a number nobody can re-derive is one that will be quietly widened.
+///
+/// `StateValueMajor` at **7.567e-1** is the one that settles the layout question, and against the
+/// oracle's own 2.481e-7 agreement that IS six orders. `OutputBeforeUpdate` is the weakest at
+/// 2.183e-1 — still 3,200x the bar — and it is the form no anchor defect run covers.
+const MEASURE_NOQKL2NORM: f32 = 8.359e-1;
+const MEASURE_GATECLAMPED: f32 = 5.754e-1;
+const MEASURE_BETAPRESIGMOID: f32 = 6.952e-1;
+const MEASURE_STATEVALUEMAJOR: f32 = 7.567e-1;
+const MEASURE_OUTPUTBEFOREUPDATE: f32 = 2.183e-1;
+
 /// One KDA layer's recurrence boundary: every input fla's kernel takes, and both things it returns.
 ///
 /// **Every number a caller could get wrong is RAW here.** `q` and `k` are pre-L2-norm, `beta` is
@@ -2188,8 +2447,17 @@ const KDA_OBSERVED_WORST: f32 = 2.265e-7;
 /// internally.
 ///
 /// The two state fields are the ONE exception: they are transposed out of the reference's layout into
-/// the kernel's on the way in — see [`transpose_heads`], which carries the measurement that
+/// the kernel's on the way in — see [`to_key_major`], which carries the measurement that
 /// established the difference.
+///
+/// **The name carries the model and that is deliberate here.** `Kda`, `KDA_LAYERS`, `host_kda` and
+/// the `KdaForm` variants all say "Kimi Delta Attention", which this tree's naming rule forbids on a
+/// kernel — and `gated_delta_recurrent_f32` was renamed off it for exactly that reason. The fixture
+/// side tracks the ANCHOR instead: the captures are `model.layers.N.kda.fused_recurrent_kda.*` and
+/// the defect runs are `Kda*`, both of which predate this item and neither of which rivoli chooses.
+/// Renaming here would sever a fixture from the names of the things it reads. The exemption stops at
+/// the `kernels/` and `src/` boundary; flagged by review 2026-08-12 because invoking a rule in one
+/// file and ignoring it in the next needs to be a decision rather than an oversight.
 struct Kda {
     heads: usize,
     head_dim: usize,
@@ -2237,7 +2505,6 @@ fn kda(g: &GoldenSet, layer: usize) -> Kda {
     );
     let (os, want_o) = get("out.o");
     assert_eq!(os, qs, "{m}: the recurrence is width-preserving");
-    let t = |v: Vec<f32>| transpose_heads(&v, heads, head_dim);
     Kda {
         heads,
         head_dim,
@@ -2248,13 +2515,16 @@ fn kda(g: &GoldenSet, layer: usize) -> Kda {
         beta: get("in.beta").1,
         a_log: get("in.A_log").1,
         dt_bias: get("in.dt_bias").1,
-        state: t(state),
+        state: to_key_major(&state, heads, head_dim),
         want_o,
-        want_state: t(get("out.state").1),
+        want_state: to_key_major(&get("out.state").1, heads, head_dim),
     }
 }
 
-/// Swap each head's two state axes.
+/// Re-lay each head's state from the reference's `[value][key]` into the kernel's `[key][value]`.
+///
+/// Named for the POSTCONDITION, not the mechanism: "transpose" is direction-free, and this is the
+/// one place in the port where getting the direction backwards is invisible to every assertion.
 ///
 /// # The reference stores the state `[value][key]` and this kernel stores it `[key][value]`
 ///
@@ -2270,8 +2540,8 @@ fn kda(g: &GoldenSet, layer: usize) -> Kda {
 /// order on it, and `[key][value]` is the order that makes `S[i*d + t]` consecutive across the
 /// threads of a wave — which is the whole reason `kernels/recurrent.hip` is a two-pass kernel rather
 /// than four. So the transpose is a FIXTURE boundary, applied once here to compare two conventions,
-/// and `KdaAs::StateValueMajor` is the red-proof that this fixture can tell them apart.
-fn transpose_heads(v: &[f32], heads: usize, dim: usize) -> Vec<f32> {
+/// and `KdaForm::StateValueMajor` is the red-proof that this fixture can tell them apart.
+fn to_key_major(v: &[f32], heads: usize, dim: usize) -> Vec<f32> {
     assert_eq!(v.len(), heads * dim * dim, "not a per-head square");
     (0..heads)
         .flat_map(|h| (0..dim).flat_map(move |i| (0..dim).map(move |j| (h, i, j))))
@@ -2298,8 +2568,8 @@ fn for_each_kda(mut f: impl FnMut(&str, usize, f32, f32, Kda)) {
 /// oracle with exactly one thing changed, and writing it out separately is how the two drift into
 /// differing by something nobody intended. Here it also matters that the five variants are the
 /// anchor's own — four of them have a `--defect` run behind them and each is named for it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum KdaAs {
+#[derive(Clone, Copy, PartialEq)]
+enum KdaForm {
     Reference,
     /// `KdaNoQkL2Norm`: q and k used as projected.
     NoQkL2Norm,
@@ -2317,7 +2587,7 @@ enum KdaAs {
 }
 
 /// §4 steps 3-7 in f64, over one decode step.
-fn host_kda(c: &Kda, lb: f32, form: KdaAs) -> (Vec<f32>, Vec<f32>) {
+fn host_kda(c: &Kda, lb: f32, form: KdaForm) -> (Vec<f32>, Vec<f32>) {
     let dim = c.head_dim;
     let lb = f64::from(lb);
     let mut state: Vec<f64> = c.state.iter().copied().map(f64::from).collect();
@@ -2331,7 +2601,7 @@ fn host_kda(c: &Kda, lb: f32, form: KdaAs) -> (Vec<f32>, Vec<f32>) {
         // 3) — a different convention from every RMSNorm in this tree, and applied to q and k only.
         let l2 = |v: &[f32]| -> Vec<f64> {
             let s: f64 = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
-            let inv = if form == KdaAs::NoQkL2Norm {
+            let inv = if form == KdaForm::NoQkL2Norm {
                 1.0
             } else {
                 1.0 / (s + 1e-6).sqrt()
@@ -2348,9 +2618,9 @@ fn host_kda(c: &Kda, lb: f32, form: KdaAs) -> (Vec<f32>, Vec<f32>) {
             .map(|i| {
                 // `dt_bias` goes on BEFORE the scale, and `a` multiplies inside the sigmoid.
                 let z = f64::from(c.g[base + i]) + f64::from(c.dt_bias[base + i]);
-                if form == KdaAs::GateClamped {
+                if form == KdaForm::GateClamped {
                     // fla's `safe_gate=False` activation, verbatim from its docstring
-                    // (`fla/ops/kda/chunk.py:250-256`): `-exp(A_log)·softplus(g + dt_bias)`, with
+                    // (fla 0.5.2's `fla/ops/kda/chunk.py:250-256`): `-exp(A_log)·softplus(g + dt_bias)`, with
                     // `lower_bound` as a floor. Both forms are bounded below by `lb` and monotone
                     // in `z`, which is what makes this the plausible wrong one rather than an
                     // obviously broken one.
@@ -2361,12 +2631,12 @@ fn host_kda(c: &Kda, lb: f32, form: KdaAs) -> (Vec<f32>, Vec<f32>) {
             })
             .collect();
         let bp = f64::from(c.beta[h]);
-        let beta = if form == KdaAs::BetaPreSigmoid {
+        let beta = if form == KdaForm::BetaPreSigmoid {
             bp
         } else {
             1.0 / (1.0 + (-bp).exp())
         };
-        let vm = form == KdaAs::StateValueMajor;
+        let vm = form == KdaForm::StateValueMajor;
         let at = |i: usize, j: usize| h * dim * dim + if vm { j * dim + i } else { i * dim + j };
         // Decay the rows by the per-key-channel gate, and read `u = S^T k` off the DECAYED state.
         let mut u = vec![0f64; dim];
@@ -2385,7 +2655,7 @@ fn host_kda(c: &Kda, lb: f32, form: KdaAs) -> (Vec<f32>, Vec<f32>) {
                 let pre = state[at(i, j)];
                 state[at(i, j)] = pre + kn[i] * dv;
                 o += qn[i]
-                    * if form == KdaAs::OutputBeforeUpdate {
+                    * if form == KdaForm::OutputBeforeUpdate {
                         pre
                     } else {
                         state[at(i, j)]
@@ -2436,11 +2706,27 @@ fn device_kda(c: &Kda, lb: f32) -> (Vec<f32>, Vec<f32>) {
 /// A synthetic case at arbitrary widths, for the two things the goldens cannot reach: the real
 /// geometry, and the launcher's refusals.
 ///
-/// The gate input is drawn WIDE on purpose (`±12` before `dt_bias`), because `alpha` is the one
-/// quantity in this kernel with a saturating range the anchor never visits: at the tiny widths every
-/// decay lands mid-scale, while `alpha == 1.0` exactly is legitimate saturation the reference
-/// documents and `e^-5` is the other end.
+/// The gate input is drawn wide (`±12` before `dt_bias`) so that `alpha` reaches both ends of its
+/// range — `1.0` exactly, which is the legitimate perfect retention the reference documents, and the
+/// `e^-5` floor.
+///
+/// > **CORRECTED 2026-08-12 by review, and the correction runs the other way.** This said `alpha` is
+/// > "the one quantity in this kernel with a saturating range the anchor never visits: at the tiny
+/// > widths every decay lands mid-scale". Measured over both draws, layers 0/1/12 and all 768 gate
+/// > channels: **37 alphas are exactly 1.0f, 311 exceed 0.9999, 38 sit at the e^-5 floor, and the
+/// > median is 0.9981.** The anchor is CONCENTRATED at near-identity decay, so what it under-covers
+/// > is the MID-SCALE decay, not saturation. A reader who trusted the old sentence would have
+/// > dropped this sweep's saturated cells as redundant and not added the mid-scale ones — which is
+/// > why `mid_scale` is now a parameter and one case uses it.
 fn synthetic_kda(heads: usize, head_dim: usize, seed: u64) -> Kda {
+    synthetic_kda_gain(heads, head_dim, seed, 12.0)
+}
+
+/// The same, with the gate gain chosen. **`dt_bias` scales with it**, and it has to: `A_log` reaches
+/// `log(16)`, so `exp(A_log)·(g + dt_bias)` is up to 16x whichever of the two is larger, and leaving
+/// `dt_bias` at its own scale saturated the sigmoid at every gain tried. Measured: 12.0 reaches both
+/// ends of `alpha` (1.0 exactly and the e^-5 floor), 0.03 keeps every channel inside [0.04, 0.17].
+fn synthetic_kda_gain(heads: usize, head_dim: usize, seed: u64, g_gain: f32) -> Kda {
     let mut r = common::Lcg(seed);
     let n = heads * head_dim;
     let mut draw = |len: usize, gain: f32| (0..len).map(|_| r.f() * gain).collect::<Vec<f32>>();
@@ -2450,7 +2736,7 @@ fn synthetic_kda(heads: usize, head_dim: usize, seed: u64) -> Kda {
         q: draw(n, 1.0),
         k: draw(n, 1.0),
         v: draw(n, 1.0),
-        g: draw(n, 12.0),
+        g: draw(n, g_gain),
         beta: draw(heads, 4.0),
         // `log(uniform(1, 16))` is the anchor's own range for `A_log`, and it must not be constant:
         // a constant makes every head decay identically and a kernel ignoring the term would match.
@@ -2458,7 +2744,7 @@ fn synthetic_kda(heads: usize, head_dim: usize, seed: u64) -> Kda {
             .iter()
             .map(|x| (1.0 + 15.0 * x.abs()).ln())
             .collect(),
-        dt_bias: draw(n, 2.0),
+        dt_bias: draw(n, 2.0 * g_gain / 12.0),
         state: draw(n * head_dim, 1.0),
         want_o: Vec::new(),
         want_state: Vec::new(),
@@ -2494,13 +2780,19 @@ fn the_gated_delta_recurrence_matches_the_anchor_at_every_kda_layer() {
 #[test]
 fn the_kda_host_oracle_agrees_with_the_anchor() {
     for_each_kda(|salt, layer, tol, lb, c| {
-        let (o, state) = host_kda(&c, lb, KdaAs::Reference);
+        let (o, state) = host_kda(&c, lb, KdaForm::Reference);
         for (what, got, want) in [("o", &o, &c.want_o), ("state", &state, &c.want_state)] {
             let r = rel(got, want);
-            assert!(
-                r <= tol,
-                "{salt} layer {layer} {what}: {r:e} exceeds {tol:e}"
-            );
+            let at = format!("{salt} layer {layer} {what}");
+            assert!(r <= tol, "{at}: {r:e} exceeds {tol:e}");
+            // **And the tripwire, which this test lacked until 2026-08-12.** It was the only
+            // golden-scored site in the file without one, and it is the site that most needs it:
+            // the five red-proofs below score `moved` against a DEVICE constant, so a regression
+            // that degraded THIS oracle into the 6.8e-5..6.3e-4 band would leave this test green,
+            // leave all five of them green, and quietly empty the sensitivity claim they make.
+            // The constructed break that found it: eps on the mean instead of the sum. Worst
+            // measured over both draws and layers 0/1/12: 2.481e-7.
+            tripwire(r, 2.481e-7, tol, &at);
         }
     });
 }
@@ -2524,56 +2816,83 @@ fn the_kda_host_oracle_agrees_with_the_anchor() {
 fn the_recurrence_arithmetic_inside_flas_kernel_is_all_priced() {
     for_each_kda(|salt, layer, tol, lb, c| {
         let bar = KDA_OBSERVED_WORST * 10.0 * 30.0;
-        for form in [
-            KdaAs::NoQkL2Norm,
-            KdaAs::GateClamped,
-            KdaAs::BetaPreSigmoid,
-            KdaAs::StateValueMajor,
-            KdaAs::OutputBeforeUpdate,
+        // The label rides beside the variant rather than in a `match` past this loop: that
+        // function had one call site and an arm for `Reference` this loop can never reach.
+        for (form, what, measured) in [
+            (
+                KdaForm::NoQkL2Norm,
+                "dropping the q/k L2 norm (--defect KdaNoQkL2Norm)",
+                MEASURE_NOQKL2NORM,
+            ),
+            (
+                KdaForm::GateClamped,
+                "clamping the gate instead of scaling it (KdaGateLowerBoundOff)",
+                MEASURE_GATECLAMPED,
+            ),
+            (
+                KdaForm::BetaPreSigmoid,
+                "taking beta pre-sigmoid (KdaBetaSigmoidOutside)",
+                MEASURE_BETAPRESIGMOID,
+            ),
+            (
+                KdaForm::StateValueMajor,
+                "swapping the state's two axes (KdaStateLayout)",
+                MEASURE_STATEVALUEMAJOR,
+            ),
+            (
+                KdaForm::OutputBeforeUpdate,
+                "reading o from the pre-update state (no anchor defect)",
+                MEASURE_OUTPUTBEFOREUPDATE,
+            ),
         ] {
             let (o, state) = host_kda(&c, lb, form);
             // The WORSE of the two outputs, not the mean: a variant that left `o` untouched while
             // corrupting the state is still caught by this fixture, and one that moved neither
             // would not be.
             let moved = rel(&o, &c.want_o).max(rel(&state, &c.want_state));
+            // **The measured separation, not just the bar.** The docs state this item's headline
+            // finding as "six orders" while the bar below is 6.8e-5, three orders weaker — so the
+            // claim was quoted and not checked (review 2026-08-12). Each form now carries the
+            // minimum it actually reaches over both draws and all three layers, and a separation
+            // that fell to a tenth of it fails here even though it would still clear the bar.
+            assert!(
+                moved >= measured * 0.1,
+                "{salt} layer {layer} {what}: separation fell to {moved:e} from a measured \
+                 {measured:e} — the docs quote this magnitude, so re-measure and move the constant \
+                 rather than leaning on the {bar:e} bar"
+            );
             assert!(
                 moved > bar,
-                "{salt} layer {layer} {}: moved the recurrence by only {moved:e}, under the \
+                "{salt} layer {layer} {what}: moved the recurrence by only {moved:e}, under the \
                  {bar:e} this fixture's tripwire needs cleared by the table's 30x — so the \
                  agreement above says nothing about which form the kernel implements. (The \
-                 operator tolerance is {tol:e}.)",
-                kda_as_name(form)
+                 operator tolerance is {tol:e}.)"
             );
         }
     });
 }
 
-/// The variant names, for the message above. A `Debug` derive would print the same text with none
-/// of the pointer to the run that prices it.
-fn kda_as_name(form: KdaAs) -> &'static str {
-    match form {
-        KdaAs::Reference => "the reference",
-        KdaAs::NoQkL2Norm => "dropping the q/k L2 norm (--defect KdaNoQkL2Norm)",
-        KdaAs::GateClamped => "clamping the gate instead of scaling it (KdaGateLowerBoundOff)",
-        KdaAs::BetaPreSigmoid => "taking beta pre-sigmoid (KdaBetaSigmoidOutside)",
-        KdaAs::StateValueMajor => "swapping the state's two axes (KdaStateLayout)",
-        KdaAs::OutputBeforeUpdate => "reading o from the pre-update state (no anchor defect)",
-    }
-}
-
-/// **The recurrence at K3's real geometry, and at decays the goldens never reach.**
+/// **The recurrence at K3's real geometry, and in the three regimes the goldens do not cover.**
 ///
-/// Three gaps the anchor leaves. Width: 96 heads of 128 against the tiny 4 of 32, which is the case
-/// where the state is 64 KB per head and the two-pass shape is the reason this kernel exists.
-/// Saturation: the anchor's gate inputs all land mid-scale, while `alpha == 1.0` exactly is
-/// legitimate perfect retention and `e^-5` is the other end of the bound. And a `heads = 1` case,
-/// where a grid-mapping error has nowhere to hide.
+/// Width: 96 heads of 128 against the tiny 4 of 32, which is where the state is 64 KB per head and
+/// the two-pass shape is the reason this kernel exists. `heads = 1`, where a grid-mapping error has
+/// nowhere to hide. And **mid-scale decay**, which is the regime the anchor actually lacks — see
+/// `synthetic_kda`, whose old claim about this was backwards. The `(4, 128)` case separates a
+/// head-count bug from a head-width one: it shares the width with the first case and the head count
+/// with the anchor's.
 #[test]
-fn the_recurrence_holds_at_real_widths_and_saturated_decays() {
-    for &(heads, head_dim) in &[(96usize, 128usize), (4, 128), (1, 32)] {
-        let c = synthetic_kda(heads, head_dim, 0x5A_11 + heads as u64);
+fn the_recurrence_holds_at_real_widths_and_every_decay_regime() {
+    // `(heads, head_dim, gate gain)`. The last one is the mid-scale decay case — see
+    // `synthetic_kda_gain` for why the gain has to be this small.
+    for &(heads, head_dim, g_gain) in &[
+        (96usize, 128usize, 12.0f32),
+        (4, 128, 12.0),
+        (1, 32, 12.0),
+        (8, 128, 0.03),
+    ] {
+        let c = synthetic_kda_gain(heads, head_dim, 0x5A_11 + heads as u64, g_gain);
         let (o, state) = device_kda(&c, -5.0);
-        let (wo, ws) = host_kda(&c, -5.0, KdaAs::Reference);
+        let (wo, ws) = host_kda(&c, -5.0, KdaForm::Reference);
         // 10x the 5.465e-7 measured over these cases (96x128, `o`) — 2.4x looser than the
         // golden-backed sites above and legitimately so: at head_dim 128 each `o` is a 128-term
         // reduction against the anchor's 32, and the device sums it in a different order from the
@@ -2588,10 +2907,110 @@ fn the_recurrence_holds_at_real_widths_and_saturated_decays() {
         // would not, and that is a NaN in S3 rather than a wrong number here.
         assert!(
             state.iter().all(|x| x.is_finite()) && o.iter().all(|x| x.is_finite()),
-            "heads={heads} dim={head_dim}: the recurrence produced a non-finite value at a \
-             saturated decay"
+            "heads={heads} dim={head_dim}: the recurrence produced a non-finite value"
         );
+        // **And the regime this case claims to be in is ASSERTED, not hoped for.** It is a property
+        // of the DRAW: a future seed or width could re-degenerate it silently, which is exactly the
+        // argument `attn_res_at_real_widths_and_multiple_tokens` makes where it asserts `pmax < 0.9`
+        // per token. Without this, "covers the saturated decay" was a comment.
+        let (lo, hi) = alpha_span(&c, -5.0);
+        if g_gain > 0.1 {
+            assert!(
+                hi >= 0.99 && lo <= (-4.0f32).exp(),
+                "heads={heads} dim={head_dim}: alpha spans only [{lo:e}, {hi}], so this case does \
+                 not reach the saturation it exists for"
+            );
+        } else {
+            assert!(
+                hi < 0.99 && lo > (-4.0f32).exp(),
+                "heads={heads} dim={head_dim}: alpha spans [{lo:e}, {hi}], which saturates — the \
+                 mid-scale case has become a second copy of the saturated ones"
+            );
+        }
     }
+}
+
+/// The decay range one case actually produces, so a test can assert the regime it claims.
+fn alpha_span(c: &Kda, lb: f32) -> (f32, f32) {
+    let (mut lo, mut hi) = (f32::INFINITY, 0.0f32);
+    for h in 0..c.heads {
+        let a = c.a_log[h].exp();
+        for i in 0..c.head_dim {
+            let z = a * (c.g[h * c.head_dim + i] + c.dt_bias[h * c.head_dim + i]);
+            let alpha = (lb / (1.0 + (-z).exp())).exp();
+            lo = lo.min(alpha);
+            hi = hi.max(alpha);
+        }
+    }
+    (lo, hi)
+}
+
+/// **The delta rule's own regime: a state that already PREDICTS the value.**
+///
+/// `dv = beta·(v − u)` with `u = Sᵀk`, and the recurrence exists because `u` is the state's
+/// prediction of `v` for the current key — so once a key direction has been written into `S`, `v − u`
+/// is a difference of near-equal quantities and the relative error in `dv` is amplified by
+/// `|v|/|v−u|`. Two steps on the same key with `beta` near 1 gives ~50x.
+///
+/// **Every other KDA case here measures the operator where it is numerically easiest**, which review
+/// 2026-08-12 found and which is worth a case of its own: `synthetic_kda` draws the state i.i.d.
+/// uniform, uncorrelated with `kn`, and the anchor's `initial_state` comes from an 8-token prefill of
+/// a randomly-initialised model, so neither visits the cancellation. This seeds the state as the
+/// outer product one step of the recurrence actually produces, `kn ⊗ (beta·v)`, and re-measures
+/// there. Note the bound: it is LOOSER than the other sweep's and that is the finding, not a
+/// concession.
+#[test]
+fn the_recurrence_holds_where_the_state_predicts_the_value() {
+    let (heads, dim) = (8usize, 128usize);
+    // The SAME case with an i.i.d. state, so the comparison isolates the cancellation rather than
+    // conflating it with per-head-versus-whole-tensor scoring.
+    let plain = synthetic_kda(heads, dim, 0x5A_11_5D);
+    let mut c = synthetic_kda(heads, dim, 0x5A_11_5D);
+    for h in 0..heads {
+        let base = h * dim;
+        // The kernel's own normalisation, so the seeded state is the one a first step leaves behind.
+        let n2: f32 = c.k[base..base + dim].iter().map(|x| x * x).sum();
+        let inv = 1.0 / (n2 + 1e-6).sqrt();
+        let beta = 1.0 / (1.0 + (-c.beta[h]).exp());
+        for i in 0..dim {
+            for j in 0..dim {
+                c.state[base * dim + i * dim + j] = c.k[base + i] * inv * beta * c.v[base + j];
+            }
+        }
+    }
+    let worst = |c: &Kda| {
+        let (o, state) = device_kda(c, -5.0);
+        let (wo, ws) = host_kda(c, -5.0, KdaForm::Reference);
+        let mut m = 0.0f32;
+        for h in 0..c.heads {
+            let (r, sr) = (h * dim..(h + 1) * dim, h * dim * dim..(h + 1) * dim * dim);
+            m = m
+                .max(rel(&o[r.clone()], &wo[r]))
+                .max(rel(&state[sr.clone()], &ws[sr]));
+        }
+        m
+    };
+    // **Scored PER HEAD, and that is half of what this case is for.** `rel` divides by the largest
+    // |value| in the WHOLE tensor, so a single head that lost every significant digit to
+    // cancellation is diluted by the largest of 8 x 128 outputs. Per head, the denominator is that
+    // head's own scale — and the review that asked for this case was right about the denominator
+    // even where the amplification turned out milder than predicted.
+    let (structured, iid) = (worst(&c), worst(&plain));
+    // 10x the 2.383e-6 measured. Against the i.i.d. state's 4.076e-7 at the same width and the same
+    // per-head denominator, the cancellation costs **5.8x** — real, and far less than the ~50x the
+    // amplification argument predicts, because `beta = sigmoid(b_proj)` approaches 1 for only a
+    // minority of heads and `v - u = (1 - beta)v` is small only for those.
+    assert!(
+        structured <= 2.4e-5,
+        "the predicting state disagrees by {structured:e} per head"
+    );
+    // The comparison is the finding, so it is asserted rather than described: a future change that
+    // made the two equal would mean this case had stopped being the cancellation case.
+    assert!(
+        structured > iid * 2.0,
+        "the predicting state ({structured:e}) is no worse per head than the i.i.d. one ({iid:e}), \
+         so this case is a second copy of the width sweep rather than the delta rule's own regime"
+    );
 }
 
 /// **The launcher refuses what it cannot compute.**
@@ -2631,4 +3050,16 @@ fn the_recurrence_guards_its_width_and_its_gate_bound() {
         kda_launch(&odd, -5.0).is_err(),
         "head_dim 96 was accepted, and the L2-norm reduction would have dropped elements"
     );
+    // Guard 1001, added 2026-08-12 — it was the one refusal code here with no case. Zero heads is
+    // a launch of nothing that would otherwise return SUCCESS, and zero `head_dim` is a zero-thread
+    // block, which the driver rejects with an error a caller would then have to interpret.
+    for (heads, head_dim) in [(0usize, 32usize), (2usize, 0usize)] {
+        let mut z = synthetic_kda(heads.max(1), head_dim.max(1), 0x5A_11_60);
+        z.heads = heads;
+        z.head_dim = head_dim;
+        assert!(
+            kda_launch(&z, -5.0).is_err(),
+            "heads={heads} head_dim={head_dim} was accepted rather than refused (1001)"
+        );
+    }
 }

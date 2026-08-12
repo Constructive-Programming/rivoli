@@ -21,6 +21,9 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+#[path = "common/k3_tolerance.rs"]
+mod k3_tolerance;
+
 const INDEX: &str = "docs/00-orientation/INDEX.md";
 const STATUSES: [&str; 5] = [
     "live",
@@ -528,4 +531,41 @@ fn the_jscpd_exemption_count_is_derived() {
          and {total} is what `src/`, `tests/` and `build.rs` carry. Per-file: {}",
         per_file.join(", ")
     );
+}
+
+/// **`anchor.md`'s verdict must carry every `Rel` value the tolerance table actually holds.**
+///
+/// The table is the only place these numbers are CHECKED (`tolerances_leave_room` derives each `Rel`
+/// from its floor). They are then transcribed into `anchor.md`'s verdict, into the `INDEX.md` row
+/// that `the_index_lists_every_doc_with_a_matching_verdict` gates against it, and into prose in three
+/// files — and on 2026-08-12 a re-measurement moved three of them and left four downstream arguments
+/// citing the old values, one of which stated a ratio that was 2.2x wrong in three places at once.
+///
+/// So this makes the doc DERIVED from the table rather than agreeing with it by hand, the same way
+/// `the_jscpd_exemption_count_is_derived` does for a count. It gates the verdict line specifically
+/// because `INDEX.md` already has to match that, so one assertion covers both.
+#[test]
+fn the_anchor_verdict_carries_the_measured_tolerances() {
+    let body = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/measurement/k3-reference/anchor.md"),
+    )
+    .expect("anchor.md");
+    let verdict = front_matter(&body).expect("anchor.md front matter").1;
+    for t in k3_tolerance::TOLERANCES {
+        let k3_tolerance::Policy::Rel(tol) = t.policy else {
+            continue; // `ExactOnly` has no value to carry.
+        };
+        // TWO significant figures, which is how the verdict writes them and how the table's own
+        // `FLOOR_MULT` rule says an author writes them. Rust's bare `{:e}` drops a trailing zero —
+        // `6.0e-4` becomes `6e-4` — and matching that against the doc fails for the one row whose
+        // mantissa ends in zero, which is exactly how this check first went red.
+        let want = format!("{tol:.1e}");
+        assert!(
+            verdict.contains(&want),
+            "anchor.md's verdict does not carry `{}`'s tolerance {want} — the table moved and the \
+             doc did not. Every argument in the tree that divides by this number is now stale; \
+             re-derive them rather than editing this line alone.",
+            t.operator
+        );
+    }
 }

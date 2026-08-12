@@ -253,8 +253,10 @@ them at the five MoE layers would roughly quadruple both vendored files. What th
 anchor-scored GEMV, and that comparison is weak where it is not free: rivoli's trunk matmul is
 `gemm_bf16`, whose weights are **bf16**, while this reference runs fp32 — one of the four declared
 deviations at the top of this file. A bf16 weight is ~2⁻⁹ off its fp32 twin, **1.95e−3 against
-`moe_latent`'s 2.9e−4 tolerance**, so the fixture could only be stated seven times looser than the
-operator's own bar, and it would still be at hidden 192 rather than 7168.
+`moe_latent`'s 6.3e−4 tolerance**, so the fixture could only be stated three times looser than the
+operator's own bar, and it would still be at hidden 192 rather than 7168. *(This read "2.9e−4 ...
+seven times looser" — the tolerance this same change replaced. The decision holds either way;
+corrected 2026-08-12, and the same sentence in `wrap_latent_sandwich`'s docstring with it.)*
 `tests/k3_kernels.rs::the_trunk_gemv_matches_an_f64_dot_at_k3_widths` scores that kernel against an
 f64 dot at the **real** widths instead, which is both cheaper and wider. Revisit this only if
 something needs the reference's particular matrix.
@@ -380,7 +382,8 @@ Every bold cell is asserted. Read the rows:
 > **CORRECTED 2026-08-11, and it is the useful correction of this round.** The bullet above and
 > `defect_kda_gate_lower_bound_off`'s docstring both said the gate bound's *form* — multiply, not
 > clamp — is arithmetic "nothing outside fla's kernel attests to". **fla's own docstring attests to
-> it**, at `fla/ops/kda/chunk.py:250-256`, and gives both forms explicitly: with `lower_bound` set
+> it**, at fla 0.5.2's `fla/ops/kda/chunk.py:250-256` (the version this anchor pins), and gives both
+> forms explicitly: with `lower_bound` set
 > and `safe_gate=True` the activation changes from `-exp(A_log) * softplus(g + dt_bias)` to
 > `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`, "which naturally clamps the output to
 > `[lower_bound, 0)`". So **S2 has a written reference for this term and should port from it**,
@@ -501,12 +504,17 @@ correct. Checked rather than assumed. And **not caused by item 3's new captures*
 floor is 2.851e−5 / 6.287e−5 whether or not the two new tensors are in the bucket, measured both
 ways.
 
+**EVERY ROW BELOW IS SUPERSEDED except `dense_mlp` and `kda_op`**, and the marker used to sit on
+`mla` alone — which left a reader who started at the table believing four one-draw floors. The live
+values are in `tests/common/k3_tolerance.rs`; these are kept for what they show about the one-draw
+habit, not as reference. Marked per row 2026-08-12.
+
 | operator | fp32 floor | weakest own defect | margin | policy |
 |---|---|---|---|---|
-| `attn_res` | 1.57e−5 | 1.80e+0 `AttnResNormalisedValues` | 114,000× | `Rel(1.6e-4)` |
+| `attn_res` *(superseded)* | 1.57e−5 | 1.80e+0 `AttnResNormalisedValues` | 114,000× | `Rel(1.6e-4)` |
 | **`mla`** *(superseded)* | **1.70e−5** | **2.22e−5 `MlaLoraEps1e5`** | **1.3×** | **exact only** |
-| `moe_latent` | 2.85e−5 | 2.05e+2 `LatentNormAfterUp` | 7.2M× | `Rel(2.9e-4)` |
-| `moe_route` | 2.47e−5 | 2.23e+0 `RouterBiasInWeight` | 90,000× | `Rel(2.5e-4)` |
+| `moe_latent` *(superseded)* | 2.85e−5 | 2.05e+2 `LatentNormAfterUp` | 7.2M× | `Rel(2.9e-4)` |
+| `moe_route` *(superseded)* | 2.47e−5 | 2.23e+0 `RouterBiasInWeight` | 90,000× | `Rel(2.5e-4)` |
 | `kda_op` | 6.30e−5 | 1.75e+0 `KdaBetaSigmoidOutside` | 27,700× | `Rel(6.3e-4)` |
 | `dense_mlp` | 9.37e−7 | 1.28e+0 `DenseMlpGateUpSwap` | 1.4M× | `Rel(9.4e-6)` |
 

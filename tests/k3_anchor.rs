@@ -705,6 +705,7 @@ fn exactly_the_declared_layers_were_captured() {
 #[test]
 fn the_tolerance_table_is_supported_by_its_measurements() {
     k3_tolerance::tolerances_leave_room();
+    k3_tolerance::the_floor_band_admits_every_rule_following_row();
     // These six are the operators whose floor was MEASURED, and the spelling S2 will look a row up
     // by — so a rename or a swapped row is caught here, which a count of rows would not catch.
     //

@@ -375,7 +375,7 @@ def defect_kda_gate_lower_bound_off(model, ctx):
     """Drop `lower_bound` (-5.0 from the real config) AND `safe_gate` -- trap 4.
 
     The bound MULTIPLIES the gate's sigmoid rather than clamping it, and fla's own docstring says
-    so — `fla/ops/kda/chunk.py:250-256` writes out both forms. An earlier version of this comment
+    so — fla 0.5.2's `fla/ops/kda/chunk.py:250-256` writes out both forms. An earlier version of this
     claimed nothing outside the kernel attested to it; that was wrong, and `anchor.md` carries the
     correction. **S2 should port the term from that docstring**, not infer its shape from a red
     cell. What this run buys is the other thing: proof the golden is SENSITIVE to the term, since a
@@ -733,14 +733,43 @@ def wrap_latent_sandwich(model, cap, ctx, layers):
     both vendored files. What they would buy is an anchor-scored GEMV, and that comparison is weak
     where it is not free: rivoli's trunk matmul is `gemm_bf16`, whose weights are bf16, while this
     reference runs fp32 (one of the anchor's four declared deviations). A bf16 weight is ~2^-9
-    relative off its fp32 twin -- 1.95e-3 against `moe_latent`'s 2.9e-4 tolerance -- so the
-    fixture could only be stated at a tolerance seven times looser than the operator's, and it
+    relative off its fp32 twin -- 1.95e-3 against `moe_latent`'s 6.3e-4 tolerance -- so the
+    fixture could only be stated at a tolerance three times looser than the operator's, and it
     would still be at hidden 192 rather than 7168. `tests/k3_kernels.rs` scores `gemm_bf16`
     against an f64 host dot at K3's REAL widths instead, which is both cheaper and wider.
     """
     return pre_hook_inputs(
         model, cap, ctx, layers, ".routed_expert_norm", ".in", params=("weight",)
     )
+
+
+def wrap_kda_params(model, cap, ctx, layers):
+    """The two KDA weights a fixture needs and no hook produced -- S2 items 5b and 5c.
+
+    Same shape of gap as `wrap_attn_res`'s fold and `wrap_latent_sandwich`'s norm weight, found the
+    same way (by walking up to write the fixture), and now recognised on sight: **an input and an
+    output do not determine an operator when a weight sits between them.**
+
+    * **`{q,k,v}_conv1d.weight`** -- `ShortConvolution`'s depthwise taps, `[channels][kernel]`. The
+      golden already holds `q_proj` (the conv's input) and `q_conv1d.0`/`.1` (its output and the
+      returned history), so the taps were the only missing term. Item 5b is the one operator here
+      whose fixture is STATEFUL: `.1` is the history the next token convolves against, and §4 step 2
+      says the history holds pre-conv, pre-SiLU inputs.
+    * **`o_norm.weight`** -- `FusedRMSNormGated`'s `[head_dim]`, shared across heads. Item 5c.
+
+    Both go through `pre_hook_inputs`, which also records each module's INPUT. That is not waste for
+    `o_norm`: it is called as `o_norm(o, g)` and `inp[0]` is the recurrence's `o`, so
+    `o_norm.in` against `fused_recurrent_kda.out.o` is a free cross-check that the module hook and
+    the operator wrapper agree about what leaves the recurrence -- the same trick
+    `o_proj.in_gated` already plays against `o_norm`'s output.
+
+    Returns the hooked names per suffix so `main` can assert a census against the KDA layer count
+    rather than trusting that four suffixes matched something.
+    """
+    return {
+        ends: pre_hook_inputs(model, cap, ctx, layers, ends, ".in", params=("weight",))
+        for ends in (".q_conv1d", ".k_conv1d", ".v_conv1d", ".o_norm")
+    }
 
 
 def wrap_kda_ops(mod, cap, ctx, layers):
@@ -1310,6 +1339,7 @@ def main():
     wrap_attn_res(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
     wrap_mla_attention(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
     latent = wrap_latent_sandwich(model, cap, ctx, CAPTURE_LAYERS)
+    kda_params = wrap_kda_params(model, cap, ctx, CAPTURE_LAYERS)
     ids = torch.arange(1, args.seq + 1, device=args.device).unsqueeze(0) % cfg.vocab_size
 
     if args.mode == "kda-equiv":
@@ -1362,6 +1392,20 @@ def main():
     for tag in (".routed_expert_norm.in", ".routed_expert_norm.weight"):
         got = sum(1 for s in cap.seen if s.endswith(tag))
         assert got == len(moe_layers), f"{got} captures of {tag} for {len(moe_layers)} MoE layers"
+    # Items 5b/5c's weights, counted against the KDA layers rather than `any`-ed, for the reason
+    # above: a suffix that matched nothing looks exactly like a partition that put no KDA layer in
+    # `CAPTURE_LAYERS`, and the config is what tells them apart.
+    kda_layers = [i for i in CAPTURE_LAYERS if i in ctx["kda_layer_ids"]]
+    for ends, hooked in kda_params.items():
+        assert len(hooked) == len(kda_layers), (
+            f"{len(hooked)} `{ends}` pre-hooks for {len(kda_layers)} KDA capture layers "
+            f"{kda_layers} -- expected one each"
+        )
+        for suffix in (".in", ".weight"):
+            got = sum(1 for s in cap.seen if s.endswith(f"{ends}{suffix}"))
+            assert got == len(kda_layers), (
+                f"{got} captures of {ends}{suffix} for {len(kda_layers)} KDA layers"
+            )
 
     import fla
     import transformers

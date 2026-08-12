@@ -29,17 +29,37 @@
 // before it.
 //
 // The state is read at `S[i*d + t]`, so consecutive threads read consecutive addresses within
-// one key channel. That is what makes the [K][V] axis order the right one for this mapping;
-// the transposed store would give each thread a private row and cost the coalescing.
+// one key channel.
+//
+// **[K][V] is the only layout that can be simultaneously VECTORIZED and coalesced, and that —
+// not coalescing alone — is why it is the right one.** The first version of this comment said
+// the transposed store "would give each thread a private row and cost the coalescing", and a
+// performance review priced that argument and found it the weaker half: with a per-thread row
+// the DRAM traffic is the same (the 32 over-fetched lines per wave-instruction are consumed by
+// the same thread over its next 15 iterations, out of a 32 KB L0 that a wave's 2 KB footprint
+// fits), and the request-count penalty is a small multiple rather than 16x. What the transpose
+// would also permit is a `float4` per-thread row — 512 B in flight per wave-instruction
+// against this kernel's 128 B — on the axis this tree has twice measured as the limiter. So
+// judged as WRITTEN the two shapes are close, and [K][V] pulls ahead only once a thread owns
+// four consecutive value channels, which is a change this kernel has not made. Read that as a
+// reason to make it, not as a licence to leave the scalar mapping alone.
 //
 // **The reference stores it the other way round, and this kernel deliberately does not.** fla
 // is called with `transpose_state_layout=True`, so the anchor's `initial_state` and
 // `out.state` are [V][K] — measured rather than read off the kwarg, because the state is
 // square (128x128 in the model, 32x32 in the anchor) and no shape assertion can see the
 // difference: `tests/k3_kernels.rs` scores both interpretations of the anchor's own state and
-// they separate by six orders. Nothing forces that layout on the port, whose state starts at
-// zero and never leaves the device, so the fixture transposes at its boundary and the decode
-// path pays nothing.
+// they separate by 7.567e-1 against the oracle's own 2.481e-7 agreement. Note whose layout
+// this is: `k3-architecture.md` §4 step 7 writes `S[i][j]` with `i` the key channel, so the C
+// reference AGREES with this kernel and what is declined is fla's BUFFER order.
+//
+// Nothing forces that order on the port, whose state starts at zero and never leaves the
+// device, so the fixture transposes at its boundary and the decode path pays nothing. **Two
+// costs it does have**, both named by review rather than by measurement: a live state dumped
+// at S3 and diffed against the anchor's will load, shape-check and disagree by exactly the
+// magnitude these docs file as the signature of `--defect KdaStateLayout`; and a chunked
+// prefill can only be ported from fla, whose buffer is [V][K], so transliterating its index
+// math against this layout is wrong with every shape check green.
 //
 // Everything fla hides inside its kernel is here, because the anchor's captures put it here:
 // `q`/`k` arrive PRE-L2-norm, `beta` arrives PRE-sigmoid, and `g` is the raw gate projection
@@ -55,7 +75,15 @@ extern "C" __global__ void gated_delta_recurrent_f32(
     // fixed [128] because the anchor runs head_dim 32 and the real model 128, and a kernel
     // whose LDS silently sized for one of them would be a ceiling nobody stated.
     extern __shared__ float sh[];
-    const int d = (int)blockDim.x;  // head_dim == head_k_dim; the launcher guards it
+    // **`d` is head_k_dim AND head_v_dim, and nothing can check that they are equal.** Thread `t`
+    // is key channel `t` for `q`, `k`, `g`, `dt_bias` and its `alpha`, and value channel `t` for
+    // `v`, `out` and its private state column — while both state loops run `i` over the same `d`.
+    // The launcher takes ONE width, so the equality is not "guarded" (an earlier comment here said
+    // it was): it is structurally unexpressible, and the square state makes every shape check pass
+    // either way. True for K3 at 128/128; a gated-delta-rule model with head_v_dim = 2*head_k_dim
+    // would be silently WRONG here rather than refused, which is worth knowing given this file is
+    // named for the arithmetic and invites the family.
+    const int d = (int)blockDim.x;
     const int h = (int)blockIdx.x;
     const int t = (int)threadIdx.x;
     float* qn = sh;
@@ -89,7 +117,7 @@ extern "C" __global__ void gated_delta_recurrent_f32(
 
     // Decay (§4 step 5). `a_log` is PER HEAD, `dt_bias` per (head, channel), and the bias goes
     // on BEFORE the scale. `lower_bound` MULTIPLIES the sigmoid — it is not a clamp; fla's own
-    // docstring gives this form for `safe_gate=True` (`fla/ops/kda/chunk.py:250-256`), which is
+    // docstring gives this form for `safe_gate=True` (fla 0.5.2's `fla/ops/kda/chunk.py:250-256`, the version `tests/k3_anchor.rs` pins), which is
     // the written reference this term has and the `KdaGateLowerBoundOff` defect only proves the
     // golden is sensitive to. `alpha == 1.0f` exactly is LEGITIMATE saturation, meaning perfect
     // retention: in fp32 the sigmoid underflows to zero below about -87.3, so a kernel
@@ -103,7 +131,18 @@ extern "C" __global__ void gated_delta_recurrent_f32(
     float* s = state + (size_t)h * d * d;
 
     // Decay and `u = S^T k` in one pass over the state.
+    //
+    // **`#pragma unroll` on both state loops, and it is not a guess.** Un-pragma'd, each loop
+    // issues one dword load and consumes it immediately, so a wave holds exactly ONE request in
+    // flight per memory round-trip — the disease `common.hpp::dot_f4_wave_r` names in its own
+    // comment and that measured **146.63 -> 195.27 GB/s (+33.2%)** on this hardware when it was
+    // fixed there. The fold order is preserved (the adds stay sequential; only the loads hoist
+    // above the chain), which is `v4-decode-decomposition.md`'s argument and is why this is
+    // byte-identical rather than a re-association. **The K3 magnitude is NOT measured** — there is
+    // no engine caller to measure end to end until S3 — so the 33.2% is the precedent's number and
+    // not a claim about this kernel.
     float u = 0.0f;
+#pragma unroll 4
     for (int i = 0; i < d; ++i) {
         const float sv = alpha[i] * s[(size_t)i * d + t];
         s[(size_t)i * d + t] = sv;
@@ -117,6 +156,7 @@ extern "C" __global__ void gated_delta_recurrent_f32(
     // which is the ordering the delta rule is defined by. No barrier between the passes: every
     // thread touches only column `t`.
     float o = 0.0f;
+#pragma unroll 4
     for (int i = 0; i < d; ++i) {
         const float sv = s[(size_t)i * d + t] + kn[i] * dv;
         s[(size_t)i * d + t] = sv;
@@ -131,8 +171,11 @@ extern "C" int rivoli_gated_delta_recurrent_f32(const float* q, const float* k, 
                                                 int heads, int head_dim, float lower_bound,
                                                 float* state, float* out, void* stream) {
     if (heads <= 0 || head_dim <= 0) return 1001;
-    // `head_dim` IS the block, so it inherits the launch limit; the LDS is four rows of it.
-    if (head_dim > 1024 || (size_t)4 * head_dim * sizeof(float) > 65536) return 1002;
+    // `head_dim` IS the block, so it inherits the launch limit. The LDS needs no clause of its
+    // own: four rows of `head_dim` floats is 16 KB at that maximum, a quarter of gfx1151's 64 KB,
+    // so an `> 65536` disjunct here could never fire and was decoration that read as a live bound
+    // (review 2026-08-12). It would start to matter above head_dim 4096 or at a fifth LDS row.
+    if (head_dim > 1024) return 1002;
     // `block_sum_lds` reduces by halving `blockDim.x`, which drops elements unless the block is
     // a power of two. 32 (the anchor's) and 128 (the model's) both are; refuse the rest rather
     // than return a silently short norm. Same code and same expression as `blockindex.hip`'s

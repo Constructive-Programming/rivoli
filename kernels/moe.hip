@@ -359,25 +359,47 @@ __device__ __forceinline__ size_t f4_ng(int i_dim) {
 // DISABLE the clamp — `<= 0`, NaN and +/-inf alike — because an
 // unclamped SwiGLU on a `.f4` expert is `v4oracle::Defect::SwigluUnclamped` and there is no
 // V4 configuration that wants it.
+// The row mapping and both projections — everything the two gate/up kernels share.
+//
+// **Factored 2026-08-12 because `kernels/` has no duplication gate.** `moe_gateup_f4_situ` was
+// twelve lines of this restated verbatim with `hidden` spelled `expert_in`, and jscpd never scans
+// this directory, so a divergence between the two would have been invisible to every tool here but
+// the compiler. What the two kernels genuinely differ in is their ACTIVATION and their store, plus
+// the parameters those need (`wexpert`/`limit` against the two betas), which is why they are still
+// two kernels rather than one with a third template argument.
+//
+// Bit-neutrality is not assumed: `tests/f4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist`
+// hashes the fp4 expert path's OUTPUT, so the same gate that pinned the `swiglu_clamped` hoist
+// pins this one. Returns false when this wave has no row.
+template <int R>
+__device__ __forceinline__ bool f4_gate_up_dots(const float* __restrict__ x, int expert_in,
+                                                int inter, int e_start, int e_count,
+                                                const ExpertDescF4* __restrict__ descs, int& lane,
+                                                int& e, int& j, float* g, float* u) {
+    lane = threadIdx.x & (WAVE - 1);
+    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
+    if (r >= (size_t)e_count * inter) return false;
+    e = e_start + (int)(r / inter);
+    j = (int)(r % inter);
+    const ExpertDescF4 d = descs[e];
+    size_t rb = (size_t)(expert_in / 2), ng = f4_ng(expert_in);
+    // `(gu8p)` on the four descriptor spans — flat_load → global_load, see the typedef and
+    // the struct's own note for why the cast is true.
+    dot_f4_wave_r<R>(x, expert_in, (gu8p)d.gate_packed + (size_t)j * rb,
+                     (gu8p)d.gate_scale + (size_t)j * ng, expert_in, lane, g);
+    dot_f4_wave_r<R>(x, expert_in, (gu8p)d.up_packed + (size_t)j * rb,
+                     (gu8p)d.up_scale + (size_t)j * ng, expert_in, lane, u);
+    return true;
+}
+
 template <int R>
 __device__ __forceinline__ void moe_gateup_f4_impl(
     const float* __restrict__ x, int hidden, int inter, int e_start, int e_count,
     const ExpertDescF4* __restrict__ descs, const float* __restrict__ wexpert, float limit,
     float* __restrict__ h_out) {
-    int lane = threadIdx.x & (WAVE - 1);
-    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
-    if (r >= (size_t)e_count * inter) return;
-    int e = e_start + (int)(r / inter);
-    int j = (int)(r % inter);
-    const ExpertDescF4 d = descs[e];
-    size_t rb = (size_t)(hidden / 2), ng = f4_ng(hidden);
+    int lane, e, j;
     float g[R], u[R];
-    // `(gu8p)` on the four descriptor spans — flat_load → global_load, see the typedef and
-    // the struct's own note for why the cast is true.
-    dot_f4_wave_r<R>(x, hidden, (gu8p)d.gate_packed + (size_t)j * rb,
-                     (gu8p)d.gate_scale + (size_t)j * ng, hidden, lane, g);
-    dot_f4_wave_r<R>(x, hidden, (gu8p)d.up_packed + (size_t)j * rb,
-                     (gu8p)d.up_scale + (size_t)j * ng, hidden, lane, u);
+    if (!f4_gate_up_dots<R>(x, hidden, inter, e_start, e_count, descs, lane, e, j, g, u)) return;
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t) {
@@ -408,18 +430,29 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
     }
 }
 
-// Pass 2: acc[t][o] += fixed(bf16(w2_o · h[e][t])). The routing weight is ALREADY in `h`
-// (see the block comment's point 3), so unlike the VQ/int4 twins this takes no `wexpert`
-// — one source of truth for the routing, and no way for a mask to disagree with the data.
+// Pass 2: acc[t][o] += fixed(bf16(w2_o · h[e][t])), with the routing weight applied here or
+// already folded into `h` depending on `WEIGHTED`.
 //
-// A row that did not route to `e` gets `h == 0` exactly — pass 1 ENFORCES that rather than
-// deriving it (see the note there) — hence a dot of exactly 0.0 and `moe_fixed(0) == 0`.
-// Adding it is a no-op, so riding through the arithmetic is bit-identical to skipping it.
-// It is not free, but it is not the cost either: the weight read is, and that happens
-// either way.
+// **The next three paragraphs are the `WEIGHTED == false` (DeepSeek-V4) arm only, and they were
+// written before the other arm existed.** Scoped 2026-08-12 by review: every one of them is FALSE
+// for `moe_down_f4_weighted`, and the third is the dangerous one — an S3 implementer who read it
+// would insert `act_quant_f8` between K3's passes, which is precisely what
+// `rivoli_moe_expert_range_f4_situ`'s own comment argues against.
+//
+// The routing weight is ALREADY in `h` (see the block comment's point 3), so unlike the VQ/int4
+// twins the unweighted arm takes no `wexpert` — one source of truth for the routing, and no way
+// for a mask to disagree with the data.
+//
+// A row that did not route to `e` gets `h == 0` exactly — `moe_gateup_f4_impl` ENFORCES that
+// rather than deriving it (see the note there) — hence a dot of exactly 0.0 and
+// `moe_fixed(0) == 0`. Adding it is a no-op, so riding through the arithmetic is bit-identical to
+// skipping it. It is not free, but it is not the cost either: the weight read is, and that happens
+// either way. **`moe_gateup_f4_situ` does NOT enforce it**: it writes a live activation for every
+// expert in the range, and the weighted arm's `w != 0.0f` skip is what stands in.
 //
 // `h` must have been re-quantized to fp8 between the passes: `w2` is a quantized `Linear`
-// like any other and quantizes its own input.
+// like any other and quantizes its own input. **K3's `w2` does not** — §6 hands
+// `k3_matmul_mxfp4` a plain fp32 activation, so the situ pair is two launches, not three.
 // **`WEIGHTED` is Kimi-K3's half and it is ONE line, so it is argued here rather than left to
 // the code.** `if (WEIGHTED)` is a template bool, so each instantiation compiles to exactly the
 // arithmetic below it and the unweighted arm is bit-identical to what it was before the split.
@@ -430,7 +463,9 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
 // weight and THEN stores bf16 in front of `w2` (`weights * x`, then `x.to(dtype)`), so its pass 1
 // folds `w` into `h` and this pass takes no `wexpert`. Kimi-K3 does the opposite: `moe_infer` ends
 // `new_x.type(topk_weight.dtype).mul_(topk_weight).sum(dim=1)` on the expert's FULL output
-// (reference `:867-874`, and `k3-architecture.md` §6's `accL[i] += wt[j] * edn[i]`, where `edn` is
+// (`modeling_kimi_linear.py:867-874` at the pinned revision — the bare-colon form the tests use,
+// spelled out once here because this is the first file under `kernels/` to cite it — and
+// `k3-architecture.md` §6's `accL[i] += wt[j] * edn[i]`, where `edn` is
 // the `w2` output). `w2` is linear, so `w2(w·h)` and `w·w2(h)` agree in exact arithmetic and the
 // fold looks free — it is not, because there is a **bf16 store between them** and this pass
 // accumulates in **fixed point**. `bf16(sw·w)` is not `bf16(sw)` scaled afterwards.
@@ -504,18 +539,15 @@ extern "C" __global__ void moe_gateup_f4(
 extern "C" __global__ void moe_gateup_f4_situ(
     const float* __restrict__ x, int expert_in, int inter, int e_start, int e_count,
     const ExpertDescF4* __restrict__ descs, float b1, float b2, float* __restrict__ h_out) {
-    int lane = threadIdx.x & (WAVE - 1);
-    size_t r = (size_t)blockIdx.x * ROWS_PER_BLOCK + threadIdx.x / WAVE;
-    if (r >= (size_t)e_count * inter) return;
-    int e = e_start + (int)(r / inter);
-    int j = (int)(r % inter);
-    const ExpertDescF4 d = descs[e];
-    size_t rb = (size_t)(expert_in / 2), ng = f4_ng(expert_in);
+    int lane, e, j;
     float g[1], u[1];
-    dot_f4_wave_r<1>(x, expert_in, (gu8p)d.gate_packed + (size_t)j * rb,
-                     (gu8p)d.gate_scale + (size_t)j * ng, expert_in, lane, g);
-    dot_f4_wave_r<1>(x, expert_in, (gu8p)d.up_packed + (size_t)j * rb,
-                     (gu8p)d.up_scale + (size_t)j * ng, expert_in, lane, u);
+    if (!f4_gate_up_dots<1>(x, expert_in, inter, e_start, e_count, descs, lane, e, j, g, u)) return;
+    // `situ_glu` is **two `tanhf` and one `expf`** where `swiglu_clamped` is one `expf`, and it is
+    // evaluated under `if (lane == 0)` so 31 lanes are masked while the wave pays it. Priced by a
+    // performance review at ~150-400 wave-cycles against a ~5,500-cycle per-wave budget: **~3-7% of
+    // this pass and ~0% of a token**, since the pass is bandwidth-bound on 280 MB of expert weights.
+    // Left alone deliberately — the exp2-identity rewrite of `tanhf` moves bits, and a tolerance is
+    // the only thing holding this operator. Recorded so it is priced rather than rediscovered.
     if (lane == 0) h_out[(size_t)e * inter + j] = rbf16(situ_glu(g[0], u[0], b1, b2));
 }
 

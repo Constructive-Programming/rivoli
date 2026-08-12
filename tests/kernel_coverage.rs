@@ -312,8 +312,18 @@ fn every_launcher_has_an_oracle() {
 ///
 /// `gpu.rs` is the GLM-5.2 decode path (`.vq3`/`.i4`); `f4gpu.rs`, `attn.rs` and
 /// `kvcompress.rs` are DeepSeek-V4-Flash-0731's (`.f4`). An empty slice asserts the launcher
-/// has NO engine caller, which is a real and interesting state — three of them are staged
-/// work, not dead code, and saying so is the point.
+/// has NO engine caller, which is a real and interesting state — several are staged work, not
+/// dead code, and saying so is the point. The count is DERIVED by
+/// [`the_staged_launchers_are_counted`] rather than written here, because it was stale at "three"
+/// while seven K3 rows were live and this file's own doc explains why a hand-written census is the
+/// thing it exists to refuse.
+///
+/// **A commented empty slice means staged; an uncommented one means unknown.** The seven K3 rows
+/// each name the stage that will call them and the fixture that scores them. `gemv_i4`, `gemv_vq`,
+/// `index_score_blocks` and `swiglu_clamped_bf16` do not, and one of them is recorded below as
+/// having once been credited with a caller it does not have — so a reader looking for a kernel to
+/// delete cannot tell those four apart from staged work. Flagged 2026-08-12; resolving it means
+/// finding out, which is not this diff's to do.
 const OWNERS: &[(&str, &[&str])] = &[
     ("act_quant_f8", &["f4gpu.rs"]),
     ("act_quant_f8_prefix", &["attn.rs", "kvcompress.rs"]),
@@ -459,5 +469,27 @@ fn every_launcher_is_attributed_to_the_paths_that_call_it() {
     println!(
         "{} launchers attributed, all verified against the tree",
         OWNERS.len()
+    );
+}
+
+/// **The number of launchers with no engine caller is DERIVED, not described.**
+///
+/// This file's doc comment said "three of them are staged work" while there were eleven empty
+/// slices, seven of them K3's — and the census test above derives the row SET but not this count, so
+/// nothing went red. Same shape as `tests/docs.rs::the_jscpd_exemption_count_is_derived`, and for
+/// the same reason: the one claim in a self-checking file that nothing checked.
+#[test]
+fn the_staged_launchers_are_counted() {
+    let empty: Vec<&str> = OWNERS
+        .iter()
+        .filter(|(_, o)| o.is_empty())
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        empty.len(),
+        11,
+        "the set of launchers with no engine caller changed to {empty:?}. That is expected as S3 \
+         wires K3's layer loop — update this number and say which way it moved, rather than \
+         deleting the assertion."
     );
 }

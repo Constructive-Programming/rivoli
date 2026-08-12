@@ -106,6 +106,15 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
 // not conflict. `moe.hip` spelled its copy `bf16r`; that one carries the magnitude the
 // rounding is worth.
 __device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
+
+// **And what a trailing `_f32` means, because the split above does not cover it.** Settled here
+// 2026-08-12 rather than in one kernel's comment, on this block's own instruction to resolve a new
+// sense at the rule: a trailing `_f32` names the STORE (`linalg.hip::situ_glu_f32`,
+// `recurrent.hip::gated_delta_recurrent_f32`) **unless the kernel is a member of a
+// `gemv_<weight-format>` family**, where the suffix has always named the weight dtype instead
+// (`gemv_f32` against `gemv_fp8`/`_i4`/`_i8`/`_vq`, whose weights really are `float`). That
+// exception is the whole of the ambiguity; naming it is cheaper than renaming either side, and
+// leaving it unnamed is how a third sense arrives.
 // NAMING RULE for `bf16` in kernel names, stated here because this helper is what the rule
 // is about: a trailing `_bf16` names the STORE (`gemv_fp8_bf16`, `swiglu_clamped_bf16` —
 // both end in `rbf16`); `bf16` elsewhere in a name is the INPUT dtype (`gemm_bf16` weights,
@@ -133,6 +142,14 @@ __device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
 // spelling without it: one extra block barrier per token per norm, on the decode path.
 // UNMEASURED — these kernels are bandwidth-bound so the expectation is that it is free,
 // but that is an expectation, in the same sense as `mla.hip`'s pragma note.
+// > **CORRECTED 2026-08-12 by review.** Both of the statements above were falsified by
+// > `recurrent.hip::gated_delta_recurrent_f32` and neither was updated where a reader consults
+// > them. It launches `dim3(head_dim)` — **32** at the anchor's widths and **128** at the model's,
+// > so "every caller launches 256" is no longer true and the power-of-two precondition is now
+// > load-bearing rather than incidentally satisfied (that launcher's guard 1003 is what enforces
+// > it). And it **reduces twice back to back**, so the trailing barrier this function was given
+// > speculatively has its caller. The recurrence says so from its own side; this is the definition
+// > site, and the definition is where the precondition gets checked.
 __device__ __forceinline__ float block_sum_lds(float v, float* red) {
     red[threadIdx.x] = v;
     __syncthreads();
@@ -220,9 +237,13 @@ __device__ __forceinline__ float swiglu_clamped(float g, float u, float limit) {
 //     `SituAndMul` does `.to(torch.float32)`, which is a widening no-op — whatever rounding
 //     the real model does happened at the projection, and rivoli's trunk carries f32
 //     activations throughout. Rounding here would be a step the reference does not take.
-//  4. **The product is returned UNROUNDED**, matching `swiglu_clamped` point 4 and for the
-//     same reason: the fp4 caller folds the routing weight in and rounds `bf16(y·w)` where
-//     the reference rounds, while the dense and shared callers have no routing weight.
+//  4. **The product is returned UNROUNDED**, and the rounding is the caller's. `moe.hip`'s fp4
+//     caller stores `rbf16(y)` — pass 1's bf16 store — and applies the routing weight in pass 2,
+//     while the dense and shared callers have no routing weight and no store here at all.
+//     (CORRECTED 2026-08-12: this said "the fp4 caller folds the routing weight in and rounds
+//     `bf16(y·w)`", which item 4b moved to pass 2. The conclusion was right and the premise had
+//     become false — and re-folding `w` into pass 1 is exactly the defect
+//     `folding_the_routing_weight_before_w2_is_not_the_same_function` exists to price.)
 //
 // `1.0f/(1.0f+expf(-g))` and not a multiply form: `torch.sigmoid` is the division form, and
 // unlike `F.silu` there is no `x·sigmoid(x)` idiom here to match — the sigmoid's argument is

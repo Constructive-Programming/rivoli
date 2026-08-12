@@ -31,6 +31,16 @@
 //! **A tolerance nobody can justify from a measurement is a number that will be widened the first
 //! time a kernel disagrees.**
 //!
+//! # These tolerances are NOT what binds a kernel, and saying so once is better than per row
+//!
+//! Every `Rel` here is 65x to 4,800x above what `tests/k3_kernels.rs` actually measures, because a
+//! floor measured on a whole-model fp32-vs-fp64 run carries upstream drift that a fixture handing a
+//! kernel the reference's OWN inputs does not. So at every golden-backed site the bar that fires
+//! first is that fixture's `tripwire` — its measured worst times ten — and the tolerance is the
+//! outer envelope. That was stated for `attn_res` alone and is true of all seven (review
+//! 2026-08-12); the table reads as the binding constraint and is not one anywhere. `tripwire` now
+//! asserts it is the tighter of the two, so the relationship is checked rather than described.
+//!
 //! Included by `#[path]` (this repo's pattern, cf. `common/f4_artifact_dir.rs`) so S2's kernel tests
 //! and `k3_anchor.rs` share one table.
 
@@ -163,6 +173,22 @@ pub const TOLERANCES: &[Tol] = &[
         weakest_defect: 2.046e2,
         policy: Policy::Rel(6.3e-4),
     },
+    // **This bucket mixes the ROUTER with the SHARED EXPERT MLP, and its `weakest_defect` is
+    // contradicted by a measurement in the same tree.** `operator_of` buckets everything under
+    // `block_sparse_moe` that is not `routed_expert*` as `moe_route`, so the shared experts are
+    // scored here — and S2 item 4a measured the capped-sigmoid SiTU defect at those experts at
+    // **4.10e-3**, which is 68.8x this floor. Applied literally, the column's own rule ("the
+    // smallest signal among the defect runs that TARGET this operator") would put `weakest_defect`
+    // at 4.10e-3, `margin` under `exact_below`, and this row's `Rel` would be rejected by
+    // [`tolerances_leave_room`] in favour of `ExactOnly`.
+    //
+    // The only thing preventing that is definitional: the capped-sigmoid variant is a FIXTURE
+    // variant, not one of the eleven anchor `--defect` runs, so the column is really "the weakest of
+    // eleven perturbations someone chose". Recorded 2026-08-12 by an adversarial review rather than
+    // acted on, because the instrument is wrong rather than the number: **a bucket-level tolerance
+    // provably cannot catch a capped-sigmoid-class error at the shared experts**, and
+    // `the_situ_sigmoid_takes_the_uncapped_gate` catches it by 2,800x on the tripwire instead. The
+    // fix is item 6 splitting the bucket, which is where the router's own tolerance belongs.
     Tol {
         operator: "moe_route",
         floor: 5.956e-5,
@@ -170,9 +196,27 @@ pub const TOLERANCES: &[Tol] = &[
         policy: Policy::Rel(6.0e-4),
     },
     // `kda_op`'s floor is 6.301e-5 from chunk-vs-recurrent, an order of magnitude above the 5.99e-6
-    // the fp64 island reports — and the larger number is the honest one. The island measures the
-    // kernel's sensitivity to slightly different fp32 inputs; chunk-vs-recurrent measures two real
-    // implementations of the recurrence disagreeing, which is what a HIP port will be.
+    // the fp64 island reports — and the larger number is the honest one for what it measures. The
+    // island measures the kernel's sensitivity to slightly different fp32 inputs; chunk-vs-recurrent
+    // measures two real implementations of the recurrence disagreeing.
+    //
+    // > **AND IT IS NOT A FLOOR IN THIS MODULE'S SENSE. Recorded 2026-08-12, when S2 item 5a's
+    // > kernel beat it by 278x.** The doc above defines `floor` by a property — "an independent
+    // > correct implementation in fp32, associating its sums differently, cannot beat this" — and
+    // > `gated_delta_recurrent_f32` measures **2.265e-7** against the anchor, 278x under 6.301e-5.
+    // > The reason is in the measurement's provenance: chunk-vs-recurrent compares two ALGORITHMS
+    // > over 8 prefill positions, and part of the disagreement is the chunked form's own
+    // > approximation compounding over a sequence — which the port does not implement and, per
+    // > `k3-architecture.md` §4, could not implement without reinstating two correctness conditions
+    // > the C reference lacks. One decode step of the recurrent form is a different and much easier
+    // > measurement.
+    // >
+    // > So item 5a is entitled to this row for its `DEFECT_MARGIN` half — its five red-proofs each
+    // > clear 30x of the tripwire, and the weakest KDA defect is 1.75e0 — and NOT for the claim
+    // > that `Rel(6.3e-4)` is a bar its kernel cleared. `Rel(6.3e-4)` sits 2,780x above what that
+    // > kernel achieves; the tripwire in `k3_kernels.rs` is what binds, as the module doc now says
+    // > of every row. A true rounding floor for the one-step recurrent form would have to come from
+    // > an fp64 island that fla cannot compile, which is why this row is what it is.
     Tol {
         operator: "kda_op",
         floor: 6.301e-5,
@@ -219,11 +263,25 @@ pub fn rel_tolerance(operator: &str) -> f32 {
 
 /// A `Rel` tolerance is placed at **10x the floor**, and admitted within two-significant-figure
 /// rounding of that. The band is not slack: every tolerance in the table is written to 2 s.f. while
-/// its floor is recorded to 4, so the realised ratios run 9.998x (`kda_op`, 6.3e-4 over 6.301e-5)
-/// to 10.185x (`attn_res`). A literal `== 10.0` would reject `kda_op` for a rounding digit, and a
+/// its floor is recorded to 4. A literal `== 10.0` would reject `kda_op` for a rounding digit, and a
 /// bare lower bound would let a tolerance sit three orders of magnitude high — which it did, and
 /// which the module doc above wrongly claimed was caught.
-const FLOOR_MULT: (f32, f32) = (9.9, 10.2);
+///
+/// > **WIDENED 2026-08-12 from `(9.9, 10.2)`, which was the observed range of five rows dressed as a
+/// > rounding allowance.** An adversarial review derived the band the RULE actually implies instead
+/// > of fitting it: rounding `10 x floor` to 2 s.f. moves it by up to half a unit in the second
+/// > digit, which is worst when the leading digit is 1 — for a mantissa `m` in `[1, 10)` the realised
+/// > ratio spans `10m/(m + 0.05)` to `10m/(m - 0.05)`, i.e. **9.52x to 10.53x** at `m = 1.0`. The old
+/// > band rejected a rule-following row: floor `1.049e-5` gives `1.0e-4` at 2 s.f., a ratio of
+/// > **9.533x**, and the failure message would have told its author their tolerance was wrong when
+/// > the gate was.
+/// >
+/// > Not hypothetical. `anchor.md` instructs S2 to measure four more operators, and item 5d's
+/// > `kda_trunk` floor of 2.292e-5 gives 10.035x — inside the old band **by luck**, since one
+/// > leading-1 floor among the remaining three would have landed outside it. Verified by
+/// > [`the_floor_band_admits_every_rule_following_row`], which sweeps the mantissa range the old
+/// > constants were never tested against.
+const FLOOR_MULT: (f32, f32) = (9.5, 10.6);
 
 /// And at least this far UNDER the weakest defect it has to catch.
 const DEFECT_MARGIN: f32 = 30.0;
@@ -250,6 +308,23 @@ pub fn tolerances_leave_room() {
     // The one boundary, so the two branches partition the ratio line with no gap and no overlap.
     let exact_below = FLOOR_MULT.0 * DEFECT_MARGIN;
     for t in TOLERANCES {
+        // **Both measurements must be positive and finite, and this is the ONLY thing bounding them
+        // on an `ExactOnly` row.** That branch asserts `margin < exact_below`, which enlarging the
+        // floor or shrinking the defect both make MORE true — so a defect run that reddened nothing
+        // (`weakest_defect == 0`) would pass as `ExactOnly`, and the gate could not tell "no
+        // threshold separates a correct kernel from this defect" from "the defect measurement is
+        // broken". Found 2026-08-12 by an adversarial review, which noted that `mla`'s two numbers
+        // are exactly the pair producing the 0.33x finding this port promotes to its verdict line.
+        // This does not close the asymmetry — nothing here can, without a second independent
+        // measurement — but it does refuse the degenerate case.
+        assert!(
+            t.floor > 0.0 && t.floor.is_finite() && t.weakest_defect > 0.0,
+            "{}: floor {:e} and weakest_defect {:e} must both be positive measurements — a zero \
+             defect signal means the run that produced it reddened nothing",
+            t.operator,
+            t.floor,
+            t.weakest_defect
+        );
         let margin = t.weakest_defect / t.floor;
         match t.policy {
             Policy::Rel(tol) => {
@@ -287,6 +362,38 @@ pub fn tolerances_leave_room() {
                 t.operator,
                 t.floor * FLOOR_MULT.0
             ),
+        }
+    }
+}
+
+/// **[`FLOOR_MULT`] admits a tolerance written the way the rule says, at every mantissa.**
+///
+/// The old `(9.9, 10.2)` did not: it was fitted to the five rows that existed, none of which had a
+/// leading-1 tenfold, and it would have rejected `floor = 1.049e-5` at 9.533x. This sweeps the whole
+/// mantissa range and rounds to 2 s.f. exactly as an author writing the table by hand would, so the
+/// band is proved against the RULE rather than against the current rows.
+///
+/// Not a `#[test]` — this module is `#[path]`-included into test binaries that each pick a subset,
+/// so it is called from `tests/k3_anchor.rs` beside [`tolerances_leave_room`], the way that one is.
+pub fn the_floor_band_admits_every_rule_following_row() {
+    // 0.001 steps, not 0.1: on a 0.1 grid every mantissa rounds EXACTLY and the sweep would report
+    // 10.0x everywhere while proving nothing. The rejected case is a floor BETWEEN grid points.
+    for step in 0..9000 {
+        let mantissa = 1.0 + f64::from(step) / 1000.0;
+        for exp in [-7i32, -5, -3] {
+            let floor = mantissa * 10f64.powi(exp);
+            // 10x the floor, written to two significant figures — what the rule tells an author.
+            let ten = 10.0 * floor;
+            let scale = 10f64.powi(1 - (ten.log10().floor() as i32));
+            let tol = (ten * scale).round() / scale;
+            let ratio = (tol / floor) as f32;
+            assert!(
+                ratio >= FLOOR_MULT.0 && ratio <= FLOOR_MULT.1,
+                "a floor of {floor:e} gives {tol:e} at two significant figures, a ratio of \
+                 {ratio:.4}x — outside the {:?} band, so the gate would reject a row that followed \
+                 the rule and tell its author the tolerance was wrong",
+                FLOOR_MULT
+            );
         }
     }
 }
