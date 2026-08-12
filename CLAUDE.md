@@ -247,13 +247,31 @@ A featureless build compiles to a refusal stub — that is deliberate, not break
 - **The GPU is sole-tenant.** Never run two benchmarks at once. This also breaks *tests*:
   `DeviceTier::new` fails to allocate while a decode holds the budget.
 - **The other tenant is Kubernetes, and there are TWO ways to evict it — pick by duration.**
-  `ai/llama-swap` runs on this node (`rh-anine`, the only one labelled
-  `hr-home.xyz/rocm=true`), and it schedules there BECAUSE of that label.
+  `ai/llama-swap` runs on this node, the only one labelled `hr-home.xyz/rocm=true`, and it
+  schedules there BECAUSE of that label. **The node's name is `rh-anine.hr-home.xyz`** — get it
+  from `kubectl get nodes`, because a bare `rh-anine` is not a node and every command below fails
+  with `NotFound` on it.
 
   | you need | do this |
   |---|---|
-  | the GPU for one run | `POST http://10.43.48.47:8080/unload` — the ClusterIP, never a pod IP. Reversible, models reload on demand, the service stays up (measured 2026-08-11: 41.4 GB of GTT → 174 MB, three models). It can come BACK mid-sweep, so witness every arm |
-  | the GPU for a whole session | **flip the node label to `disabled`** — `kubectl label node rh-anine hr-home.xyz/rocm=disabled --overwrite`. The nodeSelector stops matching, so nothing reschedules here. Restore with `=true` when you are done |
+  | the GPU for one run | **`GET`** `http://10.43.48.47:8080/unload` — the ClusterIP, never a pod IP. Reversible, models reload on demand, the service stays up (measured 2026-08-11: 41.4 GB of GTT → 174 MB, three models). It can come BACK mid-sweep, so witness every arm |
+  | the GPU for a whole session | **flip the node label to `disabled` AND THEN DELETE THE POD** — `kubectl label node rh-anine.hr-home.xyz hr-home.xyz/rocm=disabled --overwrite && kubectl -n ai delete pod -l app=llama-swap`. Restore with `=true` when you are done |
+
+  > **CORRECTED 2026-08-13, all three parts measured in one round.** The node name was wrong (see
+  > above). The method was wrong twice more:
+  >
+  > **`POST /unload` returns `Method Not Allowed`.** It is a `GET`. A POST looks like it worked if
+  > you only check the exit code — `curl` exits 0 having been refused — and the model stays loaded.
+  > Check `/running` after, not `$?`.
+  >
+  > **The label flip alone frees nothing, and this line used to claim it did.** A nodeSelector is
+  > consulted at SCHEDULING time, so flipping the label does not touch the pod already running:
+  > it keeps serving and reloads a model on the next request. Measured here — the label was flipped,
+  > and llama-swap took 36.7 GB of GTT back mid-build minutes later. **Deleting the pod is what
+  > makes the flip real**: with the label `disabled` the replacement has nowhere to go and sits
+  > `Pending` with no node, which is the state this table used to promise from the flip by itself.
+  > Order matters — delete first and the ReplicaSet re-schedules onto the still-matching node, which
+  > is the same failure `cordon` had.
 
   **The label flip is the owner's prescribed method (2026-08-12) and replaces `cordon`.**
   `kubectl cordon` + `drain` looks like it works and does not: the ReplicaSet re-scheduled onto
@@ -263,13 +281,24 @@ A featureless build compiles to a refusal stub — that is deliberate, not break
   also works and takes the AI service down cluster-wide rather than just off this node — prefer
   the label.
 
-  **Restore the label.** A `disabled` label left behind keeps the AI service off this node
-  indefinitely, and nothing in this repo will remind you.
+  **Restore the label, and remember it now owes a pod too.** A `disabled` label left behind keeps
+  the AI service off this node indefinitely, and nothing in this repo will remind you. Restoring
+  `=true` is enough on its own — the ReplicaSet's `Pending` pod schedules as soon as the selector
+  matches again; you do not have to recreate anything.
+
+  **Waiting it out is not a strategy.** The loaded model carried `ttl:7200`, so an idle tenant
+  holds the GPU for two hours. Read the TTL from `/running` before deciding to wait.
 
   **And the tenant can be invisible to KFD** — llama-swap has held 1.6 GB of GTT with **zero**
   `/sys/class/kfd/kfd/proc/` entries — so read `mem_info_gtt_used` too, not just the holder
   count. It does take the flock when a model loads through `gpu-lock-wait.sh`, so
   `flock -w N -E 66` blocking is a legitimate reading, not a bug.
+
+  **And `fuser -v /var/run/sys-gpu.lock` cannot tell a holder from a waiter** — it lists every
+  process with the file open, so your own blocked `flock` appears exactly where the holder would,
+  and a lock held from inside a container shows up as nothing at all. Read
+  `/proc/<pid>/wchan` instead: `locks_lock_inode_wait` means that process is WAITING. Twice now a
+  queued job has been diagnosed as "stuck" when it was blocked behind llama-swap's shared lock.
 - **Always `-- --test-threads=1` on any suite that touches the device.** The "intermittent
   `gpustream` hang" recorded here for months is **not intermittent** — diagnosed 2026-08-05.
   libtest runs `#[test]`s in parallel, and each device test builds its own tier, pool and
