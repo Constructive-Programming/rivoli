@@ -837,12 +837,55 @@ model is stored in — is answered above: none.)*
    > case at `expert_in = 3584`, one at `inter = 3072` — because that is what the arithmetic depends
    > on, while the row counts only exercise the grid mapping. Anyone who needs the full shape should
    > reach for `--release`.
-5. **KDA** — the new family and the bulk of the stage. **Decompose into units with their own
-   G2 sub-gates.** Heads are independent and head-parallel is bit-identical in the reference,
-   so one block per head maps directly; `S` is 64 KB/head and will not sit in LDS, so **fusing
-   the four passes is the HIP win the C does not have.** Decode recurrence first — no chunked
-   prefill exists in the reference, and a chunked port must reinstate two correctness
-   conditions (`k3-architecture.md` §4).
+5. **KDA** — the new family and the bulk of the stage. Heads are independent and head-parallel is
+   bit-identical in the reference, so one block per head maps directly; `S` is 64 KB/head and will
+   not sit in LDS, so **fusing the four passes is the HIP win the C does not have.** No chunked
+   prefill exists in the reference, and a chunked port must reinstate two correctness conditions
+   (`k3-architecture.md` §4).
+
+   **DECOMPOSED 2026-08-12, from what the anchor can and cannot score.** §4's ten steps do not map
+   to ten units — fla fuses them into three observable boundaries, and the golden's capture set is
+   what decides where the sub-gates go. Enumerated rather than guessed, from the vendored bytes:
+
+   | unit | §4 steps | anchor boundary | fixture today |
+   |---|---|---|---|
+   | **5a recurrence** | 3-7 | `kda.fused_recurrent_kda.in.{q,k,v,g,beta,A_log,dt_bias,initial_state}` → `.out.{o,state}` | **COMPLETE. No regen.** |
+   | **5b ShortConv+SiLU** | 2 | `self_attn.{q,k,v}_proj` → `self_attn.{q,k,v}_conv1d.{0,1}` | needs the conv **weights** |
+   | **5c fused norm+gate** | 8-9 | `.out.o` + `self_attn.g_proj` → `self_attn.o_norm` | needs **`o_norm.weight`** |
+   | **5d projections** | 1, 10 | `self_attn.{q,k,v,b,f_a,f_b,g,o}_proj` | complete, but see the tolerance note |
+
+   **Do 5a FIRST, and not only because the plan said "decode recurrence first".** It is the one unit
+   whose fixture is already complete — everything inside fla's kernel is captured on both sides, and
+   the four KDA defect runs (`KdaNoQkL2Norm`, `KdaGateLowerBoundOff`, `KdaStateLayout`,
+   `KdaBetaSigmoidOutside`) price exactly this boundary's arithmetic, each reddening 16 of layer 0's
+   40 tensors while leaving the 24 upstream alone. It is also the largest kernel in the port. Four
+   items in a row began with a regeneration; this one does not need one.
+
+   **5b and 5c each need ONE more capture, and both are parameters.** Same shape of gap as the
+   AttnRes fold and the latent norm: an input and an output do not determine an operator when a
+   weight sits between them. `ShortConvolution`'s depthwise taps are `[channels][k]` (§4 step 2 —
+   oldest→newest, `w[k-1]` on the current token, SiLU fused into the output) and
+   `FusedRMSNormGated`'s is `[head_dim]`. At the tiny widths that is 3 x [128][4] + [32] per KDA
+   layer over three captured KDA layers (0, 1, 12 — the other three are MLA), about 19 KB per
+   golden. **Batch them into one regeneration**, and take 5b's conv CACHE semantics with it: `.1` is
+   the returned history, and at decode the history is what makes the conv stateful.
+
+   > **5c is where trap 10 finally becomes checkable, and only halfway.** `o_norm` is
+   > `FusedRMSNormGated(head_dim, activation='sigmoid')` called as `o_norm(o, g)`, so norm-then-gate
+   > is ONE module and the intermediate is unobservable — item 2 recorded that and deferred it here.
+   > What 5c can prove is the composition end to end (both inputs and the output are in the file);
+   > what it cannot prove is the ORDER within the fusion. That has to come from the reference's
+   > source, as the MLA side's did. Note also that `o_norm`'s output and `o_proj.in_gated` are the
+   > same tensor under two names — a free cross-check that the pre-hook and the module hook agree.
+
+   **5d has no tolerance row, and that is a documented GAP rather than a decision.** `operator_of`
+   buckets a KDA layer's projections as `kda_trunk`, one of the four buckets `anchor.md` says "S2
+   must not score against a threshold — compare them exactly, or measure the floor the same way and
+   add a row". The fp64 island runs from item 3 already contain it: **7.680e-6 on draw 1, 2.292e-5
+   on draw 2**, so the floor is 2.292e-5 and a `Rel(2.3e-4)` row is one `--by-operator` away from
+   being defensible. Its weakest targeting defect is the open question — no defect in the eleven
+   targets a KDA projection — so 5d may have to stay exact-only for want of a ceiling, which would
+   be the second `ExactOnly` in the table and for a different reason than `mla`'s.
 6. **Router** — sigmoid, bias on selection only, weights from the **unbiased** score,
    renormalised over the 16.
 7. **Trunk GEMV, for speed.** `gemm_bf16` is correct and carries S2/S3 unchanged. Its inner loop is
