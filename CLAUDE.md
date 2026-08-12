@@ -246,17 +246,29 @@ A featureless build compiles to a refusal stub — that is deliberate, not break
 
 - **The GPU is sole-tenant.** Never run two benchmarks at once. This also breaks *tests*:
   `DeviceTier::new` fails to allocate while a decode holds the budget.
-- **The other tenant is Kubernetes, and you evict it by UNLOADING, not by draining.**
+- **The other tenant is Kubernetes, and there are TWO ways to evict it — pick by duration.**
   `ai/llama-swap` runs on this node (`rh-anine`, the only one labelled
-  `hr-home.xyz/rocm=true`). `POST http://10.43.48.47:8080/unload` — the ClusterIP, never a pod
-  IP — frees it reversibly; models reload on demand and the service stays up (measured
-  2026-08-11: 41.4 GB of GTT → 174 MB, three models). **`kubectl cordon` + `drain` looks like
-  it works and does not**: the ReplicaSet re-scheduled onto the cordoned node within seconds,
-  because its tolerations do not cover `unschedulable`, so the run that follows is not
-  sole-tenant. Scaling the deployment to 0 does work and takes the AI service down for the
-  window. And the tenant can be invisible to KFD — llama-swap has held 1.6 GB of GTT with
-  **zero** `/sys/class/kfd/kfd/proc/` entries — so read `mem_info_gtt_used` too, not just the
-  holder count. It does take the flock when a model loads through `gpu-lock-wait.sh`, so
+  `hr-home.xyz/rocm=true`), and it schedules there BECAUSE of that label.
+
+  | you need | do this |
+  |---|---|
+  | the GPU for one run | `POST http://10.43.48.47:8080/unload` — the ClusterIP, never a pod IP. Reversible, models reload on demand, the service stays up (measured 2026-08-11: 41.4 GB of GTT → 174 MB, three models). It can come BACK mid-sweep, so witness every arm |
+  | the GPU for a whole session | **flip the node label to `disabled`** — `kubectl label node rh-anine hr-home.xyz/rocm=disabled --overwrite`. The nodeSelector stops matching, so nothing reschedules here. Restore with `=true` when you are done |
+
+  **The label flip is the owner's prescribed method (2026-08-12) and replaces `cordon`.**
+  `kubectl cordon` + `drain` looks like it works and does not: the ReplicaSet re-scheduled onto
+  the cordoned node within seconds, because its tolerations do not cover `unschedulable`, so the
+  run that follows is not sole-tenant. The label is what the scheduler actually consults for this
+  workload, which is why flipping it holds where cordoning did not. Scaling the deployment to 0
+  also works and takes the AI service down cluster-wide rather than just off this node — prefer
+  the label.
+
+  **Restore the label.** A `disabled` label left behind keeps the AI service off this node
+  indefinitely, and nothing in this repo will remind you.
+
+  **And the tenant can be invisible to KFD** — llama-swap has held 1.6 GB of GTT with **zero**
+  `/sys/class/kfd/kfd/proc/` entries — so read `mem_info_gtt_used` too, not just the holder
+  count. It does take the flock when a model loads through `gpu-lock-wait.sh`, so
   `flock -w N -E 66` blocking is a legitimate reading, not a bug.
 - **Always `-- --test-threads=1` on any suite that touches the device.** The "intermittent
   `gpustream` hang" recorded here for months is **not intermittent** — diagnosed 2026-08-05.

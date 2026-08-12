@@ -91,7 +91,17 @@ the lock too.
   wants the GPU — a bare-metal `flock` now correctly *waits* for it (verified: an exclusive
   attempt blocks the whole time a held shared lock's process is alive, and unblocks the instant
   it exits), but nothing forces that release early. If it's not going to unload on its own soon
-  enough, hit `llama-swap`'s `/unload` or scale the deployment down.
+  enough, hit `llama-swap`'s `/unload` — or, for a whole session rather than one run, **flip the
+  node label**: `kubectl label node rh-anine hr-home.xyz/rocm=disabled --overwrite`, and
+  `=true` to restore.
+
+  **The label is the owner's prescribed method as of 2026-08-12, and it replaces `cordon`.**
+  llama-swap schedules onto `rh-anine` because of that label, so removing the match is what
+  actually keeps it off; `kubectl cordon` does not, because the ReplicaSet's tolerations do not
+  cover `unschedulable` and it rescheduled within seconds. Scaling the deployment to 0 also
+  works but takes the AI service down cluster-wide instead of just off this node. **Restore the
+  label when you finish** — nothing here will remind you, and `disabled` left behind keeps the
+  service off this node indefinitely.
 - **Does not cover three specific small models, deliberately.** `qwen3-embedding-4b`,
   `whisper-large-v3-turbo`, and `whisper-translate` are all `ttl: -1` (pinned, near-permanently
   resident) on the hr-fleet side — small enough (~5 GiB, ~3 GiB, ~3 GiB) that making bare-metal
