@@ -21,7 +21,9 @@ use crate::artifact::config::Mode;
 use crate::artifact::format::{
     Dtype, ExpertSet, FormatMeta, RoutedFmt, Safetensors, SetDims, f4_layer_range, load_codebooks,
 };
-use crate::artifact::model::{GLIMMER_LAYER_PREFIX, GlimmerTextConfig, ModelConfig, V4Config};
+use crate::artifact::model::{
+    GLIMMER_LAYER_PREFIX, GLIMMER_LAYER_TENSORS, GlimmerTextConfig, ModelConfig, V4Config,
+};
 use crate::artifact::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
 };
@@ -1169,6 +1171,11 @@ impl F4Pin {
 /// attention block, not four** — `self_attn.gate_proj` is a per-head output gate applied
 /// before `o_proj`, it is the same shape as `q_proj`, and it is the one an HF-shaped port
 /// drops on the floor.
+/// **Deliberately NOT `Copy`, unlike every other pin struct here.** A copy of a streamed
+/// layer's addresses stays valid-looking after the slot behind it has been refilled with
+/// another layer — the read-outlives-its-slot shape that is still an open defect on the GLM
+/// arena path. Borrowing from [`GlimmerPin::layer`] (which takes `&mut self`) is what makes
+/// holding a stale one a compile error instead of a wrong answer.
 pub struct GlimmerLayerPin {
     /// Pre-attention, `rms_norm_eps`.
     pub input_ln: *const f32,
@@ -1197,20 +1204,97 @@ pub struct GlimmerLayerPin {
     pub mlp_down: Bf16Weight,
 }
 
-/// The Muse Glimmer resident weight set. All of it.
+impl GlimmerLayerPin {
+    /// The twelve device addresses, in [`GLIMMER_LAYER_TENSORS`] order.
+    ///
+    /// Exists so [`Slot`] can derive its fill offsets by SUBTRACTING addresses rather than by
+    /// predicting how the tier aligned them. The order is asserted against that constant by
+    /// `glimmer_residency.rs` — a permutation here would make a streamed layer a permutation
+    /// of a pinned one, every tensor the right shape and the model silently wrong.
+    fn addrs(&self) -> [*const u8; GLIMMER_LAYER_TENSORS.len()] {
+        [
+            self.input_ln as *const u8,
+            self.post_attn_ln as *const u8,
+            self.pre_ffn_ln as *const u8,
+            self.post_ffn_ln as *const u8,
+            self.q.packed as *const u8,
+            self.k.packed as *const u8,
+            self.v.packed as *const u8,
+            self.o.packed as *const u8,
+            self.attn_gate.packed as *const u8,
+            self.mlp_gate.packed as *const u8,
+            self.mlp_up.packed as *const u8,
+            self.mlp_down.packed as *const u8,
+        ]
+    }
+}
+
+use crate::artifact::model::{GLIMMER_PIN_SLACK, GLIMMER_STREAM_SLOTS as SLOT_COUNT};
+
+/// The Muse Glimmer weight set: what the budget pinned, plus slots for the rest.
+///
+/// > **REPLACED 2026-08-12.** This was "the resident weight set. **All of it**", on the
+/// > argument that "Glimmer is dense, so there is nothing to stream, no pool, no cache policy
+/// > and no residency decision." That inverts `reference/principles.md` **P6** — the pin is a
+/// > function of free memory at run time, never of model architecture — and it is wrong about
+/// > dense models specifically: every weight is read every token (53.02 GB bf16, 26.51 fp8,
+/// > 13.65 int4), so there is no routed union to hide behind and the resident FRACTION is the
+/// > whole tok/s story. 55.7 GB placed unconditionally is not a model that runs beside a 1.7
+/// > GB KV cache, a 2.6 GB drafter, or another tenant. `investigations/glimmer-integration.md`
+/// > §R1.
+///
+/// Layers `0..pinned.len()` live in the tier for the run; the rest cycle through
+/// [`SLOT_COUNT`] slots. **Which one a caller got is not observable** — [`Self::layer`] returns
+/// the same `GlimmerLayerPin` shape either way, and `glimmer_residency.rs` gates that the
+/// BYTES behind it are identical at every budget. That indistinguishability is P4 (the budget
+/// trades speed, never text) expressed as a type rather than as a convention.
 pub struct GlimmerPin {
     #[allow(dead_code)] // RAII owner of the slab every pointer below points into.
     tier: DeviceTier,
+    /// The mmap'd artifact, kept alive because a streamed layer is read from it on every
+    /// visit. An all-resident pin holds it too and never reads it again — one field rather
+    /// than an `Option` nothing checks.
+    src: Safetensors,
     /// `[vocab, hidden]` bf16, 2.690 GB.
     pub embed: Bf16Weight,
     /// `lm_head.weight`, `[vocab, hidden]` bf16 — a second 2.690 GB, because
     /// `tie_word_embeddings` is false and both tensors ship.
     pub head: Bf16Weight,
     pub final_norm: *const f32,
-    /// Indexed by ABSOLUTE layer id, unlike [`F4Pin::layers`]. `convert_glimmer` refuses a
-    /// checkpoint missing any layer's tensors, so there is no partial artifact to offset for
-    /// and therefore no accessor to hide an offset behind.
-    pub layers: Vec<GlimmerLayerPin>,
+    /// Layers the budget pinned, indexed by ABSOLUTE layer id — a PREFIX, so the index is
+    /// the layer id with no offset to get wrong. `convert_glimmer` refuses a checkpoint
+    /// missing any layer's tensors, so a gap here can only come from the budget.
+    pinned: Vec<GlimmerLayerPin>,
+    /// The streaming slots: fixed device addresses, refilled per visit. Empty when the budget
+    /// pinned everything, which is why an all-resident run allocates none.
+    slots: Vec<Slot>,
+    /// Which layer each slot currently holds, so a re-visit inside one slot's lifetime is a
+    /// hit rather than a second copy of the same bytes.
+    slot_layer: Vec<Option<usize>>,
+    /// The model's layer count, carried because `pinned.len()` is now a partition rather than
+    /// the model — without it, "is `l` a real layer?" would be unanswerable here.
+    n_layers: usize,
+    /// Cheap counters. Not a policy input — see [`Self::layer`] on why there is no policy —
+    /// but the only way to tell a partition that is working from one that thrashes.
+    hits: u64,
+    fills: u64,
+}
+
+/// One streaming slot: a layer-sized region of the tier, with the twelve device addresses
+/// inside it precomputed.
+///
+/// **The addresses are computed ONCE and never move.** A fill overwrites bytes at fixed
+/// offsets; it does not re-place anything. That is what lets `layer()` hand out a
+/// `GlimmerLayerPin` whose pointers are stable for as long as the slot holds that layer, and
+/// it is the difference between this and the GLM arena, whose compaction can move a slot out
+/// from under an in-flight read (`docs` — arena relocation, still open there).
+struct Slot {
+    pin: GlimmerLayerPin,
+    /// Device base of the slot, and the per-tensor `(offset, len)` a fill writes to. In the
+    /// order of [`GLIMMER_LAYER_TENSORS`], so the fill loop and the placement loop cannot
+    /// disagree about which tensor goes where.
+    base: *mut u8,
+    spans: Vec<(usize, usize)>,
 }
 
 /// Place one Glimmer f32 norm, with its LENGTH checked against `hidden`.
@@ -1266,21 +1350,130 @@ fn place_glimmer_proj(
     Ok(w)
 }
 
-impl GlimmerPin {
-    /// Build the whole resident set from artifact directory `dir`.
+/// One layer's tensor names, in the order [`GLIMMER_LAYER_TENSORS`] declares them.
+///
+/// The prefix is spelled once here rather than at each of the two call sites (pinned
+/// placement and slot layout), because the two must agree tensor-for-tensor or a streamed
+/// layer would be a permutation of a pinned one — and a permutation of correctly-shaped
+/// tensors is exactly the silent wrongness this port keeps finding.
+fn glimmer_layer_names(l: usize) -> Vec<String> {
+    GLIMMER_LAYER_TENSORS
+        .iter()
+        .map(|t| format!("{GLIMMER_LAYER_PREFIX}.{l}.{t}.weight"))
+        .collect()
+}
+
+/// Place one whole layer into the tier — the pinned path.
+///
+/// Extracted from `GlimmerPin::build`'s loop so [`Slot::new`] can build the same twelve-field
+/// pin over slot-relative addresses. Both go through [`place_glimmer_norm`] and
+/// [`place_glimmer_proj`], so both keep the extent and shape checks that two reviews added on
+/// 2026-08-11.
+fn place_glimmer_layer(
+    tier: &mut DeviceTier,
+    st: &Safetensors,
+    cfg: &GlimmerTextConfig,
+    l: usize,
+) -> Result<GlimmerLayerPin> {
+    let p = format!("{GLIMMER_LAYER_PREFIX}.{l}");
+    let norm = |tier: &mut DeviceTier, t: &str| {
+        place_glimmer_norm(tier, st, cfg.hidden, &format!("{p}.{t}"))
+    };
+    Ok(GlimmerLayerPin {
+        input_ln: norm(tier, "input_layernorm.weight")?,
+        post_attn_ln: norm(tier, "post_attention_layernorm.weight")?,
+        pre_ffn_ln: norm(tier, "pre_feedforward_layernorm.weight")?,
+        post_ffn_ln: norm(tier, "post_feedforward_layernorm.weight")?,
+        q: place_glimmer_proj(tier, st, cfg, &p, "self_attn.q_proj")?,
+        k: place_glimmer_proj(tier, st, cfg, &p, "self_attn.k_proj")?,
+        v: place_glimmer_proj(tier, st, cfg, &p, "self_attn.v_proj")?,
+        o: place_glimmer_proj(tier, st, cfg, &p, "self_attn.o_proj")?,
+        attn_gate: place_glimmer_proj(tier, st, cfg, &p, "self_attn.gate_proj")?,
+        mlp_gate: place_glimmer_proj(tier, st, cfg, &p, "mlp.gate_proj")?,
+        mlp_up: place_glimmer_proj(tier, st, cfg, &p, "mlp.up_proj")?,
+        mlp_down: place_glimmer_proj(tier, st, cfg, &p, "mlp.down_proj")?,
+    })
+}
+
+impl Slot {
+    /// Reserve a layer-sized region and precompute the twelve addresses inside it.
     ///
-    /// **No `capacity` parameter, and no cache policy.** Both exist on [`Pin`] and [`F4Pin`]
-    /// to divide a budget between a resident tier and a streaming pool. There is no pool
-    /// here: the resident set is the model, its size is a function of the config alone
-    /// ([`GlimmerTextConfig::resident_bytes`]), and a device that cannot hold it cannot run
-    /// the model at any setting. Taking a budget would imply otherwise —
-    /// `DeviceTier::new` already refuses what does not fit, and it names the shortfall.
-    pub fn build(dir: &str, cfg: &GlimmerTextConfig) -> Result<Self> {
-        // Alignment slack. `DeviceTier::place` starts every reservation at a 256-byte
-        // boundary, and this pin makes `3 + 12·n_layers` = 627 placements, so the padding is
-        // under 160 KB. 1 MiB is ~6x that bound and 0.002% of the 55.7 GB it sits beside.
-        const SLACK: usize = 1 << 20;
-        let want = cfg.resident_bytes()?;
+    /// **Built by placing layer 0 and then recording where each tensor landed.** That reuses
+    /// the pinned path's shape and extent checks instead of restating a layout — the
+    /// alternative was a second offset table, which is a second thing to get wrong and which
+    /// jscpd would have matched against the first. The bytes placed here are layer 0's and
+    /// are overwritten by the first [`Self::fill`]; what survives is the geometry.
+    fn new(tier: &mut DeviceTier, st: &Safetensors, cfg: &GlimmerTextConfig) -> Result<Self> {
+        let pin = place_glimmer_layer(tier, st, cfg, 0)?;
+        // **The spans come from the PIN's own addresses, not from restated alignment
+        // arithmetic.** The first draft recomputed `next_multiple_of(256)` per tensor to
+        // predict where `place` had put things — a second copy of `bump`, correct only while
+        // it happened to agree. Subtracting the pointers makes "the fill writes where the pin
+        // points" true by construction, and it needs no knowledge of how the tier aligns.
+        let addrs = pin.addrs();
+        let base = addrs[0] as *mut u8;
+        let mut spans = Vec::with_capacity(GLIMMER_LAYER_TENSORS.len());
+        for (name, &p) in glimmer_layer_names(0).iter().zip(&addrs) {
+            // SAFETY-adjacent, and it is arithmetic rather than a dereference: every address
+            // came from one `place` call on one slab, so the difference is an offset within it.
+            let off = (p as usize) - (base as usize);
+            spans.push((off, st.raw(name)?.0.len()));
+        }
+        Ok(Self { pin, base, spans })
+    }
+
+    /// Overwrite this slot with layer `l`'s bytes.
+    ///
+    /// A host `memcpy` per tensor, from the mmap'd artifact into the tier — the same operation
+    /// `DeviceTier::place` performs, and valid for the same reason: under HIP's unified
+    /// addressing the tier's device pointer IS a host address. **That coincidence is not
+    /// portable and `DeviceTier::place`'s own doc says callers must not depend on it** — which
+    /// is why this goes through [`DeviceTier::write_at`] rather than dereferencing `base`
+    /// here, so the one place that knows about unified addressing stays the one place.
+    ///
+    /// `ponytail:` buffered I/O through the mmap, not the O_DIRECT io_uring path the routed
+    /// experts use. `ExpertSet` streams per-layer sidecar files whose blocks are aligned for
+    /// O_DIRECT; a safetensors tensor starts wherever the header left it, so the same path
+    /// needs the converter to emit aligned per-layer files. **Upgrade path: `convert_glimmer`
+    /// grows a layer-blocked output and this becomes an `AsyncFetch` submit.** Until then the
+    /// page cache is doing the caching, which S5 must account for before quoting any
+    /// bytes-from-disk number.
+    fn fill(&mut self, st: &Safetensors, l: usize) -> Result<()> {
+        for (name, &(off, len)) in glimmer_layer_names(l).iter().zip(&self.spans) {
+            let bytes = st.raw(name)?.0;
+            ensure!(
+                bytes.len() == len,
+                "{name} is {} bytes but layer 0's was {len} — every Glimmer layer is the same \
+                 shape, so this artifact is not the one this slot was laid out for",
+                bytes.len()
+            );
+            // SAFETY: `base + off + len` is inside the region `Slot::new` reserved (the spans
+            // were derived from that reservation and checked against it), and the source is a
+            // live mmap slice that cannot overlap the device slab.
+            unsafe { DeviceTier::write_at(self.base, off, bytes) };
+        }
+        Ok(())
+    }
+}
+
+impl GlimmerPin {
+    /// Build from artifact directory `dir`, pinning as much as `budget` allows.
+    ///
+    /// `budget` is `None` for "pin everything" — the all-resident case, which is a BUDGET
+    /// VALUE and not a separate code path (see the struct's note on why that distinction is
+    /// load-bearing). `Some(bytes)` partitions: model-level tensors first, then whole layers
+    /// in ascending order while they fit, then [`SLOT_COUNT`] slots for the remainder.
+    ///
+    /// **The partition is a fixed PREFIX, and that is the optimal policy rather than a
+    /// simplification.** A dense model reads its layers in fixed cyclic order, which is
+    /// LRU's pathological case: at any deficit LRU evicts exactly the layer needed next and
+    /// the hit rate is **0**, not `pinned/n_layers`. Belady on a cyclic scan — evict the
+    /// block whose next use is farthest, i.e. the one just used — degenerates to holding a
+    /// fixed subset, and every fixed subset of size `k` has the same hit rate `k/n`. So the
+    /// whole `--cache-policy` axis collapses to one answer here, `run_glimmer` still refuses
+    /// the flag, and nothing in this file consults residency to make a decision.
+    pub fn build(dir: &str, cfg: &GlimmerTextConfig, budget: Option<usize>) -> Result<Self> {
+        let (n_pinned, capacity) = cfg.partition(budget)?;
         // **The cheap refusals first, then the 55.7 GB allocation.** `FormatMeta::load` is the
         // version and VQ-parameter gate every artifact passes — skipping it would let one
         // written by an older converter load silently — and `open_dir` is where a missing or
@@ -1289,7 +1482,7 @@ impl GlimmerPin {
         // fired, which inverts the ordering the rest of this port is careful about.
         FormatMeta::load(dir)?;
         let st = Safetensors::open_dir(dir)?;
-        let mut tier = DeviceTier::new(want + SLACK)?;
+        let mut tier = DeviceTier::new(capacity)?;
 
         let embed = place_bf16(&mut tier, &st, "model.language_model.embed_tokens.weight")?;
         let head = place_bf16(&mut tier, &st, "lm_head.weight")?;
@@ -1312,34 +1505,91 @@ impl GlimmerPin {
             "model.language_model.norm.weight",
         )?;
 
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        for l in 0..cfg.n_layers {
-            let p = format!("{GLIMMER_LAYER_PREFIX}.{l}");
-            let norm = |tier: &mut DeviceTier, t: &str| {
-                place_glimmer_norm(tier, &st, cfg.hidden, &format!("{p}.{t}"))
-            };
-            layers.push(GlimmerLayerPin {
-                input_ln: norm(&mut tier, "input_layernorm.weight")?,
-                post_attn_ln: norm(&mut tier, "post_attention_layernorm.weight")?,
-                pre_ffn_ln: norm(&mut tier, "pre_feedforward_layernorm.weight")?,
-                post_ffn_ln: norm(&mut tier, "post_feedforward_layernorm.weight")?,
-                q: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.q_proj")?,
-                k: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.k_proj")?,
-                v: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.v_proj")?,
-                o: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.o_proj")?,
-                attn_gate: place_glimmer_proj(&mut tier, &st, cfg, &p, "self_attn.gate_proj")?,
-                mlp_gate: place_glimmer_proj(&mut tier, &st, cfg, &p, "mlp.gate_proj")?,
-                mlp_up: place_glimmer_proj(&mut tier, &st, cfg, &p, "mlp.up_proj")?,
-                mlp_down: place_glimmer_proj(&mut tier, &st, cfg, &p, "mlp.down_proj")?,
-            });
+        let mut pinned = Vec::with_capacity(n_pinned);
+        for l in 0..n_pinned {
+            pinned.push(place_glimmer_layer(&mut tier, &st, cfg, l)?);
+        }
+        // Slots only when something streams. `n_pinned == n_layers` allocates none, so the
+        // all-resident partition costs exactly what it did before this budget existed.
+        let n_slots = if n_pinned < cfg.n_layers {
+            SLOT_COUNT
+        } else {
+            0
+        };
+        let mut slots = Vec::with_capacity(n_slots);
+        for _ in 0..n_slots {
+            slots.push(Slot::new(&mut tier, &st, cfg)?);
         }
         Ok(Self {
             tier,
+            src: st,
             embed,
             head,
             final_norm,
-            layers,
+            pinned,
+            slot_layer: vec![None; slots.len()],
+            slots,
+            n_layers: cfg.n_layers,
+            hits: 0,
+            fills: 0,
         })
+    }
+
+    /// Layer `l`'s twelve device addresses — **pinned or streamed, indistinguishably.**
+    ///
+    /// `&mut self` because a miss fills a slot. That is the honest signature: a caller cannot
+    /// hold two layers' pins at once, which is exactly the aliasing a slot reuse would break.
+    ///
+    /// **The fill is SYNCHRONOUS, and there is deliberately no ticket.** Under HIP's unified
+    /// addressing the tier is host-writable, so a fill is a host `memcpy` (the same operation
+    /// `DeviceTier::place` performs) and it has completed by the time this returns — there is
+    /// no dependency for a caller to await. Handing back an always-satisfied ticket would be a
+    /// second, host-side encoding of "is this ready?" that cannot ever disagree with reality,
+    /// and `fetch/asyncfetch.rs`'s `Ticket` doc records what that cost the GLM path when the
+    /// `hit: Vec<bool>` mask silently won. **When S5 makes the fill asynchronous it must add a
+    /// real ticket here and every call site must enqueue its wait** — that is the one change
+    /// this signature is shaped to accept.
+    ///
+    /// `ponytail:` a synchronous fill blocks the decode thread for a layer's worth of memcpy
+    /// and buys no overlap. Deliberate at R1, whose gates are about WHAT the bytes are, not
+    /// when they arrive; S5 measures the overlap and owns the upgrade.
+    pub fn layer(&mut self, l: usize) -> Result<&GlimmerLayerPin> {
+        ensure!(
+            l < self.n_layers,
+            "layer {l} is past this model's {} layers",
+            self.n_layers
+        );
+        if l < self.pinned.len() {
+            return Ok(&self.pinned[l]);
+        }
+        // Round-robin over the streamed suffix. Injective across any `SLOT_COUNT` consecutive
+        // layers, which is what stops a fill landing on the slot a kernel is still reading —
+        // `glimmer_residency.rs` runs the wrong map as a red proof.
+        let s = (l - self.pinned.len()) % self.slots.len();
+        if self.slot_layer[s] == Some(l) {
+            self.hits += 1;
+            return Ok(&self.slots[s].pin);
+        }
+        self.slots[s].fill(&self.src, l)?;
+        self.slot_layer[s] = Some(l);
+        self.fills += 1;
+        Ok(&self.slots[s].pin)
+    }
+
+    /// How many layers this budget pinned. `n_layers` means all-resident.
+    pub fn pinned_layers(&self) -> usize {
+        self.pinned.len()
+    }
+
+    /// How many layers stream. Zero when the budget pinned everything.
+    pub fn streamed_layers(&self) -> usize {
+        self.n_layers - self.pinned.len()
+    }
+
+    /// Slot hits and fills. A partition working as designed fills once per streamed layer per
+    /// token; a fill count above that is thrash and means the slot map is wrong.
+    pub fn slot_stats(&self) -> (u64, u64) {
+        (self.hits, self.fills)
     }
 }
 

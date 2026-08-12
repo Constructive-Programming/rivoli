@@ -982,6 +982,31 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
         gt.resident_bytes()? as f64 / 1e9,
     );
 
+    // **The partition, reported before any refusal — R1.** `--max-mem` is ACCEPTED for this
+    // architecture (it was refused until 2026-08-12 on the grounds that "the resident set IS
+    // the model"; `principles.md` P6 says the pin is a function of free memory, and a dense
+    // model that reads every weight every token is the case where that matters most). Reported
+    // rather than merely computed, because this line is the only thing that tells an operator
+    // how much of the model their budget actually pinned — and it comes from
+    // `GlimmerPin::partition`, the same arithmetic the pin uses, so it cannot disagree with it.
+    let budget = device_budget(cfg.max_mem)?;
+    let (n_pinned, _) = gt.partition(Some(budget))?;
+    let layer_gb = gt.layer_bytes()? as f64 / 1e9;
+    info!(
+        "residency: {n_pinned} of {} layers pinned ({:.3} GB), {} streaming through {} slots \
+         ({:.3} GB/layer); floor for this artifact is {:.3} GB of weights",
+        gt.n_layers,
+        n_pinned as f64 * layer_gb + gt.global_bytes() as f64 / 1e9,
+        gt.n_layers - n_pinned,
+        if n_pinned == gt.n_layers {
+            0
+        } else {
+            rivoli::artifact::model::GLIMMER_STREAM_SLOTS
+        },
+        layer_gb,
+        gt.floor_bytes()? as f64 / 1e9,
+    );
+
     let window_note = format!(
         "an `--attn streaming` knob. This model HAS a sliding window — {} rows, inclusive of \
          the current position, on {sliding} of {} layers — but it comes from `sliding_window` \
@@ -1028,15 +1053,16 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
         (
             "--cache-policy",
             explicit.contains("cache_policy"),
-            "picks an eviction policy for the routed-expert pool. A dense model streams \
-             nothing, so there is no pool and nothing to evict",
-        ),
-        (
-            "--max-mem",
-            explicit.contains("max_mem"),
-            "sizes the device budget whose remainder grows the routed pool. `GlimmerPin` \
-             takes no capacity: the resident set IS the model (55.712 GB), and a device \
-             that cannot hold it cannot run this artifact at any setting",
+            // REWRITTEN 2026-08-12 (R1). The old reason was "a dense model streams nothing,
+            // so there is no pool and nothing to evict" — which is false; this model streams
+            // whatever the budget did not pin. The flag is still refused, for a stronger
+            // reason: on a dense model the policy question has ONE answer.
+            "picks an eviction policy. This model reads its layers in fixed cyclic order, \
+             which is LRU's pathological case — at any deficit it evicts exactly the layer \
+             needed next, for a hit rate of 0 — while Belady on a cyclic scan degenerates to \
+             holding a fixed subset, and every subset of the same size has the same hit rate. \
+             So the partition is a fixed prefix (see --max-mem) and there is no policy left \
+             to choose",
         ),
         (
             "--trace",

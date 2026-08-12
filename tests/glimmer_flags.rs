@@ -25,9 +25,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 mod common;
-use common::{TempRoot, glimmer_convert_fixture};
-
-const DIM: usize = 8;
+use common::{GLIMMER_FIXTURE_DIM as DIM, TempRoot, glimmer_convert_fixture};
 
 /// Run the shipped binary against the converted fixture with `extra` appended, and return
 /// **stdout and stderr together**. `tracing`'s fmt layer writes to stdout and `anyhow`'s
@@ -59,6 +57,29 @@ fn rivoli(artifact: &std::path::Path, extra: &[&str]) -> String {
 /// exit-code check would pass on every row without any refusal existing. That is the same
 /// trap `glimmer_pin`'s refusal test hit for real on a busy GPU.
 #[test]
+fn max_mem_is_accepted_and_reports_the_partition() {
+    // **`--max-mem` moved from refused to ACCEPTED at R1**, so this asserts the OPPOSITE of
+    // what the table below asserts for every other residency flag. It is a separate test
+    // rather than a table row because "is refused, naming its reason" and "is accepted, and
+    // the run then reaches the honest bail" are different shapes.
+    //
+    // 8 GB against a 4-layer fixture is far above the whole model, so the partition is
+    // all-resident — the point here is that the flag PARSES and the run proceeds, not what
+    // the split is. `glimmer_residency.rs` gates the arithmetic at every boundary.
+    let root = TempRoot::new("glimmer-maxmem");
+    let _ = glimmer_convert_fixture(root.path(), DIM);
+    let err = rivoli(&root.join("out"), &["--max-mem", "8"]);
+    assert!(
+        !err.contains("--max-mem does not apply"),
+        "--max-mem must be accepted for a Glimmer artifact since R1, got:\n{err}"
+    );
+    assert!(
+        err.contains("do not decode yet"),
+        "with --max-mem accepted the run must reach the honest decode bail, got:\n{err}"
+    );
+}
+
+#[test]
 fn every_flag_that_does_not_apply_is_refused_by_name() {
     let root = TempRoot::new("glimmer-flags");
     let _ = glimmer_convert_fixture(root.path(), DIM);
@@ -79,14 +100,12 @@ fn every_flag_that_does_not_apply_is_refused_by_name() {
         ("--misa-heads", vec!["--misa-heads", "4"], "no analogue of"),
         ("--mode", vec!["--mode", "int4"], "no second format to pick"),
         (
+            // The reason CHANGED at R1 and the fragment is chosen to hold the new claim:
+            // "nothing to evict" was false once the budget could leave layers streaming, and
+            // a test matching only the flag name would have passed the rewrite either way.
             "--cache-policy",
             vec!["--cache-policy", "lru"],
-            "nothing to evict",
-        ),
-        (
-            "--max-mem",
-            vec!["--max-mem", "70"],
-            "cannot run this artifact at any setting",
+            "no policy left to choose",
         ),
         (
             "--trace",

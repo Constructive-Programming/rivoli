@@ -315,7 +315,9 @@ pub fn sync_read(b: &rivoli::memory::device::DeviceBuf) -> Vec<f32> {
 pub fn fill(n: usize, salt: usize, scale: f32) -> Vec<f32> {
     (0..n)
         .map(|i| {
-            let h = i.wrapping_mul(2_654_435_761).wrapping_add(salt.wrapping_mul(40_503));
+            let h = i
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(salt.wrapping_mul(40_503));
             let u = ((h ^ (h >> 13)) % 65_536) as f32;
             (u / 32_768.0 - 1.0) * scale
         })

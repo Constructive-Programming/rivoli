@@ -22,16 +22,14 @@
 
 mod common;
 use common::{
-    GLIMMER_FIXTURE_LAYERS as L, TempRoot, glimmer_convert_fixture, glimmer_fixture,
-    run_convert_glimmer, write_index,
+    GLIMMER_FIXTURE_DIM as DIM, GLIMMER_FIXTURE_LAYERS as L, TempRoot, glimmer_convert_fixture,
+    glimmer_fixture, run_convert_glimmer, write_index,
 };
 // Module alias rather than a second flat `use` list: the converter imports the same names
 // from the same two modules, and jscpd (which normalizes identifiers) reports the matching
 // import blocks as a clone. Aliasing here is the smaller change and reads fine in a test.
 use rivoli::artifact::format::{Dtype, FormatMeta, Safetensors};
 use rivoli::artifact::model as gm;
-
-const DIM: usize = 8;
 
 #[test]
 fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {

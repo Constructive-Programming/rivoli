@@ -1653,6 +1653,25 @@ pub struct GlimmerTextConfig {
 /// > is nine against a list of twelve — it counted the attention block and forgot the MLP.
 /// > `pin.rs`'s `GlimmerLayerPin` had it right, so the tree disagreed with itself about the
 /// > length of the one constant that exists to stop exactly that.
+/// How many streaming slots a budgeted `GlimmerPin` keeps for the layers it could not pin.
+///
+/// **Two, and the number is a correctness requirement rather than a tuning choice.** A launch
+/// reads layer `l` while the next fill targets `l+1`, so one slot would overwrite weights a
+/// kernel is still reading — the read-outlives-its-slot class this repo has open on the GLM
+/// arena path. Two is the minimum that separates them; more buys prefetch DEPTH, which is worth
+/// nothing until the fill is asynchronous (R1's is a synchronous host memcpy — see
+/// `GlimmerPin::layer`) and would cost `GLIMMER_STREAM_SLOTS × 967.889 MB` of residency.
+///
+/// Here beside the byte arithmetic rather than in `memory::pin` because
+/// [`GlimmerTextConfig::floor_bytes`] needs it and that module is `rocm`-gated.
+pub const GLIMMER_STREAM_SLOTS: usize = 2;
+
+/// Alignment slack in a `GlimmerPin`'s tier request. `DeviceTier::place` starts every
+/// reservation at a 256-byte boundary and the pin makes at most `3 + 12·n_layers` = 627
+/// placements, so the padding is under 160 KB; 1 MiB is ~6x that bound and 0.002% of the 55.7
+/// GB it can sit beside.
+pub const GLIMMER_PIN_SLACK: usize = 1 << 20;
+
 pub const GLIMMER_LAYER_TENSORS: [&str; 12] = [
     "input_layernorm",
     "post_attention_layernorm",
@@ -1811,16 +1830,107 @@ impl GlimmerTextConfig {
     /// text half of the checkpoint. `tests/glimmer_names.rs` reproduces it from the shipped
     /// index's own shapes, which is where that 2.782 MB is accounted for rather than asserted.
     pub fn resident_bytes(&self) -> Result<usize> {
+        Ok(self.global_bytes() + self.n_layers * self.layer_bytes()?)
+    }
+
+    /// Bytes ONE layer's twelve tensors occupy — 967.889 MB for the shipped model.
+    ///
+    /// Split out of [`Self::resident_bytes`] for `GlimmerPin`'s budget arithmetic: how many
+    /// layers a budget pins is `(budget - globals - slots·this) / this`, and a second spelling
+    /// of the per-layer size would be a number that could disagree with the one that sized the
+    /// tier. Every layer is identical — Glimmer has no dense/MoE split — so this is exact
+    /// rather than an average, and that is what makes a static partition expressible at all.
+    pub fn layer_bytes(&self) -> Result<usize> {
         let mut per_layer = 0usize;
         for t in GLIMMER_LAYER_TENSORS {
             let shape = self.layer_tensor_shape(t)?;
             let n: usize = shape.iter().product();
             per_layer += n * if shape.len() == 1 { 4 } else { 2 };
         }
-        // `embed_tokens` and `lm_head`, both `[vocab, hidden]` bf16 and both shipped —
-        // `tie_word_embeddings` is false, so this is 2x2.690 GB and not one of them.
-        let global = 2 * self.vocab * self.hidden * 2 + self.hidden * 4;
-        Ok(global + self.n_layers * per_layer)
+        Ok(per_layer)
+    }
+
+    /// Bytes the model-level tensors occupy — 5.380 GB for the shipped model.
+    ///
+    /// `embed_tokens` and `lm_head`, both `[vocab, hidden]` bf16 and both shipped —
+    /// `tie_word_embeddings` is false, so this is 2x2.690 GB and not one of them — plus the
+    /// final norm at f32.
+    ///
+    /// **These are unconditionally resident at every budget** and that is an arithmetic
+    /// decision, not a convenience: they are read once per TOKEN each (5.380 GB against a
+    /// layer's 0.968), so streaming them would buy 5.4 GB of residency and pay for it on
+    /// every token, while pinning them costs 9.7% of the model. `GlimmerPin`'s floor
+    /// includes them, so a budget that cannot hold them is refused rather than partitioned.
+    pub fn global_bytes(&self) -> usize {
+        2 * self.vocab * self.hidden * 2 + self.hidden * 4
+    }
+
+    /// The smallest budget this artifact can run under: model-level tensors, plus
+    /// [`GLIMMER_STREAM_SLOTS`] layer slots, plus alignment.
+    ///
+    /// **This is a floor on WEIGHTS only, and saying so is the point.** KV at the configured
+    /// context, activation scratch and the DFlash drafter are not here — they are not the pin's
+    /// to size — so a budget clearing this floor can still be too small to decode. What it
+    /// guarantees is that the failure happens at load, with a number, rather than at layer 40
+    /// of the first token.
+    pub fn floor_bytes(&self) -> Result<usize> {
+        Ok(self.global_bytes() + GLIMMER_STREAM_SLOTS * self.layer_bytes()? + GLIMMER_PIN_SLACK)
+    }
+
+    /// How a device budget divides: `(layers pinned, tier bytes to request)`.
+    ///
+    /// `None` — and any budget at or above the whole model — pins every layer and allocates no
+    /// slots, so an over-generous budget does not reserve slots nothing would ever fill. Below
+    /// that, the model-level tensors and the slots come first and whole layers fill the rest in
+    /// ascending order.
+    ///
+    /// **The partition is a fixed PREFIX, and that is the optimal policy rather than a
+    /// simplification.** A dense model reads its layers in fixed cyclic order, which is LRU's
+    /// pathological case: at any deficit LRU evicts exactly the layer needed next and the hit
+    /// rate is **0**, not `pinned/n_layers`. Belady on a cyclic scan — evict the block whose
+    /// next use is farthest, i.e. the one just used — degenerates to holding a fixed subset,
+    /// and every fixed subset of size `k` has the same hit rate `k/n`. So the whole
+    /// `--cache-policy` axis collapses to one answer here, which is why `run_glimmer` still
+    /// refuses that flag while accepting `--max-mem`.
+    ///
+    /// **Here rather than on `GlimmerPin` because it is arithmetic over a config and touches no
+    /// device.** `memory::pin` is `#[cfg(feature = "rocm")]`, so a `GlimmerPin::partition` was
+    /// unreachable from a featureless build — and CI has no rocm job, so the gate that claimed
+    /// to cover this could not run there at all. Found by trying it, 2026-08-12.
+    pub fn partition(&self, budget: Option<usize>) -> Result<(usize, usize)> {
+        let want = self.resident_bytes()?;
+        let layer = self.layer_bytes()?;
+        let Some(b) = budget.filter(|b| *b < want + GLIMMER_PIN_SLACK) else {
+            return Ok((self.n_layers, want + GLIMMER_PIN_SLACK));
+        };
+        let floor = self.floor_bytes()?;
+        ensure!(
+            b >= floor,
+            "a device budget of {:.3} GB is below this artifact's floor of {:.3} GB: the \
+             model-level tensors are {:.3} GB (embed + lm_head + final norm, each read once per \
+             TOKEN, so streaming them would cost more than it frees) and {GLIMMER_STREAM_SLOTS} \
+             streaming slots are {:.3} GB. Weights only — KV at your context, activation scratch \
+             and any drafter are on top of this",
+            b as f64 / 1e9,
+            floor as f64 / 1e9,
+            self.global_bytes() as f64 / 1e9,
+            (GLIMMER_STREAM_SLOTS * layer) as f64 / 1e9,
+        );
+        // Integer division, so the remainder stays unspent rather than pinning a layer the
+        // budget cannot hold.
+        let pinned = usize::min((b - floor) / layer, self.n_layers);
+        // **Ask for what the partition USES, never for the whole budget.** `b` includes the two
+        // slots' worth of room, and a budget that turns out to pin every layer allocates no
+        // slots — so returning `b` there would reserve `2 x 967.889 MB` of tier that nothing
+        // ever writes to. `DeviceTier::new` allocates its capacity, so this is a real 1.9 GB,
+        // not a ceiling. Caught by the featureless gate on 2026-08-12, where 1 MiB of alignment
+        // slack dwarfs the whole tiny model and made the arithmetic visible.
+        let used = if pinned == self.n_layers {
+            want + GLIMMER_PIN_SLACK
+        } else {
+            b
+        };
+        Ok((pinned, usize::min(b, used)))
     }
 
     /// Cross-field checks. Each guards a failure that produces text rather than an error.

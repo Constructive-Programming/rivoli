@@ -241,6 +241,31 @@ mod tier {
             Ok(dst)
         }
 
+        /// Overwrite `len` bytes at `base + off` with `bytes` — a REFILL of memory this tier
+        /// already placed, for a caller that recycles one region across many tensors.
+        ///
+        /// **This is the only sanctioned second write to a placed region, and it exists so the
+        /// unified-addressing assumption stays in one file.** [`Self::place`]'s doc says the
+        /// device pointer and the host address coincide under HIP, that the coincidence is not
+        /// portable, and that callers must not depend on it — so `GlimmerPin`'s streaming slots
+        /// (which memcpy a layer's weights over the previous layer's, once per visit) call this
+        /// rather than dereferencing the pointer `place` handed back. A backend where the two
+        /// addresses differ changes this function and nothing else.
+        ///
+        /// # Safety
+        /// `base` must be a pointer this tier returned from [`Self::place`], and
+        /// `off + bytes.len()` must lie inside that same placement's reservation. Neither is
+        /// checkable here — the tier does not retain per-placement extents — so the caller
+        /// derives both from its own placement (see `Slot::new`, which subtracts the addresses
+        /// `place` returned rather than predicting them).
+        pub unsafe fn write_at(base: *mut u8, off: usize, bytes: &[u8]) {
+            // SAFETY: the caller's contract above; source and destination cannot overlap (one
+            // is the mmap'd artifact, the other the device slab).
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(off), bytes.len());
+            }
+        }
+
         /// Read the slab's first `len` bytes back to the host. Test-only, and it exists
         /// so ONE `tier_roundtrips_placed_bytes` covered both backends: the Vulkan tier
         /// handed out device addresses that cannot be dereferenced on the host, so a test

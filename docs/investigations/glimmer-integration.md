@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: What is LEFT of the Muse Glimmer-30B integration, re-planned 2026-08-12 against reference/principles.md after the owner corrected the port's central assumption — the pin is a function of free memory, so S1a's all-resident GlimmerPin ("a dense model has nothing to stream") violates P6 and dense makes streaming MORE load-bearing, not less: every weight is read every token (53.02 GB bf16 / 26.51 fp8 / 13.65 int4), there is no routed union to hide behind, and the resident fraction times bandwidth IS the tok/s model. Four stages remain: R1 residency contract + budget-aware pin (cyclic access makes LRU pathological — hit rate 0 at any deficit — and Belady degenerates to a STATIC prefix partition, so the policy axis collapses; output across budgets gated identical at zero tolerance on the tiny model), S3 layer loop against that contract from day one (sandwich norms x*(1+w) have NO kernel yet; gate operand scored vs gate_proj.out captures; streams passed, not null; G3 owes the softcap probability-space check nothing at S2 could make), S4 real weights (chat template byte-pinned, dNLL ladder per format, the 2.69 GB lm_head is 1.25x i32::MAX bytes and untested at every stage), S5 performance (speculative decode DIVIDES weight traffic by accepted length — the biggest single lever on a bandwidth-bound dense model; prefetch is PERFECT because the schedule is known before the run; NPU re-opened per P3, the closure is GLM-scoped). Supersedes glimmer-port.md's S3+ sections ON SWITCH-OVER, which is the owner's call; S0-S2 records stay where they are.
+verdict: What is LEFT of the Muse Glimmer-30B integration, re-planned 2026-08-12 against reference/principles.md after the owner corrected the port's central assumption — the pin is a function of free memory, so S1a's all-resident GlimmerPin ("a dense model has nothing to stream") violates P6 and dense makes streaming MORE load-bearing, not less: every weight is read every token (53.02 GB bf16 / 26.51 fp8 / 13.65 int4), there is no routed union to hide behind, and the resident fraction times bandwidth IS the tok/s model. Four stages remain: R1 residency contract + budget-aware pin (cyclic access makes LRU pathological — hit rate 0 at any deficit — and Belady degenerates to a STATIC prefix partition, so the policy axis collapses; output across budgets gated identical at zero tolerance on the tiny model), S3 layer loop against that contract from day one (sandwich norms x*(1+w) have NO kernel yet; gate operand scored vs gate_proj.out captures; streams passed, not null; G3 owes the softcap probability-space check nothing at S2 could make), S4 real weights (chat template byte-pinned, dNLL ladder per format, the 2.69 GB lm_head is 1.25x i32::MAX bytes and untested at every stage), S5 performance (speculative decode DIVIDES weight traffic by accepted length — the biggest single lever on a bandwidth-bound dense model; prefetch is PERFECT because the schedule is known before the run; NPU re-opened per P3, the closure is GLM-scoped). R1 IMPLEMENTED 2026-08-12: the contract is GlimmerPin::layer(l), one shape whether pinned or streamed; --max-mem is now ACCEPTED and run_glimmer reports the partition from the same arithmetic the pin uses; --cache-policy is still refused but for a NEW reason (the old one, 'a dense model streams nothing', became false the moment a budget could leave layers streaming). Four decisions recorded: NO ticket because the fill is a synchronous host memcpy and an always-satisfied dependency object is the hit-mask mistake asyncfetch.rs already paid for; SLOT_COUNT=2 as a correctness floor, not a tuning knob; GlimmerLayerPin deliberately NOT Copy so a stale streamed pin is a compile error; and the source is the mmap rather than io_uring because O_DIRECT needs a layer-blocked artifact convert_glimmer does not emit yet, so S5 must account for the page cache before quoting any bytes-from-disk number. G-R1(a) as planned was NOT reachable - it asks for decode output and there is no decode until S3 - so the gate is per-layer BYTE identity across every budget instead: stronger where it overlaps, and weaker in one way S3 still owes, since a loop can consume correct bytes in the wrong ORDER. Still open at R1: the attention-weights pin-vs-slot decision, which needs a decode to measure. Supersedes glimmer-port.md's S3+ sections ON SWITCH-OVER, which is the owner's call; S0-S2 records stay where they are.
 ---
 
 # Muse Glimmer — what is left, planned against the principles
@@ -69,6 +69,52 @@ fit).**
    the fetch stream, overlap gated in S5, correctness gated now: a deliberate off-by-one in
    the schedule (fetch l+1's bytes into l's slot) must redden the R1 gates.
 
+### R1 as built — 2026-08-12
+
+**The contract is `GlimmerPin::layer(l) -> &GlimmerLayerPin`.** Same twelve-field shape whether
+the layer was pinned or arrived through a slot; the caller cannot tell, and that is P4 expressed
+as a type. Four decisions worth the record, each of which could have gone the other way:
+
+1. **No ticket, because the fill is synchronous.** Under HIP's unified addressing the tier is
+   host-writable, so a fill is the same host `memcpy` `DeviceTier::place` performs and it has
+   completed when `layer()` returns. Handing back an always-satisfied `Ticket` would be a
+   second, host-side encoding of "is this ready?" that can never disagree with reality — which
+   is precisely what `fetch/asyncfetch.rs`'s `Ticket` doc records the `hit: Vec<bool>` mask
+   costing the GLM path. **S5 makes the fill asynchronous and must add a real ticket then**; the
+   signature is shaped to accept exactly that change and nothing else.
+2. **`SLOT_COUNT = 2`, a correctness floor rather than a tuning knob.** A launch reads layer `l`
+   while the next fill targets `l+1`; one slot would overwrite bytes a kernel is still reading —
+   the read-outlives-its-slot defect still open on the GLM arena. More slots buy prefetch DEPTH,
+   which is worth nothing until the fill is async, and would cost `SLOT_COUNT × 967.889 MB`.
+3. **`GlimmerLayerPin` is deliberately NOT `Copy`**, alone among the pin structs here. A copied
+   pin of a streamed layer stays valid-looking after its slot is refilled; borrowing from a
+   `&mut self` method makes holding a stale one a compile error.
+4. **The streaming source is the mmap, not io_uring.** `ExpertSet` streams per-layer sidecar
+   files whose blocks are aligned for O_DIRECT; a safetensors tensor starts wherever the header
+   left it, so the same path needs `convert_glimmer` to emit an aligned layer-blocked output.
+   `ponytail:` buffered I/O through the page cache, ceiling named at the call site. **Upgrade
+   path: a layer-blocked artifact turns `Slot::fill` into an `AsyncFetch` submit.** Until then
+   the page cache is doing the caching, and **S5 must account for that before quoting any
+   bytes-from-disk number.**
+
+**The globals stay resident at every budget, by arithmetic.** embed + lm_head + final norm are
+5.380 GB against a layer's 0.968, and each is read once per TOKEN — streaming them frees 5.4 GB
+and pays on every token, so they are in the floor and a budget below it is refused.
+
+**`--max-mem` is now ACCEPTED for Glimmer** and `run_glimmer` reports the partition it implies
+from `GlimmerPin::partition` — the same arithmetic the pin uses, so the operator's line cannot
+disagree with the pin's split. **`--cache-policy` is still refused, for a new reason**: the old
+one ("a dense model streams nothing, so there is no pool") became false the moment a budget
+could leave layers streaming. The standing reason is that the policy question has one answer
+here — cyclic access makes LRU evict exactly the layer needed next (hit rate 0), and Belady
+degenerates to a fixed subset where every subset of size `k` scores `k/n`.
+
+**Still owed at R1, and not done:** the attention-weights decision (§3 above) is unmade — the
+current partition streams whole layers including their 170.4 MB of attention weights, which is
+the simple thing and not necessarily the right one. It needs the floor arithmetic at the formats
+that matter, then a measurement, and it cannot be settled before S3 gives it a decode to
+measure.
+
 **G-R1 — met when** (a) tiny-model decode output is **bit-identical across every budget**
 from all-resident to the floor — P4 as a gate, zero tolerance, and the tiny checkpoint CAN
 exercise it (force a budget that pins only some of its 8 layers); (b) the schedule
@@ -77,6 +123,24 @@ LOUDLY at build, not at layer 40 of the first decode; (d) a **>2 GiB single-tens
 alloc+copy test exists and passes** — `lm_head` is 2,689,662,976 bytes = 1.25× `i32::MAX`,
 `DeviceBuf::new`/`copy_in_at` were traced size_t-clean by review but no test allocates past
 2 GiB anywhere in the tree.
+
+> **(a) AS WRITTEN IS NOT REACHABLE AT R1, and `tests/glimmer_residency.rs` carries the
+> substitute.** It asks for DECODE output across budgets; there is no decode until S3, whose
+> whole content is the layer loop. Waiting would ship R1's partition ungated, so the gate is
+> per-layer instead: **`layer(l)` resolves to byte-identical tensors at every budget**, all
+> twelve tensors, every layer, two passes per budget so a refilled slot is re-read. That is
+> stronger than (a) where they overlap — it localises a wrong partition to the tensor rather
+> than to the run — and strictly weaker in one way that matters: **a loop can consume correct
+> bytes in the wrong ORDER, and only a decode sees that.** S3 still owes the end-to-end form,
+> and this is not a substitute for it there.
+>
+> (b) is likewise arithmetic rather than a broken build: the slot map's correctness property is
+> that it is injective over any `SLOT_COUNT` consecutive streamed layers, and the red proof
+> asserts that a single slot collides on every consecutive pair — so reducing `SLOT_COUNT` to 1
+> reddens it. (c) is `partition`'s floor refusal, gated with no device at every boundary
+> including one byte under. (d) is `#[ignore]`d by default: it allocates 2.69 GB of GTT, which
+> is not something a routine `cargo test` on a shared GPU should do; run it explicitly under
+> the flock.
 
 ## S3 — the layer loop, against the contract from day one
 

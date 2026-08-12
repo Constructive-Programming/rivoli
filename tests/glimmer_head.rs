@@ -75,8 +75,16 @@ fn softcap_on_device(x: &[f32], mult: f32, cap: f32) -> Vec<f32> {
     let b = dev(&f32b(x));
     // SAFETY: `b` holds exactly `x.len()` live f32 and outlives the sync inside `sync_read`.
     // Null stream: one kernel, then a join — nothing to order against.
-    unsafe { launch_logit_softcap(b.ptr() as *mut f32, x.len(), mult, cap, std::ptr::null_mut()) }
-        .expect("logit_softcap launch");
+    unsafe {
+        launch_logit_softcap(
+            b.ptr() as *mut f32,
+            x.len(),
+            mult,
+            cap,
+            std::ptr::null_mut(),
+        )
+    }
+    .expect("logit_softcap launch");
     sync_read(&b)
 }
 
@@ -249,7 +257,12 @@ fn omission_is_loud_and_non_finites_survive() {
     let probe = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 0.0, 400.0];
     let got = softcap_on_device(&probe, MULT, CAP);
     assert_eq!(got[0], f32::INFINITY, "+Inf was laundered to {}", got[0]);
-    assert_eq!(got[1], f32::NEG_INFINITY, "-Inf was laundered to {}", got[1]);
+    assert_eq!(
+        got[1],
+        f32::NEG_INFINITY,
+        "-Inf was laundered to {}",
+        got[1]
+    );
     assert!(got[2].is_nan(), "NaN was laundered to {}", got[2]);
     assert_eq!(got[3], 0.0, "zero must map to zero");
     assert!(

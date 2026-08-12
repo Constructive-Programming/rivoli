@@ -854,6 +854,16 @@ pub const GLIMMER_SHIPPED_CONFIG: &str =
 /// One period of Glimmer's `[sliding, sliding, sliding, full]` layer pattern.
 pub const GLIMMER_FIXTURE_LAYERS: usize = 4;
 
+/// The width every Glimmer fixture is built at.
+///
+/// **Hoisted 2026-08-12 because the fourth restatement of it was a build error.** Four test
+/// binaries declared `const DIM: usize = 8` beside the same two `use` lines, and jscpd —
+/// which normalizes identifiers — matched the import-plus-const block as a clone. That gate
+/// was right about the substance as well as the tokens: the fixture's width is one fact, and
+/// a file that disagreed about it would build a checkpoint the shared converter helper cannot
+/// describe. `glimmer_convert.rs` already carries a note about the import-block half of this.
+pub const GLIMMER_FIXTURE_DIM: usize = 8;
+
 /// bf16 bytes for `n` values, distinct per `seed` so a mixed-up copy is visible as a wrong
 /// VALUE rather than as a right length.
 pub fn bf16_blob(seed: u16, n: usize) -> Vec<u8> {

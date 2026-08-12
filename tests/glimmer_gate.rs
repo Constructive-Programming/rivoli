@@ -125,7 +125,10 @@ fn the_gate_reproduces_the_reference() {
     // the projection's accumulation — 525x above what one multiply produces — so the row alone
     // cannot see this kernel regress by two decades, and the `expf`-not-`__expf` decision the
     // kernel comment insists on would otherwise be ungated.
-    assert!(worst <= 3.2e-6, "worst rel {worst:e} > 20x the 2026-08-12 measurement");
+    assert!(
+        worst <= 3.2e-6,
+        "worst rel {worst:e} > 20x the 2026-08-12 measurement"
+    );
 }
 
 /// **Trap 4, run.** Gating on the attention output instead of the layer input's projection.
@@ -184,7 +187,11 @@ fn the_gate_operand_is_not_recoverable_from_the_attend_output() {
     });
     println!("operand separation (sigmoid space): closest over {cases} cases: {closest:e}");
     // Same census, same reason: `closest` is INFINITY-seeded.
-    assert_eq!(cases, fixture::expected().0, "the separation ran over nothing");
+    assert_eq!(
+        cases,
+        fixture::expected().0,
+        "the separation ran over nothing"
+    );
     assert!(
         closest > 0.1,
         "sigmoid(gate_proj(h)) and sigmoid(attend.out) agree to {closest:e} somewhere, so trap 4 \

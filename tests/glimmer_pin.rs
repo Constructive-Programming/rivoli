@@ -19,11 +19,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
 mod common;
-use common::{FixtureTensor, GLIMMER_FIXTURE_LAYERS as L, TempRoot, glimmer_convert_fixture};
+use common::{
+    FixtureTensor, GLIMMER_FIXTURE_DIM as DIM, GLIMMER_FIXTURE_LAYERS as L, TempRoot,
+    glimmer_convert_fixture,
+};
 use rivoli::artifact::model as gm;
 use rivoli::memory::pin::GlimmerPin;
-
-const DIM: usize = 8;
 
 /// Convert the synthetic checkpoint and return `(artifact dir, config, source tensors)`.
 /// The caller owns the temp root and removes it.
@@ -64,9 +65,12 @@ fn glimmer_pin_places_every_tensor_with_the_shape_the_config_implies() {
     let (root, cfg, tensors) = convert("ok");
     let src: std::collections::HashMap<&str, &Vec<u8>> =
         tensors.iter().map(|(n, _, b)| (n.as_str(), b)).collect();
-    let pin = GlimmerPin::build(root.join("out").to_str().unwrap(), &cfg.text).unwrap();
+    // `None` = pin everything, the all-resident partition this test has always exercised.
+    // `tests/glimmer_residency.rs` covers the budgeted ones and the equivalence between them.
+    let mut pin = GlimmerPin::build(root.join("out").to_str().unwrap(), &cfg.text, None).unwrap();
 
-    assert_eq!(pin.layers.len(), L);
+    assert_eq!(pin.pinned_layers(), L);
+    assert_eq!(pin.streamed_layers(), 0, "None must pin every layer");
     // Globals. Both `[vocab, hidden]` and both present: `tie_word_embeddings` is false, so a
     // pin that aliased one to the other would be wrong about 2.690 GB on the real model.
     for (w, name) in [
@@ -101,7 +105,8 @@ fn glimmer_pin_places_every_tensor_with_the_shape_the_config_implies() {
         "final_norm is wired to the wrong tensor"
     );
 
-    for (l, layer) in pin.layers.iter().enumerate() {
+    for l in 0..L {
+        let layer = pin.layer(l).unwrap();
         // Paired with the tensor name so the assertion below reads the shape table rather
         // than restating eight shapes — and so a field wired to the wrong name is visible as
         // a shape mismatch on the pairs the shapes DO separate.
@@ -174,7 +179,7 @@ fn glimmer_pin_refuses_a_config_the_artifact_does_not_match() {
     broken.num_key_value_heads *= 2;
     let e = format!(
         "{:#}",
-        GlimmerPin::build(root.join("out").to_str().unwrap(), &broken)
+        GlimmerPin::build(root.join("out").to_str().unwrap(), &broken, None)
             .err()
             .expect("a config implying different dims must be refused")
     );
@@ -233,7 +238,7 @@ fn glimmer_pin_refuses_a_norm_that_is_not_hidden_long() {
     let cfg: gm::GlimmerConfig = gm::load_config(out.to_str().unwrap()).unwrap();
     let e = format!(
         "{:#}",
-        GlimmerPin::build(out.to_str().unwrap(), &cfg.text)
+        GlimmerPin::build(out.to_str().unwrap(), &cfg.text, None)
             .err()
             .expect("a norm shorter than hidden must be refused")
     );
