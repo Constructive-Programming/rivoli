@@ -188,26 +188,46 @@ pub fn each_case(mut f: impl FnMut(&Golden, usize, usize, usize)) {
 /// printed "worst abs over 0 cases". `num_hidden_layers` comes out of `tiny_config`, which the
 /// driver writes separately, so the two can disagree — and a zero of either is now refused
 /// outright rather than multiplied through.
+/// `(layers, steps)` for one golden, with the two refusals that stop a census multiplying zero.
+///
+/// Both matter and they are different failures. A zero of either makes an expected count of zero
+/// against a loop that scored nothing, so `assert_eq!(0, 0)` passes while the suite reports a worst
+/// over nothing — this repo hit that once. And `num_hidden_layers` comes from `tiny_config` while
+/// `layer_is_sliding` is written separately by the driver, so the two can DISAGREE; cross-checking
+/// them is what makes a layer count independent of the loop that consumes it, which arithmetic over
+/// the same value never is.
+///
+/// Extracted 2026-08-12: the chain census in `glimmer_norm.rs` needed the same two refusals, wrote
+/// them out, and jscpd rejected the copy — the gate landing on the exact lines a review had just
+/// asked to be shared.
+pub fn census_dims(gold: &Golden) -> (usize, usize) {
+    let (_, steps) = gold.steps();
+    let layers = gold.n("num_hidden_layers");
+    let sliding = ints_of(gold, "layer_is_sliding").len();
+    assert!(
+        layers > 0 && steps > 0,
+        "{}: {layers} layers, {steps} decode steps",
+        gold.name
+    );
+    assert_eq!(
+        sliding, layers,
+        "{}: layer_is_sliding has {sliding} entries against num_hidden_layers {layers}",
+        gold.name
+    );
+    (layers, steps)
+}
+
 pub fn expected() -> (usize, usize) {
     let (mut all, mut ring) = (0, 0);
     for gold in &goldens() {
         let (_, steps) = gold.steps();
-        let sliding = golden_read::ints(&gold.g, "layer_is_sliding").to_vec();
-        let layers = gold.n("num_hidden_layers");
-        assert_eq!(
-            sliding.len(),
-            layers,
-            "{}: layer_is_sliding has {} entries against num_hidden_layers {layers}",
-            gold.name,
-            sliding.len()
-        );
-        assert!(
-            layers > 0 && steps > 0,
-            "{}: {layers} layers, {steps} decode steps",
-            gold.name
-        );
+        let (layers, _) = census_dims(gold);
         all += (steps + 1) * layers;
-        ring += steps * sliding.iter().filter(|s| **s != 0).count();
+        ring += steps
+            * ints_of(gold, "layer_is_sliding")
+                .iter()
+                .filter(|s| **s != 0)
+                .count();
     }
     (all, ring)
 }
@@ -239,6 +259,17 @@ pub fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
     if got.iter().any(|g| !g.is_finite()) {
         return f32::INFINITY;
     }
+    // The SAME trap on the reference side, and it needs a different answer. `scale` above is
+    // another `f32::max` fold, so a NaN in `want` is silently skipped there too — but returning
+    // INFINITY would report it as the kernel being wrong, which is a diagnosis of the wrong side.
+    // Added 2026-08-12 when the chain gates put golden bytes on this side of a score for the first
+    // time; `glimmer_anchor.rs` asserts the captures are finite, so this fires only if that gate
+    // and this one disagree, and then the message has to say so.
+    assert!(
+        want.iter().all(|w| w.is_finite()),
+        "the REFERENCE side holds a non-finite value — this is a corrupt or mis-read capture, not \
+         a kernel result"
+    );
     got.iter()
         .zip(want)
         .map(|(g, w)| (g - w).abs())
@@ -263,6 +294,65 @@ pub fn rel_tolerance(operator: &str) -> f32 {
              bit-equal with torch. That is a decision about this operator and has to be read."
         ),
         None => panic!("tolerance::GLIMMER has no `{operator}` row, so nothing here is scored"),
+    }
+}
+
+/// A running score against one tolerance row: the bar, the worst seen, **which case produced it**,
+/// and how many there were.
+///
+/// Two fixtures spelled the same four-line epilogue and jscpd rejected the second copy
+/// (2026-08-12); the count lives with the score because a loop that forgets to increment prints a
+/// worst over nothing, the vacuity `expected()` next door exists to catch.
+///
+/// **`at` is the reason this is a struct and not a free function.** Both callers finish with a bar
+/// an order of magnitude tighter than the row (the row is a whole-bucket fp32 floor and cannot see a
+/// two-decade regression), and that tighter bar is checked on the FOLD — so without a remembered
+/// locator its failure names none of the 612 cases, and finding out which one meant re-instrumenting
+/// a test that needs a shared GPU under a flock. Review finding, 2026-08-12.
+///
+/// `glimmer_attend.rs` and `glimmer_rope.rs` carry the same epilogue and were NOT migrated: jscpd
+/// does not match them, so nothing forces it, and rewriting two green GPU fixtures to share a
+/// three-field accumulator is not worth the run. Said here rather than left silent, because the next
+/// reader will otherwise take two call sites for the tree's only two.
+pub struct Scored {
+    pub tol: f32,
+    pub worst: f32,
+    pub at: String,
+    pub cases: usize,
+    operator: &'static str,
+}
+
+impl Scored {
+    pub fn new(operator: &'static str) -> Self {
+        Self {
+            tol: rel_tolerance(operator),
+            worst: 0.0,
+            at: "<nothing scored>".to_string(),
+            cases: 0,
+            operator,
+        }
+    }
+
+    /// Score one case under the row's metric and refuse it over the row's tolerance.
+    ///
+    /// `what` names the case and runs only when this case ties or beats the worst so far — which is
+    /// also the only state the assert below can fire in, since a strictly worse earlier case would
+    /// already have failed. So the label is available where it is needed without formatting every
+    /// green case, and `at` survives the loop for the caller's tighter bar.
+    pub fn case(&mut self, got: &[f32], want: &[f32], what: impl FnOnce() -> String) {
+        let r = worst_rel(got, want);
+        if r >= self.worst {
+            self.worst = r;
+            self.at = what();
+        }
+        assert!(
+            r <= self.tol,
+            "{}: {} scores {r:e} > {:e}",
+            self.operator,
+            self.at,
+            self.tol
+        );
+        self.cases += 1;
     }
 }
 

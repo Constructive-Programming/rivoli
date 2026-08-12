@@ -101,22 +101,19 @@ fn tensors(gold: &fixture::Golden, t: usize, l: usize) -> (Vec<f32>, Vec<f32>, V
 /// The kernel against the reference, at every layer and step of both goldens.
 #[test]
 fn the_gate_reproduces_the_reference() {
-    let tol = fixture::rel_tolerance("o_proj");
-    let (mut worst, mut cases) = (0.0f32, 0);
+    let mut s = fixture::Scored::new("o_proj");
     each_case(|gold, t, l, _win| {
         let (attn, gate, want) = tensors(gold, t, l);
-        let r = worst_rel(&gate_on_device(&attn, &gate), &want);
-        assert!(
-            r <= tol,
-            "{}: t{t}.L{l} worst rel {r:e} > {tol:e}",
-            gold.name
-        );
-        worst = worst.max(r);
-        cases += 1;
+        s.case(&gate_on_device(&attn, &gate), &want, || {
+            format!("{} t{t}.L{l}", gold.name)
+        });
     });
-    println!("gate: worst rel over {cases} cases: {worst:e} against tol {tol:e}");
+    println!(
+        "gate: worst rel over {} cases: {:e} at {} against tol {:e}",
+        s.cases, s.worst, s.at, s.tol
+    );
     assert_eq!(
-        cases,
+        s.cases,
         fixture::expected().0,
         "the loop did not cover every step and layer"
     );
@@ -126,8 +123,10 @@ fn the_gate_reproduces_the_reference() {
     // cannot see this kernel regress by two decades, and the `expf`-not-`__expf` decision the
     // kernel comment insists on would otherwise be ungated.
     assert!(
-        worst <= 3.2e-6,
-        "worst rel {worst:e} > 20x the 2026-08-12 measurement"
+        s.worst <= 3.2e-6,
+        "worst rel {:e} at {} > 20x the 2026-08-12 measurement",
+        s.worst,
+        s.at
     );
 }
 

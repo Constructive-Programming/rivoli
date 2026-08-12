@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: What is LEFT of the Muse Glimmer-30B integration, re-planned 2026-08-12 against reference/principles.md after the owner corrected the port's central assumption — the pin is a function of free memory, so S1a's all-resident GlimmerPin ("a dense model has nothing to stream") violates P6 and dense makes streaming MORE load-bearing, not less: every weight is read every token (53.02 GB bf16 / 26.51 fp8 / 13.65 int4), there is no routed union to hide behind, and the resident fraction times bandwidth IS the tok/s model. Four stages remain: R1 residency contract + budget-aware pin (cyclic access makes LRU pathological — hit rate 0 at any deficit — and Belady degenerates to a STATIC prefix partition, so the policy axis collapses; output across budgets gated identical at zero tolerance on the tiny model), S3 layer loop against that contract from day one (sandwich norms x*(1+w) have NO kernel yet; gate operand scored vs gate_proj.out captures; streams passed, not null; G3 owes the softcap probability-space check nothing at S2 could make), S4 real weights (chat template byte-pinned, dNLL ladder per format, the 2.69 GB lm_head is 1.25x i32::MAX bytes and untested at every stage), S5 performance (speculative decode DIVIDES weight traffic by accepted length — the biggest single lever on a bandwidth-bound dense model; prefetch is PERFECT because the schedule is known before the run; NPU re-opened per P3, the closure is GLM-scoped). R1 IMPLEMENTED 2026-08-12 and then substantially corrected by three reviews: the contract is GlimmerPin::layer(l), one shape whether pinned or streamed, gated at 24 (budget, layer, pass) resolutions all byte-identical to all-resident; --max-mem is ACCEPTED and no longer hidden, and run_glimmer reports the partition AFTER every refusal (above them, device_budget's hipMemGetInfo let a low free-GTT reading preempt every architectural refusal with a memory error, and made the flag suite a GPU arm silently). THE REVIEWS OVERTURNED TWO OF MY ARGUMENTS, not just my code. GLIMMER_STREAM_SLOTS is 1, not 2, and the slot count is NOT a correctness property: kernel launches are asynchronous, so no finite slot count establishes write-after-read ordering -- only a dependency does -- and with a synchronous fill a second slot buys no overlap while costing one extra streamed layer (967.942 MB) every token, because the floor charges every slot unconditionally. The invariant a caller owes is now stated on layer() and S5 must add the fence in the same change as any slot increase. Second, R1 had introduced a real regression: only the PINNED prefix got the dtype and shape checks, so which invariants a layer received became a function of --max-mem, and a q_proj stored transposed is byte-identical in length and was accepted under a low budget while refused at full residency; every layer's headers are now validated at build. Also: partition asks for what it uses (the version first recorded as a fix guarded an unreachable branch and left the real streaming-path over-allocation); Slot writes to each tensor's own address, dropping a base-is-lowest assumption that would have wrapped under --release; the per-layer figure is 967.942 MB, not the checkpoint's bf16-norm 967.889 MB, and is now pinned by a shipped-widths test; the >2 GiB gate tested DeviceBuf/hipMemcpy while the pin places through DeviceTier/VmmBuf and now runs the pin's path; and G-R1(b) was WITHDRAWN rather than repaired, because its test re-implemented the slot map as a local closure and its premise dissolved. Still open: the attention-weights pin-vs-slot decision, which needs a decode to measure. Supersedes glimmer-port.md's S3+ sections ON SWITCH-OVER, which is the owner's call; S0-S2 records stay where they are.
+verdict: What is LEFT of the Muse Glimmer-30B integration, re-planned 2026-08-12 against reference/principles.md after the owner corrected the port's central assumption — the pin is a function of free memory, so S1a's all-resident GlimmerPin ("a dense model has nothing to stream") violates P6 and dense makes streaming MORE load-bearing, not less: every weight is read every token (53.02 GB bf16 / 26.51 fp8 / 13.65 int4), there is no routed union to hide behind, and the resident fraction times bandwidth IS the tok/s model. Four stages remain: R1 residency contract + budget-aware pin (cyclic access makes LRU pathological — hit rate 0 at any deficit — and Belady degenerates to a STATIC prefix partition, so the policy axis collapses; output across budgets gated identical at zero tolerance on the tiny model), S3 layer loop against that contract from day one (sandwich norms x*(1+w) now have rmsnorm_centered_single, scored against the goldens' three EXACT input->output chains at 612 rows / hidden 72 / worst 3.238e-7 with the eps census as its standing red proof (41.8-56.6x on the two post-norm chains, 0.1x on the pre-norm one, which stands at mean(x2) 1); gate operand scored vs gate_proj.out captures; streams passed, not null; G3 owes the softcap probability-space check nothing at S2 could make), S4 real weights (chat template byte-pinned, dNLL ladder per format, the 2.69 GB lm_head is 1.25x i32::MAX bytes and untested at every stage), S5 performance (speculative decode DIVIDES weight traffic by accepted length — the biggest single lever on a bandwidth-bound dense model; prefetch is PERFECT because the schedule is known before the run; NPU re-opened per P3, the closure is GLM-scoped). R1 IMPLEMENTED 2026-08-12 and then substantially corrected by three reviews: the contract is GlimmerPin::layer(l), one shape whether pinned or streamed, gated at 24 (budget, layer, pass) resolutions all byte-identical to all-resident; --max-mem is ACCEPTED and no longer hidden, and run_glimmer reports the partition AFTER every refusal (above them, device_budget's hipMemGetInfo let a low free-GTT reading preempt every architectural refusal with a memory error, and made the flag suite a GPU arm silently). THE REVIEWS OVERTURNED TWO OF MY ARGUMENTS, not just my code. GLIMMER_STREAM_SLOTS is 1, not 2, and the slot count is NOT a correctness property: kernel launches are asynchronous, so no finite slot count establishes write-after-read ordering -- only a dependency does -- and with a synchronous fill a second slot buys no overlap while costing one extra streamed layer (967.942 MB) every token, because the floor charges every slot unconditionally. The invariant a caller owes is now stated on layer() and S5 must add the fence in the same change as any slot increase. Second, R1 had introduced a real regression: only the PINNED prefix got the dtype and shape checks, so which invariants a layer received became a function of --max-mem, and a q_proj stored transposed is byte-identical in length and was accepted under a low budget while refused at full residency; every layer's headers are now validated at build. Also: partition asks for what it uses (the version first recorded as a fix guarded an unreachable branch and left the real streaming-path over-allocation); Slot writes to each tensor's own address, dropping a base-is-lowest assumption that would have wrapped under --release; the per-layer figure is 967.942 MB, not the checkpoint's bf16-norm 967.889 MB, and is now pinned by a shipped-widths test; the >2 GiB gate tested DeviceBuf/hipMemcpy while the pin places through DeviceTier/VmmBuf and now runs the pin's path; and G-R1(b) was WITHDRAWN rather than repaired, because its test re-implemented the slot map as a local closure and its premise dissolved. Still open: the attention-weights pin-vs-slot decision, which needs a decode to measure. Supersedes glimmer-port.md's S3+ sections ON SWITCH-OVER, which is the owner's call; S0-S2 records stay where they are.
 ---
 
 # Muse Glimmer — what is left, planned against the principles
@@ -218,17 +218,67 @@ What the loop must get right, each with its gate:
    produces a wrong model") and §5 contradicts itself; three code comments had propagated the wrong
    half. The two-entry-point design stands on neither direction announcing itself.
 
-   > **OWED, and it is the gate this item should have had.** Both reviews found three EXACT
+   > **The owed gate: PAID 2026-08-12, before the loop.** Both reviews found three EXACT
    > input→output chains in the goldens — `embed_norm.out` → `L0.input_layernorm.out`,
    > `attn.o_proj.out` → `post_attention_layernorm.out`, `mlp.down_proj.out` →
    > `post_feedforward_layernorm.out` — verified by recovering `1+w` per row and confirming it is
-   > constant across all 18 rows to ~3e-7. So the kernel CAN be scored against reference bytes:
-   > recover the weight from one row, predict the rest, compare under the `norm` row. It would
-   > redden at 25–45x on `post_norm_eps_shared` and would run at hidden **72**, where 184 of 256
-   > threads contribute nothing to the ladder — a regime no value check in the tree touches. The
-   > fixture header had argued no gate was possible; that argument covers only the FORM (recovering
-   > `1+w` and feeding it to a plain kernel reproduces the output), and was used to skip the
-   > arithmetic and eps gates too. **Write this before S3's loop consumes the kernel.**
+   > constant across all 18 rows to ~3e-7. The fixture header had argued no gate was possible; that
+   > argument covers only the FORM (recovering `1+w` and feeding it to a plain kernel reproduces the
+   > output), and was used to skip the arithmetic and eps gates too.
+   >
+   > `the_centered_norm_reproduces_the_anchors_three_exact_chains` recovers `w` per element from the
+   > row where that element's normalised input is largest, predicts every row through the DEVICE
+   > kernel, and scores it under the `norm` row: **612 reference rows over 34 (chain, layer) pairs at
+   > hidden 72, worst 3.238e-7 against 7.70e-5**. Hidden **72** is a regime no other value check in
+   > this tree touches: 184 of the ladder's 256 threads contribute nothing.
+   >
+   > **The recovery has its own independent check.** The recovered `w` spans **[-0.2000, 0.1999]**,
+   > which is the driver's `uniform_(-0.2, 0.2)` to four figures, and each (chain, layer) pair's own
+   > range must exceed 0.3 — that second half is what catches a pair left at `w`'s ZERO
+   > initialisation, whose prediction rows would stop being able to see a kernel ignoring `w` while
+   > the other 33 pairs still filled the interval. Together they catch the one failure the prediction
+   > score cannot attribute: a wrong `w` the prediction then faithfully reproduces.
+   >
+   > **The eps census is the standing red proof.** Driving the same recover-and-predict path with the
+   > other eps reddens the two post-norm chains at **41.8x–56.6x** the tolerance (worst rows at
+   > mean(x²) 1.139e-3…1.545e-3) and leaves the pre-norm chain at **0.1x** — its input is
+   > `embed_norm.out`, a NORMALISED vector at mean(x²) 9.95e-1 where the substitution is a decade
+   > under the bar. So the test asserts TWO censuses, powered at `> 10x tol` and blind at `<= tol`, so
+   > a chain drifting into the gap fails both rather than sliding from one to the other. The plan
+   > predicted 25–45x and the band's top is higher because the worst row is not the worst-mean row.
+   > Two one-off red proofs, run and reverted: dividing the reduction by `n-1` reddens it at
+   > **6.969e-3, 90x**, and dropping the centering to `x·w` reddens it at **8.618e-1, 1.12e4x** — and that proof lives on the ASYMMETRY between a host f64 recovery and a device
+   > prediction, which is now written at `inv_rms` because its own comment had been inviting the
+   > refactor that would cancel it.
+   >
+   > Two smaller gates landed with it. The kernel may write into its own input, scored **bit-identical**
+   > to the non-aliased launch at both eps rather than against a tolerance — one buffer S3's loop does
+   > not have to hold. And **ragged** widths (257/1000/6655/6657, worst 1.762e-7): the claim first
+   > recorded here said "a width that is not a multiple of 256", which was wrong — 6656 is exactly
+   > 26x256 and 72 is under one block, so no test had ever run the regime where some threads
+   > accumulate `k` terms and others `k+1`.
+   >
+   > Cost: the scoring epilogue became `fixture::Scored` (jscpd rejected the second copy of
+   > score/refuse/fold/count) and the two vacuity refusals became `fixture::census_dims` (jscpd
+   > rejected that copy too, landing on the exact lines a review had just asked to be shared).
+   >
+   > **THREE REVIEWS, and the two most valuable findings were against the file's ARGUMENTS again.**
+   > (1) "The form is not falsifiable from these bytes" was half false: the REFERENCE's form is
+   > unidentifiable, but the KERNEL's is fully gated here, because the recovery fixes the convention —
+   > a kernel switched to `x·w` reddens at 8.618e-1, measured, 1.12e4x. (2) Chain 0's eps column is **decoration**: flipping
+   > it leaves every assertion green, because `recover` and the prediction take the same eps and chain
+   > 0's input sits at mean(x²) ≈ 1 for every row, so the wrong choice cancels to ~1e-10. Chains 1
+   > and 2 escape only because their row means vary 4x. That is now stated at the table and measured
+   > by the census. Also fixed: `X_SCALE` cited a band it was BELOW (8.3e-4 against 1.14e-3) and is
+   > now 0.11 = mean(x²) 4.03e-3, inside the measured band, which drops its own eps signal from a
+   > flattering 77x to an honest 16x; the census reported a max-mean paired with a max-signal that
+   > were 2.5x apart under their own formula and now reports one row's two numbers, which reconcile;
+   > `worst_rel` guards non-finite values on the REFERENCE side now that goldens sit there; the
+   > coverage is pinned as an absolute 612/34 because both derived counts are functions of the same
+   > metadata the loop reads; and the aliasing question — raised by all three reviewers, two of whom
+   > wanted the test deleted — was answered by writing the in-place contract AT the kernel, where
+   > `swiglu`/`swiglu_clamped_bf16` already carry theirs and are launched in place from `gpu.rs` and
+   > `f4gpu.rs` in production. The missing thing was the argument, not the test.
 
 1. **Sandwich norms — the original prescription, kept for what it asked:** Four per layer, post-norms on the BRANCH before
    the residual add, and they are CENTERED: `x*(1+w)` — **no kernel in the tree computes

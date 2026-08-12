@@ -385,8 +385,19 @@ extern "C" __global__ void rmsnorm_single(
 // declined separately: `block_sum_lds` carries a trailing barrier that spelling lacks, and
 // `common.hpp` prices that as UNMEASURED on the decode path.
 //
+// Safe in place (`y` may alias `x`), and the argument needs one more clause than `swiglu`'s above.
+// There, each thread reads its own index and writes its own, so the write depending on the read is
+// the whole proof. Here loop 1 reads OTHER threads' indices — so the `__syncthreads()` inside
+// `block_sum_lds` is load-bearing: every read of `x` precedes it and every write of `y` follows it,
+// and `__restrict__` licenses no reordering across a barrier intrinsic. Loop 2's thread `i` then
+// reads and writes the same index and no other thread touches it, which is `swiglu`'s clause again.
+// `gpu.rs` and `f4gpu.rs` already launch `swiglu` in place (`h == g`), so this is the tree's
+// established position on `__restrict__` and aliasing rather than a new one — stated HERE because
+// three reviews read the qualifier and not the argument (2026-08-12), which is what a kernel that
+// supports in-place owes its callers.
+//
 // `tests/glimmer_norm.rs` scores it against `tolerance::GLIMMER`'s `norm` row, measured before
-// this existed.
+// this existed, and the aliased launch bit-against-bit with the non-aliased one.
 extern "C" __global__ void rmsnorm_centered_single(
     const float* __restrict__ x, const float* __restrict__ w, int n, float eps,
     float* __restrict__ y) {
