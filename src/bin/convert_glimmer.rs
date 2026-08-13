@@ -24,6 +24,12 @@ use rivoli::artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, finis
 use rivoli::artifact::model::{
     GLIMMER_LAYER_PREFIX, GLIMMER_LAYER_TENSORS, GlimmerConfig, load_config,
 };
+use rivoli::artifact::tokenizer::eos_token_ids;
+
+/// The one file carrying Muse Glimmer's stop tokens. Named because three places spell it and
+/// [`eos_ids`] refuses on its contents — a literal repeated beside a check that reads it is one
+/// rename away from checking a different file than the one it copies.
+const GEN: &str = "generation_config.json";
 
 /// Auxiliary files copied beside the weights. `generation_config.json` is **load-bearing and
 /// not optional decoration**: it carries `eos_token_id: [200001, 200008]`, and the
@@ -40,7 +46,7 @@ use rivoli::artifact::model::{
 const AUX: [&str; 4] = [
     "tokenizer.json",
     "tokenizer_config.json",
-    "generation_config.json",
+    GEN,
     "chat_template.jinja",
 ];
 
@@ -69,7 +75,7 @@ struct Args {
 /// `artifact-drops-the-chat-template` records rivoli drifting away from for months precisely
 /// because it lived only upstream. A converter that shrugs at their absence hands the problem
 /// to whoever debugs the decode.
-const REQUIRED_AUX: [&str; 2] = ["generation_config.json", "chat_template.jinja"];
+const REQUIRED_AUX: [&str; 2] = [GEN, "chat_template.jinja"];
 
 /// The EOS ids `generation_config.json` carries, refusing a file that exists and says nothing.
 ///
@@ -92,24 +98,19 @@ const REQUIRED_AUX: [&str; 2] = ["generation_config.json", "chat_template.jinja"
 /// count here would be the same over-fit `layer_types`' doc argues against: the pair is a fact
 /// about this checkpoint, not a rule about the architecture. What is architectural is that a decode
 /// with zero stop tokens cannot terminate.
-fn eos_ids(dir: &str) -> Result<Vec<u64>> {
-    let p = format!("{dir}/generation_config.json");
-    let text = std::fs::read_to_string(&p).with_context(|| format!("read {p}"))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("{p} is not JSON"))?;
-    // Both spellings, matching `Tokenizer::load_eos` — an array of ints or a bare int. Read
-    // through the same shapes the ENGINE reads, or this gate certifies a file the engine then
-    // reads differently.
-    let ids: Vec<u64> = match v.get("eos_token_id") {
-        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_u64()).collect(),
-        Some(other) => other.as_u64().into_iter().collect(),
-        None => Vec::new(),
-    };
+fn eos_ids(dir: &str) -> Result<Vec<u32>> {
+    // **The ENGINE's parser, not a second one.** This function was fifteen lines re-spelling
+    // `Tokenizer::load_eos`, with a comment asserting the two "match" — a claim the shared
+    // function makes structural rather than asserted (review, 2026-08-13). What belongs here is
+    // the REFUSAL: `artifact/tokenizer.rs` is shared with three other models and warns rather
+    // than failing, which is its call to keep; this binary converts one checkpoint and knows what
+    // that checkpoint has to carry.
+    let ids = eos_token_ids(dir)?;
     ensure!(
         !ids.is_empty(),
-        "{p} carries no usable `eos_token_id`. The file exists, so REQUIRED_AUX is satisfied and \
-         the artifact would ship — with NO stop token, which makes every decode run to its token \
-         limit (glimmer-architecture.md §9 trap 13). Glimmer's is `[200001, 200008]`",
+        "{dir}/{GEN} carries no usable `eos_token_id`. The file exists, so REQUIRED_AUX is \
+         satisfied and the artifact would ship — with NO stop token, which makes every decode run \
+         to its token limit (glimmer-architecture.md §9 trap 13). Glimmer's is `[200001, 200008]`",
     );
     Ok(ids)
 }
@@ -137,12 +138,31 @@ fn main() -> Result<()> {
             args.src_dir
         );
     }
-    eos_ids(&args.src_dir)?;
     // Parsed, and therefore validated, before a single tensor is read: `GlimmerConfig` is
     // where the layer/RoPE pairing invariant and the width checks live, and a checkpoint that
     // fails them must not produce a half-written artifact.
     let cfg: GlimmerConfig = load_config(&args.src_dir)?;
     let g = &cfg.text;
+    // AFTER `load_config` so `g.vocab` is available, and still before any tensor is read — nothing
+    // between the two touches the checkpoint. The bound is what separates "at least one number
+    // parses" from "at least one token this model can emit": an id past the vocabulary is a stop
+    // token no argmax can ever return, which is the same unstoppable decode one layer down
+    // (review, 2026-08-13).
+    //
+    // PRINTED, not just checked. The ids decide whether a decode can terminate at all, they live
+    // in an aux file rather than in the manifest, and the operator running this has the checkpoint
+    // in front of them — so the one line that lets them notice a wrong set is worth more here than
+    // after a decode has run to its token limit.
+    let ids = eos_ids(&args.src_dir)?;
+    for &id in &ids {
+        ensure!(
+            (id as usize) < g.vocab,
+            "eos_token_id {id} is past this model's vocabulary of {} — no argmax can return it, \
+             so it is a stop token that never fires",
+            g.vocab
+        );
+    }
+    eprintln!("convert_glimmer: eos_token_id {ids:?}");
     std::fs::create_dir_all(&args.out_dir)?;
 
     // ONE predicate driving both which shards are opened and what is written — the pairing
@@ -241,6 +261,24 @@ fn main() -> Result<()> {
         &manifest,
         &AUX,
     )?;
+    // **AGAIN, against the ARTIFACT — the source-side check above does not establish this.**
+    // `finish_artifact` downgrades every aux-copy failure to `eprintln!("WARNING: {name} not
+    // copied")` and returns `Ok(())`, which is the defect [`REQUIRED_AUX`]'s own note was written
+    // for. So a checkpoint that passes the check at the top can still produce an artifact with no
+    // `generation_config.json` at all — the exact zero-stop-token state this file argues against —
+    // whenever the copy fails: the filesystem fills between the 53 GB write and the aux copy, the
+    // mount goes read-only, or the source file is removed during a three-hour run. The check at the
+    // top narrows the window; this one closes it, and it is the invariant the engine actually
+    // depends on, because the engine reads the ARTIFACT's copy and never the source's.
+    //
+    // Found by review 2026-08-13, against a version whose test already asserted the artifact-side
+    // property while the shipped binary only asserted the source-side one.
+    let placed = eos_ids(&args.out_dir)?;
+    ensure!(
+        placed == ids,
+        "the artifact's eos_token_id is {placed:?} but the checkpoint's is {ids:?} — the aux copy \
+         did not reproduce the file the engine will read"
+    );
     Ok(())
 }
 

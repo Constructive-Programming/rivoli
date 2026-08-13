@@ -14,6 +14,36 @@ pub struct Tokenizer {
     pub eos: Vec<u32>,
 }
 
+/// The snapshot's stop tokens, as the engine reads them: `generation_config.json`'s
+/// `eos_token_id`, either an array of ints or a bare one.
+///
+/// **`pub` and free rather than private to [`Tokenizer`], because a second caller needs to read
+/// this file the SAME way.** `bin/convert_glimmer` refuses a checkpoint whose ids are unusable —
+/// Muse Glimmer carries two (`[200001, 200008]`) and an artifact with none cannot terminate a
+/// decode at all. That converter had its own copy of this parse for one commit, with a comment
+/// asserting the two "match"; a claim a shared function makes structural instead (review,
+/// 2026-08-13). A gate that reads the file differently from the engine certifies a file the engine
+/// then rejects, or passes one it cannot use.
+///
+/// **A MISSING key is `Ok(vec![])`, not an error.** It is the same outcome as an empty array — no
+/// stop tokens — and both callers act on the outcome rather than on how it was spelled. Only an
+/// unreadable or non-JSON file is an `Err`, and each says which. (It was `Err` until 2026-08-13,
+/// which made `Tokenizer::load` report a missing key as "could not read eos ids" and would have
+/// given the converter two messages for one condition.)
+pub fn eos_token_ids(dir: &str) -> Result<Vec<u32>> {
+    let p = format!("{dir}/generation_config.json");
+    let text = std::fs::read_to_string(&p).with_context(|| format!("read {p}"))?;
+    let v: Value = serde_json::from_str(&text).with_context(|| format!("{p} is not JSON"))?;
+    Ok(match v.get("eos_token_id") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_u64().map(|n| n as u32))
+            .collect(),
+        Some(other) => other.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
+        None => Vec::new(),
+    })
+}
+
 /// Thinking control for [`Tokenizer::encode_chat_turns`], named after the parameters of the
 /// same names in the checkpoint's `chat_template.jinja`.
 ///
@@ -150,7 +180,7 @@ impl Tokenizer {
             tokenizers::Tokenizer::from_file(&path).map_err(|e| anyhow!("load {path}: {e}"))?;
         // An empty eos means decode can never stop on an end token (runaway
         // generation) — surface a broken generation_config loudly, don't swallow.
-        let eos = match Self::load_eos(snapshot_dir) {
+        let eos = match eos_token_ids(snapshot_dir) {
             Ok(e) if !e.is_empty() => e,
             Ok(_) => {
                 warn!("generation_config has no eos_token_id — decode won't stop on EOS");
@@ -162,21 +192,6 @@ impl Tokenizer {
             }
         };
         Ok(Self { inner, eos })
-    }
-
-    fn load_eos(dir: &str) -> Result<Vec<u32>> {
-        let text = std::fs::read_to_string(format!("{dir}/generation_config.json"))?;
-        let v: serde_json::Value = serde_json::from_str(&text)?;
-        let e = v.get("eos_token_id").context("no eos_token_id")?;
-        // Either a single int or an array of ints.
-        let ids = match e {
-            serde_json::Value::Array(a) => a
-                .iter()
-                .filter_map(|x| x.as_u64().map(|n| n as u32))
-                .collect(),
-            other => other.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
-        };
-        Ok(ids)
     }
 
     /// GLM turn framing: `[gMASK] <sop> <|user|> \n {text} <|assistant|> \n`.

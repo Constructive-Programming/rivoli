@@ -23,7 +23,7 @@
 mod common;
 use common::{
     GLIMMER_FIXTURE_DIM as DIM, GLIMMER_FIXTURE_LAYERS as L, TempRoot, glimmer_convert_fixture,
-    glimmer_fixture, run_convert_glimmer, write_index,
+    glimmer_fixture, glimmer_fixture_eos, run_convert_glimmer, write_glimmer_eos, write_index,
 };
 // Module alias rather than a second flat `use` list: the converter imports the same names
 // from the same two modules, and jscpd (which normalizes identifiers) reports the matching
@@ -31,12 +31,8 @@ use common::{
 use rivoli::artifact::format::{Dtype, FormatMeta, Safetensors};
 use rivoli::artifact::model as gm;
 
-/// The one file that carries Muse Glimmer's stop tokens, and the real checkpoint's contents.
-///
-/// Spelled once because three tests write it and the whole point of the gate below is that the
-/// bytes matter — a second copy is a second chance to write the minimum a check accepts.
+/// The one file that carries Muse Glimmer's stop tokens. Spelled once because two tests name it.
 const GEN: &str = "generation_config.json";
-const EOS_PAIR: &[u8] = br#"{"eos_token_id": [200001, 200008]}"#;
 
 #[test]
 fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
@@ -114,10 +110,10 @@ fn convert_glimmer_refuses_before_it_writes() {
         !o.status.success() && err.contains("generation_config.json is missing"),
         "{err}"
     );
-    // Restored with REAL ids, not `{}`. `{}` is a file that exists and says nothing, which
+    // Restored with USABLE ids, not `{}`. `{}` is a file that exists and says nothing, which
     // `eos_ids` now refuses on its own — restoring it that way would mask every assertion below
     // behind the EOS refusal and this test would still be green.
-    std::fs::write(src.join(GEN), EOS_PAIR).unwrap();
+    write_glimmer_eos(&src, &glimmer_fixture_eos(DIM));
 
     // A checkpoint missing one per-layer tensor refuses by NAME, before the write.
     let dropped = format!("{}.2.mlp.up_proj.weight", gm::GLIMMER_LAYER_PREFIX);
@@ -156,23 +152,33 @@ fn both_eos_ids_reach_the_artifact_and_an_empty_generation_config_is_refused() {
     let (src, out) = (root.join("src"), root.join("out"));
     glimmer_fixture(&src, DIM);
 
-    // The fixture writes the real pair; assert the ARTIFACT's copy parses back to both, rather
-    // than that the converter exited 0. The file is the engine's only source for these.
+    // **A DISTINCT pair, written here rather than taken from the fixture's default**, so the
+    // assertion proves the artifact TRACKED the source. Against the fixture's own ids it would be
+    // satisfied by a converter that emitted that constant from anywhere.
+    //
+    // Compared as BYTES, not as a parsed id list: the copy is `std::fs::copy`, so byte equality is
+    // the property, and a parse-and-compare would pass a reordering or an added key. It is also
+    // the third parser of this field in the tree if written out (review, 2026-08-13).
+    let ids = [(DIM + 4 - 3) as u32, (DIM + 4 - 1) as u32];
+    write_glimmer_eos(&src, &ids);
+    let want = std::fs::read(src.join(GEN)).unwrap();
     let o = run_convert_glimmer(&src, &out);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let copied = std::fs::read_to_string(out.join(GEN)).expect("generation_config in the artifact");
-    let v: serde_json::Value = serde_json::from_str(&copied).unwrap();
-    let ids: Vec<u64> = v["eos_token_id"]
-        .as_array()
-        .expect("eos_token_id is an array")
-        .iter()
-        .filter_map(|x| x.as_u64())
-        .collect();
     assert_eq!(
-        ids,
-        vec![200001, 200008],
+        std::fs::read(out.join(GEN)).expect("generation_config in the artifact"),
+        want,
         "the artifact's stop tokens are not the checkpoint's — a decode built on this stops on \
          the wrong set, or on nothing"
+    );
+
+    // An id past the vocabulary is refused: it is a stop token no argmax can return, which is the
+    // same unstoppable decode as having none. This is why the fixture's ids scale with its width.
+    write_glimmer_eos(&src, &[(DIM + 4) as u32]);
+    let o = run_convert_glimmer(&src, &root.join("out-vocab"));
+    let err = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(
+        !o.status.success() && err.contains("past this model's vocabulary"),
+        "{err}"
     );
 
     // Red proof, and the case that was live: a file that satisfies the presence check and carries
@@ -182,21 +188,25 @@ fn both_eos_ids_reach_the_artifact_and_an_empty_generation_config_is_refused() {
         (br#"{"eos_token_id": []}"#, "an empty array"),
         (br#"{"eos_token_id": null}"#, "a null"),
     ] {
+        let dst = root.join("out-red");
         std::fs::write(src.join(GEN), bytes).unwrap();
-        let o = run_convert_glimmer(&src, &root.join("out-red"));
+        let o = run_convert_glimmer(&src, &dst);
         let err = String::from_utf8_lossy(&o.stderr).to_string();
         assert!(
             !o.status.success() && err.contains("no usable `eos_token_id`"),
             "{what} was accepted, so the artifact ships with no stop token: {err}"
         );
+        // Refused BEFORE any tensor is read, and before `create_dir_all` — the whole argument for
+        // checking here rather than at load is that a three-hour convert must not end in this.
+        // The DIRECTORY, not the artifact inside it: the converter creates it at the point the
+        // check has already passed, so its absence is the stronger statement and it catches the
+        // check being moved one line later. Inside the loop so all three arms are covered rather
+        // than only the last (review, 2026-08-13).
+        assert!(
+            !dst.exists(),
+            "{what}: the converter got past the EOS check"
+        );
     }
-
-    // And it refuses BEFORE any tensor is read — the whole argument for checking here rather than
-    // at load is that a three-hour convert must not end in this.
-    assert!(
-        !root.join("out-red").join("resident.safetensors").exists(),
-        "the artifact must not exist after a refusal"
-    );
 }
 
 /// **The fixture's own value generator, which nothing else checks and which had three defects.**

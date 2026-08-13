@@ -986,6 +986,34 @@ pub fn write_index(dir: &std::path::Path, tensors: &[FixtureTensor]) {
 /// `dim` sets `hidden_size`; the rest derive from it exactly as the shipped config's do, so
 /// `head_dim * num_attention_heads != hidden_size` holds here too. That inequality is the
 /// model's trap 15 and a fixture that lost it would let a derived-head-dim port pass.
+/// The fixture checkpoint's stop tokens, **scaled with its vocabulary the way every other
+/// dimension is.**
+///
+/// The two top ids of a `dim + 4` vocabulary. The real checkpoint carries `[200001, 200008]` and
+/// this fixture briefly did too (2026-08-13) — against a `vocab_size` of **12**, because the fix
+/// shrank one half of the pair with the model and copied the other verbatim. That is not a
+/// harmless inconsistency: `convert_glimmer` now refuses an id past the vocabulary, on the ground
+/// that a stop token no argmax can return is the same unstoppable decode one layer down, and a
+/// fixture carrying 200008 would have gone red and made "weaken the check" the cheap repair —
+/// exactly the retreat this fixture's own note warns about (review, 2026-08-13).
+///
+/// A function of `dim` rather than a constant because `glimmer_fixture` is parametric: the fence
+/// gate builds it at 256.
+pub fn glimmer_fixture_eos(dim: usize) -> [u32; 2] {
+    let vocab = dim + 4;
+    [(vocab - 2) as u32, (vocab - 1) as u32]
+}
+
+/// Write a `generation_config.json` carrying exactly `ids`.
+///
+/// Shared so the fixture and the tests that restore it after a refusal cannot drift into writing
+/// different files — the whole subject of the gate is that these bytes decide whether a decode
+/// can terminate.
+pub fn write_glimmer_eos(dir: &std::path::Path, ids: &[u32]) {
+    let v = serde_json::json!({ "eos_token_id": ids });
+    std::fs::write(dir.join("generation_config.json"), v.to_string()).unwrap();
+}
+
 pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> {
     use rivoli::artifact::model as gm;
     std::fs::create_dir_all(dir).unwrap();
@@ -1059,17 +1087,12 @@ pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> 
     // > **AND IT STILL DID, until 2026-08-13.** The fix wrote all four as `{}`, which satisfies a
     // > PRESENCE check and carries no `eos_token_id` — so the fixture certified an artifact with
     // > zero stop tokens, one step worse than the scalar it was fixing. `convert_glimmer::eos_ids`
-    // > now reads the content, and the two ids below are why this fixture passes it. **A fixture
-    // > that writes the minimum a gate accepts is a fixture that stops testing the gate**; these
-    // > are the real checkpoint's ids, so a future content check has something true to check.
+    // > now reads the content. **A fixture that writes the minimum a gate accepts is a fixture
+    // > that stops testing the gate.**
     for aux in ["tokenizer.json", "tokenizer_config.json"] {
         std::fs::write(dir.join(aux), b"{}").unwrap();
     }
-    std::fs::write(
-        dir.join("generation_config.json"),
-        br#"{"eos_token_id": [200001, 200008]}"#,
-    )
-    .unwrap();
+    write_glimmer_eos(dir, &glimmer_fixture_eos(dim));
     std::fs::write(dir.join("chat_template.jinja"), b"{{ x }}").unwrap();
     tensors
 }
