@@ -12,6 +12,11 @@ pub mod config;
 /// Jinja template — the checkpoint ships no `chat_template.jinja` on purpose.
 pub mod dsv4_encoding;
 pub mod format;
+/// Muse Glimmer's prompt encoding, beside [`dsv4_encoding`] and for the same reason: it
+/// produces the STRING and [`tokenizer`] turns it into ids. Unlike DeepSeek's this one IS a
+/// port of a `chat_template.jinja`, and it is pinned byte-for-byte against that file's own
+/// renderer rather than against a reading of it.
+pub mod glimmer_encoding;
 pub mod model;
 pub mod quant;
 pub mod tokenizer;
