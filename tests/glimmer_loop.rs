@@ -32,7 +32,7 @@ mod common;
 use common::{GLIMMER_FIXTURE_DIM as DIM, TempRoot, glimmer_convert_fixture};
 use rivoli::artifact::model as gm;
 use rivoli::artifact::model::LayerKind;
-use rivoli::glimmer_gpu::{Glimmer, Window, qk_scales, window_of};
+use rivoli::glimmer_gpu::{Glimmer, Window, qk_scales, runtime_bytes, window_of};
 
 /// Muse Glimmer's shipped window, and a context comfortably past it so the ring wraps.
 const WIN: usize = 2048;
@@ -293,4 +293,103 @@ fn a_stop_token_ends_the_run_without_appearing_in_it() {
     // above a statement about EOS and not about a loop that emits nothing.
     let mut e2 = engine(&root, gt, prompt.len() + 8).unwrap();
     assert_eq!(e2.decode(&prompt, 8, &[]).unwrap().len(), 8);
+}
+
+/// **The KV cache and the activations are charged to the budget, and at the shipped widths they
+/// are GIGABYTES.**
+///
+/// Deviceless: `runtime_bytes` is arithmetic over the config. It exists because `GlimmerPin::build`
+/// sizes a `DeviceTier` from the budget and clears `guard_capacity`'s `capacity + 4 GiB HEADROOM
+/// <= free`, after which every allocation the loop makes was an unguarded `hipMalloc` on top —
+/// against a reserve that exists for driver scratch.
+///
+/// The numbers are asserted as bounds rather than exactly: what must not drift is the ORDER, and
+/// an exact figure here would be a second copy of the formula.
+#[test]
+fn the_kv_cache_is_charged_to_the_budget_and_it_is_gigabytes() {
+    let cfg: serde_json::Value = serde_json::from_str(common::GLIMMER_SHIPPED_CONFIG).unwrap();
+    let gt: rivoli::artifact::model::GlimmerTextConfig =
+        serde_json::from_value(cfg["text_config"].clone()).expect("the shipped text config");
+
+    // Twelve tokens: the KV cache is a rounding error and the activations dominate.
+    let small = runtime_bytes(&gt, 12).unwrap();
+    assert!(
+        (1..64 << 20).contains(&small),
+        "at 12 positions the footprint should be megabytes, got {small}"
+    );
+
+    // The trained maximum. **This is the number that makes the item real**: a full-attention
+    // layer's cache is LINEAR in the context, and 13 of the 52 layers are full.
+    let ceiling = runtime_bytes(&gt, gt.max_position_embeddings).unwrap();
+    assert!(
+        (3 << 30..5 << 30).contains(&ceiling),
+        "at {} positions the footprint should be 3-5 GiB, got {:.3} GB — this is what used to be \
+         allocated on top of a budget that had already passed its headroom check",
+        gt.max_position_embeddings,
+        ceiling as f64 / 1e9
+    );
+
+    // Growth is linear in the context on the full layers and CAPPED on the sliding ones, which is
+    // the whole shape of the cost. Doubling the context past the window must not double the total.
+    let a = runtime_bytes(&gt, 8192).unwrap();
+    let b = runtime_bytes(&gt, 16384).unwrap();
+    assert!(
+        b < 2 * a,
+        "the sliding layers' rings are capped at `sliding_window`, so doubling the context cannot \
+         double the footprint: {a} -> {b}"
+    );
+    // And it is monotone, which a `min` written the wrong way round would break.
+    assert!(a > runtime_bytes(&gt, 4096).unwrap());
+
+    // **The footprint CHANGES THE PARTITION, which is the decision it exists to affect.** At a
+    // budget that holds every layer with nothing to spare, charging the KV cache first must push
+    // the split off all-resident — otherwise the subtraction is arithmetic nobody acts on.
+    // The threshold is SEARCHED, not assumed to be `resident_bytes`: `partition` charges the
+    // streaming slots and `GLIMMER_PIN_SLACK` on top, so the smallest all-resident budget is
+    // strictly larger than the weights (measured: `partition(resident_bytes)` pins 50 of 52).
+    let mut all_in = gt.resident_bytes().unwrap();
+    while gt.partition(Some(all_in)).unwrap().0 < gt.n_layers {
+        all_in += 1 << 30;
+    }
+    let over = runtime_bytes(&gt, gt.max_position_embeddings).unwrap();
+    assert!(
+        gt.partition(Some(all_in - over)).unwrap().0 < gt.n_layers,
+        "charging {:.3} GB of KV cache and activations must move the split off all-resident — \
+         otherwise the subtraction is arithmetic nobody acts on",
+        over as f64 / 1e9
+    );
+}
+
+/// **A budget smaller than the runtime footprint is refused, naming both numbers.**
+///
+/// Before this the pin would be built from the full budget and the KV cache allocated after it,
+/// so the failure was a `hipMalloc` error with no numbers attached — after a tier of tens of GB
+/// had already been placed.
+///
+/// **What is NOT gated here, stated because a red proof said so:** removing the subtraction
+/// (`budget.map(|b| b - overhead)` → `budget`) leaves every test in this file green. Its effect is
+/// only observable when the device is genuinely near-full, which a test cannot force. The
+/// arithmetic that decides the split IS gated, one test up, at the `partition` boundary; this one
+/// gates the refusal. Between them the subtraction is covered by its two consequences and not
+/// directly.
+#[test]
+fn a_budget_that_cannot_hold_the_kv_cache_is_refused() {
+    let (root, cfg) = fixture("glimmer-budget");
+    let gt = &cfg.text;
+    let need = runtime_bytes(gt, 4096).unwrap();
+    let r = Glimmer::new(root.join("out").to_str().unwrap(), gt, Some(need / 2), 4096);
+    let m = match r {
+        Ok(_) => panic!("a budget under the runtime footprint must be refused"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        m.contains("KV cache") && m.contains("--max-mem"),
+        "the refusal must name what it could not fit and what to change: {m}"
+    );
+    // The same context at a budget that DOES cover it is accepted — so the refusal is about the
+    // number and not about the context being large.
+    assert!(
+        Glimmer::new(root.join("out").to_str().unwrap(), gt, Some(need * 8), 4096).is_ok(),
+        "a budget above the footprint is fine"
+    );
 }

@@ -58,7 +58,7 @@ use crate::backend::hip::{
 };
 use crate::memory::device::DeviceBuf;
 use crate::memory::pin::{Bf16Weight, GlimmerLayerPin, GlimmerPin};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 /// f32 scratch of `n` elements.
 fn scratch(n: usize) -> Result<DeviceBuf> {
@@ -251,6 +251,52 @@ pub fn qk_scales(qk_scale_factor: f32) -> QkScale {
     }
 }
 
+/// How many KV slots layer kind `k` gets at `n_ctx`.
+///
+/// **Derived from [`window_of`], and read by BOTH the allocation and the budget accounting.** The
+/// two must agree exactly: a cache sized from one expression and indexed by another is a device
+/// write past the end, and a budget that charges for a different number of slots than were
+/// allocated is a report the operator cannot act on. jscpd reported the second copy the moment it
+/// was written, which is the gate arriving at the same conclusion.
+fn slots_of(k: LayerKind, win: usize, n_ctx: usize) -> usize {
+    match window_of(k, win, n_ctx, 0).ring_cap {
+        0 => n_ctx,
+        cap => cap,
+    }
+}
+
+/// The device bytes a decode needs BESIDE its weights: the KV cache at `n_ctx`, plus the
+/// activation scratch.
+///
+/// **It has to be subtracted from the budget before the pin is built, and it was not.**
+/// `GlimmerPin::build` sizes a `DeviceTier` from the budget and clears `guard_capacity`'s
+/// `capacity + 4 GiB HEADROOM <= free`; every allocation below was then an unguarded `hipMalloc`
+/// on top. At the 131072-position ceiling the KV cache alone is ~3.4 GiB — 85% of the reserve that
+/// exists for driver scratch — and the `residency:` line the operator reads counted none of it.
+/// `GlimmerTextConfig::floor_bytes`' own doc had named the gap ("KV at the configured context,
+/// activation scratch and the DFlash drafter are not here"); it was inert until S3 allocated a KV
+/// cache for the first time (review, 2026-08-13).
+///
+/// `pub` because `run_glimmer` reports the partition, and a reported split that used a different
+/// budget from the built one is the disagreement this repo has already been bitten by.
+pub fn runtime_bytes(gt: &GlimmerTextConfig, n_ctx: usize) -> Result<usize> {
+    ensure!(n_ctx > 0, "n_ctx must be positive");
+    let kvd = gt.num_key_value_heads * gt.head_dim;
+    // Sized BY `window_of`, exactly as the allocation is — the two must not be able to disagree
+    // about how many slots a layer gets.
+    let mut kv = 0usize;
+    for &k in &gt.layer_types {
+        // Keys AND values.
+        kv += 2 * slots_of(k, gt.sliding_window, n_ctx) * kvd;
+    }
+    let qd = gt.n_heads * gt.head_dim;
+    // `x`, `xn`, `br`; `q`, `attn`, `gate`; `mg`, `mu`, `mh`; `logits`; `pick` (2 words).
+    let act = 3 * gt.hidden + 3 * qd + 3 * gt.inter + gt.vocab + 2;
+    (kv + act)
+        .checked_mul(4)
+        .context("the runtime footprint overflows a usize")
+}
+
 /// The Muse Glimmer decode path: weights, activations, KV cache, and the loop over them.
 pub struct Glimmer {
     pin: GlimmerPin,
@@ -351,7 +397,21 @@ impl Glimmer {
             "n_ctx {n_ctx} is past this model's {} trained positions",
             gt.max_position_embeddings
         );
-        let pin = GlimmerPin::build(dir, gt, budget)?;
+        // **The pin gets what is left after the KV cache and the activations**, not the whole
+        // budget — see [`runtime_bytes`]. Subtracted BEFORE the tier is sized, because the tier is
+        // what `guard_capacity` checks against free memory and everything below it is unguarded.
+        let overhead = runtime_bytes(gt, n_ctx)?;
+        if let Some(b) = budget {
+            ensure!(
+                b > overhead,
+                "the KV cache and activations for {n_ctx} positions need {:.3} GB, which is the \
+                 whole {:.3} GB budget — there is nothing left to pin weights into. Lower the \
+                 context or raise --max-mem",
+                overhead as f64 / 1e9,
+                b as f64 / 1e9
+            );
+        }
+        let pin = GlimmerPin::build(dir, gt, budget.map(|b| b - overhead))?;
         let (hq, hkv, hd) = (gt.n_heads, gt.num_key_value_heads, gt.head_dim);
         let qd = hq * hd;
         let kvd = hkv * hd;
@@ -362,10 +422,7 @@ impl Glimmer {
         let mut kc = Vec::with_capacity(gt.n_layers);
         let mut vc = Vec::with_capacity(gt.n_layers);
         for &k in &gt.layer_types {
-            let slots = match window_of(k, gt.sliding_window, n_ctx, 0).ring_cap {
-                0 => n_ctx,
-                cap => cap,
-            };
+            let slots = slots_of(k, gt.sliding_window, n_ctx);
             kc.push(scratch(slots * kvd)?);
             vc.push(scratch(slots * kvd)?);
         }

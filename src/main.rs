@@ -1092,22 +1092,6 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     // > while its own header claimed to be deviceless. An architectural refusal must not be
     // > preempted by a transient measurement.
     let budget = device_budget(cfg.max_mem)?;
-    let (n_pinned, _) = gt.partition(Some(budget))?;
-    let layer_gb = gt.layer_bytes()? as f64 / 1e9;
-    info!(
-        "residency: {n_pinned} of {} layers pinned ({:.3} GB), {} streaming through {} slots \
-         ({:.3} GB/layer); floor for this artifact is {:.3} GB of weights",
-        gt.n_layers,
-        n_pinned as f64 * layer_gb + gt.global_bytes() as f64 / 1e9,
-        gt.n_layers - n_pinned,
-        if n_pinned == gt.n_layers {
-            0
-        } else {
-            rivoli::artifact::model::GLIMMER_STREAM_SLOTS
-        },
-        layer_gb,
-        gt.floor_bytes()? as f64 / 1e9,
-    );
 
     // **The prompt is encoded plainly, not through a chat template.** The artifact does not ship
     // one — `chat_template.jinja` lives only in the fp8 SOURCE — and hand-porting it is S4's item,
@@ -1144,6 +1128,34 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
         .len()
         .checked_add(max_new)
         .context("prompt length plus --bench overflows a usize")?;
+
+    // **The partition is reported here and not before the tokenizer, because until `n_ctx` exists
+    // there is no honest number to report.** The KV cache and the activation scratch are device
+    // bytes the pin does not get, and they are a function of the context; reporting a split that
+    // ignored them was the defect (`glimmer_gpu::runtime_bytes`). The report still comes after
+    // every refusal, which is the ordering an earlier review established and the reason is
+    // unchanged: whether a flag applies is a fact about argv and the manifest, and must not be
+    // preempted by a measurement of the machine.
+    let overhead = rivoli::glimmer_gpu::runtime_bytes(gt, n_ctx)?;
+    let (n_pinned, _) = gt.partition(Some(budget.saturating_sub(overhead)))?;
+    let layer_gb = gt.layer_bytes()? as f64 / 1e9;
+    info!(
+        "residency: {n_pinned} of {} layers pinned ({:.3} GB), {} streaming through {} slots \
+         ({:.3} GB/layer); KV cache and activations at {n_ctx} positions take {:.3} GB off the \
+         budget first; floor for this artifact is {:.3} GB of weights",
+        gt.n_layers,
+        n_pinned as f64 * layer_gb + gt.global_bytes() as f64 / 1e9,
+        gt.n_layers - n_pinned,
+        if n_pinned == gt.n_layers {
+            0
+        } else {
+            rivoli::artifact::model::GLIMMER_STREAM_SLOTS
+        },
+        layer_gb,
+        overhead as f64 / 1e9,
+        gt.floor_bytes()? as f64 / 1e9,
+    );
+
     let mut engine = rivoli::glimmer_gpu::Glimmer::new(&cfg.model, gt, Some(budget), n_ctx)?;
     let t0 = std::time::Instant::now();
     let out = engine.decode(&ids, max_new, &tok.eos)?;

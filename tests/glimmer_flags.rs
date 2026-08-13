@@ -82,14 +82,20 @@ fn max_mem_is_accepted_and_reports_the_partition() {
         !err.contains("--max-mem does not apply"),
         "--max-mem must be accepted for a Glimmer artifact since R1, got:\n{err}"
     );
-    // **The marker is the partition line, not a bail.** It was `"do not decode yet"` until S3's
-    // layer loop deleted that bail (2026-08-13) and this test went red — correctly: it was keyed
-    // on a sentence rather than on its subject. What the flag being ACCEPTED means is that the run
-    // proceeds far enough to report the split the budget implies, and that survives the loop
-    // landing, the fixture gaining a tokenizer, and the run going on to decode.
+    // **The marker is the budget line, which carries the flag's own VALUE.** It has now been
+    // re-keyed twice and the reason both times was the same: it named a downstream sentence rather
+    // than its subject. It was `"do not decode yet"` until S3's layer loop deleted that bail; then
+    // `"residency:"`, until that report moved BELOW the tokenizer — it has to, because the KV cache
+    // is charged to the budget and its size is a function of the prompt, so before the prompt
+    // exists there is no honest split to print. This fixture has no usable tokenizer, so the run
+    // no longer reaches it.
+    //
+    // `device_budget` emits this line, it names the GiB the flag asked for, and it is the closest
+    // thing to "the value reached the thing that consumes it" — which is what accepting a flag
+    // means. It survives the decode path growing further, which the previous two markers did not.
     assert!(
-        err.contains("residency:") && err.contains("layers pinned"),
-        "with --max-mem accepted the run must proceed and report the partition, got:\n{err}"
+        err.contains("8.0 GiB") && err.contains("--max-mem"),
+        "with --max-mem accepted, its VALUE must reach the budget, got:\n{err}"
     );
 }
 
