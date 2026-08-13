@@ -261,6 +261,33 @@ pub fn u32v(b: &[u8]) -> Vec<u32> {
 /// supersedes carry the guard. The copy promoted here (from `tests/kernel.rs`) was the one
 /// that did NOT, which would have made the shared helper strictly weaker than the copies it
 /// replaces. Reachable through `zeros(0)` or an empty fixture, not by anything today.
+/// Build a Glimmer engine over the artifact at `dir`, run `prompt` through it, and hand it back
+/// with one token decoded.
+///
+/// **Three callers wrote this by hand and jscpd reported the third** — and it is the right thing to
+/// share for a reason beyond the tokens: `n_ctx` must be at least `prompt.len() + 1` or `decode`
+/// refuses, and three copies of that arithmetic is three places for it to drift into a message
+/// about the KV cache when the caller only wanted one forward.
+///
+/// Returns the engine rather than the token because every caller wants a readback afterwards —
+/// `logits()` or `branch()`.
+#[cfg(feature = "rocm")]
+pub fn decode_one(
+    dir: &std::path::Path,
+    gt: &rivoli::artifact::model::GlimmerTextConfig,
+    prompt: &[u32],
+) -> rivoli::glimmer_gpu::Glimmer {
+    let mut e = rivoli::glimmer_gpu::Glimmer::new(
+        dir.to_str().expect("the artifact path is utf-8"),
+        gt,
+        None,
+        prompt.len() + 1,
+    )
+    .expect("build the engine");
+    e.decode(prompt, 1, &[]).expect("one forward");
+    e
+}
+
 #[cfg(feature = "rocm")]
 pub fn dev(b: &[u8]) -> rivoli::memory::device::DeviceBuf {
     let mut d = rivoli::memory::device::DeviceBuf::new(b.len().max(1)).expect("alloc");

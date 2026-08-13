@@ -97,6 +97,15 @@ use rivoli::glimmer_gpu::Glimmer;
 /// `glimmer_chain.rs`, which has no weight term and runs at 2e-5.
 const TOL: f32 = 2e-1;
 
+/// The same envelope one layer up, where the branch is scored rather than the logits — MEASURED
+/// per layer, exactly as [`TOL`] was, and for the same reason: the first value here was a guess
+/// (2e-2, "tighter, because it is one layer's error") and layer 3 went red on a correct engine.
+///
+/// The bf16 floor on this tensor GROWS with depth, because the branch is computed from a residual
+/// stream that has already accumulated it: **4.7e-3 at L0 to 3.0e-2 at L6**, over both salts.
+/// 1e-1 is ~3.3x the worst.
+const TOL_BRANCH: f32 = 1e-1;
+
 /// The engine's loop, over the reference's parameters, compared to the reference's logits.
 ///
 /// **Both salts**, because that is this anchor's discipline everywhere else: a defect that reddens
@@ -320,4 +329,80 @@ fn effective_prompt(g: &fixture::Golden, w: &rivoli::golden::GoldenSet) -> Vec<u
         g.name
     );
     out
+}
+
+/// **Every layer's branch against the reference's own capture — 16 cells, and NOT the eps gate it
+/// was built to be.**
+///
+/// The plan predicted this tensor would close the eps assignment: a post-norm consumes a branch at
+/// `mean(x²)~1e-3`, where 1e-5 against 1e-8 is not negligible, and `glimmer_norm.rs` separates them
+/// 41.8-56.6x there. Reading the right tensor was indeed the missing half. **The other half is
+/// that this comparison cannot carry it**, measured 2026-08-13 across both salts and all eight
+/// layers:
+///
+/// | | range |
+/// |---|---|
+/// | the eps transposition's own size, f64 exact weights | 1.6e-3 – 1.3e-2 |
+/// | this comparison's bf16 weight floor | 4.7e-3 – 3.0e-2 |
+///
+/// **The signal is 0.2x to 0.6x the floor at every single cell.** The obstacle is not the
+/// tolerance and never was — it is that rivoli stores bf16 and the reference computed f32, and the
+/// rounding lands on the same tensor at the same magnitude. `tests/glimmer_chain.rs` is where the
+/// eps gate went, because its two sides share the artifact's bf16 weights exactly and its floor is
+/// reduction noise.
+///
+/// What this test IS: per-layer, per-salt scoring of the engine against Muse Glimmer's own
+/// intermediates, which is 16 comparison points where the logit test has 14 and every one of them
+/// upstream of the residual add that washes defects out.
+///
+/// **Truncating the model is what selects a layer.** The engine keeps one branch buffer and every
+/// layer overwrites it, so a run whose config ends at layer `l` leaves `l`'s post-FFN branch in it.
+/// Layers 0..l compute identically either way — the truncation removes work after the read, not
+/// before it — and the pin simply builds fewer layers from the same artifact.
+#[test]
+fn every_layers_branch_matches_the_reference() {
+    let mut cells = 0;
+    let mut worst = (0.0f32, 0usize, "");
+    for (g, w) in goldens().iter().zip(weight_sets()) {
+        let root = TempRoot::new(&format!("glimmer-branch-{}", g.name));
+        let cfg = write_checkpoint(&root, g, &w.1);
+        let prompt = effective_prompt(g, &w.1);
+        let hid = g.n("hidden_size");
+        for l in 0..g.n("num_hidden_layers") {
+            let mut gt = cfg.text.clone();
+            gt.n_layers = l + 1;
+            gt.layer_types.truncate(l + 1);
+            gt.layer_rope_theta.truncate(l + 1);
+            let got = fixture::decode_one(&root.join("out"), &gt, &prompt)
+                .branch()
+                .unwrap();
+            // The capture is `[1, rows, hidden]` over the whole prompt; the engine decodes
+            // token-major, so its buffer holds the LAST row.
+            let (shape, want) = float(&g.g, &format!("t0.L{l}.post_feedforward_layernorm.out"));
+            assert_eq!(shape, &[1, prompt.len(), hid], "capture shape at L{l}");
+            let last = &want[(prompt.len() - 1) * hid..];
+            assert!(
+                last.iter().any(|v| *v != 0.0),
+                "{}: L{l}'s captured branch is all zero, so the score below is against nothing",
+                g.name
+            );
+            let d = worst_rel(&got, last);
+            assert!(
+                d < TOL_BRANCH,
+                "{}: layer {l}'s post-FFN branch disagrees with the reference by {d:.3e}. This \
+                 tensor is where the two epsilons are 41.8-56.6x apart, so a transposition lands \
+                 HERE and nowhere downstream",
+                g.name
+            );
+            if d > worst.0 {
+                worst = (d, l, g.name);
+            }
+            cells += 1;
+        }
+    }
+    println!(
+        "  {cells} layer branches scored, worst {:.3e} at L{} of {}",
+        worst.0, worst.1, worst.2
+    );
+    assert_eq!(cells, 16, "both salts must contribute all eight layers");
 }

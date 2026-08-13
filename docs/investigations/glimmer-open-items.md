@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- ten open items in four classes, one closed the day this file was written. (1) UNGATED CORRECTNESS, one item and it is the sharpest: swapping eps_post and eps_pre at pre_norm/branch_add reddens NOTHING in the tree, and it was filed as covered by a citation that resolves to a file with no eps census. (2) FIXTURE-GEOMETRY BLIND SPOTS, two: the toy checkpoint sets head_dim = hidden, so attn_scale sourced from the wrong one is a no-op, and it has ONE kv head, so trap 10's block-vs-interleave broadcast is unconstructible -- both close by widening a fixture five test binaries share. (3) UNPRICED COST, two: the KV cache is hipMalloc'd outside the budget the operator was shown (3.4 GB at the 131072 ceiling against a 4 GiB driver headroom), and prefill is token-major, which re-streams the whole model per prompt token below full residency. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. Also carried here: the branch is 50 commits unpushed, and the GPU node label is left at disabled with llama-swap Pending.
+verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- nine open items in three live classes, two closed the day this file was written. (1) UNGATED CORRECTNESS: EMPTY as of 2026-08-13. The eps transposition -- the item this register called its sharpest -- turned out to be gated already, at 3.673e-5 against the chain gate's 2e-5, closed by the softcap tolerance work one commit earlier; the 'nothing reddens' recorded here was a measurement taken before that change and never re-run, which is the same stale-fact defect as the wrong citation it replaced. A second, LOCALISING gate was added anyway (Glimmer::branch plus a per-layer score against the oracle), and the route this file predicted -- scoring the reference's own captures -- is REFUTED by measurement: there the eps signal is 1.6e-3 to 1.3e-2 against a bf16 weight floor of 4.7e-3 to 3.0e-2, i.e. 0.2x to 0.6x the noise at every layer of both salts. Both surviving margins are thin (1.8x and 1.6x) because the FIXTURE's branch sits at mean(x2) ~ O(1) where the two epsilons nearly agree -- which is a second reason to do (2). (2) FIXTURE-GEOMETRY BLIND SPOTS, two: the toy checkpoint sets head_dim = hidden, so attn_scale sourced from the wrong one is a no-op, and it has ONE kv head, so trap 10's block-vs-interleave broadcast is unconstructible -- both close by widening a fixture five test binaries share. (3) UNPRICED COST, two: the KV cache is hipMalloc'd outside the budget the operator was shown (3.4 GB at the 131072 ceiling against a 4 GiB driver headroom), and prefill is token-major, which re-streams the whole model per prompt token below full residency. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. Also carried here: the branch is 50 commits unpushed, and the GPU node label is left at disabled with llama-swap Pending.
 ---
 
 # Muse Glimmer — open items after S3
@@ -19,37 +19,37 @@ row here should either move into that plan's stage sections or be closed and del
 
 ## 1. Ungated correctness
 
-### 1.1 The eps assignment is ungated — **the sharpest item here**
+### 1.1 The eps assignment — **CLOSED 2026-08-13**
 
-`Glimmer::pre_norm` reads `eps_pre` (1e-5) and `Glimmer::branch_add` reads `eps_post` (1e-8).
-**Swap them and nothing in the tree reddens.**
+`Glimmer::pre_norm` reads `eps_pre` (1e-5) and `Glimmer::branch_add` reads `eps_post` (1e-8),
+assigned by position. Transposing them now reddens **two** tests in `glimmer_chain.rs`.
 
-* `tests/glimmer_chain.rs` cannot see it: the swap moves `1/sqrt(mean(x²)+eps)` by ~5e-6
-  relative where `mean(x²)` is O(1), which is what the fixture's branch carries — under its
-  2e-5 tolerance.
-* `tests/glimmer_norm.rs` **does** separate the two epsilons, 41.8-56.6x, but on activations at
-  `mean(x²)~1e-3` and against the OPERATOR. It never imports `glimmer_gpu`, so it cannot
-  observe which eps the loop hands the kernel.
+> **AND IT WAS ALREADY CLOSED WHEN THIS FILE CALLED IT THE SHARPEST OPEN ITEM.** The
+> transposition reddens `the_loop_matches_a_host_reference_at_every_position` at **3.673e-5**
+> against its 2e-5 bound — and what closed it was the *softcap* tolerance work one commit
+> earlier, which tightened that bound from 1e-4 and made the comparison per-position. The
+> "nothing in the tree reddens" recorded here came from a measurement taken **before** that
+> change and never re-run. A stale measurement carried forward as a fact; the same defect class
+> as the wrong `glimmer_head.rs` citation it replaced.
 
-> **This was recorded as CLOSED for one commit, by a citation to `glimmer_head.rs`'s "eps
-> census" — a file that has no eps census.** The wrong citation reached three places including
-> the INDEX verdict, which `CLAUDE.md` tells readers to consult *instead of* the doc. Corrected
-> 2026-08-13.
+**What was added anyway, and why it still earns its place.** `Glimmer::branch()` and
+`every_layers_branch_matches_the_oracle_and_that_is_where_the_eps_lives` score each layer's
+post-FFN branch against the host oracle, selecting a layer by truncating the config. It
+LOCALISES the defect to a layer and is a second, independent catch.
 
-> **AND §4.1 DOES NOT CLOSE IT — measured 2026-08-13, against this file's own expectation.** This
-> paragraph read "closes by the reference comparison in §4.1, since the real model's branch
-> statistic is where `glimmer_norm.rs` measured the separation". `tests/glimmer_reference.rs` now
-> exists, runs the engine on Muse Glimmer's own parameters, and the transposition is **green** on
-> it too. So the defect is invisible to both whole-chain gates for the same reason — the branch
-> sits at `mean(x²)` ~ O(1) in the reference as well — and it is not a fixture artefact.
+**Both margins are thin, and both are measured** — 1.8x over tolerance for the logits, 1.6x for
+the branch. The cause is the FIXTURE: its branch sits at `mean(x²)` ~ O(1), where 1e-5 and 1e-8
+are nearly the same number. The reference's sits at ~1e-3, where `glimmer_norm.rs` measures
+41.8-56.6x. **§2 widens this** — a fixture with a realistic branch statistic turns two thin
+gates into two comfortable ones, which is a second reason to do that work.
 
-**Closes by:** a gate that observes the ASSIGNMENT rather than its numeric effect. The two
-epsilons are distinguishable only where the statistic is small, which is `glimmer_norm.rs`'s
-regime and not the loop's; a whole-chain score at any tolerance either file can defend will not
-see it. Candidates: score a per-layer branch capture (`post_attention_layernorm.out`) directly
-against the engine, which needs an intermediate readback the engine does not expose; or make the
-eps a property of the norm's call site that a deviceless test can read, the way `QkScale` and
-`window_of` were.
+> **The route this file predicted — scoring the reference's own captures — is REFUTED, measured.**
+> `tests/glimmer_reference.rs` reads each layer's branch against Muse Glimmer's capture, and there
+> the transposition is **1.6e-3 – 1.3e-2** against a bf16 weight floor of **4.7e-3 – 3.0e-2**: the
+> signal is 0.2x to 0.6x the noise at every layer of both salts. rivoli stores bf16 and the
+> reference computed f32, and that rounding lands on the same tensor at the same magnitude. The
+> comparison that works is the one with no weight term — engine against oracle, both reading the
+> same artifact.
 
 ---
 

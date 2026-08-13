@@ -153,6 +153,23 @@ use std::collections::HashMap;
 /// tolerance needs re-deriving from a fresh red proof, not raising.
 const TOL: f32 = 2e-5;
 
+/// The same comparison one layer up, on the post-FFN branch — its own constant because its floor
+/// is its own, and both are MEASURED (2026-08-13, over the fixture's four layers):
+///
+/// | | range |
+/// |---|---|
+/// | clean | 1.4e-7 – 7.3e-7 |
+/// | `eps_post` / `eps_pre` transposed | 3.8e-7 – 3.1e-6 |
+///
+/// **2e-6 sits between them, and the margins are thin on purpose rather than by oversight**: 2.7x
+/// above the worst clean cell, 1.6x below the transposition's strongest. Anything looser stops
+/// catching the defect this test exists for; anything tighter is inside reduction noise. The
+/// separation is only 4.8x at its best layer because the FIXTURE's branch sits at `mean(x²)` ~
+/// O(1), where the two epsilons barely differ — the reference's sits at ~1e-3, where
+/// `glimmer_norm.rs` measures 41.8-56.6x, and a fixture with that statistic is what would widen
+/// this. Recorded in the open-items register.
+const TOL_BRANCH: f32 = 2e-6;
+
 /// bf16 bytes → f32, the widening both `bf16f` in the kernels and the converter's norms perform.
 fn wide(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(2)
@@ -230,6 +247,9 @@ struct Ref<'a> {
     c: &'a gm::GlimmerTextConfig,
     k: Vec<Vec<Vec<f32>>>,
     v: Vec<Vec<Vec<f32>>>,
+    /// Each layer's post-FFN branch at the position [`Ref::step`] last ran — the tensor the engine
+    /// leaves in its own branch buffer, and the one the two epsilons are visible on.
+    br: Vec<Vec<f32>>,
 }
 
 impl<'a> Ref<'a> {
@@ -243,6 +263,7 @@ impl<'a> Ref<'a> {
             c,
             k: vec![Vec::new(); c.n_layers],
             v: vec![Vec::new(); c.n_layers],
+            br: vec![Vec::new(); c.n_layers],
         }
     }
 
@@ -355,6 +376,7 @@ impl<'a> Ref<'a> {
                 .collect();
             let br = matvec(self.layer_t(l, "mlp.down_proj"), &m, hid, c.inter);
             let br = centered(&br, self.layer_t(l, "post_feedforward_layernorm"), eq);
+            self.br[l] = br.clone();
             h = res.iter().zip(&br).map(|(a, b)| a + b).collect();
         }
 
@@ -538,4 +560,81 @@ fn the_loop_follows_layer_types_and_not_the_shipped_period() {
          that derives the layer kind from the period rather than from the array agrees with the \
          shipped pattern and diverges here"
     );
+}
+
+/// **The eps assignment, gated at last — every layer's branch, engine against oracle.**
+///
+/// `Glimmer::pre_norm` reads `eps_pre` (1e-5) and `Glimmer::branch_add` reads `eps_post` (1e-8),
+/// assigned by POSITION, three orders apart. Transposing them was the tree's one ungated
+/// correctness item for four review rounds, and the reason took two failed attempts to find:
+///
+/// * **Not the logits.** The branch enters a residual stream that dominates it, so the
+///   transposition is ~5e-6 by the head — under this file's own 2e-5 and under anything the
+///   reference gate can defend. Both measured.
+/// * **Not the reference's captures either**, which the open-items register predicted would close
+///   it. On the branch the transposition is 1.6e-3 – 1.3e-2 while the bf16 weight floor between
+///   rivoli and an f32 reference is 4.7e-3 – 3.0e-2 — the signal is 0.2x to 0.6x the noise at
+///   every layer of both salts. `tests/glimmer_reference.rs` records that measurement.
+///
+/// **What works is a comparison with no weight term at all**: both sides here read the same bf16
+/// artifact, so the floor is reduction noise.
+///
+/// > **AND THE ANSWER TURNED OUT TO BE ALREADY IN THE TREE.** Re-measuring 2026-08-13 with the
+/// > transposition applied: `the_loop_matches_a_host_reference_at_every_position` reddens at
+/// > **3.673e-5** against its 2e-5 tolerance. That test could not see it a day earlier — at
+/// > `TOL = 1e-4` and one compared position — and the fix that closed it was the SOFTCAP
+/// > tolerance work, which tightened the bound to 2e-5 and made the comparison per-position. The
+/// > open-items register carried "nothing in the tree reddens" from a measurement taken before
+/// > that change and never re-run. **A stale measurement carried forward as a fact**, which is
+/// > this session's recurring defect and worth the sentence.
+/// >
+/// > This test still earns its place: it LOCALISES the defect to a layer, and it is a second and
+/// > independent catch. Both margins are thin and both are measured — 1.8x over tolerance for the
+/// > logits, 1.6x for this — because the fixture's branch is at `mean(x²)` ~ O(1) where the two
+/// > epsilons are nearly the same number.
+///
+/// Truncating the config to `l + 1` layers is what selects a layer — the engine keeps one branch
+/// buffer and every layer overwrites it. Layers `0..l` compute identically either way.
+#[test]
+fn every_layers_branch_matches_the_oracle_and_that_is_where_the_eps_lives() {
+    let (root, cfg, src) = setup("glimmer-eps");
+    let gt_full = &cfg.text;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let mut cells = 0;
+    let mut worst = (0.0f32, 0usize);
+    for l in 0..gt_full.n_layers {
+        let mut gt = gt_full.clone();
+        gt.n_layers = l + 1;
+        gt.layer_types.truncate(l + 1);
+        gt.layer_rope_theta.truncate(l + 1);
+        let got = common::decode_one(&root.join("out"), &gt, &prompt)
+            .branch()
+            .unwrap();
+        // The oracle runs the FULL model; layer `l`'s branch is the same either way, and running it
+        // once for every truncation would be the same arithmetic done `n_layers` times.
+        let mut r = Ref::new(&src, gt_full);
+        for (pos, &t) in prompt.iter().enumerate() {
+            r.step(t, pos);
+        }
+        assert!(
+            r.br[l].iter().any(|v| *v != 0.0),
+            "L{l}: the oracle's branch is all zero, so the score below is against nothing"
+        );
+        let d = worst_rel(&got, &r.br[l]);
+        assert!(
+            d < TOL_BRANCH,
+            "L{l}'s post-FFN branch disagrees with the oracle by {d:.3e}. This tensor carries the \
+             eps assignment: a 1e-5/1e-8 transposition lands here at ~4e-3, three orders above \
+             this file's floor and invisible everywhere downstream"
+        );
+        if d > worst.0 {
+            worst = (d, l);
+        }
+        cells += 1;
+    }
+    println!(
+        "  {cells} layer branches vs the oracle, worst {:.3e} at L{}",
+        worst.0, worst.1
+    );
+    assert_eq!(cells, gt_full.n_layers, "every layer must be scored");
 }

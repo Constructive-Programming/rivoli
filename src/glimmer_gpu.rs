@@ -86,6 +86,20 @@ unsafe fn proj(x: *const f32, w: &Bf16Weight, out: *mut f32, i_dim: usize) -> Re
     unsafe { launch_gemm_bf16(x, w.packed, out, 1, w.o_dim, w.i_dim, NULL_STREAM) }
 }
 
+/// The first `n` f32 of a device buffer, on the host.
+///
+/// Shared by the two readbacks — `build.rs`'s jscpd gate rejected the second copy, and it is right
+/// about the substance too: the `copy_out_prefix` length and the `chunks_exact` width are one fact
+/// written twice, and a pair that disagreed would return a shorter vector rather than an error.
+fn read_f32(b: &DeviceBuf, n: usize) -> Result<Vec<f32>> {
+    let mut raw = Vec::new();
+    b.copy_out_prefix(&mut raw, n * 4)?;
+    Ok(raw
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// Where one layer's keys and values live, and how the kernel must be told to read them.
 ///
 /// The three fields are derived together and never separately — see this module's header.
@@ -748,11 +762,33 @@ impl Glimmer {
             "no logits yet: `sample` has not run on this engine, so this buffer holds whatever \
              `hipMalloc` returned"
         );
-        let mut b = Vec::new();
-        self.logits.copy_out_prefix(&mut b, self.vocab * 4)?;
-        Ok(b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
+        read_f32(&self.logits, self.vocab)
+    }
+
+    /// The branch buffer as the last completed layer left it — its post-FFN norm output, `hidden`
+    /// long, before the residual add.
+    ///
+    /// **This is the only window onto an INTERMEDIATE, and it exists for one defect.** The two
+    /// epsilons are 1e-5 and 1e-8, assigned by position, and a transposition is invisible to every
+    /// whole-chain gate in this tree — measured, on the synthetic fixture AND on Muse Glimmer's own
+    /// weights. The reason is the residual add: the branch enters a stream that dominates it, so by
+    /// the logits the difference is ~5e-6. One layer upstream it is 41.8-56.6x
+    /// (`tests/glimmer_norm.rs`, on the reference's own captures), and that is where this reads.
+    ///
+    /// Same argument as [`Self::logits`] for why it is a plain accessor rather than an instrument
+    /// behind a feature and a flag: a D2H of a buffer that already exists, after a sync that has
+    /// already happened, and nothing on the decode path calls it.
+    ///
+    /// **Which layer's branch it holds is the CALLER's arrangement** — the engine keeps one branch
+    /// buffer and every layer overwrites it, so reading a particular layer means running a model
+    /// truncated to end there. `tests/glimmer_reference.rs` does exactly that, which is also why
+    /// this needs no layer argument.
+    pub fn branch(&self) -> Result<Vec<f32>> {
+        ensure!(
+            self.sampled,
+            "no branch yet: no forward has completed on this engine"
+        );
+        read_f32(&self.br, self.hidden)
     }
 
     /// Greedy decode: consume `prompt`, then emit until an `eos` or `max_new`.
