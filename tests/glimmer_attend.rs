@@ -38,8 +38,8 @@ use rivoli::backend::hip::{device_sync, launch_gqa_attend};
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
 use fixture::{
-    Golden, cap, cap_rows, dev, each_case, expected, f32b, float, present, sync_read, worst_rel,
-    zeros,
+    Golden, cap, cap_rows, dev, each_case, expected, f32b, float, present, sync_read, window_lo,
+    worst_rel, zeros,
 };
 
 // What this kernel actually measures against that bar, recorded 2026-08-12 so a future change
@@ -104,20 +104,6 @@ fn run(c: &Case, ring_cap: usize) -> Vec<f32> {
     }
     .expect("gqa_attend launch");
     sync_read(&ob)
-}
-
-/// The window's lower bound for a query at absolute position `pos`: `[pos - win + 1, pos]`,
-/// INCLUSIVE of `pos` itself, and 0 on a global layer. Trap 14 is the `+ 1`.
-///
-/// Shared by the host oracle and the mask comparison — jscpd caught them restating it, and it is
-/// right to: two copies of a bound is how one of them drifts. The kernel has its own, in HIP,
-/// which is the implementation this file exists to check.
-fn window_lo(pos: usize, win: usize) -> usize {
-    if win > 0 && pos >= win {
-        pos - win + 1
-    } else {
-        0
-    }
 }
 
 /// The reference attention, on the host, with the KV broadcast selectable.

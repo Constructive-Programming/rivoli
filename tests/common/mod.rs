@@ -69,6 +69,21 @@ pub fn walk(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// The sliding window's lower bound for a query at absolute position `pos`: `[pos - win + 1, pos]`,
+/// INCLUSIVE of `pos` itself, and 0 on a global layer. Trap 14 is the `+ 1`.
+///
+/// **Shared, because two copies of a bound is how one of them drifts.** `glimmer_attend.rs` (host
+/// oracle and mask comparison) and `glimmer_chain.rs` (the loop's reference) both need it, and
+/// jscpd caught the second copy the moment it was written. The kernel has its own, in HIP, which
+/// is the implementation those files exist to check — this is deliberately not that one.
+pub fn window_lo(pos: usize, win: usize) -> usize {
+    if win > 0 && pos >= win {
+        pos - win + 1
+    } else {
+        0
+    }
+}
+
 /// f32 slice → little-endian bytes, the form every device upload takes.
 pub fn f32b(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()

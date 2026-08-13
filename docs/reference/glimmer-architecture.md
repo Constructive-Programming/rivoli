@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: Muse Glimmer-30B's forward pass, precise enough to write kernels from — extracted 2026-08-10 from first-party sources only (raw config.json, the safetensors headers by range request, and transformers' own modeling_muse_glimmer.py), no summarizing fetch in the chain. 52 dense layers, 39 sliding (window 2048) + 13 full at zero-based 3,7,...,51, GQA 32Q/2KV head_dim 128. SANDWICH NORMS: four per layer, post-norms on the BRANCH before the residual add, and they are CENTERED (x*(1+w)) while the final norm and the two weightless norms are plain (x*w) — two formulas in one model. Q and K carry a WEIGHTLESS RMSNorm that ships no tensor (with_scale=False) and Q alone is then scaled by qk_scale_factor 3.87. RoPE is rotate_half (split-half), NOT rivoli's interleaved convention — a row permutation of q_proj/k_proj converts it, argued in section 6 and unproven. NoPE layers skip rotation entirely. Attention output is gated by sigmoid(gate_proj(layer input)) BEFORE o_proj. Logits are 20*tanh(x*0.196116/20), which is argmax-invariant — so every greedy gate is BLIND to it. Text side 55.71 GB bf16 = 26.51 GB/token at fp8. Fifteen traps in section 9. The DFlash drafter is a SEPARATE 2.556 B checkpoint (section 11): a 5-layer BIDIRECTIONAL cross-attention adapter that shares almost nothing with the target (32Q/8KV, plain pre-norm, weighted QK-norm) and borrows the target's embedding UNNORMED plus its lm_head; because the target is dense, break-even is N>1.1 accepted tokens per cycle, inverting the MoE-union economics that made ungated MTP a loss on GLM.
+verdict: Muse Glimmer-30B's forward pass, precise enough to write kernels from — extracted 2026-08-10 from first-party sources only (raw config.json, the safetensors headers by range request, and transformers' own modeling_muse_glimmer.py), no summarizing fetch in the chain. 52 dense layers, 39 sliding (window 2048) + 13 full at zero-based 3,7,...,51, GQA 32Q/2KV head_dim 128. SANDWICH NORMS: four per layer, post-norms on the BRANCH before the residual add, and they are CENTERED (x*(1+w)) while the final norm and the two weightless norms are plain (x*w) — two formulas in one model. Q and K carry a WEIGHTLESS RMSNorm that ships no tensor (with_scale=False) and Q alone is then scaled by qk_scale_factor 3.87 -- though CORRECTED 2026-08-13 by measurement, the trap-3 SWAP of those two scales is an identity and cannot change any output, since both operands are normed first and only the product a*b enters the score, with RoPE a norm-preserving rotation that commutes; what is live is the MAGNITUDE (dropping the factor moves the fixture's logits by 1.7 where swapping it stays inside 2.3e-6 reduction noise) and the softmax scale still applying on top. RoPE is rotate_half (split-half), NOT rivoli's interleaved convention — a row permutation of q_proj/k_proj converts it, argued in section 6 and unproven. NoPE layers skip rotation entirely. Attention output is gated by sigmoid(gate_proj(layer input)) BEFORE o_proj. Logits are 20*tanh(x*0.196116/20), which is argmax-invariant — so every greedy gate is BLIND to it. Text side 55.71 GB bf16 = 26.51 GB/token at fp8. Fifteen traps in section 9. The DFlash drafter is a SEPARATE 2.556 B checkpoint (section 11): a 5-layer BIDIRECTIONAL cross-attention adapter that shares almost nothing with the target (32Q/8KV, plain pre-norm, weighted QK-norm) and borrows the target's embedding UNNORMED plus its lm_head; because the target is dense, break-even is N>1.1 accepted tokens per cycle, inverting the MoE-union economics that made ungated MTP a loss on GLM.
 ---
 
 # Muse Glimmer-30B — the forward pass
@@ -301,6 +301,24 @@ repeated block.
    rotates the 13 NoPE layers.
 2. Skipping `qk_norm` because no tensor ships for it.
 3. Applying `qk_scale_factor` to K as well as Q, or instead of the `1/sqrt(128)` softmax scale.
+
+   > **CORRECTED 2026-08-13, by measurement.** This trap has been read here and in three places in
+   > the tree as "3.87 must go to Q and 1.0 to K, and a swap is fluent and wrong". **The SWAP is an
+   > identity and cannot change any output.** Both operands are weightless-RMS-normed first, so the
+   > score is `(a·q̂)·(b·k̂)·head_dim^-0.5` and only the PRODUCT `a·b` enters; RoPE is a
+   > norm-preserving rotation applied after, and it commutes with a scalar. Cached keys make no
+   > difference — a key scaled by 3.87 dotted with a later query scaled by 1.0 is the same product.
+   > Measured on the toy checkpoint (`tests/glimmer_chain.rs`, which scores the whole chain against
+   > a host reference at 2.3e-6): swapping the two scales leaves the logits inside reduction-order
+   > noise, while **dropping** the factor — product 1.0 instead of 3.87 — moves them by **1.7**,
+   > and applying it to K *as well as* Q would move them by the same kind of margin.
+   >
+   > So the live half of this trap is the second clause and the magnitude, not the assignment: what
+   > the model depends on is that the product is `qk_scale_factor` and that the softmax scale still
+   > applies on top. Keeping the 3.87 on Q remains right — it is what the reference does, it is
+   > where the intermediate magnitudes belong, and anything that ever reads `q` or `k` for itself
+   > (a trace, a probe) would see the difference — but it is a fidelity point, not a correctness
+   > hazard, and it should stop being gated as though a swap could produce wrong text.
 4. Gating on the attention output instead of the layer input.
 5. Substituting plain RMSNorm (`* w`) for the centered form (`* (1+w)`) on the four per-layer
    norms — or the reverse on the final norm.

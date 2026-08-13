@@ -394,11 +394,14 @@ const OWNERS: &[(&str, &[&str])] = &[
     // qk_norm.k), and the kernel refuses an unusable scale, but no test in this tree can see a
     // caller handing 3.87 to K: that is trap 3, and it is open until a call site exists."
     //
-    // The call site exists. The two scales now arrive at the launcher from `glimmer_gpu::qk_scales`
-    // as a NAMED pair, gated deviceless by `tests/glimmer_loop.rs` — which narrows the trap without
-    // closing it: a call site reading `s.q` twice still passes, and that is a rename away from
-    // correct rather than an argument order away. No numeric test can do better while every
-    // scoring path hands the same scale to the kernel and to the oracle.
+    // The call site exists — and the warning's premise turned out to be FALSE, measured
+    // 2026-08-13. **Handing 3.87 to K instead of Q cannot change any output**: both operands are
+    // weightless-normed before the scale, so the attention score carries only their product, and
+    // RoPE is a norm-preserving rotation that commutes with a scalar. `tests/glimmer_chain.rs`
+    // red-proved it both ways — swapping leaves the logits inside 2.3e-6 reduction noise, while
+    // DROPPING the factor moves them by 1.7. So the thing to gate is the product, which
+    // `glimmer_loop.rs` now asserts; the assignment is fidelity, not correctness, and
+    // `glimmer-architecture.md` §9 trap 3 is corrected in place.
     //
     // **AND TRAP 2'S WIRING HALF IS NOT CLOSED BY THIS ROW, WHICH IS WHAT THE COMMIT THAT FILLED IT
     // IN CLAIMED.** Retracted the same day, by review. This census tests whether a FILE contains a

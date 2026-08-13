@@ -157,17 +157,15 @@ fn every_context_yields_a_window_the_launcher_accepts() {
     assert_eq!(window_of(LayerKind::FullAttention, WIN, 12, 5).ring_cap, 0);
 }
 
-/// **Q takes `qk_scale_factor` and K takes 1.0 — trap 3, and it had no gate at all until a call
-/// site existed.**
+/// **Q takes `qk_scale_factor`, K takes 1.0, and their PRODUCT is `qk_scale_factor`.**
 ///
-/// Every scoring path in this tree hands the same scale to the kernel and to the oracle, so no
-/// numeric test can observe which one a caller chose; `glimmer_qk_norm.rs` would pass with the two
-/// swapped. What makes the swap catchable is that the values arrive at the launcher by NAME, and
-/// this asserts the names carry the right numbers.
+/// The product is the load-bearing half and the assignment is not, which inverts what this file
+/// said when it was written. Both operands are normed before the scale, so the attention score
+/// carries only `a·b`; `tests/glimmer_chain.rs` measured a swap leaving the logits inside 2.3e-6
+/// reduction noise and a DROPPED factor moving them by 1.7. See [`rivoli::glimmer_gpu::QkScale`].
 ///
-/// It does NOT catch a call site that reads `s.q` twice. That one is a rename away from correct
-/// rather than an argument order away, which is the whole reason for the named pair — but it is a
-/// narrowing, not a closure, and saying so is the point of this paragraph.
+/// So this asserts the product first — that is what a wrong value breaks — and the assignment
+/// second, as the fidelity point it is.
 #[test]
 fn the_qk_scale_is_qs_alone_and_k_takes_unity() {
     let s = qk_scales(3.87);
@@ -180,8 +178,14 @@ fn the_qk_scale_is_qs_alone_and_k_takes_unity() {
         "K takes 1.0 — a K scaled by qk_scale_factor is fluent and wrong, and the goldens gate \
          the reference rather than the caller"
     );
-    // The identity case is the one that would make a swapped call site pass, so it is asserted to
-    // be the only value at which the two agree.
+    // The product is what enters the score, so it is asserted as such rather than inferred from
+    // the two fields — a version that scaled BOTH by `sqrt(3.87)` would satisfy the fields' spirit
+    // and the model, and one that scaled both by 3.87 would satisfy neither.
+    assert_eq!(
+        s.q * s.k,
+        3.87,
+        "the product is what the attention score carries"
+    );
     let one = qk_scales(1.0);
     assert_eq!((one.q, one.k), (1.0, 1.0));
     // And the scale is passed through, not derived: a version that returned a constant would pass

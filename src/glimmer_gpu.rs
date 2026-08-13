@@ -205,13 +205,21 @@ impl Handles {
     }
 }
 
-/// The two scales the weightless QK-norm takes, which are NOT the same number.
+/// The two scales the weightless QK-norm takes: `qk_scale_factor` on Q, 1.0 on K.
 ///
-/// **Q gets `qk_scale_factor` (3.87) and K gets 1.0** — `glimmer-architecture.md` trap 3. Returned
-/// as a named pair rather than passed positionally so that swapping them is a rename rather than
-/// an argument reorder: nothing downstream of a K scaled by 3.87 reads as an error, and no numeric
-/// test in this tree can see which scale a caller chose, because every scoring path hands the same
-/// one to the kernel and to the oracle.
+/// **What the model depends on is their PRODUCT, and the assignment is fidelity rather than
+/// correctness — measured 2026-08-13, against what this tree and `glimmer-architecture.md` trap 3
+/// had said for weeks.** Both operands are weightless-RMS-normed before the scale, so the score is
+/// `(a·q̂)·(b·k̂)·head_dim^-0.5` and only `a·b` enters; RoPE is a norm-preserving rotation applied
+/// afterwards and commutes with a scalar, and a cached key scaled by 3.87 dotted with a later
+/// query scaled by 1.0 gives the same product. `tests/glimmer_chain.rs` red-proves it both ways:
+/// SWAPPING the two leaves the logits inside 2.3e-6 reduction noise, while DROPPING the factor
+/// moves them by 1.7.
+///
+/// So the pair stays named — a swap is still a rename rather than an argument reorder, and 3.87 on
+/// Q is where the reference puts it, where the intermediate magnitudes belong, and what any future
+/// consumer of `q` or `k` alone (a trace, a probe) would see — but it is no longer described as a
+/// hazard that produces wrong text, because it cannot.
 ///
 /// It does NOT replace the softmax scale. `head_dim^-0.5` still applies, for an effective Q factor
 /// of `3.87 / sqrt(128)`.
@@ -413,10 +421,10 @@ impl Glimmer {
             proj(xn, &wq, self.q.ptr() as *mut f32, self.hidden)?;
             proj(xn, &wk, kslot, self.hidden)?;
             proj(xn, &wv, vslot, self.hidden)?;
-            // **The 3.87 is Q's alone**, and it arrives here by NAME — see [`QkScale`]. Written as
-            // `s.q` and `s.k` rather than as `self.qk_scale` and a literal `1.0` so that the
-            // trap-3 swap is a rename: `nothing downstream of a K scaled by 3.87 reads as an
-            // error, and no numeric test in this tree can see which scale a caller chose.
+            // **The 3.87 is Q's alone**, and it arrives here by NAME — see [`QkScale`], which
+            // also records what a swap actually costs (nothing: only the product enters the
+            // score). What is NOT free is dropping or doubling the factor, and that the chain gate
+            // does see.
             let s = qk_scales(self.qk_scale);
             launch_rmsnorm_weightless_batch(
                 self.q.ptr() as *mut f32,
@@ -703,6 +711,28 @@ impl Glimmer {
             self.vocab
         );
         Ok(idx as u32)
+    }
+
+    /// The logit vector the last [`Self::sample`] produced — post-softcap, `vocab` long.
+    ///
+    /// **The only way to see this model's logit path at all.** `output_multiplier` and
+    /// `final_logit_softcapping` are argmax-invariant by construction, so a greedy gate, a
+    /// teacher-forced argmax check and a byte-identical-output comparison are all blind to their
+    /// being wrong or absent; every probability, NLL and confidence value is wrong regardless.
+    /// G3's probability-space check reads this, and so does `tests/glimmer_chain.rs`, which scores
+    /// the whole chain against a host reference — a 12-way argmax is one integer of evidence about
+    /// a 52-layer composition.
+    ///
+    /// **Not an instrument in the sense `CLAUDE.md` puts behind a feature and a flag.** Those are
+    /// gated because they perturb what they measure — `--pred-probe` puts a blocking D2H on the
+    /// per-layer path. This is a D2H of a buffer that already exists, after the `device_sync`
+    /// `sample` already performs, and nothing on the decode path calls it.
+    pub fn logits(&self) -> Result<Vec<f32>> {
+        let mut b = Vec::new();
+        self.logits.copy_out_prefix(&mut b, self.vocab * 4)?;
+        Ok(b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
     }
 
     /// Greedy decode: consume `prompt`, then emit until an `eos` or `max_new`.
