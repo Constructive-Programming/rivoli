@@ -43,9 +43,15 @@ fn rivoli(artifact: &std::path::Path, extra: &[&str]) -> String {
         .args(extra)
         .output()
         .expect("run rivoli");
+    // **Every run here fails, and since 2026-08-13 the REASON is the fixture and not the
+    // engine.** It used to be "Glimmer does not decode"; S3's loop deleted that bail, and what
+    // stops these runs now is that `glimmer_convert_fixture` writes no usable `tokenizer.json`.
+    // The distinction matters to the rows below: they assert on the MESSAGE precisely because a
+    // failing exit code proves nothing about whether a refusal fired.
     assert!(
         !o.status.success(),
-        "a Glimmer artifact must not decode yet"
+        "the fixture has no tokenizer, so no run against it can succeed — a success here means \
+         this helper's premise changed and every message assertion below is now vacuous"
     );
     String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
 }
@@ -76,13 +82,14 @@ fn max_mem_is_accepted_and_reports_the_partition() {
         !err.contains("--max-mem does not apply"),
         "--max-mem must be accepted for a Glimmer artifact since R1, got:\n{err}"
     );
-    assert!(
-        err.contains("do not decode yet"),
-        "with --max-mem accepted the run must reach the honest decode bail, got:\n{err}"
-    );
+    // **The marker is the partition line, not a bail.** It was `"do not decode yet"` until S3's
+    // layer loop deleted that bail (2026-08-13) and this test went red — correctly: it was keyed
+    // on a sentence rather than on its subject. What the flag being ACCEPTED means is that the run
+    // proceeds far enough to report the split the budget implies, and that survives the loop
+    // landing, the fixture gaining a tokenizer, and the run going on to decode.
     assert!(
         err.contains("residency:") && err.contains("layers pinned"),
-        "the run must report the partition the budget implies, got:\n{err}"
+        "with --max-mem accepted the run must proceed and report the partition, got:\n{err}"
     );
 }
 
@@ -164,31 +171,38 @@ fn every_flag_that_does_not_apply_is_refused_by_name() {
     }
 }
 
-/// **A bare run gets past every refusal and stops at the one honest bail.**
+/// **A bare run gets past every refusal.**
 ///
 /// The other half of the gate, and the half that catches a refusal fired on the DEFAULT
 /// value. A table of nine `bail!`s where one asks the wrong question refuses a
 /// user who passed nothing — which reads as "this model is broken" rather than "you passed a
 /// flag it cannot honour", and no test above can see it.
+///
+/// > **RE-KEYED 2026-08-13**, from `"do not decode yet"` — the S1a bail S3's layer loop deleted.
+/// > The test named the sentence it was looking for and not the property, so the loop landing
+/// > reddened it. It now asserts the property: past every refusal, past the config parse, and into
+/// > the run. This fixture cannot go further — `glimmer_convert_fixture` writes no real
+/// > `tokenizer.json`, so a bare run ends there, which is a fact about the fixture rather than
+/// > about the engine and is deliberately NOT asserted here.
 #[test]
-fn a_run_with_no_flags_reaches_the_decode_bail() {
+fn a_run_with_no_flags_gets_past_every_refusal() {
     let root = TempRoot::new("glimmer-bare");
     let _ = glimmer_convert_fixture(root.path(), DIM);
     let err = rivoli(&root.join("out"), &[]);
     assert!(
-        err.contains("do not decode yet") && err.contains("S2"),
-        "a bare run must reach the decode bail, got:\n{err}"
+        err.contains("residency:") && err.contains("layers pinned"),
+        "a bare run must reach the partition report, got:\n{err}"
     );
     assert!(
         !err.contains("does not apply"),
         "no flag refusal may fire on a run that passed no flags:\n{err}"
     );
-    // The layer map is logged BEFORE the bail — the evidence that the config parsed rather
-    // than that the binary recognised a directory name. 3 of the fixture's 4 layers slide,
+    // The layer map is logged before anything can fail — the evidence that the config parsed
+    // rather than that the binary recognised a directory name. 3 of the fixture's 4 layers slide,
     // one period of the shipped `[sliding, sliding, sliding, full]` pattern.
     assert!(
         err.contains("4 layers (3 sliding at window 2 / 1 full)") && err.contains("DENSE"),
-        "the layer map must be reported before the bail:\n{err}"
+        "the layer map must be reported before the run can stop:\n{err}"
     );
 }
 

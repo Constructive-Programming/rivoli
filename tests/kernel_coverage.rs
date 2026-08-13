@@ -325,24 +325,30 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("act_quant_f8_prefix", &["attn.rs", "kvcompress.rs"]),
     ("act_quant_f4_rotated", &["kvcompress.rs"]),
     ("append_kv", &["gpu.rs"]),
-    ("argmax", &["gpu.rs", "f4gpu.rs"]),
+    ("argmax", &["gpu.rs", "f4gpu.rs", "glimmer_gpu.rs"]),
     ("attend", &["gpu.rs"]),
-    ("embed_bf16_row_bcast", &["f4gpu.rs"]),
+    ("embed_bf16_row_bcast", &["f4gpu.rs", "glimmer_gpu.rs"]),
     ("embed_i8_row", &["gpu.rs"]),
     ("flag_nonfinite", &["gpu.rs"]),
     ("gather_attn_shared_kv", &["attn.rs"]),
     ("gather_rope", &["gpu.rs"]),
-    ("gemm_bf16", &["kvcompress.rs", "f4gpu.rs"]),
+    (
+        "gemm_bf16",
+        &["kvcompress.rs", "f4gpu.rs", "glimmer_gpu.rs"],
+    ),
     ("gemv_f32", &["gpu.rs", "f4gpu.rs"]),
     ("gemv_fp8", &["gpu.rs"]),
     ("gemv_fp8_bf16", &["attn.rs", "f4gpu.rs"]),
     ("gemv_i4", &[]),
     ("gemv_i8", &["gpu.rs"]),
     ("gemv_vq", &[]),
-    // Muse Glimmer's GQA attend. No engine caller yet BY CONSTRUCTION: S2 gates each kernel
-    // against the S1b goldens before S3 writes the layer loop that calls it, so this row is
-    // empty for exactly as long as that stage lasts.
-    ("gqa_attend", &[]),
+    // Muse Glimmer's GQA attend. The row was empty BY CONSTRUCTION through S2 — the kernels are
+    // gated against the S1b goldens before the loop that calls them exists — and S3's loop filled
+    // it 2026-08-13. What the caller owes is `win`/`ring_cap` derivation: it comes from
+    // `glimmer_gpu::window_of`, one match on `layer_types`, gated deviceless by
+    // `tests/glimmer_loop.rs` because the pair that truncates a full layer (`win != 0` with
+    // `ring_cap == 0`) is ACCEPTED here.
+    ("gqa_attend", &["glimmer_gpu.rs"]),
     ("hc_head_collapse", &["f4gpu.rs"]),
     ("hc_post", &["f4gpu.rs"]),
     ("hc_pre", &["f4gpu.rs"]),
@@ -372,28 +378,42 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("moe_expert_range_i4", &["gpu.rs"]),
     ("qk_norm", &["attn.rs"]),
     ("rmsnorm_batch", &["attn.rs", "f4gpu.rs"]),
-    // Muse Glimmer's CENTERED sandwich norm, empty for the same reason `rope_split_half` is:
-    // S3 gates the kernel before the layer loop that will call it exists.
-    ("rmsnorm_centered_single", &[]),
-    ("rmsnorm_single", &["gpu.rs"]),
+    // Muse Glimmer's CENTERED sandwich norm. Filled by S3's loop 2026-08-13. Four calls per layer
+    // and the eps is NOT a parameter at either call site — `Glimmer::pre_norm` reads `eps_pre` and
+    // `Glimmer::branch_add` reads `eps_post`, so the three-orders-of-magnitude swap is not
+    // expressible at the level that chooses which norm runs where.
+    ("rmsnorm_centered_single", &["glimmer_gpu.rs"]),
+    ("rmsnorm_single", &["gpu.rs", "glimmer_gpu.rs"]),
     // Muse Glimmer's WEIGHTLESS qk-norm plus Q's 3.87, empty for the same reason the row above is.
     // Named for what it does, not for the model: `mla.hip::qk_norm` already holds the name and is a
     // different kernel (bf16 statistic, DeepSeek-V4's), which is why this one spells its contract.
     //
-    // **WHOEVER FILLS THIS ROW IN: Q passes 3.87 and K passes 1.0, and NOTHING GATES THAT.** The
-    // goldens gate the reference (`glimmer_anchor.rs` — q.pre_rope / qk_norm.q is 3.87, k.pre_rope is
-    // bit-identical to qk_norm.k), and the kernel refuses an unusable scale, but no test in this tree
-    // can see a caller handing 3.87 to K: that is trap 3, and it is open until a call site exists.
-    // This check runs in BOTH directions, so adding an owner here is the one moment the tree forces
-    // someone to read that — which is why the warning lives at the row rather than only at the
-    // kernel. The same moment closes trap 2's wiring half: a port that never calls this kernel at
-    // all passes every test in `glimmer_qk_norm.rs`.
-    ("rmsnorm_weightless_batch", &[]),
+    // **THE ROW WAS FILLED IN 2026-08-13, and here is what its warning asked for.** It read:
+    // "Q passes 3.87 and K passes 1.0, and NOTHING GATES THAT. The goldens gate the reference
+    // (`glimmer_anchor.rs` — q.pre_rope / qk_norm.q is 3.87, k.pre_rope is bit-identical to
+    // qk_norm.k), and the kernel refuses an unusable scale, but no test in this tree can see a
+    // caller handing 3.87 to K: that is trap 3, and it is open until a call site exists."
+    //
+    // The call site exists. The two scales now arrive at the launcher from `glimmer_gpu::qk_scales`
+    // as a NAMED pair, gated deviceless by `tests/glimmer_loop.rs` — which narrows the trap without
+    // closing it: a call site reading `s.q` twice still passes, and that is a rename away from
+    // correct rather than an argument order away. No numeric test can do better while every
+    // scoring path hands the same scale to the kernel and to the oracle.
+    //
+    // **Trap 2's wiring half IS closed by this row being non-empty**: a port that never calls this
+    // kernel at all passes every test in `glimmer_qk_norm.rs`, and the census is what sees that.
+    // Three calls per token per layer — Q, K, and the embedding norm, which is the same weightless
+    // form at `rows = 1`.
+    ("rmsnorm_weightless_batch", &["glimmer_gpu.rs"]),
     ("rope_adjacent", &["attn.rs"]),
     ("rope_interleave", &["gpu.rs"]),
-    // Muse Glimmer's rotation convention. Empty for the same reason `gqa_attend` is: S2 gates
-    // each kernel against the S1b goldens before S3 writes the layer loop that calls it.
-    ("rope_split_half", &[]),
+    // Muse Glimmer's rotation convention. Filled by S3's loop 2026-08-13, and the caller's own
+    // obligation is that it is CONDITIONAL: `layer_rope_theta` is 500000 on sliding layers and 0
+    // on full ones, so a NoPE layer must not be rotated at all. `Glimmer` resolves that field to a
+    // `Vec<bool>` once at construction, which is what it is — the first-party code builds ONE
+    // table and passes it or `None` per layer, so a port that reads it as a per-layer base is
+    // doing arithmetic nobody asked for.
+    ("rope_split_half", &["glimmer_gpu.rs"]),
     // Muse Glimmer's logit softcap and attention output gate, empty for the same reason as
     // `rope_split_half` above. (The comment sat on the wrong row until 2026-08-12 — it called
     // `logit_softcap` "the attention output gate", the third orphaned-comment insertion of the
@@ -416,11 +436,20 @@ const OWNERS: &[(&str, &[&str])] = &[
     //
     // And it is not "pass a non-null stream" either: a compute stream at these two launches inside
     // an otherwise null-stream layer is the same bug inverted. Match the launches around them.
-    ("logit_softcap", &[]),
-    ("sigmoid_gate", &[]),
-    ("swiglu", &["gpu.rs", "f4gpu.rs"]),
+    //
+    // **ANSWERED 2026-08-13, and the answer is NULL at both — uniformly, as a decision.** S3's loop
+    // runs its whole chain on the legacy default stream, so the launches around these two are on
+    // it too and the ordering the warning above is about is the null stream's own. That is the
+    // "match the launches around them" clause satisfied, not evaded: six of the launchers the
+    // chain needs (`rope_split_half`, `rmsnorm_single`, `vadd`, `argmax`, and two more) take no
+    // stream parameter at all, so a compute-stream loop would be precisely the inversion this
+    // comment warns about. `glimmer_gpu.rs`'s header carries the argument, and S5 owns the change
+    // — which is giving those six a stream first, not passing one here.
+    ("logit_softcap", &["glimmer_gpu.rs"]),
+    ("sigmoid_gate", &["glimmer_gpu.rs"]),
+    ("swiglu", &["gpu.rs", "f4gpu.rs", "glimmer_gpu.rs"]),
     ("swiglu_clamped_bf16", &[]),
-    ("vadd", &["gpu.rs"]),
+    ("vadd", &["gpu.rs", "glimmer_gpu.rs"]),
     ("vq_encode", &["bin/convert.rs"]),
 ];
 

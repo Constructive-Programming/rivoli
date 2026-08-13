@@ -1109,13 +1109,46 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
         gt.floor_bytes()? as f64 / 1e9,
     );
 
-    bail!(
-        "{} artifacts do not decode yet — S1a is done (config schema, converter, pin, and \
-         these refusals), and the GQA attention family with its sliding window and sigmoid \
-         output gate is S2. Everything above this line ran: see \
-         docs/investigations/glimmer-port.md.",
-        arch.name()
+    // **The prompt is encoded plainly, not through a chat template.** The artifact does not ship
+    // one — `chat_template.jinja` lives only in the fp8 SOURCE — and hand-porting it is S4's item,
+    // where it gets byte-pinned against the source. An `encode_chat` here would silently apply
+    // GLM's framing to a Glimmer model, which is the shape of defect this port has already been
+    // bitten by once.
+    let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
+    let prompt_text = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
+    let ids = tok.encode(prompt_text)?;
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "the prompt encoded to no tokens: {prompt_text:?}"
     );
+    // `--bench N` is "decode N tokens then exit" everywhere else here; there is no server mode
+    // for this architecture yet (`--port` is refused above), so it is also the only mode.
+    let max_new = cfg.bench.unwrap_or(64);
+    anyhow::ensure!(max_new > 0, "--bench 0 asks for no tokens");
+    info!(
+        "prompt: {} tokens, generating up to {max_new}; eos {:?}",
+        ids.len(),
+        tok.eos
+    );
+    // The KV cache is sized HERE and not from `max_position_embeddings`: a full-attention layer's
+    // cache is linear in the context, and this model's trained maximum is 131072 — 3.5 GB of cache
+    // to emit twelve tokens. See `Glimmer::new`.
+    // `Some(budget)` and not `cfg.max_mem`: `budget` is what `partition` above was asked, so the
+    // pin the engine builds is the split the operator was just shown. Handing the raw flag here
+    // would let the reported partition and the built one disagree on a defaulted budget.
+    let mut engine =
+        rivoli::glimmer_gpu::Glimmer::new(&cfg.model, gt, Some(budget), ids.len() + max_new)?;
+    let t0 = std::time::Instant::now();
+    let out = engine.decode(&ids, max_new, &tok.eos)?;
+    let dt = t0.elapsed();
+    println!("{}", tok.decode_all(&out)?);
+    info!(
+        "{} tokens in {:.2} s — {:.3} tok/s",
+        out.len(),
+        dt.as_secs_f64(),
+        out.len() as f64 / dt.as_secs_f64()
+    );
+    Ok(())
 }
 
 /// A build with no compute backend cannot reach this: see the stub above.

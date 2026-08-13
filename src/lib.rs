@@ -91,6 +91,11 @@ pub mod gpu;
 #[cfg(feature = "rocm")]
 pub mod f4gpu;
 
+/// Muse Glimmer's layer loop — the third of these, and gated the same way and for the same
+/// reason: every launcher it drives is `crate::backend::hip`'s.
+#[cfg(feature = "rocm")]
+pub mod glimmer_gpu;
+
 /// Teacher-forced scoring (`--ppl`). An instrument, not an engine feature — nothing in a
 /// decode reaches it — so it is a module boundary AND a feature boundary, and the two
 /// cannot drift apart. `bin/ppl`, which does the statistics over its output, is pure host
