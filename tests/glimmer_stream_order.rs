@@ -17,7 +17,7 @@
 //! **The first clause is CONFIRMED, not refuted.** A null stream there really is an unordered
 //! read. Only "no fixture can see it" fell.
 //!
-//! # What it measured, gfx1151, 2026-08-13 — 14 measurements over 7 runs
+//! # What it measured, gfx1151, 2026-08-13 — 18 measurements over 9 runs
 //!
 //! A **3.48-3.86 ms** `gemm_bf16` on a real stream writes the consumer's operand; the consumer is
 //! enqueued **5.7-34.5 µs** later, **108-656x inside** the producer.
@@ -107,8 +107,10 @@ const OUT: usize = M * N;
 
 /// How far inside the producer's lifetime the consumer must be enqueued for an arm to count.
 ///
-/// Measured 6-42 µs against a 3.7-4.9 ms producer, so 90-800x; this bar keeps an order of
-/// magnitude of headroom and still cannot pass on an idle device, where the two are equal.
+/// The margin actually measured is in this module's header; it is two orders of magnitude, so this
+/// bar keeps a decimal order of headroom and still cannot pass on an idle device, where the two are
+/// equal. **The numbers live in ONE place on purpose** — a second copy here disagreed with the
+/// header one commit after both were written (review, 2026-08-13).
 const INSIDE: u32 = 10;
 
 /// What the producer's destination holds BEFORE it runs. A consumer that reads it has read
@@ -142,7 +144,7 @@ const CAP: f32 = 20.0;
 /// `dst` is the producer's output and the consumer's operand — `g` for [`launch_sigmoid_gate`],
 /// `x` in place for [`launch_logit_softcap`]. `x` is the gate's value operand; the softcap never
 /// reads or writes it, and it lives here only so `Rig` serves both consumers rather than being
-/// duplicated. (It costs that test one unused 8 MB refill per arm. What makes the two launchers'
+/// duplicated. (It costs the softcap one unused 8 MB refill per arm. What makes the two launchers'
 /// counts comparable is [`score`] being one function, not this field.)
 struct Rig {
     a: DeviceBuf,
@@ -168,15 +170,16 @@ struct Arms {
     /// How long the producer occupies the device, from the joined arm. The unjoined arms are only
     /// meaningful if their consumer was enqueued well inside this.
     producer: Duration,
+    /// Whether the consumer writes the buffer the producer writes — see [`score`], which is the
+    /// only thing that reads it. Carried here rather than passed alongside, because it also picks
+    /// which buffer [`Rig::observe`] reads and the two must not be able to disagree.
+    in_place: bool,
 }
 
 impl Rig {
     fn new() -> Self {
         let a = dev(&f32b(&fixture::fill(M * K, 1, 1.0)));
-        let wb: Vec<u8> = fixture::to_bf16(&fixture::fill(N * K, 2, 1.0))
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let wb = fixture::u16b(&fixture::to_bf16(&fixture::fill(N * K, 2, 1.0)));
         let stale = f32b(&vec![STALE; OUT]);
         let ones = f32b(&vec![1.0f32; OUT]);
         Rig {
@@ -214,59 +217,50 @@ impl Rig {
         };
     }
 
-    /// Producer, consumer, join. `inside` carries the producer's measured duration for the arms
-    /// that do NOT join between the two, and its absence marks the arm that measures it.
+    /// Whatever the consumer wrote. Which buffer that is IS `in_place` — the softcap
+    /// read-modify-writes the producer's `dst`, the gate writes `x` — so the two are one bit here
+    /// rather than a closure the caller passes alongside it, which was a second spelling of the
+    /// same fact and could disagree with the one [`score`] reads (review, 2026-08-13).
+    fn observe(&self, in_place: bool) -> Vec<f32> {
+        sync_read(if in_place { &self.dst } else { &self.x })
+    }
+
+    /// Producer, consumer WITHOUT a join between them, join. The unordered and ordered arms.
     ///
-    /// **The unjoined arms have to prove their consumer was submitted while the producer was still
-    /// running**, or a divergence count cannot tell "the consumer read early" from "the producer
-    /// had already retired". An earlier version compared two reads of the same clock taken in
-    /// program order (`enqueued < total`), which is a theorem rather than a measurement and could
-    /// not go red for any input — both reviews found it, 2026-08-13. Comparing against the
-    /// producer's own duration is what makes the arm mean what it claims.
+    /// **This has to prove its consumer was submitted while the producer was still running**, or a
+    /// divergence count cannot tell "the consumer read early" from "the producer had already
+    /// retired". An earlier version compared two reads of the same clock taken in program order
+    /// (`enqueued < total`), which is a theorem rather than a measurement and could not go red for
+    /// any input — both reviews found it, 2026-08-13. Comparing against the producer's own
+    /// duration, measured in the joined arm, is what makes this one mean what it claims.
     fn run(
         &mut self,
-        inside: Option<Duration>,
+        producer: Duration,
         stream: *mut c_void,
         consume: &dyn Fn(&Rig, *mut c_void),
-        observe: &dyn Fn(&Rig) -> Vec<f32>,
-    ) -> (Vec<f32>, Duration) {
+        in_place: bool,
+    ) -> Vec<f32> {
         self.reset();
         let t0 = Instant::now();
         self.produce();
-        if inside.is_none() {
-            device_sync().expect("producer join");
-        }
-        let producer = t0.elapsed();
         consume(self, stream);
         let enqueued = t0.elapsed();
         device_sync().expect("join");
-        // On the unjoined arms `producer` is only the LAUNCH's return, tens of microseconds — the
-        // producer is still running. Printing it as a duration there would read as a 10 µs
-        // producer, so the two arms report different things because they measured different things.
-        match inside {
-            None => println!("    producer alone ran {producer:?}"),
-            Some(d) => {
-                println!(
-                    "    consumer enqueued at {enqueued:?}, {:.0}x inside a {d:?} producer",
-                    d.as_secs_f64() / enqueued.as_secs_f64()
-                );
-                assert!(
-                    enqueued * INSIDE < d,
-                    "the consumer was enqueued at {enqueued:?}, not inside the first 1/{INSIDE} \
-                     of a {d:?} producer — this arm measured a launch onto an idle or nearly-idle \
-                     device, not the unordered-read hazard"
-                );
-            }
-        }
-        (observe(self), producer)
+        println!(
+            "    consumer enqueued at {enqueued:?}, {:.0}x inside a {producer:?} producer",
+            producer.as_secs_f64() / enqueued.as_secs_f64()
+        );
+        assert!(
+            enqueued * INSIDE < producer,
+            "the consumer was enqueued at {enqueued:?}, not inside the first 1/{INSIDE} of a \
+             {producer:?} producer — this arm measured a launch onto an idle or nearly-idle \
+             device, not the unordered-read hazard"
+        );
+        self.observe(in_place)
     }
 
     /// The producer's four arms for one consumer.
-    fn arms(
-        &mut self,
-        consume: &dyn Fn(&Rig, *mut c_void),
-        observe: &dyn Fn(&Rig) -> Vec<f32>,
-    ) -> Arms {
+    fn arms(&mut self, consume: &dyn Fn(&Rig, *mut c_void), in_place: bool) -> Arms {
         let null = std::ptr::null_mut();
         // **Warm-up, and it is load-bearing.** HIP loads a kernel's code object on its FIRST
         // launch, and paying that inside a timed arm would put the consumer on an idle device. Here
@@ -277,19 +271,32 @@ impl Rig {
         consume(self, null);
         device_sync().expect("warm-up join");
 
+        // The joined arm, inline because it is the one that JOINS between producer and consumer —
+        // so it is the only arm that can time the producer, and the only one with nothing to assert
+        // about enqueue order. Folding it into `run` cost an `Option<Duration>` that meant "which
+        // arm am I" in one branch and "how long" in the other (review, 2026-08-13).
+        self.reset();
+        let t0 = Instant::now();
+        self.produce();
+        device_sync().expect("producer join");
+        let producer = t0.elapsed();
+        consume(self, null);
+        device_sync().expect("join");
+        let want = self.observe(in_place);
+        println!("    producer alone ran {producer:?}");
+
         let raw = self.s.raw();
-        let (want, producer) = self.run(None, null, consume, observe);
-        let inside = Some(producer);
         Arms {
             want,
-            unordered: self.run(inside, null, consume, observe).0,
-            ordered: self.run(inside, raw, consume, observe).0,
+            unordered: self.run(producer, null, consume, in_place),
+            ordered: self.run(producer, raw, consume, in_place),
             unproduced: {
                 self.reset();
                 consume(self, null);
-                observe(self)
+                self.observe(in_place)
             },
             producer,
+            in_place,
         }
     }
 }
@@ -300,15 +307,16 @@ impl Rig {
 /// about the substance too — a red arm and a green arm are only comparable if the same code
 /// decides what "wrong" counts as.
 ///
-/// `in_place` says whether the consumer writes the buffer the producer writes, which changes what
-/// a wrong element MEANS. `sigmoid_gate` reads `dst` and writes `x`, so every wrong element is a
-/// stale read. `logit_softcap` read-modify-writes `dst`, so an unordered element has three
+/// [`Arms::in_place`] says whether the consumer writes the buffer the producer writes, which
+/// changes what a wrong element MEANS. `sigmoid_gate` reads `dst` and writes `x`, so every wrong
+/// element is a stale read. `logit_softcap` read-modify-writes `dst`, so an unordered element has
+/// three
 /// possible survivors — the ordered answer, the raw product (the consumer's write was lost), or
 /// the capped stale value (the consumer's write won but read stale) — and the last two are both
 /// "wrong" for different reasons. The split is counted and printed rather than asserted in prose,
 /// which the first version did: it claimed the survivor "is the uncapped logit" and measured
 /// nothing.
-fn score(name: &str, in_place: bool, a: &Arms) {
+fn score(name: &str, a: &Arms) {
     assert!(
         a.want.iter().all(|v| v.is_finite()) && a.want.iter().any(|v| *v != 0.0),
         "{name}: the ordered answer is all-zero or non-finite, so every comparison below is a \
@@ -343,7 +351,7 @@ fn score(name: &str, in_place: bool, a: &Arms) {
         u - stale,
         a.producer
     );
-    if !in_place {
+    if !a.in_place {
         assert_eq!(
             stale,
             u,
@@ -393,9 +401,9 @@ fn a_null_stream_consumer_reads_its_operand_before_the_producer_writes_it() {
             unsafe { launch_sigmoid_gate(r.x.ptr() as *mut f32, r.dst.ptr() as *const f32, OUT, s) }
                 .expect("sigmoid_gate launch")
         },
-        &|r| sync_read(&r.x),
+        false,
     );
-    score("sigmoid_gate", false, &gate);
+    score("sigmoid_gate", &gate);
 
     let cap = rig.arms(
         &|r, s| {
@@ -404,7 +412,7 @@ fn a_null_stream_consumer_reads_its_operand_before_the_producer_writes_it() {
             unsafe { launch_logit_softcap(r.dst.ptr() as *mut f32, OUT, MULT, CAP, s) }
                 .expect("logit_softcap launch")
         },
-        &|r| sync_read(&r.dst),
+        true,
     );
-    score("logit_softcap", true, &cap);
+    score("logit_softcap", &cap);
 }

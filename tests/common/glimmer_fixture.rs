@@ -22,7 +22,7 @@ mod golden_read;
 // twice, and folding the includes into one is the fix that keeps working as fixtures are added.
 #[path = "mod.rs"]
 mod device;
-pub use device::{GLIMMER_SHIPPED_CONFIG, back, dev, f32b, f32v, gemm_bf16_launch, zeros};
+pub use device::{GLIMMER_SHIPPED_CONFIG, back, dev, f32b, f32v, gemm_bf16_launch, u16b, zeros};
 
 #[path = "tolerance.rs"]
 pub mod tolerance;
