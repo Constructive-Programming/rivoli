@@ -77,13 +77,11 @@
 //! null in one body and relies on four explicit `device_sync` boundaries its header enumerates.
 //! Null is correct in both, for reasons no grep can see.
 //!
-//! **A NARROWER rule does mechanise and is not gated today** (found by review, 2026-08-13, left as
-//! an open item rather than done here because it edits three engine files this port does not own):
-//! `src/backend.rs:86` defines `NULL_STREAM` precisely so a deliberate null reads as a decision,
-//! and about fourteen `src/` call sites still pass a bare `std::ptr::null_mut()` in the stream
-//! position — including `src/f4gpu.rs:1686`, in the file that imports `NULL_STREAM` and uses it
-//! eight lines away. A source census in `kernel_coverage.rs`'s style would cost one test and no
-//! device.
+//! **A NARROWER rule does mechanise — a `NULL_STREAM` source census — and it is OPEN.** The
+//! argument, the call-site count and the file references live in `glimmer-integration.md` item 4,
+//! which is where this repo tracks open items; they were restated here and are not, because a
+//! second copy of a line number across a file boundary rots with nothing to notice it. That is the
+//! same defect [`INSIDE`] names, one commit later and applied to a paragraph.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
@@ -170,9 +168,13 @@ struct Arms {
     /// How long the producer occupies the device, from the joined arm. The unjoined arms are only
     /// meaningful if their consumer was enqueued well inside this.
     producer: Duration,
-    /// Whether the consumer writes the buffer the producer writes — see [`score`], which is the
-    /// only thing that reads it. Carried here rather than passed alongside, because it also picks
-    /// which buffer [`Rig::observe`] reads and the two must not be able to disagree.
+    /// Whether the consumer writes the buffer the producer writes. [`score`] says what that
+    /// changes; [`Rig::observe`] reads it too, which is why it is one bit and not a bool beside a
+    /// closure — those were a second spelling of the same fact and could disagree (review,
+    /// 2026-08-13). Its pairing with `consume` is the one coupling no type enforces, and it cannot
+    /// pass silently either way: the gate with `true` reads a buffer no consumer writes, so `u`
+    /// collapses to 0 and trips the floor (run); the softcap with `false` reads the all-ones `x` in
+    /// every arm, so `want == unproduced` everywhere and `blind == 0` trips first (reasoned).
     in_place: bool,
 }
 
@@ -217,10 +219,7 @@ impl Rig {
         };
     }
 
-    /// Whatever the consumer wrote. Which buffer that is IS `in_place` — the softcap
-    /// read-modify-writes the producer's `dst`, the gate writes `x` — so the two are one bit here
-    /// rather than a closure the caller passes alongside it, which was a second spelling of the
-    /// same fact and could disagree with the one [`score`] reads (review, 2026-08-13).
+    /// Whatever the consumer wrote — which buffer that is IS [`Arms::in_place`].
     fn observe(&self, in_place: bool) -> Vec<f32> {
         sync_read(if in_place { &self.dst } else { &self.x })
     }
@@ -310,9 +309,8 @@ impl Rig {
 /// [`Arms::in_place`] says whether the consumer writes the buffer the producer writes, which
 /// changes what a wrong element MEANS. `sigmoid_gate` reads `dst` and writes `x`, so every wrong
 /// element is a stale read. `logit_softcap` read-modify-writes `dst`, so an unordered element has
-/// three
-/// possible survivors — the ordered answer, the raw product (the consumer's write was lost), or
-/// the capped stale value (the consumer's write won but read stale) — and the last two are both
+/// three possible survivors — the ordered answer, the raw product (the consumer's write was lost),
+/// or the capped stale value (the consumer's write won but read stale) — and the last two are both
 /// "wrong" for different reasons. The split is counted and printed rather than asserted in prose,
 /// which the first version did: it claimed the survivor "is the uncapped logit" and measured
 /// nothing.
