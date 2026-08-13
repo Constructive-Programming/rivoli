@@ -400,10 +400,16 @@ const OWNERS: &[(&str, &[&str])] = &[
     // correct rather than an argument order away. No numeric test can do better while every
     // scoring path hands the same scale to the kernel and to the oracle.
     //
-    // **Trap 2's wiring half IS closed by this row being non-empty**: a port that never calls this
-    // kernel at all passes every test in `glimmer_qk_norm.rs`, and the census is what sees that.
-    // Three calls per token per layer — Q, K, and the embedding norm, which is the same weightless
-    // form at `rows = 1`.
+    // **AND TRAP 2'S WIRING HALF IS NOT CLOSED BY THIS ROW, WHICH IS WHAT THE COMMIT THAT FILLED IT
+    // IN CLAIMED.** Retracted the same day, by review. This census tests whether a FILE contains a
+    // line naming the launcher — not how many call sites, not whether any of them runs. Glimmer
+    // calls this kernel three times per token: Q and K in `attention`, once per layer, plus the
+    // embedding norm in `hidden_state`, which is the same weightless form at `rows = 1` and runs
+    // once per token. **Delete both QK-norm calls — trap 2 exactly — and the embedding norm alone
+    // keeps this row green**, with `glimmer_qk_norm.rs` green beside it because it scores the
+    // kernel and not the caller. What closes the trap is a test that RUNS the loop; the toy
+    // Glimmer fixture makes that possible without the 55.7 GB checkpoint, and
+    // `tests/glimmer_loop.rs` now does it.
     ("rmsnorm_weightless_batch", &["glimmer_gpu.rs"]),
     ("rope_adjacent", &["attn.rs"]),
     ("rope_interleave", &["gpu.rs"]),

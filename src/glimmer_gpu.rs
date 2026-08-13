@@ -10,15 +10,23 @@
 //! on a real one: 99.9% of a 2M-element operand read stale. The conclusion it draws is **not**
 //! "never pass null" — it is that every launch touching one buffer must be on ONE stream, and that
 //! a compute stream at two call sites inside an otherwise null-stream layer is the same bug
-//! inverted. Six of the launchers this chain needs (`rope_split_half`, `rmsnorm_single`, `vadd`,
-//! `argmax`, `rope_interleave`, `swiglu`'s siblings) take no stream parameter at all, so a
-//! "compute stream" loop would be exactly that inversion — a real stream at the launches that
-//! accept one and the legacy default at the six that cannot.
+//! inverted. **Four of the twelve launchers this chain drives take no stream parameter at all** —
+//! `rmsnorm_single`, `rope_split_half`, `vadd` and `argmax` — so a "compute stream" loop would be
+//! exactly that inversion: a real stream at the eight launches that accept one and the legacy
+//! default at the four that cannot.
+//!
+//! > **CORRECTED 2026-08-13, same day, by review.** This said SIX and listed `rope_interleave` and
+//! > "`swiglu`'s siblings". `swiglu` takes a stream, and this file passes it `NULL_STREAM` like
+//! > every other; `rope_interleave` is the INTERLEAVED convention — the one this model must never
+//! > use, since Glimmer is split-half and applying one where the other belongs is trap 9, fluent
+//! > and wrong. Writing it into the inventory of "launchers this chain needs" put a forbidden
+//! > kernel on S5's to-do list. The decision below is unaffected; its stated reason was wrong on
+//! > two of its six entries, and a closure gets inherited together with its justification.
 //!
 //! So the whole chain is null, uniformly, and the legacy stream's own ordering carries the
 //! dependencies. `f4gpu.rs::pre_norm` is the precedent and makes the same argument. **The cost is
 //! that nothing overlaps**, which is S5's to change — and the change is not "pass a stream here",
-//! it is giving those six launchers one first. Until then a stream argument in this file would be
+//! it is giving those four launchers one first. Until then a stream argument in this file would be
 //! decoration that reads as a guarantee.
 //!
 //! # What the loop must not get wrong, and where each is handled
@@ -49,7 +57,7 @@ use crate::backend::hip::{
     launch_vadd,
 };
 use crate::memory::device::DeviceBuf;
-use crate::memory::pin::{Bf16Weight, GlimmerPin};
+use crate::memory::pin::{Bf16Weight, GlimmerLayerPin, GlimmerPin};
 use anyhow::{Result, ensure};
 
 /// f32 scratch of `n` elements.
@@ -100,15 +108,38 @@ pub struct Window {
 ///
 /// A free function rather than a method so `tests/glimmer_loop.rs` can gate it without a device: a
 /// rule whose test needs 55 GB of weights to run is a rule nothing runs.
+///
+/// `win` must be positive on a sliding layer — [`Glimmer::new`] refuses a config where it is not,
+/// because a zero here is a division by zero one line down and a contradiction in the manifest
+/// (a layer typed `sliding_attention` with no window).
 pub fn window_of(kind: LayerKind, win: usize, n_ctx: usize, pos: usize) -> Window {
     match kind {
         LayerKind::SlidingAttention => {
-            // The ring is `sliding_window` slots — the launcher's floor of `win + tq - 1` at the
-            // `tq == 1` this file decodes at. Clamped to `n_ctx` because a run shorter than the
-            // window would otherwise allocate slots no position can reach.
+            // Asserted rather than left to `pos % 0`. This is `pub`, so a caller that never went
+            // through `Glimmer::new`'s refusal — a bench, a future server path, a test — reaches
+            // it directly, and "attempt to calculate the remainder with a divisor of zero" names
+            // neither the field that was zero nor why it may not be.
+            assert!(
+                win > 0 && n_ctx > 0,
+                "a sliding layer needs a positive window and context, got win {win} and n_ctx \
+                 {n_ctx} — a layer typed `sliding_attention` with `sliding_window` 0 is a \
+                 contradiction in the manifest"
+            );
+            // **The window is clamped WITH the ring, and clamping only one of them is a hard
+            // refusal at layer 0.** `rivoli_gqa_attend` rejects `ring_cap < win + tq - 1` (code
+            // 1005, `kernels/attn.hip:647`), which at `tq == 1` is `ring_cap < win` — so a ring
+            // sized to a context shorter than the window and a `win` left at the model's value is
+            // the one pair the launcher refuses outright. The first version returned exactly that,
+            // and since the default `--bench 64` gives `n_ctx` ≈ 70 against a 2048-row window, the
+            // default invocation could not emit a single token (review, 2026-08-13).
+            //
+            // Clamping both is not a compromise, it is the same attention: the clamp only fires
+            // when `n_ctx <= win`, and then every position is below `win`, so the kernel's
+            // `lo = (win > 0 && pos >= win) ? pos - win + 1 : 0` is 0 either way — the whole causal
+            // prefix. A sliding layer in a run shorter than its window has nothing to slide past.
             let cap = win.min(n_ctx);
             Window {
-                win,
+                win: cap,
                 ring_cap: cap,
                 slot: pos % cap,
             }
@@ -120,6 +151,57 @@ pub fn window_of(kind: LayerKind, win: usize, n_ctx: usize, pos: usize) -> Windo
             ring_cap: 0,
             slot: pos,
         },
+    }
+}
+
+/// One layer's twelve device handles, resolved from the pin ONCE per layer.
+///
+/// **This exists to make [`GlimmerPin::layer`]'s narrowest rule structural.** That contract says
+/// in as many words: *do not launch from pointers captured across a `layer()` call* — the fence it
+/// performs syncs kernels already enqueued and cannot see a caller that captures layer `l`'s
+/// addresses, requests another layer, and only then launches. The first version of this loop
+/// requested the pin three times per layer and launched from the first request's pointers after
+/// the second and third, which was safe only because all three asked for the SAME `l` and a repeat
+/// request takes the hit path. Safe by accident is the state S5's prefetch turns into wrong text,
+/// so the request happens once and the handles are passed down (review, 2026-08-13).
+///
+/// It also fixes a live measurement defect: `GlimmerPin`'s `hits` counter is documented as the way
+/// to tell a working partition from a thrashing one, and three requests per layer inflated it
+/// threefold.
+///
+/// A copy of `GlimmerLayerPin` rather than a borrow, because holding the borrow would keep
+/// `self.pin` mutably borrowed across every `&mut self` call in the layer body.
+struct Handles {
+    input_ln: *const f32,
+    post_attn_ln: *const f32,
+    pre_ffn_ln: *const f32,
+    post_ffn_ln: *const f32,
+    q: Bf16Weight,
+    k: Bf16Weight,
+    v: Bf16Weight,
+    o: Bf16Weight,
+    attn_gate: Bf16Weight,
+    mlp_gate: Bf16Weight,
+    mlp_up: Bf16Weight,
+    mlp_down: Bf16Weight,
+}
+
+impl Handles {
+    fn of(p: &GlimmerLayerPin) -> Self {
+        Self {
+            input_ln: p.input_ln,
+            post_attn_ln: p.post_attn_ln,
+            pre_ffn_ln: p.pre_ffn_ln,
+            post_ffn_ln: p.post_ffn_ln,
+            q: p.q,
+            k: p.k,
+            v: p.v,
+            o: p.o,
+            attn_gate: p.attn_gate,
+            mlp_gate: p.mlp_gate,
+            mlp_up: p.mlp_up,
+            mlp_down: p.mlp_down,
+        }
     }
 }
 
@@ -216,6 +298,29 @@ impl Glimmer {
         n_ctx: usize,
     ) -> Result<Self> {
         ensure!(n_ctx > 0, "n_ctx must be positive");
+        // **The geometry is asserted here rather than inherited from `GlimmerTextConfig::validate`,
+        // WHICH THIS CONSTRUCTOR DOES NOT CALL.** `new` is `pub` on a `pub` type, so a caller can
+        // hand it a config the artifact loader never saw. Two of these matter beyond tidiness: the
+        // KV vectors below are built by iterating `layer_types` while everything that indexes them
+        // runs `0..n_layers`, so a short array is an index panic mid-token after the pin is
+        // already placed; and a `sliding_window` of 0 under a `sliding_attention` layer reaches
+        // `window_of` as a division by zero (review, 2026-08-13).
+        ensure!(
+            gt.layer_types.len() == gt.n_layers && gt.layer_rope_theta.len() == gt.n_layers,
+            "the config declares {} layers but carries {} layer_types and {} layer_rope_theta",
+            gt.n_layers,
+            gt.layer_types.len(),
+            gt.layer_rope_theta.len()
+        );
+        let sliding = gt
+            .layer_types
+            .iter()
+            .filter(|k| **k == LayerKind::SlidingAttention)
+            .count();
+        ensure!(
+            sliding == 0 || gt.sliding_window > 0,
+            "the config types {sliding} layers `sliding_attention` and gives `sliding_window` 0"
+        );
         ensure!(
             n_ctx <= gt.max_position_embeddings,
             "n_ctx {n_ctx} is past this model's {} trained positions",
@@ -294,10 +399,9 @@ impl Glimmer {
     /// post-QK-norm, post-RoPE keys. Each projection writes where its result is consumed: `k` and
     /// `v` go STRAIGHT into their cache slot, so the norm and the rotation run in place on the
     /// cache and no copy exists to get wrong.
-    fn attention(&mut self, l: usize, pos: usize, w: &Window) -> Result<()> {
+    fn attention(&mut self, l: usize, pos: usize, w: &Window, h: &Handles) -> Result<()> {
         let (qd, kvd) = (self.hq * self.hd, self.hkv * self.hd);
-        let p = self.pin.layer(l)?;
-        let (wq, wk, wv, wo, wg) = (p.q, p.k, p.v, p.o, p.attn_gate);
+        let (wq, wk, wv, wo, wg) = (h.q, h.k, h.v, h.o, h.attn_gate);
         let xn = self.xn.ptr() as *const f32;
         let kslot = unsafe { (self.kc[l].ptr() as *mut f32).add(w.slot * kvd) };
         let vslot = unsafe { (self.vc[l].ptr() as *mut f32).add(w.slot * kvd) };
@@ -431,11 +535,8 @@ impl Glimmer {
     }
 
     /// The MLP: `down(silu(gate(xn)) · up(xn))`, leaving its output in `br` for the post-norm.
-    fn mlp(&mut self, l: usize) -> Result<()> {
-        let (wg, wu, wd) = {
-            let p = self.pin.layer(l)?;
-            (p.mlp_gate, p.mlp_up, p.mlp_down)
-        };
+    fn mlp(&mut self, h: &Handles) -> Result<()> {
+        let (wg, wu, wd) = (h.mlp_gate, h.mlp_up, h.mlp_down);
         let xn = self.xn.ptr() as *const f32;
         // SAFETY: `xn` is `hidden` live f32 from the pre-norm; `mg`/`mu`/`mh` are each `inter` and
         // `br` is `hidden`, all owned by this struct. `swiglu` writes `mh`, which aliases neither
@@ -464,25 +565,36 @@ impl Glimmer {
     /// Reads as the reference's twelve lines because it is those twelve lines —
     /// `glimmer-architecture.md` §3. Each norm's eps comes from the half it belongs to, so the
     /// three-orders-of-magnitude swap is not expressible at this level.
+    ///
+    /// # The pin invariant this body relies on, stated as what actually holds
+    ///
+    /// The four norm pointers are captured once and then used ACROSS the `pin.layer` calls that
+    /// [`Self::attention`] and [`Self::mlp`] make — `post_attn_ln` after the first, `post_ffn_ln`
+    /// after the second. `GlimmerPin::layer`'s own doc names that as the hazard its fence does NOT
+    /// cover: the fence syncs kernels already enqueued, and cannot see a caller that captures layer
+    /// `l`'s pointers, calls `layer(l + 1)`, and only then launches.
+    ///
+    /// **What makes this sound is narrower and it is the thing to preserve: every `pin.layer` call
+    /// inside this function is for the SAME `l`.** A repeat visit takes the `slot_layer[s] ==
+    /// Some(l)` hit path, which neither fences nor refills, so no pointer can move under a capture.
+    /// Prefetching `l + 1`, splitting the sandwich halves across layers, or reordering these calls
+    /// breaks it with no compile error and no fence to catch it — position-dependent wrong text.
+    /// The first version of this comment claimed the opposite ordering and cited the fence as the
+    /// mechanism; both were wrong (review, 2026-08-13).
     fn layer(&mut self, l: usize, pos: usize) -> Result<()> {
         let w = self.attn_window(l, pos);
-        let (input_ln, post_attn_ln, pre_ffn_ln, post_ffn_ln) = {
-            let p = self.pin.layer(l)?;
-            (p.input_ln, p.post_attn_ln, p.pre_ffn_ln, p.post_ffn_ln)
-        };
-        // SAFETY: the four norm weights are `hidden` f32 in the pin, valid until the next
-        // `pin.layer` call — which the calls below make, so each is used before the one that could
-        // move it. That ordering is the borrow this block cannot express and the fence in
-        // `GlimmerPin::layer` is what makes safe: it syncs before any refill.
-        unsafe { self.pre_norm(input_ln)? };
-        self.attention(l, pos, &w)?;
+        let h = Handles::of(self.pin.layer(l)?);
+        // SAFETY: every pointer in `h` is live in the pin and stays at its address for as long as
+        // its slot holds layer `l` — which is the whole of this function, per the section above.
+        unsafe { self.pre_norm(h.input_ln)? };
+        self.attention(l, pos, &w, &h)?;
         // SAFETY: as above.
-        unsafe { self.branch_add(post_attn_ln)? };
+        unsafe { self.branch_add(h.post_attn_ln)? };
         // SAFETY: as above.
-        unsafe { self.pre_norm(pre_ffn_ln)? };
-        self.mlp(l)?;
+        unsafe { self.pre_norm(h.pre_ffn_ln)? };
+        self.mlp(&h)?;
         // SAFETY: as above.
-        unsafe { self.branch_add(post_ffn_ln) }
+        unsafe { self.branch_add(h.post_ffn_ln) }
     }
 
     /// Embed `token`, run every layer at `pos`, and leave the final hidden state in `x`.
@@ -567,11 +679,28 @@ impl Glimmer {
         }
         device_sync()?;
         let mut out = Vec::new();
-        self.pick.copy_out_prefix(&mut out, 4)?;
+        self.pick.copy_out_prefix(&mut out, 8)?;
         let idx = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+        let val = f32::from_le_bytes([out[4], out[5], out[6], out[7]]);
+        // **The VALUE is the fault detector, and the index is not.** `argmax_reduce` initialises
+        // `bidx = 0` and `amax_combine` only ever assigns one of its two input indices, so
+        // `out_idx` is always in `[0, n)` — an all-NaN logit vector returns index 0 with no
+        // complaint. This read `ensure!(idx >= 0, "argmax found no finite logit")` for one commit,
+        // which is a branch that cannot be taken carrying the message of one that matters: it
+        // deleted the ONLY post-final-layer fault detector this model has, one launch after
+        // `logit_softcap` deliberately passes non-finite values through to preserve it. GLM's tail
+        // (`gpu.rs`) bails on the value and keeps the index as a debug assertion; so does this now.
+        // Found by review, 2026-08-13.
+        debug_assert!(idx >= 0, "argmax returned {idx}");
         ensure!(
-            idx >= 0,
-            "argmax found no finite logit — every candidate was NaN or the head produced none"
+            val.is_finite(),
+            "the head produced a non-finite winning logit ({val}) at token index {idx} — every \
+             candidate was NaN or Inf, and an argmax over those picks index 0 silently"
+        );
+        ensure!(
+            (idx as usize) < self.vocab,
+            "argmax returned {idx}, past the vocabulary of {}",
+            self.vocab
         );
         Ok(idx as u32)
     }
@@ -591,13 +720,37 @@ impl Glimmer {
             !prompt.is_empty(),
             "the prompt is empty — nothing to decode from"
         );
+        // `checked_add`, because the sum is the ONLY thing standing between a caller's numbers and
+        // a device write past the end of `kc[l]`: a wrapped sum satisfies this bound and then
+        // `slot = pos` on a full layer indexes wherever it likes. Release builds compile the
+        // overflow check out, so the guard has to be the explicit one.
+        let need = prompt
+            .len()
+            .checked_add(max_new)
+            .filter(|n| *n <= self.n_ctx);
         ensure!(
-            prompt.len() + max_new <= self.n_ctx,
+            need.is_some(),
             "{} prompt tokens plus {max_new} new is past the {} positions this engine's KV cache \
              was built for",
             prompt.len(),
             self.n_ctx
         );
+        // **Every error path joins the device before returning.** `Glimmer` has no `Drop`, so its
+        // fields drop in declaration order and `pin` is FIRST — `DeviceTier`'s `VmmBuf` calls
+        // `hipMemUnmap`/`hipMemRelease` with no synchronisation, while the activation `DeviceBuf`s
+        // whose `hipFree` would implicitly join drop AFTER it. So an error returned mid-layer
+        // unmaps the weight slab with that layer's kernels still in flight. The success path is
+        // already joined by `sample`; this covers the rest (review, 2026-08-13).
+        let r = self.decode_inner(prompt, max_new, eos);
+        if r.is_err() {
+            let _ = device_sync();
+        }
+        r
+    }
+
+    /// [`Self::decode`]'s body. Split out so the join above covers every `?` in it rather than
+    /// each one carrying its own.
+    fn decode_inner(&mut self, prompt: &[u32], max_new: usize, eos: &[u32]) -> Result<Vec<u32>> {
         let mut next = 0u32;
         for (pos, &t) in prompt.iter().enumerate() {
             self.hidden_state(t, pos)?;
@@ -610,12 +763,18 @@ impl Glimmer {
                 device_sync()?;
             }
         }
+        // **The stop token is NOT part of the output**, matching `GpuEngine::generate`'s `emit`
+        // (`gpu.rs`), which returns before pushing. The first version pushed and then tested, so an
+        // EOS-terminated run rendered the marker into the printed completion and reported one token
+        // more than it produced — two decode drivers in one binary disagreeing about whether the
+        // terminator is output, which a `serve.rs` port or a golden comparison inherits silently
+        // (review, 2026-08-13).
         let mut out = Vec::with_capacity(max_new);
         for i in 0..max_new {
-            out.push(next);
             if eos.contains(&next) {
                 break;
             }
+            out.push(next);
             if i + 1 == max_new {
                 break;
             }

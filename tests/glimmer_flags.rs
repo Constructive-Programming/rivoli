@@ -189,10 +189,15 @@ fn a_run_with_no_flags_gets_past_every_refusal() {
     let root = TempRoot::new("glimmer-bare");
     let _ = glimmer_convert_fixture(root.path(), DIM);
     let err = rivoli(&root.join("out"), &[]);
-    assert!(
-        err.contains("residency:") && err.contains("layers pinned"),
-        "a bare run must reach the partition report, got:\n{err}"
-    );
+    // **NOT the `residency:` line, and that is the whole point of this arm.** With no flags,
+    // `device_budget` reads `hipMemGetInfo` and subtracts the 16 GiB OS reserve, so on a machine
+    // whose free GTT is below that the budget saturates toward 0 and `partition` refuses BEFORE
+    // the residency line is printed — a red that means "another tenant holds the GPU", not "a
+    // refusal regressed". This file's own header calls itself deviceless and a sibling test three
+    // lines down records the same trap hitting `glimmer_pin` for real. The bare arm therefore
+    // asserts on the layer map, which is emitted before anything measures the machine; the
+    // `--max-mem` arm takes the literal branch and is the one that asserts the partition
+    // (re-keyed 2026-08-13, then corrected the same day by review).
     assert!(
         !err.contains("does not apply"),
         "no flag refusal may fire on a run that passed no flags:\n{err}"

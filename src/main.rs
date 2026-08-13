@@ -1136,8 +1136,15 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     // `Some(budget)` and not `cfg.max_mem`: `budget` is what `partition` above was asked, so the
     // pin the engine builds is the split the operator was just shown. Handing the raw flag here
     // would let the reported partition and the built one disagree on a defaulted budget.
-    let mut engine =
-        rivoli::glimmer_gpu::Glimmer::new(&cfg.model, gt, Some(budget), ids.len() + max_new)?;
+    // `checked_add`: this sum sizes the KV cache, and `Glimmer::decode`'s own bound recomputes it
+    // — so a wrapped value satisfies both and the loop then writes past the allocation on a full
+    // attention layer, where the slot IS the position. Release builds compile the overflow check
+    // out, so the guard has to be explicit (review, 2026-08-13).
+    let n_ctx = ids
+        .len()
+        .checked_add(max_new)
+        .context("prompt length plus --bench overflows a usize")?;
+    let mut engine = rivoli::glimmer_gpu::Glimmer::new(&cfg.model, gt, Some(budget), n_ctx)?;
     let t0 = std::time::Instant::now();
     let out = engine.decode(&ids, max_new, &tok.eos)?;
     let dt = t0.elapsed();
