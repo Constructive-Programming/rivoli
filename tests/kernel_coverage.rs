@@ -379,6 +379,15 @@ const OWNERS: &[(&str, &[&str])] = &[
     // Muse Glimmer's WEIGHTLESS qk-norm plus Q's 3.87, empty for the same reason the row above is.
     // Named for what it does, not for the model: `mla.hip::qk_norm` already holds the name and is a
     // different kernel (bf16 statistic, DeepSeek-V4's), which is why this one spells its contract.
+    //
+    // **WHOEVER FILLS THIS ROW IN: Q passes 3.87 and K passes 1.0, and NOTHING GATES THAT.** The
+    // goldens gate the reference (`glimmer_anchor.rs` — q.pre_rope / qk_norm.q is 3.87, k.pre_rope is
+    // bit-identical to qk_norm.k), and the kernel refuses an unusable scale, but no test in this tree
+    // can see a caller handing 3.87 to K: that is trap 3, and it is open until a call site exists.
+    // This check runs in BOTH directions, so adding an owner here is the one moment the tree forces
+    // someone to read that — which is why the warning lives at the row rather than only at the
+    // kernel. The same moment closes trap 2's wiring half: a port that never calls this kernel at
+    // all passes every test in `glimmer_qk_norm.rs`.
     ("rmsnorm_weightless_batch", &[]),
     ("rope_adjacent", &["attn.rs"]),
     ("rope_interleave", &["gpu.rs"]),

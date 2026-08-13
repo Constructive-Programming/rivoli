@@ -797,7 +797,18 @@ fn the_qk_norm_captures_are_normalised_over_head_dim_per_head() {
         "a head_dim run has mean(y^2) off 1 by {worst:e} — the reference did not normalise over \
          this axis"
     );
-    assert!(runs > 0, "no captures were checked");
+    // **An absolute, not `runs > 0`.** `layers` comes from `tiny_config` and `steps` from the
+    // golden's own metadata, so a census derived from them cannot notice either one shrinking — a
+    // re-vendor whose `decode_steps` drops to 1, or a `num_hidden_layers` drifted from
+    // `layer_is_sliding`, would leave `worst` a max over fewer rows with every assert still green.
+    // That is the rule this tree wrote down for the sandwich norms' 612/34 one item ago, applied
+    // here after review pointed out this test had the weak form. 2,304 is what the line above
+    // PRINTS on the vendored goldens; no factorisation of it is asserted, because a factorisation
+    // would be a second derived count standing in for the absolute.
+    assert_eq!(
+        runs, 2304,
+        "the axis census covered {runs} head rows, not 2,304"
+    );
 }
 
 /// **Trap 3, refuted by the reference's own bytes: Q is scaled by 3.87 and K is not.**
@@ -818,9 +829,10 @@ fn the_qk_norm_captures_are_normalised_over_head_dim_per_head() {
 /// **And it constrains the reference, not rivoli.** Trap 3 is a port-side defect; nothing here stops
 /// a caller passing 3.87 for K, the anchor has no defect run for that form, and until the layer loop
 /// lands there is no call site to gate. `kernels/linalg.hip` says so at the kernel. The
-/// `qk_scale_on_k` defect that exists scales `k_proj`'s output, upstream of a scale-invariant norm,
-/// and moves nothing anywhere by more than 6.2e-4 — measured and corrected in `anchor.md`
-/// 2026-08-12.
+/// `qk_scale_on_k` defect that exists scales `k_proj`'s output, upstream of a norm that cancels a
+/// scalar only up to the eps term. Its residue peaks at 6.2e-4 — which this line used to call
+/// "nothing", and which is **7.9x the `qk_norm` row's own tolerance**. See `tolerance.rs` for the
+/// correction, the closed form, and why the row's exclusion now rests on margin instead.
 ///
 /// **MEASURED: the ratio over 10,368 elements is [3.8699996, 3.8700001]** — f32 rounding on one
 /// multiply, not a tolerance — **and 3,456 K elements are unchanged, across 28 roped cases.**

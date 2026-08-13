@@ -846,6 +846,13 @@ launchers! {
     /// # Safety
     /// `x` is a device buffer of `rows · d` live f32, written in place, live until the next
     /// [`device_sync`]. `stream` is null or a live stream ordering every producer of `x`.
+    ///
+    /// **`x` is DESTROYED — the pre-norm values do not survive this call**, so no consumer of them
+    /// may be enqueued after this launch on any stream. The clause above constrains what may WRITE
+    /// `x` before; this one constrains what may READ it after, and only the first was written down
+    /// (review, 2026-08-13). The realistic violation is a `--trace` or `--pred-probe` readback of q
+    /// expecting `q_proj`'s output and getting post-norm, post-3.87 bytes; no fixture can see it,
+    /// which is the same shape as the null-stream finding this port already carries.
     launch_rmsnorm_weightless_batch -> rivoli_rmsnorm_weightless_batch, "rmsnorm_weightless_batch" (
         x: *mut f32,
         rows: usize as i32,

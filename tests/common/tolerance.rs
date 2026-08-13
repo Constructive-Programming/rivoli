@@ -226,13 +226,33 @@ pub const GLIMMER: &[Tol] = &[
     // | `qk_norm_off` — the norm skipped, which is trap 2 (it ships no tensor) | 1.575e0 | 1.483e0 | **1.483e0** |
     // | `qk_scale_on_k` — `qk_scale_factor` on K too | 4.324e-4 | 2.825e-4 | 2.825e-4 |
     //
-    // **`qk_scale_on_k` is EXCLUDED, and for a different reason than `attend`'s exclusion of the
-    // same defect.** There it was an algebraic identity: `(s*q).k` and `q.(s*k)` are one product.
-    // Here the driver applies the scale to `k_proj`'s OUTPUT, i.e. to this operator's input, and an
-    // RMS norm cancels a scalar on its input but for the eps — so a correct kernel handed the scaled
-    // input reproduces the perturbed reference exactly, and no kernel-vs-golden comparison could
-    // ever produce this signal. Counting it would have forced `ExactOnly` at 36x the floor, on a
-    // false premise — the trap the `attend` row records.
+    // **`qk_scale_on_k` is EXCLUDED on MARGIN, and the "it is invisible" argument this block used to
+    // make is false.** There is a real difference from `attend`'s exclusion of the same defect: there
+    // it was an algebraic identity, `(s*q).k` and `q.(s*k)` being one product, so the cancellation is
+    // exact. Here the driver applies the scale to `k_proj`'s OUTPUT, i.e. to this operator's input,
+    // and an RMS norm cancels a scalar on its input **only up to the eps term** — which is not
+    // nothing. The residue is `sqrt(1 + (s²−1)·eps/(s²·m + eps)) − 1`, and it reproduces this table's
+    // own measured figures: 2.916e-4 at the back-solved `mean(k²)` 0.016 against a measured 2.825e-4,
+    // and 6.219e-4 at m = 7.5e-3 against `attend`'s measured 6.232e-4.
+    //
+    // > **CORRECTED 2026-08-13, and this is the third argument in this operator's round that
+    // > measurement overturned.** This paragraph said "a correct kernel handed the scaled input
+    // > reproduces the perturbed reference exactly, and no kernel-vs-golden comparison could ever
+    // > produce this signal." Both halves are wrong. Against this row's own `Rel(7.85e-5)` the
+    // > residue is **3.71x to 7.92x the tolerance** over the m range this anchor can reach — so the
+    // > comparison the sentence says could never produce the signal produces it, and a wiring defect
+    // > that scaled K would redden a `qk_norm.k` score rather than sail through it.
+    // >
+    // > **What that leaves OPEN, stated rather than resolved.** The framework's rule is that a
+    // > defect this operator provably CANCELS is not one it can be priced against, and the measured
+    // > residue says this one is not fully cancelled. Counting it makes the weakest targeting defect
+    // > 2.825e-4, a margin of 36x the floor against the 297x a `Rel` policy needs — so by the rule as
+    // > written the row would have to be `ExactOnly`, which a kernel scored against a HOST oracle
+    // > cannot satisfy at all (its own best is 1.41e-7, not 0). The row stays `Rel` and the exclusion
+    // > stays, on margin: every m in this analysis comes from the anchor's toy widths with a
+    // > deterministic draw and NO real weights, the residue falls as 1/m, and at m ≈ 1 it is 4.67e-6
+    // > = 0.06x tol. **The real 6656-wide checkpoint has never been measured, and this exclusion is a
+    // > function of that unmeasured number.** Re-derive it at S4 rather than inheriting this.
     //
     // > **Two corrections review made to this paragraph, 2026-08-12.** (1) It said "an operator
     // > cannot be priced against a defect in its INPUT", which is too broad and contradicts this

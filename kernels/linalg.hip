@@ -415,11 +415,25 @@ extern "C" __global__ void rmsnorm_centered_single(
 //     q = qk_norm(q) * qk_scale_factor      # 3.87, Q ALONE            M:341
 //     k = qk_norm(k)                        # normed, NOT scaled       M:342
 //
-// So Q passes `qk_scale_factor` and K passes `1.0f`. The scale is folded rather than given its own
-// pass because a second pass over q is a second full read of the tensor, which section 7's
-// bytes-per-token budget spends for nothing. It costs one association change against the reference,
-// which applies the scale to the norm's OUTPUT: `x*(s*rs)` here against `(x*rs)*s` there, one
-// rounding apart at ~6e-8 — four decades under this operator's row.
+// So Q passes `qk_scale_factor` and K passes `1.0f`. It costs one association change against the
+// reference, which applies the scale to the norm's OUTPUT: `x*(s*rs)` here against `(x*rs)*s` there,
+// one rounding apart at ~6e-8 — four decades under this operator's row.
+//
+// **The alternative worth arguing against is not a second pass over q — it is `gqa_attend`, which
+// ALREADY takes a runtime `float scale`** (`attn.hip`, applied once per (row, head, kv row) at the
+// dot product). Folding `qk_scale_factor / sqrt(head_dim)` into that argument is arithmetically the
+// same value, commutes with RoPE because a rotation commutes with a scalar, costs ZERO new lines —
+// `attn.rs` already computes `1/sqrt(d)` there — and would make trap 3 unrepresentable in this
+// kernel, since K's scale would stop existing as a parameter. It is genuinely cheaper. Review,
+// 2026-08-13, and the earlier version of this comment argued against a strawman second kernel pass
+// instead, which is not what a reader will find when they go looking.
+//
+// It is declined because rivoli's q intermediate would then be 3.87x smaller than the golden's
+// `q.pre_rope` bytes, and this port's whole method is elementwise tensor-vs-capture scoring — the
+// fixture already treats a LAYOUT deviation as something that must be named at the call site, so a
+// VALUE deviation on the tensor every future chain gate compares is the larger concession. That is
+// the trade: one kernel parameter and one open trap, against every q gate from here to S4 carrying
+// a constant in its fixture.
 //
 // **NOTHING GATES A CALLER THAT PASSES 3.87 FOR K, which is section 9's trap 3.** An earlier version
 // of this comment said `tests/glimmer_qk_norm.rs` reddens on it; that is false and review caught it.
@@ -432,8 +446,18 @@ extern "C" __global__ void rmsnorm_centered_single(
 //
 // **The near-miss a reader will reach for first is twenty lines above: `rmsnorm_centered_single`.**
 // With `w` all zeros — the form Glimmer's sandwich norms actually ship — its arithmetic IS this
-// one's. What it cannot do is the geometry: `dim3(1)`, one statistic per launch, out of place, no
-// scale. Thirty-two Q heads per row would be thirty-two launches.
+// one's. **The geometry is NOT the reason to decline it**, and an earlier version of this comment
+// said it was: `dim3(1)` and one statistic per launch are a `rows` parameter and a `blockIdx.x`
+// stride away, which is a smaller diff than this kernel, so a reader who checks that argument finds
+// it refutable in two lines and concludes the kernel was unnecessary. Review, 2026-08-13.
+//
+// The real reason is the one this file already argues for the plain-vs-centered split twenty lines
+// up, and it transfers verbatim: neither direction is self-announcing at a call site. Reaching a
+// WEIGHTLESS norm by feeding a centered kernel the weights that happen to make it plain encodes a
+// coincidence of Glimmer's parameterisation — that its sandwich `w` initialises to zeros — as this
+// operator's definition. QK-norm is weightless because the reference ships no tensor for it
+// (`with_scale=False`), not because some tensor happens to be zero, and the next reader should not
+// have to re-derive `(1+0) = 1` on the attention path to know which one they are looking at.
 //
 // The two distant ones fail on arithmetic instead. `rmsnorm_batch` multiplies a learned weight and
 // STORES bf16 — there is no weight here (`with_scale=False`, trap 2) and a bf16 store is 2^-9 of
@@ -444,6 +468,21 @@ extern "C" __global__ void rmsnorm_centered_single(
 // One block per row, `block_sum_lds` for the ladder (the rule `headtail.hip` states), and
 // `1.0f/sqrtf` rather than `rsqrtf` for `rmsnorm_batch`'s reason: this factor multiplies a whole
 // head, so a hardware approximation is a systematic scale rather than a rounding difference.
+// **No bar in this tree can see that choice, and the comment above used to imply one could.**
+// `v_rsq_f32` is ~1 ulp, so swapping to `rsqrtf` would land near 2.6e-7 — 8x under this operator's
+// own 2.0e-6 test bar and 300x under its row. So this is a defensible default, not an enforced
+// property, and it is held to a weaker standard than the bf16 store two paragraphs up, which IS
+// 25x the tolerance. Stated rather than gated because a bar tight enough to see 1 ulp would reject
+// correct code on a different compiler. Review, 2026-08-13.
+//
+// **IN PLACE, and `x` is DESTROYED.** The pre-norm q/k does not survive this call, and the sibling
+// `rmsnorm_centered_single` twenty lines up is out of place — so a caller migrating between them
+// silently converts a read-preserving operator into a destructive one, with no shape change in the
+// signature to notice. The aliasing itself is safe here for the two-clause reason the sibling
+// spells out: every read of `row` precedes `block_sum_lds`'s first `__syncthreads()`, and the second
+// loop's thread `i` reads and writes only its own index. What that does NOT cover is a consumer
+// enqueued AFTER this launch that expected the pre-norm values — a `--trace` or `--pred-probe`
+// readback of q is the realistic one, and no fixture can see it. Review, 2026-08-13.
 extern "C" __global__ void rmsnorm_weightless_batch(float* __restrict__ x, int d, float eps,
                                                     float scale) {
     __shared__ float red[256];

@@ -384,6 +384,16 @@ can see the softcap, so G3 compares softmax/NLL against the tiny reference and a
 `softcap_off` engine run must redden it. All of G3 runs at every budget G-R1 sweeps, so the
 loop is never green only-resident.
 
+**Added 2026-08-13, from item 2's review round: G3 also owes the two QK-norm traps whose WIRING
+half no kernel test can reach.** Item 2 is marked DONE and its open obligation was nested in its
+own prose, where a reader working this checklist would never meet it. (a) **Trap 3** — the loop
+must pass `qk_scale_factor` to Q and `1.0` to K, and nothing in the tree gates that today: every
+scoring path hands the same scale to the kernel and the oracle, so no test can observe which one a
+caller chose. `tests/kernel_coverage.rs`'s empty OWNERS row is the only mechanical stop, and it
+fires the moment a call site appears. (b) **Trap 2's wiring half** — an engine that never calls
+`rmsnorm_weightless_batch` at all passes every assertion in `glimmer_qk_norm.rs`, which is
+precisely the tree's state until the loop lands.
+
 ## S4 — real weights
 
 **Serves P5 (the quality ladder) and closes what the tiny model cannot price.**

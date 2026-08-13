@@ -33,7 +33,9 @@
 //!    `apply_rotary_pos_emb`, i.e. after norm AND after scale, so `q.pre_rope / qk_norm.q` is 3.87
 //!    elementwise — and `k.pre_rope` is **bit-identical** to `qk_norm.k`. Trap 3 is refuted by the
 //!    reference's own bytes rather than by a defect run: there IS no defect run for it, because the
-//!    anchor's `qk_scale_on_k` scales upstream of a scale-invariant norm and is nearly a no-op
+//!    anchor's `qk_scale_on_k` scales upstream of a norm that cancels a scalar only up to the eps
+//!    term — a residue of 3.7x to 7.9x this row's tolerance, NOT the no-op this line used to claim;
+//!    `tolerance.rs` carries the correction and what it leaves open
 //!    (`anchor.md`, corrected 2026-08-12).
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
@@ -127,22 +129,29 @@ fn qk_norm(x: &[f32], d: usize, eps: f32, scale: f32) -> Vec<f32> {
 /// **The kernel against the host oracle**, over every width and both scale paths that matter.
 ///
 /// One test and one accumulator, because the two halves were the same comparison to the same bar
-/// with two different mechanisms (review, 2026-08-12): head_dim **128**, which is the width that
-/// matters and no golden reaches — every capture is at 8 — and four RAGGED widths, where some
-/// threads run the strided accumulation one more time than others. Neither 8 nor 128 is ragged:
-/// both are under one 256-thread block, so the stride never wraps.
+/// with two different mechanisms (review, 2026-08-12). The widths cover four classes: **8**, which
+/// is what every golden is at and therefore the width S3's wiring will score against; **128**, the
+/// production head_dim, which no golden reaches; **512**, an exact multiple where all 256 threads
+/// run the strided loop the same number of times; and 257/300/1000, RAGGED, where some threads run
+/// it once more than others. 8 and 128 are both under one block, so there the stride never wraps.
 ///
-/// **Trap 2 is gated here and not by a test of its own.** A port that skips the norm returns its
-/// input, and that scores 7.775e-1 against this oracle — 9,903x the tolerance. The dedicated test
-/// that once stated it separately computed the signal on the HOST and never ran the kernel, which
-/// made it a statement about `fill`'s dynamic range; it is now the anti-vacuity line below.
+/// **Trap 2 is gated here only on the KERNEL side, and the wiring half is open with trap 3's.** A
+/// port that skips the norm returns its input, and that scores 7.775e-1 against this oracle —
+/// 9,905x the tolerance, which the anti-vacuity line below prints. But trap 2 as defined at the
+/// head of this file is a port that *never implements the norm at all*, and no test here can see
+/// that: an engine that never calls `rmsnorm_weightless_batch` passes every assertion in this file,
+/// and `tests/kernel_coverage.rs` records that the tree is in exactly that state today. The
+/// dedicated test that once stated trap 2 separately computed the signal on the HOST and never ran
+/// the kernel, which made it a statement about `fill`'s dynamic range.
 ///
 /// **Red proof, run and reverted 2026-08-12:** dropping `scale` from the kernel (`rs = 1.0f/...`)
-/// reddens the Q path at **7.416e-1, 9,447x the tolerance**, and leaves the K path at 1.322e-7 —
-/// exactly the shape the defect has, since K passes 1.0.
+/// reddens the Q path by four decades and leaves the K path at the unscaled figure — exactly the
+/// shape the defect has, since K passes 1.0. Its magnitudes are not quoted: the code that produced
+/// them is gone, so no run can reproduce them.
 ///
-/// MEASURED 2026-08-12 on gfx1151: **1.322e-7** (K, unscaled), **1.367e-7** (Q, x3.87), and
-/// 1.414e-7 worst over the ragged widths.
+/// MEASURED: the assert below prints ONE worst over all cases and that is the only figure to quote.
+/// This comment previously carried three per-case numbers from a draft that reported per-case, one
+/// of which (a "ragged worst" of 1.414e-7) was LARGER than the overall worst it sat under.
 #[test]
 fn the_qk_norm_matches_a_host_oracle_at_every_width_that_matters() {
     let (hd, e, qs) = (head_dim(), eps(), qk_scale());
@@ -151,21 +160,32 @@ fn the_qk_norm_matches_a_host_oracle_at_every_width_that_matters() {
     // claimed this was "more rows than any single block count this kernel will see per layer at
     // production" — false for any prefill of more than three rows, since production is 32 Q heads
     // times rows.)
-    for (d, scale) in [
-        (hd, 1.0f32),
-        (hd, qs),
-        (257, qs),
-        (300, qs),
-        (512, qs),
-        (1000, qs),
+    // **The eps column is not decoration, and every case but the last one would be blind without
+    // it.** Everywhere else the shipped `e` goes to BOTH the kernel and the oracle, so a kernel that
+    // ignored its `eps` argument and hardcoded 1e-5 scores clean at every width — and the next
+    // test's bad-eps refusals cannot see it either, because they are in the C wrapper and return
+    // before the kernel reads anything. The 1e-3 case is the only thing in this file that proves the
+    // value reaches the arithmetic; at these activations it separates the two by ~9.3e-3, 118x tol.
+    for (d, scale, eps) in [
+        (8, qs, e),
+        (hd, 1.0f32, e),
+        (hd, qs, e),
+        (257, qs, e),
+        (300, qs, e),
+        (512, qs, e),
+        (1000, qs, e),
+        (hd, qs, 1.0e-3f32),
     ] {
         let x = fixture::fill(96 * d, 21, 0.4);
         s.case(
-            &qk_norm(&x, d, e, scale),
-            &host_qk_norm(&x, d, e, scale),
-            || format!("width {d} at scale {scale}"),
+            &qk_norm(&x, d, eps, scale),
+            &host_qk_norm(&x, d, eps, scale),
+            || format!("width {d} at scale {scale} eps {eps:e}"),
         );
     }
+    // An absolute, not `DIMS.len()`: a derived count cannot notice a tuple being deleted, which is
+    // the rule this tree wrote down for the sandwich-norm coverage one item ago.
+    assert_eq!(s.cases, 8, "a width class was dropped from the sweep");
     println!(
         "qk_norm over {} widths: worst rel {:e} at {} against tol {:e}",
         s.cases, s.worst, s.at, s.tol
@@ -189,7 +209,7 @@ fn the_qk_norm_matches_a_host_oracle_at_every_width_that_matters() {
     // reference's widths, so it cannot see this kernel regress by two decades.
     assert!(
         s.worst <= 2.0e-6,
-        "worst rel {:e} at {} > 15x the 2026-08-12 measurement",
+        "worst rel {:e} at {} > 14.2x the 2026-08-12 measurement of 1.410519e-7",
         s.worst,
         s.at
     );
@@ -206,39 +226,55 @@ fn the_launcher_refuses_geometry_and_constants_a_config_cannot_produce() {
     for (args, want, what) in [
         ((0usize, 8usize, eps(), 1.0f32), Some(1001), "no rows"),
         ((2, 0, eps(), 1.0), Some(1001), "a zero width"),
+        // **Both guards are driven with BOTH non-finite classes, and that asymmetry was a real
+        // hole.** Each guard is written `!(v > 0 && v < INFINITY)`, which rejects NaN and infinity
+        // through different clauses; the first version drove NaN on eps and infinity on scale, so
+        // for each guard one clause was untested. Rewritten the obvious way — `scale <= 0.0f ||
+        // scale > 1e30f` — NaN fails both comparisons, falls through, and the kernel fills the
+        // tensor with NaN while every assertion in this file stays green: no scored case passes a
+        // non-finite scale, and the join below is an `assert_ne!`, which NaN satisfies.
         ((2, 8, 0.0, 1.0), Some(1002), "a zero eps"),
+        ((2, 8, -eps(), 1.0), Some(1002), "a negative eps"),
         ((2, 8, f32::NAN, 1.0), Some(1002), "a NaN eps"),
+        ((2, 8, f32::INFINITY, 1.0), Some(1002), "an infinite eps"),
         ((2, 8, eps(), 0.0), Some(1003), "a zero scale"),
         ((2, 8, eps(), -qk_scale()), Some(1003), "a negative scale"),
+        ((2, 8, eps(), f32::NAN), Some(1003), "a NaN scale"),
         (
             (2, 8, eps(), f32::INFINITY),
             Some(1003),
             "an infinite scale",
         ),
-        (
-            (2, 8, eps(), qk_scale()),
-            None,
-            "Q's real scale, which must pass",
-        ),
-        ((2, 8, eps(), 1.0), None, "K's unit scale, which must pass"),
     ] {
         let (rows, d, eps, scale) = args;
         fixture::expect_guard(call(rows, d, eps, scale), want, what);
     }
-    // **The join, and it does more than join.** Reading the buffer back proves the two ACCEPTED
-    // rows actually launched and wrote — a guard table whose accepted rows silently did nothing
-    // would be a table of refusals wearing a census. `sync_read` opens with `device_sync`, so this
-    // is also what keeps `b` alive past the last in-flight launch.
-    //
-    // **Compared against the bytes that went in, not against a constant.** The first version
-    // asserted `any(|v| *v != 1.0)` on a buffer `fill` had drawn in [-1, 1) — true before any
-    // launch, so the assert could not fail and was the exact census-wearing-refusals it names.
-    // Review, 2026-08-12.
-    assert_ne!(
+    // **Every row above is a REFUSAL, and the buffer proves they refused before launching.** A guard
+    // that launched and then returned its code would satisfy `expect_guard` and be invisible.
+    assert_eq!(
         fixture::sync_read(&b),
         before,
-        "the accepted rows left the buffer byte-identical, so nothing launched"
+        "a refused call still wrote — the guard returns its code AFTER launching"
     );
+    // **Each accept is proven SEPARATELY, against the bytes immediately before IT.** Capturing
+    // `before` once and joining after both accepts is satisfied by either one alone: a launcher that
+    // grew a `if (scale == 1.0f) return 0;` fast path for K would return Ok, satisfy
+    // `expect_guard`, and hide behind Q's write. Review, 2026-08-13 — one round after this same test
+    // shipped an anti-vacuity assert that could not fail, which is why the weaker form is named here
+    // rather than just replaced.
+    //
+    // Running Q then K on the same buffer is not a no-op: after Q the rows stand at mean(y²) ≈
+    // 3.87², so K's unit-scale pass renormalises them back to 1 and the bytes move again.
+    // `sync_read` opens with `device_sync`, so this is also what keeps `b` alive past each launch.
+    for (scale, what) in [(qk_scale(), "Q's real scale"), (1.0, "K's unit scale")] {
+        let prior = fixture::sync_read(&b);
+        fixture::expect_guard(call(2, 8, eps(), scale), None, what);
+        assert_ne!(
+            fixture::sync_read(&b),
+            prior,
+            "{what} was accepted but left the buffer byte-identical, so nothing launched"
+        );
+    }
 }
 
 /// **Where the eps sits, pinned without a golden — the one thing the oracle cannot check.**
@@ -256,7 +292,9 @@ fn the_launcher_refuses_geometry_and_constants_a_config_cannot_produce() {
 /// this is the arithmetic saying the same thing.
 ///
 /// It also records why a `qk_norm.*` capture cannot be fed to this kernel as INPUT: every capture is
-/// post-norm, and re-norming a normed vector moves it only ~9.6e-5 (= eps/2m at m = 0.4²/3), against
+/// post-norm, and re-norming a normed vector moves it only 9.863e-5 under this file's own metric
+/// (host-recomputed on `fill(64*128, 25, 0.4)`; the closed form `eps/2m` predicts 9.375e-5 and the
+/// difference is `worst_rel` dividing by a tensor-wide max while the displacement is per row), against
 /// 7.8e-1 for skipping the norm on raw input. Four decades apart — the gap that makes a
 /// capture-as-input test blind rather than merely weak.
 #[test]
@@ -268,8 +306,16 @@ fn the_eps_is_inside_the_mean_and_the_identity_says_so() {
     // mean(x²) = 3 the identity is 3.3e-6 against a noise floor near 1.2e-7, so the relative error is
     // ~4% of nothing. The first version of this test swept up to `scale_of_x = 3.0` and went red at
     // 5.789e-2 on exactly that — the bound was wrong by construction, not the kernel. These three
-    // put the identity at 6.98e-2 / 1.19e-2 / 1.33e-3, and they are also where the model's own
-    // post-norm activations sit.
+    // put the identity at 6.98e-2 / 1.19e-2 / 1.33e-3, well clear of the f32 floor.
+    //
+    // **They are BELOW the reference's own regime, deliberately, and an earlier version of this
+    // comment claimed the opposite.** `x` here is the norm's INPUT, not a post-norm activation —
+    // post-norm activations sit at mean(y²) ≈ 1 by construction, which is what the anchor's axis
+    // test asserts. These scales give m = 1.33e-4 / 8.33e-4 / 7.50e-3, and `tolerance.rs` bounds the
+    // reference's SMALLEST input mean-square at 1.233e-2 from that same axis run, so all three are
+    // under it. That direction is the safe one — smaller m makes `eps/(m+eps)` larger and the test
+    // more sensitive — but the constraint runs the other way from "this is where the model sits",
+    // and a reader who believed that would widen the sweep upward and reproduce the original red.
     for scale_of_x in [0.02f32, 0.05, 0.15] {
         let x = fixture::fill(64 * hd, 25, scale_of_x);
         let y = qk_norm(&x, hd, e, 1.0);
@@ -282,12 +328,25 @@ fn the_eps_is_inside_the_mean_and_the_identity_says_so() {
         }
     }
     println!("eps placement, worst relative error in 1 - mean(y^2): {worst:e}");
+    // `worst` starts at 0.0 and `worst < 1e-2` passes over an empty loop. The bounds are literals so
+    // that is unreachable today, but this tree has shipped an `assert_eq!(0, 0)` once.
+    assert!(worst > 0.0, "no rows were scored — the sweep ran empty");
     // **Measured 1.4222e-4 — a 70x margin under the bound, and 1.6x ABOVE the f32 noise floor I
     // predicted (9.0e-5) when picking the regime.** The prediction is left here rather than quietly
     // replaced because the direction is the useful part: an f32 error estimate over a 128-term sum
     // undershoots, so a bound set at the predicted floor would have been a coin flip. 1e-2 is loose
-    // against the MEASUREMENT and still tight against every other placement by orders —
-    // `sqrt(mean)+eps` moves the identity by a factor of `sqrt(m)/eps`, ~1e3 at the narrowest scale.
+    // against the MEASUREMENT and tight against every other placement AT THESE SCALES — measured on
+    // the host: eps outside the sqrt scores 9.77e-1 / 9.44e-1 / 8.27e-1, eps on the rsqrt result and
+    // eps missing entirely both score ~1.0, and eps on the SUM instead of the mean 9.92e-1.
+    //
+    // **The discriminant has a ZERO, and the sweep must stay away from it — this is a precondition,
+    // not a noise argument.** For `y = x/(sqrt(m)+eps)` the measured quantity lands at `2*eps/sqrt(m)`
+    // against a `want` of `eps/m`, so the relative separation is exactly `|2*sqrt(m) - 1|` — no eps
+    // in it, and it VANISHES at m = 1/4. At scale_of_x 0.866 (m = 0.25) that wrong placement scores
+    // 2.93e-5, three decades UNDER this bound, and the test would pass it. The earlier version of
+    // this line claimed the separation was `sqrt(m)/eps`, ~1e3, which is a different quantity
+    // altogether and hid the zero. So there are two independent reasons the sweep stays small — the
+    // f32 noise floor above, and this — and only the first was written down. Review, 2026-08-13.
     assert!(
         worst < 1e-2,
         "1 - mean(y^2) is {worst:e} away from eps/(m+eps) — the eps is not inside the mean"
