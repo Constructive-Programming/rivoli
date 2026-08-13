@@ -362,11 +362,52 @@ What the loop must get right, each with its gate:
    its wrapper), and the norm is NOT idempotent at this eps (re-norming moves a normed vector 9.6e-5,
    comparable to the row), so the reason a capture cannot serve as this kernel's input is a ratio
    argument and not an identity.
-3. **The gate operand.** S2 proved the kernel and explicitly not the wiring; the anchor
-   captures both `input_layernorm.out` and `attn.gate_proj.out` per (step, layer), so the
-   loop is scored against `gate_proj.out` directly — the realistic trap-4 miswiring
-   (`gate_proj` of the pre-norm residual or the post-attention norm) differs mostly by a
-   scale and ONLY this capture catches it.
+3. **The gate operand. PAID 2026-08-13 as far as it can be without a loop, and the plan's own
+   premise was wrong.** S2 proved the kernel and explicitly not the wiring; the anchor captures
+   both `input_layernorm.out` and `attn.gate_proj.out` per (step, layer), so the loop is scored
+   against `gate_proj.out` directly — the realistic trap-4 miswiring (`gate_proj` of the pre-norm
+   residual or the post-attention norm) differs mostly by a scale and ONLY this capture catches it.
+
+   > **"So the loop is scored against `gate_proj.out` directly" SKIPPED A STEP: scoring
+   > `gate_proj` needs the projection, and the anchor is activations-only by design.** Worse, the
+   > move that worked for the sandwich norms — recover the parameter from the captures, predict the
+   > other rows — is not merely weaker here, it is **vacuous**. `gate_proj` is 72 → 48 and a layer
+   > sees 18 rows, so each output element has 18 equations against 72 unknowns: underdetermined by
+   > 4x, and EVERY candidate operand admits a weight that reproduces the captures exactly. The norms
+   > escaped that only because they are elementwise, where one row recovers one parameter.
+   > `glimmer_mlp.rs` had already written down the same wall for its own composition and named the
+   > only two ways out; this is the second.
+   >
+   > **So the driver exports the weight** (`--dump-weights`, `weights_capture`) to a SEPARATE file
+   > per salt, which keeps the goldens' bytes and their four pinned FNVs exactly where they were —
+   > verified by regenerating both goldens with the flag on and finding them **byte-identical**.
+   > Only `attn.gate_proj` today, 113 KB per salt. The whole tiny model is ~1.9 MB per salt, and
+   > **items 4–5 and G3 each need more of it** — G3's "match the tiny model at zero tolerance" needs
+   > all of it, including `lm_head`. Extend that file rather than starting a second.
+   >
+   > `tests/glimmer_gate_operand.rs`: **112 (salt, layer, step) cases over 288 rows**, both pinned
+   > as absolutes. The correct operand scores **5.301e-3** through the device; the two wrong ones
+   > redden at a WEAKEST **9.104e-1** and **2.036e-1**.
+   >
+   > **The bar is 1e-2 and it is set by the FORMAT, not the operator — no `tolerance.rs` row
+   > applies.** rivoli stores this projection bf16 as the real checkpoint does and the reference
+   > computed it f32, so the floor is 5.301e-3 measured — 64x above the `o_proj` row
+   > `glimmer_gate.rs` scores against. An fp32-floor row from the anchor's defect runs cannot price
+   > a bf16 storage decision, and stretching one to fit is the trap the `attend` row records.
+   >
+   > **THE BAR'S MARGIN WAS WRONG TWICE, both times from a number I did not measure.** 100x was
+   > inherited from `glimmer_gate.rs`, which scores the SIGMOID of this gate — a compression into
+   > (0, 1), so the margins are different quantities. 50x came from a single-case host probe at
+   > L0 t0, and the weakest case over all 112 is **4x smaller than that probe**. It is 10x now, from
+   > the weakest measurement, with 2x headroom. Same round, same class: the host bf16 estimate
+   > (3.703e-3) under-predicted the device (5.301e-3) by 1.43x, the GEMM's accumulation order being
+   > the part a host estimate does not model — the second time today a host-side prediction sat next
+   > to a bar pretending to be its floor.
+   >
+   > **What it does NOT do: there is still no layer loop, so it does not gate the engine's wiring.**
+   > It gates the comparison the wiring will be held to. When the loop lands the substitution is one
+   > line — its `gate_proj` output in place of the fixture's `gemm_bf16` call — and **until then this
+   > item is a contract, not a passing wiring gate.**
 4. **Streams, not null.** `sigmoid_gate` and `logit_softcap` take the trailing stream now;
    the loop passes its compute stream at both call sites. A null there is the unordered-read
    bug `linalg.hip`'s swiglu note describes, and no fixture can see it — review round 2's

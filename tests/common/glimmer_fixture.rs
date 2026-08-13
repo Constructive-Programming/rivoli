@@ -42,6 +42,40 @@ pub const TEXT: [(&str, &[u8]); 2] = [
     ("text-1", include_bytes!("../glimmer-anchor-text-1.bin")),
     ("text-2", include_bytes!("../glimmer-anchor-text-2.bin")),
 ];
+
+/// The tiny model's `attn.gate_proj` weight per layer, one file per salt, in the SAME container
+/// format as the goldens (`--dump-weights`, `glimmer_anchor_driver.py::weights_capture`).
+///
+/// **Why this exists at all, since the anchor's whole design is activations-only.** S3 item 3
+/// scores the gate OPERAND against `attn.gate_proj.out`, and computing `gate_proj` needs the
+/// projection. It is NOT recoverable from the captures: `gate_proj` is 72 -> 48 and a layer sees
+/// 18 rows, so 18 equations against 72 unknowns per output element is underdetermined by 4x and
+/// EVERY candidate operand admits a weight that fits the captures exactly. The recover-and-predict
+/// shape the sandwich norms use works there only because a norm is elementwise; here it would be
+/// vacuous rather than weak, which is the harder failure to notice.
+///
+/// **Separate files, so the goldens did not move.** Adding these to the goldens would change their
+/// bytes and all four FNVs pinned in `glimmer_anchor.rs`. Instead `--dump-weights` adds nothing to
+/// the capture set, and that was verified the only way it can be: both goldens were regenerated
+/// with the flag on and came back BYTE-IDENTICAL to the vendored ones (2026-08-13).
+pub const WEIGHTS: [(&str, &[u8]); 2] = [
+    ("text-1", include_bytes!("../glimmer-anchor-weights-1.bin")),
+    ("text-2", include_bytes!("../glimmer-anchor-weights-2.bin")),
+];
+
+/// The weight sets, in the same order and under the same names as [`goldens`], so a caller can zip
+/// them. Panics rather than skipping if a file is unreadable: a missing weight set must not
+/// degrade item 3's gate into a pass over nothing.
+pub fn weight_sets() -> Vec<(&'static str, golden_read::GoldenSet)> {
+    WEIGHTS
+        .iter()
+        .map(|(name, bytes)| {
+            let g = golden_read::GoldenSet::read_glimmer(&mut &bytes[..])
+                .unwrap_or_else(|e| panic!("{name} weights: {e:#}"));
+            (*name, g)
+        })
+        .collect()
+}
 pub struct Golden {
     pub name: &'static str,
     pub g: golden_read::GoldenSet,
@@ -474,27 +508,34 @@ pub fn from_bf16(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
-/// `out[j] = Σ_i x[i] · w[j][i]` for one activation row, via `gemm_bf16`.
-pub fn gemv_bf16(x: &[f32], w: &[u16], n: usize, k: usize) -> Vec<f32> {
-    assert_eq!(x.len(), k, "activation width");
+/// `out[t][j] = Σ_i x[t][i] · w[j][i]` over `m` activation rows, via `gemm_bf16`.
+pub fn gemm_bf16(x: &[f32], w: &[u16], m: usize, n: usize, k: usize) -> Vec<f32> {
+    assert_eq!(x.len(), m * k, "activation elements");
     assert_eq!(w.len(), n * k, "weight elements");
     let xb = dev(&f32b(x));
     let wb = dev(&w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-    let ob = zeros(n * 4);
-    // SAFETY: `x` is `k` live f32, `w` is `n*k` live u16, `out` is `n` writable f32, none aliasing
-    // another, all live until the sync in `sync_read`. m = 1: one activation row.
+    let ob = zeros(m * n * 4);
+    // SAFETY: `x` is `m*k` live f32, `w` is `n*k` live u16, `out` is `m*n` writable f32, none
+    // aliasing another, all live until the sync in `sync_read`.
     unsafe {
         device::gemm_bf16_launch(
             xb.ptr() as *const f32,
             wb.ptr() as *const u16,
             ob.ptr() as *mut f32,
-            1,
+            m,
             n,
             k,
             std::ptr::null_mut(),
         )
     };
     sync_read(&ob)
+}
+
+/// One activation row. Item 3 needs `m` = 12 (a whole prefill), so the body moved to [`gemm_bf16`]
+/// and this delegates — a second copy of those twelve lines is what jscpd would have refused, and
+/// the shared body is also the only way the two stay the same call.
+pub fn gemv_bf16(x: &[f32], w: &[u16], n: usize, k: usize) -> Vec<f32> {
+    gemm_bf16(x, w, 1, n, k)
 }
 
 /// `h = silu(g) * u` via `swiglu`.

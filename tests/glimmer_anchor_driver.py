@@ -984,6 +984,31 @@ def _install_draft_taps(mdl, draft, taps):
     return handles
 
 
+def weights_capture(model):
+    """The tiny model's `attn.gate_proj` weight, per layer, for S3 item 3.
+
+    Item 3 scores the gate OPERAND against the `attn.gate_proj.out` captures, and that needs the
+    projection itself. **It cannot be recovered from the captures**: `gate_proj` is 72 -> 48, a
+    layer sees 18 rows (12 prompt + 6 decode), and 18 equations against 72 unknowns per output
+    element is underdetermined by 4x — so ANY candidate operand admits a weight that fits the
+    captures exactly, and a recover-and-predict gate of the shape the sandwich norms use would be
+    vacuous here rather than merely weak. The norms escaped that because they are ELEMENTWISE.
+
+    Written to a SEPARATE file, not added to `cap`: the goldens' bytes and their four pinned FNVs
+    do not move, which is what lets `tests/glimmer-anchor.sh` prove this change is additive by
+    regenerating and comparing. Same container format, so the Rust side reads it with the reader it
+    already has.
+
+    Only `gate_proj` today. Items 4-5 and G3 will want q/k/v/o and the MLP; extend this rather than
+    starting a second file, and note that the whole tiny model is ~475k floats, so exporting all of
+    it is ~1.9 MB per salt — a decision to make deliberately, not by accretion.
+    """
+    cap = Capture()
+    for li, layer in enumerate(model.model.language_model.layers):
+        cap.add(f"L{li}.attn.gate_proj.weight", layer.self_attn.gate_proj.weight)
+    return cap
+
+
 def _draft_hook(cap, name):
     def fn(_mod, _args, out):
         cap.add(name, out)
@@ -1281,6 +1306,12 @@ def main():
     ap.add_argument("--salt", default="glimmer-anchor-1")
     ap.add_argument("--defect", default="None", choices=sorted(DEFECTS))
     ap.add_argument("--out")
+    ap.add_argument(
+        "--dump-weights",
+        metavar="PATH",
+        help="also write the tiny model's gate_proj weights (see weights_capture); adds nothing "
+        "to the golden, so the golden's bytes and FNV are unchanged by passing this",
+    )
     ap.add_argument("--compare", nargs=2, metavar=("CLEAN", "DEFECT"))
     ap.add_argument("--by-operator", nargs=2, metavar=("A", "B"))
     # **fp64 needs no island here, and that is a real difference from K3's anchor.** K3 holds every
@@ -1337,6 +1368,12 @@ def main():
         f"{a.out}: {n} B, {len(cap.floats)} float tensors, {len(cap.ints)} int tensors, "
         f"defect={a.defect}"
     )
+    if a.dump_weights:
+        if a.mode != "text" or a.defect != "None":
+            ap.error("--dump-weights is for the clean text model; a defect run's weights are a trap")
+        w = weights_capture(model)
+        wn = write_golden(a.dump_weights, meta, w)
+        print(f"{a.dump_weights}: {wn} B, {len(w.floats)} weight tensors")
 
 
 if __name__ == "__main__":
