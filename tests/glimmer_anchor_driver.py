@@ -1339,6 +1339,12 @@ def main():
     allowed = TEXT_DEFECTS if a.mode == "text" else DRAFT_DEFECTS
     if a.defect not in allowed:
         ap.error(f"--defect {a.defect} does not apply to --mode {a.mode}")
+    # Beside the other argument-compatibility refusal, and NOT after the run: this check used to sit
+    # below `write_golden`, so `--defect X --dump-weights` built the model, ran all seven steps,
+    # wrote a complete golden, and only then exited 2 -- aborting `glimmer-anchor.sh` mid-sweep with
+    # a good-looking artefact already on disk. Review, 2026-08-13.
+    if a.dump_weights and (a.mode != "text" or a.defect != "None"):
+        ap.error("--dump-weights is for the clean text model; a defect run's weights are a trap")
     if not a.no_preflight:
         preflight_env()
 
@@ -1369,8 +1375,6 @@ def main():
         f"defect={a.defect}"
     )
     if a.dump_weights:
-        if a.mode != "text" or a.defect != "None":
-            ap.error("--dump-weights is for the clean text model; a defect run's weights are a trap")
         w = weights_capture(model)
         wn = write_golden(a.dump_weights, meta, w)
         print(f"{a.dump_weights}: {wn} B, {len(w.floats)} weight tensors")

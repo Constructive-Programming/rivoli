@@ -80,6 +80,20 @@ for salt in "${SALTS[@]}"; do
                 --no-preflight >/dev/null
         done
 
+        # The weight sets ride the clean text run: --dump-weights adds nothing to the golden, so
+        # the cmp below still proves the golden reproduces, and the second cmp proves the weights do.
+        # They were vendored with no regeneration path at all until review caught it (2026-08-13).
+        if [ "$mode" = text ]; then
+            "$PY" "$DRIVER" --mode text --salt "$salt" --defect None --out "$OUT/w-$n.bin" \
+                --dump-weights "$OUT/weights-$n.bin" --no-preflight >/dev/null
+            if cmp -s "$OUT/weights-$n.bin" "$ROOT/tests/glimmer-anchor-weights-$n.bin"; then
+                echo "  weights-$n  reproduces the vendored bytes"
+            else
+                echo "  weights-$n  DIFFERS — find out why it moved before re-vendoring"
+                fail=1
+            fi
+        fi
+
         clean=$OUT/$mode-$n-None.bin
         vendored=$ROOT/tests/glimmer-anchor-$mode-$n.bin
         if cmp -s "$clean" "$vendored"; then

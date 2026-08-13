@@ -398,11 +398,25 @@ What the loop must get right, each with its gate:
    > **THE BAR'S MARGIN WAS WRONG TWICE, both times from a number I did not measure.** 100x was
    > inherited from `glimmer_gate.rs`, which scores the SIGMOID of this gate — a compression into
    > (0, 1), so the margins are different quantities. 50x came from a single-case host probe at
-   > L0 t0, and the weakest case over all 112 is **4x smaller than that probe**. It is 10x now, from
-   > the weakest measurement, with 2x headroom. Same round, same class: the host bf16 estimate
-   > (3.703e-3) under-predicted the device (5.301e-3) by 1.43x, the GEMM's accumulation order being
-   > the part a host estimate does not model — the second time today a host-side prediction sat next
-   > to a bar pretending to be its floor.
+   > L0 t0, and the weakest case over all 112 is **4x smaller than that probe**. It is **15x** now,
+   > stated as a RATIO of the weakest wrong operand to the correct one rather than against the bar —
+   > review's point, and a sharp one: a red proof asserting only a LOWER bound is satisfied by every
+   > way the shared path can break, since NaN, a half-written buffer and the wrong reference tensor
+   > all RAISE the measured error. As a ratio a common-mode failure moves both sides together.
+   > Measured: 177.8x, 171.7x, 38.4x for the three wrong operands.
+   >
+   > > **CORRECTED 2026-08-13, same round, and this one was mine twice over.** This paragraph said
+   > > "the host bf16 estimate (3.703e-3) under-predicted the device (5.301e-3) by 1.43x, the GEMM's
+   > > accumulation order being the part a host estimate does not model." **There is no 1.43x.** My
+   > > host probe rounded the weight to nearest-even and also narrowed the ACTIVATION; the device
+   > > path truncates the weight (`to_bf16` is `bits >> 16`) and leaves the activation f32. Same
+   > > chain, right rounding: **5.3012e-3, four significant figures and the same (salt, layer, step)**
+   > > the device reports. Re-associating a 72-term f32 dot moves the result ~1e-7, three orders too
+   > > small to have been the cause. So I attributed a discrepancy to the GPU that my own host code
+   > > had created, and then generalised it into a lesson about host predictions under-shooting
+   > > devices. What survives is duller: **make the host model the device's arithmetic exactly before
+   > > comparing them at all** — and bf16 weight truncation is the ENTIRE floor here, the device
+   > > contributing under 1e-6 of it.
    >
    > **What it does NOT do: there is still no layer loop, so it does not gate the engine's wiring.**
    > It gates the comparison the wiring will be held to. When the loop lands the substitution is one
