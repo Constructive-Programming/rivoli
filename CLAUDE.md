@@ -72,10 +72,45 @@ cargo clippy --release --features rocm --all-targets
 cargo clippy --release --features rocm,otlp,teacher-forcing,pred-probe,trace,stale-sel --all-targets
 ```
 
+**Build output belongs on `/var/cache/rivoli`, not in the worktree — `/home` is NFS.**
+`192.168.2.10:/home`, so every artefact cargo writes and every freshness `stat` it makes crosses
+the network. Measured 2026-08-13: `du -sh` on an in-worktree `target/` **timed out at 120 s**,
+while the same command on the cache dir returns in **0.006 s**. That per-stat cost is paid
+constantly, not once.
+
+`/var/cache/rivoli` is a **btrfs subvolume** on the local NVMe with **`chattr +C`** (nodatacow):
+no copy-on-write fragmentation and no checksum cost for output that is rewritten constantly, and
+nested subvolumes are excluded from any snapshot of `/` for free. **The flag is inherited only by
+files created after it is set**, so it has to go on the subvolume while it is empty — it cannot
+be applied retroactively to an existing tree.
+
+Point a worktree at it with a local `.cargo/config.toml` holding `[build] target-dir =
+"/var/cache/rivoli/target/<worktree>"`, and add `/.cargo/` to `info/exclude` in the **common**
+gitdir (`git rev-parse --git-common-dir`) — the per-worktree gitdir's `info/exclude` is NOT read,
+which costs a confused minute if you put it there.
+
+**One target dir PER WORKTREE.** Four worktrees share this repo on different branches; a single
+shared target dir has each build invalidating the last, and a shared build directory is already
+something this tree has been bitten by — review subagents inherit `Bash` and will build into
+their parent's `target/`.
+
+**Scratch files go to `/var/cache/rivoli/scratch`**, not `/tmp`. `/tmp` is a **63 GB tmpfs in
+RAM** that competes with the GPU's unified-memory budget, and it is session-scoped: a sweep
+script written there is gone next session, and reading a census from a *previous* session's
+scratch directory is how a stale result gets mistaken for a fresh one.
+
 **Develop on the dev profile. Use `--release` for benchmarks and performance evaluation
-only.** `[profile.release]` sets `lto` and `opt-level` and **no `debug-assertions`**, and no
-`.cargo/config.toml` overrides it — so under `--release` every `debug_assert!` in `src/` is
-compiled out. There are **43** across 13 files (`grep -ro 'debug_assert[_a-z]*!' src/ | wc -l`;
+only.** `[profile.release]` sets `lto` and `opt-level` and **no `debug-assertions`**, and
+**nothing overrides the profile** — so under `--release` every `debug_assert!` in `src/` is
+compiled out.
+
+> **AMENDED 2026-08-13.** This used to say "and no `.cargo/config.toml` overrides it", which is
+> now the wrong evidence for a claim that is still true. A worktree-local `.cargo/config.toml`
+> may exist and sets **`build.target-dir` only** (see the build-cache note above) — no profile,
+> no flags, and it is in the *common* gitdir's `info/exclude`, so it is not a repo file and CI
+> never sees it. **Check what such a file contains rather than assuming from its absence or
+> presence**; the load-bearing fact is that no profile override exists anywhere, not that the
+> file does not. There are **43** across 13 files (`grep -ro 'debug_assert[_a-z]*!' src/ | wc -l`;
 23 of them bare), and the two in `kvcompress.rs` are described by their own doc as "what
 ENFORCES the bsz=1 scope cut". Under `--release` they enforce nothing. The distribution as of
 2026-08-05 is in `docs/investigations/v4-flash-port.md`.
