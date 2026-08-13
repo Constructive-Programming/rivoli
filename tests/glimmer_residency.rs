@@ -497,6 +497,21 @@ fn polluted_rows(
     // asserting the property in prose ("inside a live kernel by construction") with nothing timing
     // it, 2026-08-12. Measured on gfx1151: launch returns at ~27 µs, the raw write is done by ~35 µs,
     // the kernel drains at ~6.5 ms — the write lands 0.5% into the kernel's life.
+    //
+    // > **CORRECTED 2026-08-13, found by two independent reviews of S3 item 4's sibling gate.**
+    // > The assert below is a TAUTOLOGY, not a discriminator: `disturbed` and `total` are two reads
+    // > of the same monotonic clock taken in program order with a `device_sync` between them, so
+    // > `disturbed < total` is a theorem of the code and cannot go red for any input or any device
+    // > state. The paragraph above claims it "settles" the idle-device case; it does not.
+    // >
+    // > It is kept, and NOT strengthened to a ratio, because the two arms want different bounds and
+    // > the function is shared: arm A's write finishes ~35 µs into a ~6.5 ms kernel (a 180x margin a
+    // > ratio bar would check), while arm B's `layer()` refill spends the whole kernel inside
+    // > `device_sync` and finishes 0.35 µs before the drain — 1.0001x — so any ratio that validates
+    // > A red-lines B by construction. **What actually evidences arm B's window is the no-fence
+    // > column of the table on `a_slot_refill_cannot_land_under_a_live_kernel`**, which is what that
+    // > doc already says. `tests/glimmer_stream_order.rs` had the same shape and could fix it, by
+    // > comparing against a duration measured in a DIFFERENT arm rather than a later clock read.
     assert!(
         disturbed < total,
         "the disturbance finished at {disturbed:?} but the kernel had already drained by {total:?} \

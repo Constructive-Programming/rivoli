@@ -1,5 +1,10 @@
 //! **S3 item 4: the stream a call site hands a launcher, and what a null one costs.**
 //!
+//! Run with `--nocapture` to see the counts below; libtest swallows them otherwise. This binary
+//! needs `--test-threads=1` like every device arm here, and for a sharper reason than usual: the
+//! quantity it measures IS timing, and a sibling test's blocking H2D on the process-wide null
+//! stream queues ahead of this one's consumer.
+//!
 //! # The item's own premise was wrong, and that is the finding
 //!
 //! `docs/investigations/glimmer-integration.md` item 4 reads "`sigmoid_gate` and `logit_softcap`
@@ -7,50 +12,78 @@
 //! there is the unordered-read bug `linalg.hip`'s swiglu note describes, **and no fixture can see
 //! it**". Half of that is already true (both launchers took the parameter at S2), half is
 //! unbuildable (there is no layer loop, so there is no call site to hold to anything) — and the
-//! clause in bold is **false**. This file is the fixture. It reproduces the bug on **more than
-//! 99.9% of elements in every run**, deterministically enough to assert on.
+//! clause in bold is **false**. This file is the fixture.
 //!
-//! # What it measured, gfx1151, 2026-08-13
+//! **The first clause is CONFIRMED, not refuted.** A null stream there really is an unordered
+//! read. Only "no fixture can see it" fell.
 //!
-//! A 3.7-4.9 ms `gemm_bf16` on a real stream writes the consumer's operand; the consumer is
-//! enqueued **6-42 µs** later — inside the producer's first 1% — on the null stream or on the
-//! producer's own.
+//! # What it measured, gfx1151, 2026-08-13 — 14 measurements over 7 runs
 //!
-//! | | elements disagreeing with the ordered answer, of 2,097,152 |
+//! A **3.48-3.86 ms** `gemm_bf16` on a real stream writes the consumer's operand; the consumer is
+//! enqueued **5.7-34.5 µs** later, **108-656x inside** the producer.
+//!
+//! | consumer's stream | elements disagreeing with the ordered answer, of 2,097,152 |
 //! |---|---:|
-//! | consumer on the **null stream** | **2,095,272 - 2,097,152 (99.91-100.00%)**, 14 measurements |
-//! | consumer on the **producer's stream** | **0**, every run |
+//! | **null** | **2,095,258 - 2,097,152 (99.910-100.000%)**, both launchers |
+//! | **the producer's** | **0**, every run |
 //!
-//! Both launchers, same shape. The red proof is the launcher dropping its stream argument
-//! (`(hipStream_t)stream` → `(hipStream_t)0` in `kernels/fwd.hip`, run and reverted): the stream
-//! arm goes from 0 to **2,097,152** and **2,095,292**, so the green column is the stream being
-//! honoured and not the race failing to fire.
+//! The red proof is the launcher dropping its stream argument (`(hipStream_t)stream` →
+//! `(hipStream_t)0` in `kernels/fwd.hip`, run and reverted): the stream arm goes from 0 to
+//! **2,097,152** and **2,095,292**, so the green column is the stream being honoured and not the
+//! race failing to fire. It stays self-red-proving — dropping the argument again trips `o == 0`.
 //!
-//! **The 0.08% that is not stale is the honest part of the number.** `gemm_bf16` is one wave per
-//! output element over a 262,144-block grid, so its earliest blocks retire in microseconds and a
-//! consumer dispatched at 7 µs finds a few hundred elements already written. That is why the
-//! assertion is `> 0` rather than a fraction: the mechanism guarantees staleness, the exact count
-//! is scheduling.
+//! **The two launchers fail in DIFFERENT ways, and the counts now say which.** `sigmoid_gate`
+//! reads `dst` and writes `x`, so all 2,095,258+ wrong elements are stale reads and **0 are lost
+//! writes, every run** — asserted, not observed. `logit_softcap` read-modify-writes `dst`, and
+//! there the split inverts: **0-261 elements kept the capped stale value and 2,095,254-2,097,152
+//! lost the consumer's write entirely.** So at the head, a null stream does not compute a wrong
+//! softcap — it computes the right one and has it overwritten by the raw logits. **The softcap
+//! simply does not happen**, which is exactly the failure no greedy gate in this repo can see.
+//! (The first version of this file asserted the survivor "is the uncapped logit" in prose and
+//! measured nothing; review, 2026-08-13.)
+//!
+//! **The residue that is not stale is the honest part.** `gemm_bf16` is one wave per output
+//! element over a 262,144-block grid, so its earliest blocks retire in microseconds and a consumer
+//! dispatched at 10 µs finds a couple of thousand elements already written (**1,894** in the
+//! weakest run, 0.090%). Hence the floor is `> OUT/2` rather than a tight fraction: the mechanism
+//! guarantees staleness, the exact count is scheduling.
+//!
+//! # The two assertions are NOT the same kind of claim
+//!
+//! * `o == 0` is about **rivoli**: `rivoli_sigmoid_gate` and `rivoli_logit_softcap` forward their
+//!   `void* stream` to `hipLaunchKernelGGL` rather than dropping it. This is the durable half.
+//! * `u > OUT/2` is about **HIP**: a `hipStreamNonBlocking` stream (`kernels/async.hip:20`) carries
+//!   no implicit ordering against the legacy null stream. It holds for every kernel, and
+//!   `gemm_bf16` stands in for `gqa_attend` only because it runs for 3.8 ms.
+//!
+//! **If the second half ever goes red for an environmental reason, do not delete the file** — the
+//! first half is the only thing in the tree gating that these launchers use their stream at all.
 //!
 //! # What this does NOT gate, and it is the important half
 //!
 //! **Nothing here says a call site passes the right stream, because there is no call site.** These
-//! two launchers have no `src/` caller at all — `tests/kernel_coverage.rs`'s OWNERS rows carry
-//! empty slices, and that census fires the moment one appears. What this file adds is the price
-//! tag: whoever fills those rows in can read what a null costs rather than take it on the comment.
+//! two launchers have no `src/` caller — `tests/kernel_coverage.rs`'s OWNERS rows carry empty
+//! slices, and that census fires the moment one appears. What this file adds is the price tag.
 //!
 //! **And the contract the plan states is too weak — the item is not "non-null at these two
 //! sites".** A compute stream at exactly these two launches inside an otherwise null-stream layer
 //! is the SAME bug inverted, and it satisfies the plan's wording. What has to hold is that every
 //! launch touching one buffer is on one stream, or separated by an explicit event or sync.
 //!
-//! That is not statically checkable, and `src/f4gpu.rs` is the proof: it deliberately mixes four
-//! streams in one function, and its header records `launch_hc_pre`, `launch_hc_post` and
-//! `launch_moe_acc_drain` as taking a stream and being HANDED NULL on purpose — "correct today,
-//! because everything around them is null-stream, so a non-null one would reorder against the
-//! norms". Same reasoning, opposite conclusion, from the same premise. So there is no rule to
-//! mechanise here beyond the census, and pretending otherwise would put a gate on the loop that
-//! is wrong about the engine it already has.
+//! That full invariant needs interprocedural dataflow — which buffer a launcher touches, and where
+//! the syncs land — so it does not mechanise. `src/f4gpu.rs` shows both halves of why: `pre_norm`
+//! and `layer` hand `launch_hc_pre` / `launch_hc_post` a null on purpose because those functions
+//! are null-stream throughout, while `routed_experts` mixes `compute_stream`, `miss_stream` and a
+//! null in one body and relies on four explicit `device_sync` boundaries its header enumerates.
+//! Null is correct in both, for reasons no grep can see.
+//!
+//! **A NARROWER rule does mechanise and is not gated today** (found by review, 2026-08-13, left as
+//! an open item rather than done here because it edits three engine files this port does not own):
+//! `src/backend.rs:86` defines `NULL_STREAM` precisely so a deliberate null reads as a decision,
+//! and about fourteen `src/` call sites still pass a bare `std::ptr::null_mut()` in the stream
+//! position — including `src/f4gpu.rs:1686`, in the file that imports `NULL_STREAM` and uses it
+//! eight lines away. A source census in `kernel_coverage.rs`'s style would cost one test and no
+//! device.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]
 
@@ -58,7 +91,7 @@ use rivoli::backend::Stream;
 use rivoli::backend::hip::{device_sync, launch_logit_softcap, launch_sigmoid_gate};
 use rivoli::memory::device::DeviceBuf;
 use std::ffi::c_void;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[path = "common/glimmer_fixture.rs"]
 mod fixture;
@@ -72,20 +105,33 @@ const N: usize = 512;
 const K: usize = 256;
 const OUT: usize = M * N;
 
+/// How far inside the producer's lifetime the consumer must be enqueued for an arm to count.
+///
+/// Measured 6-42 µs against a 3.7-4.9 ms producer, so 90-800x; this bar keeps an order of
+/// magnitude of headroom and still cannot pass on an idle device, where the two are equal.
+const INSIDE: u32 = 10;
+
 /// What the producer's destination holds BEFORE it runs. A consumer that reads it has read
 /// pre-production values.
 ///
-/// **The separation between the two answers is CHECKED, not argued** — `score`'s `blind` count
-/// asserts that no element's ordered answer equals its unproduced one, because an element where
-/// they agreed would score a stale read as *correct* and quietly shrink the red arm.
+/// **-1e6 SATURATES BOTH KERNELS, and that is the whole reason for the value.** `expf(1e6)` is
+/// `+Inf`, so the gate's `1/(1+Inf)` is exactly `0.0f`; `tanhf(-9806)` is exactly `-1`, so the
+/// softcap's answer is exactly `-CAP`. Neither is reachable from a real product: the producer's
+/// outputs span **-46.769 to +88.152** (std 22.20 over all 2,097,152, measured on the host at
+/// these exact widths), whose sigmoids bottom out at 4.88e-21 — nonzero — and whose softcaps peak
+/// at |13.970| against a cap of 20. So the two answers are separated by SATURATION, structurally,
+/// for any producer distribution that stays inside f32's exponent range.
 ///
-/// That check is doing real work here, and the argument a reader would expect is FALSE: these
-/// products span **-46.769 to +88.152**, std 22.20 over all 2,097,152 of them (measured on the
-/// host at these exact widths, 2026-08-13), so **188,778 are more negative than `STALE`** and
-/// `sigmoid` maps them BELOW `sigmoid(-30)` = 9.36e-14 rather than above it. What actually holds
-/// is exact equality: not one product is exactly -30.0, and both kernels are injective, so
-/// neither can map a real product onto the stale answer.
-const STALE: f32 = -30.0;
+/// > **This constant was -30.0 for two commits and the argument for it was wrong three times**
+/// > (2026-08-13, both reviews). It claimed no product reached it — 188,778 of them are more
+/// > negative — then claimed the kernels are injective, which `sigmoid` in f32 is emphatically
+/// > not: 381,486 products already map to exactly `1.0f`. What actually held was a **37-ulp**
+/// > margin from the single closest product (-29.9999026), i.e. roughly a 5% chance that any
+/// > change to `M`/`N`/`K`/either salt would have re-rolled it into a collision and reported the
+/// > discriminator as broken. One review proposed `+200` as the fix; that maps to `1.0f` and would
+/// > have collided on **381,486 elements**, which is why a proposed constant gets measured before
+/// > it gets taken.
+const STALE: f32 = -1.0e6;
 
 /// Muse Glimmer's own two, from `glimmer_head.rs` — the launcher refuses `mult >= cap`.
 const MULT: f32 = 0.196_116_14;
@@ -94,9 +140,10 @@ const CAP: f32 = 20.0;
 /// One long producer on a real stream, one consumer, and the buffers both touch.
 ///
 /// `dst` is the producer's output and the consumer's operand — `g` for [`launch_sigmoid_gate`],
-/// `x` in place for [`launch_logit_softcap`]. `x` is the gate's value operand and the softcap
-/// ignores it; carrying it here rather than in one test is what lets both launchers travel the
-/// same four runs, which is the only reason their counts are comparable.
+/// `x` in place for [`launch_logit_softcap`]. `x` is the gate's value operand; the softcap never
+/// reads or writes it, and it lives here only so `Rig` serves both consumers rather than being
+/// duplicated. (It costs that test one unused 8 MB refill per arm. What makes the two launchers'
+/// counts comparable is [`score`] being one function, not this field.)
 struct Rig {
     a: DeviceBuf,
     w: DeviceBuf,
@@ -118,12 +165,13 @@ struct Arms {
     ordered: Vec<f32>,
     /// Consumer with NO producer at all — what a fully lost race computes.
     unproduced: Vec<f32>,
+    /// How long the producer occupies the device, from the joined arm. The unjoined arms are only
+    /// meaningful if their consumer was enqueued well inside this.
+    producer: Duration,
 }
 
 impl Rig {
     fn new() -> Self {
-        // `fill` is the fixture's deterministic pseudo-random spread; salts differ so the
-        // activation and the weight are not the same sequence.
         let a = dev(&f32b(&fixture::fill(M * K, 1, 1.0)));
         let wb: Vec<u8> = fixture::to_bf16(&fixture::fill(N * K, 2, 1.0))
             .iter()
@@ -166,39 +214,51 @@ impl Rig {
         };
     }
 
-    /// Producer, consumer, join — with `joined` deciding whether the host waits BETWEEN them.
+    /// Producer, consumer, join. `inside` carries the producer's measured duration for the arms
+    /// that do NOT join between the two, and its absence marks the arm that measures it.
     ///
-    /// The unjoined arms assert the consumer was submitted while the producer was still running.
-    /// A total-divergence count cannot tell "the consumer read early" from "the producer had
-    /// already retired", which is `glimmer_residency.rs`'s lesson one hazard over: the timestamp
-    /// is what makes the arm mean what it claims.
+    /// **The unjoined arms have to prove their consumer was submitted while the producer was still
+    /// running**, or a divergence count cannot tell "the consumer read early" from "the producer
+    /// had already retired". An earlier version compared two reads of the same clock taken in
+    /// program order (`enqueued < total`), which is a theorem rather than a measurement and could
+    /// not go red for any input — both reviews found it, 2026-08-13. Comparing against the
+    /// producer's own duration is what makes the arm mean what it claims.
     fn run(
         &mut self,
-        joined: bool,
+        inside: Option<Duration>,
         stream: *mut c_void,
         consume: &dyn Fn(&Rig, *mut c_void),
         observe: &dyn Fn(&Rig) -> Vec<f32>,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, Duration) {
         self.reset();
         let t0 = Instant::now();
         self.produce();
-        if joined {
+        if inside.is_none() {
             device_sync().expect("producer join");
         }
+        let producer = t0.elapsed();
         consume(self, stream);
         let enqueued = t0.elapsed();
         device_sync().expect("join");
-        let total = t0.elapsed();
-        println!("    consumer enqueued at {enqueued:?}, device idle at {total:?}");
-        if !joined {
-            assert!(
-                enqueued < total,
-                "the consumer was enqueued at {enqueued:?} but the device was already idle by \
-                 {total:?} — this arm measured a launch onto an IDLE device, not the \
-                 unordered-read hazard"
-            );
+        // On the unjoined arms `producer` is only the LAUNCH's return, tens of microseconds — the
+        // producer is still running. Printing it as a duration there would read as a 10 µs
+        // producer, so the two arms report different things because they measured different things.
+        match inside {
+            None => println!("    producer alone ran {producer:?}"),
+            Some(d) => {
+                println!(
+                    "    consumer enqueued at {enqueued:?}, {:.0}x inside a {d:?} producer",
+                    d.as_secs_f64() / enqueued.as_secs_f64()
+                );
+                assert!(
+                    enqueued * INSIDE < d,
+                    "the consumer was enqueued at {enqueued:?}, not inside the first 1/{INSIDE} \
+                     of a {d:?} producer — this arm measured a launch onto an idle or nearly-idle \
+                     device, not the unordered-read hazard"
+                );
+            }
         }
-        observe(self)
+        (observe(self), producer)
     }
 
     /// The producer's four arms for one consumer.
@@ -208,16 +268,28 @@ impl Rig {
         observe: &dyn Fn(&Rig) -> Vec<f32>,
     ) -> Arms {
         let null = std::ptr::null_mut();
+        // **Warm-up, and it is load-bearing.** HIP loads a kernel's code object on its FIRST
+        // launch, and paying that inside a timed arm would put the consumer on an idle device. Here
+        // rather than relying on the joined arm running first, because that ordering would be
+        // enforced by nothing but the order of the struct fields below.
+        self.reset();
+        self.produce();
+        consume(self, null);
+        device_sync().expect("warm-up join");
+
         let raw = self.s.raw();
+        let (want, producer) = self.run(None, null, consume, observe);
+        let inside = Some(producer);
         Arms {
-            want: self.run(true, null, consume, observe),
-            unordered: self.run(false, null, consume, observe),
-            ordered: self.run(false, raw, consume, observe),
+            want,
+            unordered: self.run(inside, null, consume, observe).0,
+            ordered: self.run(inside, raw, consume, observe).0,
             unproduced: {
                 self.reset();
                 consume(self, null);
                 observe(self)
             },
+            producer,
         }
     }
 }
@@ -227,17 +299,32 @@ impl Rig {
 /// One function rather than a tail in each test: jscpd rejected the second copy, and it is right
 /// about the substance too — a red arm and a green arm are only comparable if the same code
 /// decides what "wrong" counts as.
-fn score(name: &str, a: &Arms) {
+///
+/// `in_place` says whether the consumer writes the buffer the producer writes, which changes what
+/// a wrong element MEANS. `sigmoid_gate` reads `dst` and writes `x`, so every wrong element is a
+/// stale read. `logit_softcap` read-modify-writes `dst`, so an unordered element has three
+/// possible survivors — the ordered answer, the raw product (the consumer's write was lost), or
+/// the capped stale value (the consumer's write won but read stale) — and the last two are both
+/// "wrong" for different reasons. The split is counted and printed rather than asserted in prose,
+/// which the first version did: it claimed the survivor "is the uncapped logit" and measured
+/// nothing.
+fn score(name: &str, in_place: bool, a: &Arms) {
     assert!(
-        a.want.iter().all(|v| v.is_finite()),
-        "{name}: the ordered answer is not finite, so every comparison below is a comparison \
-         against noise"
+        a.want.iter().all(|v| v.is_finite()) && a.want.iter().any(|v| *v != 0.0),
+        "{name}: the ordered answer is all-zero or non-finite, so every comparison below is a \
+         comparison against noise"
+    );
+    // `unproduced` is the other operand of the discriminator, and a NaN there would make every
+    // `==` below false and the `blind` count trivially 0 — the exact hole this repo's fence gate
+    // fell into. Asserted rather than argued, for the same one line it costs.
+    assert!(
+        a.unproduced.iter().all(|v| v.is_finite()),
+        "{name}: the unproduced answer is not finite, so `blind` below is vacuously 0"
     );
     // **The discriminator has to be able to fire everywhere, or a zero count is ambiguous.** If the
     // ordered answer and the unproduced one agreed anywhere, an element that read stale would be
     // scored correct and the red arm would under-count for a reason that has nothing to do with
-    // ordering. Checked rather than argued: the same class of hole made this repo's fence gate go
-    // green on a fixture that could only produce NaN.
+    // ordering. See [`STALE`] for why saturation makes this structural rather than lucky.
     let blind = (0..OUT).filter(|&i| a.want[i] == a.unproduced[i]).count();
     assert_eq!(
         blind, 0,
@@ -246,14 +333,34 @@ fn score(name: &str, a: &Arms) {
     );
     let bad = |v: &[f32]| (0..OUT).filter(|&i| v[i] != a.want[i]).count();
     let (u, o) = (bad(&a.unordered), bad(&a.ordered));
+    let stale = (0..OUT)
+        .filter(|&i| a.unordered[i] == a.unproduced[i])
+        .count();
     println!(
-        "  {name}: null stream {u} of {OUT} wrong ({:.2}%), its own stream {o}",
-        100.0 * u as f64 / OUT as f64
+        "  {name}: null stream {u} of {OUT} wrong ({:.3}%) — {stale} kept the stale answer, {} \
+         lost the consumer's write; its own stream {o}; producer {:?}",
+        100.0 * u as f64 / OUT as f64,
+        u - stale,
+        a.producer
     );
+    if !in_place {
+        assert_eq!(
+            stale,
+            u,
+            "{name}: the consumer writes a different buffer than the producer, so every wrong \
+             element must be a stale read — {} are neither the ordered answer nor the stale one",
+            u - stale
+        );
+    }
     assert!(
-        u > 0,
-        "{name}: the null-stream arm computed the ordered answer everywhere — the race did not \
-         fire, so this gate proves nothing and must not be read as evidence that null is safe"
+        u > OUT / 2,
+        "{name}: only {u} of {OUT} elements read stale — the race did not fire, so this gate \
+         proves nothing and must not be read as evidence that null is safe. FIRST CHECK the \
+         environment: `AMD_SERIALIZE_KERNEL`, `HIP_LAUNCH_BLOCKING`, rocprof/rocgdb with \
+         serialized dispatch, or `--test-threads` above 1 all defeat this by construction. NEXT \
+         check `kernels/async.hip`: if streams stopped being `hipStreamNonBlocking` they carry \
+         implicit ordering against the null stream and this hazard is GONE, which is a green \
+         outcome wearing a red hat"
     );
     assert_eq!(
         o, 0,
@@ -264,13 +371,21 @@ fn score(name: &str, a: &Arms) {
 
 /// **The hazard `kernels/fwd.hip` describes for both launchers, made to happen.**
 ///
-/// The gate sits between the attend and the o_proj GEMV. Give it the compute stream and it reads
-/// what the attend wrote; give it null and rivoli's `hipStreamNonBlocking` streams carry no
-/// implicit ordering against it, so it reads whatever was in the buffer when it was dispatched.
+/// The gate sits between the attend and the o_proj GEMV, the softcap between the head GEMV and
+/// `argmax`. Give either the compute stream and it sees what the producer wrote; give it null and
+/// rivoli's `hipStreamNonBlocking` streams carry no implicit ordering against it.
+///
+/// The softcap is the worse spelling. It is the one operation every greedy gate here is provably
+/// blind to (the anchor measured `softcap_off` leaving `emitted.ids` bit-identical), so a null
+/// stream at that call site silently deletes it and nothing downstream of a decode can tell.
+///
+/// ONE test rather than two: both consumers launch on the process-wide null stream, and libtest
+/// would otherwise run them concurrently by default — a sibling's blocking H2D queueing ahead of
+/// this one's consumer perturbs the only quantity being measured (review, 2026-08-13).
 #[test]
-fn a_null_stream_gate_reads_its_operand_before_the_producer_writes_it() {
+fn a_null_stream_consumer_reads_its_operand_before_the_producer_writes_it() {
     let mut rig = Rig::new();
-    let arms = rig.arms(
+    let gate = rig.arms(
         &|r, s| {
             // SAFETY: `x` and `dst` are two distinct `OUT`-element live f32 allocations (the
             // kernel's parameters are `__restrict__`), both outliving the join in `run`. The
@@ -280,20 +395,9 @@ fn a_null_stream_gate_reads_its_operand_before_the_producer_writes_it() {
         },
         &|r| sync_read(&r.x),
     );
-    score("sigmoid_gate", &arms);
-}
+    score("sigmoid_gate", false, &gate);
 
-/// The same, one launch later in the model: the softcap is in place on the head's output, so an
-/// unordered call is a write-WRITE race and the surviving value is the uncapped logit.
-///
-/// That is the worst spelling of this bug in the tree. `logit_softcap` is the one operation every
-/// greedy gate here is provably blind to (the anchor measured `softcap_off` leaving `emitted.ids`
-/// bit-identical), so a null stream at this call site silently deletes it and nothing downstream
-/// of a decode can tell.
-#[test]
-fn a_null_stream_softcap_is_overwritten_by_the_head_it_was_meant_to_cap() {
-    let mut rig = Rig::new();
-    let arms = rig.arms(
+    let cap = rig.arms(
         &|r, s| {
             // SAFETY: `dst` is `OUT` writable live f32 outliving the join in `run`; `MULT` and
             // `CAP` satisfy the launcher's guards (both finite, positive, `MULT < CAP`).
@@ -302,5 +406,5 @@ fn a_null_stream_softcap_is_overwritten_by_the_head_it_was_meant_to_cap() {
         },
         &|r| sync_read(&r.dst),
     );
-    score("logit_softcap", &arms);
+    score("logit_softcap", true, &cap);
 }

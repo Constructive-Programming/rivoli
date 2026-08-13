@@ -400,13 +400,22 @@ const OWNERS: &[(&str, &[&str])] = &[
     // same commit. OWNERS is the tree's checked model-affiliation authority, the one place a
     // mis-attribution matters most.)
     //
-    // **WHOEVER FILLS EITHER ROW IN: the stream you pass is the whole of S3 item 4, and the null
-    // one costs 99.9% of the buffer.** `tests/glimmer_stream_order.rs` measures it — a consumer
-    // enqueued 8 µs into a 3.8 ms producer disagrees with the ordered answer on 2,095,272 of
-    // 2,097,152 elements. The gate sits between `gqa_attend` and the o_proj GEMV and the softcap
-    // between the head GEMV and `argmax`, so at a stream-ordered call site null is not a default.
-    // It is not "pass a non-null stream" either: a compute stream at these two launches inside an
-    // otherwise null-stream layer is the same bug inverted. Match the launches around them.
+    // **WHOEVER FILLS EITHER ROW IN: the stream you pass is the whole of S3 item 4.** The gate sits
+    // between `gqa_attend` and the o_proj GEMV, the softcap between the head GEMV and `argmax`, so
+    // at a stream-ordered call site null is not a default — it is an unordered read, and for the
+    // softcap a LOST WRITE: `tests/glimmer_stream_order.rs` measures the raw logits overwriting the
+    // capped ones on essentially the whole buffer, i.e. the softcap silently not happening, which
+    // is the one thing no greedy gate here can see.
+    //
+    // **Its 99.9% is scoped to ITS shape and is not a prediction about the call sites.** It scores a
+    // 2,097,152-element operand behind a 3.5-3.9 ms producer. At decode the gate's operand is one
+    // row of 32x128 = 4,096 floats behind a microsecond `gqa_attend`, and the logit buffer is
+    // 202,048 floats behind the head GEMV. The hazard is identical and the duty cycle is not, so a
+    // decode that looks clean with null passed is not evidence — it is the same latent bug at a
+    // lower hit rate.
+    //
+    // And it is not "pass a non-null stream" either: a compute stream at these two launches inside
+    // an otherwise null-stream layer is the same bug inverted. Match the launches around them.
     ("logit_softcap", &[]),
     ("sigmoid_gate", &[]),
     ("swiglu", &["gpu.rs", "f4gpu.rs"]),
