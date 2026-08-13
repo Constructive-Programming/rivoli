@@ -1131,7 +1131,20 @@ pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> 
     use rivoli::artifact::model as gm;
     std::fs::create_dir_all(dir).unwrap();
     let l = GLIMMER_FIXTURE_LAYERS;
-    let (heads, kv_heads, head_dim) = (2, 1, dim);
+    // **The geometry carries three inequalities, and each was a blind spot the day it was
+    // missing.** `head_dim != hidden / n_heads` is trap 15, and this fixture has always had it.
+    // The other two arrived 2026-08-13, both found by review as things a mutation could not be
+    // caught by:
+    //
+    //   * `head_dim != hidden` — it was `dim`, so sourcing the softmax scale from `hidden` instead
+    //     of `head_dim` was a NO-OP here and no gate could see it.
+    //   * `kv_heads > 1` AND `n_heads / kv_heads > 1` — it was 1, so `head / (hq / hkv)` and
+    //     `head % hkv` were both 0 for every head, and trap 10's broadcast was not merely
+    //     unexercised but UNCONSTRUCTIBLE.
+    //
+    // At 4 query heads over 2 KV heads the two mappings are `[0,0,1,1]` and `[0,1,0,1]` — they
+    // disagree on two heads of four, which is the smallest fixture that can tell them apart.
+    let (heads, kv_heads, head_dim) = (4, 2, dim / 2);
     let (inter, vocab) = (dim * 2, dim + 4);
 
     let mut cfg: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED_CONFIG).unwrap();

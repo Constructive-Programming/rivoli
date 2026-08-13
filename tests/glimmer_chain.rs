@@ -4,88 +4,52 @@
 //! window and the QK scales the helpers return, `kernel_coverage.rs` checks that the file names
 //! each launcher, and the S2 suites score each kernel against the anchor goldens. Between them
 //! they miss the entire middle: **which operand reaches which launcher.** Review enumerated seven
-//! mutations that pass all of it and produce fluent wrong text (2026-08-13) —
+//! such mutations (2026-08-13) and the fixture's own geometry supplied three more.
 //!
-//! None of the first six changes a shape, so `proj`'s `i_dim` check cannot see them and every
-//! launcher guard accepts them; the seventh is the exception and is marked as such. **Each was
-//! applied to `glimmer_gpu.rs` and run** — measured 2026-08-13 in [`worst_rel`]'s metric, against a
-//! green run whose worst position scores **3.9e-6**:
+//! None of these changes a shape, so `proj`'s `i_dim` check cannot see them and every launcher
+//! guard accepts them. **Each was applied and run** — re-measured 2026-08-13 on the WIDENED
+//! fixture (4 query heads over 2 KV, `head_dim` off the width), against clean floors of 7.1e-7
+//! (logits), 5.7e-7 (permuted) and 2.7e-7 (branch):
 //!
-//! | mutation | worst | first diverges at |
-//! |---|---|---|
-//! | `launch_logit_softcap` deleted (multiplier goes with it) | **4.1e0** | position 4 |
-//! | `output_multiplier` → 1.0, softcap kept | **4.1e0** | position 4 |
-//! | `launch_rope_split_half` → `launch_rope_interleave` | **1.8e0** | position 1 |
-//! | `wq` / `wg` swapped — same `[hq·hd, hidden]` shape | **1.3e0** | position 1 |
-//! | `wk` / `wv` swapped — same `[kv·hd, hidden]` shape | **9.0e-1** | position 0 |
-//! | `if self.rotated[l]` inverted — the 13 NoPE layers rotate | **3.2e-1** | position 1 |
-//! | the layer kind from `l % 4 == 3` instead of `layer_types` | **2.4e-1** | permuted config only |
-//! | `qk_scale_factor` DROPPED from Q (product 1.0, not 3.87) | **1.1e-1** | position 1 |
-//! | the softcap's `tanh` alone, `output_multiplier` KEPT | **9.9e-5** | position 8 |
-//! | the gate from the attend output, not the layer input | **RED on `proj`'s shape check** | — |
+//! | mutation | worst |
+//! |---|---|
+//! | `launch_logit_softcap` deleted (multiplier goes with it) | **4.1e0** |
+//! | `output_multiplier` → 1.0, softcap kept | **4.1e0** |
+//! | `wk` / `wv` swapped — same `[kv·hd, hidden]` shape | **2.9e0** |
+//! | `wq` / `wg` swapped — same `[hq·hd, hidden]` shape | **2.5e0** |
+//! | `launch_rope_split_half` → `launch_rope_interleave` | **1.8e0** |
+//! | `qk_scale_factor` DROPPED from Q (product 1.0, not 3.87) | **1.7e0** |
+//! | the layer kind from `l % 4 == 3` instead of `layer_types` | **1.0e0** |
+//! | the KV broadcast as `head % hkv` instead of `head / (hq/hkv)` | **9.5e-1** |
+//! | `if self.rotated[l]` inverted — the NoPE layers rotate | **8.2e-1** |
+//! | `attn_scale` from `hidden` instead of `head_dim` | **3.7e-1** |
+//! | the softcap's `tanh` alone, `output_multiplier` KEPT | **9.4e-5** |
+//! | `eps_post` / `eps_pre` transposed on the branch norms | **1.5e-5** |
+//! | the gate from the attend output, not the layer input | RED on `proj`'s shape check |
 //!
-//! The rotation ones first diverge at position **1** and not 0, which is the sweep working: at
-//! `pos = 0` the angle is 0 and every rope convention is the identity.
+//! **THREE ROWS ARE NEW, and two were previously UNCONSTRUCTIBLE rather than merely uncaught.**
+//! Until the fixture widened on 2026-08-13 it had `head_dim = hidden` and ONE KV head, so sourcing
+//! the softmax scale from the wrong dimension was an exact no-op and `head / (hq/hkv)` and
+//! `head % hkv` were the same function. No tolerance could have found either. The eps
+//! transposition — this tree's one ungated correctness item for four review rounds — now reddens
+//! all three tests here.
 //!
-//! **Two rows are also caught by something cheaper, and saying so is the point of a census.** The
-//! interleaved-rope substitution removes `glimmer_gpu.rs`'s only mention of `launch_rope_split_half`,
-//! so `kernel_coverage.rs`'s OWNERS census reddens on it with no GPU at all; and the gate-from-the-
-//! attend-output reddens on `proj`'s own `i_dim` check, which fires on any decode of the fixture and
-//! therefore already in `glimmer_loop.rs`. This gate's marginal value is the other eight rows.
+//! **ONE mutation still does not redden, and it is the one that cannot.** Swapping the two QK
+//! scales is an identity in exact arithmetic: both operands are normed before the scale, so the
+//! score carries only their product, and RoPE commutes with a scalar. Three limits, all from
+//! review — it is not byte-identical (`fl(3.87·q̂)` and `fl(3.87·k̂)` round differently), it holds
+//! only while the KV cache is f32, and **it does change `q` and `k` themselves**, which the anchor
+//! captures elementwise, so a swapped engine is 3.87x off at S4's tensor-vs-capture scoring.
+//! `tests/common/tolerance.rs` recorded the algebra on 2026-08-12; what was new was only that
+//! `glimmer-architecture.md` §9 still called the swap fluent-and-wrong.
 //!
-//! **The `tanh` row is why [`TOL`] is what it is.** At the 1e-4 this file shipped with, that
-//! mutation PASSED one of the two tests by 1% — the argmax-invariant defect `Glimmer::logits`
-//! exists to catch, sitting under the tolerance of the gate that consumes it. Found by review, and
-//! the tree had already measured the same class at 4.879e-5 on the anchor.
+//! A gate that reports only its reds is a gate whose blind spots are discovered by the next
+//! defect. This table lists outcomes, and the two rows that changed from GREEN to a number are why
+//! the fixture's geometry is now three inequalities with a comment on each.
 //!
-//! **The `l % 4 == 3` row was re-measured with the ALLOCATION mutated in lockstep**, because review
-//! argued the first proof reddened through a device write past a cache sized from the true kinds
-//! rather than through the masking difference. Same magnitude, 2.353e-1, so it did not: the
-//! consistent defect — a port that computes the period everywhere — is what that number measures.
-//!
-//! **And three mutations do NOT redden.**
-//!
-//! * **Swapping the two QK scales does not change the LOGITS.** Both operands are normed before
-//!   the scale, so the score carries only their product, and RoPE commutes with a scalar. It is an
-//!   identity in exact arithmetic and measured inside reduction noise here — but the claim needs
-//!   three limits, all added by review 2026-08-13 after the first version asserted it flatly:
-//!   (a) it is **not byte-identical**, since `fl(3.87·q̂)` and `fl(3.87·k̂)` are different roundings,
-//!   and 2.3e-6 was the size of that perturbation rather than evidence of an identity;
-//!   (b) it holds while the KV cache is f32 and the norm precedes the scale, both true today and
-//!   the first of them an explicit S5 lever; and (c) **it changes `q` and `k` themselves**, which
-//!   the anchor captures elementwise, so a swapped engine is 3.87x off at S4's tensor-vs-capture
-//!   scoring. The decode output cannot see it; the tree can.
-//!   **This was already known here.** `tests/common/tolerance.rs` recorded the algebra on
-//!   2026-08-12 — "`(s*q)·k` and `q·(s*k)` are the same product … invisible to this kernel by
-//!   ALGEBRA, not by insufficient resolution" — while excluding `qk_scale_on_k` from `attend`'s
-//!   defect set. What was new on 2026-08-13 is only that `glimmer-architecture.md` §9 still called
-//!   the swap fluent-and-wrong.
-//! * **`attn_scale` from `hidden` instead of `head_dim` is invisible TO THIS FIXTURE**, which sets
-//!   `head_dim = hidden = 8`. The shipped model has 128 against 6656. The fixture preserves
-//!   `head_dim != hidden / n_heads` (trap 15) and not `head_dim != hidden`; closing this needs the
-//!   fixture's head_dim to stop tracking its width, which touches every shape it writes.
-//! * **Swapping `eps_post` for `eps_pre` at `pre_norm` / `branch_add` is below [`TOL`] here, and
-//!   NOTHING ELSE IN THE TREE GATES IT EITHER — it is OPEN.** This file said it was covered by
-//!   "`glimmer_head.rs`'s eps census"; that file has no eps census, the 41.8-56.6x figures are
-//!   `tests/glimmer_norm.rs`'s, and what they establish is that the OPERATOR distinguishes the two
-//!   epsilons on activations at `mean(x²)~1e-3` — not which eps the loop hands it. `glimmer_norm.rs`
-//!   never imports `glimmer_gpu`. Swap the two call sites and every test in the tree stays green.
-//!   (Corrected by review 2026-08-13; the wrong citation had reached three places including the
-//!   INDEX verdict, which `CLAUDE.md` tells readers to trust instead of the doc.)
-//!
-//! **A fourth blind spot, same round:** trap 10, the KV head broadcast, is unconstructible here
-//! because the fixture has **one** KV head — `head / (hq/hkv)` and `head % hkv` are both 0 for every
-//! head, as is any other mapping. The oracle carries that expression and a comment naming the trap,
-//! which reads as coverage and is not. It is gated at the kernel level by `glimmer_attend.rs`;
-//! raising the fixture to 4 query heads over 2 KV heads would close it here too.
-//!
-//! A gate that reports only its reds is a gate whose blind spots are discovered by the next defect.
-//!
-//! **Incidental, and worth knowing before it surprises someone:** the oracle reads the SOURCE
-//! checkpoint's bytes while the engine reads the CONVERTED artifact, so a green run also says
-//! `convert_glimmer` reproduced these tensors faithfully. A future converter change — §6's declined
-//! `q_proj`/`k_proj` row permutation, say — would redden this file for a reason its own docs would
-//! not otherwise explain.
+//! **Incidental:** `glimmer_reference.rs`'s comparison reads the SOURCE checkpoint's bytes while
+//! the engine reads the CONVERTED artifact, so a green run there also says `convert_glimmer`
+//! reproduced those tensors faithfully.
 //!
 //! # Why a host reference and not the goldens
 //!
@@ -130,45 +94,51 @@ use std::collections::HashMap;
 
 /// Relative tolerance on a logit, in [`worst_rel`]'s metric.
 ///
-/// **Set from the weakest RED-PROVED mutation, not from a rounding model** — and the first version
-/// was set the other way and was caught by it. It read 1e-4, justified as "the two sides differ
-/// only in reduction ORDER". Both halves were wrong (review, 2026-08-13):
+/// **Set from the weakest RED-PROVED mutation, not from a rounding model**, and re-derived from
+/// scratch on 2026-08-13 when the fixture widened to 4 query heads over 2 KV heads with a
+/// `head_dim` off the width. Every number below is that fixture's; the previous set was the old
+/// geometry's and none of it carried over.
 ///
-/// * The two sides do not differ only in reduction order. `gqa_attend` runs an ONLINE softmax
-///   (running max, one `rescale` multiply per KV row) against this file's two-pass; `gemm_bf16`
-///   compiles under clang's HIP default `-ffp-contract=fast`, so its dot is an FMA reduction with
-///   the product never rounded, against `.sum()` here; and the transcendentals are device `expf` /
-///   `tanhf` / `pow` against host `f32::exp` / `f32::tanh` / `f64::powf`. `weightless` also folds
-///   the scale the way the KERNEL does (`scale * rms_inv`) rather than the way the reference does
-///   (`(x·rs)·s`), a deviation `kernels/linalg.hip` prices at ~6e-8 and names in place.
-/// * More seriously, **1e-4 was above a real defect.** Removing the softcap's `tanh` while keeping
-///   `output_multiplier` — the argmax-invariant failure `Glimmer::logits` was added to make
-///   visible — scores **9.9e-5** in one of the two tests here and 1.2e-4 in the other. At 1e-4 the
-///   first test PASSED it, by 1%. The tree had already measured the same defect class at 4.879e-5
-///   on the anchor and recorded why (a tiny model's untrained logits sit in `tanh`'s linear
-///   region), so the margin was knowable before it was lucky.
+/// | | worst |
+/// |---|---|
+/// | clean | **7.1e-7** |
+/// | `eps_post` / `eps_pre` transposed | **1.0e-5** |
+/// | the softcap's `tanh` alone, `output_multiplier` kept | **9.4e-5** |
+/// | `qk_scale_factor` dropped from Q | **1.7e0** |
 ///
-/// 2e-5 sits ~5x above the worst green position (3.9e-6) and ~5x below that weakest defect. The
-/// green figure is what to watch: if it approaches this, the fixture's widths grew and the
-/// tolerance needs re-deriving from a fresh red proof, not raising.
-const TOL: f32 = 2e-5;
+/// The permuted-`layer_types` test shares this bound: its clean floor is **5.7e-7** and the same
+/// transposition moves it to **1.5e-5**, so it catches the eps defect at 26x.
+///
+/// > **A separate `TOL_KIND = 1e-3` nearly shipped here**, justified by "the permuted test's clean
+/// > floor is 1.5e-5, twenty times the other one" — with a whole paragraph explaining why a
+/// > full-attention layer at position 0 accumulates more softmax error. **1.5e-5 was that test's
+/// > reading under the eps MUTATION**, read off a run where the mutation was still applied and
+/// > written down as a clean floor. The explanation was plausible, internally consistent, and
+/// > about a number that did not exist. Caught by re-running clean.
+///
+/// 3e-6 is 4.2x above the worst floor and 3.5x below the weakest defect. **The two sides do NOT differ
+/// only in reduction order** — `gqa_attend` runs an online softmax against this file's two-pass,
+/// `gemm_bf16` compiles under `-ffp-contract=fast` so its dot is an FMA reduction, and the
+/// transcendentals are device against host libm. The bound is empirical for that reason.
+///
+/// > **The first version was 1e-4, justified as reduction noise, and it PASSED the `tanh` mutation
+/// > by 1%** — the argmax-invariant defect `Glimmer::logits` exists to make visible, under the
+/// > tolerance of the gate that consumes it. The tree had already measured that class at 4.879e-5
+/// > on the anchor.
+const TOL: f32 = 3e-6;
 
 /// The same comparison one layer up, on the post-FFN branch — its own constant because its floor
-/// is its own, and both are MEASURED (2026-08-13, over the fixture's four layers):
+/// is its own, and both MEASURED on the widened fixture (2026-08-13):
 ///
-/// | | range |
+/// | | worst over four layers |
 /// |---|---|
-/// | clean | 1.4e-7 – 7.3e-7 |
-/// | `eps_post` / `eps_pre` transposed | 3.8e-7 – 3.1e-6 |
+/// | clean | **2.7e-7** |
+/// | `eps_post` / `eps_pre` transposed | **3.1e-6** |
 ///
-/// **2e-6 sits between them, and the margins are thin on purpose rather than by oversight**: 2.7x
-/// above the worst clean cell, 1.6x below the transposition's strongest. Anything looser stops
-/// catching the defect this test exists for; anything tighter is inside reduction noise. The
-/// separation is only 4.8x at its best layer because the FIXTURE's branch sits at `mean(x²)` ~
-/// O(1), where the two epsilons barely differ — the reference's sits at ~1e-3, where
-/// `glimmer_norm.rs` measures 41.8-56.6x, and a fixture with that statistic is what would widen
-/// this. Recorded in the open-items register.
-const TOL_BRANCH: f32 = 2e-6;
+/// 8e-7 is 3.0x above the floor and 3.9x below the signal. **Widening the fixture is what made
+/// that comfortable**: at 2 query heads over 1 KV head the same separation was 4.8x end to end and
+/// the constant had 1.6x of room, which is the kind of margin a re-drawn fixture breaks.
+const TOL_BRANCH: f32 = 8e-7;
 
 /// bf16 bytes → f32, the widening both `bf16f` in the kernels and the converter's norms perform.
 fn wide(b: &[u8]) -> Vec<f32> {

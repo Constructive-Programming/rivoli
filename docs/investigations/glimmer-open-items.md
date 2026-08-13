@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- nine open items in three live classes, two closed the day this file was written. (1) UNGATED CORRECTNESS: EMPTY as of 2026-08-13. The eps transposition -- the item this register called its sharpest -- turned out to be gated already, at 3.673e-5 against the chain gate's 2e-5, closed by the softcap tolerance work one commit earlier; the 'nothing reddens' recorded here was a measurement taken before that change and never re-run, which is the same stale-fact defect as the wrong citation it replaced. A second, LOCALISING gate was added anyway (Glimmer::branch plus a per-layer score against the oracle), and the route this file predicted -- scoring the reference's own captures -- is REFUTED by measurement: there the eps signal is 1.6e-3 to 1.3e-2 against a bf16 weight floor of 4.7e-3 to 3.0e-2, i.e. 0.2x to 0.6x the noise at every layer of both salts. Both surviving margins are thin (1.8x and 1.6x) because the FIXTURE's branch sits at mean(x2) ~ O(1) where the two epsilons nearly agree -- which is a second reason to do (2). (2) FIXTURE-GEOMETRY BLIND SPOTS, two: the toy checkpoint sets head_dim = hidden, so attn_scale sourced from the wrong one is a no-op, and it has ONE kv head, so trap 10's block-vs-interleave broadcast is unconstructible -- both close by widening a fixture five test binaries share. (3) UNPRICED COST, two: the KV cache is hipMalloc'd outside the budget the operator was shown (3.4 GB at the 131072 ceiling against a 4 GiB driver headroom), and prefill is token-major, which re-streams the whole model per prompt token below full residency. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. Also carried here: the branch is 50 commits unpushed, and the GPU node label is left at disabled with llama-swap Pending.
+verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- seven open items in two live classes; four of the eleven were closed the day this file was written, and two of those four had been recorded as open on evidence that was already stale. (1) UNGATED CORRECTNESS: EMPTY as of 2026-08-13. The eps transposition -- the item this register called its sharpest -- turned out to be gated already, at 3.673e-5 against the chain gate's 2e-5, closed by the softcap tolerance work one commit earlier; the 'nothing reddens' recorded here was a measurement taken before that change and never re-run, which is the same stale-fact defect as the wrong citation it replaced. A second, LOCALISING gate was added anyway (Glimmer::branch plus a per-layer score against the oracle), and the route this file predicted -- scoring the reference's own captures -- is REFUTED by measurement: there the eps signal is 1.6e-3 to 1.3e-2 against a bf16 weight floor of 4.7e-3 to 3.0e-2, i.e. 0.2x to 0.6x the noise at every layer of both salts. Both surviving margins are thin (1.8x and 1.6x) because the FIXTURE's branch sits at mean(x2) ~ O(1) where the two epsilons nearly agree -- which is a second reason to do (2). (2) FIXTURE-GEOMETRY BLIND SPOTS: CLOSED 2026-08-13 by widening the toy checkpoint from (2 heads, 1 kv, head_dim = dim) to (4, 2, dim/2). Both were UNCONSTRUCTIBLE rather than merely uncaught -- at head_dim = hidden the two candidate softmax scales are the same NUMBER, and at hkv = 1 the block and modulo KV broadcasts are the same FUNCTION, so no tolerance could have separated either. They now measure 3.7e-1 and 9.5e-1. Six test binaries share the fixture and all pass unchanged; the widening also improved every clean floor in the chain gate by 2.7-5.5x, so its three tolerances and its whole 13-row mutation census were re-derived rather than carried over. (3) UNPRICED COST, two: the KV cache is hipMalloc'd outside the budget the operator was shown (3.4 GB at the 131072 ceiling against a 4 GiB driver headroom), and prefill is token-major, which re-streams the whole model per prompt token below full residency. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. Also carried here: the branch is 50 commits unpushed, and the GPU node label is left at disabled with llama-swap Pending.
 ---
 
 # Muse Glimmer — open items after S3
@@ -53,31 +53,26 @@ gates into two comfortable ones, which is a second reason to do that work.
 
 ---
 
-## 2. Fixture-geometry blind spots
+## 2. Fixture-geometry blind spots — **BOTH CLOSED 2026-08-13**
 
-Both are properties of `tests/common/mod.rs::glimmer_fixture`, both make a real mutation a
-no-op, and both are recorded in `glimmer_chain.rs`'s own blind-spot census rather than implied
-away.
+`tests/common/mod.rs::glimmer_fixture` went from `(heads, kv_heads, head_dim) = (2, 1, dim)` to
+**`(4, 2, dim / 2)`**, and the geometry now carries three inequalities with the reason for each
+written at the line. Six test binaries share that fixture; all pass unchanged.
 
-### 2.1 `attn_scale` from `hidden` instead of `head_dim` is a no-op
+| was | now measured |
+|---|---|
+| `attn_scale` from `hidden` instead of `head_dim` — an exact NO-OP, `head_dim == hidden` | **3.7e-1** |
+| the KV broadcast as `head % hkv` — UNCONSTRUCTIBLE, one KV head made every mapping identical | **9.5e-1** |
 
-The fixture sets `(heads, kv_heads, head_dim) = (2, 1, dim)` — so `head_dim == hidden`. It
-preserves trap 15 (`head_dim != hidden / n_heads`) and not `head_dim != hidden`. The shipped
-model is 128 against 6656.
+**Unconstructible is a stronger word than uncaught, and it is the right one.** No tolerance and
+no additional gate could have found either: at `head_dim = hidden` the two scales are the same
+number, and at `hkv = 1` the two broadcasts are the same function. 4 over 2 is the smallest
+geometry that separates `[0,0,1,1]` from `[0,1,0,1]`.
 
-**Closes by:** giving the fixture a `head_dim` that does not track its width. That changes
-every shape it writes, and it is shared by `glimmer_convert`, `glimmer_pin`, `glimmer_loop`,
-`glimmer_chain` and `glimmer_flags`.
-
-### 2.2 Trap 10's KV-head broadcast is unconstructible
-
-`hkv = 1`, so `head / (hq / hkv)` and `head % hkv` are both 0 for every head — as is any other
-mapping into a one-element set. `glimmer_chain.rs`'s oracle carries the correct expression and
-a comment naming the trap, which reads as coverage and is not.
-
-Gated at the kernel level by `glimmer_attend.rs` against the goldens (`head % hkv` reddens at
-1.20). **Closes by:** 4 query heads over 2 KV heads in the fixture — a smaller change than
-§2.1 and the two are best done together.
+**It also widened the eps margins, which was the second reason to do it** (§1.1). The branch
+comparison went from 4.8x separation to **11.6x**, and every clean floor in `glimmer_chain.rs`
+improved 2.7-5.5x — so all three of that file's tolerances were re-derived from scratch rather
+than carried over, along with its whole mutation census.
 
 ---
 
