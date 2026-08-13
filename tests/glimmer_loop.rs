@@ -393,3 +393,56 @@ fn a_budget_that_cannot_hold_the_kv_cache_is_refused() {
         "a budget above the footprint is fine"
     );
 }
+
+/// **The prefill is LAYER-MAJOR, and this is the only gate that can tell.**
+///
+/// The reorder is bit-for-bit identical arithmetic — the same launches with the same arguments in
+/// a different order — so every numeric gate in the tree is blind to it by construction. What
+/// changes is residency: `GlimmerPin::layer(l)` is called once per layer per CHUNK instead of once
+/// per layer per token, and a streamed Glimmer layer is a synchronous 967.942 MB host memcpy.
+///
+/// So the assertion is on the pin's own fill counter. A token-major loop over this prompt would
+/// pay `n_layers * tokens` fills; layer-major pays `n_layers * ceil(tokens / PREFILL_CHUNK)`.
+///
+/// The budget is set to force streaming — at full residency nothing is ever filled and the counter
+/// is 0 either way, which would make this test pass over nothing.
+#[test]
+fn the_prefill_is_layer_major_and_the_fill_count_says_so() {
+    let (root, cfg) = fixture("glimmer-major");
+    let gt = &cfg.text;
+    // 300 tokens crosses the 256-wide chunk, so the two-chunk path is exercised rather than
+    // assumed. Ids stay under the fixture's vocabulary and away from its stop tokens.
+    let prompt: Vec<u32> = (0..300).map(|i| (i % 6) as u32).collect();
+    let n_ctx = prompt.len() + 1;
+    // The floor plus ONE layer, so the partition pins one and streams the rest — above the floor
+    // (or the pin refuses) and below all-resident (or nothing is ever filled and the counter below
+    // proves nothing). The runtime footprint is added on top because `Glimmer::new` takes it off
+    // again before the pin sees it.
+    let left = gt.floor_bytes().unwrap() + gt.layer_bytes().unwrap();
+    let budget = runtime_bytes(gt, n_ctx).unwrap() + left;
+    let mut e = Glimmer::new(root.join("out").to_str().unwrap(), gt, Some(budget), n_ctx).unwrap();
+    e.decode(&prompt, 1, &[]).unwrap();
+    let (hits, fills) = e.slot_stats();
+    assert!(
+        fills > 0,
+        "this budget must leave layers streaming, or the counter below proves nothing"
+    );
+    // Two chunks of 300 tokens at CHUNK 256, one streamed layer per chunk, plus one visit per
+    // layer for the single generated token.
+    let chunks = prompt.len().div_ceil(256);
+    let streamed = gt.n_layers
+        - gt.partition(Some(budget - runtime_bytes(gt, n_ctx).unwrap()))
+            .unwrap()
+            .0;
+    assert!(
+        fills <= (streamed * (chunks + 1)) as u64,
+        "layer-major prefill must fill each streamed layer once per chunk: {streamed} streamed \
+         layers x {chunks} chunks (+1 decode step) against {fills} fills. Token-major would be \
+         {} — the arithmetic is identical either way, so this counter is the only witness",
+        streamed * prompt.len()
+    );
+    println!(
+        "  {fills} fills, {hits} hits over {chunks} chunks of {} tokens",
+        prompt.len()
+    );
+}

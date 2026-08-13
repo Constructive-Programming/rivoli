@@ -251,6 +251,19 @@ pub fn qk_scales(qk_scale_factor: f32) -> QkScale {
     }
 }
 
+/// How many prompt positions a layer-major prefill batch carries.
+///
+/// **The batch is chunked, and the chunk size is a memory trade with a very flat payoff curve.**
+/// Layer-major prefill fetches each streamed layer once per CHUNK instead of once per token, so a
+/// 2048-token prompt at 39 streamed layers goes from 2048 fetches per layer to 8 — 99.6% of the
+/// saving a whole-prompt batch would give, for 1/256th of the residual-stream memory. Whole-prompt
+/// would cost `n_ctx * hidden * 4`, which is **3.49 GB** at this model's 131072-position ceiling
+/// and on top of the KV cache; this costs 6.8 MB.
+///
+/// Correct at any value: chunk `c` runs EVERY layer before chunk `c+1` starts, so layer `l`'s KV
+/// cache already holds every position below the chunk when the chunk's attends run.
+const PREFILL_CHUNK: usize = 256;
+
 /// How many KV slots layer kind `k` gets at `n_ctx`.
 ///
 /// **Derived from [`window_of`], and read by BOTH the allocation and the budget accounting.** The
@@ -291,7 +304,8 @@ pub fn runtime_bytes(gt: &GlimmerTextConfig, n_ctx: usize) -> Result<usize> {
     }
     let qd = gt.n_heads * gt.head_dim;
     // `x`, `xn`, `br`; `q`, `attn`, `gate`; `mg`, `mu`, `mh`; `logits`; `pick` (2 words).
-    let act = 3 * gt.hidden + 3 * qd + 3 * gt.inter + gt.vocab + 2;
+    // `x`, `xn`, `br`, plus `xs` at one row per position in a prefill chunk.
+    let act = (3 + PREFILL_CHUNK.min(n_ctx)) * gt.hidden + 3 * qd + 3 * gt.inter + gt.vocab + 2;
     (kv + act)
         .checked_mul(4)
         .context("the runtime footprint overflows a usize")
@@ -327,8 +341,14 @@ pub struct Glimmer {
     rotated: Vec<bool>,
 
     // Activations. One set, reused every layer and every token.
-    /// The residual stream.
+    /// The residual stream for ONE position — the decode path's, and the prefill's last row is
+    /// read straight out of `xs` instead.
     x: DeviceBuf,
+    /// The residual streams of one prefill CHUNK, `PREFILL_CHUNK * hidden`. Layer-major prefill
+    /// advances a layer at a time across a batch of positions, so every stream in the batch has to
+    /// survive until the next layer reaches it — that is the memory the reorder costs, and
+    /// [`runtime_bytes`] charges it.
+    xs: DeviceBuf,
     /// A pre-norm's output — the attention block's and the MLP's input.
     xn: DeviceBuf,
     /// The branch, from the attention output or the MLP output up to its post-norm.
@@ -449,6 +469,7 @@ impl Glimmer {
             // boolean wearing a float's clothes. Resolved here, once.
             rotated: gt.layer_rope_theta.iter().map(|t| *t != 0.0).collect(),
             x: scratch(gt.hidden)?,
+            xs: scratch(PREFILL_CHUNK.min(n_ctx) * gt.hidden)?,
             xn: scratch(gt.hidden)?,
             br: scratch(gt.hidden)?,
             q: scratch(qd)?,
@@ -570,12 +591,12 @@ impl Glimmer {
     ///
     /// # Safety
     /// `w` is `hidden` live f32 and stays valid until the next [`GlimmerPin::layer`] call.
-    unsafe fn pre_norm(&mut self, w: *const f32) -> Result<()> {
-        // SAFETY: `x` and `xn` are each `hidden` f32 this struct owns for its whole life; `w` is
-        // the caller's obligation.
+    unsafe fn pre_norm(&mut self, x: *mut f32, w: *const f32) -> Result<()> {
+        // SAFETY: `x` is `hidden` live f32 and `xn` is this struct's own; `w` is the caller's
+        // obligation.
         unsafe {
             launch_rmsnorm_centered_single(
-                self.x.ptr() as *const f32,
+                x,
                 w,
                 self.hidden,
                 self.eps_pre,
@@ -597,7 +618,7 @@ impl Glimmer {
     ///
     /// # Safety
     /// `w` is `hidden` live f32 and stays valid until the next [`GlimmerPin::layer`] call.
-    unsafe fn branch_add(&mut self, w: *const f32) -> Result<()> {
+    unsafe fn branch_add(&mut self, x: *mut f32, w: *const f32) -> Result<()> {
         // SAFETY: `br` and `x` are each `hidden` f32 this struct owns; the centered norm's own
         // contract permits `y` aliasing `x`, which is what makes the in-place form legal.
         unsafe {
@@ -609,11 +630,7 @@ impl Glimmer {
                 self.br.ptr() as *mut f32,
                 NULL_STREAM,
             )?;
-            launch_vadd(
-                self.x.ptr() as *mut f32,
-                self.br.ptr() as *const f32,
-                self.hidden,
-            )
+            launch_vadd(x, self.br.ptr() as *const f32, self.hidden)
         }
     }
 
@@ -664,20 +681,19 @@ impl Glimmer {
     /// breaks it with no compile error and no fence to catch it — position-dependent wrong text.
     /// The first version of this comment claimed the opposite ordering and cited the fence as the
     /// mechanism; both were wrong (review, 2026-08-13).
-    fn layer(&mut self, l: usize, pos: usize) -> Result<()> {
+    fn layer(&mut self, x: *mut f32, h: &Handles, l: usize, pos: usize) -> Result<()> {
         let w = self.attn_window(l, pos);
-        let h = Handles::of(self.pin.layer(l)?);
         // SAFETY: every pointer in `h` is live in the pin and stays at its address for as long as
         // its slot holds layer `l` — which is the whole of this function, per the section above.
-        unsafe { self.pre_norm(h.input_ln)? };
-        self.attention(l, pos, &w, &h)?;
+        unsafe { self.pre_norm(x, h.input_ln)? };
+        self.attention(l, pos, &w, h)?;
         // SAFETY: as above.
-        unsafe { self.branch_add(h.post_attn_ln)? };
+        unsafe { self.branch_add(x, h.post_attn_ln)? };
         // SAFETY: as above.
-        unsafe { self.pre_norm(h.pre_ffn_ln)? };
-        self.mlp(&h)?;
+        unsafe { self.pre_norm(x, h.pre_ffn_ln)? };
+        self.mlp(h)?;
         // SAFETY: as above.
-        unsafe { self.branch_add(h.post_ffn_ln) }
+        unsafe { self.branch_add(x, h.post_ffn_ln) }
     }
 
     /// Embed `token`, run every layer at `pos`, and leave the final hidden state in `x`.
@@ -685,7 +701,7 @@ impl Glimmer {
     /// **The embedding is NORMED, by the weightless form** (`MuseGlimmerTextNormedEmbedding`) —
     /// and it cannot be folded into the matrix, because the DFlash drafter shares that matrix
     /// unnormed. A port that folds it is correct until S6.
-    fn hidden_state(&mut self, token: u32, pos: usize) -> Result<()> {
+    fn embed(&mut self, token: u32, dst: *mut f32) -> Result<()> {
         ensure!(
             (token as usize) < self.vocab,
             "token {token} is past this model's vocabulary of {}",
@@ -697,28 +713,72 @@ impl Glimmer {
         // every forward makes the accessor's answer "the last COMPLETED sample or nothing"
         // (review, 2026-08-13).
         self.sampled = false;
-        // SAFETY: `embed` is `[vocab, hidden]` bf16 in the pin and `token < vocab`; `x` is
-        // `hidden` writable f32 this struct owns.
+        // SAFETY: `embed` is `[vocab, hidden]` bf16 in the pin and `token < vocab`; `dst` is
+        // `hidden` writable f32, the caller's obligation.
         unsafe {
             launch_embed_bf16_row_bcast(
                 self.pin.embed.packed,
                 token as usize,
                 self.hidden,
                 1,
-                self.x.ptr() as *mut f32,
+                dst,
                 NULL_STREAM,
             )?;
-            launch_rmsnorm_weightless_batch(
-                self.x.ptr() as *mut f32,
-                1,
-                self.hidden,
-                self.eps_pre,
-                1.0,
-                NULL_STREAM,
-            )?;
+            // §5: the embedding is NORMED, by the weightless form — and it cannot be folded into
+            // the matrix, because the DFlash drafter shares that matrix unnormed.
+            launch_rmsnorm_weightless_batch(dst, 1, self.hidden, self.eps_pre, 1.0, NULL_STREAM)
         }
+    }
+
+    /// One token at `pos`, every layer, leaving the hidden state in `x`.
+    fn hidden_state(&mut self, token: u32, pos: usize) -> Result<()> {
+        let x = self.x.ptr() as *mut f32;
+        self.embed(token, x)?;
         for l in 0..self.n_layers {
-            self.layer(l, pos)?;
+            let h = Handles::of(self.pin.layer(l)?);
+            self.layer(x, &h, l, pos)?;
+        }
+        Ok(())
+    }
+
+    /// **The prompt, LAYER-MAJOR: every token through layer `l` before any token reaches `l+1`.**
+    ///
+    /// Identical arithmetic to running the tokens one at a time — the same launches with the same
+    /// arguments, only reordered, so the logits are bit-for-bit what the token-major loop produced.
+    /// `tests/glimmer_chain.rs` and `tests/glimmer_reference.rs` both score this path and neither
+    /// moved when it landed, which is the check that the reorder is a reorder.
+    ///
+    /// **What it buys is the residency, and that is the whole point.** `GlimmerPin::layer(l)` is
+    /// called ONCE per layer instead of once per layer per token, so a streamed layer is fetched
+    /// once for the whole prompt rather than once for every position — and a streamed Glimmer layer
+    /// is a synchronous **967.942 MB** host memcpy. At a 2048-token prompt with 39 layers streaming
+    /// that is the difference between ~77 TB of memcpy and ~38 GB.
+    ///
+    /// **It does NOT batch the math.** Every projection is still a GEMM at `m = 1` and the attend
+    /// is still `tq = 1`, which is why the rings stay at `sliding_window` and the launcher's
+    /// `ring_cap >= win + tq - 1` union hazard is not reachable from here. Batching the math is a
+    /// further step, it needs a rows dimension on the centered norm and a per-row position on the
+    /// rope, and it changes the arithmetic — so it belongs to whoever can re-measure the gates.
+    // ponytail: reorder only; batch the math when someone can price the kernel changes.
+    fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
+        ensure!(!tokens.is_empty(), "an empty prompt has nothing to prefill");
+        let xs = self.xs.ptr() as *mut f32;
+        for (c, chunk) in tokens.chunks(PREFILL_CHUNK).enumerate() {
+            let base = c * PREFILL_CHUNK;
+            for (i, &tok) in chunk.iter().enumerate() {
+                // SAFETY: `xs` is `PREFILL_CHUNK * hidden` f32 and `i < chunk.len() <= CHUNK`.
+                self.embed(tok, unsafe { xs.add(i * self.hidden) })?;
+            }
+            for l in 0..self.n_layers {
+                // **ONE pin request per layer per chunk** — the saving, and also what keeps
+                // `GlimmerPin::layer`'s captured-pointer rule satisfied: no other layer is
+                // requested between this capture and the launches that read it.
+                let h = Handles::of(self.pin.layer(l)?);
+                for i in 0..chunk.len() {
+                    // SAFETY: as above.
+                    self.layer(unsafe { xs.add(i * self.hidden) }, &h, l, base + i)?;
+                }
+            }
         }
         Ok(())
     }
@@ -734,12 +794,12 @@ impl Glimmer {
     /// **The softcap cannot move the argmax below it**, so this function's return value is the
     /// same with or without it. It is here because every probability depends on it — and that is
     /// why a greedy gate cannot be this path's evidence.
-    fn sample(&mut self) -> Result<u32> {
+    fn sample(&mut self, x: *const f32) -> Result<u32> {
         // SAFETY: `x` is the `hidden` f32 the layer loop left; `final_norm` is `hidden` f32 in the
         // pin; `logits` is `vocab` writable f32; `pick` is 8 bytes taking one i32 then one f32.
         unsafe {
             launch_rmsnorm_single(
-                self.x.ptr() as *const f32,
+                x,
                 self.pin.final_norm,
                 self.hidden,
                 self.eps_pre,
@@ -793,6 +853,17 @@ impl Glimmer {
             self.vocab
         );
         Ok(idx as u32)
+    }
+
+    /// `(hits, fills)` from the pin — how many layer visits found their slot already loaded, and
+    /// how many paid a 967.942 MB host memcpy.
+    ///
+    /// **The only way to see whether the prefill is actually layer-major**, which is a residency
+    /// property and therefore invisible to every numeric gate: the reorder is bit-for-bit
+    /// identical arithmetic, so nothing that compares outputs can tell it from a token-major loop.
+    /// `tests/glimmer_loop.rs` asserts the fill count against `n_layers * chunks`.
+    pub fn slot_stats(&self) -> (u64, u64) {
+        self.pin.slot_stats()
     }
 
     /// The logit vector the last [`Self::sample`] produced — post-softcap, `vocab` long.
@@ -894,18 +965,13 @@ impl Glimmer {
     /// [`Self::decode`]'s body. Split out so the join above covers every `?` in it rather than
     /// each one carrying its own.
     fn decode_inner(&mut self, prompt: &[u32], max_new: usize, eos: &[u32]) -> Result<Vec<u32>> {
-        let mut next = 0u32;
-        for (pos, &t) in prompt.iter().enumerate() {
-            self.hidden_state(t, pos)?;
-            // The last prompt position is the only one whose logits are wanted; the rest run for
-            // their KV cache alone. Sampling them all would cost a 2.69 GB head GEMM per prompt
-            // token for a value nothing reads.
-            if pos + 1 == prompt.len() {
-                next = self.sample()?;
-            } else {
-                device_sync()?;
-            }
-        }
+        // **Layer-major**, which is where the prompt's residency cost lives — see [`Self::prefill`].
+        self.prefill(prompt)?;
+        // The head reads the last position, which is the last row of the last chunk.
+        let last = (prompt.len() - 1) % PREFILL_CHUNK;
+        // SAFETY: `xs` holds `PREFILL_CHUNK` rows of `hidden` f32 and `last` is inside it.
+        let mut next =
+            self.sample(unsafe { (self.xs.ptr() as *const f32).add(last * self.hidden) })?;
         // **The stop token is NOT part of the output**, matching `GpuEngine::generate`'s `emit`
         // (`gpu.rs`), which returns before pushing. The first version pushed and then tested, so an
         // EOS-terminated run rendered the marker into the printed completion and reported one token
@@ -922,7 +988,7 @@ impl Glimmer {
                 break;
             }
             self.hidden_state(next, prompt.len() + i)?;
-            next = self.sample()?;
+            next = self.sample(self.x.ptr() as *const f32)?;
         }
         Ok(out)
     }
