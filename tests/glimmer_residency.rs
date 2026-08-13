@@ -113,10 +113,15 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     );
 
     let e = format!("{:#}", cfg.partition(Some(floor - 1)).unwrap_err());
+    // `"what is LEFT for weights"` replaced `"Weights only"` on 2026-08-14. The old fragment
+    // pinned a disclaimer that was FALSE for the number beside it — both callers hand `partition`
+    // a budget `weight_budget` has already taken the KV cache out of, so "KV ... on top of this"
+    // told the operator to add back what had just been subtracted. The assertion's job is
+    // unchanged: the refusal has to say what the figure it quotes actually is.
     for fragment in [
         "below this artifact's floor",
         "read once per",
-        "Weights only",
+        "what is LEFT for weights",
     ] {
         assert!(
             e.contains(fragment),

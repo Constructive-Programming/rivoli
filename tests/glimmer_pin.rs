@@ -247,3 +247,52 @@ fn glimmer_pin_refuses_a_norm_that_is_not_hidden_long() {
         "the refusal must name the norm. Got: {e}"
     );
 }
+
+/// `tie_word_embeddings` is **false**, so the embedding matrix and the output head are two
+/// different `[vocab, hidden]` tensors and the pin must hold both at two addresses.
+///
+/// **S4 item 5, and the reason it is a named item rather than an assumption.** On the shipped
+/// checkpoint each is 2,689,662,976 bytes — 1.252x `i32::MAX`, measured 2026-08-14 on the
+/// converted artifact, where their contents are also distinct (blake2b `916305e9…` against
+/// `f614edea…`). A port that aliased them would save 2.690 GB, place a legal-looking pin, decode
+/// without erroring, and be a different model: the head would be scoring against the input
+/// embedding. Nothing downstream can see it — logits stay finite, shapes stay right, and the
+/// `glimmer_reference.rs` comparison runs on Muse Glimmer's own weights where the aliasing would
+/// have to be reproduced to be caught.
+///
+/// **The check is on the ADDRESSES, not on the contents**, because aliasing is a placement
+/// property. Two tensors that happen to hold equal bytes are still two tensors, and the fixture's
+/// generator is free to make them equal; two names resolving to one pointer is the defect, at any
+/// contents.
+#[test]
+fn the_head_and_the_embedding_are_two_tensors_at_two_addresses() {
+    let (root, cfg, _) = convert("untied");
+    let pin = GlimmerPin::build(root.join("out").to_str().unwrap(), &cfg.text, None).unwrap();
+    assert!(
+        !pin.embed.packed.is_null() && !pin.head.packed.is_null(),
+        "both `[vocab, hidden]` tensors must be placed"
+    );
+    assert_ne!(
+        pin.embed.packed, pin.head.packed,
+        "`tie_word_embeddings` is false: the embedding and the head must be two placements, not \
+         one pointer handed out twice"
+    );
+    // Both really are `[vocab, hidden]`, so the address check above is comparing the two tensors
+    // this test names rather than whatever else the pin happens to expose.
+    for (what, w) in [("embed", &pin.embed), ("head", &pin.head)] {
+        assert_eq!(
+            (w.o_dim, w.i_dim),
+            (cfg.text.vocab, cfg.text.hidden),
+            "{what} must be [vocab, hidden]"
+        );
+    }
+    // And the budget was charged for both. `global_bytes` is what `partition` subtracts before it
+    // pins a single layer, so an accounting that counted one would under-report the floor by
+    // 2.690 GB on the shipped model and pin two layers it cannot hold.
+    let pair = 2 * cfg.text.vocab * cfg.text.hidden * 2; // two bf16 `[vocab, hidden]` matrices
+    assert!(
+        cfg.text.global_bytes() >= pair,
+        "global_bytes {} must charge BOTH [vocab, hidden] tensors ({pair} B) plus the final norm",
+        cfg.text.global_bytes()
+    );
+}

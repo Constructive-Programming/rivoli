@@ -1925,11 +1925,18 @@ impl GlimmerTextConfig {
         let floor = self.floor_bytes()?;
         ensure!(
             b >= floor,
-            "a device budget of {:.3} GB is below this artifact's floor of {:.3} GB: the \
+            // **"on top of this" was FALSE for the number it quoted**, on the path that matters.
+            // Both callers hand this a budget `glimmer_gpu::weight_budget` has already taken the
+            // KV cache and the activations out of, so the message told the operator to add back
+            // what had just been subtracted, over a figure smaller than the `--max-mem` they
+            // typed (review, 2026-08-14). What is true of `b` either way is that it is the
+            // budget for WEIGHTS.
+            "a weight budget of {:.3} GB is below this artifact's floor of {:.3} GB: the \
              model-level tensors are {:.3} GB (embed + lm_head + final norm, each read once per \
              TOKEN, so streaming them would cost more than it frees) and {GLIMMER_STREAM_SLOTS} \
-             streaming slots are {:.3} GB. Weights only — KV at your context, activation scratch \
-             and any drafter are on top of this",
+             streaming slots are {:.3} GB. This figure is what is LEFT for weights — the KV cache \
+             and activation scratch at your context are accounted separately \
+             (`glimmer_gpu::runtime_bytes`) and have already been taken out of --max-mem",
             b as f64 / 1e9,
             floor as f64 / 1e9,
             self.global_bytes() as f64 / 1e9,

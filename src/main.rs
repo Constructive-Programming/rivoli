@@ -1093,14 +1093,36 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     // > preempted by a transient measurement.
     let budget = device_budget(cfg.max_mem)?;
 
-    // **The prompt is encoded plainly, not through a chat template.** The artifact does not ship
-    // one — `chat_template.jinja` lives only in the fp8 SOURCE — and hand-porting it is S4's item,
-    // where it gets byte-pinned against the source. An `encode_chat` here would silently apply
-    // GLM's framing to a Glimmer model, which is the shape of defect this port has already been
-    // bitten by once.
+    // **The prompt goes through Muse Glimmer's OWN chat framing** (`artifact::glimmer_encoding`,
+    // S4 item 2, byte-pinned against the checkpoint's `apply_chat_template` by
+    // `tests/glimmer_template.rs`). Until 2026-08-14 it was encoded plainly, deliberately, because
+    // no port of the template existed and reaching for `encode_chat` would have applied GLM's
+    // framing to a Glimmer model — the defect this port has been bitten by once.
+    //
+    // Plain encoding is not a neutral fallback, which is why this is wired the moment the port
+    // lands: Glimmer's two stop ids are `<|end_of_text|>` and `<|eot|>`, and `<|eot|>` is what
+    // ends an assistant turn. Fed raw text the model is doing document continuation, is never
+    // inside a turn, and emits neither — the exact state behind `benchmarks.md`'s retraction,
+    // where 56 GLM runs ran to their token limit and drifted into looping scaffolding.
+    //
+    // `Tokenizer::encode` passes `add_special_tokens = false`, which is what the pin's vendored
+    // ids were generated with, so the framing's specials come from the rendered TEXT and resolve
+    // to single ids — a property that file asserts rather than assumes.
     let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
     let prompt_text = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
-    let ids = tok.encode(prompt_text)?;
+    let framed = rivoli::artifact::glimmer_encoding::render(
+        &[serde_json::json!({"role": "user", "content": prompt_text})],
+        &rivoli::artifact::glimmer_encoding::GlimmerChatOpts {
+            // The clock is read HERE and nowhere below it: the renderer takes the date as a
+            // parameter precisely so that reading it is one caller's decision, and this is the
+            // caller for which "what day is it" is a real question.
+            current_date: &rivoli::artifact::glimmer_encoding::utc_date(
+                std::time::SystemTime::now(),
+            ),
+            ..Default::default()
+        },
+    );
+    let ids = tok.encode(&framed)?;
     anyhow::ensure!(
         !ids.is_empty(),
         "the prompt encoded to no tokens: {prompt_text:?}"
@@ -1136,8 +1158,15 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     // every refusal, which is the ordering an earlier review established and the reason is
     // unchanged: whether a flag applies is a fact about argv and the manifest, and must not be
     // preempted by a measurement of the machine.
+    // `weight_budget`, not `runtime_bytes` and a `saturating_sub`: the subtraction alone left a
+    // budget that clears the weights floor but not floor-plus-overhead failing inside this
+    // DIAGNOSTIC, with `partition`'s floor message quoting the post-subtraction number the
+    // operator never supplied — while the refusal written for that exact case sat unreachable in
+    // `Glimmer::new`. One shared function means the binary hits the refusal that names the cause
+    // (review, 2026-08-14).
     let overhead = rivoli::glimmer_gpu::runtime_bytes(gt, n_ctx)?;
-    let (n_pinned, _) = gt.partition(Some(budget.saturating_sub(overhead)))?;
+    let (n_pinned, _) =
+        gt.partition(Some(rivoli::glimmer_gpu::weight_budget(gt, n_ctx, budget)?))?;
     let layer_gb = gt.layer_bytes()? as f64 / 1e9;
     info!(
         "residency: {n_pinned} of {} layers pinned ({:.3} GB), {} streaming through {} slots \

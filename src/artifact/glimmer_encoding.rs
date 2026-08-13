@@ -39,6 +39,38 @@ use super::tokenizer::python_json;
 const DEFAULT_CUTOFF: &str = "2026-01-04";
 const DEFAULT_REASONING: &str = "high";
 
+/// `%Y-%m-%d` in UTC for [`GlimmerChatOpts::current_date`], from a caller-supplied instant.
+///
+/// **The instant is an argument, which is the same argument the opts field makes.** A function
+/// that read `SystemTime::now()` internally would be untestable without a clock and would make
+/// every caller's output a function of when it ran; taking the time in keeps the decision at the
+/// one place that should own it — the CLI, which is where "what day is it" is a legitimate
+/// question. `main` passes `SystemTime::now()`; the test passes known epochs.
+///
+/// Ten lines rather than a dependency: this crate has no date library, `chrono` and `time` are
+/// each a nontrivial tree, and what is needed is one civil date with no timezone, no locale and
+/// no parsing. The conversion is Howard Hinnant's `civil_from_days`, which is exact for every
+/// day in the proleptic Gregorian calendar — no leap-year special cases to get wrong. Before the
+/// epoch it returns `1970-01-01`; a system clock set to 1969 is not a case worth branching for.
+pub fn utc_date(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // Shift the era so it starts on 0000-03-01, which puts the leap day at the END of the year
+    // and makes every month the same length pattern. 719468 is the day count from that origin to
+    // 1970-01-01.
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z / 146_097; // 146097 days = 400 years, the Gregorian cycle
+    let doe = z - era * 146_097; // day of era, 0..=146096
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // year of era, 0..=399
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of the March-started year
+    let mp = (5 * doy + 2) / 153; // month, 0 = March
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// What the caller controls, mapping one-to-one onto the template's kwargs.
 ///
 /// **`current_date` is required, and that is a property of the template rather than a house

@@ -9,7 +9,7 @@
 //! > **The first version of this header said `glimmer_gpu.rs` "needs 55.7 GB of weights to run one
 //! > token", and used that to explain why nothing here executes it. That is false, and review said
 //! > so the same day.** The toy Glimmer checkpoint `tests/common` already builds — 4 layers, hidden
-//! > 8, 2 Q heads over 1 KV head, `head_dim` 8, `sliding_window` 2 — converts and pins exactly like
+//! > 8, 4 Q heads over 2 KV heads, `head_dim` 4, `sliding_window` 2 — converts and pins exactly like
 //! > the real one, so `Glimmer::new` needs a device and not a checkpoint. The premise had cost
 //! > something concrete by the time it was challenged: the commit that wrote it shipped a loop that
 //! > could not decode at all (see [`the_loop_runs_end_to_end_on_the_toy_checkpoint`]).

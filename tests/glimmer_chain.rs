@@ -593,9 +593,14 @@ fn every_layers_branch_matches_the_oracle_and_that_is_where_the_eps_lives() {
         let d = worst_rel(&got, &r.br[l]);
         assert!(
             d < TOL_BRANCH,
+            // The numbers are THIS test's, measured on this fixture: clean 2.7e-7, transposed
+            // 3.1e-6. It read "~4e-3, three orders above this file's floor" until 2026-08-14 —
+            // that figure belongs to the reference comparison, which carries a bf16 weight term
+            // this one does not. Whoever triaged a red run at 9e-7 would have read it and ruled
+            // the transposition OUT, three orders too small, when 9e-7 is squarely in range.
             "L{l}'s post-FFN branch disagrees with the oracle by {d:.3e}. This tensor carries the \
-             eps assignment: a 1e-5/1e-8 transposition lands here at ~4e-3, three orders above \
-             this file's floor and invisible everywhere downstream"
+             eps assignment: on this fixture a 1e-5/1e-8 transposition lands at ~3.1e-6 against a \
+             clean ~2.7e-7 — a factor of ~11, and invisible everywhere downstream"
         );
         if d > worst.0 {
             worst = (d, l);

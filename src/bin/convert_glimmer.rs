@@ -226,8 +226,13 @@ fn main() -> Result<()> {
             "the checkpoint has no {required} — this is not a complete Glimmer text model"
         );
     }
-    // Per-layer completeness, so a truncated shard set is caught before the write rather than
-    // at pin time. Nine tensors per layer: five projections, four norms.
+    // Per-layer completeness, so a truncated shard set is caught before the write rather than at
+    // pin time. **Twelve** tensors per layer: five attention projections (q/k/v/o and the
+    // sigmoid gate), three MLP (gate/up/down), four norms — `GLIMMER_LAYER_TENSORS` is the list
+    // and it is `[&str; 12]`. This comment said "Nine ... five projections, four norms" and so
+    // omitted the whole MLP; the loop always covered them, because it iterates the constant
+    // rather than a count. Reconciled against the shipped checkpoint 2026-08-14: 52 x 12 + 3
+    // model-level = 627 text tensors, and 627 + 809 vision = the index's 1436.
     for l in 0..g.n_layers {
         for t in GLIMMER_LAYER_TENSORS {
             let n = format!("{GLIMMER_LAYER_PREFIX}.{l}.{t}.weight");

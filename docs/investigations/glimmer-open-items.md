@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- five open items, all of them stage work (S4, S5 and the rest of G3); six of the eleven were closed the day this file was written, and two of those six had been recorded as open on evidence that was already stale. The three live CLASSES this file opened with -- ungated correctness, fixture blind spots, unpriced cost -- are all empty. (1) UNGATED CORRECTNESS: EMPTY as of 2026-08-13. The eps transposition -- the item this register called its sharpest -- turned out to be gated already, at 3.673e-5 against the chain gate's 2e-5, closed by the softcap tolerance work one commit earlier; the 'nothing reddens' recorded here was a measurement taken before that change and never re-run, which is the same stale-fact defect as the wrong citation it replaced. A second, LOCALISING gate was added anyway (Glimmer::branch plus a per-layer score against the oracle), and the route this file predicted -- scoring the reference's own captures -- is REFUTED by measurement: there the eps signal is 1.6e-3 to 1.3e-2 against a bf16 weight floor of 4.7e-3 to 3.0e-2, i.e. 0.2x to 0.6x the noise at every layer of both salts. Both surviving margins are thin (1.8x and 1.6x) because the FIXTURE's branch sits at mean(x2) ~ O(1) where the two epsilons nearly agree -- which is a second reason to do (2). (2) FIXTURE-GEOMETRY BLIND SPOTS: CLOSED 2026-08-13 by widening the toy checkpoint from (2 heads, 1 kv, head_dim = dim) to (4, 2, dim/2). Both were UNCONSTRUCTIBLE rather than merely uncaught -- at head_dim = hidden the two candidate softmax scales are the same NUMBER, and at hkv = 1 the block and modulo KV broadcasts are the same FUNCTION, so no tolerance could have separated either. They now measure 3.7e-1 and 9.5e-1. Six test binaries share the fixture and all pass unchanged; the widening also improved every clean floor in the chain gate by 2.7-5.5x, so its three tolerances and its whole 13-row mutation census were re-derived rather than carried over. (3) UNPRICED COST: the KV cache item is CLOSED 2026-08-13 -- glimmer_gpu::runtime_bytes is subtracted from the budget BEFORE the tier is sized, a budget that cannot cover it is refused by name, the slot count is one function read by both the allocation and the accounting, and the residency line moved below the tokenizer because the footprint is a function of the context; gated deviceless at the shipped widths plus a partition-boundary assertion, with one gap stated rather than papered over (removing the subtraction leaves every test green, since its effect needs a genuinely near-full device). Prefill is CLOSED too: Glimmer::prefill is layer-major and chunked at 256, so GlimmerPin::layer is called once per layer per chunk instead of once per token -- measured 6 fills against 900 token-major on the fixture, red-proved by reverting the order. It is a pure reorder (every numeric gate was bit-for-bit unchanged, which is the check), so no output comparison can see it and Glimmer::slot_stats exposes the pin's fill counter for the assertion. Chunked rather than whole-prompt because the batch's residual streams stay live: whole-prompt is 3.49 GB at the 131072 ceiling and 3.1's own gate caught it at 7.144 GB, where chunking costs 6.8 MB for 99.6% of the saving. The MATH is still m=1 / tq=1; batching it needs a rows dimension on the centered norm and a per-row rope position, changes the arithmetic, and first makes the launcher's ring union hazard reachable -- separate work. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. Also carried here: the branch is 50 commits unpushed, and the GPU node label is left at disabled with llama-swap Pending.
+verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- five open items, all of them stage work (S4, S5 and the rest of G3); six of the eleven were closed the day this file was written, and two of those six had been recorded as open on evidence that was already stale. The three live CLASSES this file opened with -- ungated correctness, fixture blind spots, unpriced cost -- are all empty. (1) UNGATED CORRECTNESS: EMPTY as of 2026-08-13. The eps transposition -- the item this register called its sharpest -- turned out to be gated already, against the chain gate's tolerance of the day, closed by the softcap tolerance work one commit earlier; the 'nothing reddens' recorded here was a measurement taken before that change and never re-run, which is the same stale-fact defect as the wrong citation it replaced. A second, LOCALISING gate was added anyway (Glimmer::branch plus a per-layer score against the oracle), and the route this file predicted -- scoring the reference's own captures -- is REFUTED by measurement: there the eps signal is 1.6e-3 to 1.3e-2 against a bf16 weight floor of 4.7e-3 to 3.0e-2, i.e. 0.2x to 0.6x the noise at every layer of both salts. Both surviving margins were thin because the FIXTURE's branch sits at mean(x2) ~ O(1) where the two epsilons nearly agree -- which is a second reason to do (2), and (2) then re-derived both tolerances so the old figures no longer describe anything (the prose counts are deleted rather than corrected a third time; tests/glimmer_chain.rs's TOL and TOL_BRANCH carry their own measured separations). (2) FIXTURE-GEOMETRY BLIND SPOTS: CLOSED 2026-08-13 by widening the toy checkpoint from (2 heads, 1 kv, head_dim = dim) to (4, 2, dim/2). Both were UNCONSTRUCTIBLE rather than merely uncaught -- at head_dim = hidden the two candidate softmax scales are the same NUMBER, and at hkv = 1 the block and modulo KV broadcasts are the same FUNCTION, so no tolerance could have separated either. They now measure 3.7e-1 and 9.5e-1. Six test binaries share the fixture and all pass unchanged; the widening also improved every clean floor in the chain gate by 2.7-5.5x, so its three tolerances and its whole 13-row mutation census were re-derived rather than carried over. (3) UNPRICED COST: the KV cache item is CLOSED 2026-08-13 -- glimmer_gpu::runtime_bytes is subtracted from the budget BEFORE the tier is sized, a budget that cannot cover it is refused by name, the slot count is one function read by both the allocation and the accounting, and the residency line moved below the tokenizer because the footprint is a function of the context; gated deviceless at the shipped widths plus a partition-boundary assertion, with one gap stated rather than papered over (removing the subtraction leaves every test green, since its effect needs a genuinely near-full device). Prefill is CLOSED too: Glimmer::prefill is layer-major and chunked at 256, so GlimmerPin::layer is called once per layer per chunk instead of once per token -- measured 6 fills against 900 token-major on the fixture, red-proved by reverting the order. It is a pure reorder (every numeric gate was bit-for-bit unchanged, which is the check), so no output comparison can see it and Glimmer::slot_stats exposes the pin's fill counter for the assertion. Chunked rather than whole-prompt because the batch's residual streams stay live: whole-prompt is 3.49 GB at the 131072 ceiling and 3.1's own gate caught it at 7.144 GB, where chunking costs 6.8 MB for 99.6% of the saving. The MATH is still m=1 / tq=1; batching it needs a rows dimension on the centered norm and a per-row rope position, changes the arithmetic, and first makes the launcher's ring union hazard reachable -- separate work. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. S4 is now PART-CLOSED (2026-08-14): the 59.553 GB checkpoint is downloaded, structurally verified and converted bf16-verbatim to a 55.71 GB artifact (418 verbatim + 209 norms widened + 809 vision skipped, reconciling to the index's 1436); the chat template is hand-ported as artifact::glimmer_encoding and pinned byte-for-byte against 24 cases rendered by the checkpoint's OWN apply_chat_template, with 11 red proofs; and tie_word_embeddings: false is gated on ADDRESSES (the two [vocab, hidden] tensors are 2,689,662,976 B each, 1.252x i32::MAX, contents distinct), red-proved by aliasing the head onto the embedding. What S4 still owes is a human-read decode, the dNLL ladder per format, and the first quantized format. S5 remains gated on G4. Also carried here: the branch is 50+ commits unpushed, the checkpoint lives at /swarm/storage/ai/rivoli because /swarm/storage/ai/models is root-owned, and the GPU node label is left at disabled with llama-swap Pending.
 ---
 
 # Muse Glimmer — open items after S3
@@ -37,11 +37,16 @@ assigned by position. Transposing them now reddens **two** tests in `glimmer_cha
 post-FFN branch against the host oracle, selecting a layer by truncating the config. It
 LOCALISES the defect to a layer and is a second, independent catch.
 
-**Both margins are thin, and both are measured** — 1.8x over tolerance for the logits, 1.6x for
-the branch. The cause is the FIXTURE: its branch sits at `mean(x²)` ~ O(1), where 1e-5 and 1e-8
-are nearly the same number. The reference's sits at ~1e-3, where `glimmer_norm.rs` measures
-41.8-56.6x. **§2 widens this** — a fixture with a realistic branch statistic turns two thin
-gates into two comfortable ones, which is a second reason to do that work.
+**Both margins were thin, and §2's widening is what fixed that.** The cause was the FIXTURE:
+its branch sat at `mean(x²)` ~ O(1), where 1e-5 and 1e-8 are nearly the same number, against
+the reference's ~1e-3 where `glimmer_norm.rs` measures 41.8-56.6x.
+
+> **The margins are not restated here, deliberately** (2026-08-14). This paragraph carried
+> "1.8x and 1.6x" past the widening that re-derived both tolerances from scratch — so did the
+> `verdict:` and the INDEX row, which `CLAUDE.md` tells readers to trust INSTEAD of opening the
+> doc. A prose number nothing checks has now been wrong in this file twice. `TOL` and
+> `TOL_BRANCH` in `tests/glimmer_chain.rs` carry their own measured separations in their doc
+> blocks, and those are re-derived whenever the fixture moves; read them there.
 
 > **The route this file predicted — scoring the reference's own captures — is REFUTED, measured.**
 > `tests/glimmer_reference.rs` reads each layer's branch against Muse Glimmer's capture, and there
@@ -120,7 +125,9 @@ Red-proved by reverting the loop order.
 compares numbers was bit-for-bit unchanged when it landed (2.705e-7, 7.114e-7, 3.693e-2, 3.984e-2,
 4.769e-2, all identical), which is the check that the reorder is a reorder. The corollary is that
 **no numeric gate can see this property at all**, so `Glimmer::slot_stats` exposes the pin's fill
-counter and `tests/glimmer_loop.rs` asserts against `n_layers * chunks`.
+counter and `tests/glimmer_loop.rs` asserts against `streamed * (chunks + 1)` — the STREAMED
+layers, plus one visit each for the decode step. (Written here and on `slot_stats` as
+`n_layers * chunks` until review checked it against the code, 2026-08-14.)
 
 **Chunked at 256 because whole-prompt batching is a memory trade with a flat payoff.** The
 residual streams of a batch must all stay live; at the 131072 ceiling that is `n_ctx * hidden * 4`
@@ -203,11 +210,35 @@ device, `kernel_coverage.rs`'s style.
 
 **Deferred to the owner:** it edits three engine files this port does not own.
 
-### 4.5 S4 — real weights
+### 4.5 S4 — real weights — **items 1, 2 and 5 CLOSED 2026-08-14**
 
-The full checkpoint bf16-verbatim, then the first quantized format by dNLL. Carries the chat
-template (hand-ported and byte-pinned; the artifact drops it) and the 2.69 GB `lm_head`, which
-is 1.25x `i32::MAX` bytes and untested at every stage.
+The full checkpoint bf16-verbatim, then the first quantized format by dNLL.
+
+> **Item 1 — the checkpoint is converted.** `meta-models/Muse-Glimmer-30B`, 59.553 GB in two
+> shards, verified structurally before use (each shard's payload ends exactly at its file size,
+> and the index's tensor total plus the two headers is the byte count on disk). It lives at
+> `/swarm/storage/ai/rivoli/muse-glimmer-30b` — **NOT** `/swarm/storage/ai/models`, which is
+> `root:root` and not writable here. `convert_glimmer` produced a 55.71 GB artifact at
+> `/swarm/storage/ai/rivoli/glimmer-30b-bf16`: **418 tensors bf16 verbatim, 209 norms widened to
+> f32, 809 vision skipped**, which reconciles exactly — 209 is `52 x 4 + 1`, and 627 text + 809
+> vision is the index's 1436. Both EOS ids (`[200001, 200008]`) reached the artifact.
+>
+> **Item 2 — the chat template is ported and pinned** (`51bb252`). `artifact::glimmer_encoding`,
+> gated byte-for-byte against 24 cases rendered by `apply_chat_template` on the checkpoint
+> itself, plus the ids, with 11 red proofs. The tools block the plan predicted is there: it is
+> the ATEM protocol, ~2 KB of preamble per system turn.
+>
+> **Item 5 — `tie_word_embeddings: false` is gated.** `the_head_and_the_embedding_are_two_tensors_at_two_addresses`
+> asserts the pin places both `[vocab, hidden]` tensors at DIFFERENT addresses and that
+> `global_bytes` charges both; red-proved by aliasing `head` onto `embed` in `GlimmerPin::build`.
+> Measured on the shipped artifact: each is **2,689,662,976 B = 1.252x `i32::MAX`**, and their
+> contents differ (blake2b `916305e9…` vs `f614edea…`). The check is on ADDRESSES, because
+> aliasing is a placement property and equal contents would still be two tensors.
+
+**Still open here:** item 3 (a bounded greedy run read by a human), item 4 (the dNLL ladder per
+format, and the softcap priced on trained logits), and the first quantized format itself —
+int4+g128 at 13.65 GB/token is the only row that plausibly decodes at interactive speed on this
+GTT; fp8 at 26.51 is the quality anchor.
 
 ### 4.6 S5 — performance
 

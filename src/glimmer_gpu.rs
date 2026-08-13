@@ -294,6 +294,36 @@ fn slots_of(k: LayerKind, win: usize, n_ctx: usize) -> usize {
 /// budget from the built one is the disagreement this repo has already been bitten by.
 pub fn runtime_bytes(gt: &GlimmerTextConfig, n_ctx: usize) -> Result<usize> {
     ensure!(n_ctx > 0, "n_ctx must be positive");
+    // **These two guards live HERE and not in the caller**, moved down from `Glimmer::new`
+    // 2026-08-14 after review found each of them arriving too late for this function.
+    //
+    // `n_ctx`: `run_glimmer` calls this with `ids.len() + --bench`, and `--bench` is an
+    // unbounded `usize`, while the trained-positions check used to sit twenty lines further on
+    // inside `Glimmer::new`. At `--bench 1e17` a full-attention layer wants `2 · 1e17 · 256` =
+    // 5.12e19 elements against a `u64::MAX` of 1.845e19, so the accumulation below overflows
+    // BEFORE `checked_mul(4)` is ever reached: on the dev profile — the profile CLAUDE.md
+    // prescribes for everything that is not a benchmark — that is a bare "attempt to multiply
+    // with overflow" panic instead of the message the operator needs, and under `--release` it
+    // wraps silently and reports a nonsense footprint.
+    //
+    // `sliding_window`: `slots_of` calls `window_of`, which ASSERTS `win > 0` for a sliding
+    // layer. This function is `pub` and takes a config that need not have been validated, so
+    // that assert is reachable from any caller — a sizing tool, a bench, a future serve path —
+    // as a panic out of a function whose signature promises a `Result`.
+    ensure!(
+        n_ctx <= gt.max_position_embeddings,
+        "n_ctx {n_ctx} is past this model's {} trained positions",
+        gt.max_position_embeddings
+    );
+    let sliding = gt
+        .layer_types
+        .iter()
+        .filter(|k| **k == LayerKind::SlidingAttention)
+        .count();
+    ensure!(
+        sliding == 0 || gt.sliding_window > 0,
+        "the config types {sliding} layers `sliding_attention` and gives `sliding_window` 0"
+    );
     let kvd = gt.num_key_value_heads * gt.head_dim;
     // Sized BY `window_of`, exactly as the allocation is — the two must not be able to disagree
     // about how many slots a layer gets.
@@ -303,12 +333,36 @@ pub fn runtime_bytes(gt: &GlimmerTextConfig, n_ctx: usize) -> Result<usize> {
         kv += 2 * slots_of(k, gt.sliding_window, n_ctx) * kvd;
     }
     let qd = gt.n_heads * gt.head_dim;
-    // `x`, `xn`, `br`; `q`, `attn`, `gate`; `mg`, `mu`, `mh`; `logits`; `pick` (2 words).
-    // `x`, `xn`, `br`, plus `xs` at one row per position in a prefill chunk.
+    // `x`, `xn`, `br`, plus `xs` at one row per position in a prefill chunk; `q`, `attn`,
+    // `gate`; `mg`, `mu`, `mh`; `logits`; `pick` (2 words). This list is the only cross-check
+    // anyone auditing `Glimmer::new` has, so it enumerates every allocation rather than the
+    // ones a given edit touched — it briefly carried two lines, each missing what the other had.
     let act = (3 + PREFILL_CHUNK.min(n_ctx)) * gt.hidden + 3 * qd + 3 * gt.inter + gt.vocab + 2;
     (kv + act)
         .checked_mul(4)
         .context("the runtime footprint overflows a usize")
+}
+
+/// The budget left for WEIGHTS once [`runtime_bytes`] is taken out, refusing a budget the
+/// runtime footprint already consumes.
+///
+/// **Shared so the CLI can reach the refusal, which it could not.** `run_glimmer` reported the
+/// partition by calling `partition(budget - overhead)` directly, and on any budget that clears
+/// the weights floor but not floor-plus-overhead that call failed first — with `partition`'s
+/// floor message, quoting the POST-subtraction number the operator never supplied. The refusal
+/// written for exactly this case sat in `Glimmer::new` and was unreachable from the binary;
+/// only the tiny-fixture tests could get to it (review, 2026-08-14).
+pub fn weight_budget(gt: &GlimmerTextConfig, n_ctx: usize, budget: usize) -> Result<usize> {
+    let overhead = runtime_bytes(gt, n_ctx)?;
+    ensure!(
+        budget > overhead,
+        "the KV cache and activations for {n_ctx} positions need {:.3} GB, which is the whole \
+         {:.3} GB budget — there is nothing left to pin weights into. Lower the context or raise \
+         --max-mem",
+        overhead as f64 / 1e9,
+        budget as f64 / 1e9
+    );
+    Ok(budget - overhead)
 }
 
 /// The Muse Glimmer decode path: weights, activations, KV cache, and the loop over them.
@@ -403,35 +457,20 @@ impl Glimmer {
             gt.layer_types.len(),
             gt.layer_rope_theta.len()
         );
-        let sliding = gt
-            .layer_types
-            .iter()
-            .filter(|k| **k == LayerKind::SlidingAttention)
-            .count();
-        ensure!(
-            sliding == 0 || gt.sliding_window > 0,
-            "the config types {sliding} layers `sliding_attention` and gives `sliding_window` 0"
-        );
-        ensure!(
-            n_ctx <= gt.max_position_embeddings,
-            "n_ctx {n_ctx} is past this model's {} trained positions",
-            gt.max_position_embeddings
-        );
         // **The pin gets what is left after the KV cache and the activations**, not the whole
-        // budget — see [`runtime_bytes`]. Subtracted BEFORE the tier is sized, because the tier is
-        // what `guard_capacity` checks against free memory and everything below it is unguarded.
-        let overhead = runtime_bytes(gt, n_ctx)?;
-        if let Some(b) = budget {
-            ensure!(
-                b > overhead,
-                "the KV cache and activations for {n_ctx} positions need {:.3} GB, which is the \
-                 whole {:.3} GB budget — there is nothing left to pin weights into. Lower the \
-                 context or raise --max-mem",
-                overhead as f64 / 1e9,
-                b as f64 / 1e9
-            );
-        }
-        let pin = GlimmerPin::build(dir, gt, budget.map(|b| b - overhead))?;
+        // budget — see [`runtime_bytes`], which also carries the `n_ctx` and `sliding_window`
+        // guards this function used to make on its own behalf. Subtracted BEFORE the tier is
+        // sized, because the tier is what `guard_capacity` checks against free memory and
+        // everything below it is unguarded.
+        let for_weights = match budget {
+            Some(b) => Some(weight_budget(gt, n_ctx, b)?),
+            // An absent budget still has to run the guards, and they are inside `runtime_bytes`.
+            None => {
+                runtime_bytes(gt, n_ctx)?;
+                None
+            }
+        };
+        let pin = GlimmerPin::build(dir, gt, for_weights)?;
         let (hq, hkv, hd) = (gt.n_heads, gt.num_key_value_heads, gt.head_dim);
         let qd = hq * hd;
         let kvd = hkv * hd;
@@ -668,19 +707,27 @@ impl Glimmer {
     ///
     /// # The pin invariant this body relies on, stated as what actually holds
     ///
-    /// The four norm pointers are captured once and then used ACROSS the `pin.layer` calls that
-    /// [`Self::attention`] and [`Self::mlp`] make — `post_attn_ln` after the first, `post_ffn_ln`
-    /// after the second. `GlimmerPin::layer`'s own doc names that as the hazard its fence does NOT
+    /// The twelve device handles in `h` are resolved from the pin ONCE and then held across every
+    /// launch below. `GlimmerPin::layer`'s own doc names that as the hazard its fence does NOT
     /// cover: the fence syncs kernels already enqueued, and cannot see a caller that captures layer
     /// `l`'s pointers, calls `layer(l + 1)`, and only then launches.
     ///
-    /// **What makes this sound is narrower and it is the thing to preserve: every `pin.layer` call
-    /// inside this function is for the SAME `l`.** A repeat visit takes the `slot_layer[s] ==
-    /// Some(l)` hit path, which neither fences nor refills, so no pointer can move under a capture.
-    /// Prefetching `l + 1`, splitting the sandwich halves across layers, or reordering these calls
-    /// breaks it with no compile error and no fence to catch it — position-dependent wrong text.
-    /// The first version of this comment claimed the opposite ordering and cited the fence as the
-    /// mechanism; both were wrong (review, 2026-08-13).
+    /// **The invariant is the CALLER's, and that is the thing to preserve: no `pin.layer` request
+    /// may be issued between resolving `h` and the last launch that reads it.** This function
+    /// makes no pin calls at all, so nothing it does can violate the rule — which means reading
+    /// the rule here and checking only this body proves nothing. [`Self::prefill`] resolves `h`
+    /// once and then runs up to [`PREFILL_CHUNK`] `layer` calls from it; [`Self::hidden_state`]
+    /// resolves it per layer. A prefetch of `l + 1` from inside `prefill`'s inner loop would
+    /// satisfy every word of a rule stated about `layer` and break the real one — position
+    /// dependent wrong text, no compile error, no fence to catch it. **That is precisely what S5
+    /// wants to add**, and the `Handles` resolution is the only thing keeping the hazard
+    /// unreachable today.
+    ///
+    /// > **CORRECTED twice.** The first version claimed the opposite call ordering and cited the
+    /// > fence as the mechanism; both were wrong (review, 2026-08-13). The second stated the rule
+    /// > as "every `pin.layer` call inside this function is for the SAME `l`" — true, but
+    /// > vacuously so once `60641fa` moved the pin calls out to the callers, so it described a
+    /// > code shape that no longer exists and protected nothing (review, 2026-08-14).
     fn layer(&mut self, x: *mut f32, h: &Handles, l: usize, pos: usize) -> Result<()> {
         let w = self.attn_window(l, pos);
         // SAFETY: every pointer in `h` is live in the pin and stays at its address for as long as
@@ -696,7 +743,12 @@ impl Glimmer {
         unsafe { self.branch_add(x, h.post_ffn_ln) }
     }
 
-    /// Embed `token`, run every layer at `pos`, and leave the final hidden state in `x`.
+    /// Look `token` up in the embedding matrix and leave the normed row in `dst`.
+    ///
+    /// `dst` rather than `self.x`, because the prefill writes one row of `xs` per position and
+    /// runs no layers here. (The summary line said "run every layer at `pos`, and leave the final
+    /// hidden state in `x`" until review caught it 2026-08-14 — it was `hidden_state`'s, left
+    /// behind when the two were split, and rustdoc shows the first line as the item summary.)
     ///
     /// **The embedding is NORMED, by the weightless form** (`MuseGlimmerTextNormedEmbedding`) —
     /// and it cannot be folded into the matrix, because the DFlash drafter shares that matrix
@@ -861,7 +913,11 @@ impl Glimmer {
     /// **The only way to see whether the prefill is actually layer-major**, which is a residency
     /// property and therefore invisible to every numeric gate: the reorder is bit-for-bit
     /// identical arithmetic, so nothing that compares outputs can tell it from a token-major loop.
-    /// `tests/glimmer_loop.rs` asserts the fill count against `n_layers * chunks`.
+    /// `tests/glimmer_loop.rs` asserts the fill count against `streamed * (chunks + 1)` — the
+    /// STREAMED layers, not all of them, and one extra visit each for the decode step. Written
+    /// here as `n_layers * chunks` until review checked it against the code 2026-08-14; the coded
+    /// bound is the looser of the two, and it only binds at all because that test tunes its budget
+    /// to pin exactly one layer.
     pub fn slot_stats(&self) -> (u64, u64) {
         self.pin.slot_stats()
     }
@@ -921,14 +977,18 @@ impl Glimmer {
 
     /// Greedy decode: consume `prompt`, then emit until an `eos` or `max_new`.
     ///
-    /// **Prefill is token-major — one position per forward, `tq == 1` throughout.** That is what
-    /// lets every sliding layer's ring be exactly `sliding_window` slots, since the launcher's
-    /// floor is `win + tq - 1`. It is also the slow way: layer-major prefill is 2.15x on the GLM
-    /// path and a streamed Glimmer layer is 967.942 MB of memcpy per token, so token-major prefill
-    /// re-streams the whole model for every prompt token. **S5's, not S3's** — a wider `tq` needs
-    /// a ring of `win + tq - 1` and a `q` buffer of `tq · hq · hd`, and neither is a change to the
-    /// chain above.
-    // ponytail: token-major prefill, layer-major when S5 prices the wider ring.
+    /// **Every forward is one position — `tq == 1` throughout — and that is what lets every
+    /// sliding layer's ring be exactly `sliding_window` slots**, since the launcher's floor is
+    /// `win + tq - 1`. It is still true after the layer-major reorder, but it is no longer a
+    /// property of THIS function: [`Self::prefill`] batches the fetch and not the math, so the
+    /// claim now has to be re-made against its inner loop.
+    ///
+    /// > **CORRECTED 2026-08-14, by review.** This said "prefill is token-major", called
+    /// > layer-major "S5's, not S3's", and carried a `ponytail:` marker scheduling work that had
+    /// > already landed in `60641fa`. It matters because this paragraph is the load-bearing
+    /// > statement of why `ring_cap == win` is safe: an editor who widens `tq` and reads
+    /// > "token-major" here would look for the one-position-per-forward argument in
+    /// > `hidden_state` and miss that `prefill` now runs 256 of them per layer.
     pub fn decode(&mut self, prompt: &[u32], max_new: usize, eos: &[u32]) -> Result<Vec<u32>> {
         ensure!(
             !prompt.is_empty(),

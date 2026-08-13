@@ -182,3 +182,35 @@ fn the_fixture_varies_every_option() {
         "case count moved without the byte test noticing"
     );
 }
+
+/// `utc_date` against dates computed independently, including the two shapes a hand-rolled
+/// civil-date conversion gets wrong.
+///
+/// **Not a formality.** The conversion exists because this crate has no date dependency, and the
+/// two classic failures are leap-day handling and the century rule — 2000 is a leap year and 1900
+/// is not, and a conversion that treats every 4th year as a leap year is right for 128 years
+/// running and then silently off by one. The epochs below are `date -u -d <date> +%s`.
+#[test]
+fn utc_date_matches_the_calendar() {
+    use rivoli::artifact::glimmer_encoding::utc_date;
+    use std::time::{Duration, UNIX_EPOCH};
+    for (secs, want) in [
+        (0u64, "1970-01-01"),
+        (86_399, "1970-01-01"),        // last second of the day
+        (86_400, "1970-01-02"),        // and the first of the next
+        (951_782_400, "2000-02-29"),   // the century-rule leap day: divisible by 400, so it exists
+        (1_709_164_800, "2024-02-29"), // an ordinary leap day
+        (1_709_251_200, "2024-03-01"),
+        (4_107_542_400, "2100-03-01"), // the day after a Feb that has NO 29th: 2100 is not a leap year
+        (1_755_129_600, "2025-08-14"),
+        (1_786_665_600, "2026-08-14"), // the date the fixture pins
+    ] {
+        assert_eq!(
+            utc_date(UNIX_EPOCH + Duration::from_secs(secs)),
+            want,
+            "utc_date({secs})"
+        );
+    }
+    // Before the epoch is documented as clamping rather than wrapping to year -something.
+    assert_eq!(utc_date(UNIX_EPOCH - Duration::from_secs(1)), "1970-01-01");
+}

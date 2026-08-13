@@ -62,9 +62,13 @@ fn rivoli(artifact: &std::path::Path, extra: &[&str]) -> String {
 /// its reason" and "is accepted, and the run then reports and reaches the honest bail" are
 /// different shapes.
 ///
-/// The `residency:` assertion is the half review found missing: the first version checked only
-/// that the flag parsed, so nothing in the tree asserted that `run_glimmer` prints the split —
-/// which is the one thing R1 gives an operator.
+/// **Nothing in the tree asserts that `run_glimmer` prints the residency split, and nothing on
+/// this fixture can.** That is stated rather than implied, because two comments in this file
+/// used to delegate the assertion to each other and neither made it: the report moved below the
+/// tokenizer when the KV cache was charged to the budget (018f7d0), the fixture has no usable
+/// tokenizer, so the run stops before the line. Deleting the whole `info!("residency: …")` block
+/// leaves this suite green — checked 2026-08-14. Closing it needs a fixture with a tokenizer,
+/// not a marker moved a fourth time.
 #[test]
 fn max_mem_is_accepted_and_reports_the_partition() {
     // **`--max-mem` moved from refused to ACCEPTED at R1**, so this asserts the OPPOSITE of
@@ -201,9 +205,12 @@ fn a_run_with_no_flags_gets_past_every_refusal() {
     // the residency line is printed — a red that means "another tenant holds the GPU", not "a
     // refusal regressed". This file's own header calls itself deviceless and a sibling test three
     // lines down records the same trap hitting `glimmer_pin` for real. The bare arm therefore
-    // asserts on the layer map, which is emitted before anything measures the machine; the
-    // `--max-mem` arm takes the literal branch and is the one that asserts the partition
-    // (re-keyed 2026-08-13, then corrected the same day by review).
+    // asserts on the layer map, which is emitted before anything measures the machine.
+    //
+    // This used to end "the `--max-mem` arm takes the literal branch and is the one that asserts
+    // the partition". It does not — see that test's own doc. Neither arm does, on this fixture
+    // neither can, and the two comments pointing at each other is how it went unnoticed
+    // (review, 2026-08-14).
     assert!(
         !err.contains("does not apply"),
         "no flag refusal may fire on a run that passed no flags:\n{err}"
