@@ -120,8 +120,8 @@
 
 mod common;
 use common::{
-    FixtureTensor, GLIMMER_FIXTURE_DIM as DIM, TempRoot, glimmer_convert_fixture, window_lo,
-    worst_rel,
+    FixtureTensor, GLIMMER_FIXTURE_DIM as DIM, TempRoot, glimmer_convert_fixture, rms_inv,
+    weightless, window_lo, worst_rel,
 };
 use rivoli::artifact::model as gm;
 use rivoli::artifact::model::LayerKind;
@@ -169,11 +169,6 @@ fn matvec(w: &[f32], x: &[f32], o: usize, i: usize) -> Vec<f32> {
         .collect()
 }
 
-/// `1/sqrt(mean(x²) + eps)` — the factor all three norm forms share.
-fn rms_inv(x: &[f32], eps: f32) -> f32 {
-    1.0 / (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt()
-}
-
 /// `MuseGlimmerTextCenteredRMSNorm`: `_norm(x) * (1 + w)`. The four per-layer norms, and nothing
 /// else. Its weight is initialised to ZEROS, which is why substituting the plain form here
 /// multiplies the residual stream by ~0 and is the LOUD direction of that mistake.
@@ -202,16 +197,6 @@ fn plain(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     );
     let inv = rms_inv(x, eps);
     x.iter().zip(w).map(|(v, wi)| v * inv * wi).collect()
-}
-
-/// The weightless form over `rows` segments of `d`, times `scale`. The QK-norm (per head) and the
-/// embedding norm (`rows = 1`, `d = hidden`, `scale = 1`) are the same operator.
-fn weightless(x: &mut [f32], rows: usize, d: usize, eps: f32, scale: f32) {
-    for r in 0..rows {
-        let seg = &mut x[r * d..(r + 1) * d];
-        let f = scale * rms_inv(seg, eps);
-        seg.iter_mut().for_each(|v| *v *= f);
-    }
 }
 
 /// Split-half RoPE in place over `rows` segments of `d`: the pair is `(x[j], x[j + d/2])`,

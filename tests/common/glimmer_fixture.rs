@@ -23,8 +23,9 @@ mod golden_read;
 #[path = "mod.rs"]
 mod device;
 pub use device::{
-    GLIMMER_SHIPPED_CONFIG, back, dev, f32b, f32v, gemm_bf16_launch, u16b, window_lo, worst_rel,
-    zeros,
+    FixtureTensor, GLIMMER_SHIPPED_CONFIG, TempRoot, back, dev, f32b, f32v, gemm_bf16_launch,
+    rms_inv, run_convert_glimmer, u16b, weightless, window_lo, worst_rel, write_glimmer_aux,
+    write_glimmer_config, write_index, write_safetensors, zeros,
 };
 
 #[path = "tolerance.rs"]

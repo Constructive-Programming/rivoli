@@ -985,27 +985,61 @@ def _install_draft_taps(mdl, draft, taps):
 
 
 def weights_capture(model):
-    """The tiny model's `attn.gate_proj` weight, per layer, for S3 item 3.
+    """The tiny model's WHOLE parameter set, for G3's comparison against the reference.
 
-    Item 3 scores the gate OPERAND against the `attn.gate_proj.out` captures, and that needs the
-    projection itself. **It cannot be recovered from the captures**: `gate_proj` is 72 -> 48, a
-    layer sees 18 rows (12 prompt + 6 decode), and 18 equations against 72 unknowns per output
-    element is underdetermined by 4x — so ANY candidate operand admits a weight that fits the
-    captures exactly, and a recover-and-predict gate of the shape the sandwich norms use would be
-    vacuous here rather than merely weak. The norms escaped that because they are ELEMENTWISE.
+    **Extended 2026-08-13 from `attn.gate_proj` alone**, which was S3 item 3's need. The previous
+    docstring specified this change and its price, so this is the deliberate decision it asked
+    for rather than accretion:
 
-    Written to a SEPARATE file, not added to `cap`: the goldens' bytes and their four pinned FNVs
-    do not move, which is what lets `tests/glimmer-anchor.sh` prove this change is additive by
-    regenerating and comparing. Same container format, so the Rust side reads it with the reader it
-    already has.
+        "Only `gate_proj` today. Items 4-5 and G3 will want q/k/v/o and the MLP; extend this
+        rather than starting a second file, and note that the whole tiny model is ~475k floats,
+        so exporting all of it is ~1.9 MB per salt -- a decision to make deliberately, not by
+        accretion."
 
-    Only `gate_proj` today. Items 4-5 and G3 will want q/k/v/o and the MLP; extend this rather than
-    starting a second file, and note that the whole tiny model is ~475k floats, so exporting all of
-    it is ~1.9 MB per salt — a decision to make deliberately, not by accretion.
+    **What it buys is the only comparison that is against MUSE GLIMMER.** Every other Glimmer
+    gate in rivoli scores either a kernel against these captures, or the engine against a host
+    reference transcribed from `glimmer-architecture.md` -- and a transcription shares its
+    author's misreadings with the engine, so a defect written into both sides passes. With the
+    parameters exported, rivoli can build a checkpoint from THEM, run its own loop, and compare
+    logits to `tN.logits`: the reference model's own output, from the reference's own weights.
+
+    The keeper of the old docstring's warning: `gate_proj` is not recoverable from the captures
+    (72 -> 48, 18 rows seen, underdetermined 4x), and neither is any other projection. That is
+    why this dump exists at all rather than a recover-and-predict gate.
+
+    Still a SEPARATE file from the golden, unchanged: the goldens' bytes and their four pinned
+    FNVs do not move, which is what lets `tests/glimmer-anchor.sh` prove this change is additive
+    by regenerating and comparing.
+
+    Names are the rivoli-side tensor names (`GLIMMER_LAYER_TENSORS` plus the three globals), not
+    the reference's module paths, so the Rust side can build a checkpoint without a second
+    mapping table to keep in step.
     """
     cap = Capture()
-    for li, layer in enumerate(model.model.language_model.layers):
-        cap.add(f"L{li}.attn.gate_proj.weight", layer.self_attn.gate_proj.weight)
+    lm = model.model.language_model
+    cap.add("model.language_model.embed_tokens.weight", lm.embed_tokens.weight)
+    cap.add("model.language_model.norm.weight", lm.norm.weight)
+    cap.add("lm_head.weight", model.lm_head.weight)
+    for li, layer in enumerate(lm.layers):
+        a, m = layer.self_attn, layer.mlp
+        for name, t in (
+            ("input_layernorm", layer.input_layernorm.weight),
+            ("post_attention_layernorm", layer.post_attention_layernorm.weight),
+            ("pre_feedforward_layernorm", layer.pre_feedforward_layernorm.weight),
+            ("post_feedforward_layernorm", layer.post_feedforward_layernorm.weight),
+            ("self_attn.q_proj", a.q_proj.weight),
+            ("self_attn.k_proj", a.k_proj.weight),
+            ("self_attn.v_proj", a.v_proj.weight),
+            ("self_attn.o_proj", a.o_proj.weight),
+            ("self_attn.gate_proj", a.gate_proj.weight),
+            ("mlp.gate_proj", m.gate_proj.weight),
+            ("mlp.up_proj", m.up_proj.weight),
+            ("mlp.down_proj", m.down_proj.weight),
+        ):
+            cap.add(f"model.language_model.layers.{li}.{name}.weight", t)
+        # The old name, kept so `tests/glimmer_gate.rs` does not have to move in the same commit
+        # that changes what this function exports. Delete it when that file reads the new name.
+        cap.add(f"L{li}.attn.gate_proj.weight", a.gate_proj.weight)
     return cap
 
 
@@ -1309,7 +1343,7 @@ def main():
     ap.add_argument(
         "--dump-weights",
         metavar="PATH",
-        help="also write the tiny model's gate_proj weights (see weights_capture); adds nothing "
+        help="also write the tiny model's WHOLE parameter set (see weights_capture); adds nothing "
         "to the golden, so the golden's bytes and FNV are unchanged by passing this",
     )
     ap.add_argument("--compare", nargs=2, metavar=("CLEAN", "DEFECT"))

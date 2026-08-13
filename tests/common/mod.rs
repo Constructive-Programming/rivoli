@@ -69,6 +69,27 @@ pub fn walk(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// `1/sqrt(mean(x²) + eps)` — the factor all three norm forms share.
+pub fn rms_inv(x: &[f32], eps: f32) -> f32 {
+    1.0 / (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt()
+}
+
+// **MOVED HERE from `glimmer_chain.rs` 2026-08-13**, the third helper to make this trip and for
+// the same reason each time: a second host-side reader appeared (`glimmer_reference.rs`, which
+// needs it to recover which embedding row the reference used) and jscpd reported the copy. The
+// formula is `glimmer-architecture.md` §5's weightless norm; sharing it between two files that
+// both transcribe the reference does not weaken either — what would weaken them is transcribing
+// the CHAIN twice, and neither does that.
+/// The weightless form over `rows` segments of `d`, times `scale`. The QK-norm (per head) and the
+/// embedding norm (`rows = 1`, `d = hidden`, `scale = 1`) are the same operator.
+pub fn weightless(x: &mut [f32], rows: usize, d: usize, eps: f32, scale: f32) {
+    for r in 0..rows {
+        let seg = &mut x[r * d..(r + 1) * d];
+        let f = scale * rms_inv(seg, eps);
+        seg.iter_mut().for_each(|v| *v *= f);
+    }
+}
+
 /// The sliding window's lower bound for a query at absolute position `pos`: `[pos - win + 1, pos]`,
 /// INCLUSIVE of `pos` itself, and 0 on a global layer. Trap 14 is the `+ 1`.
 ///
@@ -1104,11 +1125,7 @@ pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> 
     // hardest thing `validate` checks, and a prefix of the shipped arrays still satisfies it.
     t["layer_types"] = serde_json::json!(t["layer_types"].as_array().unwrap()[..l]);
     t["layer_rope_theta"] = serde_json::json!(t["layer_rope_theta"].as_array().unwrap()[..l]);
-    std::fs::write(
-        dir.join("config.json"),
-        serde_json::to_vec_pretty(&cfg).unwrap(),
-    )
-    .unwrap();
+    write_glimmer_config(dir, &cfg["text_config"]);
 
     let text: gm::GlimmerTextConfig =
         serde_json::from_value(cfg["text_config"].clone()).expect("fixture text_config");
@@ -1154,12 +1171,42 @@ pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> 
     // > zero stop tokens, one step worse than the scalar it was fixing. `convert_glimmer::eos_ids`
     // > now reads the content. **A fixture that writes the minimum a gate accepts is a fixture
     // > that stops testing the gate.**
+    write_glimmer_aux(dir, &glimmer_fixture_eos(dim));
+    tensors
+}
+
+/// All four of `convert_glimmer`'s AUX files, with `eos` the stop tokens the artifact will carry.
+///
+/// **Shared from the moment there was a second checkpoint writer** (`glimmer_reference.rs`, which
+/// builds one from the anchor's exported parameters) — jscpd reported the copy immediately, and it
+/// is right about the substance: `REQUIRED_AUX` is a list two writers can disagree about, and the
+/// one that writes fewer files certifies the artifact shape where trap 13 lives. That is not
+/// hypothetical here; it is this fixture's own recorded history, twice.
+/// The SHIPPED config with `text_config` replaced by `text`, written to `dir/config.json`.
+///
+/// Two checkpoint writers need it — the synthetic fixture, which mutates the shipped dims, and
+/// `glimmer_reference.rs`, which splices in the anchor's `tiny_config` verbatim — and jscpd caught
+/// the second copy. Sharing it also keeps the OUTER structure single-sourced: the converter
+/// descends into `text_config` and asserts it did not land in `vision_config`, a sibling that
+/// parses several of the same fields, so a writer that got the wrapper subtly wrong would be
+/// testing a different descent than the one that ships.
+pub fn write_glimmer_config(dir: &std::path::Path, text: &serde_json::Value) {
+    let mut cfg: serde_json::Value = serde_json::from_str(GLIMMER_SHIPPED_CONFIG).unwrap();
+    cfg["text_config"] = text.clone();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec_pretty(&cfg).unwrap(),
+    )
+    .unwrap();
+}
+
+pub fn write_glimmer_aux(dir: &std::path::Path, eos: &[u32]) {
     for aux in ["tokenizer.json", "tokenizer_config.json"] {
         std::fs::write(dir.join(aux), b"{}").unwrap();
     }
-    write_glimmer_eos(dir, &glimmer_fixture_eos(dim));
+    write_glimmer_eos(dir, eos);
     std::fs::write(dir.join("chat_template.jinja"), b"{{ x }}").unwrap();
-    tensors
 }
 
 /// Run the real `convert_glimmer` binary, so the gate exercises what ships rather than a
