@@ -31,6 +31,13 @@ use common::{
 use rivoli::artifact::format::{Dtype, FormatMeta, Safetensors};
 use rivoli::artifact::model as gm;
 
+/// The one file that carries Muse Glimmer's stop tokens, and the real checkpoint's contents.
+///
+/// Spelled once because three tests write it and the whole point of the gate below is that the
+/// bytes matter — a second copy is a second chance to write the minimum a check accepts.
+const GEN: &str = "generation_config.json";
+const EOS_PAIR: &[u8] = br#"{"eos_token_id": [200001, 200008]}"#;
+
 #[test]
 fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
     let root = TempRoot::new("glimmer-conv");
@@ -100,14 +107,17 @@ fn convert_glimmer_refuses_before_it_writes() {
     // A source missing a REQUIRED_AUX file refuses too, and refuses EARLY — before the config
     // is even parsed. `finish_artifact` would only have warned, three hours in, and the
     // artifact would ship with trap 13's scalar EOS as its only one.
-    std::fs::remove_file(src.join("generation_config.json")).unwrap();
+    std::fs::remove_file(src.join(GEN)).unwrap();
     let o = run_convert_glimmer(&src, &out);
     let err = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(
         !o.status.success() && err.contains("generation_config.json is missing"),
         "{err}"
     );
-    std::fs::write(src.join("generation_config.json"), b"{}").unwrap();
+    // Restored with REAL ids, not `{}`. `{}` is a file that exists and says nothing, which
+    // `eos_ids` now refuses on its own — restoring it that way would mask every assertion below
+    // behind the EOS refusal and this test would still be green.
+    std::fs::write(src.join(GEN), EOS_PAIR).unwrap();
 
     // A checkpoint missing one per-layer tensor refuses by NAME, before the write.
     let dropped = format!("{}.2.mlp.up_proj.weight", gm::GLIMMER_LAYER_PREFIX);
@@ -119,6 +129,72 @@ fn convert_glimmer_refuses_before_it_writes() {
     assert!(!o.status.success() && err.contains(&dropped), "{err}");
     assert!(
         !out.join("resident.safetensors").exists(),
+        "the artifact must not exist after a refusal"
+    );
+}
+
+/// **S3 item 5, the EOS clause: both ids reach the artifact, and a file that exists but says
+/// nothing is refused.**
+///
+/// The plan states this as "two EOS ids (`[200001, 200008]` — a scalar-EOS port stops on one)".
+/// The engine half of that was already safe before this test: `Tokenizer` holds `eos: Vec<u32>`,
+/// `load_eos` reads both the array and the bare-int spellings, and `gpu.rs` stops on
+/// `eos.contains(&t)` — plural throughout, shared with every model here.
+///
+/// **What was NOT safe is one step worse than the trap the plan names.** `REQUIRED_AUX` checks that
+/// `generation_config.json` EXISTS. This tree's own fixture wrote it as `{}`, which passes that
+/// check, copies into the artifact, and yields **zero** stop tokens — so the port does not stop on
+/// one of the two, it stops on none, announced by a single `warn!` at load. The signature is the
+/// one behind `docs/measurement/benchmarks.md`'s retraction: 56 runs, not one terminating
+/// naturally, every one to its token limit.
+///
+/// Three arms, and the two refusals are the red proof for the first: without them "the ids reached
+/// the artifact" is satisfied by any converter that copies a file.
+#[test]
+fn both_eos_ids_reach_the_artifact_and_an_empty_generation_config_is_refused() {
+    let root = TempRoot::new("glimmer-eos");
+    let (src, out) = (root.join("src"), root.join("out"));
+    glimmer_fixture(&src, DIM);
+
+    // The fixture writes the real pair; assert the ARTIFACT's copy parses back to both, rather
+    // than that the converter exited 0. The file is the engine's only source for these.
+    let o = run_convert_glimmer(&src, &out);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let copied = std::fs::read_to_string(out.join(GEN)).expect("generation_config in the artifact");
+    let v: serde_json::Value = serde_json::from_str(&copied).unwrap();
+    let ids: Vec<u64> = v["eos_token_id"]
+        .as_array()
+        .expect("eos_token_id is an array")
+        .iter()
+        .filter_map(|x| x.as_u64())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![200001, 200008],
+        "the artifact's stop tokens are not the checkpoint's — a decode built on this stops on \
+         the wrong set, or on nothing"
+    );
+
+    // Red proof, and the case that was live: a file that satisfies the presence check and carries
+    // no ids. `{}` first, then the shape a hand-edit produces — the key present and empty.
+    for (bytes, what) in [
+        (&b"{}"[..], "an empty object"),
+        (br#"{"eos_token_id": []}"#, "an empty array"),
+        (br#"{"eos_token_id": null}"#, "a null"),
+    ] {
+        std::fs::write(src.join(GEN), bytes).unwrap();
+        let o = run_convert_glimmer(&src, &root.join("out-red"));
+        let err = String::from_utf8_lossy(&o.stderr).to_string();
+        assert!(
+            !o.status.success() && err.contains("no usable `eos_token_id`"),
+            "{what} was accepted, so the artifact ships with no stop token: {err}"
+        );
+    }
+
+    // And it refuses BEFORE any tensor is read — the whole argument for checking here rather than
+    // at load is that a three-hour convert must not end in this.
+    assert!(
+        !root.join("out-red").join("resident.safetensors").exists(),
         "the artifact must not exist after a refusal"
     );
 }

@@ -1055,13 +1055,21 @@ pub fn glimmer_fixture(dir: &std::path::Path, dim: usize) -> Vec<FixtureTensor> 
     // converter refuses without them. Until 2026-08-11 the fixture shipped two, so every green
     // run in this branch certified the artifact shape in which trap 13 (the scalar EOS) is
     // live — which is what review found.
-    for aux in [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "generation_config.json",
-    ] {
+    //
+    // > **AND IT STILL DID, until 2026-08-13.** The fix wrote all four as `{}`, which satisfies a
+    // > PRESENCE check and carries no `eos_token_id` — so the fixture certified an artifact with
+    // > zero stop tokens, one step worse than the scalar it was fixing. `convert_glimmer::eos_ids`
+    // > now reads the content, and the two ids below are why this fixture passes it. **A fixture
+    // > that writes the minimum a gate accepts is a fixture that stops testing the gate**; these
+    // > are the real checkpoint's ids, so a future content check has something true to check.
+    for aux in ["tokenizer.json", "tokenizer_config.json"] {
         std::fs::write(dir.join(aux), b"{}").unwrap();
     }
+    std::fs::write(
+        dir.join("generation_config.json"),
+        br#"{"eos_token_id": [200001, 200008]}"#,
+    )
+    .unwrap();
     std::fs::write(dir.join("chat_template.jinja"), b"{{ x }}").unwrap();
     tensors
 }

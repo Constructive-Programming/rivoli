@@ -71,6 +71,49 @@ struct Args {
 /// to whoever debugs the decode.
 const REQUIRED_AUX: [&str; 2] = ["generation_config.json", "chat_template.jinja"];
 
+/// The EOS ids `generation_config.json` carries, refusing a file that exists and says nothing.
+///
+/// **PRESENCE WAS CHECKED AND CONTENT WAS NOT, and that left trap 13 live in a worse spelling.**
+/// [`REQUIRED_AUX`] was added because a partial download produced an artifact whose only EOS was
+/// `text_config`'s scalar. It refuses a MISSING file — and until 2026-08-13 this tree's own Glimmer
+/// fixture wrote `generation_config.json` as `{}`, which passes that check, copies into the
+/// artifact, and yields `Tokenizer::load_eos` **no ids at all**. The engine's whole response is one
+/// `warn!("decode won't stop on EOS")` and then `eos.contains(&t)` is false for every token, so
+/// generation runs to `ngen` every time. That is not hypothetical damage: it is the exact signature
+/// behind `docs/measurement/benchmarks.md`'s retraction, where across 56 runs not one terminated
+/// naturally and the model drifted into list scaffolding and then looped.
+///
+/// So a port does not "stop on one of the two" — it stops on NONE, and it says so in a log line
+/// nobody reads three hours into a convert. Checked here rather than in `artifact/tokenizer.rs`
+/// because that path is shared with three other models and its tolerance is theirs to keep; this
+/// binary converts one checkpoint and knows what that checkpoint has to carry.
+///
+/// **Non-empty, NOT "exactly two".** Glimmer's file carries `[200001, 200008]`, but pinning the
+/// count here would be the same over-fit `layer_types`' doc argues against: the pair is a fact
+/// about this checkpoint, not a rule about the architecture. What is architectural is that a decode
+/// with zero stop tokens cannot terminate.
+fn eos_ids(dir: &str) -> Result<Vec<u64>> {
+    let p = format!("{dir}/generation_config.json");
+    let text = std::fs::read_to_string(&p).with_context(|| format!("read {p}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("{p} is not JSON"))?;
+    // Both spellings, matching `Tokenizer::load_eos` — an array of ints or a bare int. Read
+    // through the same shapes the ENGINE reads, or this gate certifies a file the engine then
+    // reads differently.
+    let ids: Vec<u64> = match v.get("eos_token_id") {
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_u64()).collect(),
+        Some(other) => other.as_u64().into_iter().collect(),
+        None => Vec::new(),
+    };
+    ensure!(
+        !ids.is_empty(),
+        "{p} carries no usable `eos_token_id`. The file exists, so REQUIRED_AUX is satisfied and \
+         the artifact would ship — with NO stop token, which makes every decode run to its token \
+         limit (glimmer-architecture.md §9 trap 13). Glimmer's is `[200001, 200008]`",
+    );
+    Ok(ids)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     // jscpd:ignore-end
@@ -94,6 +137,7 @@ fn main() -> Result<()> {
             args.src_dir
         );
     }
+    eos_ids(&args.src_dir)?;
     // Parsed, and therefore validated, before a single tensor is read: `GlimmerConfig` is
     // where the layer/RoPE pairing invariant and the width checks live, and a checkpoint that
     // fails them must not produce a half-written artifact.
