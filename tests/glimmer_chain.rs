@@ -6,40 +6,86 @@
 //! they miss the entire middle: **which operand reaches which launcher.** Review enumerated seven
 //! mutations that pass all of it and produce fluent wrong text (2026-08-13) —
 //!
-//! Not one changes a shape, so `proj`'s `i_dim` check cannot see them and every launcher
-//! guard accepts them. **Each was applied to `glimmer_gpu.rs` and run** — measured 2026-08-13,
-//! worst relative logit disagreement, against a green run of **2.3e-6**:
+//! None of the first six changes a shape, so `proj`'s `i_dim` check cannot see them and every
+//! launcher guard accepts them; the seventh is the exception and is marked as such. **Each was
+//! applied to `glimmer_gpu.rs` and run** — measured 2026-08-13 in [`worst_rel`]'s metric, against a
+//! green run whose worst position scores **3.9e-6**:
 //!
-//! | mutation | result |
-//! |---|---|
-//! | `wk` / `wv` swapped — same `[kv·hd, hidden]` shape | **RED, 1.5e0** |
-//! | `qk_scale_factor` DROPPED from Q (product 1.0, not 3.87) | **RED, 1.7e0** |
-//! | `wq` / `wg` swapped — same `[hq·hd, hidden]` shape | **RED, 9.6e-1** |
-//! | `if self.rotated[l]` inverted — the 13 NoPE layers rotate | **RED, 7.9e-1** |
-//! | `launch_rope_split_half` → `launch_rope_interleave`, same arity | **RED, 8.5e-1** |
-//! | the layer kind from `l % 4 == 3` instead of `layer_types` | **RED, 9.9e-1** — but only on the
-//!   permuted config; see [`the_loop_follows_layer_types_and_not_the_shipped_period`] |
-//! | the gate built from the attend output instead of the layer input | **RED**, by `proj`'s shape
-//!   check rather than numerically — 16 against a `hidden` of 8 |
+//! | mutation | worst | first diverges at |
+//! |---|---|---|
+//! | `launch_logit_softcap` deleted (multiplier goes with it) | **4.1e0** | position 4 |
+//! | `output_multiplier` → 1.0, softcap kept | **4.1e0** | position 4 |
+//! | `launch_rope_split_half` → `launch_rope_interleave` | **1.8e0** | position 1 |
+//! | `wq` / `wg` swapped — same `[hq·hd, hidden]` shape | **1.3e0** | position 1 |
+//! | `wk` / `wv` swapped — same `[kv·hd, hidden]` shape | **9.0e-1** | position 0 |
+//! | `if self.rotated[l]` inverted — the 13 NoPE layers rotate | **3.2e-1** | position 1 |
+//! | the layer kind from `l % 4 == 3` instead of `layer_types` | **2.4e-1** | permuted config only |
+//! | `qk_scale_factor` DROPPED from Q (product 1.0, not 3.87) | **1.1e-1** | position 1 |
+//! | the softcap's `tanh` alone, `output_multiplier` KEPT | **9.9e-5** | position 8 |
+//! | the gate from the attend output, not the layer input | **RED on `proj`'s shape check** | — |
 //!
-//! **And three do NOT redden. Each is worth more than the six that do.**
+//! The rotation ones first diverge at position **1** and not 0, which is the sweep working: at
+//! `pos = 0` the angle is 0 and every rope convention is the identity.
 //!
-//! * **Swapping the two QK scales is an IDENTITY.** Both operands are normed before the scale, so
-//!   the score carries only their product, and RoPE commutes with a scalar. This tree called that
-//!   swap "fluent and wrong" in four places; it cannot change any output. Dropping the factor is
-//!   the live mistake, and it is the row above. `glimmer-architecture.md` §9 trap 3 is corrected.
+//! **Two rows are also caught by something cheaper, and saying so is the point of a census.** The
+//! interleaved-rope substitution removes `glimmer_gpu.rs`'s only mention of `launch_rope_split_half`,
+//! so `kernel_coverage.rs`'s OWNERS census reddens on it with no GPU at all; and the gate-from-the-
+//! attend-output reddens on `proj`'s own `i_dim` check, which fires on any decode of the fixture and
+//! therefore already in `glimmer_loop.rs`. This gate's marginal value is the other eight rows.
+//!
+//! **The `tanh` row is why [`TOL`] is what it is.** At the 1e-4 this file shipped with, that
+//! mutation PASSED one of the two tests by 1% — the argmax-invariant defect `Glimmer::logits`
+//! exists to catch, sitting under the tolerance of the gate that consumes it. Found by review, and
+//! the tree had already measured the same class at 4.879e-5 on the anchor.
+//!
+//! **The `l % 4 == 3` row was re-measured with the ALLOCATION mutated in lockstep**, because review
+//! argued the first proof reddened through a device write past a cache sized from the true kinds
+//! rather than through the masking difference. Same magnitude, 2.353e-1, so it did not: the
+//! consistent defect — a port that computes the period everywhere — is what that number measures.
+//!
+//! **And three mutations do NOT redden.**
+//!
+//! * **Swapping the two QK scales does not change the LOGITS.** Both operands are normed before
+//!   the scale, so the score carries only their product, and RoPE commutes with a scalar. It is an
+//!   identity in exact arithmetic and measured inside reduction noise here — but the claim needs
+//!   three limits, all added by review 2026-08-13 after the first version asserted it flatly:
+//!   (a) it is **not byte-identical**, since `fl(3.87·q̂)` and `fl(3.87·k̂)` are different roundings,
+//!   and 2.3e-6 was the size of that perturbation rather than evidence of an identity;
+//!   (b) it holds while the KV cache is f32 and the norm precedes the scale, both true today and
+//!   the first of them an explicit S5 lever; and (c) **it changes `q` and `k` themselves**, which
+//!   the anchor captures elementwise, so a swapped engine is 3.87x off at S4's tensor-vs-capture
+//!   scoring. The decode output cannot see it; the tree can.
+//!   **This was already known here.** `tests/common/tolerance.rs` recorded the algebra on
+//!   2026-08-12 — "`(s*q)·k` and `q·(s*k)` are the same product … invisible to this kernel by
+//!   ALGEBRA, not by insufficient resolution" — while excluding `qk_scale_on_k` from `attend`'s
+//!   defect set. What was new on 2026-08-13 is only that `glimmer-architecture.md` §9 still called
+//!   the swap fluent-and-wrong.
 //! * **`attn_scale` from `hidden` instead of `head_dim` is invisible TO THIS FIXTURE**, which sets
 //!   `head_dim = hidden = 8`. The shipped model has 128 against 6656. The fixture preserves
 //!   `head_dim != hidden / n_heads` (trap 15) and not `head_dim != hidden`; closing this needs the
 //!   fixture's head_dim to stop tracking its width, which touches every shape it writes.
-//! * **Swapping `eps_post` for `eps_pre` on a branch norm is below the tolerance here.** 1e-5
-//!   against 1e-8 moves `1/sqrt(mean(x²)+eps)` by ~5e-6 relative when `mean(x²)` is O(1), which is
-//!   what the residual stream carries. `glimmer_head.rs`'s eps census separates them 41.8-56.6x on
-//!   the norm chains, where the statistic is small — so the eps assignment IS gated, just not by
-//!   this file, and a reader must not take a green run here as covering it.
+//! * **Swapping `eps_post` for `eps_pre` at `pre_norm` / `branch_add` is below [`TOL`] here, and
+//!   NOTHING ELSE IN THE TREE GATES IT EITHER — it is OPEN.** This file said it was covered by
+//!   "`glimmer_head.rs`'s eps census"; that file has no eps census, the 41.8-56.6x figures are
+//!   `tests/glimmer_norm.rs`'s, and what they establish is that the OPERATOR distinguishes the two
+//!   epsilons on activations at `mean(x²)~1e-3` — not which eps the loop hands it. `glimmer_norm.rs`
+//!   never imports `glimmer_gpu`. Swap the two call sites and every test in the tree stays green.
+//!   (Corrected by review 2026-08-13; the wrong citation had reached three places including the
+//!   INDEX verdict, which `CLAUDE.md` tells readers to trust instead of the doc.)
 //!
-//! A gate that reports only its reds is a gate whose blind spots are discovered by the next
-//! defect. These three are the reason this table lists outcomes and not intentions.
+//! **A fourth blind spot, same round:** trap 10, the KV head broadcast, is unconstructible here
+//! because the fixture has **one** KV head — `head / (hq/hkv)` and `head % hkv` are both 0 for every
+//! head, as is any other mapping. The oracle carries that expression and a comment naming the trap,
+//! which reads as coverage and is not. It is gated at the kernel level by `glimmer_attend.rs`;
+//! raising the fixture to 4 query heads over 2 KV heads would close it here too.
+//!
+//! A gate that reports only its reds is a gate whose blind spots are discovered by the next defect.
+//!
+//! **Incidental, and worth knowing before it surprises someone:** the oracle reads the SOURCE
+//! checkpoint's bytes while the engine reads the CONVERTED artifact, so a green run also says
+//! `convert_glimmer` reproduced these tensors faithfully. A future converter change — §6's declined
+//! `q_proj`/`k_proj` row permutation, say — would redden this file for a reason its own docs would
+//! not otherwise explain.
 //!
 //! # Why a host reference and not the goldens
 //!
@@ -56,6 +102,15 @@
 //! `q = qk_norm(q) * 3.87` with `k = qk_norm(k)`, the gate reading the layer input, the post-norms
 //! on the branch, `kvh = head / (hq / hkv)`, the split-half pairing `(x[j], x[j+seg/2])`.
 //!
+//! **Three readings are NOT independent, and two of them are additionally sub-tolerance** (review,
+//! 2026-08-13). The rope-on/off predicate is character-for-character the same on both sides
+//! (`layer_rope_theta[l] != 0.0`), from §2's "read as a boolean"; the final norm's eps is a guess
+//! from §5's SILENCE — it names the plain form and no epsilon, both sides chose `rms_norm_eps`, and
+//! the alternative is sub-`TOL` anyway; and `weightless` folds the scale the KERNEL's way
+//! (`scale * rms_inv`) rather than the reference's `(x·rs)·s`, a deviation `kernels/linalg.hip`
+//! prices at ~6e-8 and names in place. A green run carries no information about the second and
+//! third at all.
+//!
 //! **What it does NOT establish** is that either side matches Muse Glimmer. The goldens are what
 //! say the kernels are right; this says the loop feeds them correctly. Both are needed and neither
 //! substitutes.
@@ -66,21 +121,37 @@
 mod common;
 use common::{
     FixtureTensor, GLIMMER_FIXTURE_DIM as DIM, TempRoot, glimmer_convert_fixture, window_lo,
+    worst_rel,
 };
 use rivoli::artifact::model as gm;
 use rivoli::artifact::model::LayerKind;
 use rivoli::glimmer_gpu::Glimmer;
 use std::collections::HashMap;
 
-/// Relative tolerance on a logit.
+/// Relative tolerance on a logit, in [`worst_rel`]'s metric.
 ///
-/// The two sides do the same arithmetic in f32 over the same widened bf16 weights and differ only
-/// in reduction ORDER — the kernels reduce in LDS trees and across a strided grid, this reduces
-/// left to right. At the fixture's widths (dots of 8, 16 and 12 terms) that is a handful of ulps,
-/// and the measured worst case over every position of a 9-step run is far below this. It is set
-/// where a real wiring defect cannot hide: the smallest of the seven mutations below moves a logit
-/// by more than 1%.
-const TOL: f32 = 1e-4;
+/// **Set from the weakest RED-PROVED mutation, not from a rounding model** — and the first version
+/// was set the other way and was caught by it. It read 1e-4, justified as "the two sides differ
+/// only in reduction ORDER". Both halves were wrong (review, 2026-08-13):
+///
+/// * The two sides do not differ only in reduction order. `gqa_attend` runs an ONLINE softmax
+///   (running max, one `rescale` multiply per KV row) against this file's two-pass; `gemm_bf16`
+///   compiles under clang's HIP default `-ffp-contract=fast`, so its dot is an FMA reduction with
+///   the product never rounded, against `.sum()` here; and the transcendentals are device `expf` /
+///   `tanhf` / `pow` against host `f32::exp` / `f32::tanh` / `f64::powf`. `weightless` also folds
+///   the scale the way the KERNEL does (`scale * rms_inv`) rather than the way the reference does
+///   (`(x·rs)·s`), a deviation `kernels/linalg.hip` prices at ~6e-8 and names in place.
+/// * More seriously, **1e-4 was above a real defect.** Removing the softcap's `tanh` while keeping
+///   `output_multiplier` — the argmax-invariant failure `Glimmer::logits` was added to make
+///   visible — scores **9.9e-5** in one of the two tests here and 1.2e-4 in the other. At 1e-4 the
+///   first test PASSED it, by 1%. The tree had already measured the same defect class at 4.879e-5
+///   on the anchor and recorded why (a tiny model's untrained logits sit in `tanh`'s linear
+///   region), so the margin was knowable before it was lucky.
+///
+/// 2e-5 sits ~5x above the worst green position (3.9e-6) and ~5x below that weakest defect. The
+/// green figure is what to watch: if it approaches this, the fixture's widths grew and the
+/// tolerance needs re-deriving from a fresh red proof, not raising.
+const TOL: f32 = 2e-5;
 
 /// bf16 bytes → f32, the widening both `bf16f` in the kernels and the converter's norms perform.
 fn wide(b: &[u8]) -> Vec<f32> {
@@ -107,6 +178,14 @@ fn rms_inv(x: &[f32], eps: f32) -> f32 {
 /// else. Its weight is initialised to ZEROS, which is why substituting the plain form here
 /// multiplies the residual stream by ~0 and is the LOUD direction of that mistake.
 fn centered(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    // `zip` TRUNCATES, so a norm weight of the wrong length would yield a short vector and surface
+    // later at a `matvec` length assert naming the wrong operation. The oracle is the side that
+    // must fail loudly (review, 2026-08-13).
+    assert_eq!(
+        x.len(),
+        w.len(),
+        "centered norm: weight is not the activation's width"
+    );
     let inv = rms_inv(x, eps);
     x.iter()
         .zip(w)
@@ -116,6 +195,11 @@ fn centered(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 
 /// `MuseGlimmerRMSNorm`: `_norm(x) * w`. The final `model.norm` only, in this chain.
 fn plain(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
+    assert_eq!(
+        x.len(),
+        w.len(),
+        "plain norm: weight is not the activation's width"
+    );
     let inv = rms_inv(x, eps);
     x.iter().zip(w).map(|(v, wi)| v * inv * wi).collect()
 }
@@ -161,7 +245,6 @@ struct Ref<'a> {
     c: &'a gm::GlimmerTextConfig,
     k: Vec<Vec<Vec<f32>>>,
     v: Vec<Vec<Vec<f32>>>,
-    h: Vec<f32>,
 }
 
 impl<'a> Ref<'a> {
@@ -175,7 +258,6 @@ impl<'a> Ref<'a> {
             c,
             k: vec![Vec::new(); c.n_layers],
             v: vec![Vec::new(); c.n_layers],
-            h: Vec::new(),
         }
     }
 
@@ -191,6 +273,16 @@ impl<'a> Ref<'a> {
 
     /// One position: §3's twelve lines with §4 inlined. Returns the post-softcap logits.
     fn step(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        // The cache is a `push`-ordered Vec, so `self.k[l][j]` is position `j` only if this is
+        // called with 0, 1, 2, ... exactly once each. Asserted rather than assumed: violated, the
+        // failure is an index panic in the softmax naming an operation that is not the defect —
+        // and this oracle is the template S4's real-weights comparison will start from, where the
+        // positions will not be a bare `enumerate` (review, 2026-08-13).
+        assert_eq!(
+            pos,
+            self.k[0].len(),
+            "the reference replays positions in order, once each"
+        );
         let c = self.c;
         let (hid, hq, hkv, hd) = (c.hidden, c.n_heads, c.num_key_value_heads, c.head_dim);
         let (qd, kvd) = (hq * hd, hkv * hd);
@@ -282,8 +374,8 @@ impl<'a> Ref<'a> {
         }
 
         // §5: the final norm is the PLAIN form, then the head, then the softcap.
-        self.h = plain(&h, self.t("model.language_model.norm.weight"), ep);
-        let logits = matvec(self.t("lm_head.weight"), &self.h, c.vocab, hid);
+        let fin = plain(&h, self.t("model.language_model.norm.weight"), ep);
+        let logits = matvec(self.t("lm_head.weight"), &fin, c.vocab, hid);
         let (mult, cap) = (c.output_multiplier as f32, c.final_logit_softcapping as f32);
         logits
             .iter()
@@ -298,19 +390,6 @@ fn setup(tag: &str) -> (TempRoot, gm::GlimmerConfig, Vec<FixtureTensor>) {
     let (src, _) = glimmer_convert_fixture(root.path(), DIM);
     let cfg = gm::load_config(root.join("out").to_str().unwrap()).unwrap();
     (root, cfg, src)
-}
-
-/// Worst relative disagreement between two logit vectors, and where.
-fn worst(a: &[f32], b: &[f32]) -> (f32, usize) {
-    assert_eq!(a.len(), b.len());
-    let mut w = (0.0f32, 0usize);
-    for i in 0..a.len() {
-        let d = (a[i] - b[i]).abs() / a[i].abs().max(b[i].abs()).max(1e-6);
-        if d > w.0 {
-            w = (d, i);
-        }
-    }
-    w
 }
 
 /// **The engine's logits match a reference transcribed from §3-§5, at every position of a run
@@ -329,6 +408,9 @@ fn the_loop_matches_a_host_reference_at_every_position() {
     let gt = &cfg.text;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let max_new = 5;
+
+    // One continuous run first — it is what exercises the ring across a wrap, and it decides which
+    // tokens the sweep below replays.
     let mut e = Glimmer::new(
         root.join("out").to_str().unwrap(),
         gt,
@@ -336,63 +418,73 @@ fn the_loop_matches_a_host_reference_at_every_position() {
         prompt.len() + max_new,
     )
     .unwrap();
-    let mut r = Ref::new(&src, gt);
-
-    // The engine samples only at the last prompt position, so the reference is run to that point
-    // and the two are compared there; then each generated token is fed to both.
     let out = e.decode(&prompt, max_new, &[]).unwrap();
     assert_eq!(out.len(), max_new);
-
-    let mut worst_seen = (0.0f32, 0usize, 0usize);
     let mut fed: Vec<u32> = prompt.clone();
     fed.extend_from_slice(&out[..out.len() - 1]);
-    // Replay: the reference consumes exactly what the engine consumed, in the same order. Its
-    // logits after position `p` are what the engine's were when it sampled `out[p - prompt.len()]`.
-    let mut lg = Vec::new();
-    for (pos, &t) in fed.iter().enumerate() {
-        lg = r.step(t, pos);
-    }
-    // The engine's `logits()` holds the LAST sample, which is the one that produced `out.last()`.
-    let (d, i) = worst(&lg, &e.logits().unwrap());
-    if d > worst_seen.0 {
-        worst_seen = (d, i, fed.len() - 1);
-    }
-    println!(
-        "  final position {}: worst relative disagreement {:.3e} at logit {i} of {}",
-        worst_seen.2, worst_seen.0, gt.vocab
-    );
     assert!(
-        worst_seen.0 < TOL,
-        "the engine and the reference disagree by {:.3e} at logit {i} of position {} — the two \
-         run the same arithmetic on the same weights and differ only in reduction order, so a \
-         disagreement above {TOL:e} is a wiring defect and not rounding",
-        worst_seen.0,
-        worst_seen.2
+        fed.len() > 2 * gt.sliding_window,
+        "the run must wrap the ring: {} positions against a window of {}",
+        fed.len(),
+        gt.sliding_window
     );
 
-    // **The argmaxes agree too, and that is the WEAKER claim** — stated so the numbers above are
-    // not read as merely reproducing it. A 12-way argmax over 9 steps is 9 integers; the logit
-    // comparison is 108 floats, and the softcap this chain applies cannot move an argmax at all.
-    let mut r2 = Ref::new(&src, gt);
-    let mut picks = Vec::new();
-    let mut feed = prompt.clone();
-    for _ in 0..max_new {
-        let mut l2 = Vec::new();
-        for (pos, &t) in feed.iter().enumerate() {
-            l2 = r2.step(t, pos);
+    // **Per POSITION, and it costs one engine each.** The engine samples only at the last position
+    // it is given, so the only way to see position `i`'s logits is to hand it the prefix ending
+    // there — and a fresh engine, because the KV cache of a longer run is not the state a prefix
+    // would have produced. On a 4-layer fixture that is ten pins of a few kilobytes.
+    //
+    // > **This test claimed a per-position comparison for one commit and performed ONE, at the
+    // > last position** — the replay loop overwrote its intermediate logits and the `worst_seen`
+    // > tuple beside it was vestigial. Review, 2026-08-13. Which position first diverges is the
+    // > first question a red run raises, and a gate that answers it only for the last is a gate
+    // > whose message is wrong about its own evidence.
+    let mut worst_seen = (0.0f32, 0usize);
+    for i in 0..fed.len() {
+        let mut ei = Glimmer::new(root.join("out").to_str().unwrap(), gt, None, i + 2).unwrap();
+        let picked = ei.decode(&fed[..=i], 1, &[]).unwrap();
+        let mut r = Ref::new(&src, gt);
+        let mut lg = Vec::new();
+        for (pos, &t) in fed[..=i].iter().enumerate() {
+            lg = r.step(t, pos);
         }
-        let best = l2
-            .iter()
-            .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |b, (i, v)| {
-                if *v > b.1 { (i, *v) } else { b }
-            })
-            .0 as u32;
-        picks.push(best);
-        feed.push(best);
-        r2 = Ref::new(&src, gt); // the reference replays from scratch; it holds no ring to reset
+        let got = ei.logits().unwrap();
+        // Non-degeneracy, on the REFERENCE side, before any comparison: `worst_rel` returns
+        // INFINITY for a non-finite `got` and asserts a finite `want`, but an all-zero pair still
+        // scores 0.0 and would pass every assertion below.
+        assert!(
+            lg.iter().any(|v| *v != 0.0),
+            "position {i}: the reference produced an all-zero logit vector, so the score below is \
+             a comparison against nothing"
+        );
+        let d = worst_rel(&got, &lg);
+        assert!(
+            d < TOL,
+            "position {i} of {}: the engine and the reference disagree by {d:.3e} — the two run \
+             the same arithmetic on the same weights and differ only in reduction order, so \
+             anything above {TOL:e} is a wiring defect and not rounding. This is the FIRST \
+             position that diverges; earlier ones agreed.",
+            fed.len()
+        );
+        if d > worst_seen.0 {
+            worst_seen = (d, i);
+        }
+        // The continuous run and the prefix run must also agree on what they emit at this
+        // position, which is what says the sweep is measuring the same execution.
+        if i + 1 == prompt.len() {
+            assert_eq!(
+                picked,
+                vec![out[0]],
+                "prefix and continuous runs disagree at the prompt"
+            );
+        }
     }
-    assert_eq!(picks, out, "the two chains emit different tokens");
+    println!(
+        "  {} positions scored, worst {:.3e} at position {}",
+        fed.len(),
+        worst_seen.0,
+        worst_seen.1
+    );
 }
 
 /// **The loop reads `layer_types`, on a config whose pattern is NOT the shipped period.**
@@ -423,6 +515,16 @@ fn the_loop_follows_layer_types_and_not_the_shipped_period() {
         "the permutation must move the full-attention layer off the period's last slot"
     );
     assert_eq!(gt.layer_rope_theta[0], 0.0, "and its theta with it");
+    // **The permutation must DISAGREE with the modulo somewhere, or this test is vacuous** — it
+    // would then be a second copy of the test above wearing a different name. Asserted rather than
+    // reasoned from the rotation, because the fixture's layer count is shared and can change
+    // (review, 2026-08-13).
+    assert!(
+        (0..gt.n_layers).any(|l| (gt.layer_types[l] == LayerKind::FullAttention) != (l % 4 == 3)),
+        "the rotated pattern agrees with `l % 4 == 3` at every layer, so nothing here can \
+         distinguish them: {:?}",
+        gt.layer_types
+    );
 
     let prompt: Vec<u32> = vec![2, 3, 4, 5, 6];
     let mut e = Glimmer::new(
@@ -439,12 +541,16 @@ fn the_loop_follows_layer_types_and_not_the_shipped_period() {
     for (pos, &t) in prompt.iter().enumerate() {
         lg = r.step(t, pos);
     }
-    let (d, i) = worst(&lg, &e.logits().unwrap());
-    println!("  permuted layer_types: worst relative disagreement {d:.3e} at logit {i}");
+    assert!(
+        lg.iter().any(|v| *v != 0.0),
+        "the reference produced nothing to compare"
+    );
+    let d = worst_rel(&e.logits().unwrap(), &lg);
+    println!("  permuted layer_types: worst relative disagreement {d:.3e}");
     assert!(
         d < TOL,
-        "the engine and the reference disagree by {d:.3e} at logit {i} under a rotated \
-         `layer_types` — a loop that derives the layer kind from the period rather than from the \
-         array agrees with the shipped pattern and diverges here"
+        "the engine and the reference disagree by {d:.3e} under a rotated `layer_types` — a loop \
+         that derives the layer kind from the period rather than from the array agrees with the \
+         shipped pattern and diverges here"
     );
 }

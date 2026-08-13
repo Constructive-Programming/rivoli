@@ -289,6 +289,9 @@ pub struct Glimmer {
     /// How many positions the linear (full-attention) layers can hold. A sliding layer's
     /// capacity is `win` and needs no field.
     n_ctx: usize,
+    /// Whether [`Self::sample`] has ever run, so [`Self::logits`] cannot hand back an
+    /// uninitialised buffer.
+    sampled: bool,
 }
 
 impl Glimmer {
@@ -388,6 +391,7 @@ impl Glimmer {
             kc,
             vc,
             n_ctx,
+            sampled: false,
         })
     }
 
@@ -616,6 +620,12 @@ impl Glimmer {
             "token {token} is past this model's vocabulary of {}",
             self.vocab
         );
+        // **Cleared HERE, not only set in `sample`.** A `decode` that errors mid-layer leaves the
+        // previous position's logits in the buffer, and a caller that logs the error and reads
+        // `logits()` would get a plausible vector for the wrong position. Clearing at the start of
+        // every forward makes the accessor's answer "the last COMPLETED sample or nothing"
+        // (review, 2026-08-13).
+        self.sampled = false;
         // SAFETY: `embed` is `[vocab, hidden]` bf16 in the pin and `token < vocab`; `x` is
         // `hidden` writable f32 this struct owns.
         unsafe {
@@ -686,6 +696,7 @@ impl Glimmer {
             )?;
         }
         device_sync()?;
+        self.sampled = true;
         let mut out = Vec::new();
         self.pick.copy_out_prefix(&mut out, 8)?;
         let idx = i32::from_le_bytes([out[0], out[1], out[2], out[3]]);
@@ -728,6 +739,15 @@ impl Glimmer {
     /// per-layer path. This is a D2H of a buffer that already exists, after the `device_sync`
     /// `sample` already performs, and nothing on the decode path calls it.
     pub fn logits(&self) -> Result<Vec<f32>> {
+        // `DeviceBuf::new` is a bare `hipMalloc` with no zero-fill, so before the first `sample`
+        // this buffer is whatever the allocator handed back. Returning that is worse than useless
+        // for the one thing this accessor exists for — a garbage-but-plausible logit vector is
+        // exactly what G3's probability-space check is meant to catch (review, 2026-08-13).
+        ensure!(
+            self.sampled,
+            "no logits yet: `sample` has not run on this engine, so this buffer holds whatever \
+             `hipMalloc` returned"
+        );
         let mut b = Vec::new();
         self.logits.copy_out_prefix(&mut b, self.vocab * 4)?;
         Ok(b.chunks_exact(4)

@@ -23,7 +23,8 @@ mod golden_read;
 #[path = "mod.rs"]
 mod device;
 pub use device::{
-    GLIMMER_SHIPPED_CONFIG, back, dev, f32b, f32v, gemm_bf16_launch, u16b, window_lo, zeros,
+    GLIMMER_SHIPPED_CONFIG, back, dev, f32b, f32v, gemm_bf16_launch, u16b, window_lo, worst_rel,
+    zeros,
 };
 
 #[path = "tolerance.rs"]
@@ -266,51 +267,6 @@ pub fn expected() -> (usize, usize) {
                 .count();
     }
     (all, ring)
-}
-
-/// `max|got - want| / max|want|` — **the metric every Glimmer tolerance is stated in**, and the one
-/// `glimmer_anchor_driver.py::by_operator` computes to produce the floors. Stated once, here,
-/// because a fixture that scores against a row in a different metric is comparing two numbers that
-/// are not the same quantity.
-///
-/// Scaled by the reference side's own magnitude, once per tensor, not per element: a per-element
-/// ratio divides one rounding error by another wherever the reference is near zero.
-pub fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
-    assert_eq!(got.len(), want.len(), "length");
-    let scale = want.iter().copied().fold(0.0f32, |m, w| m.max(w.abs()));
-    // An all-zero reference has no scale to divide by; any difference is then infinitely relative,
-    // and reporting infinity is more honest than dividing by an epsilon.
-    if scale == 0.0 {
-        return if got.iter().all(|g| *g == 0.0) {
-            0.0
-        } else {
-            f32::INFINITY
-        };
-    }
-    // A non-finite `got` is INFINITY, checked BEFORE the max — `f32::max` returns the other
-    // argument when one side is NaN, so the fold below silently discards every NaN difference
-    // and an all-NaN kernel output would otherwise score 0.0, a perfect match. That is not
-    // hypothetical: a broken kernel in this repo once passed 9 of 9 comparisons that way
-    // (2026-08-05), and a review found this helper reintroducing the trap on 2026-08-12.
-    if got.iter().any(|g| !g.is_finite()) {
-        return f32::INFINITY;
-    }
-    // The SAME trap on the reference side, and it needs a different answer. `scale` above is
-    // another `f32::max` fold, so a NaN in `want` is silently skipped there too — but returning
-    // INFINITY would report it as the kernel being wrong, which is a diagnosis of the wrong side.
-    // Added 2026-08-12 when the chain gates put golden bytes on this side of a score for the first
-    // time; `glimmer_anchor.rs` asserts the captures are finite, so this fires only if that gate
-    // and this one disagree, and then the message has to say so.
-    assert!(
-        want.iter().all(|w| w.is_finite()),
-        "the REFERENCE side holds a non-finite value — this is a corrupt or mis-read capture, not \
-         a kernel result"
-    );
-    got.iter()
-        .zip(want)
-        .map(|(g, w)| (g - w).abs())
-        .fold(0.0, f32::max)
-        / scale
 }
 
 /// The `Rel` tolerance for one operator, or a panic saying which of the two ways it was absent.
