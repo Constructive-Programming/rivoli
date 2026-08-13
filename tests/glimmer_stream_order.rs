@@ -73,9 +73,18 @@ const K: usize = 256;
 const OUT: usize = M * N;
 
 /// What the producer's destination holds BEFORE it runs. A consumer that reads it has read
-/// pre-production values, and the value is chosen so both kernels map it somewhere no real product
-/// reaches: `sigmoid(-30)` is 9.36e-14 against 1.1e-7 for the most negative product these widths
-/// produce, and `20*tanh(-30*MULT/20)` is -5.79 against a raw range of about ±16.
+/// pre-production values.
+///
+/// **The separation between the two answers is CHECKED, not argued** — `score`'s `blind` count
+/// asserts that no element's ordered answer equals its unproduced one, because an element where
+/// they agreed would score a stale read as *correct* and quietly shrink the red arm.
+///
+/// That check is doing real work here, and the argument a reader would expect is FALSE: these
+/// products span **-46.769 to +88.152**, std 22.20 over all 2,097,152 of them (measured on the
+/// host at these exact widths, 2026-08-13), so **188,778 are more negative than `STALE`** and
+/// `sigmoid` maps them BELOW `sigmoid(-30)` = 9.36e-14 rather than above it. What actually holds
+/// is exact equality: not one product is exactly -30.0, and both kernels are injective, so
+/// neither can map a real product onto the stale answer.
 const STALE: f32 = -30.0;
 
 /// Muse Glimmer's own two, from `glimmer_head.rs` — the launcher refuses `mult >= cap`.
