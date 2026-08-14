@@ -89,7 +89,7 @@
 //! converting the six without also taking `memcpy_dtod_async` leaves the overlap defeated and this
 //! header claiming otherwise. Marked at the two placements that use it.
 //!
-//! **And three launchers here ALREADY take a stream and are handed `null_mut()`:**
+//! **And three launchers here ALREADY take a stream and are handed [`NULL_STREAM`]:**
 //! [`launch_hc_pre`], [`launch_hc_post`] and [`launch_moe_acc_drain`]. That is correct today —
 //! everything around them is null-stream, so a non-null one would reorder against the norms — but
 //! it is the reason (1)-(3) above cannot narrow the day the other six convert: the
@@ -1683,7 +1683,7 @@ impl F4Engine {
         // path into this engine, and the version here was one-sided anyway.
         let limit = self.cfg.swiglu_limit as f32;
         let (cs, ms) = (self.compute_stream.raw(), self.miss_stream.raw());
-        let null: *mut c_void = std::ptr::null_mut();
+        let null: *mut c_void = NULL_STREAM;
 
         // Header item 1. The `xq` these read was produced on the NULL stream, and both expert
         // streams are `hipStreamNonBlocking`, so they do not implicitly join it. This sync is
@@ -1953,7 +1953,7 @@ impl F4Engine {
             // Now quantize, for the experts. In place at block 128 over the full row, which is
             // what every quantized `Linear` in the reference performs.
             memcpy_dtod(xq, xw, m * dim * size_of::<f32>())?;
-            launch_act_quant_f8(xq.cast(), m, dim, std::ptr::null_mut())?;
+            launch_act_quant_f8(xq.cast(), m, dim, NULL_STREAM)?;
         }
         // Mark 7: the gate chain's last enqueue — the D2H below is what retires it.
         self.route_ev[M_GATE].record(NULL_STREAM)?;
@@ -2018,7 +2018,7 @@ impl F4Engine {
     /// pooling state. That is what makes it safe to run before a full `layer` on the same input.
     fn pre_norm(&mut self, layer: usize, ffn: bool, m: usize) -> Result<()> {
         let (dim, hc) = (self.cfg.hidden, self.cfg.hc_mult);
-        let null = std::ptr::null_mut();
+        let null = NULL_STREAM;
         let lp = self.pin.layer(layer)?;
         let (hcw, norm) = if ffn {
             (lp.hc_ffn, lp.ffn_norm)
@@ -2075,7 +2075,7 @@ impl F4Engine {
     /// after the flip rather than hoisting the pointer.
     fn layer(&mut self, layer: usize, m: usize, start_pos: usize) -> Result<()> {
         let (dim, hc) = (self.cfg.hidden, self.cfg.hc_mult);
-        let null = std::ptr::null_mut();
+        let null = NULL_STREAM;
         // The route-split window opens (see [`Profile`]): the wall clock first, then mark
         // 0, so the window contains the mark by construction. The stream is drained here on
         // every layer but the step's first (the previous layer's end-of-layer sync), where
@@ -2236,7 +2236,7 @@ impl F4Engine {
                 dim,
                 self.dims.norm_eps,
                 self.cfg.hc_eps as f32,
-                std::ptr::null_mut(),
+                NULL_STREAM,
             )?;
             launch_rmsnorm_batch(
                 self.head_x.ptr_mut().cast(),
@@ -2268,7 +2268,7 @@ impl F4Engine {
                 1,
                 self.cfg.vocab,
                 dim,
-                std::ptr::null_mut(),
+                NULL_STREAM,
             )?;
         }
         Ok(())

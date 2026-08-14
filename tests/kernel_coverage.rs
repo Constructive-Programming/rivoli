@@ -522,3 +522,101 @@ fn every_launcher_is_attributed_to_the_paths_that_call_it() {
         OWNERS.len()
     );
 }
+
+/// A bare `null_mut()` in `src/` must be a POINTER, never a stream — [`NULL_STREAM`] is the
+/// name for the second, and the difference between a decision and a default.
+///
+/// **`src/backend.rs` defined the constant and then nothing made the call sites use it.** Sixteen
+/// remained on 2026-08-14, including six in `f4gpu.rs` — a file that imports `NULL_STREAM` at the
+/// top and spells it correctly six lines from a bare one. That is the shape a convention takes
+/// when it is written down and not enforced, and it is why this is a test rather than a paragraph.
+///
+/// **Comment lines are skipped, and that is the load-bearing detail.** The same file's jscpd
+/// marker cost this repo two corrections for exactly the opposite reason — there a mention inside
+/// a comment WAS live, so counting had to include it. Here prose about `null_mut()` is ordinary
+/// documentation and four such lines exist; counting them would make the census a function of how
+/// often the convention is discussed. What is enforced is the CODE.
+///
+/// The survivors are listed with their reason rather than counted, so adding one is a visible
+/// edit to this list and not a number that drifts.
+#[test]
+fn a_bare_null_mut_is_never_a_stream() {
+    /// `(path suffix, occurrences, why it is not a stream)`.
+    const ALLOWED: [(&str, usize, &str); 3] = [
+        (
+            "memory/device.rs",
+            2,
+            "out-parameter handed to hipMalloc, written by the driver",
+        ),
+        (
+            "gpu.rs",
+            1,
+            "the indexer POOL pointer — absent means `no pool`, not `no stream`",
+        ),
+        (
+            "fetch/stream.rs",
+            1,
+            "an io_uring destination array, initialised empty",
+        ),
+    ];
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut stack = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let rel = p
+                    .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                for line in std::fs::read_to_string(&p).unwrap_or_default().lines() {
+                    let t = line.trim_start();
+                    // Prose is documentation, not a call site. See the doc above for why this
+                    // exclusion is the right one HERE and the wrong one for the jscpd marker.
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    if line.contains("null_mut()") {
+                        *found.entry(rel.clone()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    // `backend.rs` DEFINES the constant, so its one occurrence is the definition itself.
+    let defn = found.remove("src/backend.rs");
+    assert_eq!(
+        defn,
+        Some(1),
+        "src/backend.rs must contain exactly the NULL_STREAM definition"
+    );
+    let mut unexplained: Vec<String> = Vec::new();
+    for (file, n) in &found {
+        match ALLOWED.iter().find(|(suffix, ..)| file.ends_with(suffix)) {
+            Some((_, want, why)) if want == n => {}
+            Some((_, want, why)) => {
+                unexplained.push(format!("{file}: {n} occurrences, expected {want} ({why})"))
+            }
+            None => unexplained.push(format!(
+                "{file}: {n} occurrences and no entry in ALLOWED — if this is a STREAM, it is \
+                 `NULL_STREAM`; if it is a pointer, add it here with its reason"
+            )),
+        }
+    }
+    assert!(
+        unexplained.is_empty(),
+        "bare `null_mut()` in code, unexplained:\n  {}",
+        unexplained.join("\n  ")
+    );
+    // Anti-vacuity: a scan that walked no files, or a filter that ate every line, would leave
+    // `found` empty and every assertion above trivially satisfied.
+    assert_eq!(
+        found.len(),
+        ALLOWED.len(),
+        "expected exactly {} files with a non-stream `null_mut()`, scanned {found:?}",
+        ALLOWED.len()
+    );
+}

@@ -703,7 +703,7 @@ launchers! {
     /// HOST blocks, which is a contract split the arena relocation depends on. Two spellings of
     /// one dispatch differing only in a stream handle has no such justification.
     ///
-    /// All seven existing call sites pass `null_mut()` and are unchanged in behaviour, on both
+    /// All seven existing call sites pass [`NULL_STREAM`] and are unchanged in behaviour, on both
     /// backends: `vk::launch_gemv_f32` routes the same argument through `Q::parse`, which maps 0
     /// and 1 alike to `Q::Main` for exactly this case.
     ///

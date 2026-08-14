@@ -1085,15 +1085,18 @@ pub mod v4 {
 /// the selection bail rather than on a launcher. This repo has shipped a tautological
 /// anti-vacuity assertion twice and reported it working both times; the mutation is why
 /// this one is not a third.
-/// Every call below passes `std::ptr::null_mut()` for the stream, and that is the honest
-/// argument rather than a shortcut: these cases return before the first launch, so there is
-/// no device work for a stream to order. A real `HipStream` here would also make the module
-/// need a device to construct one, which is exactly the property the doc above rests on.
+/// Every call below passes [`NULL_STREAM`] for the stream, and that is the honest argument
+/// rather than a shortcut: these cases return before the first launch, so there is no device
+/// work for a stream to order. A real `HipStream` here would also make the module need a
+/// device to construct one, which is exactly the property the doc above rests on. (Spelled
+/// `std::ptr::null_mut()` until 2026-08-14 — the value was always this, but a bare literal
+/// says "a pointer" where the constant says "deliberately not on a stream".)
 #[cfg(all(test, feature = "rocm"))]
 mod v4_guard_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
     use super::Sel;
     use super::v4::{Dims, Fp8W, Io, Pass, Scratch, Weights, attention};
+    use crate::backend::NULL_STREAM;
     use crate::kvcompress::LayerKind;
 
     /// The shipped V4 geometry, so a rejection below is about the guard and not about a
@@ -1190,9 +1193,9 @@ mod v4_guard_tests {
         step: Pass,
     ) -> anyhow::Result<()> {
         // SAFETY: as the doc above — null pointers, and every guard precedes every launch.
-        // `null_mut()` is the honest stream here: there is no launch for one to order,
+        // `NULL_STREAM` is the honest stream here: there is no launch for one to order,
         // and `None` marks for the same reason — nothing runs for them to bracket.
-        unsafe { attention(d, sel, &p.0, &p.1, &p.2, step, None, std::ptr::null_mut()) }
+        unsafe { attention(d, sel, &p.0, &p.1, &p.2, step, None, NULL_STREAM) }
     }
 
     #[test]

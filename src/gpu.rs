@@ -26,7 +26,7 @@ use crate::attn::{AttnMode, streaming_rows};
 // name here actually exists in the backend.
 use crate::artifact::format::RoutedFmt;
 use crate::backend::{
-    Event, ExpertDesc, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
+    Event, ExpertDesc, NULL_STREAM, Stream, device_sync, fill_u32, launch_append_kv, launch_argmax,
     launch_attend, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope, launch_gemv_f32,
     launch_gemv_fp8, launch_gemv_i8, launch_index_append, launch_index_head_route,
     launch_index_pool_push, launch_index_score, launch_index_topk, launch_layernorm,
@@ -1314,7 +1314,7 @@ impl<'a> GpuEngine<'a> {
         // avoid. At `nrow == 1` both are bit-identical to what this did before.
         let bracket = active_heads.is_none();
         if bracket {
-            self.idx_ev_start.record(std::ptr::null_mut())?;
+            self.idx_ev_start.record(NULL_STREAM)?;
         }
         let mut out = [(std::ptr::null(), 0usize); MAXROW];
         // `nt` of the last row that actually ran the scorer; 0 = every row was still dense,
@@ -1381,15 +1381,7 @@ impl<'a> GpuEngine<'a> {
                 )?;
                 launch_rope_interleave(iqp, nh, hd, rope, pos, theta)?; // per head: stride hd, seg rope
                 // weights_proj is bf16→f32 [n_heads, hidden] — plain f32 GEMV.
-                launch_gemv_f32(
-                    xnp,
-                    ip.weights_proj,
-                    nh,
-                    cfg.hidden,
-                    1,
-                    iwp,
-                    crate::backend::NULL_STREAM,
-                )?;
+                launch_gemv_f32(xnp, ip.weights_proj, nh, cfg.hidden, 1, iwp, NULL_STREAM)?;
             }
 
             // Active head set for the O(nt) scan: all `nh` heads (DSA), or the MISA-routed
@@ -1480,7 +1472,7 @@ impl<'a> GpuEngine<'a> {
                                 rowp as *mut u8,
                                 stale as *const u8,
                                 topk * 4,
-                                crate::backend::NULL_STREAM,
+                                NULL_STREAM,
                             )?;
                         }
                         (rowp as *const u32, pnr, false)
@@ -1513,7 +1505,7 @@ impl<'a> GpuEngine<'a> {
             scored_nt = nt;
         }
         if bracket && scored_nt > 0 {
-            self.idx_ev_end.record(std::ptr::null_mut())?;
+            self.idx_ev_end.record(NULL_STREAM)?;
             self.idx_ev_pending = true;
         }
         // The mid-layer join. ONE consumer left — retiring the event pair. It used to have
@@ -1799,7 +1791,7 @@ impl<'a> GpuEngine<'a> {
                         2 * cfg.hidden,
                         nrow,
                         dst,
-                        std::ptr::null_mut(),
+                        NULL_STREAM,
                     )?;
                 }
                 std::mem::swap(&mut self.x, &mut self.mtp_x);
@@ -1973,7 +1965,7 @@ impl<'a> GpuEngine<'a> {
                         hidden,
                         1,
                         self.pred_gl.ptr_mut() as *mut f32,
-                        std::ptr::null_mut(),
+                        NULL_STREAM,
                     )?;
                 }
                 // Blocking D2H, but a cheap one HERE: the previous layer ended in
@@ -2150,7 +2142,7 @@ impl<'a> GpuEngine<'a> {
                     )?;
                     // One launch: elementwise over contiguous row-minor buffers.
                     // Null stream: GLM's dense MLP is null-stream end to end.
-                    launch_swiglu(gp, up, nrow * inter, gp, std::ptr::null_mut())?; // in place: h = silu(gate)*up
+                    launch_swiglu(gp, up, nrow * inter, gp, NULL_STREAM)?; // in place: h = silu(gate)*up
                     launch_gemv_fp8(
                         gp,
                         m.down.packed,
@@ -2168,15 +2160,7 @@ impl<'a> GpuEngine<'a> {
                 // Router gate on device, then read logits to route on host.
                 // SAFETY: gate_w resident F32; glp device scratch.
                 unsafe {
-                    launch_gemv_f32(
-                        xnp,
-                        gate_w,
-                        cfg.n_experts,
-                        hidden,
-                        nrow,
-                        glp,
-                        std::ptr::null_mut(),
-                    )?
+                    launch_gemv_f32(xnp, gate_w, cfg.n_experts, hidden, nrow, glp, NULL_STREAM)?
                 };
                 // The gate-logits D2H is a blocking join, so timing around it is free —
                 // no sync we don't already pay. (All the always-on profile buckets wrap
@@ -2626,7 +2610,7 @@ impl<'a> GpuEngine<'a> {
                         nrow * hidden,
                         MOE_ACC_ROWS,
                         self.moe_gain,
-                        std::ptr::null_mut(),
+                        NULL_STREAM,
                     )?,
                     false => launch_vadd(xp, self.moe_out.ptr() as *const f32, nrow * hidden)?,
                 }
@@ -2729,7 +2713,7 @@ impl<'a> GpuEngine<'a> {
             // Open the tail GPU span. The end-of-layer `device_sync` just above drained
             // everything, so this timestamp sits on an idle stream and the span that
             // follows is the tail kernels and nothing else.
-            self.tail_ev_start.record(std::ptr::null_mut())?;
+            self.tail_ev_start.record(NULL_STREAM)?;
             self.tail_ev_pending = true;
             // The tail's host launch cost, on the same `cpu_launch_ns` clock as the
             // layers'. Nothing blocks between here and the end of `forward`.
@@ -2930,7 +2914,7 @@ impl<'a> GpuEngine<'a> {
         // Close the tail GPU span here — AFTER the argmax launch, BEFORE the D2H — so
         // it brackets exactly rmsnorm → lm_head → argmax. The start was recorded in
         // `forward`; the D2H below retires both, so reading it costs no extra sync.
-        self.tail_ev_end.record(std::ptr::null_mut())?;
+        self.tail_ev_end.record(NULL_STREAM)?;
         // The one blocking call the whole tail phase hides behind: it drains the final
         // rmsnorm, lm_head AND argmax. Class it explicitly, or those milliseconds land
         // in the derived `cpu` bucket and look like host work.
