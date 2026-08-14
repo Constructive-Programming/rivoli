@@ -112,6 +112,28 @@ pub(crate) fn python_json(v: &Value) -> String {
     }
 }
 
+/// Python truthiness, which is what a bare `{%- if x -%}` in a Jinja chat template tests and
+/// what `if response_format:` tests in DeepSeek's Python one.
+///
+/// `false`, `0`, `0.0`, `""`, `[]`, `{}` and `null` are false; everything else — including the
+/// STRING `"false"` and the string `"0"` — is true.
+///
+/// **Beside [`python_json`] because it is the same kind of thing: a Python semantic this crate
+/// has to reproduce exactly, owned by neither model.** It began as `dsv4_encoding::json_truthy`;
+/// Glimmer's port needed it for `{%- if tools -%}` and `end_turn`, wrote a second copy, and
+/// `build.rs` reported the clone on the first compile (2026-08-14). Two ports getting Python's
+/// truth table right independently is not something to have twice.
+pub(crate) fn json_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
 /// One call the model made, as the template writes it back into the conversation:
 /// `<tool_call>{name}<arg_key>{k}</arg_key><arg_value>{v}</arg_value>...</tool_call>`.
 ///

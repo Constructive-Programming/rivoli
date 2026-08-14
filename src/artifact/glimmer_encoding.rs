@@ -32,7 +32,7 @@
 
 use serde_json::Value;
 
-use super::tokenizer::python_json;
+use super::tokenizer::{json_truthy, python_json};
 
 /// The template's own defaults for the system block it synthesises when the caller supplies no
 /// system turn. Both are literals in `chat_template.jinja`; neither is in `config.json`.
@@ -100,13 +100,25 @@ pub struct GlimmerChatOpts<'a> {
     pub tool_namespace_descriptions: Option<&'a Value>,
 }
 
-impl Default for GlimmerChatOpts<'_> {
-    /// **No default for `current_date`** — `Default` exists for the other five, and a caller
-    /// that wants it must still say which day it is. `..Default::default()` on a struct update
-    /// leaves the field it does not set, so this costs nothing at a call site.
-    fn default() -> Self {
+impl<'a> GlimmerChatOpts<'a> {
+    /// The date, plus the template's own defaults for the other five.
+    ///
+    /// **This replaced a `Default` impl that set `current_date: ""`, which was the same
+    /// contradiction twice over** (review, 2026-08-14): the struct's doc said "no default for
+    /// `current_date`" directly above an impl that gave it one, and the value it gave was the
+    /// one value that renders a system block **no reference renderer can produce** — the Jinja's
+    /// `elif strftime_now is defined` arm always fires under transformers, so `Knowledge cutoff:`
+    /// is never followed by a blank line there. `..Default::default()` was the shape the struct's
+    /// own doc recommended, so the wrong prompt was the path of least resistance. A constructor
+    /// taking the date makes the field unskippable while `..GlimmerChatOpts::new(d)` still costs
+    /// a caller nothing.
+    ///
+    /// Passing `""` deliberately still omits the line; that is a non-template mode, kept because
+    /// this is a rendering path with no error channel, and it is now something a caller has to
+    /// ask for rather than something they get by writing `..Default::default()`.
+    pub fn new(current_date: &'a str) -> Self {
         Self {
-            current_date: "",
+            current_date,
             add_generation_prompt: true,
             reasoning_strength: None,
             knowledge_cutoff: None,
@@ -135,6 +147,21 @@ impl Default for GlimmerChatOpts<'_> {
 /// round-tripping digits, then use fixed notation when the decimal exponent is in `-4..16` and
 /// scientific otherwise, always with at least one fractional digit in fixed form and at least
 /// two exponent digits in scientific form.
+///
+/// **This closes the SCALAR path only.** A float inside a list, an object or a tool schema goes
+/// through [`python_json`] instead — `serde_json`, whose float format is not CPython's — and
+/// diverges at `1e-5` (`0.00001` against `1e-05`) and below `1e-6` on the exponent's zero pad
+/// (`1e-7` against `1e-07`). That is reachable from an ordinary JSON-Schema `minimum` and it
+/// shifts the bytes of the SYSTEM prompt. `artifact/dsv4_encoding.rs`'s module header measures
+/// the whole table and `numeric_rendering_diverges_from_python` pins it.
+///
+/// **Not fixed here, on that file's own argument.** Two of its four diverging rows are PARSE
+/// precision (`1e-30` → `9.999999999999999e-31`, and an integer past `f64`), which no formatter
+/// can reach; the complete fix is `serde_json/arbitrary_precision`, a crate-wide feature that
+/// changes `Value::Number` for `format.rs`, `model.rs` and GLM's `tools_system_turn`. Overriding
+/// `write_f64` to call this function would close two rows of four and, in that file's words,
+/// "look repaired and still be wrong". Recorded here because `py_float` otherwise reads as if the
+/// number question were settled; for the scalar path it is (review, 2026-08-14).
 ///
 /// `{:e}` already gives the shortest round-tripping digits in normalized form — mantissa in
 /// `[1, 10)` and the decimal exponent spelled out — so this reads them back off it rather than
@@ -349,10 +376,21 @@ fn tool_defs(tools: &Value, descriptions: Option<&Value>) -> String {
     s.push_str("// Function schemas");
     for tool in tools.as_array().into_iter().flatten() {
         let f = function_of(tool);
-        // `| tojson` on an undefined variable is a Jinja error, but transformers' sandbox
-        // renders it as `null` rather than raising; a schema missing `description` or
-        // `parameters` is malformed input either way, and `null` is what the reference
-        // produces for it.
+        // **The reference RAISES here; this port renders `null` instead, deliberately.**
+        //
+        // > **CORRECTED 2026-08-14, by review, and the correction runs against what this said.**
+        // > It read "transformers' sandbox renders it as `null` rather than raising ... `null` is
+        // > what the reference produces for it". Measured on the environment that generated the
+        // > fixture: `tojson` is `json.dumps(..., ensure_ascii=False)`, and `json.dumps` on a
+        // > Jinja `Undefined` raises `TypeError: Object of type Undefined is not JSON
+        // > serializable`. So a schema missing `description` or `parameters` fails
+        // > `apply_chat_template` outright.
+        //
+        // Rendering `null` is the same trade `atem` documents for a non-mapping `arguments`: this
+        // is a `-> String` path with no error channel, the input is malformed either way, and a
+        // caller that reaches here has already decided to send the tools. What is NOT acceptable
+        // is claiming the reference agrees, which is the invented-measurement class this repo
+        // punishes.
         s.push_str(&format!(
             "\n{{\"name\": {}, \"description\": {}, \"parameters\": {}}}",
             python_json(f.get("name").unwrap_or(&Value::Null)),
@@ -396,10 +434,20 @@ fn atem(call: &Value) -> String {
         "<atem:function_calls>\n<atem:invoke name=\"{}\">\n",
         call_name(call)
     );
-    if let Some(args) = function_of(call)
-        .get("arguments")
-        .and_then(Value::as_object)
-    {
+    // **A JSON-STRING `arguments` is parsed, not dropped** (review, 2026-08-14). That is what
+    // OpenAI, Azure and every SDK mirroring them actually put on the wire, and `as_object` yielded
+    // `None` for it and skipped the whole loop — emitting a syntactically valid call to the right
+    // function with EVERY argument gone, which then teaches the model on the next turn that
+    // calling it without arguments is normal. The template refuses this shape by name (`a JSON
+    // string cannot be parsed in the HF jinja sandbox`), and that refusal is about JINJA's
+    // sandbox rather than about the shape being meaningless — outside the sandbox it parses fine.
+    // `atem`'s doc deferred to "`serve`-side validation"; there is no Glimmer serve path, so the
+    // deferral had no destination and the silent drop was the entire behaviour.
+    let raw = function_of(call).get("arguments");
+    let parsed = raw
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    if let Some(args) = parsed.as_ref().or(raw).and_then(Value::as_object) {
         for (k, v) in args {
             s.push_str(&format!(
                 "<atem:parameter name=\"{k}\">{}</atem:parameter>\n",
@@ -420,15 +468,30 @@ fn reasoning(opts: &GlimmerChatOpts) -> String {
     format!("Reasoning strength: {rs}.")
 }
 
+/// `tools` as the template sees it: `{%- if tools -%}` is PYTHON truthiness, so an empty array
+/// and `null` are both false.
+///
+/// **`Option::is_some` is the wrong test and it cost 1277 bytes of prompt** (review, 2026-08-14).
+/// A caller forwarding an OpenAI request body gets `Some(Array([]))` for `"tools": []` and
+/// `Some(Null)` for `"tools": null` — both of which real clients send — and the old gate emitted
+/// the whole ATEM preamble for them: an empty `// Tool metadata` list, an empty schema list, and
+/// a worked example calling `example_tool_name.example_function_name`, a tool that does not
+/// exist. The reference emits none of it. Unreachable from today's binary, which passes `None`;
+/// live the moment anything forwards a request body, which is what `atem`'s doc already
+/// anticipates.
+fn tools_of<'a>(opts: &GlimmerChatOpts<'a>) -> Option<&'a Value> {
+    opts.tools.filter(|t| json_truthy(t))
+}
+
 /// The tail every system block shares: the optional tool definitions, then the recipients.
 fn system_tail(opts: &GlimmerChatOpts) -> String {
     let mut s = String::new();
-    if let Some(t) = opts.tools {
+    if let Some(t) = tools_of(opts) {
         s.push_str("\n\n");
         s.push_str(&tool_defs(t, opts.tool_namespace_descriptions));
     }
     s.push_str("\n\n");
-    s.push_str(&system_meta(opts.tools));
+    s.push_str(&system_meta(tools_of(opts)));
     s.push_str("<|eot|>");
     s
 }
@@ -449,14 +512,20 @@ fn tool_name(message: &Value, all: &[Value]) -> String {
     let Some(id) = message.get("tool_call_id").and_then(Value::as_str) else {
         return String::new();
     };
+    // **Last match wins, and the early `return` this replaced was first-match** (review,
+    // 2026-08-14). The template's loop carries no `break` and assigns `rns.name` on every hit, so
+    // a conversation that reuses a `tool_call_id` attributes the result to the LATER call. A
+    // client bug, which is why it is cheap rather than important — but it is wrong in the turn
+    // header AND in the `<tool_output name=...>` attribute, so it misattributes twice.
+    let mut found: Option<&str> = None;
     for m in all {
         for tc in tool_calls(m) {
             if tc.get("id").and_then(Value::as_str) == Some(id) {
-                return call_name(tc).into();
+                found = Some(call_name(tc));
             }
         }
     }
-    id.into()
+    found.unwrap_or(id).into()
 }
 
 /// Render an OpenAI-shaped `messages` array as Muse Glimmer's chat framing.
@@ -571,9 +640,16 @@ pub fn render(messages: &[Value], opts: &GlimmerChatOpts) -> String {
                     // user is a step in a chain, so it ends with `<|eom|>` and the model keeps
                     // going. An explicit `false` forces that for a user-addressed turn too,
                     // which is how a split answer is fed back.
+                    // **Only `null`/absent triggers the inference.** The template tests
+                    // `end_turn is none` and then applies Python truthiness to whatever else is
+                    // there, so `0`, `""`, `[]` and `{}` END the message and `1`, `"x"`, `"0"`,
+                    // `"false"` do not. Matching on `Some(Value::Bool)` alone collapsed
+                    // "present but not a bool" into "absent" and got 10 of 12 shapes wrong
+                    // (review, 2026-08-14) — and this decides `<|eot|>` against `<|eom|>`, i.e.
+                    // whether a decode STOPS, since only the first is a stop id.
                     let end_turn = match message.get("end_turn") {
-                        Some(Value::Bool(b)) => *b,
-                        _ => recipient == "user",
+                        None | Some(Value::Null) => recipient == "user",
+                        Some(v) => json_truthy(v),
                     };
                     // The template guards this with `if recipient`, which is always true —
                     // the `or 'user'` above cannot yield an empty string — so the guard is

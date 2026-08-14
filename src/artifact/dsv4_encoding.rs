@@ -171,7 +171,7 @@
 //! parameter. The divergence runs in both directions and neither is reachable from a client
 //! that emits standard JSON.
 
-use crate::artifact::tokenizer::python_json;
+use crate::artifact::tokenizer::{json_truthy, python_json};
 use anyhow::{Result, bail, ensure};
 use serde_json::Value;
 
@@ -1134,19 +1134,6 @@ fn render_tools(tools: &[Tool]) -> String {
          Available Tool Schemas\n\n{schemas}\n\nYou MUST strictly follow the above defined \
          tool name and parameter schemas to invoke tool calls.\n"
     )
-}
-
-/// Python truthiness, for `if response_format:`. An empty object is falsy there and must
-/// not render a `## Response Format:` heading with `{}` under it.
-fn json_truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
 }
 
 /// What a `system` or `developer` turn appends after its instructions. Shared by both so

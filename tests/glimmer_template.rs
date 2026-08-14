@@ -3,7 +3,7 @@
 //!
 //! **The expected side is not a reading of the template — it is the template's output.**
 //! `tests/glimmer_template_driver.py` runs `AutoTokenizer.apply_chat_template` on
-//! `meta-models/Muse-Glimmer-30B` over 24 cases and vendors `(kwargs, expected, ids)` into
+//! `meta-models/Muse-Glimmer-30B` over 31 cases and vendors `(kwargs, expected, ids)` into
 //! `tests/glimmer-chat-cases.json`. That is what makes this a pin rather than a second
 //! transcription: GLM's hand-port drifted to GLM-4's framing and survived months of review
 //! because nothing ever compared it against the checkpoint's own file
@@ -29,7 +29,6 @@ fn cases() -> Vec<Value> {
 /// exactly the arguments the Python side was.
 fn opts_of(kw: &Value) -> GlimmerChatOpts<'_> {
     GlimmerChatOpts {
-        current_date: kw["current_date"].as_str().unwrap_or(""),
         add_generation_prompt: kw
             .get("add_generation_prompt")
             .and_then(Value::as_bool)
@@ -38,6 +37,7 @@ fn opts_of(kw: &Value) -> GlimmerChatOpts<'_> {
         knowledge_cutoff: kw.get("knowledge_cutoff").and_then(Value::as_str),
         tools: kw.get("tools"),
         tool_namespace_descriptions: kw.get("tool_namespace_descriptions"),
+        ..GlimmerChatOpts::new(kw["current_date"].as_str().unwrap_or(""))
     }
 }
 
@@ -79,22 +79,31 @@ fn every_case_renders_byte_for_byte() {
     // test green having compared nothing. The count is the driver's own, so it moves only when
     // a case is deliberately added or removed.
     assert_eq!(
-        checked, 24,
-        "expected 24 vendored cases, compared {checked}"
+        checked, 31,
+        "expected 31 vendored cases, compared {checked}"
     );
 }
 
-/// The string is only useful if the tokenizer resolves the specials to single ids, and that is
-/// a property of the tokenizer rather than of the template.
+/// The vendored ids exist and every special the template can emit is exercised by some case.
 ///
-/// **This is what a lookalike would fail.** A port that emitted `<|start|>` as five ordinary
-/// pieces, or that used a visually identical token from elsewhere in the vocabulary, matches
-/// [`every_case_renders_byte_for_byte`] and produces a different prompt. The driver pins the
-/// ids alongside the text for exactly that reason.
+/// > **CORRECTED 2026-08-14, by review, and the correction is that this test does LESS than it
+/// > claimed.** It read: "This is what a lookalike would fail. A port that emitted `<|start|>` as
+/// > five ordinary pieces ... matches [`every_case_renders_byte_for_byte`] and produces a
+/// > different prompt." **That is incoherent** — `<|start|>` is the same *string* either way, and
+/// > whether it becomes one id is decided by the tokenizer the ENGINE loads. This test reads
+/// > `case["ids"]`, which Python wrote, and calls neither [`render`] nor any tokenizer: replace
+/// > `render`'s whole body with `String::new()` and it stays green.
+/// >
+/// > The property is TRUE — every id below resolves out of the shipped `tokenizer.json` as
+/// > `special: true, normalized: false`, and `tokenizer_config.json` carries no
+/// > `added_tokens_decoder`, so the Rust side sees the same added vocabulary Python does. It is
+/// > true and UNVERIFIED. `src/main.rs` cited this test for it and no longer does.
 ///
-/// Ids are compared as a SET of the specials plus the total length, not element by element:
-/// the ordinary text between them is the tokenizer's business, and pinning all of it would
-/// make this test fail on any tokenizer revision without saying anything about the port.
+/// **What would close it:** `Tokenizer::load(dir).encode(&render(msgs, &opts))` against
+/// `case["ids"]`, on an artifact with a real tokenizer. The tiny fixture has none.
+///
+/// What this still buys: a census. Every special the template can emit appears in some case, so
+/// a fixture regenerated from a template that stopped emitting one goes red.
 #[test]
 fn the_special_tokens_survive_tokenization_as_single_ids() {
     // `<|begin_of_text|>`, `<|start|>`, `<|message|>`, `<|eot|>`, `<|eom|>`, `<|patch|>`,
@@ -137,18 +146,52 @@ fn the_special_tokens_survive_tokenization_as_single_ids() {
 #[test]
 fn the_fixture_varies_every_option() {
     let cases = cases();
-    let has = |k: &str| cases.iter().any(|c| c["kwargs"].get(k).is_some());
-    for k in [
-        "reasoning_strength",
-        "knowledge_cutoff",
-        "tools",
-        "tool_namespace_descriptions",
-    ] {
+    // **Presence is not variation, and this asserted presence** (review, 2026-08-14). A case
+    // that set `reasoning_strength: "high"` — the port's own default — satisfies "some case sets
+    // it" while leaving `render` free to ignore the option entirely. The values are checked
+    // against the defaults instead, which is the property that makes the byte test bind.
+    let differs = |k: &str, default: &str| {
+        cases.iter().any(|c| {
+            c["kwargs"]
+                .get(k)
+                .and_then(Value::as_str)
+                .is_some_and(|v| v != default)
+        })
+    };
+    assert!(
+        differs("reasoning_strength", "high"),
+        "no case sets `reasoning_strength` to anything but the port's default — it could be a \
+         hardcoded string and this suite would not notice"
+    );
+    assert!(
+        differs("knowledge_cutoff", "2026-01-04"),
+        "no case sets `knowledge_cutoff` away from the template's own literal"
+    );
+    // `tools` has no scalar default to differ from; what matters is that BOTH truthiness arms are
+    // present, since the empty array and `null` are false in Jinja and were the branch a review
+    // found emitting 1277 bytes the reference omits.
+    let tool_shapes: BTreeSet<&str> = cases
+        .iter()
+        .map(|c| match c["kwargs"].get("tools") {
+            None => "absent",
+            Some(Value::Null) => "null",
+            Some(Value::Array(a)) if a.is_empty() => "empty",
+            _ => "populated",
+        })
+        .collect();
+    for want in ["absent", "null", "empty", "populated"] {
         assert!(
-            has(k),
-            "no vendored case sets `{k}` — the port could ignore it"
+            tool_shapes.contains(want),
+            "no vendored case has `tools` {want} — Python truthiness and Rust Option-ness \
+             disagree on `null` and `empty`, which is how 1277 bytes of ATEM preamble got emitted"
         );
     }
+    assert!(
+        cases
+            .iter()
+            .any(|c| c["kwargs"].get("tool_namespace_descriptions").is_some()),
+        "no vendored case sets `tool_namespace_descriptions`"
+    );
     let gen_prompt: BTreeSet<bool> = cases
         .iter()
         .map(|c| {
@@ -178,7 +221,7 @@ fn the_fixture_varies_every_option() {
     assert_eq!(dates.iter().next().copied(), Some("2026-08-14"));
     assert_eq!(
         cases.len(),
-        24,
+        31,
         "case count moved without the byte test noticing"
     );
 }

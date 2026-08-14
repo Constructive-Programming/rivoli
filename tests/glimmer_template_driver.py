@@ -194,6 +194,37 @@ CASES = [
         {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Oslo"}}}]},
         {"role": "assistant", "content": "done"},
     ], "tools": TOOLS, "add_generation_prompt": True}),
+    # -- the branches a review found UNCOVERED, 2026-08-14 ------------------------------
+    # `{%- if tools -%}` is PYTHON truthiness, so an empty array and null are both FALSE and the
+    # whole ATEM preamble is omitted. The port gated on Rust `Option`-ness and emitted 1277 bytes
+    # of tool protocol -- an empty metadata list, an empty schema list, and a worked example
+    # calling a tool that does not exist -- for `"tools": []`, which real clients send.
+    ("tools_empty", {"messages": [{"role": "user", "content": "Hi"}], "tools": [], "add_generation_prompt": True}),
+    ("tools_null", {"messages": [{"role": "user", "content": "Hi"}], "tools": None, "add_generation_prompt": True}),
+    # An explicit system turn has its OWN `{%- if tools -%}`; the port factors both into one
+    # function, so this is cheap, but nothing exercised that arm.
+    ("system_and_tools", {"messages": [{"role": "system", "content": "Be terse."}, {"role": "user", "content": "Hi"}],
+                          "tools": TOOLS, "add_generation_prompt": True}),
+    # `end_turn` is tested with `is none` and then by TRUTHINESS, so `0` ends the message and the
+    # string `"false"` does not. Matching only on a JSON bool got 10 of 12 shapes wrong -- and this
+    # decides `<|eot|>` against `<|eom|>`, i.e. whether a decode stops at all.
+    ("end_turn_zero", {"messages": [{"role": "user", "content": "Hi"},
+                                    {"role": "assistant", "content": "a", "end_turn": 0}], "add_generation_prompt": True}),
+    ("end_turn_str_false", {"messages": [{"role": "user", "content": "Hi"},
+                                         {"role": "assistant", "recipient": "self", "content": "a", "end_turn": "false"}],
+                            "add_generation_prompt": True}),
+    ("end_turn_true", {"messages": [{"role": "user", "content": "Hi"},
+                                    {"role": "assistant", "recipient": "self", "content": "a", "end_turn": True}],
+                       "add_generation_prompt": True}),
+    # The id-recovery loop has no `break`, so a REUSED tool_call_id resolves to the LAST match.
+    # The port returned on the first. A client bug, but it misattributes the result twice: in the
+    # turn header and in the `<tool_output name=...>` attribute.
+    ("tool_result_duplicate_id", {"messages": [
+        {"role": "user", "content": "Weather?"},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "github.create_issue", "arguments": {"title": "a"}}}]},
+        {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Oslo"}}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "4C, rain"},
+    ], "tools": TOOLS, "add_generation_prompt": True}),
     # An unknown role renders as NOTHING -- the template's `if/elif` chain has no else. Pinned
     # because a hand-port that framed it as `user` (which GLM's does, deliberately) would be
     # wrong HERE, and silently.

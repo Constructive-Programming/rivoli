@@ -1106,27 +1106,35 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     // where 56 GLM runs ran to their token limit and drifted into looping scaffolding.
     //
     // `Tokenizer::encode` passes `add_special_tokens = false`, which is what the pin's vendored
-    // ids were generated with, so the framing's specials come from the rendered TEXT and resolve
-    // to single ids — a property that file asserts rather than assumes.
+    // ids were generated with. **Nothing yet checks that the framing's specials survive that
+    // encode as single ids**, and this comment used to claim `tests/glimmer_template.rs` did:
+    // that file reads ids the DRIVER wrote and never calls `Tokenizer::encode` at all (review,
+    // 2026-08-14). The property holds — every id in its `SPECIALS` resolves out of the shipped
+    // `tokenizer.json` as `special: true, normalized: false` — but it holds unverified, and
+    // closing it needs a test that loads a real artifact's tokenizer.
     let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
     let prompt_text = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
+    // Refused BEFORE the framing, not after. `render` always emits `<|begin_of_text|>` and a
+    // whole system block, so `ids` is ~60 tokens even for an empty prompt and the old check on
+    // `ids.is_empty()` could no longer fire — while its message still named `prompt_text`, which
+    // was no longer what had been encoded (review, 2026-08-14).
+    anyhow::ensure!(
+        !prompt_text.is_empty(),
+        "--prompt is empty; the template would frame an empty user turn and decode from it"
+    );
     let framed = rivoli::artifact::glimmer_encoding::render(
         &[serde_json::json!({"role": "user", "content": prompt_text})],
         &rivoli::artifact::glimmer_encoding::GlimmerChatOpts {
+            add_generation_prompt: true,
             // The clock is read HERE and nowhere below it: the renderer takes the date as a
             // parameter precisely so that reading it is one caller's decision, and this is the
             // caller for which "what day is it" is a real question.
-            current_date: &rivoli::artifact::glimmer_encoding::utc_date(
-                std::time::SystemTime::now(),
-            ),
-            ..Default::default()
+            ..rivoli::artifact::glimmer_encoding::GlimmerChatOpts::new(
+                &rivoli::artifact::glimmer_encoding::utc_date(std::time::SystemTime::now()),
+            )
         },
     );
     let ids = tok.encode(&framed)?;
-    anyhow::ensure!(
-        !ids.is_empty(),
-        "the prompt encoded to no tokens: {prompt_text:?}"
-    );
     // `--bench N` is "decode N tokens then exit" everywhere else here; there is no server mode
     // for this architecture yet (`--port` is refused above), so it is also the only mode.
     let max_new = cfg.bench.unwrap_or(64);
