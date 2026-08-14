@@ -542,23 +542,38 @@ fn every_launcher_is_attributed_to_the_paths_that_call_it() {
 #[test]
 fn a_bare_null_mut_is_never_a_stream() {
     /// `(path suffix, occurrences, why it is not a stream)`.
-    const ALLOWED: [(&str, usize, &str); 3] = [
+    /// **Full relative paths, compared with `==`.** `ends_with("gpu.rs")` was true for
+    /// `src/f4gpu.rs` AND `src/glimmer_gpu.rs`, so a bare stream null in either was scored
+    /// against the exemption written for `src/gpu.rs`'s indexer pool pointer — and if that
+    /// pointer ever becomes an `Option`, as its own comment invites, the count would match too
+    /// and the gate would go green on a real violation (review, 2026-08-14).
+    const ALLOWED: [(&str, usize, &str); 4] = [
         (
-            "memory/device.rs",
+            "src/memory/device.rs",
             2,
             "out-parameter handed to hipMalloc, written by the driver",
         ),
         (
-            "gpu.rs",
+            "src/gpu.rs",
             1,
             "the indexer POOL pointer — absent means `no pool`, not `no stream`",
         ),
         (
-            "fetch/stream.rs",
+            "src/attn.rs",
+            1,
+            "a dangling `*mut f32` in the guard tests, never dereferenced — every case there \
+             returns before the first launch. Found only when the matcher widened to catch a \
+             turbofish, which is the point of widening it",
+        ),
+        (
+            "src/fetch/stream.rs",
             1,
             "an io_uring destination array, initialised empty",
         ),
     ];
+    // `std::ptr::null()` and `null::<T>()` are deliberately NOT matched: a stream parameter is
+    // `*mut c_void`, so a `*const` null cannot be one. Narrowing on the mutability is what keeps
+    // this census about streams rather than about every null in the tree.
     let mut found: std::collections::BTreeMap<String, usize> = Default::default();
     let mut stack = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
     while let Some(dir) = stack.pop() {
@@ -573,14 +588,20 @@ fn a_bare_null_mut_is_never_a_stream() {
                     .to_string_lossy()
                     .replace('\\', "/");
                 for line in std::fs::read_to_string(&p).unwrap_or_default().lines() {
-                    let t = line.trim_start();
                     // Prose is documentation, not a call site. See the doc above for why this
                     // exclusion is the right one HERE and the wrong one for the jscpd marker.
-                    if t.starts_with("//") {
-                        continue;
-                    }
-                    if line.contains("null_mut()") {
-                        *found.entry(rel.clone()).or_default() += 1;
+                    // **The comment is stripped rather than the line skipped**, and the count is
+                    // of OCCURRENCES rather than lines: a leading-`//` test missed a trailing one
+                    // (so documenting the convention beside code broke the build), and a per-line
+                    // count let `f(null_mut(), x, null_mut())` — an out-param AND a stream on one
+                    // line, exactly the mixed shape ALLOWED is about — read as one (2026-08-14).
+                    let code = line.split_once("//").map_or(line, |(c, _)| c);
+                    //  rather than , so a turbofished  counts too — it
+                    // does not appear in this tree today, and a census that silently ignored a
+                    // spelling would be the same hole the path matching had (2026-08-14).
+                    let n = code.matches("null_mut").count();
+                    if n > 0 {
+                        *found.entry(rel.clone()).or_default() += n;
                     }
                 }
             }
@@ -595,7 +616,7 @@ fn a_bare_null_mut_is_never_a_stream() {
     );
     let mut unexplained: Vec<String> = Vec::new();
     for (file, n) in &found {
-        match ALLOWED.iter().find(|(suffix, ..)| file.ends_with(suffix)) {
+        match ALLOWED.iter().find(|(path, ..)| file.as_str() == *path) {
             Some((_, want, why)) if want == n => {}
             Some((_, want, why)) => {
                 unexplained.push(format!("{file}: {n} occurrences, expected {want} ({why})"))

@@ -927,6 +927,28 @@ fn run_v4(
     Ok(())
 }
 
+/// The `--ppl` corpus, tokenized, in BOTH feature configurations — `None` when the flag is
+/// absent or the feature is off, so callers size a context from it without a second code path.
+///
+/// **One function because `build.rs` found the second copy.** The GLM arm and `run_glimmer` had
+/// written the same `#[cfg]` pair around the same `match` (2026-08-14, 50 tokens); the cfg-gated
+/// shape is not incidental — without `teacher-forcing` there is no `eval` module to call — so it
+/// is exactly the kind of thing that gets re-derived rather than reused.
+#[cfg(feature = "rocm")]
+#[cfg_attr(not(feature = "teacher-forcing"), allow(unused_variables))]
+fn ppl_corpus(
+    ppl: Option<&String>,
+    tok: &rivoli::artifact::tokenizer::Tokenizer,
+) -> Result<Option<Vec<u32>>> {
+    #[cfg(feature = "teacher-forcing")]
+    match ppl {
+        Some(path) => Ok(Some(rivoli::eval::load_corpus(path, tok)?)),
+        None => Ok(None),
+    }
+    #[cfg(not(feature = "teacher-forcing"))]
+    Ok(None)
+}
+
 /// Muse Glimmer: validate the manifest, report the layer map, refuse every flag that does not
 /// apply, and then refuse the run.
 ///
@@ -948,30 +970,17 @@ fn run_v4(
 ///
 /// `--cache-policy` stays refused because on a dense model the policy question has one answer,
 /// not because nothing streams — the refusal message carries the argument.
-#[cfg(feature = "rocm")]
-/// The `--ppl` corpus, tokenized, in BOTH feature configurations — `None` when the flag is
-/// absent or the feature is off, so callers size a context from it without a second code path.
-///
-/// **One function because `build.rs` found the second copy.** The GLM arm and `run_glimmer` had
-/// written the same `#[cfg]` pair around the same `match` (2026-08-14, 50 tokens); the cfg-gated
-/// shape is not incidental — without `teacher-forcing` there is no `eval` module to call — so it
-/// is exactly the kind of thing that gets re-derived rather than reused.
-#[cfg_attr(not(feature = "teacher-forcing"), allow(unused_variables))]
-fn ppl_corpus(
-    ppl: Option<&String>,
-    tok: &rivoli::artifact::tokenizer::Tokenizer,
-) -> Result<Option<Vec<u32>>> {
-    #[cfg(feature = "teacher-forcing")]
-    match ppl {
-        Some(path) => Ok(Some(rivoli::eval::load_corpus(path, tok)?)),
-        None => Ok(None),
-    }
-    #[cfg(not(feature = "teacher-forcing"))]
-    Ok(None)
-}
-
 // The two `--ppl` paths are read only under `teacher-forcing`; the parameters stay so the
 // signature does not fork.
+//
+// **`#[cfg(feature = "rocm")]` is BELOW this comment and not above it, and that placement is the
+// whole point.** `ppl_corpus` was inserted between this function's doc block and its `rocm` gate
+// (2026-08-14), which silently moved the gate onto `ppl_corpus` and left `run_glimmer` compiled
+// in EVERY configuration — where `device_budget`, `glimmer_gpu` and `ppl_corpus` itself are all
+// out of scope. Every command CLAUDE.md prescribes locally passes `--features rocm`, so nothing
+// here could see it; only featureless CI and `tests/feature-matrix.sh` could, and this file
+// already carries a note recording that CI went red on exactly this class once before.
+#[cfg(feature = "rocm")]
 #[cfg_attr(not(feature = "teacher-forcing"), allow(unused_variables))]
 fn run_glimmer(
     cfg: &Config,
@@ -1149,6 +1158,18 @@ fn run_glimmer(
     // could see it. A corpus is not a chat turn: it is scored raw, with no framing and no
     // generation prompt, so none of the prompt path below applies to it.
     let corpus = ppl_corpus(ppl, &tok)?;
+    // Refused HERE, naming the file the operator passed. `nll_forced` has the same bound, but it
+    // is reached after `Glimmer::new` has built the whole 55.712 GB pin — minutes of I/O to learn
+    // that a corpus has one token — and an EMPTY one is worse: `n_ctx` becomes 0 and the first
+    // complaint is `runtime_bytes`' "n_ctx must be positive", an internal quantity nobody set.
+    // `run_v4` already refuses this at load time; this is its message (review, 2026-08-14).
+    if let Some(c) = &corpus {
+        anyhow::ensure!(
+            c.len() >= 2,
+            "--ppl corpus tokenizes to {} token(s); need at least 2 to score",
+            c.len()
+        );
+    }
 
     let prompt_text = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
     // Refused BEFORE the framing, not after. `render` always emits `<|begin_of_text|>` and a
@@ -1174,13 +1195,21 @@ fn run_glimmer(
     let ids = tok.encode(&framed)?;
     // `--bench N` is "decode N tokens then exit" everywhere else here; there is no server mode
     // for this architecture yet (`--port` is refused above), so it is also the only mode.
+    //
+    // **Both the refusal and the log are skipped under `--ppl`, because neither applies.** A
+    // scoring run emits nothing, so `--bench 0` was being refused with "asks for no tokens" on a
+    // run that asks for none by construction, and every successful `--ppl` run logged "generating
+    // up to 64" directly above its own `PPL:` line — in the file this repo reads measurements out
+    // of. The GLM arm already forces `ngen` to 0 when a corpus is present (review, 2026-08-14).
     let max_new = cfg.bench.unwrap_or(64);
-    anyhow::ensure!(max_new > 0, "--bench 0 asks for no tokens");
-    info!(
-        "prompt: {} tokens, generating up to {max_new}; eos {:?}",
-        ids.len(),
-        tok.eos
-    );
+    if corpus.is_none() {
+        anyhow::ensure!(max_new > 0, "--bench 0 asks for no tokens");
+        info!(
+            "prompt: {} tokens, generating up to {max_new}; eos {:?}",
+            ids.len(),
+            tok.eos
+        );
+    }
     // The KV cache is sized HERE and not from `max_position_embeddings`: a full-attention layer's
     // cache is linear in the context, and this model's trained maximum is 131072 — 3.5 GB of cache
     // to emit twelve tokens. See `Glimmer::new`.

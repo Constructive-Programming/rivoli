@@ -267,10 +267,6 @@ fn finish(
     Ok(())
 }
 
-/// Score `ids` teacher-forced (GLM) and report; write per-token NLLs to `out` when given.
-/// Per-token NLLs are the actual deliverable: two runs over the same text are PAIRED at
-/// every position, and differencing them detects a systematic shift far smaller than the
-/// sampling noise in two independent perplexities.
 /// What a `--ppl` run needs from an engine: a teacher-forced score, and the two residency
 /// counters [`report`] turns into a hit rate.
 ///
@@ -308,6 +304,16 @@ impl Forced for crate::glimmer_gpu::Glimmer {
     }
 }
 
+/// Score `ids` teacher-forced and report; write per-token NLLs to `out` when given.
+///
+/// Per-token NLLs are the actual deliverable: two runs over the same text are PAIRED at every
+/// position, and differencing them detects a systematic shift far smaller than the sampling
+/// noise in two independent perplexities. `bin/ppl` does that arithmetic.
+///
+/// > **This doc said "(GLM)" and was attached to [`Forced`] rather than to this function**, both
+/// > because the trait was inserted above it and inherited the block (review, 2026-08-14). The
+/// > parenthetical had also stopped being true: the whole point of the trait is that this is no
+/// > longer GLM-specific.
 pub fn run<E: Forced + ?Sized>(
     engine: &mut E,
     ids: &[u32],

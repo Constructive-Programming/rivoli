@@ -940,8 +940,17 @@ impl Glimmer {
     /// is not a timing run.
     ///
     /// The last position is forwarded and then discarded: there is no `ids[len]` to score it
-    /// against. Counted here rather than by shortening the loop, because the KV cache has to hold
-    /// every position for the ones before it to be right.
+    /// against.
+    ///
+    /// > **CORRECTED 2026-08-14, by review.** This said the loop is not shortened "because the KV
+    /// > cache has to hold every position for the ones before it to be right". **That is
+    /// > backwards.** `launch_gqa_attend` derives its causal bound from `start_pos = pos`, so the
+    /// > K/V written at the last slot is read only by queries at positions >= it, and there are
+    /// > none — the final forward is INERT, not load-bearing. It costs one sweep of 52 layers
+    /// > (0.13% on the 762-token corpus) and inflates `slot_stats` by one visit per layer, which
+    /// > is what `eval::Forced::counters` reports. The real reasons to keep it are that it keeps
+    /// > the loop one shape and that `hidden_state` is what range-checks the final id; the wrong
+    /// > reason FORBADE the obvious fix, which is worse than the cost it was defending.
     #[cfg(feature = "teacher-forcing")]
     pub fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         ensure!(

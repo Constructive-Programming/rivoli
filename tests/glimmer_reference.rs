@@ -143,6 +143,12 @@ fn nll(v: &[f32], token: usize) -> f32 {
 /// relative-max over the vector, this is an L1 over the distribution, and a defect concentrated
 /// on one high-probability token moves this far more than it moves that. It is NOT independent
 /// evidence, and it is NOT a softcap gate — see [`TOL_NLL`].
+///
+/// **Red-proved by a x10 scale on the metric itself: 1.464e-3 -> 6.468e-3, past this bound.**
+/// Recorded because the only mutation this constant's doc used to cite was the softcap, which
+/// moves it by NOTHING (1.249e-3 -> 1.249e-3) — a bound whose sole documented experiment is one
+/// that cannot redden it is a bound with no evidence that it is a gate at all (review,
+/// 2026-08-14).
 const TOL_TV: f32 = 5e-3;
 
 /// `|NLL_got − NLL_want|` for the reference's own emitted token — MEASURED at 5.316e-3 and
@@ -188,8 +194,11 @@ const TOL_TV: f32 = 5e-3;
 ///
 /// So the softcap is invisible to greedy decode, invisible to total variation on a confident
 /// prompt, and enormous in the tail — which is the regime perplexity lives in. **The instrument
-/// for it is teacher-forced NLL on non-argmax tokens, i.e. S4 item 4's dNLL ladder**, and that
-/// needs a Glimmer `--ppl` path, which does not exist (`src/eval.rs` has `run` and `run_v4`).
+/// for it is teacher-forced NLL on non-argmax tokens**, and that path was then built:
+/// `Glimmer::nll_forced` + `eval::Forced` + `run_glimmer`'s `--ppl` arm. It priced the softcap at
+/// **+2.06868 nats/token, 95% CI [+1.80699, +2.33036]**, i.e. 691% of PPL (7.008490 -> 55.467635
+/// on `tests/ppl-corpus.txt`). This paragraph said the path "does not exist" until 2026-08-14,
+/// which was true when it was written and false one commit later.
 const TOL_NLL: f32 = 2e-2;
 
 /// The engine's loop, over the reference's parameters, compared to the reference's logits.
@@ -199,6 +208,7 @@ const TOL_NLL: f32 = 2e-2;
 #[test]
 fn the_engine_reproduces_muse_glimmers_own_logits() {
     let mut ran = 0;
+    let (mut worst_all_tv, mut worst_all_nll) = (0.0f32, 0.0f32);
     for (g, w) in goldens().iter().zip(weight_sets()) {
         assert_eq!(
             g.name, w.0,
@@ -263,6 +273,8 @@ fn the_engine_reproduces_muse_glimmers_own_logits() {
             if dn > worst_nll.0 {
                 worst_nll = (dn, step);
             }
+            worst_all_tv = worst_all_tv.max(tv);
+            worst_all_nll = worst_all_nll.max(dn);
             assert!(
                 tv < TOL_TV,
                 "{}: step {step} disagrees with the reference IN PROBABILITY by {tv:.3e} total \
@@ -303,6 +315,17 @@ fn the_engine_reproduces_muse_glimmers_own_logits() {
     // A census: both salts, every step. The loop above is over two vectors either of which could
     // become empty without a single assertion failing.
     assert_eq!(ran, 14, "both salts must contribute all seven steps");
+    // **Anti-vacuity for the two probability-space metrics, and it is not decoration.** Both
+    // assertions above are upper bounds, and `dNLL` is a DIFFERENCE of two calls to the same
+    // function — so a `total_variation` that compared a vector against itself, or an `nll` whose
+    // `MIN_POSITIVE` clamp started firing on both sides, would return 0 and pass forever while
+    // the worsts printed 0.000e0 and nothing read them (review, 2026-08-14). Both are measured
+    // non-zero (TV 1.249e-3 / 1.464e-3, dNLL 5.316e-3 / 6.305e-3), so this costs nothing.
+    assert!(
+        worst_all_tv > 0.0 && worst_all_nll > 0.0,
+        "the probability-space metrics returned zero on every step ({worst_all_tv:.3e} TV, \
+         {worst_all_nll:.3e} dNLL) — they are comparing something against itself"
+    );
 }
 
 /// Write the reference's parameters as a Muse Glimmer checkpoint and convert it.
