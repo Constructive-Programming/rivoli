@@ -217,10 +217,26 @@ against `cap = 1e30`, everything else identical:
 | entropy | 4.05e-7 nats | 1.28e-13 nats — a factor of 3.2 million |
 
 **The softcap is invisible to greedy decode, invisible to total variation on a confident prompt,
-and enormous in the tail.** That is the whole answer to why it was hard to gate, and it names the
-right instrument: **teacher-forced NLL on NON-argmax tokens**, which is S4 item 4's dNLL ladder.
-It does not exist for this model — `src/eval.rs` has `run` and `run_v4` and no Glimmer path — so
-item 4 now has a second prerequisite besides a quantized format.
+and enormous in the tail.** That named the right instrument: teacher-forced NLL on NON-argmax
+tokens. It did not exist for this model, so it was built — and it settles the question outright.
+
+> **PRICED, 2026-08-14, on `tests/ppl-corpus.txt` (762 tokens), same artifact, same corpus, the
+> softcap the only difference:**
+>
+> | | PPL | mean dNLL | 95% CI (nats) |
+> |---|---:|---:|---|
+> | softcap **on** (`cap = 20`) | **7.008490** | — | — |
+> | softcap **off** (`cap = 1e30`) | **55.467635** | **+2.06868** | **[+1.80699, +2.33036]** |
+>
+> **The softcap is worth 2.07 nats per token, and removing it costs 691% of PPL** — while
+> leaving greedy output bit-identical, because it is argmax-invariant. The interval is entirely
+> on the worse side, so this is a decisive FAIL for the uncapped arm rather than an
+> underpowered null. `bin/ppl` notes the SE (0.13351) exceeds its 1%-bar of 0.00995 nats: true,
+> and irrelevant here — the effect is **15x the SE**. A 1% question on this corpus would need
+> more text; a 691% one does not.
+
+**bf16 PPL 7.008490 is the ladder's first rung**, and every format from here is compared against
+it on this corpus with `bin/ppl`'s paired statistics.
 
 **What the two new metrics DO buy**, stated narrowly. TV is a second norm on the same logits in
 the space the output lives in (`worst_rel` is relative-max, this is L1 on the distribution), so a

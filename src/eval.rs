@@ -271,8 +271,45 @@ fn finish(
 /// Per-token NLLs are the actual deliverable: two runs over the same text are PAIRED at
 /// every position, and differencing them detects a systematic shift far smaller than the
 /// sampling noise in two independent perplexities.
-pub fn run(
-    engine: &mut crate::gpu::GpuEngine,
+/// What a `--ppl` run needs from an engine: a teacher-forced score, and the two residency
+/// counters [`report`] turns into a hit rate.
+///
+/// **A trait rather than a third wrapper, because `build.rs` rejected the third wrapper.** Adding
+/// Muse Glimmer's scorer as a fourth-line-identical `run_glimmer` was a 105-token jscpd clone of
+/// [`run`] on the first compile — correctly, since the only thing that differed was which two
+/// counters got read. `run_v4` stays separate: it threads an `on_tok` callback the other two have
+/// no use for, and contorting the trait to carry it would put a parameter in both impls to serve
+/// neither.
+pub trait Forced {
+    fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>>;
+    /// `(hits, misses)` in whatever sense the engine's residency has one.
+    fn counters(&self) -> (u64, u64);
+}
+
+impl Forced for crate::gpu::GpuEngine<'_> {
+    fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        crate::gpu::GpuEngine::nll_forced(self, ids)
+    }
+    fn counters(&self) -> (u64, u64) {
+        (self.hits(), self.misses())
+    }
+}
+
+impl Forced for crate::glimmer_gpu::Glimmer {
+    fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        crate::glimmer_gpu::Glimmer::nll_forced(self, ids)
+    }
+    /// The PIN's counters, not a KV pool's: slot hits against slot fills, which for a dense model
+    /// is the residency question — how often a streamed layer had to be re-fetched. **At
+    /// all-resident both are zero and the reported rate is vacuous**, which is honest, because
+    /// there is nothing to hit.
+    fn counters(&self) -> (u64, u64) {
+        self.slot_stats()
+    }
+}
+
+pub fn run<E: Forced + ?Sized>(
+    engine: &mut E,
     ids: &[u32],
     out: Option<&String>,
     label: &str,
@@ -280,7 +317,7 @@ pub fn run(
     let t0 = std::time::Instant::now();
     let nlls = engine.nll_forced(ids)?;
     let dt = t0.elapsed().as_secs_f64();
-    let (hits, misses) = (engine.hits(), engine.misses());
+    let (hits, misses) = engine.counters();
     finish(nlls, dt, hits, misses, out, label)
 }
 

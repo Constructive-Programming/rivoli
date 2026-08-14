@@ -949,7 +949,36 @@ fn run_v4(
 /// `--cache-policy` stays refused because on a dense model the policy question has one answer,
 /// not because nothing streams — the refusal message carries the argument.
 #[cfg(feature = "rocm")]
-fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
+/// The `--ppl` corpus, tokenized, in BOTH feature configurations — `None` when the flag is
+/// absent or the feature is off, so callers size a context from it without a second code path.
+///
+/// **One function because `build.rs` found the second copy.** The GLM arm and `run_glimmer` had
+/// written the same `#[cfg]` pair around the same `match` (2026-08-14, 50 tokens); the cfg-gated
+/// shape is not incidental — without `teacher-forcing` there is no `eval` module to call — so it
+/// is exactly the kind of thing that gets re-derived rather than reused.
+#[cfg_attr(not(feature = "teacher-forcing"), allow(unused_variables))]
+fn ppl_corpus(
+    ppl: Option<&String>,
+    tok: &rivoli::artifact::tokenizer::Tokenizer,
+) -> Result<Option<Vec<u32>>> {
+    #[cfg(feature = "teacher-forcing")]
+    match ppl {
+        Some(path) => Ok(Some(rivoli::eval::load_corpus(path, tok)?)),
+        None => Ok(None),
+    }
+    #[cfg(not(feature = "teacher-forcing"))]
+    Ok(None)
+}
+
+// The two `--ppl` paths are read only under `teacher-forcing`; the parameters stay so the
+// signature does not fork.
+#[cfg_attr(not(feature = "teacher-forcing"), allow(unused_variables))]
+fn run_glimmer(
+    cfg: &Config,
+    explicit: &Explicit,
+    ppl: Option<&String>,
+    ppl_out: Option<&String>,
+) -> Result<()> {
     use rivoli::arch::Arch;
     let arch = Arch::MuseGlimmer;
     // **Parsed BEFORE the refusals, and before the bail.** The schema is the part of this port
@@ -1113,6 +1142,14 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     // `tokenizer.json` as `special: true, normalized: false` — but it holds unverified, and
     // closing it needs a test that loads a real artifact's tokenizer.
     let tok = rivoli::artifact::tokenizer::Tokenizer::load(&cfg.model)?;
+
+    // **The corpus is loaded BEFORE the context is sized, because it is what sizes it.** The
+    // first version sized `n_ctx` from the prompt and then handed a 762-token corpus to an engine
+    // built for 125 — caught by `nll_forced`'s own bound, which was the only thing left that
+    // could see it. A corpus is not a chat turn: it is scored raw, with no framing and no
+    // generation prompt, so none of the prompt path below applies to it.
+    let corpus = ppl_corpus(ppl, &tok)?;
+
     let prompt_text = cfg.prompt.as_deref().unwrap_or("The sky is blue because");
     // Refused BEFORE the framing, not after. `render` always emits `<|begin_of_text|>` and a
     // whole system block, so `ids` is ~60 tokens even for an empty prompt and the old check on
@@ -1154,10 +1191,15 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     // — so a wrapped value satisfies both and the loop then writes past the allocation on a full
     // attention layer, where the slot IS the position. Release builds compile the overflow check
     // out, so the guard has to be explicit (review, 2026-08-13).
-    let n_ctx = ids
-        .len()
-        .checked_add(max_new)
-        .context("prompt length plus --bench overflows a usize")?;
+    let n_ctx = match &corpus {
+        // Every position is fed and the last is forwarded before it is discarded, so the context
+        // is exactly the corpus — no `+1`, and no `--bench` term, since scoring emits nothing.
+        Some(c) => c.len(),
+        None => ids
+            .len()
+            .checked_add(max_new)
+            .context("prompt length plus --bench overflows a usize")?,
+    };
 
     // **The partition is reported here and not before the tokenizer, because until `n_ctx` exists
     // there is no honest number to report.** The KV cache and the activation scratch are device
@@ -1194,6 +1236,21 @@ fn run_glimmer(cfg: &Config, explicit: &Explicit) -> Result<()> {
     );
 
     let mut engine = rivoli::glimmer_gpu::Glimmer::new(&cfg.model, gt, Some(budget), n_ctx)?;
+    // **`--ppl` scores and returns; it does not decode.** Wired here rather than left to the
+    // refusal table above because neither was true of it: the flag is not architecturally
+    // inapplicable to a dense model, so refusing it would be wrong, and until now nothing read
+    // it — which is the "accepted and dropped" lie that table's own `--moe-gain` row was added
+    // to stop. `--ppl` is what register item 4.2 named as the softcap's only instrument, and
+    // what S4 item 4's dNLL ladder is built from.
+    #[cfg(feature = "teacher-forcing")]
+    if let Some(c) = &corpus {
+        let label = format!(
+            "muse-glimmer bf16, {} of {} layers pinned",
+            n_pinned, gt.n_layers
+        );
+        rivoli::eval::run(&mut engine, c, ppl_out, &label)?;
+        return Ok(());
+    }
     let t0 = std::time::Instant::now();
     let out = engine.decode(&ids, max_new, &tok.eos)?;
     let dt = t0.elapsed();
@@ -1386,7 +1443,13 @@ fn main() -> Result<()> {
             // flag refusals and the final bail. The K3 arm above still carries its own copy of
             // the first two because it has no `run_k3` yet; when it gets one, this is the
             // shape it should take, and the comment there says so.
-            return run_glimmer(&cfg, &explicit);
+            // `Args::ppl`/`ppl_out` are themselves behind `teacher-forcing`, so the CALL is
+            // gated and the signature is not — a stable signature keeps the flag's absence a
+            // build fact rather than a second code path to keep in step.
+            #[cfg(feature = "teacher-forcing")]
+            return run_glimmer(&cfg, &explicit, a.ppl.as_ref(), a.ppl_out.as_ref());
+            #[cfg(not(feature = "teacher-forcing"))]
+            return run_glimmer(&cfg, &explicit, None, None);
         }
     }
     // (Until 2026-08-08 a bail! here refused --logit-dump/--force-tokens as "V4-only
@@ -1521,13 +1584,14 @@ fn main() -> Result<()> {
     // `--ppl` scores a fixed text instead of generating, so `-bench` is meaningless there.
     // Defined in BOTH configurations rather than gating each of its three readers: without
     // the feature there is no corpus to load, so it is a `None` the sizing below folds away.
+    // `Args::ppl` exists only under the feature, so the ARGUMENT is gated and the helper is
+    // not — the same split `run_glimmer`'s call site gets for free, since its `ppl` is a
+    // parameter whose type does not depend on the feature.
     #[cfg(feature = "teacher-forcing")]
-    let ppl_ids = match &a.ppl {
-        Some(path) => Some(rivoli::eval::load_corpus(path, &tok)?),
-        None => None,
-    };
+    let ppl_arg = a.ppl.as_ref();
     #[cfg(not(feature = "teacher-forcing"))]
-    let ppl_ids: Option<Vec<u32>> = None;
+    let ppl_arg: Option<&String> = None;
+    let ppl_ids = ppl_corpus(ppl_arg, &tok)?;
     // Three shapes of run, and only `-bench` carries a token budget: `--ppl` scores a
     // corpus, and the server takes its budget per request (bounded by `--ctx`).
     let ngen = match (ppl_ids.is_some(), a.port.is_some()) {

@@ -922,6 +922,55 @@ impl Glimmer {
         self.pin.slot_stats()
     }
 
+    /// Teacher-forced NLL, one per predicted token: feed `ids` position by position and score
+    /// each step's distribution against the token that actually follows.
+    ///
+    /// **This is the instrument register item 4.2 identified and could not use.** The softcap is
+    /// argmax-invariant, so greedy decode cannot see it and total variation cannot either on a
+    /// confident prompt — but it moves the runner-up token by **15.4 nats** on trained logits.
+    /// That is a quantity only a teacher-forced score reads, because it is about the tokens the
+    /// model did NOT pick. It is also the measuring stick S4 item 4's dNLL ladder is built from,
+    /// so no quantized format can be evaluated before this exists.
+    ///
+    /// **One engine, `ids.len()` forwards, no reuse of a decode loop.** [`Self::decode`] prefills
+    /// layer-major and then samples once; scoring needs the logits at EVERY position, so it steps
+    /// [`Self::hidden_state`] per token — the same shape GLM's `nll_forced` uses and for the same
+    /// reason. That gives up layer-major's fetch amortisation, which costs nothing at
+    /// all-resident and would matter under a budget; noted rather than fixed, since a scoring run
+    /// is not a timing run.
+    ///
+    /// The last position is forwarded and then discarded: there is no `ids[len]` to score it
+    /// against. Counted here rather than by shortening the loop, because the KV cache has to hold
+    /// every position for the ones before it to be right.
+    #[cfg(feature = "teacher-forcing")]
+    pub fn nll_forced(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        ensure!(
+            ids.len() >= 2,
+            "need at least 2 tokens to score a prediction: one to feed and one to predict"
+        );
+        ensure!(
+            ids.len() <= self.n_ctx,
+            "scoring {} tokens needs a context of at least that; this engine was built for {}",
+            ids.len(),
+            self.n_ctx
+        );
+        let mut out = Vec::with_capacity(ids.len() - 1);
+        for (pos, &tok) in ids.iter().enumerate() {
+            self.hidden_state(tok, pos)?;
+            let Some(&next) = ids.get(pos + 1) else {
+                break;
+            };
+            // `sample` is what applies `output_multiplier` and the softcap, so scoring has to go
+            // through it rather than reading the hidden state — the whole point of this function
+            // is the shape of the distribution those two produce. Its argmax is discarded.
+            self.sample(self.x.ptr() as *const f32)?;
+            let lg = self.logits()?;
+            let bytes: Vec<u8> = lg.iter().flat_map(|v| v.to_le_bytes()).collect();
+            out.push(crate::eval::nll_of(&bytes, next as usize)?);
+        }
+        Ok(out)
+    }
+
     /// The logit vector the last [`Self::sample`] produced — post-softcap, `vocab` long.
     ///
     /// **The only way to see this model's logit path at all.** `output_multiplier` and

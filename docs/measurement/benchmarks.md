@@ -283,14 +283,14 @@ this is what tells the cells apart, and re-deriving it costs a device slot:
 MIN=2 at HB=16 is the cell that lands on a different `n_splits`, which is why its first
 column moves while the shipped cell's does not.
 
-## Long runs are NON-DETERMINISTIC: ~40% of 5k-token scores are silently wrong — 2026-08-02
-
-**~40% of 5k-token scores are silently wrong (2026-08-02).** Confirms the "worse than the
-crash" case: a NaN needs a slot that was never written, and on a warm pool the same race reads
-a *stale* slot instead — plausible numbers, no crash. This is why `distinct` cannot be trusted
-and why long-run PPL needs a repeat.
-
 ## Long-run divergence: a RACE, not residency — INV-1 exonerated, and the first witnessed pairs — 2026-08-05
+
+### Long runs are NON-DETERMINISTIC
+
+**~40% of 5k-token scores are silently wrong** (2026-08-02; its own section until 2026-08-14,
+folded in under the line cap because the round below root-caused it). A NaN needs a slot never
+written; on a warm pool the same race reads a STALE one — plausible numbers, no crash. Why
+`distinct` cannot be trusted and why long-run PPL needs a repeat.
 
 **Still not root-caused** — the repo's #1 OPEN defect. Two whole classes are closed, and the
 earlier measurement was wrong in a way worth keeping.
@@ -480,25 +480,15 @@ Not comparable to the 334/0 above: that was `--release`, union, all 35 targets. 
 attempts were discarded under a witnessed foreign tenant (33.6-39.5 GiB GTT, 0 kfd —
 `reference/gpu-lock.md`); cleared by draining `rh-anine`, GTT 39517 -> **17 MiB**.
 
-## Muse Glimmer bf16: 1.8 tok/s resident, 0.36–0.64 streaming, and it terminates — 2026-08-14
+## Muse Glimmer bf16: 1.8 tok/s resident, 0.36–0.64 streaming, PPL 7.008 — 2026-08-14
 
-**`scope: glimmer`.** First numbers from real Glimmer weights, S4 items 1–3. `convert_glimmer`
+**`scope: glimmer`.** First numbers from real Glimmer weights, S4 items 1–4. `convert_glimmer`
 bf16-verbatim over `meta-models/Muse-Glimmer-30B` → **55.712 GB**; census, shard verification and
-the read text are in `glimmer-open-items.md` §4.5. Sole tenant, witnessed per run. `flock …
-target/release/rivoli <artifact> --prompt "<text>" [--max-mem N] --bench <N>`.
-
-| prompt | pinned/streamed | emitted | s | tok/s | ended |
-|---|---:|---:|---:|---:|---|
-| NVMe-vs-quantized, 81 tok | 52 / 0 | 96 (limit) | 64.62 | 1.486 | limit |
-| same | 52 / 0 | 500 (limit) | 221.13 | **2.261** | limit |
-| "Say hello.", 59 tok | 52 / 0 | **110 of 400** | 60.98 | 1.804 | **EOS** |
-
-1.486 → 2.261 is warm-up amortizing, not loop variance: same binary, prompt and residency, a
-fifth of the tokens carrying the same cost. **Row three is the item** — a natural EOS stop is
-what GLM achieved in none of 56 runs before its framing was fixed (see the RETRACTION above), and
-it is the payoff of routing the prompt through `artifact::glimmer_encoding` rather than encoding
-it raw. It stopped INSIDE the reasoning channel; what that means for a server is in the register.
-**The streaming curve below** is "Say hello." at `--bench 24`, one `--max-mem` per arm.
+the read text are in `glimmer-open-items.md` §4.5. Sole tenant, witnessed per run. All-resident
+decode, 52/52 pinned: **1.486 tok/s** over 96 tokens, **2.261** over 500 (warm-up amortizing, not
+variance), **1.804** on a run that TERMINATED on EOS at 110 of 400 — a natural stop being what GLM
+managed in none of 56 runs before its framing was fixed (RETRACTION above). **The streaming curve**
+is "Say hello." at `--bench 24`, one `--max-mem` per arm:
 
 | GiB | pinned/streamed | tok/s | s/token | streamed GB/token | marginal GB/s |
 |---:|---:|---:|---:|---:|---:|
@@ -507,14 +497,24 @@ it raw. It stopped INSIDE the reasoning channel; what that means for a server is
 | 30 | 26 / 26 | 0.453 | 2.208 | 25.17 | 15.2 |
 | 15 | 10 / 42 | 0.355 | 2.817 | 40.65 | 18.0 |
 
-**First evidence that Glimmer streams at all**, and the pin is worth **5.1×** end to end.
-Marginal bandwidth RISES with the streamed count — 8.6 → 18.0 GB/s — so the per-fill fixed cost
-dominates at small streamed sets and amortizes; that is exactly what S5's prefetch item is about,
-measured before its lever is built. `GLIMMER_STREAM_SLOTS` is 1 throughout; the 30 and 15 GiB arms
-carried a 1-holder KFD witness at 18.7 MB GTT (the previous arm tearing down).
+**First evidence that Glimmer streams at all**, and the pin is worth **5.1×**. Marginal bandwidth
+RISES with the streamed count (8.6 → 18.0 GB/s): the per-fill fixed cost dominates a small streamed
+set and amortizes — what S5's prefetch item is about, measured before its lever exists;
+`GLIMMER_STREAM_SLOTS` is 1. **Prefill is unbatched** (`m = 1`, `tq = 1`): 0.416 s/token at 1201 and
+0.561 at 7661, so a 7661-token prompt is **72 minutes to first token** (§4.3).
 
-**The first version of this table was NON-MONOTONIC** — 26 streamed layers beat 9 — and it was page
-cache, not a finding: the 45 GiB arm ran first and paid the cold NFS read for the whole file.
-**82.81 s cold against 37.90 and 37.64 s warm — a 2.2× confound**, bigger than most effects here,
-reproducing to 0.8% once warm. `CLAUDE.md` warns not to build between arms; this is the same hazard
-from arm ORDER alone, and the fix is a discarded warm-up arm.
+**Teacher-forced quality, softcap priced** (`--ppl tests/ppl-corpus.txt`, 762 tokens, `bin/ppl`):
+
+| | PPL | mean dNLL | 95% CI (nats) |
+|---|---:|---:|---|
+| bf16, softcap on | **7.008490** | — | the ladder's first rung |
+| same, `cap = 1e30` | 55.467635 | **+2.06868** | [+1.80699, +2.33036] |
+
+**The softcap is worth 2.07 nats/token — 691% of PPL — while leaving greedy output bit-identical**,
+because it is argmax-invariant; §4.2 has the anchor's failed attempt and why it could not work. The
+SE (0.13351) exceeds `bin/ppl`'s 1% bar — which matters for a 1% question, not a 691% one.
+
+**The first streaming table was NON-MONOTONIC and it was PAGE CACHE, not a finding**: the 45 GiB arm
+ran first and paid the cold NFS read for the whole file — **82.81 s cold against 37.90 and 37.64 s
+warm, a 2.2× confound**, bigger than most effects here. The same hazard `CLAUDE.md` names for
+building between arms, from arm ORDER alone; the fix is a discarded warm-up arm.
