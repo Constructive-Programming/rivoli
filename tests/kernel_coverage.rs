@@ -337,7 +337,12 @@ const OWNERS: &[(&str, &[&str])] = &[
         &["kvcompress.rs", "f4gpu.rs", "glimmer_gpu.rs"],
     ),
     ("gemv_f32", &["gpu.rs", "f4gpu.rs"]),
-    ("gemv_fp8", &["gpu.rs"]),
+    // Two models, one kernel, and the second one is deliberate. GLM's attention has read fp8
+    // block-scaled weights since the beginning; Muse Glimmer's `--fp8` artifact stores its eight
+    // per-layer projections the same way, so `Glimmer::proj` dispatches here rather than growing
+    // a second fp8 GEMV (S4 item 4, 2026-08-14). NOT `gemv_fp8_bf16`, which quantizes the
+    // ACTIVATION in front of the GEMM — that one is on the row below and is a different question.
+    ("gemv_fp8", &["gpu.rs", "glimmer_gpu.rs"]),
     ("gemv_fp8_bf16", &["attn.rs", "f4gpu.rs"]),
     ("gemv_i4", &[]),
     ("gemv_i8", &["gpu.rs"]),

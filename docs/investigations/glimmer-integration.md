@@ -736,6 +736,24 @@ precisely the tree's state until the loop lands.
 holds byte-for-byte, a human has read the output, and every format in the ladder has a
 paired-dNLL row whose interval does not straddle zero (or is recorded inconclusive).
 
+> **G4 MET 2026-08-15. `glimmer-open-items.md` §4.5 has the record; the numbers are in
+> `measurement/benchmarks.md`.** Two corrections this stage made to its own plan, both worth more
+> than the checkmark:
+>
+> **The first quantized format is fp8, not int4, and the reason is not the one written above.**
+> This section says int4+g128 "is the only row that plausibly decodes at interactive speed" and
+> calls fp8 "the quality anchor" — that argument is untouched and int4 remains the next rung. What
+> it did not weigh is BUILD cost: `quantize_fp8_block`, `place_fp8` and `gemv_fp8` already existed,
+> so fp8 cost a converter pass and a `GlimmerProj` sum type, and all of that plumbing is what int4
+> will reuse. Ordering a ladder by what is cheap to build first is not the same as choosing a
+> default, and the default is still open.
+>
+> **G4's own wording needed reading carefully, and this is the case it was written for.** fp8's
+> interval DOES straddle zero (−0.00701, +0.00649). It is still a pass, because its upper bound is
+> below `bin/ppl`'s 1% bar — a null WITH power, which is exactly what "or is recorded inconclusive"
+> exists to distinguish from. A gate phrased as "does not straddle zero" would have failed the
+> honest result and passed a noisier one.
+
 ## S5 — performance, each lever priced
 
 **Serves P2, P3, P5. Nothing here starts until G4; every number lands in

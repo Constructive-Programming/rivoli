@@ -13,10 +13,11 @@
 //! stay two; a comment cannot enforce that, which is why this paragraph explains a split that
 //! otherwise looks arbitrary.
 //!
-//! **What six cycles per test does and does not buy, since the number looks like a measurement.**
-//! Every rate above was measured per RUN of a whole suite, never per allocate/free cycle, so
-//! nothing here can claim a detection probability — only that the two-thread shape is exercised on
-//! every dev-profile run for well under a second. If a regression ever slips past, raise it.
+//! **`CYCLES` is load-bearing evidence, not a tuning knob, which is why it is a named constant
+//! this file's own record quotes.** The 7.2 rates above were measured at this count; a later run
+//! at a smaller one would not be comparable to them, and a table that put the two side by side
+//! would read as a refutation while measuring something else. Review found exactly that shape here
+//! on 2026-08-14 and the arms were re-run rather than argued about.
 //!
 //! A GPU arm — it needs the device, the flock and `--test-threads=1` like every other device suite.
 #![cfg(feature = "rocm")]
@@ -25,6 +26,17 @@
 mod common;
 use common::{GLIMMER_FIXTURE_DIM as DIM, TempRoot, decode_one, glimmer_convert_fixture};
 use rivoli::artifact::model as gm;
+
+/// Engine build/decode/drop cycles per `#[test]`. **Small on purpose, and the reason it can be
+/// small is that this is a regression gate rather than the evidence for a closure.**
+///
+/// The closure arm — the "0 in 20" that justified deleting the workaround — was re-run at 500,
+/// which is the count the 7.2 baseline beside it in `hip-vmm-segv.md` was measured at. Reproduce
+/// that by raising this constant, not by running the shipped value more times: 20 runs at 6 cycles
+/// is 240 cycles of exposure against 20,000, and a table that put the two side by side would be
+/// comparing arms that differ by 83x in the thing under test. Review caught exactly that shape
+/// here on 2026-08-14.
+const CYCLES: usize = 6;
 
 /// Build, decode and drop `n` engines, varying the context so each sizes its KV cache and
 /// activations differently — the shape `glimmer_reference.rs` has, and the one that surfaced the
@@ -44,12 +56,12 @@ fn cycle(tag: &str, n: usize) {
 
 #[test]
 fn engines_build_and_drop_on_this_thread() {
-    cycle("vmm-a", 6);
+    cycle("vmm-a", CYCLES);
 }
 
 /// The second thread. See the module header: this is not a copy of the test above, it is the
 /// other half of the condition under test.
 #[test]
 fn engines_build_and_drop_on_a_second_thread_too() {
-    cycle("vmm-b", 6);
+    cycle("vmm-b", CYCLES);
 }

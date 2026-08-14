@@ -1251,12 +1251,36 @@ pub fn write_glimmer_aux(dir: &std::path::Path, eos: &[u32]) {
 
 /// Run the real `convert_glimmer` binary, so the gate exercises what ships rather than a
 /// library entry point the binary might not use.
-pub fn run_convert_glimmer(src: &std::path::Path, out: &std::path::Path) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_convert_glimmer"))
-        .arg(src)
-        .arg(out)
-        .output()
-        .expect("run convert_glimmer")
+pub fn run_convert_glimmer(
+    src: &std::path::Path,
+    out: &std::path::Path,
+    fmt: rivoli::artifact::model::GlimmerFormat,
+) -> std::process::Output {
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_convert_glimmer"));
+    c.arg(src).arg(out);
+    // The flag rather than a bool the helper interprets: what a gate exercises should be the
+    // argv an operator types, and `--fp8` is what `docs/measurement/benchmarks.md` records.
+    if fmt == rivoli::artifact::model::GlimmerFormat::Fp8 {
+        c.arg("--fp8");
+    }
+    c.output().expect("run convert_glimmer")
+}
+
+/// The bf16 weight behind a Glimmer projection, refusing any other format.
+///
+/// **A panic, not a silent reinterpretation.** Two gates are bf16 by construction — `glimmer_pin`
+/// compares the pin's bytes against the SOURCE checkpoint's, which only a verbatim artifact
+/// reproduces, and `glimmer_residency`'s fence arm launches `gemm_bf16` directly. If either ever
+/// runs on an fp8 fixture, e4m3 bytes read as bf16 halves are numbers, not an error, so the
+/// failure has to be constructed here.
+#[cfg(feature = "rocm")]
+pub fn bf16_of(w: rivoli::memory::pin::GlimmerProj) -> rivoli::memory::pin::Bf16Weight {
+    match w {
+        rivoli::memory::pin::GlimmerProj::Bf16(w) => w,
+        rivoli::memory::pin::GlimmerProj::Fp8(_) => {
+            panic!("this gate compares against bf16 source bytes and was handed an fp8 projection")
+        }
+    }
 }
 
 /// One synthetic tensor: `(name, shape, bytes)`. Named because the fixture builders pass
@@ -1270,13 +1294,47 @@ pub type FixtureTensor = (String, Vec<usize>, Vec<u8>);
 /// 136-token clone — and it should be shared anyway: the pin test's whole claim is about the
 /// artifact the converter produces, so the two must go through the same call.
 pub fn glimmer_convert_fixture(root: &std::path::Path, dim: usize) -> (Vec<FixtureTensor>, String) {
+    glimmer_convert_fixture_fmt(root, dim, rivoli::artifact::model::GlimmerFormat::Bf16)
+}
+
+/// [`glimmer_convert_fixture`] at a chosen format.
+///
+/// Separate from it rather than a third parameter on it: twelve call sites want the bf16 default
+/// and would each have to name it, which makes "this gate is about bf16" indistinguishable from
+/// "this gate never thought about the format".
+///
+/// **`GLIMMER_FIXTURE_DIM` is too small to gate fp8 and callers must not use it here.** At `dim`
+/// 8 every projection is 8x8, which is ONE `FP8_BLOCK` tile — so the scale index
+/// `(o/block)*sc_cols + i/block` is 0 for every element and a transposed or mis-strided grid is
+/// arithmetically invisible. [`GLIMMER_FP8_FIXTURE_DIM`] is the width that can see it.
+pub fn glimmer_convert_fixture_fmt(
+    root: &std::path::Path,
+    dim: usize,
+    fmt: rivoli::artifact::model::GlimmerFormat,
+) -> (Vec<FixtureTensor>, String) {
     let _ = std::fs::remove_dir_all(root);
     let tensors = glimmer_fixture(&root.join("src"), dim);
-    let o = run_convert_glimmer(&root.join("src"), &root.join("out"));
+    let o = run_convert_glimmer(&root.join("src"), &root.join("out"), fmt);
     let log = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(o.status.success(), "converter failed: {log}");
     (tensors, log)
 }
+
+/// The fixture width the fp8 gates use — **320, and every digit of it is load-bearing.**
+///
+/// `glimmer_fixture` derives `head_dim = dim/2`, `inter = dim*2`, `heads = 4`, so this gives
+/// projections of `[640, 320]`, `[320, 320]` and `[320, 640]`. Against `FP8_BLOCK` 128 that is:
+///
+/// * **multi-tile on both axes** — 5x3, 3x3 and 3x5 scale grids, so the row and column strides of
+///   the grid are both exercised. At any `dim <= 128` all three collapse to 1x1 and the whole
+///   index is dead arithmetic.
+/// * **non-square grids that are not transposes of each other** — 5x3 against 3x5, so swapping
+///   the two grid dimensions changes the answer instead of permuting it.
+/// * **ragged** — 320 is 2.5 tiles, so the last tile of that axis is 64 wide and a quantizer that
+///   assumed full tiles reads past its own row.
+///
+/// It is ~11 MB of source tensors, which converts and decodes in seconds.
+pub const GLIMMER_FP8_FIXTURE_DIM: usize = 320;
 
 /// A temp directory that removes itself on drop.
 ///

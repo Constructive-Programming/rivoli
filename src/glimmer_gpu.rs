@@ -51,13 +51,13 @@
 use crate::artifact::model::{GlimmerTextConfig, LayerKind};
 use crate::backend::NULL_STREAM;
 use crate::backend::hip::{
-    device_sync, launch_argmax, launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_gqa_attend,
-    launch_logit_softcap, launch_rmsnorm_centered_single, launch_rmsnorm_single,
+    device_sync, launch_argmax, launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_gemv_fp8,
+    launch_gqa_attend, launch_logit_softcap, launch_rmsnorm_centered_single, launch_rmsnorm_single,
     launch_rmsnorm_weightless_batch, launch_rope_split_half, launch_sigmoid_gate, launch_swiglu,
     launch_vadd,
 };
 use crate::memory::device::DeviceBuf;
-use crate::memory::pin::{Bf16Weight, GlimmerLayerPin, GlimmerPin};
+use crate::memory::pin::{GlimmerLayerPin, GlimmerPin, GlimmerProj};
 use anyhow::{Context, Result, ensure};
 
 /// f32 scratch of `n` elements.
@@ -65,25 +65,38 @@ fn scratch(n: usize) -> Result<DeviceBuf> {
     DeviceBuf::new(n * 4)
 }
 
-/// One bf16 projection applied to a single row: `out = w · x`, `w` being `[o_dim, i_dim]`.
+/// One projection applied to a single row: `out = w · x`, `w` being `[o_dim, i_dim]` in whichever
+/// format the artifact stores.
 ///
-/// A GEMM at `m = 1` rather than a GEMV because there is no bf16 GEMV in the tree and adding one
-/// is S5's arithmetic to price, not S3's. The shape check is here rather than trusted: every
-/// caller below passes a buffer sized from the config, and a projection whose `i_dim` disagrees
-/// with the activation it is handed reads past the end of a live allocation and stays fluent.
+/// The bf16 arm is a GEMM at `m = 1` rather than a GEMV because there is no bf16 GEMV in the tree
+/// and adding one is S5's arithmetic to price, not S3's. The fp8 arm IS a GEMV — `gemv_fp8` is the
+/// kernel GLM's attention already runs — and it takes the activation in f32 and dequantizes the
+/// weight per `FP8_BLOCK` tile, so this is a WEIGHT-only quantization: nothing here rounds `x`.
+/// (`gemv_fp8_bf16`, the other fp8 entry point, quantizes the activation to fp8 in front of the
+/// GEMM. It is the wrong one here — it would put an activation-quantization error into the dNLL
+/// ladder's fp8 rung that the format itself does not have.)
+///
+/// The shape check is here rather than trusted: every caller below passes a buffer sized from the
+/// config, and a projection whose `i_dim` disagrees with the activation it is handed reads past
+/// the end of a live allocation and stays fluent.
 ///
 /// # Safety
-/// `x` is `w.i_dim` live f32, `out` is `w.o_dim` writable f32, the two do not alias, and both
+/// `x` is `i_dim` live f32, `out` is `o_dim` writable f32, the two do not alias, and both
 /// outlive the next [`device_sync`].
-unsafe fn proj(x: *const f32, w: &Bf16Weight, out: *mut f32, i_dim: usize) -> Result<()> {
+unsafe fn proj(x: *const f32, w: &GlimmerProj, out: *mut f32, i_dim: usize) -> Result<()> {
+    let [o, i] = w.dims();
     ensure!(
-        w.i_dim == i_dim,
-        "projection expects an activation of {} but was handed {i_dim} — a shape mismatch here \
-         reads past the end of a live buffer and produces fluent wrong text",
-        w.i_dim
+        i == i_dim,
+        "projection expects an activation of {i} but was handed {i_dim} — a shape mismatch here \
+         reads past the end of a live buffer and produces fluent wrong text"
     );
     // SAFETY: the caller's contract, plus the `i_dim` agreement checked above.
-    unsafe { launch_gemm_bf16(x, w.packed, out, 1, w.o_dim, w.i_dim, NULL_STREAM) }
+    unsafe {
+        match w {
+            GlimmerProj::Bf16(w) => launch_gemm_bf16(x, w.packed, out, 1, o, i, NULL_STREAM),
+            GlimmerProj::Fp8(w) => launch_gemv_fp8(x, w.packed, w.scale, o, i, w.block, 1, out),
+        }
+    }
 }
 
 /// The first `n` f32 of a device buffer, on the host.
@@ -190,14 +203,14 @@ struct Handles {
     post_attn_ln: *const f32,
     pre_ffn_ln: *const f32,
     post_ffn_ln: *const f32,
-    q: Bf16Weight,
-    k: Bf16Weight,
-    v: Bf16Weight,
-    o: Bf16Weight,
-    attn_gate: Bf16Weight,
-    mlp_gate: Bf16Weight,
-    mlp_up: Bf16Weight,
-    mlp_down: Bf16Weight,
+    q: GlimmerProj,
+    k: GlimmerProj,
+    v: GlimmerProj,
+    o: GlimmerProj,
+    attn_gate: GlimmerProj,
+    mlp_gate: GlimmerProj,
+    mlp_up: GlimmerProj,
+    mlp_down: GlimmerProj,
 }
 
 impl Handles {
@@ -857,7 +870,10 @@ impl Glimmer {
                 self.eps_pre,
                 self.xn.ptr() as *mut f32,
             )?;
-            let head = self.pin.head;
+            // `lm_head` is bf16 at every [`GlimmerFormat`] — requantizing 2.690 GB read once per
+            // token is its own quality question, so the wrap here is a fact about the tensor and
+            // not a default anything falls back to.
+            let head = GlimmerProj::Bf16(self.pin.head);
             proj(
                 self.xn.ptr() as *const f32,
                 &head,
@@ -1073,6 +1089,14 @@ impl Glimmer {
         // whose `hipFree` would implicitly join drop AFTER it. So an error returned mid-layer
         // unmaps the weight slab with that layer's kernels still in flight. The success path is
         // already joined by `sample`; this covers the rest (review, 2026-08-13).
+        //
+        // > **SUPERSEDED as the whole story, 2026-08-14.** `sample`'s join is upstream of the
+        // > drop, not part of it, so "the success path is already joined" argued for a narrower
+        // > fix than the hazard needs — a successful decode still drops its engine through the
+        // > same unsynchronised unmap. `Drop for VmmBuf` now joins unconditionally, which covers
+        // > both paths at the one place that knows about the unmap. This line is left in place
+        // > because it is now REDUNDANT rather than wrong, and free: it fires only on an error
+        // > return, where a second `hipDeviceSynchronize` costs nothing anyone is timing.
         let r = self.decode_inner(prompt, max_new, eos);
         if r.is_err() {
             let _ = device_sync();

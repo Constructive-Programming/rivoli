@@ -22,7 +22,8 @@ use crate::artifact::format::{
     Dtype, ExpertSet, FormatMeta, RoutedFmt, Safetensors, SetDims, f4_layer_range, load_codebooks,
 };
 use crate::artifact::model::{
-    GLIMMER_LAYER_PREFIX, GLIMMER_LAYER_TENSORS, GlimmerTextConfig, ModelConfig, V4Config,
+    GLIMMER_LAYER_PREFIX, GLIMMER_LAYER_TENSORS, GlimmerFormat, GlimmerTextConfig, ModelConfig,
+    V4Config,
 };
 use crate::artifact::quant::{
     VQ_DIM, VQ_K, i4_expert_bytes, i4_slot_offsets, vq_expert_bytes, vq_slot_offsets,
@@ -1185,6 +1186,38 @@ impl F4Pin {
 /// that outlives the borrow, and `tests/glimmer_residency.rs::tensors_of` does exactly that.
 /// Review found this 2026-08-12. The type narrows the mistake; it does not forbid it, and the
 /// invariant on [`GlimmerPin::layer`] is what a caller actually has to honour.
+/// One Glimmer projection, in whichever format the artifact stores — see [`GlimmerFormat`].
+///
+/// **A sum type rather than a second `GlimmerLayerPin`.** Every other property of the layer is
+/// format-independent: the same twelve tensors, the same shapes, the same order, the same
+/// streaming slot. Only the arithmetic differs, and [`Self::dims`] is what lets the shape checks
+/// stay written once for both.
+#[derive(Clone, Copy)]
+pub enum GlimmerProj {
+    Bf16(Bf16Weight),
+    Fp8(Fp8Weight),
+}
+
+impl GlimmerProj {
+    /// `[o_dim, i_dim]`, whichever variant this is. Both carry them, and every caller that
+    /// checks a shape or launches a GEMV wants them rather than the format.
+    pub fn dims(&self) -> [usize; 2] {
+        match self {
+            Self::Bf16(w) => [w.o_dim, w.i_dim],
+            Self::Fp8(w) => [w.o_dim, w.i_dim],
+        }
+    }
+
+    /// The device addresses this placement occupies, in the order
+    /// [`glimmer_layer_names`] emits their names — one for bf16, weight-then-scale for fp8.
+    fn addrs(&self) -> Vec<*const u8> {
+        match self {
+            Self::Bf16(w) => vec![w.packed as *const u8],
+            Self::Fp8(w) => vec![w.packed, w.scale as *const u8],
+        }
+    }
+}
+
 pub struct GlimmerLayerPin {
     /// Pre-attention, `rms_norm_eps`.
     pub input_ln: *const f32,
@@ -1198,27 +1231,49 @@ pub struct GlimmerLayerPin {
     pub post_ffn_ln: *const f32,
     /// `[n_heads·head_dim, hidden]` = `[4096, 6656]`. **Not square**, and not derivable from
     /// `hidden / n_heads`.
-    pub q: Bf16Weight,
+    pub q: GlimmerProj,
     /// `[kv_heads·head_dim, hidden]` = `[256, 6656]`. GQA at 16 query heads per KV head.
-    pub k: Bf16Weight,
+    pub k: GlimmerProj,
     /// Same shape as [`Self::k`], and separable from it only by NAME.
-    pub v: Bf16Weight,
+    pub v: GlimmerProj,
     /// `[hidden, n_heads·head_dim]` — the transposed one.
-    pub o: Bf16Weight,
+    pub o: GlimmerProj,
     /// `self_attn.gate_proj`, same shape as [`Self::q`] and likewise separable only by name.
-    pub attn_gate: Bf16Weight,
-    pub mlp_gate: Bf16Weight,
-    pub mlp_up: Bf16Weight,
+    pub attn_gate: GlimmerProj,
+    pub mlp_gate: GlimmerProj,
+    pub mlp_up: GlimmerProj,
     /// `[hidden, inter]` — the other transposed one.
-    pub mlp_down: Bf16Weight,
+    pub mlp_down: GlimmerProj,
 }
 
 impl GlimmerLayerPin {
-    /// The twelve device addresses, in [`GLIMMER_LAYER_TENSORS`] order.
+    /// The eight projections in [`GLIMMER_LAYER_TENSORS`] order — the four norms come first
+    /// there, so this is the tail of that list.
+    ///
+    /// Exists so [`Self::addrs`] and the format checks iterate one list instead of restating
+    /// eight field names each; the four norms stay spelled out because they are four different
+    /// eps positions and a loop over them would hide that.
+    fn projs(&self) -> [GlimmerProj; 8] {
+        [
+            self.q,
+            self.k,
+            self.v,
+            self.o,
+            self.attn_gate,
+            self.mlp_gate,
+            self.mlp_up,
+            self.mlp_down,
+        ]
+    }
+
+    /// This layer's device addresses, in [`GLIMMER_LAYER_TENSORS`] order — **twelve at bf16,
+    /// twenty at fp8**, since each fp8 projection contributes its weight and then its scale grid.
     ///
     /// Exists so [`Slot::fill`] can write to each tensor's own address instead of computing an
     /// offset. A permutation here would make a streamed layer a permutation of a pinned one —
-    /// every tensor the right shape, the model silently wrong.
+    /// every tensor the right shape, the model silently wrong. The interleaving must match
+    /// [`glimmer_layer_names`] exactly, which is why both derive it from the same place:
+    /// [`GlimmerProj::addrs`] emits one or two, and that function emits one or two names.
     ///
     /// **Nothing asserts the order directly, and this doc claimed otherwise until 2026-08-12**
     /// ("asserted against that constant by `glimmer_residency.rs`" — that file never names
@@ -1226,21 +1281,15 @@ impl GlimmerLayerPin {
     /// so any swap of two same-length entries reddens the byte-identity gate, and a swap of
     /// different-length entries fails `Slot::fill`'s length check. Weaker than the assertion the
     /// doc promised, and worth knowing which one you have.
-    fn addrs(&self) -> [*const u8; GLIMMER_LAYER_TENSORS.len()] {
-        [
+    fn addrs(&self) -> Vec<*const u8> {
+        let mut a = vec![
             self.input_ln as *const u8,
             self.post_attn_ln as *const u8,
             self.pre_ffn_ln as *const u8,
             self.post_ffn_ln as *const u8,
-            self.q.packed as *const u8,
-            self.k.packed as *const u8,
-            self.v.packed as *const u8,
-            self.o.packed as *const u8,
-            self.attn_gate.packed as *const u8,
-            self.mlp_gate.packed as *const u8,
-            self.mlp_up.packed as *const u8,
-            self.mlp_down.packed as *const u8,
-        ]
+        ];
+        a.extend(self.projs().iter().flat_map(GlimmerProj::addrs));
+        a
     }
 }
 
@@ -1270,6 +1319,14 @@ pub struct GlimmerPin {
     /// visit. An all-resident pin holds it too and never reads it again — one field rather
     /// than an `Option` nothing checks.
     src: Safetensors,
+    /// Read off the artifact at build, then carried: a refill has to name the same tensors the
+    /// placement did, and at fp8 that includes each projection's scale grid.
+    fmt: GlimmerFormat,
+    /// Cloned because [`Self::layer`] needs `layer_tensor_shape` on every miss to decide which
+    /// entries take a scale, and threading a `&GlimmerTextConfig` through `layer()` would put a
+    /// second lifetime on the one signature this port has already reworked twice for aliasing.
+    /// It is 52 enum values and a dozen scalars.
+    cfg: GlimmerTextConfig,
     /// `[vocab, hidden]` bf16, 2.690 GB.
     pub embed: Bf16Weight,
     /// `lm_head.weight`, `[vocab, hidden]` bf16 — a second 2.690 GB, because
@@ -1305,10 +1362,12 @@ pub struct GlimmerPin {
 /// from under an in-flight read (`docs` — arena relocation, still open there).
 struct Slot {
     pin: GlimmerLayerPin,
-    /// Each tensor's byte length, in [`GLIMMER_LAYER_TENSORS`] order — the extent of the
-    /// placement the matching address in `pin.addrs()` points at. A refill checks the incoming
-    /// tensor against this, which is what bounds the write to its own placement.
-    lens: [usize; GLIMMER_LAYER_TENSORS.len()],
+    /// Each tensor's byte length, in [`GLIMMER_LAYER_TENSORS`] order and as long as
+    /// `pin.addrs()` — the extent of the placement the matching address points at. A refill
+    /// checks the incoming tensor against this, which is what bounds the write to its own
+    /// placement. `Vec` rather than a fixed array because an fp8 layer carries twenty entries
+    /// to a bf16 layer's twelve.
+    lens: Vec<usize>,
 }
 
 /// Place one Glimmer f32 norm, with its LENGTH checked against `hidden`.
@@ -1336,45 +1395,84 @@ fn place_glimmer_norm(
     Ok(tier.place(bytes)? as *const f32)
 }
 
-/// Place one Glimmer layer projection, with the shape the config implies.
+/// Place one Glimmer layer projection in `fmt`, with the shape the config implies.
 ///
 /// The shape comes from [`GlimmerTextConfig::layer_tensor_shape`] rather than from the caller,
 /// so the twelve call sites below cannot each get it slightly wrong, and so the one table
 /// `tests/glimmer_names.rs` validates against the shipped checkpoint is the one used here.
+///
+/// **The dtype is not a parameter to get wrong either** — `place_bf16` and `place_fp8` each go
+/// through `Safetensors::typed`, which refuses any other dtype. So an fp8 artifact loaded as bf16
+/// fails on the first projection with a dtype error rather than reading e4m3 bytes as bf16 halves,
+/// which would be fluent wrong text at exactly half the expected magnitude.
 fn place_glimmer_proj(
     tier: &mut DeviceTier,
-    st: &Safetensors,
-    cfg: &GlimmerTextConfig,
+    src: &LayerSrc,
     prefix: &str,
     tensor: &str,
-) -> Result<Bf16Weight> {
-    let want = cfg.layer_tensor_shape(tensor)?;
-    let w = place_bf16(tier, st, &format!("{prefix}.{tensor}.weight"))?;
+) -> Result<GlimmerProj> {
+    let want = src.cfg.layer_tensor_shape(tensor)?;
+    let name = format!("{prefix}.{tensor}");
+    let w = match src.fmt {
+        GlimmerFormat::Bf16 => {
+            GlimmerProj::Bf16(place_bf16(tier, src.st, &format!("{name}.weight"))?)
+        }
+        GlimmerFormat::Fp8 => GlimmerProj::Fp8(place_fp8(
+            tier,
+            src.st,
+            &name,
+            crate::artifact::quant::FP8_BLOCK,
+        )?),
+    };
     // Checked AFTER placing, which is safe and not merely tolerable: the tier is sized from
     // `resident_bytes`, so a tensor larger than its declared shape bails inside `place` on
     // capacity instead, and either way the pin refuses before a decode ever runs. Checking
     // first would mean reading the header twice for the sake of which error message fires.
+    let got = w.dims();
     ensure!(
-        [w.o_dim, w.i_dim] == want[..],
-        "{prefix}.{tensor}.weight is [{}, {}], but this config implies {want:?} — the \
-         artifact and the config describe different models",
-        w.o_dim,
-        w.i_dim
+        got == want[..],
+        "{name}.weight is {got:?}, but this config implies {want:?} — the \
+         artifact and the config describe different models"
     );
     Ok(w)
 }
 
-/// One layer's tensor names, in the order [`GLIMMER_LAYER_TENSORS`] declares them.
+/// One layer's tensor names, in the order [`GLIMMER_LAYER_TENSORS`] declares them, with an fp8
+/// artifact's scale grids interleaved after the weights they scale.
 ///
 /// The prefix is spelled once here rather than at each of the two call sites (pinned
 /// placement and slot layout), because the two must agree tensor-for-tensor or a streamed
 /// layer would be a permutation of a pinned one — and a permutation of correctly-shaped
 /// tensors is exactly the silent wrongness this port keeps finding.
-fn glimmer_layer_names(l: usize) -> Vec<String> {
-    GLIMMER_LAYER_TENSORS
-        .iter()
-        .map(|t| format!("{GLIMMER_LAYER_PREFIX}.{l}.{t}.weight"))
-        .collect()
+///
+/// **Which entries take a scale is decided by `layer_tensor_shape`**, the same table
+/// `layer_bytes` consults to decide whether an entry is a norm or a projection — not by a second
+/// reading of the name. A `t.ends_with("layernorm")` here would be a third spelling of that split,
+/// and the one that silently disagrees is the one that costs a debugging session.
+fn glimmer_layer_names(src: &LayerSrc, l: usize) -> Result<Vec<String>> {
+    let mut v = Vec::with_capacity(GLIMMER_LAYER_TENSORS.len());
+    for t in GLIMMER_LAYER_TENSORS {
+        let base = format!("{GLIMMER_LAYER_PREFIX}.{l}.{t}");
+        v.push(format!("{base}.weight"));
+        if src.fmt == GlimmerFormat::Fp8 && src.cfg.layer_tensor_shape(t)?.len() == 2 {
+            v.push(format!("{base}.weight_scale_inv"));
+        }
+    }
+    Ok(v)
+}
+
+/// Where one Glimmer layer's tensors come from: the open artifact, the config that says what shape
+/// each of them should be, and the format they are stored in.
+///
+/// **One struct because the three are never apart.** `place_glimmer_layer`, `Slot::new` and
+/// `Slot::fill` each need all three, and once `fmt` joined the list on 2026-08-14 their parameter
+/// lists became a 39-token jscpd clone of each other. This is the factoring that removes the text
+/// rather than an exemption that hides it — `build.rs`'s own note is that the gate did not author
+/// what it found.
+struct LayerSrc<'a> {
+    st: &'a Safetensors,
+    cfg: &'a GlimmerTextConfig,
+    fmt: GlimmerFormat,
 }
 
 /// Place one whole layer into the tier — the pinned path.
@@ -1383,29 +1481,25 @@ fn glimmer_layer_names(l: usize) -> Vec<String> {
 /// pin over slot-relative addresses. Both go through [`place_glimmer_norm`] and
 /// [`place_glimmer_proj`], so both keep the extent and shape checks that two reviews added on
 /// 2026-08-11.
-fn place_glimmer_layer(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
-    cfg: &GlimmerTextConfig,
-    l: usize,
-) -> Result<GlimmerLayerPin> {
+fn place_glimmer_layer(tier: &mut DeviceTier, src: &LayerSrc, l: usize) -> Result<GlimmerLayerPin> {
     let p = format!("{GLIMMER_LAYER_PREFIX}.{l}");
     let norm = |tier: &mut DeviceTier, t: &str| {
-        place_glimmer_norm(tier, st, cfg.hidden, &format!("{p}.{t}"))
+        place_glimmer_norm(tier, src.st, src.cfg.hidden, &format!("{p}.{t}"))
     };
+    let proj = |tier: &mut DeviceTier, t: &str| place_glimmer_proj(tier, src, &p, t);
     Ok(GlimmerLayerPin {
         input_ln: norm(tier, "input_layernorm.weight")?,
         post_attn_ln: norm(tier, "post_attention_layernorm.weight")?,
         pre_ffn_ln: norm(tier, "pre_feedforward_layernorm.weight")?,
         post_ffn_ln: norm(tier, "post_feedforward_layernorm.weight")?,
-        q: place_glimmer_proj(tier, st, cfg, &p, "self_attn.q_proj")?,
-        k: place_glimmer_proj(tier, st, cfg, &p, "self_attn.k_proj")?,
-        v: place_glimmer_proj(tier, st, cfg, &p, "self_attn.v_proj")?,
-        o: place_glimmer_proj(tier, st, cfg, &p, "self_attn.o_proj")?,
-        attn_gate: place_glimmer_proj(tier, st, cfg, &p, "self_attn.gate_proj")?,
-        mlp_gate: place_glimmer_proj(tier, st, cfg, &p, "mlp.gate_proj")?,
-        mlp_up: place_glimmer_proj(tier, st, cfg, &p, "mlp.up_proj")?,
-        mlp_down: place_glimmer_proj(tier, st, cfg, &p, "mlp.down_proj")?,
+        q: proj(tier, "self_attn.q_proj")?,
+        k: proj(tier, "self_attn.k_proj")?,
+        v: proj(tier, "self_attn.v_proj")?,
+        o: proj(tier, "self_attn.o_proj")?,
+        attn_gate: proj(tier, "self_attn.gate_proj")?,
+        mlp_gate: proj(tier, "mlp.gate_proj")?,
+        mlp_up: proj(tier, "mlp.up_proj")?,
+        mlp_down: proj(tier, "mlp.down_proj")?,
     })
 }
 
@@ -1417,8 +1511,8 @@ impl Slot {
     /// alternative was a second offset table, which is a second thing to get wrong and which
     /// jscpd would have matched against the first. The bytes placed here are layer 0's and
     /// are overwritten by the first [`Self::fill`]; what survives is the geometry.
-    fn new(tier: &mut DeviceTier, st: &Safetensors, cfg: &GlimmerTextConfig) -> Result<Self> {
-        let pin = place_glimmer_layer(tier, st, cfg, 0)?;
+    fn new(tier: &mut DeviceTier, src: &LayerSrc) -> Result<Self> {
+        let pin = place_glimmer_layer(tier, src, 0)?;
         // **A refill's destination is the PIN'S OWN ADDRESS — there is no offset arithmetic at
         // all.** Two earlier shapes were worse. The first recomputed `next_multiple_of(256)` per
         // tensor to predict where `place` had put things: a second copy of `bump`, correct only
@@ -1431,9 +1525,19 @@ impl Slot {
         // Writing to each address directly needs no ordering assumption and no subtraction, and
         // each write is bounded by the extent of the placement it targets — which is what `lens`
         // records and `fill` enforces.
-        let mut lens = [0usize; GLIMMER_LAYER_TENSORS.len()];
-        for (len, name) in lens.iter_mut().zip(glimmer_layer_names(0)) {
-            *len = st.raw(&name)?.0.len();
+        let names = glimmer_layer_names(src, 0)?;
+        // The two lists are built from the same `fmt` and must come out the same length; a
+        // mismatch would silently truncate the shorter side in `fill`'s `zip` and leave whatever
+        // tensor fell off the end holding layer 0's bytes for the whole run.
+        ensure!(
+            names.len() == pin.addrs().len(),
+            "slot layout: {} names against {} placements",
+            names.len(),
+            pin.addrs().len()
+        );
+        let mut lens = Vec::with_capacity(names.len());
+        for name in &names {
+            lens.push(src.st.raw(name)?.0.len());
         }
         Ok(Self { pin, lens })
     }
@@ -1454,15 +1558,15 @@ impl Slot {
     /// grows a layer-blocked output and this becomes an `AsyncFetch` submit.** Until then the
     /// page cache is doing the caching, which S5 must account for before quoting any
     /// bytes-from-disk number.
-    fn fill(&mut self, st: &Safetensors, l: usize) -> Result<()> {
+    fn fill(&mut self, src: &LayerSrc, l: usize) -> Result<()> {
         for ((&dst, &len), name) in self
             .pin
             .addrs()
             .iter()
             .zip(&self.lens)
-            .zip(glimmer_layer_names(l))
+            .zip(glimmer_layer_names(src, l)?)
         {
-            let bytes = st.raw(&name)?.0;
+            let bytes = src.st.raw(&name)?.0;
             ensure!(
                 bytes.len() == len,
                 "{name} is {} bytes but layer 0's was {len} — every Glimmer layer is the same \
@@ -1495,8 +1599,7 @@ impl GlimmerPin {
     /// whole `--cache-policy` axis collapses to one answer here, `run_glimmer` still refuses
     /// the flag, and nothing in this file consults residency to make a decision.
     pub fn build(dir: &str, cfg: &GlimmerTextConfig, budget: Option<usize>) -> Result<Self> {
-        let (n_pinned, capacity) = cfg.partition(budget)?;
-        // **The cheap refusals first, then the 55.7 GB allocation.** `FormatMeta::load` is the
+        // **The cheap refusals first, then the 30-55 GB allocation.** `FormatMeta::load` is the
         // version and VQ-parameter gate every artifact passes — skipping it would let one
         // written by an older converter load silently — and `open_dir` is where a missing or
         // malformed shard is found. Both were BELOW `DeviceTier::new` until review pointed out
@@ -1504,6 +1607,12 @@ impl GlimmerPin {
         // fired, which inverts the ordering the rest of this port is careful about.
         FormatMeta::load(dir)?;
         let st = Safetensors::open_dir(dir)?;
+        // The partition moved BELOW the open because it now needs the format, and the format is
+        // a property of the tensors rather than of the config — an artifact is what says whether
+        // a layer costs 967.942 MB or 484.142 MB, so a tier sized before reading one would be
+        // sized for whichever format the code happened to assume.
+        let fmt = GlimmerFormat::of(&st)?;
+        let (n_pinned, capacity) = cfg.partition(budget, fmt)?;
         let mut tier = DeviceTier::new(capacity)?;
 
         let embed = place_bf16(&mut tier, &st, "model.language_model.embed_tokens.weight")?;
@@ -1545,28 +1654,45 @@ impl GlimmerPin {
         // Headers only: this reads the index, not the bytes, so it costs 12 lookups per layer
         // and no device memory. It also restores the ordering this function argues for above —
         // the cheap refusals before the big allocation.
+        //
+        // The projection dtype comes from `fmt`, which was read off layer 0 — so this loop is
+        // also what refuses a MIXED artifact, where some layers are bf16 and some fp8. The scale
+        // grid is checked here too, because at fp8 a projection with no `weight_scale_inv` would
+        // otherwise reach `Slot::fill` as a missing-tensor error mid-token.
         for l in n_pinned..cfg.n_layers {
             let p = format!("{GLIMMER_LAYER_PREFIX}.{l}");
             for t in GLIMMER_LAYER_TENSORS {
                 let name = format!("{p}.{t}.weight");
                 let want = cfg.layer_tensor_shape(t)?;
                 let (_, dtype, shape) = st.raw(&name)?;
-                let want_dtype = if want.len() == 1 {
-                    Dtype::F32
-                } else {
-                    Dtype::Bf16
+                let want_dtype = match (want.len(), fmt) {
+                    (1, _) => Dtype::F32,
+                    (_, GlimmerFormat::Bf16) => Dtype::Bf16,
+                    (_, GlimmerFormat::Fp8) => Dtype::F8E4M3,
                 };
                 ensure!(
                     *shape == want[..] && dtype == want_dtype,
                     "{name} is {shape:?} {dtype:?}, but this config implies {want:?} \
                      {want_dtype:?} — the artifact and the config describe different models"
                 );
+                if want.len() == 2 && fmt == GlimmerFormat::Fp8 {
+                    let b = crate::artifact::quant::FP8_BLOCK;
+                    let sname = format!("{p}.{t}.weight_scale_inv");
+                    let grid: Vec<usize> = want.iter().map(|d| d.div_ceil(b)).collect();
+                    let (_, sdtype, sshape) = st.raw(&sname)?;
+                    ensure!(
+                        *sshape == grid[..] && sdtype == Dtype::F32,
+                        "{sname} is {sshape:?} {sdtype:?}, but a {want:?} weight at block {b} \
+                         implies {grid:?} F32"
+                    );
+                }
             }
         }
 
+        let src = LayerSrc { st: &st, cfg, fmt };
         let mut pinned = Vec::with_capacity(n_pinned);
         for l in 0..n_pinned {
-            pinned.push(place_glimmer_layer(&mut tier, &st, cfg, l)?);
+            pinned.push(place_glimmer_layer(&mut tier, &src, l)?);
         }
         // Slots only when something streams. `n_pinned == n_layers` allocates none, so the
         // all-resident partition costs exactly what it did before this budget existed.
@@ -1577,11 +1703,13 @@ impl GlimmerPin {
         };
         let mut slots = Vec::with_capacity(n_slots);
         for _ in 0..n_slots {
-            slots.push(Slot::new(&mut tier, &st, cfg)?);
+            slots.push(Slot::new(&mut tier, &src)?);
         }
         Ok(Self {
             tier,
             src: st,
+            fmt,
+            cfg: cfg.clone(),
             embed,
             head,
             final_norm,
@@ -1592,6 +1720,12 @@ impl GlimmerPin {
             hits: 0,
             fills: 0,
         })
+    }
+
+    /// The format this artifact's projections are in — what `run_glimmer` labels a `--ppl` row
+    /// with, so a ladder rung cannot be recorded under the wrong format's name.
+    pub fn format(&self) -> GlimmerFormat {
+        self.fmt
     }
 
     /// Layer `l`'s twelve device addresses — **pinned or streamed, indistinguishably.**
@@ -1684,7 +1818,14 @@ impl GlimmerPin {
         // and got the mixture, silently. Review finding, 2026-08-12: a flag set in the success
         // path and not cleared in the failure path.
         self.slot_layer[s] = None;
-        self.slots[s].fill(&self.src, l)?;
+        self.slots[s].fill(
+            &LayerSrc {
+                st: &self.src,
+                cfg: &self.cfg,
+                fmt: self.fmt,
+            },
+            l,
+        )?;
         self.slot_layer[s] = Some(l);
         self.fills += 1;
         Ok(&self.slots[s].pin)

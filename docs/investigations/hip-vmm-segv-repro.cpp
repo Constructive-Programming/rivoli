@@ -20,9 +20,14 @@
 //   * The same work split across TWO threads that never run concurrently: crashes.
 // So it is not concurrency and not churn on its own — it is that a second thread participates.
 //
-// Build:  hipcc -O2 -o vmm_repro vmm_repro.cpp
+// Build:  hipcc -O2 -o vmm_repro hip-vmm-segv-repro.cpp
 // Run:    ./vmm_repro [cycles_per_thread] [threads] [bytes]
-// Exit:   0 = completed, 1 = a HIP call returned an error, or SIGSEGV.
+//
+// Exit:   0 = completed, 1 = a HIP call returned an error or an argument was rejected.
+//         **A reproduction is a SIGNAL DEATH, not an exit code** — the shell reports 139 and
+//         `waitpid` reports `WIFSIGNALED`, never 1. A harness that counts `$? == 1` counts zero
+//         crashes on a firing reproducer, which is the same class of false read as the SIGBUS
+//         noted in `hip-vmm-segv.md`. Count `$? -ge 128`, or just `!= 0`.
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
@@ -101,8 +106,16 @@ static void cycle(int id, int cycles, size_t bytes) {
     hipMemGenericAllocationHandle_t h;
     size_t mapped = 0;
 
-    // Sizes vary per cycle, as the application's do (a differently-sized tier per engine):
-    // every distinct size is a distinct granularity rounding and a distinct VA reservation.
+    // Sizes vary per cycle so that every cycle is a distinct granularity rounding and a distinct
+    // VA reservation — an extra degree of freedom, NOT a transliteration.
+    //
+    // > CORRECTED 2026-08-14 by review. This said "as the application's do (a differently-sized
+    // > tier per engine)". The application's tier is NOT differently sized per engine: the loop
+    // > under suspicion builds every engine with `budget: None`, which reaches
+    // > `GlimmerTextConfig::partition(None)` and returns a capacity derived from the config alone.
+    // > The per-engine variation is in the KV and activation `hipMalloc`s, not in the VMM
+    // > mapping. So varying here covers a case the application does not have, and the case it
+    // > does have — the same size reserved and released over and over — is row 1 of the bisect.
     vmm_alloc(bytes + (size_t)(i % 5) * 4096, 0, &vp, &h, &mapped);
 
     // The CPU fills the mapping in place — the reason for using VMM at all.
@@ -149,8 +162,15 @@ int main(int argc, char** argv) {
   // `g_map = nullptr` on failure, so the `memcpy` below was skipped and the run still exited 0
   // while claiming to have exercised a page-cache source. That is the same class as the SIGBUS
   // this file already records: a silently weakened reproducer reads as a negative result.
+  //
+  // **In the CURRENT DIRECTORY, not `/tmp`.** The property being modelled is that the source
+  // pages are page cache backed by a real filesystem, the way the weight artifact's mmap is. On
+  // the box this was written for, `/tmp` is a 63 GB tmpfs in RAM — a `MAP_PRIVATE` mapping of a
+  // tmpfs file never faults in from a block device, so putting it there would have quietly
+  // removed the one ingredient this block exists to supply while the comment still claimed it.
+  // Run this from a directory on real storage. (Review caught the tmpfs version, 2026-08-14.)
   {
-    char path[] = "/tmp/vmm_repro_src_XXXXXX";
+    char path[] = "vmm_repro_src_XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) {
       std::perror("mkstemp");

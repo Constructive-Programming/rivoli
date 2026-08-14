@@ -508,13 +508,33 @@ mod tier {
         /// its ERROR path, on the reasoning that success is "already joined by `sample`". The
         /// join belongs where the unmap is, so no caller has to re-derive it.
         ///
-        /// That reasoning was too narrow — two of the three cores captured while chasing the §4b
-        /// SIGSEGV were success-path drops.
+        /// **SCOPE, because "no caller has to re-derive it" overstated this when first written.**
+        /// `hipDeviceSynchronize` retires work already enqueued *by any thread*, so this closes
+        /// the hazard for the thread doing the drop. It cannot close the other order: a SECOND
+        /// thread that enqueues after this returns writes into a mapping that is about to go away,
+        /// and no barrier here can prevent that. `RoutedPool` has that shape today — no `Drop`
+        /// impl, so its fields drop in declaration order and `buf: VmmBuf` goes before
+        /// `fetch: AsyncFetch`, whose reaper thread is joined later and drains queued jobs into
+        /// `host_ptr()` on the way out. Reported by review 2026-08-14, static argument only, not
+        /// reproduced; `glimmer-open-items.md` carries it. It is also not an io_uring barrier —
+        /// this waits on the device, not on completions.
         ///
-        /// > **This was written while chasing that SIGSEGV and is NOT what fixed it** — measured,
-        /// > 2 crashes in 27 runs before and 1 in 25 after, indistinguishable. That turned out to
-        /// > be an upstream bug, gone in ROCm 7.14. It survives on the hazard above, which is real
-        /// > on its own.
+        /// That reasoning is too narrow **on the a-priori argument alone** — an engine is dropped
+        /// on the success path too, and `sample`'s join is upstream of the drop, not part of it.
+        ///
+        /// > **This was written while chasing the §4b SIGSEGV and is NOT what fixed it** —
+        /// > measured, 2 crashes in 27 runs before and 1 in 25 after, indistinguishable. That
+        /// > turned out to be an upstream bug, gone in ROCm 7.14.
+        /// >
+        /// > **No captured core supports this line, and an earlier version of this comment claimed
+        /// > one did** ("two of the three cores were success-path drops", 2026-08-14). The census
+        /// > in `docs/investigations/hip-vmm-segv.md` says the opposite: of four cores, THREE are
+        /// > in `rivoli_vmm_alloc` under `GlimmerPin::build` and exactly one is in
+        /// > `rivoli_vmm_free` — and that one faulted inside `hipMemUnmap` on what the same file
+        /// > concludes was an upstream NULL dereference, which is not evidence of a live kernel
+        /// > either. The sentence inverted the measurement it cited. **This line stands on the
+        /// > synchronisation argument above and on nothing measured**, which is a weaker claim and
+        /// > the true one.
         ///
         /// A `device_sync` per teardown is free in the only sense that matters: buffers of this
         /// kind are built once per engine, not per token.

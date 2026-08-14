@@ -161,16 +161,6 @@ ps -o pid,ppid,pgid,cmd -C rivoli
 If `PGID` equals the process's own `PID`, and `PPID` is not the harness shell, the run
 survives a reap. `tests/ppl-sweep-powered.sh` cites this check.
 
-## Measurement caveat
-
-**Free-running greedy tok/s cannot rank modes.** A degenerate run routes to the same few
-experts -> inflated hit% -> artificially FAST; the early int4 rows posted the highest tok/s
-BECAUSE they degenerated. Gate on output quality first, then read the rate.
-
-**And the distinct-token gate cannot be that quality gate.** 2026-07-27 a branch-gain sweep
-tripled PPL (**73 -> 216**) while distinct-ratio held. It separates a crash from a completion,
-nothing more — every cell of the retracted matrix passed it.
-
 ## DSA indexer round: `examples/indexer_bench`
 
 Instrument for the NPU-offload gates (`investigations/npu-offload.md` M0/M1), gfx1151 sole
@@ -207,6 +197,13 @@ The matrix itself was bracket 44 -> 8 -> 4 -> 2 at 512/2048/4096/10000 tokens, `
 one process per cell, ~10 h; **the 512-token column stands** and the rest is the artifact. (Its
 own heading was folded in here 2026-08-14 under this file's line cap — it said nothing this
 paragraph does not.)
+
+**Two method caveats folded in here 2026-08-15, same reason, because this retraction is what they
+are about.** *Free-running greedy tok/s cannot rank modes*: a degenerate run routes to the same few
+experts → inflated hit% → artificially FAST, and the early int4 rows posted the highest tok/s
+BECAUSE they degenerated — gate on quality first, then read the rate. *And the distinct-token gate
+cannot be that quality gate*: 2026-07-27 a branch-gain sweep tripled PPL (**73 → 216**) while
+distinct-ratio held. Every cell of this matrix passed it.
 
 ## `--mode int4` vs int3-vq — the point estimate favours int4, the test cannot confirm it
 
@@ -480,15 +477,15 @@ Not comparable to the 334/0 above: that was `--release`, union, all 35 targets. 
 attempts were discarded under a witnessed foreign tenant (33.6-39.5 GiB GTT, 0 kfd —
 `reference/gpu-lock.md`); cleared by draining `rh-anine`, GTT 39517 -> **17 MiB**.
 
-## Muse Glimmer bf16: 1.8 tok/s resident, 0.36–0.64 streaming, PPL 7.008 — 2026-08-14
+## Muse Glimmer: the format ladder — fp8 halves the model for **−0.00026 nats** — 2026-08-14
 
-**`scope: glimmer`.** First numbers from real Glimmer weights, S4 items 1–4. `convert_glimmer`
-bf16-verbatim over `meta-models/Muse-Glimmer-30B` → **55.712 GB**; census, shard verification and
-the read text are in `glimmer-open-items.md` §4.5. Sole tenant, witnessed per run. All-resident
-decode, 52/52 pinned: **1.486 tok/s** over 96 tokens, **2.261** over 500 (warm-up amortizing, not
-variance), **1.804** on a run that TERMINATED on EOS at 110 of 400 — a natural stop being what GLM
-managed in none of 56 runs before its framing was fixed (RETRACTION above). **The streaming curve**
-is "Say hello." at `--bench 24`, one `--max-mem` per arm:
+**`scope: glimmer`.** Real Glimmer weights, S4 items 1–4. `glimmer-open-items.md` §4.5 owns the
+narrative — census, shard verification, the read text, the page-cache confound; this section owns
+the numbers. `convert_glimmer` over `meta-models/Muse-Glimmer-30B` → **55.712 GB** bf16, **30.555
+GB** `--fp8`. Sole tenant, witnessed per run. All-resident bf16 decode, 52/52 pinned: **1.486
+tok/s** over 96 tokens, **2.261** over 500 (warm-up amortizing, not variance), **1.804** on a run
+that TERMINATED on EOS at 110 of 400 — what GLM managed in none of 56 (RETRACTION above). **The
+bf16 streaming curve**, "Say hello." at `--bench 24`, one `--max-mem` per arm:
 
 | GiB | pinned/streamed | tok/s | s/token | streamed GB/token | marginal GB/s |
 |---:|---:|---:|---:|---:|---:|
@@ -497,24 +494,27 @@ is "Say hello." at `--bench 24`, one `--max-mem` per arm:
 | 30 | 26 / 26 | 0.453 | 2.208 | 25.17 | 15.2 |
 | 15 | 10 / 42 | 0.355 | 2.817 | 40.65 | 18.0 |
 
-**First evidence that Glimmer streams at all**, and the pin is worth **5.1×**. Marginal bandwidth
-RISES with the streamed count (8.6 → 18.0 GB/s): the per-fill fixed cost dominates a small streamed
-set and amortizes — what S5's prefetch item is about, measured before its lever exists;
-`GLIMMER_STREAM_SLOTS` is 1. **Prefill is unbatched** (`m = 1`, `tq = 1`): 0.416 s/token at 1201 and
-0.561 at 7661, so a 7661-token prompt is **72 minutes to first token** (§4.3).
+The pin is worth **5.1×**, and marginal bandwidth RISES with the streamed count (8.6 → 18.0 GB/s):
+per-fill fixed cost dominates a small streamed set and amortizes — S5's prefetch item, measured
+before its lever exists; `GLIMMER_STREAM_SLOTS` is 1. **Prefill is unbatched** (`m = 1`, `tq = 1`),
+0.416 s/token at 1201 and 0.561 at 7661 = **72 minutes to first token** on 7661 (§4.3).
 
-**Teacher-forced quality, softcap priced** (`--ppl tests/ppl-corpus.txt`, 762 tokens, `bin/ppl`):
+**Teacher-forced quality — the S4 ladder, and the softcap priced** (`--ppl tests/ppl-corpus.txt`,
+762 tokens, `bin/ppl`, baseline bf16). Both format arms re-run back to back on ROCm **7.14.60850**:
 
-| | PPL | mean dNLL | 95% CI (nats) |
-|---|---:|---:|---|
-| bf16, softcap on | **7.008490** | — | the ladder's first rung |
-| same, `cap = 1e30` | 55.467635 | **+2.06868** | [+1.80699, +2.33036] |
+| | PPL | mean dNLL | 95% CI (nats) | verdict |
+|---|---:|---:|---|---|
+| bf16, 55.712 GB | **7.008490** | — | — | the reference rung |
+| **fp8, 30.555 GB** | **7.006667** | **−0.00026** | [−0.00701, **+0.00649**] | **PASS**, and CONCLUSIVE |
+| bf16, `cap = 1e30` | 55.467635 | **+2.06868** | [+1.80699, +2.33036] | **691% of PPL**, argmax-invariant (§4.2) |
 
-**The softcap is worth 2.07 nats/token — 691% of PPL — while leaving greedy output bit-identical**,
-because it is argmax-invariant; §4.2 has the anchor's failed attempt and why it could not work. The
-SE (0.13351) exceeds `bin/ppl`'s 1% bar — which matters for a 1% question, not a 691% one.
-
-**The first streaming table was NON-MONOTONIC and it was PAGE CACHE, not a finding**: the 45 GiB arm
-ran first and paid the cold NFS read for the whole file — **82.81 s cold against 37.90 and 37.64 s
-warm, a 2.2× confound**, bigger than most effects here. The same hazard `CLAUDE.md` names for
-building between arms, from arm ORDER alone; the fix is a discarded warm-up arm.
+**fp8 costs nothing measurable and the interval is tight enough to SAY so**: its 95% upper bound
+(+0.00649) is under `bin/ppl`'s 1% bar (0.00995) — a pass, not the underpowered null that tool
+prints a paragraph distinguishing; `worse%` 53.9 = no systematic shift. `--fp8` quantizes the
+**416** layer projections only — `embed_tokens`/`lm_head`/norms stay bf16, hence 54.8% and not 50%.
+Greedy output READ: coherent, on topic. **The bf16 arm was re-run only because the recorded one
+predated 7.14, and the two are BYTE-IDENTICAL** (0 of 761 NLLs differ), so that runtime change has
+zero measured effect here. **No speed number from these runs** — the fp8 wall clock (141.9 s vs
+306.4) and a 220-token fp8 decode at 4.714 tok/s both had a NON-EMPTY witness (`/tmp/hiptest`, root,
+not ours), and the rule here is to discard such an arm; they are lower bounds, and the clean format
+A/B is S5's.

@@ -271,6 +271,43 @@ impl<'a> SafeWriter<'a> {
         self.add_fp8_pair(name, w.into(), shape, f32b.into(), ssh)
     }
 
+    /// Quantize a BF16 tensor to fp8-e4m3 at `block` and add it as the `<name>.weight` +
+    /// `<name>.weight_scale_inv` pair the resident fp8 path reads. `name` is the BASE, as
+    /// [`Self::copy_fp8_e8m0`] takes it.
+    ///
+    /// **The only converter path in this tree that quantizes rather than copies**, and
+    /// `quant::quantize_fp8_block`'s doc carries the whole argument for why: GLM, DeepSeek-V4 and
+    /// Kimi-K3 all ship a publisher's quantization to copy, Muse Glimmer ships bf16 and nothing
+    /// else, so the scale choice here is rivoli's and answers to a dNLL measurement rather than to
+    /// an upstream.
+    ///
+    /// **Owned output, unlike [`Self::copy_verbatim`]'s borrow.** One byte per weight plus the
+    /// grid, so quantizing the shipped Glimmer's 416 projections holds ~25.2 GB before [`Self::write`]
+    /// runs. `ponytail:` accepted rather than engineered around — this is a one-off offline
+    /// conversion on a 128 GB host, and it is the only reason a bf16 convert of the same model
+    /// costs no host memory at all. Upgrade path if it ever binds: `write` gains a streaming mode
+    /// that emits each payload as it is produced instead of collecting them first.
+    pub fn add_quantized_fp8(
+        &mut self,
+        src: &'a Safetensors,
+        name: &str,
+        block: usize,
+    ) -> Result<()> {
+        let wname = format!("{name}.weight");
+        let (raw, shape) = src.typed(&wname, Dtype::Bf16)?;
+        ensure!(shape.len() == 2, "{wname}: shape {shape:?} is not 2-D");
+        let w: Vec<f32> = raw
+            .chunks_exact(2)
+            .map(|c| crate::math::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let (packed, scale) =
+            crate::artifact::quant::quantize_fp8_block(&w, [shape[0], shape[1]], block)
+                .with_context(|| wname.clone())?;
+        let sshape: Vec<usize> = shape.iter().map(|d| d.div_ceil(block)).collect();
+        let sbytes: Vec<u8> = scale.iter().flat_map(|s| s.to_le_bytes()).collect();
+        self.add_fp8_pair(name, packed.into(), shape, sbytes.into(), &sshape)
+    }
+
     /// Copy a tensor verbatim — same dtype, same shape, same bytes. For the ones that are
     /// already what the loader wants (`attn_sink` and the `hc_*` tables are F32; `embed`
     /// and `head` stay BF16 because whether to requantize them is a QUALITY decision with

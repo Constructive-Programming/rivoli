@@ -293,6 +293,9 @@ fn the_resident_byte_accounting_reproduces_the_checkpoint() {
             n * if f.shape.len() == 1 { 4 } else { 2 }
         })
         .sum();
-    assert_eq!(shipped().resident_bytes().unwrap(), want);
+    assert_eq!(
+        shipped().resident_bytes(gm::GlimmerFormat::Bf16).unwrap(),
+        want
+    );
     assert_eq!(want, 55_712_344_064, "55.712 GB resident");
 }

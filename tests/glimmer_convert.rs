@@ -96,7 +96,7 @@ fn convert_glimmer_refuses_before_it_writes() {
 
     // Writing into the source directory is a SIGBUS risk, not an error — the writer maps the
     // shards while it writes. Refused by path identity, so `src/.` must refuse too.
-    let o = run_convert_glimmer(&src, &src.join("."));
+    let o = run_convert_glimmer(&src, &src.join("."), gm::GlimmerFormat::Bf16);
     let err = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(!o.status.success() && err.contains("SIGBUS"), "{err}");
 
@@ -104,7 +104,7 @@ fn convert_glimmer_refuses_before_it_writes() {
     // is even parsed. `finish_artifact` would only have warned, three hours in, and the
     // artifact would ship with trap 13's scalar EOS as its only one.
     std::fs::remove_file(src.join(GEN)).unwrap();
-    let o = run_convert_glimmer(&src, &out);
+    let o = run_convert_glimmer(&src, &out, gm::GlimmerFormat::Bf16);
     let err = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(
         !o.status.success() && err.contains("generation_config.json is missing"),
@@ -120,7 +120,7 @@ fn convert_glimmer_refuses_before_it_writes() {
     tensors.retain(|(n, _, _)| *n != dropped);
     common::write_safetensors(&src.join("model-00001-of-00001.safetensors"), &tensors);
     write_index(&src, &tensors);
-    let o = run_convert_glimmer(&src, &out);
+    let o = run_convert_glimmer(&src, &out, gm::GlimmerFormat::Bf16);
     let err = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(!o.status.success() && err.contains(&dropped), "{err}");
     assert!(
@@ -162,7 +162,7 @@ fn both_eos_ids_reach_the_artifact_and_an_empty_generation_config_is_refused() {
     let ids = [(DIM + 4 - 3) as u32, (DIM + 4 - 1) as u32];
     write_glimmer_eos(&src, &ids);
     let want = std::fs::read(src.join(GEN)).unwrap();
-    let o = run_convert_glimmer(&src, &out);
+    let o = run_convert_glimmer(&src, &out, gm::GlimmerFormat::Bf16);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(
         std::fs::read(out.join(GEN)).expect("generation_config in the artifact"),
@@ -174,7 +174,7 @@ fn both_eos_ids_reach_the_artifact_and_an_empty_generation_config_is_refused() {
     // An id past the vocabulary is refused: it is a stop token no argmax can return, which is the
     // same unstoppable decode as having none. This is why the fixture's ids scale with its width.
     write_glimmer_eos(&src, &[(DIM + 4) as u32]);
-    let o = run_convert_glimmer(&src, &root.join("out-vocab"));
+    let o = run_convert_glimmer(&src, &root.join("out-vocab"), gm::GlimmerFormat::Bf16);
     let err = String::from_utf8_lossy(&o.stderr).to_string();
     assert!(
         !o.status.success() && err.contains("past this model's vocabulary"),
@@ -190,7 +190,7 @@ fn both_eos_ids_reach_the_artifact_and_an_empty_generation_config_is_refused() {
     ] {
         let dst = root.join("out-red");
         std::fs::write(src.join(GEN), bytes).unwrap();
-        let o = run_convert_glimmer(&src, &dst);
+        let o = run_convert_glimmer(&src, &dst, gm::GlimmerFormat::Bf16);
         let err = String::from_utf8_lossy(&o.stderr).to_string();
         assert!(
             !o.status.success() && err.contains("no usable `eos_token_id`"),

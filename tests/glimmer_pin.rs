@@ -121,6 +121,7 @@ fn glimmer_pin_places_every_tensor_with_the_shape_the_config_implies() {
             (layer.mlp_down, "mlp.down_proj"),
         ];
         for (w, t) in mats {
+            let w = common::bf16_of(w);
             let full = format!("{}.{l}.{t}.weight", gm::GLIMMER_LAYER_PREFIX);
             assert_eq!(
                 [w.o_dim, w.i_dim],
@@ -228,7 +229,7 @@ fn glimmer_pin_refuses_a_norm_that_is_not_hidden_long() {
     common::write_index(&src, &tensors);
 
     let out = root.join("out");
-    let o = common::run_convert_glimmer(&src, &out);
+    let o = common::run_convert_glimmer(&src, &out, gm::GlimmerFormat::Bf16);
     assert!(
         o.status.success(),
         "the converter is expected to ACCEPT this — it is the gap the pin closes: {}",

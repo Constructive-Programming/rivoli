@@ -1668,6 +1668,87 @@ pub const GLIMMER_LAYER_TENSORS: [&str; 12] = [
     "mlp.down_proj",
 ];
 
+/// Which dtype an artifact stores Muse Glimmer's eight projections in.
+///
+/// **Deliberately not a manifest field.** `GlimmerPin::build` reads the dtype of layer 0's
+/// `q_proj` and checks every other tensor against what that implies, so the artifact's own bytes
+/// are the declaration. A manifest field can disagree with the tensors it describes, and here the
+/// disagreement would size the tier for one format and place the other.
+///
+/// **What is NOT in this enum, and why.** The four norms are f32 in every format —
+/// `convert_glimmer` widens them, the house convention — and `embed`/`lm_head` stay bf16 in every
+/// format. Requantizing 5.380 GB that is read once per token each is its own quality question with
+/// its own measurement attached, which is the argument [`crate::memory::pin::Bf16Weight`]'s doc
+/// already makes for V4. So this axis covers the 483.9 M weights per layer that dominate both the
+/// resident set and the per-token read, and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlimmerFormat {
+    /// Verbatim from the checkpoint: 2 bytes per weight, no scales.
+    Bf16,
+    /// e4m3 with one f32 scale per `FP8_BLOCK × FP8_BLOCK` tile. One byte per weight plus a
+    /// 1/16384th-of-a-float scale grid, so **0.50018 of bf16** — the grid is 0.024% of the
+    /// payload and rounds away at any precision anyone quotes, but it is charged exactly here
+    /// because a tier sized without it is short by 118 KB per layer.
+    Fp8,
+}
+
+impl std::fmt::Display for GlimmerFormat {
+    /// `bf16` / `fp8` — the spelling `--fp8`, `docs/measurement/benchmarks.md` and this repo's
+    /// prose all use. Derived `Debug` would give `Bf16`/`Fp8`, and this goes into the `--ppl`
+    /// label that lands verbatim in a `.nll` header and from there into a benchmarks row.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8 => "fp8",
+        })
+    }
+}
+
+impl GlimmerFormat {
+    /// Which format the artifact at `dir` stores its projections in, read from **layer 0's
+    /// `q_proj`** — see this type's own note on why that is the artifact's declaration and a
+    /// manifest field is not.
+    ///
+    /// One tensor decides, and everything else is checked against what it implies: the pinned
+    /// layers by `place_glimmer_proj`, whose `Safetensors::typed` call refuses any other dtype,
+    /// and the streamed ones by `GlimmerPin::build`'s header loop. So an artifact whose layers
+    /// disagree refuses at load rather than decoding part of itself through the wrong kernel.
+    pub fn of_artifact(dir: &str) -> Result<Self> {
+        Self::of(&crate::artifact::format::Safetensors::open_dir(dir)?)
+    }
+
+    /// [`Self::of_artifact`] against an already-open artifact — the pin's entry point, since it
+    /// has one and a second `open_dir` would mmap the same 30-55 GB twice.
+    pub fn of(st: &crate::artifact::format::Safetensors) -> Result<Self> {
+        let name = format!("{GLIMMER_LAYER_PREFIX}.0.self_attn.q_proj.weight");
+        let (_, dtype, _) = st.raw(&name)?;
+        Ok(match dtype {
+            crate::artifact::format::Dtype::Bf16 => Self::Bf16,
+            crate::artifact::format::Dtype::F8E4M3 => Self::Fp8,
+            d => bail!(
+                "{name} is {d:?} — a Muse Glimmer artifact stores its projections BF16 \
+                 (`convert_glimmer`) or F8E4M3 (`convert_glimmer --fp8`)"
+            ),
+        })
+    }
+
+    /// Bytes one projection of `shape` occupies in this format, **scale grid included**.
+    ///
+    /// The grid is `ceil(d / FP8_BLOCK)` per dimension, which is `quantize_fp8_block`'s own
+    /// layout — written as a fold over `shape` rather than as `[o, i]` so the two cannot drift
+    /// apart if a 1-D projection ever exists.
+    pub fn proj_bytes(self, shape: &[usize]) -> usize {
+        let n: usize = shape.iter().product();
+        match self {
+            Self::Bf16 => n * 2,
+            Self::Fp8 => {
+                let b = crate::artifact::quant::FP8_BLOCK;
+                n + shape.iter().map(|d| d.div_ceil(b)).product::<usize>() * 4
+            }
+        }
+    }
+}
+
 /// How many streaming slots a budgeted `GlimmerPin` keeps for the layers it could not pin.
 ///
 /// **ONE at R1, and the number is NOT a correctness property — that was the first version's
@@ -1829,8 +1910,10 @@ impl GlimmerTextConfig {
         })
     }
 
-    /// Bytes the resident set occupies **in the artifact's dtypes** — bf16 projections, f32
-    /// norms — from the config alone. 55.712 GB for the shipped model.
+    /// Bytes the resident set occupies **in the artifact's dtypes** — `fmt` projections, f32
+    /// norms, bf16 `embed`/`lm_head` — from the config alone. For the shipped model: **55.712 GB**
+    /// at bf16, **30.555 GB** at fp8. The two differ by less than half, not by half, because the
+    /// 5.380 GB of model-level tensors are bf16 in both (see [`GlimmerFormat`]).
     ///
     /// Sized from [`Self::layer_tensor_shape`] rather than restating the shapes, so the number
     /// and the checks the pin makes cannot drift apart. It is what sizes the tier, which is
@@ -1841,11 +1924,12 @@ impl GlimmerTextConfig {
     /// the house convention every architecture follows — so this is 2.782 MB larger than the
     /// text half of the checkpoint. `tests/glimmer_names.rs` reproduces it from the shipped
     /// index's own shapes, which is where that 2.782 MB is accounted for rather than asserted.
-    pub fn resident_bytes(&self) -> Result<usize> {
-        Ok(self.global_bytes() + self.n_layers * self.layer_bytes()?)
+    pub fn resident_bytes(&self, fmt: GlimmerFormat) -> Result<usize> {
+        Ok(self.global_bytes() + self.n_layers * self.layer_bytes(fmt)?)
     }
 
-    /// Bytes ONE layer's twelve tensors occupy — **967.942 MB** for the shipped model.
+    /// Bytes ONE layer's twelve tensors occupy — **967.942 MB** at bf16 for the shipped model,
+    /// **484.142 MB** at fp8 (0.50018×, the scale grid being the 0.018%).
     ///
     /// > Written as 967.889 MB until 2026-08-12. That is the figure with the four norms at
     /// > bf16, which is the CHECKPOINT's dtype — `convert_glimmer` widens them, so the artifact's
@@ -1859,12 +1943,18 @@ impl GlimmerTextConfig {
     /// of the per-layer size would be a number that could disagree with the one that sized the
     /// tier. Every layer is identical — Glimmer has no dense/MoE split — so this is exact
     /// rather than an average, and that is what makes a static partition expressible at all.
-    pub fn layer_bytes(&self) -> Result<usize> {
+    pub fn layer_bytes(&self, fmt: GlimmerFormat) -> Result<usize> {
         let mut per_layer = 0usize;
         for t in GLIMMER_LAYER_TENSORS {
             let shape = self.layer_tensor_shape(t)?;
-            let n: usize = shape.iter().product();
-            per_layer += n * if shape.len() == 1 { 4 } else { 2 };
+            // The norms are f32 whatever the projections are, so the format applies to the 2-D
+            // entries only — and `shape.len()` is what separates them, exactly as it did when
+            // both arms were a bytes-per-element constant.
+            per_layer += if shape.len() == 1 {
+                shape[0] * 4
+            } else {
+                fmt.proj_bytes(&shape)
+            };
         }
         Ok(per_layer)
     }
@@ -1892,8 +1982,8 @@ impl GlimmerTextConfig {
     /// to size — so a budget clearing this floor can still be too small to decode. What it
     /// guarantees is that the failure happens at load, with a number, rather than at layer 40
     /// of the first token.
-    pub fn floor_bytes(&self) -> Result<usize> {
-        Ok(self.global_bytes() + GLIMMER_STREAM_SLOTS * self.layer_bytes()? + GLIMMER_PIN_SLACK)
+    pub fn floor_bytes(&self, fmt: GlimmerFormat) -> Result<usize> {
+        Ok(self.global_bytes() + GLIMMER_STREAM_SLOTS * self.layer_bytes(fmt)? + GLIMMER_PIN_SLACK)
     }
 
     /// How a device budget divides: `(layers pinned, tier bytes to request)`.
@@ -1916,13 +2006,13 @@ impl GlimmerTextConfig {
     /// device.** `memory::pin` is `#[cfg(feature = "rocm")]`, so a `GlimmerPin::partition` was
     /// unreachable from a featureless build — and CI has no rocm job, so the gate that claimed
     /// to cover this could not run there at all. Found by trying it, 2026-08-12.
-    pub fn partition(&self, budget: Option<usize>) -> Result<(usize, usize)> {
-        let want = self.resident_bytes()?;
-        let layer = self.layer_bytes()?;
+    pub fn partition(&self, budget: Option<usize>, fmt: GlimmerFormat) -> Result<(usize, usize)> {
+        let want = self.resident_bytes(fmt)?;
+        let layer = self.layer_bytes(fmt)?;
         let Some(b) = budget.filter(|b| *b < want + GLIMMER_PIN_SLACK) else {
             return Ok((self.n_layers, want + GLIMMER_PIN_SLACK));
         };
-        let floor = self.floor_bytes()?;
+        let floor = self.floor_bytes(fmt)?;
         ensure!(
             b >= floor,
             // **"on top of this" was FALSE for the number it quoted**, on the path that matters.

@@ -1,18 +1,23 @@
 //! `convert_glimmer` — build a Muse Glimmer-30B artifact from the HuggingFace checkpoint.
 //!
-//! **This converter quantizes nothing, on purpose.** Glimmer ships BF16 and nothing else, so
-//! unlike GLM (fp8), DeepSeek-V4 (fp8 + e8m0) and Kimi-K3 (mxfp4) there is no publisher
-//! decision to copy — `quantize_fp8_block` exists, but choosing its scales is *rivoli's*
-//! quality decision and it has no measurement behind it yet. So the first artifact is
-//! **bf16 verbatim**: 53.02 GB/token against fp8's 26.51, and zero new arithmetic between the
-//! checkpoint and the kernels. `docs/investigations/glimmer-port.md` S1a item 2 carries the
-//! dNLL gate the fp8 halving has to pass before it becomes the default, and this file is the
-//! reference arm that gate is measured against.
+//! **Default: quantizes nothing.** Glimmer ships BF16 and nothing else, so unlike GLM (fp8),
+//! DeepSeek-V4 (fp8 + e8m0) and Kimi-K3 (mxfp4) there is no publisher decision to copy — choosing
+//! the scales is *rivoli's* quality decision. So the default artifact is **bf16 verbatim**, and it
+//! is the reference arm every other rung of the ladder is measured against.
 //!
-//! It is also why this converter has no memory problem. `SafeWriter` holds `Cow<'a, [u8]>`
-//! and `copy_verbatim` **borrows the mapped source**, so a 55.7 GB resident set streams
-//! through without a host copy. An fp8 pass would produce owned bytes and put ~26 GB in RAM;
-//! that is the two-pass work item, and going bf16 first defers it rather than solving it.
+//! > **AMENDED 2026-08-14, S4 item 4.** This said "quantizes nothing, on purpose", full stop, and
+//! > deferred the fp8 pass as "the two-pass work item". `--fp8` now exists and this file is both
+//! > arms. What has NOT changed is the argument above: bf16 stays the DEFAULT, because it is the
+//! > arm with no arithmetic of ours between the checkpoint and the kernels, and a ladder needs a
+//! > rung nothing was done to. Which format ships as the default for decoding is settled by the
+//! > paired dNLL in `docs/measurement/benchmarks.md`, not here.
+//!
+//! **`--fp8` costs host memory that the bf16 pass does not, and the asymmetry is structural.**
+//! `SafeWriter` holds `Cow<'a, [u8]>` and `copy_verbatim` **borrows the mapped source**, so a
+//! 55.7 GB bf16 resident set streams through with no host copy at all. Quantized bytes are
+//! produced rather than borrowed, so `--fp8` holds ~25.2 GB before the write. That is accepted for
+//! a one-off offline conversion on this host; `SafeWriter::add_quantized_fp8` carries the upgrade
+//! path.
 //!
 //! Separate from `bin/convert` and `bin/convert_k3` because it shares almost nothing with
 //! either: no codebook to learn, no VQ encode, no fp8 dequant, no expert files at all. A
@@ -58,12 +63,16 @@ const AUX: [&str; 4] = [
 // or drop clap for `std::env::args()` and lose `--help` on a tool whose two positional
 // directories are easy to swap. Being a verbatim copy IS the point here.
 #[derive(Parser)]
-#[command(about = "Build a Muse Glimmer artifact (bf16 verbatim) from an HF checkpoint")]
+#[command(about = "Build a Muse Glimmer artifact (bf16 verbatim, or --fp8) from an HF checkpoint")]
 struct Args {
     /// The HF checkpoint directory: `config.json` + `model.safetensors.index.json` + shards.
     src_dir: String,
     /// Where to write `resident.safetensors` and `manifest.json`.
     out_dir: String,
+    /// Quantize the 416 layer projections to fp8-e4m3 at `FP8_BLOCK`. `embed_tokens`, `lm_head`
+    /// and every norm are unaffected — see `GlimmerFormat`.
+    #[arg(long)]
+    fp8: bool,
 }
 
 /// The subset of [`AUX`] whose absence is a REFUSAL rather than a warning, checked before any
@@ -194,7 +203,7 @@ fn main() -> Result<()> {
     };
 
     let mut w = SafeWriter::new();
-    let (mut verbatim, mut widened) = (0usize, 0usize);
+    let (mut verbatim, mut widened, mut quantized) = (0usize, 0usize, 0usize);
     let mut names: Vec<String> = src.names().iter().map(|s| s.to_string()).collect();
     names.sort();
     for name in &names {
@@ -204,6 +213,12 @@ fn main() -> Result<()> {
         if is_norm(name) {
             w.add_widened(&src, name)?;
             widened += 1;
+        } else if args.fp8 && is_layer_proj(name) {
+            let base = name
+                .strip_suffix(".weight")
+                .with_context(|| format!("{name} is a layer projection with no `.weight` tail"))?;
+            w.add_quantized_fp8(&src, base, rivoli::artifact::quant::FP8_BLOCK)?;
+            quantized += 1;
         } else {
             // Verbatim, and asserted BF16 rather than "whatever it is": `typed` refuses any
             // other dtype, so an fp8 or 4-bit export of this model refuses here instead of
@@ -212,6 +227,17 @@ fn main() -> Result<()> {
             verbatim += 1;
         }
     }
+    // **The count is asserted, not printed and trusted.** `is_layer_proj` is two string
+    // predicates over names this binary does not control; if either ever stopped matching, the
+    // artifact would come out with some projections bf16 and some fp8, and `GlimmerPin::build`'s
+    // header loop would refuse it — correctly, but hours later and with a message about one
+    // tensor rather than about the pass that skipped it.
+    ensure!(
+        quantized == if args.fp8 { g.n_layers * 8 } else { 0 },
+        "--fp8 quantized {quantized} tensors; this checkpoint's {} layers imply {}",
+        g.n_layers,
+        g.n_layers * 8
+    );
 
     // The tensors the decode path cannot run without. Checked by NAME here rather than left
     // to the pin: a missing `lm_head` in a partial checkpoint would otherwise surface as a
@@ -243,8 +269,8 @@ fn main() -> Result<()> {
     let out = format!("{}/resident.safetensors", args.out_dir);
     w.write(&out).with_context(|| format!("write {out}"))?;
     eprintln!(
-        "convert_glimmer: {verbatim} tensors bf16 verbatim, {widened} norms widened to f32, \
-         {skipped} vision tensors skipped -> {out}"
+        "convert_glimmer: {verbatim} tensors bf16 verbatim, {quantized} projections quantized to \
+         fp8, {widened} norms widened to f32, {skipped} vision tensors skipped -> {out}"
     );
 
     // The manifest is the checkpoint's own `config.json` plus the `format` section, so
@@ -321,4 +347,19 @@ fn is_vision(name: &str) -> bool {
 /// else this can catch today; if one ever appears it is a norm and this is still right.
 fn is_norm(name: &str) -> bool {
     name.ends_with("norm.weight")
+}
+
+/// The eight per-layer projections — everything `--fp8` quantizes, and nothing else.
+///
+/// **`embed_tokens` and `lm_head` are deliberately NOT here**, though they are 5.380 GB of the
+/// 55.712: requantizing two tensors that are read once per token each is its own quality question
+/// with its own measurement, and `GlimmerFormat`'s doc is where that scope is written down. The
+/// four per-layer norms are excluded by [`is_norm`] having already claimed them above, and they
+/// are f32 in every format anyway.
+///
+/// Composed from the two predicates that already exist rather than listing eight suffixes: a
+/// list would be a fourth spelling of [`GLIMMER_LAYER_TENSORS`], and the count assertion at the
+/// call site is what turns "these are the eight" from a belief into an observation.
+fn is_layer_proj(name: &str) -> bool {
+    name.starts_with(GLIMMER_LAYER_PREFIX) && !is_norm(name)
 }

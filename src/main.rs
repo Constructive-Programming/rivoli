@@ -998,6 +998,12 @@ fn run_glimmer(
     let g: rivoli::artifact::model::GlimmerConfig =
         rivoli::artifact::model::load_config(&cfg.model)?;
     let gt = &g.text;
+    // **The artifact's projection dtype, read from the tensors rather than declared** — see
+    // `GlimmerFormat`. Read here, before the summary, because every byte figure printed below is a
+    // function of it: a "resident 55.712 GB" line over a 30.555 GB fp8 artifact would be the same
+    // class of wrong as the residency split this file already reports after `n_ctx` exists rather
+    // than before.
+    let fmt = rivoli::artifact::model::GlimmerFormat::of_artifact(&cfg.model)?;
     // Counted from the array directly. The obvious `layer_is_sliding(i).unwrap_or(false)` is
     // the silent "full attention" that method's doc exists to forbid, and it is what this call
     // site wrote on the first try — see that doc, and the 2026-08-11 reviews.
@@ -1008,7 +1014,8 @@ fn run_glimmer(
         .count();
     info!(
         "model: {} ({}) — {} layers ({} sliding at window {} / {} full), hidden {}, inter {}, \
-         {} heads x {} kv (dim {}), vocab {}, DENSE (no experts), resident {:.3} GB",
+         {} heads x {} kv (dim {}), vocab {}, DENSE (no experts), {} projections, \
+         resident {:.3} GB",
         arch.name(),
         arch.summary(),
         gt.n_layers,
@@ -1021,7 +1028,8 @@ fn run_glimmer(
         gt.num_key_value_heads,
         gt.head_dim,
         gt.vocab,
-        gt.resident_bytes()? as f64 / 1e9,
+        fmt,
+        gt.resident_bytes(fmt)? as f64 / 1e9,
     );
 
     let window_note = format!(
@@ -1244,9 +1252,11 @@ fn run_glimmer(
     // `Glimmer::new`. One shared function means the binary hits the refusal that names the cause
     // (review, 2026-08-14).
     let overhead = rivoli::glimmer_gpu::runtime_bytes(gt, n_ctx)?;
-    let (n_pinned, _) =
-        gt.partition(Some(rivoli::glimmer_gpu::weight_budget(gt, n_ctx, budget)?))?;
-    let layer_gb = gt.layer_bytes()? as f64 / 1e9;
+    let (n_pinned, _) = gt.partition(
+        Some(rivoli::glimmer_gpu::weight_budget(gt, n_ctx, budget)?),
+        fmt,
+    )?;
+    let layer_gb = gt.layer_bytes(fmt)? as f64 / 1e9;
     info!(
         "residency: {n_pinned} of {} layers pinned ({:.3} GB), {} streaming through {} slots \
          ({:.3} GB/layer); KV cache and activations at {n_ctx} positions take {:.3} GB off the \
@@ -1261,7 +1271,7 @@ fn run_glimmer(
         },
         layer_gb,
         overhead as f64 / 1e9,
-        gt.floor_bytes()? as f64 / 1e9,
+        gt.floor_bytes(fmt)? as f64 / 1e9,
     );
 
     let mut engine = rivoli::glimmer_gpu::Glimmer::new(&cfg.model, gt, Some(budget), n_ctx)?;
@@ -1273,9 +1283,13 @@ fn run_glimmer(
     // what S4 item 4's dNLL ladder is built from.
     #[cfg(feature = "teacher-forcing")]
     if let Some(c) = &corpus {
+        // **The format comes from the artifact, not from a literal.** This read
+        // `"muse-glimmer bf16, ..."` until 2026-08-14, which was true of the only artifact that
+        // existed and would have labelled every fp8 rung of the dNLL ladder `bf16` — a paired
+        // comparison whose two arms carry the same label is not a ladder, it is one row twice.
         let label = format!(
-            "muse-glimmer bf16, {} of {} layers pinned",
-            n_pinned, gt.n_layers
+            "muse-glimmer {}, {} of {} layers pinned",
+            fmt, n_pinned, gt.n_layers
         );
         rivoli::eval::run(&mut engine, c, ppl_out, &label)?;
         return Ok(());

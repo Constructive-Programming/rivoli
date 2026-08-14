@@ -371,7 +371,7 @@ fn write_checkpoint(
     let vocab = g.n("vocab_size") as u32;
     fixture::write_glimmer_aux(&src, &[vocab - 1]);
 
-    let o = run_convert_glimmer(&src, &root.join("out"));
+    let o = run_convert_glimmer(&src, &root.join("out"), gm::GlimmerFormat::Bf16);
     assert!(
         o.status.success(),
         "converting the reference's parameters failed: {}",

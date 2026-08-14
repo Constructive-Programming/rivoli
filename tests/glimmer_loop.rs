@@ -347,13 +347,21 @@ fn the_kv_cache_is_charged_to_the_budget_and_it_is_gigabytes() {
     // The threshold is SEARCHED, not assumed to be `resident_bytes`: `partition` charges the
     // streaming slots and `GLIMMER_PIN_SLACK` on top, so the smallest all-resident budget is
     // strictly larger than the weights (measured: `partition(resident_bytes)` pins 50 of 52).
-    let mut all_in = gt.resident_bytes().unwrap();
-    while gt.partition(Some(all_in)).unwrap().0 < gt.n_layers {
+    let mut all_in = gt.resident_bytes(gm::GlimmerFormat::Bf16).unwrap();
+    while gt
+        .partition(Some(all_in), gm::GlimmerFormat::Bf16)
+        .unwrap()
+        .0
+        < gt.n_layers
+    {
         all_in += 1 << 30;
     }
     let over = runtime_bytes(&gt, gt.max_position_embeddings).unwrap();
     assert!(
-        gt.partition(Some(all_in - over)).unwrap().0 < gt.n_layers,
+        gt.partition(Some(all_in - over), gm::GlimmerFormat::Bf16)
+            .unwrap()
+            .0
+            < gt.n_layers,
         "charging {:.3} GB of KV cache and activations must move the split off all-resident — \
          otherwise the subtraction is arithmetic nobody acts on",
         over as f64 / 1e9
@@ -418,7 +426,8 @@ fn the_prefill_is_layer_major_and_the_fill_count_says_so() {
     // (or the pin refuses) and below all-resident (or nothing is ever filled and the counter below
     // proves nothing). The runtime footprint is added on top because `Glimmer::new` takes it off
     // again before the pin sees it.
-    let left = gt.floor_bytes().unwrap() + gt.layer_bytes().unwrap();
+    let left = gt.floor_bytes(gm::GlimmerFormat::Bf16).unwrap()
+        + gt.layer_bytes(gm::GlimmerFormat::Bf16).unwrap();
     let budget = runtime_bytes(gt, n_ctx).unwrap() + left;
     let mut e = Glimmer::new(root.join("out").to_str().unwrap(), gt, Some(budget), n_ctx).unwrap();
     e.decode(&prompt, 1, &[]).unwrap();
@@ -431,9 +440,12 @@ fn the_prefill_is_layer_major_and_the_fill_count_says_so() {
     // layer for the single generated token.
     let chunks = prompt.len().div_ceil(256);
     let streamed = gt.n_layers
-        - gt.partition(Some(budget - runtime_bytes(gt, n_ctx).unwrap()))
-            .unwrap()
-            .0;
+        - gt.partition(
+            Some(budget - runtime_bytes(gt, n_ctx).unwrap()),
+            gm::GlimmerFormat::Bf16,
+        )
+        .unwrap()
+        .0;
     assert!(
         fills <= (streamed * (chunks + 1)) as u64,
         "layer-major prefill must fill each streamed layer once per chunk: {streamed} streamed \
