@@ -8,3 +8,17 @@
 //! because this boundary held. Owns the `rocm` feature; without it the crate
 //! compiles empty and the workspace still builds and tests (that featureless
 //! build is a real, CI-tested configuration, not breakage).
+
+pub mod abi;
+
+#[cfg(feature = "rocm")]
+pub mod gpustream;
+#[cfg(feature = "rocm")]
+pub mod hip;
+// The waist itself — Signal, block_on, NULL_STREAM, and the backend-neutral re-exports.
+// Its items sit at the crate root (`rivoli_backend::Stream`), exactly where the old tree's
+// `crate::backend::Stream` sat relative to its consumers.
+#[cfg(feature = "rocm")]
+mod waist;
+#[cfg(feature = "rocm")]
+pub use waist::*;

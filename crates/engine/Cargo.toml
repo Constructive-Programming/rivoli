@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Forwarded down the DAG: `--features rocm` at any level arms the one backend.
+rocm = ["rivoli-backend/rocm"]
+
 [lints]
 workspace = true
 
