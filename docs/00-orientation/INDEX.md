@@ -16,6 +16,7 @@ that move is the signal. A closed verdict rules its question out **only for its 
 
 | doc | scope | status | verdict |
 |---|---|---|---|
+| [rewrite.md](../investigations/rewrite.md) | engine | live | The gates-first rewrite is through M0 and the substance of M1 — gates armed and red-proofed before any code, anchors vendored before the engine, arena/cache/hybrid/partition/fetch/waist ported with both feature arms verified; three M1 items (legality table, gate-taxonomy types, proptest) are deliberately deferred to their first consumers rather than built speculatively. |
 | [architecture.md](../reference/architecture.md) | engine | live | The rewrite's architecture as built so far — the six-crate layering and what it precludes, the P6 residency contract, and the §8b invariant registry (INV-1), which grows a section per milestone rather than being written ahead of the code. |
 | [principles.md](../reference/principles.md) | engine | live | Why rivoli exists, as seven principles a plan can be checked against — confirmed by the owner 2026-08-12. Decode bigger-than-memory models on this one box; caching IS the space/bandwidth/compute trade; maximize hardware features over portability; the budget trades speed, never text; bytes/token is the currency; the pin is a function of free memory, not of architecture; every claim is a gate that can go red. |
 | [how-to-measure.md](../measurement/how-to-measure.md) | engine | live | How to measure, and the four-out-of-five lesson that says why the ISA beats a profile. |
