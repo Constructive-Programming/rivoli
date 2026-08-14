@@ -62,12 +62,16 @@ Every row is `--test-threads=1`, so no two threads ever run at the same time.
 
 | shape | crashes |
 |---|---|
-| 1500 bare `DeviceTier` alloc/free cycles (`examples/vmm_churn`) | 0 |
+| 1500 bare `DeviceTier` alloc/free cycles | 0 |
 | ~1000 engine build/decode/drop cycles in ONE `#[test]` | 0 |
 | the same work split across TWO `#[test]`s in one binary | **2 in 8, then 3 in 12** |
 | both marshalled onto one worker thread | **0 in 12** |
 
 **So it is not churn and not concurrency — it is that a second thread participates at all.**
+
+Row 1 had a driver, `examples/vmm_churn`, deleted 2026-08-14 with the workaround: 47 lines that
+never reproduced anything, whose result is the row above and whose replacement is a `for` loop over
+`DeviceTier::new`. Row 3 is the one that still fires, and it is kept as `tests/vmm_threads.rs`.
 libtest gives every `#[test]` its own thread, which is why a test binary finds this and the
 single-threaded production decode path does not.
 

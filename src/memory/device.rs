@@ -508,13 +508,13 @@ mod tier {
         /// its ERROR path, on the reasoning that success is "already joined by `sample`". The
         /// join belongs where the unmap is, so no caller has to re-derive it.
         ///
-        /// > **It was written while chasing the §4b SIGSEGV and is NOT what fixed that** —
-        /// > measured, 2 crashes in 27 runs before and 1 in 25 after, indistinguishable. That
-        /// > turned out to be an upstream bug, gone in ROCm 7.14. This survives because the
-        /// > hazard it closes is real on its own and was documented independently by
-        /// > `glimmer_gpu.rs`'s `decode`, which fixed only its error path on the reasoning that
-        /// > success is "already joined by `sample`" — two of the captured cores were
-        /// > success-path drops, so that reasoning was too narrow.
+        /// That reasoning was too narrow — two of the three cores captured while chasing the §4b
+        /// SIGSEGV were success-path drops.
+        ///
+        /// > **This was written while chasing that SIGSEGV and is NOT what fixed it** — measured,
+        /// > 2 crashes in 27 runs before and 1 in 25 after, indistinguishable. That turned out to
+        /// > be an upstream bug, gone in ROCm 7.14. It survives on the hazard above, which is real
+        /// > on its own.
         ///
         /// A `device_sync` per teardown is free in the only sense that matters: buffers of this
         /// kind are built once per engine, not per token.

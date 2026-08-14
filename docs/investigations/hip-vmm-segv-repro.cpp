@@ -40,6 +40,11 @@
     }                                                                                  \
   } while (0)
 
+// How much page-cache-backed memory each cycle copies into the VMM mapping. The mapping is
+// created at exactly this size, so the copy below cannot run off the end — the first version of
+// this file read 64 KB from a 7 KB file and died on SIGBUS, which is not the SIGSEGV under test.
+static constexpr size_t SRC_BYTES = 65536;
+
 static void* g_map = nullptr;
 
 __global__ void touch(float* p, int n) {
@@ -104,8 +109,9 @@ static void cycle(int id, int cycles, size_t bytes) {
     std::memset(vp, 0, 4096);
 
     // The application fills the VMM slab by memcpy FROM AN MMAPPED FILE (its weight artifact),
-    // so the source pages are page-cache, not anonymous memory.
-    if (g_map) std::memcpy(vp, g_map, 65536);
+    // so the source pages are page-cache, not anonymous memory. `main` refuses to start without
+    // the mapping, so this is unconditional and cannot be skipped into a weaker run.
+    std::memcpy(vp, g_map, SRC_BYTES);
 
     // ~20 plain device allocations per cycle, which is what one engine makes: a K and a V
     // buffer per layer plus activations. One hipMalloc per cycle did NOT reproduce.
@@ -126,6 +132,10 @@ int main(int argc, char** argv) {
   int cycles = argc > 1 ? std::atoi(argv[1]) : 40;
   int nthreads = argc > 2 ? std::atoi(argv[2]) : 2;
   size_t bytes = argc > 3 ? (size_t)std::atoll(argv[3]) : 1425856;
+  if (bytes < SRC_BYTES) {
+    std::fprintf(stderr, "bytes must be >= %zu, the size of the memcpy source\n", SRC_BYTES);
+    return 1;
+  }
 
   int dev_count = 0;
   CHECK(hipGetDeviceCount(&dev_count));
@@ -134,11 +144,30 @@ int main(int argc, char** argv) {
   std::fprintf(stderr, "device 0: %s (%s), HIP %d.%d\n", p.name, p.gcnArchName, HIP_VERSION_MAJOR,
                HIP_VERSION_MINOR);
   std::fprintf(stderr, "%d thread(s) x %d cycles, base %zu bytes\n", nthreads, cycles, bytes);
-  // A file to memcpy from, standing in for the weight artifact's mmap.
-  int fd = open("/var/cache/rivoli/scratch/vmm_src.bin", O_RDONLY);
-  if (fd >= 0) {
-    g_map = mmap(nullptr, 65536, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (g_map == MAP_FAILED) g_map = nullptr;
+  // A file to memcpy from, standing in for the weight artifact's mmap — CREATED here rather than
+  // assumed. An earlier version opened a path this program does not write and fell through to
+  // `g_map = nullptr` on failure, so the `memcpy` below was skipped and the run still exited 0
+  // while claiming to have exercised a page-cache source. That is the same class as the SIGBUS
+  // this file already records: a silently weakened reproducer reads as a negative result.
+  {
+    char path[] = "/tmp/vmm_repro_src_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) {
+      std::perror("mkstemp");
+      return 1;
+    }
+    unlink(path); // the fd keeps it alive; nothing is left behind
+    std::vector<char> filler(SRC_BYTES, 0x5a);
+    if (write(fd, filler.data(), filler.size()) != (ssize_t)filler.size()) {
+      std::perror("write");
+      return 1;
+    }
+    g_map = mmap(nullptr, SRC_BYTES, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (g_map == MAP_FAILED) {
+      std::perror("mmap");
+      return 1;
+    }
+    close(fd); // the mapping survives the descriptor
   }
 
   // SEQUENTIAL threads: each is joined before the next starts, so no two ever run at the same
