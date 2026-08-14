@@ -94,32 +94,26 @@ zero, so **INCONCLUSIVE** — which is neither "small cost confirmed" nor certif
 the origin of the four-verdict vocabulary (PASS / FAIL / COST ESTABLISHED / INCONCLUSIVE) that
 `vulkan-port.md`'s staged acceptance gate reuses.
 
-## Per-kernel round: matched A/B, `examples/dot_bench`
+## Per-kernel round: matched A/B, `examples/dot_bench` — RETIRED, verdict kept
 
-Matched A/B on one instrument binary, three INTERLEAVED repeats (base/fix/base/fix/base/fix)
-so drift shows as within-arm spread rather than as the effect. GLM dims from the manifest:
-H=64, qk_head_dim=256. The interleaving discipline is the transferable part.
+**RETIRED 2026-08-14** under the line cap: superseded as a DECISION by the in-engine section
+below, which is the number the merge rested on. `how-to-measure.md` owns the matched-A/B method;
+the body was the H=64 / qk_head_dim=256 run. Both subsections kept are cited ANCHORS.
 
 ### Section tokens recorded rounds invoke
 
-`examples/dot_bench` takes a section name, and rounds below are recorded by it. These tokens
-are **frozen**: `moe`, `gemv`, `v4gemv`, `v4res`, `glmi4`, `mla`, `attend`, `tail`. `v4gemv`
-and `glmi4` still carry model-derived names where the kernels they drive were renamed for
-behaviour on 2026-08-09, deliberately — a recorded command that no longer runs cannot be
-re-run to settle a question. `dot_bench.rs`'s `main` cites this section for that argument.
+`examples/dot_bench` takes a section name and the rounds below are recorded by it. **Frozen**:
+`moe`, `gemv`, `v4gemv`, `v4res`, `glmi4`, `mla`, `attend`, `tail`. `v4gemv` and `glmi4` keep
+model-derived names though their kernels were renamed for behaviour on 2026-08-09, deliberately:
+a recorded command that no longer runs cannot re-settle a question — `dot_bench.rs`'s `main`
+cites this section for that argument.
 
 ### A fingerprint is the only instrument that shows bit-identity
 
-`assert_close` cannot tell a bit-identical restructure from a reassociating one — both pass,
-and the margin print does not separate them. `examples/dot_bench` prints an FNV-1a hash of
-each kernel's raw output bytes; the absorb restructure's claim rests on
-**`0925c147afeea3fb`**, unchanged across 14 interleaved runs of both arms.
-
-**It only works if the inputs VARY.** `run_fp8` and `run_mla` used constant `x`, `q` and
-`clat` — correct for throughput, since traffic does not depend on values, but a constant
-input leaves the output insensitive to summation order, so the fingerprint would have been
-green for a change that reassociated. The instrument and the input generator are ONE
-instrument; a fingerprint over degenerate data is a fingerprint of nothing.
+`assert_close` cannot tell a bit-identical restructure from a reassociating one — both pass, and
+the margin print does not separate them. `examples/dot_bench` prints an FNV-1a hash of each
+kernel's raw bytes; the absorb restructure rests on **`0925c147afeea3fb`**, unchanged across 14
+interleaved runs of both arms.
 
 ## In-engine confirmation — the number a merge decision rests on
 
@@ -486,35 +480,41 @@ Not comparable to the 334/0 above: that was `--release`, union, all 35 targets. 
 attempts were discarded under a witnessed foreign tenant (33.6-39.5 GiB GTT, 0 kfd —
 `reference/gpu-lock.md`); cleared by draining `rh-anine`, GTT 39517 -> **17 MiB**.
 
-## Muse Glimmer, bf16 all-resident: 1.5–2.3 tok/s, and it terminates — 2026-08-14
+## Muse Glimmer bf16: 1.8 tok/s resident, 0.36–0.64 streaming, and it terminates — 2026-08-14
 
-**`scope: glimmer`.** First numbers from real Glimmer weights, S4 items 1–3. Artifact is
-`convert_glimmer` bf16-verbatim over `meta-models/Muse-Glimmer-30B` → **55.712 GB**; the tensor
-census and the shard verification are in `glimmer-open-items.md` §4.5. Command:
-`flock -w 3000 -E 66 /var/run/sys-gpu.lock target/release/rivoli <artifact> --prompt "<text>"
---bench <N>`. Sole tenant, witnessed per run: **0 KFD holders, 18.7 MB GTT** before each.
+**`scope: glimmer`.** First numbers from real Glimmer weights, S4 items 1–3. `convert_glimmer`
+bf16-verbatim over `meta-models/Muse-Glimmer-30B` → **55.712 GB**; census, shard verification and
+the read text are in `glimmer-open-items.md` §4.5. Sole tenant, witnessed per run. `flock …
+target/release/rivoli <artifact> --prompt "<text>" [--max-mem N] --bench <N>`.
 
-| prompt | framed | emitted | s | tok/s | ended |
-|---|---|---|---|---|---|
-| NVMe-vs-quantized | 81 tok | 96 (limit) | 64.62 | **1.486** | limit |
-| same | 81 tok | 500 (limit) | 221.13 | **2.261** | limit |
-| "Say hello." | 59 tok | **110 of 400** | 60.98 | 1.804 | **EOS** |
+| prompt | pinned/streamed | emitted | s | tok/s | ended |
+|---|---:|---:|---:|---:|---|
+| NVMe-vs-quantized, 81 tok | 52 / 0 | 96 (limit) | 64.62 | 1.486 | limit |
+| same | 52 / 0 | 500 (limit) | 221.13 | **2.261** | limit |
+| "Say hello.", 59 tok | 52 / 0 | **110 of 400** | 60.98 | 1.804 | **EOS** |
 
-**All 52 layers pinned** at `auto` = 100 GiB (free 116 − 16 OS reserve), 0 streaming slots — so
-these say **nothing about streaming**, and S5's prefetch numbers need a budget under 55.712 GB
-to mean anything. The 1.486 → 2.261 spread is warm-up amortizing, not loop variance: same
-binary, prompt and residency, a fifth of the tokens carrying the same fixed cost.
+1.486 → 2.261 is warm-up amortizing, not loop variance: same binary, prompt and residency, a
+fifth of the tokens carrying the same cost. **Row three is the item** — a natural EOS stop is
+what GLM achieved in none of 56 runs before its framing was fixed (see the RETRACTION above), and
+it is the payoff of routing the prompt through `artifact::glimmer_encoding` rather than encoding
+it raw. It stopped INSIDE the reasoning channel; what that means for a server is in the register.
+**The streaming curve below** is "Say hello." at `--bench 24`, one `--max-mem` per arm.
 
-**Row three is the one that matters:** a natural EOS stop is what GLM achieved in none of 56
-runs before its framing was fixed (see the RETRACTION above), and it is the direct payoff of
-routing the prompt through `artifact::glimmer_encoding` instead of encoding it raw.
+| GiB | pinned/streamed | tok/s | s/token | streamed GB/token | marginal GB/s |
+|---:|---:|---:|---:|---:|---:|
+| auto (100) | 52 / 0 | **1.804** | 0.554 | 0 | — |
+| 45 | 43 / 9 | 0.638 | 1.567 | 8.71 | 8.6 |
+| 30 | 26 / 26 | 0.453 | 2.208 | 25.17 | 15.2 |
+| 15 | 10 / 42 | 0.355 | 2.817 | 40.65 | 18.0 |
 
-**Read, not scored.** Every run completes the generation prompt `<|start|>assistant` with
-` to=self<|message|>` — the reasoning channel `Reasoning strength: high` asks for — and the
-500-token run writes three well-formed sentences answering the question, then counts them. Its
-several restatements of the task are a scratchpad pattern, not a loop; `distinct`/repeated-block
-are banned here precisely because they cannot tell those apart. **Caveat:** that stop happened
-*inside* the reasoning channel, so a bounded CLI decode yields reasoning and never the answer —
-`<|eom|>` (200007) ends a reasoning turn and is deliberately not a stop id, so the loop is right
-to run through it and a server that wants the answer must treat it as "continue into the next
-channel". No CLI knob for reasoning strength exists, so every run above is `high`.
+**First evidence that Glimmer streams at all**, and the pin is worth **5.1×** end to end.
+Marginal bandwidth RISES with the streamed count — 8.6 → 18.0 GB/s — so the per-fill fixed cost
+dominates at small streamed sets and amortizes; that is exactly what S5's prefetch item is about,
+measured before its lever is built. `GLIMMER_STREAM_SLOTS` is 1 throughout; the 30 and 15 GiB arms
+carried a 1-holder KFD witness at 18.7 MB GTT (the previous arm tearing down).
+
+**The first version of this table was NON-MONOTONIC** — 26 streamed layers beat 9 — and it was page
+cache, not a finding: the 45 GiB arm ran first and paid the cold NFS read for the whole file.
+**82.81 s cold against 37.90 and 37.64 s warm — a 2.2× confound**, bigger than most effects here,
+reproducing to 0.8% once warm. `CLAUDE.md` warns not to build between arms; this is the same hazard
+from arm ORDER alone, and the fix is a discarded warm-up arm.
