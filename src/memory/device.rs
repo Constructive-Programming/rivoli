@@ -501,7 +501,29 @@ mod tier {
     }
 
     impl Drop for VmmBuf {
+        /// **Joins the device before unmapping.** `rivoli_vmm_free` is `hipMemUnmap` +
+        /// `hipMemRelease` + `hipMemAddressFree`, none of which synchronise — unlike `hipFree`,
+        /// which joins implicitly. Tearing a mapping out from under running kernels is a real
+        /// hazard, and `glimmer_gpu.rs`'s `decode` already carried the argument but fixed only
+        /// its ERROR path, on the reasoning that success is "already joined by `sample`". The
+        /// join belongs where the unmap is, so no caller has to re-derive it.
+        ///
+        /// > **This is NOT the fix for the `glimmer_reference` SIGSEGV, and it was written while
+        /// > chasing it** (`glimmer-open-items.md` §4b). Measured: 2 crashes in 27 runs before,
+        /// > **1 in 25 after** — indistinguishable. Three captured cores put the fault inside
+        /// > `libamdhip64`'s VMM path, and **two of the three are in `rivoli_vmm_ALLOC`**
+        /// > (`VmmBuf::new` → `DeviceTier::new` → `GlimmerPin::build`), not in the free this
+        /// > synchronises. The hypothesis that an unsynchronised teardown corrupts the runtime
+        /// > and surfaces on the next allocation is UNSUPPORTED at that rate.
+        ///
+        /// Kept on its own merits — the hazard is real, was documented independently, and a
+        /// `device_sync` per teardown is free in the only sense that matters, since buffers of
+        /// this kind are built once per engine rather than per token — but it closes a different
+        /// hole than the one it was written for, and saying so is the point of this note.
         fn drop(&mut self) {
+            // Deliberately unreported: a `Drop` cannot return an error, and a device already in
+            // a bad state is exactly when the unmap below must still run.
+            let _ = crate::backend::hip::device_sync();
             // SAFETY: (ptr,handle,mapped) came from rivoli_vmm_alloc, freed once.
             unsafe { rivoli_vmm_free(self.ptr as *mut c_void, self.handle, self.mapped) };
         }
