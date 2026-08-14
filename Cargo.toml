@@ -1,0 +1,43 @@
+# Virtual workspace — the layering IS the dependency graph, and the graph is enforced here.
+#
+# core ← {artifact, oracles} ← engine ← cli, with backend independent below engine. Two
+# structural consequences, each precluding a defect the old tree carries:
+#   - `rivoli-core` cannot name a weight format: `Fmt` lives in `rivoli-artifact`, which
+#     core does not depend on. The hybrid format-follows-residency defect (old tree's #2
+#     open defect, a P4 violation) becomes un-writeable rather than tested-against.
+#   - Featureless `cargo test --workspace` is the default CI build: core/artifact/oracles
+#     are fully tested, backend compiles empty, engine is the refusal stub.
+#
+# A crate that needs an edge not listed in its Cargo.toml has found a design error, not a
+# missing line. Argue the edge in a PR before adding it.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/artifact",
+    "crates/oracles",
+    "crates/backend",
+    "crates/engine",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Total functions are the house style: `unwrap`/`expect` are deny-level everywhere.
+# Tests and build scripts opt back in per-file with `#![allow]` and one line of argument —
+# a panic there is loud and correct; a panic on the decode path is a crash in a server.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+# `debug-assertions` is deliberately ABSENT from [profile.release] (the default: off).
+# Develop on the dev profile, where every `debug_assert!` is live; `--release` is for
+# benchmarks and performance evaluation only, and every published number is measured
+# under it. This is the old tree's hardest-won build rule, inherited verbatim.
+[profile.release]
+lto = true
+opt-level = 3

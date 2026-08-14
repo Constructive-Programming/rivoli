@@ -1,0 +1,69 @@
+# The featureless host job — the default build of the workspace, and the one every commit
+# must pass. Ported from the old tree's ci.yml with one systematic change: every
+# anti-vacuity constant became a DERIVED count (the old "files scanned >= 40" would brick
+# a young tree and undershoot a grown one; equality against `git ls-files` does neither).
+#
+# There is deliberately no GPU arm here: this machine's runner arrives with the release
+# workflow (M4). Until then every `rocm` build is checked exactly as often as someone runs
+# it on the box, and CLAUDE.md says so.
+name: ci
+on:
+  push:
+    branches: [rw/main]
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+jobs:
+  host:
+    name: featureless (fmt + duplication + clippy + test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      # fmt first: cheapest fix, no cache, no network — and the jscpd gate's correctness
+      # precondition (an unformatted tree hides clones from the tokenizer).
+      - run: cargo fmt --check
+      - uses: Swatinem/rust-cache@v2
+      # Pinned: build.rs runs whatever `npx --no` finds, and marker semantics were
+      # measured on 4.0.5 — an unpinned 6.x could change them silently.
+      - run: npm install -g jscpd@4.0.5
+      - name: Prove the duplication gate is armed
+        # Not a re-run of build.rs — an independent invocation whose file count is
+        # compared against git's, so "the scanner examined nothing" fails instead of
+        # passing. Clones must be zero; .jscpd.json carries no threshold on purpose.
+        run: |
+          jscpd -c .jscpd.json --reporters json --output /tmp/jscpd crates
+          python3 - <<'EOF'
+          import json, subprocess
+          stats = json.load(open('/tmp/jscpd/jscpd-report.json'))['statistics']
+          scanned = stats['formats']['rust']['total']['sources']
+          clones  = stats['total']['clones']
+          want = len(subprocess.check_output(
+              ['git', 'ls-files', 'crates/**/*.rs']).decode().split())
+          assert scanned == want, f"jscpd scanned {scanned} files, git tracks {want} — the gate is not seeing the tree"
+          assert clones == 0, f"{clones} clones present"
+          print(f"armed: {scanned} files scanned, 0 clones")
+          EOF
+      - run: cargo clippy --workspace --release --locked --all-targets
+      # The deviceless feature-union clippy run joins here the day the first instrument
+      # feature exists (M1's feature-matrix lands alongside it).
+      - run: cargo test --workspace --release --locked
+      - name: CodeScene gate
+        # Hard once the CS_ACCESS_TOKEN secret is configured; loud no-op until then.
+        # The test itself classifies tool-absence by output, and RIVOLI_CS_REQUIRED turns
+        # absence into failure — so this step cannot silently skip once armed.
+        env:
+          CS_ACCESS_TOKEN: ${{ secrets.CS_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$CS_ACCESS_TOKEN" ]; then
+            echo "::warning::CS_ACCESS_TOKEN secret not configured — CodeScene gate ran in warn-and-skip mode. Add the secret and a cs install step to arm it (owner action)."
+          else
+            echo "TODO(owner): install the cs CLI here, then: RIVOLI_CS_REQUIRED=1 cargo test --workspace --release --locked --test codescene"
+            exit 1
+          fi

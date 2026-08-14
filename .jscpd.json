@@ -1,0 +1,10 @@
+{
+  "minTokens": 15,
+  "maxLines": 10000,
+  "maxSize": "1mb",
+  "reporters": ["console"],
+  "absolute": true,
+  "gitignore": true,
+  "ignore": ["**/target/**"],
+  "format": ["rust"]
+}
