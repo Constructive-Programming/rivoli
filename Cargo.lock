@@ -124,6 +124,9 @@ version = "0.1.0"
 [[package]]
 name = "rivoli-core"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
 
 [[package]]
 name = "rivoli-engine"

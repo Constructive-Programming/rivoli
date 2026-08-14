@@ -16,6 +16,7 @@ that move is the signal. A closed verdict rules its question out **only for its 
 
 | doc | scope | status | verdict |
 |---|---|---|---|
+| [architecture.md](../reference/architecture.md) | engine | live | The rewrite's architecture as built so far — the six-crate layering and what it precludes, the P6 residency contract, and the §8b invariant registry (INV-1), which grows a section per milestone rather than being written ahead of the code. |
 | [principles.md](../reference/principles.md) | engine | live | Why rivoli exists, as seven principles a plan can be checked against — confirmed by the owner 2026-08-12. Decode bigger-than-memory models on this one box; caching IS the space/bandwidth/compute trade; maximize hardware features over portability; the budget trades speed, never text; bytes/token is the currency; the pin is a function of free memory, not of architecture; every claim is a gate that can go red. |
 | [how-to-measure.md](../measurement/how-to-measure.md) | engine | live | How to measure, and the four-out-of-five lesson that says why the ISA beats a profile. |
 | [gate-red-proofs.md](../measurement/gate-red-proofs.md) | engine | data | Every M0 gate was shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. |

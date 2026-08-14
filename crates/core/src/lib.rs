@@ -11,4 +11,8 @@
 //! arithmetic — the old tree's hybrid defect, where `--max-mem` changed the output
 //! text — cannot be expressed here at all.
 
+pub mod arena;
+pub mod cache;
 pub mod hash;
+pub mod hybrid;
+pub mod residency;
