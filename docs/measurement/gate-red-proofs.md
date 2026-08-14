@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate was shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN.
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN.
 ---
 
 # M0 gate red proofs
@@ -40,6 +40,16 @@ cargo test -p rivoli --test docs                        → 3 passed  (green aga
 The derived exemption ledger (third test in the same file) also fired unplanted during
 the port: the frozen V4 oracle brought 3 ignore-marker regions and the test refused
 CLAUDE.md's stale `0` until the ledger line was updated.
+
+## 2b. Invariant registry (added 2026-08-15, M1)
+
+Planted: the §8b table's `INV-1` renamed to `INV-9`, which breaks BOTH directions at
+once — INV-9 documented with no test, `inv_1_*` tested with no row.
+
+```
+INV-[9] documented in architecture.md §8b with no `inv_<n>_*` test. ...   FAILED  (red)
+revert → 1 passed                                                          (green again)
+```
 
 ## 3. CodeScene (10/10 code health)
 
