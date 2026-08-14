@@ -81,32 +81,18 @@ the io_uring path gets.
 - **fp8 block scale mis-applied at `block < 4`** — `common.hpp::fp8_dot_strided` read four fp8
   weights per lane as one dword and applied ONE scale to all four. Numerics, not perf; it sat
   under every fp8 block-scaled GEMV. Fixed.
-- **First-failure build masking** — `build.rs` compiled shaders in sorted order and aborted on
-  the first failure. Now compiles all and fails once with the whole list.
 
-## `top-m` offline screen (CACHE_ROUTE, arXiv:2412.00099)
+## `top-m` offline screen (CACHE_ROUTE, arXiv:2412.00099) — RETIRED, record moved
 
-Offline `bin/replay` over three 512-token captured routing traces, one per mode — no engine
-change, so free of the decode-trajectory confound. **`top-m` is RETIRED and removed from the
-engine.** The screen — the (J, M) grid, its hit/swap columns and the powered cell below — is
-the record of why.
+**RETIRED 2026-08-14** under this file's line cap; `cache-conditional-routing.md` keeps the grid.
 
 ### DECISION: `top-m` ships opt-in and UNCERTIFIED
 
-The powered cell that decided the feature: `int3-vq`, **5,184 teacher-forced positions**,
-`--max-mem 100`, shared baseline, one process per cell. Baseline (lru) **PPL 4.130637**, hit
-72.25%.
-
-| cell | PPL | dPPL% | 95% CI (nats) | hit% | swap% | verdict |
-|---|---:|---:|---|---:|---:|---|
-| J=4/M=9 | 4.15252 | +0.529% | [−0.00207, +0.01263] | **77.69%** (+5.44pp) | 5.79% | **INCONCLUSIVE** — interval contains zero |
-| J=4/M=10 | 4.16786 | +0.901% | [+0.00077, +0.01717] | 81.47% (+9.22pp) | 9.80% | **COST ESTABLISHED, MAGNITUDE UNRESOLVED** |
-
-**J=4/M=9 shipped**, and INCONCLUSIVE is not "small cost confirmed": the interval contains
-zero, so no cost is established *and* it is not certified within the bar either. J=4/M=10 is
-not ship-able — its lower bound clears zero. This is the origin of the four-verdict
-vocabulary (PASS / FAIL / COST ESTABLISHED / INCONCLUSIVE) that `vulkan-port.md`'s staged
-acceptance gate reuses.
+The shipped cell was **J=4/M=9** on `int3-vq`, 5,184 teacher-forced positions at `--max-mem 100`:
+**PPL 4.15252 against a 4.130637 baseline, 95% CI [−0.00207, +0.01263]**. The interval contains
+zero, so **INCONCLUSIVE** — which is neither "small cost confirmed" nor certified. That cell is
+the origin of the four-verdict vocabulary (PASS / FAIL / COST ESTABLISHED / INCONCLUSIVE) that
+`vulkan-port.md`'s staged acceptance gate reuses.
 
 ## Per-kernel round: matched A/B, `examples/dot_bench`
 
@@ -159,10 +145,10 @@ not a hidden kernel — ~6 ms/tok of 6.2 ms host compute, itemised as kernel lau
 
 ## Read the ISA before you book the device
 
-**The GPU is the scarce resource; the compiler is not.** `hipcc` answers a large class of
-kernel questions on the CPU in seconds with no queue, and answers some of them BETTER than a
-bench because it gives the mechanism rather than a number. Four of five perf questions in one
-round were settled this way. Prescribed in `how-to-measure.md`.
+**The GPU is the scarce resource; the compiler is not.** `hipcc` answers a large class of kernel
+questions on the CPU in seconds with no queue, and better than a bench, because it gives the
+mechanism rather than a number — four of five perf questions in one round. Owned and prescribed
+by `how-to-measure.md`; kept here as the anchor `perf-evidence.md` and `vulkan-port.md` cite.
 
 ## Running these benches — detach anything multi-cell
 
@@ -223,11 +209,10 @@ established:** one prompt, one context (nt ≈ 2496 mean), n = 2 per arm.
 throughput.** The headline — `int3-vq/streaming/2q` as "the only cell that gets FASTER with
 context" — is an artifact. All 58 cells were reclassified from their logs with a structural
 repetition check. **Cited by `README.md` and `artifact/tokenizer.rs` as "the retraction".**
-
-## Benchmark matrix: mode x attn x cache-policy, 115 GiB, 512 -> 10k tokens
-
-Bracket 44 -> 8 -> 4 -> 2 at 512/2048/4096/10000 tokens, `--max-mem 115`, one process per
-cell, ~10 h. **Invalid at 2048+ — see the RETRACTION above.** The 512-token column stands.
+The matrix itself was bracket 44 -> 8 -> 4 -> 2 at 512/2048/4096/10000 tokens, `--max-mem 115`,
+one process per cell, ~10 h; **the 512-token column stands** and the rest is the artifact. (Its
+own heading was folded in here 2026-08-14 under this file's line cap — it said nothing this
+paragraph does not.)
 
 ## `--mode int4` vs int3-vq — the point estimate favours int4, the test cannot confirm it
 
@@ -500,3 +485,36 @@ verbatim tensors, `write` became atomic), so this is a regression gate — no to
 Not comparable to the 334/0 above: that was `--release`, union, all 35 targets. Earlier
 attempts were discarded under a witnessed foreign tenant (33.6-39.5 GiB GTT, 0 kfd —
 `reference/gpu-lock.md`); cleared by draining `rh-anine`, GTT 39517 -> **17 MiB**.
+
+## Muse Glimmer, bf16 all-resident: 1.5–2.3 tok/s, and it terminates — 2026-08-14
+
+**`scope: glimmer`.** First numbers from real Glimmer weights, S4 items 1–3. Artifact is
+`convert_glimmer` bf16-verbatim over `meta-models/Muse-Glimmer-30B` → **55.712 GB**; the tensor
+census and the shard verification are in `glimmer-open-items.md` §4.5. Command:
+`flock -w 3000 -E 66 /var/run/sys-gpu.lock target/release/rivoli <artifact> --prompt "<text>"
+--bench <N>`. Sole tenant, witnessed per run: **0 KFD holders, 18.7 MB GTT** before each.
+
+| prompt | framed | emitted | s | tok/s | ended |
+|---|---|---|---|---|---|
+| NVMe-vs-quantized | 81 tok | 96 (limit) | 64.62 | **1.486** | limit |
+| same | 81 tok | 500 (limit) | 221.13 | **2.261** | limit |
+| "Say hello." | 59 tok | **110 of 400** | 60.98 | 1.804 | **EOS** |
+
+**All 52 layers pinned** at `auto` = 100 GiB (free 116 − 16 OS reserve), 0 streaming slots — so
+these say **nothing about streaming**, and S5's prefetch numbers need a budget under 55.712 GB
+to mean anything. The 1.486 → 2.261 spread is warm-up amortizing, not loop variance: same
+binary, prompt and residency, a fifth of the tokens carrying the same fixed cost.
+
+**Row three is the one that matters:** a natural EOS stop is what GLM achieved in none of 56
+runs before its framing was fixed (see the RETRACTION above), and it is the direct payoff of
+routing the prompt through `artifact::glimmer_encoding` instead of encoding it raw.
+
+**Read, not scored.** Every run completes the generation prompt `<|start|>assistant` with
+` to=self<|message|>` — the reasoning channel `Reasoning strength: high` asks for — and the
+500-token run writes three well-formed sentences answering the question, then counts them. Its
+several restatements of the task are a scratchpad pattern, not a loop; `distinct`/repeated-block
+are banned here precisely because they cannot tell those apart. **Caveat:** that stop happened
+*inside* the reasoning channel, so a bounded CLI decode yields reasoning and never the answer —
+`<|eom|>` (200007) ends a reasoning turn and is deliberately not a stop id, so the loop is right
+to run through it and a server that wants the answer must treat it as "continue into the next
+channel". No CLI knob for reasoning strength exists, so every run above is `high`.
