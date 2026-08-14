@@ -441,15 +441,18 @@ mod tier {
 
     impl VmmBuf {
         pub fn new(len: usize) -> Result<Self> {
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            let mut handle: u64 = 0;
-            let mut mapped: usize = 0;
-            // SAFETY: out-pointers are valid; the shim owns the mapping until free.
-            let e = unsafe { rivoli_vmm_alloc(len, 0, &mut ptr, &mut handle, &mut mapped) };
-            ensure!(
-                e == 0 && !ptr.is_null(),
-                "rivoli_vmm_alloc({len}) failed ({e})"
-            );
+            // Allocated on the VMM thread — see [`vmm_thread`]. Raw pointers are not `Send`,
+            // so the mapping crosses back as an integer.
+            let res = vmm_thread::run(move || {
+                let mut p: *mut c_void = std::ptr::null_mut();
+                let mut h: u64 = 0;
+                let mut m: usize = 0;
+                // SAFETY: out-pointers are valid; the shim owns the mapping until free.
+                let e = unsafe { rivoli_vmm_alloc(len, 0, &mut p, &mut h, &mut m) };
+                (e, p as usize, h, m)
+            });
+            let (e, ptr, handle, mapped) = res?;
+            ensure!(e == 0 && ptr != 0, "rivoli_vmm_alloc({len}) failed ({e})");
             Ok(Self {
                 ptr: ptr as *mut u8,
                 handle,
@@ -500,6 +503,74 @@ mod tier {
         }
     }
 
+    /// Every `rivoli_vmm_alloc`/`rivoli_vmm_free` in the process runs on ONE thread.
+    ///
+    /// **HIP's VMM handles are thread-affine on this runtime, and that is measured rather than
+    /// assumed** (`glimmer-open-items.md` §4b, 2026-08-14). `tests/glimmer_reference.rs` SIGSEGV'd
+    /// a few runs in a hundred inside `libamdhip64`; the kernel log gives
+    /// `segfault at e0 ... error 4` on `mov rdx,[rax+0xe0]` with `rax = 0`, i.e. the runtime
+    /// dereferencing a null internal object, and names the faulting thread after the `#[test]`.
+    ///
+    /// libtest gives every `#[test]` its own thread. The bisect:
+    ///
+    /// | shape | crashes |
+    /// |---|---|
+    /// | 1500 bare `DeviceTier` alloc/free cycles (`examples/vmm_churn`) | 0 |
+    /// | ~1000 engine build/decode/drop cycles in ONE test | 0 |
+    /// | the same work split across TWO tests in one binary | **2 in 8, then 3 in 12** |
+    /// | both tests marshalled onto one worker thread | **0 in 12** |
+    ///
+    /// `--test-threads=1` throughout, so the two never overlap: it is not concurrency, it is that
+    /// a SECOND thread touches the VMM API at all. `hipSetDevice(dev)` in the allocator was tried
+    /// first and changed nothing (3 in 12) — the per-thread binding is not what is missing.
+    ///
+    /// **Cost is nil where it matters.** Tiers are allocated once per engine, not per token, so
+    /// this adds one channel round-trip to an operation that already maps hundreds of megabytes.
+    /// The thread is spawned on first use and lives for the process.
+    ///
+    /// The mapped memory is still read and written from any thread — only the four calls that
+    /// create and destroy the mapping are pinned here.
+    mod vmm_thread {
+        use anyhow::{Context, Result};
+        use std::sync::OnceLock;
+        use std::sync::mpsc::{Sender, channel};
+
+        type Job = Box<dyn FnOnce() + Send>;
+
+        /// Run `f` on the VMM thread and wait for it.
+        ///
+        /// **Fallible rather than panicking, and never an inline fallback.** Running the mapping
+        /// calls on the caller's thread is exactly the bug this module prevents, so a failure to
+        /// reach the worker must not quietly do that — it would restore the crash while looking
+        /// like a graceful degrade. The only ways to fail are a spawn that never happened or a
+        /// worker that died mid-job; both are reported, and each caller decides.
+        pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+            static TX: OnceLock<Option<Sender<Job>>> = OnceLock::new();
+            let tx = TX
+                .get_or_init(|| {
+                    let (tx, rx) = channel::<Job>();
+                    std::thread::Builder::new()
+                        .name("rivoli-vmm".into())
+                        .spawn(move || {
+                            while let Ok(job) = rx.recv() {
+                                job();
+                            }
+                        })
+                        .ok()
+                        .map(|_| tx)
+                })
+                .as_ref();
+            let tx = tx.context("the VMM thread could not be spawned")?;
+            let (done_tx, done_rx) = channel();
+            let job: Job = Box::new(move || {
+                let _ = done_tx.send(f());
+            });
+            tx.send(job)
+                .map_err(|_| anyhow::anyhow!("the VMM thread is gone"))?;
+            done_rx.recv().context("the VMM thread died mid-job")
+        }
+    }
+
     impl Drop for VmmBuf {
         /// **Joins the device before unmapping.** `rivoli_vmm_free` is `hipMemUnmap` +
         /// `hipMemRelease` + `hipMemAddressFree`, none of which synchronise — unlike `hipFree`,
@@ -524,8 +595,18 @@ mod tier {
             // Deliberately unreported: a `Drop` cannot return an error, and a device already in
             // a bad state is exactly when the unmap below must still run.
             let _ = crate::backend::hip::device_sync();
-            // SAFETY: (ptr,handle,mapped) came from rivoli_vmm_alloc, freed once.
-            unsafe { rivoli_vmm_free(self.ptr as *mut c_void, self.handle, self.mapped) };
+            let (p, h, m) = (self.ptr as usize, self.handle, self.mapped);
+            // Freed on the SAME thread that allocated it — see [`vmm_thread`]. If the worker
+            // is unreachable the mapping is LEAKED rather than freed here: a process whose VMM
+            // thread has died is ending anyway, and leaking is strictly better than the crash
+            // that freeing from this thread would risk.
+            let freed = vmm_thread::run(move || {
+                // SAFETY: (ptr,handle,mapped) came from rivoli_vmm_alloc, freed once.
+                unsafe { rivoli_vmm_free(p as *mut c_void, h, m) }
+            });
+            if let Err(e) = freed {
+                tracing::error!("VMM mapping leaked, the worker is unreachable: {e:#}");
+            }
         }
     }
 }
