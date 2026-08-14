@@ -106,6 +106,92 @@ const TOL: f32 = 2e-1;
 /// 1e-1 is ~3.3x the worst.
 const TOL_BRANCH: f32 = 1e-1;
 
+/// Softmax, numerically stable. The distribution the model actually emits, which is what the
+/// softcap shapes and what neither the logit gate nor a greedy argmax reads.
+fn softmax(v: &[f32]) -> Vec<f32> {
+    let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        m.is_finite(),
+        "logits are not finite; softmax would be meaningless"
+    );
+    let e: Vec<f32> = v.iter().map(|x| (x - m).exp()).collect();
+    let s: f32 = e.iter().sum();
+    e.iter().map(|x| x / s).collect()
+}
+
+/// Total variation distance, `0.5·Σ|p−q|` — 0 for identical distributions, 1 for disjoint ones.
+///
+/// Chosen over KL because it is bounded and symmetric: a KL blows up on any token the reference
+/// gives near-zero mass and this one does not, which makes the number a fact about the vocabulary
+/// tail rather than about the defect.
+fn total_variation(a: &[f32], b: &[f32]) -> f32 {
+    let (p, q) = (softmax(a), softmax(b));
+    0.5 * p.iter().zip(&q).map(|(x, y)| (x - y).abs()).sum::<f32>()
+}
+
+/// `-ln p(token)`, the quantity a perplexity ladder is built from.
+fn nll(v: &[f32], token: usize) -> f32 {
+    -softmax(v)[token].max(f32::MIN_POSITIVE).ln()
+}
+
+/// Total variation between the engine's output distribution and the reference's — MEASURED at
+/// **1.249e-3 (text-1) and 1.464e-3 (text-2)**, and set at ~3.4x the worse, the same margin
+/// convention as [`TOL`] and for the same reason.
+///
+/// **What this buys, stated narrowly because it is narrower than it looks.** It is a second NORM
+/// on the same logits, in the space the model's output actually lives in: `worst_rel` is a
+/// relative-max over the vector, this is an L1 over the distribution, and a defect concentrated
+/// on one high-probability token moves this far more than it moves that. It is NOT independent
+/// evidence, and it is NOT a softcap gate — see [`TOL_NLL`].
+const TOL_TV: f32 = 5e-3;
+
+/// `|NLL_got − NLL_want|` for the reference's own emitted token — MEASURED at 5.316e-3 and
+/// 6.305e-3, set at ~3.2x.
+///
+/// **Its resolution is a ~10% temperature error, and that is measured too.** Scaling only the
+/// engine's logits: x1.05 scores 1.2e-2 and PASSES, x1.10 scores 2.231e-2 and reddens, x1.25
+/// scores 3.602e-2. The anchor's logits span |0.24| over a vocabulary of 61, so the distribution
+/// is nearly uniform and one token's NLL barely moves — this is a coarse instrument HERE, on this
+/// fixture, and tightening the bound to catch 5% would leave 1.6x over the clean value, which is
+/// the exact thinness that made §1.1's gates go red on a correct engine.
+///
+/// A common-mode mutation cannot redden it at all — scaling BOTH sides cancels in the difference.
+/// That is a property of a differential metric rather than a hole, and it is why the red proof
+/// above perturbs one side only.
+///
+/// # This gate CANNOT see the softcap, and that is measured rather than suspected
+///
+/// Register item 4.2 asked for the softcap checked in probability space, on the grounds that S2
+/// proved argmax-invariance so no greedy gate can see it. Both metrics above were added for it.
+/// **They cannot see it either, and neither can any tolerance, because the anchor's logits are in
+/// the wrong range entirely:**
+///
+/// | | max &#124;logit&#124; | what `20·tanh(x/20)` does there |
+/// |---|---|---|
+/// | this anchor | **0.24** | changes it by **0.0002%** — arithmetically the identity |
+/// | the real 30B on a trained prompt | **36.27** | compresses it to **18.96**, a 48% cut |
+///
+/// Red-proved by disabling the softcap on this fixture: TV moved from 1.249e-3 to 1.249e-3 and
+/// dNLL from 5.316e-3 to 5.311e-3. Not "a small signal" — no signal, because `tanh` is linear
+/// near zero and the anchor never leaves that region. `glimmer-integration.md` S4 item 4
+/// predicted exactly this ("the anchor provably cannot"); this is the measurement behind it.
+///
+/// **What the softcap actually does, priced on the real model** (`--prompt "Say hello."`, one
+/// step, capped against `cap = 1e30`):
+///
+/// * top1−top2 logit gap **33.46 → 18.05**
+/// * total variation between the two distributions: **1.92e-8** — invisible, because both
+///   saturate at `p(top1) = 1.0`
+/// * runner-up token probability **2.95e-15 → 1.45e-8**, a factor of **4.9 million**, which is
+///   **15.4 nats** of NLL
+/// * entropy **1.28e-13 → 4.05e-7 nats**, a factor of 3.2 million
+///
+/// So the softcap is invisible to greedy decode, invisible to total variation on a confident
+/// prompt, and enormous in the tail — which is the regime perplexity lives in. **The instrument
+/// for it is teacher-forced NLL on non-argmax tokens, i.e. S4 item 4's dNLL ladder**, and that
+/// needs a Glimmer `--ppl` path, which does not exist (`src/eval.rs` has `run` and `run_v4`).
+const TOL_NLL: f32 = 2e-2;
+
 /// The engine's loop, over the reference's parameters, compared to the reference's logits.
 ///
 /// **Both salts**, because that is this anchor's discipline everywhere else: a defect that reddens
@@ -143,6 +229,7 @@ fn the_engine_reproduces_muse_glimmers_own_logits() {
         // position is the only way to see that step's logit vector — the same construction
         // `glimmer_chain.rs` uses, and it is what makes a red name the step it started at.
         let mut worst = (0.0f32, 0usize);
+        let (mut worst_tv, mut worst_nll) = ((0.0f32, 0usize), (0.0f32, 0usize));
         for step in 0..emitted.len() {
             let mut fed = prompt.clone();
             fed.extend_from_slice(&emitted[..step]);
@@ -163,6 +250,31 @@ fn the_engine_reproduces_muse_glimmers_own_logits() {
             if d > worst.0 {
                 worst = (d, step);
             }
+            // **PROBABILITY SPACE, which is a different question from the logits above.** The
+            // softcap is `20·tanh(x/20)`: it is argmax-invariant by construction, so neither the
+            // `picked` assertion below nor any greedy decode can see it, and a relative agreement
+            // on the logit VECTOR can still hide a large reshaping of the distribution the model
+            // actually emits — which is what sampling and NLL read.
+            let tv = total_variation(&got, want);
+            let dn = (nll(&got, emitted[step] as usize) - nll(want, emitted[step] as usize)).abs();
+            if tv > worst_tv.0 {
+                worst_tv = (tv, step);
+            }
+            if dn > worst_nll.0 {
+                worst_nll = (dn, step);
+            }
+            assert!(
+                tv < TOL_TV,
+                "{}: step {step} disagrees with the reference IN PROBABILITY by {tv:.3e} total \
+                 variation. The logits agreed to {d:.3e}, so this is a distribution defect the \
+                 logit gate and the argmax both pass",
+                g.name
+            );
+            assert!(
+                dn < TOL_NLL,
+                "{}: step {step}'s NLL for the reference's own token differs by {dn:.3e} nats",
+                g.name
+            );
             // **The token too, and it is the WEAKER claim** — a 61-way argmax is one integer where
             // the comparison above is 61 floats. Stated so a green argmax is not read as the
             // evidence: this model's logit path is argmax-invariant by construction, so the pick
@@ -176,11 +288,16 @@ fn the_engine_reproduces_muse_glimmers_own_logits() {
             ran += 1;
         }
         println!(
-            "  {}: {} steps against the reference, worst {:.3e} at step {}",
+            "  {}: {} steps against the reference, worst logit {:.3e} at step {}, worst TV \
+             {:.3e} at step {}, worst dNLL {:.3e} at step {}",
             g.name,
             emitted.len(),
             worst.0,
-            worst.1
+            worst.1,
+            worst_tv.0,
+            worst_tv.1,
+            worst_nll.0,
+            worst_nll.1
         );
     }
     // A census: both salts, every step. The loop above is over two vectors either of which could

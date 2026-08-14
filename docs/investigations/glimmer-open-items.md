@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: live
-verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- five open items, all of them stage work (S4, S5 and the rest of G3); six of the eleven were closed the day this file was written, and two of those six had been recorded as open on evidence that was already stale. The three live CLASSES this file opened with -- ungated correctness, fixture blind spots, unpriced cost -- are all empty. (1) UNGATED CORRECTNESS: EMPTY as of 2026-08-13. The eps transposition -- the item this register called its sharpest -- turned out to be gated already, against the chain gate's tolerance of the day, closed by the softcap tolerance work one commit earlier; the 'nothing reddens' recorded here was a measurement taken before that change and never re-run, which is the same stale-fact defect as the wrong citation it replaced. A second, LOCALISING gate was added anyway (Glimmer::branch plus a per-layer score against the oracle), and the route this file predicted -- scoring the reference's own captures -- is REFUTED by measurement: there the eps signal is 1.6e-3 to 1.3e-2 against a bf16 weight floor of 4.7e-3 to 3.0e-2, i.e. 0.2x to 0.6x the noise at every layer of both salts. Both surviving margins were thin because the FIXTURE's branch sits at mean(x2) ~ O(1) where the two epsilons nearly agree -- which is a second reason to do (2), and (2) then re-derived both tolerances so the old figures no longer describe anything (the prose counts are deleted rather than corrected a third time; tests/glimmer_chain.rs's TOL and TOL_BRANCH carry their own measured separations). (2) FIXTURE-GEOMETRY BLIND SPOTS: CLOSED 2026-08-13 by widening the toy checkpoint from (2 heads, 1 kv, head_dim = dim) to (4, 2, dim/2). Both were UNCONSTRUCTIBLE rather than merely uncaught -- at head_dim = hidden the two candidate softmax scales are the same NUMBER, and at hkv = 1 the block and modulo KV broadcasts are the same FUNCTION, so no tolerance could have separated either. They now measure 3.7e-1 and 9.5e-1. Six test binaries share the fixture and all pass unchanged; the widening also improved every clean floor in the chain gate by 2.7-5.5x, so its three tolerances and its whole 13-row mutation census were re-derived rather than carried over. (3) UNPRICED COST: the KV cache item is CLOSED 2026-08-13 -- glimmer_gpu::runtime_bytes is subtracted from the budget BEFORE the tier is sized, a budget that cannot cover it is refused by name, the slot count is one function read by both the allocation and the accounting, and the residency line moved below the tokenizer because the footprint is a function of the context; gated deviceless at the shipped widths plus a partition-boundary assertion, with one gap stated rather than papered over (removing the subtraction leaves every test green, since its effect needs a genuinely near-full device). Prefill is CLOSED too: Glimmer::prefill is layer-major and chunked at 256, so GlimmerPin::layer is called once per layer per chunk instead of once per token -- measured 6 fills against 900 token-major on the fixture, red-proved by reverting the order. It is a pure reorder (every numeric gate was bit-for-bit unchanged, which is the check), so no output comparison can see it and Glimmer::slot_stats exposes the pin's fill counter for the assertion. Chunked rather than whole-prompt because the batch's residual streams stay live: whole-prompt is 3.49 GB at the 131072 ceiling and 3.1's own gate caught it at 7.144 GB, where chunking costs 6.8 MB for 99.6% of the saving. The MATH is still m=1 / tq=1; batching it needs a rows dimension on the centered norm and a per-row rope position, changes the arithmetic, and first makes the launcher's ring union hazard reachable -- separate work. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. S4 is now PART-CLOSED (2026-08-14): the 59.553 GB checkpoint is downloaded, structurally verified and converted bf16-verbatim to a 55.71 GB artifact (418 verbatim + 209 norms widened + 809 vision skipped, reconciling to the index's 1436); the chat template is hand-ported as artifact::glimmer_encoding and pinned byte-for-byte against 24 cases rendered by the checkpoint's OWN apply_chat_template, with 11 red proofs; and tie_word_embeddings: false is gated on ADDRESSES (the two [vocab, hidden] tensors are 2,689,662,976 B each, 1.252x i32::MAX, contents distinct), red-proved by aliasing the head onto the embedding. Item 3 is CLOSED too (2026-08-14): three greedy runs on the bf16 artifact, sole tenant with a KFD/GTT witness, all 52 layers pinned at 55.712 GB -- 1.486 tok/s at 96 tokens, 2.261 at 500 (warm-up amortizing), and 1.804 on a run that TERMINATED NATURALLY at 110 of a 400 limit, which is what GLM did in none of 56 runs before its framing was fixed. The text is coherent and it is the reasoning channel: every run completes the generation prompt with ' to=self<|message|>' as Reasoning strength: high asks, and the 500-token run writes three correct sentences and then checks them. One finding is for the SERVING layer, not S4: the run that stopped stopped inside the reasoning channel, because <|eom|> (200007) is deliberately not a stop id -- so a bounded CLI decode yields reasoning and never the answer, and there is no way to lower the reasoning strength from the CLI. What S4 still owes is the dNLL ladder per format and the first quantized format, and the ladder cannot start before the format exists. S5 remains gated on G4, but the STREAMING curve is now measured on bf16 and it is the first evidence Glimmer streams at all: 1.804 tok/s all-resident against 0.638 / 0.453 / 0.355 at --max-mem 45 / 30 / 15 (9 / 26 / 42 layers streaming), so the pin is worth 5.1x end to end. Marginal streaming bandwidth RISES with the streamed count -- 8.6 -> 15.2 -> 18.0 GB/s -- so the per-fill fixed cost dominates small streamed sets and amortizes, which is exactly what S5's prefetch item is about, measured before the lever exists. The first version of that table was NON-MONOTONIC and it was PAGE CACHE, not a finding: the first arm paid the cold NFS read for the whole 55.712 GB file, 82.81 s cold against 37.90 and 37.64 s warm -- a 2.2x confound, bigger than most effects being measured, reproducing to 0.8% once warm. Also carried here: the branch is 50+ commits unpushed, the checkpoint lives at /swarm/storage/ai/rivoli because /swarm/storage/ai/models is root-owned, and the GPU node label is left at disabled with llama-swap Pending.
+verdict: Everything the Muse Glimmer port owes after S3's layer loop landed 2026-08-13, in one list, because the obligations had spread across four commit messages, two verdict lines and three source comments. THE SHORT VERSION -- five open items, all of them stage work (S4, S5 and the rest of G3); six of the eleven were closed the day this file was written, and two of those six had been recorded as open on evidence that was already stale. The three live CLASSES this file opened with -- ungated correctness, fixture blind spots, unpriced cost -- are all empty. (1) UNGATED CORRECTNESS: EMPTY as of 2026-08-13. The eps transposition -- the item this register called its sharpest -- turned out to be gated already, against the chain gate's tolerance of the day, closed by the softcap tolerance work one commit earlier; the 'nothing reddens' recorded here was a measurement taken before that change and never re-run, which is the same stale-fact defect as the wrong citation it replaced. A second, LOCALISING gate was added anyway (Glimmer::branch plus a per-layer score against the oracle), and the route this file predicted -- scoring the reference's own captures -- is REFUTED by measurement: there the eps signal is 1.6e-3 to 1.3e-2 against a bf16 weight floor of 4.7e-3 to 3.0e-2, i.e. 0.2x to 0.6x the noise at every layer of both salts. Both surviving margins were thin because the FIXTURE's branch sits at mean(x2) ~ O(1) where the two epsilons nearly agree -- which is a second reason to do (2), and (2) then re-derived both tolerances so the old figures no longer describe anything (the prose counts are deleted rather than corrected a third time; tests/glimmer_chain.rs's TOL and TOL_BRANCH carry their own measured separations). (2) FIXTURE-GEOMETRY BLIND SPOTS: CLOSED 2026-08-13 by widening the toy checkpoint from (2 heads, 1 kv, head_dim = dim) to (4, 2, dim/2). Both were UNCONSTRUCTIBLE rather than merely uncaught -- at head_dim = hidden the two candidate softmax scales are the same NUMBER, and at hkv = 1 the block and modulo KV broadcasts are the same FUNCTION, so no tolerance could have separated either. They now measure 3.7e-1 and 9.5e-1. Six test binaries share the fixture and all pass unchanged; the widening also improved every clean floor in the chain gate by 2.7-5.5x, so its three tolerances and its whole 13-row mutation census were re-derived rather than carried over. (3) UNPRICED COST: the KV cache item is CLOSED 2026-08-13 -- glimmer_gpu::runtime_bytes is subtracted from the budget BEFORE the tier is sized, a budget that cannot cover it is refused by name, the slot count is one function read by both the allocation and the accounting, and the residency line moved below the tokenizer because the footprint is a function of the context; gated deviceless at the shipped widths plus a partition-boundary assertion, with one gap stated rather than papered over (removing the subtraction leaves every test green, since its effect needs a genuinely near-full device). Prefill is CLOSED too: Glimmer::prefill is layer-major and chunked at 256, so GlimmerPin::layer is called once per layer per chunk instead of once per token -- measured 6 fills against 900 token-major on the fixture, red-proved by reverting the order. It is a pure reorder (every numeric gate was bit-for-bit unchanged, which is the check), so no output comparison can see it and Glimmer::slot_stats exposes the pin's fill counter for the assertion. Chunked rather than whole-prompt because the batch's residual streams stay live: whole-prompt is 3.49 GB at the 131072 ceiling and 3.1's own gate caught it at 7.144 GB, where chunking costs 6.8 MB for 99.6% of the saving. The MATH is still m=1 / tq=1; batching it needs a rows dimension on the centered norm and a per-row rope position, changes the arithmetic, and first makes the launcher's ring union hazard reachable -- separate work. (4) STAGE WORK, six, mostly S4 and S5. G3's comparison against MUSE GLIMMER rather than against rivoli's own transcription is DONE 2026-08-13 (tests/glimmer_reference.rs): the anchor driver now exports all 107 parameter tensors, both goldens regenerate BYTE-IDENTICAL so the change is provably additive, and rivoli's loop reproduces the reference's own logits on the reference's own weights over 7 steps x 2 salts, worst 4.8e-2, all 14 emitted tokens exact, red-proved at 1.3e0 / 1.1e0 / 6.7e-1. It carries a bf16 weight-rounding term MEASURED at 9.3e-3 to 6.8e-2 (rivoli stores projections bf16, the reference computed f32), which sets its tolerance and costs it resolution -- so it and the finer chain gate are complements, not substitutes. Its load-bearing by-product is that an independent f64 transcription of sections 3-5 reproduces the reference to 3.8e-6, the first evidence here that the architecture doc is right about the WHOLE chain. AND IT DID NOT CLOSE THE EPS ITEM, which this file had expected it to: the transposition is green on the reference's own weights too, so it is not a fixture artefact. S4 is now PART-CLOSED (2026-08-14): the 59.553 GB checkpoint is downloaded, structurally verified and converted bf16-verbatim to a 55.71 GB artifact (418 verbatim + 209 norms widened + 809 vision skipped, reconciling to the index's 1436); the chat template is hand-ported as artifact::glimmer_encoding and pinned byte-for-byte against 24 cases rendered by the checkpoint's OWN apply_chat_template, with 11 red proofs; and tie_word_embeddings: false is gated on ADDRESSES (the two [vocab, hidden] tensors are 2,689,662,976 B each, 1.252x i32::MAX, contents distinct), red-proved by aliasing the head onto the embedding. Item 3 is CLOSED too (2026-08-14): three greedy runs on the bf16 artifact, sole tenant with a KFD/GTT witness, all 52 layers pinned at 55.712 GB -- 1.486 tok/s at 96 tokens, 2.261 at 500 (warm-up amortizing), and 1.804 on a run that TERMINATED NATURALLY at 110 of a 400 limit, which is what GLM did in none of 56 runs before its framing was fixed. The text is coherent and it is the reasoning channel: every run completes the generation prompt with ' to=self<|message|>' as Reasoning strength: high asks, and the 500-token run writes three correct sentences and then checks them. One finding is for the SERVING layer, not S4: the run that stopped stopped inside the reasoning channel, because <|eom|> (200007) is deliberately not a stop id -- so a bounded CLI decode yields reasoning and never the answer, and there is no way to lower the reasoning strength from the CLI. What S4 still owes is the dNLL ladder per format and the first quantized format, and the ladder cannot start before the format exists. Register items 4.2, 4.3 and 4.4 are all CLOSED 2026-08-14. 4.3: a 7661-token prompt with a needle at token ~53 -- 7608 tokens back, outside every sliding window, so only the 13 full-attention layers can carry it across a ring that wrapped 3.7x -- and the model reproduced TANGERINE-4417 EXACTLY, coherently. A behavioural probe at shipped width, not a new numeric gate (that exists at sliding_window=2). It also exposed the real cost of an unbatched prefill: 0.416 s/token at 1201 and 0.561 at 7661, i.e. 75-101% of a decode step, because section 3.2 batched the FETCH and not the arithmetic -- so a 7661-token prompt is 72 MINUTES before the first output token, which makes batching the prefill math the highest-value S5 item by a wide margin. 4.4: sixteen bare null_mut() in stream position (not the 'about fourteen' this file estimated), all converted, with a test that lists the three genuine pointer survivors by reason. 4.2: CLOSED BY REFUTATION plus a price -- the anchor's logits max at 0.24 where 20*tanh(x/20) is arithmetically the identity (0.0002%), so disabling the softcap moves total variation from 1.249e-3 to 1.249e-3 and NO tolerance could ever see it; priced instead on the real model, where it cuts max|logit| 36.27 -> 18.96 and the top1-top2 gap 33.46 -> 18.05, leaves total variation at 1.92e-8 (both saturate), and moves the RUNNER-UP token by 15.4 nats -- so the instrument for it is teacher-forced NLL on non-argmax tokens, i.e. item 4's dNLL ladder, which needs a Glimmer --ppl path that does not exist. S5 remains gated on G4, but the STREAMING curve is now measured on bf16 and it is the first evidence Glimmer streams at all: 1.804 tok/s all-resident against 0.638 / 0.453 / 0.355 at --max-mem 45 / 30 / 15 (9 / 26 / 42 layers streaming), so the pin is worth 5.1x end to end. Marginal streaming bandwidth RISES with the streamed count -- 8.6 -> 15.2 -> 18.0 GB/s -- so the per-fill fixed cost dominates small streamed sets and amortizes, which is exactly what S5's prefetch item is about, measured before the lever exists. The first version of that table was NON-MONOTONIC and it was PAGE CACHE, not a finding: the first arm paid the cold NFS read for the whole 55.712 GB file, 82.81 s cold against 37.90 and 37.64 s warm -- a 2.2x confound, bigger than most effects being measured, reproducing to 0.8% once warm. Also carried here: the branch is 50+ commits unpushed, the checkpoint lives at /swarm/storage/ai/rivoli because /swarm/storage/ai/models is root-owned, and the GPU node label is left at disabled with llama-swap Pending.
 ---
 
 # Muse Glimmer — open items after S3
@@ -185,30 +185,115 @@ and the fix is already specified in the driver's own docstring:
 > right about the whole chain — and it is what says `glimmer_chain.rs`'s oracle scores against a
 > correct reading rather than a shared misreading.
 
-### 4.2 G3 — the probability-space softcap check
+### 4.2 G3 — the probability-space softcap check — **CLOSED 2026-08-14, by REFUTATION plus a price**
 
-S2 proved argmax-invariance, so no greedy gate can see the softcap. `Glimmer::logits()` is the
-accessor for it and exists; the check compares softmax/NLL against the reference and requires a
-`softcap_off` run to redden. §4.1 supplies the reference side.
+The check was built: `total_variation` and per-token NLL now score every reference step in
+`glimmer_reference.rs`, measured and bounded like every other tolerance there.
 
-> Partly paid already: the chain gate red-proves a deleted softcap (4.1e0) and the `tanh` alone
-> (9.9e-5), and that second figure is what set its tolerance. What is missing is the comparison
-> in probability space rather than in logits.
+> **THE ANCHOR CANNOT PRICE THE SOFTCAP, and that is measured, not suspected.** Disabling the
+> softcap on this fixture moves total variation from 1.249e-3 to 1.249e-3 and dNLL from 5.316e-3
+> to 5.311e-3. Not a small signal — NO signal, and no tolerance could ever recover it:
+>
+> | | max &#124;logit&#124; | what `20·tanh(x/20)` does there |
+> |---|---|---|
+> | this anchor | **0.24** | changes it by **0.0002%** — arithmetically the identity |
+> | the real 30B, trained prompt | **36.27** | compresses to **18.96**, a 48% cut |
+>
+> `tanh` is linear near zero and the anchor never leaves that region. `glimmer-integration.md`
+> S4 item 4 predicted this in as many words ("the anchor provably cannot"); this is the
+> measurement behind the prediction.
 
-### 4.3 G3 — a decode crossing position 2048
+**So it was priced on the real model instead** — `--prompt "Say hello."`, one step, `cap = 20`
+against `cap = 1e30`, everything else identical:
 
-The ring's first eviction. `glimmer_chain.rs` wraps the fixture's window four times, which is
-the same mechanism at `sliding_window = 2`; this is the shipped-width version and needs S4's
-weights.
+| | capped | uncapped |
+|---|---|---|
+| max &#124;logit&#124; | 18.96 | 36.27 |
+| top1−top2 logit gap | 18.05 | 33.46 |
+| argmax | 328 | 328 — **the same**, as S2 proved it must be |
+| total variation between the two | **1.92e-8** | — invisible; both saturate at `p(top1) = 1.0` |
+| runner-up probability | 1.45e-8 | 2.95e-15 — a factor of **4.9 million** |
+| runner-up NLL | 18.05 nats | 33.46 nats — **15.4 nats apart** |
+| entropy | 4.05e-7 nats | 1.28e-13 nats — a factor of 3.2 million |
 
-### 4.4 The `NULL_STREAM` source census
+**The softcap is invisible to greedy decode, invisible to total variation on a confident prompt,
+and enormous in the tail.** That is the whole answer to why it was hard to gate, and it names the
+right instrument: **teacher-forced NLL on NON-argmax tokens**, which is S4 item 4's dNLL ladder.
+It does not exist for this model — `src/eval.rs` has `run` and `run_v4` and no Glimmer path — so
+item 4 now has a second prerequisite besides a quantized format.
 
-`src/backend.rs` defines `NULL_STREAM` so a deliberate null reads as a decision, and about
-fourteen `src/` call sites still pass a bare `std::ptr::null_mut()` in the stream position —
-including one in a file that imports `NULL_STREAM` and uses it eight lines away. One test, no
-device, `kernel_coverage.rs`'s style.
+**What the two new metrics DO buy**, stated narrowly. TV is a second norm on the same logits in
+the space the output lives in (`worst_rel` is relative-max, this is L1 on the distribution), so a
+defect concentrated on one high-probability token moves it far more. Bound 5e-3 at ~3.4x the
+measured clean value; red-proved. dNLL's resolution is **a ~10% temperature error** — measured:
+x1.05 on the engine's logits scores 1.2e-2 and passes, x1.10 scores 2.231e-2 and reddens. Coarse,
+because the anchor's 61-way distribution is nearly uniform, and tightening it would leave 1.6x
+over clean — the exact thinness that made §1.1's gates red on a correct engine.
 
-**Deferred to the owner:** it edits three engine files this port does not own.
+### 4.3 G3 — a decode crossing position 2048 — **CLOSED 2026-08-14**
+
+The ring's first eviction at shipped width. `glimmer_chain.rs` wraps the fixture's window four
+times, which is the same mechanism at `sliding_window = 2`; this needed S4's weights, which now
+exist.
+
+> **A needle probe, because it discriminates where a smoke test does not.** A 7661-token framed
+> prompt carrying `the vault access code is TANGERINE-4417` at token ~53 — **7608 tokens before
+> the end, so outside every one of the 39 sliding layers' 2048-token windows.** Only the 13
+> full-attention layers can carry it, across a ring that wrapped **3.7 times**. A ring that
+> mis-evicted would corrupt the residual stream and make a specific string from the far past
+> unrecoverable.
+>
+> **The model reproduced `TANGERINE-4417` exactly**, and the surrounding text is coherent and
+> on-task ("The user gives a huge list of maintenance logs, all routine inspection with no…").
+> Control at 1201 tokens — inside the window, so the sliding layers can see it too — also
+> retrieved it.
+>
+> **This is a behavioural probe at shipped width, not a new numeric gate**, and it is worth being
+> exact about that: the numeric ring gate exists at `sliding_window = 2` in `glimmer_chain.rs`.
+> What this adds is that nothing about the mechanism is width-dependent — no 2048-sized block
+> assumption, no index that overflows, no eviction that fires early.
+>
+> **And it exposed the cost of an unbatched prefill**, which is the more actionable finding:
+>
+> | prompt | n_ctx | total | prefill s/token |
+> |---:|---:|---:|---:|
+> | 1201 | 1249 | 526.5 s | 0.416 |
+> | 7661 | 7709 | 4327.8 s | 0.561 |
+>
+> Prefill costs **75-101% of a decode step per token**, because the math is still `m = 1`,
+> `tq = 1` (§3.2 batched the FETCH, not the arithmetic) and at all-resident there are no fetches
+> left to save. A 7661-token prompt is **72 minutes before the first output token**. The growth
+> from 0.416 to 0.561 is the 13 full-attention layers being O(n) while the 39 sliding ones cap at
+> 2048. **This makes batching the prefill math the highest-value S5 item by a wide margin** — it
+> is the difference between long context being usable and not, independent of tok/s.
+
+### 4.4 The `NULL_STREAM` source census — **CLOSED 2026-08-14**
+
+`src/backend.rs` defines `NULL_STREAM` so a deliberate null reads as a decision, and nothing
+made the call sites use it.
+
+> **Sixteen, not "about fourteen".** The estimate in this row was prose nobody had counted —
+> the same class of defect as the margins in §1.1. Actual: **9 in `gpu.rs`** (four
+> `Event::record`, five launcher tails), **6 in `f4gpu.rs`** — which imports `NULL_STREAM` at
+> line 109 and spells it correctly six lines from a bare one — and **1 in `attn.rs`**, the guard
+> test module whose own doc argues the null is honest. It is, and the constant is what says so.
+>
+> Every site was classified by READING it. Three occurrences are pointers and stay: `gpu.rs`'s
+> indexer pool pointer (absent means "no pool", not "no stream"), `memory/device.rs`'s two
+> `hipMalloc` out-parameters, and `fetch/stream.rs`'s io_uring destination array.
+>
+> **The substitution is value-identical by construction** — `NULL_STREAM` IS
+> `std::ptr::null_mut()` — so compilation is the proof and no behaviour can have moved.
+>
+> `tests/kernel_coverage.rs::a_bare_null_mut_is_never_a_stream` keeps it, listing the three
+> survivors with their reasons rather than a count. Red-proved by reintroducing one null.
+> **Comment lines are skipped, the OPPOSITE of the jscpd marker rule** — there a comment mention
+> was live and two corrections were spent establishing it; here counting prose would make the
+> census a function of how often the convention is discussed.
+>
+> **rustfmt then reflowed two `gpu.rs` calls**, because dropping the `crate::backend::` prefix
+> shortened lines enough for them to collapse. The committed file was fmt-clean, so those hunks
+> were mine; fixed here, and jscpd re-run after the reflow rather than before.
 
 ### 4.5 S4 — real weights — **items 1, 2 and 5 CLOSED 2026-08-14**
 
