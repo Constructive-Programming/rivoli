@@ -1090,13 +1090,9 @@ impl Glimmer {
         // unmaps the weight slab with that layer's kernels still in flight. The success path is
         // already joined by `sample`; this covers the rest (review, 2026-08-13).
         //
-        // > **SUPERSEDED as the whole story, 2026-08-14.** `sample`'s join is upstream of the
-        // > drop, not part of it, so "the success path is already joined" argued for a narrower
-        // > fix than the hazard needs — a successful decode still drops its engine through the
-        // > same unsynchronised unmap. `Drop for VmmBuf` now joins unconditionally, which covers
-        // > both paths at the one place that knows about the unmap. This line is left in place
-        // > because it is now REDUNDANT rather than wrong, and free: it fires only on an error
-        // > return, where a second `hipDeviceSynchronize` costs nothing anyone is timing.
+        // > **NARROWER THAN THE HAZARD, 2026-08-14**: a successful decode drops its engine
+        // > through the same unsynchronised unmap, so `Drop for VmmBuf` now joins unconditionally
+        // > and this is redundant rather than wrong. Kept because it is free on an error return.
         let r = self.decode_inner(prompt, max_new, eos);
         if r.is_err() {
             let _ = device_sync();

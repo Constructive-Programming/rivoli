@@ -352,14 +352,12 @@ fn is_norm(name: &str) -> bool {
 /// The eight per-layer projections — everything `--fp8` quantizes, and nothing else.
 ///
 /// **`embed_tokens` and `lm_head` are deliberately NOT here**, though they are 5.380 GB of the
-/// 55.712: requantizing two tensors that are read once per token each is its own quality question
-/// with its own measurement, and `GlimmerFormat`'s doc is where that scope is written down. The
-/// four per-layer norms are excluded by [`is_norm`] having already claimed them above, and they
-/// are f32 in every format anyway.
+/// 55.712: requantizing two tensors read once per token each is its own quality question, and
+/// `GlimmerFormat`'s doc holds that scope. The norms are already claimed by [`is_norm`] above.
 ///
-/// Composed from the two predicates that already exist rather than listing eight suffixes: a
-/// list would be a fourth spelling of [`GLIMMER_LAYER_TENSORS`], and the count assertion at the
-/// call site is what turns "these are the eight" from a belief into an observation.
+/// Composed from two existing predicates rather than listing eight suffixes, which would be a
+/// fourth spelling of [`GLIMMER_LAYER_TENSORS`]; the count assertion at the call site is what
+/// makes "these are the eight" an observation.
 fn is_layer_proj(name: &str) -> bool {
     name.starts_with(GLIMMER_LAYER_PREFIX) && !is_norm(name)
 }

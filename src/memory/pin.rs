@@ -1722,12 +1722,6 @@ impl GlimmerPin {
         })
     }
 
-    /// The format this artifact's projections are in — what `run_glimmer` labels a `--ppl` row
-    /// with, so a ladder rung cannot be recorded under the wrong format's name.
-    pub fn format(&self) -> GlimmerFormat {
-        self.fmt
-    }
-
     /// Layer `l`'s twelve device addresses — **pinned or streamed, indistinguishably.**
     ///
     /// `&mut self` because a miss fills a slot. That is the honest signature: a caller cannot

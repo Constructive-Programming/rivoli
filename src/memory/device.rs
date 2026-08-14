@@ -519,22 +519,19 @@ mod tier {
         /// reproduced; `glimmer-open-items.md` carries it. It is also not an io_uring barrier —
         /// this waits on the device, not on completions.
         ///
-        /// That reasoning is too narrow **on the a-priori argument alone** — an engine is dropped
-        /// on the success path too, and `sample`'s join is upstream of the drop, not part of it.
+        /// `glimmer_gpu.rs`'s reasoning is too narrow on the a-priori argument alone: an engine is
+        /// dropped on the success path too, and `sample`'s join is upstream of the drop rather than
+        /// part of it. **This line stands on that argument and on NOTHING MEASURED** — it was
+        /// written while chasing the §4b SIGSEGV and is not what fixed it (2 crashes in 27 runs
+        /// before, 1 in 25 after, indistinguishable; the real cause was upstream, gone in 7.14).
         ///
-        /// > **This was written while chasing the §4b SIGSEGV and is NOT what fixed it** —
-        /// > measured, 2 crashes in 27 runs before and 1 in 25 after, indistinguishable. That
-        /// > turned out to be an upstream bug, gone in ROCm 7.14.
-        /// >
-        /// > **No captured core supports this line, and an earlier version of this comment claimed
-        /// > one did** ("two of the three cores were success-path drops", 2026-08-14). The census
-        /// > in `docs/investigations/hip-vmm-segv.md` says the opposite: of four cores, THREE are
-        /// > in `rivoli_vmm_alloc` under `GlimmerPin::build` and exactly one is in
-        /// > `rivoli_vmm_free` — and that one faulted inside `hipMemUnmap` on what the same file
-        /// > concludes was an upstream NULL dereference, which is not evidence of a live kernel
-        /// > either. The sentence inverted the measurement it cited. **This line stands on the
-        /// > synchronisation argument above and on nothing measured**, which is a weaker claim and
-        /// > the true one.
+        /// > **A version of this comment dated 2026-08-14 claimed a captured core supported it, and
+        /// > inverted the census to do so** ("two of the three cores were success-path drops"). Of
+        /// > the FOUR cores in `docs/investigations/hip-vmm-segv.md`, three are in
+        /// > `rivoli_vmm_alloc` and exactly one in `rivoli_vmm_free` — and that one faulted inside
+        /// > `hipMemUnmap` on an upstream NULL dereference, which is not evidence of a live kernel
+        /// > either. Kept as a correction rather than silently rewritten because the false version
+        /// > shipped.
         ///
         /// A `device_sync` per teardown is free in the only sense that matters: buffers of this
         /// kind are built once per engine, not per token.

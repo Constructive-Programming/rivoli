@@ -1686,9 +1686,13 @@ pub enum GlimmerFormat {
     /// Verbatim from the checkpoint: 2 bytes per weight, no scales.
     Bf16,
     /// e4m3 with one f32 scale per `FP8_BLOCK × FP8_BLOCK` tile. One byte per weight plus a
-    /// 1/16384th-of-a-float scale grid, so **0.50018 of bf16** — the grid is 0.024% of the
-    /// payload and rounds away at any precision anyone quotes, but it is charged exactly here
+    /// 1/16384th-of-a-float scale grid, so **0.500122 of bf16** for the projections themselves.
+    /// The grid rounds away at any precision anyone quotes, but it is charged exactly here
     /// because a tier sized without it is short by 118 KB per layer.
+    ///
+    /// > Read **0.50018** until review corrected it 2026-08-15. That is the ratio of a whole
+    /// > LAYER, which the f32 norms drag up by being the same size in both formats — a different
+    /// > quantity from this variant's own, and the one [`GlimmerTextConfig::layer_bytes`] quotes.
     Fp8,
 }
 
@@ -1929,7 +1933,10 @@ impl GlimmerTextConfig {
     }
 
     /// Bytes ONE layer's twelve tensors occupy — **967.942 MB** at bf16 for the shipped model,
-    /// **484.142 MB** at fp8 (0.50018×, the scale grid being the 0.018%).
+    /// **484.142 MB** at fp8. That is 0.500177×, and the 0.0177% over half is TWO things: the
+    /// scale grid at 0.0122% and the four f32 norms, unchanged by the format, at 0.0055%. (This
+    /// said "the scale grid being the 0.018%" and so credited the grid with the norms' share
+    /// too; review, 2026-08-15.)
     ///
     /// > Written as 967.889 MB until 2026-08-12. That is the figure with the four norms at
     /// > bf16, which is the CHECKPOINT's dtype — `convert_glimmer` widens them, so the artifact's

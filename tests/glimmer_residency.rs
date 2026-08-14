@@ -33,6 +33,11 @@ use fx::{TempRoot, glimmer_convert_fixture};
 use rivoli::artifact::model as gm;
 
 const DIM: usize = fx::GLIMMER_FIXTURE_DIM;
+
+/// The fixture is a bf16 artifact, so every byte-arithmetic call below names this. Bound once
+/// rather than spelled seventeen times: at seventeen the format reads as noise in the call, and
+/// six of them had reflowed onto three lines each to carry it.
+const BF16: gm::GlimmerFormat = gm::GlimmerFormat::Bf16;
 const L: usize = fx::GLIMMER_FIXTURE_LAYERS;
 
 /// The fixture's config — for the deviceless arithmetic test.
@@ -71,9 +76,9 @@ fn converted(tag: &str, dim: usize) -> (TempRoot, String, gm::GlimmerTextConfig)
 #[test]
 fn the_partition_arithmetic_holds_at_every_boundary() {
     let cfg = tiny_cfg();
-    let want = cfg.resident_bytes(gm::GlimmerFormat::Bf16).unwrap();
-    let layer = cfg.layer_bytes(gm::GlimmerFormat::Bf16).unwrap();
-    let floor = cfg.floor_bytes(gm::GlimmerFormat::Bf16).unwrap();
+    let want = cfg.resident_bytes(BF16).unwrap();
+    let layer = cfg.layer_bytes(BF16).unwrap();
+    let floor = cfg.floor_bytes(BF16).unwrap();
     assert_eq!(cfg.n_layers, L, "the fixture's layer count moved");
     // Kept for shape, but it is the SHIPPED-widths twin that can fail: at 416-byte globals and
     // 1,920-byte layers a floor charging zero slots is still 1,048,992 > 2,336. Review, 2026-08-12.
@@ -83,7 +88,7 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     );
 
     assert_eq!(
-        cfg.partition(None, gm::GlimmerFormat::Bf16).unwrap().0,
+        cfg.partition(None, BF16).unwrap().0,
         L,
         "None must pin every layer"
     );
@@ -95,7 +100,7 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     // the model, because the two orderings swap between tiny and real widths.
     let all_resident = want + gm::GLIMMER_PIN_SLACK;
     for b in [all_resident, all_resident * 4] {
-        let (pinned, capacity) = cfg.partition(Some(b), gm::GlimmerFormat::Bf16).unwrap();
+        let (pinned, capacity) = cfg.partition(Some(b), BF16).unwrap();
         assert_eq!(pinned, L, "a budget of {b} must pin every layer");
         // And it must not ASK for more than the all-resident set. `DeviceTier::new` allocates
         // its capacity rather than treating it as a ceiling, and also feeds `guard_capacity`, so
@@ -106,17 +111,13 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
         );
     }
 
-    let (pinned, _) = cfg.partition(Some(floor), gm::GlimmerFormat::Bf16).unwrap();
+    let (pinned, _) = cfg.partition(Some(floor), BF16).unwrap();
     assert_eq!(
         pinned, 0,
         "exactly the floor buys the globals and the slots, and no layers"
     );
 
-    let e = format!(
-        "{:#}",
-        cfg.partition(Some(floor - 1), gm::GlimmerFormat::Bf16)
-            .unwrap_err()
-    );
+    let e = format!("{:#}", cfg.partition(Some(floor - 1), BF16).unwrap_err());
     // `"what is LEFT for weights"` replaced `"Weights only"` on 2026-08-14. The old fragment
     // pinned a disclaimer that was FALSE for the number beside it — both callers hand `partition`
     // a budget `weight_budget` has already taken the KV cache out of, so "KV ... on top of this"
@@ -145,16 +146,12 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     let crossover = L - gm::GLIMMER_STREAM_SLOTS;
     for k in 1..crossover {
         assert_eq!(
-            cfg.partition(Some(floor + k * layer), gm::GlimmerFormat::Bf16)
-                .unwrap()
-                .0,
+            cfg.partition(Some(floor + k * layer), BF16).unwrap().0,
             k,
             "floor + {k} layers must pin {k}"
         );
         assert_eq!(
-            cfg.partition(Some(floor + k * layer - 1), gm::GlimmerFormat::Bf16)
-                .unwrap()
-                .0,
+            cfg.partition(Some(floor + k * layer - 1), BF16).unwrap().0,
             k - 1,
             "one byte short of {k} layers must pin {}, not round up",
             k - 1
@@ -163,7 +160,7 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
     // The crossover itself, asserted rather than merely avoided: at `k + SLOTS == n_layers` the
     // budget must pin EVERYTHING and drop the slots.
     let (pinned, capacity) = cfg
-        .partition(Some(floor + crossover * layer), gm::GlimmerFormat::Bf16)
+        .partition(Some(floor + crossover * layer), BF16)
         .unwrap();
     assert_eq!(
         (pinned, capacity),
@@ -188,8 +185,8 @@ fn every_budget_resolves_every_layer_to_the_same_bytes() {
     use rivoli::memory::pin::GlimmerPin;
     let (_root, dir, cfg) = converted("glimmer-residency-bytes", DIM);
     let dir = dir.as_str();
-    let layer = cfg.layer_bytes(gm::GlimmerFormat::Bf16).unwrap();
-    let floor = cfg.floor_bytes(gm::GlimmerFormat::Bf16).unwrap();
+    let layer = cfg.layer_bytes(BF16).unwrap();
+    let floor = cfg.floor_bytes(BF16).unwrap();
 
     // The reference: all resident, no slots.
     let mut all = GlimmerPin::build(dir, &cfg, None).unwrap();
@@ -322,10 +319,10 @@ fn tensors_of(p: &rivoli::memory::pin::GlimmerLayerPin) -> Vec<Vec<u8>> {
 fn the_partition_arithmetic_holds_at_the_shipped_widths() {
     let cfg: gm::GlimmerConfig = serde_json::from_str(fx::GLIMMER_SHIPPED_CONFIG).unwrap();
     let cfg = cfg.text;
-    let layer = cfg.layer_bytes(gm::GlimmerFormat::Bf16).unwrap();
+    let layer = cfg.layer_bytes(BF16).unwrap();
     let global = cfg.global_bytes();
-    let want = cfg.resident_bytes(gm::GlimmerFormat::Bf16).unwrap();
-    let floor = cfg.floor_bytes(gm::GlimmerFormat::Bf16).unwrap();
+    let want = cfg.resident_bytes(BF16).unwrap();
+    let floor = cfg.floor_bytes(BF16).unwrap();
 
     // Re-derived by hand from config.json, not quoted from any doc — the figure in this repo's
     // prose was 967.889 MB in four places, which is the CHECKPOINT's bf16-norm arithmetic; the
@@ -345,7 +342,7 @@ fn the_partition_arithmetic_holds_at_the_shipped_widths() {
     // Every budget in the band below all-resident must pin fewer than every layer, and must ask
     // for what it uses rather than for the whole budget — the over-allocation review found.
     for b in [floor, floor + layer, want, want - 1] {
-        let (pinned, capacity) = cfg.partition(Some(b), gm::GlimmerFormat::Bf16).unwrap();
+        let (pinned, capacity) = cfg.partition(Some(b), BF16).unwrap();
         assert!(pinned < cfg.n_layers, "{b} must leave something streaming");
         assert!(
             capacity <= b,
@@ -608,7 +605,7 @@ fn a_slot_refill_cannot_land_under_a_live_kernel() {
 
     // The floor pins ZERO layers, so every layer streams and layers 0 and 1 map to the same slot.
     // That is the configuration the hazard needs and the one a tight budget produces.
-    let floor = cfg.floor_bytes(gm::GlimmerFormat::Bf16).unwrap();
+    let floor = cfg.floor_bytes(BF16).unwrap();
     let mut pin = GlimmerPin::build(dir, &cfg, Some(floor)).unwrap();
     // **Both of these are load-bearing, not sanity checks.** If the floor pinned layer 0, `q` would
     // be a PINNED pointer, `layer(1)` would refill a slot in unrelated memory, and every arm below

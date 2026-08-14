@@ -149,7 +149,9 @@ fn the_fp8_artifact_is_fp8_exactly_where_it_should_be() {
         b8, actual,
         "layer_bytes(Fp8) must be the bytes the artifact's layer 0 occupies"
     );
-    assert!(b8 * 2 > b16 && b8 < b16, "fp8 is just over half of bf16");
+    // No `b8 < b16 && b8 * 2 > b16` beside it: that is arithmetic over two numbers the exact
+    // equality above already pins, and it would still pass on a `b8` that was wrong by 40%.
+    let _ = b16;
 }
 
 /// **The arithmetic gate: one placed fp8 projection against a host oracle over the SAME bytes.**
@@ -270,17 +272,22 @@ fn bytemuck_f32(v: &[f32]) -> Vec<u8> {
 ///
 /// **An `fp8`-vs-`bf16` bound is not available at any useful tightness, because the quantization
 /// is the difference.** e4m3 carries 3 mantissa bits, so the two arms hold genuinely different
-/// numbers and the gap is whatever this architecture amplifies them into — measured here at
-/// ~8% of the logit row scale over only four layers, with the fixture's 320-wide projections.
-/// (That amplification was measured on the way to this file, by decoding a third artifact holding
-/// the fp8 weights dequantized back to bf16: it agrees with `bf16` no better than `fp8` does, so
-/// the gap is cancellation through the residual stream and not a defect. The third artifact is not
-/// kept — a 55-line oracle whose tightest honest tolerance is 8% gates nothing the projection test
-/// does not gate at 1e-4.)
+/// numbers and the gap is whatever this architecture amplifies them into — **measured at ~8% of
+/// the logit row scale over only four layers**, by decoding a third artifact holding the fp8
+/// weights dequantized back to bf16. That artifact is not kept: an oracle whose tightest honest
+/// tolerance is 8% gates nothing the projection test does not gate at 1e-4.
 ///
 /// So the assertions are the two that ARE sharp: the decode produces a usable logit row, and it is
-/// not the bf16 one. The second is the anti-vacuity half — if `proj` ever fell back to the verbatim
-/// weights, every other test here would still pass.
+/// not the bf16 one.
+///
+/// **The second is the anti-vacuity half, and it is NOT redundant with the `else { panic! }` in
+/// the projection test** — review proposed dropping this arm on that reading, 2026-08-15. That
+/// `panic!` fires if the PIN placed something other than an `Fp8` variant. It cannot see a
+/// `glimmer_gpu::proj` whose fp8 match arm launches the wrong kernel, because the projection test
+/// calls `launch_gemv_fp8` **directly** and never goes through `proj` at all. A `proj` that
+/// dispatched both variants to `launch_gemm_bf16` would place fp8, pass the oracle gate, decode
+/// finite non-constant logits — and be caught only here. The bf16 arm is what costs the extra
+/// fixture conversion, and it is the half doing the work.
 #[test]
 fn an_fp8_artifact_decodes_and_is_not_secretly_the_bf16_one() {
     let bf16_root = TempRoot::new("glimmer-fp8-e2e-bf16");
