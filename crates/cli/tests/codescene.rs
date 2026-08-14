@@ -107,17 +107,10 @@ fn tool_absent(context: &str, detail: &str) -> bool {
     true
 }
 
-/// Cache: path → (fnv1a of contents, score). Keyed on content hash + cs version so a cs
-/// upgrade re-reviews everything. FNV-1a, not a sha2 dependency — the same trade the
-/// artifact pins make.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
+/// Cache keying: FNV-1a of contents + cs version, hash owned by `rivoli_core::hash` (this
+/// file carried its own copy for one build, until the anchor port brought the second copy
+/// and jscpd reported the pair — the gate's first live catch in this tree).
+use rivoli_core::hash::fnv1a;
 
 fn cache_path() -> PathBuf {
     // The workspace redirects target-dir via .cargo/config.toml; honour it.

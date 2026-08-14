@@ -5,3 +5,6 @@
 //! written from the reference, not from rivoli's idea of the reference — so it
 //! changes only when the reference does, and the engine must never call into it
 //! on a decode path. Host-only and featureless.
+
+pub mod golden;
+pub mod v4oracle;

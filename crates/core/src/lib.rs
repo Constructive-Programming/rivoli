@@ -10,3 +10,5 @@
 //! which this crate does not depend on, so a residency decision that selects
 //! arithmetic — the old tree's hybrid defect, where `--max-mem` changed the output
 //! text — cannot be expressed here at all.
+
+pub mod hash;

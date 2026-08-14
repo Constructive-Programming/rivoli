@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 rivoli-engine = { path = "../engine" }
+rivoli-core = { path = "../core" }
+anyhow = "1"
 
 [dev-dependencies]
 serde_json = "1"

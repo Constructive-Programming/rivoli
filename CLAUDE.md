@@ -52,8 +52,10 @@ appears that enum dispatch cannot fill.
 
 - **jscpd** — duplication is a build error, zero budget (`crates/cli/build.rs`, every
   build, both feature arms). Precondition: rustfmt-clean, or the result is a lower bound.
-  **0** regions are exempt via ignore markers; the count is derived by
-  `crates/cli/tests/docs.rs`, and marker text may appear only on a bare marker line.
+  **3** regions are exempt via ignore markers (all in the ported frozen V4 oracle, each
+  arguing in place that a verbatim transcription of the reference is the point); the count
+  is derived by `crates/cli/tests/docs.rs`, and marker text may appear only on a bare
+  marker line.
 - **CodeScene 10/10** — `crates/cli/tests/codescene.rs`, whole tree, hard threshold;
   standing red-proof fixture must score < 10 every run; exemptions argued in place and
   checked at both ends. Warn-and-skip without a license locally; CI hard-fails via
