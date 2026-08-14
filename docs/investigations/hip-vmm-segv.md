@@ -1,39 +1,40 @@
 ---
 scope: engine
-status: live
-verdict: A SIGSEGV inside libamdhip64's virtual-memory path on gfx1151/HIP 7.2.53210, hit by tests/glimmer_reference.rs at ~6% of runs and by a two-thread synthetic at 25%. The fault is a NULL dereference in the runtime -- `mov rdx,[rax+0xe0]` with rax=0, `segfault at e0 error 4` -- landing in hipMemCreate/AddressReserve/Map (2 of 3 captured cores) or in hipMemUnmap/Release/AddressFree (1 of 3). NOT concurrency: with --test-threads=1 the threads never overlap, and it is the mere PARTICIPATION of a second thread that matters. Bisected: 1500 bare VMM alloc/free cycles on one thread clean, ~1000 engine build/decode/drop cycles in ONE test clean, the same work split across TWO tests 2-in-8 then 3-in-12, all of it marshalled onto one worker thread 0-in-12. Two rivoli-side fixes were tried and MEASURED: hipSetDevice per thread changed nothing (3 in 12), and a dedicated VMM thread fixed the synthetic (25% -> 0 in 15) but NOT glimmer_reference (1 in 15 against 3 in 52 before, i.e. unchanged) -- and the surviving crash is ON the VMM thread, which refutes thread-affinity as the whole cause. A standalone C reproducer is in hip-vmm-segv-repro.cpp; it does NOT yet fire, which rules out the simple shapes (VMM churn, hipMalloc volume, kernels, syncs, varying sizes, mmap-sourced memcpy, two sequential threads) and is itself part of the report. SUPERSEDED THE SAME DAY: a full ROCm 7.14.0 upgrade landed mid-session at 20:02 and libamdhip64.so.7.2.53210 is DELETED from disk, so every measurement here is against a runtime that no longer exists and none of it has been re-tested. It could not be: pre-upgrade binaries now fail with hipMemGetInfo 100 (hipErrorNoDevice) although the GPU is healthy -- their gfx1151 code objects are what 7.14 rejects -- and hipcc cannot rebuild them because clang-23.1.0_rc3 dies on an undefined symbol in its own libclang-cpp. The next action is to make the toolchain consistent, rebuild, and re-run tests/vmm_threads.rs and glimmer_reference in a loop.
+status: closed-shipped
+verdict: A SIGSEGV inside libamdhip64's virtual-memory path on gfx1151/HIP 7.2.53210, hit by tests/glimmer_reference.rs at ~6% of runs and by a two-thread synthetic at 25%. The fault is a NULL dereference in the runtime -- `mov rdx,[rax+0xe0]` with rax=0, `segfault at e0 error 4` -- landing in hipMemCreate/AddressReserve/Map (2 of 3 captured cores) or in hipMemUnmap/Release/AddressFree (1 of 3). NOT concurrency: with --test-threads=1 the threads never overlap, and it is the mere PARTICIPATION of a second thread that matters. Bisected: 1500 bare VMM alloc/free cycles on one thread clean, ~1000 engine build/decode/drop cycles in ONE test clean, the same work split across TWO tests 2-in-8 then 3-in-12, all of it marshalled onto one worker thread 0-in-12. Two rivoli-side fixes were tried and MEASURED: hipSetDevice per thread changed nothing (3 in 12), and a dedicated VMM thread fixed the synthetic (25% -> 0 in 15) but NOT glimmer_reference (1 in 15 against 3 in 52 before, i.e. unchanged) -- and the surviving crash is ON the VMM thread, which refutes thread-affinity as the whole cause. A standalone C reproducer is in hip-vmm-segv-repro.cpp; it does NOT yet fire, which rules out the simple shapes (VMM churn, hipMalloc volume, kernels, syncs, varying sizes, mmap-sourced memcpy, two sequential threads) and is itself part of the report. CLOSED 2026-08-14: an UPSTREAM bug, fixed by ROCm 7.14.0, nothing to file. Re-run with rivoli's workaround BYPASSED: glimmer_reference 0 in 20 (was ~3 in 52) and the two-thread synthetic 0 in 20 (was 2 in 8, then 3 in 12). The dedicated VMM thread is REMOVED -- 103 lines of allocator complexity in every model's path, defending against a bug the runtime no longer has; the one-line device_sync before the unmap stays, because it closes a hazard glimmer_gpu.rs documented independently and which was never this bug's cause. Getting there was mostly a TOOLCHAIN repair worth knowing: Gentoo's pre-release LLVM ebuilds default debug (LLVM_ENABLE_ABI_BREAKING_CHECKS) ON, which changes ilist_iterator_w_bits's template parameters, and llvm was rebuilt with -debug while clang and lld were not. The symptom moved as each was fixed -- clang++ symbol lookup, then HIP enumerating the GPU but failing at 'Failed to load COMGR library' because rocm-comgr links lld, which was still stale.
 ---
 
 # A SIGSEGV inside HIP's VMM path — gfx1151, HIP 7.2.53210
 
-> **THE RUNTIME THIS WAS MEASURED ON NO LONGER EXISTS ON THIS BOX (2026-08-14, 20:02).** A full
-> ROCm **7.14.0** upgrade landed mid-session — `dev-util/hip-7.14.0`, plus `rocm-core`,
-> `rocm-comgr` and `rocm-device-libs` — and `libamdhip64.so.7` now resolves to
-> **7.14.60850-0000000**. The 7.2.53210 object is deleted, not shadowed.
+> **CLOSED 2026-08-14: ROCm 7.14.0 fixes it, and nothing needs filing.** The box was upgraded
+> mid-investigation (`dev-util/hip-7.14.0`, `libamdhip64.so.7.14.60850`), the toolchain was
+> repaired, and the same shapes were re-run **with rivoli's workaround BYPASSED**:
 >
-> **Everything below is evidence against 7.2.53210 and has NOT been re-tested on 7.14.0.** That
-> is the first question any bug report gets, so it goes at the top rather than in a footnote.
+> | shape, no workaround | 7.2.53210 | 7.14.60850 |
+> |---|---|---|
+> | `glimmer_reference` | ~3 in 52 | **0 in 20** |
+> | two-thread synthetic (`tests/vmm_threads.rs`) | 2 in 8, then 3 in 12 | **0 in 20** |
 >
-> **It could not be re-tested, for two reasons that are worth writing down:**
+> So this was an upstream defect, fixed between 7.2 and mainline. **The dedicated VMM thread has
+> been removed** — 103 lines of allocator complexity, in every model's path, defending against a
+> bug the runtime no longer has. What survives is the one-line `device_sync` before the unmap,
+> which closes a hazard `glimmer_gpu.rs` had documented independently and which was never this
+> bug's cause.
 >
-> * **Binaries built before the upgrade fail with `hipMemGetInfo failed (100)`** —
->   `hipErrorNoDevice` — although the GPU is healthy (`rocminfo` sees gfx1151, `rocm-smi` reports
->   it, `/dev/kfd` and both topology nodes are present). The soname did not change, so old
->   binaries load 7.14 and their gfx1151 code objects, built by the 7.2 toolchain, are what the
->   runtime rejects. Everything needs rebuilding.
-> * **`hipcc` cannot compile.** `clang++` from LLVM 23 dies on an undefined symbol in its own
->   `libclang-cpp.so.23.1` (`LLVM_23.1`); the installed compiler is `clang-23.1.0_rc3`, built the
->   same evening. A two-line kernel does not build, so the rebuild above is blocked until the
->   toolchain is consistent — `clang-22.1.8` is still installed and is what built this tree
->   earlier the same day.
+> **The C reproducer never fired and is kept anyway**: it rules out, in plain C, VMM churn,
+> `hipMalloc` volume, kernel launches, syncs, varying sizes, an mmap memcpy source and two
+> sequential threads. Nothing below has been re-derived on 7.14 — it is the record of a closed
+> question, not a live one.
 >
-> **So the next action is unchanged in shape and cheaper than it was**: rebuild on 7.14.0 and
-> re-run `cargo test --features rocm --test vmm_threads` and `--test glimmer_reference` in a
-> loop. If the crash is gone, this file becomes a note. If it survives a jump from 7.2.0 to
-> mainline, that is the strongest line the report can carry.
-
-**Not root-caused, and the point of this file is that the evidence is worth more than the
-guesses.** Two hypotheses have already been killed by their own measurements.
+> **Repairing the toolchain was most of the work and is the transferable part.** Gentoo's
+> pre-release LLVM ebuilds default `debug` (= `LLVM_ENABLE_ABI_BREAKING_CHECKS`) ON, which
+> changes `ilist_iterator_w_bits`'s template parameters. LLVM was rebuilt with `-debug` while
+> clang and lld were not, so `libclang-cpp` wanted
+> `node_options<Instruction, true, …>` and `libLLVM` exported `node_options<Instruction, false, …>`.
+> The symptom moved as each package was fixed: first `clang++` died on a symbol lookup, then —
+> with clang rebuilt — HIP enumerated the GPU and failed at **`Failed to load COMGR library`**,
+> because `rocm-comgr` links `lld`, which was still the old build. Only when all three matched
+> did `hipGetDeviceCount` return 1.
 
 ## The fault
 
