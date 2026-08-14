@@ -6,7 +6,16 @@ license.workspace = true
 
 [features]
 # Forwarded down the DAG: `--features rocm` at any level arms the one backend.
-rocm = ["rivoli-backend/rocm"]
+rocm = ["rivoli-backend/rocm", "dep:io-uring"]
+# The instrument features. Each gates an instrument behind a feature AND a flag; the ones
+# declared empty gate code that arrives with later milestones — declared now so the
+# feature matrix and CI's union clippy run compile every combination from day one (the
+# old tree's `mod otlp` sat broken for weeks because no prescribed command named it).
+otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+teacher-forcing = []
+pred-probe = []
+trace = []
+stale-sel = []
 
 [lints]
 workspace = true
@@ -16,3 +25,11 @@ rivoli-core = { path = "../core" }
 rivoli-artifact = { path = "../artifact" }
 rivoli-oracles = { path = "../oracles" }
 rivoli-backend = { path = "../backend" }
+anyhow = "1"
+# preserve_order is load-bearing: tool-schema key order is a trained token sequence.
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+io-uring = { version = "0.7", optional = true }
+opentelemetry = { version = "0.30", optional = true }
+opentelemetry_sdk = { version = "0.30", optional = true }
+opentelemetry-otlp = { version = "0.30", optional = true }

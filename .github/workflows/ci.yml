@@ -51,8 +51,9 @@ jobs:
           print(f"armed: {scanned} files scanned, 0 clones")
           EOF
       - run: cargo clippy --workspace --release --locked --all-targets
-      # The deviceless feature-union clippy run joins here the day the first instrument
-      # feature exists (M1's feature-matrix lands alongside it).
+      # The deviceless feature union — the E0609-rot class's only watcher: `mod otlp` sat
+      # broken for weeks in the old tree because no prescribed command compiled it.
+      - run: cargo clippy -p rivoli --release --locked --features otlp,teacher-forcing,pred-probe,trace,stale-sel --all-targets
       - run: cargo test --workspace --release --locked
       - name: CodeScene gate
         # Hard once the CS_ACCESS_TOKEN secret is configured; loud no-op until then.

@@ -7,6 +7,11 @@ license.workspace = true
 [features]
 # Forwarded down the DAG: `--features rocm` at any level arms the one backend.
 rocm = ["rivoli-engine/rocm"]
+otlp = ["rivoli-engine/otlp"]
+teacher-forcing = ["rivoli-engine/teacher-forcing"]
+pred-probe = ["rivoli-engine/pred-probe"]
+trace = ["rivoli-engine/trace"]
+stale-sel = ["rivoli-engine/stale-sel"]
 
 [lints]
 workspace = true

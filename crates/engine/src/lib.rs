@@ -7,3 +7,6 @@
 //! (contention witness + paired-dNLL slots — an unwitnessed number is
 //! structurally unciteable), and eval. Instrument features live here, each
 //! behind a feature AND a flag, never an env var.
+
+pub mod fetch;
+pub mod telemetry;
