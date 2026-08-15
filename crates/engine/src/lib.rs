@@ -11,6 +11,8 @@
 #[cfg(feature = "rocm")]
 pub mod device;
 pub mod fetch;
+#[cfg(feature = "rocm")]
+pub mod glm;
 pub mod indexer;
 #[cfg(feature = "rocm")]
 pub mod routed;
