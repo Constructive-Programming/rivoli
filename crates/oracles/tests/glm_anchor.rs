@@ -26,13 +26,13 @@ const GOLDENS: &[Vendored] = &[
         name: "glm-anchor-1",
         bytes: include_bytes!("glm-anchor-1.bin"),
         len: 265_019,
-        fnv: 0x7883_73ee_fde4_2775,
+        fnv: 0x78f5_be85_0546_296e,
     },
     Vendored {
         name: "glm-anchor-2",
         bytes: include_bytes!("glm-anchor-2.bin"),
         len: 265_019,
-        fnv: 0x73ee_9b34_13e7_c6c7,
+        fnv: 0xd43e_3d2d_8b0d_6601,
     },
 ];
 

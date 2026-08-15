@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import math
 import struct
 import sys
 
@@ -553,16 +554,25 @@ DEFECTS = {
 # The run.
 
 
-def run(salt, defect, cap):
+def run(salt, defect, cap, dtype=torch.float32):
     from transformers.models.glm_moe_dsa import configuration_glm_moe_dsa as C
     from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as mdl
 
     cfg = tiny_config(C)
     cfg._attn_implementation = "eager"
+    # Eager EXPERTS too, as a declared deviation beside eager attention: the default
+    # grouped_mm fast path refuses float64 (the floor measurement's dtype), and the
+    # reference the port is scored against should be the transparent per-expert loop the
+    # modeling file spells out, not a fused integration. Pinned at BOTH dtypes so the
+    # floor compares like against like.
+    cfg._experts_implementation = "eager"
     model = mdl.GlmMoeDsaForCausalLM(cfg)
     model.config._attn_implementation = "eager"
+    model.config._experts_implementation = "eager"
     model.eval()
     init_weights(model, salt)
+    if dtype is not torch.float32:
+        model.to(dtype)
 
     fn = DEFECTS[defect][0]
     note = fn(mdl, model, cfg, salt) if fn else ""
@@ -755,18 +765,88 @@ def compare(a_path, b_path):
     )
 
 
+def bucket_of(name):
+    """The operator bucket a capture belongs to — the granularity tolerances are keyed at."""
+    for tag in ("router.", "experts.out", "shared.out", "moe.out", "mlp.out", "attend.",
+                "q_resid", "kv_latent", "norm.", "logits", "attn.out",
+                ".index.q.post_rope", ".index.k.post_rope", ".attn.q.post_rope", ".attn.k.post_rope"):
+        if tag in name:
+            return {".index.q.post_rope": "rope_index", ".index.k.post_rope": "rope_index",
+                    ".attn.q.post_rope": "rope_attn", ".attn.k.post_rope": "rope_attn",
+                    "router.": "router", "experts.out": "moe", "shared.out": "moe",
+                    "moe.out": "moe", "mlp.out": "dense_mlp", "attend.": "attend",
+                    "q_resid": "lora_norm", "kv_latent": "lora_norm", "norm.": "norm",
+                    "logits": "logits", "attn.out": "attn_out"}[tag]
+    return "other"
+
+
+def floors(vendored_path, salt):
+    """The fp32 rounding floor per operator bucket: the same reference at float64 against
+    the vendored fp32 golden. A tolerance for a kernel is chosen ABOVE its operator's
+    floor and BELOW its weakest targeting defect; a floor from one draw is half a
+    measurement (glimmer's attend floor differed 2.1x between draws), so run this at both
+    salts and take the worse."""
+    meta, ref = read_golden(vendored_path)
+    if meta.get("defect", "None") != "None":
+        raise SystemExit("floors must be measured against a CLEAN golden")
+    if meta.get("salt") != salt:
+        raise SystemExit(f"golden is salt {meta.get('salt')!r}, asked for {salt!r}")
+    cap = Capture()
+    run(salt, "None", cap, dtype=torch.float64)
+    by_bucket = {}
+    compared = 0
+    for name, shape, vals in cap.floats:
+        if name not in ref:
+            raise SystemExit(f"{name}: captured at f64 but absent from the golden")
+        rv = ref[name][1]
+        if len(rv) != len(vals):
+            raise SystemExit(f"{name}: length changed between dtypes")
+        d = 0.0
+        for x, y in zip(vals, rv):
+            if "mask" in name:
+                # The mask's sentinel is torch.finfo(dtype).min — dtype-dependent BY
+                # CONSTRUCTION (-3.4e38 at f32; -inf once the f64 sentinel is cast to
+                # f32 for capture). Selection is discrete, so what must agree across
+                # dtypes is the masked/kept CLASS of each position, never the sentinel:
+                # a floor for a mask would be a category error.
+                masked_x, masked_y = x < -1e30, y < -1e30
+                if masked_x != masked_y:
+                    raise SystemExit(f"{name}: the f64 run SELECTED differently ({x} vs {y})")
+                if not masked_x:
+                    d = max(d, abs(x - y))
+                continue
+            if not (math.isfinite(x) and math.isfinite(y)):
+                raise SystemExit(
+                    f"{name}: non-finite value in the floor comparison ({x} vs {y})"
+                )
+            d = max(d, abs(x - y))
+        b = bucket_of(name)
+        by_bucket[b] = max(by_bucket.get(b, 0.0), d)
+        compared += 1
+    if compared < 500:
+        raise SystemExit(f"only {compared} captures compared — the f64 run is incomplete")
+    print(f"fp32 floors at salt {salt} over {compared} captures:")
+    for b in sorted(by_bucket):
+        print(f"  {b:12s} {by_bucket[b]:.3e}")
+    return by_bucket
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--salt", default="glm-anchor-1")
     ap.add_argument("--defect", default="None", choices=sorted(DEFECTS))
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2, metavar=("CLEAN", "DEFECT"))
+    ap.add_argument("--floors", metavar="VENDORED", help="measure fp32 floors against a clean golden")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--preflight-against", metavar="GOLDEN")
     args = ap.parse_args()
 
     if args.compare:
         compare(*args.compare)
+        return
+    if args.floors:
+        floors(args.floors, args.salt)
         return
     if args.preflight_against and not args.no_preflight:
         preflight_env(args.preflight_against)
