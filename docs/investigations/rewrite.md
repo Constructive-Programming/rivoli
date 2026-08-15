@@ -97,3 +97,23 @@ copy). Review round 1 (24 findings applied) sits between the anchor and this clo
 Moved out of M2 with reasons: tokenizer (coupled to `dsv4_encoding` — M4 with the CLI);
 `artifact_compat`/`arch_artifacts` byte-pin regressions against REAL artifacts (need the
 real dirs and belong with M4's first real decode, not a synthetic fixture).
+
+## M3 — GLM kernels via oracle TDD (IN PROGRESS 2026-08-15)
+
+- **Floors first** (commit `2121af0`): fp32 floors at both draws, 10 buckets; the DSA
+  mask found exact-only; goldens re-pinned on eager experts.
+- **Routing home** (`acfc2e1`): `core::routing` with INV-1 (inherited number and
+  meaning); the P6 invariant renumbered to INV-8.
+- **Oracle suites ported** (`18e3c61`, `92794e7`): kernel.rs + indexer_kernel +
+  fwd_kernel + headtail + the generic device-test common half; engine::indexer.
+- **DEVICE RUNS GREEN 2026-08-15 ~08:00: 38/38** — kernel 24/24 (184.65s, dev
+  profile), indexer_kernel 5/5, fwd_kernel 4/4, headtail 5/5, each `--test-threads=1`
+  under the flock, binaries built outside it. Run context recorded: an idle KFD tenant
+  (`hiptest`, another session, 0.17 GB, 6h45m old, flock free) was present; these are
+  correctness suites with no timing claims, so the runs stand — any red would have been
+  treated as suspect-contention and re-run, none occurred.
+
+Still owed for M3: the kernel census gate (with a both-ends-checked deferred-to-M8 table
+for V4-only launchers), and wiring the anchor-derived floors into the oracle tolerances
+(the ported suites carry the old tree's measured tolerances; the GLM-anchor floors are
+the cross-check).
