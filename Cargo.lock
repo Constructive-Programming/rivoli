@@ -1150,6 +1150,8 @@ dependencies = [
  "rivoli-core",
  "rivoli-engine",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

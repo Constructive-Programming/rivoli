@@ -7,26 +7,10 @@ use super::MAXROW;
 use super::engine::{ARGMAX_BYTES, GlmEngine};
 use anyhow::{Result, bail, ensure};
 use rivoli_backend::launch_argmax;
-
-/// One generation request. Bundled (like the pool's `PoolCfg`) so `generate`'s
-/// signature stays readable and a new knob cannot push it past the argument budget.
-pub struct GenSpec<'a> {
-    pub prompt: &'a [u32],
-    /// Token budget for the GENERATED tail (the prompt is not counted).
-    pub ngen: usize,
-    /// Any of these ends the run (and is not emitted).
-    pub eos: &'a [u32],
-}
-
-/// What a decode measured about itself. Minimal on purpose: the old engine's
-/// per-phase `Profile` is deferred to the first benchmark (M4's exit gate is anchor
-/// correctness) — but a run still reports the two numbers that make its cost citeable.
-pub struct DecodeStats {
-    pub decode_s: f64,
-    pub tok_s: f64,
-    pub hits: u64,
-    pub misses: u64,
-}
+// The request and result shapes live at the seam, not here: neither names anything
+// GLM-shaped, and `Engine::generate` must be able to name both in a build where this
+// module does not exist at all.
+use crate::seam::{DecodeStats, GenSpec};
 
 impl GlmEngine<'_> {
     /// Greedy argmax over each of the pass's `n` logit rows — reduced ON DEVICE, so

@@ -45,7 +45,7 @@ fn main() -> Result<()> {
     )?;
     let mut eng = rivoli_engine::glm::engine::GlmEngine::new(pin, &cfg, 4096)?;
     let (out, stats) = eng.generate(
-        rivoli_engine::glm::decode::GenSpec {
+        rivoli_engine::GenSpec {
             prompt: &prompt,
             ngen,
             eos: &[],

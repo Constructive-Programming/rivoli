@@ -51,7 +51,7 @@ fn arch_of_named(cfg: &serde_json::Value) -> Result<(Arch, String)> {
         );
     let mut found: Option<(Arch, &str)> = None;
     for s in declared {
-        let a = Arch::from_manifest_str(s)
+        let a = crate::arch::from_manifest_str(s)
             .with_context(|| format!("unsupported architecture {s:?}"))?;
         if let Some((prev, prev_s)) = found {
             ensure!(

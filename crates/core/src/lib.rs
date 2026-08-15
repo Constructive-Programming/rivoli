@@ -15,6 +15,7 @@ pub mod arena;
 pub mod cache;
 pub mod hash;
 pub mod hybrid;
+pub mod legality;
 pub mod num;
 pub mod residency;
 pub mod routing;

@@ -21,6 +21,10 @@ rivoli-engine = { path = "../engine" }
 rivoli-core = { path = "../core" }
 anyhow = "1"
 libc = "0.2"
+tracing = "0.1"
+# The binary is the process, so it is the one that installs a log sink; every library crate
+# here logs through `tracing` and never chooses a subscriber.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rivoli-artifact = { path = "../artifact" }
 rivoli-backend = { path = "../backend" }
