@@ -16,7 +16,7 @@ mod golden_read;
 // from tokenizing identically to `k3_anchor.rs`'s (jscpd found exactly that pair when
 // this file was first written; module preambles are where the duplication gate bites
 // every new anchor, and the facade is the honest fix rather than an exemption).
-use golden_read::{GoldenSet, Vendored, fnv1a, ints};
+use golden_read::{GoldenSet, Vendored, ints};
 use serde_json::Value;
 
 /// The two salts, byte-pinned. A vendored fixture that changed by one byte cannot pass as

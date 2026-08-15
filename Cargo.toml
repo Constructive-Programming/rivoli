@@ -30,7 +30,16 @@ license = "MIT"
 # Total functions are the house style: `unwrap`/`expect` are deny-level everywhere.
 # Tests and build scripts opt back in per-file with `#![allow]` and one line of argument —
 # a panic there is loud and correct; a panic on the decode path is a crash in a server.
+#
+# EVERY warning is an error (owner rule, 2026-08-15): rustc's whole `warnings` group and
+# clippy's default set are deny-level IN THE MANIFEST, not just under CI's RUSTFLAGS — a
+# local `cargo check` enforces exactly what CI enforces, so a warning cannot ride a green
+# local build into a red remote one. `priority = -1` keeps the named lints able to layer.
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+
 [workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 

@@ -70,8 +70,11 @@ appears that enum dispatch cannot fill.
 - **line caps** — 1200 hard (`crates/cli/tests/line_limit.rs`, red-proofed), 800 soft
   (`cargo:warning` from the cli build script on every build: the next edit to a warned
   file should shrink it). CodeScene binds independently below both.
-- **clippy** `-D warnings`, `--all-targets`, plus the deviceless feature-union run once
-  instrument features exist.
+- **warnings are errors, structurally** — `[workspace.lints.rust] warnings = deny` and
+  `[workspace.lints.clippy] all = deny` in the manifest, so a local `cargo check`
+  enforces what CI enforces (owner rule 2026-08-15; red-proofed with a planted unused
+  variable). Per-file `#![allow]` needs its argument written beside it.
+- **clippy** `--all-targets` plus the deviceless feature-union run.
 - **docs registry** — status/scope/verdict front matter + INDEX agreement, test-enforced.
 - Landing later, each with the thing that makes it non-vacuous: INV-n registry (first
   invariant, M1), feature matrix (first feature, M1), kernel census (first launcher, M3),

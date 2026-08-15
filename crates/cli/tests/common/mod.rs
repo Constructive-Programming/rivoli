@@ -2,6 +2,10 @@
 //! same helper — the old tree's `tests/common/mod.rs` reached 1050 lines one forced
 //! factoring at a time, and each move was jscpd telling it a copy existed.
 
+// Compiled into EACH meta-gate binary; none uses every helper (matrix.rs needs only
+// repo_root) — the engine tests' common carries the same argument.
+#![allow(dead_code)]
+
 /// Every file under `root` with extension `ext`, recursively. Unsorted.
 ///
 /// WALK, do not list files. The old tree's registry checks each grew their own copy of
