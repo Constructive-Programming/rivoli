@@ -404,52 +404,43 @@ static int compress_guard(CompGeom p) {
     return 0;
 }
 
-// **The TILED form: one block per (output column, tile of GEMM_TILE rows), staging the weight
-// column in LDS and reusing it down the rows.**
+// **The TILED form: one block per (output column, tile of GEMM_TILE rows), the weight column read
+// ONCE PER TILE instead of once per row.**
 //
 // This exists because `gemm_bf16` above has NO cross-row reuse. It is one wave per output element
 // — `gw = r*n + c`, each wave reading the whole weight row `w + c*k` independently for every `r` —
 // so `m` rows are `m` GEMVs fused into one launch and the weight comes from DRAM `m` times.
 // Batching Muse Glimmer's prefill to `m = 256` therefore bought ~13% (launch overhead) against an
-// arithmetic prediction of 256x, measured 2026-08-15.
+// arithmetic prediction of 256x. Tiled, prefill is 0.207 s/token against 0.363 and an original
+// 0.416 — 2.01x end to end, measured 2026-08-15.
 //
-// Here each block reads its weight column ONCE per tile and multiplies it into GEMM_TILE rows, so
-// the traffic falls by that factor. The tile is a register-pressure choice: `acc[GEMM_TILE]` is
-// per thread, and 8 keeps a 256-thread block comfortable.
-//
-// **The k-loop is chunked through LDS**, so every thread in the block reads the staged chunk
-// rather than the same DRAM line — which is also what makes the row loop cheap: the weight is
-// already resident when row `r+1` needs it.
+// **The reuse is in a REGISTER, and a first version staged the column in LDS for nothing.** That
+// version's staging loop and consuming loop used the same `i = threadIdx.x; i += blockDim.x`
+// stride, so every thread read back exactly the elements it had written and no thread ever saw
+// another's — a pure round trip, justified in its own comment by sharing that did not happen
+// (review, 2026-08-15). `wv` below is what actually carries the weight across the tile's rows: one
+// DRAM read, `nr` multiply-adds. It also frees 2 KB of LDS per block and both `__syncthreads()`.
 #define GEMM_TILE 8
-#define GEMM_CHUNK 512
 extern "C" __global__ void gemm_bf16_tiled(const float* __restrict__ x,
                                            const unsigned short* __restrict__ w,
                                            float* __restrict__ out, int m, int n, int k) {
-    __shared__ float wl[GEMM_CHUNK];
     __shared__ float red[256];
     const int c = (int)blockIdx.x;
     const int r0 = (int)blockIdx.y * GEMM_TILE;
+    const int nr = min(GEMM_TILE, m - r0);  // the last tile is partial unless GEMM_TILE divides m
     const unsigned short* wr = w + (size_t)c * k;
     float acc[GEMM_TILE];
 #pragma unroll
     for (int r = 0; r < GEMM_TILE; ++r) acc[r] = 0.0f;
 
-    for (int i0 = 0; i0 < k; i0 += GEMM_CHUNK) {
-        const int len = min(GEMM_CHUNK, k - i0);
-        __syncthreads();  // the previous iteration's readers must finish before this overwrites
-        for (int i = (int)threadIdx.x; i < len; i += (int)blockDim.x) wl[i] = bf16f(wr[i0 + i]);
-        __syncthreads();
-        for (int r = 0; r < GEMM_TILE && r0 + r < m; ++r) {
-            const float* xr = x + (size_t)(r0 + r) * k + i0;
-            float a = 0.0f;
-            for (int i = (int)threadIdx.x; i < len; i += (int)blockDim.x) a += xr[i] * wl[i];
-            acc[r] += a;
-        }
+    for (int i = (int)threadIdx.x; i < k; i += (int)blockDim.x) {
+        const float wv = bf16f(wr[i]);
+        for (int r = 0; r < nr; ++r) acc[r] += x[(size_t)(r0 + r) * k + i] * wv;
     }
-    // One block reduction per row of the tile. `block_sum_lds` syncs internally, and the loop is
-    // over at most GEMM_TILE rows once per block — not per element — so its cost is noise beside
-    // the k-loop above.
-    for (int r = 0; r < GEMM_TILE && r0 + r < m; ++r) {
+    // One block reduction per row of the tile — once per block, not per element, so its cost is
+    // noise beside the k-loop. `block_sum_lds` syncs internally and `nr` is uniform across the
+    // block, so every thread reaches every barrier.
+    for (int r = 0; r < nr; ++r) {
         float s = block_sum_lds(acc[r], red);
         if (threadIdx.x == 0) out[(size_t)(r0 + r) * n + c] = s;
     }

@@ -66,15 +66,9 @@ fn a_full_layer_can_never_be_handed_a_window_without_a_ring() {
                 // **A sliding layer's ring is `win + PREFILL_CHUNK - 1`, not `win`, and the
                 // extra rows are a CORRECTNESS requirement.**
                 //
-                // > This asserted `(WIN, WIN, pos % WIN)` until 2026-08-15, with the argument
-                // > "the launcher's floor of `win + tq - 1` at the `tq == 1` this loop decodes
-                // > at". That floor is about how many positions are LIVE IN THE RING at once, and
-                // > `tq` stopped being the answer when prefill batched: a chunk writes every K and
-                // > V before any of them attends, so at `ring_cap == win` writing position `p+1`
-                // > overwrites the oldest key still inside position `p`'s window. Measured at
-                // > **1.079e0** against `glimmer_chain`'s host reference — a whole magnitude, not
-                // > a tolerance. The launcher's guard never fired, because the attends really are
-                // > still `tq == 1`.
+                // > This asserted `(WIN, WIN, pos % WIN)` until 2026-08-15. `window_of`'s own
+                // > comment carries the mechanism and the 1.079e0 that found it; repeating it
+                // > here made it the third copy of one argument.
                 LayerKind::SlidingAttention => {
                     let ring = (WIN + rivoli::glimmer_gpu::PREFILL_CHUNK - 1).min(CTX);
                     assert_eq!((w.win, w.ring_cap, w.slot), (WIN, ring, pos % ring));

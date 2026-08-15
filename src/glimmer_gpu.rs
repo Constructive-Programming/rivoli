@@ -96,20 +96,11 @@ unsafe fn proj(
         "projection expects an activation of {i} but was handed {i_dim} — a shape mismatch here \
          reads past the end of a live buffer and produces fluent wrong text"
     );
-    ensure!(rows > 0, "a projection over zero rows");
-    // **`rows > 1` BATCHES THE LAUNCH AND NOT THE WEIGHT READ, and that is measured, not
-    // suspected.** The arithmetic said batching a 256-token chunk should divide prefill's weight
-    // traffic by 256; on the shipped bf16 model it moved prefill from 0.416 to **0.363 s/token**,
-    // ~13%, which is launch overhead and nothing else.
-    //
-    // `kernels/kvcompress.hip::gemm_bf16` is **one wave per output element**: `gw = r*n + c`, and
-    // each wave reads `w + c*k`, the whole weight row, independently for every `r`. So it is `m`
-    // GEMVs fused into one launch — there is no reuse across rows to capture, and `m` was never
-    // the lever. The lever is a TILED GEMM that stages a weight tile in LDS and reuses it down the
-    // rows; this restructure is its precondition, not its payoff.
-    //
-    // Keeping it anyway is not sunk cost: it is 13% for 95 MB, it is what the tiled kernel plugs
-    // into, and it is what surfaced the ring-sizing defect `window_of` now carries.
+    // `rows > 1` is a real batch on the bf16 path: `rivoli_gemm_bf16` dispatches to
+    // `gemm_bf16_tiled` at `m >= 8`, which reads each weight column once per tile of rows instead
+    // of once per row. That kernel carries the measurement (prefill 0.416 -> 0.363 -> 0.207
+    // s/token); the middle number is what the wave-per-element form was worth, and it is why the
+    // tiled one exists.
     // SAFETY: the caller's contract, plus the `i_dim` agreement checked above.
     unsafe {
         match w {
@@ -229,6 +220,12 @@ pub fn window_of(kind: LayerKind, win: usize, n_ctx: usize, pos: usize) -> Windo
             //
             // Clamped by `n_ctx` for `window_of`'s own reason: a run shorter than the window has
             // nothing to slide past, and a ring longer than the context is slots nothing fills.
+            //
+            // **What it costs, since the scratch beside it is priced and this was not** (review,
+            // 2026-08-15): `PREFILL_CHUNK - 1` extra slots on every sliding layer, charged
+            // automatically through `slots_of` -> `runtime_bytes`. At the shipped widths that is
+            // 39 sliding layers x 2 (K and V) x 255 x 256 x 4 = **20.4 MB**, and only at a context
+            // long enough that the clamp does not already bind.
             let ring = (cap + PREFILL_CHUNK - 1).min(n_ctx);
             Window {
                 win: cap,
@@ -503,11 +500,11 @@ pub struct Glimmer {
     logits: DeviceBuf,
     /// `argmax`'s two outputs, one i32 then one f32.
     pick: DeviceBuf,
-
-    /// Per layer, keys then values, sized by that layer's own window.
     /// How many rows the last [`Self::layer`] call left in `br` — what [`Self::branch`] needs to
     /// find the last one. One for a decode step, a whole chunk during prefill.
     br_rows: usize,
+
+    /// Per layer, keys then values, sized by that layer's own window.
     kc: Vec<DeviceBuf>,
     vc: Vec<DeviceBuf>,
     /// How many positions the linear (full-attention) layers can hold. A sliding layer's
@@ -603,7 +600,9 @@ impl Glimmer {
             // **Every per-layer scratch holds a whole prefill CHUNK, not one row.** That is what
             // the batched `layer` writes into, and it is the memory the batching costs: 95.2 MB
             // against 8.0 MB at the shipped widths and `PREFILL_CHUNK` 256, i.e. 0.16% of the
-            // bf16 model to remove 255 of every 256 weight reads in prefill. `runtime_bytes`
+            // bf16 model. It does NOT remove 255 of every 256 weight reads, which this said until
+            // review: `gemm_bf16_tiled` reuses a weight column across GEMM_TILE = 8 rows, so a
+            // 256-row chunk reads each column 32 times rather than once. `runtime_bytes`
             // charges exactly this list, and `.min(n_ctx)` keeps a short context from paying for
             // rows it can never fill.
             xs: scratch(rows * gt.hidden)?,
@@ -665,18 +664,16 @@ impl Glimmer {
         let (qd, kvd) = (self.hq * self.hd, self.hkv * self.hd);
         let (wq, wk, wv, wo, wg) = (h.q, h.k, h.v, h.o, h.attn_gate);
         let xn = self.xn.ptr() as *const f32;
-        let kslot = unsafe { (self.kc[l].ptr() as *mut f32).add(w.slot * kvd) };
-        let vslot = unsafe { (self.vc[l].ptr() as *mut f32).add(w.slot * kvd) };
-        let runs = self.slot_runs(l, pos, rows);
+        let runs = Self::slot_runs(&w, rows);
         // SAFETY: `xn` is `hidden` live f32 written by this layer's pre-norm; each destination is
         // its projection's `o_dim` f32 inside a live allocation — `q` its own buffer, `k`/`v` one
         // `hkv*hd` slot of a cache with at least `slot+1` slots by `attn_window`'s construction.
         // None aliases `xn` or another. All outlive the `device_sync` in `decode`.
         unsafe {
             proj(xn, &wq, self.q.ptr() as *mut f32, self.hidden, rows)?;
-            // One launch per contiguous slot run. At `rows == 1` this is one run of one, and
-            // `kslot`/`vslot` above are its base — the decode path, unchanged.
-            for &(r0, n, slot) in &runs {
+            // One launch per contiguous slot run. At `rows == 1` that is one run of one starting
+            // at `w.slot` — the decode path, unchanged.
+            for &(r0, n, slot) in runs.iter().filter(|r| r.1 > 0) {
                 let (kd, vd) = (
                     (self.kc[l].ptr() as *mut f32).add(slot * kvd),
                     (self.vc[l].ptr() as *mut f32).add(slot * kvd),
@@ -684,7 +681,6 @@ impl Glimmer {
                 proj(xn.add(r0 * self.hidden), &wk, kd, self.hidden, n)?;
                 proj(xn.add(r0 * self.hidden), &wv, vd, self.hidden, n)?;
             }
-            let _ = (kslot, vslot);
             // **The 3.87 is Q's alone**, and it arrives here by NAME — see [`QkScale`], which
             // also records what a swap actually costs (nothing: only the product enters the
             // score). What is NOT free is dropping or doubling the factor, and that the chain gate
@@ -700,7 +696,7 @@ impl Glimmer {
                 s.q,
                 NULL_STREAM,
             )?;
-            for &(_, n, slot) in &runs {
+            for &(_, n, slot) in runs.iter().filter(|r| r.1 > 0) {
                 launch_rmsnorm_weightless_batch(
                     (self.kc[l].ptr() as *mut f32).add(slot * kvd),
                     n * self.hkv,
@@ -899,24 +895,30 @@ impl Glimmer {
         unsafe { self.branch_add(x, h.post_ffn_ln, rows) }
     }
 
-    /// The contiguous KV-cache slot runs `rows` consecutive positions from `pos` occupy, as
-    /// `(first row, length, first slot)`.
+    /// The contiguous KV-cache slot runs `rows` consecutive positions from `w` occupy, as
+    /// `(first row, length, first slot)` — **always exactly two entries, the second often empty.**
     ///
-    /// **One or two, never `rows`.** `window_of` gives `slot = pos % ring_cap` on a sliding layer
-    /// and `slot = pos` on a full one, so consecutive positions take consecutive slots and the only
-    /// discontinuity is the ring wrapping — at most once in a chunk, because `PREFILL_CHUNK` is
-    /// smaller than any ring this model builds. Returned rather than assumed, so the K/V
-    /// projections batch per run without the wrap having to be reasoned about at the call site.
-    fn slot_runs(&self, l: usize, pos: usize, rows: usize) -> Vec<(usize, usize, usize)> {
-        let mut runs: Vec<(usize, usize, usize)> = Vec::with_capacity(2);
-        for r in 0..rows {
-            let slot = self.attn_window(l, pos + r).slot;
-            match runs.last_mut() {
-                Some(last) if last.2 + last.1 == slot => last.1 += 1,
-                _ => runs.push((r, 1, slot)),
-            }
+    /// `window_of` gives `slot = pos % ring_cap` on a sliding layer and `slot = pos` on a full one,
+    /// so consecutive positions take consecutive slots and the only discontinuity is the ring
+    /// wrapping. A closed form rather than a loop that re-derives `window_of` per row: the fixed
+    /// array makes "one or two, never `rows`" STRUCTURAL, where the loop only promised it in a doc
+    /// comment (review, 2026-08-15).
+    ///
+    /// One wrap is enough because `rows <= ring_cap` always: `rows` is at most
+    /// `PREFILL_CHUNK.min(n_ctx)`, and a sliding ring is `(win + PREFILL_CHUNK - 1).min(n_ctx)`,
+    /// which is never smaller. Asserted rather than reasoned about at the call site.
+    fn slot_runs(w: &Window, rows: usize) -> [(usize, usize, usize); 2] {
+        if w.ring_cap == 0 {
+            // A full layer indexes by position and never wraps.
+            return [(0, rows, w.slot), (rows, 0, 0)];
         }
-        runs
+        debug_assert!(
+            rows <= w.ring_cap,
+            "{rows} rows into a {} ring would wrap more than once",
+            w.ring_cap
+        );
+        let first = rows.min(w.ring_cap - w.slot);
+        [(0, first, w.slot), (first, rows - first, 0)]
     }
 
     /// Look `token` up in the embedding matrix and leave the normed row in `dst`.
@@ -971,8 +973,11 @@ impl Glimmer {
 
     /// **The prompt, LAYER-MAJOR: every token through layer `l` before any token reaches `l+1`.**
     ///
-    /// Identical arithmetic to running the tokens one at a time — the same launches with the same
-    /// arguments, only reordered, so the logits are bit-for-bit what the token-major loop produced.
+    /// **CORRECTED 2026-08-15: this is no longer a pure reorder.** It said "Identical arithmetic
+    /// to running the tokens one at a time ... bit-for-bit what the token-major loop produced".
+    /// The projections now run at `m = rows`, and above `m = 8` through `gemm_bf16_tiled`, whose
+    /// reduction order differs from the wave-per-element kernel decode still uses. The LAYER ORDER
+    /// is still a reorder and the fill-count gate still measures it; the arithmetic is not.
     /// `tests/glimmer_chain.rs` and `tests/glimmer_reference.rs` both score this path and neither
     /// moved when it landed, which is the check that the reorder is a reorder.
     ///
@@ -982,12 +987,11 @@ impl Glimmer {
     /// is a synchronous **967.942 MB** host memcpy. At a 2048-token prompt with 39 layers streaming
     /// that is the difference between ~77 TB of memcpy and ~38 GB.
     ///
-    /// **It does NOT batch the math.** Every projection is still a GEMM at `m = 1` and the attend
-    /// is still `tq = 1`, which is why the rings stay at `sliding_window` and the launcher's
-    /// `ring_cap >= win + tq - 1` union hazard is not reachable from here. Batching the math is a
+    /// **It DOES batch the math since 2026-08-15.** The projections run at `m = rows`; the attends
+    /// are still `tq = 1`, but that is no longer what bounds the ring — a chunk writes every K and
+    /// V before any of them attends, so the ring is `win + PREFILL_CHUNK - 1`. See `window_of`.
     /// further step, it needs a rows dimension on the centered norm and a per-row position on the
     /// rope, and it changes the arithmetic — so it belongs to whoever can re-measure the gates.
-    // ponytail: reorder only; batch the math when someone can price the kernel changes.
     fn prefill(&mut self, tokens: &[u32]) -> Result<()> {
         ensure!(!tokens.is_empty(), "an empty prompt has nothing to prefill");
         let xs = self.xs.ptr() as *mut f32;
@@ -1221,7 +1225,7 @@ impl Glimmer {
         // post-FFN branch **3.008e0** against `glimmer_chain`'s oracle — the first position's
         // branch compared against the last position's reference, arithmetically unrelated
         // (2026-08-15).
-        let n = self.br_rows.max(1) * self.hidden;
+        let n = self.br_rows * self.hidden;
         // Through `read_f32` and sliced on the host, rather than a second readback with an offset
         // — jscpd matched that spelling against `tests/kernel.rs`, and it is right that the
         // chunks_exact/from_le_bytes tail is one fact this file already owns once.

@@ -2277,7 +2277,12 @@ fn fx_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// **The tiled `gemm_bf16` must agree with the wave-per-element one it replaces above `m = 8`.**
+/// **Both `gemm_bf16` kernels, scored against a HOST ORACLE across the `m >= 8` dispatch.**
+///
+/// Named for what it does: it does not compare the two kernels to each other — it scores each
+/// against an independent dot product, which is stronger and is what makes a shared defect
+/// visible. (It was `..._agrees_with_the_wave_per_element_one` until review pointed out the name
+/// promised the weaker test, 2026-08-15.)
 ///
 /// Not bit-identity — the two reduce in different orders, which is a different f32 answer and the
 /// whole reason the tiled form is faster. The bound is reduction noise over `k`, and it is scored
@@ -2288,7 +2293,7 @@ fn fx_bytes(v: &[f32]) -> Vec<u8> {
 /// take the tiled one, and 19 is not a multiple of `GEMM_TILE` so its last block is partial. A
 /// tiled kernel that dropped the `r0 + r < m` guard would write past `out` at 19 and pass at 16.
 #[test]
-fn the_tiled_gemm_agrees_with_the_wave_per_element_one() {
+fn the_tiled_gemm_matches_a_host_oracle_across_its_dispatch_threshold() {
     const K: usize = 1100; // > 2 LDS chunks of 512, and not a multiple of one
     const N: usize = 24;
     let w16: Vec<u16> = (0..N * K)

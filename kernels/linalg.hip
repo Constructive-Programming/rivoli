@@ -332,11 +332,11 @@ extern "C" __global__ void swiglu_clamped_bf16(
 // USED BY: GLM-5.2 (`gpu.rs`, one launch per row). DeepSeek-V4-Flash uses
 // `mla.hip::rmsnorm_batch`.
 //
-// **`_single` MEANS ONE ROW, AND THAT IS THE WHOLE POINT OF THE NAME.** The grid is
-// `dim3(1)`, so this takes ONE statistic over whatever it is handed. Passing it `s x dim`
-// therefore normalises every token against a single shared mean instead of per row — a real
-// defect, modelled as `v4oracle::Defect::HeadNormOverAllTokens`, and **invisible at decode
-// because `s == 1` there**, which is why it needs a name rather than a comment.
+// > **SUPERSEDED 2026-08-15.** This argued "`_single` MEANS ONE ROW ... the grid is `dim3(1)`, so
+// > this takes ONE statistic over whatever it is handed", and named passing it `s x dim` as the
+// > `v4oracle::Defect::HeadNormOverAllTokens` defect. The grid is `dim3(rows)` and each block
+// > takes its OWN statistic, so the name now says what it does. The defect it describes is still
+// > real — it is what happens if a caller passes `rows = 1` and a `rows`-long buffer.
 //
 // Renamed from bare `rmsnorm` on 2026-08-09 for exactly that reason. A name claiming the
 // general operation while silently implementing the single-row case is the same failure as

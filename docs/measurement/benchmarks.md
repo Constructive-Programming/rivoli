@@ -493,7 +493,7 @@ per-fill fixed cost dominates a small streamed set and amortizes — S5's prefet
 before its lever exists; `GLIMMER_STREAM_SLOTS` is 1. **Prefill was unbatched** (`m = 1`) at 0.416
 s/token over 1201, 0.561 over 7661 = **72 min to first token** there (§4.3).
 
-**Prefill: 0.416 → 0.363 → 0.207 s/token, `2.01×` end to end** (1659 tokens, bf16, witness
+**Prefill: 0.416 → 0.363 → 0.204 s/token, `2.04×` end to end** (1659 tokens, bf16, witness
 non-empty in all three). Batching alone bought ~13% — the arithmetic said 256×, but `gemm_bf16` was
 **one wave per OUTPUT ELEMENT** (`gw = r*n + c`, each wave re-reading the whole weight row for every
 `r`), so `m` rows were `m` GEMVs in one launch with no cross-row reuse. `gemm_bf16_tiled` (one block
