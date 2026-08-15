@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The gates-first rewrite is through M0 and the substance of M1 — gates armed and red-proofed before any code, anchors vendored before the engine, arena/cache/hybrid/partition/fetch/waist ported with both feature arms verified; three M1 items (legality table, gate-taxonomy types, proptest) are deliberately deferred to their first consumers rather than built speculatively.
+verdict: The gates-first rewrite is through M0, M1, and M2 — gates armed and red-proofed before any code, anchors vendored before the engine (GLM's generated fresh, 26/26 defect cells), substrate and artifact layers ported with both feature arms verified, converter round-trip proven byte-stable on a synthetic checkpoint, and review round 1's 24 findings applied; deferred items are named per-milestone with their return consumers.
 ---
 
 # The rewrite, milestone by milestone
@@ -52,7 +52,7 @@ in the session memory.
    is currently swept deterministically over a range; proptest joins when the arena
    relocation properties port in M2+).
 
-## M2 — GLM artifact + config + converter + the GLM anchor (IN PROGRESS 2026-08-15)
+## M2 — GLM artifact + config + converter + the GLM anchor (DONE 2026-08-15)
 
 Landed so far: `core::num` (conversions + `Scoring`), `artifact::{quant,format,schema,
 arch,glm_config}` (commit `46f2153` — sniffing is identity-only, presentation policy
@@ -86,5 +86,14 @@ Still owed: the GLM anchor, artifact tests, tokenizer (deferred — coupled to
   v_head 10, index_topk 4 (< PROMPT_LEN so the sparse path is exercised — the old dsa
   fast-path-below-topk lesson), index_head_dim 16, index_n_heads 2.
 
-Exit unchanged: anchor integrity green, defect matrix (≥10 defects × 2 salts) fully
-red-capable, converter round-trip byte-stable.
+**Exit gate MET (2026-08-15):** anchor integrity green (`glm_anchor.rs`, 8 tests, byte
+pins + derived census), defect matrix fully red-capable (13 × 2 = 26/26, regeneration
+script green end-to-end), and converter round-trip byte-stable (`glm_convert.rs`: a
+synthetic two-layer fp8 checkpoint — one dense + one MoE layer, every branch of the
+tensor walk — converts twice to byte-identical artifacts, and a checkpoint without
+`generation_config.json` REFUSES, closing the old tree's 56-run no-stop-tokens defect at
+`finish_artifact` itself: aux copies are now errors, gated on the ARTIFACT after the
+copy). Review round 1 (24 findings applied) sits between the anchor and this close.
+Moved out of M2 with reasons: tokenizer (coupled to `dsv4_encoding` — M4 with the CLI);
+`artifact_compat`/`arch_artifacts` byte-pin regressions against REAL artifacts (need the
+real dirs and belong with M4's first real decode, not a synthetic fixture).

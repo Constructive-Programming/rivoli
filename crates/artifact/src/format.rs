@@ -1133,10 +1133,18 @@ pub fn finish_artifact(
     std::fs::write(&path, serde_json::to_vec_pretty(manifest)?)
         .with_context(|| format!("write {path}"))?;
     for name in aux {
-        match std::fs::copy(format!("{src_dir}/{name}"), format!("{out_dir}/{name}")) {
-            Ok(_) => eprintln!("{tool}: copied {name}"),
-            Err(e) => eprintln!("{tool}: WARNING: {name} not copied ({e})"),
-        }
+        std::fs::copy(format!("{src_dir}/{name}"), format!("{out_dir}/{name}"))
+            .with_context(|| format!("{tool}: copy {name} into the artifact"))?;
+        // Gate the ARTIFACT, not the input: the copy above could succeed against a
+        // just-deleted source or a full disk in ways whose error surfaces elsewhere, and
+        // the old tree shipped a converter that exited 0 with no generation_config.json —
+        // leaving the engine ZERO stop tokens, announced by one warn!, behind a 56-run
+        // retraction. A structural absence is an error here, never a warning.
+        anyhow::ensure!(
+            std::fs::metadata(format!("{out_dir}/{name}")).is_ok_and(|m| m.len() > 0),
+            "{tool}: {name} is missing or empty in the artifact after the copy"
+        );
+        eprintln!("{tool}: copied {name}");
     }
     Ok(())
 }
