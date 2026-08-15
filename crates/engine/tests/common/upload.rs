@@ -216,3 +216,17 @@ pub fn back(d: &rivoli_engine::device::DeviceBuf) -> Vec<u8> {
     rivoli_backend::hip::device_sync().expect("device_sync");
     d.copy_out().expect("copy_out")
 }
+
+// **MOVED HERE from `kernel.rs` 2026-08-16**, when the MLA/attend suites left it for
+// `kernel_attend.rs`: both that file and `kernel.rs` (GEMV) read a device destination back
+// against a CPU oracle, and a second copy of the join is what `build.rs`'s duplication gate is
+// for. It did NOT come with the MoE split a day earlier — that split's oracles read their
+// destination through the fixed-point drain's own `f32v(.copy_out())` instead, so nothing there
+// called this helper yet.
+/// [`super::assert_close`] against a device destination, read back. The join belongs to the
+/// caller — several oracles enqueue two kernels and sync once, which is how the engine runs
+/// them.
+#[cfg(feature = "rocm")]
+pub fn assert_out(want: &[f32], got: &rivoli_engine::device::DeviceBuf, label: &str) {
+    super::assert_close(want, &f32v(&got.copy_out().expect("out")), label);
+}

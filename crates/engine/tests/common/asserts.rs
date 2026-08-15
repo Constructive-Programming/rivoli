@@ -57,8 +57,14 @@ pub fn assert_bits(want: &[f32], got: &[f32], label: &str) {
 // **MOVED HERE from `kernel.rs` 2026-08-15**, when the MoE expert-range oracles left it for
 // `kernel_moe.rs`: the batched-row claim and the guard-code assertion are each made on BOTH
 // sides of that split, and a second copy of either is what `build.rs`'s duplication gate is
-// for. `assert_out` did NOT come — it is `DeviceBuf`-typed and only the file that kept the
-// GEMV/MLA destinations still calls it.
+// for. `assert_out` did NOT come at the time — it is `DeviceBuf`-typed and only the file that
+// kept the GEMV/MLA destinations still called it.
+//
+// **CORRECTED 2026-08-16.** `assert_out` has since moved too, but to `upload.rs` beside
+// `DeviceBuf` rather than here: when `kernel.rs` split again and the MLA/attend suites left for
+// `kernel_attend.rs`, both files needed it, and a second copy is exactly what `build.rs`'s
+// duplication gate is for. It stayed device-typed, so `upload.rs` — not this file, which the
+// featureless registry binaries also compile — is where it landed.
 /// Both rows of a two-row batch against their own single-row runs, named per row.
 ///
 /// Row 0 alone would pass a kernel that batches correctly but leaks row 0's input into row 1
