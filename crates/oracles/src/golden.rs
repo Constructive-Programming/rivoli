@@ -35,6 +35,10 @@ const MAGIC_K3: &[u8; 8] = b"RIVK3GLD";
 // usual mistake is a gate reaching for the wrong model's fixture.
 const MAGIC_GLIMMER: &[u8; 8] = b"RIVGLGLD";
 
+// GLM-5.2's anchor (`tests/glm_anchor_driver.py`) — the fourth model, first to be
+// anchored in the rewrite tree rather than ported from the old one.
+const MAGIC_GLM: &[u8; 8] = b"RIVGMGLD";
+
 /// The metadata key `v4-oracle emit` records its `--defect` under -- one constant, because
 /// the writer (the bin) and the readers below must agree on the spelling or the check
 /// silently degrades to "every file is legacy".
@@ -80,6 +84,11 @@ impl GoldenSet {
     /// A Muse Glimmer anchor golden.
     pub fn read_glimmer(r: &mut impl Read) -> Result<Self> {
         Self::read_anchor(r, MAGIC_GLIMMER)
+    }
+
+    /// A GLM-5.2 anchor golden.
+    pub fn read_glm(r: &mut impl Read) -> Result<Self> {
+        Self::read_anchor(r, MAGIC_GLM)
     }
 
     /// A python-produced S1b anchor golden, of whichever model `want` names.

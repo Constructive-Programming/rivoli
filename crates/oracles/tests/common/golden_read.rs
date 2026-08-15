@@ -82,3 +82,13 @@ impl Vendored {
         assert_eq!(fnv1a(self.bytes), self.fnv, "{}: FNV-1a", self.name);
     }
 }
+
+/// Check every vendored golden against its byte pins. One owner: the three anchor gates
+/// each carried this loop until jscpd matched a pair of them (2026-08-15) — found only
+/// when a THIRD anchor forced the build script to re-run, the stale-fingerprint hole
+/// CLAUDE.md's "clippy-green is not duplication-green" note warns about.
+pub fn check_pinned_bytes(goldens: &[Vendored]) {
+    for v in goldens {
+        v.check_bytes();
+    }
+}

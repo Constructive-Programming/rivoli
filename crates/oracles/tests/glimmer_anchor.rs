@@ -309,9 +309,7 @@ fn the_vendored_weight_sets_are_the_measured_ones() {
 /// effect of running the driver.
 #[test]
 fn the_vendored_bytes_are_the_measured_ones() {
-    for v in GOLDENS {
-        v.check_bytes();
-    }
+    golden_read::check_pinned_bytes(GOLDENS);
     // Two salts are coverage, not redundancy. Identical bytes would mean the salt never reached the
     // weights, and every "both salts" claim above would be one claim wearing two names.
     for mode in ["text", "draft"] {

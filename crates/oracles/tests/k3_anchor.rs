@@ -187,8 +187,8 @@ fn the_vendored_real_config_is_the_one_the_goldens_saw() {
 
 #[test]
 fn the_vendored_bytes_are_the_measured_ones() {
+    golden_read::check_pinned_bytes(GOLDENS);
     for v in GOLDENS {
-        v.check_bytes();
         let g = load(v);
         assert_eq!(g.floats.len(), 223, "{}: float tensors", v.name);
         assert_eq!(g.ints.len(), 5, "{}: int tensors", v.name);
