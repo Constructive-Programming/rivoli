@@ -40,7 +40,7 @@ use rivoli_backend::hip::{
 };
 use rivoli_engine::device::DeviceBuf;
 use rivoli_oracles::v4oracle::{
-    forward::{Capture, Defect, HeadTailW, Oracle},
+    forward::{Capture, Defect, HeadRows, HeadTailW, Oracle},
     numerics::{bf16_decode, bf16_encode},
     weights::{NamedRng, V4Config, WMat},
 };
@@ -134,8 +134,15 @@ impl Fixture {
     /// The oracle's three head-tail goldens.
     fn oracle(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut cap = Capture::default();
-        Oracle::new(self.cfg.clone(), Defect::None)
-            .head_tail(&self.hw, &self.h, self.s, "d", &mut cap);
+        Oracle::new(self.cfg.clone(), Defect::None).head_tail(
+            &self.hw,
+            HeadRows {
+                h: &self.h,
+                s: self.s,
+                step_tag: "d",
+            },
+            &mut cap,
+        );
         let g = |n: &str| cap.float(&format!("head.d.{n}")).expect(n).to_vec();
         (g("hc_head_out"), g("final_norm_out"), g("logits"))
     }

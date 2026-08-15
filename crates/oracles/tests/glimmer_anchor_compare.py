@@ -68,9 +68,12 @@ def _score(ta, tb, is_green):
 
 
 def _held_green(held, is_green):
-    """The declared-green captures that survived. Its COUNT is the final line `compare` prints,
-    and its EMPTINESS is the "declares green captures but none of them held" refusal -- the same
-    two readings the old body took from one `any`/`sum` pair over `held`."""
+    """The declared-green captures that survived.
+
+    Its COUNT is the final line `compare` prints, and its EMPTINESS is the "declares green captures
+    but none of them held" refusal -- the same two readings the old body took from an `any` and a
+    `sum` over `held`, taken here from one list because both want the same predicate applied once.
+    """
     return [n for n in held if is_green(n)]
 
 

@@ -65,6 +65,15 @@ import torch
 # 2026-08-15 to hold every authored file under the 800-line cap. The split moved bodies between
 # files and changed nothing else; `main` stayed because it reads this module's `__doc__` for
 # `--help`, so moving it would change what the CLI prints.
+#
+# Later the same day, for the CodeScene 10.0 gate (this file scored 8.52), what was left was
+# decomposed IN PLACE: `install_text_taps` into its four numbered taps plus the two hook families,
+# `run_draft` into `_draft_inputs`/`_draft_mask`/`_run_draft_block`, `main` into
+# `_build_parser`/`_check_run_args`/`_metadata`, and the target build `run_text` and `run_draft`
+# had each written out into `_build_target`. **Shape only, and deliberately so** -- the venv that
+# regenerates these goldens is gone, so a behaviour change here could not have been caught by
+# re-running anything. Every helper is one contiguous run of the body it came from, called in that
+# body's order, with its comments attached to the lines they were about.
 from glimmer_anchor_compare import compare
 from glimmer_anchor_defects import (
     DEFECTS,
@@ -153,11 +162,11 @@ class Taps:
 def install_text_taps(mdl, model, taps):
     """Tap the four places the target's arithmetic is visible and a module hook is not enough.
 
-    The six helpers below are the four numbered taps and the two hook families, in the order they
-    were written and applied. Split out of this body 2026-08-15 for the CodeScene 10.0 gate (it was
-    76 LoC): the patch order, the hook registration order and therefore the order of the returned
-    list are the ones that produced the vendored goldens, and `Taps.close` still unwinds the patches
-    in reverse because it always did.
+    The six helpers are taps 1 to 4 as the comments below number them, the 1b layer-index publisher
+    that two of them depend on, and the unnumbered module-hook family. Split out of this body
+    2026-08-15 (it was 76 LoC): the patch order, the hook registration order and therefore the order
+    of the returned list are the ones that produced the vendored goldens, and `Taps.close` still
+    unwinds the patches in reverse.
     """
     _patch_rotary(mdl, taps)
     _patch_attention_layer(mdl, taps)
@@ -323,7 +332,7 @@ def _build_target(cfg_mod, mdl, salt):
     `run_draft` uses it as the drafter's context source, and the drafter's goldens are only anchored
     to Muse Glimmer if that context comes from the SAME construction the text goldens pin. The two
     bodies were already identical statement for statement; making that structural is the whole of
-    the change (2026-08-15, with the CodeScene split -- it also took `run_draft` from 94 LoC).
+    the change (2026-08-15 -- it also took `run_draft` from 94 LoC).
 
     Returns the text config beside the model because both callers need it: `run_text` for the vocab
     the prompt is drawn from, `run_draft` to force the drafter's `hidden_size` equal to it.
@@ -445,7 +454,7 @@ def run_draft(salt, defect, cap):
 
     with torch.no_grad():
         ctx, noise = _draft_inputs(target, dcfg, ids, cap)
-        dout = _run_draft_block(mdl, draft, dcfg, (ctx, noise), cap)
+        dout = _run_draft_block((mdl, draft, dcfg), (ctx, noise), cap)
 
         # Logits from the TARGET's lm_head, then slice off index 0 -> block_size-1 candidates.
         logits = target.lm_head(dout.last_hidden_state)
@@ -524,12 +533,15 @@ def _draft_mask(draft, dcfg, ctx, noise):
     return attn_mask
 
 
-def _run_draft_block(mdl, draft, dcfg, inputs, cap):
+def _run_draft_block(drafter, inputs, cap):
     """The single draft forward pass, taps installed around it and torn down after.
 
-    `inputs` is `(ctx, noise)` as one argument because they are one thing -- the pair
-    `_draft_inputs` returns, and neither is meaningful to this call without the other.
+    Both arguments bundle things that are useless apart. `drafter` is `(mdl, draft, dcfg)`: the
+    reference module exists here only to be patched on the model built from that config. `inputs`
+    is `(ctx, noise)` as `_draft_inputs` returns them -- the context is the K/V prefix of that
+    noise block and means nothing without it.
     """
+    mdl, draft, dcfg = drafter
     ctx, noise = inputs
     taps = Taps(cap)
     taps.step = 0
@@ -693,7 +705,7 @@ def _check_run_args(ap, a):
 
     Order is behaviour here, because every `ap.error` exits: `--out` is reported before the
     mode/defect mismatch, which is reported before the `--dump-weights` trap. Only the nesting of
-    that last predicate moved (2026-08-15, CodeScene 10.0) -- it is the same test, named.
+    that last predicate moved -- it is the same test, named.
     """
     allowed = TEXT_DEFECTS if a.mode == "text" else DRAFT_DEFECTS
     if a.defect not in allowed:
@@ -712,9 +724,9 @@ def _check_run_args(ap, a):
 def _metadata(a, model, note, extra):
     """The golden's self-describing header: what ran, under which environment, at which widths.
 
-    A golden that hides what produced it is worse than no golden -- so the declared deviations in
-    this module's docstring each have a key here, and `preflight_env` reads the versions back OUT
-    of these bytes rather than out of a constant.
+    A golden that hides what produced it is worse than no golden -- so each declared deviation in
+    this module's docstring has a key here, and `preflight_env` reads the versions back OUT of
+    these bytes rather than out of a constant.
     """
     cfg = model.config
     tiny = cfg.text_config.to_dict() if hasattr(cfg, "text_config") else cfg.to_dict()

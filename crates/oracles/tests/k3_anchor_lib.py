@@ -4,6 +4,12 @@ Split out of `k3_anchor_driver.py` on 2026-08-15 under the 800-line-per-file gat
 below moved verbatim, comments and measurements with it; nothing was rewritten, because the
 goldens these produce cannot be regenerated without the pinned venv and the GPU.
 
+Decomposed the same day under the CodeScene 10/10 gate, on the same rule: `compare`'s three gate
+arms became one function each, the two reports' shared merge and table became `_merged` and
+`_print_rows`, and `operator_of`'s prefix chain became a table whose ORDER is semantic. Arithmetic
+and literals are untouched; the arms were re-proven red against synthesised goldens, and both
+scorers re-run over the vendored bytes unchanged.
+
 **The cut is the one the driver already drew.** `k3_anchor_driver` binds `torch` inside `main`
 rather than at import, so that `--compare` and `--by-operator` re-score vendored bytes on a
 machine with no torch, no fla and no GPU. Everything on that side of the line lives here: the

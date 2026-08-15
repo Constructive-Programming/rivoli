@@ -57,6 +57,13 @@ the forward hooks are `k3_anchor_capture.py`; the two values no hook can see are
 unchanged -- these goldens cannot be regenerated without the pinned venv and a GPU, so a rewrite
 of one would be a change nothing could score. All three are re-exported below, because this
 file's name is the one `tests/k3-anchor.sh` and every recipe in `anchor.md` run.
+
+**Decomposed further the same day** under the CodeScene 10/10 gate: `main`, `kda_equiv` and
+`fp32_island` were cut into named steps, and the `(cap, ctx, layers)` triple every tap and the
+capture pass carry became a `Tap`. The split's rule held — shape only, with arithmetic, literals
+and comments unmoved, and the pre-split importable names a strict superset. Checked the way this
+file can be checked without a GPU: both scorers re-run over the two vendored goldens, and every
+gate arm in `compare` proven able to go red against synthesised ones.
 """
 
 import argparse

@@ -57,8 +57,10 @@ __device__ __forceinline__ unsigned long long moe_fixed(float v) {
 // (formats.hpp) is bit surgery, `block_sum_lds`'s (reduce.hpp) only operator is `+`, and
 // `swiglu_clamped`'s below only `+` is `1.0f + expf(...)`, whose addends are a constant and
 // a call return — there is no multiply for an FMA to absorb in any of them. That is NOT
-// true of `f2e4m3_rne` in formats.hpp, which does carry one — see the note there for what
-// an ISA diff caught.
+// true of `e4m3_subnormal_mantissa` in formats.hpp, which does carry one — see the note
+// there for what an ISA diff caught. [CORRECTED 2026-08-15: this named `f2e4m3_rne`, which
+// held the pragma until that function was split; it travelled down to the one branch with
+// a fusable pair, and the split's note says why that direction is the safe one.]
 
 // `Expert.forward`'s clamped SwiGLU intermediate, BEFORE the routing weight and before the
 // bf16 store: `silu(min(bf16(g), L)) · clamp(bf16(u), ±L)` (model.py:601-608).
@@ -194,6 +196,40 @@ __device__ __forceinline__ float fp8_dot_strided(const float* __restrict__ x,
 //
 // R=1 is BIT-IDENTICAL to the scalar form: hoisting the four `lut[]` reads into locals
 // changes neither the values nor the order they are summed in.
+
+// One dword's four columns folded into R accumulators — the weights already decoded
+// through the LUT and the block scale already read, because both amortise over the rows.
+// Lifted out of `fp8_dot_strided_r`'s inner loop 2026-08-15, SHAPE ONLY: the same four
+// products in the same `s * (…)` grouping, the same ascending fold into `acc[r]`.
+//
+// The four weights arrive as SCALARS, not as a pointer to the caller's local array. An
+// array would have to survive SROA to stay in registers, and there is no reason to hand
+// the optimizer that job when the values are already in registers at the call.
+template <int R>
+__device__ __forceinline__ void fp8_quad_accum(const float* __restrict__ x, int x_stride, int i0,
+                                               float s, float l0, float l1, float l2, float l3,
+                                               float* __restrict__ acc) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float* xr = x + (size_t)r * x_stride;
+        acc[r] += s * (xr[i0] * l0 + xr[i0 + 1] * l1 + xr[i0 + 2] * l2 + xr[i0 + 3] * l3);
+    }
+}
+
+// One column folded into R accumulators — the remainder path, where the dword read does
+// not fit.
+//
+// `x * l * s`, NOT `x * (l*s)`. Folding the two weight-side factors first would be one
+// fewer multiply per row and a DIFFERENT number — fp multiplication does not associate —
+// which is exactly the kind of drift the bit-identity test exists to refuse. The loads are
+// hoisted at the call; the arithmetic is not touched.
+template <int R>
+__device__ __forceinline__ void fp8_col_accum(const float* __restrict__ x, int x_stride, int i,
+                                              float l, float s, float* __restrict__ acc) {
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] += x[(size_t)r * x_stride + i] * l * s;
+}
+
 template <int R>
 __device__ __forceinline__ void fp8_dot_strided_r(const float* __restrict__ x, int x_stride,
                                                   const unsigned char* __restrict__ wrow,
@@ -211,27 +247,12 @@ __device__ __forceinline__ void fp8_dot_strided_r(const float* __restrict__ x, i
     for (int j = start; j < n4; j += stride) {
         unsigned int p = w4[j];
         int i0 = j << 2;
-        float s = scalerow[i0 >> bsh];
-        float l0 = lut[(unsigned char)p];
-        float l1 = lut[(unsigned char)(p >> 8)];
-        float l2 = lut[(unsigned char)(p >> 16)];
-        float l3 = lut[(unsigned char)(p >> 24)];
-#pragma unroll
-        for (int r = 0; r < R; ++r) {
-            const float* xr = x + (size_t)r * x_stride;
-            acc[r] += s * (xr[i0] * l0 + xr[i0 + 1] * l1 + xr[i0 + 2] * l2 + xr[i0 + 3] * l3);
-        }
+        fp8_quad_accum<R>(x, x_stride, i0, scalerow[i0 >> bsh], lut[(unsigned char)p],
+                          lut[(unsigned char)(p >> 8)], lut[(unsigned char)(p >> 16)],
+                          lut[(unsigned char)(p >> 24)], acc);
     }
-    for (int i = (n4 << 2) + start; i < i_dim; i += stride) {
-        // `x * l * s`, NOT `x * (l*s)`. Folding the two weight-side factors first would be
-        // one fewer multiply per row and a DIFFERENT number — fp multiplication does not
-        // associate — which is exactly the kind of drift the bit-identity test exists to
-        // refuse. The loads are hoisted; the arithmetic is not touched.
-        float l = lut[wrow[i]];
-        float s = scalerow[i >> bsh];
-#pragma unroll
-        for (int r = 0; r < R; ++r) acc[r] += x[(size_t)r * x_stride + i] * l * s;
-    }
+    for (int i = (n4 << 2) + start; i < i_dim; i += stride)
+        fp8_col_accum<R>(x, x_stride, i, lut[wrow[i]], scalerow[i >> bsh], acc);
 }
 
 // One WAVE reduces one row: strided MAC over the wave's lanes, then a wave-sum.
@@ -281,6 +302,86 @@ static_assert(I4_GROUP % 8 == 0, "the dword fast path's 8 columns must not strad
 __device__ __forceinline__ float nib(unsigned int w, int k) {
     return (float)((int)((w >> (4 * k)) & 0xFu) - 8); // nibble k → signed weight
 }
+// `dot_i4_wave_r`'s dword fast path, returning the column `base` its scalar tail resumes
+// from. A row that is not 4-byte aligned returns 0 and is handed to the tail whole — the
+// same partition the wrapping `if` used to express, written as an early return so this
+// loop sits at one level of nesting instead of two.
+//
+// Lifted out 2026-08-15, SHAPE ONLY. The `#pragma unroll 4` and every number the note
+// inside it measures travel WITH the loop; the fold order, the two accumulators and the
+// group-scale hoist are untouched.
+template <int R>
+__device__ __forceinline__ int i4_dword_pass(const float* __restrict__ v, int v_stride,
+                                             const unsigned char* __restrict__ row,
+                                             const float* __restrict__ scalerow, int dim, int lane,
+                                             float* __restrict__ a0, float* __restrict__ a1) {
+    int base = 0;
+    if ((((size_t)row) & 3u) != 0) return base;
+    const unsigned int* rw = (const unsigned int*)row;
+    // Unrolled 2026-08-09, MEASURED, not copied from fp4. Un-pragma'd, this loop issued
+    // 4 (R=1) / 6 (R=2) loads and drained them all in-body — `vmcnt(3) lgkmcnt(0)` down
+    // to `vmcnt(0)`, one iteration in flight, M7's disease and the same gap M11 fixed on
+    // `dot_f4_wave_r` below. `dot_bench glmi4` at the artifact's dims (6144x2048, 1.083 GB
+    // rotating past the 32 MB MALL, two counterbalanced passes, benchmarks.md "GLM int4
+    // MoE unroll round"): depth 4 is **+12.6% at R=1 (169.2 -> 190.6 GB/s), +16.4% at
+    // R=2 (163.3 -> 190.1), +20.1% at e_count=1 (125.9 -> 151.3)**, fingerprint-identical
+    // on BOTH token rows; depth 2 gave +11.6%/+3.0%, so depth 4 is the rung that pays at
+    // the R=2 width speculative decode actually runs.
+    //
+    // The register cost the un-unrolled comment here worried about was measured FIRST and
+    // does not bite: depth 4 is VGPR 88/123/83/95 across the four kernels, occupancy 16
+    // everywhere except gateup_r2 at 10 waves/SIMD — exactly where fp4's winning arm sat —
+    // zero spill, zero scratch. Two adjacent negatives, priced in the same round so nobody
+    // re-tries them: AS1-typing these pointers (the fp4 `gu8p` treatment; flat_load ->
+    // global_load, the lgkmcnt coupling gone) measured +-0.6% == nothing, and a ballast
+    // with the whole nibble decode and every FMA removed measured +0.5%/-1.1% — the decode
+    // is FREE at the un-unrolled schedule, so the entire gap was memory-level parallelism.
+    //
+    // Fold order is unchanged — each accumulator stays one serial fadd chain, ascending
+    // `base` (the fingerprint gate would have caught anything else; arm X, a deliberate
+    // even/odd split, moved it and was measured doing so). Multi-trip coverage INCLUDING
+    // the remainder loop this pragma creates: tests/kernel.rs::
+    // the_i4_dword_path_matches_the_oracle_at_multiple_trips (1280/1024 = 5 and 4 trips;
+    // every engine dim is 0 mod 4, so only that fixture ever enters the epilogue).
+#pragma unroll 4
+    for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
+        int col = base + lane * 8;
+        unsigned int w = rw[col >> 3];              // 8 nibbles = 8 consecutive columns
+        float s = scalerow[col >> I4_GROUP_SHIFT];  // one group for all 8
+        // Decoded ONCE for every row.
+        float n0 = nib(w, 0), n1 = nib(w, 1), n2 = nib(w, 2), n3 = nib(w, 3);
+        float n4 = nib(w, 4), n5 = nib(w, 5), n6 = nib(w, 6), n7 = nib(w, 7);
+#pragma unroll
+        for (int t = 0; t < R; ++t) {
+            const float* vt = v + (size_t)t * v_stride;
+            float4 x0 = *(const float4*)(vt + col);
+            float4 x1 = *(const float4*)(vt + col + 4);
+            a0[t] += s * (x0.x * n0 + x0.y * n1 + x0.z * n2 + x0.w * n3);
+            a1[t] += s * (x1.x * n4 + x1.y * n5 + x1.z * n6 + x1.w * n7);
+        }
+    }
+    return base;
+}
+
+// The per-column remainder, from `base` to `dim`. Folds into `a0` only — `a1` exists to
+// give the dword path two independent FMA chains and there is no second chain here.
+//
+// The left-to-right `v[i] * (n−8) * scale` is the arithmetic, not an accident of
+// spelling: hoisting `(n−8) * scale` out of the row loop would re-associate the product.
+template <int R>
+__device__ __forceinline__ void i4_tail_accum(const float* __restrict__ v, int v_stride,
+                                              const unsigned char* __restrict__ row,
+                                              const float* __restrict__ scalerow, int dim,
+                                              int base, int lane, float* __restrict__ a0) {
+    for (int i = base + lane; i < dim; i += WAVE) {
+        unsigned char b = row[i >> 1];
+        int n = (i & 1) ? (b >> 4) : (b & 0x0F);
+#pragma unroll
+        for (int t = 0; t < R; ++t)
+            a0[t] += v[(size_t)t * v_stride + i] * (float)(n - 8) * scalerow[i >> I4_GROUP_SHIFT];
+    }
+}
+
 // R token rows against ONE read of the weight row — the nibble decode and the group scale
 // amortise over the rows, which is the whole point of batching (the weight read is ~92% of
 // an expert launch). `v_stride` is the row-minor stride of `v`.
@@ -290,6 +391,9 @@ __device__ __forceinline__ float nib(unsigned int w, int k) {
 // left-to-right `v[i] * (n−8) * scale` are both reproduced exactly. Hoisting the nibbles
 // is safe (same values, same order); hoisting `(n−8) * scale` out of the tail would NOT be
 // — it re-associates the product. See tests/kernel.rs.
+//
+// The two passes are a PARTITION of the columns, which is why `base` is threaded between
+// them by value rather than each pass deciding its own bound.
 template <int R>
 __device__ __forceinline__ void dot_i4_wave_r(const float* __restrict__ v, int v_stride,
                                               const unsigned char* __restrict__ row,
@@ -298,59 +402,8 @@ __device__ __forceinline__ void dot_i4_wave_r(const float* __restrict__ v, int v
     float a0[R], a1[R];
 #pragma unroll
     for (int t = 0; t < R; ++t) { a0[t] = 0.0f; a1[t] = 0.0f; }
-    int base = 0;
-    if ((((size_t)row) & 3u) == 0) {
-        const unsigned int* rw = (const unsigned int*)row;
-        // Unrolled 2026-08-09, MEASURED, not copied from fp4. Un-pragma'd, this loop issued
-        // 4 (R=1) / 6 (R=2) loads and drained them all in-body — `vmcnt(3) lgkmcnt(0)` down
-        // to `vmcnt(0)`, one iteration in flight, M7's disease and the same gap M11 fixed on
-        // `dot_f4_wave_r` below. `dot_bench glmi4` at the artifact's dims (6144x2048, 1.083 GB
-        // rotating past the 32 MB MALL, two counterbalanced passes, benchmarks.md "GLM int4
-        // MoE unroll round"): depth 4 is **+12.6% at R=1 (169.2 -> 190.6 GB/s), +16.4% at
-        // R=2 (163.3 -> 190.1), +20.1% at e_count=1 (125.9 -> 151.3)**, fingerprint-identical
-        // on BOTH token rows; depth 2 gave +11.6%/+3.0%, so depth 4 is the rung that pays at
-        // the R=2 width speculative decode actually runs.
-        //
-        // The register cost the un-unrolled comment here worried about was measured FIRST and
-        // does not bite: depth 4 is VGPR 88/123/83/95 across the four kernels, occupancy 16
-        // everywhere except gateup_r2 at 10 waves/SIMD — exactly where fp4's winning arm sat —
-        // zero spill, zero scratch. Two adjacent negatives, priced in the same round so nobody
-        // re-tries them: AS1-typing these pointers (the fp4 `gu8p` treatment; flat_load ->
-        // global_load, the lgkmcnt coupling gone) measured +-0.6% == nothing, and a ballast
-        // with the whole nibble decode and every FMA removed measured +0.5%/-1.1% — the decode
-        // is FREE at the un-unrolled schedule, so the entire gap was memory-level parallelism.
-        //
-        // Fold order is unchanged — each accumulator stays one serial fadd chain, ascending
-        // `base` (the fingerprint gate would have caught anything else; arm X, a deliberate
-        // even/odd split, moved it and was measured doing so). Multi-trip coverage INCLUDING
-        // the remainder loop this pragma creates: tests/kernel.rs::
-        // the_i4_dword_path_matches_the_oracle_at_multiple_trips (1280/1024 = 5 and 4 trips;
-        // every engine dim is 0 mod 4, so only that fixture ever enters the epilogue).
-#pragma unroll 4
-        for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
-            int col = base + lane * 8;
-            unsigned int w = rw[col >> 3];              // 8 nibbles = 8 consecutive columns
-            float s = scalerow[col >> I4_GROUP_SHIFT];  // one group for all 8
-            // Decoded ONCE for every row.
-            float n0 = nib(w, 0), n1 = nib(w, 1), n2 = nib(w, 2), n3 = nib(w, 3);
-            float n4 = nib(w, 4), n5 = nib(w, 5), n6 = nib(w, 6), n7 = nib(w, 7);
-#pragma unroll
-            for (int t = 0; t < R; ++t) {
-                const float* vt = v + (size_t)t * v_stride;
-                float4 x0 = *(const float4*)(vt + col);
-                float4 x1 = *(const float4*)(vt + col + 4);
-                a0[t] += s * (x0.x * n0 + x0.y * n1 + x0.z * n2 + x0.w * n3);
-                a1[t] += s * (x1.x * n4 + x1.y * n5 + x1.z * n6 + x1.w * n7);
-            }
-        }
-    }
-    for (int i = base + lane; i < dim; i += WAVE) {
-        unsigned char b = row[i >> 1];
-        int n = (i & 1) ? (b >> 4) : (b & 0x0F);
-#pragma unroll
-        for (int t = 0; t < R; ++t)
-            a0[t] += v[(size_t)t * v_stride + i] * (float)(n - 8) * scalerow[i >> I4_GROUP_SHIFT];
-    }
+    int base = i4_dword_pass<R>(v, v_stride, row, scalerow, dim, lane, a0, a1);
+    i4_tail_accum<R>(v, v_stride, row, scalerow, dim, base, lane, a0);
 #pragma unroll
     for (int t = 0; t < R; ++t) out[t] = wave_sum(a0[t] + a1[t]);
 }
@@ -448,6 +501,104 @@ typedef const unsigned char __attribute__((address_space(1)))* gu8p;
 // `row` and `scalerow` are `gu8p` — AS1-typed, see the typedef above — because both come
 // out of an `ExpertDescF4` at every call site and the flat_load they otherwise lower to is
 // a measured cost on an issue-bound loop.
+// `dot_f4_wave_r`'s dword fast path, returning the column `base` its scalar tail resumes
+// from — the fp4 twin of `i4_dword_pass` above, and lifted out on the same day and for the
+// same reason (SHAPE ONLY; the pragma, the fold order and every measured number below
+// travel with the loop).
+//
+// Predicated on the WEIGHT row's 4-byte alignment, which is what the dword read needs; an
+// unaligned row returns 0 and the tail takes it whole. The `float4` loads below are on the
+// ACTIVATION and are NOT checked — a 16-byte-aligned `v` is an unchecked caller obligation
+// (`launch_moe_expert_range_f4`'s `# Safety`), and a misaligned one faults rather than
+// falling back to the tail.
+template <int R>
+__device__ __forceinline__ int f4_dword_pass(const float* __restrict__ v, int v_stride,
+                                             gu8p __restrict__ row, gu8p __restrict__ scalerow,
+                                             int dim, int lane, float* __restrict__ a0,
+                                             float* __restrict__ a1) {
+    int base = 0;
+    if ((((size_t)row) & 3u) != 0) return base;
+    const unsigned int __attribute__((address_space(1)))* rw =
+        (const unsigned int __attribute__((address_space(1)))*)row;
+    // Unrolled 2026-08-09 (M11). Un-pragma'd, this loop drained inside its own body
+    // (`s_waitcnt vmcnt(1)`/`vmcnt(0)` in-body) — ONE iteration of loads in flight, ever,
+    // which is M7's disease; `fp8_dot_strided` above was fixed for it and the exemption
+    // beside that pragma names `fp8_dot_strided_r`, so this loop was never in that
+    // conversation. `dot_bench v4res` MICROBENCHMARK at the engine's dims: 146.63 →
+    // 195.27 GB/s. Depth is what buys it — a ballast with the decode and every FMA
+    // removed buys only +12.8%, so the bound was never issue rate.
+    //
+    // A change that grows this body must re-read the ISA. Unroll 4 is 125 VGPR on
+    // `moe_gateup_f4` (**10 waves/SIMD**, down from 16) and 93 on `moe_down_f4` (still 16);
+    // no spill on either, 0 scratch. Unroll 2 keeps 16 waves everywhere at 74/66 VGPR and
+    // measured 172.55; **both rungs are registered arms of an engine A/B and
+    // `docs/investigations/v4-decode-decomposition.md` §M11b decides between them on the
+    // engine wall, not this comment.**
+    //
+    // Fold order must stay the ascending-`base` sum, and this was READ OUT of the
+    // compiler rather than argued: the device IR carries `contract` (FMA fusion, which
+    // stock already relies on) but **zero `reassoc`/`fast`/`nnan`** at stock, unroll 2 and
+    // unroll 4; each accumulator stays a SINGLE serial fadd chain terminating at the loop
+    // phi — exactly two float phis in the loop header at all three depths, no partial-
+    // accumulator split — and the chain is `phi + t(base) + t(base+256) + …`, ascending.
+    // The epilogue remainder chains off the main loop's exit values, so it continues the
+    // same order. `-ffast-math` is absent (`build.rs`), but `-ffp-contract=fast` is clang's
+    // HIP default, which is why this was read and not assumed
+    // (`tests/f4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` records that
+    // lesson).
+    //
+    // Multi-trip coverage is `tests/f4_kernel.rs::the_dword_path_matches_the_oracle_at_
+    // multiple_trips` (1280/1024 = 5 and 4 trips; at `V4Config::toy` gate/up runs this loop
+    // ONCE and down never enters it, so every other test executes only the remainder copy).
+    // Measured 2026-08-09: it gates arithmetic wrong past the first trip — red at 65x
+    // tolerance on an injected `n7 = 0 when base != 0`, while all 27 other tests stay green.
+    // It does NOT gate this bound (measured 2026-08-09 by building both): `<=` -> `<` moves
+    // the last trip into the scalar tail below, which resumes from `base`, and the test
+    // still passes — the two paths are a PARTITION, so an off-by-one that SHORTENS this
+    // loop is a performance bug no test will catch. Loosening it is a different animal:
+    // reading `rw[col >> 3]` past the row faults or corrupts. The remainder is unreachable
+    // at the engine's dims but reachable in production in principle — the launcher guards
+    // `% ACT_QUANT_BLOCK` (128), not 256, so a conforming dim like 1152 or 3712 gives an
+    // odd trip count.
+#pragma unroll 4
+    for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
+        int col = base + lane * 8;
+        unsigned int w = rw[col >> 3];             // 8 nibbles = 8 consecutive columns
+        float s = e8m0f(scalerow[col >> F4_GROUP_SHIFT]);  // one group for all 8
+        // Decoded ONCE for every row — the weight side is the expensive half.
+        float n0 = e2m1f(w), n1 = e2m1f(w >> 4), n2 = e2m1f(w >> 8), n3 = e2m1f(w >> 12);
+        float n4 = e2m1f(w >> 16), n5 = e2m1f(w >> 20), n6 = e2m1f(w >> 24),
+              n7 = e2m1f(w >> 28);
+#pragma unroll
+        for (int t = 0; t < R; ++t) {
+            const float* vt = v + (size_t)t * v_stride;
+            float4 x0 = *(const float4*)(vt + col);
+            float4 x1 = *(const float4*)(vt + col + 4);
+            a0[t] += s * (x0.x * n0 + x0.y * n1 + x0.z * n2 + x0.w * n3);
+            a1[t] += s * (x1.x * n4 + x1.y * n5 + x1.z * n6 + x1.w * n7);
+        }
+    }
+    return base;
+}
+
+// The per-column remainder, from `base` to `dim` — `i4_tail_accum`'s fp4 twin. Folds into
+// `a0` only, for the same reason: `a1` is the dword path's second FMA chain and there is
+// no second chain here. The scale is decoded PER COLUMN rather than hoisted, because this
+// path has no group of eight to hoist it out of.
+template <int R>
+__device__ __forceinline__ void f4_tail_accum(const float* __restrict__ v, int v_stride,
+                                              gu8p __restrict__ row, gu8p __restrict__ scalerow,
+                                              int dim, int base, int lane,
+                                              float* __restrict__ a0) {
+    for (int i = base + lane; i < dim; i += WAVE) {
+        unsigned char b = row[i >> 1];
+        unsigned int n = (i & 1) ? (unsigned int)(b >> 4) : (unsigned int)(b & 0x0F);
+        float s = e8m0f(scalerow[i >> F4_GROUP_SHIFT]);
+#pragma unroll
+        for (int t = 0; t < R; ++t) a0[t] += v[(size_t)t * v_stride + i] * e2m1f(n) * s;
+    }
+}
+
 template <int R>
 __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v_stride,
                                               gu8p __restrict__ row,
@@ -456,80 +607,8 @@ __device__ __forceinline__ void dot_f4_wave_r(const float* __restrict__ v, int v
     float a0[R], a1[R];
 #pragma unroll
     for (int t = 0; t < R; ++t) { a0[t] = 0.0f; a1[t] = 0.0f; }
-    int base = 0;
-    // Predicated on the WEIGHT row's 4-byte alignment, which is what the dword read needs.
-    // The `float4` loads below are on the ACTIVATION and are NOT checked — a 16-byte-aligned
-    // `v` is an unchecked caller obligation (`launch_moe_expert_range_f4`'s `# Safety`), and
-    // a misaligned one faults rather than falling back to the tail.
-    if ((((size_t)row) & 3u) == 0) {
-        const unsigned int __attribute__((address_space(1)))* rw =
-            (const unsigned int __attribute__((address_space(1)))*)row;
-        // Unrolled 2026-08-09 (M11). Un-pragma'd, this loop drained inside its own body
-        // (`s_waitcnt vmcnt(1)`/`vmcnt(0)` in-body) — ONE iteration of loads in flight, ever,
-        // which is M7's disease; `fp8_dot_strided` above was fixed for it and the exemption
-        // beside that pragma names `fp8_dot_strided_r`, so this loop was never in that
-        // conversation. `dot_bench v4res` MICROBENCHMARK at the engine's dims: 146.63 →
-        // 195.27 GB/s. Depth is what buys it — a ballast with the decode and every FMA
-        // removed buys only +12.8%, so the bound was never issue rate.
-        //
-        // A change that grows this body must re-read the ISA. Unroll 4 is 125 VGPR on
-        // `moe_gateup_f4` (**10 waves/SIMD**, down from 16) and 93 on `moe_down_f4` (still 16);
-        // no spill on either, 0 scratch. Unroll 2 keeps 16 waves everywhere at 74/66 VGPR and
-        // measured 172.55; **both rungs are registered arms of an engine A/B and
-        // `docs/investigations/v4-decode-decomposition.md` §M11b decides between them on the
-        // engine wall, not this comment.**
-        //
-        // Fold order must stay the ascending-`base` sum, and this was READ OUT of the
-        // compiler rather than argued: the device IR carries `contract` (FMA fusion, which
-        // stock already relies on) but **zero `reassoc`/`fast`/`nnan`** at stock, unroll 2 and
-        // unroll 4; each accumulator stays a SINGLE serial fadd chain terminating at the loop
-        // phi — exactly two float phis in the loop header at all three depths, no partial-
-        // accumulator split — and the chain is `phi + t(base) + t(base+256) + …`, ascending.
-        // The epilogue remainder chains off the main loop's exit values, so it continues the
-        // same order. `-ffast-math` is absent (`build.rs`), but `-ffp-contract=fast` is clang's
-        // HIP default, which is why this was read and not assumed
-        // (`tests/f4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` records that
-        // lesson).
-        //
-        // Multi-trip coverage is `tests/f4_kernel.rs::the_dword_path_matches_the_oracle_at_
-        // multiple_trips` (1280/1024 = 5 and 4 trips; at `V4Config::toy` gate/up runs this loop
-        // ONCE and down never enters it, so every other test executes only the remainder copy).
-        // Measured 2026-08-09: it gates arithmetic wrong past the first trip — red at 65x
-        // tolerance on an injected `n7 = 0 when base != 0`, while all 27 other tests stay green.
-        // It does NOT gate this bound (measured 2026-08-09 by building both): `<=` -> `<` moves
-        // the last trip into the scalar tail below, which resumes from `base`, and the test
-        // still passes — the two paths are a PARTITION, so an off-by-one that SHORTENS this
-        // loop is a performance bug no test will catch. Loosening it is a different animal:
-        // reading `rw[col >> 3]` past the row faults or corrupts. The remainder is unreachable
-        // at the engine's dims but reachable in production in principle — the launcher guards
-        // `% ACT_QUANT_BLOCK` (128), not 256, so a conforming dim like 1152 or 3712 gives an
-        // odd trip count.
-#pragma unroll 4
-        for (; base + WAVE * 8 <= dim; base += WAVE * 8) {
-            int col = base + lane * 8;
-            unsigned int w = rw[col >> 3];             // 8 nibbles = 8 consecutive columns
-            float s = e8m0f(scalerow[col >> F4_GROUP_SHIFT]);  // one group for all 8
-            // Decoded ONCE for every row — the weight side is the expensive half.
-            float n0 = e2m1f(w), n1 = e2m1f(w >> 4), n2 = e2m1f(w >> 8), n3 = e2m1f(w >> 12);
-            float n4 = e2m1f(w >> 16), n5 = e2m1f(w >> 20), n6 = e2m1f(w >> 24),
-                  n7 = e2m1f(w >> 28);
-#pragma unroll
-            for (int t = 0; t < R; ++t) {
-                const float* vt = v + (size_t)t * v_stride;
-                float4 x0 = *(const float4*)(vt + col);
-                float4 x1 = *(const float4*)(vt + col + 4);
-                a0[t] += s * (x0.x * n0 + x0.y * n1 + x0.z * n2 + x0.w * n3);
-                a1[t] += s * (x1.x * n4 + x1.y * n5 + x1.z * n6 + x1.w * n7);
-            }
-        }
-    }
-    for (int i = base + lane; i < dim; i += WAVE) {
-        unsigned char b = row[i >> 1];
-        unsigned int n = (i & 1) ? (unsigned int)(b >> 4) : (unsigned int)(b & 0x0F);
-        float s = e8m0f(scalerow[i >> F4_GROUP_SHIFT]);
-#pragma unroll
-        for (int t = 0; t < R; ++t) a0[t] += v[(size_t)t * v_stride + i] * e2m1f(n) * s;
-    }
+    int base = f4_dword_pass<R>(v, v_stride, row, scalerow, dim, lane, a0, a1);
+    f4_tail_accum<R>(v, v_stride, row, scalerow, dim, base, lane, a0);
 #pragma unroll
     for (int t = 0; t < R; ++t) out[t] = wave_sum(a0[t] + a1[t]);
 }

@@ -10,8 +10,9 @@
 // No `#pragma clang fp contract(off)` anywhere below, and none is needed: the only
 // operators in this file are `+` and `fmaxf` over shuffles, so there is no multiply for an
 // FMA to absorb. common.hpp's "V4 shared device helpers" note runs that same argument over
-// the helpers it covers and names `f2e4m3_rne` (formats.hpp) as the one that DOES need the
-// pragma, with the ISA diff that measured it.
+// the helpers it covers and names `e4m3_subnormal_mantissa` (formats.hpp) as the one that
+// DOES need the pragma, with the ISA diff that measured it. [CORRECTED 2026-08-15: named
+// `f2e4m3_rne` until that function was split and the pragma moved to the branch it guards.]
 #pragma once
 
 #include <hip/hip_runtime.h>

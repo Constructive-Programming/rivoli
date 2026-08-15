@@ -9,6 +9,11 @@ forward hook can reach -- the AttnRes fold, whose modules are read rather than c
 KDA operator, which is a free function -- need a wrapper each, and those live in
 `k3_anchor_taps.py`. The split is that boundary; each tap's own docstring records what its
 absence cost when the harness had only the hooks.
+
+Decomposed the same day under the CodeScene 10/10 gate: `hook_model`'s name tests are now
+[`_is_captured`], with every measurement that shaped them carried along, and the `Tap` triple the
+taps and the capture pass all take is defined here beside `Capture`. Shape only -- the hooked set
+is unchanged, checked name-by-name against the pre-split predicate.
 """
 
 import collections

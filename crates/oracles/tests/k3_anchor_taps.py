@@ -1,7 +1,10 @@
 """The two taps: the values a `register_forward_hook` cannot see, and how each is reached.
 
 Split out of `k3_anchor_driver.py` on 2026-08-15 under the 800-line-per-file gate. Every body
-below moved verbatim, comments and measurements with it.
+below moved verbatim, comments and measurements with it. Decomposed the same day under the
+CodeScene 10/10 gate -- each recorder inside the KDA wrapper is now its own function, which is
+what took that wrapper's nesting from four conditionals to two; the calls, their order and their
+kwargs are unchanged.
 
 Both write into a `k3_anchor_capture.Capture`, and both exist because the hook mechanism in that
 module is blind to them: `_apply_attn_res` READS its `proj` and `norm` modules instead of calling

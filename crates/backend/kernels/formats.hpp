@@ -53,9 +53,11 @@ __device__ __forceinline__ unsigned short f2bf16(float x) {
 // rounding is worth.
 //
 // No `#pragma clang fp contract(off)` here, and none needed: this is bit surgery, with no
-// multiply for an FMA to absorb. That is NOT true of `f2e4m3_rne` below, which does carry
-// one — see the note there for what an ISA diff caught, and common.hpp's "V4 shared device
-// helpers" note for the same argument across the helpers it covers.
+// multiply for an FMA to absorb. That is NOT true of `e4m3_subnormal_mantissa` below, which
+// does carry one — see the note there for what an ISA diff caught, and common.hpp's "V4
+// shared device helpers" note for the same argument across the helpers it covers.
+// [CORRECTED 2026-08-15: this named `f2e4m3_rne`, which held the pragma until it was split
+// into three; the pragma now sits on the one branch whose `a * 512.0f` feeds a subtract.]
 __device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
 // NAMING RULE for `bf16` in kernel names, stated here because this helper is what the rule
 // is about: a trailing `_bf16` names the STORE (`gemv_fp8_bf16`, `swiglu_clamped_bf16` —
@@ -190,35 +192,95 @@ __device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
 // One ulp on a tie is not much, and it is still worth its own function: this is the only
 // encoder that will ever be compared against the oracle, and a known difference inside a
 // result whose whole job is to expose unknown ones is the thing this port cannot afford.
-__device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
-    // **Load-bearing, and MEASURED IN THE ISA rather than argued — 2026-08-05.** This
-    // function had a twin inside `mla.hip`, below that file's own file-scope
-    // `#pragma clang fp contract(off)`. S3 requirement 11 deleted the twin and pointed
-    // `act_quant_f8_prefix` here; `common.hpp` is included ABOVE that pragma and clang attaches FP
-    // options per expression at parse time, so inlining into a `contract(off)` caller does
-    // NOT restore the property — the subnormal branch's `scaled - m` (fed by `a * 512.0f`)
-    // began fusing. Counted inside `act_quant_f8_prefix` at `--offload-arch=gfx1151 -O3`, and the
-    // delta is **one `v_fma_f32`**: 4 at 78796eb, 5 with this pragma removed, 4 with it
-    // (6 / 7 / 6 counting `v_fmac_f32` too). A third tier of 7 / 8 / 7 is
-    // reachable by also counting the one `v_div_fmas_f32` — DON'T: that belongs to the f32
-    // divide expansion (`v_div_scale` x2, `v_div_fmas`, `v_div_fixup`, all present here),
-    // which `mla.hip`'s pragma note already excludes as contraction evidence. It shows up
-    // in a naive grep only because "di*v_fma*s" contains the substring. The check was run in that order precisely so it was seen to go red
-    // before being trusted green.
-    //
-    // **Count `v_fma_f32`/`v_fmac_f32`, and compare a DELTA rather than an absolute.** A
-    // `v_fma|v_mac|v_mad` grep reads 15 / 16 / 15 here, because eight `v_mad_u64_u32` are
-    // ADDRESS arithmetic that contraction neither does nor should touch — enough to make a
-    // one-instruction regression look like noise. Found on `index_score_blocks`, where the
-    // same pragma moved 1 `v_fmac_f32` to 0 while a naive count read 10 → 9.
-    //
-    // Values do not move either way: reaching this branch bounds `a` to (2^-10, 2^-6),
-    // where `a` is normal and `a * 512.0f` is exact, so the FMA elides two roundings that
-    // were already no-ops. The pragma is here for the CLAIM, not the arithmetic —
-    // `mla.hip`'s "VERIFIED IN THE ISA" note and the `ULP_BUDGET = 1` it justifies in
-    // `tests/f4_attn.rs` both rest on contraction being absent from the V4 path, and a
-    // silent 8th instruction makes those two false while nothing goes red.
+//
+// Split into the three pieces below 2026-08-15 — SHAPE ONLY, the arithmetic and its
+// association are untouched. What moved and why is recorded at each piece.
+
+// The round-to-nearest-EVEN tie rule, stated ONCE for both of `f2e4m3_rne`'s mantissa
+// paths: `rem`/`half` are floats in the subnormal path and integers in the normal one,
+// which is the whole reason this is a template and not two copies of one line. Strictly
+// past the midpoint rounds up; strictly below rounds down; EXACTLY on it the tie goes to
+// the even mantissa, so the low bit of what is KEPT decides.
+//
+// Bit-identical to the `rem > half || (rem == half && (keep & 1u))` pair it replaces,
+// NaN included: every comparison against a NaN is false, so that form answered "no", and
+// here `rem != half` is true and `rem > half` is then false. Neither caller can present a
+// NaN (`f2e4m3_rne` returns on `isnan` before either path, and the normal path's operands
+// are integers), and that is stated rather than relied on because the two forms agree
+// there anyway.
+template <typename T>
+__device__ __forceinline__ bool rne_rounds_up(T rem, T half, unsigned int keep) {
+    if (rem != half) return rem > half;
+    return (keep & 1u) != 0u;
+}
+
+// e4m3's SUBNORMAL mantissa for `a` in (2^-10, 2^-6): value = m·2^-9, m in 1..=8, where
+// m == 8 promotes to the smallest normal (code 0x08) and the caller applies that. floor +
+// an explicit tie test rather than `rintf`, so the rule is on the page instead of in the
+// hardware's current rounding mode.
+//
+// **The pragma is load-bearing, and MEASURED IN THE ISA rather than argued — 2026-08-05.**
+// `f2e4m3_rne` had a twin inside `mla.hip`, below that file's own file-scope
+// `#pragma clang fp contract(off)`. S3 requirement 11 deleted the twin and pointed
+// `act_quant_f8_prefix` here; `common.hpp` is included ABOVE that pragma and clang attaches FP
+// options per expression at parse time, so inlining into a `contract(off)` caller does
+// NOT restore the property — this branch's `scaled - m` (fed by `a * 512.0f`)
+// began fusing. Counted inside `act_quant_f8_prefix` at `--offload-arch=gfx1151 -O3`, and the
+// delta is **one `v_fma_f32`**: 4 at 78796eb, 5 with this pragma removed, 4 with it
+// (6 / 7 / 6 counting `v_fmac_f32` too). A third tier of 7 / 8 / 7 is
+// reachable by also counting the one `v_div_fmas_f32` — DON'T: that belongs to the f32
+// divide expansion (`v_div_scale` x2, `v_div_fmas`, `v_div_fixup`, all present here),
+// which `mla.hip`'s pragma note already excludes as contraction evidence. It shows up
+// in a naive grep only because "di*v_fma*s" contains the substring. The check was run in that order precisely so it was seen to go red
+// before being trusted green.
+//
+// **Count `v_fma_f32`/`v_fmac_f32`, and compare a DELTA rather than an absolute.** A
+// `v_fma|v_mac|v_mad` grep reads 15 / 16 / 15 here, because eight `v_mad_u64_u32` are
+// ADDRESS arithmetic that contraction neither does nor should touch — enough to make a
+// one-instruction regression look like noise. Found on `index_score_blocks`, where the
+// same pragma moved 1 `v_fmac_f32` to 0 while a naive count read 10 → 9.
+//
+// Values do not move either way: reaching this branch bounds `a` to (2^-10, 2^-6),
+// where `a` is normal and `a * 512.0f` is exact, so the FMA elides two roundings that
+// were already no-ops. The pragma is here for the CLAIM, not the arithmetic —
+// `mla.hip`'s "VERIFIED IN THE ISA" note and the `ULP_BUDGET = 1` it justifies in
+// `tests/f4_attn.rs` both rest on contraction being absent from the V4 path, and a
+// silent 8th instruction makes those two false while nothing goes red.
+//
+// **The pragma travelled DOWN here with the fusable pair on 2026-08-15, and that direction
+// is the safe one.** It is the same per-expression-at-parse-time rule the paragraph above
+// turns on, read the other way: options attach to THIS function's expressions where they
+// are parsed, so inlining into `f2e4m3_rne` — which no longer carries the pragma — cannot
+// take them off again. The reverse (relying on a caller's pragma) is what was measured to
+// fail.
+__device__ __forceinline__ unsigned int e4m3_subnormal_mantissa(float a) {
 #pragma clang fp contract(off)
+    // `a * 512.0f` feeding `scaled - m` is the fusable pair the pragma exists for.
+    float scaled = a * 512.0f;
+    float m = floorf(scaled), rem = scaled - m;
+    if (rne_rounds_up(rem, 0.5f, (unsigned int)m)) m += 1.0f;
+    return (unsigned int)m;
+}
+
+// e4m3's NORMAL path, from the input magnitude's raw f32 bits `b` and its unbiased
+// exponent `e`: keep 3 mantissa bits, RNE on the 20 dropped ones, then re-bias. `sign` is
+// the caller's already-extracted sign bit, folded in here so this returns the finished
+// code rather than half of one.
+//
+// No `contract(off)`, and none needed: every operator below is integer.
+__device__ __forceinline__ unsigned char e4m3_normal_code(unsigned int b, int e,
+                                                          unsigned char sign) {
+    unsigned int mant = b & 0x7fffffu, m3 = mant >> 20, rem = mant & 0xfffffu;
+    if (rne_rounds_up(rem, 0x80000u, m3)) m3 += 1u;
+    int exp = e + 7;
+    if (m3 == 8u) { m3 = 0u; exp += 1; }
+    // Unreachable given `f2e4m3_rne`'s `a >= 464` return (which caps m3 at 6 when exp is
+    // 15); kept because it is the format's own bound and costs one compare.
+    if (exp >= 15 && m3 >= 7u) return sign | 0x7e;
+    return (unsigned char)(sign | (unsigned char)(exp << 3) | (unsigned char)m3);
+}
+
+__device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
     if (isnan(x)) return 0x7f;
     unsigned char sign = signbit(x) ? 0x80 : 0x00;
     float a = fabsf(x);
@@ -233,27 +295,10 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
     __builtin_memcpy(&b, &a, sizeof(b));
     int e = (int)((b >> 23) & 0xffu) - 127;
     if (e < -6) {
-        // Subnormal: value = m·2^-9, m in 1..=7 (m == 8 promotes to the smallest normal,
-        // code 0x08). floor + explicit tie test rather than `rintf`, so the rule is on the
-        // page instead of in the hardware's current rounding mode.
-        //
-        // `a * 512.0f` feeding `scaled - m` is the fusable pair the function's pragma
-        // exists for.
-        float scaled = a * 512.0f;
-        float m = floorf(scaled), rem = scaled - m;
-        if (rem > 0.5f || (rem == 0.5f && ((unsigned int)m & 1u))) m += 1.0f;
-        unsigned int mi = (unsigned int)m;
+        unsigned int mi = e4m3_subnormal_mantissa(a);
         return mi >= 8u ? (unsigned char)(sign | 0x08) : (unsigned char)(sign | mi);
     }
-    // Normal: keep 3 mantissa bits, RNE on the 20 dropped ones.
-    unsigned int mant = b & 0x7fffffu, m3 = mant >> 20, rem = mant & 0xfffffu;
-    if (rem > 0x80000u || (rem == 0x80000u && (m3 & 1u))) m3 += 1u;
-    int exp = e + 7;
-    if (m3 == 8u) { m3 = 0u; exp += 1; }
-    // Unreachable given the `a >= 464` return above (which caps m3 at 6 when exp is 15);
-    // kept because it is the format's own bound and costs one compare.
-    if (exp >= 15 && m3 >= 7u) return sign | 0x7e;
-    return (unsigned char)(sign | (unsigned char)(exp << 3) | (unsigned char)m3);
+    return e4m3_normal_code(b, e, sign);
 }
 
 // One element of a block-128 group, fused quantize-then-dequantize: the value a V4 GEMM
