@@ -156,6 +156,21 @@ fn min_completion(begin: usize, len: usize) -> u64 {
 
 /// A ring of in-flight reads. `entries` caps how many can be queued before a
 /// `reap` batch — sized to a layer's cold-read count with margin.
+/// One read's byte extent. Grouped because `begin` and `len` are two bare `usize` a
+/// caller can transpose and O_DIRECT alignment makes the wrong pair plausible.
+#[derive(Clone, Copy)]
+pub struct ReadSpan {
+    pub begin: usize,
+    pub len: usize,
+}
+
+/// One read's destination: the aligned pointer and the slot whose ticket gates reuse.
+#[derive(Clone, Copy)]
+pub struct ReadDst {
+    pub ptr: *mut u8,
+    pub slot: u32,
+}
+
 pub struct Streamer {
     /// `ManuallyDrop` so `Drop` can tear the ring down BEFORE freeing the arena the
     /// ring's SQEs point into (Rust would otherwise run the `Drop` body — the arena
@@ -244,14 +259,9 @@ impl Streamer {
     /// `dst` must be `ALIGN`-aligned and valid for `slot_span(len)` writable bytes
     /// until this read's [`reap`](Self::reap) completes. `slot` must not be in use by a
     /// read whose bounce copy has not yet retired (the caller's ticket gate).
-    pub unsafe fn queue(
-        &mut self,
-        fd: RawFd,
-        begin: usize,
-        len: usize,
-        dst: *mut u8,
-        slot: u32,
-    ) -> Result<usize> {
+    pub unsafe fn queue(&mut self, fd: RawFd, span: ReadSpan, dst: ReadDst) -> Result<usize> {
+        let ReadSpan { begin, len } = span;
+        let ReadDst { ptr: dst, slot } = dst;
         debug_assert_eq!(
             dst as usize % ALIGN,
             0,

@@ -5,13 +5,15 @@ use rivoli_oracles::v4oracle::forward::{Capture, LayerCtx, LayerW, Oracle};
 use rivoli_oracles::v4oracle::numerics::{bf16_decode, bf16_encode};
 use rivoli_oracles::v4oracle::weights::{NamedRng, V4Config};
 
-pub fn prefill_capture(
-    o: &Oracle,
-    lw: &LayerW,
-    layer: usize,
-    ids: &[u32],
-    h: &mut Vec<f32>,
-) -> Capture {
+/// The layer a probe drives: its weights and its index, together — the pair every probe
+/// call threads and a bare `(usize, &LayerW)` invites swapping against other indices.
+pub struct ProbeLayer<'a> {
+    pub idx: usize,
+    pub w: &'a LayerW,
+}
+
+pub fn prefill_capture(o: &Oracle, at: ProbeLayer<'_>, ids: &[u32], h: &mut Vec<f32>) -> Capture {
+    let ProbeLayer { idx: layer, w: lw } = at;
     let mut st = o.fresh_state(layer);
     let mut cap = Capture::default();
     let step = LayerCtx {

@@ -386,7 +386,19 @@ impl Reaper {
             // this read's signal resolves; the VQ blocks are VQ_ALIGN-aligned so the
             // returned sub-offset is 0 (the slot start IS the block). `t.slot` came from
             // `take_slot`, so its previous copy has retired.
-            let sub = unsafe { streamer.queue(r.fd, r.begin, r.len, r.dst, u32::from(t.slot))? };
+            let sub = unsafe {
+                streamer.queue(
+                    r.fd,
+                    crate::fetch::stream::ReadSpan {
+                        begin: r.begin,
+                        len: r.len,
+                    },
+                    crate::fetch::stream::ReadDst {
+                        ptr: r.dst,
+                        slot: u32::from(t.slot),
+                    },
+                )?
+            };
             debug_assert_eq!(
                 sub, 0,
                 "VQ expert read must be block-aligned (sub-offset 0)"

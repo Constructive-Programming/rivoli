@@ -23,8 +23,8 @@ use rivoli_artifact::{
     format::{FormatMeta, I4Source, Safetensors},
     glm_config::ModelConfig,
     quant::{
-        ExpertProjs, I4_GROUP, expert_base, expert_projs, i4_expert_bytes, i4_expert_stride,
-        i4_slot_offsets, quant_i4, write_i4_proj,
+        ExpertProjs, I4_GROUP, RowScaledW, expert_base, expert_projs, i4_expert_bytes,
+        i4_expert_stride, i4_slot_offsets, quant_i4, write_i4_proj,
     },
 };
 use std::fs::File;
@@ -130,9 +130,9 @@ impl<'a> Encoder<'a> {
     fn build_block(&self, base: &str, slot: &mut [u8]) -> Result<()> {
         for (k, &(proj, (o_dim, i_dim))) in self.projs.iter().enumerate() {
             let name = format!("{base}.{proj}");
-            let w = self.src.dequant_fp8(&name, o_dim, i_dim, self.block)?;
+            let w = self.src.dequant_fp8(&name, [o_dim, i_dim], self.block)?;
             let (packed, scale) = quant_i4(&w, o_dim, i_dim);
-            write_i4_proj(slot, &self.off, k, &packed, &scale);
+            write_i4_proj(slot, &self.off, k, RowScaledW::new(&packed, &scale));
         }
         Ok(())
     }

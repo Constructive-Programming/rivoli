@@ -569,13 +569,8 @@ impl Safetensors {
     /// `[ceil(o/block), ceil(i/block)]` row-major, and a scale tensor of the wrong
     /// extent would otherwise mis-tile silently — a wrong-but-plausible dequant,
     /// which is far worse than a hard failure.
-    pub fn dequant_fp8(
-        &self,
-        name: &str,
-        o_dim: usize,
-        i_dim: usize,
-        block: usize,
-    ) -> Result<Vec<f32>> {
+    pub fn dequant_fp8(&self, name: &str, shape: [usize; 2], block: usize) -> Result<Vec<f32>> {
+        let [o_dim, i_dim] = shape;
         let (w, shape) = self.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
         ensure!(
             shape == [o_dim, i_dim],
@@ -1204,13 +1199,23 @@ pub fn write_expert_layer(
 /// without `generation_config.json`, and failing a multi-hour convert on its absence at
 /// the very end would be the worse trade. A missing manifest is not survivable, so that
 /// one propagates.
+/// The two directories an artifact finish reads and writes — one value because the pair
+/// travels together and swapping them is a plausible, silent call-site error.
+pub struct ArtifactDirs<'a> {
+    pub out: &'a str,
+    pub src: &'a str,
+}
+
 pub fn finish_artifact(
     tool: &str,
-    out_dir: &str,
-    src_dir: &str,
+    dirs: ArtifactDirs<'_>,
     manifest: &serde_json::Value,
     aux: &[&str],
 ) -> Result<()> {
+    let ArtifactDirs {
+        out: out_dir,
+        src: src_dir,
+    } = dirs;
     let path = format!("{out_dir}/manifest.json");
     std::fs::write(&path, serde_json::to_vec_pretty(manifest)?)
         .with_context(|| format!("write {path}"))?;
@@ -2166,15 +2171,15 @@ mod tests {
         w.write(&path).unwrap();
         let st = Safetensors::open_file(&path).unwrap();
 
-        let got = st.dequant_fp8("t", 2, 4, 2).unwrap();
+        let got = st.dequant_fp8("t", [2, 4], 2).unwrap();
         assert_eq!(
             got,
             vec![10.0, 20.0, 100.0, -100.0, -10.0, 0.0, 200.0, 100.0]
         );
 
         // Wrong declared dims, and a scale grid of the wrong extent, both fail loud.
-        assert!(st.dequant_fp8("t", 4, 2, 2).is_err());
-        assert!(st.dequant_fp8("t", 2, 4, 1).is_err()); // would want a [2,4] grid
+        assert!(st.dequant_fp8("t", [4, 2], 2).is_err());
+        assert!(st.dequant_fp8("t", [2, 4], 1).is_err()); // would want a [2,4] grid
     }
 
     /// Provenance round-trips, a missing field reads as unstamped, a malformed one is

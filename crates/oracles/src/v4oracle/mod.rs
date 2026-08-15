@@ -45,6 +45,7 @@
 //! see a bug they share. That includes the safetensors reader, which is written here rather
 //! than borrowed from `src/artifact/`.
 
+pub mod attention;
 pub mod forward;
 pub mod numerics;
 pub mod toy;

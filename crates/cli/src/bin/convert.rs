@@ -11,8 +11,8 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli_artifact::format::{
-    Dtype, ExpertHeader, FormatMeta, LAYER_WINDOW, LayerDims, SafeWriter, Safetensors, VQ3_MAGIC,
-    finish_artifact, load_codebooks, write_expert_layer,
+    ArtifactDirs, Dtype, ExpertHeader, FormatMeta, LAYER_WINDOW, LayerDims, SafeWriter,
+    Safetensors, VQ3_MAGIC, finish_artifact, load_codebooks, write_expert_layer,
 };
 use rivoli_artifact::quant::{
     ExpertProjs, FP8_BLOCK, PROJ, VQ_DIM, expert_base, expert_projs, learn_codebook, quant_vq,
@@ -35,235 +35,15 @@ use rivoli_artifact::quant::VQ_GROUP;
 #[cfg(any(feature = "rocm", test))]
 use rivoli_core::num::f32_to_bf16;
 
-/// GPU-accelerated encode: the nearest-codebook argmin (the run-time ceiling, ~VQ_K×
-/// the other work) offloaded to `rivoli_vq_encode`. Host still does fp8 dequant,
-/// group normalization, the closed-form scale refit, and packing — all O(o·i), a
-/// fraction of the argmin. Produces bytes BIT-IDENTICAL to `quant_vq` (same
-/// metric/tie-break in the kernel, same host refit here). Ported from `fp82vq`'s
-/// validated GPU path; one encoder per projection codebook, shared behind a `Mutex`
-/// so host dequant/refit/pack run parallel while the GPU argmins serialize.
+// `#[path]` because this file is a CRATE ROOT, not a module: rustc resolves a bin root's
+// children against the root's OWN directory, so a bare `mod gpu;` looks for
+// `src/bin/gpu.rs` (measured — E0583 with that exact suggestion, 2026-08-15), never
+// `src/bin/convert/gpu.rs`. Naming the path also keeps `src/bin/` free of non-bin files:
+// cargo's autobin discovery treats every `src/bin/*.rs` as its own binary target, so the
+// default layout would have made this module a second, nonsense `gpu` executable.
 #[cfg(feature = "rocm")]
-mod gpu {
-    use super::*;
-    use rivoli_artifact::quant::{set_idx, vq_groups};
-    use rivoli_backend::hip::{device_sync, launch_vq_encode};
-    use rivoli_engine::device::DeviceBuf;
-
-    /// Subvectors per group — the span one bf16 scale covers, and therefore the slice of
-    /// pass-1 indices the refit is fitted against.
-    const SUBS: usize = VQ_GROUP / VQ_DIM;
-
-    fn f32_as_bytes(v: &[f32]) -> &[u8] {
-        // SAFETY: f32 is POD; the view is `4·len` read-only bytes (LE host == LE device).
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
-    }
-
-    /// Resident codebook + `‖c‖²` on device, plus reusable subvector/index buffers
-    /// sized to the largest projection.
-    pub struct Encoder {
-        codebook: DeviceBuf,
-        cbnorm: DeviceBuf,
-        sub: DeviceBuf,
-        idx: DeviceBuf,
-        max_sub: usize,
-    }
-
-    // SAFETY: DeviceBuf holds process-global device pointers; every access goes
-    // through `encode` behind the caller's Mutex, so device ops never run concurrent.
-    unsafe impl Send for Encoder {}
-
-    impl Encoder {
-        pub fn new(codebook: &[f32], max_sub: usize) -> Result<Self> {
-            let cbnorm = rivoli_artifact::quant::codebook_norms(codebook);
-            let mut cb = DeviceBuf::new(codebook.len() * 4)?;
-            cb.copy_in_at(0, f32_as_bytes(codebook))?;
-            let mut nb = DeviceBuf::new(cbnorm.len() * 4)?;
-            nb.copy_in_at(0, f32_as_bytes(&cbnorm))?;
-            Ok(Self {
-                codebook: cb,
-                cbnorm: nb,
-                sub: DeviceBuf::new(max_sub * VQ_DIM * 4)?,
-                idx: DeviceBuf::new(max_sub * 2)?,
-                max_sub,
-            })
-        }
-
-        pub fn encode(&mut self, sub: &[f32]) -> Result<Vec<u16>> {
-            let n = sub.len() / VQ_DIM;
-            ensure!(
-                n <= self.max_sub,
-                "encode batch {n} > max_sub {}",
-                self.max_sub
-            );
-            self.sub.copy_in_at(0, f32_as_bytes(sub))?;
-            // SAFETY: buffers sized ≥ n; live until the sync below.
-            unsafe {
-                launch_vq_encode(
-                    self.sub.ptr() as *const f32,
-                    self.codebook.ptr() as *const f32,
-                    self.cbnorm.ptr() as *const f32,
-                    n,
-                    self.idx.ptr_mut() as *mut u16,
-                )?;
-            }
-            device_sync()?;
-            let mut bytes = Vec::new();
-            self.idx.copy_out_prefix(&mut bytes, n * 2)?;
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect())
-        }
-    }
-
-    /// One projection's geometry, derived once. Both passes and the packer index the same
-    /// three arrays off it, so a recomputation is a chance for them to disagree.
-    #[derive(Clone, Copy)]
-    struct Shape {
-        o_dim: usize,
-        i_dim: usize,
-        ngroups: usize,
-        nsub_row: usize,
-    }
-
-    impl Shape {
-        /// Every group of `w` as `(weights, staging subvector base, scale index)`, in
-        /// row-major order. Stated once because both passes walk it and a refit is only
-        /// sound if it renormalizes the exact span pass 1 normalized.
-        ///
-        /// By value, not by reference: the caller reads it out of the `Staging` it is about
-        /// to write, so a borrow here would collide with that write.
-        fn groups(self, w: &[f32]) -> impl Iterator<Item = (&[f32], usize, usize)> {
-            let Shape {
-                o_dim,
-                i_dim,
-                ngroups,
-                nsub_row,
-            } = self;
-            (0..o_dim).flat_map(move |o| {
-                (0..ngroups).map(move |grp| {
-                    (
-                        &w[o * i_dim + grp * VQ_GROUP..][..VQ_GROUP],
-                        o * nsub_row + grp * SUBS,
-                        o * ngroups + grp,
-                    )
-                })
-            })
-        }
-    }
-
-    /// What the host hands the GPU and what it keeps: `sub` is every group's weights
-    /// divided by its scale (the argmin input), `scales` the bf16 scale each was divided
-    /// by. One value because they are only meaningful together — a scale that moves
-    /// invalidates exactly its own subvectors.
-    struct Staging {
-        sh: Shape,
-        sub: Vec<f32>,
-        scales: Vec<u16>,
-    }
-
-    impl Staging {
-        /// Derives the geometry as well as the arrays: `Shape` has no other construction
-        /// site, and one constructor is one place for the two to disagree about the dims.
-        fn new(shape: [usize; 2]) -> Self {
-            let [o_dim, i_dim] = shape;
-            let _ = vq_groups(i_dim); // dim sanity (asserts i_dim % VQ_GROUP == 0)
-            let sh = Shape {
-                o_dim,
-                i_dim,
-                ngroups: i_dim / VQ_GROUP,
-                nsub_row: i_dim / VQ_DIM,
-            };
-            Staging {
-                sh,
-                sub: vec![0.0f32; sh.o_dim * sh.nsub_row * VQ_DIM],
-                scales: vec![0u16; sh.o_dim * sh.ngroups],
-            }
-        }
-
-        /// Divide one group by `scale` into its subvector span — the only write into `sub`,
-        /// so pass 1 and the refit cannot normalize differently.
-        fn renorm(&mut self, seg: &[f32], sbase: usize, scale: u16) {
-            let inv = 1.0 / bf16_to_f32(scale);
-            let base = sbase * VQ_DIM;
-            for (t, &v) in seg.iter().enumerate() {
-                self.sub[base + t] = v * inv;
-            }
-        }
-
-        /// Pass 1: normalize every group by its amax-derived bf16 scale.
-        fn normalize(&mut self, w: &[f32]) {
-            for (seg, sbase, si) in self.sh.groups(w) {
-                let amax = seg.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-                let sb = f32_to_bf16(if amax > 0.0 { amax } else { 1.0 });
-                self.scales[si] = sb;
-                self.renorm(seg, sbase, sb);
-            }
-        }
-
-        /// Refit each group against its pass-1 entries; renormalize only changed groups.
-        /// Reports whether any changed — if none did, pass 1's indices are already final
-        /// and the second GPU argmin is skipped entirely.
-        fn refit(&mut self, w: &[f32], codebook: &[f32], idx1: &[u16]) -> bool {
-            let mut changed = false;
-            for (seg, sbase, si) in self.sh.groups(w) {
-                // The refit itself is `quant_vq`'s, called rather than restated: the two
-                // encoders are asserted bit-identical under `--validate`, and this
-                // accumulation is where a divergence would come from.
-                let refit =
-                    rivoli_artifact::quant::vq_refit(seg, &idx1[sbase..sbase + SUBS], codebook);
-                if let Some(refit) = refit
-                    && refit != self.scales[si]
-                {
-                    self.scales[si] = refit;
-                    self.renorm(seg, sbase, refit);
-                    changed = true;
-                }
-            }
-            changed
-        }
-
-        /// Flat per-subvector indices → the on-disk row layout (`set_idx` owns the 12-bit
-        /// packing, so this only walks it), paired with the scales they were fitted under.
-        fn pack(self, idx: &[u16]) -> (Vec<u8>, Vec<u16>) {
-            let (rb, nsub_row) = (vq_row_bytes(self.sh.i_dim), self.sh.nsub_row);
-            let mut indices = vec![0u8; self.sh.o_dim * rb];
-            for (o, ir) in indices.chunks_exact_mut(rb).enumerate() {
-                for t in 0..nsub_row {
-                    set_idx(ir, t, idx[o * nsub_row + t]);
-                }
-            }
-            (indices, self.scales)
-        }
-    }
-
-    /// One locked argmin batch. Both call sites go through it so the poison mapping — a
-    /// worker that died mid-launch, from which there is no recovery here — is written once.
-    fn argmin(enc: &std::sync::Mutex<Encoder>, sub: &[f32]) -> Result<Vec<u16>> {
-        enc.lock()
-            .map_err(|_| anyhow::anyhow!("encoder poisoned"))?
-            .encode(sub)
-    }
-
-    /// GPU analog of `quant_vq`: two batched argmin passes (amax-scale, then the
-    /// refit scale) around the same host refit. Bit-identical output to `quant_vq`.
-    pub fn quant_vq_gpu(
-        w: &[f32],
-        shape: [usize; 2],
-        codebook: &[f32],
-        enc: &std::sync::Mutex<Encoder>,
-    ) -> Result<(Vec<u8>, Vec<u16>)> {
-        let mut st = Staging::new(shape);
-        st.normalize(w);
-        let idx1 = argmin(enc, &st.sub)?;
-        let idx = if st.refit(w, codebook, &idx1) {
-            argmin(enc, &st.sub)?
-        } else {
-            idx1
-        };
-        Ok(st.pack(&idx))
-    }
-}
+#[path = "convert/gpu.rs"]
+mod gpu;
 
 /// Model dims the converter needs (a subset of config.json).
 struct Dims {
@@ -292,7 +72,7 @@ fn dims(cfg: &serde_json::Value) -> Result<Dims> {
 
 /// Dequantize an fp8 projection `<base>.<proj>.weight` (+ `weight_scale_inv`) to f32.
 fn deq(src: &Safetensors, base: &str, proj: &str, shape: [usize; 2]) -> Result<Vec<f32>> {
-    src.dequant_fp8(&format!("{base}.{proj}"), shape[0], shape[1], FP8_BLOCK)
+    src.dequant_fp8(&format!("{base}.{proj}"), [shape[0], shape[1]], FP8_BLOCK)
 }
 
 /// Write one projection's (indices, scales) into `dst`: indices then LE bf16 scales.
@@ -350,7 +130,11 @@ impl Encode<'_> {
         match self.enc {
             #[cfg(feature = "rocm")]
             Some(e) => {
-                let g = gpu::quant_vq_gpu(w, [o_dim, i_dim], cb, &e[p])?;
+                let dw = gpu::DenseW {
+                    w,
+                    shape: [o_dim, i_dim],
+                };
+                let g = gpu::quant_vq_gpu(dw, cb, &e[p])?;
                 // `--validate`: the GPU argmin must reproduce the CPU quant_vq
                 // bit-for-bit (same metric, tie-break, and host refit) — else the two
                 // paths would silently disagree on the shipped bytes.
@@ -590,7 +374,7 @@ impl<'a> Job<'a> {
                 n_experts: d.n_experts,
                 expert_in: d.hidden,
                 moe_inter: d.moe_inter,
-                stride: stride,
+                stride,
             },
         )
         .to_bytes();
@@ -716,8 +500,10 @@ impl<'a> Job<'a> {
         manifest["format"] = serde_json::to_value(FormatMeta::current(FP8_BLOCK))?;
         finish_artifact(
             "convert",
-            &self.args.out_dir,
-            &self.args.fp8_dir,
+            ArtifactDirs {
+                out: &self.args.out_dir,
+                src: &self.args.fp8_dir,
+            },
             &manifest,
             &["tokenizer.json", "generation_config.json"],
         )

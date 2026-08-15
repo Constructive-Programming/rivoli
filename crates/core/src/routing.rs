@@ -404,14 +404,18 @@ mod tests {
     /// A VERBATIM copy of `route_into` as it stood before `top-m` was ever added
     /// (HEAD 0894d14) — and, now that `top-m` is removed, also what it must compute
     /// forever after.
-    fn route_into_pre(
-        gate_logits: &[u8],
-        bias: &[f32],
-        top_k: usize,
-        scores: &mut [f32],
-        choice: &mut [f32],
-        sel: &mut Vec<usize>,
-    ) {
+    ///
+    /// > **SIGNATURE ADAPTED 2026-08-15** under the whole-tree 10/10 mandate: the three
+    /// > scratch buffers ride the same `RouteScratch` the live function takes (they are
+    /// > plumbing, not arithmetic — the photograph's frozen half is the three statements
+    /// > below, which remain byte-identical, and the equality test still pins the live
+    /// > function against them).
+    fn route_into_pre(gate_logits: &[u8], bias: &[f32], top_k: usize, out: RouteScratch<'_>) {
+        let RouteScratch {
+            scores,
+            choice,
+            sel,
+        } = out;
         for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
             *c = sigmoid(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
         }
@@ -458,7 +462,16 @@ mod tests {
                         scoring: Scoring::Sigmoid,
                     };
                     route_into(&g, &bias, policy, live);
-                    route_into_pre(&g, &bias, k, &mut s2, &mut c2, &mut sel2);
+                    route_into_pre(
+                        &g,
+                        &bias,
+                        k,
+                        RouteScratch {
+                            scores: &mut s2,
+                            choice: &mut c2,
+                            sel: &mut sel2,
+                        },
+                    );
                     assert_eq!(sel1, sel2, "selection drifted from the frozen routing");
                     assert_eq!(s1, s2, "scores drifted");
                     assert_eq!(c1, c2, "choice drifted");

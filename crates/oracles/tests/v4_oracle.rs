@@ -2259,12 +2259,7 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
     // > exactly the "most-trusted case is the blind spot" failure. The assertion below is
     // > still correct as a statement about the fixture, and is what it now claims to be.
     let (cfg, m) = model();
-    let ids = fixed_ids(cfg, "ids-pre", 5);
-    let drive = |c: &V4Config, d: Defect| {
-        let o = Oracle::new(c.clone(), d);
-        let mut h = residual_probe(cfg, "h-pre", 5);
-        oracle_probe::prefill_capture(&o, &m.layers[0], 0, &ids, &mut h)
-    };
+    let drive = |c: &V4Config, d: Defect| drive_layer0(c, &m, d);
     let full = drive(cfg, Defect::None);
     assert!(
         identical(&full, &drive(cfg, Defect::SinkhornIterCountProbe)),
@@ -2305,14 +2300,28 @@ fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
 
 /// Claim 1. Bit-identical to `None` on the toy, so the exclusion goes red the day a toy
 /// dimension grows past the predicate.
+
+/// Drive layer 0 of the toy under `d` and capture the prefill — the shared probe both
+/// blindness assertions score (their closures became a jscpd clone once the ProbeLayer
+/// literal went multi-line, 2026-08-15).
+fn drive_layer0(cfg: &V4Config, m: &ToyModel, d: Defect) -> Capture {
+    let o = Oracle::new(cfg.clone(), d);
+    let mut h = residual_probe(cfg, "h-pre", 5);
+    let ids = fixed_ids(cfg, "ids-pre", 5);
+    oracle_probe::prefill_capture(
+        &o,
+        oracle_probe::ProbeLayer {
+            idx: 0,
+            w: &m.layers[0],
+        },
+        &ids,
+        &mut h,
+    )
+}
+
 fn assert_toy_cannot_select_the_fold() {
     let (cfg, m) = model();
-    let ids = fixed_ids(cfg, "ids-pre", 5);
-    let drive = |d: Defect| {
-        let o = Oracle::new(cfg.clone(), d);
-        let mut h = residual_probe(cfg, "h-pre", 5);
-        oracle_probe::prefill_capture(&o, &m.layers[0], 0, &ids, &mut h)
-    };
+    let drive = |d: Defect| drive_layer0(cfg, &m, d);
     assert!(
         identical(&drive(Defect::None), &drive(Defect::SplitKFoldOrder)),
         "the toy can see the split-k fold: the matrix-exclusion argument is dead and this \

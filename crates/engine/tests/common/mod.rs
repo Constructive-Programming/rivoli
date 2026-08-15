@@ -44,7 +44,6 @@
 #![allow(clippy::unwrap_used)]
 
 use rivoli_artifact::quant::{Fp8W, RowScaledW};
-use rivoli_oracles::v4oracle::numerics::{bf16_decode, bf16_encode};
 
 // (`walk` stayed with its consumers — the cli crate's registry meta-gates own the one
 // copy; the kernel-oracle scaffolding here never walks the tree.)
@@ -276,6 +275,20 @@ pub fn dev(b: &[u8]) -> rivoli_engine::device::DeviceBuf {
     d
 }
 
+/// The device buffer type every helper here returns and every oracle file names.
+///
+/// Re-exported rather than imported per file: `use rivoli_engine::device::DeviceBuf;` sat
+/// directly above `mod common;` in three of the four oracle files, and that five-line run of
+/// boilerplate is a jscpd clone with nothing in it worth sharing. Named through the module
+/// that hands you `dev()` instead, it joins the `use common::{…}` list those files already have.
+// `#[allow(unused_imports)]` for the reason the module header gives `dead_code`: this compiles
+// into EVERY test binary and most of them never name the buffer type. A re-export nobody in a
+// given binary uses is that binary's business, not a defect — and the allow is on this ONE item
+// rather than the file, so a genuinely dead `use` elsewhere still reports.
+#[allow(unused_imports)]
+#[cfg(feature = "rocm")]
+pub use rivoli_engine::device::DeviceBuf;
+
 /// A zeroed device buffer of `n` bytes — a kernel destination.
 ///
 /// ZEROED rather than uninitialised, and load-bearing for the oracles that compare a
@@ -390,6 +403,43 @@ pub fn assert_bitwise<T: PartialEq + std::fmt::Debug>(want: &[T], got: &[T], lab
 pub fn assert_bits(want: &[f32], got: &[f32], label: &str) {
     let b = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
     assert_bitwise(&b(want), &b(got), label);
+}
+
+// **MOVED HERE from `kernel.rs` 2026-08-15**, when the MoE expert-range oracles left it for
+// `kernel_moe.rs`: the batched-row claim and the guard-code assertion are each made on BOTH
+// sides of that split, and a second copy of either is what `build.rs`'s duplication gate is
+// for. `assert_out` did NOT come — it is `DeviceBuf`-typed and only the file that kept the
+// GEMV/MLA destinations still calls it.
+/// Both rows of a two-row batch against their own single-row runs, named per row.
+///
+/// Row 0 alone would pass a kernel that batches correctly but leaks row 0's input into row 1
+/// (a missing `r * stride`), so both rows are asserted and the message says which failed.
+pub fn assert_rows<T: PartialEq + std::fmt::Debug>(got: &[T], want: &[Vec<T>], w: usize, k: &str) {
+    assert_eq!(got[..w], want[0][..], "{k} row 0 must be bit-identical");
+    assert_eq!(got[w..], want[1][..], "{k} row 1 must be bit-identical");
+}
+
+/// A launcher result against an expected guard code: `None` must be ACCEPTED, `Some(n)`
+/// rejected with `n` somewhere in the message.
+///
+/// The CODE is asserted rather than merely `is_err`, and that is the whole value of these
+/// tests: one that accepted any error would still pass if someone replaced a power-of-two
+/// check with `block != 128`, or if an unrelated dimension guard started swallowing the
+/// case first.
+///
+/// (That paragraph sat on [`assert_rows`] in `kernel.rs` — two doc blocks stacked on one
+/// function, describing two. It is re-anchored, not rewritten.)
+pub fn assert_guard<T: std::fmt::Debug>(r: anyhow::Result<T>, want: Option<u32>, what: &str) {
+    match want {
+        None => assert!(r.is_ok(), "{what}: {r:?}"),
+        Some(code) => {
+            let msg = format!("{:#}", r.expect_err("expected a guard rejection"));
+            assert!(
+                msg.contains(&code.to_string()),
+                "{what}: want guard {code}, got {msg:?}"
+            );
+        }
+    }
 }
 
 /// `golden.rs::Diff.rel` — max absolute disagreement over the largest expected magnitude.
@@ -544,25 +594,28 @@ pub fn block_scales(r: &mut Lcg, n: usize) -> Vec<f32> {
     (0..n).map(|_| (r.f() * 0.1).abs() + 0.01).collect()
 }
 
-/// An fp8 GEMV case: e4m3 weights, `n_scales` block scales, the input, and the host result.
+/// An fp8 GEMV case: e4m3 weights, the block-scale grid over them, the input, and the host
+/// result.
 ///
-/// `n_scales` is the caller's, not computed here. That was because the two backends spelled
-/// the scale grid differently (`i_dim / block` against `i_dim.div_ceil(block)`); with one
-/// backend left, **the parameter is now a knob nothing turns and could be computed** —
-/// noted rather than done, because collapsing it is a change to a fixture no current shape
-/// distinguishes. The DRAW ORDER — weights, scales, x — is the part that has to be shared:
-/// it is what makes a seed mean the same data at both call sites.
+/// `n_scales` was the caller's, not computed here, because the two backends spelled the scale
+/// grid differently (`i_dim / block` against `i_dim.div_ceil(block)`); with one backend left it
+/// was "a knob nothing turns and could be computed", noted here and **collapsed 2026-08-15**,
+/// when CodeScene's excess-argument rule made the price of keeping it explicit. `div_ceil` on
+/// BOTH axes, mirroring the kernel — the caller passed exactly this, and the ragged shape
+/// (`o_dim = 130` at `block = 128`) is the one that made `o_dim / block` wrong.
+///
+/// The DRAW ORDER — weights, scales, x — is the part that has to be shared: it is what makes a
+/// seed mean the same data at both call sites.
 pub fn gemv_fp8_case(
     r: &mut Lcg,
     o_dim: usize,
     i_dim: usize,
     block: usize,
-    n_scales: usize,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
     let packed: Vec<u8> = (0..o_dim * i_dim)
         .map(|_| rivoli_core::num::f32_to_e4m3(r.f()))
         .collect();
-    let scale = block_scales(r, n_scales);
+    let scale = block_scales(r, o_dim.div_ceil(block) * i_dim.div_ceil(block));
     let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
     let mut want = vec![0.0f32; o_dim];
     rivoli_artifact::quant::matvec_fp8(&mut want, &x, Fp8W::new(&packed, &scale, block), i_dim);
@@ -587,9 +640,13 @@ pub fn i8_weights(r: &mut Lcg, o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>
 /// `matvec_i8` into a fresh `o_dim` vector. Returned rather than written through an
 /// out-param so the caller binds it in one line; the two int8 oracles generate their
 /// weights differently and share only this step.
-pub fn want_i8(x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) -> Vec<f32> {
-    let mut want = vec![0.0f32; o_dim];
-    rivoli_artifact::quant::matvec_i8(&mut want, x, RowScaledW::new(packed, scale), [o_dim, i_dim]);
+///
+/// `dims` is `matvec_i8`'s own `[o_dim, i_dim]` rather than two trailing `usize` — the pair is
+/// passed straight through, and two bare interchangeable dimensions at the end of an argument
+/// list is the defect [`Mla`] below exists to answer, made small (2026-08-15).
+pub fn want_i8(x: &[f32], packed: &[u8], scale: &[f32], dims: [usize; 2]) -> Vec<f32> {
+    let mut want = vec![0.0f32; dims[0]];
+    rivoli_artifact::quant::matvec_i8(&mut want, x, RowScaledW::new(packed, scale), dims);
     want
 }
 
@@ -609,8 +666,9 @@ pub struct Mla {
     /// A `value_dims(h, nope, vh, kvl, block)` constructor did that zeroing until 2026-08-15.
     /// It was deleted rather than reshaped: five positional `usize` is the same excess-argument
     /// defect this struct exists to answer, and with the fields public `Mla { qh: 0, .. }` says
-    /// it without an order to get wrong. [`Mla::new`] has the same defect and survives only
-    /// because its call sites are in another file.
+    /// it without an order to get wrong. [`Mla::new`] took six the same way and was reshaped to
+    /// take ONE the same day — see its own note for why the fix was an array and not six named
+    /// fields at every call site.
     pub qh: usize,
     pub nope: usize,
     pub vh: usize,
@@ -619,7 +677,21 @@ pub struct Mla {
 }
 
 impl Mla {
-    pub fn new(h: usize, qh: usize, nope: usize, vh: usize, kvl: usize, block: usize) -> Self {
+    /// The six dims in kv_b order: `[h, qh, nope, vh, kvl, block]`.
+    ///
+    /// **One array argument, and the order is spelled HERE and nowhere else.** It took the six
+    /// as six parameters until 2026-08-15, which is CodeScene's excess-argument rule at full
+    /// size. The obvious fix — delete the constructor, write `Mla { h: 4, qh: 128, .. }` at each
+    /// call site — was tried and REVERTED the same day: rustfmt's `struct_lit_width` is 18, so
+    /// every literal wider than that becomes one line per field, and `kernel.rs`'s six MLA
+    /// shapes (which differ in one dim at a time, deliberately) then shared four identical lines
+    /// three ways. `build.rs`'s duplication gate reported it, correctly.
+    ///
+    /// So the array is not "positional again by accident". It keeps the six TOGETHER, names
+    /// their order in one place, and leaves the public fields for a caller who wants
+    /// `Mla { qh: 0, .. }` — which the value-kernel callers do.
+    pub fn new(dims: [usize; 6]) -> Self {
+        let [h, qh, nope, vh, kvl, block] = dims;
         Self {
             h,
             qh,
@@ -671,18 +743,30 @@ pub struct Att {
 }
 
 impl Att {
-    /// `n_blocks` is not a free parameter — the fp8 latent cache carries one block scale per
-    /// 128 latent dims, so it FOLLOWS from `kvl`, and every test derived it the same way.
-    /// Deriving it once removes the only way a reference and a launcher could have been
-    /// handed different block-scale strides for the same cache.
-    pub fn new(h: usize, nr: usize, kvl: usize, rope: usize, scale: f32) -> Self {
+    /// Neither `n_blocks` nor `scale` is a free parameter, and both are derived here for the
+    /// same reason.
+    ///
+    /// The fp8 latent cache carries one block scale per 128 latent dims, so `n_blocks`
+    /// FOLLOWS from `kvl` and every test derived it the same way; deriving it once removes the
+    /// only way a reference and a launcher could have been handed different block-scale
+    /// strides for the same cache.
+    ///
+    /// The softmax `scale` follows from `kvl + rope` the same way. `kernel.rs` carried an
+    /// `att(h, nt, kvl, rope)` wrapper that did nothing else, arguing that "five call sites
+    /// spelling `1.0 / ((kvl + rope) as f32).sqrt()` is five places for it to drift from the
+    /// kernel's" — true, and the wrapper left a fifth argument here that could still be handed
+    /// a wrong number. **Folded in 2026-08-15** with the `kernel.rs` split, which deleted the
+    /// wrapper: there is now no way to state a scale that does not follow from the shape. The
+    /// guard test, which only asks whether a `kvl` is accepted, previously passed a literal
+    /// `1.0` and now takes the derived value — it never reads the result.
+    pub fn new(h: usize, nr: usize, kvl: usize, rope: usize) -> Self {
         Self {
             h,
             nr,
             kvl,
             rope,
             n_blocks: kvl / 128,
-            scale,
+            scale: 1.0 / ((kvl + rope) as f32).sqrt(),
         }
     }
 }
@@ -738,6 +822,179 @@ impl Lcg {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((self.0 >> 32) as f32 / u32::MAX as f32) * 2.0 - 1.0
+    }
+}
+
+/// MoE expert-range dispatch scaffolding, shared by `kernel_moe.rs` and
+/// `kernel_moe_artifact.rs`.
+///
+/// **MOVED HERE from `kernel.rs` (via `kernel_moe.rs`) 2026-08-15**, when the MoE oracles
+/// split into `kernel_moe.rs` (synthetic quantized fixtures, runs on any GPU) and
+/// `kernel_moe_artifact.rs` (the shipped `.i4` set and its fp8 checkpoint, skips loudly
+/// without them). `i4_launch_drain` is what both drive, and it drags in the whole chain
+/// below — a second copy of any of it is what `build.rs`'s duplication gate is for.
+///
+/// It sits beside [`MoeRange`], which was already in the parent for the same reason, and
+/// follows [`GemmBf16`]/[`gemm_bf16_launch`]: a device-typed launch operand and its wrapper
+/// live here GATED, so the featureless registry binaries (`docs`, `invariants`) never see
+/// them. **One `#[cfg]` on the module rather than nine on the items** — nine copies of the
+/// attribute is nine identical token runs, and jscpd reported two of the structs as a clone
+/// of each other on the strength of it.
+#[cfg(feature = "rocm")]
+pub mod moe {
+    use super::{MoeRange, dev, f32b, f32v};
+    use rivoli_backend::gpustream::HipStream;
+    use rivoli_backend::hip::ExpertDesc;
+    use rivoli_engine::device::DeviceBuf;
+
+    /// The four per-dispatch buffers of one MoE expert range: the token rows, the gate weights,
+    /// the per-expert `h` staging, and the fixed-point accumulator.
+    ///
+    /// Descriptors, codebooks and geometry are fixed for a whole test; these four are what a
+    /// batched arm swaps. Bundled so the two batching tests can each drive their range through
+    /// a closure taking ONE operand rather than the same five-parameter list written twice.
+    pub struct MoeIo<'a> {
+        x: &'a DeviceBuf,
+        w: &'a DeviceBuf,
+        h: &'a mut DeviceBuf,
+        acc: &'a mut DeviceBuf,
+    }
+
+    impl<'a> MoeIo<'a> {
+        pub fn new(
+            x: &'a DeviceBuf,
+            w: &'a DeviceBuf,
+            h: &'a mut DeviceBuf,
+            a: &'a mut DeviceBuf,
+        ) -> Self {
+            Self { x, w, h, acc: a }
+        }
+
+        /// The four device addresses, in launcher order. Consuming, because two of them are
+        /// unique borrows and the address outlives the reborrow that produced it.
+        pub fn ptrs(self) -> (*const f32, *const f32, *mut f32, *mut u64) {
+            let (x, w) = (self.x.ptr() as *const f32, self.w.ptr() as *const f32);
+            let acc = self.acc.ptr_mut() as *mut u64;
+            (x, w, self.h.ptr_mut() as *mut f32, acc)
+        }
+    }
+
+    /// What every int4 expert-range dispatch holds fixed for a whole test: the uploaded
+    /// descriptor array and the stream it runs on. Only [`MoeIo`] and `nrow` change between arms.
+    pub struct MoeCtx<'a> {
+        descs: &'a DeviceBuf,
+        stream: &'a HipStream,
+    }
+
+    impl<'a> MoeCtx<'a> {
+        pub fn new(descs: &'a DeviceBuf, stream: &'a HipStream) -> Self {
+            Self { descs, stream }
+        }
+    }
+
+    /// `moe_expert_range_i4` over experts `[g.e_start, g.e_end())`.
+    pub fn expert_range_i4(io: MoeIo<'_>, cx: &MoeCtx<'_>, g: MoeRange, nrow: usize) {
+        let (x, w, h, acc) = io.ptrs();
+        let d = cx.descs.ptr() as *const ExpertDesc;
+        let (hidden, inter, st) = (g.hidden, g.inter, cx.stream.raw());
+        // SAFETY: `x` is `nrow` rows of [hidden], `w` is [e_count·nrow], `h` [e_count·nrow·inter]
+        // and `acc` `nrow` rows of [hidden] u64; the stream is live for the call.
+        unsafe {
+            rivoli_backend::hip::launch_moe_expert_range_i4(
+                x, hidden, inter, g.e_start, g.e_count, d, w, h, acc, nrow, st,
+            )
+        }
+        .expect("moe_expert_range_i4");
+    }
+
+    /// The drain's two buffers: the fixed-point accumulator it consumes and the f32 destination
+    /// it writes. Always allocated and drained as a pair, and both are unique borrows.
+    pub struct Drain<'a> {
+        pub out: &'a mut DeviceBuf,
+        pub acc: &'a mut DeviceBuf,
+    }
+
+    impl<'a> Drain<'a> {
+        pub fn new(out: &'a mut DeviceBuf, acc: &'a mut DeviceBuf) -> Self {
+            Self { out, acc }
+        }
+    }
+
+    /// One `moe_acc_drain` over row `row` of the accumulator.
+    ///
+    /// `row` is what lets a batched arm drain its rows with the same launch the single-row arms
+    /// use — the drain itself is always single-row.
+    pub fn drain(d: Drain<'_>, row: usize, hidden: usize, stream: &HipStream) {
+        // SAFETY: `row` is inside both buffers, which every caller sizes for it; the stream is
+        // live for the call.
+        unsafe {
+            rivoli_backend::hip::launch_moe_acc_drain(
+                d.out.ptr_mut().add(row * hidden * 4) as *mut f32,
+                d.acc.ptr_mut().add(row * hidden * 8) as *mut u64,
+                hidden,
+                1,
+                1.0,
+                stream.raw(),
+            )
+        }
+        .expect("moe_acc_drain");
+    }
+
+    /// The descriptor ARRAY on device — the addresses themselves, uploaded verbatim.
+    pub fn desc_buf(descs: &[ExpertDesc]) -> DeviceBuf {
+        // SAFETY: `ExpertDesc` is plain pointers, and the span is exactly the slice's own bytes.
+        dev(unsafe {
+            std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs))
+        })
+    }
+
+    /// One MoE expert's two matrix dims. Both are bare `usize` and each is plausible in the
+    /// other's position at every launcher, oracle and buffer size that takes the pair.
+    #[derive(Clone, Copy)]
+    pub struct Dims {
+        pub hidden: usize,
+        pub inter: usize,
+    }
+
+    impl Dims {
+        pub fn new(hidden: usize, inter: usize) -> Self {
+            Self { hidden, inter }
+        }
+    }
+
+    /// The three MoE destination buffers for `nrow` token rows: per-expert `h` staging, the
+    /// fixed-point accumulator, and the f32 output.
+    ///
+    /// ONE u64 accumulator row per token, not `e` partial rows; the output starts at zero
+    /// because the drain ADDS into it — it is the residual add.
+    pub fn moe_bufs(e: usize, nrow: usize, d: Dims) -> (DeviceBuf, DeviceBuf, DeviceBuf) {
+        let z = |n: usize| dev(&vec![0u8; n]);
+        (
+            z(e * nrow * d.inter * 4),
+            z(nrow * d.hidden * 8),
+            z(nrow * d.hidden * 4),
+        )
+    }
+
+    /// Launch `[0, descs.len())` int4 experts ONE AT A TIME and drain — the tail every int4 MoE
+    /// test shares, extracted because `gpu_i4_moe` and `gpu_i4_expert` had it verbatim and the
+    /// duplication gate said so. Per expert rather than one range: bit-identical by
+    /// `moe_expert_range`'s own argument (`e = e_start + row / inter`, every row independent).
+    ///
+    /// The caller must keep the buffers the descriptors point INTO alive across this call.
+    pub fn i4_launch_drain(descs: &[ExpertDesc], x: &[f32], w: &[f32], d: Dims) -> Vec<f32> {
+        let e = descs.len();
+        let (descb, xb, wb) = (desc_buf(descs), dev(&f32b(x)), dev(&f32b(w)));
+        let (mut hbuf, mut pbuf, mut obuf) = moe_bufs(e, 1, d);
+        let stream = HipStream::new().expect("stream");
+        let cx = MoeCtx::new(&descb, &stream);
+        for k in 0..e {
+            let io = MoeIo::new(&xb, &wb, &mut hbuf, &mut pbuf);
+            expert_range_i4(io, &cx, MoeRange::new(d.hidden, d.inter, k, 1), 1);
+        }
+        drain(Drain::new(&mut obuf, &mut pbuf), 0, d.hidden, &stream);
+        rivoli_backend::hip::device_sync().expect("sync");
+        f32v(&obuf.copy_out().expect("out"))
     }
 }
 
