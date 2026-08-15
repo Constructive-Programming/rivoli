@@ -52,10 +52,11 @@ appears that enum dispatch cannot fill.
 
 - **jscpd** — duplication is a build error, zero budget (`crates/cli/build.rs`, every
   build, both feature arms). Precondition: rustfmt-clean, or the result is a lower bound.
-  **6** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
+  **7** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
   where verbatim transcription of the reference is the point; two in `backend/hip.rs`,
   the HIP ABI wall's extern declarations and its one hand-written launcher; one in
-  `artifact/quant.rs`, the `matvec_*` oracle parameter lists — each argues in place); the
+  `artifact/quant.rs`, the `matvec_*` oracle parameter lists; one in `core/routing.rs`,
+  the frozen `route_into_pre` photograph — each argues in place); the
   count is derived by `crates/cli/tests/docs.rs`, and marker text may appear only on a
   bare marker line.
 - **CodeScene 10/10** — `crates/cli/tests/codescene.rs`, whole tree, hard threshold;

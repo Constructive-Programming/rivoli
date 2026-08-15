@@ -17,3 +17,4 @@ pub mod hash;
 pub mod hybrid;
 pub mod num;
 pub mod residency;
+pub mod routing;

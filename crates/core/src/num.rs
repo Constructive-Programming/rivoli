@@ -12,7 +12,7 @@ pub fn silu(x: f32) -> f32 {
 
 /// Logistic sigmoid — the MoE router's scoring function (scoring_func=sigmoid).
 #[inline]
-fn sigmoid(x: f32) -> f32 {
+pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
@@ -27,7 +27,7 @@ fn sigmoid(x: f32) -> f32 {
 /// are no longer confined to (0,1) — nothing downstream assumes they are, but the
 /// bias is trained against this scale, not sigmoid's.
 #[inline]
-fn sqrt_softplus(x: f32) -> f32 {
+pub(crate) fn sqrt_softplus(x: f32) -> f32 {
     (x.max(0.0) + (-x.abs()).exp().ln_1p()).sqrt()
 }
 

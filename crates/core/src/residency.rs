@@ -136,13 +136,16 @@ mod tests {
         slot_bytes: Bytes(15),
     };
 
-    /// INV-1: the pin is a function of `(ordered, free, floor)` ONLY — P6 as a gate.
+    /// INV-8: the pin is a function of `(ordered, free, floor)` ONLY — P6 as a gate.
+    /// (Numbered fresh: INV-1 is the old tree's routing-purity invariant, which ported
+    /// into `routing.rs` after this test briefly held the number — citations travel on
+    /// the old numbers, so the NEW invariant moved, not the inherited one.)
     /// The signature admits no architecture parameter, so the property provable here is
     /// the surviving one: same inputs, same partition, and the partition is monotone in
     /// `free` — more memory only ever EXTENDS the pinned prefix. This is the invariant
     /// whose violation was the old tree's dense-pin category error.
     #[test]
-    fn inv_1_the_pin_is_monotone_in_free_memory_and_nothing_else() {
+    fn inv_8_the_pin_is_monotone_in_free_memory_and_nothing_else() {
         let us = units(&[100, 50, 200, 25]);
         let mut prev_len = 0;
         for free in (50..=500).step_by(7) {
