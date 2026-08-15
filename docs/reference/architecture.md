@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The rewrite's architecture as built so far — the six-crate layering and what it precludes, the P6 residency contract, and the §8b invariant registry (INV-1), which grows a section per milestone rather than being written ahead of the code.
+verdict: The rewrite's architecture as built so far — the six-crate layering and what it precludes, the P6 residency contract, and the §8b invariant registry, which grows a section per milestone rather than being written ahead of the code.
 ---
 
 # Architecture
@@ -42,3 +42,4 @@ the old tree so citations travel.
 | INV-8 | The pin is a function of `(ordered units, free bytes, floor)` only — monotone in `free`, prefix-shaped, all-resident as the degenerate top. P6 as a gate: no architecture parameter exists to consult, so "this model is dense, so everything is pinned" cannot be expressed. Numbered fresh (1 was briefly reused here before the routing port arrived carrying the original; the NEW invariant moved). | `crates/core/src/residency.rs::inv_8_the_pin_is_monotone_in_free_memory_and_nothing_else` |
 | INV-4 | A device-side wait may be enqueued BEFORE its producer exists and still waits — the property `hipStreamWaitEvent` lacks, stated as a property because the retired second backend reached it by a different mechanism. Arrived with the waist port; ID inherited from the old registry so citations travel. Device test: runs only under `--features rocm` on the box. | `crates/backend/src/gpustream.rs::inv_4_wait_enqueued_before_signal_still_waits` |
 | INV-6 | A wait can always be released from the HOST, so a producer that dies owing a ticket cannot hang the device (monotone CAS into signal memory). Missing in the old tree until 2026-08-01 — `hipStreamWaitValue64` has no error state, so a fetch error hung the device instead of returning. Device test, same rocm-only caveat as INV-4. | `crates/backend/src/gpustream.rs::inv_6_a_host_release_retires_an_enqueued_wait` |
+| INV-5 | An expert cannot be launched without enqueueing its data dependency: `RoutedPool::submit` returns a `Ticket` per selected expert and no residency mask, so the loop has nothing to branch on — resident / missing / in-flight are one code path, and `wait_on` is the only consumer. The testable half is the encoding: `RESIDENT` is value 0, a genuinely satisfied wait, never a sentinel the consumer must recognise and skip (that branch is the `hit` mask growing back — the bool that once won a disagreement silently and launched over a slot still being written). ID inherited from the old registry; arrived with the M4 pool port, rocm-only like the pool. | `crates/engine/src/routed.rs::inv_5_every_descriptor_carries_a_ticket` |

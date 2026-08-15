@@ -159,6 +159,27 @@ exists.
 M4's exit gate (unchanged from the plan): anchor decode gate green at the pre-measured
 tolerance; INV-1 red-proofed live; release.yml on.
 
+**M4 opened 2026-08-15 — the pool, redesigned rather than ported.** A first verbatim-shaped
+port of `old:src/routed.rs` landed red (CodeScene 8.6: `submit` cc 18 / 110 LoC / 8 args,
+`new` 73 LoC / 8 args) and was reset rather than patched, because the score was pointing
+at a design fault, not a style one: `submit`'s eighth argument was `fmt: &mut
+Vec<RoutedFmt>` — the exact channel of the old tree's #2 open defect, per-expert format
+decided by which tier residency chose. The redo (`crates/engine/src/routed.rs`, 10.0)
+makes the pool **single-format** per Q1: one `RoutedGeom`, `submit` fills a `SubmitOut`
+of slots + tickets only, and `RoutedPool::fmt()` is the only format answer — a per-expert
+one is no longer expressible. Operands bundled as `PoolCfg`/`Batch`/`RankWindow`
+(startup knobs vs per-layer selection vs trace-only inputs); the three arena phases are
+named methods. INV-5 (ticket-per-descriptor, no residency mask) entered §8b with its
+ported test. Suite green, device arm 60/0.
+
+**Watchdog DROPPED (owner decision, 2026-08-15): legacy functionality, not ported.** The
+old wedge watchdog existed to reap decodes hung by the gpustream bug class the rewrite
+closes structurally (INV-4/INV-6: host-releasable waits — a dead producer cannot hang
+the device). Its one obligation that survives is honesty about trace sinks:
+`flush_trace`'s per-token flush now argues from `Drop` discarding errors, not from a
+watchdog's `process::exit`. If a wedge class ever reappears, reopen this with the
+evidence rather than resurrecting the module.
+
 
 ## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)
 

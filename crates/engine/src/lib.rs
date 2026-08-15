@@ -12,4 +12,6 @@
 pub mod device;
 pub mod fetch;
 pub mod indexer;
+#[cfg(feature = "rocm")]
+pub mod routed;
 pub mod telemetry;
