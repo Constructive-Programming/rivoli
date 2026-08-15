@@ -16,3 +16,9 @@ memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 safetensors = { version = "0.8.0", default-features = false, features = ["alloc"] }
+# The trained BPE vocab is 19.3 MB of data; hand-rolling its decoder would be the
+# archetypal wheel to not reinvent. `default-features = false` + `fancy-regex` is the
+# reference's own feature choice (`old:Cargo.toml` @ 6b7f496) — it drops `onig` (a C
+# dependency) and `http` (a network fetcher this engine must never grow), leaving the
+# pure-Rust pattern engine the GLM pre-tokenizer's lookarounds need.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }

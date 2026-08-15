@@ -12,3 +12,4 @@ pub mod glimmer;
 pub mod glm_config;
 pub mod quant;
 pub mod schema;
+pub mod tokenizer;
