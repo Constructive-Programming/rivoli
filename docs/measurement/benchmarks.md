@@ -491,14 +491,15 @@ bf16 streaming curve**, "Say hello." at `--bench 24`, one `--max-mem` per arm:
 The pin is worth **5.1×**, and marginal bandwidth RISES with the streamed count (8.6 → 18.0 GB/s):
 per-fill fixed cost dominates a small streamed set and amortizes — S5's prefetch item, measured
 before its lever exists; `GLIMMER_STREAM_SLOTS` is 1. **Prefill was unbatched** (`m = 1`) at 0.416
-s/token over 1201 and 0.561 over 7661 = **72 min to first token** on 7661 (§4.3).
+s/token over 1201, 0.561 over 7661 = **72 min to first token** there (§4.3).
 
-**Batching it is worth ~13% — 0.363 s/token over 1659, witness non-empty — and that REFUTES the
-estimate that made it S5's top item.** The arithmetic predicted 256×; `kvcompress.hip::gemm_bf16`
-is **one wave per OUTPUT ELEMENT** (`gw = r*n + c`, each wave reading the whole weight row
-independently for every `r`), so `m` rows are `m` GEMVs fused into one launch with no cross-row
-reuse. **The lever is a tiled GEMM** staging a weight tile in LDS; the batching is its
-precondition, and paid for itself by surfacing defects at 1.079e0 / 3.008e0 (§3.2).
+**Prefill: 0.416 → 0.363 → 0.207 s/token, `2.01×` end to end** (1659 tokens, bf16, witness
+non-empty in all three). Batching alone bought ~13% — the arithmetic said 256×, but `gemm_bf16` was
+**one wave per OUTPUT ELEMENT** (`gw = r*n + c`, each wave re-reading the whole weight row for every
+`r`), so `m` rows were `m` GEMVs in one launch with no cross-row reuse. `gemm_bf16_tiled` (one block
+per column × tile of **8** rows, weight staged in LDS) is the other **1.74×**; dispatch is `m >= 8`
+so DECODE keeps the old kernel and its exact reduction order. 1.74 of a theoretical 8 says something
+else now bounds prefill — attends/RoPE unbatched, fp8 capped at 2 rows (§3.2).
 
 **Teacher-forced quality — the S4 ladder, softcap priced** (`--ppl tests/ppl-corpus.txt`, 762 tokens, `bin/ppl`, baseline bf16); both format arms re-run back to back on ROCm **7.14.60850**:
 
@@ -510,8 +511,7 @@ precondition, and paid for itself by surfacing defects at 1.079e0 / 3.008e0 (§3
 
 **fp8 costs nothing measurable and the interval is tight enough to SAY so**: its 95% upper bound
 (+0.00649) is under `bin/ppl`'s 1% bar (0.00995) — a pass, not the underpowered null that tool
-prints a paragraph distinguishing; `worse%` 53.9 = no systematic shift. `--fp8` quantizes the
-**416** layer projections only — `embed_tokens`/`lm_head`/norms stay bf16, hence 54.8% and not 50%.
+distinguishes; `worse%` 53.9 = no systematic shift. `--fp8` quantizes the **416** layer projections only — `embed_tokens`/`lm_head`/norms stay bf16, hence 54.8% and not 50%.
 Greedy output READ: coherent, on topic. **The bf16 arm was re-run only because the recorded one
 predated 7.14, and the two are BYTE-IDENTICAL** (0 of 761 NLLs differ), so that runtime change has
 zero measured effect here. **No speed number from these runs** — the fp8 wall clock (141.9 s vs

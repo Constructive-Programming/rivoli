@@ -404,14 +404,78 @@ static int compress_guard(CompGeom p) {
     return 0;
 }
 
+// **The TILED form: one block per (output column, tile of GEMM_TILE rows), staging the weight
+// column in LDS and reusing it down the rows.**
+//
+// This exists because `gemm_bf16` above has NO cross-row reuse. It is one wave per output element
+// — `gw = r*n + c`, each wave reading the whole weight row `w + c*k` independently for every `r` —
+// so `m` rows are `m` GEMVs fused into one launch and the weight comes from DRAM `m` times.
+// Batching Muse Glimmer's prefill to `m = 256` therefore bought ~13% (launch overhead) against an
+// arithmetic prediction of 256x, measured 2026-08-15.
+//
+// Here each block reads its weight column ONCE per tile and multiplies it into GEMM_TILE rows, so
+// the traffic falls by that factor. The tile is a register-pressure choice: `acc[GEMM_TILE]` is
+// per thread, and 8 keeps a 256-thread block comfortable.
+//
+// **The k-loop is chunked through LDS**, so every thread in the block reads the staged chunk
+// rather than the same DRAM line — which is also what makes the row loop cheap: the weight is
+// already resident when row `r+1` needs it.
+#define GEMM_TILE 8
+#define GEMM_CHUNK 512
+extern "C" __global__ void gemm_bf16_tiled(const float* __restrict__ x,
+                                           const unsigned short* __restrict__ w,
+                                           float* __restrict__ out, int m, int n, int k) {
+    __shared__ float wl[GEMM_CHUNK];
+    __shared__ float red[256];
+    const int c = (int)blockIdx.x;
+    const int r0 = (int)blockIdx.y * GEMM_TILE;
+    const unsigned short* wr = w + (size_t)c * k;
+    float acc[GEMM_TILE];
+#pragma unroll
+    for (int r = 0; r < GEMM_TILE; ++r) acc[r] = 0.0f;
+
+    for (int i0 = 0; i0 < k; i0 += GEMM_CHUNK) {
+        const int len = min(GEMM_CHUNK, k - i0);
+        __syncthreads();  // the previous iteration's readers must finish before this overwrites
+        for (int i = (int)threadIdx.x; i < len; i += (int)blockDim.x) wl[i] = bf16f(wr[i0 + i]);
+        __syncthreads();
+        for (int r = 0; r < GEMM_TILE && r0 + r < m; ++r) {
+            const float* xr = x + (size_t)(r0 + r) * k + i0;
+            float a = 0.0f;
+            for (int i = (int)threadIdx.x; i < len; i += (int)blockDim.x) a += xr[i] * wl[i];
+            acc[r] += a;
+        }
+    }
+    // One block reduction per row of the tile. `block_sum_lds` syncs internally, and the loop is
+    // over at most GEMM_TILE rows once per block — not per element — so its cost is noise beside
+    // the k-loop above.
+    for (int r = 0; r < GEMM_TILE && r0 + r < m; ++r) {
+        float s = block_sum_lds(acc[r], red);
+        if (threadIdx.x == 0) out[(size_t)(r0 + r) * n + c] = s;
+    }
+}
+
+// **`m` decides which kernel runs, and DECODE MUST KEEP THE OLD ONE.**
+//
+// At `m == 1` the tiled form has a block reduction and an LDS round trip that the wave-per-element
+// form does not, and buys no reuse — there is one row to reuse across. Decode is `m == 1` on every
+// projection of every layer of every token, so routing it through the tiled kernel would pay that
+// overhead on the path that matters most. The threshold also keeps decode BIT-IDENTICAL across
+// this change: a different reduction order is a different f32 answer, and decode's is unchanged.
 extern "C" int rivoli_gemm_bf16(const float* x, const unsigned short* w, float* out,
                                 int m, int n, int k, void* stream) {
     if (m <= 0 || n <= 0 || k <= 0) return 1001;
     hipGetLastError();
-    size_t waves = (size_t)m * n;
-    size_t threads = waves * WAVE;
-    hipLaunchKernelGGL(gemm_bf16, dim3((unsigned)((threads + 255) / 256)), dim3(256), 0,
-                       (hipStream_t)stream, x, w, out, m, n, k);
+    if (m >= GEMM_TILE) {
+        hipLaunchKernelGGL(gemm_bf16_tiled,
+                           dim3((unsigned)n, (unsigned)((m + GEMM_TILE - 1) / GEMM_TILE)),
+                           dim3(256), 0, (hipStream_t)stream, x, w, out, m, n, k);
+    } else {
+        size_t waves = (size_t)m * n;
+        size_t threads = waves * WAVE;
+        hipLaunchKernelGGL(gemm_bf16, dim3((unsigned)((threads + 255) / 256)), dim3(256), 0,
+                           (hipStream_t)stream, x, w, out, m, n, k);
+    }
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

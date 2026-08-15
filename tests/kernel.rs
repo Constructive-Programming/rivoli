@@ -6,11 +6,11 @@ use anyhow::Result;
 use rivoli::artifact::quant::{VQ_DIM, VQ_K, matvec_vq, quant_vq};
 use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
-    ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
-    launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8,
-    launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_acc_drain_to, launch_moe_expert_range,
-    launch_moe_expert_range_i4, launch_rmsnorm_centered_rows, launch_rmsnorm_rows,
-    launch_rope_interleave, launch_swiglu, launch_vadd, launch_vq_encode,
+    ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemm_bf16,
+    launch_gemv_fp8, launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_topk,
+    launch_mla_absorb_fp8, launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_acc_drain_to,
+    launch_moe_expert_range, launch_moe_expert_range_i4, launch_rmsnorm_centered_rows,
+    launch_rmsnorm_rows, launch_rope_interleave, launch_swiglu, launch_vadd, launch_vq_encode,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::memory::device::DeviceBuf;
@@ -2275,4 +2275,63 @@ fn the_rmsnorm_row_dimension_is_a_reorder() {
 /// `&[f32]` as little-endian bytes, for [`dev`].
 fn fx_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// **The tiled `gemm_bf16` must agree with the wave-per-element one it replaces above `m = 8`.**
+///
+/// Not bit-identity — the two reduce in different orders, which is a different f32 answer and the
+/// whole reason the tiled form is faster. The bound is reduction noise over `k`, and it is scored
+/// against the ROW SCALE rather than per element, so a near-zero output cannot manufacture a ratio
+/// from two tiny numbers.
+///
+/// **`m` sweeps across the dispatch threshold on purpose**: 1 and 7 take the old kernel, 8 and 19
+/// take the tiled one, and 19 is not a multiple of `GEMM_TILE` so its last block is partial. A
+/// tiled kernel that dropped the `r0 + r < m` guard would write past `out` at 19 and pass at 16.
+#[test]
+fn the_tiled_gemm_agrees_with_the_wave_per_element_one() {
+    const K: usize = 1100; // > 2 LDS chunks of 512, and not a multiple of one
+    const N: usize = 24;
+    let w16: Vec<u16> = (0..N * K)
+        .map(|i| f32_to_bf16(((i * 31 % 71) as f32 - 35.0) / 29.0))
+        .collect();
+    let wb = dev(&w16
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect::<Vec<u8>>());
+
+    for m in [1usize, 7, 8, 19] {
+        let x: Vec<f32> = (0..m * K)
+            .map(|i| ((i * 17 % 53) as f32 - 26.0) / 13.0)
+            .collect();
+        let xb = dev(&fx_bytes(&x));
+        let got = zeros(m * N * 4);
+        let (xp, wp, op) = (
+            xb.ptr() as *const f32,
+            wb.ptr() as *const u16,
+            got.ptr() as *mut f32,
+        );
+        // SAFETY: `xp` is `m*K` live f32, `wp` is `N*K` live u16, `op` is `m*N` writable f32, none
+        // aliasing; null stream, synced before the readback. (Bound above rather than spelled in
+        // the call, which put this launch's argument tail over jscpd's floor against the fp8 one
+        // in `glimmer_fp8.rs` — the shared-SUFFIX class `src/backend/hip.rs` records.)
+        unsafe { launch_gemm_bf16(xp, wp, op, m, N, K, std::ptr::null_mut()).unwrap() };
+        rivoli::backend::hip::device_sync().unwrap();
+        let g = f32v(&back(&got));
+
+        // The host oracle, in the order the reference would: one dot per (row, column).
+        let want: Vec<f32> = (0..m * N)
+            .map(|gw| {
+                let (r, c) = (gw / N, gw % N);
+                (0..K)
+                    .map(|i| x[r * K + i] * bf16_to_f32(w16[c * K + i]))
+                    .sum()
+            })
+            .collect();
+        let worst = common::worst_vs_scale(&want, &g, &format!("m={m}"));
+        assert!(
+            worst < 1e-5,
+            "m={m}: tiled gemm_bf16 differs from the host oracle by {worst} of the row scale — \
+             that is not summation order"
+        );
+    }
 }

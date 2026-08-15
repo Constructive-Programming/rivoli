@@ -231,12 +231,10 @@ fn a_placed_fp8_projection_matches_the_host_oracle_over_the_same_bytes() {
             .unwrap();
         }
         rivoli::backend::hip::device_sync().unwrap();
-        let mut raw = Vec::new();
-        ob.copy_out_prefix(&mut raw, o_dim * 4).unwrap();
-        let got: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // Through `common`'s readback pair rather than a hand-rolled `copy_out_prefix` +
+        // `chunks_exact` — jscpd matched that spelling against `tests/kernel.rs`, and it is right
+        // that the conversion is one fact the shared module already owns.
+        let got = common::f32v(&common::back(&ob));
 
         // **Guard BOTH sides, and the device side is not optional.**
         //
@@ -247,21 +245,7 @@ fn a_placed_fp8_projection_matches_the_host_oracle_over_the_same_bytes() {
         // > row its grid failed to cover, scored a PERFECT match. This repo has already shipped a
         // > broken kernel that passed 9 of 9 that way; the gate is red-proved against a NaN
         // > device row below.
-        let scale_of = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-        assert!(
-            want.iter().all(|v| v.is_finite()) && scale_of > 0.0,
-            "{name}: the host oracle is all-zero or non-finite"
-        );
-        assert!(
-            got.len() == want.len() && got.iter().all(|v| v.is_finite()),
-            "{name}: the DEVICE row is short or non-finite — every ratio below would be NaN, and \
-             NaN folds through `f32::max` as a perfect match"
-        );
-        let worst = want
-            .iter()
-            .zip(&got)
-            .map(|(a, b)| (a - b).abs() / scale_of)
-            .fold(0f32, f32::max);
+        let worst = common::worst_vs_scale(&want, &got, name);
         // Reduction order only. A scale-grid or block defect is O(1) here, not O(1e-6), so this
         // bound has three orders of magnitude of daylight on either side of it.
         assert!(

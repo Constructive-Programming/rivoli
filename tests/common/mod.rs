@@ -1283,6 +1283,35 @@ pub fn bf16_of(w: rivoli::memory::pin::GlimmerProj) -> rivoli::memory::pin::Bf16
     }
 }
 
+/// Worst difference between a device row and its host oracle, **relative to the oracle's row
+/// scale**, with BOTH sides guarded first.
+///
+/// **The guards are the point and they are why this is shared.** `f32::max` returns the non-NaN
+/// argument, so folding a max over an all-NaN difference gives 0.0 and a bound of any size passes
+/// — this repo has shipped a broken kernel that scored 9 of 9 that way, and the same omission was
+/// found again in `glimmer_fp8.rs` on 2026-08-15. An all-zero oracle is the mirror: every ratio is
+/// zero and the gate proves nothing. Written once, in the file both callers already include,
+/// rather than twice with one of them eventually missing a guard.
+///
+/// Relative to the ROW SCALE rather than per element, so a near-zero output cannot manufacture a
+/// huge ratio out of two numbers that are both tiny.
+pub fn worst_vs_scale(want: &[f32], got: &[f32], what: &str) -> f32 {
+    let scale = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+    assert!(
+        want.iter().all(|v| v.is_finite()) && scale > 0.0,
+        "{what}: the host oracle is all-zero or non-finite, so nothing below can mean what it claims"
+    );
+    assert!(
+        got.len() == want.len() && got.iter().all(|v| v.is_finite()),
+        "{what}: the device row is short or non-finite — NaN folds through `f32::max` as a perfect \
+         match"
+    );
+    want.iter()
+        .zip(got)
+        .map(|(a, b)| (a - b).abs() / scale)
+        .fold(0f32, f32::max)
+}
+
 /// One synthetic tensor: `(name, shape, bytes)`. Named because the fixture builders pass
 /// vectors of it across four signatures.
 pub type FixtureTensor = (String, Vec<usize>, Vec<u8>);
