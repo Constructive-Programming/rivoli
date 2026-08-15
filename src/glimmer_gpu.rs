@@ -83,18 +83,61 @@ fn scratch(n: usize) -> Result<DeviceBuf> {
 /// # Safety
 /// `x` is `i_dim` live f32, `out` is `o_dim` writable f32, the two do not alias, and both
 /// outlive the next [`device_sync`].
-unsafe fn proj(x: *const f32, w: &GlimmerProj, out: *mut f32, i_dim: usize) -> Result<()> {
+unsafe fn proj(
+    x: *const f32,
+    w: &GlimmerProj,
+    out: *mut f32,
+    i_dim: usize,
+    rows: usize,
+) -> Result<()> {
     let [o, i] = w.dims();
     ensure!(
         i == i_dim,
         "projection expects an activation of {i} but was handed {i_dim} — a shape mismatch here \
          reads past the end of a live buffer and produces fluent wrong text"
     );
+    ensure!(rows > 0, "a projection over zero rows");
+    // **`rows > 1` BATCHES THE LAUNCH AND NOT THE WEIGHT READ, and that is measured, not
+    // suspected.** The arithmetic said batching a 256-token chunk should divide prefill's weight
+    // traffic by 256; on the shipped bf16 model it moved prefill from 0.416 to **0.363 s/token**,
+    // ~13%, which is launch overhead and nothing else.
+    //
+    // `kernels/kvcompress.hip::gemm_bf16` is **one wave per output element**: `gw = r*n + c`, and
+    // each wave reads `w + c*k`, the whole weight row, independently for every `r`. So it is `m`
+    // GEMVs fused into one launch — there is no reuse across rows to capture, and `m` was never
+    // the lever. The lever is a TILED GEMM that stages a weight tile in LDS and reuses it down the
+    // rows; this restructure is its precondition, not its payoff.
+    //
+    // Keeping it anyway is not sunk cost: it is 13% for 95 MB, it is what the tiled kernel plugs
+    // into, and it is what surfaced the ring-sizing defect `window_of` now carries.
     // SAFETY: the caller's contract, plus the `i_dim` agreement checked above.
     unsafe {
         match w {
-            GlimmerProj::Bf16(w) => launch_gemm_bf16(x, w.packed, out, 1, o, i, NULL_STREAM),
-            GlimmerProj::Fp8(w) => launch_gemv_fp8(x, w.packed, w.scale, o, i, w.block, 1, out),
+            GlimmerProj::Bf16(w) => launch_gemm_bf16(x, w.packed, out, rows, o, i, NULL_STREAM),
+            // **`gemv_fp8` refuses any `nrow` but 1 or 2** (`kernels/linalg.hip`, code 1004:
+            // `gemv_fp8_impl<R>` carries a `float acc[R]` and is instantiated for those two), so
+            // the batched path walks the rows in pairs. That is CORRECT and only 2x of the weight
+            // re-read the batching exists to remove — the remaining factor needs more template
+            // instantiations or a tiled GEMM, and this loop is the one place that changes when
+            // either lands. bf16 has no such limit: `gemm_bf16` takes `m` outright.
+            GlimmerProj::Fp8(w) => {
+                let mut r = 0;
+                while r < rows {
+                    let n = (rows - r).min(2);
+                    launch_gemv_fp8(
+                        x.add(r * i),
+                        w.packed,
+                        w.scale,
+                        o,
+                        i,
+                        w.block,
+                        n,
+                        out.add(r * o),
+                    )?;
+                    r += n;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -165,10 +208,32 @@ pub fn window_of(kind: LayerKind, win: usize, n_ctx: usize, pos: usize) -> Windo
             // `lo = (win > 0 && pos >= win) ? pos - win + 1 : 0` is 0 either way — the whole causal
             // prefix. A sliding layer in a run shorter than its window has nothing to slide past.
             let cap = win.min(n_ctx);
+            // **The RING is `win + PREFILL_CHUNK - 1` slots, not `win`, and the extra rows are a
+            // CORRECTNESS requirement rather than slack.**
+            //
+            // > Found by measurement 2026-08-15, the moment prefill batched. `glimmer_chain`'s
+            // > host reference disagreed by **1.079e0** — a whole-magnitude error, not a
+            // > tolerance. At `ring_cap == win` the ring holds exactly the window, so writing
+            // > position `p+1` overwrites the key at `p+1-win`, which is the OLDEST key still
+            // > inside position `p`'s window `[p-win+1, p]`. Per-position prefill never saw it
+            // > because `p` attended before `p+1` was written; a batched chunk writes every K and
+            // > V before any of them attends, so row 0 read a key belonging to a position a whole
+            // > window later.
+            // >
+            // > This is exactly `rivoli_gqa_attend`'s own `ring_cap >= win + tq - 1` rule
+            // > (`kernels/attn.hip`, code 1005), and `glimmer-open-items.md` §3.2 predicted that
+            // > batching would make it reachable. It was reached by a route that note did not
+            // > name: the ATTENDS are still `tq == 1`, so the launcher's guard never fires. What
+            // > batched was the WRITES, and the rule is really about how many positions are live
+            // > in the ring at once — which is the chunk, whatever `tq` says.
+            //
+            // Clamped by `n_ctx` for `window_of`'s own reason: a run shorter than the window has
+            // nothing to slide past, and a ring longer than the context is slots nothing fills.
+            let ring = (cap + PREFILL_CHUNK - 1).min(n_ctx);
             Window {
                 win: cap,
-                ring_cap: cap,
-                slot: pos % cap,
+                ring_cap: ring,
+                slot: pos % ring,
             }
         }
         // `ring_cap == 0` makes the slot the position itself, so the cache must run from position
@@ -275,7 +340,10 @@ pub fn qk_scales(qk_scale_factor: f32) -> QkScale {
 ///
 /// Correct at any value: chunk `c` runs EVERY layer before chunk `c+1` starts, so layer `l`'s KV
 /// cache already holds every position below the chunk when the chunk's attends run.
-const PREFILL_CHUNK: usize = 256;
+/// `pub` since 2026-08-15: it is no longer only an internal batch size. It sets how many rows a
+/// sliding layer's ring carries past its window — a correctness property `window_of` computes and
+/// `tests/glimmer_loop.rs` asserts, so both need the number.
+pub const PREFILL_CHUNK: usize = 256;
 
 /// How many KV slots layer kind `k` gets at `n_ctx`.
 ///
@@ -346,11 +414,17 @@ pub fn runtime_bytes(gt: &GlimmerTextConfig, n_ctx: usize) -> Result<usize> {
         kv += 2 * slots_of(k, gt.sliding_window, n_ctx) * kvd;
     }
     let qd = gt.n_heads * gt.head_dim;
-    // `x`, `xn`, `br`, plus `xs` at one row per position in a prefill chunk; `q`, `attn`,
-    // `gate`; `mg`, `mu`, `mh`; `logits`; `pick` (2 words). This list is the only cross-check
+    // `x` at one row; `xs`, `xn`, `br` at a chunk of rows each; `q`, `attn`, `gate` likewise;
+    // `mg`, `mu`, `mh` likewise; `logits`; `pick` (2 words). This list is the only cross-check
     // anyone auditing `Glimmer::new` has, so it enumerates every allocation rather than the
     // ones a given edit touched — it briefly carried two lines, each missing what the other had.
-    let act = (3 + PREFILL_CHUNK.min(n_ctx)) * gt.hidden + 3 * qd + 3 * gt.inter + gt.vocab + 2;
+    //
+    // **`rows` multiplies almost all of it, 2026-08-15, and that is the batched prefill's price.**
+    // Every per-layer scratch went from one row to a chunk so the projections can see the whole
+    // chunk at once; at the shipped widths and `PREFILL_CHUNK` 256 this is 95.2 MB against the
+    // 8.0 MB it was. A budget that cannot cover it is refused by name, as before.
+    let rows = PREFILL_CHUNK.min(n_ctx);
+    let act = (1 + 3 * rows) * gt.hidden + 3 * rows * qd + 3 * rows * gt.inter + gt.vocab + 2;
     (kv + act)
         .checked_mul(4)
         .context("the runtime footprint overflows a usize")
@@ -431,6 +505,9 @@ pub struct Glimmer {
     pick: DeviceBuf,
 
     /// Per layer, keys then values, sized by that layer's own window.
+    /// How many rows the last [`Self::layer`] call left in `br` — what [`Self::branch`] needs to
+    /// find the last one. One for a decode step, a whole chunk during prefill.
+    br_rows: usize,
     kc: Vec<DeviceBuf>,
     vc: Vec<DeviceBuf>,
     /// How many positions the linear (full-attention) layers can hold. A sliding layer's
@@ -486,6 +563,8 @@ impl Glimmer {
         let pin = GlimmerPin::build(dir, gt, for_weights)?;
         let (hq, hkv, hd) = (gt.n_heads, gt.num_key_value_heads, gt.head_dim);
         let qd = hq * hd;
+        // The row count every per-layer scratch is sized for; `runtime_bytes` charges the same.
+        let rows = PREFILL_CHUNK.min(n_ctx);
         let kvd = hkv * hd;
         // **The allocation is sized BY [`window_of`], not alongside it.** A ring the loop indexes
         // modulo `cap` and a buffer sized from a second copy of that expression is a device write
@@ -521,17 +600,24 @@ impl Glimmer {
             // boolean wearing a float's clothes. Resolved here, once.
             rotated: gt.layer_rope_theta.iter().map(|t| *t != 0.0).collect(),
             x: scratch(gt.hidden)?,
-            xs: scratch(PREFILL_CHUNK.min(n_ctx) * gt.hidden)?,
-            xn: scratch(gt.hidden)?,
-            br: scratch(gt.hidden)?,
-            q: scratch(qd)?,
-            attn: scratch(qd)?,
-            gate: scratch(qd)?,
-            mg: scratch(gt.inter)?,
-            mu: scratch(gt.inter)?,
-            mh: scratch(gt.inter)?,
+            // **Every per-layer scratch holds a whole prefill CHUNK, not one row.** That is what
+            // the batched `layer` writes into, and it is the memory the batching costs: 95.2 MB
+            // against 8.0 MB at the shipped widths and `PREFILL_CHUNK` 256, i.e. 0.16% of the
+            // bf16 model to remove 255 of every 256 weight reads in prefill. `runtime_bytes`
+            // charges exactly this list, and `.min(n_ctx)` keeps a short context from paying for
+            // rows it can never fill.
+            xs: scratch(rows * gt.hidden)?,
+            xn: scratch(rows * gt.hidden)?,
+            br: scratch(rows * gt.hidden)?,
+            q: scratch(rows * qd)?,
+            attn: scratch(rows * qd)?,
+            gate: scratch(rows * qd)?,
+            mg: scratch(rows * gt.inter)?,
+            mu: scratch(rows * gt.inter)?,
+            mh: scratch(rows * gt.inter)?,
             logits: scratch(gt.vocab)?,
             pick: DeviceBuf::new(8)?,
+            br_rows: 1,
             kc,
             vc,
             n_ctx,
@@ -555,77 +641,120 @@ impl Glimmer {
     /// post-QK-norm, post-RoPE keys. Each projection writes where its result is consumed: `k` and
     /// `v` go STRAIGHT into their cache slot, so the norm and the rotation run in place on the
     /// cache and no copy exists to get wrong.
-    fn attention(&mut self, l: usize, pos: usize, w: &Window, h: &Handles) -> Result<()> {
+    ///
+    /// **`rows` consecutive positions from `pos`, and the ring is what makes this more than a
+    /// loop bound.** Q, the gate and `o_proj` are pointwise in position, so they batch outright.
+    /// K and V go straight into their cache slots and `slot = pos % ring_cap`, so a chunk's
+    /// destinations are contiguous EXCEPT where the ring wraps — at most once per chunk, since a
+    /// chunk is shorter than any ring. [`Self::slot_runs`] finds the split and the K/V projections
+    /// run once per run: two launches in the worst case, never `rows` of them, which is the whole
+    /// point (K and V together are only 0.7% of a layer's weights, but at `m = 1` they are read
+    /// `rows` times and that alone would double the traffic the batching removes).
+    ///
+    /// RoPE and the attend stay per row: RoPE needs the position, and the attend keeps `tq == 1`
+    /// so the launcher's `ring_cap >= win + tq - 1` union hazard stays unreachable. Neither reads
+    /// a weight, so neither is where the time goes.
+    fn attention(
+        &mut self,
+        l: usize,
+        pos: usize,
+        w: &Window,
+        h: &Handles,
+        rows: usize,
+    ) -> Result<()> {
         let (qd, kvd) = (self.hq * self.hd, self.hkv * self.hd);
         let (wq, wk, wv, wo, wg) = (h.q, h.k, h.v, h.o, h.attn_gate);
         let xn = self.xn.ptr() as *const f32;
         let kslot = unsafe { (self.kc[l].ptr() as *mut f32).add(w.slot * kvd) };
         let vslot = unsafe { (self.vc[l].ptr() as *mut f32).add(w.slot * kvd) };
+        let runs = self.slot_runs(l, pos, rows);
         // SAFETY: `xn` is `hidden` live f32 written by this layer's pre-norm; each destination is
         // its projection's `o_dim` f32 inside a live allocation — `q` its own buffer, `k`/`v` one
         // `hkv*hd` slot of a cache with at least `slot+1` slots by `attn_window`'s construction.
         // None aliases `xn` or another. All outlive the `device_sync` in `decode`.
         unsafe {
-            proj(xn, &wq, self.q.ptr() as *mut f32, self.hidden)?;
-            proj(xn, &wk, kslot, self.hidden)?;
-            proj(xn, &wv, vslot, self.hidden)?;
+            proj(xn, &wq, self.q.ptr() as *mut f32, self.hidden, rows)?;
+            // One launch per contiguous slot run. At `rows == 1` this is one run of one, and
+            // `kslot`/`vslot` above are its base — the decode path, unchanged.
+            for &(r0, n, slot) in &runs {
+                let (kd, vd) = (
+                    (self.kc[l].ptr() as *mut f32).add(slot * kvd),
+                    (self.vc[l].ptr() as *mut f32).add(slot * kvd),
+                );
+                proj(xn.add(r0 * self.hidden), &wk, kd, self.hidden, n)?;
+                proj(xn.add(r0 * self.hidden), &wv, vd, self.hidden, n)?;
+            }
+            let _ = (kslot, vslot);
             // **The 3.87 is Q's alone**, and it arrives here by NAME — see [`QkScale`], which
             // also records what a swap actually costs (nothing: only the product enters the
             // score). What is NOT free is dropping or doubling the factor, and that the chain gate
             // does see.
             let s = qk_scales(self.qk_scale);
+            // `rows` streams of `hq` heads laid end to end are `rows * hq` heads of `hd` — the
+            // kernel's own unit, and it already took a row count.
             launch_rmsnorm_weightless_batch(
                 self.q.ptr() as *mut f32,
-                self.hq,
+                rows * self.hq,
                 self.hd,
                 self.eps_pre,
                 s.q,
                 NULL_STREAM,
             )?;
-            launch_rmsnorm_weightless_batch(
-                kslot,
-                self.hkv,
-                self.hd,
-                self.eps_pre,
-                s.k,
-                NULL_STREAM,
-            )?;
+            for &(_, n, slot) in &runs {
+                launch_rmsnorm_weightless_batch(
+                    (self.kc[l].ptr() as *mut f32).add(slot * kvd),
+                    n * self.hkv,
+                    self.hd,
+                    self.eps_pre,
+                    s.k,
+                    NULL_STREAM,
+                )?;
+            }
             // NoPE: the full-attention layers carry no rotation at all. `rotated` is the boolean
             // `layer_rope_theta` really is; the base comes from the ONE `rope_parameters` table.
-            if self.rotated[l] {
-                launch_rope_split_half(
-                    self.q.ptr() as *mut f32,
+            for r in 0..rows {
+                let p = pos + r;
+                let slot = self.attn_window(l, p).slot;
+                if self.rotated[l] {
+                    // Q and K rotate identically apart from their base and head count, so one
+                    // closure rather than two argument lists — which jscpd reported as a clone the
+                    // moment the batching indented them.
+                    let (hd, theta) = (self.hd, self.theta);
+                    let mut rope = |base: *mut f32, heads: usize| unsafe {
+                        launch_rope_split_half(base, heads, hd, hd, p, theta)
+                    };
+                    rope((self.q.ptr() as *mut f32).add(r * qd), self.hq)?;
+                    rope((self.kc[l].ptr() as *mut f32).add(slot * kvd), self.hkv)?;
+                }
+                // **After every K in the chunk is written and rotated?** No — and it does not need
+                // to be. Position `p` attends over `[lo, p]`, so it reads only keys at positions
+                // `<= p`, which are exactly the rows this loop has already finished. Running RoPE
+                // and the attend together per row is therefore the same attention as two passes,
+                // and it keeps the rotated key one launch away from its use.
+                launch_gqa_attend(
+                    (self.q.ptr() as *const f32).add(r * qd),
+                    self.kc[l].ptr() as *const f32,
+                    self.vc[l].ptr() as *const f32,
                     self.hq,
+                    self.hkv,
                     self.hd,
-                    self.hd,
-                    pos,
-                    self.theta,
+                    1,
+                    p,
+                    w.win,
+                    w.ring_cap,
+                    self.attn_scale,
+                    (self.attn.ptr() as *mut f32).add(r * qd),
+                    NULL_STREAM,
                 )?;
-                launch_rope_split_half(kslot, self.hkv, self.hd, self.hd, pos, self.theta)?;
             }
-            launch_gqa_attend(
-                self.q.ptr() as *const f32,
-                self.kc[l].ptr() as *const f32,
-                self.vc[l].ptr() as *const f32,
-                self.hq,
-                self.hkv,
-                self.hd,
-                1,
-                pos,
-                w.win,
-                w.ring_cap,
-                self.attn_scale,
-                self.attn.ptr() as *mut f32,
-                NULL_STREAM,
-            )?;
             // **The gate reads the layer input, not the attend output.** `wg` consumes `xn`; a
             // gate built from `self.attn` has the right shapes, the right tensor and the wrong
             // model (trap 3's sibling, `glimmer-architecture.md` §4 item 3).
-            proj(xn, &wg, self.gate.ptr() as *mut f32, self.hidden)?;
+            proj(xn, &wg, self.gate.ptr() as *mut f32, self.hidden, rows)?;
             launch_sigmoid_gate(
                 self.attn.ptr() as *mut f32,
                 self.gate.ptr() as *const f32,
-                qd,
+                rows * qd,
                 NULL_STREAM,
             )?;
             proj(
@@ -633,6 +762,7 @@ impl Glimmer {
                 &wo,
                 self.br.ptr() as *mut f32,
                 qd,
+                rows,
             )?;
         }
         Ok(())
@@ -677,37 +807,39 @@ impl Glimmer {
     ///
     /// # Safety
     /// `w` is `hidden` live f32 and stays valid until the next [`GlimmerPin::layer`] call.
-    unsafe fn branch_add(&mut self, x: *mut f32, w: *const f32) -> Result<()> {
-        // SAFETY: `br` and `x` are each `hidden` f32 this struct owns; the centered norm's own
-        // contract permits `y` aliasing `x`, which is what makes the in-place form legal.
+    unsafe fn branch_add(&mut self, x: *mut f32, w: *const f32, rows: usize) -> Result<()> {
+        // SAFETY: `br` and `x` are each `rows * hidden` f32 this struct owns; the centered norm's
+        // own contract permits `y` aliasing `x`, which is what makes the in-place form legal.
+        // `vadd` is elementwise, so `rows` streams laid end to end are one call of `rows * hidden`.
         unsafe {
             launch_rmsnorm_centered_rows(
                 self.br.ptr() as *const f32,
                 w,
-                1,
+                rows,
                 self.hidden,
                 self.eps_post,
                 self.br.ptr() as *mut f32,
                 NULL_STREAM,
             )?;
-            launch_vadd(x, self.br.ptr() as *const f32, self.hidden)
+            launch_vadd(x, self.br.ptr() as *const f32, rows * self.hidden)
         }
     }
 
     /// The MLP: `down(silu(gate(xn)) · up(xn))`, leaving its output in `br` for the post-norm.
-    fn mlp(&mut self, h: &Handles) -> Result<()> {
+    fn mlp(&mut self, h: &Handles, rows: usize) -> Result<()> {
         let (wg, wu, wd) = (h.mlp_gate, h.mlp_up, h.mlp_down);
         let xn = self.xn.ptr() as *const f32;
-        // SAFETY: `xn` is `hidden` live f32 from the pre-norm; `mg`/`mu`/`mh` are each `inter` and
-        // `br` is `hidden`, all owned by this struct. `swiglu` writes `mh`, which aliases neither
-        // of its operands. The three weights are live until the next `pin.layer` call.
+        // SAFETY: `xn` is `rows * hidden` live f32 from the pre-norm; `mg`/`mu`/`mh` are each
+        // `rows * inter` and `br` is `rows * hidden`, all owned by this struct. `swiglu` writes
+        // `mh`, which aliases neither of its operands, and is elementwise so `rows` rows laid end
+        // to end are one call. The three weights are live until the next `pin.layer` call.
         unsafe {
-            proj(xn, &wg, self.mg.ptr() as *mut f32, self.hidden)?;
-            proj(xn, &wu, self.mu.ptr() as *mut f32, self.hidden)?;
+            proj(xn, &wg, self.mg.ptr() as *mut f32, self.hidden, rows)?;
+            proj(xn, &wu, self.mu.ptr() as *mut f32, self.hidden, rows)?;
             launch_swiglu(
                 self.mg.ptr() as *const f32,
                 self.mu.ptr() as *const f32,
-                self.inter,
+                rows * self.inter,
                 self.mh.ptr() as *mut f32,
                 NULL_STREAM,
             )?;
@@ -716,6 +848,7 @@ impl Glimmer {
                 &wd,
                 self.br.ptr() as *mut f32,
                 self.inter,
+                rows,
             )
         }
     }
@@ -749,19 +882,41 @@ impl Glimmer {
     /// > as "every `pin.layer` call inside this function is for the SAME `l`" — true, but
     /// > vacuously so once `60641fa` moved the pin calls out to the callers, so it described a
     /// > code shape that no longer exists and protected nothing (review, 2026-08-14).
-    fn layer(&mut self, x: *mut f32, h: &Handles, l: usize, pos: usize) -> Result<()> {
+    fn layer(&mut self, x: *mut f32, h: &Handles, l: usize, pos: usize, rows: usize) -> Result<()> {
         let w = self.attn_window(l, pos);
         // SAFETY: every pointer in `h` is live in the pin and stays at its address for as long as
         // its slot holds layer `l` — which is the whole of this function, per the section above.
-        unsafe { self.pre_norm(x, h.input_ln, 1)? };
-        self.attention(l, pos, &w, h)?;
+        // `x` is `rows * hidden` live f32, the caller's obligation.
+        unsafe { self.pre_norm(x, h.input_ln, rows)? };
+        self.attention(l, pos, &w, h, rows)?;
         // SAFETY: as above.
-        unsafe { self.branch_add(x, h.post_attn_ln)? };
+        unsafe { self.branch_add(x, h.post_attn_ln, rows)? };
         // SAFETY: as above.
-        unsafe { self.pre_norm(x, h.pre_ffn_ln, 1)? };
-        self.mlp(h)?;
+        unsafe { self.pre_norm(x, h.pre_ffn_ln, rows)? };
+        self.mlp(h, rows)?;
+        self.br_rows = rows;
         // SAFETY: as above.
-        unsafe { self.branch_add(x, h.post_ffn_ln) }
+        unsafe { self.branch_add(x, h.post_ffn_ln, rows) }
+    }
+
+    /// The contiguous KV-cache slot runs `rows` consecutive positions from `pos` occupy, as
+    /// `(first row, length, first slot)`.
+    ///
+    /// **One or two, never `rows`.** `window_of` gives `slot = pos % ring_cap` on a sliding layer
+    /// and `slot = pos` on a full one, so consecutive positions take consecutive slots and the only
+    /// discontinuity is the ring wrapping — at most once in a chunk, because `PREFILL_CHUNK` is
+    /// smaller than any ring this model builds. Returned rather than assumed, so the K/V
+    /// projections batch per run without the wrap having to be reasoned about at the call site.
+    fn slot_runs(&self, l: usize, pos: usize, rows: usize) -> Vec<(usize, usize, usize)> {
+        let mut runs: Vec<(usize, usize, usize)> = Vec::with_capacity(2);
+        for r in 0..rows {
+            let slot = self.attn_window(l, pos + r).slot;
+            match runs.last_mut() {
+                Some(last) if last.2 + last.1 == slot => last.1 += 1,
+                _ => runs.push((r, 1, slot)),
+            }
+        }
+        runs
     }
 
     /// Look `token` up in the embedding matrix and leave the normed row in `dst`.
@@ -809,7 +964,7 @@ impl Glimmer {
         self.embed(token, x)?;
         for l in 0..self.n_layers {
             let h = Handles::of(self.pin.layer(l)?);
-            self.layer(x, &h, l, pos)?;
+            self.layer(x, &h, l, pos, 1)?;
         }
         Ok(())
     }
@@ -847,10 +1002,13 @@ impl Glimmer {
                 // `GlimmerPin::layer`'s captured-pointer rule satisfied: no other layer is
                 // requested between this capture and the launches that read it.
                 let h = Handles::of(self.pin.layer(l)?);
-                for i in 0..chunk.len() {
-                    // SAFETY: as above.
-                    self.layer(unsafe { xs.add(i * self.hidden) }, &h, l, base + i)?;
-                }
+                // **ONE `layer` call for the whole chunk — the projections see every position at
+                // once.** This was `for i in 0..chunk.len()` until 2026-08-15, and that loop is
+                // where prefill's cost was: at `m = 1` each position re-read the layer's whole
+                // 967.942 MB of weights, so a 256-token chunk read them 256 times. `layer` now
+                // takes a row count and everything pointwise in position batches behind it.
+                // SAFETY: `xs` holds `PREFILL_CHUNK * hidden` f32 and `chunk.len() <= CHUNK`.
+                self.layer(xs, &h, l, base, chunk.len())?;
             }
         }
         Ok(())
@@ -888,6 +1046,7 @@ impl Glimmer {
                 &head,
                 self.logits.ptr() as *mut f32,
                 self.hidden,
+                1,
             )?;
             launch_logit_softcap(
                 self.logits.ptr() as *mut f32,
@@ -1055,7 +1214,18 @@ impl Glimmer {
             self.sampled,
             "no branch yet: no forward has completed on this engine"
         );
-        read_f32(&self.br, self.hidden)
+        // **The LAST row `br` holds, not the first — and the difference only appeared when prefill
+        // batched.** `br` used to carry one position because `layer` ran one position; a batched
+        // chunk fills `br_rows` of it, and the row this accessor is about is the one the per-row
+        // loop would have left behind, which is the last. Reading row 0 instead scored L0's
+        // post-FFN branch **3.008e0** against `glimmer_chain`'s oracle — the first position's
+        // branch compared against the last position's reference, arithmetically unrelated
+        // (2026-08-15).
+        let n = self.br_rows.max(1) * self.hidden;
+        // Through `read_f32` and sliced on the host, rather than a second readback with an offset
+        // — jscpd matched that spelling against `tests/kernel.rs`, and it is right that the
+        // chunks_exact/from_le_bytes tail is one fact this file already owns once.
+        Ok(read_f32(&self.br, n)?[n - self.hidden..].to_vec())
     }
 
     /// Greedy decode: consume `prompt`, then emit until an `eos` or `max_new`.

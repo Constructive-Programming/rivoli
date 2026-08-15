@@ -63,10 +63,21 @@ fn a_full_layer_can_never_be_handed_a_window_without_a_ring() {
                     assert_eq!((w.win, w.ring_cap, w.slot), (0, 0, pos));
                     full += 1;
                 }
-                // A sliding layer's ring is exactly `sliding_window` — the launcher's floor of
-                // `win + tq - 1` at the `tq == 1` this loop decodes at.
+                // **A sliding layer's ring is `win + PREFILL_CHUNK - 1`, not `win`, and the
+                // extra rows are a CORRECTNESS requirement.**
+                //
+                // > This asserted `(WIN, WIN, pos % WIN)` until 2026-08-15, with the argument
+                // > "the launcher's floor of `win + tq - 1` at the `tq == 1` this loop decodes
+                // > at". That floor is about how many positions are LIVE IN THE RING at once, and
+                // > `tq` stopped being the answer when prefill batched: a chunk writes every K and
+                // > V before any of them attends, so at `ring_cap == win` writing position `p+1`
+                // > overwrites the oldest key still inside position `p`'s window. Measured at
+                // > **1.079e0** against `glimmer_chain`'s host reference — a whole magnitude, not
+                // > a tolerance. The launcher's guard never fired, because the attends really are
+                // > still `tq == 1`.
                 LayerKind::SlidingAttention => {
-                    assert_eq!((w.win, w.ring_cap, w.slot), (WIN, WIN, pos % WIN));
+                    let ring = (WIN + rivoli::glimmer_gpu::PREFILL_CHUNK - 1).min(CTX);
+                    assert_eq!((w.win, w.ring_cap, w.slot), (WIN, ring, pos % ring));
                     sliding += 1;
                 }
             }
@@ -151,8 +162,14 @@ fn every_context_yields_a_window_the_launcher_accepts() {
     // is the same attention (`pos >= win` is never true either way, so the kernel's `lo` is 0).
     let short = window_of(LayerKind::SlidingAttention, WIN, 12, 5);
     assert_eq!((short.win, short.ring_cap, short.slot), (12, 12, 5));
+    // The ring carries a chunk's worth of extra rows past the window (see the sweep above), so at
+    // a context long enough to hold them the slot is `pos % (win + CHUNK - 1)`, not `pos % win`.
+    let ring = (WIN + rivoli::glimmer_gpu::PREFILL_CHUNK - 1).min(CTX);
     let long = window_of(LayerKind::SlidingAttention, WIN, CTX, WIN + 3);
-    assert_eq!((long.win, long.ring_cap, long.slot), (WIN, WIN, 3));
+    assert_eq!(
+        (long.win, long.ring_cap, long.slot),
+        (WIN, ring, (WIN + 3) % ring)
+    );
     // And a full layer is untouched by the clamp at either length.
     assert_eq!(window_of(LayerKind::FullAttention, WIN, 12, 5).ring_cap, 0);
 }
