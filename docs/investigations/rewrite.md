@@ -172,7 +172,20 @@ one is no longer expressible. Operands bundled as `PoolCfg`/`Batch`/`RankWindow`
 named methods. INV-5 (ticket-per-descriptor, no residency mask) entered §8b with its
 ported test. Suite green, device arm 60/0.
 
-**Watchdog DROPPED (owner decision, 2026-08-15): legacy functionality, not ported.** The
+**GlmPin landed (a40e4c3): placement authored by `partition()`, executed by the pin.**
+Units = routed experts layer-major; floor = resident footprint + slack + batch slots;
+KV/scratch deliberately 0 (GLM's `--max-mem` has always budgeted weights only — folding
+them in changes the flag's meaning and is owed its own measurement). `.f4` refused as a
+V4 container at the one place GLM's format set is confronted.
+
+**Loop staging (the remaining M4 code, in commit-sized steps, each green before the
+next):** 1. `glm/desc.rs` — expert-descriptor builders, single format. 2. `glm/engine.rs`
+— the engine struct + `new()` (KV slabs, scratch, streams; dense attention only).
+3. `glm/forward.rs` — `Span` + the layer-major schedule + the dense forward pass over
+the ticketed pool. 4. `glm/decode.rs` — argmax, greedy `generate`. DEFERRED with the
+instruments: `Profile` (the old per-phase timer — M4's exit gate is anchor correctness,
+not tok/s; it returns with the first benchmark), checksum-x/pred-probe/stale-sel
+(feature-gated instruments, each behind feature AND flag when they land). The
 old wedge watchdog existed to reap decodes hung by the gpustream bug class the rewrite
 closes structurally (INV-4/INV-6: host-releasable waits — a dead producer cannot hang
 the device). Its one obligation that survives is honesty about trace sinks:

@@ -9,6 +9,11 @@
 //! 72-minute prompt is what a rows retrofit costs — so [`MAXROW`] exists before anything
 //! batches.
 
+mod attn;
+pub mod decode;
+pub mod engine;
+mod forward;
+mod mlp;
 pub mod pin;
 
 /// The most token rows one forward pass may carry. 2 is the MTP verify-pass shape; MTP

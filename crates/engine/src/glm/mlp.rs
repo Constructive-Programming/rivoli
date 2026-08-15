@@ -1,0 +1,386 @@
+//! The GLM MLP sublayer: fp8 SwiGLU on the three dense layers, the routed-expert MoE
+//! (host routing → ticketed pool submit → two-stream launch → fixed-point drain) on
+//! the rest. Ported from `old:src/gpu.rs`'s MoE half; the ticketed-dataflow arguments
+//! travel with their loops.
+
+use super::engine::{GlmEngine, MOE_ACC_ROWS};
+use super::forward::{Pass, XRow};
+use crate::fetch::asyncfetch::Ticket;
+use crate::glm::pin::{Fp8Mlp, Fp8Weight, LayerMlp};
+use crate::routed::{Batch, ExpertSlot, RankWindow, TRACE_WINDOW};
+use anyhow::Result;
+use rivoli_artifact::format::RoutedFmt;
+use rivoli_backend::{
+    ExpertDesc, NULL_STREAM, launch_gemv_f32, launch_gemv_fp8, launch_moe_acc_drain,
+    launch_moe_expert_range, launch_moe_expert_range_i4, launch_swiglu, launch_vadd, stream_signal,
+};
+use rivoli_core::routing::{RoutePolicy, RouteScratch, route_into, topk_into};
+
+/// One MoE dispatch's per-call operands; everything else comes off the engine.
+#[derive(Clone, Copy)]
+struct MoeLaunch {
+    acc: *mut u64,
+    stream: *mut std::ffi::c_void,
+    nrow: usize,
+}
+
+/// Six-pointer descriptor from a resolved slot. One builder for routed and shared
+/// experts; the int4 kernel reinterprets the same bytes at its own slot offsets, which
+/// is why one descriptor type serves both formats.
+fn desc_of(m: &ExpertSlot) -> ExpertDesc {
+    ExpertDesc {
+        gate_indices: m.gate.packed,
+        gate_scales: m.gate.scale as *const u16,
+        up_indices: m.up.packed,
+        up_scales: m.up.scale as *const u16,
+        down_indices: m.down.packed,
+        down_scales: m.down.scale as *const u16,
+    }
+}
+
+/// `&[T]` as little-endian bytes for a device upload (T is plain-old-data here: f32 /
+/// `ExpertDesc`).
+fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: plain-old-data slices reinterpret as bytes; len scales by size_of.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+impl GlmEngine<'_> {
+    /// The dense-layer MLP sublayer: fp8 SwiGLU into `moe_out`, then the residual add.
+    /// Null stream end to end.
+    pub(super) fn dense_sublayer(&mut self, m: Fp8Mlp, pass: Pass, xp: XRow) -> Result<()> {
+        let inter = m.gate.o_dim;
+        let xnp = self.xn.ptr() as *const f32;
+        let gp = self.mlp_g.ptr_mut() as *mut f32;
+        let up = self.mlp_u.ptr_mut() as *mut f32;
+        let outp = self.moe_out.ptr_mut() as *mut f32;
+        let gemv = |x: *const f32, w: Fp8Weight, y: *mut f32| -> Result<()> {
+            // SAFETY: weights resident; x/y live device scratch for nrow rows.
+            unsafe {
+                launch_gemv_fp8(
+                    x, w.packed, w.scale, w.o_dim, w.i_dim, w.block, pass.nrow, y,
+                )
+            }
+        };
+        gemv(xnp, m.gate, gp)?;
+        gemv(xnp, m.up, up)?;
+        // SAFETY: gp/up hold nrow·inter live f32; one elementwise launch over the
+        // contiguous row-minor buffers, in place: h = silu(gate)·up.
+        unsafe { launch_swiglu(gp, up, pass.nrow * inter, gp, NULL_STREAM)? };
+        gemv(gp as *const f32, m.down, outp)?;
+        // SAFETY: xp is nrow rows of live residual; moe_out was fully written above on
+        // the null stream.
+        unsafe { launch_vadd(xp.0, outp as *const f32, pass.nrow * self.cfg.hidden) }
+    }
+
+    /// The MoE sublayer: host routing, pool submit, the ticketed two-stream launch,
+    /// then the drain — which IS the residual add (it converts the fixed-point
+    /// accumulator straight into `x` and resets it, so the conversion costs no extra
+    /// pass; both MoE streams were awaited, so no barrier is needed despite both
+    /// having written `moe_acc`).
+    pub(super) async fn moe_sublayer(&mut self, l: usize, pass: Pass, xp: XRow) -> Result<()> {
+        self.route_layer(l, pass)?;
+        self.moe_layer(l, pass).await?;
+        // SAFETY: xp nrow rows live; moe_acc's writers completed.
+        unsafe {
+            launch_moe_acc_drain(
+                xp.0,
+                self.moe_acc.ptr_mut() as *mut u64,
+                pass.nrow * self.cfg.hidden,
+                MOE_ACC_ROWS,
+                1.0,
+                NULL_STREAM,
+            )
+        }
+    }
+
+    /// Host routing for a MoE layer: gate GEMV, the blocking logits D2H, per-row
+    /// routing, and the UNION build. Row 0's picks come first and in order, so an
+    /// `nrow == 1` pass submits exactly what the unbatched engine submitted. Routing
+    /// is a pure function of (logits, bias, top_k) — it does NOT consult residency
+    /// (INV-1).
+    fn route_layer(&mut self, l: usize, pass: Pass) -> Result<()> {
+        let cfg = self.cfg;
+        let LayerMlp::Moe { gate_w, .. } = self.pin.layers[l].mlp else {
+            anyhow::bail!("route_layer on dense layer {l}")
+        };
+        let (xnp, glp) = (
+            self.xn.ptr() as *const f32,
+            self.gate_logits.ptr_mut() as *mut f32,
+        );
+        // SAFETY: gate_w resident F32; glp device scratch for nrow·n_experts.
+        unsafe {
+            launch_gemv_f32(
+                xnp,
+                gate_w,
+                cfg.n_experts,
+                cfg.hidden,
+                pass.nrow,
+                glp,
+                NULL_STREAM,
+            )?
+        };
+        // The gate-logits D2H is the layer's one blocking join on the host path.
+        self.gate_logits.copy_out_into(&mut self.gl_host)?;
+        // Descending, so `scores`/`choice` are left holding ROW 0 for the trace window
+        // below — the trace measures the router against the real token, and row 0 is
+        // the real token.
+        let ne = cfg.n_experts * 4;
+        let policy = RoutePolicy {
+            top_k: cfg.top_k,
+            scoring: cfg.scoring(),
+        };
+        for r in (0..pass.nrow).rev() {
+            route_into(
+                &self.gl_host[r * ne..(r + 1) * ne],
+                self.pin.moe_bias(l),
+                policy,
+                RouteScratch {
+                    scores: &mut self.scores,
+                    choice: &mut self.choice,
+                    sel: &mut self.sel_row[r],
+                },
+            );
+            self.weigh_row(r);
+        }
+        self.build_union(pass.nrow);
+        // Trace v2 only: re-rank the same `choice` array to the wider candidate window
+        // the offline (J, M) grid needs. Behind the trace gate so a stock decode is
+        // byte-for-byte the work it was.
+        if self.pin.routed.tracing() {
+            topk_into(&self.choice, TRACE_WINDOW, &mut self.window);
+        }
+        Ok(())
+    }
+
+    /// Row `r`'s routed weights: the affinity score BEFORE the bias (the bias steers
+    /// selection only), sum-normalized over THIS row's picks, then scaled. Runs while
+    /// `scores` still belongs to row `r` — the next `route_into` overwrites it.
+    fn weigh_row(&mut self, r: usize) {
+        let wr = &mut self.wrow[r];
+        wr.clear();
+        for &e in &self.sel_row[r] {
+            wr.push(self.scores[e]);
+        }
+        let mut sm: f32 = wr.iter().sum();
+        if self.cfg.norm_topk_prob {
+            sm += 1e-20;
+            for wi in wr.iter_mut() {
+                *wi /= sm;
+            }
+        }
+        for wi in wr.iter_mut() {
+            *wi *= self.cfg.routed_scale as f32;
+        }
+    }
+
+    /// The deduplicated union of every row's picks, row 0's first and in order.
+    fn build_union(&mut self, nrow: usize) {
+        self.union.clear();
+        for r in 0..nrow {
+            for &e in &self.sel_row[r] {
+                if !self.union.contains(&e) {
+                    self.union.push(e);
+                }
+            }
+        }
+    }
+
+    /// The routed pool round: submit the union's cold reads (each selected expert gets
+    /// a ticket — hit → RESIDENT, miss → resolves when its bytes land; the slot
+    /// ADDRESSES are known after submit, so the descriptors are valid pointers), stage
+    /// the batch, launch. The UNION, not one row's picks: every expert any row routed
+    /// to must be resident before the batch launches.
+    async fn moe_layer(&mut self, l: usize, pass: Pass) -> Result<()> {
+        let (out, window, choice, union) =
+            (&mut self.batch_out, &self.window, &self.choice, &self.union);
+        self.pin.routed.submit(
+            Batch {
+                layer: l,
+                sel: union,
+            },
+            RankWindow { window, choice },
+            out,
+        )?;
+        self.stage_batch(l, pass)?;
+        self.launch_moe(pass).await
+    }
+
+    /// Host staging after submit: the `[descriptor][row]` weight matrix, the
+    /// descriptor table (routed + shared), the ticket list, and the two device
+    /// uploads.
+    fn stage_batch(&mut self, l: usize, pass: Pass) -> Result<()> {
+        let nrow = pass.nrow;
+        // Scatter each row's weights into the layout the kernel reads as
+        // `wexpert[e*R + t]`. Driven from the union rather than from each row's picks,
+        // so "this row did not route here" is the natural `None` and leaves the 0.0
+        // the resize put there — the kernel SKIPS a zero weight rather than
+        // multiplying by it (`0 * dv` with a non-finite `dv` is NaN, which the
+        // fixed-point clamp would turn into a finite extreme). That skip is what makes
+        // row 0 of a batched pass bit-identical to an unbatched one.
+        self.w.clear();
+        self.w.resize(self.union.len() * nrow, 0.0);
+        for (u, &e) in self.union.iter().enumerate() {
+            for r in 0..nrow {
+                if let Some(i) = self.sel_row[r].iter().position(|&x| x == e) {
+                    self.w[u * nrow + r] = self.wrow[r][i];
+                }
+            }
+        }
+        self.descs.clear();
+        for m in &self.batch_out.slots {
+            self.descs.push(desc_of(m));
+        }
+        self.tickets.clear();
+        self.tickets.extend_from_slice(&self.batch_out.tickets);
+        let LayerMlp::Moe { shared, .. } = self.pin.layers[l].mlp else {
+            anyhow::bail!("stage_batch on dense layer {l}")
+        };
+        self.descs.push(desc_of(&shared));
+        // Weight 1.0 for EVERY row: the shared expert is unconditional. It is in the
+        // RESIDENT tier, never streamed, so its dependency is already satisfied — but
+        // it must still grow `tickets` with `descs`, or the launch loop indexes past
+        // the end (it did once in the old tree: "len is 8 but the index is 8").
+        self.w.extend(std::iter::repeat_n(1.0, nrow));
+        self.tickets.push(Ticket::RESIDENT);
+        self.descs_buf.copy_in_at(0, as_le_bytes(&self.descs))?;
+        self.wexpert_buf.copy_in_at(0, as_le_bytes(&self.w))?;
+        Ok(())
+    }
+
+    /// TICKETED DATAFLOW. Every expert is enqueued behind a DEVICE-SIDE wait on its
+    /// own data, with no branch on residency and no host round trip — resident,
+    /// missing and in-flight take the same path (a resident expert carries
+    /// `Ticket::RESIDENT`, value 0, satisfied on arrival). The wait is enqueued BEFORE
+    /// the producer has run, which is what `hipStreamWaitEvent` cannot do and
+    /// `hipStreamWaitValue64` can (INV-4). Do not "simplify" this to events.
+    ///
+    /// ORDER MATTERS, and getting it wrong cost 20% in the old tree: the compute
+    /// stream is FIFO, so enqueueing in `sel` order puts every resident expert BEHIND
+    /// the first miss's wait, and nothing computes while that fetch is in flight —
+    /// which is the overlap the whole engine is built on. So residents go first
+    /// (batched into maximal runs), misses after ON THE MISS STREAM (their waits then
+    /// start at the top of the layer, and the GPU's wake latency is absorbed by the
+    /// resident compute running beside it — measured +382 µs per layer-with-misses
+    /// when the compute stream carried them). Reordering LAUNCHES is safe by
+    /// construction: each expert accumulates into fixed-point atomically, and integer
+    /// addition is associative — the two-stream split is a contention fix, not a
+    /// correctness one.
+    ///
+    /// This branches on `ticket.is_resident()`, and that is NOT the old `hit` mask
+    /// coming back: the mask decided whether to WAIT (a wrong bit read unwritten
+    /// memory, silently); this decides only the ORDER of launches that each enqueue
+    /// their wait unconditionally. A wrong bit costs throughput and cannot cost
+    /// correctness.
+    async fn launch_moe(&mut self, pass: Pass) -> Result<()> {
+        let ndesc = self.descs.len();
+        debug_assert_eq!(
+            self.tickets.len(),
+            ndesc,
+            "every descriptor needs a ticket (routed picks + the shared expert)"
+        );
+        let acc = self.moe_acc.ptr_mut() as *mut u64;
+        // The miss stream's accumulator block — see `moe_acc`'s layout doc.
+        // SAFETY: `moe_acc` is MOE_ACC_ROWS·MAXROW·hidden u64; this is block 1, in
+        // bounds for nrow ≤ MAXROW.
+        let acc_miss = unsafe { acc.add(pass.nrow * self.cfg.hidden) };
+        let (cs_raw, ms_raw) = (self.compute_stream.raw(), self.miss_stream.raw());
+        self.launch_residents(MoeLaunch {
+            acc,
+            stream: cs_raw,
+            nrow: pass.nrow,
+        })?;
+        self.launch_misses(MoeLaunch {
+            acc: acc_miss,
+            stream: ms_raw,
+            nrow: pass.nrow,
+        })?;
+        // BOTH streams, because neither waits for the other: with a fixed-point
+        // accumulator nothing between them needs ordering, and the only consumer of
+        // all experts (the drain) runs after this returns.
+        stream_signal(cs_raw)?.await;
+        stream_signal(ms_raw)?.await;
+        Ok(())
+    }
+
+    /// Residents, batched into maximal runs. A hit's ticket is already resolved, so
+    /// awaiting before launching buys nothing and costs the GPU an idle gap (~7 of 9
+    /// experts per layer at the measured ~76% hit rate). The wait is enqueued anyway
+    /// rather than skipped: `wait_on` is the only way to consume a ticket, a resident
+    /// one short-circuits on value 0, and the unconditional call is what makes "every
+    /// launch is behind its dependency" true by reading the code rather than trusting
+    /// this loop's classification.
+    fn launch_residents(&mut self, ml: MoeLaunch) -> Result<()> {
+        let ndesc = self.descs.len();
+        let mut i = 0usize;
+        while i < ndesc {
+            if !self.tickets[i].is_resident() {
+                i += 1;
+                continue;
+            }
+            let j = (i..ndesc)
+                .find(|&k| !self.tickets[k].is_resident())
+                .unwrap_or(ndesc);
+            for k in i..j {
+                self.pin.routed.wait_on(self.tickets[k], ml.stream)?;
+            }
+            // SAFETY: descs/codebooks resident; every expert in [i, j) has its
+            // dependency enqueued above; scratch live; the stream is live.
+            unsafe { self.expert_range(i..j, ml)? };
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// The misses, one wait + one launch each, on the miss stream.
+    fn launch_misses(&mut self, ml: MoeLaunch) -> Result<()> {
+        for e in 0..self.descs.len() {
+            if self.tickets[e].is_resident() {
+                continue;
+            }
+            self.pin.routed.wait_on(self.tickets[e], ml.stream)?;
+            // SAFETY: as in `launch_residents`; this expert's bytes are gated by the
+            // wait just enqueued on the same stream.
+            unsafe { self.expert_range(e..e + 1, ml)? };
+        }
+        Ok(())
+    }
+
+    /// Enqueue the `experts` slice of the descriptor table in the run's ONE format.
+    /// The int4 kernel reinterprets the same descriptor bytes at its own slot offsets,
+    /// which is why one descriptor buffer serves both formats; `.f4` needs a different
+    /// descriptor type and is refused (spelled out so a fourth variant cannot fall
+    /// through a `_`).
+    ///
+    /// # Safety
+    /// `descs_buf`/codebooks resident; scratch live; `ml.stream` live; every expert in
+    /// `experts` already gated by a wait enqueued on `ml.stream`.
+    unsafe fn expert_range(&self, experts: std::ops::Range<usize>, ml: MoeLaunch) -> Result<()> {
+        let (x, h, acc) = (
+            self.xn.ptr() as *const f32,
+            self.moe_h.ptr() as *mut f32,
+            ml.acc,
+        );
+        let descs = self.descs_buf.ptr() as *const ExpertDesc;
+        let wexpert = self.wexpert_buf.ptr() as *const f32;
+        let (hidden, inter) = (self.cfg.hidden, self.cfg.moe_inter);
+        let [cb0, cb1, cb2] = self.codebooks;
+        let (e_start, e_count) = (experts.start, experts.len());
+        // SAFETY: forwarded verbatim from this function's own contract.
+        unsafe {
+            match self.fmt {
+                RoutedFmt::I4 => launch_moe_expert_range_i4(
+                    x, hidden, inter, e_start, e_count, descs, wexpert, h, acc, ml.nrow, ml.stream,
+                ),
+                RoutedFmt::Vq3 => launch_moe_expert_range(
+                    x, hidden, inter, e_start, e_count, descs, cb0, cb1, cb2, wexpert, h, acc,
+                    ml.nrow, ml.stream,
+                ),
+                RoutedFmt::F4 => anyhow::bail!(
+                    "an .f4 expert reached GLM's MoE dispatch — it needs ExpertDescF4 and \
+                     launch_moe_expert_range_f4, not this descriptor"
+                ),
+            }
+        }
+    }
+}
