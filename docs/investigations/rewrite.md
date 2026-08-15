@@ -148,15 +148,13 @@ exists.
    (layer-major prefill is a Span iteration, not a second engine; rows batching is not a
    retrofit — Glimmer's 72-minute prompt is the cautionary number).
 
-**Open design questions for the owner (the reason this note precedes the code):**
-- Q1: Does the M4 loop take hybrid mode at all, or int3-vq/int4 single-format only until
-  the format-follows-identity redesign (the plan's FormatPlan) lands? Proposal: single-
-  format only at M4; hybrid returns as FormatPlan with its own INV re-armed.
-- Q2: `--attn` modes at M4: dense + dsa only (streaming/misa follow), or all four?
-  Proposal: dense + dsa (the anchor pins dsa; streaming/misa have no anchor evidence yet).
-- Q3: MTP/speculative decode: defer entirely to post-parity (M5+)? Proposal: yes — the
-  verify pass rides the Rows dimension, which is designed in from the start, so nothing
-  is foreclosed.
+**Design questions ANSWERED by the owner, 2026-08-15 ~17:30:**
+- Q1: **Single format first.** int3-vq/int4 only at M4; hybrid returns as FormatPlan
+  with its own INV re-armed.
+- Q2: **`--attn dense` first.** Dense only at M4 — dsa follows it (the anchor pins dsa,
+  so dsa is the first post-dense increment), streaming/misa after.
+- Q3: **MTP deferred** past parity (M5+). The verify pass rides the Rows dimension,
+  designed in from the start, so nothing is foreclosed.
 
 M4's exit gate (unchanged from the plan): anchor decode gate green at the pre-measured
 tolerance; INV-1 red-proofed live; release.yml on.
