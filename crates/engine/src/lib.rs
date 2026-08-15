@@ -11,4 +11,5 @@
 #[cfg(feature = "rocm")]
 pub mod device;
 pub mod fetch;
+pub mod indexer;
 pub mod telemetry;
