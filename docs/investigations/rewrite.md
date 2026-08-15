@@ -122,7 +122,7 @@ dropped: cross-checking the ported oracle tolerances against the anchor-derived 
 (the ported suites carry the old tree's own measured tolerances, so the port is not
 ungated — the floors are the second witness).
 
-## M4 — the GLM decode loop: design note BEFORE code (drafted 2026-08-15, awaiting owner)
+## M4 — the GLM decode loop (CLOSED 2026-08-15; design note below, evidence at the end)
 
 The loop rewrite is the heart of this whole effort and the first piece with real design
 freedom — everything until now was gates, anchors, and ports. Written down before any
@@ -189,7 +189,27 @@ satisfies — so M4's end-to-end evidence is this real decode plus the old-engin
 comparison (the M5 parity primary, pulled forward as a smoke): same ids through the
 reference at the pinned SHA, compared with `--ids-out`.
 
-**Loop staging (the remaining M4 code, in commit-sized steps, each green before the
+**M4 EXIT EVIDENCE (2026-08-15), with the one substitution argued above** (the tiny
+anchor cannot drive the fp8-KV device engine, so the end-to-end gate is the first real
+decode against the pinned reference):
+
+- **Token parity with the reference.** Old engine at the pin (built detached at
+  `6b7f496e`, its own target dir), `--mode int3-vq --attn dense --no-mtp --max-mem 100
+  --prompt "Hi"`: prompt ids `[154822, 154824, 154827, 13041, 154828, 154841, 154842]`
+  → `[13041, 1052, 0, 358]` ("Hi there! I"). The rewrite on the SAME ids, dev profile,
+  every `debug_assert!` live: **identical, token for token.**
+- **INV-1 live (P4).** Same decode at `--max-mem 60` (3052 resident experts vs 5853,
+  43.8 vs 83.8 GiB pool): **identical ids.** Residency moved bytes, never text. The id
+  comparison can go red — the earlier different-prompt run's `[17351, 198, 40, 2776]`
+  mismatches it — and the weight-perturbation red-proof is M5's, where the parity gate
+  becomes a scripted test over longer runs rather than a hand-driven smoke.
+- **release.yml** landed at M0 (self-hosted rocm+gfx1151 runner, tag-gated).
+
+Deliberately OUT of M4, each with its recorded owner decision: MTP (deferred past
+parity), dsa/misa (first post-dense increment), tokenizer + `enum Engine` + serve
+(M6 with the CLI), hybrid (returns as `FormatPlan`), `Profile` (first benchmark).
+
+**Loop staging (the M4 code as landed, in commit-sized steps, each green before the
 next):** 1. `glm/desc.rs` — expert-descriptor builders, single format. 2. `glm/engine.rs`
 — the engine struct + `new()` (KV slabs, scratch, streams; dense attention only).
 3. `glm/forward.rs` — `Span` + the layer-major schedule + the dense forward pass over
