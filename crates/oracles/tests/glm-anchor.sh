@@ -37,6 +37,11 @@ import sys; sys.path.insert(0, '$TESTS')
 from glm_anchor_driver import DEFECTS as d
 print('\n'.join(sorted(k for k in d if k != 'None')))")
 
+# Anti-vacuity: mapfile hides the producer's exit status from set -e, so an import
+# error would otherwise yield an empty list and a vacuous "all reddened" (review
+# 2026-08-15 — the guard was accidental before, now it is designed).
+[ "${#DEFECTS[@]}" -ge 10 ] || { echo "derived only ${#DEFECTS[@]} defects — the driver import failed"; exit 1; }
+
 SALTS=(glm-anchor-1 glm-anchor-2)
 
 mkdir -p "$OUT"

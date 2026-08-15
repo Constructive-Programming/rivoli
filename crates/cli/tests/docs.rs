@@ -156,9 +156,10 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
         if f.ends_with("TOUR.md") {
             continue;
         }
-        if !index_norm.contains(&norm(&verdict)) {
-            mismatched.push(format!("{f}\n      front matter: {verdict}"));
-        }
+        // Row-scoped when the doc HAS a row: the whole-index fallback let one doc's
+        // stale verdict be satisfied by another doc's row text (review 2026-08-15 —
+        // the same one-doc's-cell hazard the scope check below already guards).
+        // The fallback remains only for prose-linked docs, which have no row to scope to.
         // The scope is a table cell (`| glm |`), matched on the doc's own index row so one
         // doc's cell cannot satisfy another doc's check. Rows are collected, not `find`-ed:
         // a doc with TWO rows is how a stale verdict survives — the old tree's k3-port.md
@@ -176,7 +177,14 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
             .filter(|l| {
                 l.split_once("](")
                     .and_then(|(_, rest)| rest.split_once(')'))
-                    .is_some_and(|(target, _)| f.ends_with(target.trim_start_matches("../")))
+                    // EXACT path match, not a suffix: `docs/measurement/glm-reference/
+                    // anchor.md` ends_with `reference/anchor.md`, so a suffix rule would
+                    // let a future `docs/reference/anchor.md` row adopt every
+                    // `*-reference/anchor.md` doc (review 2026-08-15). Targets are
+                    // relative to docs/00-orientation/.
+                    .is_some_and(|(target, _)| {
+                        f.strip_prefix("docs/") == Some(target.trim_start_matches("../"))
+                    })
             })
             .collect();
         assert!(
@@ -187,6 +195,18 @@ fn the_index_lists_every_doc_with_a_matching_verdict() {
             rows.len()
         );
         let row = rows.first().copied();
+        // The verdict must agree with THE DOC'S OWN ROW when one exists — the old
+        // whole-index `contains` let one doc's stale verdict be satisfied by another
+        // doc's row text (review 2026-08-15; the same one-doc's-cell hazard the scope
+        // arm below guards). Prose-linked docs keep the whole-index fallback: they have
+        // no row to scope to.
+        let ok = match row {
+            Some(r) => norm(r).contains(&norm(&verdict)),
+            None => index_norm.contains(&norm(&verdict)),
+        };
+        if !ok {
+            mismatched.push(format!("{f}\n      front matter: {verdict}"));
+        }
         // A check that LOCATES its input by matching text has three outcomes, not two:
         // right, wrong, and ABSENT — and absent must not fall out as a silent skip. A doc
         // linked only from prose passes the `linked` test above, matches no table row, and

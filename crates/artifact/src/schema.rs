@@ -34,9 +34,6 @@ use anyhow::{Context, Result, ensure};
 /// to the architecture this engine happens to run today: an artifact whose architecture we
 /// cannot name is one whose decode path we cannot choose, and choosing anyway is the exact
 /// failure this port is built to avoid — it does not crash, it produces fluent wrong text.
-fn arch_of(cfg: &serde_json::Value) -> Result<Arch> {
-    arch_of_named(cfg).map(|(a, _)| a)
-}
 
 /// [`arch_of`], also returning the config string it resolved — so a refusal can quote the
 /// file rather than only the enum variant.
@@ -83,19 +80,9 @@ fn config_path(dir: &str) -> String {
     }
 }
 
-/// The architecture `dir`'s artifact declares — the one discriminant, read from the one
-/// file.
-///
-/// No caller in this tree yet. It exists for the multi-model branch's `--help` rendering,
-/// which re-renders against the artifact's architecture; it is here rather than there so
-/// that the manifest is parsed in exactly one place. Today the live consumers of the
-/// discriminant are [`parse_config`]'s refusals.
-pub fn arch_of_artifact(dir: &str) -> Result<Arch> {
-    let path = config_path(dir);
-    let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-    let doc: serde_json::Value = serde_json::from_str(&text)?;
-    arch_of(&doc).with_context(|| format!("parse {path}"))
-}
+// (`arch_of_artifact` — the one-call sniffing entry `Engine::open` will use — returns
+// with its caller at M4; a pub fn with no caller is the shape this file already deleted
+// twice. `arch_of_named` below is the whole mechanism.)
 
 /// A config schema that describes exactly one architecture.
 ///

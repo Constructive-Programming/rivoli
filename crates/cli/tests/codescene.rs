@@ -24,9 +24,9 @@
 //! `tests/codescene-redproof/` must score BELOW 10, so "cs silently started scoring
 //! everything 10" is a failure, not a pass.
 //!
-//! Exemptions: `EXEMPT` below, argued in place, checked at both ends like the kernel
-//! census — a row whose file scores 10 anyway is suppressing nothing and must be deleted
-//! (a stale exemption is a hole in the gate).
+//! Exemptions: none yet, deliberately — see the note at the top of the file body. The
+//! argued-in-place, checked-at-both-ends machinery returns WITH the first real row and
+//! its red-proof; shipping it never-red was itself a P7 violation (review 2026-08-15).
 
 #![allow(clippy::expect_used)] // meta-gate: a broken harness should panic loudly
 
@@ -35,11 +35,11 @@ use std::process::{Command, Stdio};
 
 mod common;
 
-/// (repo-relative path, cs issue-category substring, argument). Empty on purpose — the
-/// tree starts clean. A future row must name the category `cs review` reports and carry
-/// the argument for why the code is right anyway; the checks below fail on a row whose
-/// file is gone, whose category is no longer reported, or whose file scores 10 without it.
-const EXEMPT: &[(&str, &str, &str)] = &[];
+// Exemptions: none. The both-ends checking machinery (category match via `cs check`,
+// file-exists sweep) was CUT in review 2026-08-15 as an arm that had never once been red
+// — against P7 — and reviewers found it would misclassify an unlicensed `cs check` as
+// "stale exemption, delete the row". It returns WITH the first real exemption, plus the
+// red-proof that arms it.
 
 /// One `cs review` outcome, classified by output.
 enum Cs {
@@ -95,8 +95,9 @@ fn trunc(s: &str) -> String {
     s.lines().next().unwrap_or("").chars().take(120).collect()
 }
 
-/// Skip-or-panic on a tool that did not run, per the absent policy above.
-fn tool_absent(context: &str, detail: &str) -> bool {
+/// Skip-or-panic on a tool that did not run, per the absent policy above. Returns only
+/// in skip mode; the caller's next statement is its `return`.
+fn tool_absent(context: &str, detail: &str) {
     if std::env::var_os("RIVOLI_CS_REQUIRED").is_some() {
         panic!("CodeScene gate REQUIRED but cs did not run ({context}): {detail}");
     }
@@ -104,7 +105,6 @@ fn tool_absent(context: &str, detail: &str) -> bool {
         "CodeScene gate DID NOT RUN ({context}): {detail}\n\
          code health is UNCHECKED this run. Export CS_ACCESS_TOKEN to arm it."
     );
-    true
 }
 
 /// Cache keying: FNV-1a of contents + cs version, hash owned by `rivoli_core::hash` (this
@@ -113,7 +113,11 @@ fn tool_absent(context: &str, detail: &str) -> bool {
 use rivoli_core::hash::fnv1a;
 
 fn cache_path() -> PathBuf {
-    // The workspace redirects target-dir via .cargo/config.toml; honour it.
+    // CARGO_TARGET_DIR when the environment sets one (this box's profile does — and an
+    // env var OVERRIDES .cargo/config.toml's target-dir, so reading the config would be
+    // wrong twice); otherwise the workspace-local target/. Review 2026-08-15: the first
+    // comment here claimed the config file was honoured — it never was, and cargo does
+    // not export the config's value to test processes.
     std::env::var_os("CARGO_TARGET_DIR")
         .map_or_else(|| common::repo_root().join("target"), PathBuf::from)
         .join("codescene-cache.json")
@@ -141,10 +145,8 @@ fn every_workspace_rust_file_scores_ten() {
     );
 
     let Some(version) = cs_version() else {
-        if tool_absent("cs version", "binary not on PATH or not executable") {
-            return;
-        }
-        unreachable!("tool_absent panics under RIVOLI_CS_REQUIRED");
+        tool_absent("cs version", "binary not on PATH or not executable");
+        return;
     };
 
     let cache_file = cache_path();
@@ -180,20 +182,7 @@ fn every_workspace_rust_file_scores_ten() {
             }
             Cs::Score(s) => {
                 reviewed += 1;
-                let exempt = EXEMPT.iter().find(|(p, _, _)| *p == rel);
-                match exempt {
-                    Some((_, cat, why)) => {
-                        // Both ends: the exemption must still be suppressing THIS category.
-                        let detail = review_issues(&rel, &root);
-                        assert!(
-                            detail.contains(cat),
-                            "{rel} is exempt for `{cat}` but cs no longer reports that \
-                             category (now: {detail}). Stale exemption = hole in the gate; \
-                             delete the row. (argument was: {why})"
-                        );
-                    }
-                    None => failures.push(format!("{rel}: score {s}")),
-                }
+                failures.push(format!("{rel}: score {s}"));
             }
             Cs::NoScorableCode => {
                 // A stub is fine; a real file scoring null means cs skipped something big.
@@ -207,18 +196,10 @@ fn every_workspace_rust_file_scores_ten() {
                 cache.insert(rel, hash.into());
             }
             Cs::Absent(d) => {
-                if tool_absent(&rel, &d) {
-                    return;
-                }
+                tool_absent(&rel, &d);
+                return;
             }
         }
-    }
-    // Exempt rows must point at living files (the other end of the both-ends check).
-    for (p, _, _) in EXEMPT {
-        assert!(
-            root.join(p).is_file(),
-            "EXEMPT row names `{p}`, which does not exist. Delete the row."
-        );
     }
     let _ = std::fs::create_dir_all(cache_file.parent().unwrap_or(Path::new(".")));
     let _ = std::fs::write(
@@ -238,23 +219,6 @@ fn every_workspace_rust_file_scores_ten() {
          ends and dies when stale.",
         failures.join("\n  ")
     );
-}
-
-/// The lint-style issue list for a file, for exemption-category matching.
-fn review_issues(rel: &str, root: &Path) -> String {
-    Command::new("cs")
-        .env("CS_DISABLE_VERSION_CHECK", "1")
-        .current_dir(root)
-        .args(["check", rel])
-        .output()
-        .map(|o| {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            )
-        })
-        .unwrap_or_default()
 }
 
 /// The standing red-proof: a vendored, deliberately unhealthy file must score BELOW 10.
@@ -277,8 +241,6 @@ fn the_red_proof_fixture_scores_below_ten() {
             "cs found no scorable code in the red-proof fixture — it is not reviewing \
              what it is handed"
         ),
-        Cs::Absent(d) => {
-            let _ = tool_absent("red-proof fixture", &d);
-        }
+        Cs::Absent(d) => tool_absent("red-proof fixture", &d),
     }
 }

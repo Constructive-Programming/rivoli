@@ -58,10 +58,30 @@ fn the_feature_matrix_lists_match_the_manifests() {
     // Anti-vacuity: the parse found a real feature set, not an empty table.
     assert!(!declared.is_empty(), "no non-backend features parsed");
 
-    // BACKENDS must equal the backend crate's feature list (one entry today; the knob is
-    // what a second backend would want back).
-    let backends = sh_array(&script, "BACKENDS");
-    assert_eq!(backends, ["rocm"], "BACKENDS drifted from the one backend");
+    // BACKENDS must equal the backend crate's declared features — parsed from the
+    // manifest like the OPTIONAL half, not pinned to a literal (review 2026-08-15: the
+    // literal made the header's "match what the manifests declare" claim false).
+    let backend = std::fs::read_to_string(root.join("crates/backend/Cargo.toml"))
+        .expect("backend Cargo.toml");
+    let bfeats = backend
+        .split("[features]")
+        .nth(1)
+        .expect("backend [features]")
+        .split("\n[")
+        .next()
+        .expect("features table body");
+    let mut declared_backends: Vec<String> = bfeats
+        .lines()
+        .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim().to_string()))
+        .filter(|k| !k.starts_with('#'))
+        .collect();
+    declared_backends.sort();
+    let mut backends = sh_array(&script, "BACKENDS");
+    backends.sort();
+    assert_eq!(
+        backends, declared_backends,
+        "BACKENDS drifted from crates/backend/Cargo.toml's [features]"
+    );
 
     // The cli must forward every engine feature it names — a forward missing here makes a
     // matrix cell silently vacuous (the feature resolves but gates nothing).

@@ -54,7 +54,15 @@ jobs:
       # The deviceless feature union — the E0609-rot class's only watcher: `mod otlp` sat
       # broken for weeks in the old tree because no prescribed command compiled it.
       - run: cargo clippy -p rivoli --release --locked --features otlp,teacher-forcing,pred-probe,trace,stale-sel --all-targets
-      - run: cargo test --workspace --release --locked
+      # DEV profile deliberately (this tree's own rule: a run that is not timing
+      # something is a dev-profile run — release compiles out every debug_assert!, so a
+      # release-only CI never executes them; review 2026-08-15). Clippy above keeps the
+      # release arm honest for the code the profile changes.
+      - run: cargo test --workspace --locked
+        env:
+          # Hard-fail the CodeScene gate exactly when the license secret exists; without
+          # it the gate warns-and-skips and the warning step below says so.
+          RIVOLI_CS_REQUIRED: ${{ secrets.CS_ACCESS_TOKEN != '' && '1' || '' }}
       - name: CodeScene gate
         # Hard once the CS_ACCESS_TOKEN secret is configured; loud no-op until then.
         # The test itself classifies tool-absence by output, and RIVOLI_CS_REQUIRED turns
@@ -65,6 +73,6 @@ jobs:
           if [ -z "$CS_ACCESS_TOKEN" ]; then
             echo "::warning::CS_ACCESS_TOKEN secret not configured — CodeScene gate ran in warn-and-skip mode. Add the secret and a cs install step to arm it (owner action)."
           else
-            echo "TODO(owner): install the cs CLI here, then: RIVOLI_CS_REQUIRED=1 cargo test --workspace --release --locked --test codescene"
+            echo "::error::CS_ACCESS_TOKEN is configured but no cs install step exists yet — the test step above already ran REQUIRED and failed on absence; write the install step (owner action)."
             exit 1
           fi

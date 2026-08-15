@@ -13,7 +13,6 @@
 //! because two places that can independently judge a configuration is the silent-wrong
 //! hazard the old file itself warned about.
 /// The architectures the engine has a decode path for. Parsed from the artifact manifest's
-/// The architectures the engine has a decode path for. Parsed from the artifact manifest's
 /// `architectures` / `model_type`; an unrecognised value must REFUSE at startup rather than
 /// fall back to a default. Falling back to GLM is the specific mistake worth naming: it is
 /// the only value that would look like it worked.

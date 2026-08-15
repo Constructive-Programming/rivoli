@@ -9,66 +9,23 @@
 /// The `repr(C)` mirror of `kernels/kvcompress.hip`'s `CompGeom`, and the only part of the
 /// compressor's geometry that crosses the ABI wall.
 ///
-/// Fields are PRIVATE and [`CompGeom::new`] is the only way in, because three of the six
-/// integers are derived and a caller that computed one from a stale `coff` gets a kernel
-/// that reads the right shape at the wrong stride — `ape`'s row stride is `cd`, and at
-/// ratio 4 that is 1024 while at ratio 128 it is 512. Handing the kernel six loose `i32`s
-/// would make every one of those positions plausible in the others.
-///
-/// In the old tree the engine's `Geom` was the one construction site, enforced by module
-/// privacy; across the crate boundary that enforcement is down to `new` being awkward
-/// enough that nobody calls it casually, plus the run-time `compress_guard` (catches a
-/// REORDER of the six ints) and the layout assert below (catches a width/count drift).
-/// When the compressor module arrives (M8), it re-earns sole-producer status there.
+/// Fields are PUBLIC, and that is a reviewed retreat, not an oversight: the old tree
+/// enforced "only `Geom` constructs this" with module privacy, which a crate boundary
+/// cannot express — a 7-arg field-order constructor is exactly as transposable as the
+/// fields themselves (review 2026-08-15), so the ~45 lines of getters bought nothing.
+/// What actually guards the layout is the compile-time assert below plus the kernel's
+/// run-time `compress_guard`; what guards DERIVATION is the M8 rule that the engine's
+/// `Geom` is the sole producer.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct CompGeom {
-    ratio: i32,
-    coff: i32,
-    d: i32,
-    cd: i32,
-    ents: i32,
-    rd: i32,
-    eps: f32,
-}
-
-impl CompGeom {
-    /// The one way in. Argument order is the C struct's field order on purpose — a caller
-    /// building this is transcribing the kernel's declaration, not composing free values.
-    #[allow(clippy::too_many_arguments)] // it mirrors a seven-field C struct, one arg per field
-    pub const fn new(ratio: i32, coff: i32, d: i32, cd: i32, ents: i32, rd: i32, eps: f32) -> Self {
-        CompGeom {
-            ratio,
-            coff,
-            d,
-            cd,
-            ents,
-            rd,
-            eps,
-        }
-    }
-
-    pub const fn ratio(&self) -> i32 {
-        self.ratio
-    }
-    pub const fn coff(&self) -> i32 {
-        self.coff
-    }
-    pub const fn d(&self) -> i32 {
-        self.d
-    }
-    pub const fn cd(&self) -> i32 {
-        self.cd
-    }
-    pub const fn ents(&self) -> i32 {
-        self.ents
-    }
-    pub const fn rd(&self) -> i32 {
-        self.rd
-    }
-    pub const fn eps(&self) -> f32 {
-        self.eps
-    }
+    pub ratio: i32,
+    pub coff: i32,
+    pub d: i32,
+    pub cd: i32,
+    pub ents: i32,
+    pub rd: i32,
+    pub eps: f32,
 }
 
 // The `repr(C)` mirror, pinned at compile time. The run-time `compress_guard` already

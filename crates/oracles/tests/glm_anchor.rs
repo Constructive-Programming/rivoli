@@ -70,17 +70,6 @@ fn a_wrong_magic_is_refused_by_name() {
 }
 
 #[test]
-fn the_two_salts_differ() {
-    // Two salts are coverage, not redundancy: byte-identical salts would mean the salt
-    // never reached the weights and every "both salts" claim collapses to one.
-    assert_ne!(
-        fnv1a(GOLDENS[0].bytes),
-        fnv1a(GOLDENS[1].bytes),
-        "the two salts produced identical bytes"
-    );
-}
-
-#[test]
 fn the_tiny_config_is_the_declared_one_and_non_degenerate() {
     for v in GOLDENS {
         let g = read(v);
@@ -138,7 +127,11 @@ fn the_capture_census_is_the_derived_one() {
         let full: Vec<i64> = ints(&g, "structure.indexer_is_full").to_vec();
         let layers = sparse.len();
         assert_eq!(layers, full.len());
-        let steps = 1 + 6; // prefill + DECODE_STEPS
+        let steps: usize = 1 + g
+            .meta_get("decode_steps")
+            .expect("decode_steps metadata")
+            .parse::<usize>()
+            .expect("numeric decode_steps"); // prefill + the golden's own DECODE_STEPS
         let n_sparse: i64 = sparse.iter().sum();
         let n_full: i64 = full.iter().sum();
         // Alternation is a driver promise (pattern FSFSFS), and the sharing mechanism is

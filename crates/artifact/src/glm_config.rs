@@ -74,13 +74,14 @@ pub struct ModelConfig {
     #[serde(rename = "vocab_size")]
     pub vocab: usize,
     pub rms_norm_eps: f64,
-    /// GLM-5.2 nests theta; the DeepSeek/Llama lineage puts `rope_theta` at top
-    /// level. Accept either — this is the first thing that fails on a non-GLM
-    /// config, before any dimension is even looked at.
-    #[serde(rename = "rope_parameters", default)]
-    rope: Option<RopeParameters>,
-    #[serde(rename = "rope_theta", default)]
-    rope_theta_flat: Option<f64>,
+    /// GLM-5.2 nests theta under `rope_parameters` — REQUIRED, not optional-with-
+    /// fallback. The old tree accepted a flat top-level `rope_theta` too, arguing "first
+    /// thing that fails on a non-GLM config"; that rationale predates this tree's design
+    /// (review 2026-08-15): `parse_config` refuses non-GLM architectures BEFORE serde
+    /// reads a dimension, so a DeepSeek config never reaches this struct — and the real
+    /// checkpoint carries only the nested form (verified against glm52-fp8's config).
+    #[serde(rename = "rope_parameters")]
+    rope: RopeParameters,
 }
 
 impl ArchConfig for ModelConfig {
@@ -90,6 +91,11 @@ impl ArchConfig for ModelConfig {
     /// here with a clear message rather than as an out-of-bounds panic deep in
     /// the decode loop.
     fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.n_layers > 0,
+            "num_hidden_layers is 0 — an empty model validates nothing and panics later \
+             (review 2026-08-15: indexer_layout indexes [0] after a length check that 0 == 0 passes)"
+        );
         if self.dense_layers > self.n_layers {
             anyhow::bail!(
                 "dense_layers {} > n_layers {}",
@@ -119,12 +125,6 @@ impl ArchConfig for ModelConfig {
             Some(other) => anyhow::bail!(
                 "unsupported scoring_func {other:?} — implemented: sigmoid, sqrtsoftplus"
             ),
-        }
-        if self.rope_theta() == 0.0 {
-            anyhow::bail!(
-                "no rope_theta: expected either a nested `rope_parameters.rope_theta` \
-                 (GLM-5.2) or a top-level `rope_theta` (DeepSeek/Llama lineage)"
-            );
         }
         // VQ_GROUP=64 is a multiple of the 8 the 12-bit packing needs, so this one check
         // covers the indices too. GLM-5.2: 6144, 2048 — both clean.
@@ -170,12 +170,7 @@ impl ModelConfig {
     }
 
     pub fn rope_theta(&self) -> f64 {
-        // `validate` has already established one of the two is present.
-        self.rope
-            .as_ref()
-            .map(|r| r.rope_theta)
-            .or(self.rope_theta_flat)
-            .unwrap_or(0.0)
+        self.rope.rope_theta
     }
 
     /// Validate the indexer config for the dsa/misa attention modes and return

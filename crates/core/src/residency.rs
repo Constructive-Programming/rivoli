@@ -21,7 +21,7 @@ pub struct UnitId(pub u32);
 
 /// A byte count. A newtype because the old tree passed bare `usize` byte counts beside
 /// element counts and slot indices, and one transposition survived review.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Bytes(pub u64);
 
 /// One placeable unit: an identity and a size. Sizes are nonzero by construction — a
@@ -36,7 +36,7 @@ pub struct Unit {
 /// pays whether or not a single unit is resident: the always-resident set (embeddings,
 /// norms, whatever the model cannot stream), KV at the configured max context, scratch,
 /// and the streaming slots themselves.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Floor {
     pub always_resident: Bytes,
     pub kv_at_max_ctx: Bytes,

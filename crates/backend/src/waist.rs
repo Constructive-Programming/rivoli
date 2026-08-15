@@ -143,7 +143,6 @@ impl Signal {
     ///
     /// The `Arc` arithmetic lives here rather than in `gpustream.rs` so the representation
     /// stays private to this module and the refcount has one place to be got wrong in.
-    #[cfg(feature = "rocm")]
     pub(crate) fn share_raw(&self) -> *mut std::ffi::c_void {
         Arc::into_raw(self.0.clone()) as *mut std::ffi::c_void
     }
@@ -152,7 +151,6 @@ impl Signal {
     ///
     /// # Safety
     /// `p` must come from one [`Signal::share_raw`] that has not been reclaimed yet.
-    #[cfg(feature = "rocm")]
     pub(crate) unsafe fn reclaim_raw(p: *mut std::ffi::c_void) -> Self {
         // SAFETY: the caller's contract is exactly `Arc::from_raw`'s.
         Signal(unsafe { Arc::from_raw(p as *const SignalState) })

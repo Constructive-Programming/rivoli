@@ -29,7 +29,7 @@ Commits `4b5b3da`, `3c0f577`, `74bdb20`, `285e989`, `f071c52`.
   as a signature (one author, prefix-shaped, monotone in `free`, refuses below floor with
   the arithmetic). INV-1 registered.
 - **Backend waist:** `hip.rs` + `gpustream.rs` + `Signal`/`block_on`/`NULL_STREAM` + all
-  12 kernels; both arms verified on the box (featureless = `abi` alone; `rocm` = 11
+  11 kernels; both arms verified on the box (featureless = `abi` alone; `rocm` = 11
   kernels through hipcc, clippy clean). The three `repr(C)` mirrors moved to
   `backend::abi` with the layout assert. INV-4/INV-6 arrived with the port and the
   registry gate refused the tree until §8b documented them.

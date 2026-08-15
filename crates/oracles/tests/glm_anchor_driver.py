@@ -347,7 +347,7 @@ def _assert_taps_fired(taps, cfg, step):
 _DENSE_T0 = ("t0.L0.", "t0.L1.", "prompt.", "structure.")
 
 
-def defect_router_softmax(mdl, model, cfg):
+def defect_router_softmax(mdl, model, cfg, salt):
     orig = mdl.GlmMoeDsaTopkRouter.forward
 
     def fwd(self, hidden_states):
@@ -365,28 +365,28 @@ def defect_router_softmax(mdl, model, cfg):
     return "router scores via softmax instead of sigmoid"
 
 
-def defect_router_bias_off(mdl, model, cfg):
+def defect_router_bias_off(mdl, model, cfg, salt):
     for layer in model.model.layers:
         if hasattr(layer.mlp, "gate"):
             layer.mlp.gate.e_score_correction_bias.zero_()
     return "e_score_correction_bias zeroed: choice score == gate score"
 
 
-def defect_router_norm_topk_off(mdl, model, cfg):
+def defect_router_norm_topk_off(mdl, model, cfg, salt):
     for layer in model.model.layers:
         if hasattr(layer.mlp, "gate"):
             layer.mlp.gate.norm_topk_prob = False
     return "top-k weights unnormalised"
 
 
-def defect_router_scaling_off(mdl, model, cfg):
+def defect_router_scaling_off(mdl, model, cfg, salt):
     for layer in model.model.layers:
         if hasattr(layer.mlp, "gate"):
             layer.mlp.gate.routed_scaling_factor = 1.0
     return "routed_scaling_factor 2.5 -> 1.0"
 
 
-def defect_shared_expert_off(mdl, model, cfg):
+def defect_shared_expert_off(mdl, model, cfg, salt):
     # Zero the shared expert's down_proj rather than skipping its call: the call must
     # still happen so its capture exists (a skipped call orphans the hook and shrinks
     # the tensor set, which --compare refuses), but its contribution becomes exactly 0.
@@ -397,7 +397,7 @@ def defect_shared_expert_off(mdl, model, cfg):
     return "shared expert contribution zeroed out of the MoE sum"
 
 
-def defect_rope_half_split(mdl, model, cfg):
+def defect_rope_half_split(mdl, model, cfg, salt):
     # DeepSeek-V3.2's non-interleaved form — THE documented difference. Uses the sibling
     # implementation transformers ships for models that split halves.
     def half_split(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -413,39 +413,32 @@ def defect_rope_half_split(mdl, model, cfg):
     return "half-split rope where the reference interleaves"
 
 
-def defect_indexer_relu_off(mdl, model, cfg):
-    orig = F.relu
-
+def defect_indexer_relu_off(mdl, model, cfg, salt):
     def no_relu(x, *a, **kw):
         return x
 
     # The indexer is the only F.relu caller in this model (SiLU activations elsewhere).
+    # PROCESS-POISONING and never restored, deliberately: every defect run is its own
+    # python process (glm-anchor.sh runs one cell per invocation). Batching cells into
+    # one process would inherit this patch — do not, without adding teardown to DEFECTS.
     F.relu = no_relu
     return "indexer score ReLU dropped"
 
 
-def defect_indexer_select_all(mdl, model, cfg):
+def defect_indexer_select_all(mdl, model, cfg, salt):
     for layer in model.model.layers:
         if layer.self_attn.indexer is not None:
             layer.self_attn.indexer.index_topk = 10_000
     return "index_topk raised past the sequence: DSA selects everything"
 
 
-def defect_kv_norm_spans_rope(mdl, model, cfg):
-    orig = mdl.GlmMoeDsaAttention.forward
-
-    def fwd(self, hidden_states, position_embeddings, attention_mask, past_key_values=None,
-            position_ids=None, prev_topk_indices=None, **kwargs):
-        # DEFECT: normalise the WHOLE compressed projection, then split — the reference
-        # normalises only the kv_lora half and leaves the rope slice raw.
-        batch_size, seq_length = hidden_states.shape[:-1]
-        whole = self.kv_a_proj_with_mqa(hidden_states)
-        whole = self.kv_a_layernorm.weight * (
-            whole * torch.rsqrt(whole.pow(2).mean(-1, keepdim=True) + 1e-5)
-        )[..., : self.kv_lora_rank + self.qk_rope_head_dim].contiguous() if False else whole
-        return orig(self, hidden_states, position_embeddings, attention_mask,
-                    past_key_values, position_ids, prev_topk_indices, **kwargs)
-
+def defect_kv_norm_spans_rope(mdl, model, cfg, salt):
+    # Wrong VARIANCE DENOMINATOR, modelled by zero-padding the row the norm sees — the
+    # eps-and-width half of "normalised as if the rope slice were in the row". (A first
+    # draft also swapped in a whole replacement forward that was never installed; review
+    # 2026-08-15 deleted it. Zero-pad models the denominator defect only, not rope VALUES
+    # leaking into the sum — that stronger variant needs the projection order changed and
+    # is a different defect.)
     # Implemented as a patch of the layernorm itself: widen what it sees.
     class SpanningNorm(torch.nn.Module):
         def __init__(self, inner, rope_dim):
@@ -466,7 +459,7 @@ def defect_kv_norm_spans_rope(mdl, model, cfg):
     return "kv_a_layernorm variance computed as if the rope slice were in the row"
 
 
-def defect_q_a_norm_off(mdl, model, cfg):
+def defect_q_a_norm_off(mdl, model, cfg, salt):
     for layer in model.model.layers:
         a = layer.self_attn
         a.q_a_layernorm.weight.data.fill_(1.0)
@@ -476,7 +469,7 @@ def defect_q_a_norm_off(mdl, model, cfg):
     return "q_a_layernorm bypassed"
 
 
-def defect_expand_kv_swapped_split(mdl, model, cfg):
+def defect_expand_kv_swapped_split(mdl, model, cfg, salt):
     orig = mdl.GlmMoeDsaAttention.expand_kv
 
     def expand_kv(self, kv_nope, k_rot):
@@ -499,13 +492,13 @@ def defect_expand_kv_swapped_split(mdl, model, cfg):
     return "expand_kv split order swapped (value taken where k_nope belongs)"
 
 
-def defect_attn_scale_unscaled(mdl, model, cfg):
+def defect_attn_scale_unscaled(mdl, model, cfg, salt):
     for layer in model.model.layers:
         layer.self_attn.scaling = 1.0
     return "attention scaling 1/sqrt(qk_head_dim) dropped"
 
 
-def defect_indexer_share_off(mdl, model, cfg):
+def defect_indexer_share_off(mdl, model, cfg, salt):
     """Structural: the cross-layer top-k SHARING is the mechanism under test — a port that
     runs a full indexer on every layer instead of reusing the previous full layer's
     selection. Chosen over `first_k_dense_off` deliberately: that defect REPLACES the
@@ -519,7 +512,7 @@ def defect_indexer_share_off(mdl, model, cfg):
         model.model.layers[i].self_attn = mdl.GlmMoeDsaAttention(cfg, i)
     # Deterministic by NAME, so re-running the whole-model init leaves every existing
     # parameter exactly as it was and draws only the new indexers' weights.
-    init_weights(model, _CURRENT_SALT[0])
+    init_weights(model, salt)
     return "shared indexer layers rebuilt as full: no cross-layer top-k reuse"
 
 
@@ -560,11 +553,7 @@ DEFECTS = {
 # The run.
 
 
-_CURRENT_SALT = [None]
-
-
 def run(salt, defect, cap):
-    _CURRENT_SALT[0] = salt
     from transformers.models.glm_moe_dsa import configuration_glm_moe_dsa as C
     from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as mdl
 
@@ -576,7 +565,7 @@ def run(salt, defect, cap):
     init_weights(model, salt)
 
     fn = DEFECTS[defect][0]
-    note = fn(mdl, model, cfg) if fn else ""
+    note = fn(mdl, model, cfg, salt) if fn else ""
 
     taps = Taps(cap)
     handles = install_taps(mdl, model, taps)
@@ -725,11 +714,28 @@ def compare(a_path, b_path):
         return any(g in name for g in green)
 
     moved, held, violations = [], [], []
-    for name, (_shape, va) in sorted(ta.items()):
+    for name, (shape_a, va) in sorted(ta.items()):
         if name not in tb:
             continue
-        vb = tb[name][1]
-        d = max((abs(x - y) for x, y in zip(va, vb)), default=0.0)
+        shape_b, vb = tb[name]
+        # Shape first: zip() silently truncates, so a length change under a defect would
+        # be scored only over the overlap and a divergent tail would read as held.
+        if shape_a != shape_b or len(va) != len(vb):
+            moved.append(name)
+            if is_green(name):
+                violations.append(f"{name}: declared green, SHAPE moved {shape_a}->{shape_b}")
+            continue
+        # NaN is not order-comparable, so max() DROPS it after the first element — the
+        # repo's own false-green class (`f32::max ignores NaN`). Any non-finite on either
+        # side is a divergence by definition; the clean side must be finite for the whole
+        # comparison to mean anything.
+        import math
+        if any(not math.isfinite(x) for x in va):
+            raise SystemExit(f"{a_path}: {name} carries a non-finite value in the CLEAN run")
+        if any(not math.isfinite(y) for y in vb):
+            d = float("inf")
+        else:
+            d = max((abs(x - y) for x, y in zip(va, vb)), default=0.0)
         (moved if d > 0 else held).append(name)
         if is_green(name) and d > 0:
             violations.append(f"{name}: declared green, moved by {d:.3e}")

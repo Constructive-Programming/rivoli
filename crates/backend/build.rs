@@ -48,6 +48,7 @@ fn main() {
     // tree applies verbatim: cargo already configures this script through the
     // environment, and rerun-if-env-changed puts the toggle inside cargo's fingerprint.)
     println!("cargo:rerun-if-env-changed=RIVOLI_OFFLOAD_ARCH");
+    println!("cargo:rerun-if-env-changed=HIPCC");
     let arch = std::env::var("RIVOLI_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1151".into());
     let offload = format!("--offload-arch={arch}");
 
@@ -56,7 +57,11 @@ fn main() {
     let mut objs = Vec::new();
     for k in kernels {
         let src = format!("kernels/{k}.hip");
-        let obj = format!("{out_dir}/{k}.o");
+        // The ARCH is part of the object's identity, not just its mtime: review 2026-08-15
+        // found that switching RIVOLI_OFFLOAD_ARCH re-ran this script (rerun-if-env-changed)
+        // but `stale()` then found every .o "fresh" and silently linked the OLD arch's
+        // objects. Baking the arch into the filename makes a switched arch a cache MISS.
+        let obj = format!("{out_dir}/{k}.{arch}.o");
         println!("cargo:rerun-if-changed={src}");
         // SKIP an object that is newer than both its source and the shared header —
         // without this every re-run recompiled all the kernels through hipcc, seconds of
