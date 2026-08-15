@@ -17,6 +17,8 @@ pred-probe = []
 trace = []
 stale-sel = []
 
+[dev-dependencies]
+
 [lints]
 workspace = true
 
