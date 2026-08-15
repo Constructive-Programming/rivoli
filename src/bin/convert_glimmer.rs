@@ -281,8 +281,14 @@ fn main() -> Result<()> {
     // `FormatMeta::current` stamps the compiled-in VQ parameters even though this artifact has
     // no VQ tensors. That is inert rather than a lie: `FormatMeta::load` compares them against
     // the same constants, so they always agree, and the plan's "nullable VQ section" turned
-    // out to be work that nothing needed. `fp8_block` likewise describes a format this
-    // artifact does not use yet — it is what the fp8 pass will write.
+    // out to be work that nothing needed.
+    //
+    // **`fp8_block` is now LOAD-BEARING and this comment said it was not.** It read "describes a
+    // format this artifact does not use yet — it is what the fp8 pass will write"; the pass
+    // exists, `--fp8` writes grids at exactly this block, and `GlimmerPin::build` refuses an
+    // artifact whose declared block disagrees with the one it computes with. Stamped from the same
+    // constant `add_quantized_fp8` is handed, so the two cannot disagree here — the refusal is for
+    // an artifact written by a DIFFERENT build (review, 2026-08-15).
     manifest["format"] =
         serde_json::to_value(FormatMeta::current(rivoli::artifact::quant::FP8_BLOCK))?;
     finish_artifact(

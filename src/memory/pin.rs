@@ -170,6 +170,19 @@ fn place_f32(tier: &mut DeviceTier, st: &Safetensors, name: &str) -> Result<*con
 
 /// Place an fp8-e4m3 block-scaled weight (`<name>.weight` F8E4M3 + `.weight_scale_inv`
 /// F32) into the tier. Dims come from the weight's `[o_dim, i_dim]` shape.
+///
+/// **The SCALE GRID's shape is checked, and until 2026-08-15 it was the only fp8 reader in this
+/// tree that did not check it.** `Safetensors::dequant_fp8` and [`place_fp8_qkv`] both do, and
+/// both say why in nearly the same words: a grid of the wrong extent mis-tiles SILENTLY, which is
+/// a wrong-but-plausible dequant rather than a failure. The kernel indexes
+/// `scale[(o/block)·sc_cols + i/block]` with `sc_cols` derived from `i_dim` — so a grid stored
+/// `[sc_cols, sc_rows]` has every tile taking a neighbour's scale (fluent wrong text, no error),
+/// and a SHORTER grid has the kernel reading past the placement into the next tensor's e4m3 bytes
+/// reinterpreted as f32.
+///
+/// Found by review on the Glimmer fp8 path, where the shape check the same commit added ran only
+/// for STREAMED layers — and the shipping partition on this host pins all 52, so it iterated zero
+/// times. Fixed here rather than there because it is every model's hole, not Glimmer's.
 fn place_fp8(
     tier: &mut DeviceTier,
     st: &Safetensors,
@@ -178,7 +191,13 @@ fn place_fp8(
 ) -> Result<Fp8Weight> {
     let (w, shape) = st.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
     let (o_dim, i_dim) = dims2(&format!("{name}.weight"), shape)?;
-    let (sc, _) = st.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
+    let (sc, sshape) = st.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
+    let want = [o_dim.div_ceil(block), i_dim.div_ceil(block)];
+    ensure!(
+        sshape == want,
+        "{name}.weight_scale_inv is {sshape:?}, but a [{o_dim}, {i_dim}] weight at block {block} \
+         implies {want:?} — a grid of the wrong extent mis-tiles silently"
+    );
     let packed = tier.place(w)?;
     let scale = tier.place(sc)?;
     Ok(Fp8Weight {
@@ -1271,9 +1290,20 @@ impl GlimmerLayerPin {
     ///
     /// Exists so [`Slot::fill`] can write to each tensor's own address instead of computing an
     /// offset. A permutation here would make a streamed layer a permutation of a pinned one —
-    /// every tensor the right shape, the model silently wrong. The interleaving must match
-    /// [`glimmer_layer_names`] exactly, which is why both derive it from the same place:
-    /// [`GlimmerProj::addrs`] emits one or two, and that function emits one or two names.
+    /// every tensor the right shape, the model silently wrong.
+    ///
+    /// **This and [`glimmer_layer_names`] must agree element-for-element, and they do NOT derive
+    /// it from the same place — this doc claimed they did until 2026-08-15.** That function walks
+    /// [`GLIMMER_LAYER_TENSORS`] and asks [`GlimmerTextConfig::layer_tensor_shape`] which entries
+    /// are 2-D; this one walks a hand-written list of four norms and then [`Self::projs`]. Two
+    /// procedures, one required answer. [`Slot::new`]'s `ensure!` compares only their LENGTHS,
+    /// which is arithmetically incapable of failing today (both are `12 + 8·[fp8]`) and would
+    /// catch only a future edit that changed the 2-D count in one place and not the other. **What
+    /// actually gates the permutation is
+    /// `glimmer_residency.rs::every_budget_resolves_every_layer_to_the_same_bytes_at_fp8`**, which
+    /// is red-proved by swapping [`GlimmerProj::addrs`]'s weight-then-scale order — and reddens
+    /// there while the bf16 sweep beside it stays green, because at bf16 there is nothing
+    /// interleaved to permute.
     ///
     /// **Nothing asserts the order directly, and this doc claimed otherwise until 2026-08-12**
     /// ("asserted against that constant by `glimmer_residency.rs`" — that file never names
@@ -1605,13 +1635,32 @@ impl GlimmerPin {
         // malformed shard is found. Both were BELOW `DeviceTier::new` until review pointed out
         // that this made a stale artifact pay a full-model allocation before its cheap refusal
         // fired, which inverts the ordering the rest of this port is careful about.
-        FormatMeta::load(dir)?;
+        let meta = FormatMeta::load(dir)?;
         let st = Safetensors::open_dir(dir)?;
         // The partition moved BELOW the open because it now needs the format, and the format is
         // a property of the tensors rather than of the config — an artifact is what says whether
         // a layer costs 967.942 MB or 484.142 MB, so a tier sized before reading one would be
         // sized for whichever format the code happened to assume.
         let fmt = GlimmerFormat::of(&st)?;
+        // **The artifact's DECLARED block has to be the one this build computes with, and until
+        // 2026-08-15 this path loaded it and threw it away.** `FormatMeta::load` only asserts the
+        // field is a positive power of two; every other fp8 consumer then READS it
+        // (`Pin::build`, `bin/fp8_to_i4`), while this one passed the compiled-in constant into
+        // `place_fp8` and into `layer_bytes`. An artifact written at block 256 would have loaded
+        // clean, placed a 4x-too-small grid, and had `gemv_fp8` index far past it into the next
+        // tensor's e4m3 bytes read as f32 scales — garbage magnitudes, no error.
+        //
+        // A refusal rather than threading the value through: `layer_bytes`/`partition` are
+        // deviceless config arithmetic with no manifest in reach, so a variable block would need
+        // it in two places that cannot see each other. If that is ever wanted, this is the line
+        // that says so.
+        let block = crate::artifact::quant::FP8_BLOCK;
+        ensure!(
+            fmt != GlimmerFormat::Fp8 || meta.fp8_block == block,
+            "this artifact declares fp8_block {} and this build computes at {block}; the scale \
+             grids and the tier sizing would describe different tilings",
+            meta.fp8_block
+        );
         let (n_pinned, capacity) = cfg.partition(budget, fmt)?;
         let mut tier = DeviceTier::new(capacity)?;
 

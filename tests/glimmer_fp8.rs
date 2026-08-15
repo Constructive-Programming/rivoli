@@ -220,7 +220,11 @@ fn a_placed_fp8_projection_matches_the_host_oracle_over_the_same_bytes() {
                 f.scale,
                 o_dim,
                 i_dim,
-                FP8_BLOCK,
+                // **`f.block`, not the `FP8_BLOCK` literal** — the field `glimmer_gpu::proj`
+                // actually reads. Passing the constant meant the placement's own block was on
+                // neither side of the comparison, while this gate's doc claimed "the wrong block
+                // reaches the kernel" as one of the four things it catches (review, 2026-08-15).
+                f.block,
                 1,
                 ob.ptr() as *mut f32,
             )
@@ -234,12 +238,24 @@ fn a_placed_fp8_projection_matches_the_host_oracle_over_the_same_bytes() {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
-        // Guard the REFERENCE before believing the comparison — an all-zero oracle would make
-        // every ratio below zero and the gate would pass on a kernel that wrote nothing.
+        // **Guard BOTH sides, and the device side is not optional.**
+        //
+        // > Review found this checking only `want`, 2026-08-15 — the exact trap `worst()` above
+        // > guards against and cites, in this same file, three functions up. `f32::max` returns
+        // > the non-NaN argument, so `fold(0f32, f32::max)` over an all-NaN difference is **0.0**
+        // > and `0.0 < 1e-4` passes. A kernel that wrote NaN into every element, or into every
+        // > row its grid failed to cover, scored a PERFECT match. This repo has already shipped a
+        // > broken kernel that passed 9 of 9 that way; the gate is red-proved against a NaN
+        // > device row below.
         let scale_of = want.iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!(
             want.iter().all(|v| v.is_finite()) && scale_of > 0.0,
             "{name}: the host oracle is all-zero or non-finite"
+        );
+        assert!(
+            got.len() == want.len() && got.iter().all(|v| v.is_finite()),
+            "{name}: the DEVICE row is short or non-finite — every ratio below would be NaN, and \
+             NaN folds through `f32::max` as a perfect match"
         );
         let worst = want
             .iter()
@@ -280,14 +296,20 @@ fn bytemuck_f32(v: &[f32]) -> Vec<u8> {
 /// So the assertions are the two that ARE sharp: the decode produces a usable logit row, and it is
 /// not the bf16 one.
 ///
-/// **The second is the anti-vacuity half, and it is NOT redundant with the `else { panic! }` in
-/// the projection test** — review proposed dropping this arm on that reading, 2026-08-15. That
-/// `panic!` fires if the PIN placed something other than an `Fp8` variant. It cannot see a
-/// `glimmer_gpu::proj` whose fp8 match arm launches the wrong kernel, because the projection test
-/// calls `launch_gemv_fp8` **directly** and never goes through `proj` at all. A `proj` that
-/// dispatched both variants to `launch_gemm_bf16` would place fp8, pass the oracle gate, decode
-/// finite non-constant logits — and be caught only here. The bf16 arm is what costs the extra
-/// fixture conversion, and it is the half doing the work.
+/// **What the second assertion actually establishes, stated twice wrong before it was stated
+/// right.** It first read "if `proj` ever fell back to the verbatim weights, every other test here
+/// would still pass"; a second pass narrowed that to a `proj` dispatching both variants to
+/// `launch_gemm_bf16`. Neither is constructible: an fp8 artifact holds no bf16 projections to fall
+/// back TO (`place_bf16` on an `F8E4M3` tensor is a `typed` dtype refusal), and `gemm_bf16` takes
+/// `*const u16` where `Fp8Weight::packed` is `*const u8`, so that mis-dispatch would not compile.
+///
+/// What `q > 1e-3` DOES establish is that the two artifacts are not the same model — i.e. that
+/// `--fp8` did something. That is load-bearing and nothing else here covers it: `glimmer_fixture`
+/// seeds every tensor from `bf16_blob(seed, n)` with `seed` its index, so both arms are built from
+/// **byte-identical source tensors**, and a `--fp8` that was ignored, or a `quantize_fp8_block`
+/// that round-tripped to the input, would give exactly `q == 0`. It is NOT a guard against a
+/// wrong-but-finite fp8 path — any dispatch bug also moves the logits and passes. That job belongs
+/// to the projection test, which is why this file keeps both. (Review, 2026-08-15, both passes.)
 #[test]
 fn an_fp8_artifact_decodes_and_is_not_secretly_the_bf16_one() {
     let bf16_root = TempRoot::new("glimmer-fp8-e2e-bf16");

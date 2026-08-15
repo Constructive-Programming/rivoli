@@ -29,7 +29,7 @@ mod common;
 // fourth Glimmer binary and the preamble is where they collide — the gate is right that the
 // text is identical, and the honest fix is to stop writing it a fourth time.
 use common as fx;
-use fx::{TempRoot, glimmer_convert_fixture};
+use fx::TempRoot;
 use rivoli::artifact::model as gm;
 
 const DIM: usize = fx::GLIMMER_FIXTURE_DIM;
@@ -54,8 +54,17 @@ fn tiny_cfg() -> gm::GlimmerTextConfig {
 /// **The `TempRoot` is RETURNED, not dropped**: it owns the directory the returned path names, so a
 /// caller that binds it to `_` deletes the artifact it is about to open.
 fn converted(tag: &str, dim: usize) -> (TempRoot, String, gm::GlimmerTextConfig) {
+    converted_fmt(tag, dim, BF16)
+}
+
+/// [`converted`] at a chosen format.
+fn converted_fmt(
+    tag: &str,
+    dim: usize,
+    fmt: gm::GlimmerFormat,
+) -> (TempRoot, String, gm::GlimmerTextConfig) {
     let root = TempRoot::new(tag);
-    let _ = glimmer_convert_fixture(root.path(), dim);
+    let _ = fx::glimmer_convert_fixture_fmt(root.path(), dim, fmt);
     let dir = root
         .join("out")
         .to_str()
@@ -182,11 +191,38 @@ fn the_partition_arithmetic_holds_at_every_boundary() {
 #[test]
 #[cfg(feature = "rocm")]
 fn every_budget_resolves_every_layer_to_the_same_bytes() {
+    sweep_every_budget("glimmer-residency-bytes", DIM, BF16);
+}
+
+/// **The same sweep at fp8, and it is not a duplicate arm — it is the only thing that executes
+/// the fp8 streaming path at all.**
+///
+/// Every test in `glimmer_fp8.rs` builds with `budget: None`, so `Slot::new` and `Slot::fill`
+/// never run there, and the shipping partition on this host pins all 52 layers. Review found the
+/// consequence 2026-08-15: the `GlimmerProj::Fp8` arm in `tensors_of` below was DEAD CODE, and
+/// with it the twenty-element `glimmer_layer_names`/`GlimmerLayerPin::addrs` zip that this commit
+/// called its highest-risk coupling. At bf16 those lists are twelve entries and interleave
+/// nothing; only here does a scale grid have to land beside the weight it scales.
+///
+/// `GLIMMER_FP8_FIXTURE_DIM` rather than `DIM` for the reason that constant documents: at dim 8
+/// every projection is one scale tile and the grid index is dead arithmetic.
+#[test]
+#[cfg(feature = "rocm")]
+fn every_budget_resolves_every_layer_to_the_same_bytes_at_fp8() {
+    sweep_every_budget(
+        "glimmer-residency-bytes-fp8",
+        fx::GLIMMER_FP8_FIXTURE_DIM,
+        gm::GlimmerFormat::Fp8,
+    );
+}
+
+#[cfg(feature = "rocm")]
+fn sweep_every_budget(tag: &str, dim: usize, fmt: gm::GlimmerFormat) {
     use rivoli::memory::pin::GlimmerPin;
-    let (_root, dir, cfg) = converted("glimmer-residency-bytes", DIM);
+    let (_root, dir, cfg) = converted_fmt(tag, dim, fmt);
     let dir = dir.as_str();
-    let layer = cfg.layer_bytes(BF16).unwrap();
-    let floor = cfg.floor_bytes(BF16).unwrap();
+    let layer = cfg.layer_bytes(fmt).unwrap();
+    let floor = cfg.floor_bytes(fmt).unwrap();
 
     // The reference: all resident, no slots.
     let mut all = GlimmerPin::build(dir, &cfg, None).unwrap();

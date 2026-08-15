@@ -1779,9 +1779,16 @@ impl GlimmerFormat {
 pub const GLIMMER_STREAM_SLOTS: usize = 1;
 
 /// Alignment slack in a `GlimmerPin`'s tier request. `DeviceTier::place` starts every
-/// reservation at a 256-byte boundary and the pin makes at most `3 + 12·n_layers` = 627
-/// placements, so the padding is under 160 KB; 1 MiB is ~6x that bound and 0.002% of the 55.7
-/// GB it can sit beside.
+/// reservation at a 256-byte boundary, so the bound is 255 B per placement.
+///
+/// > **Re-derived 2026-08-15, by review.** This read "at most `3 + 12·n_layers` = 627 placements,
+/// > so the padding is under 160 KB; 1 MiB is ~6x that bound" — true at bf16 and stale at fp8,
+/// > where each layer is **20** placements (8 weights, 8 scale grids, 4 norms) rather than 12. The
+/// > worst case is `3 + 20·(n_pinned + GLIMMER_STREAM_SLOTS)` = 1063 at the shipped 52, i.e.
+/// > 271,065 B, and the margin is **3.9x rather than 6x**. Still ample, and the real padding is
+/// > ~20 KB because most grids land on the boundary anyway — but the constant is justified by an
+/// > arithmetic that has to describe the format that grew it. At fp8 the stated worst case would
+/// > reach 1 MiB at roughly `n_layers >= 205`.
 pub const GLIMMER_PIN_SLACK: usize = 1 << 20;
 
 /// The prefix Glimmer's text-side tensors carry. The `language_model.` segment is the

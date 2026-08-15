@@ -1334,6 +1334,12 @@ pub fn glimmer_convert_fixture_fmt(
 ///   assumed full tiles reads past its own row.
 ///
 /// It is ~11 MB of source tensors, which converts and decodes in seconds.
+///
+/// **One property it does NOT have, noted so nobody reads three reasons as four**: at 320 and 640
+/// every projection has `i_dim` below `GEMV_SPLITK_MIN_IDIM` (4096), so the fp8 gates here only
+/// ever run the wave-per-row `gemv_fp8`. At the shipped widths every Glimmer projection takes
+/// `gemv_fp8_splitk` instead. That path is scored against the same `matvec_fp8` oracle by
+/// `tests/kernel.rs`, so it is covered — just not from here (review, 2026-08-15).
 pub const GLIMMER_FP8_FIXTURE_DIM: usize = 320;
 
 /// A temp directory that removes itself on drop.
