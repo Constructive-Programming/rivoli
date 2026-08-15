@@ -18,6 +18,9 @@ trace = []
 stale-sel = []
 
 [dev-dependencies]
+# The smoke example's log sink only — the library logs through `tracing` and never
+# chooses a subscriber; a real consumer (the CLI, M6) brings its own.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints]
 workspace = true

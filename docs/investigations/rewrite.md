@@ -178,6 +178,17 @@ KV/scratch deliberately 0 (GLM's `--max-mem` has always budgeted weights only �
 them in changes the flag's meaning and is owed its own measurement). `.f4` refused as a
 V4 container at the one place GLM's format set is confronted.
 
+**FIRST REAL DECODE, 2026-08-15 (`examples/glm_smoke.rs`).** The whole new stack —
+GlmPin over `partition()` (5853 of 19200 experts resident at `--max-mem 100`), the
+single-format pool, the dense loop — decoded `glm52-vq3-full` end-to-end on the DEV
+profile with every `debug_assert!` live: prompt ids `[9707, 3837]` → greedy
+`[17351, 198, 40, 2776]`, all finite, clean exit, 624 hits / 1176 misses. (0.02 tok/s is
+a dev-profile NFS-cold number and is not a benchmark.) The tiny GLM anchor cannot drive
+the device engine — its `kv_lora=20` violates the fp8-KV 128-block the real model's 512
+satisfies — so M4's end-to-end evidence is this real decode plus the old-engine id
+comparison (the M5 parity primary, pulled forward as a smoke): same ids through the
+reference at the pinned SHA, compared with `--ids-out`.
+
 **Loop staging (the remaining M4 code, in commit-sized steps, each green before the
 next):** 1. `glm/desc.rs` — expert-descriptor builders, single format. 2. `glm/engine.rs`
 — the engine struct + `new()` (KV slabs, scratch, streams; dense attention only).
