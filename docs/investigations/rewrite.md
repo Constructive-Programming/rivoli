@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The gates-first rewrite is through M0, M1, and M2 — gates armed and red-proofed before any code, anchors vendored before the engine (GLM's generated fresh, 26/26 defect cells), substrate and artifact layers ported with both feature arms verified, converter round-trip proven byte-stable on a synthetic checkpoint, and review round 1's 24 findings applied; deferred items are named per-milestone with their return consumers.
+verdict: The gates-first rewrite is through M0, M1, and M2 — gates armed and red-proofed before any code, anchors vendored before the engine (GLM's generated fresh, 26/26 defect cells), substrate and artifact layers ported with both feature arms verified, converter round-trip proven byte-stable on a synthetic checkpoint, review round 1's 24 findings applied, and M3 closed on silicon — 38/38 kernel oracles green on gfx1151, floors measured at both draws, census armed with a shrink-only deferred table; M4's decode-loop design note awaits the owner before the loop is written.
 ---
 
 # The rewrite, milestone by milestone
@@ -98,7 +98,7 @@ Moved out of M2 with reasons: tokenizer (coupled to `dsv4_encoding` — M4 with 
 `artifact_compat`/`arch_artifacts` byte-pin regressions against REAL artifacts (need the
 real dirs and belong with M4's first real decode, not a synthetic fixture).
 
-## M3 — GLM kernels via oracle TDD (IN PROGRESS 2026-08-15)
+## M3 — GLM kernels via oracle TDD (DONE 2026-08-15)
 
 - **Floors first** (commit `2121af0`): fp32 floors at both draws, 10 buckets; the DSA
   mask found exact-only; goldens re-pinned on eager experts.
@@ -113,7 +113,50 @@ real dirs and belong with M4's first real decode, not a synthetic fixture).
   correctness suites with no timing claims, so the runs stand — any red would have been
   treated as suspect-contention and re-run, none occurred.
 
-Still owed for M3: the kernel census gate (with a both-ends-checked deferred-to-M8 table
-for V4-only launchers), and wiring the anchor-derived floors into the oracle tolerances
-(the ported suites carry the old tree's measured tolerances; the GLM-anchor floors are
-the cross-check).
+- **Census armed** (`08af54b`): 53 launchers, 32 with oracles, 21 in a both-ends-checked
+  DEFERRED table (6 → M7, 15 → M8) that can only shrink; red-proofed both directions.
+
+**Exit gate MET:** every GLM-owned launcher passes its oracle on the device; census
+green; floors recorded with provenance. One residual carried into M4, named rather than
+dropped: cross-checking the ported oracle tolerances against the anchor-derived floors
+(the ported suites carry the old tree's own measured tolerances, so the port is not
+ungated — the floors are the second witness).
+
+## M4 — the GLM decode loop: design note BEFORE code (drafted 2026-08-15, awaiting owner)
+
+The loop rewrite is the heart of this whole effort and the first piece with real design
+freedom — everything until now was gates, anchors, and ports. Written down before any
+code, per the plan's own discipline; the owner should react to this before `glm/loop.rs`
+exists.
+
+**What ports with confidence (the old loop's proven interior):**
+- The per-layer kernel SEQUENCE (norm → MLA q/kv projections → rope → DSA select →
+  attend → o_proj → router → expert descriptors → MoE accumulate → drain) — byte-level
+  behaviour pinned by 38 device-green oracles and the anchor.
+- The fixed-point u64 MoE accumulator (kernel-side; "no invariant to violate").
+- The descriptor-array MoE launch and the staged-hop fetch destination.
+
+**What re-architects (the new contracts, all already built and tested):**
+1. Residency: `GlmPin` becomes a thin view over `core::residency::partition()` (INV-8) —
+   the old `Pin` derived placement itself; the new one only EXECUTES a partition.
+2. Fetch: the `hit`-mask-free ticketed dataflow ports, but `wait_on` consumes a typed
+   `Pending` and slot refills carry the write-after-read fence per the s2 lesson.
+3. Dispatch: `enum Engine` with `Engine::open` sniffing the artifact (schema::arch_of_named
+   already refuses unknowns); `run_glm` is a real branch from day one — the old tree's
+   500-line main-fallthrough shape is the named anti-goal.
+4. Traversal: the loop body takes `Span{layers, x_off, tail}` + `Rows` from day one
+   (layer-major prefill is a Span iteration, not a second engine; rows batching is not a
+   retrofit — Glimmer's 72-minute prompt is the cautionary number).
+
+**Open design questions for the owner (the reason this note precedes the code):**
+- Q1: Does the M4 loop take hybrid mode at all, or int3-vq/int4 single-format only until
+  the format-follows-identity redesign (the plan's FormatPlan) lands? Proposal: single-
+  format only at M4; hybrid returns as FormatPlan with its own INV re-armed.
+- Q2: `--attn` modes at M4: dense + dsa only (streaming/misa follow), or all four?
+  Proposal: dense + dsa (the anchor pins dsa; streaming/misa have no anchor evidence yet).
+- Q3: MTP/speculative decode: defer entirely to post-parity (M5+)? Proposal: yes — the
+  verify pass rides the Rows dimension, which is designed in from the start, so nothing
+  is foreclosed.
+
+M4's exit gate (unchanged from the plan): anchor decode gate green at the pre-measured
+tolerance; INV-1 red-proofed live; release.yml on.
