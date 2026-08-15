@@ -15,7 +15,9 @@
 // ^ a test harness panics loudly on a broken fixture; that is the correct failure here.
 
 use rivoli_oracles::golden::{Diff, GoldenSet};
-use rivoli_oracles::v4oracle::forward::{Capture, Defect, LayerCtx, LayerW, Oracle};
+use rivoli_oracles::v4oracle::forward::{
+    Capture, Defect, HeadRows, LayerCtx, LayerW, Oracle, Sinks,
+};
 use rivoli_oracles::v4oracle::numerics::{bf16_decode, bf16_encode};
 use rivoli_oracles::v4oracle::toy::{self, ToyModel};
 use rivoli_oracles::v4oracle::weights::{NamedRng, V4Config};
@@ -40,7 +42,14 @@ pub fn prefill_capture(o: &Oracle, at: ProbeLayer<'_>, ids: &[u32], h: &mut Vec<
         input_ids: ids,
         step_tag: "pre",
     };
-    o.run_layer(&step, &mut st, h, &mut cap);
+    o.run_layer(
+        &step,
+        h,
+        Sinks {
+            st: &mut st,
+            cap: &mut cap,
+        },
+    );
     cap
 }
 
@@ -152,14 +161,29 @@ pub fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
             input_ids: &ids,
             step_tag: &tag,
         };
-        o.run_layer(&step, &mut st, &mut h, &mut caps[slot]);
+        o.run_layer(
+            &step,
+            &mut h,
+            Sinks {
+                st: &mut st,
+                cap: &mut caps[slot],
+            },
+        );
         // The head tail, on THIS layer's output. `bin/v4-oracle` deliberately refuses to do
         // that (see `HeadTailW`) because a logits vector taken at 4 of 43 layers is not a
         // quantity the model computes and would be misread as one. Here nothing is ever read
         // as a model quantity -- the whole family is a structural gate on the toy -- and the
         // composition buys the thing a standalone head fixture could not: every layer defect
         // is shown to REACH the logits, so the head tail is proved unable to mask one.
-        o.head_tail(&m.head_tail, &h, s, &tag, &mut caps[slot]);
+        o.head_tail(
+            &m.head_tail,
+            HeadRows {
+                h: &h,
+                s,
+                step_tag: &tag,
+            },
+            &mut caps[slot],
+        );
     }
     let [pre, dec] = caps;
     Run { pre, dec }

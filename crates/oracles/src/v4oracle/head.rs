@@ -70,6 +70,14 @@ pub struct HeadTailW {
     pub lm_head: WMat,
 }
 
+/// The residual rows the head consumes and the step tag their captures carry. Grouped
+/// 2026-08-15 from three loose args.
+pub struct HeadRows<'a> {
+    pub h: &'a [f32],
+    pub s: usize,
+    pub step_tag: &'a str,
+}
+
 impl Oracle {
     /// `Transformer.forward` lines 914-916: embed, then expand to `hc_mult` copies.
     /// Returns `[s, hc_mult, dim]`.
@@ -154,14 +162,8 @@ impl Oracle {
     /// copy under a name ending in `.in`, which the matrix treats as fixed-by-construction —
     /// a silent claim no implementation could violate would then be attached to a tensor that
     /// every upstream defect moves.
-    pub fn head_tail(
-        &self,
-        hw: &HeadTailW,
-        h: &[f32],
-        s: usize,
-        step_tag: &str,
-        cap: &mut Capture,
-    ) {
+    pub fn head_tail(&self, hw: &HeadTailW, rows: HeadRows<'_>, cap: &mut Capture) {
+        let HeadRows { h, s, step_tag } = rows;
         let (dim, vocab) = (self.cfg.dim, self.cfg.vocab_size);
         // Both `[s, dim]` goldens below go through here. Two spelled-out `cap.push` calls is
         // what they were until the `step_tag` rename pushed each past `max_width` and rustfmt
@@ -202,7 +204,7 @@ impl Oracle {
         // `F.linear(x.float(), self.weight)` on an f32 parameter: the dense branch, so no
         // activation quantization, and the result is f32 and stays f32. Rounding it to bf16
         // here would be a defect all of its own; there is no store in the reference to model.
-        let logits = self.linear(&x[row * dim..(row + 1) * dim], 1, dim, &hw.lm_head);
+        let logits = self.linear(&x[row * dim..(row + 1) * dim], 1, &hw.lm_head);
         // Recorded, not returned. Both callers read their logits back out of `cap`, and a
         // return value would offer a second path to the number the goldens are the record of.
         cap.push(&format!("head.{step_tag}.logits"), &[1, vocab], logits);

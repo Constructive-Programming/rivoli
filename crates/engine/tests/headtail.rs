@@ -28,7 +28,7 @@
 //! flattened row — has a signal of the same ORDER as that re-association noise at real
 //! dimensions. **No tolerance here can separate it.** It is settled by reading
 //! `kernels/headtail.hip`, and pinned at small dimensions by
-//! `tests/v4_oracle.rs::the_head_tail_matches_torch_absolutely`, which compares against
+//! `tests/v4_oracle_head_tail.rs::the_head_tail_matches_torch_absolutely`, which compares against
 //! PyTorch itself.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #![cfg(feature = "rocm")]

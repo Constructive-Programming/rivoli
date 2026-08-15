@@ -151,11 +151,25 @@ class Taps:
 
 
 def install_text_taps(mdl, model, taps):
-    """Tap the four places the target's arithmetic is visible and a module hook is not enough."""
-    cap = taps.cap
+    """Tap the four places the target's arithmetic is visible and a module hook is not enough.
 
+    The six helpers below are the four numbered taps and the two hook families, in the order they
+    were written and applied. Split out of this body 2026-08-15 for the CodeScene 10.0 gate (it was
+    76 LoC): the patch order, the hook registration order and therefore the order of the returned
+    list are the ones that produced the vendored goldens, and `Taps.close` still unwinds the patches
+    in reverse because it always did.
+    """
+    _patch_rotary(mdl, taps)
+    _patch_attention_layer(mdl, taps)
+    _patch_rope(mdl, taps)
+    _patch_attend(mdl, taps)
+    return _hook_weightless_norms(model, taps) + _hook_modules(model, taps)
+
+
+def _patch_rotary(mdl, taps):
     # 1. The rotary table. One table for the whole model (M:513); the per-layer NoPE decision is a
     #    flag applied at the CALL SITE, not a second table, and that is trap #1 in section 9.
+    cap = taps.cap
     orig_rotary = mdl.MuseGlimmerTextRotaryEmbedding.forward
 
     def rotary(self, x, position_ids):
@@ -167,6 +181,8 @@ def install_text_taps(mdl, model, taps):
 
     taps.patch(mdl.MuseGlimmerTextRotaryEmbedding, "forward", rotary)
 
+
+def _patch_attention_layer(mdl, taps):
     # 1b. The attention module, which is the only place the LAYER INDEX is in scope. It publishes it
     #     for the two function taps below, which see nothing but tensors.
     orig_attn = mdl.MuseGlimmerTextAttention.forward
@@ -181,8 +197,11 @@ def install_text_taps(mdl, model, taps):
 
     taps.patch(mdl.MuseGlimmerTextAttention, "forward", attn_forward)
 
+
+def _patch_rope(mdl, taps):
     # 2. `apply_rotary_pos_emb`, so the golden holds q and k on BOTH sides of the rotation. A port
     #    that gets rotate_half vs interleaved wrong differs here and nowhere earlier.
+    cap = taps.cap
     orig_rope = mdl.apply_rotary_pos_emb
 
     def roped(q, k, cos, sin, unsqueeze_dim=1):
@@ -197,9 +216,12 @@ def install_text_taps(mdl, model, taps):
 
     taps.patch(mdl, "apply_rotary_pos_emb", roped)
 
+
+def _patch_attend(mdl, taps):
     # 3. `eager_attention_forward`, which sees the POST-CACHE key/value states -- that is the ring
     #    buffer's contents as the kernel must reproduce them, including eviction -- and returns the
     #    attend output BEFORE the sigmoid gate and o_proj.
+    cap = taps.cap
     orig_attend = mdl.eager_attention_forward
 
     def attend(module, query, key, value, attention_mask, scaling, dropout=0.0, **kw):
@@ -222,6 +244,8 @@ def install_text_taps(mdl, model, taps):
 
     taps.patch(mdl, "eager_attention_forward", attend)
 
+
+def _hook_weightless_norms(model, taps):
     # 4. The two WEIGHTLESS norms, which ship no tensor and are therefore the two a port can omit
     #    without the checkpoint complaining: `embed_norm` and the per-layer `qk_norm`. The latter is
     #    one module called twice, q then k in that order (M:342-343), and the q call is captured
@@ -232,6 +256,7 @@ def install_text_taps(mdl, model, taps):
     #    still produces the capture -- holding the unnormalised value, which is the whole point. The
     #    first version patched the class method, so `qk_norm_off` and `embed_norm_off` deleted their
     #    own evidence and died in the tap census instead of reddening a golden.
+    cap = taps.cap
     handles = []
 
     def qk_hook(_mod, _args, out):
@@ -249,9 +274,14 @@ def install_text_taps(mdl, model, taps):
     )
     for layer in model.model.language_model.layers:
         handles.append(layer.self_attn.qk_norm.register_forward_hook(qk_hook))
+    return handles
 
+
+def _hook_modules(model, taps):
     # Module hooks for everything that IS a module output. Cheap, and they cover the sandwich: four
     # norms per layer, the gate before o_proj, and the SwiGLU.
+    cap = taps.cap
+    handles = []
     for li, layer in enumerate(model.model.language_model.layers):
         for what, mod in (
             ("input_layernorm", layer.input_layernorm),
@@ -286,14 +316,22 @@ def _hook(cap, taps, layer, what):
 # The runs.
 
 
-def run_text(salt, defect, cap):
-    from transformers.models.muse_glimmer import configuration_muse_glimmer as C
-    from transformers.models.muse_glimmer import modeling_muse_glimmer as mdl
+def _build_target(cfg_mod, mdl, salt):
+    """The target at tiny widths: eager, evaluated, and filled from the salt.
 
-    text = tiny_text_config(C)
-    top = C.MuseGlimmerConfig(
+    **One builder for both modes, because the two must not drift.** `run_text` scores this model and
+    `run_draft` uses it as the drafter's context source, and the drafter's goldens are only anchored
+    to Muse Glimmer if that context comes from the SAME construction the text goldens pin. The two
+    bodies were already identical statement for statement; making that structural is the whole of
+    the change (2026-08-15, with the CodeScene split -- it also took `run_draft` from 94 LoC).
+
+    Returns the text config beside the model because both callers need it: `run_text` for the vocab
+    the prompt is drawn from, `run_draft` to force the drafter's `hidden_size` equal to it.
+    """
+    text = tiny_text_config(cfg_mod)
+    top = cfg_mod.MuseGlimmerConfig(
         text_config=text,
-        vision_config=tiny_vision_config(C),
+        vision_config=tiny_vision_config(cfg_mod),
         image_token_id=59,  # shrunk into the tiny vocab
         video_token_id=58,  # shrunk into the tiny vocab
         out_hidden_size=32,
@@ -304,6 +342,14 @@ def run_text(salt, defect, cap):
     model.config.text_config._attn_implementation = "eager"
     model.eval()
     init_weights(model, salt)
+    return text, model
+
+
+def run_text(salt, defect, cap):
+    from transformers.models.muse_glimmer import configuration_muse_glimmer as C
+    from transformers.models.muse_glimmer import modeling_muse_glimmer as mdl
+
+    text, model = _build_target(C, mdl, salt)
 
     fn = DEFECTS[defect][0]
     note = fn(mdl, model, model.config.text_config) if fn else ""
@@ -382,20 +428,7 @@ def run_draft(salt, defect, cap):
         modeling_muse_glimmer_assistant as mdl,
     )
 
-    text = tiny_text_config(C)
-    top = C.MuseGlimmerConfig(
-        text_config=text,
-        vision_config=tiny_vision_config(C),
-        image_token_id=59,
-        video_token_id=58,
-        out_hidden_size=32,
-        projector_hidden_size=48,
-    )
-    top._attn_implementation = "eager"
-    target = tgt_mdl.MuseGlimmerForConditionalGeneration(top)
-    target.config.text_config._attn_implementation = "eager"
-    target.eval()
-    init_weights(target, salt)
+    text, target = _build_target(C, tgt_mdl, salt)
 
     dcfg = tiny_draft_config(DC, text)
     dcfg._attn_implementation = "eager"
@@ -411,69 +444,8 @@ def run_draft(salt, defect, cap):
     cap.add_ints("target_layer_ids", dcfg.target_layer_ids)
 
     with torch.no_grad():
-        tout = target(input_ids=ids, output_hidden_states=True, use_cache=False)
-        # `hidden_states[i]` is the INPUT to layer i, so layer i's OUTPUT is index i+1. Off by one
-        # here is a silent quality loss, and it is exactly the kind of thing a golden exists for.
-        ctx = torch.cat([tout.hidden_states[i + 1] for i in dcfg.target_layer_ids], dim=-1)
-        cap.add("draft.context_concat", ctx)
-
-        # The draft block: the last accepted token, then masks. Embedded from the TARGET's
-        # embedding matrix RAW -- section 11 item 3: the weightless embed-norm is skipped, so this
-        # reaches past `MuseGlimmerTextNormedEmbedding.forward` to `nn.Embedding` on purpose.
-        anchor = int(tout.logits[:, -1, :].argmax(-1))
-        block = torch.tensor([[anchor] + [dcfg.mask_token_id] * (dcfg.block_size - 1)])
-        emb = target.model.language_model.embed_tokens
-        noise = torch.nn.functional.embedding(block, emb.weight)
-        cap.add_ints("draft.block_ids", block[0].tolist())
-        cap.add("draft.noise_embeds", noise)
-
-        taps = Taps(cap)
-        taps.step = 0
-        handles = _install_draft_taps(mdl, draft, taps)
-        # **The mask spans `context + block`, and the first draft call must be CACHELESS.**
-        #
-        # Q is the 4 block rows; K/V are `concat(context, block)`, 16 rows, and the two lengths
-        # differ inside one call. `MuseGlimmerAssistantModel.forward` builds its masks from
-        # `inputs_embeds=noise_embeds`, so the default mask is 4 wide and the reference raises on
-        # the add. Passing a 2D mask of length 16 fixes that -- but only with `use_cache=False`:
-        # measured 2026-08-11, `create_bidirectional_sliding_window_mask` takes `kv_length` from
-        # `past_key_values` when one is present, and a freshly built `DFlashCache` reports 0, so
-        # the 16-wide mask comes back 4 wide again and the same error returns.
-        #
-        # A cacheless first step is right for this anchor either way -- section 11 says the cycle is
-        # one forward pass with no denoising loop, and the cache exists to carry accepted context
-        # across cycles, which a single step has none of. Recorded in the metadata as `use_cache`.
-        attn_mask = torch.ones(1, int(ctx.shape[1]) + dcfg.block_size, dtype=torch.long)
-        if getattr(draft, "_anchor_force_causal", False):
-            from transformers.masking_utils import (
-                create_causal_mask,
-                create_sliding_window_causal_mask,
-            )
-
-            mk = dict(
-                config=dcfg,
-                inputs_embeds=noise,
-                attention_mask=attn_mask,
-                past_key_values=None,
-            )
-            attn_mask = {
-                "full_attention": create_causal_mask(**mk),
-                "sliding_attention": create_sliding_window_causal_mask(**mk),
-            }
-        dout = draft(
-            noise_embeds=noise,
-            context_hidden_states=ctx,
-            attention_mask=attn_mask,
-            use_cache=False,
-        )
-        cap.add("draft.last_hidden", dout.last_hidden_state)
-        if taps.attend_calls != dcfg.num_hidden_layers:
-            raise AssertionError(
-                f"draft attend tap fired {taps.attend_calls}x, expected {dcfg.num_hidden_layers}"
-            )
-        for h in handles:
-            h.remove()
-        taps.close()
+        ctx, noise = _draft_inputs(target, dcfg, ids, cap)
+        dout = _run_draft_block(mdl, draft, dcfg, (ctx, noise), cap)
 
         # Logits from the TARGET's lm_head, then slice off index 0 -> block_size-1 candidates.
         logits = target.lm_head(dout.last_hidden_state)
@@ -492,6 +464,92 @@ def run_draft(salt, defect, cap):
             # key is the two-frozen-copies shape this port has already been bitten by once.
         },
     )
+
+
+def _draft_inputs(target, dcfg, ids, cap):
+    """The drafter's two inputs, both produced by the UNPERTURBED target: context and noise block.
+
+    Run inside `run_draft`'s `no_grad` block, where these statements were written.
+    """
+    tout = target(input_ids=ids, output_hidden_states=True, use_cache=False)
+    # `hidden_states[i]` is the INPUT to layer i, so layer i's OUTPUT is index i+1. Off by one
+    # here is a silent quality loss, and it is exactly the kind of thing a golden exists for.
+    ctx = torch.cat([tout.hidden_states[i + 1] for i in dcfg.target_layer_ids], dim=-1)
+    cap.add("draft.context_concat", ctx)
+
+    # The draft block: the last accepted token, then masks. Embedded from the TARGET's
+    # embedding matrix RAW -- section 11 item 3: the weightless embed-norm is skipped, so this
+    # reaches past `MuseGlimmerTextNormedEmbedding.forward` to `nn.Embedding` on purpose.
+    anchor = int(tout.logits[:, -1, :].argmax(-1))
+    block = torch.tensor([[anchor] + [dcfg.mask_token_id] * (dcfg.block_size - 1)])
+    emb = target.model.language_model.embed_tokens
+    noise = torch.nn.functional.embedding(block, emb.weight)
+    cap.add_ints("draft.block_ids", block[0].tolist())
+    cap.add("draft.noise_embeds", noise)
+    return ctx, noise
+
+
+def _draft_mask(draft, dcfg, ctx, noise):
+    """**The mask spans `context + block`, and the first draft call must be CACHELESS.**
+
+    Q is the 4 block rows; K/V are `concat(context, block)`, 16 rows, and the two lengths
+    differ inside one call. `MuseGlimmerAssistantModel.forward` builds its masks from
+    `inputs_embeds=noise_embeds`, so the default mask is 4 wide and the reference raises on
+    the add. Passing a 2D mask of length 16 fixes that -- but only with `use_cache=False`:
+    measured 2026-08-11, `create_bidirectional_sliding_window_mask` takes `kv_length` from
+    `past_key_values` when one is present, and a freshly built `DFlashCache` reports 0, so
+    the 16-wide mask comes back 4 wide again and the same error returns.
+
+    A cacheless first step is right for this anchor either way -- section 11 says the cycle is
+    one forward pass with no denoising loop, and the cache exists to carry accepted context
+    across cycles, which a single step has none of. Recorded in the metadata as `use_cache`.
+    """
+    attn_mask = torch.ones(1, int(ctx.shape[1]) + dcfg.block_size, dtype=torch.long)
+    if getattr(draft, "_anchor_force_causal", False):
+        from transformers.masking_utils import (
+            create_causal_mask,
+            create_sliding_window_causal_mask,
+        )
+
+        mk = dict(
+            config=dcfg,
+            inputs_embeds=noise,
+            attention_mask=attn_mask,
+            past_key_values=None,
+        )
+        attn_mask = {
+            "full_attention": create_causal_mask(**mk),
+            "sliding_attention": create_sliding_window_causal_mask(**mk),
+        }
+    return attn_mask
+
+
+def _run_draft_block(mdl, draft, dcfg, inputs, cap):
+    """The single draft forward pass, taps installed around it and torn down after.
+
+    `inputs` is `(ctx, noise)` as one argument because they are one thing -- the pair
+    `_draft_inputs` returns, and neither is meaningful to this call without the other.
+    """
+    ctx, noise = inputs
+    taps = Taps(cap)
+    taps.step = 0
+    handles = _install_draft_taps(mdl, draft, taps)
+    attn_mask = _draft_mask(draft, dcfg, ctx, noise)
+    dout = draft(
+        noise_embeds=noise,
+        context_hidden_states=ctx,
+        attention_mask=attn_mask,
+        use_cache=False,
+    )
+    cap.add("draft.last_hidden", dout.last_hidden_state)
+    if taps.attend_calls != dcfg.num_hidden_layers:
+        raise AssertionError(
+            f"draft attend tap fired {taps.attend_calls}x, expected {dcfg.num_hidden_layers}"
+        )
+    for h in handles:
+        h.remove()
+    taps.close()
+    return dout
 
 
 def _install_draft_taps(mdl, draft, taps):
@@ -603,7 +661,9 @@ def _draft_hook(cap, name):
 # ---------------------------------------------------------------------------------------------
 
 
-def main():
+def _build_parser():
+    """The CLI. `main` keeps reading THIS MODULE's `__doc__` for `--help`, which is why the split
+    that moved the fixtures, the defects and the scoring out of this file left `main` behind."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--mode", choices=("text", "draft"), default="text")
     ap.add_argument("--salt", default="glimmer-anchor-1")
@@ -625,20 +685,16 @@ def main():
     # IDENTICAL weights and differs only in accumulation -- which is the entire point.
     ap.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     ap.add_argument("--no-preflight", action="store_true")
-    a = ap.parse_args()
+    return ap
 
-    if a.compare:
-        compare(*a.compare)
-        return
-    if a.by_operator:
-        by_operator(*a.by_operator)
-        return
-    if not a.out:
-        ap.error("--out is required unless --compare or --by-operator is given")
-    # Before the model is built: the reference reads the default dtype at construction time for
-    # every buffer it allocates, including the RoPE table.
-    torch.set_default_dtype(getattr(torch, a.dtype))
 
+def _check_run_args(ap, a):
+    """The refusals a generating run has to pass, in the order they were written.
+
+    Order is behaviour here, because every `ap.error` exits: `--out` is reported before the
+    mode/defect mismatch, which is reported before the `--dump-weights` trap. Only the nesting of
+    that last predicate moved (2026-08-15, CodeScene 10.0) -- it is the same test, named.
+    """
     allowed = TEXT_DEFECTS if a.mode == "text" else DRAFT_DEFECTS
     if a.defect not in allowed:
         ap.error(f"--defect {a.defect} does not apply to --mode {a.mode}")
@@ -646,16 +702,20 @@ def main():
     # below `write_golden`, so `--defect X --dump-weights` built the model, ran all seven steps,
     # wrote a complete golden, and only then exited 2 -- aborting `glimmer-anchor.sh` mid-sweep with
     # a good-looking artefact already on disk. Review, 2026-08-13.
-    if a.dump_weights and (a.mode != "text" or a.defect != "None"):
+    weights_would_be_a_trap = a.mode != "text" or a.defect != "None"
+    if a.dump_weights and weights_would_be_a_trap:
         ap.error("--dump-weights is for the clean text model; a defect run's weights are a trap")
     if not a.no_preflight:
         preflight_env()
 
-    torch.manual_seed(0)  # nothing here should consume it; a stray draw would be a bug, not noise
-    cap = Capture()
-    runner = run_text if a.mode == "text" else run_draft
-    model, note, extra = runner(a.salt, a.defect, cap)
 
+def _metadata(a, model, note, extra):
+    """The golden's self-describing header: what ran, under which environment, at which widths.
+
+    A golden that hides what produced it is worse than no golden -- so the declared deviations in
+    this module's docstring each have a key here, and `preflight_env` reads the versions back OUT
+    of these bytes rather than out of a constant.
+    """
     cfg = model.config
     tiny = cfg.text_config.to_dict() if hasattr(cfg, "text_config") else cfg.to_dict()
     meta = [
@@ -672,6 +732,32 @@ def main():
     ]
     meta += [(k, str(v)) for k, v in sorted(environment().items())]
     meta += [(k, str(v)) for k, v in sorted(extra.items())]
+    return meta
+
+
+def main():
+    ap = _build_parser()
+    a = ap.parse_args()
+
+    if a.compare:
+        compare(*a.compare)
+        return
+    if a.by_operator:
+        by_operator(*a.by_operator)
+        return
+    if not a.out:
+        ap.error("--out is required unless --compare or --by-operator is given")
+    # Before the model is built: the reference reads the default dtype at construction time for
+    # every buffer it allocates, including the RoPE table.
+    torch.set_default_dtype(getattr(torch, a.dtype))
+    _check_run_args(ap, a)
+
+    torch.manual_seed(0)  # nothing here should consume it; a stray draw would be a bug, not noise
+    cap = Capture()
+    runner = run_text if a.mode == "text" else run_draft
+    model, note, extra = runner(a.salt, a.defect, cap)
+
+    meta = _metadata(a, model, note, extra)
     n = write_golden(a.out, meta, cap)
     print(
         f"{a.out}: {n} B, {len(cap.floats)} float tensors, {len(cap.ints)} int tensors, "

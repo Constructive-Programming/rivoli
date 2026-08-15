@@ -77,7 +77,7 @@ import struct  # noqa: F401
 # torch, so `--compare` still runs without one); `k3_anchor_capture` holds the hooks, and
 # `k3_anchor_taps` the two values no hook can see. All three sit beside this file, which is
 # `sys.path[0]` whenever it runs as a script -- the only way it is ever run.
-from k3_anchor_capture import Capture, _fire, hook_model  # noqa: F401
+from k3_anchor_capture import Capture, Tap, _fire, hook_model  # noqa: F401
 from k3_anchor_lib import (  # noqa: F401
     CAPTURE_LAYERS,
     EXPECT_GREEN,
@@ -362,6 +362,36 @@ DEFECTS = {
 FLA_MODULES = ("ShortConvolution", "FusedRMSNormGated")
 
 
+def _down(x):
+    """fp64 -> fp32 for anything floating; ints, `None` and flags pass through untouched."""
+    return x.float() if hasattr(x, "dtype") and x.is_floating_point() else x
+
+
+def _up(out):
+    """The island's return trip, and the two arms test DIFFERENT predicates on purpose.
+
+    A tuple member is raised only if it is floating point -- fla's ops return integer index
+    tensors and `None` beside their activations. A bare return value is raised on `hasattr` alone,
+    which is what these modules have always done; both halves are the pre-split behaviour and a
+    golden that moved would be a golden nothing could re-derive.
+    """
+    if isinstance(out, tuple):
+        return tuple(
+            o.double() if hasattr(o, "dtype") and o.is_floating_point() else o for o in out
+        )
+    return out.double() if hasattr(out, "dtype") else out
+
+
+def _fp32_shim(orig):
+    """Wrap one fla module's `forward` so it computes in fp32 between fp64 neighbours."""
+
+    def shim(*a, _orig=orig, **kw):
+        out = _orig(*[_down(x) for x in a], **{k: _down(v) for k, v in kw.items()})
+        return _up(out)
+
+    return shim
+
+
 def fp32_island(model):
     """Make every fla module compute in fp32 while the rest of the model runs in fp64.
 
@@ -375,35 +405,21 @@ def fp32_island(model):
     for m in model.modules():
         if type(m).__name__ not in FLA_MODULES:
             continue
-        orig = m.forward
-
-        def shim(*a, _orig=orig, **kw):
-            down = lambda x: (  # noqa: E731
-                x.float() if hasattr(x, "dtype") and x.is_floating_point() else x
-            )
-            out = _orig(*[down(x) for x in a], **{k: down(v) for k, v in kw.items()})
-            if isinstance(out, tuple):
-                return tuple(o.double() if hasattr(o, "dtype") and o.is_floating_point() else o for o in out)
-            return out.double() if hasattr(out, "dtype") else out
-
-        m.forward = shim
+        m.forward = _fp32_shim(m.forward)
         n += 1
     return n
 
 
-def kda_equiv(model, mdl_mod, ctx, seq, device, vocab):
-    """**KDA's tolerance floor, measured against fla's own second implementation of it.**
+def _kda_both_paths(model, ctx, args, vocab):
+    """Run the same tokens twice, once through each of fla's two KDA implementations.
 
-    fp64 cannot serve here (see `wrap_kda_ops`), so the floor comes from the two paths fla ships
-    for the same recurrence: `chunk_kda` over T positions at once, and `fused_recurrent_kda` one
-    position at a time. They are the same mathematics by the same authors, so their disagreement is
-    exactly what "a correct implementation in fp32, associating differently" costs — which is the
-    number a HIP kernel's tolerance has to sit above.
-
-    Reported over EVERY KDA layer, not just the captured six: a tolerance is a bound, and a bound
-    wants the worst case.
+    The prefill goes through `chunk_kda` (T positions at once); the token-at-a-time loop goes
+    through `fused_recurrent_kda`, which is the decode path. `equiv_sink` is what the KDA tap
+    files each call's output into, and `kda_calls` is reset per step because the tap numbers
+    layers by call order within one forward.
     """
     chunk, steps = {}, {}
+    seq, device = args.seq, args.device
     with torch.no_grad():
         ctx["equiv_sink"], ctx["kda_calls"] = chunk, 0
         ids = torch.arange(1, seq + 1, device=device).unsqueeze(0) % vocab
@@ -416,20 +432,57 @@ def kda_equiv(model, mdl_mod, ctx, seq, device, vocab):
             past = out.past_key_values
             ctx["kda_calls"] = 0
     ctx["equiv_sink"] = None
+    return chunk, steps
 
-    worst, rows = 0.0, []
+
+def _step_rel(chunked, stepped):
+    """Worst relative disagreement between one layer's chunked output and its per-step twin.
+
+    Scaled by the step's own largest magnitude, floored at 1e-30 so an all-zero position does not
+    divide by zero.
+    """
+    rel = 0.0
+    for i, step in enumerate(stepped):
+        a, b = chunked[:, i].reshape(-1), step.reshape(-1)
+        scale = max(abs(float(v)) for v in b) or 1e-30
+        rel = max(rel, max(abs(float(x) - float(y)) for x, y in zip(a, b)) / scale)
+    return rel
+
+
+def _steps_of(steps, layer, seq):
+    """One layer's per-step outputs, asserting the decode loop reached it once per position."""
+    r = steps.get(("fused_recurrent_kda", layer))
+    assert r is not None and len(r) == seq, f"layer {layer}: {r and len(r)} steps for {seq}"
+    return r
+
+
+def _kda_equiv_rows(chunk, steps, seq):
+    """`(layer, max_rel)` per KDA layer, in layer order."""
+    rows = []
     for (tag, layer), got in sorted(chunk.items(), key=lambda kv: kv[0][1]):
         assert tag == "chunk_kda", f"prefill went through {tag}"
         c = got[0]                                    # [1, T, H, D]
-        r = steps.get(("fused_recurrent_kda", layer))
-        assert r is not None and len(r) == seq, f"layer {layer}: {r and len(r)} steps for {seq}"
-        rel = 0.0
-        for i, step in enumerate(r):
-            a, b = c[:, i].reshape(-1), step.reshape(-1)
-            scale = max(abs(float(v)) for v in b) or 1e-30
-            rel = max(rel, max(abs(float(x) - float(y)) for x, y in zip(a, b)) / scale)
-        rows.append((layer, rel))
-        worst = max(worst, rel)
+        rows.append((layer, _step_rel(c, _steps_of(steps, layer, seq))))
+    return rows
+
+
+def kda_equiv(model, tap, args, vocab):
+    """**KDA's tolerance floor, measured against fla's own second implementation of it.**
+
+    fp64 cannot serve here (see `wrap_kda_ops`), so the floor comes from the two paths fla ships
+    for the same recurrence: `chunk_kda` over T positions at once, and `fused_recurrent_kda` one
+    position at a time. They are the same mathematics by the same authors, so their disagreement is
+    exactly what "a correct implementation in fp32, associating differently" costs — which is the
+    number a HIP kernel's tolerance has to sit above.
+
+    Reported over EVERY KDA layer, not just the captured six: a tolerance is a bound, and a bound
+    wants the worst case.
+    """
+    chunk, steps = _kda_both_paths(model, tap.ctx, args, vocab)
+    rows = _kda_equiv_rows(chunk, steps, args.seq)
+    # `default` rather than a `worst = 0.0` seed carried through the loop -- same value, including
+    # the no-KDA-layer case the seed used to cover.
+    worst = max((rel for _, rel in rows), default=0.0)
     print("# chunk_kda vs fused_recurrent_kda, same weights, same tokens")
     print(f"kda layers\t{len(rows)}\nworst max_rel\t{worst:.3e}")
     print("layer\tmax_rel")
@@ -514,7 +567,13 @@ def preflight_env():
     )
 
 
-def main():
+def _parse_args():
+    """The command line, and the one cross-argument rule argparse cannot state.
+
+    `--ref`/`--config`/`--out` are required for a generation run and meaningless for a scoring
+    one, so they are checked here rather than declared `required=True` -- which would break the
+    deviceless `--compare` this whole split exists to keep.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--compare",
@@ -545,26 +604,16 @@ def main():
         help="score two goldens per OPERATOR instead of per layer, and exit; no GPU, no torch",
     )
     args = ap.parse_args()
-
-    if args.compare:
-        compare(*args.compare)
-        return
-    if args.by_operator:
-        by_operator(*args.by_operator)
-        return
+    if args.compare or args.by_operator:
+        return args
     for req in ("ref", "config", "out"):
         if getattr(args, req) is None:
             ap.error(f"--{req} is required unless --compare is given")
+    return args
 
-    global torch
-    import torch
 
-    # Before `load_reference` and before any weight is drawn: a wrong venv should cost seconds.
-    preflight_env()
-
-    cfg_mod, mdl_mod = load_reference(args.ref)
-    cfg = build_config(cfg_mod, args.config)
-
+def _build_model(mdl_mod, cfg, args):
+    """The reference model, initialised, on the device, at the requested precision."""
     torch.use_deterministic_algorithms(True, warn_only=True)
     model = mdl_mod.KimiLinearForCausalLM(cfg)
     # AFTER construction: `KimiLinearModel.__init__` overwrites the field with
@@ -581,33 +630,31 @@ def main():
         # kernel returns an fp32 recurrent state whatever the input dtype anyway.
         model.double()
         print(f"k3-anchor: fp64 with {fp32_island(model)} fla modules held at fp32")
+    return model
 
-    ctx = {
+
+def _new_ctx(cfg, args):
+    """The mutable per-run state every defect, tap and hook shares."""
+    return {
         "kda_layer_ids": [i for i in range(cfg.num_hidden_layers) if cfg.is_kda_layer(i)],
         "kda_kwargs": {},
         "kda_calls": 0,
         "capturing": False,
         "kda_fp32_island": args.dtype == "float64",
     }
-    DEFECTS[args.defect](model, ctx)
 
-    cap = Capture()
-    # Wrappers go on BEFORE any forward pass so a kwarg-only defect perturbs the warm prefill
-    # too; `ctx["capturing"]` is what decides whether a call is recorded.
-    wrap_kda_ops(mdl_mod, cap, ctx, CAPTURE_LAYERS)
-    wrap_attn_res(mdl_mod, model, cap, ctx, CAPTURE_LAYERS)
-    ids = torch.arange(1, args.seq + 1, device=args.device).unsqueeze(0) % cfg.vocab_size
 
-    if args.mode == "kda-equiv":
-        # A measurement, not a golden: it writes nothing, because what it produces is one number
-        # per KDA layer rather than a fixture anything scores against.
-        kda_equiv(model, mdl_mod, ctx, args.seq, args.device, cfg.vocab_size)
-        return
+def _capture_pass(model, tap, args, vocab):
+    """Run the mode's forward pass with the hooks armed, and return the names that were hooked.
 
+    Handles are removed here rather than by the caller: a hook left registered would fire on
+    whatever ran next, and nothing after this returns needs them.
+    """
+    ids = torch.arange(1, args.seq + 1, device=args.device).unsqueeze(0) % vocab
     with torch.no_grad():
         if args.mode == "prefill":
-            handles, expected = hook_model(model, cap, CAPTURE_LAYERS)
-            ctx["capturing"] = True
+            handles, expected = hook_model(model, tap.cap, tap.layers)
+            tap.ctx["capturing"] = True
             out = model(input_ids=ids, use_cache=True)
         else:
             # Prefill UNHOOKED, then capture exactly one decode step. The cache and the KDA
@@ -615,19 +662,26 @@ def main():
             # (`fused_recurrent_kda`, not `chunk_kda`), and capturing the prefill too would
             # triple the file for tensors the prefill golden already holds.
             warm = model(input_ids=ids, use_cache=True)
-            handles, expected = hook_model(model, cap, CAPTURE_LAYERS)
-            ctx["capturing"] = True
-            nxt = torch.tensor([[args.seq + 1]], device=args.device) % cfg.vocab_size
+            handles, expected = hook_model(model, tap.cap, tap.layers)
+            tap.ctx["capturing"] = True
+            nxt = torch.tensor([[args.seq + 1]], device=args.device) % vocab
             out = model(input_ids=nxt, past_key_values=warm.past_key_values, use_cache=True)
-        cap.add("logits", out.logits)
+        tap.cap.add("logits", out.logits)
     for h in handles:
         h.remove()
+    return expected
 
-    # A hook that never fires is silent, and that silence is what hid the AttnRes gap for a day.
-    # Every registered hook must have produced at least one tensor, and every KDA layer must have
-    # been reached exactly once -- a short count would RELABEL captures (layer 1's operator
-    # boundary written under layer 0's name) rather than produce a layer nothing expects, which
-    # no assertion in `tests/k3_anchor.rs` could see.
+
+def _assert_captured(tap, expected):
+    """Refuse a golden whose capture was SHORT.
+
+    A hook that never fires is silent, and that silence is what hid the AttnRes gap for a day.
+    Every registered hook must have produced at least one tensor, and every KDA layer must have
+    been reached exactly once -- a short count would RELABEL captures (layer 1's operator boundary
+    written under layer 0's name) rather than produce a layer nothing expects, which no assertion
+    in `tests/k3_anchor.rs` could see.
+    """
+    cap, ctx = tap.cap, tap.ctx
     silent = sorted(set(expected) - cap.fired)
     assert not silent, f"{len(silent)} hooks never fired, e.g. {silent[:4]}"
     assert ctx["kda_calls"] == len(ctx["kda_layer_ids"]), (
@@ -637,11 +691,15 @@ def main():
         assert any(f".{tag}.out" in s for s in cap.seen), f"no {tag} fold was captured"
     assert any("output_attn_res.out" in s for s in cap.seen), "no model-level fold was captured"
 
+
+def _metadata(args, model, cfg):
+    """Everything the bytes have to carry about what produced them, including all four declared
+    deviations -- a golden that hides what produced it is worse than no golden."""
     import fla
     import transformers
     import triton
 
-    meta = [
+    return [
         ("defect", args.defect),
         ("mode", args.mode),
         ("seq", str(args.seq)),
@@ -662,11 +720,54 @@ def main():
         ("ref_config_sha256_16", sha_of(pathlib.Path(args.ref) / "configuration_kimi_k3.py")),
         ("real_config_sha256_16", sha_of(args.config)),
     ]
-    n = write_golden(args.out, meta, cap)
+
+
+def _generate(args):
+    """One generation run: build, perturb, capture, and write the golden (or, in `kda-equiv`,
+    print the floor and write nothing)."""
+    cfg_mod, mdl_mod = load_reference(args.ref)
+    cfg = build_config(cfg_mod, args.config)
+    model = _build_model(mdl_mod, cfg, args)
+
+    ctx = _new_ctx(cfg, args)
+    DEFECTS[args.defect](model, ctx)
+
+    tap = Tap(Capture(), ctx, CAPTURE_LAYERS)
+    # Wrappers go on BEFORE any forward pass so a kwarg-only defect perturbs the warm prefill
+    # too; `ctx["capturing"]` is what decides whether a call is recorded.
+    wrap_kda_ops(mdl_mod, tap)
+    wrap_attn_res(mdl_mod, model, tap)
+
+    if args.mode == "kda-equiv":
+        # A measurement, not a golden: it writes nothing, because what it produces is one number
+        # per KDA layer rather than a fixture anything scores against.
+        kda_equiv(model, tap, args, cfg.vocab_size)
+        return
+
+    _assert_captured(tap, _capture_pass(model, tap, args, cfg.vocab_size))
+    cap = tap.cap
+    n = write_golden(args.out, _metadata(args, model, cfg), cap)
     print(
         f"k3-anchor: {args.out} — {len(cap.floats)} float, {len(cap.ints)} int tensors, "
         f"{n} bytes, defect={args.defect} mode={args.mode}",
     )
+
+
+def main():
+    args = _parse_args()
+    if args.compare:
+        compare(*args.compare)
+        return
+    if args.by_operator:
+        by_operator(*args.by_operator)
+        return
+
+    global torch
+    import torch
+
+    # Before `load_reference` and before any weight is drawn: a wrong venv should cost seconds.
+    preflight_env()
+    _generate(args)
 
 
 if __name__ == "__main__":

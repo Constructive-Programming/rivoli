@@ -189,10 +189,38 @@ enum Health {
     NotRun(String),
 }
 
+/// The ONE sanctioned exception, owner-accepted 2026-08-15: `(path, floor)`. numerics.rs
+/// is 21 scalar-in/scalar-out frozen transliterations, and Primitive Obsession wants most
+/// ARGUMENTS non-primitive — measured: named aliases don't count, one newtype doesn't
+/// move the ratio, and wrapping every argument would bury the Python-to-Rust
+/// correspondence the file exists for. The row's three deaths ARE its red-proof
+/// machinery: it fails if the file vanishes, if it sinks BELOW the accepted floor (real
+/// decay), and — via the healed check in the sweep — if it reaches 10.0 (an exemption
+/// suppressing nothing must go).
+const EXEMPT: &[(&str, f64)] = &[("crates/oracles/src/v4oracle/numerics.rs", 9.6)];
+
+/// The verdict for a scored file, exemption triple included: an exempt file is green in
+/// `[floor, 10)`, red below its floor (decay), and red AT 10.0 (a row suppressing
+/// nothing must go). Everything else needs 10.0 exactly.
+fn scored(rel: &str, s: f64) -> Health {
+    match EXEMPT.iter().find(|(p, _)| *p == rel) {
+        None if s >= 10.0 => Health::Green,
+        None => Health::Below(format!("{rel}: score {s}")),
+        Some(_) if s >= 10.0 => Health::Below(format!(
+            "{rel}: scored 10.0 but carries an EXEMPT row — the exemption is suppressing \
+             nothing; delete it"
+        )),
+        Some((_, floor)) if s >= *floor => Health::Green,
+        Some((_, floor)) => Health::Below(format!(
+            "{rel}: {s} sank below its accepted floor {floor} — the exemption covers the \
+             measured state, not decay"
+        )),
+    }
+}
+
 fn health_of(root: &Path, rel: &str, body: &[u8]) -> Health {
     match review(&[rel], None, root) {
-        Cs::Score(s) if s >= 10.0 => Health::Green,
-        Cs::Score(s) => Health::Below(format!("{rel}: score {s}")),
+        Cs::Score(s) => scored(rel, s),
         Cs::NoScorableCode => {
             assert_null_score_is_not_vacuity(rel, body);
             Health::Green
@@ -247,7 +275,12 @@ fn sweep(root: &Path, files: &[PathBuf], cache: &mut Cache) -> Sweep {
 /// that found almost nothing means the gate is aimed at the wrong tree — not that the
 /// tree is healthy.
 fn walked_rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = common::walk(&root.join("crates"), "rs");
+    // .rs + .hpp + .py since 2026-08-15 (owner extended the mandate; cs scores all
+    // three). .hip is NOT scored by cs — the kernels' gates are the device oracles.
+    let mut files: Vec<PathBuf> = ["rs", "hpp", "py"]
+        .iter()
+        .flat_map(|e| common::walk(&root.join("crates"), e))
+        .collect();
     files.sort();
     assert!(
         files.len() >= 6,

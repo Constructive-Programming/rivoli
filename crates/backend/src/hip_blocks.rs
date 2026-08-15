@@ -255,7 +255,7 @@ launchers! {
     /// > agree bit-for-bit". True of the toy fixture, false of the checkpoint — 19 vs 20
     /// > moves 39,893/53,248 of `L0.pre.ffn_norm_out` there. A real-weights golden would
     /// > gate the count; the toy fixture these kernel tests run on cannot. Measurement in
-    /// > `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`.
+    /// > `tests/v4_oracle_targeted.rs::sinkhorn_has_converged_long_before_iteration_20`.
     ///
     /// `hc` is checked against the kernel's `HC_MULT`, not merely passed: `mix_hc = (2+hc)·hc`
     /// is how the mHC weights are packed on disk, so a mismatch is a different checkpoint.

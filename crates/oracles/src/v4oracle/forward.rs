@@ -86,7 +86,7 @@
 //! moved VERBATIM: this is a frozen transliteration, the arithmetic is `model.py`'s, and
 //! tidying anything on the way across would be a value change wearing a refactor's clothes.
 
-use crate::v4oracle::attention::Sinks;
+pub use crate::v4oracle::attention::Sinks;
 use crate::v4oracle::hc::HcW;
 use crate::v4oracle::numerics::{act_quant_inplace, bf16_decode, bf16_encode};
 use crate::v4oracle::weights::{V4Config, WMat};
@@ -100,10 +100,11 @@ use crate::v4oracle::weights::{V4Config, WMat};
 pub use crate::v4oracle::attention::{compress_topk, window_topk};
 pub use crate::v4oracle::breakages::{Defect, splitk_combine, splitk_fold, wave_ladder};
 pub use crate::v4oracle::capture::{Capture, Counters};
-pub use crate::v4oracle::head::HeadTailW;
+pub use crate::v4oracle::head::{HeadRows, HeadTailW};
 pub use crate::v4oracle::layer::{
     CompState, CompressorW, ExpertW, IndexerW, LayerCtx, LayerRings, LayerW,
 };
+pub use crate::v4oracle::moe::ExpertOperand;
 
 // ---------------------------------------------------------------------------------------
 // the oracle
@@ -287,24 +288,22 @@ impl Oracle {
     /// the reference stores).
     ///
     /// `pub` since 2026-08-08 (the `qk_norm` precedent) so
-    /// `tests/v4_oracle.rs::the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims`
+    /// `tests/v4_oracle_targeted.rs::the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims`
     /// can drive the `splitk_selects` WIRING at real dims: review found that no committed
     /// test ever reached `linear` with the predicate true — the toy drive selects nothing
     /// by design and the real-dims probes called `splitk_fold` directly — so a predicate
     /// typo that made it never-true would reproduce §M9's "all tensors bit-identical"
     /// host result VACUOUSLY. The unrounded return is what makes the wiring observable
     /// (the raw fold delta is ~59% of sums; the bf16 stores downstream absorb it).
-    pub fn linear(&self, x: &[f32], m: usize, k: usize, w: &WMat) -> Vec<f32> {
-        // `assert`, not `debug_assert`: `[profile.release]` does not set `debug-assertions`
-        // and CLAUDE.md prescribes `cargo test --release`, so a debug assertion here would
-        // never run in the only configuration anyone uses. These are per-GEMM, not
-        // per-element -- the cost is nil against a 4000-line CPU oracle.
-        assert_eq!(
-            w.cols(),
-            k,
-            "linear: weight expects k={}, got {k}",
-            w.cols()
-        );
+    pub fn linear(&self, x: &[f32], m: usize, w: &WMat) -> Vec<f32> {
+        // `k` DERIVED from the weight since 2026-08-15: the parameter was asserted equal
+        // to `w.cols()` on entry, so it was redundant, and every call site that could
+        // have disagreed now cannot. The x-length assert below carries the same
+        // mismatch-detection the deleted assert did.
+        // (`assert`, not `debug_assert`: `[profile.release]` does not set
+        // `debug-assertions`, so a debug assertion here would never run under the release
+        // suite. Per-GEMM, not per-element -- the cost is nil against a CPU oracle.)
+        let k = w.cols();
         assert_eq!(x.len(), m * k);
         let n = w.rows();
         // For quantized weights the activation is first quantized to fp8 at block 128 with
@@ -602,13 +601,8 @@ pub(super) fn topk_idx(v: &[f32], k: usize) -> Vec<usize> {
 
 impl Oracle {
     /// `Block.forward` (model.py:695-707) for one layer, in place on the residual stream.
-    pub fn run_layer(
-        &self,
-        step: &LayerCtx,
-        st: &mut LayerRings,
-        h: &mut Vec<f32>,
-        cap: &mut Capture,
-    ) {
+    pub fn run_layer(&self, step: &LayerCtx, h: &mut Vec<f32>, sinks: Sinks<'_>) {
+        let Sinks { st, cap } = sinks;
         let LayerCtx { lw, s, .. } = *step;
         let tag = step.tag();
         let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);

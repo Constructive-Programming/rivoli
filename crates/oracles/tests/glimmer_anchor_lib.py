@@ -167,6 +167,52 @@ def _gen(name, salt):
     return torch.Generator().manual_seed(int.from_bytes(h[:8], "little") & ((1 << 63) - 1))
 
 
+def _centered_norm_owners(model):
+    """The module paths whose weight is applied as `(1 + w)` instead of `x * w`.
+
+    Telling the two families apart by module TYPE rather than by name is deliberate: both are
+    called `...norm.weight`, so a name rule would have to guess.
+    """
+    centered = set()
+    for mod_name, mod in model.named_modules():
+        if type(mod).__name__.endswith("CenteredRMSNorm"):
+            centered.add(mod_name)
+    return centered
+
+
+def _draw_into(flat, owner, centered, g):
+    """The three-way draw, keyed to how the owning module APPLIES the weight it is given.
+
+    A centered norm filled near 1.0 doubles every activation it touches, and a golden of
+    exponentially growing numbers agrees with nothing -- see `init_weights`.
+    """
+    if owner in centered:
+        flat.uniform_(-0.2, 0.2, generator=g)  # applied as (1 + w)
+    elif "norm" in owner.split(".")[-1]:
+        flat.uniform_(0.8, 1.2, generator=g)  # applied as (x * w)
+    else:
+        flat.uniform_(-0.08, 0.08, generator=g)
+
+
+def _restore_padding_row(model):
+    """`post_init` zeroes the `padding_idx` row and the fill loop overwrote it. Put it back:
+    the zeroing is the reference's own behaviour.
+
+    Called from INSIDE `init_weights`' `no_grad` block, where it was written -- the write is
+    in-place on a leaf parameter and needs that block as much as the fill loop does.
+
+    **The drafter raises here rather than returning None**, because it owns no embedding at
+    all -- it borrows the target's (section 11). That is a documented structural fact, so it
+    is caught rather than worked around, and a DIFFERENT failure would still propagate.
+    """
+    try:
+        emb = model.get_input_embeddings()
+    except NotImplementedError:
+        emb = None
+    if emb is not None and getattr(emb, "padding_idx", None) is not None:
+        emb.weight[emb.padding_idx].zero_()
+
+
 def init_weights(model, salt):
     """Fill every parameter deterministically, in two families.
 
@@ -176,35 +222,22 @@ def init_weights(model, salt):
     growing numbers agrees with nothing. The drafter's plain `MuseGlimmerAssistantRMSNorm` and the
     target's final `MuseGlimmerRMSNorm` apply `x * w` and take the near-one draw. Telling them apart
     by module TYPE rather than by name is deliberate: both are called `...norm.weight`.
+
+    The three steps below -- collect the centered set, draw into each parameter, put the padding row
+    back -- are the ones this body always had; `_centered_norm_owners`, `_draw_into` and
+    `_restore_padding_row` are those steps under their own names, split 2026-08-15 for the CodeScene
+    10.0 gate (cc 10, two bumps). The draw order, the generator per parameter and every bound are
+    untouched, which is what lets the vendored goldens still be this function's output.
     """
-    centered = set()
-    for mod_name, mod in model.named_modules():
-        if type(mod).__name__.endswith("CenteredRMSNorm"):
-            centered.add(mod_name)
+    centered = _centered_norm_owners(model)
     with torch.no_grad():
         for name, p in model.named_parameters():
             g = _gen(name, salt)
             flat = torch.empty(p.numel(), dtype=torch.float32)
             owner = name.rsplit(".", 1)[0]
-            if owner in centered:
-                flat.uniform_(-0.2, 0.2, generator=g)  # applied as (1 + w)
-            elif "norm" in owner.split(".")[-1]:
-                flat.uniform_(0.8, 1.2, generator=g)  # applied as (x * w)
-            else:
-                flat.uniform_(-0.08, 0.08, generator=g)
+            _draw_into(flat, owner, centered, g)
             p.copy_(flat.view(p.shape).to(p.dtype))
-        # `post_init` zeroes the `padding_idx` row and the loop above just overwrote it. Put it
-        # back: the zeroing is the reference's own behaviour.
-        #
-        # **The drafter raises here rather than returning None**, because it owns no embedding at
-        # all -- it borrows the target's (section 11). That is a documented structural fact, so it
-        # is caught rather than worked around, and a DIFFERENT failure would still propagate.
-        try:
-            emb = model.get_input_embeddings()
-        except NotImplementedError:
-            emb = None
-        if emb is not None and getattr(emb, "padding_idx", None) is not None:
-            emb.weight[emb.padding_idx].zero_()
+        _restore_padding_row(model)
 
 
 def prompt_ids(salt, vocab, n=PROMPT_LEN):

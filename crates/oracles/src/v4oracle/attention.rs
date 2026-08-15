@@ -248,10 +248,10 @@ impl Oracle {
         let c = &self.cfg;
         let (rd, d, nh) = (c.rope_head_dim, c.head_dim, c.n_heads);
         let freqs = self.freqs(layer);
-        let mut qr = self.linear(x, s, c.dim, &lw.wq_a);
+        let mut qr = self.linear(x, s, &lw.wq_a);
         self.round_bf16(&mut qr);
         self.rmsnorm(&mut qr, c.q_lora_rank, &lw.q_norm);
-        let mut q = self.linear(&qr, s, c.q_lora_rank, &lw.wq_b);
+        let mut q = self.linear(&qr, s, &lw.wq_b);
         self.round_bf16(&mut q);
         // `Defect::QkNormAfterRope` is a SWAP and nothing else, so the rope loop is written
         // once and only the `qk_norm` call moves across it. Two transcriptions of the loop
@@ -277,7 +277,7 @@ impl Oracle {
         let (lw, layer, s, start_pos) = (step.lw, step.layer, step.s, step.start_pos);
         let (rd, d) = (self.cfg.rope_head_dim, self.cfg.head_dim);
         let freqs = self.freqs(layer);
-        let mut kv = self.linear(x, s, self.cfg.dim, &lw.wkv);
+        let mut kv = self.linear(x, s, &lw.wkv);
         self.round_bf16(&mut kv);
         self.rmsnorm(&mut kv, d, &lw.kv_norm);
         for t in 0..s {
@@ -445,7 +445,7 @@ impl Oracle {
             }
         }
         self.round_bf16(&mut y);
-        let mut out = self.linear(&y, s, g * r, &lw.wo_b);
+        let mut out = self.linear(&y, s, &lw.wo_b);
         self.round_bf16(&mut out);
         out
     }
@@ -492,9 +492,12 @@ impl Oracle {
 /// One parameter because they always travel together — no stage below is handed one without
 /// the other — and because a stage that took both separately plus its own inputs is exactly
 /// the argument pile-up that made `attention` a Brain Method.
-pub(super) struct Sinks<'a> {
-    pub(super) st: &'a mut LayerRings,
-    pub(super) cap: &'a mut Capture,
+/// The two mutable sinks a layer writes: its ring state and the capture. Public since
+/// 2026-08-15 — `Oracle::run_layer` takes one, so the pair callers used to thread as two
+/// loose `&mut`s travels as the value this path already used internally.
+pub struct Sinks<'a> {
+    pub st: &'a mut LayerRings,
+    pub cap: &'a mut Capture,
 }
 
 /// The two activations the compressed selection reads: the block's normalised input `x`,

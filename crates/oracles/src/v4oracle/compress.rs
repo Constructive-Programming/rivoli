@@ -55,8 +55,8 @@ impl Oracle {
         let cd = coff * d;
         let use_ape = self.defect != Defect::CompressorNoApe;
 
-        let mut kv = self.linear(x, s, self.cfg.dim, &cw.wkv);
-        let mut score = self.linear(x, s, self.cfg.dim, &cw.wgate);
+        let mut kv = self.linear(x, s, &cw.wkv);
+        let mut score = self.linear(x, s, &cw.wgate);
 
         let (mut pooled, first_block) = if start_pos == 0 {
             let should = s >= ratio;
@@ -286,7 +286,7 @@ impl Oracle {
         );
         let end_pos = start_pos + s;
 
-        let mut q = self.linear(qr, s, c.q_lora_rank, &iw.wq_b);
+        let mut q = self.linear(qr, s, &iw.wq_b);
         self.round_bf16(&mut q);
         for t in 0..s {
             for hh in 0..h {
@@ -302,7 +302,7 @@ impl Oracle {
         counters.indexer_compressed_blocks += own.compressed_blocks;
 
         // `weights_proj(x) * (softmax_scale * n_heads ** -0.5)`.
-        let mut w = self.linear(x, s, c.dim, &iw.weights_proj);
+        let mut w = self.linear(x, s, &iw.weights_proj);
         self.round_bf16(&mut w);
         // bf16 all the way: `weights_proj` is a bf16 `Linear`, so the scale multiply lands
         // in bf16 too (model.py:424).

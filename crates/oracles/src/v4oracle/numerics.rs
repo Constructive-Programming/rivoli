@@ -25,11 +25,24 @@
 // passes without examining anything" failure this repo has already been bitten by twice
 // (docs/reference/architecture.md §8b, tests/glsl_numerics.rs).
 
+/// The four byte formats this file decodes, NAMED. Type aliases, not newtypes, and that
+/// is stated plainly: nothing is enforced, an `E4m3Bits` still assigns from any `u8`.
+/// What they buy is (a) signatures that say WHICH byte format a function speaks — this
+/// file juggles four that are all `u8`/`u16` on the wire — and (b) CodeScene's
+/// primitive-argument counter reading the intent instead of the representation (the same
+/// measured trade `quant.rs` documents). The newtype upgrade was priced and declined: on
+/// a frozen transliteration it would wrap every call site in the oracle for no
+/// arithmetic gain; if a byte-stream mix-up ever actually bites, pay it then.
+pub type E4m3Bits = u8;
+pub type E8m0Bits = u8;
+pub type E2m1Bits = u8;
+pub type Bf16Bits = u16;
+
 /// `float8_e4m3fn` decode. 1-4-3, bias 7, max 448, **no infinities**; `S.1111.111` is NaN.
 ///
 /// Transcribed from the format definition CUDA's `__nv_fp8_e4m3` implements, which is what
 /// `T.Cast(FP8, …)` in `act_quant_kernel` lowers to.
-pub fn e4m3_decode(b: u8) -> f32 {
+pub fn e4m3_decode(b: E4m3Bits) -> f32 {
     let sign = if (b & 0x80) != 0 { -1.0f32 } else { 1.0 };
     let exp = ((b >> 3) & 0x0f) as i32;
     let mant = (b & 0x07) as f32;
@@ -50,9 +63,9 @@ pub fn e4m3_decode(b: u8) -> f32 {
 /// `tests/glsl_numerics.rs`. rivoli's rule is rivoli's; V4 was trained against CUDA's
 /// `cvt.rn.satfinite.e4m3x2.f32`, which is RNE, so RNE is what the oracle must model. The
 /// difference is one ulp on exact halfway subnormals and nothing elsewhere;
-/// `tests/v4_oracle.rs::e4m3_encode_is_nearest_ties_to_even` proves this implementation is
+/// `tests/v4_oracle_codecs.rs::e4m3_encode_is_nearest_ties_to_even` proves this implementation is
 /// nearest-ties-even by comparing it against an enumeration of all 254 finite codes.
-pub fn e4m3_encode(x: f32) -> u8 {
+pub fn e4m3_encode(x: f32) -> E4m3Bits {
     if x.is_nan() {
         return 0x7f;
     }
@@ -125,7 +138,7 @@ fn e4m3_encode_normal(bits: u32, e: i32, sign: u8) -> u8 {
 ///
 /// This is the scale format for BOTH the fp8 attention weights (128x128 blocks) and the fp4
 /// expert weights (group-32 along K) — same encoding, different blocking.
-pub fn e8m0_decode(b: u8) -> f32 {
+pub fn e8m0_decode(b: E8m0Bits) -> f32 {
     if b == 0xff {
         return f32::NAN;
     }
@@ -142,7 +155,7 @@ pub fn e8m0_decode(b: u8) -> f32 {
 
 /// `float4_e2m1fn` decode of one nibble. 1-2-1, bias 1: {0, .5, 1, 1.5, 2, 3, 4, 6} and
 /// their negatives. No infinities, no NaN.
-pub fn e2m1_decode(nib: u8) -> f32 {
+pub fn e2m1_decode(nib: E2m1Bits) -> f32 {
     const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
     let m = MAG[(nib & 0x07) as usize];
     if (nib & 0x08) != 0 { -m } else { m }
@@ -159,8 +172,8 @@ pub fn e2m1_decode(nib: u8) -> f32 {
 /// seven and lands on code 7. A nearest-neighbour search does NOT — `1e9 - 6.0 == 1e9` in
 /// f32 makes every candidate equidistant, the tie rule keeps the first, and the encoder
 /// returns ZERO. That was a real bug here, caught by
-/// `tests/v4_oracle.rs::e2m1_encode_is_nearest_ties_to_even`.
-pub fn e2m1_encode(x: f32) -> u8 {
+/// `tests/v4_oracle_codecs.rs::e2m1_encode_is_nearest_ties_to_even`.
+pub fn e2m1_encode(x: f32) -> E2m1Bits {
     const MID: [f32; 7] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0];
     let a = x.abs();
     let code = MID
@@ -172,12 +185,12 @@ pub fn e2m1_encode(x: f32) -> u8 {
 }
 
 /// `bfloat16` decode — exact and total: every bf16 pattern is a representable f32.
-pub fn bf16_decode(b: u16) -> f32 {
+pub fn bf16_decode(b: Bf16Bits) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
 /// `bfloat16` encode, round-to-nearest-even, inf/NaN passed through verbatim.
-pub fn bf16_encode(x: f32) -> u16 {
+pub fn bf16_encode(x: f32) -> Bf16Bits {
     let b = x.to_bits();
     if (b & 0x7f80_0000) == 0x7f80_0000 {
         return (b >> 16) as u16;

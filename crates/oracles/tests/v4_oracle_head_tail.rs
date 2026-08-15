@@ -13,7 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli_oracles::golden::diff;
-use rivoli_oracles::v4oracle::forward::{Capture, Defect, HeadTailW, Oracle};
+use rivoli_oracles::v4oracle::forward::{Capture, Defect, HeadRows, HeadTailW, Oracle};
 use rivoli_oracles::v4oracle::weights::{V4Config, WMat};
 
 #[path = "common/oracle_probe.rs"]
@@ -152,7 +152,15 @@ fn the_head_tail_matches_torch_absolutely() {
         },
     };
     let mut cap = Capture::default();
-    o.head_tail(&hw, t::H, t::S, "abs", &mut cap);
+    o.head_tail(
+        &hw,
+        HeadRows {
+            h: t::H,
+            s: t::S,
+            step_tag: "abs",
+        },
+        &mut cap,
+    );
 
     // Bitwise, not `assert_close`. At these dimensions a sequential f32 dot reproduces
     // torch's reduction exactly -- checked when the fixture was captured, all 5 logits equal

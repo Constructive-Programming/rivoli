@@ -11,6 +11,8 @@ KDA operator, which is a free function -- need a wrapper each, and those live in
 absence cost when the harness had only the hooks.
 """
 
+import collections
+
 
 # **`torch` resolved on first attribute access, never at import.** `k3_anchor_driver` binds its
 # own `torch` inside `main` for one stated reason -- `--compare` re-scores vendored bytes with no
@@ -28,6 +30,14 @@ class _LazyTorch:
 
 
 torch = _LazyTorch()
+
+
+# **The three things every tap and the capture pass all need**, in one value: where tensors go,
+# the run's mutable `ctx` (which the DEFECTS write into), and which layers are captured. Bundled
+# because each of those functions takes exactly these three alongside one or two arguments of its
+# own, which put five and six parameters on functions whose real arity is two. A `namedtuple` and
+# not a class: it holds no behaviour, and the three fields are read positionally nowhere.
+Tap = collections.namedtuple("Tap", "cap ctx layers")
 
 
 class Capture:
@@ -68,6 +78,54 @@ def _fire(cap, name, out):
     cap.add_any(name, out)
 
 
+# The model-level tail, captured alongside the per-layer submodules: the final norm and the head
+# are the two boundaries no layer prefix reaches.
+TAIL = ("model.norm", "lm_head")
+
+
+def _name_filters(layers):
+    """The three name tests `_is_captured` applies, built once per hook pass.
+
+    The trailing dot on `prefixes` is load-bearing, and its absence was measured: an earlier
+    version also matched the bare `model.layers.{i}`, so `model.layers.1` caught layers 10-19 and
+    `model.layers.3` caught 30-39 -- 25 captured layers instead of 6. The layer's own output is
+    reached by the exact-name test instead.
+    """
+    return tuple(f"model.layers.{i}." for i in layers), tuple(f"model.layers.{i}" for i in layers)
+
+
+def _is_captured(name, prefixes, exact):
+    """Whether a submodule name gets a hook: in the captured set, and not one of the two
+    never-fires families.
+
+    Everything at or under `.experts` is excluded, and the reason is not size. `moe_infer` calls
+    only the experts that WON tokens, so which expert modules fire is routing-dependent -- any
+    defect that moves the routing changes the golden's tensor SET, and every such comparison then
+    scores "absent on one side" rather than a number. Measured: the first defect matrix reported
+    `inf` for most layers on four of five defects for exactly this reason, drowning the real
+    signal. `topk_idx`/`topk_weight` and the block output are the routing fixture and are always
+    present.
+
+    `.experts` and not `.experts.`, so the `ModuleList` ITSELF goes too: its forward is never
+    called, so its hook could never fire, and the silent-hook assertion at the end of `main`
+    caught all five of them on its first run. `shared_experts` is untouched -- the substring needs
+    a dot before `experts`, and there the preceding character is an underscore.
+
+    The four AttnRes modules per layer are the OTHER never-fires case: `_apply_attn_res` reads
+    their `.weight` directly instead of calling them. `wrap_attn_res` captures the fold; hooking
+    them here would register four dead hooks per layer.
+    """
+    wanted = name in TAIL or name in exact or name.startswith(prefixes)
+    never_fires = ".experts" in name or name.endswith(("_res_norm", "_res_proj"))
+    return wanted and not never_fires
+
+
+def _hook_targets(model, layers):
+    """The `(name, module)` pairs that get a hook, in `named_modules` order."""
+    prefixes, exact = _name_filters(layers)
+    return [(n, m) for n, m in model.named_modules() if _is_captured(n, prefixes, exact)]
+
+
 def hook_model(model, cap, layers):
     """A forward hook on every submodule of the captured layers, plus the model-level tail.
 
@@ -79,35 +137,8 @@ def hook_model(model, cap, layers):
     is silent, and that silence cost this harness its AttnRes coverage for a day — see
     `wrap_attn_res`.
     """
-    # The trailing dot is load-bearing, and its absence was measured: an earlier version also
-    # matched the bare `model.layers.{i}`, so `model.layers.1` caught layers 10-19 and
-    # `model.layers.3` caught 30-39 -- 25 captured layers instead of 6. The layer's own output is
-    # reached by the exact-name test below instead.
-    prefixes = tuple(f"model.layers.{i}." for i in layers)
-    exact = tuple(f"model.layers.{i}" for i in layers)
-    tail = ("model.norm", "lm_head")
     handles, expected = [], []
-    for name, mod in model.named_modules():
-        wanted = name in tail or name in exact or name.startswith(prefixes)
-        # Everything at or under `.experts` is excluded, and the reason is not size. `moe_infer`
-        # calls only the experts that WON tokens, so which expert modules fire is
-        # routing-dependent -- any defect that moves the routing changes the golden's tensor SET,
-        # and every such comparison then scores "absent on one side" rather than a number.
-        # Measured: the first defect matrix reported `inf` for most layers on four of five defects
-        # for exactly this reason, drowning the real signal. `topk_idx`/`topk_weight` and the block
-        # output are the routing fixture and are always present.
-        #
-        # `.experts` and not `.experts.`, so the `ModuleList` ITSELF goes too: its forward is never
-        # called, so its hook could never fire, and the silent-hook assertion at the end of `main`
-        # caught all five of them on its first run. `shared_experts` is untouched -- the substring
-        # needs a dot before `experts`, and there the preceding character is an underscore.
-        if not wanted or ".experts" in name:
-            continue
-        # The four AttnRes modules per layer are the OTHER never-fires case: `_apply_attn_res`
-        # reads their `.weight` directly instead of calling them. `wrap_attn_res` captures the
-        # fold; hooking them here would register four dead hooks per layer.
-        if name.endswith(("_res_norm", "_res_proj")):
-            continue
+    for name, mod in _hook_targets(model, layers):
         handles.append(mod.register_forward_hook(lambda m, i, o, n=name: _fire(cap, n, o)))
         expected.append(name)
     return handles, expected

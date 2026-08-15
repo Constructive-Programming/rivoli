@@ -8,6 +8,9 @@ module is blind to them: `_apply_attn_res` READS its `proj` and `norm` modules i
 them, and fla's KDA entry points are free functions on the reference module rather than modules
 at all. A `setattr` over each is the only thing that sees the values, and the golden went a day
 without the first of them while three comments claimed otherwise.
+
+Each tap takes a `Tap` — the `(cap, ctx, layers)` triple every recorder here needs — rather than
+those three as separate parameters; see its definition in `k3_anchor_capture`.
 """
 
 # The lazily-resolved `torch` the capture side already defines -- imported, never restated, since
@@ -15,7 +18,35 @@ without the first of them while three comments claimed otherwise.
 from k3_anchor_capture import torch
 
 
-def wrap_attn_res(mod, model, cap, ctx, layers):
+# ---------------------------------------------------------------------------------------------
+# The AttnRes fold.
+
+
+def _fold_is_captured(base, layers):
+    """Whether a fold's owning module is one of the captured ones: the two model-level folds, or
+    any fold inside a captured layer."""
+    return base.startswith("model.output") or any(
+        base.startswith(f"model.layers.{i}.") for i in layers
+    )
+
+
+def _res_fold_owners(model, layers):
+    """Map each captured fold's `proj` module id to the name the fold is recorded under.
+
+    Folds are named by the identity of the `proj` they were handed, which is what distinguishes
+    `self_attention_res` from `mlp_res` without depending on call order.
+    """
+    owners = {}
+    for name, m in model.named_modules():
+        if not name.endswith("_res_proj"):
+            continue
+        base = name[: -len("_proj")]
+        if _fold_is_captured(base, layers):
+            owners[id(m)] = base
+    return owners
+
+
+def wrap_attn_res(mod, model, tap):
     """Capture the AttnRes fold, which no forward hook can see.
 
     **`_apply_attn_res` never calls its `proj` and `norm` modules** -- it reads
@@ -28,30 +59,19 @@ def wrap_attn_res(mod, model, cap, ctx, layers):
 
     It is a module-level free function, and all three call sites (twice per layer, once
     model-level) resolve it from module globals at call time, so one `setattr` catches every
-    fold. Folds are named by the identity of the `proj` they were handed, which is what
-    distinguishes `self_attention_res` from `mlp_res` without depending on call order.
+    fold.
     """
-    owners = {}
-    for name, m in model.named_modules():
-        if not name.endswith("_res_proj"):
-            continue
-        base = name[: -len("_proj")]
-        if base.startswith("model.output") or any(
-            base.startswith(f"model.layers.{i}.") for i in layers
-        ):
-            owners[id(m)] = base
+    owners = _res_fold_owners(model, tap.layers)
     orig = mod._apply_attn_res
 
     def inner(prefix_sum, block_residual, proj, norm):
-        if ctx.get("attn_res_mix_normalised"):
-            out = _fold_mixing_normalised(prefix_sum, block_residual, proj, norm)
-        else:
-            out = orig(prefix_sum, block_residual, proj, norm)
+        fold = _fold_mixing_normalised if tap.ctx.get("attn_res_mix_normalised") else orig
+        out = fold(prefix_sum, block_residual, proj, norm)
         tag = owners.get(id(proj))
-        if tag is not None and ctx["capturing"]:
-            cap.add(f"{tag}.in.prefix_sum", prefix_sum)
-            cap.add(f"{tag}.in.block_residual", block_residual)
-            cap.add(f"{tag}.out", out)
+        if tag is not None and tap.ctx["capturing"]:
+            tap.cap.add(f"{tag}.in.prefix_sum", prefix_sum)
+            tap.cap.add(f"{tag}.in.block_residual", block_residual)
+            tap.cap.add(f"{tag}.out", out)
         return out
 
     mod._apply_attn_res = inner
@@ -72,7 +92,106 @@ def _fold_mixing_normalised(prefix_sum, block_residual, proj, norm):
     return torch.matmul(probs, k).squeeze(1).to(v.dtype)
 
 
-def wrap_kda_ops(mod, cap, ctx, layers):
+# ---------------------------------------------------------------------------------------------
+# The KDA operator.
+
+
+def _to_fp32(v):
+    """Anything with a floating-point dtype down to fp32; everything else (ints, `None`, flags)
+    through untouched."""
+    return v.float() if hasattr(v, "dtype") and v.is_floating_point() else v
+
+
+def _kda_fp32_island(fn, kw):
+    """Run one KDA call in fp32 while the rest of the model is fp64, and cast its outputs back.
+
+    **fla's KDA kernel cannot be compiled for fp64 at all** — it raises
+    `fp_downcast_rounding should be set only for truncating fp conversions` on an internal
+    fp32->fp64 conversion (measured 2026-08-11). So `--dtype float64` runs the whole model in
+    double EXCEPT this operator, which stays fp32 with its inputs cast down and its outputs cast
+    back. That makes the fp64 run a rounding-floor reference for every operator but this one;
+    KDA's own floor comes from `--mode kda-equiv` instead, and would have needed a separate
+    measurement anyway because the kernel returns an fp32 state whatever the input dtype.
+
+    `q` by name, not "the first kwarg with a dtype". That took whatever the reference happened to
+    pass first -- today `q`, but a revision putting `cu_seqlens` or a position index earlier would
+    cast every KDA output to an INTEGER dtype, and the only symptom would be a wrong floor in a
+    measurement nobody re-derives.
+    """
+    q = kw.get("q")
+    assert q is not None and q.is_floating_point(), (
+        f"the fp32 island reads its dtype from `q`; got {type(q).__name__}. The "
+        f"reference calls this op with all-keyword arguments, so a rename upstream "
+        f"lands here rather than silently picking another kwarg's dtype."
+    )
+    dt = q.dtype
+    out = fn(**{k: _to_fp32(v) for k, v in kw.items()})
+    return tuple(o.to(dt) if o is not None else None for o in out)
+
+
+def _kda_transposed(out, ctx):
+    """`KdaStateLayout`: hand the next token a recurrent state with its last two axes swapped."""
+    if ctx.get("kda_transpose_out_state") and out[1] is not None:
+        return (out[0], out[1].transpose(-1, -2).contiguous())
+    return out
+
+
+def _kda_record_equiv(sink, ctx, tag, out):
+    """`--mode kda-equiv`'s sink: this call's output filed under `(op, layer)`, in call order."""
+    which_all = ctx["kda_layer_ids"][ctx["kda_calls"]]
+    ctx["kda_calls"] += 1
+    sink.setdefault((tag, which_all), []).append(out[0].detach().float().cpu())
+
+
+def _kda_record_capture(tap, tag, kw, out):
+    """The KDA fixture itself, for a captured layer: the operator's inputs, its output and state.
+
+    The nth KDA call of the capture pass is the nth KDA layer in index order, which the model
+    guarantees by iterating `self.layers` in order.
+    """
+    ctx = tap.ctx
+    which = ctx["kda_layer_ids"][ctx["kda_calls"]]
+    ctx["kda_calls"] += 1
+    if which not in tap.layers:
+        return
+    for k in ("q", "k", "v", "g", "beta", "A_log", "dt_bias", "initial_state"):
+        if kw.get(k) is not None:
+            tap.cap.add(f"model.layers.{which}.kda.{tag}.in.{k}", kw[k])
+    tap.cap.add(f"model.layers.{which}.kda.{tag}.out.o", out[0])
+    if out[1] is not None:
+        tap.cap.add(f"model.layers.{which}.kda.{tag}.out.state", out[1])
+
+
+def _kda_call(fn, tag, tap, kw):
+    """One wrapped KDA call: the defect's kwarg overrides, the call, and whichever recorder is
+    armed. The two recorders are exclusive -- `--mode kda-equiv` runs no capture pass.
+    """
+    ctx = tap.ctx
+    kw = dict(kw, **ctx["kda_kwargs"])
+    out = _kda_fp32_island(fn, kw) if ctx["kda_fp32_island"] else fn(**kw)
+    out = _kda_transposed(out, ctx)
+    sink = ctx.get("equiv_sink")
+    if sink is not None:
+        _kda_record_equiv(sink, ctx, tag, out)
+    elif ctx["capturing"]:
+        _kda_record_capture(tap, tag, kw, out)
+    return out
+
+
+def _kda_wrapper(fn, tag, tap):
+    """Bind one fla entry point to [`_kda_call`].
+
+    A closure rather than a `functools.partial`: the reference calls these ops with keyword
+    arguments only, and `partial` would put `fn` and `tag` into the same namespace as the kwargs.
+    """
+
+    def inner(**kw):
+        return _kda_call(fn, tag, tap, kw)
+
+    return inner
+
+
+def wrap_kda_ops(mod, tap):
     """Record the KDA operator's own inputs and outputs, which no module hook can see.
 
     `q`/`k`/`v` after the short convolutions, the log-space gate, `beta`, `A_log`, `dt_bias` in;
@@ -85,61 +204,5 @@ def wrap_kda_ops(mod, cap, ctx, layers):
     never touched -- so `in.initial_state` was bit-identical between the runs BY CONSTRUCTION and
     the state-propagation claim was the one thing those defects could not test.
     """
-
-    def wrap(fn, tag):
-        def inner(**kw):
-            kw = dict(kw, **ctx["kda_kwargs"])
-            if ctx["kda_fp32_island"]:
-                # **fla's KDA kernel cannot be compiled for fp64 at all** — it raises
-                # `fp_downcast_rounding should be set only for truncating fp conversions` on an
-                # internal fp32->fp64 conversion (measured 2026-08-11). So `--dtype float64` runs
-                # the whole model in double EXCEPT this operator, which stays fp32 with its inputs
-                # cast down and its outputs cast back. That makes the fp64 run a rounding-floor
-                # reference for every operator but this one; KDA's own floor comes from
-                # `--mode kda-equiv` instead, and would have needed a separate measurement anyway
-                # because the kernel returns an fp32 state whatever the input dtype.
-                # `q` by name, not "the first kwarg with a dtype". That took whatever the reference
-                # happened to pass first -- today `q`, but a revision putting `cu_seqlens` or a
-                # position index earlier would cast every KDA output to an INTEGER dtype, and the
-                # only symptom would be a wrong floor in a measurement nobody re-derives.
-                q = kw.get("q")
-                assert q is not None and q.is_floating_point(), (
-                    f"the fp32 island reads its dtype from `q`; got {type(q).__name__}. The "
-                    f"reference calls this op with all-keyword arguments, so a rename upstream "
-                    f"lands here rather than silently picking another kwarg's dtype."
-                )
-                dt = q.dtype
-                kw = {
-                    k: (v.float() if hasattr(v, "dtype") and v.is_floating_point() else v)
-                    for k, v in kw.items()
-                }
-                out = fn(**kw)
-                out = tuple(o.to(dt) if o is not None else None for o in out)
-            else:
-                out = fn(**kw)
-            if ctx.get("kda_transpose_out_state") and out[1] is not None:
-                out = (out[0], out[1].transpose(-1, -2).contiguous())
-            sink = ctx.get("equiv_sink")
-            if sink is not None:
-                which_all = ctx["kda_layer_ids"][ctx["kda_calls"]]
-                ctx["kda_calls"] += 1
-                sink.setdefault((tag, which_all), []).append(out[0].detach().float().cpu())
-                return out
-            if ctx["capturing"]:
-                # The nth KDA call of the capture pass is the nth KDA layer in index order, which
-                # the model guarantees by iterating `self.layers` in order.
-                which = ctx["kda_layer_ids"][ctx["kda_calls"]]
-                ctx["kda_calls"] += 1
-                if which in layers:
-                    for k in ("q", "k", "v", "g", "beta", "A_log", "dt_bias", "initial_state"):
-                        if kw.get(k) is not None:
-                            cap.add(f"model.layers.{which}.kda.{tag}.in.{k}", kw[k])
-                    cap.add(f"model.layers.{which}.kda.{tag}.out.o", out[0])
-                    if out[1] is not None:
-                        cap.add(f"model.layers.{which}.kda.{tag}.out.state", out[1])
-            return out
-
-        return inner
-
     for tag in ("chunk_kda", "fused_recurrent_kda"):
-        setattr(mod, tag, wrap(getattr(mod, tag), tag))
+        setattr(mod, tag, _kda_wrapper(getattr(mod, tag), tag, tap))

@@ -117,28 +117,40 @@ fn main() {
 /// captures test output and a captured warning is no warning (recorded lesson). The
 /// contract: the next edit to a warned file should shrink it, not grow it.
 fn soft_line_cap(root: &std::path::Path) {
-    const SOFT: usize = 800;
     let mut stack = vec![root.join("crates")];
     while let Some(dir) = stack.pop() {
+        // Every entry either descends or gets the per-file check, which filters
+        // non-sources itself — one call per entry keeps this loop a single decision.
+        // (A partition-based form was tried and was a token-for-token jscpd clone of
+        // the test-side `common::walk`; the two must not converge textually.)
         for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p
-                .extension()
-                .is_some_and(|x| ["rs", "hip", "hpp", "py", "sh"].iter().any(|e| x == *e))
-            {
-                let lines = std::fs::read_to_string(&p)
-                    .map(|s| s.lines().count())
-                    .unwrap_or(0);
-                if lines > SOFT {
-                    println!(
-                        "cargo:warning={} is {lines} lines (soft cap {SOFT}) — the next \
-                         edit here should refactor it smaller, and 1200 is a hard gate",
-                        p.strip_prefix(root).unwrap_or(&p).display()
-                    );
-                }
+            match e.path() {
+                p if p.is_dir() => stack.push(p),
+                p => warn_if_over_soft_cap(root, &p),
             }
         }
+    }
+}
+
+/// One file's check: sources over 800 lines draw the warning (non-sources are skipped
+/// here, which is what keeps the walk above branchless); the hard 1200 cap lives in
+/// `tests/line_limit.rs`.
+fn warn_if_over_soft_cap(root: &std::path::Path, p: &std::path::Path) {
+    const SOFT: usize = 800;
+    let source = p
+        .extension()
+        .is_some_and(|x| ["rs", "hip", "hpp", "py", "sh"].iter().any(|e| x == *e));
+    if !source {
+        return;
+    }
+    let lines = std::fs::read_to_string(p)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    if lines > SOFT {
+        println!(
+            "cargo:warning={} is {lines} lines (soft cap {SOFT}) — the next edit here \
+             should refactor it smaller, and 1200 is a hard gate",
+            p.strip_prefix(root).unwrap_or(p).display()
+        );
     }
 }

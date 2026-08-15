@@ -16,7 +16,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli_oracles::golden::{diff, identical};
-use rivoli_oracles::v4oracle::forward::{Capture, Defect, LayerCtx, Oracle, splitk_fold};
+use rivoli_oracles::v4oracle::forward::{
+    Capture, Defect, ExpertOperand, LayerCtx, Oracle, splitk_fold,
+};
 use rivoli_oracles::v4oracle::toy::ToyModel;
 use rivoli_oracles::v4oracle::weights::{NamedRng, V4Config, WMat};
 
@@ -31,7 +33,15 @@ fn expert_at_scale(defect: Defect, scale: f32) -> (Vec<f32>, usize) {
     let mut r = NamedRng::new("swiglu-probe");
     let x: Vec<f32> = (0..cfg.dim).map(|_| bf16_round(r.unit() * scale)).collect();
     let mut counters = Default::default();
-    let y = o.expert(&m.layers[0].experts[&0], &x, 1, None, &mut counters);
+    let y = o.expert(
+        &m.layers[0].experts[&0],
+        ExpertOperand {
+            x: &x,
+            m: 1,
+            weight: None,
+        },
+        &mut counters,
+    );
     (y, counters.swiglu_clamp_events)
 }
 
@@ -338,7 +348,7 @@ fn assert_linear_reaches_the_fold_exactly_where_the_predicate_says() {
     let wired = fp8_tiled(rows, kk, &wb);
     let xw: Vec<f32> = (0..13 * kk).map(|_| rw.unit() * 0.05).collect();
     let out = |d: Defect, m: usize, w: &WMat, k: usize| {
-        Oracle::new(cfg.clone(), d).linear(&xw[..m * k], m, k, w)
+        Oracle::new(cfg.clone(), d).linear(&xw[..m * k], m, w)
     };
     let differs = |a: Vec<f32>, b: Vec<f32>| -> bool {
         a.iter().zip(&b).any(|(x, y)| x.to_bits() != y.to_bits())

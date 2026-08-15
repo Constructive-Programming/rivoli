@@ -221,6 +221,37 @@ def write_golden(path, meta, cap):
 # ---------------------------------------------------------------------------------------------
 # Scoring. Two reports over the same arithmetic, and the gate one of them asserts.
 
+# **Which operator a tensor inside a layer belongs to, by the prefix of its name below the layer.**
+# A table rather than a chain of `if`s, and ORDER IS SEMANTIC: `block_sparse_moe.routed_expert`
+# must be tested before the `block_sparse_moe` it starts with. `self_attn` is not in the table
+# because its answer depends on the layer (below); it is not shadowed by `self_attention_res`
+# either way -- the two names diverge at the ninth character (`self_attn` vs `self_atte`).
+_LAYER_OPERATORS = (
+    ("kda.", "kda_op"),
+    (("self_attention_res", "mlp_res"), "attn_res"),
+    ("block_sparse_moe.routed_expert", "moe_latent"),
+    ("block_sparse_moe", "moe_route"),
+    ("mlp", "dense_mlp"),
+)
+
+
+def _layer_operator(rest, kda):
+    """The operator owning `rest`, the part of a captured name below `model.layers.<n>.`.
+
+    `self_attn` is the one prefix a name cannot answer alone: it is MLA on 24 layers and KDA's
+    trunk on 69, which is why the caller has to read the partition out of the golden's own
+    `tiny_config`.
+    """
+    if rest.startswith("self_attn"):
+        return "kda_trunk" if kda else "mla"
+    for prefix, operator in _LAYER_OPERATORS:
+        if rest.startswith(prefix):
+            return operator
+    if "layernorm" in rest:
+        return "norm"
+    return "residual"
+
+
 # **Which operator each captured tensor belongs to.** Layer numbers alone cannot say: `self_attn`
 # is MLA on 24 layers and KDA on 69, so the classifier has to read the partition out of the
 # golden's own `tiny_config`. Used only by `--by-operator`, which is how the per-operator
@@ -230,22 +261,7 @@ def operator_of(name, kda_layers):
     if name.startswith("model.layers."):
         parts = name.split(".")
         layer, rest = int(parts[2]), ".".join(parts[3:])
-        kda = layer in kda_layers
-        if rest.startswith("kda."):
-            return "kda_op"
-        if rest.startswith("self_attn"):
-            return "kda_trunk" if kda else "mla"
-        if rest.startswith(("self_attention_res", "mlp_res")):
-            return "attn_res"
-        if rest.startswith("block_sparse_moe.routed_expert"):
-            return "moe_latent"
-        if rest.startswith("block_sparse_moe"):
-            return "moe_route"
-        if rest.startswith("mlp"):
-            return "dense_mlp"
-        if "layernorm" in rest:
-            return "norm"
-        return "residual"
+        return _layer_operator(rest, layer in kda_layers)
     if name.startswith("model.output_attn_res"):
         return "attn_res"
     if name == "model.norm":
@@ -289,6 +305,30 @@ def _both_sections(a_path, b_path):
     return (ma, mb), ((fa, fb), (ia, ib))
 
 
+def _merged(sections, key_of):
+    """Fold [`_score`] over both tensor sections into one `key -> (tensors, differing, max_rel)`.
+
+    Shared by both reports, which differ only in what they key by: `compare` keys by layer to ask
+    about localisation, `by_operator` keys by operator to ask about tolerance, and the merge is
+    the same arithmetic either way.
+    """
+    per = {}
+    for items_a, items_b in sections:
+        for k, v in _score(items_a, items_b, key_of).items():
+            n, diff, rel = per.get(k, (0, 0, 0.0))
+            per[k] = (n + v[0], diff + v[1], max(rel, v[2]))
+    return per
+
+
+def _print_rows(header, per, keys):
+    """The one table both reports print, in `keys` order: how many tensors the bucket holds, how
+    many of them differ BYTE-for-byte, and the worst relative gap in it."""
+    print(f"{header}\ttensors\tdiffering\tmax_rel")
+    for k in keys:
+        n, diff, rel = per[k]
+        print(f"{k}\t{n}\t{diff}\t{rel:.3e}")
+
+
 def by_operator(a_path, b_path):
     """Per-OPERATOR agreement between two goldens -- the shape a tolerance has to be stated in.
 
@@ -298,16 +338,9 @@ def by_operator(a_path, b_path):
     """
     (ma, mb), sections = _both_sections(a_path, b_path)
     kda = _kda_zero_based(json.loads(ma["tiny_config"]))
-    per = {}
-    for items_a, items_b in sections:
-        for k, v in _score(items_a, items_b, lambda n: operator_of(n, kda)).items():
-            n, diff, rel = per.get(k, (0, 0, 0.0))
-            per[k] = (n + v[0], diff + v[1], max(rel, v[2]))
+    per = _merged(sections, lambda n: operator_of(n, kda))
     print(f"# {mb.get('defect')}/{mb.get('dtype')} vs {ma.get('defect')}/{ma.get('dtype')}")
-    print("operator\ttensors\tdiffering\tmax_rel")
-    for k in sorted(per):
-        n, diff, rel = per[k]
-        print(f"{k}\t{n}\t{diff}\t{rel:.3e}")
+    _print_rows("operator", per, sorted(per))
 
 
 def _kda_zero_based(cfg):
@@ -338,15 +371,101 @@ EXPECT_GREEN = {
 }
 
 
+def _layer_of(name):
+    """The bucket a captured tensor is reported under: its layer index, or the model-level fold."""
+    return name.split(".")[2] if name.startswith("model.layers.") else "model"
+
+
+def _layer_sort_key(key):
+    """Numeric layers in index order, with the model-level bucket last."""
+    return (key == "model", int(key) if key.isdigit() else 0)
+
+
+def _captured_layers(per):
+    """The numeric buckets in index order.
+
+    Numeric keys ONLY: `per` also holds "model" for the model-level fold, and sorting the whole
+    key set by `int` raises on it. That arm had never executed when it was written -- every
+    exercise of the comparator tripped an earlier gate first -- which is how the crash was found.
+    """
+    return sorted((k for k in per if k.isdigit()), key=int)
+
+
+def _gate_captured(defect, per, green):
+    """Every layer a defect declares green must actually have been CAPTURED.
+
+    An uncaptured one used to score as green, because `per.get(layer, (0, 0, 0))[1]` reads an
+    absent layer as zero differing tensors. The localisation claim would then rest on an empty
+    set: drop a layer from CAPTURE_LAYERS, or name a layer outside it in EXPECT_GREEN, and the
+    matrix prints, finds nothing reddened, and exits 0. Found by review 2026-08-11.
+    """
+    absent = [layer for layer in green if layer not in per]
+    if absent:
+        raise SystemExit(
+            f"--defect {defect} declares layer(s) {absent} green, but nothing captured them -- "
+            f"captured: {sorted(per)}. An uncaptured layer is not evidence of localisation.",
+        )
+
+
+def _gate_reddened(defect, per, green):
+    """...and every one of them must still be bit-identical, which is the localisation claim."""
+    reddened = [layer for layer in green if per[layer][1]]
+    if reddened:
+        raise SystemExit(
+            f"--defect {defect} reddened layer(s) {reddened}, which are upstream of it and must "
+            f"stay bit-identical -- the localisation this golden claims is gone",
+        )
+
+
+def _gate_downstream(defect, per, green):
+    """The POSITIVE half, which was only "something, somewhere, differs".
+
+    EXPECT_GREEN encodes a boundary, so the first captured layer PAST it must actually redden --
+    otherwise a perturbation that missed its operator and only disturbed something downstream
+    reads as a localised, detected defect while the arithmetic the cell prices was never
+    exercised.
+    """
+    downstream = [layer for layer in _captured_layers(per) if layer not in green]
+    if not downstream:
+        return
+    if per[downstream[0]][1]:
+        return
+    raise SystemExit(
+        f"--defect {defect} left layer {downstream[0]} bit-identical, the first captured layer "
+        f"it does NOT declare green -- so whatever it changed, it was not this operator here. "
+        f"Either the perturbation missed, or EXPECT_GREEN names the wrong boundary.",
+    )
+
+
+def _gate_defect(defect, base_defect, per):
+    """`k3-port.md` §G rule 1 over one scored pair, in four parts.
+
+      * the defect changed SOMETHING -- a defect that reddens nothing is not a defect;
+      * every layer in `EXPECT_GREEN[defect]` was captured, and is BIT-IDENTICAL. Only upstream
+        layers can be there, since one forward pass propagates everything downstream;
+      * the first captured layer past that boundary did redden.
+
+    A golden scored against itself (`base_defect` equal) is the `None`-vs-`None` case and gates
+    nothing; a defect with no EXPECT_GREEN entry is an error, since an omitted entry would
+    otherwise pass silently.
+    """
+    if defect == base_defect:
+        return
+    if defect not in EXPECT_GREEN:
+        raise SystemExit(f"--defect {defect} has no EXPECT_GREEN entry; add one, even if empty")
+    if not any(diff for _, diff, _ in per.values()):
+        raise SystemExit(f"--defect {defect} changed NOTHING; that is not a defect run")
+    green = list(map(str, EXPECT_GREEN[defect]))
+    _gate_captured(defect, per, green)
+    _gate_reddened(defect, per, green)
+    _gate_downstream(defect, per, green)
+
+
 def compare(a_path, b_path):
     """Score one defect run against the `None` golden, per captured layer, and GATE it.
 
     Reported per LAYER rather than per tensor because that is what G1b asks about, and 800 tensor
-    lines cannot be read. Two things are asserted, which together are `k3-port.md` §G rule 1:
-
-      * the defect changed SOMETHING -- a defect that reddens nothing is not a defect;
-      * every layer in `EXPECT_GREEN[defect]` is BIT-IDENTICAL. Only upstream layers can be
-        there, since one forward pass propagates everything downstream.
+    lines cannot be read. What is asserted is `k3-port.md` §G rule 1 -- see [`_gate_defect`].
 
     The two tensor SETS must match exactly. They are a property of the config and the capture
     list, never of the numbers -- so a mismatch is a broken harness, not a defect finding, and it
@@ -355,58 +474,8 @@ def compare(a_path, b_path):
     fires a different set of expert modules.
     """
     (ma, mb), sections = _both_sections(a_path, b_path)
-    per = {}
-    layer_of = lambda n: n.split(".")[2] if n.startswith("model.layers.") else "model"  # noqa: E731
-    for items_a, items_b in sections:
-        for k, v in _score(items_a, items_b, layer_of).items():
-            n, diff, rel = per.get(k, (0, 0, 0.0))
-            per[k] = (n + v[0], diff + v[1], max(rel, v[2]))
+    per = _merged(sections, _layer_of)
     defect = mb.get("defect")
     print(f"# {defect} vs {ma.get('defect')}  mode={ma.get('mode')}")
-    print("layer\ttensors\tdiffering\tmax_rel")
-    for layer in sorted(per, key=lambda k: (k == "model", int(k) if k.isdigit() else 0)):
-        n, diff, rel = per[layer]
-        print(f"{layer}\t{n}\t{diff}\t{rel:.3e}")
-
-    if defect == ma.get("defect"):
-        return
-    if defect not in EXPECT_GREEN:
-        raise SystemExit(f"--defect {defect} has no EXPECT_GREEN entry; add one, even if empty")
-    if not any(diff for _, diff, _ in per.values()):
-        raise SystemExit(f"--defect {defect} changed NOTHING; that is not a defect run")
-
-    # A declared-green layer that was never CAPTURED used to score as green, because
-    # `per.get(layer, (0, 0, 0))[1]` reads an absent layer as zero differing tensors. The
-    # localisation claim would then rest on an empty set: drop a layer from CAPTURE_LAYERS, or name a
-    # layer outside it in EXPECT_GREEN, and the matrix prints, finds nothing reddened, and exits 0.
-    # Found by review 2026-08-11.
-    green = list(map(str, EXPECT_GREEN[defect]))
-    absent = [layer for layer in green if layer not in per]
-    if absent:
-        raise SystemExit(
-            f"--defect {defect} declares layer(s) {absent} green, but nothing captured them -- "
-            f"captured: {sorted(per)}. An uncaptured layer is not evidence of localisation.",
-        )
-    reddened = [layer for layer in green if per[layer][1]]
-    if reddened:
-        raise SystemExit(
-            f"--defect {defect} reddened layer(s) {reddened}, which are upstream of it and must "
-            f"stay bit-identical -- the localisation this golden claims is gone",
-        )
-
-    # And the POSITIVE half, which was only "something, somewhere, differs". EXPECT_GREEN encodes a
-    # boundary, so the first captured layer PAST it must actually redden -- otherwise a perturbation
-    # that missed its operator and only disturbed something downstream reads as a localised,
-    # detected defect while the arithmetic the cell prices was never exercised.
-    # Numeric keys only: `per` also holds "model" for the model-level fold, and sorting the whole
-    # key set by `int` raises on it. This arm had never executed when it was written -- every
-    # exercise of the comparator tripped an earlier gate first -- which is how the crash was found.
-    downstream = [
-        layer for layer in sorted((k for k in per if k.isdigit()), key=int) if layer not in green
-    ]
-    if downstream and not per[downstream[0]][1]:
-        raise SystemExit(
-            f"--defect {defect} left layer {downstream[0]} bit-identical, the first captured layer "
-            f"it does NOT declare green -- so whatever it changed, it was not this operator here. "
-            f"Either the perturbation missed, or EXPECT_GREEN names the wrong boundary.",
-        )
+    _print_rows("layer", per, sorted(per, key=_layer_sort_key))
+    _gate_defect(defect, ma.get("defect"), per)

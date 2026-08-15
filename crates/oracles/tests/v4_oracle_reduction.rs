@@ -22,7 +22,7 @@ mod oracle_probe;
 
 use oracle_probe::{all_bf16, bf16_round, model};
 use rivoli_oracles::v4oracle::{
-    forward::{Capture, Defect, HeadTailW, Oracle},
+    forward::{Capture, Defect, HeadRows, HeadTailW, Oracle},
     weights::{NamedRng, V4Config, WMat},
 };
 
@@ -300,7 +300,15 @@ fn measure_reassociation_floor(cfg: &V4Config, hw: &HeadTailW) -> Floor {
         let h: Vec<f32> = (0..hcd).map(|_| bf16_round(r.unit())).collect();
         let head = |d: Defect| {
             let mut cap = Capture::default();
-            Oracle::new(cfg.clone(), d).head_tail(hw, &h, 1, "floor", &mut cap);
+            Oracle::new(cfg.clone(), d).head_tail(
+                hw,
+                HeadRows {
+                    h: &h,
+                    s: 1,
+                    step_tag: "floor",
+                },
+                &mut cap,
+            );
             cap.float("head.floor.final_norm_out")
                 .expect("final_norm_out")
                 .to_vec()

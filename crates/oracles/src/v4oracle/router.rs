@@ -51,7 +51,7 @@ impl Oracle {
     ///   its scores still become the weights.
     pub fn gate(&self, step: &LayerCtx, x: &[f32], cnt: &mut Counters) -> RouterPick {
         let (lw, m) = (step.lw, step.s);
-        let logits = self.linear(x, m, self.cfg.dim, &lw.gate_w);
+        let logits = self.linear(x, m, &lw.gate_w);
         let original = self.router_scores(&logits, m, cnt);
         let selection = self.router_selection(&original, lw.gate_bias.as_deref(), m);
         self.router_topk(step, &original, &selection)

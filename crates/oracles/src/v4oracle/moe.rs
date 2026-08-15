@@ -84,6 +84,15 @@ fn scatter_add(y: &mut [f32], rows: &[(usize, f32)], o: &[f32], dim: usize) {
         }
     }
 }
+/// One expert call's operand block: the flattened rows, their count, and the routing
+/// weight that scales the SwiGLU intermediate (None for the shared expert). Grouped
+/// 2026-08-15 — the trio travelled as three loose args through every expert call.
+pub struct ExpertOperand<'a> {
+    pub x: &'a [f32],
+    pub m: usize,
+    pub weight: Option<&'a [f32]>,
+}
+
 impl Oracle {
     /// `Expert.forward` — SwiGLU with `swiglu_limit = 10.0`.
     ///
@@ -93,14 +102,13 @@ impl Oracle {
     pub fn expert(
         &self,
         e: &ExpertW,
-        x: &[f32],
-        m: usize,
-        weight: Option<&[f32]>,
+        rows: ExpertOperand<'_>,
         counters: &mut Counters,
     ) -> Vec<f32> {
+        let ExpertOperand { x, m, weight } = rows;
         let inter = self.cfg.moe_inter_dim;
-        let mut g = self.linear(x, m, self.cfg.dim, &e.w1);
-        let mut u = self.linear(x, m, self.cfg.dim, &e.w3);
+        let mut g = self.linear(x, m, &e.w1);
+        let mut u = self.linear(x, m, &e.w3);
         self.round_bf16(&mut g);
         self.round_bf16(&mut u);
         let mut h = self.swiglu(&g, &u, counters);
@@ -111,7 +119,7 @@ impl Oracle {
             scale_rows(&mut h, m, w);
         }
         self.round_bf16(&mut h);
-        let mut out = self.linear(&h, m, inter, &e.w2);
+        let mut out = self.linear(&h, m, &e.w2);
         self.round_bf16(&mut out);
         if let Some(w) = weight
             && !apply_before
@@ -189,7 +197,15 @@ impl Oracle {
                 panic!("expert {e} was routed to but not loaded");
             };
             let (xs, ws) = gather_rows(x, rows, c.dim);
-            let o = self.expert(ew, &xs, rows.len(), Some(&ws), &mut cap.counters);
+            let o = self.expert(
+                ew,
+                ExpertOperand {
+                    x: &xs,
+                    m: rows.len(),
+                    weight: Some(&ws),
+                },
+                &mut cap.counters,
+            );
             scatter_add(&mut y, rows, &o, c.dim);
         }
         let sw = if self.defect == Defect::SharedExpertWeighted {
@@ -197,7 +213,15 @@ impl Oracle {
         } else {
             None
         };
-        let sh = self.expert(&lw.shared, x, m, sw.as_deref(), &mut cap.counters);
+        let sh = self.expert(
+            &lw.shared,
+            ExpertOperand {
+                x,
+                m,
+                weight: sw.as_deref(),
+            },
+            &mut cap.counters,
+        );
         for i in 0..m * c.dim {
             y[i] += sh[i];
         }
