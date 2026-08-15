@@ -23,7 +23,7 @@ pub(super) struct Span {
 }
 
 impl Span {
-    /// The decode shape: the whole model at row 0, logits for every row of the pass.
+    /// The decode shape: the whole model at row 0, logits for every row of the rows.
     pub(super) fn whole(n_layers: usize, tail: usize) -> Self {
         Self {
             layers: 0..n_layers,
@@ -56,7 +56,7 @@ pub(super) fn layer_major_schedule(
 
 /// One pass's row geometry, threaded through every phase.
 #[derive(Clone, Copy)]
-pub(super) struct Pass {
+pub(super) struct Rows {
     pub pos: usize,
     pub nrow: usize,
 }
@@ -64,7 +64,7 @@ pub(super) struct Pass {
 /// This pass's residual-row pointer — `x` offset to the pass's first row. Copy, so the
 /// phases can hold it across `&mut self` calls without borrowing `self.x`.
 #[derive(Clone, Copy)]
-pub(super) struct XRow(pub *mut f32);
+pub(super) struct ResidualBase(pub *mut f32);
 
 /// A row-wise rmsnorm's operands: `dst[r] = rmsnorm(src[r], w)`.
 #[derive(Clone, Copy)]
@@ -87,7 +87,7 @@ impl GlmEngine<'_> {
     /// layer-major reads each `(layer, expert)` once (24.02/token, the compulsory
     /// floor). Legality rests on one property: layer L for all tokens needs only layer
     /// L−1 for all tokens — row `r` attends over `pos + r + 1` KV rows, and every row
-    /// below it appended its KV in an earlier (or the same) pass. The differing row
+    /// below it appended its KV in an earlier (or the same) rows. The differing row
     /// count IS the causal mask.
     pub(super) async fn prefill_layer_major(&mut self, ids: &[u32]) -> Result<()> {
         let n_layers = self.cfg.n_layers;
@@ -126,10 +126,12 @@ impl GlmEngine<'_> {
         span: Span,
     ) -> Result<()> {
         let nrow = tokens.len();
-        let pass = Pass { pos, nrow };
-        self.check_bounds(pass, &span)?;
+        let rows = Rows { pos, nrow };
+        self.check_bounds(rows, &span)?;
         // SAFETY: bounded by `check_bounds`' x_off ensure.
-        let xp = XRow(unsafe { (self.x.ptr_mut() as *mut f32).add(span.x_off * self.cfg.hidden) });
+        let xp = ResidualBase(unsafe {
+            (self.x.ptr_mut() as *mut f32).add(span.x_off * self.cfg.hidden)
+        });
         // Embedding row → x, ONLY when this pass starts at layer 0: under layer-major
         // prefill a row visits `forward_inner` once per layer, and re-embedding would
         // overwrite the residual stream with the token it started from.
@@ -137,10 +139,10 @@ impl GlmEngine<'_> {
             self.embed_rows(tokens, xp)?;
         }
         for l in span.layers.clone() {
-            self.run_layer(l, pass, xp).await?;
+            self.run_layer(l, rows, xp).await?;
         }
         if span.tail > 0 {
-            self.tail(pass, span.tail, xp)?;
+            self.tail(rows, span.tail, xp)?;
         }
         Ok(())
     }
@@ -149,37 +151,37 @@ impl GlmEngine<'_> {
     /// scratch is indexed, the max_ctx bound before a KV row is written out of the
     /// slabs, the `x` bound BEFORE the offset pointer is formed (`.add()` past the end
     /// of an allocation is UB even when nothing dereferences it).
-    fn check_bounds(&self, pass: Pass, span: &Span) -> Result<()> {
+    fn check_bounds(&self, rows: Rows, span: &Span) -> Result<()> {
         ensure!(
-            (1..=MAXROW).contains(&pass.nrow),
+            (1..=MAXROW).contains(&rows.nrow),
             "forward: {} token rows, but the engine's scratch is allocated for {MAXROW}",
-            pass.nrow
+            rows.nrow
         );
         ensure!(
-            pass.pos + pass.nrow <= self.max_ctx,
+            rows.pos + rows.nrow <= self.max_ctx,
             "pos {} + {} rows exceeds engine capacity max_ctx={}",
-            pass.pos,
-            pass.nrow,
+            rows.pos,
+            rows.nrow,
             self.max_ctx
         );
         ensure!(
-            span.x_off + pass.nrow <= self.x_rows,
+            span.x_off + rows.nrow <= self.x_rows,
             "forward: residual rows {}..{} but `x` holds {}",
             span.x_off,
-            span.x_off + pass.nrow,
+            span.x_off + rows.nrow,
             self.x_rows
         );
         ensure!(
-            span.tail <= pass.nrow,
+            span.tail <= rows.nrow,
             "forward: tail over {} rows of a {}-row pass",
             span.tail,
-            pass.nrow
+            rows.nrow
         );
         Ok(())
     }
 
     /// One embedding row per token into the pass's residual rows.
-    fn embed_rows(&mut self, tokens: &[u32], xp: XRow) -> Result<()> {
+    fn embed_rows(&mut self, tokens: &[u32], xp: ResidualBase) -> Result<()> {
         let (emb, hidden) = (self.pin.embed, self.cfg.hidden);
         for (r, &t) in tokens.iter().enumerate() {
             // SAFETY: embed resident; xp is this pass's rows, r < nrow.
@@ -199,14 +201,14 @@ impl GlmEngine<'_> {
     /// One layer: attention, the MLP sublayer, the end-of-layer join, and the
     /// non-finite probe. The join protects the reused descs/wexpert/moe_out buffers
     /// before the next layer overwrites them, and surfaces faults.
-    async fn run_layer(&mut self, l: usize, pass: Pass, xp: XRow) -> Result<()> {
-        self.attention(l, pass, xp)?;
+    async fn run_layer(&mut self, l: usize, rows: Rows, xp: ResidualBase) -> Result<()> {
+        self.attention(l, rows, xp)?;
         match &self.pin.layers[l].mlp {
             LayerMlp::Dense(m) => {
                 let m = *m; // Copy — ends the &pin borrow
-                self.dense_sublayer(m, pass, xp)?;
+                self.dense_sublayer(m, rows, xp)?;
             }
-            LayerMlp::Moe { .. } => self.moe_sublayer(l, pass, xp).await?,
+            LayerMlp::Moe { .. } => self.moe_sublayer(l, rows, xp).await?,
         }
         device_sync()?;
         // Localise a non-finite residual to the earliest (pos, layer) that produced
@@ -216,8 +218,8 @@ impl GlmEngine<'_> {
         unsafe {
             launch_flag_nonfinite(
                 xp.0,
-                pass.nrow * self.cfg.hidden,
-                1 + (pass.pos as u32) * 256 + l as u32,
+                rows.nrow * self.cfg.hidden,
+                1 + (rows.pos as u32) * 256 + l as u32,
                 self.argmax_dev.ptr_mut().add(MAXROW * 8) as *mut u32,
             )?;
         }
@@ -246,13 +248,13 @@ impl GlmEngine<'_> {
     /// `0..tail` — a prefill's closing pass takes 1 and puts the prompt's final row in
     /// row 0, which is where `argmax` already looks. lm_head is the single largest read
     /// in the pass, so the GEMV is batched.
-    fn tail(&mut self, pass: Pass, tail: usize, xp: XRow) -> Result<()> {
+    fn tail(&mut self, rows: Rows, tail: usize, xp: ResidualBase) -> Result<()> {
         let (hidden, head) = (self.cfg.hidden, self.pin.lm_head);
         let xnp = self.xn.ptr_mut() as *mut f32;
         // SAFETY: final_norm/lm_head resident; xn/logits device scratch; `tail <= nrow`
         // (checked at entry) keeps the offset inside the rows this pass owns.
         unsafe {
-            let last = xp.0.add((pass.nrow - tail) * hidden);
+            let last = xp.0.add((rows.nrow - tail) * hidden);
             self.norm_rows(
                 RowNorm {
                     src: last,

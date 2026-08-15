@@ -87,7 +87,7 @@ fn check_no_width_collision(v: &Vendored, c: &Value, w: Widths) {
         "{who}: the reference's own validate_architecture requires this"
     );
     assert!(
-        w.heads > w.kv && w.heads % w.kv == 0,
+        w.heads > w.kv && w.heads.is_multiple_of(w.kv),
         "{who}: GQA groups are not a clean ratio"
     );
     let group = w.group();

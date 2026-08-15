@@ -4,10 +4,10 @@
 //! travel with their loops.
 
 use super::engine::{GlmEngine, MOE_ACC_ROWS};
-use super::forward::{Pass, XRow};
+use super::forward::{ResidualBase, Rows};
 use crate::fetch::asyncfetch::Ticket;
 use crate::glm::pin::{Fp8Mlp, Fp8Weight, LayerMlp};
-use crate::routed::{Batch, ExpertSlot, RankWindow, TRACE_WINDOW};
+use crate::routed::{ExpertSlot, RankWindow, Selection, TRACE_WINDOW};
 use anyhow::Result;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_backend::{
@@ -18,7 +18,7 @@ use rivoli_core::routing::{RoutePolicy, RouteScratch, route_into, topk_into};
 
 /// One MoE dispatch's per-call operands; everything else comes off the engine.
 #[derive(Clone, Copy)]
-struct MoeLaunch {
+struct MoeLane {
     acc: *mut u64,
     stream: *mut std::ffi::c_void,
     nrow: usize,
@@ -48,7 +48,7 @@ fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
 impl GlmEngine<'_> {
     /// The dense-layer MLP sublayer: fp8 SwiGLU into `moe_out`, then the residual add.
     /// Null stream end to end.
-    pub(super) fn dense_sublayer(&mut self, m: Fp8Mlp, pass: Pass, xp: XRow) -> Result<()> {
+    pub(super) fn dense_sublayer(&mut self, m: Fp8Mlp, rows: Rows, xp: ResidualBase) -> Result<()> {
         let inter = m.gate.o_dim;
         let xnp = self.xn.ptr() as *const f32;
         let gp = self.mlp_g.ptr_mut() as *mut f32;
@@ -58,7 +58,7 @@ impl GlmEngine<'_> {
             // SAFETY: weights resident; x/y live device scratch for nrow rows.
             unsafe {
                 launch_gemv_fp8(
-                    x, w.packed, w.scale, w.o_dim, w.i_dim, w.block, pass.nrow, y,
+                    x, w.packed, w.scale, w.o_dim, w.i_dim, w.block, rows.nrow, y,
                 )
             }
         };
@@ -66,11 +66,11 @@ impl GlmEngine<'_> {
         gemv(xnp, m.up, up)?;
         // SAFETY: gp/up hold nrow·inter live f32; one elementwise launch over the
         // contiguous row-minor buffers, in place: h = silu(gate)·up.
-        unsafe { launch_swiglu(gp, up, pass.nrow * inter, gp, NULL_STREAM)? };
+        unsafe { launch_swiglu(gp, up, rows.nrow * inter, gp, NULL_STREAM)? };
         gemv(gp as *const f32, m.down, outp)?;
         // SAFETY: xp is nrow rows of live residual; moe_out was fully written above on
         // the null stream.
-        unsafe { launch_vadd(xp.0, outp as *const f32, pass.nrow * self.cfg.hidden) }
+        unsafe { launch_vadd(xp.0, outp as *const f32, rows.nrow * self.cfg.hidden) }
     }
 
     /// The MoE sublayer: host routing, pool submit, the ticketed two-stream launch,
@@ -78,15 +78,20 @@ impl GlmEngine<'_> {
     /// accumulator straight into `x` and resets it, so the conversion costs no extra
     /// pass; both MoE streams were awaited, so no barrier is needed despite both
     /// having written `moe_acc`).
-    pub(super) async fn moe_sublayer(&mut self, l: usize, pass: Pass, xp: XRow) -> Result<()> {
-        self.route_layer(l, pass)?;
-        self.moe_layer(l, pass).await?;
+    pub(super) async fn moe_sublayer(
+        &mut self,
+        l: usize,
+        rows: Rows,
+        xp: ResidualBase,
+    ) -> Result<()> {
+        self.route_layer(l, rows)?;
+        self.moe_layer(l, rows).await?;
         // SAFETY: xp nrow rows live; moe_acc's writers completed.
         unsafe {
             launch_moe_acc_drain(
                 xp.0,
                 self.moe_acc.ptr_mut() as *mut u64,
-                pass.nrow * self.cfg.hidden,
+                rows.nrow * self.cfg.hidden,
                 MOE_ACC_ROWS,
                 1.0,
                 NULL_STREAM,
@@ -99,7 +104,7 @@ impl GlmEngine<'_> {
     /// `nrow == 1` pass submits exactly what the unbatched engine submitted. Routing
     /// is a pure function of (logits, bias, top_k) — it does NOT consult residency
     /// (INV-1).
-    fn route_layer(&mut self, l: usize, pass: Pass) -> Result<()> {
+    fn route_layer(&mut self, l: usize, rows: Rows) -> Result<()> {
         let cfg = self.cfg;
         let LayerMlp::Moe { gate_w, .. } = self.pin.layers[l].mlp else {
             anyhow::bail!("route_layer on dense layer {l}")
@@ -115,13 +120,13 @@ impl GlmEngine<'_> {
                 gate_w,
                 cfg.n_experts,
                 cfg.hidden,
-                pass.nrow,
+                rows.nrow,
                 glp,
                 NULL_STREAM,
             )?
         };
         // The gate-logits D2H is the layer's one blocking join on the host path.
-        self.gate_logits.copy_out_into(&mut self.gl_host)?;
+        self.gate_logits.copy_out_into(&mut self.gate_logits_host)?;
         // Descending, so `scores`/`choice` are left holding ROW 0 for the trace window
         // below — the trace measures the router against the real token, and row 0 is
         // the real token.
@@ -130,9 +135,9 @@ impl GlmEngine<'_> {
             top_k: cfg.top_k,
             scoring: cfg.scoring(),
         };
-        for r in (0..pass.nrow).rev() {
+        for r in (0..rows.nrow).rev() {
             route_into(
-                &self.gl_host[r * ne..(r + 1) * ne],
+                &self.gate_logits_host[r * ne..(r + 1) * ne],
                 self.pin.moe_bias(l),
                 policy,
                 RouteScratch {
@@ -143,7 +148,7 @@ impl GlmEngine<'_> {
             );
             self.weigh_row(r);
         }
-        self.build_union(pass.nrow);
+        self.build_union(rows.nrow);
         // Trace v2 only: re-rank the same `choice` array to the wider candidate window
         // the offline (J, M) grid needs. Behind the trace gate so a stock decode is
         // byte-for-byte the work it was.
@@ -191,26 +196,26 @@ impl GlmEngine<'_> {
     /// ADDRESSES are known after submit, so the descriptors are valid pointers), stage
     /// the batch, launch. The UNION, not one row's picks: every expert any row routed
     /// to must be resident before the batch launches.
-    async fn moe_layer(&mut self, l: usize, pass: Pass) -> Result<()> {
+    async fn moe_layer(&mut self, l: usize, rows: Rows) -> Result<()> {
         let (out, window, choice, union) =
-            (&mut self.batch_out, &self.window, &self.choice, &self.union);
+            (&mut self.resolved, &self.window, &self.choice, &self.union);
         self.pin.routed.submit(
-            Batch {
+            Selection {
                 layer: l,
-                sel: union,
+                experts: union,
             },
             RankWindow { window, choice },
             out,
         )?;
-        self.stage_batch(l, pass)?;
-        self.launch_moe(pass).await
+        self.stage_batch(l, rows)?;
+        self.launch_moe(rows).await
     }
 
     /// Host staging after submit: the `[descriptor][row]` weight matrix, the
     /// descriptor table (routed + shared), the ticket list, and the two device
     /// uploads.
-    fn stage_batch(&mut self, l: usize, pass: Pass) -> Result<()> {
-        let nrow = pass.nrow;
+    fn stage_batch(&mut self, l: usize, rows: Rows) -> Result<()> {
+        let nrow = rows.nrow;
         // Scatter each row's weights into the layout the kernel reads as
         // `wexpert[e*R + t]`. Driven from the union rather than from each row's picks,
         // so "this row did not route here" is the natural `None` and leaves the 0.0
@@ -218,21 +223,21 @@ impl GlmEngine<'_> {
         // multiplying by it (`0 * dv` with a non-finite `dv` is NaN, which the
         // fixed-point clamp would turn into a finite extreme). That skip is what makes
         // row 0 of a batched pass bit-identical to an unbatched one.
-        self.w.clear();
-        self.w.resize(self.union.len() * nrow, 0.0);
+        self.wexpert.clear();
+        self.wexpert.resize(self.union.len() * nrow, 0.0);
         for (u, &e) in self.union.iter().enumerate() {
             for r in 0..nrow {
                 if let Some(i) = self.sel_row[r].iter().position(|&x| x == e) {
-                    self.w[u * nrow + r] = self.wrow[r][i];
+                    self.wexpert[u * nrow + r] = self.wrow[r][i];
                 }
             }
         }
         self.descs.clear();
-        for m in &self.batch_out.slots {
+        for m in &self.resolved.slots {
             self.descs.push(desc_of(m));
         }
         self.tickets.clear();
-        self.tickets.extend_from_slice(&self.batch_out.tickets);
+        self.tickets.extend_from_slice(&self.resolved.tickets);
         let LayerMlp::Moe { shared, .. } = self.pin.layers[l].mlp else {
             anyhow::bail!("stage_batch on dense layer {l}")
         };
@@ -241,10 +246,10 @@ impl GlmEngine<'_> {
         // RESIDENT tier, never streamed, so its dependency is already satisfied — but
         // it must still grow `tickets` with `descs`, or the launch loop indexes past
         // the end (it did once in the old tree: "len is 8 but the index is 8").
-        self.w.extend(std::iter::repeat_n(1.0, nrow));
+        self.wexpert.extend(std::iter::repeat_n(1.0, nrow));
         self.tickets.push(Ticket::RESIDENT);
         self.descs_buf.copy_in_at(0, as_le_bytes(&self.descs))?;
-        self.wexpert_buf.copy_in_at(0, as_le_bytes(&self.w))?;
+        self.wexpert_buf.copy_in_at(0, as_le_bytes(&self.wexpert))?;
         Ok(())
     }
 
@@ -272,7 +277,7 @@ impl GlmEngine<'_> {
     /// memory, silently); this decides only the ORDER of launches that each enqueue
     /// their wait unconditionally. A wrong bit costs throughput and cannot cost
     /// correctness.
-    async fn launch_moe(&mut self, pass: Pass) -> Result<()> {
+    async fn launch_moe(&mut self, rows: Rows) -> Result<()> {
         let ndesc = self.descs.len();
         debug_assert_eq!(
             self.tickets.len(),
@@ -283,17 +288,17 @@ impl GlmEngine<'_> {
         // The miss stream's accumulator block — see `moe_acc`'s layout doc.
         // SAFETY: `moe_acc` is MOE_ACC_ROWS·MAXROW·hidden u64; this is block 1, in
         // bounds for nrow ≤ MAXROW.
-        let acc_miss = unsafe { acc.add(pass.nrow * self.cfg.hidden) };
+        let acc_miss = unsafe { acc.add(rows.nrow * self.cfg.hidden) };
         let (cs_raw, ms_raw) = (self.compute_stream.raw(), self.miss_stream.raw());
-        self.launch_residents(MoeLaunch {
+        self.launch_residents(MoeLane {
             acc,
             stream: cs_raw,
-            nrow: pass.nrow,
+            nrow: rows.nrow,
         })?;
-        self.launch_misses(MoeLaunch {
+        self.launch_misses(MoeLane {
             acc: acc_miss,
             stream: ms_raw,
-            nrow: pass.nrow,
+            nrow: rows.nrow,
         })?;
         // BOTH streams, because neither waits for the other: with a fixed-point
         // accumulator nothing between them needs ordering, and the only consumer of
@@ -310,7 +315,7 @@ impl GlmEngine<'_> {
     /// one short-circuits on value 0, and the unconditional call is what makes "every
     /// launch is behind its dependency" true by reading the code rather than trusting
     /// this loop's classification.
-    fn launch_residents(&mut self, ml: MoeLaunch) -> Result<()> {
+    fn launch_residents(&mut self, lane: MoeLane) -> Result<()> {
         let ndesc = self.descs.len();
         let mut i = 0usize;
         while i < ndesc {
@@ -322,26 +327,26 @@ impl GlmEngine<'_> {
                 .find(|&k| !self.tickets[k].is_resident())
                 .unwrap_or(ndesc);
             for k in i..j {
-                self.pin.routed.wait_on(self.tickets[k], ml.stream)?;
+                self.pin.routed.wait_on(self.tickets[k], lane.stream)?;
             }
             // SAFETY: descs/codebooks resident; every expert in [i, j) has its
             // dependency enqueued above; scratch live; the stream is live.
-            unsafe { self.expert_range(i..j, ml)? };
+            unsafe { self.expert_range(i..j, lane)? };
             i = j;
         }
         Ok(())
     }
 
     /// The misses, one wait + one launch each, on the miss stream.
-    fn launch_misses(&mut self, ml: MoeLaunch) -> Result<()> {
+    fn launch_misses(&mut self, lane: MoeLane) -> Result<()> {
         for e in 0..self.descs.len() {
             if self.tickets[e].is_resident() {
                 continue;
             }
-            self.pin.routed.wait_on(self.tickets[e], ml.stream)?;
+            self.pin.routed.wait_on(self.tickets[e], lane.stream)?;
             // SAFETY: as in `launch_residents`; this expert's bytes are gated by the
             // wait just enqueued on the same stream.
-            unsafe { self.expert_range(e..e + 1, ml)? };
+            unsafe { self.expert_range(e..e + 1, lane)? };
         }
         Ok(())
     }
@@ -353,28 +358,29 @@ impl GlmEngine<'_> {
     /// through a `_`).
     ///
     /// # Safety
-    /// `descs_buf`/codebooks resident; scratch live; `ml.stream` live; every expert in
-    /// `experts` already gated by a wait enqueued on `ml.stream`.
-    unsafe fn expert_range(&self, experts: std::ops::Range<usize>, ml: MoeLaunch) -> Result<()> {
+    /// `descs_buf`/codebooks resident; scratch live; `lane.stream` live; every expert in
+    /// `experts` already gated by a wait enqueued on `lane.stream`.
+    unsafe fn expert_range(&self, experts: std::ops::Range<usize>, lane: MoeLane) -> Result<()> {
         let (x, h, acc) = (
             self.xn.ptr() as *const f32,
-            self.moe_h.ptr() as *mut f32,
-            ml.acc,
+            self.moe_hidden.ptr() as *mut f32,
+            lane.acc,
         );
         let descs = self.descs_buf.ptr() as *const ExpertDesc;
         let wexpert = self.wexpert_buf.ptr() as *const f32;
         let (hidden, inter) = (self.cfg.hidden, self.cfg.moe_inter);
         let [cb0, cb1, cb2] = self.codebooks;
         let (e_start, e_count) = (experts.start, experts.len());
+        let (nrow, stream) = (lane.nrow, lane.stream);
         // SAFETY: forwarded verbatim from this function's own contract.
         unsafe {
             match self.fmt {
                 RoutedFmt::I4 => launch_moe_expert_range_i4(
-                    x, hidden, inter, e_start, e_count, descs, wexpert, h, acc, ml.nrow, ml.stream,
+                    x, hidden, inter, e_start, e_count, descs, wexpert, h, acc, nrow, stream,
                 ),
                 RoutedFmt::Vq3 => launch_moe_expert_range(
                     x, hidden, inter, e_start, e_count, descs, cb0, cb1, cb2, wexpert, h, acc,
-                    ml.nrow, ml.stream,
+                    nrow, stream,
                 ),
                 RoutedFmt::F4 => anyhow::bail!(
                     "an .f4 expert reached GLM's MoE dispatch — it needs ExpertDescF4 and \

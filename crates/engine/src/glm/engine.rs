@@ -8,7 +8,7 @@ use crate::device::DeviceBuf;
 use crate::fetch::asyncfetch::Ticket;
 use crate::glm::MAXROW;
 use crate::glm::pin::GlmPin;
-use crate::routed::SubmitOut;
+use crate::routed::ResolvedBatch;
 use anyhow::{Result, ensure};
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::glm_config::ModelConfig;
@@ -45,17 +45,17 @@ pub struct GlmEngine<'a> {
     /// against.
     pub(super) x_rows: usize,
     pub(super) xn: DeviceBuf,
-    pub(super) sub: DeviceBuf,
-    pub(super) qr: DeviceBuf,
+    pub(super) attn_out: DeviceBuf,
+    pub(super) q_lora: DeviceBuf,
     pub(super) q: DeviceBuf,
-    pub(super) comp: DeviceBuf,
-    pub(super) qabs: DeviceBuf,
-    pub(super) qrope: DeviceBuf,
-    pub(super) clat: DeviceBuf,
+    pub(super) compressed_kv: DeviceBuf,
+    pub(super) q_absorbed: DeviceBuf,
+    pub(super) q_rope: DeviceBuf,
+    pub(super) ctx_latent: DeviceBuf,
     /// Split-KV partial scratch, sized ONCE for the attend kernel's worst-case split
     /// count so every context length reuses it.
     pub(super) attn_partial: DeviceBuf,
-    pub(super) ctx: DeviceBuf,
+    pub(super) attn_ctx: DeviceBuf,
     pub(super) gate_logits: DeviceBuf,
     // Dense-MLP fp8 SwiGLU scratch (gate/up projections, dense_inter wide).
     pub(super) mlp_g: DeviceBuf,
@@ -66,7 +66,7 @@ pub struct GlmEngine<'a> {
     /// never has to know they are two axes.
     pub(super) moe_acc: DeviceBuf,
     /// `[slots][MAXROW][moe_inter]` SwiGLU hidden scratch (routed MoE).
-    pub(super) moe_h: DeviceBuf,
+    pub(super) moe_hidden: DeviceBuf,
     pub(super) descs_buf: DeviceBuf,
     pub(super) wexpert_buf: DeviceBuf,
     pub(super) logits: DeviceBuf,
@@ -74,12 +74,12 @@ pub struct GlmEngine<'a> {
     /// buffer deliberately: the tail's D2H is already paid, so localising a NaN costs
     /// no extra sync — and a sync is exactly what masks the fault it localises.
     pub(super) argmax_dev: DeviceBuf,
-    // Per-layer fp8 KV latent cache, sized to max_ctx: `lc` is e4m3 (max_ctx*kvl u8),
-    // `lc_scale` the per-128 block scales (max_ctx*n_blocks f32), `rc` the roped key
+    // Per-layer fp8 KV latent cache, sized to max_ctx: `kv_latent` is e4m3 (max_ctx*kvl u8),
+    // `kv_latent_scale` the per-128 block scales (max_ctx*n_blocks f32), `kv_rope` the roped key
     // (max_ctx*rope u16, always bf16).
-    pub(super) lc: Vec<DeviceBuf>,
-    pub(super) lc_scale: Vec<DeviceBuf>,
-    pub(super) rc: Vec<DeviceBuf>,
+    pub(super) kv_latent: Vec<DeviceBuf>,
+    pub(super) kv_latent_scale: Vec<DeviceBuf>,
+    pub(super) kv_rope: Vec<DeviceBuf>,
     pub(super) n_kv_blocks: usize,
     // Host routing/argmax scratch, reused every layer so the hot path allocates nothing.
     pub(super) scores: Vec<f32>,
@@ -92,7 +92,7 @@ pub struct GlmEngine<'a> {
     /// did not route to a union expert carries 0.0 there, and the kernel SKIPS a zero
     /// weight rather than multiplying by it, which is why the union cannot perturb a
     /// row's own result.
-    pub(super) w: Vec<f32>,
+    pub(super) wexpert: Vec<f32>,
     /// Each token row's own top-`top_k` picks, before the union. Row 0's also feeds
     /// the trace, which stays defined on the real token.
     pub(super) sel_row: [Vec<usize>; MAXROW],
@@ -108,13 +108,13 @@ pub struct GlmEngine<'a> {
     /// tree's format-follows-residency channel, deleted structurally at the pool).
     pub(super) fmt: RoutedFmt,
     /// The pool's answer for the current layer: slots + tickets, in union order.
-    pub(super) batch_out: SubmitOut,
+    pub(super) resolved: ResolvedBatch,
     pub(super) descs: Vec<ExpertDesc>,
     /// Tickets for the launch loop, `descs`-parallel (the shared expert appends
     /// [`Ticket::RESIDENT`] after the pool's answer).
     pub(super) tickets: Vec<Ticket>,
     /// Gate-logits D2H staging (`nrow * n_experts` f32 as bytes).
-    pub(super) gl_host: Vec<u8>,
+    pub(super) gate_logits_host: Vec<u8>,
     pub(super) argmax_host: Vec<u8>,
     /// The MoE expert stream's compute stream — resident/loaded experts' partials run
     /// here concurrently with the fetch stream's loads (the overlap). Separate from the
@@ -159,13 +159,13 @@ impl<'a> GlmEngine<'a> {
              accumulator cap",
         );
         let n_kv_blocks = kvl / E4M3_BLOCK;
-        let mut lc = Vec::with_capacity(cfg.n_layers);
-        let mut lc_scale = Vec::with_capacity(cfg.n_layers);
-        let mut rc = Vec::with_capacity(cfg.n_layers);
+        let mut kv_latent = Vec::with_capacity(cfg.n_layers);
+        let mut kv_latent_scale = Vec::with_capacity(cfg.n_layers);
+        let mut kv_rope = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
-            lc.push(DeviceBuf::new(max_ctx * kvl)?); // e4m3 latent (1 byte)
-            lc_scale.push(DeviceBuf::new(max_ctx * n_kv_blocks * 4)?); // f32 block scales
-            rc.push(DeviceBuf::new(max_ctx * rope * 2)?); // bf16 roped key
+            kv_latent.push(DeviceBuf::new(max_ctx * kvl)?); // e4m3 latent (1 byte)
+            kv_latent_scale.push(DeviceBuf::new(max_ctx * n_kv_blocks * 4)?); // f32 block scales
+            kv_rope.push(DeviceBuf::new(max_ctx * rope * 2)?); // bf16 roped key
         }
         // Layer-major prefill keeps the WHOLE prompt's residual stream live across the
         // model, so `x` has to hold it. `max_ctx` is the honest bound — the server
@@ -192,15 +192,15 @@ impl<'a> GlmEngine<'a> {
             x: f(x_rows * cfg.hidden)?,
             x_rows,
             xn: f(MAXROW * cfg.hidden)?,
-            sub: f(MAXROW * cfg.hidden)?,
-            qr: f(MAXROW * cfg.q_lora_rank)?,
+            attn_out: f(MAXROW * cfg.hidden)?,
+            q_lora: f(MAXROW * cfg.q_lora_rank)?,
             q: f(MAXROW * h * cfg.qk_head_dim())?,
-            comp: f(MAXROW * (kvl + rope))?,
-            qabs: f(MAXROW * h * kvl)?,
-            qrope: f(MAXROW * h * rope)?,
-            clat: f(MAXROW * h * kvl)?,
+            compressed_kv: f(MAXROW * (kvl + rope))?,
+            q_absorbed: f(MAXROW * h * kvl)?,
+            q_rope: f(MAXROW * h * rope)?,
+            ctx_latent: f(MAXROW * h * kvl)?,
             attn_partial: f(MAXROW * rivoli_backend::attend_scratch_floats(h, kvl))?,
-            ctx: f(MAXROW * h * cfg.v_head_dim)?,
+            attn_ctx: f(MAXROW * h * cfg.v_head_dim)?,
             gate_logits: f(MAXROW * cfg.n_experts)?,
             mlp_g: f(MAXROW * cfg.dense_inter)?,
             mlp_u: f(MAXROW * cfg.dense_inter)?,
@@ -215,7 +215,7 @@ impl<'a> GlmEngine<'a> {
                 unsafe { fill_u32(b.ptr_mut(), 0, bytes)? };
                 b
             },
-            moe_h: f(slots * MAXROW * cfg.moe_inter)?,
+            moe_hidden: f(slots * MAXROW * cfg.moe_inter)?,
             descs_buf: DeviceBuf::new(slots * std::mem::size_of::<ExpertDesc>())?,
             wexpert_buf: f(slots * MAXROW)?,
             logits: f(MAXROW * cfg.vocab)?,
@@ -227,23 +227,23 @@ impl<'a> GlmEngine<'a> {
                 b.copy_in_at(0, &[0u8; ARGMAX_BYTES])?;
                 b
             },
-            lc,
-            lc_scale,
-            rc,
+            kv_latent,
+            kv_latent_scale,
+            kv_rope,
             n_kv_blocks,
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
             window: Vec::new(), // grown once by the first traced layer; empty otherwise
-            w: Vec::with_capacity(slots * MAXROW),
+            wexpert: Vec::with_capacity(slots * MAXROW),
             sel_row: std::array::from_fn(|_| Vec::with_capacity(cfg.top_k)),
             wrow: std::array::from_fn(|_| Vec::with_capacity(cfg.top_k)),
             union: Vec::with_capacity(slots),
             codebooks: pin.codebooks(),
             fmt: pin.routed.fmt(),
-            batch_out: SubmitOut::default(),
+            resolved: ResolvedBatch::default(),
             descs: Vec::with_capacity(slots),
             tickets: Vec::with_capacity(slots),
-            gl_host: Vec::with_capacity(MAXROW * cfg.n_experts * 4),
+            gate_logits_host: Vec::with_capacity(MAXROW * cfg.n_experts * 4),
             argmax_host: Vec::with_capacity(ARGMAX_BYTES),
             compute_stream: HipStream::compute()?,
             miss_stream: HipStream::miss()?,

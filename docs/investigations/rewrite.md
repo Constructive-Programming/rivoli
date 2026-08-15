@@ -165,9 +165,9 @@ port of `old:src/routed.rs` landed red (CodeScene 8.6: `submit` cc 18 / 110 LoC 
 at a design fault, not a style one: `submit`'s eighth argument was `fmt: &mut
 Vec<RoutedFmt>` — the exact channel of the old tree's #2 open defect, per-expert format
 decided by which tier residency chose. The redo (`crates/engine/src/routed.rs`, 10.0)
-makes the pool **single-format** per Q1: one `RoutedGeom`, `submit` fills a `SubmitOut`
+makes the pool **single-format** per Q1: one `RoutedGeom`, `submit` fills a `ResolvedBatch` (né `SubmitOut`, renamed in the 2026-08-15 naming pass)
 of slots + tickets only, and `RoutedPool::fmt()` is the only format answer — a per-expert
-one is no longer expressible. Operands bundled as `PoolCfg`/`Batch`/`RankWindow`
+one is no longer expressible. Operands bundled as `PoolCfg`/`Selection`/`RankWindow`
 (startup knobs vs per-layer selection vs trace-only inputs); the three arena phases are
 named methods. INV-5 (ticket-per-descriptor, no residency mask) entered §8b with its
 ported test. Suite green, device arm 60/0.

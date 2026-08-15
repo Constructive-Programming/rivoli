@@ -231,8 +231,8 @@ fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
     assert_linear_reaches_the_fold_exactly_where_the_predicate_says();
 }
 
-/// Claim 1. Bit-identical to `None` on the toy, so the exclusion goes red the day a toy
-/// dimension grows past the predicate.
+// Claim 1. Bit-identical to `None` on the toy, so the exclusion goes red the day a toy
+// dimension grows past the predicate.
 
 /// Drive layer 0 of the toy under `d` and capture the prefill — the shared probe both
 /// blindness assertions score (their closures became a jscpd clone once the ProbeLayer

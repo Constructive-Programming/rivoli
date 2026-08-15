@@ -38,3 +38,10 @@ io-uring = { version = "0.7", optional = true }
 opentelemetry = { version = "0.30", optional = true }
 opentelemetry_sdk = { version = "0.30", optional = true }
 opentelemetry-otlp = { version = "0.30", optional = true }
+
+# The smoke decodes on the device, so a featureless build must not try to compile it —
+# `required-features` is what keeps `clippy --workspace --all-targets` honest without a
+# cfg wall inside the example.
+[[example]]
+name = "glm_smoke"
+required-features = ["rocm"]

@@ -243,9 +243,9 @@ pub struct PoolCfg<'a> {
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
 /// the trace: see [`RoutedPool::submit`]).
 #[derive(Clone, Copy)]
-pub struct Batch<'a> {
+pub struct Selection<'a> {
     pub layer: usize,
-    pub sel: &'a [usize],
+    pub experts: &'a [usize],
 }
 
 /// The trace sink's inputs: the ranked top-[`TRACE_WINDOW`] candidate expert ids and the
@@ -268,7 +268,7 @@ impl RankWindow<'_> {
 /// [`RoutedPool::submit`]'s result buffers, caller-owned so the per-layer hot path
 /// reuses their capacity. Index i of each answers for `sel[i]`.
 #[derive(Default)]
-pub struct SubmitOut {
+pub struct ResolvedBatch {
     /// Each selected expert's six projection pointers into the pool.
     pub slots: Vec<ExpertSlot>,
     /// Each selected expert's device-side data dependency. Resident experts carry
@@ -649,9 +649,9 @@ impl RoutedPool {
     /// carry [`Ticket::RESIDENT`], so resident / missing / in-flight are one code path.
     pub fn submit(
         &mut self,
-        batch: Batch<'_>,
+        sel: Selection<'_>,
         win: RankWindow<'_>,
-        out: &mut SubmitOut,
+        out: &mut ResolvedBatch,
     ) -> Result<()> {
         out.slots.clear();
         out.tickets.clear();
@@ -666,8 +666,8 @@ impl RoutedPool {
         // exists to make impossible, reintroduced through the error path. Found by
         // review, 2026-08-05; the old `tests/f4_pool.rs` performs the first half of it
         // deliberately and asserts the pool is unchanged afterwards.
-        for &e in batch.sel {
-            self.geom.addressable(batch.layer, e)?;
+        for &e in sel.experts {
+            self.geom.addressable(sel.layer, e)?;
         }
         // A real `ensure!`, not a `debug_assert!`: `is_hit` below is a fixed
         // `[bool; MAX_BATCH]` and an over-long `sel` would INDEX PAST IT, which under
@@ -677,9 +677,9 @@ impl RoutedPool {
         // the one that makes the array access total, and it costs one compare per
         // layer.
         ensure!(
-            batch.sel.len() <= MAX_BATCH,
+            sel.experts.len() <= MAX_BATCH,
             "submit: {} experts exceeds the {MAX_BATCH}-slot batch scratch",
-            batch.sel.len()
+            sel.experts.len()
         );
         // New batch: the previous layer's reads have all landed (its awaits + its
         // end-of-layer sync), so its misses become `loaded` now; then clear the
@@ -692,11 +692,11 @@ impl RoutedPool {
             }
         }
         self.policy.begin_batch();
-        self.write_trace(batch, win)?;
+        self.write_trace(sel, win)?;
         let mut is_hit = [false; MAX_BATCH];
-        self.touch_hits(batch, &mut is_hit);
-        self.admit_misses(batch, &is_hit)?;
-        self.resolve(batch, &is_hit, out)
+        self.touch_hits(sel, &mut is_hit);
+        self.admit_misses(sel, &is_hit)?;
+        self.resolve(sel, &is_hit, out)
     }
 
     /// The `--trace` v2 sink: the demand keys this layer looks up, then `|`, then the
@@ -709,20 +709,20 @@ impl RoutedPool {
     /// `bin/replay` hard-fails a trace where that prefix does not hold. Reordering
     /// `sel` for any local reason (coalescing reads by expert id, say) would silently
     /// change the meaning of every captured trace. The debug_assert is the tripwire.
-    fn write_trace(&mut self, batch: Batch<'_>, win: RankWindow<'_>) -> Result<()> {
+    fn write_trace(&mut self, sel: Selection<'_>, win: RankWindow<'_>) -> Result<()> {
         debug_assert!(
-            win.window.is_empty() || win.window.starts_with(batch.sel),
+            win.window.is_empty() || win.window.starts_with(sel.experts),
             "trace v2: the candidate window must be the ranking that produced `sel`"
         );
         let Some(w) = &mut self.trace else {
             return Ok(());
         };
         use std::io::Write;
-        for (j, &e) in batch.sel.iter().enumerate() {
+        for (j, &e) in sel.experts.iter().enumerate() {
             if j > 0 {
                 write!(w, " ").context("write trace")?;
             }
-            write!(w, "{}", expert_key(batch.layer, e)).context("write trace")?;
+            write!(w, "{}", expert_key(sel.layer, e)).context("write trace")?;
         }
         // ponytail: the `choice` values have no consumer yet — the (J, M) grid needs
         // only the RANK order, which the list already carries. Written anyway because a
@@ -731,7 +731,7 @@ impl RoutedPool {
         // route-KL counter needs the mass distribution.
         write!(w, " |").context("write trace")?;
         for &e in win.window {
-            write!(w, " {}:{:.6}", expert_key(batch.layer, e), win.choice[e])
+            write!(w, " {}:{:.6}", expert_key(sel.layer, e), win.choice[e])
                 .context("write trace")?;
         }
         writeln!(w).context("write trace")
@@ -740,9 +740,9 @@ impl RoutedPool {
     /// Touch every hit first, so a later miss's admit can't evict it. The physical slot
     /// is deliberately NOT read here — [`Self::resolve`] takes it from `slot_of` after
     /// any same-batch relocation settles.
-    fn touch_hits(&mut self, batch: Batch<'_>, is_hit: &mut [bool; MAX_BATCH]) {
-        for (i, &e) in batch.sel.iter().enumerate() {
-            let key = expert_key(batch.layer, e);
+    fn touch_hits(&mut self, sel: Selection<'_>, is_hit: &mut [bool; MAX_BATCH]) {
+        for (i, &e) in sel.experts.iter().enumerate() {
+            let key = expert_key(sel.layer, e);
             if self.policy.hit(key) {
                 self.hits += 1;
                 // THE CHECK. A hit hands the kernel a slot pointer and a resolved
@@ -757,7 +757,7 @@ impl RoutedPool {
                          but its bytes never landed since admission. The kernel is \
                          about to read an unloaded slot — uninitialised memory (-> \
                          NaN) or a previous expert's weights (-> silently wrong).",
-                        batch.layer
+                        sel.layer
                     );
                 }
                 self.policy.protect(key);
@@ -767,12 +767,12 @@ impl RoutedPool {
     }
 
     /// Allocate the misses (evict + place + compact). Slots may relocate.
-    fn admit_misses(&mut self, batch: Batch<'_>, is_hit: &[bool; MAX_BATCH]) -> Result<()> {
+    fn admit_misses(&mut self, sel: Selection<'_>, is_hit: &[bool; MAX_BATCH]) -> Result<()> {
         let mut any_miss = false;
-        for (i, &e) in batch.sel.iter().enumerate() {
+        for (i, &e) in sel.experts.iter().enumerate() {
             if !is_hit[i] {
                 self.misses += 1;
-                self.alloc(expert_key(batch.layer, e))?;
+                self.alloc(expert_key(sel.layer, e))?;
                 any_miss = true;
             }
         }
@@ -801,14 +801,14 @@ impl RoutedPool {
     /// and signals each miss's ticket when its copy lands.
     fn resolve(
         &mut self,
-        batch: Batch<'_>,
+        sel: Selection<'_>,
         is_hit: &[bool; MAX_BATCH],
-        out: &mut SubmitOut,
+        out: &mut ResolvedBatch,
     ) -> Result<()> {
         let mut reads: Vec<ReadSpec> = Vec::new();
         let mut miss_sel: Vec<usize> = Vec::new();
-        for (i, &e) in batch.sel.iter().enumerate() {
-            let (hot, idx) = self.slot(expert_key(batch.layer, e)).context(
+        for (i, &e) in sel.experts.iter().enumerate() {
+            let (hot, idx) = self.slot(expert_key(sel.layer, e)).context(
                 "expert not resident after alloc (batch exceeds pool — raise --max-mem)",
             )?;
             let b = self.ptr(hot, idx);
@@ -819,7 +819,7 @@ impl RoutedPool {
             // satisfied.
             out.slots.push(unsafe { slot_at(b, &self.geom.off) });
             if !is_hit[i] {
-                let (fd, begin, len) = self.geom.spec(batch.layer, e)?;
+                let (fd, begin, len) = self.geom.spec(sel.layer, e)?;
                 reads.push(ReadSpec {
                     fd,
                     begin,
@@ -832,14 +832,14 @@ impl RoutedPool {
         // Queue this batch's misses to be marked loaded at the next layer.
         for &i in &miss_sel {
             self.pending_loaded
-                .push(expert_key(batch.layer, batch.sel[i]));
+                .push(expert_key(sel.layer, sel.experts[i]));
         }
         let miss_tickets = self.fetch.submit(reads)?;
         // A resident expert's data is already there, so it carries the RESIDENT ticket
         // (value 0, satisfied on arrival). Every expert therefore has a ticket and the
         // caller has one code path — there is no residency bool for anyone to branch
         // on.
-        out.tickets.resize(batch.sel.len(), Ticket::RESIDENT);
+        out.tickets.resize(sel.experts.len(), Ticket::RESIDENT);
         for (k, &i) in miss_sel.iter().enumerate() {
             out.tickets[i] = miss_tickets[k];
         }
@@ -867,7 +867,7 @@ mod ticket_tests {
     /// **INV-5: an expert cannot be launched without enqueueing its data dependency.**
     ///
     /// The structural half of this is enforced by types and cannot be tested at
-    /// runtime: [`RoutedPool::submit`] fills [`SubmitOut`] and returns no residency
+    /// runtime: [`RoutedPool::submit`] fills [`ResolvedBatch`] and returns no residency
     /// mask, so the loop has nothing to branch on and no way to spell "launch without
     /// waiting". What IS testable, and what actually broke before, is the encoding — a
     /// resident ticket must be a real satisfied dependency rather than a sentinel the
