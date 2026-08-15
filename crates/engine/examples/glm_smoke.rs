@@ -13,10 +13,13 @@
 use anyhow::{Context, Result};
 
 fn main() -> Result<()> {
+    // Logs on stderr: stdout is the id stream the parity gate diffs, and a log line
+    // interleaved into it would read as a mismatch.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(std::io::stderr)
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [dir, mem_gib, ngen, ids @ ..] = args.as_slice() else {

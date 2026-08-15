@@ -76,9 +76,14 @@ appears that enum dispatch cannot fill.
   variable). Per-file `#![allow]` needs its argument written beside it.
 - **clippy** `--all-targets` plus the deviceless feature-union run.
 - **docs registry** — status/scope/verdict front matter + INDEX agreement, test-enforced.
+- **parity** — `tests/parity-glm.sh`: the rewrite's greedy ids token-identical to the
+  pinned reference (prefix rule: the reference can stop at EOS, the smoke cannot yet),
+  flock + descendant-pid witness per arm, never builds. On-demand (GPU, ~1 h), not CI.
+  Red-proofed 2026-08-15 by a gate-codebook inversion, after two measured sub-threshold
+  rungs (1-ulp: erased by fp16 narrowing; one sign flip: under argmax margins).
 - Landing later, each with the thing that makes it non-vacuous: INV-n registry (first
   invariant, M1), feature matrix (first feature, M1), kernel census (first launcher, M3),
-  refactor/parity gates (first capture, M5).
+  refactor gates (first capture).
 
 ## Build and test
 

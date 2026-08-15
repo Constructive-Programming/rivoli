@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The gates-first rewrite is through M0, M1, and M2 — gates armed and red-proofed before any code, anchors vendored before the engine (GLM's generated fresh, 26/26 defect cells), substrate and artifact layers ported with both feature arms verified, converter round-trip proven byte-stable on a synthetic checkpoint, review round 1's 24 findings applied, and M3 closed on silicon — 38/38 kernel oracles green on gfx1151, floors measured at both draws, census armed with a shrink-only deferred table; M4's decode-loop design note awaits the owner before the loop is written.
+verdict: The gates-first rewrite is through M0–M5 — gates armed and red-proofed before any code, anchors vendored before the engine (GLM's generated fresh, 26/26 defect cells), substrate and artifact layers ported with both feature arms verified, M3 closed on silicon with 38/38 kernel oracles, M4's single-format decode loop closed on token parity with the pinned reference, and M5 turned that comparison into a scripted gate — tests/parity-glm.sh, 32/32 greedy ids identical with clean contention witnesses, red-proofed by a measured perturbation ladder whose two sub-threshold rungs are recorded as the gate's sensitivity floor.
 ---
 
 # The rewrite, milestone by milestone
@@ -223,6 +223,54 @@ the device). Its one obligation that survives is honesty about trace sinks:
 `flush_trace`'s per-token flush now argues from `Drop` discarding errors, not from a
 watchdog's `process::exit`. If a wedge class ever reappears, reopen this with the
 evidence rather than resurrecting the module.
+
+
+## M5 — parity as a scripted gate (CLOSED 2026-08-15)
+
+M4's hand-driven id comparison is now `tests/parity-glm.sh`: the reference binary
+(release, the pin `6b7f496e`, prebuilt in its own target dir) against the rewrite's
+`glm_smoke` (dev profile, every `debug_assert!` live), one invocation, both arms flock'd
+with a contention witness each. Discipline encoded rather than trusted: the gate NEVER
+builds (a build between arms evicts page cache); the witness is "KFD tenants not
+descended from the arm's own pid" — never a binary-path whitelist, which would wave
+through a peer running the identical pinned reference — plus a pre-arm GTT baseline
+(KFD is blind to Vulkan tenants); prompt ids ride the reference's own tokenizer log with
+the extracted count asserted against the advertised count (the log prints at most 12);
+exit codes classify token mismatch (1) from setup (2) from witnessed contention (3,
+discard and rerun). Parity means the reference's WHOLE sequence is a prefix of the
+rewrite's: the reference chat-frames its prompt so its EOS is reachable, and the smoke
+has no tokenizer until M6.
+
+- **GREEN 2026-08-15.** `"The sky is blue"` → 10 chat-framed ids, ngen 32,
+  `--max-mem 100`: **32/32 generated ids identical**, both witnesses empty.
+  Supplementary: the arms' prefill counters are identical (3587 expert reads, 1492
+  hits, 29.4%) — routing traffic matched, not just tokens.
+- **RED-PROOF, a measured ladder** (each rung its own ~15-min GPU run): (1) a 1-ulp
+  f32 flip in one codeword — **annihilated by the pin's f32→fp16 codebook narrowing**
+  before any arithmetic ran, ids identical; (2) a sign flip of the same codeword
+  (0.23 → −0.23, fp16-survivable, ~0.05% of one projection's weights) — **below
+  greedy-argmax margins**, ids identical; (3) the whole gate-projection codebook
+  sign-inverted — **diverges at token 1**, the output degenerates into a repetition
+  loop, and the hit/miss split moves (3950/250 vs 3055/1145): wrong arithmetic
+  cascades into ROUTING, because later layers route on a corrupted residual. The two
+  sub-threshold rungs stay recorded as the gate's sensitivity floor: single-byte
+  artifact corruption is invisible to an 8-token parity run — this gate detects wrong
+  engines, not slightly-wrong artifacts.
+- The loud-fail path fired live before the first green: run 1 failed prompt-id
+  extraction (the reference logs on stdout; the script grepped stderr) with exit 2
+  and a message naming the fix.
+- Review round (correctness + simplicity, device use forbidden in both prompts):
+  12 findings, 11 applied — descendant-pid witness, classified exit codes end to end,
+  vacuous-red-proof guards (ngen ≥ reference count, non-empty prompt-ids, realpath'd
+  shadow links), `decode_new` folded with an rc return, the locale-dependent
+  cmp-parser dropped. Declined with the argument in place: a same-invocation pristine
+  control — the green run IS the control, same binary and prompt, minutes earlier.
+- **dNLL fallback not spent.** The primary token-identity gate passed at full length,
+  so the paired-dNLL path (5000-token corpus) stays in reserve for the day a refactor
+  makes exact identity too strict (a kernel reorder inside a documented tolerance).
+
+Deliberately OUT of M5: multi-prompt sweeps (the gate takes `PARITY_PROMPT`; a corpus
+sweep belongs to the first refactor that needs one), MTP (still deferred), dsa.
 
 
 ## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)
