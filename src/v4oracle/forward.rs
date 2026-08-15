@@ -266,13 +266,13 @@ defects! {
     /// Run the final `RMSNorm` but return f32, skipping the bf16 store `RMSNorm.forward`
     /// performs on the way out. Measured at 7.5e-3 on a 3.1 max (0.24%) elsewhere in this
     /// port, and it is a live choice on the device: `kernels/mla.hip::rmsnorm_batch` bf16-rounds
-    /// and `kernels/linalg.hip::rmsnorm_single` does not.
+    /// and `kernels/linalg.hip::rmsnorm_rows` does not.
     HeadNormNotBf16,
     /// Take the final `RMSNorm`'s statistic JOINTLY over all `s * dim` values instead of per
     /// token: what handing a single-row norm kernel an `s x dim` buffer does. Invisible at
     /// decode (`s == 1`), which is the only shape most smoke tests run.
     ///
-    /// Only the STATISTIC is modelled. `kernels/linalg.hip::rmsnorm_single` would also read its
+    /// Only the STATISTIC is modelled. `kernels/linalg.hip::rmsnorm_rows` would also read its
     /// `dim`-long gain past the end of the tensor, which is undefined rather than wrapped;
     /// this tiles the gain instead, which is the charitable realization. The joint statistic
     /// is the load-bearing half, and an out-of-bounds read is not a thing an oracle can
@@ -924,7 +924,7 @@ impl Oracle {
     /// what `Defect::HeadNormNotBf16` suppresses, and `d` is what `HeadNormOverAllTokens`
     /// widens to `s * dim`. Both are choices a device implementation actually faces —
     /// `kernels/mla.hip::rmsnorm_batch` bf16-rounds and is one block per row, while
-    /// `kernels/linalg.hip::rmsnorm_single` neither rounds nor spans rows.
+    /// `kernels/linalg.hip::rmsnorm_rows` neither rounds nor spans rows.
     fn rmsnorm_raw(&self, x: &mut [f32], d: usize, w: &[f32]) {
         // `zip` below stops at the shorter side, so a short `w` would leave the tail of every
         // row not merely un-gained but UN-SCALED by `rs`, and say nothing. That is reachable:

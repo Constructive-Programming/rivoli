@@ -387,8 +387,8 @@ const OWNERS: &[(&str, &[&str])] = &[
     // and the eps is NOT a parameter at either call site — `Glimmer::pre_norm` reads `eps_pre` and
     // `Glimmer::branch_add` reads `eps_post`, so the three-orders-of-magnitude swap is not
     // expressible at the level that chooses which norm runs where.
-    ("rmsnorm_centered_single", &["glimmer_gpu.rs"]),
-    ("rmsnorm_single", &["gpu.rs", "glimmer_gpu.rs"]),
+    ("rmsnorm_centered_rows", &["glimmer_gpu.rs"]),
+    ("rmsnorm_rows", &["gpu.rs", "glimmer_gpu.rs"]),
     // Muse Glimmer's WEIGHTLESS qk-norm plus Q's 3.87, empty for the same reason the row above is.
     // Named for what it does, not for the model: `mla.hip::qk_norm` already holds the name and is a
     // different kernel (bf16 statistic, DeepSeek-V4's), which is why this one spells its contract.

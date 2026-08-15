@@ -385,7 +385,7 @@ pub fn sync_read(b: &rivoli::memory::device::DeviceBuf) -> Vec<f32> {
 // the same reason `sync_read` does: a launch wrapper is three lines of pointer casts where a
 // mistake is a wrong answer rather than a compile error, and one copy is one place to be right.
 
-/// The one place `launch_rmsnorm_centered_single` is spelled, returning its `Result`.
+/// The one place `launch_rmsnorm_centered_rows` is spelled, returning its `Result`.
 ///
 /// Two spellings — the wrapper below and `glimmer_norm.rs`'s guard table — were a jscpd clone,
 /// which is the gate being right about the substance too: a guard test and a scoring test must
@@ -405,7 +405,7 @@ pub unsafe fn rmsnorm_launch(
     // SAFETY: the caller's contract above. Null stream: every caller launches one kernel and
     // then joins, so there is nothing to order against.
     unsafe {
-        rivoli::backend::hip::launch_rmsnorm_centered_single(x, w, n, eps, y, std::ptr::null_mut())
+        rivoli::backend::hip::launch_rmsnorm_centered_rows(x, w, 1, n, eps, y, std::ptr::null_mut())
     }
 }
 
@@ -413,7 +413,7 @@ pub unsafe fn rmsnorm_launch(
 ///
 /// Here rather than in `glimmer_norm.rs` because jscpd matched the launch block against the
 /// wrappers already in this file. It briefly took a `centered: bool` and dispatched to
-/// `rmsnorm_single` for the plain form — deleted 2026-08-12 when review pointed out the test's
+/// `rmsnorm_rows` for the plain form — deleted 2026-08-12 when review pointed out the test's
 /// only plain comparison belongs on the HOST anyway, so there was never a second device form to
 /// select and the bool was pure surface.
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
@@ -430,7 +430,7 @@ pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
             y.ptr() as *mut f32,
         )
     }
-    .expect("rmsnorm_centered_single launch");
+    .expect("rmsnorm_centered_rows launch");
     sync_read(&y)
 }
 

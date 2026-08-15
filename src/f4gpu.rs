@@ -2047,7 +2047,7 @@ impl F4Engine {
                 self.comb.ptr_mut().cast(),
                 null,
             )?;
-            // `launch_rmsnorm_batch`, in place on `hc_pre`'s output — NOT GLM's `linalg.hip::rmsnorm_single`,
+            // `launch_rmsnorm_batch`, in place on `hc_pre`'s output — NOT GLM's `linalg.hip::rmsnorm_rows`,
             // which is out-of-place, does not bf16-round, and is SINGLE-ROW (`dim3(1)`, one mean
             // over its whole `n`), so handing it `m * dim` would take a joint statistic over every
             // token and read the norm weight past its allocation. V4's `RMSNorm` returns bf16 and

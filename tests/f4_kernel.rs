@@ -88,7 +88,7 @@ use rivoli::backend::gpustream::HipStream;
 use rivoli::backend::hip::{
     ExpertDescF4, device_sync, launch_act_quant_f8, launch_act_quant_f8_prefix,
     launch_gemv_fp8_bf16, launch_hc_post, launch_hc_pre, launch_moe_acc_drain,
-    launch_moe_expert_range_f4, launch_rmsnorm_single, launch_swiglu_clamped_bf16,
+    launch_moe_expert_range_f4, launch_rmsnorm_rows, launch_swiglu_clamped_bf16,
 };
 use rivoli::memory::device::DeviceBuf;
 use rivoli::v4oracle::{
@@ -1583,11 +1583,11 @@ fn gpu_hc_post(
     sync_f32(&y)
 }
 
-/// `rmsnorm_single` on the GPU, so the `hc_pre` comparison lands on a golden the oracle emits.
+/// `rmsnorm_rows` on the GPU, so the `hc_pre` comparison lands on a golden the oracle emits.
 ///
-/// **rivoli's `rmsnorm_single` kernel does NOT bf16-round its output, and V4's `RMSNorm.forward`
+/// **rivoli's `rmsnorm_rows` kernel does NOT bf16-round its output, and V4's `RMSNorm.forward`
 /// returns bf16** (`model.py:197-202` computes in f32 and the module's dtype is bf16). That
-/// is a real gap and it is NOT this stream's to close — `rmsnorm_single` is shared with the GLM
+/// is a real gap and it is NOT this stream's to close — `rmsnorm_rows` is shared with the GLM
 /// path, where adding a store would change shipped output. `mhc_reproduces_the_layer_
 /// goldens` applies the missing round on the host and PRINTS what it was worth, so the
 /// number is on the record rather than absorbed into a tolerance. **S3 owns supplying it.**
@@ -1599,7 +1599,7 @@ fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     );
     let (xb, wb) = (to_device(&f32b(x)), to_device(&f32b(w)));
     let mut y = zeros(x.len() * 4);
-    // ONE LAUNCH PER TOKEN. `rivoli_rmsnorm_single` is single-row — `dim3(1)`, one mean over its
+    // ONE LAUNCH PER TOKEN. `rivoli_rmsnorm_rows` is called at rows=1 here — `dim3(1)`, one mean over its
     // whole `n`, and `w[i]` indexed over that same `n`. Handing it `s·dim` took a JOINT rms
     // over every token (the oracle's is per token, `x.chunks_mut(d)`) and read the norm
     // weight `s-1` rows past its allocation. Both were silent: the golden's length still
@@ -1608,15 +1608,16 @@ fn gpu_rmsnorm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     for t in 0..x.len() / dim {
         // SAFETY: row `t` is `dim` live f32 inside both buffers, and `w` is `dim` long.
         unsafe {
-            launch_rmsnorm_single(
+            launch_rmsnorm_rows(
                 (xb.ptr() as *const f32).add(t * dim),
                 wb.ptr() as *const f32,
+                1,
                 dim,
                 eps,
                 (y.ptr_mut() as *mut f32).add(t * dim),
             )
         }
-        .expect("rmsnorm_single");
+        .expect("rmsnorm_rows");
     }
     sync_f32(&y)
 }
@@ -1668,7 +1669,7 @@ fn mhc_reproduces_the_layer_goldens() {
         "the driver's h is not what the oracle recorded"
     );
 
-    // The bf16 store `rmsnorm_single` is missing (see `gpu_rmsnorm`). Measured on the way past so
+    // The bf16 store `rmsnorm_rows` is missing (see `gpu_rmsnorm`). Measured on the way past so
     // the size of the gap is recorded rather than inferred: `report` prints the unrounded
     // error next to the rounded one, and if the two are ever the same number the missing
     // store has stopped mattering and this wrapper can go.

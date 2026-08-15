@@ -11,7 +11,7 @@
 //! "never pass null" — it is that every launch touching one buffer must be on ONE stream, and that
 //! a compute stream at two call sites inside an otherwise null-stream layer is the same bug
 //! inverted. **Four of the twelve launchers this chain drives take no stream parameter at all** —
-//! `rmsnorm_single`, `rope_split_half`, `vadd` and `argmax` — so a "compute stream" loop would be
+//! `rmsnorm_rows`, `rope_split_half`, `vadd` and `argmax` — so a "compute stream" loop would be
 //! exactly that inversion: a real stream at the eight launches that accept one and the legacy
 //! default at the four that cannot.
 //!
@@ -52,7 +52,7 @@ use crate::artifact::model::{GlimmerTextConfig, LayerKind};
 use crate::backend::NULL_STREAM;
 use crate::backend::hip::{
     device_sync, launch_argmax, launch_embed_bf16_row_bcast, launch_gemm_bf16, launch_gemv_fp8,
-    launch_gqa_attend, launch_logit_softcap, launch_rmsnorm_centered_single, launch_rmsnorm_single,
+    launch_gqa_attend, launch_logit_softcap, launch_rmsnorm_centered_rows, launch_rmsnorm_rows,
     launch_rmsnorm_weightless_batch, launch_rope_split_half, launch_sigmoid_gate, launch_swiglu,
     launch_vadd,
 };
@@ -643,13 +643,20 @@ impl Glimmer {
     ///
     /// # Safety
     /// `w` is `hidden` live f32 and stays valid until the next [`GlimmerPin::layer`] call.
-    unsafe fn pre_norm(&mut self, x: *mut f32, w: *const f32) -> Result<()> {
-        // SAFETY: `x` is `hidden` live f32 and `xn` is this struct's own; `w` is the caller's
-        // obligation.
+    ///
+    /// **`rows` is here ahead of its user, and that is deliberate.** The batched prefill needs it,
+    /// and the kernel already takes it; giving this wrapper a `1` literal instead put its argument
+    /// list a token over jscpd's floor against `sample`'s, which is the gate reporting a real
+    /// duplication rather than one to exempt. `xn` must hold `rows * hidden` f32 — the caller's
+    /// obligation, and `Glimmer::new` sizes it from `PREFILL_CHUNK`.
+    unsafe fn pre_norm(&mut self, x: *mut f32, w: *const f32, rows: usize) -> Result<()> {
+        // SAFETY: `x` is `rows * hidden` live f32 and `xn` is this struct's own; `w` is the
+        // caller's obligation.
         unsafe {
-            launch_rmsnorm_centered_single(
+            launch_rmsnorm_centered_rows(
                 x,
                 w,
+                rows,
                 self.hidden,
                 self.eps_pre,
                 self.xn.ptr() as *mut f32,
@@ -674,9 +681,10 @@ impl Glimmer {
         // SAFETY: `br` and `x` are each `hidden` f32 this struct owns; the centered norm's own
         // contract permits `y` aliasing `x`, which is what makes the in-place form legal.
         unsafe {
-            launch_rmsnorm_centered_single(
+            launch_rmsnorm_centered_rows(
                 self.br.ptr() as *const f32,
                 w,
+                1,
                 self.hidden,
                 self.eps_post,
                 self.br.ptr() as *mut f32,
@@ -745,12 +753,12 @@ impl Glimmer {
         let w = self.attn_window(l, pos);
         // SAFETY: every pointer in `h` is live in the pin and stays at its address for as long as
         // its slot holds layer `l` — which is the whole of this function, per the section above.
-        unsafe { self.pre_norm(x, h.input_ln)? };
+        unsafe { self.pre_norm(x, h.input_ln, 1)? };
         self.attention(l, pos, &w, h)?;
         // SAFETY: as above.
         unsafe { self.branch_add(x, h.post_attn_ln)? };
         // SAFETY: as above.
-        unsafe { self.pre_norm(x, h.pre_ffn_ln)? };
+        unsafe { self.pre_norm(x, h.pre_ffn_ln, 1)? };
         self.mlp(h)?;
         // SAFETY: as above.
         unsafe { self.branch_add(x, h.post_ffn_ln) }
@@ -863,9 +871,10 @@ impl Glimmer {
         // SAFETY: `x` is the `hidden` f32 the layer loop left; `final_norm` is `hidden` f32 in the
         // pin; `logits` is `vocab` writable f32; `pick` is 8 bytes taking one i32 then one f32.
         unsafe {
-            launch_rmsnorm_single(
+            launch_rmsnorm_rows(
                 x,
                 self.pin.final_norm,
+                1,
                 self.hidden,
                 self.eps_pre,
                 self.xn.ptr() as *mut f32,

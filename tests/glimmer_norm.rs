@@ -3,7 +3,7 @@
 //! `glimmer-architecture.md` §3 and §5: Glimmer's four per-layer sandwich norms are
 //! `MuseGlimmerTextCenteredRMSNorm` — `_norm(x) * (1 + w)` with `w` initialised to **zeros** —
 //! while its final norm, its weightless qk_norm and its embedding norm are the plain
-//! `_norm(x) * w` with `w` ones. **Two formulas in one model**, and `rmsnorm_centered_single` is
+//! `_norm(x) * w` with `w` ones. **Two formulas in one model**, and `rmsnorm_centered_rows` is
 //! the first kernel in the tree that computes the first one.
 //!
 //! The tolerance row was measured on 2026-08-12 **before this kernel existed** (`norm`: floor
@@ -189,7 +189,7 @@ fn the_plain_form_on_a_centered_weight_is_caught() {
     let w = fill(HIDDEN, 4, W_SCALE);
 
     let right = rmsnorm(&x, &w, EPS_PRE);
-    // The plain form on the HOST, not the device: `rmsnorm_single` is not this diff's
+    // The plain form on the HOST, not the device: `rmsnorm_rows` is not this diff's
     // kernel and is gated in three other files, and taking it here is what forced the fixture
     // wrapper to carry a form bool. Review, 2026-08-12.
     let wrong = host_centered(&x, &w, EPS_PRE, false);
@@ -698,7 +698,7 @@ fn the_kernel_may_write_into_its_own_input() {
                 xb.ptr() as *mut f32,
             )
         }
-        .expect("aliased rmsnorm_centered_single launch");
+        .expect("aliased rmsnorm_centered_rows launch");
         assert_eq!(
             fixture::sync_read(&xb),
             rmsnorm(&x, &w, eps),

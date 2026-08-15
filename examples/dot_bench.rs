@@ -29,7 +29,7 @@ use rivoli::backend::hip::{
     launch_argmax, launch_attend, launch_gemv_fp8, launch_gemv_fp8_bf16, launch_gemv_i4,
     launch_gemv_i8, launch_gemv_vq, launch_mla_absorb_fp8, launch_mla_value_fp8,
     launch_moe_acc_drain, launch_moe_expert_range_f4, launch_moe_expert_range_i4,
-    launch_rmsnorm_single,
+    launch_rmsnorm_rows,
 };
 use rivoli::math::{f32_to_e4m3, f32_to_f16};
 use rivoli::memory::device::DeviceBuf;
@@ -1048,9 +1048,9 @@ fn run_tail_rest(vocab: usize, hidden: usize) {
         y.ptr_mut() as *mut f32,
     );
     let us = time(60, &|| unsafe {
-        launch_rmsnorm_single(xp, wp, hidden, 1e-5, yp).expect("rmsnorm_single");
+        launch_rmsnorm_rows(xp, wp, 1, hidden, 1e-5, yp).expect("rmsnorm_rows");
     });
-    println!("rmsnorm_single [{hidden}]       {us:8.1}us  (single workgroup, dim3(1))");
+    println!("rmsnorm_rows [{hidden}]         {us:8.1}us  (one workgroup per row)");
 }
 
 /// `-- mla gemv` runs only those sections; no argument runs all of them, so a per-kernel

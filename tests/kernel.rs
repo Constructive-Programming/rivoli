@@ -9,8 +9,8 @@ use rivoli::backend::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
     launch_gemv_i4, launch_gemv_i8, launch_gemv_vq, launch_index_topk, launch_mla_absorb_fp8,
     launch_mla_value_fp8, launch_moe_acc_drain, launch_moe_acc_drain_to, launch_moe_expert_range,
-    launch_moe_expert_range_i4, launch_rope_interleave, launch_swiglu, launch_vadd,
-    launch_vq_encode,
+    launch_moe_expert_range_i4, launch_rmsnorm_centered_rows, launch_rmsnorm_rows,
+    launch_rope_interleave, launch_swiglu, launch_vadd, launch_vq_encode,
 };
 use rivoli::math::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, f32_to_e4m3, silu, softmax};
 use rivoli::memory::device::DeviceBuf;
@@ -2199,4 +2199,80 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
         };
         assert_guard(r, Some(1001), &format!("n={bad_n} rows={bad_rows}"));
     }
+}
+
+/// **The row dimension on both RMSNorms is a REORDER: `rows = R` must be bit-identical to `R`
+/// calls at `rows = 1`.**
+///
+/// That equality is what the batched prefill rests on, and it is stronger than a tolerance for a
+/// reason worth stating: each row's reduction is one block over its own `n` elements, so the
+/// arithmetic per row does not depend on how many other rows are in the grid. Anything but
+/// bit-identity here would mean a row was reading outside itself — which is exactly the failure a
+/// per-row loop cannot have and a batched launch can.
+///
+/// Red-proved by dropping the `blockIdx.x * n` offset from either kernel: every row then normalises
+/// row 0 and rows 1.. mismatch.
+#[test]
+fn the_rmsnorm_row_dimension_is_a_reorder() {
+    const N: usize = 320;
+    const R: usize = 7; // not a power of two, and > 1 in a way a `rows == 1` special case cannot fake
+    let x: Vec<f32> = (0..N * R)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+        .collect();
+    let w: Vec<f32> = (0..N).map(|i| ((i % 13) as f32 - 6.0) / 11.0).collect();
+    let (xb, wb) = (dev(&fx_bytes(&x)), dev(&fx_bytes(&w)));
+    let eps = 1e-5f32;
+
+    for centered in [false, true] {
+        // Batched: one launch over all R rows.
+        let batched = zeros(N * R * 4);
+        // SAFETY: `xb`/`wb` hold `N*R` and `N` live f32, `batched` is `N*R` writable f32, none
+        // aliasing; the launches are on the null stream and synced before the readback.
+        unsafe {
+            let (x, w, y) = (
+                xb.ptr() as *const f32,
+                wb.ptr() as *const f32,
+                batched.ptr() as *mut f32,
+            );
+            if centered {
+                launch_rmsnorm_centered_rows(x, w, R, N, eps, y, std::ptr::null_mut()).unwrap();
+            } else {
+                launch_rmsnorm_rows(x, w, R, N, eps, y).unwrap();
+            }
+        }
+        // Per row: R launches at rows = 1, which is what every caller did before the dimension
+        // existed.
+        let looped = zeros(N * R * 4);
+        for r in 0..R {
+            // SAFETY: as above, with both pointers advanced by one whole row.
+            unsafe {
+                let (x, w, y) = (
+                    (xb.ptr() as *const f32).add(r * N),
+                    wb.ptr() as *const f32,
+                    (looped.ptr() as *mut f32).add(r * N),
+                );
+                if centered {
+                    launch_rmsnorm_centered_rows(x, w, 1, N, eps, y, std::ptr::null_mut()).unwrap();
+                } else {
+                    launch_rmsnorm_rows(x, w, 1, N, eps, y).unwrap();
+                }
+            }
+        }
+        rivoli::backend::hip::device_sync().unwrap();
+        let (a, b) = (f32v(&back(&batched)), f32v(&back(&looped)));
+        // Guard the reference: an all-zero pair would compare equal and prove nothing.
+        assert!(
+            a.iter().all(|v| v.is_finite()) && a.iter().any(|v| *v != 0.0),
+            "centered={centered}: the batched result is all-zero or non-finite"
+        );
+        assert_eq!(
+            a, b,
+            "centered={centered}: rows={R} is not bit-identical to {R} calls at rows=1"
+        );
+    }
+}
+
+/// `&[f32]` as little-endian bytes, for [`dev`].
+fn fx_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }

@@ -229,7 +229,7 @@ macro_rules! launchers {
 // that is inaccurate and hand-maintained would have made this refactor a net loss.
 //
 // The pairs worth knowing before reaching for either are documented AT the kernels, because
-// that is where the arithmetic that separates them is: `rmsnorm_single`/`rmsnorm_batch` (one
+// that is where the arithmetic that separates them is: `rmsnorm_rows`/`rmsnorm_batch` (one
 // statistic vs one per row), `gemv_fp8`/`gemv_fp8_bf16` (input slicing and store dtype),
 // `swiglu`/`swiglu_clamped_bf16` (not one parameter apart at any `L`), and
 // `rope_interleave`/`rope_adjacent` (half-split vs adjacent pair convention).
@@ -797,9 +797,10 @@ launchers! {
     ///
     /// # Safety
     /// Device pointers (`x`, `w`, `y` each `n` f32) live until the next [`device_sync`].
-    launch_rmsnorm_single -> rivoli_rmsnorm_single, "rmsnorm_single" (
+    launch_rmsnorm_rows -> rivoli_rmsnorm_rows, "rmsnorm_rows" (
         x: *const f32,
         w: *const f32,
+        rows: usize as i32,
         n: usize as i32,
         eps: f32,
         y: *mut f32,
@@ -807,7 +808,7 @@ launchers! {
 
     /// `y[i] = x[i]·(1/sqrt(mean(x²)+eps))·(1 + w[i])` — Muse Glimmer's CENTERED RMSNorm, one row.
     ///
-    /// **The `(1 + w)` is the whole difference from [`launch_rmsnorm_single`], and this model uses
+    /// **The `(1 + w)` is the whole difference from [`launch_rmsnorm_rows`], and this model uses
     /// BOTH forms.** Glimmer's four per-layer sandwich norms are centered with `w` initialised to
     /// ZEROS; its final norm, weightless qk_norm and embedding norm are the plain form with `w`
     /// ones (`glimmer-architecture.md` §5). NEITHER substitution announces itself — the anchor's
@@ -826,9 +827,10 @@ launchers! {
     /// [`device_sync`]; `y` may alias `x` (each thread reads and writes only index `i` after the
     /// block-wide reduction has completed). `stream` is null or a live stream ordering every
     /// producer of `x` and `w`.
-    launch_rmsnorm_centered_single -> rivoli_rmsnorm_centered_single, "rmsnorm_centered_single" (
+    launch_rmsnorm_centered_rows -> rivoli_rmsnorm_centered_rows, "rmsnorm_centered_rows" (
         x: *const f32,
         w: *const f32,
+        rows: usize as i32,
         n: usize as i32,
         eps: f32,
         y: *mut f32,

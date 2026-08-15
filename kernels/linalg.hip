@@ -344,13 +344,16 @@ extern "C" __global__ void swiglu_clamped_bf16(
 // caller who believes it gets fluent wrong text. `mla.hip::rmsnorm_batch` is the row-wise
 // one; neither name is now the unmarked default, which is deliberate — there is no correct
 // answer to "which rmsnorm did you mean" that a caller should be allowed to skip.
-extern "C" __global__ void rmsnorm_single(
+// One block per row, exactly as `rmsnorm_centered_rows` above — see its note.
+extern "C" __global__ void rmsnorm_rows(
                                           const float* __restrict__ x, const float* __restrict__ w, int n, float eps,
                                           float* __restrict__ y) {
     __shared__ float red[256];
     int t = threadIdx.x;
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float* yr = y + (size_t)blockIdx.x * n;
     float local = 0.0f;
-    for (int i = t; i < n; i += blockDim.x) local += x[i] * x[i];
+    for (int i = t; i < n; i += blockDim.x) local += xr[i] * xr[i];
     red[t] = local;
     __syncthreads();
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
@@ -358,7 +361,7 @@ extern "C" __global__ void rmsnorm_single(
         __syncthreads();
     }
     float inv = 1.0f / sqrtf(red[0] / (float)n + eps);
-    for (int i = t; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
+    for (int i = t; i < n; i += blockDim.x) yr[i] = xr[i] * inv * w[i];
 }
 
 // y[i] = x[i]·(1/sqrt(mean(x²)+eps))·(1 + w[i]) — the CENTERED RMSNorm, one row.
@@ -376,12 +379,12 @@ extern "C" __global__ void rmsnorm_single(
 // point rather than a flag, for the reason `rope_pair` gives below; here the wrong form is the
 // silent one, so a bool would put it one argument from every GLM and V4 call site.
 //
-// **`block_sum_lds` rather than a hand-rolled ladder, and `rmsnorm_single` above keeps its own.**
+// **`block_sum_lds` rather than a hand-rolled ladder, and `rmsnorm_rows` above keeps its own.**
 // `headtail.hip`'s note states the rule — re-implementing the ladder would be another copy of a
 // helper `kernels/` has no duplication gate to catch — and `mla.hip` already spells this exact
 // line. The first draft of this kernel instead factored a `rms_inv_row` helper OUT of
-// `rmsnorm_single`, which was a fourth spelling of `block_sum_lds` and put a hand on GLM's live
-// decode path to share ten lines; review found both, 2026-08-12. Converting `rmsnorm_single` is
+// `rmsnorm_rows`, which was a fourth spelling of `block_sum_lds` and put a hand on GLM's live
+// decode path to share ten lines; review found both, 2026-08-12. Converting `rmsnorm_rows` is
 // declined separately: `block_sum_lds` carries a trailing barrier that spelling lacks, and
 // `common.hpp` prices that as UNMEASURED on the decode path.
 //
@@ -399,14 +402,21 @@ extern "C" __global__ void rmsnorm_single(
 //
 // `tests/glimmer_norm.rs` scores it against `tolerance::GLIMMER`'s `norm` row, measured before
 // this existed, and the aliased launch bit-against-bit with the non-aliased one.
-extern "C" __global__ void rmsnorm_centered_single(
+// ONE BLOCK PER ROW: `blockIdx.x` selects the row, `w` is shared by all of them. At `rows == 1`
+// the grid is dim3(1), `blockIdx.x` is 0, and every index below is what it was before the row
+// dimension existed — which is why adding it moved no tolerance in any gate (2026-08-15, for the
+// batched prefill). Rows are `n` apart because that is how a prefill chunk's residual streams are
+// laid out in `Glimmer::xs`.
+extern "C" __global__ void rmsnorm_centered_rows(
     const float* __restrict__ x, const float* __restrict__ w, int n, float eps,
     float* __restrict__ y) {
     __shared__ float red[256];
+    const float* xr = x + (size_t)blockIdx.x * n;
+    float* yr = y + (size_t)blockIdx.x * n;
     float local = 0.0f;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) local += x[i] * x[i];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) local += xr[i] * xr[i];
     float inv = 1.0f / sqrtf(block_sum_lds(local, red) / (float)n + eps);
-    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * (1.0f + w[i]);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) yr[i] = xr[i] * inv * (1.0f + w[i]);
 }
 
 // Muse Glimmer's WEIGHTLESS QK-norm, over `d` = head_dim, one block per (row, head), IN PLACE —
@@ -444,7 +454,7 @@ extern "C" __global__ void rmsnorm_centered_single(
 // the reference, not a constraint on this caller. The anchor has no defect run for the damaging form
 // either. **The gate belongs to the wiring item, and until it lands this argument is unguarded.**
 //
-// **The near-miss a reader will reach for first is twenty lines above: `rmsnorm_centered_single`.**
+// **The near-miss a reader will reach for first is twenty lines above: `rmsnorm_centered_rows`.**
 // With `w` all zeros — the form Glimmer's sandwich norms actually ship — its arithmetic IS this
 // one's. **The geometry is NOT the reason to decline it**, and an earlier version of this comment
 // said it was: `dim3(1)` and one statistic per launch are a `rows` parameter and a `blockIdx.x`
@@ -476,7 +486,7 @@ extern "C" __global__ void rmsnorm_centered_single(
 // correct code on a different compiler. Review, 2026-08-13.
 //
 // **IN PLACE, and `x` is DESTROYED.** The pre-norm q/k does not survive this call, and the sibling
-// `rmsnorm_centered_single` twenty lines up is out of place — so a caller migrating between them
+// `rmsnorm_centered_rows` twenty lines up is out of place — so a caller migrating between them
 // silently converts a read-preserving operator into a destructive one, with no shape change in the
 // signature to notice. The aliasing itself is safe here for the two-clause reason the sibling
 // spells out: every read of `row` precedes `block_sum_lds`'s first `__syncthreads()`, and the second
@@ -947,10 +957,11 @@ extern "C" int rivoli_swiglu_clamped_bf16(const float* g, const float* u, int n,
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-extern "C" int rivoli_rmsnorm_single(const float* x, const float* w, int n, float eps, float* y) {
-    if (n <= 0) return 1001;
+extern "C" int rivoli_rmsnorm_rows(const float* x, const float* w, int rows, int n, float eps,
+                                   float* y) {
+    if (n <= 0 || rows <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(rmsnorm_single, dim3(1), dim3(256), 0, 0, x, w, n, eps, y);
+    hipLaunchKernelGGL(rmsnorm_rows, dim3(rows), dim3(256), 0, 0, x, w, n, eps, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -963,12 +974,12 @@ extern "C" int rivoli_rmsnorm_single(const float* x, const float* w, int n, floa
 // `eps` is refused unless positive and finite — this model has two eps three decades apart (§3),
 // so it is never a constant here, and a zero or a NaN comes from a config never read. Spelled as
 // one compare to match `rivoli_swiglu_clamped_bf16`'s `limit` guard 30 lines up.
-extern "C" int rivoli_rmsnorm_centered_single(
-    const float* x, const float* w, int n, float eps, float* y, void* stream) {
-    if (n <= 0) return 1001;
+extern "C" int rivoli_rmsnorm_centered_rows(
+    const float* x, const float* w, int rows, int n, float eps, float* y, void* stream) {
+    if (n <= 0 || rows <= 0) return 1001;
     if (!(eps > 0.0f && eps < INFINITY)) return 1002;
     hipGetLastError();
-    hipLaunchKernelGGL(rmsnorm_centered_single, dim3(1), dim3(256), 0, (hipStream_t)stream, x, w,
+    hipLaunchKernelGGL(rmsnorm_centered_rows, dim3(rows), dim3(256), 0, (hipStream_t)stream, x, w,
                        n, eps, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
@@ -1020,7 +1031,7 @@ extern "C" int rivoli_act_quant_f8(float* v, int n_rows, int row_len, void* stre
 // order is one lane-strided comb + one `wave_sum` ladder, so a second wave cannot share a
 // row without moving bits; more width has to come from splitting the kernel, not the block.
 //
-// Takes a STREAM, unlike `rmsnorm_single`/`swiglu` above. rivoli's streams are created
+// Takes a STREAM, unlike `rmsnorm_rows`/`swiglu` above. rivoli's streams are created
 // `hipStreamNonBlocking` (`async.hip`), so the null stream does NOT implicitly order against
 // them: an mHC result on stream 0 feeding an FP4 expert range on a caller stream would be
 // unordered, and an unordered residual is a silent wrong.
