@@ -60,13 +60,29 @@ pub fn rms_inv(x: &[f32], eps: f32) -> f32 {
 // formula is `glimmer-architecture.md` §5's weightless norm; sharing it between two files that
 // both transcribe the reference does not weaken either — what would weaken them is transcribing
 // the CHAIN twice, and neither does that.
-/// The weightless form over `rows` segments of `d`, times `scale`. The QK-norm (per head) and the
-/// embedding norm (`rows = 1`, `d = hidden`, `scale = 1`) are the same operator.
-pub fn weightless(x: &mut [f32], rows: usize, d: usize, eps: f32, scale: f32) {
-    for r in 0..rows {
-        let seg = &mut x[r * d..(r + 1) * d];
-        let f = scale * rms_inv(seg, eps);
-        seg.iter_mut().for_each(|v| *v *= f);
+/// The weightless norm's shape and constants: `rows` segments of `d`, `eps` inside the mean,
+/// `scale` after it.
+///
+/// One value rather than four trailing arguments, on [`Mla`]'s argument below about its own six:
+/// `(rows, d)` and `(eps, scale)` are each interchangeable to the type checker, and a transposed
+/// pair moves the reference and the thing it scores together, so the comparison still agrees.
+#[derive(Clone, Copy)]
+pub struct Weightless {
+    pub rows: usize,
+    pub d: usize,
+    pub eps: f32,
+    pub scale: f32,
+}
+
+impl Weightless {
+    /// The weightless form over `rows` segments of `d`, times `scale`. The QK-norm (per head) and
+    /// the embedding norm (`rows = 1`, `d = hidden`, `scale = 1`) are the same operator.
+    pub fn apply(self, x: &mut [f32]) {
+        for r in 0..self.rows {
+            let seg = &mut x[r * self.d..(r + 1) * self.d];
+            let f = self.scale * rms_inv(seg, self.eps);
+            seg.iter_mut().for_each(|v| *v *= f);
+        }
     }
 }
 
@@ -85,6 +101,21 @@ pub fn window_lo(pos: usize, win: usize) -> usize {
     }
 }
 
+/// The REFERENCE side of a comparison — the tensor every tolerance in this module is scaled by.
+///
+/// A newtype, with [`Got`] as its opposite, because this module spells the pair in **both**
+/// orders: `rel(got, want)` and [`worst_rel`]`(got, want)` against [`report`]`(want, got)`,
+/// [`err_tol`]`(want, got)` and every `assert_*`. Both sides are `&[f32]`, so a swap compiles —
+/// and it is not cosmetic: every bound here is `…max_abs(want)`, so a swapped pair scales the
+/// tolerance by the KERNEL's own output and the gate ends up grading itself. Wrapped, the swap is
+/// an `E0308` instead of a green run.
+#[derive(Clone, Copy)]
+pub struct Want<'a>(pub &'a [f32]);
+
+/// The MEASURED side of a comparison — the thing under test. See [`Want`] for why it is a newtype.
+#[derive(Clone, Copy)]
+pub struct Got<'a>(pub &'a [f32]);
+
 // **MOVED HERE from `glimmer_fixture.rs` 2026-08-13**, for the reason `window_lo` moved the same
 // day and one commit earlier: a test binary that includes only this module cannot reach that one,
 // so `glimmer_chain.rs` wrote its own scorer — and reintroduced the NaN trap the history below
@@ -97,7 +128,8 @@ pub fn window_lo(pos: usize, win: usize) -> usize {
 ///
 /// Scaled by the reference side's own magnitude, once per tensor, not per element: a per-element
 /// ratio divides one rounding error by another wherever the reference is near zero.
-pub fn worst_rel(got: &[f32], want: &[f32]) -> f32 {
+pub fn worst_rel(got: Got, want: Want) -> f32 {
+    let (got, want) = (got.0, want.0);
     assert_eq!(got.len(), want.len(), "length");
     let scale = want.iter().copied().fold(0.0f32, |m, w| m.max(w.abs()));
     // An all-zero reference has no scale to divide by; any difference is then infinitely relative,
@@ -256,12 +288,25 @@ pub fn zeros(n: usize) -> rivoli_engine::device::DeviceBuf {
     dev(&vec![0u8; n])
 }
 
-/// One `gemm_bf16` launch, and the one place its seven pointer-and-dim arguments are spelled.
+/// One `gemm_bf16` launch's operands and dims, and the one place they are spelled.
 ///
 /// `glimmer_fixture.rs`'s `gemv_bf16` and `glimmer_residency.rs`'s fence gate both drive this
-/// kernel and jscpd matched their call blocks (2026-08-12). The gate is right about the substance
-/// too: seven positional arguments where `n` and `k` are both bare `usize` is a place a mistake is a
-/// wrong answer rather than a compile error.
+/// kernel and jscpd matched their call blocks (2026-08-12). The gate was right about the substance
+/// too: seven positional arguments where `n` and `k` are both bare `usize` is a place a mistake is
+/// a wrong answer rather than a compile error — so the six that describe the operands are named
+/// fields here, and [`gemm_bf16_launch`] takes this and the stream.
+#[cfg(feature = "rocm")]
+#[derive(Clone, Copy)]
+pub struct GemmBf16 {
+    pub x: *const f32,
+    pub w: *const u16,
+    pub out: *mut f32,
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+/// One `gemm_bf16` launch.
 ///
 /// > **Two things were tried first and are recorded so they are not tried again.** Hoisting it here
 /// > UNGATED is an `E0433` on the featureless build — this module compiles into `docs` and
@@ -271,20 +316,12 @@ pub fn zeros(n: usize) -> rivoli_engine::device::DeviceBuf {
 /// > delete this helper, does NOT satisfy jscpd — measured, still 29 tokens matched.
 ///
 /// # Safety
-/// `x` is `m * k` live f32, `w` is `n * k` live u16, `out` is `m * n` writable f32, none aliasing
-/// another, all live until the caller's next `device_sync`.
+/// `g.x` is `g.m * g.k` live f32, `g.w` is `g.n * g.k` live u16, `g.out` is `g.m * g.n` writable
+/// f32, none aliasing another, all live until the caller's next `device_sync`.
 #[cfg(feature = "rocm")]
-pub unsafe fn gemm_bf16_launch(
-    x: *const f32,
-    w: *const u16,
-    out: *mut f32,
-    m: usize,
-    n: usize,
-    k: usize,
-    stream: *mut std::ffi::c_void,
-) {
+pub unsafe fn gemm_bf16_launch(g: GemmBf16, stream: *mut std::ffi::c_void) {
     // SAFETY: the caller's contract above.
-    unsafe { rivoli_backend::hip::launch_gemm_bf16(x, w, out, m, n, k, stream) }
+    unsafe { rivoli_backend::hip::launch_gemm_bf16(g.x, g.w, g.out, g.m, g.n, g.k, stream) }
         .expect("gemm_bf16 launch");
 }
 
@@ -368,7 +405,7 @@ pub fn rel(got: &[f32], want: &[f32]) -> f32 {
         want.len(),
         "comparing tensors of different length"
     );
-    max_err(want, got) / max_abs(want).max(1e-30)
+    max_err(Want(want), Got(got)) / max_abs(Want(want)).max(1e-30)
 }
 
 /// [`report_rel`] promoted to an assertion, for oracles whose agreement is far tighter
@@ -380,11 +417,11 @@ pub fn rel(got: &[f32], want: &[f32]) -> f32 {
 /// oracles' honest tolerances differ by four orders of magnitude — `swiglu` is one `expf`
 /// apart from the host, `index_head_route` is an LDS tree reduction.
 pub fn assert_rel(want: &[f32], got: &[f32], label: &str, ratio: f32) {
-    let (err, tol) = report_rel(want, got, label, ratio);
+    let (err, tol) = report_rel(Want(want), Got(got), label, ratio);
     assert!(
         err <= tol,
         "{label}: err={err:.3e} > tol={tol:.3e} (rel={ratio:.1e} of max={:.3e})",
-        max_abs(want)
+        max_abs(Want(want))
     );
 }
 
@@ -392,11 +429,11 @@ pub fn assert_rel(want: &[f32], got: &[f32], label: &str, ratio: f32) {
 /// point: a green oracle that passed on 100x of headroom looks exactly like one that passed
 /// on 2x, and only one of them is evidence of anything.
 pub fn assert_close(want: &[f32], got: &[f32], label: &str) {
-    let (err, tol) = report(want, got, label);
+    let (err, tol) = report(Want(want), Got(got), label);
     assert!(
         err <= tol,
         "{label}: err={err:.3e} > tol={tol:.3e} max={:.3e}",
-        max_abs(want)
+        max_abs(Want(want))
     );
 }
 
@@ -408,17 +445,27 @@ pub fn assert_close(want: &[f32], got: &[f32], label: &str) {
 /// floor is 5% of the signal at that fixture's scale. The formulas differ on purpose; the
 /// SCALE they are stated against must not, and three copies of this fold were the duplicate
 /// the gate found.
-pub fn max_abs(v: &[f32]) -> f32 {
-    v.iter().fold(0.0f32, |m, x| m.max(x.abs()))
+///
+/// Takes [`Want`] rather than a bare slice because every caller here folds the REFERENCE: a
+/// tolerance scaled by the measured side is a gate that grades itself.
+pub fn max_abs(v: Want) -> f32 {
+    v.0.iter().fold(0.0f32, |m, x| m.max(x.abs()))
 }
 
 /// [`err_tol`] plus the comparison line, returning the pair so the caller decides what a
 /// failure means. It had two callers with two answers — [`assert_close`] panics, and the
 /// retired `vk.rs`'s `Shapes::close` recorded and kept going. The PRINT is what they shared,
 /// and a second copy of the format string is a second format.
-pub fn report(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
-    let (err, tol) = err_tol(want, got);
-    report_line(label, err, tol, max_abs(want))
+pub fn report(want: Want, got: Got, label: &str) -> (f32, f32) {
+    let (err, tol) = err_tol(want.0, got.0);
+    report_line(
+        label,
+        Scored {
+            err,
+            tol,
+            mx: max_abs(want),
+        },
+    )
 }
 
 /// [`report`] against a tolerance RELATIVE to the largest expected element, for callers
@@ -426,14 +473,33 @@ pub fn report(want: &[f32], got: &[f32], label: &str) -> (f32, f32) {
 /// `tests/f4_kernel.rs`, where one routed MoE layer's output is ~2e-2 and that floor would
 /// be 5% of it.
 ///
-/// Takes the ratio and computes the metric itself. An earlier version took `(err, tol, mx)`
-/// — three interchangeable `f32`s, where swapping the first two turns the caller's
-/// `err <= tol` into `tol <= err`: a gate that goes green on every failure. That is this module's
-/// own argument about six bare `usize` in a row, made about
-/// `f32`.
-pub fn report_rel(want: &[f32], got: &[f32], label: &str, rel: f32) -> (f32, f32) {
+/// Takes the ratio and computes the metric itself. The `(err, tol, mx)` an earlier version took
+/// bare is now [`Scored`], which carries that argument.
+pub fn report_rel(want: Want, got: Got, label: &str, rel: f32) -> (f32, f32) {
     let mx = max_abs(want);
-    report_line(label, max_err(want, got), rel * mx, mx)
+    report_line(
+        label,
+        Scored {
+            err: max_err(want, got),
+            tol: rel * mx,
+            mx,
+        },
+    )
+}
+
+/// The three numbers a comparison line prints: the error, the bound it was held to, and the
+/// scale both are stated against.
+///
+/// One value rather than three positional `f32`, and the argument is [`report_rel`]'s own, moved
+/// here with the fields it is about: an earlier version of that function took `(err, tol, mx)`
+/// bare — three interchangeable `f32`s, where swapping the first two turns the caller's
+/// `err <= tol` into `tol <= err`, a gate that goes green on every failure. That is this module's
+/// argument about six bare `usize` in a row, made about `f32`; naming the fields answers it.
+#[derive(Clone, Copy)]
+struct Scored {
+    err: f32,
+    tol: f32,
+    mx: f32,
 }
 
 /// The comparison LINE, given an error and whatever bound the caller holds it to. Named for
@@ -448,7 +514,8 @@ pub fn report_rel(want: &[f32], got: &[f32], label: &str, rel: f32) -> (f32, f32
 /// passing means err EXCEEDS tol — rendered as `margin=0.0x`, which reads as failure beside
 /// a green test. Two numbers the reader compares themselves have neither pathology, and the
 /// distance is still on the page.
-fn report_line(label: &str, err: f32, tol: f32, mx: f32) -> (f32, f32) {
+fn report_line(label: &str, s: Scored) -> (f32, f32) {
+    let Scored { err, tol, mx } = s;
     println!("{label}: err={err:.3e} tol={tol:.3e} max={mx:.3e}");
     (err, tol)
 }
@@ -456,14 +523,16 @@ fn report_line(label: &str, err: f32, tol: f32, mx: f32) -> (f32, f32) {
 /// `(max abs error, tolerance)` for a want/got pair — the shared arithmetic behind
 /// [`assert_close`] and [`report`]. Two copies of a tolerance formula is two tolerances.
 pub fn err_tol(want: &[f32], got: &[f32]) -> (f32, f32) {
+    let (want, got) = (Want(want), Got(got));
     (max_err(want, got), 1e-3 * max_abs(want) + 1e-3)
 }
 
 /// The largest absolute disagreement between two slices — the error metric every
 /// comparison in this suite uses, whatever tolerance it is held to.
-fn max_err(want: &[f32], got: &[f32]) -> f32 {
-    want.iter()
-        .zip(got)
+fn max_err(want: Want, got: Got) -> f32 {
+    want.0
+        .iter()
+        .zip(got.0)
         .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
 }
 
@@ -533,9 +602,15 @@ pub fn want_i8(x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usi
 #[derive(Clone, Copy)]
 pub struct Mla {
     pub h: usize,
-    /// The q head stride. `mla_value_fp8` never reads q, so [`Mla::value_dims`] leaves this
+    /// The q head stride. `mla_value_fp8` never reads q, so callers for that kernel leave this
     /// zero — cheaper than a second five-field shape whose only difference from this one is
     /// a field nothing reads.
+    ///
+    /// A `value_dims(h, nope, vh, kvl, block)` constructor did that zeroing until 2026-08-15.
+    /// It was deleted rather than reshaped: five positional `usize` is the same excess-argument
+    /// defect this struct exists to answer, and with the fields public `Mla { qh: 0, .. }` says
+    /// it without an order to get wrong. [`Mla::new`] has the same defect and survives only
+    /// because its call sites are in another file.
     pub qh: usize,
     pub nope: usize,
     pub vh: usize,
@@ -555,11 +630,6 @@ impl Mla {
         }
     }
 
-    /// `mla_value_fp8`'s shape: it takes no `qh`.
-    pub fn value_dims(h: usize, nope: usize, vh: usize, kvl: usize, block: usize) -> Self {
-        Self::new(h, 0, nope, vh, kvl, block)
-    }
-
     /// kv_b's full row count, `h·(nope + vh)`.
     pub fn rows(self) -> usize {
         self.h * (self.nope + self.vh)
@@ -568,8 +638,8 @@ impl Mla {
     /// The two launcher guards both CPU oracles restate. An oracle that accepted a shape
     /// the launcher rejects would be checking the kernel against a case it can never run.
     ///
-    /// `qh` is deliberately absent: `value_dims` leaves it zero and `mla_value_fp8` never
-    /// reads it, so the absorb oracle asserts it separately.
+    /// `qh` is deliberately absent: the value kernel's callers leave it zero and
+    /// `mla_value_fp8` never reads it, so the absorb oracle asserts it separately.
     pub fn assert_guarded(self) {
         let (h, nope, vh) = (self.h, self.nope, self.vh);
         let (kvl, block) = (self.kvl, self.block);

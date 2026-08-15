@@ -390,30 +390,40 @@ pub struct RepetitionReport {
 /// Structural-repetition signals over generated TEXT (not tokens — the varying slot is a
 /// token-level difference, which is exactly why token-level exact matching misses it).
 pub fn repetition_report(text: &str) -> RepetitionReport {
-    use std::collections::HashMap;
-    let mut lines: HashMap<&str, usize> = HashMap::new();
-    for l in text.lines() {
-        let l = l.trim();
-        if l.len() > 3 {
-            *lines.entry(l).or_default() += 1;
-        }
+    RepetitionReport {
+        top_line: top_line_count(text),
+        distinct: distinct_word_ratio(text),
     }
-    let top_line = lines.values().copied().max().unwrap_or(0);
+}
+
+/// Occurrences of the single most repeated line. Lines of 3 characters or fewer do not
+/// count: blank lines and stray punctuation repeat in healthy prose too, and the signal
+/// being read is a repeated TEMPLATE.
+fn top_line_count(text: &str) -> usize {
+    let mut lines: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for l in text.lines().map(str::trim).filter(|l| l.len() > 3) {
+        *lines.entry(l).or_default() += 1;
+    }
+    lines.values().copied().max().unwrap_or(0)
+}
+
+/// Distinct-word ratio, case-folded, over alphabetic runs. Empty input scores 1.0 — no
+/// words is the absence of a measurement, not zero diversity, and 0.0 would read as the
+/// most degenerate output possible.
+fn distinct_word_ratio(text: &str) -> f64 {
     let mut words = 0usize;
     let mut uniq = std::collections::HashSet::new();
-    for w in text.split(|c: char| !c.is_alphabetic()) {
-        if !w.is_empty() {
-            words += 1;
-            uniq.insert(w.to_ascii_lowercase());
-        }
+    for w in text
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|w| !w.is_empty())
+    {
+        words += 1;
+        uniq.insert(w.to_ascii_lowercase());
     }
-    RepetitionReport {
-        top_line,
-        distinct: if words == 0 {
-            1.0
-        } else {
-            uniq.len() as f64 / words as f64
-        },
+    if words == 0 {
+        1.0
+    } else {
+        uniq.len() as f64 / words as f64
     }
 }
 
@@ -601,6 +611,15 @@ impl ProfileSummary {
     /// and the `moe/layer by miss count` line, which measures the stall rather than
     /// inferring its absence.
     pub fn report(&self) {
+        self.report_phases();
+        self.report_moe_by_miss();
+        self.report_classes();
+        self.report_splits();
+        self.report_indexer();
+    }
+
+    /// WHERE the time went, by phase. One line, always printed.
+    fn report_phases(&self) {
         tracing::info!(
             // wall/route at 0.1 ms: the DSA selection A/B (docs/investigations/npu-offload.md) turns on deltas of
             // a few ms against a ~400 ms token, which 1 ms resolution rounds into noise.
@@ -614,39 +633,45 @@ impl ProfileSummary {
             self.ms_per_miss,
             self.gb_per_tok,
         );
-        // The MoE bracket decomposed by miss count — printed only when there is more than
-        // one populated bucket, since a single bucket has no shape to read.
+    }
+
+    /// The MoE bracket decomposed by miss count — printed only when there is more than
+    /// one populated bucket, since a single bucket has no shape to read.
+    fn report_moe_by_miss(&self) {
         let pop: Vec<(usize, f64, u32)> = self
             .moe_us_by_miss
             .iter()
             .enumerate()
             .filter_map(|(m, v)| v.map(|(us, n)| (m, us, n)))
             .collect();
-        if pop.len() > 1 {
-            let cells: Vec<String> = pop
-                .iter()
-                .map(|(m, us, n)| format!("{m}m:{us:.0}us(n={n})"))
-                .collect();
-            let lo = pop.first().map(|c| c.1).unwrap_or(0.0);
-            let hi = pop.last().map(|c| c.1).unwrap_or(0.0);
-            tracing::info!(
-                "  moe/layer by miss count: {} | span {:.0}->{:.0}us ({:+.0}%)",
-                cells.join(" "),
-                lo,
-                hi,
-                if lo > 0.0 {
-                    100.0 * (hi - lo) / lo
-                } else {
-                    0.0
-                },
-            );
+        if pop.len() <= 1 {
+            return;
         }
+        let cells: Vec<String> = pop
+            .iter()
+            .map(|(m, us, n)| format!("{m}m:{us:.0}us(n={n})"))
+            .collect();
+        let lo = pop.first().map(|c| c.1).unwrap_or(0.0);
+        let hi = pop.last().map(|c| c.1).unwrap_or(0.0);
+        tracing::info!(
+            "  moe/layer by miss count: {} | span {:.0}->{:.0}us ({:+.0}%)",
+            cells.join(" "),
+            lo,
+            hi,
+            if lo > 0.0 {
+                100.0 * (hi - lo) / lo
+            } else {
+                0.0
+            },
+        );
+    }
 
-        // The CLASS view: the PROFILE line says WHERE the time is (phases); this says
-        // WHAT it is. Every term is measured — none is a residual — so they OVERLAP and
-        // need not sum to wall. `io-wait` is on the reaper thread and routinely exceeds
-        // it. The `%` is therefore "of wall", not "share of wall", and unattributed time
-        // is deliberately not shown.
+    /// The CLASS view: [`Self::report_phases`] says WHERE the time is (phases); this says
+    /// WHAT it is. Every term is measured — none is a residual — so they OVERLAP and
+    /// need not sum to wall. `io-wait` is on the reaper thread and routinely exceeds
+    /// it. The `%` is therefore "of wall", not "share of wall", and unattributed time
+    /// is deliberately not shown.
+    fn report_classes(&self) {
         let pct = |ms: f64| 100.0 * ms / self.wall_ms.max(1e-9);
         tracing::info!(
             "  class/tok [spans overlap; no residual]: gpu-wait {:.1}ms ({:.0}% of wall) | \
@@ -664,9 +689,12 @@ impl ProfileSummary {
             self.cpu_route_ms,
             self.cpu_submit_ms,
         );
-        // The two phase/class splits that motivated this view: `route` was a region
-        // mixing a blocking D2H with host routing, and the whole `tail` phase was one
-        // opaque wait with ~59% attributable to no kernel.
+    }
+
+    /// The two phase/class splits that motivated the class view: `route` was a region
+    /// mixing a blocking D2H with host routing, and the whole `tail` phase was one
+    /// opaque wait with ~59% attributable to no kernel.
+    fn report_splits(&self) {
         tracing::info!(
             "  split/tok: route = {:.1}ms gpu-wait + {:.1}ms host-routing | tail wait {:.1}ms, of which {:.1}ms is GPU ({:.0}% overhead)",
             self.route_wait_ms,
@@ -675,19 +703,23 @@ impl ProfileSummary {
             self.tail_gpu_ms,
             100.0 * (self.tail_wait_ms - self.tail_gpu_ms).max(0.0) / self.tail_wait_ms.max(1e-9),
         );
-        // DSA indexer decomposition (docs/investigations/npu-offload.md M0). Silent when the indexer never
-        // scored — dense/streaming, or a context that stayed under `index_topk`, where a
-        // row of zeros would read as a measurement of something that did not happen.
-        if self.idx_layers_per_tok > 0.0 {
-            tracing::info!(
-                "  indexer/tok: gpu {:.1}ms => {:.1}us per layer (selection on device) over \
-                 {:.3} scoring layers",
-                self.idx_gpu_ms,
-                // Guarded non-zero by the `> 0.0` above, so this division is safe.
-                self.idx_gpu_ms * 1e3 / self.idx_layers_per_tok,
-                self.idx_layers_per_tok,
-            );
+    }
+
+    /// DSA indexer decomposition (docs/investigations/npu-offload.md M0). Silent when the indexer never
+    /// scored — dense/streaming, or a context that stayed under `index_topk`, where a
+    /// row of zeros would read as a measurement of something that did not happen.
+    fn report_indexer(&self) {
+        if self.idx_layers_per_tok <= 0.0 {
+            return;
         }
+        tracing::info!(
+            "  indexer/tok: gpu {:.1}ms => {:.1}us per layer (selection on device) over \
+             {:.3} scoring layers",
+            self.idx_gpu_ms,
+            // Guarded non-zero by the `> 0.0` above, so this division is safe.
+            self.idx_gpu_ms * 1e3 / self.idx_layers_per_tok,
+            self.idx_layers_per_tok,
+        );
     }
 }
 
@@ -739,15 +771,7 @@ mod otlp {
     /// endpoint + protocol come from the standard `OTEL_*` env vars; the identity of the
     /// run is [`resource`], shared with the metric export.
     pub fn export(summary: &ProfileSummary, tokens: usize, run: &RunInfo) -> Result<()> {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .build()
-            .context("build OTLP span exporter")?;
-        let provider = SdkTracerProvider::builder()
-            .with_resource(resource())
-            .with_simple_exporter(exporter)
-            .build();
-
+        let provider = span_provider()?;
         let tracer = provider.tracer("rivoli");
         // Drain BEFORE building the root: the root needs explicit start/end covering the
         // children, and `tracer.start()` would stamp it at export time — minutes after
@@ -755,25 +779,52 @@ mod otlp {
         // is what makes a waterfall render as one collapsed nest.
         let (recs, truncated) = super::spans::drain();
         let n = recs.len();
-        let bounds = recs
-            .iter()
-            .fold(None::<(SystemTime, SystemTime)>, |acc, r| match acc {
-                None => Some((r.start, r.end)),
-                Some((lo, hi)) => Some((lo.min(r.start), hi.max(r.end))),
-            });
-        let mut span = match bounds {
+        let bounds = span_bounds(&recs);
+        let mut span = start_root(&tracer, bounds);
+        set_run_attributes(&mut span, run);
+        set_outcome_attributes(&mut span, tokens, run);
+        let cx = opentelemetry::Context::current_with_span(span);
+        emit_token_spans(&tracer, &cx, recs);
+        close_root(&cx, n, truncated, bounds);
+        // Flush the simple processor's export before we return (the run ends here).
+        provider.shutdown().context("flush OTLP spans")?;
+        export_metrics(summary, tokens, run)
+    }
+
+    /// The span half of the pipeline: a blocking HTTP exporter behind a
+    /// `SimpleSpanProcessor`, so spans export synchronously on `end()`/`shutdown()` — no
+    /// async runtime of ours. Endpoint + protocol come from the standard `OTEL_*` env
+    /// vars; the identity of the run is [`resource`], shared with the metric export.
+    fn span_provider() -> Result<SdkTracerProvider> {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .build()
+            .context("build OTLP span exporter")?;
+        Ok(SdkTracerProvider::builder()
+            .with_resource(resource())
+            .with_simple_exporter(exporter)
+            .build())
+    }
+
+    /// The `rivoli.decode` root, stamped to span the drained intervals so it contains its
+    /// own children.
+    fn start_root<T: Tracer>(tracer: &T, bounds: Option<(SystemTime, SystemTime)>) -> T::Span {
+        match bounds {
             Some((lo, hi)) => tracer
                 .span_builder("rivoli.decode")
                 .with_start_time(lo)
                 .with_end_time(hi)
-                .start(&tracer),
+                .start(tracer),
             // No intervals recorded (--spans not given): a plain now-stamped span, which
             // is correct — there are no children for it to fail to contain.
             None => tracer.start("rivoli.decode"),
-        };
-        // WHAT THIS RUN WAS, not what it measured. The numbers went out as metrics —
-        // repeating them here would make two sources of truth that drift, and they are
-        // not what you search a trace by. These are.
+        }
+    }
+
+    /// WHAT THIS RUN WAS, not what it measured. The numbers went out as metrics —
+    /// repeating them here would make two sources of truth that drift, and they are
+    /// not what you search a trace by. These are.
+    fn set_run_attributes<S: Span>(span: &mut S, run: &RunInfo) {
         span.set_attribute(KeyValue::new("rivoli.model", run.model.clone()));
         span.set_attribute(KeyValue::new("rivoli.mode", run.mode.clone()));
         span.set_attribute(KeyValue::new(
@@ -796,8 +847,11 @@ mod otlp {
         if let Some(p) = &run.prompt {
             span.set_attribute(KeyValue::new("rivoli.prompt", p.clone()));
         }
+    }
 
-        // Tokens actually generated is run shape, not a measurement of speed.
+    /// What the run PRODUCED, as run shape rather than as speed: how many tokens, and
+    /// whether it degenerated.
+    fn set_outcome_attributes<S: Span>(span: &mut S, tokens: usize, run: &RunInfo) {
         span.set_attribute(KeyValue::new("rivoli.tokens_generated", tokens as i64));
         // Degeneration is a first-class outcome, not a footnote: a looped run's tok/s is
         // an artifact (few experts, inflated hit rate) and must never be ranked as if it
@@ -808,112 +862,23 @@ mod otlp {
             span.set_attribute(KeyValue::new("rivoli.loop_repeats", d.repeats as i64));
             span.set_attribute(KeyValue::new("rivoli.loop_start", d.start as i64));
         }
+    }
 
-        // Rebuild the tree: decode -> token N -> layer L -> the leaf intervals. Emitting
-        // the leaves as 1200 direct siblings of the root is technically a trace and
-        // practically unreadable; the token/layer levels are what make a waterfall
-        // navigable, and they are synthesised from the leaves' own bounds so they cannot
-        // disagree with them.
-        //
-        // Every span here is closed with `end_with_timestamp`. `end()` would stamp
-        // `now()` and silently discard the builder's `with_end_time`.
-        let cx = opentelemetry::Context::current_with_span(span);
-        let layer_states: BTreeMap<(u32, i32), super::spans::ExpertComposition> =
-            super::spans::drain_layers()
-                .into_iter()
-                .map(|st| ((st.tok, st.layer), st))
-                .collect();
-        let mut by_tok: BTreeMap<u32, Vec<super::spans::Rec>> = BTreeMap::new();
-        for r in recs {
-            by_tok.entry(r.tok).or_default().push(r);
-        }
-        for (tok_i, tok_recs) in by_tok {
-            let Some((t_lo, t_hi)) = span_bounds(&tok_recs) else {
-                continue;
-            };
-            // The token id, not just the index — the index says "the 7th step", the id
-            // says which token the model was actually working on.
-            let tok_id = tok_recs.first().map(|r| r.tok_id).unwrap_or(0);
-            let tok_span = tracer
-                .span_builder(format!("token {tok_i}"))
-                .with_start_time(t_lo)
-                .with_end_time(t_hi)
-                .with_attributes([
-                    KeyValue::new("rivoli.token_index", tok_i as i64),
-                    KeyValue::new("rivoli.token_id", i64::from(tok_id)),
-                ])
-                .start_with_context(&tracer, &cx);
-            let tok_cx = opentelemetry::Context::current_with_span(tok_span);
-
-            let mut by_layer: BTreeMap<i32, Vec<super::spans::Rec>> = BTreeMap::new();
-            for r in tok_recs {
-                by_layer.entry(r.layer).or_default().push(r);
-            }
-            for (layer_i, layer_recs) in by_layer {
-                // layer -1 is work outside the layer loop (the tail): hang it straight off
-                // the token rather than inventing a "layer -1" level for it.
-                let parent_cx = if layer_i < 0 {
-                    tok_cx.clone()
-                } else {
-                    let Some((l_lo, l_hi)) = span_bounds(&layer_recs) else {
-                        continue;
-                    };
-                    // Expert composition: residency x format. This is what explains a
-                    // layer's cost — eight cold int4 experts and eight warm vq3 ones are
-                    // different animals — and the counts are recorded at submit time
-                    // because that is the only point where both are known.
-                    let mut attrs = vec![KeyValue::new("rivoli.layer", layer_i as i64)];
-                    if let Some(st) = layer_states.get(&(tok_i, layer_i)) {
-                        attrs.push(KeyValue::new("experts.cold.int4", i64::from(st.cold_i4)));
-                        attrs.push(KeyValue::new("experts.warm.int4", i64::from(st.warm_i4)));
-                        attrs.push(KeyValue::new(
-                            "experts.cold.int3_vq",
-                            i64::from(st.cold_vq3),
-                        ));
-                        attrs.push(KeyValue::new(
-                            "experts.warm.int3_vq",
-                            i64::from(st.warm_vq3),
-                        ));
-                        attrs.push(KeyValue::new(
-                            "experts.cold",
-                            i64::from(st.cold_i4 + st.cold_vq3),
-                        ));
-                        attrs.push(KeyValue::new(
-                            "experts.total",
-                            i64::from(st.cold_i4 + st.warm_i4 + st.cold_vq3 + st.warm_vq3),
-                        ));
-                    }
-                    let ls = tracer
-                        .span_builder(format!("layer {layer_i}"))
-                        .with_start_time(l_lo)
-                        .with_end_time(l_hi)
-                        .with_attributes(attrs)
-                        .start_with_context(&tracer, &tok_cx);
-                    let c = opentelemetry::Context::current_with_span(ls);
-                    let ls = c.span();
-                    ls.end_with_timestamp(l_hi);
-                    c
-                };
-                for r in layer_recs {
-                    let mut leaf = tracer
-                        .span_builder(r.name)
-                        .with_start_time(r.start)
-                        .with_end_time(r.end)
-                        .with_attributes([KeyValue::new("thread", r.thread)])
-                        .start_with_context(&tracer, &parent_cx);
-                    leaf.end_with_timestamp(r.end);
-                }
-            }
-            let ts = tok_cx.span();
-            ts.end_with_timestamp(t_hi);
-        }
+    /// Stamp the root with what the timeline actually contains, then close it on the
+    /// children's own end rather than on `now()`.
+    fn close_root(
+        cx: &opentelemetry::Context,
+        recorded: usize,
+        truncated: bool,
+        bounds: Option<(SystemTime, SystemTime)>,
+    ) {
         let span = cx.span();
-        span.set_attribute(KeyValue::new("spans_recorded", n as i64));
+        span.set_attribute(KeyValue::new("spans_recorded", recorded as i64));
         // A truncated timeline that does not say so reads as a complete one.
         if truncated {
             span.set_attribute(KeyValue::new("spans_truncated", true));
             tracing::warn!(
-                "--spans cap reached after {n} intervals — the sampling stride \
+                "--spans cap reached after {recorded} intervals — the sampling stride \
                  under-estimated spans/token, so the exported timeline is missing the \
                  LATER sampled tokens. Raise --spans or the per_tok estimate."
             );
@@ -922,11 +887,160 @@ mod otlp {
             Some((_, hi)) => span.end_with_timestamp(hi),
             None => span.end(),
         }
+    }
 
-        // Flush the simple processor's export before we return (the run ends here).
-        provider.shutdown().context("flush OTLP spans")?;
-        export_metrics(summary, tokens, run)?;
-        Ok(())
+    /// Rebuild the tree: decode -> token N -> layer L -> the leaf intervals. Emitting
+    /// the leaves as 1200 direct siblings of the root is technically a trace and
+    /// practically unreadable; the token/layer levels are what make a waterfall
+    /// navigable, and they are synthesised from the leaves' own bounds so they cannot
+    /// disagree with them.
+    ///
+    /// Every span here is closed with `end_with_timestamp`. `end()` would stamp
+    /// `now()` and silently discard the builder's `with_end_time`.
+    fn emit_token_spans<T>(tracer: &T, cx: &opentelemetry::Context, recs: Vec<super::spans::Rec>)
+    where
+        T: Tracer,
+        T::Span: Send + Sync + 'static,
+    {
+        let layer_states: BTreeMap<(u32, i32), super::spans::ExpertComposition> =
+            super::spans::drain_layers()
+                .into_iter()
+                .map(|st| ((st.tok, st.layer), st))
+                .collect();
+        for (tok, tok_recs) in group_by(recs, |r| r.tok) {
+            let Some((t_lo, t_hi)) = span_bounds(&tok_recs) else {
+                continue;
+            };
+            // The token id, not just the index — the index says "the 7th step", the id
+            // says which token the model was actually working on.
+            let tok_id = tok_recs.first().map(|r| r.tok_id).unwrap_or(0);
+            let tok_span = tracer
+                .span_builder(format!("token {tok}"))
+                .with_start_time(t_lo)
+                .with_end_time(t_hi)
+                .with_attributes([
+                    KeyValue::new("rivoli.token_index", i64::from(tok)),
+                    KeyValue::new("rivoli.token_id", i64::from(tok_id)),
+                ])
+                .start_with_context(tracer, cx);
+            let tok_cx = opentelemetry::Context::current_with_span(tok_span);
+            emit_layer_spans(
+                tracer,
+                &tok_cx,
+                tok_recs,
+                &TokenLayers {
+                    tok,
+                    states: &layer_states,
+                },
+            );
+            tok_cx.span().end_with_timestamp(t_hi);
+        }
+    }
+
+    /// The expert-composition table, narrowed to the token whose layers are being emitted.
+    /// One argument instead of two so the emitter stays inside the argument budget, and so
+    /// the pair cannot be passed out of step with each other.
+    struct TokenLayers<'a> {
+        tok: u32,
+        states: &'a BTreeMap<(u32, i32), super::spans::ExpertComposition>,
+    }
+
+    /// The layer level of the tree, plus its leaves.
+    fn emit_layer_spans<T>(
+        tracer: &T,
+        tok_cx: &opentelemetry::Context,
+        tok_recs: Vec<super::spans::Rec>,
+        layers: &TokenLayers<'_>,
+    ) where
+        T: Tracer,
+        T::Span: Send + Sync + 'static,
+    {
+        for (layer_i, layer_recs) in group_by(tok_recs, |r| r.layer) {
+            // layer -1 is work outside the layer loop (the tail): hang it straight off
+            // the token rather than inventing a "layer -1" level for it.
+            let parent_cx = if layer_i < 0 {
+                tok_cx.clone()
+            } else {
+                let Some((l_lo, l_hi)) = span_bounds(&layer_recs) else {
+                    continue;
+                };
+                let ls = tracer
+                    .span_builder(format!("layer {layer_i}"))
+                    .with_start_time(l_lo)
+                    .with_end_time(l_hi)
+                    .with_attributes(layer_attributes(
+                        layer_i,
+                        layers.states.get(&(layers.tok, layer_i)),
+                    ))
+                    .start_with_context(tracer, tok_cx);
+                let c = opentelemetry::Context::current_with_span(ls);
+                c.span().end_with_timestamp(l_hi);
+                c
+            };
+            emit_leaf_spans(tracer, &parent_cx, layer_recs);
+        }
+    }
+
+    /// Expert composition: residency x format. This is what explains a layer's cost —
+    /// eight cold int4 experts and eight warm vq3 ones are different animals — and the
+    /// counts are recorded at submit time because that is the only point where both are
+    /// known.
+    fn layer_attributes(
+        layer_i: i32,
+        st: Option<&super::spans::ExpertComposition>,
+    ) -> Vec<KeyValue> {
+        let mut attrs = vec![KeyValue::new("rivoli.layer", i64::from(layer_i))];
+        if let Some(st) = st {
+            attrs.push(KeyValue::new("experts.cold.int4", i64::from(st.cold_i4)));
+            attrs.push(KeyValue::new("experts.warm.int4", i64::from(st.warm_i4)));
+            attrs.push(KeyValue::new(
+                "experts.cold.int3_vq",
+                i64::from(st.cold_vq3),
+            ));
+            attrs.push(KeyValue::new(
+                "experts.warm.int3_vq",
+                i64::from(st.warm_vq3),
+            ));
+            attrs.push(KeyValue::new(
+                "experts.cold",
+                i64::from(st.cold_i4 + st.cold_vq3),
+            ));
+            attrs.push(KeyValue::new(
+                "experts.total",
+                i64::from(st.cold_i4 + st.warm_i4 + st.cold_vq3 + st.warm_vq3),
+            ));
+        }
+        attrs
+    }
+
+    /// The measured intervals themselves, hung off whichever level is their parent.
+    fn emit_leaf_spans<T: Tracer>(
+        tracer: &T,
+        parent_cx: &opentelemetry::Context,
+        recs: Vec<super::spans::Rec>,
+    ) {
+        for r in recs {
+            let mut leaf = tracer
+                .span_builder(r.name)
+                .with_start_time(r.start)
+                .with_end_time(r.end)
+                .with_attributes([KeyValue::new("thread", r.thread)])
+                .start_with_context(tracer, parent_cx);
+            leaf.end_with_timestamp(r.end);
+        }
+    }
+
+    /// Bucket records by one of their positional fields. `BTreeMap`, so the export walks
+    /// tokens and layers in index order — a waterfall sorted by hash is unreadable.
+    fn group_by<K: Ord>(
+        recs: Vec<super::spans::Rec>,
+        key: impl Fn(&super::spans::Rec) -> K,
+    ) -> BTreeMap<K, Vec<super::spans::Rec>> {
+        let mut out: BTreeMap<K, Vec<super::spans::Rec>> = BTreeMap::new();
+        for r in recs {
+            out.entry(key(&r)).or_default().push(r);
+        }
+        out
     }
 
     /// Min start / max end over a set of records — the bounds a synthesised parent needs
@@ -985,6 +1099,22 @@ mod otlp {
             .map(|(k, v)| KeyValue::new(k, v))
             .collect();
 
+        record_class_gauges(&m, summary, &run_labels);
+        record_scalar_gauges(&m, summary, tokens, &run_labels);
+        record_outcome_gauges(&m, run, &run_labels);
+
+        provider.shutdown().context("flush OTLP metrics")?;
+        Ok(())
+    }
+
+    /// The class and phase axes, all on one `rivoli.ms_per_tok` gauge separated by a
+    /// `class` attribute — the class spans OVERLAP, so a stacked panel would LIE, and the
+    /// dashboard draws them as separate lines for exactly that reason.
+    fn record_class_gauges(
+        m: &opentelemetry::metrics::Meter,
+        summary: &ProfileSummary,
+        run_labels: &[KeyValue],
+    ) {
         // ms/token, the unit every number in the PROFILE line is already in.
         let per_tok = m.f64_gauge("rivoli.ms_per_tok").build();
         let g = |v: f64, class: &'static str, thread: &'static str| {
@@ -998,8 +1128,6 @@ mod otlp {
                 .collect();
             per_tok.record(v, &attrs);
         };
-        // The class axis — overlapping spans, so a stacked panel would LIE. The
-        // dashboard draws these as separate lines for exactly that reason.
         g(summary.gpu_wait_ms, "gpu-wait", "decode");
         g(summary.io_wait_ms, "io-wait", "reaper");
         g(summary.cpu_ms, "cpu", "decode");
@@ -1025,41 +1153,52 @@ mod otlp {
         g(summary.tail_wait_ms, "split/tail-wait", "decode");
         g(summary.tail_gpu_ms, "split/tail-gpu", "decode");
         g(summary.compute_gpu_ms, "split/moe-compute-gpu", "decode");
+    }
 
-        // The scalars carry run identity and nothing else — `tok_per_s` is THE ranking
-        // number, so it is the one series that must never merge two configurations.
+    /// The scalars carry run identity and nothing else — `tok_per_s` is THE ranking
+    /// number, so it is the one series that must never merge two configurations.
+    fn record_scalar_gauges(
+        m: &opentelemetry::metrics::Meter,
+        summary: &ProfileSummary,
+        tokens: usize,
+        run_labels: &[KeyValue],
+    ) {
         m.f64_gauge("rivoli.tok_per_s")
             .build()
-            .record(summary.tok_per_s, &run_labels);
+            .record(summary.tok_per_s, run_labels);
         m.f64_gauge("rivoli.hit_pct")
             .build()
-            .record(summary.hit_pct, &run_labels);
+            .record(summary.hit_pct, run_labels);
         m.f64_gauge("rivoli.gb_per_tok")
             .build()
-            .record(summary.gb_per_tok, &run_labels);
+            .record(summary.gb_per_tok, run_labels);
         m.f64_gauge("rivoli.miss_per_tok")
             .build()
-            .record(summary.miss_per_tok, &run_labels);
+            .record(summary.miss_per_tok, run_labels);
         m.u64_gauge("rivoli.tokens")
             .build()
-            .record(tokens as u64, &run_labels);
-        // Chartable, so a dashboard can show "how many cells degenerated" over a matrix
-        // run rather than requiring someone to read 44 logs — which needs the labels to
-        // say WHICH cells.
+            .record(tokens as u64, run_labels);
+    }
+
+    /// Degeneration, chartable: a dashboard can show "how many cells degenerated" over a
+    /// matrix run rather than requiring someone to read 44 logs — which needs the labels
+    /// to say WHICH cells.
+    fn record_outcome_gauges(
+        m: &opentelemetry::metrics::Meter,
+        run: &RunInfo,
+        run_labels: &[KeyValue],
+    ) {
         m.u64_gauge("rivoli.degenerate")
             .build()
-            .record(u64::from(run.degenerate.is_some()), &run_labels);
+            .record(u64::from(run.degenerate.is_some()), run_labels);
         if let Some(d) = run.degenerate {
             m.u64_gauge("rivoli.loop_period")
                 .build()
-                .record(d.period as u64, &run_labels);
+                .record(d.period as u64, run_labels);
             m.u64_gauge("rivoli.loop_repeats")
                 .build()
-                .record(d.repeats as u64, &run_labels);
+                .record(d.repeats as u64, run_labels);
         }
-
-        provider.shutdown().context("flush OTLP metrics")?;
-        Ok(())
     }
 }
 

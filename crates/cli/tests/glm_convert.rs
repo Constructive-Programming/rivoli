@@ -90,80 +90,78 @@ fn add_bf16(w: &mut SafeWriter<'_>, name: &str, shape: &[usize]) {
     );
 }
 
-/// The synthetic checkpoint, written from the converter's own tensor walk.
-fn write_fixture(dir: &Path) {
-    std::fs::create_dir_all(dir).unwrap();
+/// The gate/up/down triple every MLP is made of — dense, per-expert and shared alike, so
+/// the walk's only real branch is which bases exist, not what hangs off each one.
+fn add_mlp(w: &mut SafeWriter<'_>, base: &str, inter: usize) {
+    add_fp8(w, &format!("{base}.gate_proj"), inter, HIDDEN);
+    add_fp8(w, &format!("{base}.up_proj"), inter, HIDDEN);
+    add_fp8(w, &format!("{base}.down_proj"), HIDDEN, inter);
+}
+
+/// The two norms and the five MLA projections — identical in the dense and the MoE layer,
+/// which is why the walk branches only below `.mlp`.
+fn add_attn(w: &mut SafeWriter<'_>, lb: &str) {
+    add_bf16(w, &format!("{lb}.input_layernorm.weight"), &[HIDDEN]);
+    add_bf16(
+        w,
+        &format!("{lb}.post_attention_layernorm.weight"),
+        &[HIDDEN],
+    );
+    add_bf16(
+        w,
+        &format!("{lb}.self_attn.q_a_layernorm.weight"),
+        &[Q_LORA],
+    );
+    add_bf16(
+        w,
+        &format!("{lb}.self_attn.kv_a_layernorm.weight"),
+        &[KV_LORA],
+    );
+    let qk_head = QK_NOPE + QK_ROPE;
+    add_fp8(w, &format!("{lb}.self_attn.q_a_proj"), Q_LORA, HIDDEN);
+    add_fp8(
+        w,
+        &format!("{lb}.self_attn.q_b_proj"),
+        HEADS * qk_head,
+        Q_LORA,
+    );
+    let kv_a = format!("{lb}.self_attn.kv_a_proj_with_mqa");
+    add_fp8(w, &kv_a, KV_LORA + QK_ROPE, HIDDEN);
+    let kv_b_out = HEADS * (QK_NOPE + V_HEAD);
+    add_fp8(w, &format!("{lb}.self_attn.kv_b_proj"), kv_b_out, KV_LORA);
+    add_fp8(w, &format!("{lb}.self_attn.o_proj"), HIDDEN, HEADS * V_HEAD);
+}
+
+/// The MoE layer's own tensors: the router gate and its bias, `EXPERTS` streamed triples,
+/// and the resident shared expert — the VQ-encode and resident-set branches of the walk.
+fn add_moe(w: &mut SafeWriter<'_>, lb: &str) {
+    add_bf16(w, &format!("{lb}.mlp.gate.weight"), &[EXPERTS, HIDDEN]);
+    w.add(
+        format!("{lb}.mlp.gate.e_score_correction_bias"),
+        Dtype::F32,
+        vec![EXPERTS],
+        f32_bytes(&weights("bias", EXPERTS)),
+    );
+    for e in 0..EXPERTS {
+        add_mlp(w, &format!("{lb}.mlp.experts.{e}"), MOE_INTER);
+    }
+    add_mlp(w, &format!("{lb}.mlp.shared_experts"), MOE_INTER);
+}
+
+/// The safetensors half of the fixture: the converter's tensor walk, written out.
+fn write_tensors(dir: &Path) {
     let mut w = SafeWriter::new();
     add_bf16(&mut w, "model.embed_tokens.weight", &[VOCAB, HIDDEN]);
     add_bf16(&mut w, "lm_head.weight", &[VOCAB, HIDDEN]);
     add_bf16(&mut w, "model.norm.weight", &[HIDDEN]);
     for l in 0..LAYERS {
         let lb = format!("model.layers.{l}");
-        add_bf16(&mut w, &format!("{lb}.input_layernorm.weight"), &[HIDDEN]);
-        add_bf16(
-            &mut w,
-            &format!("{lb}.post_attention_layernorm.weight"),
-            &[HIDDEN],
-        );
-        add_bf16(
-            &mut w,
-            &format!("{lb}.self_attn.q_a_layernorm.weight"),
-            &[Q_LORA],
-        );
-        add_bf16(
-            &mut w,
-            &format!("{lb}.self_attn.kv_a_layernorm.weight"),
-            &[KV_LORA],
-        );
-        let qk_head = QK_NOPE + QK_ROPE;
-        add_fp8(&mut w, &format!("{lb}.self_attn.q_a_proj"), Q_LORA, HIDDEN);
-        add_fp8(
-            &mut w,
-            &format!("{lb}.self_attn.q_b_proj"),
-            HEADS * qk_head,
-            Q_LORA,
-        );
-        add_fp8(
-            &mut w,
-            &format!("{lb}.self_attn.kv_a_proj_with_mqa"),
-            KV_LORA + QK_ROPE,
-            HIDDEN,
-        );
-        add_fp8(
-            &mut w,
-            &format!("{lb}.self_attn.kv_b_proj"),
-            HEADS * (QK_NOPE + V_HEAD),
-            KV_LORA,
-        );
-        add_fp8(
-            &mut w,
-            &format!("{lb}.self_attn.o_proj"),
-            HIDDEN,
-            HEADS * V_HEAD,
-        );
+        add_attn(&mut w, &lb);
         if l == 0 {
             // Dense layer: the plain MLP rides copy_fp8.
-            add_fp8(&mut w, &format!("{lb}.mlp.gate_proj"), INTER, HIDDEN);
-            add_fp8(&mut w, &format!("{lb}.mlp.up_proj"), INTER, HIDDEN);
-            add_fp8(&mut w, &format!("{lb}.mlp.down_proj"), HIDDEN, INTER);
+            add_mlp(&mut w, &format!("{lb}.mlp"), INTER);
         } else {
-            add_bf16(&mut w, &format!("{lb}.mlp.gate.weight"), &[EXPERTS, HIDDEN]);
-            w.add(
-                format!("{lb}.mlp.gate.e_score_correction_bias"),
-                Dtype::F32,
-                vec![EXPERTS],
-                f32_bytes(&weights("bias", EXPERTS)),
-            );
-            for e in 0..EXPERTS {
-                let eb = format!("{lb}.mlp.experts.{e}");
-                add_fp8(&mut w, &format!("{eb}.gate_proj"), MOE_INTER, HIDDEN);
-                add_fp8(&mut w, &format!("{eb}.up_proj"), MOE_INTER, HIDDEN);
-                add_fp8(&mut w, &format!("{eb}.down_proj"), HIDDEN, MOE_INTER);
-            }
-            let sb = format!("{lb}.mlp.shared_experts");
-            add_fp8(&mut w, &format!("{sb}.gate_proj"), MOE_INTER, HIDDEN);
-            add_fp8(&mut w, &format!("{sb}.up_proj"), MOE_INTER, HIDDEN);
-            add_fp8(&mut w, &format!("{sb}.down_proj"), HIDDEN, MOE_INTER);
+            add_moe(&mut w, &lb);
         }
     }
     w.write(
@@ -172,7 +170,11 @@ fn write_fixture(dir: &Path) {
             .unwrap(),
     )
     .unwrap();
+}
 
+/// The HF-side `config.json` the converter reads — every field its `validate` checks, so
+/// dropping one here is how that check is kept honest.
+fn write_config(dir: &Path) {
     let config = serde_json::json!({
         "model_type": "glm_moe_dsa",
         "architectures": ["GlmMoeDsaForCausalLM"],
@@ -208,16 +210,24 @@ fn write_fixture(dir: &Path) {
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        dir.join("tokenizer.json"),
-        b"{\"model\":{\"type\":\"BPE\"}}",
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("generation_config.json"),
-        b"{\"eos_token_id\":[1]}",
-    )
-    .unwrap();
+}
+
+/// The two files the converter copies through rather than reads. Stub contents on purpose:
+/// this gate asserts they REACH the artifact, and `generation_config.json` is the one the
+/// refusal test deletes.
+fn write_sidecars(dir: &Path) {
+    let tok = dir.join("tokenizer.json");
+    std::fs::write(tok, b"{\"model\":{\"type\":\"BPE\"}}").unwrap();
+    let gen_cfg = dir.join("generation_config.json");
+    std::fs::write(gen_cfg, b"{\"eos_token_id\":[1]}").unwrap();
+}
+
+/// The synthetic checkpoint, written from the converter's own tensor walk.
+fn write_fixture(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    write_tensors(dir);
+    write_config(dir);
+    write_sidecars(dir);
 }
 
 fn scratch(tag: &str) -> PathBuf {

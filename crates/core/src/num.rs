@@ -5,6 +5,8 @@
 //! frozen reference material, a conversion is live vocabulary. (`v4oracle/numerics.rs`
 //! keeps its own deliberately separate transliterations, argued in place there.)
 
+use std::cmp::Ordering;
+
 #[inline]
 pub fn silu(x: f32) -> f32 {
     x * sigmoid(x)
@@ -96,6 +98,10 @@ pub fn f32_to_f16(x: f32) -> u16 {
 /// Largest finite magnitude representable in OCP `e4m3` (S.1111.110 = 448).
 pub const E4M3_MAX: f32 = 448.0;
 
+/// Magnitude bits of ±448 (S.1111.110) — the saturation target, since e4m3 has no
+/// infinities and 1111.111 is its only NaN.
+const E4M3_SAT: u8 = 0x7e;
+
 /// Quantize f32 → OCP `float8_e4m3` (1 sign, 4 exp bias-7, 3 mantissa), round to
 /// nearest even, saturating to ±448 (e4m3 has no infinities; the only NaN is
 /// 0x7f/0xff). The DeepSeek MLA latent cache stores its NoPE half this way with
@@ -108,15 +114,15 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
     let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
     let a = x.abs();
     if a >= E4M3_MAX {
-        return sign | 0x7e; // saturate to ±448 (S.1111.110)
+        return sign | E4M3_SAT;
     }
     // Smallest positive subnormal = 2^-9 (2^-6 · 1/8); below half of it → 0.
     if a < 2f32.powi(-10) {
         return sign;
     }
-    let bits = a.to_bits();
-    let e = ((bits >> 23) & 0xff) as i32 - 127; // unbiased f32 exponent
-    if e < -6 {
+    // `a < 2^-6` ⟺ unbiased exponent < -6 (a is normal here, ≥ 2^-10), so the
+    // triage stays in magnitudes and only the normal path touches the bit pattern.
+    if a < 2f32.powi(-6) {
         // Subnormal e4m3: value = m/8 · 2^-6. Round a·2^9 to nearest; m==8 means
         // it rounded up to 2^-6 = the smallest NORMAL (exp=1, m3=0), so PROMOTE
         // rather than clamp to 7 — the subnormal analogue of the normal path's
@@ -124,12 +130,26 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
         let m = (a * 512.0).round() as u8; // 2^9 = 8 · 2^6
         return if m >= 8 { sign | 0x08 } else { sign | m };
     }
-    // Normal: exp field e+7 in 1..=15, 3 mantissa bits rounded to nearest even.
+    sign | e4m3_normal(a)
+}
+
+/// Normal e4m3 for `a` in `[2^-6, 448)`: exponent field e+7 in 1..=15, 3 mantissa
+/// bits rounded to nearest even. Split out so the triage above stays one flat read
+/// of guard clauses; returns magnitude bits only, the sign being the caller's.
+fn e4m3_normal(a: f32) -> u8 {
+    let bits = a.to_bits();
+    let e = ((bits >> 23) & 0xff) as i32 - 127; // unbiased f32 exponent
     let mant = bits & 0x007f_ffff;
     let mut m3 = (mant >> 20) as u8; // top 3 mantissa bits
-    let rem = mant & 0x000f_ffff; // remaining 20 bits
-    let half = 0x0008_0000;
-    if rem > half || (rem == half && (m3 & 1) == 1) {
+    // Round to nearest even over the 20 dropped bits (0x0008_0000 = exactly half):
+    // strictly past half, or an exact tie whose keep-bit is odd — a tie from an
+    // even keep-bit already IS even, so it stays put.
+    let round_up = match (mant & 0x000f_ffff).cmp(&0x0008_0000) {
+        Ordering::Greater => true,
+        Ordering::Equal => m3 & 1 == 1,
+        Ordering::Less => false,
+    };
+    if round_up {
         m3 += 1;
     }
     let mut exp = e + 7;
@@ -138,9 +158,9 @@ pub fn f32_to_e4m3(x: f32) -> u8 {
         exp += 1;
     }
     if exp >= 15 && m3 >= 7 {
-        return sign | 0x7e; // rounded up into NaN territory → saturate
+        return E4M3_SAT; // rounded up into NaN territory → saturate
     }
-    sign | ((exp as u8) << 3) | m3
+    ((exp as u8) << 3) | m3
 }
 
 /// The MLA fp8 latent cache's block size: one f32 scale per 128 latent values

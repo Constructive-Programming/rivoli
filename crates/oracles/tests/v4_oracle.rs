@@ -70,13 +70,19 @@ fn nearest_e4m3(a: f32) -> u8 {
     let codes = e4m3_finite_codes();
     let mut best = codes[0];
     for &(c, v) in &codes {
-        let (dn, db) = ((a - v).abs(), (a - best.1).abs());
-        // Tie -> the code with the even mantissa (low bit of the code clear).
-        if dn < db || (dn == db && (best.0 & 1) != 0) {
+        if beats(a, v, best) {
             best = (c, v);
         }
     }
     best.0
+}
+
+/// The whole rounding rule in one place: strictly closer wins, and an exact tie goes to the
+/// code with the even mantissa — so the incumbent loses a tie when ITS low bit is set.
+fn beats(a: f32, cand: f32, best: (u8, f32)) -> bool {
+    let (dn, db) = ((a - cand).abs(), (a - best.1).abs());
+    let tie_to_even = dn == db && (best.0 & 1) != 0;
+    dn < db || tie_to_even
 }
 
 #[test]
@@ -158,9 +164,13 @@ fn e4m3_encode_is_nearest_ties_to_even() {
         checked > 30_000,
         "only {checked} probes reached the assertion"
     );
-    assert_eq!(e4m3_encode(1e30), 0x7e, "saturate, not overflow");
-    assert_eq!(e4m3_encode(-1e30), 0xfe);
-    assert!(e4m3_decode(0x7f).is_nan() && e4m3_decode(0xff).is_nan());
+    // The range the sweep skipped: e4m3 has no infinities, so encoding past 448 must CLAMP to
+    // the largest finite code rather than run off the top of the format.
+    let (up, down) = (e4m3_encode(1e30), e4m3_encode(-1e30));
+    assert_eq!(up, 0x7e, "saturate, not overflow");
+    assert_eq!(down, 0xfe);
+    let nans = [e4m3_decode(0x7f), e4m3_decode(0xff)];
+    assert!(nans.iter().all(|v| v.is_nan()));
 }
 
 #[test]
@@ -273,12 +283,15 @@ fn fast_round_scale_is_the_smallest_power_of_two_that_covers_amax() {
             0,
             "scale {s} is not a power of two"
         );
+        // Both halves of "smallest that covers": this scale fits amax inside fp8's range, and
+        // the next one down does not.
+        let (covered, halved) = (amax / s, amax / (s / 2.0));
         assert!(
-            amax / s <= FP8_MAX * 1.0000001,
+            covered <= FP8_MAX * 1.0000001,
             "scale {s} does not cover amax {amax}"
         );
         assert!(
-            amax / (s / 2.0) > FP8_MAX,
+            halved > FP8_MAX,
             "scale {s} is not the SMALLEST that covers {amax}"
         );
     }
@@ -573,14 +586,47 @@ fn run(layer: usize, prompt: usize, defect: Defect) -> Run {
 /// `silent` is checked in every reachable case; `loud` requires at least one golden with
 /// that suffix to differ (a decode case holds four steps and a compressor defect only
 /// reaches the step that completes a block).
+#[derive(Clone, Copy)]
 struct Expect {
     loud: &'static [&'static str],
     silent: &'static [&'static str],
 }
 
+/// The attention half's goldens in PIPELINE order.
+///
+/// A row's silent half is almost always a PREFIX of this — "everything strictly upstream of
+/// what the defect touches" — so the prefixes below are CUT from this one declaration rather
+/// than retyped per row. Retyping is real duplication and not a formatting artefact: jscpd
+/// reported the `DEROTATION`/`WO_GROUPS` pair on 2026-08-15, 28 tokens of identical prefix.
+const PIPELINE: &[&str] = &[
+    ".in",
+    ".attn_norm_out",
+    ".q",
+    ".kv_entry",
+    ".attn_core_out",
+    ".attn_derot",
+    ".attn_out",
+];
+
 /// Suffixes that are upstream of everything in the attention and are the strongest silent
 /// evidence available: if a defect moves these, it is not the defect it claims to be.
-const UPSTREAM: &[&str] = &[".in", ".attn_norm_out"];
+const UPSTREAM: &[&str] = PIPELINE.split_at(2).0;
+
+/// ...plus the query projection, which a KV-side defect must leave alone.
+const PRE_KV: &[&str] = PIPELINE.split_at(3).0;
+
+/// ...plus both projections — everything a defect *inside* the attention core is downstream of.
+const PRE_ATTN: &[&str] = PIPELINE.split_at(4).0;
+
+/// ...plus the core's own output, which the de-rotation is downstream of.
+const PRE_DEROT: &[&str] = PIPELINE.split_at(5).0;
+
+/// ...plus the de-rotation, which the output projection is downstream of.
+const PRE_WO: &[&str] = PIPELINE.split_at(6).0;
+
+/// What the router sits between: the attention half is upstream of it and the expert mix is
+/// downstream, so a routing bug may move neither.
+const AROUND_ROUTER: &[&str] = &[".in", ".attn_norm_out", ".attn_out", ".ffn_norm_out"];
 
 /// Silent claims that no implementation can violate, so they must not count as evidence.
 ///
@@ -591,76 +637,162 @@ const UPSTREAM: &[&str] = &[".in", ".attn_norm_out"];
 /// "differs somewhere" row the meta-guard exists to forbid.
 const TRIVIAL_SILENT: &[&str] = &[".in"];
 
+/// QK-norm rescales `.q` after the projection, so nothing before the projection may move.
+const QK_NORM: Expect = Expect {
+    loud: &[".q"],
+    silent: &[".in", ".attn_norm_out", ".kv_entry"],
+};
+
+/// RoPE writes the query AND the cache entry — a port that rotates only one of them is the
+/// defect this row is here to catch.
+const ROPE: Expect = Expect {
+    loud: &[".q", ".kv_entry"],
+    silent: UPSTREAM,
+};
+
+/// The KV activation quantizer touches the cache entry alone; in particular not `.q`, the
+/// projection a port is most likely to quantize alongside it.
+const KV_QUANT: Expect = Expect {
+    loud: &[".kv_entry"],
+    silent: PRE_KV,
+};
+
+/// The attention core READS the compressor's output, so `.compressed` is silent evidence here
+/// in a way it is not for [`RING_SEED`].
+const ATTN_CORE: Expect = Expect {
+    loud: &[".attn_core_out"],
+    silent: &[".in", ".attn_norm_out", ".q", ".kv_entry", ".compressed"],
+};
+
+/// Wrong ring seeding shows up only once something reads the cache, and the compressor is not
+/// on that path at all — which is why this row cannot claim `.compressed`.
+const RING_SEED: Expect = Expect {
+    loud: &[".attn_core_out"],
+    silent: PRE_ATTN,
+};
+
+/// De-rotation is the last thing before the output projection, so the core's own output is
+/// upstream of it.
+const DEROTATION: Expect = Expect {
+    loud: &[".attn_derot"],
+    silent: PRE_DEROT,
+};
+
+/// A mis-grouped `wo` moves only the projection's result; every attention golden feeding it is
+/// silent evidence.
+const WO_GROUPS: Expect = Expect {
+    loud: &[".attn_out"],
+    silent: PRE_WO,
+};
+
+/// The compressor consumes the cache entries and produces `.compressed`; it writes nothing
+/// upstream of itself.
+const COMPRESSOR: Expect = Expect {
+    loud: &[".compressed"],
+    silent: PRE_ATTN,
+};
+
+const INDEXER: Expect = Expect {
+    // Only `.indexer_scores` here. `.compress_idxs` -- the SELECTION golden -- is
+    // informative ONLY where `index_topk` truncates, which does not happen in every
+    // case of the grid, so a matrix row demanding it would be false half the time.
+    // `the_selection_golden_moves_when_topk_truncates` covers it where it bites.
+    loud: &[".indexer_scores"],
+    // The indexer has its OWN compressor; the attention compressor's output must be
+    // untouched. That separation is exactly what a port is likely to conflate.
+    silent: &[".in", ".attn_norm_out", ".q", ".kv_entry", ".compressed"],
+};
+
+/// A weighting bug moves the weights and leaves the SELECTION alone.
+const ROUTER_WEIGHTS: Expect = Expect {
+    loud: &[".router_weights"],
+    silent: AROUND_ROUTER,
+};
+
+/// ...and a dispatch bug moves the selection and leaves the weights alone.
+const ROUTER_INDICES: Expect = Expect {
+    loud: &[".router_indices"],
+    silent: AROUND_ROUTER,
+};
+
+/// Where the routing weight is applied changes the mix, never the routing that produced it.
+const EXPERT_MIX: Expect = Expect {
+    loud: &[".ffn_out"],
+    silent: &[".ffn_norm_out", ".router_weights", ".router_indices"],
+};
+
+const FP4_NIBBLES: Expect = Expect {
+    loud: &[".ffn_out"],
+    // Attention is fp8 and the shared expert is fp8; only the ROUTED experts are
+    // fp4, so nothing before the MoE may move.
+    silent: &[
+        ".in",
+        ".attn_norm_out",
+        ".q",
+        ".kv_entry",
+        ".attn_out",
+        ".router_weights",
+    ],
+};
+
+const COMBINATION: Expect = Expect {
+    loud: &[".ffn_norm_out", ".out"],
+    // `pre` comes straight from the mixes and never sees the Sinkhorn iterations, so the
+    // attention half of the block is untouched by a combination-matrix bug -- ALL of it, which
+    // is why this is the whole [`PIPELINE`]. (`.attn_derot` was missing from the hand-written
+    // list this replaced; it is upstream of `.attn_out`, which the list already claimed, so
+    // the row was understating a claim it already made.)
+    silent: PIPELINE,
+};
+
+const HEAD_NORM: Expect = Expect {
+    loud: &[".final_norm_out", ".logits"],
+    // `.hc_head_out` is the real silent half here, and it is violable: an implementation
+    // that fused `hc_head` with the final norm -- the obvious single-kernel shortcut,
+    // since both are reductions over the same row -- would move it.
+    silent: &[".hc_head_out"],
+};
+
+/// Slicing the wrong row changes the logits and nothing that produced them.
+const HEAD_LOGITS: Expect = Expect {
+    loud: &[".logits"],
+    silent: &[".hc_head_out", ".final_norm_out"],
+};
+
 fn expect(d: Defect) -> Option<Expect> {
     // `None` here means "covered by a targeted test below", and the meta-guard checks that
     // every such defect really is.
-    let e = |loud, silent| Some(Expect { loud, silent });
     match d {
         Defect::None => None,
 
-        Defect::SkipQkNorm | Defect::QkNormUsesQNormWeight => {
-            e(&[".q"], &[".in", ".attn_norm_out", ".kv_entry"])
-        }
+        Defect::SkipQkNorm | Defect::QkNormUsesQNormWeight => Some(QK_NORM),
 
-        Defect::RopeAllDims | Defect::RopeFirstDims | Defect::RopeHalfSplit => {
-            e(&[".q", ".kv_entry"], UPSTREAM)
-        }
+        Defect::RopeAllDims | Defect::RopeFirstDims | Defect::RopeHalfSplit => Some(ROPE),
         Defect::RopeNoYarn | Defect::RopeYarnEverywhere | Defect::RopeBaseThetaEverywhere => {
-            e(&[".q", ".kv_entry"], UPSTREAM)
+            Some(ROPE)
         }
 
         Defect::SkipKvActQuant | Defect::KvActQuantWholeTensor | Defect::KvActQuantNoRoundScale => {
-            e(&[".kv_entry"], &[".in", ".attn_norm_out", ".q"])
+            Some(KV_QUANT)
         }
         // See `act_quant_block_size_is_almost_invisible_under_ue8m0_scales`: this one is
         // measurably undetectable on realistic activations, so putting it in the matrix
         // would claim a resolution the oracle does not have.
         Defect::KvActQuantBlock128 => None,
 
-        Defect::SkipAttnSink | Defect::AttnSinkNotMaxShifted => e(
-            &[".attn_core_out"],
-            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".compressed"],
-        ),
-        Defect::PrefillRingWritesFirstWindow => e(
-            &[".attn_core_out"],
-            &[".in", ".attn_norm_out", ".q", ".kv_entry"],
-        ),
+        Defect::SkipAttnSink | Defect::AttnSinkNotMaxShifted => Some(ATTN_CORE),
+        Defect::PrefillRingWritesFirstWindow => Some(RING_SEED),
 
-        Defect::SkipOutputDerotation | Defect::OutputDerotationForward => e(
-            &[".attn_derot"],
-            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".attn_core_out"],
-        ),
-        Defect::WoGroupsSplitHeadDim | Defect::WoGroupsInterleaved => e(
-            &[".attn_out"],
-            &[
-                ".in",
-                ".attn_norm_out",
-                ".q",
-                ".kv_entry",
-                ".attn_core_out",
-                ".attn_derot",
-            ],
-        ),
+        Defect::SkipOutputDerotation | Defect::OutputDerotationForward => Some(DEROTATION),
+        Defect::WoGroupsSplitHeadDim | Defect::WoGroupsInterleaved => Some(WO_GROUPS),
 
         Defect::CompressorNoOverlap
         | Defect::CompressorNoApe
-        | Defect::CompressorRopeAtBlockEnd => e(
-            &[".compressed"],
-            &[".in", ".attn_norm_out", ".q", ".kv_entry"],
-        ),
+        | Defect::CompressorRopeAtBlockEnd => Some(COMPRESSOR),
         Defect::IndexerNoRelu
         | Defect::IndexerNoFp4Quant
         | Defect::IndexerNoHadamard
-        | Defect::IndexerNoWeights => e(
-            // Only `.indexer_scores` here. `.compress_idxs` -- the SELECTION golden -- is
-            // informative ONLY where `index_topk` truncates, which does not happen in every
-            // case of the grid, so a matrix row demanding it would be false half the time.
-            // `the_selection_golden_moves_when_topk_truncates` covers it where it bites.
-            &[".indexer_scores"],
-            // The indexer has its OWN compressor; the attention compressor's output must be
-            // untouched. That separation is exactly what a port is likely to conflate.
-            &[".in", ".attn_norm_out", ".q", ".kv_entry", ".compressed"],
-        ),
+        | Defect::IndexerNoWeights => Some(INDEXER),
 
         // MEASURED over the whole grid, 2026-08-05: this moves exactly ONE score element, at
         // (layer 2, prompt 12, decode step 2), out of ~60 live scores -- and never moves
@@ -685,31 +817,10 @@ fn expect(d: Defect) -> Option<Expect> {
         Defect::RouterSoftmax
         | Defect::RouterBiasedWeights
         | Defect::RouterNoRenorm
-        | Defect::RouterNoScale => e(
-            &[".router_weights"],
-            &[".in", ".attn_norm_out", ".attn_out", ".ffn_norm_out"],
-        ),
-        Defect::HashRoutingIgnored => e(
-            &[".router_indices"],
-            &[".in", ".attn_norm_out", ".attn_out", ".ffn_norm_out"],
-        ),
-        Defect::RouteWeightAfterW2 | Defect::SharedExpertWeighted => e(
-            &[".ffn_out"],
-            &[".ffn_norm_out", ".router_weights", ".router_indices"],
-        ),
-        Defect::Fp4NibbleSwap => e(
-            &[".ffn_out"],
-            // Attention is fp8 and the shared expert is fp8; only the ROUTED experts are
-            // fp4, so nothing before the MoE may move.
-            &[
-                ".in",
-                ".attn_norm_out",
-                ".q",
-                ".kv_entry",
-                ".attn_out",
-                ".router_weights",
-            ],
-        ),
+        | Defect::RouterNoScale => Some(ROUTER_WEIGHTS),
+        Defect::HashRoutingIgnored => Some(ROUTER_INDICES),
+        Defect::RouteWeightAfterW2 | Defect::SharedExpertWeighted => Some(EXPERT_MIX),
+        Defect::Fp4NibbleSwap => Some(FP4_NIBBLES),
 
         // See `sinkhorn_has_converged_long_before_iteration_20`.
         Defect::SinkhornIterCountProbe => None,
@@ -718,19 +829,7 @@ fn expect(d: Defect) -> Option<Expect> {
         // toy GEMV can select it and a matrix row would assert on 43 vacuous cells. See
         // `the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims`.
         Defect::SplitKFoldOrder => None,
-        Defect::SinkhornCombTransposed | Defect::HcPostNoComb => e(
-            &[".ffn_norm_out", ".out"],
-            // `pre` comes straight from the mixes and never sees the Sinkhorn iterations,
-            // so the attention half of the block is untouched by a combination-matrix bug.
-            &[
-                ".in",
-                ".attn_norm_out",
-                ".q",
-                ".kv_entry",
-                ".attn_core_out",
-                ".attn_out",
-            ],
-        ),
+        Defect::SinkhornCombTransposed | Defect::HcPostNoComb => Some(COMBINATION),
         // Both of these reach EVERY golden downstream of `hc_pre` -- which is all of them --
         // so neither has a silent half to declare, and `.in` (fixed by the driver) would be
         // a claim no implementation could violate. Demoted to targeted tests, the same way
@@ -744,13 +843,10 @@ fn expect(d: Defect) -> Option<Expect> {
         // gate, so both are targeted rather than matrix rows.
         Defect::HeadHcNoRsqrt | Defect::HeadHcRsqrtPerCopy => None,
 
-        // `.hc_head_out` is the real silent half here, and it is violable: an implementation
-        // that fused `hc_head` with the final norm -- the obvious single-kernel shortcut,
-        // since both are reductions over the same row -- would move it.
         Defect::HeadNormSkipped | Defect::HeadNormNotBf16 | Defect::HeadNormOverAllTokens => {
-            e(&[".final_norm_out", ".logits"], &[".hc_head_out"])
+            Some(HEAD_NORM)
         }
-        Defect::HeadLogitsFromFirstRow => e(&[".logits"], &[".hc_head_out", ".final_norm_out"]),
+        Defect::HeadLogitsFromFirstRow => Some(HEAD_LOGITS),
 
         // Mathematically INERT: `apply_rotary_emb` rotates adjacent pairs, so it PRESERVES
         // `q.square().mean(-1)`, and a scalar scale commutes with a rotation. The two orders
@@ -864,95 +960,141 @@ fn baselines() -> std::collections::HashMap<(usize, usize), Run> {
     m
 }
 
+/// One matrix row under test: the defect and the two halves of the claim it makes.
+#[derive(Clone, Copy)]
+struct Row {
+    defect: Defect,
+    expect: Expect,
+}
+
+/// Every golden the row says must MOVE really moved somewhere in this case.
+fn assert_loud(row: Row, c: &Case, ds: &[Diff]) {
+    let d = row.defect;
+    for suffix in row.expect.loud {
+        let hits = matching(ds, suffix);
+        assert!(
+            !hits.is_empty(),
+            "{d:?} at {c:?}: no golden named *{suffix} exists, so the grid does not \
+             exercise this defect at all"
+        );
+        assert!(
+            hits.iter().any(|h| h.changed > 0),
+            "{d:?} at {c:?}: left every *{suffix} bit-identical -- the gate would \
+             pass a wrong implementation here"
+        );
+    }
+}
+
+/// ...and every golden it says must NOT move is bit-identical. This is the half that carries
+/// the resolution: "differs somewhere" would pass without it.
+fn assert_silent(row: Row, c: &Case, ds: &[Diff]) {
+    let d = row.defect;
+    for h in row.expect.silent.iter().flat_map(|s| matching(ds, s)) {
+        assert_eq!(
+            h.changed, 0,
+            "{d:?} at {c:?}: perturbed {} ({} of {} elements, rel {:.3e}), which is \
+             upstream of or beside what it claims to affect",
+            h.name, h.changed, h.total, h.rel
+        );
+    }
+}
+
+/// The head tail must not be able to MASK an upstream error. Wherever a defect moved the
+/// layer's residual output, the logits have to move too -- otherwise a per-layer golden could
+/// fail while the token that comes out is unchanged, or, far worse, the reverse. Checked off
+/// the `ds` the caller already computed: a second pass over the grid would double this file's
+/// runtime for evidence that is free at this point.
+///
+/// Paired by STEP, not any-to-any across the capture. A Decode capture holds four steps, so an
+/// any/any check would be satisfied by a defect that moved `.out` at `dec0` and the logits at
+/// `dec3` -- which is not the claim. Both names carry the same `{tag}`, so the pairing is free.
+///
+/// Returns the number of (step) pairs checked, which the caller's anti-vacuity bound needs.
+fn count_propagated(d: Defect, c: &Case, ds: &[Diff]) -> usize {
+    let mut n = 0usize;
+    for h in matching(ds, ".out").iter().filter(|h| h.changed > 0) {
+        let tag = h.name.split('.').nth(1).unwrap_or_default();
+        let want = format!("head.{tag}.logits");
+        let lg = ds.iter().find(|x| x.name == want).unwrap_or_else(|| {
+            panic!(
+                "{d:?} at {c:?}: {} moved but there is no {want} to check",
+                h.name
+            )
+        });
+        assert!(
+            lg.changed > 0,
+            "{d:?} at {c:?}: moved {} but left {want} bit-identical -- the head tail \
+             absorbed the error",
+            h.name
+        );
+        n += 1;
+    }
+    n
+}
+
+/// What the grid actually exercised, so the bounds at the end of the matrix test assert over
+/// something that was incremented rather than over a loop that never ran.
+#[derive(Default)]
+struct Tally {
+    reached: usize,
+    silenced: usize,
+    propagated: usize,
+}
+
+impl Tally {
+    /// One (defect, case) cell: assert it, count it, and return its fingerprint.
+    fn check(&mut self, row: Row, c: &Case, base: &Run) -> u64 {
+        let got = run(c.layer, c.prompt, row.defect);
+        let (d, ds) = (row.defect, diff(base.of(c.phase), got.of(c.phase)));
+        let print = fingerprint(got.of(c.phase));
+        if !reachable(d, c, base) {
+            assert!(
+                identical(base.of(c.phase), got.of(c.phase)),
+                "{d:?} is unreachable at {c:?} but changed {}",
+                first_change(&ds)
+            );
+            self.silenced += 1;
+            return print;
+        }
+        assert_loud(row, c, &ds);
+        assert_silent(row, c, &ds);
+        self.propagated += count_propagated(d, c, &ds);
+        self.reached += 1;
+        print
+    }
+}
+
+/// Two defects with the SAME fingerprint vector are the same defect wearing two names, and the
+/// matrix would then count one piece of evidence twice. This is not hypothetical: `RopeNoYarn`
+/// and `RopeBaseThetaEverywhere` were exactly that until both stopped selecting the base-theta
+/// table.
+fn assert_no_twin(d: Defect, mine: &[u64], prints: &[(Defect, Vec<u64>)]) {
+    for (other, theirs) in prints {
+        assert_ne!(
+            mine,
+            theirs.as_slice(),
+            "{d:?} and {other:?} compute the SAME thing in every case -- they are one \
+             defect wearing two names, and the matrix is double-counting its evidence"
+        );
+    }
+}
+
 #[test]
 fn defect_matrix_is_bidirectional() {
     let baselines = baselines();
-    let mut reached = 0usize;
-    let mut silenced = 0usize;
-    let mut propagated = 0usize;
-    // (defect -> its fingerprint in every case). Two defects with the SAME vector are the
-    // same defect wearing two names, and the matrix would then count one piece of evidence
-    // twice. This is not hypothetical: `RopeNoYarn` and `RopeBaseThetaEverywhere` were
-    // exactly that until both stopped selecting the base-theta table.
+    let mut tally = Tally::default();
     let mut prints: Vec<(Defect, Vec<u64>)> = Vec::new();
     for &d in Defect::ALL {
-        let Some(exp) = expect(d) else { continue };
-        let mut mine = Vec::new();
-        for c in cases() {
-            let base = &baselines[&(c.layer, c.prompt)];
-            let got = run(c.layer, c.prompt, d);
-            mine.push(fingerprint(got.of(c.phase)));
-            let ds = diff(base.of(c.phase), got.of(c.phase));
-            if !reachable(d, &c, base) {
-                assert!(
-                    identical(base.of(c.phase), got.of(c.phase)),
-                    "{d:?} is unreachable at {c:?} but changed {}",
-                    first_change(&ds)
-                );
-                silenced += 1;
-                continue;
-            }
-            for suffix in exp.loud {
-                let hits = matching(&ds, suffix);
-                assert!(
-                    !hits.is_empty(),
-                    "{d:?} at {c:?}: no golden named *{suffix} exists, so the grid does not \
-                     exercise this defect at all"
-                );
-                assert!(
-                    hits.iter().any(|h| h.changed > 0),
-                    "{d:?} at {c:?}: left every *{suffix} bit-identical -- the gate would \
-                     pass a wrong implementation here"
-                );
-            }
-            for suffix in exp.silent {
-                for h in matching(&ds, suffix) {
-                    assert_eq!(
-                        h.changed, 0,
-                        "{d:?} at {c:?}: perturbed {} ({} of {} elements, rel {:.3e}), which is \
-                         upstream of or beside what it claims to affect",
-                        h.name, h.changed, h.total, h.rel
-                    );
-                }
-            }
-            // The head tail must not be able to MASK an upstream error. Wherever a defect
-            // moved the layer's residual output, the logits have to move too -- otherwise a
-            // per-layer golden could fail while the token that comes out is unchanged, or,
-            // far worse, the reverse. Checked here rather than in its own test because `ds`
-            // is already computed: a second pass over the grid would double this file's
-            // runtime for evidence that is free at this point.
-            // Paired by STEP, not any-to-any across the capture. A Decode capture holds four
-            // steps, so an any/any check would be satisfied by a defect that moved `.out` at
-            // `dec0` and the logits at `dec3` -- which is not the claim. Both names carry the
-            // same `{tag}`, so the pairing is free.
-            for h in matching(&ds, ".out").iter().filter(|h| h.changed > 0) {
-                let tag = h.name.split('.').nth(1).unwrap_or_default();
-                let want = format!("head.{tag}.logits");
-                let lg = ds.iter().find(|x| x.name == want).unwrap_or_else(|| {
-                    panic!(
-                        "{d:?} at {c:?}: {} moved but there is no {want} to check",
-                        h.name
-                    )
-                });
-                assert!(
-                    lg.changed > 0,
-                    "{d:?} at {c:?}: moved {} but left {want} bit-identical -- the head tail \
-                     absorbed the error",
-                    h.name
-                );
-                propagated += 1;
-            }
-            reached += 1;
-        }
-        for (other, theirs) in &prints {
-            assert_ne!(
-                &mine, theirs,
-                "{d:?} and {other:?} compute the SAME thing in every case -- they are one \
-                 defect wearing two names, and the matrix is double-counting its evidence"
-            );
-        }
+        let Some(expect) = expect(d) else { continue };
+        let row = Row { defect: d, expect };
+        let mine: Vec<u64> = cases()
+            .iter()
+            .map(|c| tally.check(row, c, &baselines[&(c.layer, c.prompt)]))
+            .collect();
+        assert_no_twin(d, &mine, &prints);
         prints.push((d, mine));
     }
+    let (reached, silenced, propagated) = (tally.reached, tally.silenced, tally.propagated);
     assert!(
         reached > 200,
         "only {reached} reachable (defect, case) pairs were asserted"
@@ -1168,15 +1310,19 @@ fn window_topk_matches_the_reference_by_hand() {
     // pads with -1) is the one a port forgets, and the grid reaches it only incidentally.
     let w = rivoli_oracles::v4oracle::forward::window_topk;
     // prefill, seqlen 5, window 8: causal, row t attends [max(0,t-7), t], -1 beyond.
-    assert_eq!(w(8, 5, 0)[0], vec![0, -1, -1, -1, -1]);
-    assert_eq!(w(8, 5, 0)[4], vec![0, 1, 2, 3, 4]);
-    // prefill, seqlen 12, window 8: row 11 sees positions 4..=11.
-    assert_eq!(w(8, 12, 0)[11], vec![4, 5, 6, 7, 8, 9, 10, 11]);
-    assert_eq!(w(8, 12, 0)[3], vec![0, 1, 2, 3, -1, -1, -1, -1]);
-    // decode inside the first window: F.pad(arange(sp+1), (0, win-sp-1), value=-1).
-    assert_eq!(w(8, 1, 2), vec![vec![0, 1, 2, -1, -1, -1, -1, -1]]);
-    // decode past it: cat([arange(sp%win+1, win), arange(0, sp%win+1)]) -- oldest first.
-    assert_eq!(w(8, 1, 9), vec![vec![2, 3, 4, 5, 6, 7, 0, 1]]);
+    let short = w(8, 5, 0);
+    assert_eq!(short[0], vec![0, -1, -1, -1, -1]);
+    assert_eq!(short[4], vec![0, 1, 2, 3, 4]);
+    // prefill, seqlen 12, window 8: row 11 sees positions 4..=11, and row 3 -- the middle
+    // branch, 0 < start < window - 1 -- pads.
+    let long = w(8, 12, 0);
+    assert_eq!(long[11], vec![4, 5, 6, 7, 8, 9, 10, 11]);
+    assert_eq!(long[3], vec![0, 1, 2, 3, -1, -1, -1, -1]);
+    // decode inside the first window: F.pad(arange(sp+1), (0, win-sp-1), value=-1); and past
+    // it: cat([arange(sp%win+1, win), arange(0, sp%win+1)]) -- oldest first.
+    let (inside, past) = (w(8, 1, 2), w(8, 1, 9));
+    assert_eq!(inside, vec![vec![0, 1, 2, -1, -1, -1, -1, -1]]);
+    assert_eq!(past, vec![vec![2, 3, 4, 5, 6, 7, 0, 1]]);
 }
 
 #[test]
@@ -1192,13 +1338,13 @@ fn the_golden_file_survives_a_round_trip() {
     let got = GoldenSet::read(&mut buf.as_slice()).unwrap();
     assert_eq!(got.meta, want.meta);
     assert_eq!(got.floats, want.floats);
+    // Non-empty on both sides, or the three equalities above are truths about empty vectors.
+    let carried = !want.floats.is_empty() && !want.ints.is_empty();
     assert_eq!(got.ints, want.ints);
-    assert!(
-        !got.floats.is_empty() && !got.ints.is_empty(),
-        "the round trip carried nothing"
-    );
+    assert!(carried, "the round trip carried nothing");
     // ...and it must reject something that is not a golden file, or the magic is decoration.
-    assert!(GoldenSet::read(&mut b"not a golden".as_slice()).is_err());
+    let junk = GoldenSet::read(&mut b"not a golden".as_slice());
+    assert!(junk.is_err());
 }
 
 #[test]
@@ -1392,14 +1538,16 @@ fn bf16_reduction_matches_torch_and_not_a_running_fold() {
         all_bf16(&vanishing_terms),
         "the construction must be exact in bf16 to mean anything"
     );
-    assert_eq!(
+    let (kept, rounded_away) = (
         good.bf16_sum(vanishing_terms.iter().copied()),
-        1.0625,
+        bad.bf16_sum(vanishing_terms.iter().copied()),
+    );
+    assert_eq!(
+        kept, 1.0625,
         "f32 accumulation must keep 63 eighth-ulp terms; torch gives 1.0625"
     );
     assert_eq!(
-        bad.bf16_sum(vanishing_terms.iter().copied()),
-        1.0,
+        rounded_away, 1.0,
         "a running fold must round every one of them away"
     );
 }
@@ -1499,24 +1647,31 @@ mod torch_head_tail {
 /// every V4 kernel actually uses, which is what makes the floor below a real number rather
 /// than a guess about parallelism.
 fn wave_sum(x: &[f32]) -> f32 {
-    const WAVE: usize = 32;
+    shfl_down_ladder(strided_partials(x))
+}
+
+/// A gfx1151 wave is 32 lanes wide, and the reduction order below is a fact about that width,
+/// not a tunable.
+const WAVE: usize = 32;
+
+/// Phase one: lane `l` accumulates `x[l], x[l+32], x[l+64], ...` in that order, which is the
+/// grid-stride loop every V4 kernel opens with.
+fn strided_partials(x: &[f32]) -> [f32; WAVE] {
     let mut p = [0.0f32; WAVE];
     for (lane, acc) in p.iter_mut().enumerate() {
-        let (mut a, mut i) = (0.0f32, lane);
-        while i < x.len() {
-            a += x[i];
-            i += WAVE;
-        }
-        *acc = a;
+        *acc = x.iter().skip(lane).step_by(WAVE).sum();
     }
+    p
+}
+
+/// Phase two: the five-level `__shfl_down` ladder. `snap` is what makes it a wave rather than
+/// a serial fold — every lane reads the PRE-round value.
+fn shfl_down_ladder(mut p: [f32; WAVE]) -> f32 {
     let mut off = WAVE / 2;
     while off > 0 {
-        // Every lane reads the PRE-round value, as a wave does.
         let snap = p;
-        for lane in 0..WAVE {
-            if lane + off < WAVE {
-                p[lane] = snap[lane] + snap[lane + off];
-            }
+        for lane in 0..WAVE - off {
+            p[lane] = snap[lane] + snap[lane + off];
         }
         off >>= 1;
     }
@@ -1529,6 +1684,91 @@ fn rel_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .fold(0.0f32, |m, (p, q)| m.max((p - q).abs() / scale))
+}
+
+/// A bf16 STORE, as the reference performs it. Spelled once because the fixtures that have to
+/// be bf16-exact build their draws through it and [`all_bf16`] asks the same question in
+/// reverse — two spellings of one rounding is two chances to round only one of them.
+fn bf16_round(x: f32) -> f32 {
+    bf16_decode(bf16_encode(x))
+}
+
+/// The three quantities the floor argument turns on, plus the flip count that proves the
+/// measurement was not comparing a function to itself.
+struct Floor {
+    noise_max: f32,
+    percopy_min: f32,
+    norsqrt_min: f32,
+    flips: usize,
+}
+
+/// The head-tail weights the floor is measured through. `lm_head` is deliberately all zeros:
+/// the measurement reads `final_norm_out`, and a live head would only add its own reduction
+/// order to the thing being measured.
+fn reassoc_head_weights(cfg: &V4Config) -> HeadTailW {
+    let (dim, hcd) = (cfg.dim, cfg.hc_dim());
+    let mut w = NamedRng::new("reassoc-floor-weights");
+    HeadTailW {
+        hc_head_fn: (0..cfg.hc_mult * hcd).map(|_| w.unit() * 0.05).collect(),
+        hc_head_base: (0..cfg.hc_mult).map(|_| w.unit()).collect(),
+        hc_head_scale: vec![1.0 + w.unit() * 0.5],
+        norm: (0..dim).map(|_| bf16_round(1.0 + w.unit() * 0.3)).collect(),
+        lm_head: WMat::Dense {
+            rows: cfg.vocab_size,
+            cols: dim,
+            v: vec![0.0; cfg.vocab_size * dim],
+        },
+    }
+}
+
+/// Both quantities vary a lot per draw, so a single sample decides nothing -- the first
+/// version of this test drew once, found signal above noise, and would have reported the
+/// opposite conclusion. What a gate needs is a THRESHOLD, so the question is whether the two
+/// RANGES overlap: worst-case noise against best-case signal.
+fn measure_reassociation_floor(cfg: &V4Config, hw: &HeadTailW) -> Floor {
+    let (dim, hcd) = (cfg.dim, cfg.hc_dim());
+    let mut f = Floor {
+        noise_max: 0.0,
+        percopy_min: f32::INFINITY,
+        norsqrt_min: f32::INFINITY,
+        flips: 0,
+    };
+    for draw in 0..24 {
+        let mut r = NamedRng::new(&format!("reassoc-floor-draw-{draw}"));
+        let h: Vec<f32> = (0..hcd).map(|_| bf16_round(r.unit())).collect();
+        let head = |d: Defect| {
+            let mut cap = Capture::default();
+            Oracle::new(cfg.clone(), d).head_tail(hw, &h, 1, "floor", &mut cap);
+            cap.float("head.floor.final_norm_out")
+                .expect("final_norm_out")
+                .to_vec()
+        };
+        let truth = head(Defect::None);
+        let percopy = rel_diff(&head(Defect::HeadHcRsqrtPerCopy), &truth);
+        f.percopy_min = f.percopy_min.min(percopy);
+        f.norsqrt_min = f
+            .norsqrt_min
+            .min(rel_diff(&head(Defect::HeadHcNoRsqrt), &truth));
+
+        // NOISE: the same final RMSNorm, its 4096-term variance reduced by `wave_sum` instead
+        // of sequentially. Both correct; only the order differs.
+        let row: Vec<f32> = (0..dim).map(|_| bf16_round(r.unit())).collect();
+        let sq: Vec<f32> = row.iter().map(|v| v * v).collect();
+        let norm_with = |var: f32| -> Vec<f32> {
+            let rs = (var / dim as f32 + cfg.norm_eps).sqrt().recip();
+            (0..dim)
+                .map(|i| bf16_round(hw.norm[i] * (row[i] * rs)))
+                .collect()
+        };
+        let (sequential, waved) = (norm_with(sq.iter().sum::<f32>()), norm_with(wave_sum(&sq)));
+        f.flips += waved
+            .iter()
+            .zip(&sequential)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        f.noise_max = f.noise_max.max(rel_diff(&waved, &sequential));
+    }
+    f
 }
 
 #[test]
@@ -1575,69 +1815,23 @@ fn the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have() {
         vocab_size: 16,
         ..V4Config::toy()
     };
-    let hcd = cfg.hc_dim();
-    let mut w = NamedRng::new("reassoc-floor-weights");
-    let hw = HeadTailW {
-        hc_head_fn: (0..cfg.hc_mult * hcd).map(|_| w.unit() * 0.05).collect(),
-        hc_head_base: (0..cfg.hc_mult).map(|_| w.unit()).collect(),
-        hc_head_scale: vec![1.0 + w.unit() * 0.5],
-        norm: (0..dim)
-            .map(|_| bf16_decode(bf16_encode(1.0 + w.unit() * 0.3)))
-            .collect(),
-        lm_head: WMat::Dense {
-            rows: cfg.vocab_size,
-            cols: dim,
-            v: vec![0.0; cfg.vocab_size * dim],
-        },
-    };
-    let bf = |x: f32| bf16_decode(bf16_encode(x));
-
-    // Both quantities vary a lot per draw, so a single sample decides nothing -- the first
-    // version of this test drew once, found signal above noise, and would have reported the
-    // opposite conclusion. What a gate needs is a THRESHOLD, so the question is whether the
-    // two RANGES overlap: worst-case noise against best-case signal.
-    let (mut noise_max, mut percopy_min, mut norsqrt_min) = (0.0f32, f32::INFINITY, f32::INFINITY);
-    let mut flipped_total = 0usize;
-    for draw in 0..24 {
-        let mut r = NamedRng::new(&format!("reassoc-floor-draw-{draw}"));
-        let h: Vec<f32> = (0..hcd).map(|_| bf(r.unit())).collect();
-        let run = |d: Defect| {
-            let mut cap = Capture::default();
-            Oracle::new(cfg.clone(), d).head_tail(&hw, &h, 1, "floor", &mut cap);
-            cap.float("head.floor.final_norm_out")
-                .expect("final_norm_out")
-                .to_vec()
-        };
-        let truth = run(Defect::None);
-        percopy_min = percopy_min.min(rel_diff(&run(Defect::HeadHcRsqrtPerCopy), &truth));
-        norsqrt_min = norsqrt_min.min(rel_diff(&run(Defect::HeadHcNoRsqrt), &truth));
-
-        // NOISE: the same final RMSNorm, its 4096-term variance reduced by `wave_sum` instead
-        // of sequentially. Both correct; only the order differs.
-        let row: Vec<f32> = (0..dim).map(|_| bf(r.unit())).collect();
-        let sq: Vec<f32> = row.iter().map(|v| v * v).collect();
-        let norm_with = |var: f32| -> Vec<f32> {
-            let rs = (var / dim as f32 + cfg.norm_eps).sqrt().recip();
-            (0..dim).map(|i| bf(hw.norm[i] * (row[i] * rs))).collect()
-        };
-        let (sequential, waved) = (norm_with(sq.iter().sum::<f32>()), norm_with(wave_sum(&sq)));
-        flipped_total += waved
-            .iter()
-            .zip(&sequential)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        noise_max = noise_max.max(rel_diff(&waved, &sequential));
-    }
+    let hw = reassoc_head_weights(&cfg);
+    let Floor {
+        noise_max,
+        percopy_min,
+        norsqrt_min,
+        flips,
+    } = measure_reassociation_floor(&cfg, &hw);
     println!(
-        "worst noise {noise_max:.3e} ({flipped_total} bf16 flips over 24 draws); \
+        "worst noise {noise_max:.3e} ({flips} bf16 flips over 24 draws); \
          best-case signal: PerCopy {percopy_min:.3e}, NoRsqrt {norsqrt_min:.3e}"
     );
 
     // A correct kernel is NOT bit-identical to this oracle at real dimensions. If that ever
     // stopped being true a bitwise device gate would be back on the table, so it is asserted.
     assert!(
-        flipped_total > 0 && noise_max > 1e-4,
-        "wave and sequential reduction agreed at dim {dim} ({flipped_total} flips, rel \
+        flips > 0 && noise_max > 1e-4,
+        "wave and sequential reduction agreed at dim {dim} ({flips} flips, rel \
          {noise_max:.3e}) -- the re-association floor has vanished, which would change what a \
          device gate can do"
     );
@@ -1665,10 +1859,10 @@ fn the_reassociation_floor_bounds_any_tolerance_these_goldens_can_have() {
     );
 }
 
-/// Is every value in `v` exactly representable in bf16?
+/// Is every value in `v` exactly representable in bf16 — i.e. would a [`bf16_round`] store
+/// leave it alone?
 fn all_bf16(v: &[f32]) -> bool {
-    v.iter()
-        .all(|&x| bf16_decode(bf16_encode(x)).to_bits() == x.to_bits())
+    v.iter().all(|&x| bf16_round(x).to_bits() == x.to_bits())
 }
 
 #[test]
@@ -1682,10 +1876,8 @@ fn the_head_tail_matches_torch_absolutely() {
         all_bf16(t::H),
         "the residual stream must be bf16, as the reference stores it"
     );
-    assert!(
-        all_bf16(t::NORM_W) && all_bf16(t::LM_HEAD),
-        "norm/head weights are bf16 on disk"
-    );
+    let weights_bf16 = all_bf16(t::NORM_W) && all_bf16(t::LM_HEAD);
+    assert!(weights_bf16, "norm/head weights are bf16 on disk");
     assert!(
         !all_bf16(t::FN),
         "hc_head_fn is F32 on disk; a bf16 fixture would not exercise it"
@@ -1914,9 +2106,7 @@ fn expert_at_scale(defect: Defect, scale: f32) -> (Vec<f32>, usize) {
     let (cfg, m) = model();
     let o = Oracle::new(cfg.clone(), defect);
     let mut r = NamedRng::new("swiglu-probe");
-    let x: Vec<f32> = (0..cfg.dim)
-        .map(|_| bf16_decode(bf16_encode(r.unit() * scale)))
-        .collect();
+    let x: Vec<f32> = (0..cfg.dim).map(|_| bf16_round(r.unit() * scale)).collect();
     let mut counters = Default::default();
     let y = o.expert(&m.layers[0].experts[&0], &x, 1, None, &mut counters);
     (y, counters.swiglu_clamp_events)
@@ -2108,6 +2298,14 @@ fn sinkhorn_has_converged_long_before_iteration_20() {
 ///    section's own comment for why a vacuously-true predicate is the hazard).
 #[test]
 fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
+    assert_toy_cannot_select_the_fold();
+    assert_partition_is_exact_and_the_fold_is_live_at_real_dims();
+    assert_linear_reaches_the_fold_exactly_where_the_predicate_says();
+}
+
+/// Claim 1. Bit-identical to `None` on the toy, so the exclusion goes red the day a toy
+/// dimension grows past the predicate.
+fn assert_toy_cannot_select_the_fold() {
     let (cfg, m) = model();
     let ids = fixed_ids(cfg, "ids-pre", 5);
     let drive = |d: Defect| {
@@ -2120,27 +2318,34 @@ fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
         "the toy can see the split-k fold: the matrix-exclusion argument is dead and this \
          defect needs a real Expect row"
     );
+}
 
+/// The ascending serial dot the fold is scored against — the reference order, spelled once so
+/// both probes below are scored the same way.
+fn serial_dot(x: &[f32], w: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for (a, b) in x.iter().zip(w) {
+        acc += a * b;
+    }
+    acc
+}
+
+/// Claims 2 and 3, from ONE seed in ONE order because both probes draw off the same
+/// `NamedRng` and splitting them would re-base the second.
+fn assert_partition_is_exact_and_the_fold_is_live_at_real_dims() {
     let k = 4096;
     let mut r = NamedRng::new("splitk-fold-probe");
     let xi: Vec<f32> = (0..k).map(|_| (r.unit() * 9.0).round()).collect();
     let wi: Vec<f32> = (0..k).map(|_| (r.unit() * 9.0).round()).collect();
-    let serial = |x: &[f32], w: &[f32]| {
-        let mut acc = 0.0f32;
-        for (a, b) in x.iter().zip(w) {
-            acc += a * b;
-        }
-        acc
-    };
     assert_eq!(
         splitk_fold(&xi, &wi).to_bits(),
-        serial(&xi, &wi).to_bits(),
+        serial_dot(&xi, &wi).to_bits(),
         "integer probe: the split-k partition dropped or double-counted a column"
     );
 
     let x: Vec<f32> = (0..k).map(|_| r.unit() * 0.05).collect();
     let w: Vec<f32> = (0..k).map(|_| r.unit() * 0.05).collect();
-    let (s, p) = (serial(&x, &w), splitk_fold(&x, &w));
+    let (s, p) = (serial_dot(&x, &w), splitk_fold(&x, &w));
     assert_ne!(
         s.to_bits(),
         p.to_bits(),
@@ -2163,15 +2368,28 @@ fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
          this is not reassociation noise",
         (s - p).abs()
     );
+}
 
-    // 4. The WIRING — `linear` must actually reach the fold when `splitk_selects` says so.
-    //    Review 2026-08-08: the sections above bypass the predicate entirely (the toy
-    //    drive selects nothing by design; the probes call `splitk_fold` directly), so a
-    //    predicate typo that made it never-true would reproduce §M9's "all tensors
-    //    bit-identical" host measurement VACUOUSLY. `linear` returns UNROUNDED values, so
-    //    the raw fold delta (~59% of sums on real weights) is observable here even though
-    //    every golden downstream absorbs it in a bf16 store. wkv's [512x4096] is the
-    //    smallest captured shape; the negatives pin the m, k and format terms.
+/// An fp8 weight of `rows x cols` with one 2^0 scale per 128x128 tile.
+fn fp8_tiled(rows: usize, cols: usize, w: &[u8]) -> WMat {
+    WMat::Fp8 {
+        rows,
+        cols,
+        w: w.to_vec(),
+        s: vec![127u8; rows.div_ceil(128) * cols.div_ceil(128)],
+    }
+}
+
+/// Claim 4, the WIRING — `linear` must actually reach the fold when `splitk_selects` says so.
+///
+/// Review 2026-08-08: the claims above bypass the predicate entirely (the toy drive selects
+/// nothing by design; the probes call `splitk_fold` directly), so a predicate typo that made
+/// it never-true would reproduce §M9's "all tensors bit-identical" host measurement VACUOUSLY.
+/// `linear` returns UNROUNDED values, so the raw fold delta (~59% of sums on real weights) is
+/// observable here even though every golden downstream absorbs it in a bf16 store. wkv's
+/// [512x4096] is the smallest captured shape; the negatives pin the m, k and format terms.
+fn assert_linear_reaches_the_fold_exactly_where_the_predicate_says() {
+    let (cfg, _) = model();
     let (rows, kk) = (512usize, 4096usize);
     let mut rw = NamedRng::new("splitk-wiring");
     let wb: Vec<u8> = (0..rows * kk)
@@ -2185,14 +2403,7 @@ fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
             }
         })
         .collect();
-    // One 2^0 scale per 128x128 tile: 4 row-blocks x 32 column tiles.
-    let fp8 = |r: usize, c: usize, w: &[u8]| WMat::Fp8 {
-        rows: r,
-        cols: c,
-        w: w.to_vec(),
-        s: vec![127u8; r.div_ceil(128) * c.div_ceil(128)],
-    };
-    let wired = fp8(rows, kk, &wb);
+    let wired = fp8_tiled(rows, kk, &wb);
     let xw: Vec<f32> = (0..13 * kk).map(|_| rw.unit() * 0.05).collect();
     let out = |d: Defect, m: usize, w: &WMat, k: usize| {
         Oracle::new(cfg.clone(), d).linear(&xw[..m * k], m, k, w)
@@ -2208,14 +2419,21 @@ fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
         "the predicate no longer reaches the fold through `linear` at the wkv shape — \
          every downstream null host result is vacuous until this is red-to-green again"
     );
+    let dense = WMat::Dense {
+        rows,
+        cols: kk,
+        v: wb[..rows * kk].iter().map(|&b| b as f32 * 0.01).collect(),
+    };
     for (name, m, w, k) in [
         ("m = 13 (recorded-prompt prefill)", 13usize, &wired, kk),
         (
             "k = 2048 (below the k bound)",
             1,
-            &fp8(rows, 2048, &wb[..rows * 2048]),
+            &fp8_tiled(rows, 2048, &wb[..rows * 2048]),
             2048,
         ),
+        // The format term is what keeps the compressor/gate/wo_a out.
+        ("a Dense weight at a captured shape", 1, &dense, kk),
     ] {
         assert!(
             !differs(
@@ -2225,19 +2443,6 @@ fn the_splitk_fold_is_toy_blind_partition_exact_and_nonzero_at_real_dims() {
             "{name} must NOT select the split fold"
         );
     }
-    let dense = WMat::Dense {
-        rows,
-        cols: kk,
-        v: wb[..rows * kk].iter().map(|&b| b as f32 * 0.01).collect(),
-    };
-    assert!(
-        !differs(
-            out(Defect::None, 1, &dense, kk),
-            out(Defect::SplitKFoldOrder, 1, &dense, kk)
-        ),
-        "a Dense weight at a captured shape must NOT select the split fold — the format \
-         term is what keeps the compressor/gate/wo_a out"
-    );
 }
 
 #[test]

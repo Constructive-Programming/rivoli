@@ -198,41 +198,50 @@ fn the_captures_are_finite_and_alive() {
     }
 }
 
+/// Width alone would pass on garbage indices, so range is checked in the same pass.
+fn selection_is_topk_wide_and_addresses_real_positions(g: &GoldenSet, v: &Vendored, c: &Value) {
+    let topk = num(c, "index_topk");
+    let prompt = ints(g, "prompt.ids").len();
+    // At the last prefill position the selection is exactly index_topk wide; on the
+    // first decode step the context is prompt+1 and still clamps to index_topk.
+    for l in 0..num(c, "num_hidden_layers") {
+        let sel = ints(g, &format!("t0.L{l}.topk_indices"));
+        assert_eq!(sel.len(), topk, "{}: t0.L{l} selection width", v.name);
+        // Every selected index addresses a real position.
+        assert!(
+            sel.iter().all(|&i| (i as usize) < prompt),
+            "{}: t0.L{l} selects out of range",
+            v.name
+        );
+    }
+}
+
+/// A shared layer that quietly re-selected would satisfy every width and range check
+/// above, so sharing needs its own equality.
+fn shared_layers_reuse_their_full_predecessors_selection(g: &GoldenSet, v: &Vendored) {
+    // Shared layers carry the SAME selection as their full predecessor at the last
+    // row — the cross-layer mechanism, visible in the ints.
+    let full: Vec<i64> = ints(g, "structure.indexer_is_full").to_vec();
+    for l in (1..full.len()).filter(|&l| full[l] == 0) {
+        let prev = ints(g, &format!("t0.L{}.topk_indices", l - 1));
+        let here = ints(g, &format!("t0.L{l}.topk_indices"));
+        assert_eq!(
+            prev,
+            here,
+            "{}: L{l} does not share L{}'s selection",
+            v.name,
+            l - 1
+        );
+    }
+}
+
 #[test]
 fn the_selection_shapes_say_dsa_happened() {
     for v in GOLDENS {
         let g = read(v);
         let c = cfg(&g);
-        let topk = num(&c, "index_topk");
-        let prompt = ints(&g, "prompt.ids").len();
-        // At the last prefill position the selection is exactly index_topk wide; on the
-        // first decode step the context is prompt+1 and still clamps to index_topk.
-        for l in 0..num(&c, "num_hidden_layers") {
-            let sel = ints(&g, &format!("t0.L{l}.topk_indices"));
-            assert_eq!(sel.len(), topk, "{}: t0.L{l} selection width", v.name);
-            // Every selected index addresses a real position.
-            assert!(
-                sel.iter().all(|&i| (i as usize) < prompt),
-                "{}: t0.L{l} selects out of range",
-                v.name
-            );
-        }
-        // Shared layers carry the SAME selection as their full predecessor at the last
-        // row — the cross-layer mechanism, visible in the ints.
-        let full: Vec<i64> = ints(&g, "structure.indexer_is_full").to_vec();
-        for l in 1..full.len() {
-            if full[l] == 0 {
-                let prev = ints(&g, &format!("t0.L{}.topk_indices", l - 1));
-                let here = ints(&g, &format!("t0.L{l}.topk_indices"));
-                assert_eq!(
-                    prev,
-                    here,
-                    "{}: L{l} does not share L{}'s selection",
-                    v.name,
-                    l - 1
-                );
-            }
-        }
+        selection_is_topk_wide_and_addresses_real_positions(&g, v, &c);
+        shared_layers_reuse_their_full_predecessors_selection(&g, v);
     }
 }
 

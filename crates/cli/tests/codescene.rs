@@ -132,17 +132,135 @@ fn cs_version() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-#[test]
-fn every_workspace_rust_file_scores_ten() {
-    let root = common::repo_root();
+/// The score cache: repo-relative path → content hash that last scored green.
+type Cache = serde_json::Map<String, serde_json::Value>;
+
+fn load_cache(cache_file: &Path, version: &str) -> Cache {
+    let mut cache: Cache = std::fs::read_to_string(cache_file)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    // A cs upgrade invalidates every entry: the score is a function of (file, reviewer).
+    if cache.get("__cs_version__").and_then(|v| v.as_str()) != Some(version) {
+        cache.clear();
+        cache.insert("__cs_version__".into(), version.into());
+    }
+    cache
+}
+
+/// Best-effort: a cache that fails to land costs the next run its ~0.6–1 s/file, never a
+/// verdict, so no path here is allowed to fail the gate.
+fn save_cache(cache_file: &Path, cache: Cache) {
+    let _ = std::fs::create_dir_all(cache_file.parent().unwrap_or(Path::new(".")));
+    let _ = std::fs::write(
+        cache_file,
+        serde_json::to_string(&serde_json::Value::Object(cache)).unwrap_or_default(),
+    );
+}
+
+/// Repo-relative path: both the argument handed to `cs` and the cache key.
+fn rel_of(root: &Path, file: &Path) -> String {
+    file.strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// cs scores FUNCTIONS; a file with none (pure data: repr(C) mirrors, consts, module
+/// docs) legitimately scores null at any length — the first licensed run refused 79-line
+/// abi.rs on a line-count rule, which was the wrong classifier (2026-08-15). Vacuity is
+/// null WITH functions present: that means the reviewer skipped real code.
+fn assert_null_score_is_not_vacuity(rel: &str, body: &[u8]) {
+    let fns = String::from_utf8_lossy(body).matches("fn ").count();
+    assert!(
+        fns == 0,
+        "{rel}: cs found no scorable code but the file declares {fns} fn(s) — \
+         the reviewer is skipping real code, which is vacuity, not health"
+    );
+}
+
+/// One walked file's verdict, once the null-score and threshold rules are applied.
+enum Health {
+    /// 10/10, or a file cs found no functions in — cache these bytes as green.
+    Green,
+    /// Scored under the threshold; the string is the reported line.
+    Below(String),
+    /// cs did not review this file, so the sweep has no verdict and must stop.
+    NotRun(String),
+}
+
+fn health_of(root: &Path, rel: &str, body: &[u8]) -> Health {
+    match review(&[rel], None, root) {
+        Cs::Score(s) if s >= 10.0 => Health::Green,
+        Cs::Score(s) => Health::Below(format!("{rel}: score {s}")),
+        Cs::NoScorableCode => {
+            assert_null_score_is_not_vacuity(rel, body);
+            Health::Green
+        }
+        Cs::Absent(d) => Health::NotRun(d),
+    }
+}
+
+/// What one sweep of the walked set saw. `reviewed` is the anti-vacuity count — it is
+/// compared against the walked length, so a sweep that silently skipped files fails.
+struct Sweep {
+    reviewed: usize,
+    failures: Vec<String>,
+    /// `(file, detail)` of the first file cs declined to review; the sweep stops there
+    /// and the cache is NOT written, since the remaining files have no verdict.
+    not_run: Option<(String, String)>,
+}
+
+fn sweep(root: &Path, files: &[PathBuf], cache: &mut Cache) -> Sweep {
+    let mut seen = Sweep {
+        reviewed: 0,
+        failures: Vec::new(),
+        not_run: None,
+    };
+    for f in files {
+        let rel = rel_of(root, f);
+        let body = std::fs::read(f).expect("read a walked file");
+        let hash = format!("{:016x}", fnv1a(&body));
+        // cached green: same bytes, same reviewer, same verdict
+        let cached = cache.get(&rel).and_then(|v| v.as_str()) == Some(hash.as_str());
+        let verdict = if cached {
+            Health::Green
+        } else {
+            health_of(root, &rel, &body)
+        };
+        match verdict {
+            Health::Green => {
+                cache.insert(rel, hash.into());
+            }
+            Health::Below(line) => seen.failures.push(line),
+            Health::NotRun(d) => {
+                seen.not_run = Some((rel, d));
+                return seen;
+            }
+        }
+        seen.reviewed += 1;
+    }
+    seen
+}
+
+/// The walked set, sorted. Anti-vacuity: the reviewed set is the walked set, so a walk
+/// that found almost nothing means the gate is aimed at the wrong tree — not that the
+/// tree is healthy.
+fn walked_rust_files(root: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = common::walk(&root.join("crates"), "rs");
     files.sort();
-    // Anti-vacuity: the reviewed set is the walked set, and the walk found the workspace.
     assert!(
         files.len() >= 6,
         "walked only {} .rs files under crates/ — wrong tree",
         files.len()
     );
+    files
+}
+
+#[test]
+fn every_workspace_rust_file_scores_ten() {
+    let root = common::repo_root();
+    let files = walked_rust_files(&root);
 
     let Some(version) = cs_version() else {
         tool_absent("cs version", "binary not on PATH or not executable");
@@ -150,66 +268,15 @@ fn every_workspace_rust_file_scores_ten() {
     };
 
     let cache_file = cache_path();
-    let mut cache: serde_json::Map<String, serde_json::Value> =
-        std::fs::read_to_string(&cache_file)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-    // A cs upgrade invalidates every entry: the score is a function of (file, reviewer).
-    if cache.get("__cs_version__").and_then(|v| v.as_str()) != Some(version.as_str()) {
-        cache.clear();
-        cache.insert("__cs_version__".into(), version.clone().into());
+    let mut cache = load_cache(&cache_file, &version);
+    let seen = sweep(&root, &files, &mut cache);
+    if let Some((rel, detail)) = seen.not_run {
+        tool_absent(&rel, &detail);
+        return;
     }
+    save_cache(&cache_file, cache);
 
-    let mut reviewed = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-    for f in &files {
-        let rel = f
-            .strip_prefix(&root)
-            .unwrap_or(f)
-            .to_string_lossy()
-            .to_string();
-        let body = std::fs::read(f).expect("read a walked file");
-        let hash = format!("{:016x}", fnv1a(&body));
-        if cache.get(&rel).and_then(|v| v.as_str()) == Some(hash.as_str()) {
-            reviewed += 1; // cached green: same bytes, same reviewer, same verdict
-            continue;
-        }
-        match review(&[&rel], None, &root) {
-            Cs::Score(s) if s >= 10.0 => {
-                reviewed += 1;
-                cache.insert(rel, hash.into());
-            }
-            Cs::Score(s) => {
-                reviewed += 1;
-                failures.push(format!("{rel}: score {s}"));
-            }
-            Cs::NoScorableCode => {
-                // cs scores FUNCTIONS; a file with none (pure data: repr(C) mirrors,
-                // consts, module docs) legitimately scores null at any length — the
-                // first licensed run refused 79-line abi.rs on a line-count rule, which
-                // was the wrong classifier (2026-08-15). Vacuity is null WITH functions
-                // present: that means the reviewer skipped real code.
-                let fns = String::from_utf8_lossy(&body).matches("fn ").count();
-                assert!(
-                    fns == 0,
-                    "{rel}: cs found no scorable code but the file declares {fns} fn(s) — \
-                     the reviewer is skipping real code, which is vacuity, not health"
-                );
-                reviewed += 1;
-                cache.insert(rel, hash.into());
-            }
-            Cs::Absent(d) => {
-                tool_absent(&rel, &d);
-                return;
-            }
-        }
-    }
-    let _ = std::fs::create_dir_all(cache_file.parent().unwrap_or(Path::new(".")));
-    let _ = std::fs::write(
-        &cache_file,
-        serde_json::to_string(&serde_json::Value::Object(cache)).unwrap_or_default(),
-    );
+    let reviewed = seen.reviewed;
     assert_eq!(
         reviewed,
         files.len(),
@@ -217,11 +284,11 @@ fn every_workspace_rust_file_scores_ten() {
         files.len()
     );
     assert!(
-        failures.is_empty(),
+        seen.failures.is_empty(),
         "files below 10/10 code health:\n  {}\n\nFix the code. If the code is right and \
          the rule is wrong, add an EXEMPT row with the argument — it is checked at both \
          ends and dies when stale.",
-        failures.join("\n  ")
+        seen.failures.join("\n  ")
     );
 }
 

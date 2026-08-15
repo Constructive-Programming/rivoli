@@ -9,77 +9,102 @@
 use std::path::Path;
 use std::process::Command;
 
-fn main() {
-    if std::env::var("CARGO_FEATURE_ROCM").is_err() {
-        return; // CPU-only build: no HIP toolchain required.
+/// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
+/// here is compiled, archived and rerun-tracked by the same pass.
+const KERNELS: [&str; 11] = [
+    "linalg",
+    "moe",
+    "mla",
+    "attn",
+    "fwd",
+    "vmm",
+    "indexer",
+    "async",
+    "kvcompress",
+    "blockindex",
+    "headtail",
+];
+
+/// Named once because it is BOTH a rerun trigger and a staleness input — the two must
+/// never drift apart, or an edited header rebuilds nothing.
+const COMMON_HEADER: &str = "kernels/common.hpp";
+
+/// True when `out` is missing or older than any of `deps` — the mtime comparison cargo
+/// does for its own targets, which build scripts do not get for free. Missing metadata
+/// means REBUILD: an unreadable timestamp is not evidence the output is current.
+fn stale(out: &str, deps: &[&str]) -> bool {
+    let Ok(t) = std::fs::metadata(out).and_then(|m| m.modified()) else {
+        return true;
+    };
+    deps.iter().any(|d| {
+        std::fs::metadata(d)
+            .and_then(|m| m.modified())
+            .map(|s| s > t)
+            .unwrap_or(true)
+    })
+}
+
+/// The four settings every kernel compile shares, resolved once — they co-vary (the arch
+/// reaches both the flag and the object name), so they travel as one value.
+struct Toolchain {
+    out_dir: String,
+    hipcc: String,
+    arch: String,
+    /// Derived from `arch`, hoisted so the loop does not re-format it per kernel.
+    offload: String,
+}
+
+impl Toolchain {
+    fn from_env() -> Self {
+        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+        let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
+        // ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes with
+        // RIVOLI_OFFLOAD_ARCH. (An env var — the build-script carve-out argument from the old
+        // tree applies verbatim: cargo already configures this script through the
+        // environment, and rerun-if-env-changed puts the toggle inside cargo's fingerprint.)
+        println!("cargo:rerun-if-env-changed=RIVOLI_OFFLOAD_ARCH");
+        println!("cargo:rerun-if-env-changed=HIPCC");
+        let arch = std::env::var("RIVOLI_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1151".into());
+        let offload = format!("--offload-arch={arch}");
+        Self {
+            out_dir,
+            hipcc,
+            arch,
+            offload,
+        }
     }
 
-    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
-    // True when `out` is missing or older than any of `deps` — the mtime comparison cargo
-    // does for its own targets, which build scripts do not get for free. Missing metadata
-    // means REBUILD: an unreadable timestamp is not evidence the output is current.
-    fn stale(out: &str, deps: &[&str]) -> bool {
-        let Ok(t) = std::fs::metadata(out).and_then(|m| m.modified()) else {
-            return true;
-        };
-        deps.iter().any(|d| {
-            std::fs::metadata(d)
-                .and_then(|m| m.modified())
-                .map(|s| s > t)
-                .unwrap_or(true)
-        })
-    }
-    let kernels = [
-        "linalg",
-        "moe",
-        "mla",
-        "attn",
-        "fwd",
-        "vmm",
-        "indexer",
-        "async",
-        "kvcompress",
-        "blockindex",
-        "headtail",
-    ];
-    let hipcc = std::env::var("HIPCC").unwrap_or_else(|_| "hipcc".into());
-    // ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes with
-    // RIVOLI_OFFLOAD_ARCH. (An env var — the build-script carve-out argument from the old
-    // tree applies verbatim: cargo already configures this script through the
-    // environment, and rerun-if-env-changed puts the toggle inside cargo's fingerprint.)
-    println!("cargo:rerun-if-env-changed=RIVOLI_OFFLOAD_ARCH");
-    println!("cargo:rerun-if-env-changed=HIPCC");
-    let arch = std::env::var("RIVOLI_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1151".into());
-    let offload = format!("--offload-arch={arch}");
-
-    // Headers are #included, not compiled units — track them so an edit forces a rebuild.
-    println!("cargo:rerun-if-changed=kernels/common.hpp");
-    let mut objs = Vec::new();
-    for k in kernels {
-        let src = format!("kernels/{k}.hip");
+    /// Compile one kernel unless its object is already current, and return that object.
+    fn object(&self, kernel: &str) -> String {
+        let src = format!("kernels/{kernel}.hip");
         // The ARCH is part of the object's identity, not just its mtime: review 2026-08-15
         // found that switching RIVOLI_OFFLOAD_ARCH re-ran this script (rerun-if-env-changed)
         // but `stale()` then found every .o "fresh" and silently linked the OLD arch's
         // objects. Baking the arch into the filename makes a switched arch a cache MISS.
-        let obj = format!("{out_dir}/{k}.{arch}.o");
+        let obj = format!("{}/{kernel}.{}.o", self.out_dir, self.arch);
         println!("cargo:rerun-if-changed={src}");
         // SKIP an object that is newer than both its source and the shared header —
         // without this every re-run recompiled all the kernels through hipcc, seconds of
         // rebuild for a change that cannot affect a single one of them.
-        if !stale(&obj, &[&src, "kernels/common.hpp"]) {
-            objs.push(obj);
-            continue;
+        if stale(&obj, &[&src, COMMON_HEADER]) {
+            self.run_hipcc(&src, &obj);
         }
-        let mut cmd = Command::new(&hipcc);
-        cmd.args([&offload, "-O3", "-fPIC"]);
+        obj
+    }
+
+    fn run_hipcc(&self, src: &str, obj: &str) {
+        let mut cmd = Command::new(&self.hipcc);
+        cmd.args([&self.offload, "-O3", "-fPIC"]);
         let status = cmd
-            .args(["-c", &src, "-o", &obj])
+            .args(["-c", src, "-o", obj])
             .status()
             .expect("run hipcc");
         assert!(status.success(), "hipcc failed on {src}");
-        objs.push(obj);
     }
+}
 
+/// Bundle the objects into the one static library rustc is told to link.
+fn archive(out_dir: &str, objs: &[String]) {
     let lib = format!("{out_dir}/librivolikernels.a");
     // `ar crs` only adds/replaces members — it never prunes ones dropped from the list,
     // so a since-deleted kernel's stale .o lingers and duplicate-symbol-clashes. Start
@@ -87,18 +112,37 @@ fn main() {
     let _ = std::fs::remove_file(&lib);
     let mut ar = Command::new("ar");
     ar.arg("crs").arg(&lib);
-    for o in &objs {
+    for o in objs {
         ar.arg(o);
     }
     assert!(ar.status().expect("run ar").success(), "ar failed");
+}
 
+/// The HIP runtime ships in a different directory on every distro, so probe rather than
+/// hard-code one; the first hit wins and the rest are not searched.
+fn hip_runtime_dir() -> Option<&'static str> {
+    ["/usr/lib64", "/opt/rocm/lib", "/usr/lib"]
+        .into_iter()
+        .find(|dir| Path::new(dir).join("libamdhip64.so").exists())
+}
+
+fn emit_link_flags(out_dir: &str) {
     println!("cargo:rustc-link-search=native={out_dir}");
     println!("cargo:rustc-link-lib=static=rivolikernels");
-    for dir in ["/usr/lib64", "/opt/rocm/lib", "/usr/lib"] {
-        if Path::new(dir).join("libamdhip64.so").exists() {
-            println!("cargo:rustc-link-search=native={dir}");
-            break;
-        }
+    if let Some(dir) = hip_runtime_dir() {
+        println!("cargo:rustc-link-search=native={dir}");
     }
     println!("cargo:rustc-link-lib=dylib=amdhip64");
+}
+
+fn main() {
+    if std::env::var("CARGO_FEATURE_ROCM").is_err() {
+        return; // CPU-only build: no HIP toolchain required.
+    }
+    let tc = Toolchain::from_env();
+    // Headers are #included, not compiled units — track them so an edit forces a rebuild.
+    println!("cargo:rerun-if-changed={COMMON_HEADER}");
+    let objs: Vec<String> = KERNELS.iter().map(|k| tc.object(k)).collect();
+    archive(&tc.out_dir, &objs);
+    emit_link_flags(&tc.out_dir);
 }

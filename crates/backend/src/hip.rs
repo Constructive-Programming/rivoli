@@ -64,6 +64,26 @@ pub struct ExpertDescF4 {
     pub down_scale: *const u8,
 }
 
+/// The four device buffers the sparse indexer's scoring reads and writes — the pointer half
+/// of [`launch_index_score_blocks`], whose `# Safety` section remains the single home for
+/// their sizing and non-aliasing contract.
+///
+/// Grouped for [`ScoreDims`]'s reason and on stronger evidence: `q`, `kv` and `w` are three
+/// `*const f32` in a row, so no type check can tell any of them from another, and a
+/// transposed pair still addresses real f32 — finite, plausible, wrong. Named fields move
+/// that mistake to the construction site, where it has a name.
+///
+/// NOT an ABI type, deliberately not `repr(C)`, and not in `abi.rs`: nothing here crosses
+/// the wall. The launcher destructures it back into four positional arguments before the
+/// call, so the C signature still reads 1:1 off the Rust one.
+#[derive(Clone, Copy)]
+pub struct ScoreBufs {
+    pub q: *const f32,
+    pub kv: *const f32,
+    pub w: *const f32,
+    pub score: *mut f32,
+}
+
 /// The `extern` type for one launcher argument: the `as`-cast target when the Rust side
 /// narrows at the call (`o_dim: usize as i32`), and the Rust type unchanged when it does not
 /// (`x: *const f32`). Exists only because `macro_rules!` cannot say "this one if present,
@@ -1465,11 +1485,13 @@ launchers! {
 // ONE launcher does not fit `launchers!` above, and the macro refuses what it cannot prove
 // mechanical rather than reshaping it.
 //
-//   `launch_index_score_blocks`  destructures `ScoreDims` into four i32s before the call, with
-//                              prose in place saying the struct exists to keep the four in the
-//                              right order. A positional 1:1 DSL cannot express one parameter
-//                              becoming four arguments, and the alternative — four bare `usize`
-//                              on the wrapper — deletes the thing the struct is for.
+//   `launch_index_score_blocks`  destructures `ScoreBufs` and `ScoreDims` into four pointers
+//                              and four i32s before the call, with prose in place saying each
+//                              struct exists to keep its own four in the right order. A
+//                              positional 1:1 DSL cannot express one parameter becoming four
+//                              arguments, and the alternative — four bare `usize` beside three
+//                              indistinguishable `*const f32` — deletes what the structs are
+//                              for.
 //
 // > **FIVE MORE WERE CONVERTED 2026-08-06, and how says more than what.** This list read six.
 // > `launch_attend` was never a real exception: the extern scanner terminated on `-> i32;`, and
@@ -1676,13 +1698,13 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 /// against them. All 4-byte aligned, device-resident, and outliving `stream`'s completion;
 /// `stream` is a live `hipStream_t`, or null for the default stream.
 pub unsafe fn launch_index_score_blocks(
-    q: *const f32,
-    kv: *const f32,
-    w: *const f32,
-    score: *mut f32,
+    bufs: ScoreBufs,
     dims: ScoreDims,
     stream: *mut c_void,
 ) -> Result<()> {
+    // Both groups are destructured here rather than field-accessed at the call, so the
+    // argument list below stays readable 1:1 against the C signature — the wall's point.
+    let ScoreBufs { q, kv, w, score } = bufs;
     // `dims`, not `d`: `d` means a head width everywhere else in this file, including in
     // `launch_act_quant_f4_rotated` directly above.
     //

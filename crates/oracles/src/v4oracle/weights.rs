@@ -209,42 +209,66 @@ impl V4Config {
             .with_context(|| format!("reading {}", json_path.display()))?;
         let j: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("parsing {}", json_path.display()))?;
+        // Every check appends to one `bad` and none of them returns early: a drifted config
+        // reports ALL of its divergences in one run, so a re-download is diagnosed once
+        // rather than one field per attempt.
         let mut bad = Vec::new();
-        {
-            let mut num =
-                |key: &str, mine: f64| match j.get(key).and_then(serde_json::Value::as_f64) {
-                    Some(theirs) if theirs == mine => {}
-                    Some(theirs) => bad.push(format!("{key}: oracle {mine} vs config {theirs}")),
-                    None => bad.push(format!("{key}: absent from config, oracle assumes {mine}")),
-                };
-            num("vocab_size", self.vocab_size as f64);
-            num("dim", self.dim as f64);
-            num("moe_inter_dim", self.moe_inter_dim as f64);
-            num("n_layers", self.n_layers as f64);
-            num("n_hash_layers", self.n_hash_layers as f64);
-            num("n_heads", self.n_heads as f64);
-            num("n_routed_experts", self.n_routed_experts as f64);
-            num("n_activated_experts", self.n_activated_experts as f64);
-            num("route_scale", self.route_scale as f64);
-            num("swiglu_limit", self.swiglu_limit as f64);
-            num("q_lora_rank", self.q_lora_rank as f64);
-            num("head_dim", self.head_dim as f64);
-            num("rope_head_dim", self.rope_head_dim as f64);
-            num("o_groups", self.o_groups as f64);
-            num("o_lora_rank", self.o_lora_rank as f64);
-            num("window_size", self.window_size as f64);
-            num("compress_rope_theta", self.compress_rope_theta as f64);
-            num("original_seq_len", self.original_seq_len as f64);
-            num("rope_theta", self.rope_theta as f64);
-            num("rope_factor", self.rope_factor as f64);
-            num("beta_fast", self.beta_fast as f64);
-            num("beta_slow", self.beta_slow as f64);
-            num("index_n_heads", self.index_n_heads as f64);
-            num("index_head_dim", self.index_head_dim as f64);
-            num("index_topk", self.index_topk as f64);
-            num("hc_mult", self.hc_mult as f64);
-            num("hc_sinkhorn_iters", self.hc_sinkhorn_iters as f64);
+        self.push_scalar_drift(&j, &mut bad);
+        Self::push_score_func_drift(&j, &mut bad);
+        self.push_compress_ratio_drift(&j, &mut bad);
+        if bad.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "V4Config::v4_flash() has drifted from {}:\n  {}",
+                json_path.display(),
+                bad.join("\n  ")
+            )
         }
+    }
+
+    /// The scalar half of [`V4Config::assert_matches_reference_json`]. Compared as `f64`
+    /// because that is what `serde_json` hands back for both the integer and the float
+    /// fields, and an exact `==` is right here: these are config literals on both sides,
+    /// not computed values.
+    fn push_scalar_drift(&self, j: &serde_json::Value, bad: &mut Vec<String>) {
+        let mut num = |key: &str, mine: f64| match j.get(key).and_then(serde_json::Value::as_f64) {
+            Some(theirs) if theirs == mine => {}
+            Some(theirs) => bad.push(format!("{key}: oracle {mine} vs config {theirs}")),
+            None => bad.push(format!("{key}: absent from config, oracle assumes {mine}")),
+        };
+        num("vocab_size", self.vocab_size as f64);
+        num("dim", self.dim as f64);
+        num("moe_inter_dim", self.moe_inter_dim as f64);
+        num("n_layers", self.n_layers as f64);
+        num("n_hash_layers", self.n_hash_layers as f64);
+        num("n_heads", self.n_heads as f64);
+        num("n_routed_experts", self.n_routed_experts as f64);
+        num("n_activated_experts", self.n_activated_experts as f64);
+        num("route_scale", self.route_scale as f64);
+        num("swiglu_limit", self.swiglu_limit as f64);
+        num("q_lora_rank", self.q_lora_rank as f64);
+        num("head_dim", self.head_dim as f64);
+        num("rope_head_dim", self.rope_head_dim as f64);
+        num("o_groups", self.o_groups as f64);
+        num("o_lora_rank", self.o_lora_rank as f64);
+        num("window_size", self.window_size as f64);
+        num("compress_rope_theta", self.compress_rope_theta as f64);
+        num("original_seq_len", self.original_seq_len as f64);
+        num("rope_theta", self.rope_theta as f64);
+        num("rope_factor", self.rope_factor as f64);
+        num("beta_fast", self.beta_fast as f64);
+        num("beta_slow", self.beta_slow as f64);
+        num("index_n_heads", self.index_n_heads as f64);
+        num("index_head_dim", self.index_head_dim as f64);
+        num("index_topk", self.index_topk as f64);
+        num("hc_mult", self.hc_mult as f64);
+        num("hc_sinkhorn_iters", self.hc_sinkhorn_iters as f64);
+    }
+
+    /// Not a scalar compare: the oracle implements the function, it does not read it, so the
+    /// only value that can pass is the one it was written against.
+    fn push_score_func_drift(j: &serde_json::Value, bad: &mut Vec<String>) {
         match j.get("score_func").and_then(serde_json::Value::as_str) {
             // The oracle implements exactly one scoring function. A checkpoint that asked
             // for another would make every routing golden wrong, silently.
@@ -253,6 +277,12 @@ impl V4Config {
                 "score_func: oracle implements sqrtsoftplus, config says {other:?}"
             )),
         }
+    }
+
+    /// The per-layer half: only the first `n_layers` entries are compared, because the
+    /// config's tail is padding the model never reaches (see [`V4Config::v4_flash`]), and a
+    /// short array is drift rather than a panic.
+    fn push_compress_ratio_drift(&self, j: &serde_json::Value, bad: &mut Vec<String>) {
         let theirs: Vec<usize> = j
             .get("compress_ratios")
             .and_then(serde_json::Value::as_array)
@@ -270,15 +300,6 @@ impl V4Config {
                 &self.compress_ratios[..self.n_layers.min(self.compress_ratios.len())],
                 theirs
             ));
-        }
-        if bad.is_empty() {
-            Ok(())
-        } else {
-            bail!(
-                "V4Config::v4_flash() has drifted from {}:\n  {}",
-                json_path.display(),
-                bad.join("\n  ")
-            )
         }
     }
 }

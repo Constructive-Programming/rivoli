@@ -71,21 +71,43 @@ pub fn e4m3_encode(x: f32) -> u8 {
     let bits = a.to_bits();
     let e = ((bits >> 23) & 0xff) as i32 - 127;
     if e < -6 {
-        // Subnormal: value = m * 2^-9, m in 1..=7 (m == 8 promotes to the smallest normal).
-        let scaled = a * 512.0;
-        let mut m = scaled.floor();
-        let rem = scaled - m;
-        if rem > 0.5 || (rem == 0.5 && (m as u32 & 1) != 0) {
-            m += 1.0;
-        }
-        let m = m as u32;
-        return if m >= 8 { sign | 0x08 } else { sign | m as u8 };
+        return e4m3_encode_subnormal(a, sign);
     }
+    e4m3_encode_normal(bits, e, sign)
+}
+
+/// The round-to-nearest-EVEN decision itself: past the halfway point always rounds up, AT
+/// it only when the mantissa would otherwise be left odd. Named because the bare
+/// `>`/`==`/`&&` chain is precisely where a transcription slip hides — half-away-from-zero
+/// differs from this in exactly the `mant_is_odd == false` tie. Generic over the remainder
+/// so the subnormal arm keeps its f32 compare and the normal arm its u32 one; casting
+/// either to match the other would be a change of arithmetic, which this file does not make.
+fn rne_rounds_up<T: PartialOrd>(rem: T, half: T, mant_is_odd: bool) -> bool {
+    rem > half || (rem == half && mant_is_odd)
+}
+
+/// The `e < -6` arm of [`e4m3_encode`], lifted whole so the encoder above is just its
+/// special cases and this dispatch. Statement order is the reference's, untouched.
+fn e4m3_encode_subnormal(a: f32, sign: u8) -> u8 {
+    // Subnormal: value = m * 2^-9, m in 1..=7 (m == 8 promotes to the smallest normal).
+    let scaled = a * 512.0;
+    let mut m = scaled.floor();
+    let rem = scaled - m;
+    if rne_rounds_up(rem, 0.5, (m as u32 & 1) != 0) {
+        m += 1.0;
+    }
+    let m = m as u32;
+    if m >= 8 { sign | 0x08 } else { sign | m as u8 }
+}
+
+/// The normal-range arm of [`e4m3_encode`], lifted whole: RNE on the 3-bit mantissa, the
+/// carry it can push into the exponent, then saturation. Order is the reference's.
+fn e4m3_encode_normal(bits: u32, e: i32, sign: u8) -> u8 {
     let mant = bits & 0x007f_ffff;
     let mut m3 = mant >> 20;
     let rem = mant & 0x000f_ffff;
     let half_ulp = 0x0008_0000;
-    if rem > half_ulp || (rem == half_ulp && (m3 & 1) != 0) {
+    if rne_rounds_up(rem, half_ulp, (m3 & 1) != 0) {
         m3 += 1;
     }
     let mut exp = e + 7;
@@ -189,6 +211,17 @@ pub const FP8_MAX: f32 = 448.0;
 /// FP4_MAX from `fp4_quant_kernel`.
 pub const FP4_MAX: f32 = 6.0;
 
+/// Everything by which one block-quant kernel differs from another. A struct rather than a
+/// parameter list because the five always travel together — the list itself was the whole
+/// difference between `act_quant` and `fp4_quant`.
+struct BlockQuant {
+    block: usize,
+    amax_floor: f32,
+    max: f32,
+    round_scale: bool,
+    roundtrip: fn(f32) -> f32,
+}
+
 /// The shape both `act_quant` and `fp4_quant` have: per block along the last dimension,
 /// take `amax`, floor it, derive a scale, then round-trip every element through the target
 /// format at that scale and write it back.
@@ -196,26 +229,19 @@ pub const FP4_MAX: f32 = 6.0;
 /// Factored rather than written twice because the two kernels differ ONLY in their four
 /// constants and their codec — and a copy would let one drift from the other, which for a
 /// quantization simulator is a silent-wrong of exactly the kind this file exists to catch.
-fn simulate_block_quant(
-    row: &mut [f32],
-    block: usize,
-    amax_floor: f32,
-    max: f32,
-    round_scale: bool,
-    roundtrip: fn(f32) -> f32,
-) {
-    for chunk in row.chunks_mut(block) {
+fn simulate_block_quant(row: &mut [f32], spec: &BlockQuant) {
+    for chunk in row.chunks_mut(spec.block) {
         let amax = chunk
             .iter()
             .fold(0.0f32, |a, v| a.max(v.abs()))
-            .max(amax_floor);
-        let s = if round_scale {
-            fast_round_scale(amax, 1.0 / max)
+            .max(spec.amax_floor);
+        let s = if spec.round_scale {
+            fast_round_scale(amax, 1.0 / spec.max)
         } else {
-            amax / max
+            amax / spec.max
         };
         for v in chunk.iter_mut() {
-            *v = roundtrip((*v / s).clamp(-max, max)) * s;
+            *v = (spec.roundtrip)((*v / s).clamp(-spec.max, spec.max)) * s;
         }
     }
 }
@@ -231,9 +257,16 @@ fn simulate_block_quant(
 /// Blocks run along the LAST dimension; `row` is one flattened leading index, matching the
 /// kernel's `x.view(-1, N)`.
 pub fn act_quant_inplace(row: &mut [f32], block: usize, round_scale: bool) {
-    simulate_block_quant(row, block, 1e-4, FP8_MAX, round_scale, |q| {
-        e4m3_decode(e4m3_encode(q))
-    });
+    simulate_block_quant(
+        row,
+        &BlockQuant {
+            block,
+            amax_floor: 1e-4,
+            max: FP8_MAX,
+            round_scale,
+            roundtrip: |q| e4m3_decode(e4m3_encode(q)),
+        },
+    );
 }
 
 /// `kernel.py::fp4_act_quant(x, block_size, inplace=True)`. The scale is ALWAYS rounded —
@@ -241,11 +274,13 @@ pub fn act_quant_inplace(row: &mut [f32], block: usize, round_scale: bool) {
 pub fn fp4_act_quant_inplace(row: &mut [f32], block: usize) {
     simulate_block_quant(
         row,
-        block,
-        FP4_MAX * f32::from_bits(1u32 << 23),
-        FP4_MAX,
-        true,
-        |q| e2m1_decode(e2m1_encode(q)),
+        &BlockQuant {
+            block,
+            amax_floor: FP4_MAX * f32::from_bits(1u32 << 23),
+            max: FP4_MAX,
+            round_scale: true,
+            roundtrip: |q| e2m1_decode(e2m1_encode(q)),
+        },
     );
 }
 
@@ -278,21 +313,29 @@ pub fn hadamard_rotate(row: &mut [f32]) {
     debug_assert!(n.is_power_of_two(), "Hadamard needs a power-of-two length");
     let mut h = 1usize;
     while h < n {
-        let mut i = 0;
-        while i < n {
-            for j in i..i + h {
-                let a = row[j];
-                let b = row[j + h];
-                row[j] = a + b;
-                row[j + h] = a - b;
-            }
-            i += h * 2;
-        }
+        hadamard_stage(row, h);
         h *= 2;
     }
     let scale = (n as f32).sqrt().recip();
     for v in row.iter_mut() {
         *v *= scale;
+    }
+}
+
+/// One butterfly stage of [`hadamard_rotate`] at stride `h`, lifted out so the transform
+/// above reads as stages-then-scale. Pair order and arithmetic are unchanged — and it is
+/// the ORDER that carries the Sylvester basis this function is pinned to.
+fn hadamard_stage(row: &mut [f32], h: usize) {
+    let n = row.len();
+    let mut i = 0;
+    while i < n {
+        for j in i..i + h {
+            let a = row[j];
+            let b = row[j + h];
+            row[j] = a + b;
+            row[j + h] = a - b;
+        }
+        i += h * 2;
     }
 }
 

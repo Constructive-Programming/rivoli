@@ -300,6 +300,31 @@ fn the_head_tail_matches_the_oracle_at_toy_dimensions() {
     );
 }
 
+/// One `(token, d)` element of the blend: the `hc_mult` copies summed SEQUENTIALLY, then
+/// bf16-rounded exactly where the kernel rounds. `fma` picks the contraction form, because
+/// which one hipcc emitted is what the caller is measuring.
+fn blend_copies(copies: impl Iterator<Item = (f32, f32)>, fma: bool) -> f32 {
+    let mut acc = 0.0f32;
+    for (p, x) in copies {
+        acc = if fma { p.mul_add(x, acc) } else { acc + p * x };
+    }
+    bf(acc)
+}
+
+/// The blend half of `hc_head_collapse` on the host, over a caller-supplied gate vector so the
+/// gate's re-association never enters the comparison.
+fn blend_on_host(f: &Fixture, pre: &[f32], fma: bool) -> Vec<f32> {
+    let (dim, hc) = (f.cfg.dim, f.cfg.hc_mult);
+    let mut out = vec![0.0f32; f.s * dim];
+    for t in 0..f.s {
+        for d in 0..dim {
+            let copies = (0..hc).map(|c| (pre[t * hc + c], f.h[(t * hc + c) * dim + d]));
+            out[t * dim + d] = blend_copies(copies, fma);
+        }
+    }
+    out
+}
+
 #[test]
 fn the_blend_is_bit_exact_given_the_gate() {
     // The two halves of `hc_head` promise DIFFERENT things, and conflating them is how a gate
@@ -327,21 +352,10 @@ fn the_blend_is_bit_exact_given_the_gate() {
     // The blend alone, on the device's own gate vector, in the reference's order -- computed
     // BOTH ways, because whether hipcc contracts `acc += p * x` into an FMA decides which one
     // the kernel is actually doing and the build does not say.
-    let host = |fma: bool| -> Vec<f32> {
-        let mut out = vec![0.0f32; f.s * dim];
-        for t in 0..f.s {
-            for d in 0..dim {
-                let mut acc = 0.0f32;
-                for c in 0..hc {
-                    let (p, x) = (pre[t * hc + c], f.h[(t * hc + c) * dim + d]);
-                    acc = if fma { p.mul_add(x, acc) } else { acc + p * x };
-                }
-                out[t * dim + d] = bf(acc);
-            }
-        }
-        out
-    };
-    let (plain, fma) = (host(false), host(true));
+    let (plain, fma) = (
+        blend_on_host(&f, &pre, false),
+        blend_on_host(&f, &pre, true),
+    );
     let miss = |w: &[f32]| {
         // `zip` stops at the shorter side, so a truncated `got` would score ZERO mismatches
         // and pass as agreement. The oracle documents the same hazard for `RMSNorm`'s weight.

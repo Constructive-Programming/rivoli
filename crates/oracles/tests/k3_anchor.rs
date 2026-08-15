@@ -78,19 +78,36 @@ fn attn_field(c: &Value, key: &str) -> usize {
         .unwrap_or_else(|| panic!("linear_attn_config.{key} is not an integer")) as usize
 }
 
-/// One structural field: the driver must have asserted it, and it must equal the real config's.
-///
-/// Factored rather than written twice — the top-level and `linear_attn_config` loops had identical
-/// bodies, and `build.rs`'s jscpd gate rejected them at 35 tokens. The duplication was there from
-/// the moment they were written; it only crossed the 15-token floor once `cargo fmt` broke each
-/// `assert!` across four lines, so the formatter is what made it VISIBLE, not what caused it. The
-/// fix is this function, never a reverted format or an exemption.
-fn check(declared: &[&str], scope: &str, key: &str, got: &Value, want: &Value) {
-    assert!(
-        declared.contains(&key),
-        "{key} is not in structural_asserted"
-    );
-    assert_eq!(got[key], want[key], "tiny config lost {scope}{key}");
+/// Everything a structural comparison holds fixed while the field name varies: the driver's own
+/// list of what it asserted, the two configs being compared, and the prefix a failure names them
+/// by. Grouped because all four travel together through both field loops — five bare parameters
+/// was the missing abstraction, not a formatting accident.
+struct Structural<'a> {
+    declared: &'a [&'a str],
+    scope: &'a str,
+    got: &'a Value,
+    want: &'a Value,
+}
+
+impl Structural<'_> {
+    /// One structural field: the driver must have asserted it, and it must equal the real config's.
+    ///
+    /// Factored rather than written twice — the top-level and `linear_attn_config` loops had
+    /// identical bodies, and `build.rs`'s jscpd gate rejected them at 35 tokens. The duplication was
+    /// there from the moment they were written; it only crossed the 15-token floor once `cargo fmt`
+    /// broke each `assert!` across four lines, so the formatter is what made it VISIBLE, not what
+    /// caused it. The fix is this function, never a reverted format or an exemption.
+    fn check(&self, key: &str) {
+        assert!(
+            self.declared.contains(&key),
+            "{key} is not in structural_asserted"
+        );
+        assert_eq!(
+            self.got[key], self.want[key],
+            "tiny config lost {}{key}",
+            self.scope
+        );
+    }
 }
 
 /// The provenance every consumer has to be able to read off the file, **by value**.
@@ -257,72 +274,87 @@ fn the_tiny_configs_kept_the_real_structure() {
             .expect("structural_asserted")
             .split(',')
             .collect();
-
-        // Every top-level structural field, compared against the REAL config rather than a literal
-        // — so this cannot drift from the checkpoint the way a transcribed number can.
-        for key in [
-            "num_hidden_layers",
-            "first_k_dense_replace",
-            "moe_layer_freq",
-            "attn_res_block_size",
-            "num_shared_experts",
-            "routed_scaling_factor",
-            "latent_moe_use_norm",
-            "moe_renormalize",
-            "moe_router_activation_func",
-            "activation_situ_beta",
-            "activation_situ_linear_beta",
-            "hidden_act",
-            "mla_use_nope",
-            "mla_use_output_gate",
-            "rms_norm_eps",
-            "use_grouped_topk",
-            "num_expert_group",
-            "topk_group",
-            "topk_method",
-        ] {
-            check(&declared, "", key, &c, real);
-        }
-        // And the three inside `linear_attn_config`, which the driver REBUILDS by a dict merge
-        // rather than inheriting whole — so their survival is the thing least guaranteed by
-        // construction. `gate_lower_bound` is also a KDA kernel kwarg, with its own defect run.
-        for key in [
-            "gate_lower_bound",
-            "short_conv_kernel_size",
-            "use_full_rank_gate",
-        ] {
-            check(
-                &declared,
-                "linear_attn_config.",
-                key,
-                &c["linear_attn_config"],
-                &real["linear_attn_config"],
-            );
-        }
-        // The layer partition itself, every entry of both lists, 1-based exactly as the checkpoint
-        // writes it. This is the field whose convention was documented INVERTED until G0 item 11
-        // read the code (`is_kda_layer` tests `layer_idx + 1`), so a golden that silently used the
-        // other reading would be a golden of a different model. It was pinned by a four-element
-        // substring prefix until review pointed out that a partition drifting in the MIDDLE passed.
-        for key in ["kda_layers", "full_attn_layers"] {
-            let got = c["linear_attn_config"][key].as_array().unwrap();
-            let want = real["linear_attn_config"][key].as_array().unwrap();
-            assert_eq!(got, want, "linear_attn_config.{key} must be the real list");
-        }
-        let kda = c["linear_attn_config"]["kda_layers"]
-            .as_array()
-            .unwrap()
-            .len();
-        let mla = c["linear_attn_config"]["full_attn_layers"]
-            .as_array()
-            .unwrap()
-            .len();
-        assert_eq!(
-            kda + mla,
-            field(&c, "num_hidden_layers"),
-            "the two lists must partition every layer ({kda} KDA + {mla} MLA)"
-        );
+        top_level_structure_survived(&c, real, &declared);
+        linear_attn_structure_survived(&c, real, &declared);
     }
+}
+
+/// Every top-level structural field, compared against the REAL config rather than a literal — so
+/// this cannot drift from the checkpoint the way a transcribed number can.
+fn top_level_structure_survived(c: &Value, real: &Value, declared: &[&str]) {
+    let top = Structural {
+        declared,
+        scope: "",
+        got: c,
+        want: real,
+    };
+    for key in [
+        "num_hidden_layers",
+        "first_k_dense_replace",
+        "moe_layer_freq",
+        "attn_res_block_size",
+        "num_shared_experts",
+        "routed_scaling_factor",
+        "latent_moe_use_norm",
+        "moe_renormalize",
+        "moe_router_activation_func",
+        "activation_situ_beta",
+        "activation_situ_linear_beta",
+        "hidden_act",
+        "mla_use_nope",
+        "mla_use_output_gate",
+        "rms_norm_eps",
+        "use_grouped_topk",
+        "num_expert_group",
+        "topk_group",
+        "topk_method",
+    ] {
+        top.check(key);
+    }
+}
+
+/// The `linear_attn_config` half, which the driver REBUILDS by a dict merge rather than inheriting
+/// whole — so its survival is the thing least guaranteed by construction. Separate from the
+/// top-level fields because the layer partition below is checked here too, and it is the same
+/// sub-object.
+fn linear_attn_structure_survived(c: &Value, real: &Value, declared: &[&str]) {
+    let attn = Structural {
+        declared,
+        scope: "linear_attn_config.",
+        got: &c["linear_attn_config"],
+        want: &real["linear_attn_config"],
+    };
+    // `gate_lower_bound` is also a KDA kernel kwarg, with its own defect run.
+    for key in [
+        "gate_lower_bound",
+        "short_conv_kernel_size",
+        "use_full_rank_gate",
+    ] {
+        attn.check(key);
+    }
+    // The layer partition itself, every entry of both lists, 1-based exactly as the checkpoint
+    // writes it. This is the field whose convention was documented INVERTED until G0 item 11
+    // read the code (`is_kda_layer` tests `layer_idx + 1`), so a golden that silently used the
+    // other reading would be a golden of a different model. It was pinned by a four-element
+    // substring prefix until review pointed out that a partition drifting in the MIDDLE passed.
+    for key in ["kda_layers", "full_attn_layers"] {
+        let got = c["linear_attn_config"][key].as_array().unwrap();
+        let want = real["linear_attn_config"][key].as_array().unwrap();
+        assert_eq!(got, want, "linear_attn_config.{key} must be the real list");
+    }
+    let kda = c["linear_attn_config"]["kda_layers"]
+        .as_array()
+        .unwrap()
+        .len();
+    let mla = c["linear_attn_config"]["full_attn_layers"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        kda + mla,
+        field(c, "num_hidden_layers"),
+        "the two lists must partition every layer ({kda} KDA + {mla} MLA)"
+    );
 }
 
 /// The operator fixtures S2's kernels will be scored against, named and shaped.
@@ -336,123 +368,130 @@ fn the_operator_fixtures_s2_needs_are_present() {
     for v in GOLDENS {
         let g = load(v);
         let c = cfg(&g);
-        let (hidden, latent) = (
-            field(&c, "hidden_size"),
-            field(&c, "routed_expert_hidden_size"),
-        );
-        let (nh, hd) = (attn_field(&c, "num_heads"), attn_field(&c, "head_dim"));
-
-        // KDA, on a layer the real map makes KDA (1-based 1). Decode goes through
-        // `fused_recurrent_kda`, and these inputs plus the state are the whole boundary of the one
-        // operator no document attests to: `A_log`, `dt_bias`, the qk l2-norm, the beta sigmoid and
-        // the gate lower bound all live INSIDE fla's kernel.
-        let kda = "model.layers.0.kda.fused_recurrent_kda";
-        assert_eq!(shape_of(&g, &format!("{kda}.in.q")), vec![1, 1, nh, hd]);
-        assert_eq!(shape_of(&g, &format!("{kda}.in.g")), vec![1, 1, nh, hd]);
-        assert_eq!(shape_of(&g, &format!("{kda}.in.beta")), vec![1, 1, nh]);
-        assert_eq!(shape_of(&g, &format!("{kda}.in.A_log")), vec![nh]);
-        assert_eq!(shape_of(&g, &format!("{kda}.in.dt_bias")), vec![nh * hd]);
-        // The state, in and out: the recurrence IS the decode path, and a kernel that produces the
-        // right `o` from the wrong state agrees for exactly one token. Square because
-        // `head_k_dim == head_dim` — in the tiny model and in the real one (128 == 128) — so the
-        // (K,V)-vs-(V,K) axis order is invisible to any shape assertion, which is why
-        // `--defect KdaStateLayout` exists.
-        let state = vec![1, nh, hd, hd];
-        assert_eq!(shape_of(&g, &format!("{kda}.in.initial_state")), state);
-        assert_eq!(shape_of(&g, &format!("{kda}.out.state")), state);
-
-        // MLA, on the first MLA layer (1-based 4). The KV latent path is `kv_lora_rank + rope`,
-        // which is NOT `q_head_dim` — the two were accidentally equal until the widths were fixed,
-        // and a port reading the latent width off `qk_nope_head_dim` produced a bit-identical
-        // fixture.
-        let mla = "model.layers.3.self_attn";
-        assert_eq!(
-            shape_of(&g, &format!("{mla}.kv_a_proj_with_mqa")),
-            vec![
-                1,
-                1,
-                field(&c, "kv_lora_rank") + field(&c, "qk_rope_head_dim")
-            ]
-        );
-        assert_eq!(
-            shape_of(&g, &format!("{mla}.g_proj")),
-            vec![
-                1,
-                1,
-                field(&c, "num_attention_heads") * field(&c, "v_head_dim")
-            ]
-        );
-        assert_eq!(shape_of(&g, mla), vec![1, 1, hidden]);
-
-        // The latent sandwich, and the norm that sits BETWEEN the weighted sum and the up projection
-        // — not after it, which is the ordering trap `--defect LatentNormAfterUp` prices.
-        let moe = "model.layers.1.block_sparse_moe";
-        assert_eq!(
-            shape_of(&g, &format!("{moe}.routed_expert_down_proj")),
-            vec![1, latent]
-        );
-        assert_eq!(
-            shape_of(&g, &format!("{moe}.routed_expert_norm")),
-            vec![1, latent]
-        );
-        assert_eq!(
-            shape_of(&g, &format!("{moe}.routed_expert_up_proj")),
-            vec![1, hidden]
-        );
-        // The shared expert's width, DERIVED — `num_shared_experts * moe_intermediate_size`, the
-        // `[hidden, 2*moe_inter]` coupling `validate` cannot see. This assertion was a literal and
-        // therefore worthless until the widths were fixed: `2 * moe_inter` and the latent width were
-        // both 64, so a port reading the shared expert's width off the latent passed it.
-        assert_eq!(
-            shape_of(&g, &format!("{moe}.shared_experts.gate_proj")),
-            vec![
-                1,
-                1,
-                field(&c, "num_shared_experts") * field(&c, "moe_intermediate_size")
-            ]
-        );
-
-        // AttnRes: twice per layer plus once model-level. Captured by wrapping the reference's free
-        // function, because `_apply_attn_res` reads `proj.weight` and `norm.weight` DIRECTLY and
-        // never calls either module — so forward hooks on them fired zero times and this operator,
-        // S2's FIRST, had no fixture at all until review 2026-08-11.
-        for tag in [
-            "model.layers.1.self_attention_res",
-            "model.layers.1.mlp_res",
-        ] {
-            assert_eq!(
-                shape_of(&g, &format!("{tag}.in.prefix_sum")),
-                vec![1, hidden]
-            );
-            assert_eq!(shape_of(&g, &format!("{tag}.out")), vec![1, hidden]);
-            let br = shape_of(&g, &format!("{tag}.in.block_residual"));
-            assert_eq!(
-                (br[0], br[2]),
-                (1, hidden),
-                "block residual is [tokens, blocks, hidden]"
-            );
-            // `== 1`, not `>= 1`. The layer-level fold at layer 1 mixes exactly the layer-0
-            // snapshot, and `>=` also accepted the model-level fold's 8-block stack — so the
-            // assertion could only have failed on an empty stack, which is not what it claimed to
-            // pin. The distinction is the whole point of capturing both folds separately.
-            assert_eq!(
-                br[1], 1,
-                "the layer-level fold at layer 1 mixes exactly the layer-0 snapshot, not a stack"
-            );
-        }
-        // The model-level fold, whose accumulated stack is one block per `attn_res_block_size`
-        // layers.
-        let br = shape_of(&g, "model.output_attn_res.in.block_residual");
-        assert_eq!(
-            br[1],
-            field(&c, "num_hidden_layers").div_ceil(field(&c, "attn_res_block_size")),
-            "one block residual per attn-res block"
-        );
-        assert_eq!(shape_of(&g, "model.output_attn_res.out"), vec![1, hidden]);
-
+        let hidden = field(&c, "hidden_size");
+        kda_fixtures_are_shaped(&g, &c);
+        mla_fixtures_are_shaped(&g, &c, hidden);
+        moe_fixtures_are_shaped(&g, &c, hidden);
+        attn_res_fixtures_are_shaped(&g, &c, hidden);
         assert_eq!(shape_of(&g, "model.norm"), vec![1, 1, hidden]);
         assert_eq!(shape_of(&g, "logits"), vec![1, 1, field(&c, "vocab_size")]);
     }
+}
+
+/// KDA, on a layer the real map makes KDA (1-based 1). Decode goes through `fused_recurrent_kda`,
+/// and these inputs plus the state are the whole boundary of the one operator no document attests
+/// to: `A_log`, `dt_bias`, the qk l2-norm, the beta sigmoid and the gate lower bound all live
+/// INSIDE fla's kernel.
+fn kda_fixtures_are_shaped(g: &GoldenSet, c: &Value) {
+    let (nh, hd) = (attn_field(c, "num_heads"), attn_field(c, "head_dim"));
+    let kda = "model.layers.0.kda.fused_recurrent_kda";
+    assert_eq!(shape_of(g, &format!("{kda}.in.q")), vec![1, 1, nh, hd]);
+    assert_eq!(shape_of(g, &format!("{kda}.in.g")), vec![1, 1, nh, hd]);
+    assert_eq!(shape_of(g, &format!("{kda}.in.beta")), vec![1, 1, nh]);
+    assert_eq!(shape_of(g, &format!("{kda}.in.A_log")), vec![nh]);
+    assert_eq!(shape_of(g, &format!("{kda}.in.dt_bias")), vec![nh * hd]);
+    // The state, in and out: the recurrence IS the decode path, and a kernel that produces the
+    // right `o` from the wrong state agrees for exactly one token. Square because
+    // `head_k_dim == head_dim` — in the tiny model and in the real one (128 == 128) — so the
+    // (K,V)-vs-(V,K) axis order is invisible to any shape assertion, which is why
+    // `--defect KdaStateLayout` exists.
+    let state = vec![1, nh, hd, hd];
+    assert_eq!(shape_of(g, &format!("{kda}.in.initial_state")), state);
+    assert_eq!(shape_of(g, &format!("{kda}.out.state")), state);
+}
+
+/// MLA, on the first MLA layer (1-based 4). The KV latent path is `kv_lora_rank + rope`, which is
+/// NOT `q_head_dim` — the two were accidentally equal until the widths were fixed, and a port
+/// reading the latent width off `qk_nope_head_dim` produced a bit-identical fixture.
+fn mla_fixtures_are_shaped(g: &GoldenSet, c: &Value, hidden: usize) {
+    let mla = "model.layers.3.self_attn";
+    assert_eq!(
+        shape_of(g, &format!("{mla}.kv_a_proj_with_mqa")),
+        vec![
+            1,
+            1,
+            field(c, "kv_lora_rank") + field(c, "qk_rope_head_dim")
+        ]
+    );
+    assert_eq!(
+        shape_of(g, &format!("{mla}.g_proj")),
+        vec![
+            1,
+            1,
+            field(c, "num_attention_heads") * field(c, "v_head_dim")
+        ]
+    );
+    assert_eq!(shape_of(g, mla), vec![1, 1, hidden]);
+}
+
+/// The latent sandwich, and the norm that sits BETWEEN the weighted sum and the up projection —
+/// not after it, which is the ordering trap `--defect LatentNormAfterUp` prices.
+fn moe_fixtures_are_shaped(g: &GoldenSet, c: &Value, hidden: usize) {
+    let latent = field(c, "routed_expert_hidden_size");
+    let moe = "model.layers.1.block_sparse_moe";
+    assert_eq!(
+        shape_of(g, &format!("{moe}.routed_expert_down_proj")),
+        vec![1, latent]
+    );
+    assert_eq!(
+        shape_of(g, &format!("{moe}.routed_expert_norm")),
+        vec![1, latent]
+    );
+    assert_eq!(
+        shape_of(g, &format!("{moe}.routed_expert_up_proj")),
+        vec![1, hidden]
+    );
+    // The shared expert's width, DERIVED — `num_shared_experts * moe_intermediate_size`, the
+    // `[hidden, 2*moe_inter]` coupling `validate` cannot see. This assertion was a literal and
+    // therefore worthless until the widths were fixed: `2 * moe_inter` and the latent width were
+    // both 64, so a port reading the shared expert's width off the latent passed it.
+    assert_eq!(
+        shape_of(g, &format!("{moe}.shared_experts.gate_proj")),
+        vec![
+            1,
+            1,
+            field(c, "num_shared_experts") * field(c, "moe_intermediate_size")
+        ]
+    );
+}
+
+/// AttnRes: twice per layer plus once model-level. Captured by wrapping the reference's free
+/// function, because `_apply_attn_res` reads `proj.weight` and `norm.weight` DIRECTLY and never
+/// calls either module — so forward hooks on them fired zero times and this operator, S2's FIRST,
+/// had no fixture at all until review 2026-08-11.
+fn attn_res_fixtures_are_shaped(g: &GoldenSet, c: &Value, hidden: usize) {
+    for tag in [
+        "model.layers.1.self_attention_res",
+        "model.layers.1.mlp_res",
+    ] {
+        assert_eq!(
+            shape_of(g, &format!("{tag}.in.prefix_sum")),
+            vec![1, hidden]
+        );
+        assert_eq!(shape_of(g, &format!("{tag}.out")), vec![1, hidden]);
+        let br = shape_of(g, &format!("{tag}.in.block_residual"));
+        assert_eq!(
+            (br[0], br[2]),
+            (1, hidden),
+            "block residual is [tokens, blocks, hidden]"
+        );
+        // `== 1`, not `>= 1`. The layer-level fold at layer 1 mixes exactly the layer-0
+        // snapshot, and `>=` also accepted the model-level fold's 8-block stack — so the
+        // assertion could only have failed on an empty stack, which is not what it claimed to
+        // pin. The distinction is the whole point of capturing both folds separately.
+        assert_eq!(
+            br[1], 1,
+            "the layer-level fold at layer 1 mixes exactly the layer-0 snapshot, not a stack"
+        );
+    }
+    // The model-level fold, whose accumulated stack is one block per `attn_res_block_size` layers.
+    let br = shape_of(g, "model.output_attn_res.in.block_residual");
+    assert_eq!(
+        br[1],
+        field(c, "num_hidden_layers").div_ceil(field(c, "attn_res_block_size")),
+        "one block residual per attn-res block"
+    );
+    assert_eq!(shape_of(g, "model.output_attn_res.out"), vec![1, hidden]);
 }
 
 /// The numbers are numbers, not noise — **and not degenerate**.
@@ -473,94 +512,104 @@ fn the_captured_values_are_on_their_declared_scales_and_not_degenerate() {
     for v in GOLDENS {
         let g = load(v);
         let c = cfg(&g);
-        let kda = "model.layers.0.kda.fused_recurrent_kda";
-        let (_, a_log) = float(&g, &format!("{kda}.in.A_log"));
-        assert!(
-            a_log.iter().all(|x| (0.0..=16f32.ln()).contains(x)),
-            "{}: A_log must be log(uniform(1,16)): {a_log:?}",
-            v.name
-        );
-        // The range alone accepts an ALL-ZEROS A_log, since log(1) = 0 is in it — and this test
-        // exists so that a golden of zeros cannot pass. `A_log` gates the decay per head, so a
-        // constant one makes every head decay identically and a kernel that ignored the term
-        // entirely would still match. Only the FNV pin caught that before. Measured draws span
-        // [1.41, 2.53] (salt-1) and [1.78, 2.60] (salt-2), so "not all equal" is far inside them.
-        assert!(
-            a_log.iter().any(|x| *x != a_log[0]),
-            "{}: A_log is constant at {} — every head would decay identically",
-            v.name,
-            a_log[0]
-        );
-        let (_, dt) = float(&g, &format!("{kda}.in.dt_bias"));
-        assert!(
-            dt.iter().all(|x| (-4.0..=1.0).contains(x)),
-            "{}: dt_bias out of its draw range",
-            v.name
-        );
-        // `beta` reaches the kernel PRE-sigmoid, so a draw far out in either tail would pin the
-        // delta-rule update at 0 or 1 and hide whatever the update does. +-8 is where
-        // `sigmoid` is within 4e-4 of its limits.
-        let (_, beta) = float(&g, &format!("{kda}.in.beta"));
-        assert!(
-            beta.iter().all(|x| x.abs() < 8.0),
-            "{}: a beta saturates the gate: {beta:?}",
-            v.name
-        );
-        let (_, logits) = float(&g, "logits");
-        assert!(
-            logits.iter().all(|x| x.is_finite()),
-            "{}: logits must be finite",
-            v.name
-        );
-        assert!(
-            logits.iter().any(|x| *x != logits[0]),
-            "{}: all {} logits are identical — the forward pass collapsed",
-            v.name,
-            logits.len()
-        );
-
-        // Routing, as ints: selection is exact-or-not, and `golden::diff` scores the int section
-        // that way. Distinctness is the real check — `[0, 0]` is a pair top-k cannot produce, and a
-        // bound of `0..num_experts` alone would accept it.
-        let (idx_shape, idx) = g
-            .ints
-            .iter()
-            .find(|(n, _, _)| n == "model.layers.1.block_sparse_moe.gate.0")
-            .map(|(_, s, x)| (s, x))
-            .expect("the router's top-k indices");
-        let (top_k, n_experts) = (field(&c, "num_experts_per_token"), field(&c, "num_experts"));
-        assert_eq!(idx_shape, &vec![1, top_k]);
-        assert!(
-            idx.iter().all(|&e| (e as usize) < n_experts),
-            "{}: expert id out of range: {idx:?}",
-            v.name
-        );
-        assert_eq!(
-            idx.iter().collect::<std::collections::BTreeSet<_>>().len(),
-            top_k,
-            "{}: top-{top_k} selected the same expert twice: {idx:?}",
-            v.name
-        );
-        // The gate WEIGHTS, which are what `--defect RouterBiasInWeight` moves and which nothing
-        // named before. Their sum pins the renormalisation AND `routed_scaling_factor`, read from
-        // the config rather than assumed to be 1.
-        let (_, w) = float(&g, "model.layers.1.block_sparse_moe.gate.1");
-        let scale = c["routed_scaling_factor"].as_f64().unwrap() as f32;
-        let sum: f32 = w.iter().sum();
-        assert!(
-            (sum - scale).abs() < 1e-5,
-            "{}: top-k weights sum to {sum}, not the renormalised {scale}",
-            v.name
-        );
-        // And no weight may vanish: an expert weighted at ~0 contributes nothing, so a bug in that
-        // expert's arithmetic would be invisible in this fixture. 5% of the largest is the floor.
-        let biggest = w.iter().fold(0f32, |m, x| m.max(*x));
-        assert!(
-            w.iter().all(|x| *x >= biggest * 0.05),
-            "{}: a routed weight is degenerate ({w:?}) — that expert's arithmetic is unscoreable",
-            v.name
-        );
+        kda_draws_are_on_scale(&g, v.name);
+        logits_are_finite_and_spread(&g, v.name);
+        routing_selected_distinct_experts(&g, &c, v.name);
+        gate_weights_are_renormalised_and_alive(&g, &c, v.name);
     }
+}
+
+/// The three KDA draws whose scale the recurrence depends on. Each range is the driver's
+/// `init_weights` docstring restated from the bytes; the non-degeneracy on top of it is what the
+/// second salt is for.
+fn kda_draws_are_on_scale(g: &GoldenSet, name: &str) {
+    let kda = "model.layers.0.kda.fused_recurrent_kda";
+    let (_, a_log) = float(g, &format!("{kda}.in.A_log"));
+    assert!(
+        a_log.iter().all(|x| (0.0..=16f32.ln()).contains(x)),
+        "{name}: A_log must be log(uniform(1,16)): {a_log:?}"
+    );
+    // The range alone accepts an ALL-ZEROS A_log, since log(1) = 0 is in it — and this test
+    // exists so that a golden of zeros cannot pass. `A_log` gates the decay per head, so a
+    // constant one makes every head decay identically and a kernel that ignored the term
+    // entirely would still match. Only the FNV pin caught that before. Measured draws span
+    // [1.41, 2.53] (salt-1) and [1.78, 2.60] (salt-2), so "not all equal" is far inside them.
+    assert!(
+        a_log.iter().any(|x| *x != a_log[0]),
+        "{name}: A_log is constant at {} — every head would decay identically",
+        a_log[0]
+    );
+    let (_, dt) = float(g, &format!("{kda}.in.dt_bias"));
+    assert!(
+        dt.iter().all(|x| (-4.0..=1.0).contains(x)),
+        "{name}: dt_bias out of its draw range"
+    );
+    // `beta` reaches the kernel PRE-sigmoid, so a draw far out in either tail would pin the
+    // delta-rule update at 0 or 1 and hide whatever the update does. +-8 is where
+    // `sigmoid` is within 4e-4 of its limits.
+    let (_, beta) = float(g, &format!("{kda}.in.beta"));
+    assert!(
+        beta.iter().all(|x| x.abs() < 8.0),
+        "{name}: a beta saturates the gate: {beta:?}"
+    );
+}
+
+/// The forward pass produced numbers and they are not one number: a collapsed head is the shape a
+/// golden of zeros takes at the far end of the model.
+fn logits_are_finite_and_spread(g: &GoldenSet, name: &str) {
+    let (_, logits) = float(g, "logits");
+    assert!(
+        logits.iter().all(|x| x.is_finite()),
+        "{name}: logits must be finite"
+    );
+    assert!(
+        logits.iter().any(|x| *x != logits[0]),
+        "{name}: all {} logits are identical — the forward pass collapsed",
+        logits.len()
+    );
+}
+
+/// Routing, as ints: selection is exact-or-not, and `golden::diff` scores the int section that way.
+/// Distinctness is the real check — `[0, 0]` is a pair top-k cannot produce, and a bound of
+/// `0..num_experts` alone would accept it.
+fn routing_selected_distinct_experts(g: &GoldenSet, c: &Value, name: &str) {
+    let (idx_shape, idx) = g
+        .ints
+        .iter()
+        .find(|(n, _, _)| n == "model.layers.1.block_sparse_moe.gate.0")
+        .map(|(_, s, x)| (s, x))
+        .expect("the router's top-k indices");
+    let (top_k, n_experts) = (field(c, "num_experts_per_token"), field(c, "num_experts"));
+    assert_eq!(idx_shape, &vec![1, top_k]);
+    assert!(
+        idx.iter().all(|&e| (e as usize) < n_experts),
+        "{name}: expert id out of range: {idx:?}"
+    );
+    assert_eq!(
+        idx.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        top_k,
+        "{name}: top-{top_k} selected the same expert twice: {idx:?}"
+    );
+}
+
+/// The gate WEIGHTS, which are what `--defect RouterBiasInWeight` moves and which nothing named
+/// before. Their sum pins the renormalisation AND `routed_scaling_factor`, read from the config
+/// rather than assumed to be 1.
+fn gate_weights_are_renormalised_and_alive(g: &GoldenSet, c: &Value, name: &str) {
+    let (_, w) = float(g, "model.layers.1.block_sparse_moe.gate.1");
+    let scale = c["routed_scaling_factor"].as_f64().unwrap() as f32;
+    let sum: f32 = w.iter().sum();
+    assert!(
+        (sum - scale).abs() < 1e-5,
+        "{name}: top-k weights sum to {sum}, not the renormalised {scale}"
+    );
+    // And no weight may vanish: an expert weighted at ~0 contributes nothing, so a bug in that
+    // expert's arithmetic would be invisible in this fixture. 5% of the largest is the floor.
+    let biggest = w.iter().fold(0f32, |m, x| m.max(*x));
+    assert!(
+        w.iter().all(|x| *x >= biggest * 0.05),
+        "{name}: a routed weight is degenerate ({w:?}) — that expert's arithmetic is unscoreable"
+    );
 }
 
 /// Every captured layer is present in every golden, and no others.

@@ -6,14 +6,18 @@
 
 use rivoli_core::num::{bf16_to_f32, e4m3_to_f32, f32_to_bf16};
 
+/// Raw bytes as little-endian `N`-byte words — the READ side of [`write_le_scales`], and
+/// the one place the byte→word convention lives. `chunks_exact` truncates a ragged tail,
+/// exactly as the writer does, so the two halves agree about a short buffer too.
+fn read_le<const N: usize>(bytes: &[u8]) -> impl Iterator<Item = [u8; N]> + '_ {
+    bytes.chunks_exact(N).filter_map(|c| c.try_into().ok())
+}
+
 /// Read an F32 tensor's raw little-endian bytes into a `Vec<f32>`. For O-length
 /// tensors only (norm weights, per-projection codebooks) — loaded once at startup.
 pub fn read_f32(bytes: &[u8]) -> Vec<f32> {
     debug_assert_eq!(bytes.len() % 4, 0, "F32 tensor length not a multiple of 4");
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    read_le(bytes).map(f32::from_le_bytes).collect()
 }
 
 /// The entry contract every `matvec_*` oracle below shares: one `y` per output row, one
@@ -62,6 +66,16 @@ pub struct RowScaledW<'a> {
     pub scale: &'a [f32],
 }
 
+/// The `weight_scale_inv` grid extent covering `dim` weights: `ceil` in BOTH axes, so one
+/// rule states the tile grid's rows and its columns. Sibling of [`vq_groups`]/[`i4_groups`]
+/// /[`f4_groups`] — every format states its scale-grid arithmetic exactly once, because the
+/// three readers of an fp8 grid had spelled this `div_ceil` separately and a disagreement
+/// between them moves every scale lookup without changing a single length.
+#[inline]
+fn fp8_blocks(dim: usize, block: usize) -> usize {
+    dim.div_ceil(block)
+}
+
 impl<'a> Fp8W<'a> {
     pub fn new(packed: &'a [u8], scale: &'a [f32], block: usize) -> Self {
         Fp8W {
@@ -69,6 +83,14 @@ impl<'a> Fp8W<'a> {
             scale,
             block,
         }
+    }
+
+    /// The scale governing element `[o, i]`. One spelling of the tile-grid index, shared by
+    /// the GEMV oracle and the dense dequant: a grid the two read differently is invisible
+    /// to every length and shape check downstream.
+    #[inline]
+    fn tile_scale(&self, sc_cols: usize, o: usize, i: usize) -> f32 {
+        self.scale[(o / self.block) * sc_cols + i / self.block]
     }
 }
 
@@ -99,17 +121,12 @@ fn matvec_bytes(y: &mut [f32], packed: &[u8], i_dim: usize, row_dot: impl Fn(usi
 /// against. `scale` is the F32 `weight_scale_inv`, one value per `block × block`
 /// tile: `w[o,i] = e4m3(packed[o·i_dim+i]) · scale[(o/block)·sc_cols + i/block]`.
 pub fn matvec_fp8(y: &mut [f32], x: &[f32], w: Fp8W<'_>, i_dim: usize) {
-    let Fp8W {
-        packed,
-        scale,
-        block,
-    } = w;
     debug_assert_eq!(x.len(), i_dim);
-    let sc_cols = i_dim.div_ceil(block);
-    matvec_bytes(y, packed, i_dim, |o, row| {
+    let sc_cols = fp8_blocks(i_dim, w.block);
+    matvec_bytes(y, w.packed, i_dim, |o, row| {
         let mut acc = 0.0f32;
         for (i, (&b, &xi)) in row.iter().zip(x).enumerate() {
-            acc += e4m3_to_f32(b) * scale[(o / block) * sc_cols + i / block] * xi;
+            acc += e4m3_to_f32(b) * w.tile_scale(sc_cols, o, i) * xi;
         }
         acc
     });
@@ -146,17 +163,25 @@ pub const VQ_INDEX_BITS: usize = 12;
 /// Weights per bf16 group scale (along the input dim).
 pub const VQ_GROUP: usize = 64;
 
+/// Subvectors per [`VQ_GROUP`] scale — the encoder's inner loop count, and the width of the
+/// index block one group produces.
+const VQ_SUBS: usize = VQ_GROUP / VQ_DIM;
+
+/// The `i`-th `VQ_DIM`-wide subvector of a flat `[n][VQ_DIM]` array. Codebook entry,
+/// k-means sample point and weight subvector are the SAME indexing rule — spelled once, so
+/// a stride mistake cannot survive in the encoder while the learner stays right (they are
+/// the two halves of one round trip, and a half-right stride still produces a legal file).
+#[inline]
+fn subvec(a: &[f32], i: usize) -> &[f32] {
+    &a[i * VQ_DIM..(i + 1) * VQ_DIM]
+}
+
 /// ‖c‖² per codebook entry — the argmin-VQ precompute, so nearest is
 /// `argmin(‖c‖² − 2·x·c)` (half the flops of the full squared distance, same
 /// argmin/tie-break). Shared by the CPU encoder and the GPU converter.
 pub fn codebook_norms(codebook: &[f32]) -> Vec<f32> {
     (0..VQ_K)
-        .map(|k| {
-            codebook[k * VQ_DIM..(k + 1) * VQ_DIM]
-                .iter()
-                .map(|&c| c * c)
-                .sum()
-        })
+        .map(|k| subvec(codebook, k).iter().map(|&c| c * c).sum())
         .collect()
 }
 
@@ -191,14 +216,17 @@ pub fn vq_row_bytes(i_dim: usize) -> usize {
 pub fn vq_decode_proj(p: &VqProj, codebook: &[f32]) -> Vec<f32> {
     let (o_dim, i_dim) = (p.o_dim, p.i_dim);
     let (rb, ng, nsub) = (vq_row_bytes(i_dim), vq_groups(i_dim), i_dim / VQ_DIM);
+    // Through `scales_u16` rather than re-spelling `u16::from_le_bytes` here: that spelling
+    // is a layout rule, and this used to be one of the copies its doc names. The extra
+    // `o_dim · ng` u16 is nothing beside the `o_dim · i_dim` f32 this function exists to
+    // build — the argument that keeps `scales_u16` off the decode path does not apply here.
+    let scales = p.scales_u16();
     let mut w = vec![0f32; o_dim * i_dim];
     for o in 0..o_dim {
         let ir = &p.indices[o * rb..(o + 1) * rb];
         for k in 0..nsub {
-            let g = (o * ng + (k * VQ_DIM) / VQ_GROUP) * 2;
-            let s = bf16_to_f32(u16::from_le_bytes([p.scales[g], p.scales[g + 1]]));
-            let c = &codebook[get_idx(ir, k) * VQ_DIM..][..VQ_DIM];
-            for (d, &cw) in c.iter().enumerate() {
+            let s = bf16_to_f32(scales[o * ng + (k * VQ_DIM) / VQ_GROUP]);
+            for (d, &cw) in subvec(codebook, get_idx(ir, k)).iter().enumerate() {
                 w[o * i_dim + k * VQ_DIM + d] = s * cw;
             }
         }
@@ -298,10 +326,25 @@ pub fn write_le_scales<const N: usize>(dst: &mut [u8], scales: impl Iterator<Ite
 /// quantize the shared expert's weights into a routed slot — producing a file of exactly
 /// the right size that every length check passes.
 pub fn expert_base(layer: usize, e: usize, n_experts: usize) -> String {
+    expert_slot_name(&format!("model.layers.{layer}.mlp"), e, n_experts)
+}
+
+/// `{trunk}.experts.{e}` — the ROUTED slot's name. All three checkpoints spell this half the
+/// same way; the trunk stays at each caller precisely because a shared constant is how one
+/// model's rename would retarget another model's converter, the argument [`K3_PROJ`] makes
+/// against sharing [`V4_PROJ`]'s strings.
+fn routed_expert_name(trunk: &str, e: usize) -> String {
+    format!("{trunk}.experts.{e}")
+}
+
+/// [`routed_expert_name`], or `{trunk}.shared_experts` past the routed count. The BOUNDARY,
+/// which is the half a copy gets wrong silently — and which is why K3 calls the routed half
+/// directly: it has no shared block past the routed ones to cross into.
+fn expert_slot_name(trunk: &str, e: usize, n_experts: usize) -> String {
     if e < n_experts {
-        format!("model.layers.{layer}.mlp.experts.{e}")
+        routed_expert_name(trunk, e)
     } else {
-        format!("model.layers.{layer}.mlp.shared_experts")
+        format!("{trunk}.shared_experts")
     }
 }
 
@@ -319,6 +362,14 @@ fn expert_bytes(expert_in: usize, moe_inter: usize, proj: fn(usize, usize) -> us
 /// block-aligned O_DIRECT read. Shared by all three routed formats.
 fn expert_stride(bytes: usize) -> usize {
     bytes.div_ceil(VQ_ALIGN) * VQ_ALIGN
+}
+
+/// Worker count for the two fan-outs in this module (expert packing, k-means assignment),
+/// with a fixed fallback. One owner so a box that cannot report its parallelism gets the
+/// same fan-out in both — and, for the k-means half, so the fallback cannot silently become
+/// a second number, which would change how the merge rounds and with it the shipped bytes.
+fn worker_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |t| t.get())
 }
 
 /// Fill `n` consecutive expert blocks of `stride` bytes in `buf`, in parallel, calling
@@ -349,8 +400,7 @@ pub(crate) fn fill_expert_blocks(
         "buffer {} < {n} blocks of {stride}",
         buf.len()
     );
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
-    let per = n.div_ceil(threads.max(1)).max(1);
+    let per = n.div_ceil(worker_threads().max(1)).max(1);
     let fill = &fill;
     std::thread::scope(|s| -> anyhow::Result<()> {
         let mut rest = &mut buf[..n * stride];
@@ -406,10 +456,7 @@ impl VqProj<'_> {
     /// was a copy of a layout rule that belongs here, and one of them lives in a binary
     /// that never sees a change to this format.
     pub fn scales_u16(&self) -> Vec<u16> {
-        self.scales
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect()
+        read_le(self.scales).map(u16::from_le_bytes).collect()
     }
 }
 
@@ -462,20 +509,14 @@ fn get_idx(row: &[u8], k: usize) -> usize {
 /// `_inv` name is historical — it is the dequant multiplier. Offline (converter)
 /// use only: this materializes `o_dim·i_dim` f32.
 pub fn dequant_fp8_block(w: Fp8W<'_>, shape: [usize; 2]) -> Vec<f32> {
-    let Fp8W {
-        packed,
-        scale,
-        block,
-    } = w;
     let [o_dim, i_dim] = shape;
-    debug_assert_eq!(packed.len(), o_dim * i_dim);
-    let sc_cols = i_dim.div_ceil(block);
-    debug_assert_eq!(scale.len(), o_dim.div_ceil(block) * sc_cols);
+    debug_assert_eq!(w.packed.len(), o_dim * i_dim);
+    let sc_cols = fp8_blocks(i_dim, w.block);
+    debug_assert_eq!(w.scale.len(), fp8_blocks(o_dim, w.block) * sc_cols);
     let mut out = vec![0.0f32; o_dim * i_dim];
     for o in 0..o_dim {
         for i in 0..i_dim {
-            let s = scale[(o / block) * sc_cols + i / block];
-            out[o * i_dim + i] = e4m3_to_f32(packed[o * i_dim + i]) * s;
+            out[o * i_dim + i] = e4m3_to_f32(w.packed[o * i_dim + i]) * w.tile_scale(sc_cols, o, i);
         }
     }
     out
@@ -523,46 +564,74 @@ pub fn quantize_fp8_block(
         "fp8 quantize: {} values for a {shape:?} matrix",
         w.len()
     );
-    let (sc_rows, sc_cols) = (o_dim.div_ceil(block), i_dim.div_ceil(block));
+    let sc_cols = fp8_blocks(i_dim, block);
     let mut packed = vec![0u8; o_dim * i_dim];
-    let mut scale = vec![0f32; sc_rows * sc_cols];
-    for ob in 0..sc_rows {
-        for ib in 0..sc_cols {
-            let os = ob * block..((ob + 1) * block).min(o_dim);
-            let is_ = ib * block..((ib + 1) * block).min(i_dim);
-            let s = block_amax_scale(w, i_dim, os.clone(), is_.clone())?;
-            scale[ob * sc_cols + ib] = s;
-            for o in os {
-                for i in is_.clone() {
-                    packed[o * i_dim + i] = rivoli_core::num::f32_to_e4m3(w[o * i_dim + i] / s);
-                }
-            }
-        }
+    let mut scale = vec![0f32; fp8_blocks(o_dim, block) * sc_cols];
+    // Row-major over the scale grid, so the tile a scale belongs to is `n` itself: the
+    // grid IS the loop, rather than a pair of counters the body has to re-multiply.
+    for (n, s) in scale.iter_mut().enumerate() {
+        *s = quantize_fp8_tile(
+            w,
+            &mut packed,
+            i_dim,
+            &Tile::new(n / sc_cols, n % sc_cols, block, shape),
+        )?;
     }
     Ok((packed, scale))
+}
+
+/// One `block × block` tile of a row-major matrix, as the two index ranges that name it —
+/// one value because the amax scan and the encode must cover exactly the same elements, and
+/// two loose ranges are two chances to clip one of them differently at a ragged edge.
+struct Tile {
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+}
+
+impl Tile {
+    /// Tile `(ob, ib)` of a `shape` matrix, clipped to the matrix at the ragged edges.
+    fn new(ob: usize, ib: usize, block: usize, shape: [usize; 2]) -> Self {
+        let [o_dim, i_dim] = shape;
+        Tile {
+            rows: ob * block..((ob + 1) * block).min(o_dim),
+            cols: ib * block..((ib + 1) * block).min(i_dim),
+        }
+    }
+
+    /// The tile's elements as flat row-major indices, so each pass over a tile is one loop
+    /// instead of a nested pair.
+    fn flat(&self, i_dim: usize) -> impl Iterator<Item = usize> + '_ {
+        self.rows
+            .clone()
+            .flat_map(move |o| self.cols.clone().map(move |i| o * i_dim + i))
+    }
+}
+
+/// Encode one tile at its own amax scale, returning that scale for the grid.
+fn quantize_fp8_tile(w: &[f32], packed: &mut [u8], i_dim: usize, t: &Tile) -> anyhow::Result<f32> {
+    let s = block_amax_scale(w, i_dim, t)?;
+    for n in t.flat(i_dim) {
+        packed[n] = rivoli_core::num::f32_to_e4m3(w[n] / s);
+    }
+    Ok(s)
 }
 
 /// One block's e4m3 scale: amax over the block divided by the format max, with the
 /// finiteness refusal (NaN would encode as a plausible 0x7f, ±inf saturates to ±448 —
 /// silent both ways, so the refusal happens here, before any byte is written).
-fn block_amax_scale(
-    w: &[f32],
-    i_dim: usize,
-    os: std::ops::Range<usize>,
-    is_: std::ops::Range<usize>,
-) -> anyhow::Result<f32> {
+fn block_amax_scale(w: &[f32], i_dim: usize, t: &Tile) -> anyhow::Result<f32> {
     use anyhow::ensure;
     let mut amax = 0f32;
-    for o in os {
-        for i in is_.clone() {
-            let v = w[o * i_dim + i];
-            ensure!(
-                v.is_finite(),
-                "weight [{o}, {i}] is {v}, which e4m3 would encode as a plausible \
-                 finite byte (NaN -> 0x7f, +-inf -> saturated +-448)"
-            );
-            amax = amax.max(v.abs());
-        }
+    for n in t.flat(i_dim) {
+        let v = w[n];
+        ensure!(
+            v.is_finite(),
+            "weight [{}, {}] is {v}, which e4m3 would encode as a plausible \
+             finite byte (NaN -> 0x7f, +-inf -> saturated +-448)",
+            n / i_dim,
+            n % i_dim
+        );
+        amax = amax.max(v.abs());
     }
     Ok(if amax == 0.0 {
         1.0
@@ -582,13 +651,95 @@ fn block_amax_scale(
 pub fn vq_refit(seg: &[f32], idxs: &[u16], codebook: &[f32]) -> Option<u16> {
     let (mut num, mut den) = (0.0f32, 0.0f32);
     for (t, chunk) in seg.chunks_exact(VQ_DIM).enumerate() {
-        let c = &codebook[idxs[t] as usize * VQ_DIM..][..VQ_DIM];
+        let c = subvec(codebook, idxs[t] as usize);
         for (d, &v) in chunk.iter().enumerate() {
             num += v * c[d];
             den += c[d] * c[d];
         }
     }
     (den > 0.0 && num > 0.0).then(|| f32_to_bf16(num / den))
+}
+
+/// A group's bf16 amax scale. ONE spelling, because it is both the encoder's starting scale
+/// and the normalizer [`sample_subvectors`] draws the codebook sample under: a sample
+/// normalized differently from the search fits the codebook in a space the encoder never
+/// visits, and nothing about the resulting file looks wrong.
+fn group_amax_bf16(grp: &[f32]) -> u16 {
+    let amax = grp.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    f32_to_bf16(if amax > 0.0 { amax } else { 1.0 })
+}
+
+/// A codebook and its ‖c‖² precompute as one value: the argmin reads both, and a norm table
+/// fitted to a different codebook still has the right length and still returns an index.
+struct VqEncoder<'a> {
+    codebook: &'a [f32],
+    norms: Vec<f32>,
+}
+
+impl<'a> VqEncoder<'a> {
+    fn new(codebook: &'a [f32]) -> Self {
+        VqEncoder {
+            norms: codebook_norms(codebook),
+            codebook,
+        }
+    }
+
+    /// Nearest entry to an already-normalized subvector — see [`codebook_norms`] for why
+    /// `argmin(‖c‖² − 2·x·c)` picks the same entry (and breaks ties the same way) as the
+    /// full squared distance.
+    fn nearest(&self, sub: &[f32; VQ_DIM]) -> u16 {
+        let mut best = (f32::INFINITY, 0u16);
+        for k in 0..VQ_K {
+            let dot: f32 = sub
+                .iter()
+                .zip(subvec(self.codebook, k))
+                .map(|(&a, &b)| a * b)
+                .sum();
+            let d = self.norms[k] - 2.0 * dot;
+            if d < best.0 {
+                best = (d, k as u16);
+            }
+        }
+        best.1
+    }
+
+    /// Assign every subvector of one group to its nearest entry, under `inv = 1/scale`.
+    fn assign(&self, seg: &[f32], inv: f32, idxs: &mut [u16; VQ_SUBS]) {
+        for (t, chunk) in seg.chunks_exact(VQ_DIM).enumerate() {
+            let mut sub = [0.0f32; VQ_DIM];
+            for (d, &v) in chunk.iter().enumerate() {
+                sub[d] = v * inv; // normalize into the codebook's scale
+            }
+            idxs[t] = self.nearest(&sub);
+        }
+    }
+
+    /// Per group: assign under the amax scale, refit in closed form, re-assign under the
+    /// refitted scale; a degenerate fit keeps the amax pass.
+    fn encode_group(&self, seg: &[f32]) -> (u16, [u16; VQ_SUBS]) {
+        let mut sb = group_amax_bf16(seg);
+        let mut idxs = [0u16; VQ_SUBS];
+        self.assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
+        if let Some(refit) = vq_refit(seg, &idxs, self.codebook)
+            && refit != sb
+        {
+            sb = refit;
+            self.assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
+        }
+        (sb, idxs)
+    }
+
+    /// One row of a projection: each `VQ_GROUP` of weights contributes one bf16 scale and
+    /// `VQ_SUBS` packed 12-bit indices, in order.
+    fn encode_row(&self, wr: &[f32], ir: &mut [u8], sr: &mut [u16]) {
+        for (grp, (seg, out)) in wr.chunks_exact(VQ_GROUP).zip(sr.iter_mut()).enumerate() {
+            let (sb, idxs) = self.encode_group(seg);
+            *out = sb;
+            for (t, &ix) in idxs.iter().enumerate() {
+                set_idx(ir, grp * VQ_SUBS + t, ix);
+            }
+        }
+    }
 }
 
 /// Quantize a row-major f32 weight matrix `W[o_dim, i_dim]` to VQ-int3 against a
@@ -603,63 +754,17 @@ pub fn vq_refit(seg: &[f32], idxs: &[u16], codebook: &[f32]) -> Option<u16> {
 /// reproduces the on-disk values exactly.
 pub fn quant_vq(w: &[f32], o_dim: usize, i_dim: usize, codebook: &[f32]) -> (Vec<u8>, Vec<u16>) {
     debug_assert_eq!(w.len(), o_dim * i_dim);
-    debug_assert_eq!(
-        i_dim % VQ_GROUP,
-        0,
-        "i_dim {i_dim} not a multiple of VQ_GROUP"
-    );
-    const SUBS: usize = VQ_GROUP / VQ_DIM; // subvectors per group
-    let ngroups = i_dim / VQ_GROUP;
-    let rb = vq_row_bytes(i_dim);
+    // `vq_groups` carries the "multiple of VQ_GROUP" assertion this used to restate.
+    let (rb, ngroups) = (vq_row_bytes(i_dim), vq_groups(i_dim));
     let mut indices = vec![0u8; o_dim * rb];
     let mut scales = vec![0u16; o_dim * ngroups];
-    let norms = codebook_norms(codebook);
-    let nearest = |sub: &[f32; VQ_DIM]| -> u16 {
-        let mut best = (f32::INFINITY, 0u16);
-        for k in 0..VQ_K {
-            let c = &codebook[k * VQ_DIM..(k + 1) * VQ_DIM];
-            let dot: f32 = sub.iter().zip(c).map(|(&a, &b)| a * b).sum();
-            let d = norms[k] - 2.0 * dot;
-            if d < best.0 {
-                best = (d, k as u16);
-            }
-        }
-        best.1
-    };
-    let assign = |seg: &[f32], inv: f32, idxs: &mut [u16; SUBS]| {
-        let mut sub = [0.0f32; VQ_DIM];
-        for (t, chunk) in seg.chunks_exact(VQ_DIM).enumerate() {
-            for (d, &v) in chunk.iter().enumerate() {
-                sub[d] = v * inv; // normalize into the codebook's scale
-            }
-            idxs[t] = nearest(&sub);
-        }
-    };
-    // Per group: assign under the amax scale, refit in closed form, re-assign under the
-    // refitted scale; a degenerate fit keeps the amax pass.
-    let encode_group = |seg: &[f32]| -> (u16, [u16; SUBS]) {
-        let amax = seg.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        let mut sb = f32_to_bf16(if amax > 0.0 { amax } else { 1.0 });
-        let mut idxs = [0u16; SUBS];
-        assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
-        if let Some(refit) = vq_refit(seg, &idxs, codebook)
-            && refit != sb
-        {
-            sb = refit;
-            assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
-        }
-        (sb, idxs)
-    };
-    for o in 0..o_dim {
-        let wr = &w[o * i_dim..(o + 1) * i_dim];
-        let ir = &mut indices[o * rb..(o + 1) * rb];
-        for grp in 0..ngroups {
-            let (sb, idxs) = encode_group(&wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP]);
-            scales[o * ngroups + grp] = sb;
-            for (t, &ix) in idxs.iter().enumerate() {
-                set_idx(ir, grp * SUBS + t, ix);
-            }
-        }
+    let enc = VqEncoder::new(codebook);
+    for ((wr, ir), sr) in w
+        .chunks_exact(i_dim)
+        .zip(indices.chunks_exact_mut(rb))
+        .zip(scales.chunks_exact_mut(ngroups))
+    {
+        enc.encode_row(wr, ir, sr);
     }
     (indices, scales)
 }
@@ -685,7 +790,7 @@ pub fn matvec_vq(y: &mut [f32], x: &[f32], w: VqW<'_>, shape: [usize; 2]) {
         for k in 0..nsub {
             let i0 = k * VQ_DIM;
             let s = bf16_to_f32(scales[o * ngroups + i0 / VQ_GROUP]);
-            let c = &codebook[get_idx(ir, k) * VQ_DIM..][..VQ_DIM];
+            let c = subvec(codebook, get_idx(ir, k));
             let mut dot = 0.0f32;
             for (d, &cw) in c.iter().enumerate() {
                 dot += x[i0 + d] * cw;
@@ -719,17 +824,22 @@ pub fn matvec_vq(y: &mut [f32], x: &[f32], w: VqW<'_>, shape: [usize; 2]) {
 /// Append every `stride`-th group-normalized subvector of `w` to the codebook sample.
 pub fn sample_subvectors(w: &[f32], i_dim: usize, stride: usize, out: &mut Vec<f32>) {
     let mut n = 0usize;
-    for row in w.chunks_exact(i_dim) {
-        for grp in row.chunks_exact(VQ_GROUP) {
-            let amax = grp.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-            let inv = 1.0 / bf16_to_f32(f32_to_bf16(if amax > 0.0 { amax } else { 1.0 }));
-            for sub in grp.chunks_exact(VQ_DIM) {
-                if n.is_multiple_of(stride) {
-                    out.extend(sub.iter().map(|&v| v * inv));
-                }
-                n += 1;
-            }
+    for grp in w.chunks_exact(i_dim).flat_map(|r| r.chunks_exact(VQ_GROUP)) {
+        sample_group(grp, stride, &mut n, out);
+    }
+}
+
+/// Append every `stride`-th subvector of one group, normalized by that group's bf16 amax —
+/// the same normalization [`VqEncoder::assign`] searches under, so the codebook is fitted in
+/// the space the encoder actually visits. `n` is the running subvector counter across the
+/// whole tensor, so the stride does not restart at each group.
+fn sample_group(grp: &[f32], stride: usize, n: &mut usize, out: &mut Vec<f32>) {
+    let inv = 1.0 / bf16_to_f32(group_amax_bf16(grp));
+    for sub in grp.chunks_exact(VQ_DIM) {
+        if n.is_multiple_of(stride) {
+            out.extend(sub.iter().map(|&v| v * inv));
         }
+        *n += 1;
     }
 }
 
@@ -758,20 +868,30 @@ pub fn learn_codebook_k(sample: &[f32], max_iters: usize, k: usize) -> Vec<f32> 
     let mut c = kmeans_pp_seed(sample, n, k);
     let mut prev = f64::INFINITY;
     for _ in 0..max_iters {
-        let (sum, cnt, dist) = assign_all(sample, n, &c, k);
-        for j in 0..k {
-            if cnt[j] > 0 {
-                for d in 0..VQ_DIM {
-                    c[j * VQ_DIM + d] = sum[j * VQ_DIM + d] / cnt[j] as f32;
-                }
-            }
-        }
-        if ((prev - dist) / dist.max(f64::MIN_POSITIVE)).abs() < 1e-4 {
+        let a = assign_all(sample, n, &c);
+        update_centroids(&mut c, &a);
+        if ((prev - a.dist) / a.dist.max(f64::MIN_POSITIVE)).abs() < 1e-4 {
             break;
         }
-        prev = dist;
+        prev = a.dist;
     }
     c
+}
+
+/// Lloyd's update: each centroid moves to the mean of the subvectors assigned to it. An
+/// EMPTY cluster is filtered out rather than divided by zero — it keeps its k-means++ seed,
+/// where collapsing it to the origin would make it the nearest entry to everything.
+fn update_centroids(c: &mut [f32], a: &Assignment) {
+    let live = c
+        .chunks_exact_mut(VQ_DIM)
+        .zip(a.sum.chunks_exact(VQ_DIM))
+        .zip(&a.cnt)
+        .filter(|&(_, &n)| n > 0);
+    for ((cj, sj), &n) in live {
+        for (cd, &sd) in cj.iter_mut().zip(sj) {
+            *cd = sd / n as f32;
+        }
+    }
 }
 
 /// Squared L2 between one subvector and one centroid — the inner product every phase of
@@ -786,94 +906,131 @@ fn sqdist(v: &[f32], c: &[f32]) -> f32 {
 /// byte-stable across runs (the round-trip gate's whole claim).
 fn kmeans_pp_seed(sample: &[f32], n: usize, k: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; k * VQ_DIM];
-    let mut rng = 0x2545_F491_4F6C_DD1Du64;
-    let mut next = move || {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        (rng >> 11) as f64 / (1u64 << 53) as f64
-    };
+    let mut next = xorshift64(0x2545_F491_4F6C_DD1D);
+    // Uniform 1.0 rather than a distance, so the FIRST draw is uniform over the sample.
     let mut mind = vec![1.0f32; n];
     for j in 0..k {
-        let total: f64 = mind.iter().map(|&d| d as f64).sum();
-        let mut t = next() * total;
-        let mut pick = n - 1;
-        for (i, &d) in mind.iter().enumerate() {
-            t -= d as f64;
-            if t <= 0.0 {
-                pick = i;
-                break;
-            }
-        }
-        let seed = &sample[pick * VQ_DIM..(pick + 1) * VQ_DIM];
+        let seed = subvec(sample, draw_by_d2(&mind, next()));
         c[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(seed);
-        for (i, md) in mind.iter_mut().enumerate() {
-            let d = sqdist(&sample[i * VQ_DIM..(i + 1) * VQ_DIM], seed);
-            *md = if j == 0 { d } else { md.min(d) };
-        }
+        update_mind(&mut mind, sample, seed, j == 0);
     }
     c
 }
 
-/// One assignment pass over `lo..hi`: per-centroid running sums, counts, and the total
-/// distance — the thread body of [`assign_all`].
-fn assign_partial(
-    sample: &[f32],
-    c: &[f32],
-    k: usize,
-    lo: usize,
-    hi: usize,
-) -> (Vec<f32>, Vec<u32>, f64) {
-    let mut sum = vec![0.0f32; k * VQ_DIM];
-    let mut cnt = vec![0u32; k];
-    let mut dist = 0.0f64;
-    for i in lo..hi {
-        let v = &sample[i * VQ_DIM..(i + 1) * VQ_DIM];
-        let mut best = (f32::INFINITY, 0usize);
-        for j in 0..k {
-            let d = sqdist(v, &c[j * VQ_DIM..(j + 1) * VQ_DIM]);
-            if d < best.0 {
-                best = (d, j);
-            }
-        }
-        dist += best.0 as f64;
-        cnt[best.1] += 1;
-        for d in 0..VQ_DIM {
-            sum[best.1 * VQ_DIM + d] += v[d];
-        }
+/// Deterministic xorshift in `[0, 1)`. Conversion is byte-stable across runs only because
+/// this stream is, so the constants are pinned rather than tuned.
+fn xorshift64(seed: u64) -> impl FnMut() -> f64 {
+    let mut rng = seed;
+    move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        (rng >> 11) as f64 / (1u64 << 53) as f64
     }
-    (sum, cnt, dist)
 }
 
-/// The parallel assignment step: fan `assign_partial` across threads, merge the parts.
-/// Merge order over disjoint ranges is additive, so thread count cannot move the result.
-fn assign_all(sample: &[f32], n: usize, c: &[f32], k: usize) -> (Vec<f32>, Vec<u32>, f64) {
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
-    let chunk = n.div_ceil(threads);
-    let parts: Vec<(Vec<f32>, Vec<u32>, f64)> = std::thread::scope(|s| {
-        let mut hs = Vec::new();
-        for t in 0..threads {
-            let (lo, hi) = (t * chunk, ((t + 1) * chunk).min(n));
-            if lo < hi {
-                let c = &c;
-                hs.push(s.spawn(move || assign_partial(sample, c, k, lo, hi)));
-            }
+/// Draw an index with probability proportional to `d2` — k-means++'s D² rule. `u` is a
+/// uniform draw in `[0, 1)`; the last index absorbs the floating-point remainder.
+fn draw_by_d2(d2: &[f32], u: f64) -> usize {
+    let total: f64 = d2.iter().map(|&d| d as f64).sum();
+    let mut t = u * total;
+    for (i, &d) in d2.iter().enumerate() {
+        t -= d as f64;
+        if t <= 0.0 {
+            return i;
         }
+    }
+    d2.len() - 1
+}
+
+/// Fold a newly chosen centroid into the "distance to the nearest chosen one" table.
+/// `first` REPLACES rather than minimizes: the table starts at a uniform 1.0, which is not a
+/// distance and must not be min'd against one.
+fn update_mind(mind: &mut [f32], sample: &[f32], seed: &[f32], first: bool) {
+    for (md, v) in mind.iter_mut().zip(sample.chunks_exact(VQ_DIM)) {
+        let d = sqdist(v, seed);
+        *md = if first { d } else { md.min(d) };
+    }
+}
+
+/// One assignment pass's result: per-centroid running sums, counts, and the total squared
+/// distance. One value because the three are produced together, shipped across the thread
+/// boundary together, and merged together — as three loose `Vec`s the merge can pair a sum
+/// with the wrong count and still typecheck.
+struct Assignment {
+    sum: Vec<f32>,
+    cnt: Vec<u32>,
+    dist: f64,
+}
+
+impl Assignment {
+    fn zeros(k: usize) -> Self {
+        Assignment {
+            sum: vec![0.0f32; k * VQ_DIM],
+            cnt: vec![0u32; k],
+            dist: 0.0,
+        }
+    }
+
+    /// Add one worker's part. The workers cover disjoint ranges, so this is additive and
+    /// the thread count cannot move the result.
+    fn merge(&mut self, part: &Assignment) {
+        for (a, b) in self.sum.iter_mut().zip(&part.sum) {
+            *a += b;
+        }
+        for (a, b) in self.cnt.iter_mut().zip(&part.cnt) {
+            *a += b;
+        }
+        self.dist += part.dist;
+    }
+}
+
+/// Index of the centroid nearest `v`, with its squared distance. Kept apart from the
+/// seeder's search, which tracks a running minimum over centroids chosen so far rather than
+/// scanning the whole set.
+fn nearest_centroid(v: &[f32], c: &[f32]) -> (f32, usize) {
+    let mut best = (f32::INFINITY, 0usize);
+    for (j, cj) in c.chunks_exact(VQ_DIM).enumerate() {
+        let d = sqdist(v, cj);
+        if d < best.0 {
+            best = (d, j);
+        }
+    }
+    best
+}
+
+/// One assignment pass over the sample rows in `rows` — the thread body of [`assign_all`].
+fn assign_partial(sample: &[f32], c: &[f32], rows: std::ops::Range<usize>) -> Assignment {
+    let mut a = Assignment::zeros(c.len() / VQ_DIM);
+    for i in rows {
+        let v = subvec(sample, i);
+        let (d, j) = nearest_centroid(v, c);
+        a.dist += d as f64;
+        a.cnt[j] += 1;
+        for (s, &x) in a.sum[j * VQ_DIM..(j + 1) * VQ_DIM].iter_mut().zip(v) {
+            *s += x;
+        }
+    }
+    a
+}
+
+/// The parallel assignment step: fan [`assign_partial`] across threads, merge the parts.
+fn assign_all(sample: &[f32], n: usize, c: &[f32]) -> Assignment {
+    let threads = worker_threads();
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<Assignment> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads)
+            .map(|t| t * chunk..((t + 1) * chunk).min(n))
+            .filter(|r| !r.is_empty())
+            .map(|rows| s.spawn(move || assign_partial(sample, c, rows)))
+            .collect();
         hs.into_iter().filter_map(|h| h.join().ok()).collect()
     });
-    let mut sum = vec![0.0f32; k * VQ_DIM];
-    let mut cnt = vec![0u32; k];
-    let mut dist = 0.0f64;
-    for (ps, pc, pd) in parts {
-        for (a, b) in sum.iter_mut().zip(ps) {
-            *a += b;
-        }
-        for (a, b) in cnt.iter_mut().zip(pc) {
-            *a += b;
-        }
-        dist += pd;
+    let mut all = Assignment::zeros(c.len() / VQ_DIM);
+    for p in &parts {
+        all.merge(p);
     }
-    (sum, cnt, dist)
+    all
 }
 
 // ── int4 (group-scaled): the "warm expert" format ───────────────────────────
@@ -1048,11 +1205,7 @@ pub fn v4_expert_projs(expert_in: usize, moe_inter: usize) -> ExpertProjs {
 /// arithmetic. `.f4` therefore holds routed experts ONLY; the shared expert rides the
 /// resident fp8 path.
 pub fn v4_expert_base(layer: usize, e: usize, n_experts: usize) -> String {
-    if e < n_experts {
-        format!("layers.{layer}.ffn.experts.{e}")
-    } else {
-        format!("layers.{layer}.ffn.shared_experts")
-    }
+    expert_slot_name(&format!("layers.{layer}.ffn"), e, n_experts)
 }
 
 // --- Kimi-K3 tensor naming ---------------------------------------------------------------
@@ -1106,7 +1259,10 @@ pub const K3_SCALE: &str = "weight_scale";
 /// `[7168, 6144]`), trunk-side, in a different dtype and a different layout from the routed
 /// experts. `.f4` holds routed experts only, and `has_shared()` is already false for F4.
 pub fn k3_expert_base(layer: usize, e: usize) -> String {
-    format!("{K3_TEXT_PREFIX}layers.{layer}.block_sparse_moe.experts.{e}")
+    routed_expert_name(
+        &format!("{K3_TEXT_PREFIX}layers.{layer}.block_sparse_moe"),
+        e,
+    )
 }
 
 // There is deliberately no `k3_expert_proj(layer, e, p) -> (packed, scale)` helper. One existed
@@ -1174,25 +1330,40 @@ pub fn quant_i4(w: &[f32], o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>) {
     let (rb, ng) = (i4_row_bytes(i_dim), i4_groups(i_dim));
     let mut packed = vec![0u8; o_dim * rb];
     let mut scale = vec![0.0f32; o_dim * ng];
-    for o in 0..o_dim {
-        let row = &w[o * i_dim..(o + 1) * i_dim];
-        for (g, seg) in row.chunks(I4_GROUP).enumerate() {
-            let amax = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            let s = if amax > 0.0 { amax / 7.0 } else { 1.0 };
-            scale[o * ng + g] = s;
-            for (t, &wi) in seg.iter().enumerate() {
-                let i = g * I4_GROUP + t;
-                let q = ((wi / s).round() as i32 + 8).clamp(0, 15) as u8;
-                let bi = o * rb + (i >> 1);
-                if i & 1 == 0 {
-                    packed[bi] = (packed[bi] & 0xF0) | q;
-                } else {
-                    packed[bi] = (packed[bi] & 0x0F) | (q << 4);
-                }
-            }
-        }
+    for ((row, prow), srow) in w
+        .chunks_exact(i_dim)
+        .zip(packed.chunks_exact_mut(rb))
+        .zip(scale.chunks_exact_mut(ng))
+    {
+        quant_i4_row(row, prow, srow);
     }
     (packed, scale)
+}
+
+/// One row: per group of [`I4_GROUP`] weights, `s = max|group|/7` so the group's extreme
+/// lands on nibble 15 (+7), then round-to-nearest into the packed nibbles.
+fn quant_i4_row(row: &[f32], packed: &mut [u8], scale: &mut [f32]) {
+    for (g, (seg, s)) in row.chunks(I4_GROUP).zip(scale.iter_mut()).enumerate() {
+        let amax = seg.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        *s = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+        for (t, &wi) in seg.iter().enumerate() {
+            let q = ((wi / *s).round() as i32 + 8).clamp(0, 15) as u8;
+            set_nibble(packed, g * I4_GROUP + t, q);
+        }
+    }
+}
+
+/// Write nibble `q` at column `i` of a packed int4 row: LOW nibble = even column. The WRITE
+/// half of the packing only — the two decoders keep their own spellings on purpose, see
+/// [`dequant_i4`].
+#[inline]
+fn set_nibble(row: &mut [u8], i: usize, q: u8) {
+    let b = &mut row[i >> 1];
+    *b = if i & 1 == 0 {
+        (*b & 0xF0) | q
+    } else {
+        (*b & 0x0F) | (q << 4)
+    };
 }
 
 /// Reconstruct the dense `W[o_dim, i_dim]` a `(packed, scale)` int4 pair represents —
@@ -1373,26 +1544,45 @@ mod tests {
         let ng = i4_groups(i_dim);
         assert_eq!(ng, 4);
         let mut rnd = uniform(0x1234_5678);
-        // Group `g` of every row scaled by 10^g: a single per-row scale could not stay
-        // within half a step of the SMALL groups, so this separates the two formats.
-        let mut w: Vec<f32> = (0..o_dim * i_dim)
-            .map(|n| rnd() * 10f32.powi(((n % i_dim) / I4_GROUP) as i32))
-            .collect();
-        for o in 0..o_dim {
-            for g in 0..ng {
-                w[o * i_dim + g * I4_GROUP] = 9.0 * 10f32.powi(g as i32); // the amax setter
-            }
-        }
+        let w = decade_scaled_rows(o_dim, i_dim, &mut rnd);
         let (packed, scale) = quant_i4(&w, o_dim, i_dim);
         assert_eq!(scale.len(), o_dim * ng);
         let back = dequant_i4(&packed, &scale, o_dim, i_dim);
-        for o in 0..o_dim {
-            for g in 0..ng {
-                let s = scale[o * ng + g];
+        assert_half_step_per_group(&w, &back, &scale, i_dim);
+        // The GEMV oracle and the dense reconstruction must agree on the same bytes.
+        let x: Vec<f32> = (0..i_dim).map(|_| rnd()).collect();
+        let mut y = vec![0f32; o_dim];
+        matvec_i4(&mut y, &x, RowScaledW::new(&packed, &scale), [o_dim, i_dim]);
+        assert_gemv_matches_dense(&y, &back, &x, i_dim);
+    }
+
+    /// Rows whose group `g` is scaled by 10^g, with each group's amax pinned. A single
+    /// per-row scale could not stay within half a step of the SMALL groups, so this is what
+    /// separates the two formats.
+    fn decade_scaled_rows(o_dim: usize, i_dim: usize, rnd: &mut impl FnMut() -> f32) -> Vec<f32> {
+        let mut w: Vec<f32> = (0..o_dim * i_dim)
+            .map(|n| rnd() * 10f32.powi(((n % i_dim) / I4_GROUP) as i32))
+            .collect();
+        for row in w.chunks_exact_mut(i_dim) {
+            for g in 0..i4_groups(i_dim) {
+                row[g * I4_GROUP] = 9.0 * 10f32.powi(g as i32); // the amax setter
+            }
+        }
+        w
+    }
+
+    /// Every group's round trip lands inside half of ITS OWN step — and not exactly on
+    /// zero, which would mean no rounding happened and the bound is measuring nothing.
+    fn assert_half_step_per_group(w: &[f32], back: &[f32], scale: &[f32], i_dim: usize) {
+        let ng = i4_groups(i_dim);
+        for (o, (wr, br)) in w
+            .chunks_exact(i_dim)
+            .zip(back.chunks_exact(i_dim))
+            .enumerate()
+        {
+            for (g, &s) in scale[o * ng..(o + 1) * ng].iter().enumerate() {
                 let cols = g * I4_GROUP..((g + 1) * I4_GROUP).min(i_dim);
-                let err = cols
-                    .map(|i| (w[o * i_dim + i] - back[o * i_dim + i]).abs())
-                    .fold(0.0f32, f32::max);
+                let err = cols.map(|i| (wr[i] - br[i]).abs()).fold(0.0f32, f32::max);
                 assert!(
                     err <= s * 0.5 + 1e-6,
                     "row {o} group {g}: max round-trip error {err:.6e} exceeds half a step ({:.6e})",
@@ -1404,12 +1594,12 @@ mod tests {
                 );
             }
         }
-        // The GEMV oracle and the dense reconstruction must agree on the same bytes.
-        let x: Vec<f32> = (0..i_dim).map(|_| rnd()).collect();
-        let mut y = vec![0f32; o_dim];
-        matvec_i4(&mut y, &x, RowScaledW::new(&packed, &scale), [o_dim, i_dim]);
-        for (o, &yo) in y.iter().enumerate() {
-            let want: f32 = (0..i_dim).map(|i| back[o * i_dim + i] * x[i]).sum();
+    }
+
+    /// `matvec_i4` on the packed bytes equals a plain dot against the dense reconstruction.
+    fn assert_gemv_matches_dense(y: &[f32], back: &[f32], x: &[f32], i_dim: usize) {
+        for (o, (&yo, br)) in y.iter().zip(back.chunks_exact(i_dim)).enumerate() {
+            let want: f32 = br.iter().zip(x).map(|(&b, &xi)| b * xi).sum();
             assert!(
                 (yo - want).abs() <= 1e-4 * want.abs().max(1.0),
                 "row {o}: {yo} != {want}"
@@ -1587,18 +1777,21 @@ mod tests {
             f4_expert_bytes(expert_in, inter),
             vq_expert_bytes(expert_in, inter)
         );
+        assert_the_band_is_where_f4_and_i4_collide(expert_in, inter);
+    }
 
-        // **The six OFFSETS turn on `expert_in` ALONE — `moe_inter` cannot separate them.**
-        // Found by this assertion failing on `(4096, 96)`, which was written expecting the
-        // band to apply symmetrically. It does not: `off[2]` and `off[4]` are sums of w1's and
-        // w3's spans, whose `i_dim` is `expert_in`; `off[5]` adds w2's PACKED bytes, which are
-        // `i/2` in both formats. w2's scale length — the only place `moe_inter` reaches the
-        // scale grid — is past `off[5]` and appears in no offset at all. So `moe_inter`
-        // changes `*_expert_bytes` and nothing this array can see.
-        //
-        // The offsets therefore collide iff `band(expert_in)`, and the block SIZE collides iff
-        // `band(expert_in) && band(moe_inter)`. Both models are in the band on both dims
-        // (GLM 6144/2048, V4 4096/2048), so both collide completely.
+    /// **The six OFFSETS turn on `expert_in` ALONE — `moe_inter` cannot separate them.**
+    /// Found by these assertions failing on `(4096, 96)`, which were written expecting the
+    /// band to apply symmetrically. It does not: `off[2]` and `off[4]` are sums of w1's and
+    /// w3's spans, whose `i_dim` is `expert_in`; `off[5]` adds w2's PACKED bytes, which are
+    /// `i/2` in both formats. w2's scale length — the only place `moe_inter` reaches the
+    /// scale grid — is past `off[5]` and appears in no offset at all. So `moe_inter` changes
+    /// `*_expert_bytes` and nothing this array can see.
+    ///
+    /// The offsets therefore collide iff `band(expert_in)`, and the block SIZE collides iff
+    /// `band(expert_in) && band(moe_inter)`. Both models are in the band on both dims
+    /// (GLM 6144/2048, V4 4096/2048), so both collide completely.
+    fn assert_the_band_is_where_f4_and_i4_collide(expert_in: usize, inter: usize) {
         let band = |i: usize| i.div_ceil(32) == 4 * i.div_ceil(128);
         assert!(
             band(expert_in) && band(inter),
@@ -1809,26 +2002,24 @@ mod tests {
         // codebook entries; amax over the group is 1.0 ⇒ scale 1, exact quant.
         let cb = tiny_codebook(&[[1.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, -1.0]]);
         let i_dim = VQ_GROUP;
-        let nsub = i_dim / VQ_DIM;
-        let entry = |t: usize| t % 2; // alternate entries 0,1,0,1,…
-        let mut w = vec![0.0f32; i_dim];
-        for t in 0..nsub {
-            let e = entry(t);
-            w[t * VQ_DIM..(t + 1) * VQ_DIM].copy_from_slice(&cb[e * VQ_DIM..(e + 1) * VQ_DIM]);
-        }
+        let w = alternating_entries(&cb, i_dim, 1.0);
         let (idx, scales) = quant_vq(&w, 1, i_dim, &cb);
         let x: Vec<f32> = (0..i_dim).map(|i| (i + 1) as f32).collect();
         let mut y = [0.0f32];
         matvec_vq(&mut y, &x, VqW::new(&idx, &scales, &cb), [1, i_dim]);
-        // Expected = Σ_t codebook[entry(t)] · x_subvec(t), with scale 1.
-        let mut exp = 0.0f32;
-        for t in 0..nsub {
-            let e = entry(t);
-            for d in 0..VQ_DIM {
-                exp += cb[e * VQ_DIM + d] * x[t * VQ_DIM + d];
-            }
-        }
+        // Expected = Σ_t codebook[entry(t)] · x_subvec(t), with scale 1 — spelled straight
+        // off `w`, which IS the codebook entries at this scale.
+        let exp: f32 = w.iter().zip(&x).map(|(&wi, &xi)| wi * xi).sum();
         assert!((y[0] - exp).abs() < 1e-4, "y0={} exp={}", y[0], exp);
+    }
+
+    /// `i_dim` weights built from codebook entries 0 and 1 in alternation, each times
+    /// `scale`. Both fixtures below need it: entries peak at 1, so the group amax IS
+    /// `scale` and the normalized subvectors land exactly on entries.
+    fn alternating_entries(cb: &[f32], i_dim: usize, scale: f32) -> Vec<f32> {
+        (0..i_dim)
+            .map(|n| cb[((n / VQ_DIM) % 2) * VQ_DIM + n % VQ_DIM] * scale)
+            .collect()
     }
 
     #[test]
@@ -1838,24 +2029,15 @@ mod tests {
         // faithfulness the converter relies on. (Both entries peak at 1 so the group
         // amax = the scale S; S=0.5 is bf16-exact.)
         let cb = tiny_codebook(&[[1.0, -1.0, 0.5, -0.5], [0.25, 0.5, 0.75, 1.0]]);
-        let i_dim = VQ_GROUP;
-        let nsub = i_dim / VQ_DIM;
-        let entry = |t: usize| t % 2;
-        let scale = 0.5f32;
-        let mut w = vec![0.0f32; i_dim];
-        for t in 0..nsub {
-            let e = entry(t);
-            for d in 0..VQ_DIM {
-                w[t * VQ_DIM + d] = cb[e * VQ_DIM + d] * scale;
-            }
-        }
+        let (i_dim, scale) = (VQ_GROUP, 0.5f32);
+        let w = alternating_entries(&cb, i_dim, scale);
         let (idx, scales) = quant_vq(&w, 1, i_dim, &cb);
         let s = bf16_to_f32(scales[0]);
         assert!((s - scale).abs() < 1e-6, "group scale {s} != {scale}");
-        for t in 0..nsub {
-            let e = &cb[get_idx(&idx, t) * VQ_DIM..][..VQ_DIM];
-            for d in 0..VQ_DIM {
-                assert!((e[d] * s - w[t * VQ_DIM + d]).abs() < 1e-4, "t{t} d{d}");
+        for (t, sub) in w.chunks_exact(VQ_DIM).enumerate() {
+            let e = subvec(&cb, get_idx(&idx, t));
+            for (d, (&ed, &wd)) in e.iter().zip(sub).enumerate() {
+                assert!((ed * s - wd).abs() < 1e-4, "t{t} d{d}");
             }
         }
     }

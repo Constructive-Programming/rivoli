@@ -687,6 +687,21 @@ pub struct RoutedRepack<'a> {
     pub write: bool,
 }
 
+/// Where one layer's file is, how its blocks are laid out, and whether it is already on disk.
+///
+/// Resolved once per layer and handed to both halves, so the writer and the verifier cannot
+/// disagree about the stride or the block size — the pair that decides where every expert
+/// starts, and the pair a wrong answer to would be written and read back consistently.
+struct LayerPlan {
+    layer: usize,
+    path: String,
+    stride: usize,
+    ebytes: usize,
+    /// Both converters resume by SKIPPING an output path that already exists, without reading
+    /// it — [`write_expert_layer`]'s doc carries why that is safe and what it costs.
+    reused: bool,
+}
+
 impl RoutedRepack<'_> {
     /// Convert layer `l`. `base(e)` gives expert `e`'s source tensor prefix — the ONLY thing
     /// that differs between the two models, which is why it is a closure and everything else
@@ -698,97 +713,159 @@ impl RoutedRepack<'_> {
     /// "silently" make the loop single-threaded — it would not: `write_expert_layer` requires
     /// `Sync`, so leaving it off is a compile error, which is the good outcome.)
     pub fn layer(&self, l: usize, base: impl Fn(usize) -> String + Sync) -> Result<()> {
-        let (ne, tool) = (self.n_experts, self.tool);
-        let stride = crate::quant::f4_expert_stride(self.expert_in, self.moe_inter);
-        let ebytes = crate::quant::f4_expert_bytes(self.expert_in, self.moe_inter);
-        let path = format!("{}/L{l:02}.f4", self.out_dir);
-        let reused = std::fs::metadata(&path).is_ok();
-        // "reusing" only when there is a write to skip. On a `--verify-only` run the file is the
-        // thing being checked, not something being reused, and saying so 92 times above 92
-        // "verified" lines is noise a reader has to learn to ignore.
-        if reused && self.write {
-            eprintln!("{tool}: {path} exists, reusing");
+        let plan = self.plan(l);
+        // A run either produces the file or it does not touch it; there is no third mode, and
+        // the read-only branch is the one `--verify-only` promised in its `--help`.
+        if self.write {
+            self.write_layer(&plan, &base)?;
+        } else {
+            self.require_converted(&plan)?;
         }
-        // **`--verify-only` now writes NOTHING, and that is a deliberate behaviour change** made
-        // when this loop was factored out of `convert_v4` (2026-08-11) and spotted by review
-        // rather than by me. The old inline form was `if !reused { write… }` with no verify-only
-        // guard, so `convert_v4 --verify-only` over a range containing an unconverted layer
-        // silently CONVERTED it — against that flag's own `--help`, which promises the run is
-        // read-only. Refusing here is what the flag says; the message has to be explicit, because
-        // the alternative is `std::fs::read` failing with a bare ENOENT and a reader concluding
-        // the artifact is damaged rather than incomplete.
-        if self.verify && !self.write && !reused {
-            bail!(
-                "{path} does not exist, so there is nothing to verify — layer {l} has never been \
-                 converted. `--verify-only` is read-only by contract and will not create it; drop \
-                 the flag to convert, or narrow the layer range to what this artifact holds."
-            );
+        if self.verify {
+            self.verify_layer(&plan, &base)?;
         }
-        let expert = |e| F4Expert {
+        Ok(())
+    }
+
+    /// Locate layer `l`'s file and its block geometry, and stat it — the one place the path
+    /// spelling and the `f4_*` geometry calls live, so the two halves below share them.
+    fn plan(&self, layer: usize) -> LayerPlan {
+        let path = format!("{}/L{layer:02}.f4", self.out_dir);
+        LayerPlan {
+            layer,
+            stride: f4_expert_stride(self.expert_in, self.moe_inter),
+            ebytes: f4_expert_bytes(self.expert_in, self.moe_inter),
+            reused: std::fs::metadata(&path).is_ok(),
+            path,
+        }
+    }
+
+    /// Expert `e` of this layer, located in the source checkpoint — the one construction site
+    /// outside the tests, shared by the writer and the verifier so both read the same spans.
+    fn expert(&self, base: &impl Fn(usize) -> String, e: usize) -> F4Expert<'_> {
+        F4Expert {
             src: self.src,
             base: base(e),
             expert_in: self.expert_in,
             moe_inter: self.moe_inter,
             naming: self.naming,
-        };
-        if !reused && self.write {
-            // One aligned block for the header, then `ne` routed blocks — and NO shared block,
-            // unlike `.vq3`/`.i4`. Neither model's shared expert is FP4 (V4's is fp8 e4m3, K3's
-            // is BF16 at full width), so a block written past `ne` would be the wrong
-            // ARITHMETIC, not just the wrong weights. Streamed in `LAYER_WINDOW` windows: a K3
-            // layer is 15.72 GB and buffering one would be host RAM the GPU shares.
-            let n = write_expert_layer(
-                &path,
-                &ExpertHeader::new(F4_MAGIC, l, ne, self.expert_in, self.moe_inter, stride)
-                    .to_bytes(),
-                stride,
-                ebytes,
-                ne,
-                LAYER_WINDOW,
-                |e, slot| expert(e).pack(slot),
+        }
+    }
+
+    /// Write the layer, or report that there was nothing to write.
+    ///
+    /// "reusing" is said only here, where there was a write to skip. On a `--verify-only` run
+    /// the file is the thing being checked, not something being reused, and saying so 92 times
+    /// above 92 "verified" lines is noise a reader has to learn to ignore.
+    fn write_layer(
+        &self,
+        plan: &LayerPlan,
+        base: &(impl Fn(usize) -> String + Sync),
+    ) -> Result<()> {
+        let (ne, tool) = (self.n_experts, self.tool);
+        if plan.reused {
+            eprintln!("{tool}: {} exists, reusing", plan.path);
+            return Ok(());
+        }
+        // One aligned block for the header, then `ne` routed blocks — and NO shared block,
+        // unlike `.vq3`/`.i4`. Neither model's shared expert is FP4 (V4's is fp8 e4m3, K3's
+        // is BF16 at full width), so a block written past `ne` would be the wrong
+        // ARITHMETIC, not just the wrong weights. Streamed in `LAYER_WINDOW` windows: a K3
+        // layer is 15.72 GB and buffering one would be host RAM the GPU shares.
+        let n = write_expert_layer(
+            &plan.path,
+            &ExpertHeader::new(
+                F4_MAGIC,
+                LayerDims {
+                    layer: plan.layer,
+                    n_experts: ne,
+                    expert_in: self.expert_in,
+                    moe_inter: self.moe_inter,
+                    stride: plan.stride,
+                },
             )
-            .with_context(|| format!("write layer {l} (repack or I/O)"))?;
-            eprintln!("{tool}: wrote {path} ({n} bytes)");
+            .to_bytes(),
+            plan.stride,
+            plan.ebytes,
+            ne,
+            LAYER_WINDOW,
+            |e, slot| self.expert(base, e).pack(slot),
+        )
+        .with_context(|| format!("write layer {} (repack or I/O)", plan.layer))?;
+        eprintln!("{tool}: wrote {} ({n} bytes)", plan.path);
+        Ok(())
+    }
+
+    /// A read-only pass needs the layer to exist already.
+    ///
+    /// **`--verify-only` writes NOTHING, and that is a deliberate behaviour change** made when
+    /// this loop was factored out of `convert_v4` (2026-08-11) and spotted by review rather
+    /// than by me. The old inline form was `if !reused { write… }` with no verify-only guard,
+    /// so `convert_v4 --verify-only` over a range containing an unconverted layer silently
+    /// CONVERTED it — against that flag's own `--help`, which promises the run is read-only.
+    /// Refusing here is what the flag says; the message has to be explicit, because the
+    /// alternative is `std::fs::read` failing with a bare ENOENT and a reader concluding the
+    /// artifact is damaged rather than incomplete.
+    fn require_converted(&self, plan: &LayerPlan) -> Result<()> {
+        if plan.reused {
+            return Ok(());
         }
-        // Verification reads the FILE and compares it against the mmap'd source, so it tests the
-        // writer's offsets, the block stride, the write, and whatever a previous run left behind.
-        // It runs on a REUSED layer too — that is precisely the layer whose bytes nobody has ever
-        // checked. It is deliberately NOT `back == buf`: that comparison could only ever pass,
-        // since the buffer came from `pack` and `diff` reads the same source spans, so it would be
-        // a guard unable to fire dressed as a verification.
-        //
-        // It reads ONE expert's window at a time rather than the file. This was `fs::read`,
-        // inherited from `convert_v4` where the whole layer is 3.42 GB and survivable; against
-        // K3's 896 experts the same line is a **15.72 GB allocation per layer** on a box whose
-        // 128 GB LPDDR5 is shared with the GPU — the exact figure `write_expert_layer`'s doc uses
-        // to justify bounding the WRITE side, promoted to the read side by sharing this loop
-        // (review 2026-08-11). The one-expert measurement in
-        // `docs/measurement/k3-reference/repack-one-expert.md` could not have caught it: at
-        // `ne = 1` the buffer is 17.5 MB. `diff` only ever looks at `ebytes` bytes at `off`.
-        if self.verify {
-            use std::os::unix::fs::FileExt;
-            let f = std::fs::File::open(&path).with_context(|| format!("re-read {path}"))?;
-            let len = f.metadata()?.len();
-            ensure!(
-                len == (VQ_ALIGN + ne * stride) as u64,
-                "{path}: {len} bytes on disk, expected {}",
-                VQ_ALIGN + ne * stride
-            );
-            let mut differing = 0usize;
-            let mut win = vec![0u8; ebytes];
-            for e in 0..ne {
-                let off = VQ_ALIGN + e * stride;
-                f.read_exact_at(&mut win, off as u64)
-                    .with_context(|| format!("{path}: expert {e}'s block at byte {off}"))?;
-                differing += expert(e).diff(&win)?.len();
-            }
-            ensure!(
-                differing == 0,
-                "layer {l}: {differing} bytes differ from the source — the repack is supposed \
-                 to be a COPY"
-            );
-            eprintln!("{tool}: verified L{l:02}.f4 — {ne} experts, 0 bytes differ");
+        ensure!(
+            !self.verify,
+            "{} does not exist, so there is nothing to verify — layer {} has never been \
+             converted. `--verify-only` is read-only by contract and will not create it; drop \
+             the flag to convert, or narrow the layer range to what this artifact holds.",
+            plan.path,
+            plan.layer
+        );
+        Ok(())
+    }
+
+    /// Read the FILE back and compare it against the mmap'd source, so this tests the writer's
+    /// offsets, the block stride, the write, and whatever a previous run left behind. It runs
+    /// on a REUSED layer too — that is precisely the layer whose bytes nobody has ever checked.
+    /// It is deliberately NOT `back == buf`: that comparison could only ever pass, since the
+    /// buffer came from `pack` and `diff` reads the same source spans, so it would be a guard
+    /// unable to fire dressed as a verification.
+    ///
+    /// It reads ONE expert's window at a time rather than the file. This was `fs::read`,
+    /// inherited from `convert_v4` where the whole layer is 3.42 GB and survivable; against
+    /// K3's 896 experts the same line is a **15.72 GB allocation per layer** on a box whose
+    /// 128 GB LPDDR5 is shared with the GPU — the exact figure [`write_expert_layer`]'s doc
+    /// uses to justify bounding the WRITE side, promoted to the read side by sharing this loop
+    /// (review 2026-08-11). The one-expert measurement in
+    /// `docs/measurement/k3-reference/repack-one-expert.md` could not have caught it: at
+    /// `ne = 1` the buffer is 17.5 MB. `diff` only ever looks at `ebytes` bytes at `off`.
+    fn verify_layer(&self, plan: &LayerPlan, base: &impl Fn(usize) -> String) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let (ne, tool) = (self.n_experts, self.tool);
+        let f =
+            std::fs::File::open(&plan.path).with_context(|| format!("re-read {}", plan.path))?;
+        let len = f.metadata()?.len();
+        ensure!(
+            len == (VQ_ALIGN + ne * plan.stride) as u64,
+            "{}: {len} bytes on disk, expected {}",
+            plan.path,
+            VQ_ALIGN + ne * plan.stride
+        );
+        let mut differing = 0usize;
+        let mut win = vec![0u8; plan.ebytes];
+        for e in 0..ne {
+            let off = VQ_ALIGN + e * plan.stride;
+            f.read_exact_at(&mut win, off as u64)
+                .with_context(|| format!("{}: expert {e}'s block at byte {off}", plan.path))?;
+            differing += self.expert(base, e).diff(&win)?.len();
         }
+        ensure!(
+            differing == 0,
+            "layer {}: {differing} bytes differ from the source — the repack is supposed \
+             to be a COPY",
+            plan.layer
+        );
+        eprintln!(
+            "{tool}: verified L{:02}.f4 — {ne} experts, 0 bytes differ",
+            plan.layer
+        );
         Ok(())
     }
 }
@@ -1204,13 +1281,44 @@ impl I4Source {
         ))
     }
 
-    /// Record this provenance in `<dir>/manifest.json`, merging with an existing
-    /// stamp when the two describe the same derivation over adjoining layers — so a
-    /// run resumed with `--from` still ends up claiming the whole set it rebuilt,
-    /// rather than only its own final leg.
-    ///
-    /// Written tmp→fsync→rename: a torn `manifest.json` bricks an artifact whose
-    /// `.i4` set alone is ~365 GB.
+    /// Everything a merge must match — this stamp minus its layer range. `group` belongs in
+    /// it because merging a G=64 run into a G=128 run would claim one uniform set for two
+    /// incompatible formats.
+    fn derivation(&self) -> (&str, &str, &str, Option<usize>) {
+        (&self.tool, &self.chain, &self.src, self.group)
+    }
+
+    /// Whether `prior` is the same derivation as this one over a range that touches it — the
+    /// two facts a merge needs, asked one at a time so neither can be mistaken for the other.
+    fn continues(&self, prior: &Self) -> bool {
+        if prior.derivation() != self.derivation() {
+            return false;
+        }
+        if prior.layers[0] > self.layers[1] {
+            return false;
+        }
+        self.layers[0] <= prior.layers[1]
+    }
+
+    /// This stamp, widened to cover `prior` when the two are one contiguous claim — so a run
+    /// resumed with `--from` still ends up claiming the whole set it rebuilt, rather than only
+    /// its own final leg. Anything else REPLACES, which is what stops a rebuilt set from
+    /// carrying a stale claim.
+    fn merged_with(&self, prior: Option<Self>) -> Self {
+        let Some(p) = prior.filter(|p| self.continues(p)) else {
+            return self.clone();
+        };
+        Self {
+            layers: [
+                p.layers[0].min(self.layers[0]),
+                p.layers[1].max(self.layers[1]),
+            ],
+            ..self.clone()
+        }
+    }
+
+    /// Record this provenance in `<dir>/manifest.json`, merging with an existing stamp per
+    /// [`Self::merged_with`] and publishing it per [`write_json_atomic`].
     pub fn stamp(&self, dir: &str) -> Result<()> {
         let path = format!("{dir}/manifest.json");
         let mut m: serde_json::Value =
@@ -1218,38 +1326,24 @@ impl I4Source {
                 .with_context(|| format!("parse {path}"))?;
         // An unreadable prior stamp is not an error HERE — we are replacing it. Only
         // the reader is strict, so a corrupt field can never be misreported as fact.
-        let merged = match Self::load(dir).ok().flatten() {
-            // Same derivation and the ranges touch → one contiguous claim. `group` is
-            // part of "same derivation": merging a G=64 run into a G=128 run would
-            // claim one uniform set for two incompatible formats.
-            Some(p)
-                if (p.tool.as_str(), p.chain.as_str(), p.src.as_str(), p.group)
-                    == (&self.tool, &self.chain, &self.src, self.group)
-                    && p.layers[0] <= self.layers[1]
-                    && self.layers[0] <= p.layers[1] =>
-            {
-                Self {
-                    layers: [
-                        p.layers[0].min(self.layers[0]),
-                        p.layers[1].max(self.layers[1]),
-                    ],
-                    ..self.clone()
-                }
-            }
-            _ => self.clone(),
-        };
-        m["i4_source"] = serde_json::to_value(&merged)?;
-        let tmp = format!("{path}.tmp");
-        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {tmp}"))?;
-        {
-            use std::io::Write;
-            f.write_all(&serde_json::to_vec_pretty(&m)?)?;
-        }
-        f.sync_all().with_context(|| format!("fsync {tmp}"))?;
-        drop(f);
-        std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
-        Ok(())
+        m["i4_source"] = serde_json::to_value(self.merged_with(Self::load(dir).ok().flatten()))?;
+        write_json_atomic(&path, &m)
     }
+}
+
+/// Publish a JSON document at `path` by tmp→fsync→rename.
+///
+/// The fsync is what separates this from [`write_expert_layer`], which deliberately does not
+/// pay one: a torn `manifest.json` bricks an artifact whose `.i4` set alone is ~365 GB, while
+/// a torn layer file is regenerable.
+fn write_json_atomic(path: &str, doc: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    let tmp = format!("{path}.tmp");
+    let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {tmp}"))?;
+    f.write_all(&serde_json::to_vec_pretty(doc)?)?;
+    f.sync_all().with_context(|| format!("fsync {tmp}"))?;
+    drop(f);
+    std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} -> {path}"))
 }
 
 /// The `f4_source` provenance block, written by both `.f4` converters and read by
@@ -1366,14 +1460,9 @@ impl ExpertHeader {
     /// A header for one layer file. `stride` is the value the WRITER indexes blocks with,
     /// passed in rather than re-derived here: re-deriving would let the header disagree
     /// with the file it describes and still look self-consistent.
-    pub fn new(
-        magic: [u8; 4],
-        layer: usize,
-        n_experts: usize,
-        expert_in: usize,
-        moe_inter: usize,
-        stride: usize,
-    ) -> Self {
+    pub fn new(magic: [u8; 4], d: LayerDims) -> Self {
+        let (layer, n_experts) = (d.layer, d.n_experts);
+        let (expert_in, moe_inter, stride) = (d.expert_in, d.moe_inter, d.stride);
         Self {
             magic,
             version: FormatMeta::VERSION,
@@ -1640,76 +1729,26 @@ impl ExpertSet {
         } = d;
         // Refused rather than left to underflow: `n_layers - first_layer` below is a
         // `usize` subtraction, so an inverted range panicked inside `Vec::with_capacity`
-        // instead of naming the range. `open_vq3` takes loose arguments and cannot be
-        // relied on to have checked.
+        // instead of naming the range. `SetDims` splits the `Range` into two fields to stay
+        // `Copy`, and nothing on the way in rejects an inverted one.
         ensure!(
             first_layer <= n_layers,
             "layer range [{first_layer}, {n_layers}) is inverted"
         );
         let (stride, expert_bytes) = fmt.geometry(expert_in, moe_inter);
-        let (hbytes, has_shared) = (fmt.hbytes(), fmt.has_shared());
-        // Routed blocks, plus the shared one only where the format has one. Both terms come
-        // from `fmt`, so the block count and `shared_block`'s refusal cannot disagree.
-        let want = hbytes + (n_experts + usize::from(has_shared)) * stride;
         let mut files = Vec::with_capacity(n_layers - first_layer);
-        for l in first_layer..n_layers {
-            let path = format!("{dir}/L{l:02}.{}", fmt.ext());
-            let f = open_direct(&path).with_context(|| format!("open {path}"))?;
-            let len = f.metadata()?.len() as usize;
-            ensure!(len == want, "{path}: {len} bytes, expected {want}");
-            if fmt.magic().is_some() {
-                // Header via a separate BUFFERED fd — the O_DIRECT one belongs to the
-                // streamer, and 40 bytes at offset 0 is neither length- nor
-                // buffer-aligned.
-                //
-                // Read EXACTLY the header. This was `std::fs::read(path)`, which pulls the
-                // WHOLE layer file through the page cache to look at 40 bytes of it — and
-                // the cost was not small. **Measured on the GLM arm 2026-08-05**, both
-                // binaries built before either ran and the two alternated three times with
-                // no `cargo build` between them (`tests/artifact.rs::artifact_reads_back`
-                // over `/var/db/rivoli/glm52-vq3-full`, 76 `.vq3` layers, medians):
-                //
-                //     std::fs::read   180.1 s   298.49 GB read from the block device
-                //     40-byte pread     0.038 s   0.48 MB
-                //
-                // ~4700x, and it is startup on EVERY run — a one-time cost amortizes
-                // against nothing. V4 pays the same shape at 43 x 3,422,556,160 = 147 GB.
-                // A pre-existing defect in shipped GLM code that the `.f4` reader walked
-                // into, not one `.f4` introduced.
-                let mut raw = [0u8; EXPERT_HEADER_BYTES];
-                let mut hf = std::fs::File::open(&path)
-                    .with_context(|| format!("open {path} for its header"))?;
-                std::io::Read::read_exact(&mut hf, &mut raw)
-                    .with_context(|| format!("read {path} header"))?;
-                let h = ExpertHeader::from_bytes(&raw, fmt)?;
-                // `stride` is checked too, and it was not before. The converter writes the
-                // value it INDEXED BLOCKS WITH (`ExpertHeader::new`'s doc says why it is
-                // passed rather than re-derived) while `RoutedFmt::geometry` re-derives it
-                // here — so without this conjunct the header's one non-redundant field had
-                // no reader, and a writer whose stride disagreed with this build's would
-                // pass every check on a file of the right total length.
-                ensure!(
-                    h.layer as usize == l
-                        && h.n_experts as usize == n_experts
-                        && h.expert_in as usize == expert_in
-                        && h.moe_inter as usize == moe_inter
-                        && h.stride as usize == stride,
-                    // `expert_in (hidden_size)` rather than bare `expert_in`: whoever reads this
-                    // is holding a config.json and an artifact, and `expert_in` is a name that
-                    // appears in neither. For GLM and V4 the value IS `hidden_size`; on K3 it
-                    // is `routed_expert_hidden_size`, which is why both are named.
-                    "{path}: header (layer {} experts {} expert_in {} moe_inter {} stride {}) \
-                     disagrees with config (layer {l} experts {n_experts} \
-                     expert_in [hidden_size / routed_expert_hidden_size] {expert_in} \
-                     moe_inter [moe_intermediate_size] {moe_inter} stride {stride})",
-                    h.layer,
-                    h.n_experts,
-                    h.expert_in,
-                    h.moe_inter,
-                    h.stride
-                );
-            }
-            files.push(f);
+        for layer in first_layer..n_layers {
+            files.push(open_layer(
+                dir,
+                fmt,
+                LayerDims {
+                    layer,
+                    n_experts,
+                    expert_in,
+                    moe_inter,
+                    stride,
+                },
+            )?);
         }
         Ok(Self {
             files,
@@ -1718,8 +1757,8 @@ impl ExpertSet {
             n_experts,
             stride,
             expert_bytes,
-            hbytes,
-            has_shared,
+            hbytes: fmt.hbytes(),
+            has_shared: fmt.has_shared(),
             fmt,
             slot_offsets: fmt.slot_offsets(expert_in, moe_inter),
         })
@@ -1746,18 +1785,15 @@ impl ExpertSet {
         self.n_experts
     }
 
-    /// The int3-VQ set by loose dimensions — `tests/artifact.rs` opens the shipped `.vq3`
-    /// this way, naming each dimension at the call site. The engine's own format is a
+    /// The int3-VQ set, for a caller whose format is not a runtime choice —
+    /// `tests/artifact.rs` opens the shipped `.vq3` this way. The engine's own format IS a
     /// runtime choice, so it goes through [`ExpertSet::open_routed`] directly.
-    pub fn open_vq3(
-        dir: &str,
-        first_layer: usize,
-        n_layers: usize,
-        n_experts: usize,
-        expert_in: usize,
-        moe_inter: usize,
-    ) -> Result<Self> {
-        let d = SetDims::new(first_layer..n_layers, n_experts, expert_in, moe_inter);
+    ///
+    /// Took the six dimensions loose until 2026-08-15, when the list was replaced by the
+    /// [`SetDims`] it was building anyway. Naming each dimension at the call site is what
+    /// [`SetDims::new`] is for and it still reads the same there; restating the list a second
+    /// time here bought nothing and made this the longest argument list in the file.
+    pub fn open_vq3(dir: &str, d: SetDims) -> Result<Self> {
         Self::open_routed(dir, RoutedFmt::Vq3, d)
     }
 
@@ -1823,6 +1859,101 @@ impl ExpertSet {
     }
 }
 
+/// The dims one layer file is confronted with at open — the CALLER's, not the file's own.
+///
+/// Grouped because the length check and the header check have to be made against the same five
+/// numbers. A transposed `(expert_in, moe_inter)` keeps the byte count, so the header is the
+/// only thing that can catch it — and a header checked against different dims than the length
+/// was would catch nothing.
+/// The five dimensions a layer file's header and its reader must agree on — ONE struct
+/// consumed by both `ExpertHeader::new` and the reader's expectation, so the writer and
+/// the checker cannot hold different lists (they were two copies until jscpd matched the
+/// pair, 2026-08-15).
+#[derive(Clone, Copy)]
+pub struct LayerDims {
+    pub layer: usize,
+    pub n_experts: usize,
+    pub expert_in: usize,
+    pub moe_inter: usize,
+    pub stride: usize,
+}
+
+/// Open one layer file O_DIRECT and confront it with `want`: its LENGTH first, then — where
+/// the format carries one ([`RoutedFmt::magic`]) — its 40-byte header.
+fn open_layer(dir: &str, fmt: RoutedFmt, want: LayerDims) -> Result<std::fs::File> {
+    let (layer, ext) = (want.layer, fmt.ext());
+    let path = format!("{dir}/L{layer:02}.{ext}");
+    let f = open_direct(&path).with_context(|| format!("open {path}"))?;
+    let len = f.metadata()?.len() as usize;
+    // Routed blocks, plus the shared one only where the format has one. Both terms come
+    // from `fmt`, so the block count and `shared_block`'s refusal cannot disagree.
+    let bytes = fmt.hbytes() + (want.n_experts + usize::from(fmt.has_shared())) * want.stride;
+    ensure!(len == bytes, "{path}: {len} bytes, expected {bytes}");
+    if fmt.magic().is_some() {
+        check_layer_header(&path, fmt, want)?;
+    }
+    Ok(f)
+}
+
+/// Parse a layer file's 40-byte header and confront it with the dims the set is being opened
+/// against. Headerless `.i4` never reaches here — see [`open_layer`].
+fn check_layer_header(path: &str, fmt: RoutedFmt, want: LayerDims) -> Result<()> {
+    // Header via a separate BUFFERED fd — the O_DIRECT one belongs to the streamer, and 40
+    // bytes at offset 0 is neither length- nor buffer-aligned.
+    //
+    // Read EXACTLY the header. This was `std::fs::read(path)`, which pulls the WHOLE layer
+    // file through the page cache to look at 40 bytes of it — and the cost was not small.
+    // **Measured on the GLM arm 2026-08-05**, both binaries built before either ran and the
+    // two alternated three times with no `cargo build` between them
+    // (`tests/artifact.rs::artifact_reads_back` over `/var/db/rivoli/glm52-vq3-full`, 76
+    // `.vq3` layers, medians):
+    //
+    //     std::fs::read   180.1 s   298.49 GB read from the block device
+    //     40-byte pread     0.038 s   0.48 MB
+    //
+    // ~4700x, and it is startup on EVERY run — a one-time cost amortizes against nothing. V4
+    // pays the same shape at 43 x 3,422,556,160 = 147 GB. A pre-existing defect in shipped
+    // GLM code that the `.f4` reader walked into, not one `.f4` introduced.
+    let mut raw = [0u8; EXPERT_HEADER_BYTES];
+    let mut hf =
+        std::fs::File::open(path).with_context(|| format!("open {path} for its header"))?;
+    std::io::Read::read_exact(&mut hf, &mut raw).with_context(|| format!("read {path} header"))?;
+    let h = ExpertHeader::from_bytes(&raw, fmt)?;
+    let LayerDims {
+        layer,
+        n_experts,
+        expert_in,
+        moe_inter,
+        stride,
+    } = want;
+    // `stride` is checked too, and it was not before. The converter writes the value it
+    // INDEXED BLOCKS WITH (`ExpertHeader::new`'s doc says why it is passed rather than
+    // re-derived) while `RoutedFmt::geometry` re-derives it here — so without this conjunct
+    // the header's one non-redundant field had no reader, and a writer whose stride disagreed
+    // with this build's would pass every check on a file of the right total length.
+    ensure!(
+        h.layer as usize == layer
+            && h.n_experts as usize == n_experts
+            && h.expert_in as usize == expert_in
+            && h.moe_inter as usize == moe_inter
+            && h.stride as usize == stride,
+        // `expert_in (hidden_size)` rather than bare `expert_in`: whoever reads this
+        // is holding a config.json and an artifact, and `expert_in` is a name that
+        // appears in neither. For GLM and V4 the value IS `hidden_size`; on K3 it
+        // is `routed_expert_hidden_size`, which is why both are named.
+        "{path}: header (layer {} experts {} expert_in {} moe_inter {} stride {}) \
+         disagrees with config (layer {layer} experts {n_experts} \
+         expert_in [hidden_size / routed_expert_hidden_size] {expert_in} \
+         moe_inter [moe_intermediate_size] {moe_inter} stride {stride})",
+        h.layer,
+        h.n_experts,
+        h.expert_in,
+        h.moe_inter,
+        h.stride
+    );
+    Ok(())
+}
+
 /// Open a file O_DIRECT (page-cache-bypassing NVMe DMA).
 fn open_direct(path: &str) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1869,9 +2000,21 @@ mod tests {
         dir
     }
 
+    /// The GLM-shaped layer dims both header tests use; stride is the one axis that
+    /// differs per format, so it is the one parameter.
+    fn dims_6144x2048(stride: usize) -> LayerDims {
+        LayerDims {
+            layer: 7,
+            n_experts: 256,
+            expert_in: 6144,
+            moe_inter: 2048,
+            stride,
+        }
+    }
+
     #[test]
     fn vq3_header_roundtrips() {
-        let h = ExpertHeader::new(VQ3_MAGIC, 7, 256, 6144, 2048, vq_expert_stride(6144, 2048));
+        let h = ExpertHeader::new(VQ3_MAGIC, dims_6144x2048(vq_expert_stride(6144, 2048)));
         let back = ExpertHeader::from_bytes(&h.to_bytes(), RoutedFmt::Vq3).unwrap();
         assert_eq!(back.magic, VQ3_MAGIC);
         assert_eq!(back.layer, 7);
@@ -1887,7 +2030,7 @@ mod tests {
         // length test cannot make: a `.vq3` and an `.f4` of the same nominal dims differ
         // in block count, so accepting either magic addresses past the last expert.
         assert!(ExpertHeader::from_bytes(&h.to_bytes(), RoutedFmt::F4).is_err());
-        let f4 = ExpertHeader::new(F4_MAGIC, 7, 256, 6144, 2048, f4_expert_stride(6144, 2048));
+        let f4 = ExpertHeader::new(F4_MAGIC, dims_6144x2048(f4_expert_stride(6144, 2048)));
         assert!(ExpertHeader::from_bytes(&f4.to_bytes(), RoutedFmt::Vq3).is_err());
         // Bidirectional: the correct pairing still parses, so the two refusals above are
         // the magic and not a header that stopped round-tripping.
@@ -2444,7 +2587,17 @@ mod tests {
     fn a_windowed_expert_layer_is_byte_identical_to_the_buffered_one() {
         let dir = tmpdir("expert_layer");
         let (stride, bytes, blocks) = (64usize, 40usize, 7usize);
-        let header = ExpertHeader::new(F4_MAGIC, 3, blocks, 128, 64, stride).to_bytes();
+        let header = ExpertHeader::new(
+            F4_MAGIC,
+            LayerDims {
+                layer: 3,
+                n_experts: blocks,
+                expert_in: 128,
+                moe_inter: 64,
+                stride: stride,
+            },
+        )
+        .to_bytes();
         // Distinct non-zero payload per expert, and the LAST byte of each differs, so a
         // block written into the wrong slot moves bytes rather than merely repeating them.
         let fill = |e: usize, slot: &mut [u8]| -> Result<()> {

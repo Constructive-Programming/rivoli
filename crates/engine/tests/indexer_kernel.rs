@@ -30,6 +30,7 @@ use rivoli_backend::hip::{
     launch_layernorm,
 };
 use rivoli_core::num::{bf16_to_f32, f32_to_bf16};
+use rivoli_engine::device::DeviceBuf;
 use rivoli_engine::indexer::{K_NORM_EPS, MISA_BLOCK};
 
 mod common;
@@ -196,6 +197,109 @@ fn index_pool_push_keeps_the_exact_block_running_mean() {
     assert_bits(&want, &f32v(&back(&pool)), "index_pool_push");
 }
 
+/// `index_score`'s shapes, scale factors, and one host-side draw of `q`, `w` and the key
+/// cache. Both head-selection arms score the SAME draw: a second draw would turn the
+/// DSA-vs-MISA separation below into a fixture difference rather than the indirection.
+struct ScoreCase {
+    nt: usize,
+    nh: usize,
+    hd: usize,
+    wscale: f32,
+    dscale: f32,
+    q: Vec<f32>,
+    w: Vec<f32>,
+    kf: Vec<f32>,
+}
+
+impl ScoreCase {
+    fn new(nt: usize, nh: usize, hd: usize) -> Self {
+        let mut r = Lcg(0x5C04);
+        let q: Vec<f32> = (0..nh * hd).map(|_| r.f()).collect();
+        let w: Vec<f32> = (0..nh).map(|_| r.f()).collect();
+        // The cache is bf16 on device, so the reference keeps the DECODED values, not the f32
+        // it drew. Scoring against the pre-rounding numbers would charge the kernel for a
+        // conversion the engine also performs.
+        let kf: Vec<f32> = (0..nt * hd)
+            .map(|_| bf16_to_f32(f32_to_bf16(r.f())))
+            .collect();
+        Self {
+            nt,
+            nh,
+            hd,
+            wscale: 0.75,
+            dscale: 0.125,
+            q,
+            w,
+            kf,
+        }
+    }
+
+    /// The reference sum over `active`, in the kernel's own order.
+    fn host(&self, active: &[usize]) -> Vec<f32> {
+        (0..self.nt)
+            .map(|t| {
+                active.iter().fold(0.0f32, |acc, &h| {
+                    let dot: f32 = (0..self.hd)
+                        .map(|i| self.q[h * self.hd + i] * self.kf[t * self.hd + i])
+                        .sum();
+                    acc + self.w[h] * self.wscale * (dot * self.dscale).max(0.0)
+                })
+            })
+            .collect()
+    }
+}
+
+/// A [`ScoreCase`]'s inputs resident on device, uploaded ONCE and held across both arms:
+/// these launchers are launch-only and nothing syncs between them, so a buffer dropped
+/// between arms would `hipFree` while its launch was still reading it.
+struct ScoreDevice<'a> {
+    case: &'a ScoreCase,
+    q: DeviceBuf,
+    w: DeviceBuf,
+    cache: DeviceBuf,
+}
+
+impl<'a> ScoreDevice<'a> {
+    fn new(case: &'a ScoreCase) -> Self {
+        let cache = dev(&u16b(
+            &case.kf.iter().map(|&v| f32_to_bf16(v)).collect::<Vec<_>>(),
+        ));
+        Self {
+            case,
+            q: dev(&f32b(&case.q)),
+            w: dev(&f32b(&case.w)),
+            cache,
+        }
+    }
+
+    /// One launch and readback. A null `heads` selects the DSA path (`h = tid`); non-null is
+    /// MISA and indirects through the list.
+    fn run(&self, heads: *const u32, nact: usize) -> Vec<f32> {
+        let mut sb = zeros(self.case.nt * 4);
+        // SAFETY: `q` is nh·hd f32, `w` nh f32, the cache nt·hd u16, `heads` either null or
+        // `nact` live u32, and `scores` nt f32. All live for the call.
+        ok(
+            unsafe {
+                launch_index_score(
+                    self.q.ptr() as *const f32,
+                    self.w.ptr() as *const f32,
+                    self.cache.ptr() as *const u16,
+                    heads,
+                    self.case.nt,
+                    self.case.nh,
+                    nact,
+                    self.case.hd,
+                    self.case.wscale,
+                    self.case.dscale,
+                    sb.ptr_mut() as *mut f32,
+                )
+            },
+            "index_score",
+        );
+        f32v(&back(&sb))
+    }
+}
+
 /// `index_score` — `scores[t] = Σ_{h∈active} w[h]·wscale·ReLU((q_h·k_t)·dscale)`.
 ///
 /// Both head-selection modes, because they are not the same code path: `heads == null` is
@@ -216,62 +320,12 @@ fn index_score_reduces_over_the_active_heads_only() {
     // ladder, a longer `part`, and a 768 B dynamic LDS request against 640 B — while the
     // MISA arm still covers the clamped 32. (`part`'s OFFSET is `kf + hd` and does not move
     // with `bd`; only its length and the request do.)
-    let (nt, nh, hd) = (64usize, 64usize, 128usize);
-    let (wscale, dscale) = (0.75f32, 0.125f32);
-    let mut r = Lcg(0x5C04);
-    let q: Vec<f32> = (0..nh * hd).map(|_| r.f()).collect();
-    let w: Vec<f32> = (0..nh).map(|_| r.f()).collect();
-    // The cache is bf16 on device, so the reference reads the DECODED values, not the f32
-    // it drew. Scoring against the pre-rounding numbers would charge the kernel for a
-    // conversion the engine also performs.
-    let kf: Vec<f32> = (0..nt * hd)
-        .map(|_| bf16_to_f32(f32_to_bf16(r.f())))
-        .collect();
+    let case = ScoreCase::new(/* nt */ 64, /* nh */ 64, /* hd */ 128);
 
-    let host = |active: &[usize]| -> Vec<f32> {
-        (0..nt)
-            .map(|t| {
-                active.iter().fold(0.0f32, |acc, &h| {
-                    let dot: f32 = (0..hd).map(|i| q[h * hd + i] * kf[t * hd + i]).sum();
-                    acc + w[h] * wscale * (dot * dscale).max(0.0)
-                })
-            })
-            .collect()
-    };
-
-    let (qb, wb) = (dev(&f32b(&q)), dev(&f32b(&w)));
-    let cache = dev(&u16b(
-        &kf.iter().map(|&v| f32_to_bf16(v)).collect::<Vec<_>>(),
-    ));
-    let run = |heads: *const u32, nact: usize| -> Vec<f32> {
-        let mut sb = zeros(nt * 4);
-        // SAFETY: `q` is nh·hd f32, `w` nh f32, the cache nt·hd u16, `heads` either null or
-        // `nact` live u32, and `scores` nt f32. All live for the call.
-        ok(
-            unsafe {
-                launch_index_score(
-                    qb.ptr() as *const f32,
-                    wb.ptr() as *const f32,
-                    cache.ptr() as *const u16,
-                    heads,
-                    nt,
-                    nh,
-                    nact,
-                    hd,
-                    wscale,
-                    dscale,
-                    sb.ptr_mut() as *mut f32,
-                )
-            },
-            "index_score",
-        );
-        f32v(&back(&sb))
-    };
-
-    let all: Vec<usize> = (0..nh).collect();
+    let all: Vec<usize> = (0..case.nh).collect();
     let subset = [5usize, 0, 6, 2];
-    let want_all = host(&all);
-    let want_sub = host(&subset);
+    let want_all = case.host(&all);
+    let want_sub = case.host(&subset);
     // Anti-vacuity, host against host: if the two head sets scored the same, the MISA arm
     // below would pass on a kernel that ignored `heads`.
     let sep = rel(&want_sub, &want_all);
@@ -280,6 +334,8 @@ fn index_score_reduces_over_the_active_heads_only() {
         sep > 1e-2,
         "the two head sets are indistinguishable at this seed"
     );
+
+    let gpu = ScoreDevice::new(&case);
 
     // 1e-5 relative. The ReLU'd FACTOR is non-negative but `w[h]` is signed, so the outer
     // sum over heads does cancel — an earlier version of this comment claimed it could not,
@@ -294,7 +350,7 @@ fn index_score_reduces_over_the_active_heads_only() {
     // the term they disagree about is itself near zero.
     assert_rel(
         &want_all,
-        &run(std::ptr::null(), nh),
+        &gpu.run(std::ptr::null(), case.nh),
         "index_score (DSA, all heads)",
         1e-5,
     );
@@ -304,7 +360,7 @@ fn index_score_reduces_over_the_active_heads_only() {
         .collect::<Vec<u8>>());
     assert_rel(
         &want_sub,
-        &run(hb.ptr() as *const u32, subset.len()),
+        &gpu.run(hb.ptr() as *const u32, subset.len()),
         "index_score (MISA, 4 of 64 heads)",
         1e-5,
     );

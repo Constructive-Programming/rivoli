@@ -24,17 +24,26 @@ struct Run {
     nll: Vec<f64>,
 }
 
-fn load(path: &str) -> Result<Run> {
-    let f = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
-    let mut label = String::new();
+/// The engine's header prefix. One constant so the reader and the skip in `samples` cannot
+/// drift apart and start disagreeing about which line is the header.
+const HEADER: &str = "# rivoli-nll v1 ";
+
+/// The config this file is attributable to. A file without the header is not something we
+/// can attribute at all, which is why the caller turns `None` into a hard error rather than
+/// an unlabelled run.
+fn header(lines: &[String]) -> Option<String> {
+    lines
+        .iter()
+        .find_map(|l| l.strip_prefix(HEADER))
+        .map(str::to_string)
+}
+
+/// Every line that is not the header: blanks are filler, and anything else must parse or
+/// the file is not the engine's output whatever its header claims.
+fn samples(path: &str, lines: &[String]) -> Result<Vec<f64>> {
     let mut nll = Vec::new();
-    for line in std::io::BufReader::new(f).lines() {
-        let line = line.with_context(|| format!("read {path}"))?;
-        if let Some(rest) = line.strip_prefix("# rivoli-nll v1 ") {
-            label = rest.to_string();
-            continue;
-        }
-        if line.trim().is_empty() {
+    for line in lines {
+        if line.starts_with(HEADER) || line.trim().is_empty() {
             continue;
         }
         nll.push(
@@ -46,9 +55,24 @@ fn load(path: &str) -> Result<Run> {
     if nll.is_empty() {
         bail!("{path}: no NLL samples");
     }
-    if label.is_empty() {
-        bail!("{path}: missing `# rivoli-nll v1` header — not an engine-written NLL file");
-    }
+    Ok(nll)
+}
+
+fn load(path: &str) -> Result<Run> {
+    let f = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
+    // Read whole rather than stream: the `Vec<f64>` below already holds one f64 per line,
+    // so materialising the lines adds no new memory class, and both passes below want to
+    // look at every line.
+    let lines: Vec<String> = std::io::BufReader::new(f)
+        .lines()
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("read {path}"))?;
+    // Samples first, header second — an empty file is reported as empty rather than as a
+    // missing header, which is the more useful of the two complaints.
+    let nll = samples(path, &lines)?;
+    let label = header(&lines).with_context(|| {
+        format!("{path}: missing `# rivoli-nll v1` header — not an engine-written NLL file")
+    })?;
     Ok(Run {
         path: path.to_string(),
         label,
@@ -99,6 +123,143 @@ fn stddev(v: &[f64]) -> f64 {
     (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt()
 }
 
+/// One cell's paired statistics against the baseline — the numbers the table printed and
+/// the verdict pass then re-reads. Named fields rather than the tuple this used to be, so
+/// the two passes cannot disagree about which of five `f64`s is which.
+struct Paired {
+    label: String,
+    mean: f64,
+    lo: f64,
+    hi: f64,
+    sd: f64,
+}
+
+/// The per-token paired differences, refusing a cell that did not score the same text.
+fn diffs(base: &Run, r: &Run) -> Result<Vec<f64>> {
+    // Pairing is only valid position-by-position. Different lengths mean the two runs
+    // did not score the same text, and averaging them anyway would silently compare
+    // different things — the exact failure this tool exists to prevent.
+    if r.nll.len() != base.nll.len() {
+        bail!(
+            "{}: {} tokens vs baseline's {} — not the same text, cannot pair",
+            r.path,
+            r.nll.len(),
+            base.nll.len()
+        );
+    }
+    Ok(r.nll.iter().zip(&base.nll).map(|(a, b)| a - b).collect())
+}
+
+/// The baseline block and the table's column header — everything printed before the rows.
+fn print_preamble(base: &Run) {
+    println!("baseline: {}\n          {}", base.path, base.label);
+    println!(
+        "          {} tokens, PPL {:.6}\n",
+        base.nll.len(),
+        mean(&base.nll).exp()
+    );
+    println!(
+        "{:<34}{:>10}{:>8}{:>11}{:>9}{:>9}{:>22}{:>8}",
+        "cell", "PPL", "dPPL%", "mean dNLL", "sd", "SE", "95% CI (nats)", "worse%"
+    );
+}
+
+/// One table row, returning the statistics the verdict pass needs. Printed and computed in
+/// one place so a cell's row and its verdict are the same arithmetic by construction.
+fn print_row(base: &Run, r: &Run) -> Result<Paired> {
+    let d = diffs(base, r)?;
+    let (ppl, bppl) = (mean(&r.nll).exp(), mean(&base.nll).exp());
+    // Share of positions the cell scored WORSE on. A mean shift carried by a handful
+    // of tokens looks the same as a broad one until you check this.
+    let worse = 100.0 * d.iter().filter(|&&x| x > 0.0).count() as f64 / d.len() as f64;
+    let (m, sd) = (mean(&d), stddev(&d));
+    let se = sd / (d.len() as f64).sqrt();
+    let (lo, hi) = (m - 1.96 * se, m + 1.96 * se);
+    println!(
+        "{:<34}{ppl:>10.5}{:>7.3}%{m:>11.5}{sd:>9.4}{se:>9.5}{:>22}{worse:>7.1}%",
+        cell(&r.label),
+        100.0 * (ppl - bppl) / bppl,
+        format!("[{lo:+.5}, {hi:+.5}]"),
+    );
+    Ok(Paired {
+        label: r.label.clone(),
+        mean: m,
+        lo,
+        hi,
+        sd,
+    })
+}
+
+/// The single crispest statement of underpowered: if one standard error is wider than
+/// the whole acceptance bar, the experiment cannot see the quantity it exists to bound,
+/// and no arrangement of the point estimates changes that.
+fn print_underpowered(pairs: &[Paired], bar: f64) {
+    for p in pairs {
+        let se = (p.hi - p.lo) / (2.0 * 1.96);
+        if se > bar {
+            println!(
+                "  !! {} — SE {se:.5} EXCEEDS the {bar:.5} bar: this cell cannot resolve the\n     \
+                 acceptance question at any point estimate. More TEXT is the only fix.",
+                cell(&p.label)
+            );
+        }
+    }
+}
+
+/// ONE-SIDED on purpose. Acceptance bounds the quality COST, and a cell that came out
+/// better than baseline has not failed it — requiring the lower bound to clear -bar too
+/// would report a genuine pass as inconclusive and buy device time to re-measure something
+/// already answered. A lower bound past -1% is still worth a look, though: cache
+/// substitution should not IMPROVE quality, and if it appears to, the likelier explanation
+/// is a bug than a free lunch.
+fn pass_line(p: &Paired, bar: f64) -> String {
+    let odd = if p.lo < -bar {
+        "  (note: interval also admits >1% BETTER — implausible, suspect a bug)"
+    } else {
+        ""
+    };
+    format!("PASS — upper bound {:+.5} < bar{odd}", p.hi)
+}
+
+/// Which of the four next actions this cell calls for.
+///
+/// Acceptance asks whether the cost is WITHIN 1%, so what must happen is that the
+/// interval's UPPER bound falls below the bar — not that its half-width equals the bar.
+/// Those come apart badly: an effect of 0.0 with half-width 1.0% still straddles and
+/// decides nothing, while an effect of 0.1% with half-width 0.7% passes cleanly. Sizing a
+/// re-run off half-width alone can buy hours of exclusive device time and land in the same
+/// ambiguity.
+fn verdict(p: &Paired, bar: f64) -> String {
+    let (lo, hi) = (p.lo, p.hi);
+    if hi < bar {
+        pass_line(p, bar)
+    } else if lo > bar {
+        "FAIL — interval entirely worse than +1%".to_string()
+    } else if lo > 0.0 {
+        // Distinct from INCONCLUSIVE and the difference decides what to do next. The
+        // cost is established as real (interval clears zero) but its magnitude is not
+        // (interval clears the bar too). More text refines the number without changing
+        // the decision, because "not demonstrably within budget" is already sufficient
+        // not to ship. Collapsing this into INCONCLUSIVE is how "we decided against it"
+        // gets relitigated later as "we never checked properly".
+        format!(
+            "COST ESTABLISHED, MAGNITUDE UNRESOLVED — interval [{lo:+.5}, {hi:+.5}] clears \
+             zero but not the bar. NOT ship-able; more text refines the number, not the \
+             decision."
+        )
+    } else {
+        // Interval straddles zero: nothing is established, and more text genuinely
+        // could change the answer. n to drive the upper bound under the bar AT THIS
+        // OBSERVED EFFECT SIZE — the margin is (bar - mean), so a cell whose true cost
+        // is near zero needs far less text than one sitting just under the bar.
+        format!(
+            "INCONCLUSIVE — interval straddles zero, nothing established; needs ~{} tokens \
+             at this effect size, and it may resolve either way",
+            required_n(p.sd, p.mean, bar)
+        )
+    }
+}
+
 fn main() -> Result<()> {
     const USAGE: &str = "usage: ppl <baseline.nll> <cell.nll>...";
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -108,112 +269,25 @@ fn main() -> Result<()> {
     let runs: Vec<Run> = args.iter().map(|p| load(p)).collect::<Result<_>>()?;
     let base = &runs[0];
 
-    println!("baseline: {}\n          {}", base.path, base.label);
-    println!(
-        "          {} tokens, PPL {:.6}\n",
-        base.nll.len(),
-        mean(&base.nll).exp()
-    );
-
-    println!(
-        "{:<34}{:>10}{:>8}{:>11}{:>9}{:>9}{:>22}{:>8}",
-        "cell", "PPL", "dPPL%", "mean dNLL", "sd", "SE", "95% CI (nats)", "worse%"
-    );
-    let mut verdicts: Vec<(String, f64, f64, f64, f64)> = Vec::new();
-    for r in &runs[1..] {
-        // Pairing is only valid position-by-position. Different lengths mean the two runs
-        // did not score the same text, and averaging them anyway would silently compare
-        // different things — the exact failure this tool exists to prevent.
-        if r.nll.len() != base.nll.len() {
-            bail!(
-                "{}: {} tokens vs baseline's {} — not the same text, cannot pair",
-                r.path,
-                r.nll.len(),
-                base.nll.len()
-            );
-        }
-        let d: Vec<f64> = r.nll.iter().zip(&base.nll).map(|(a, b)| a - b).collect();
-        let (ppl, bppl) = (mean(&r.nll).exp(), mean(&base.nll).exp());
-        // Share of positions the cell scored WORSE on. A mean shift carried by a handful
-        // of tokens looks the same as a broad one until you check this.
-        let worse = 100.0 * d.iter().filter(|&&x| x > 0.0).count() as f64 / d.len() as f64;
-        let (m, sd) = (mean(&d), stddev(&d));
-        let se = sd / (d.len() as f64).sqrt();
-        let (lo, hi) = (m - 1.96 * se, m + 1.96 * se);
-        println!(
-            "{:<34}{ppl:>10.5}{:>7.3}%{m:>11.5}{sd:>9.4}{se:>9.5}{:>22}{worse:>7.1}%",
-            cell(&r.label),
-            100.0 * (ppl - bppl) / bppl,
-            format!("[{lo:+.5}, {hi:+.5}]"),
-        );
-        verdicts.push((r.label.clone(), m, lo, hi, sd));
-    }
+    print_preamble(base);
+    let pairs: Vec<Paired> = runs[1..]
+        .iter()
+        .map(|r| print_row(base, r))
+        .collect::<Result<_>>()?;
 
     // The bar is a ~1% PERPLEXITY change; since PPL = exp(mean NLL) that is ln(1.01)
     // nats of mean dNLL. Comparing the interval against it is the only way to tell
     // "the cost is small" apart from "we could not measure it".
     let bar = 1.01f64.ln();
     println!("\n1% PPL bar = {bar:.5} nats of mean dNLL. Verdict per cell:");
-    // The single crispest statement of underpowered: if one standard error is wider than
-    // the whole acceptance bar, the experiment cannot see the quantity it exists to bound,
-    // and no arrangement of the point estimates changes that.
-    for (label, _, lo, hi, _) in &verdicts {
-        let se = (hi - lo) / (2.0 * 1.96);
-        if se > bar {
-            println!(
-                "  !! {} — SE {se:.5} EXCEEDS the {bar:.5} bar: this cell cannot resolve the\n     \
-                 acceptance question at any point estimate. More TEXT is the only fix.",
-                cell(label)
-            );
-        }
-    }
-    for (label, m, lo, hi, sd) in &verdicts {
-        let cell = cell(label);
-        // Acceptance asks whether the cost is WITHIN 1%, so what must happen is that the
-        // interval's UPPER bound falls below the bar — not that its half-width equals the
-        // bar. Those come apart badly: an effect of 0.0 with half-width 1.0% still
-        // straddles and decides nothing, while an effect of 0.1% with half-width 0.7%
-        // passes cleanly. Sizing a re-run off half-width alone can buy hours of exclusive
-        // device time and land in the same ambiguity.
-        let verdict = if *hi < bar {
-            // ONE-SIDED on purpose. Acceptance bounds the quality COST, and a cell that
-            // came out better than baseline has not failed it — requiring the lower bound
-            // to clear -bar too would report a genuine pass as inconclusive and buy device
-            // time to re-measure something already answered. A lower bound past -1% is
-            // still worth a look, though: cache substitution should not IMPROVE quality,
-            // and if it appears to, the likelier explanation is a bug than a free lunch.
-            let odd = if *lo < -bar {
-                "  (note: interval also admits >1% BETTER — implausible, suspect a bug)"
-            } else {
-                ""
-            };
-            format!("PASS — upper bound {hi:+.5} < bar{odd}")
-        } else if *lo > bar {
-            "FAIL — interval entirely worse than +1%".to_string()
-        } else if *lo > 0.0 {
-            // Distinct from INCONCLUSIVE and the difference decides what to do next. The
-            // cost is established as real (interval clears zero) but its magnitude is not
-            // (interval clears the bar too). More text refines the number without changing
-            // the decision, because "not demonstrably within budget" is already sufficient
-            // not to ship. Collapsing this into INCONCLUSIVE is how "we decided against it"
-            // gets relitigated later as "we never checked properly".
-            format!(
-                "COST ESTABLISHED, MAGNITUDE UNRESOLVED — interval [{lo:+.5}, {hi:+.5}] clears \
-                 zero but not the bar. NOT ship-able; more text refines the number, not the \
-                 decision."
-            )
-        } else {
-            // Interval straddles zero: nothing is established, and more text genuinely
-            // could change the answer. n to drive the upper bound under the bar AT THIS
-            // OBSERVED EFFECT SIZE — the margin is (bar - mean), so a cell whose true cost
-            // is near zero needs far less text than one sitting just under the bar.
-            format!(
-                "INCONCLUSIVE — interval straddles zero, nothing established; needs ~{} tokens \
-                 at this effect size, and it may resolve either way",
-                required_n(*sd, *m, bar)
-            )
-        };
-        println!("  {cell:<34} mean {m:+.5}  {verdict}");
+    print_underpowered(&pairs, bar);
+    for p in &pairs {
+        println!(
+            "  {:<34} mean {:+.5}  {}",
+            cell(&p.label),
+            p.mean,
+            verdict(p, bar)
+        );
     }
     println!(
         "\nPaired dNLL is the evidence; PPL is for comparability with arXiv:2412.00099.\n\

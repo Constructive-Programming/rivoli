@@ -304,49 +304,71 @@ mod tests {
         assert_eq!(a.alloc_step(false), AllocOutcome::Placed(0));
     }
 
+    /// An arena plus the key living in each `(hot, idx)` slot — the minimum bookkeeping a
+    /// compaction test needs to tell a live slot from a hole.
+    struct Keyed {
+        a: Arena,
+        key_at: HashMap<(bool, usize), u32>,
+    }
+    impl Keyed {
+        // Place `k` in a fresh `hot` slot, insisting on Placed outright: the fixture's setup
+        // must fill the budget WITHOUT compacting, or the compaction it then forces proves
+        // nothing about cascading.
+        fn grow(&mut self, hot: bool, k: u32) {
+            match self.a.alloc_step(hot) {
+                AllocOutcome::Placed(i) => {
+                    self.key_at.insert((hot, i), k);
+                }
+                s => panic!("grow hot={hot}: unexpected {s:?}"),
+            }
+        }
+        // Drop the key at `(hot, idx)` and free the slot — leaving a hole, not a live slot.
+        fn drop_slot(&mut self, hot: bool, idx: usize) {
+            self.key_at.remove(&(hot, idx));
+            self.a.free(hot, idx);
+        }
+        // Drive alloc_step to Placed, applying each Reloc to `key_at`. Every relocated
+        // `from` MUST still hold a key — that assertion IS the property under test.
+        fn drive_to_placed(&mut self, hot: bool) {
+            for _ in 0..10 {
+                match self.a.alloc_step(hot) {
+                    AllocOutcome::Placed(_) => return,
+                    AllocOutcome::Relocated(r) => self.apply_reloc(r),
+                    AllocOutcome::NeedFree => {
+                        panic!("unexpected NeedFree with free bytes available")
+                    }
+                }
+            }
+            panic!("compaction did not converge");
+        }
+        fn apply_reloc(&mut self, r: Reloc) {
+            let k = self
+                .key_at
+                .remove(&(r.hot, r.from))
+                .unwrap_or_else(|| panic!("relocated a keyless hole at {:?}", (r.hot, r.from)));
+            self.key_at.insert((r.hot, r.to), k);
+        }
+    }
+
     // Regression: compaction must cascade the frontier retreat, so a SECOND compaction
     // step never relocates a keyless hole. Without the `retreat` in alloc_step this
     // panics ("relocated a keyless hole"). Scenario: 5 cold + 1 hot fill the budget with
     // non-adjacent cold holes {1,3}; admitting a hot slot forces two compaction steps.
     #[test]
     fn compaction_never_relocates_a_hole() {
-        let mut a = Arena::new(19, 3, 4); // cs=3 (vq), hs=4 (i4)
-        let mut key_at: HashMap<(bool, usize), u32> = HashMap::new();
+        let mut s = Keyed {
+            a: Arena::new(19, 3, 4), // cs=3 (vq), hs=4 (i4)
+            key_at: HashMap::new(),
+        };
         for k in 0..5u32 {
-            match a.alloc_step(false) {
-                AllocOutcome::Placed(i) => {
-                    key_at.insert((false, i), k);
-                }
-                s => panic!("cold grow: unexpected {s:?}"),
-            }
+            s.grow(false, k);
         }
-        match a.alloc_step(true) {
-            AllocOutcome::Placed(i) => {
-                key_at.insert((true, i), 100);
-            }
-            s => panic!("hot grow: unexpected {s:?}"),
-        }
+        s.grow(true, 100);
         // Free non-adjacent cold holes (keys at slots 3 then 1) — neither is the frontier.
-        key_at.remove(&(false, 3));
-        a.free(false, 3);
-        key_at.remove(&(false, 1));
-        a.free(false, 1);
+        s.drop_slot(false, 3);
+        s.drop_slot(false, 1);
         // Admit a hot slot: drives compaction; every Reloc's `from` MUST hold a key.
-        let mut steps = 0;
-        loop {
-            match a.alloc_step(true) {
-                AllocOutcome::Placed(_) => break,
-                AllocOutcome::Relocated(r) => {
-                    let k = key_at.remove(&(r.hot, r.from)).unwrap_or_else(|| {
-                        panic!("relocated a keyless hole at {:?}", (r.hot, r.from))
-                    });
-                    key_at.insert((r.hot, r.to), k);
-                }
-                AllocOutcome::NeedFree => panic!("unexpected NeedFree with free bytes available"),
-            }
-            steps += 1;
-            assert!(steps < 10, "compaction did not converge");
-        }
+        s.drive_to_placed(true);
     }
 
     #[test]

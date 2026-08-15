@@ -159,27 +159,21 @@ impl AsyncFetch {
             tls.push(Timeline::new()?);
         }
         let slot_tl = Arc::new(tls);
-        let tl_reaper = slot_tl.clone();
         let (tx, rx) = channel::<ReapJob>();
         let fetch_ns = Arc::new(AtomicU64::new(0));
         let io_wait_ns = Arc::new(AtomicU64::new(0));
         let poisoned = Arc::new(AtomicBool::new(false));
-        let fn_reaper = fetch_ns.clone();
-        let io_reaper = io_wait_ns.clone();
-        let poison_reaper = poisoned.clone();
+        let reaper_state = Reaper {
+            streamer,
+            fetch,
+            fetch_ns: fetch_ns.clone(),
+            io_wait_ns: io_wait_ns.clone(),
+            poisoned: poisoned.clone(),
+            slot_tl: slot_tl.clone(),
+        };
         let reaper = std::thread::Builder::new()
             .name("rivoli-reaper".into())
-            .spawn(move || {
-                reaper_loop(
-                    streamer,
-                    fetch,
-                    rx,
-                    fn_reaper,
-                    io_reaper,
-                    poison_reaper,
-                    tl_reaper,
-                )
-            })?;
+            .spawn(move || reaper_state.run(rx))?;
         Ok(Self {
             tx: Some(tx),
             reaper: Some(reaper),
@@ -331,37 +325,110 @@ impl Drop for AsyncFetch {
     }
 }
 
-/// Reaper thread: one job per layer until the channel closes. Times each job's wall
-/// into `fetch_ns` — the fetch cost the main-thread compute overlaps.
-fn reaper_loop(
-    mut streamer: Streamer,
+/// Everything the reaper thread holds for its whole life: the demand ring and fetch stream
+/// it owns outright, plus the four handles it shares with the [`AsyncFetch`] on the decode
+/// thread. One struct because they are one unit — every field is moved into the thread at
+/// spawn and read by every job — and because the alternative is threading seven parameters
+/// through the loop and five more through each job.
+struct Reaper {
+    streamer: Streamer,
     fetch: Stream,
-    rx: Receiver<ReapJob>,
+    /// Shares [`AsyncFetch::fetch_ns`]; this thread is the only writer.
     fetch_ns: Arc<AtomicU64>,
+    /// Shares [`AsyncFetch::io_wait_ns`]; this thread is the only writer.
     io_wait_ns: Arc<AtomicU64>,
+    /// Shares [`AsyncFetch::poisoned`]; this thread is the only writer.
     poisoned: Arc<AtomicBool>,
+    /// Shares [`AsyncFetch::slot_tl`] — the timelines a ticket is redeemed against.
     slot_tl: Arc<Vec<Timeline>>,
-) {
-    for job in rx {
-        // Once poisoned, the ring is dirty (a prior job bailed mid-batch, leaving
-        // undrained CQEs and stale queued/min_res). Touching it again would index a
-        // stale user_data → C-side OOB or a panic that kills this thread and hangs
-        // every later consumer. So don't: abandon the ring and release the tickets.
-        if poisoned.load(Ordering::Acquire) {
-            release(&job, &slot_tl);
-            continue;
+}
+
+impl Reaper {
+    /// Reaper thread: one job per layer until the channel closes. Times each job's wall
+    /// into `fetch_ns` — the fetch cost the main-thread compute overlaps.
+    fn run(mut self, rx: Receiver<ReapJob>) {
+        for job in rx {
+            // Once poisoned, the ring is dirty (a prior job bailed mid-batch, leaving
+            // undrained CQEs and stale queued/min_res). Touching it again would index a
+            // stale user_data → C-side OOB or a panic that kills this thread and hangs
+            // every later consumer. So don't: abandon the ring and release the tickets.
+            if self.poisoned.load(Ordering::Acquire) {
+                release(&job, &self.slot_tl);
+                continue;
+            }
+            let t = std::time::Instant::now();
+            let r = self.run_job(&job);
+            self.fetch_ns
+                .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if let Err(e) = r {
+                // Fatal fetch error: poison (abandon the dirty ring for all later jobs),
+                // log, and release this job's tickets so no consumer hangs. `run_job` may
+                // have signalled some of them already; `release` is monotone.
+                tracing::error!("reaper: {e:#}");
+                self.poisoned.store(true, Ordering::Release);
+                release(&job, &self.slot_tl);
+            }
         }
-        let t = std::time::Instant::now();
-        let r = run_job(&mut streamer, &fetch, &job, &io_wait_ns, &slot_tl);
-        fetch_ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        if let Err(e) = r {
-            // Fatal fetch error: poison (abandon the dirty ring for all later jobs),
-            // log, and release this job's tickets so no consumer hangs. `run_job` may
-            // have signalled some of them already; `release` is monotone.
-            tracing::error!("reaper: {e:#}");
-            poisoned.store(true, Ordering::Release);
-            release(&job, &slot_tl);
+    }
+
+    fn run_job(&mut self, job: &ReapJob) -> Result<()> {
+        // Destructured so the ring can be borrowed mutably while the stream, the counter
+        // and the timelines are read alongside it.
+        let Self {
+            streamer,
+            fetch,
+            io_wait_ns,
+            slot_tl,
+            ..
+        } = self;
+        for (r, t) in job.reads.iter().zip(&job.tickets) {
+            // SAFETY: `dst` is an ALIGN-aligned device slot the pipeline keeps live until
+            // this read's signal resolves; the VQ blocks are VQ_ALIGN-aligned so the
+            // returned sub-offset is 0 (the slot start IS the block). `t.slot` came from
+            // `take_slot`, so its previous copy has retired.
+            let sub = unsafe { streamer.queue(r.fd, r.begin, r.len, r.dst, u32::from(t.slot))? };
+            debug_assert_eq!(
+                sub, 0,
+                "VQ expert read must be block-aligned (sub-offset 0)"
+            );
         }
+        streamer.submit()?;
+        // Everything above is CPU (building and submitting SQEs); everything in the loop
+        // below is the thread parked in the kernel waiting for NVMe. Only the latter is
+        // io-wait, which is why the clock starts here and not at the top of `run_job`.
+        let t_io = std::time::Instant::now();
+        for _ in 0..job.reads.len() {
+            // SAFETY: `fetch` is a live stream; `reap` kicks this read's copy on it and
+            // returns the completed read's user_data — which is now the STAGING SLOT, so
+            // the batch position it belongs to has to be looked up. A batch is ≤ top_k
+            // reads, so the scan is cheaper than carrying a slot→position map.
+            let slot = unsafe { streamer.reap(fetch.raw())? };
+            let u = job
+                .tickets
+                .iter()
+                .position(|t| usize::from(t.slot) == slot)
+                .ok_or_else(|| {
+                    anyhow!("completion for slot {slot}, which this batch never queued")
+                })?;
+            // Publish the ticket: enqueued on the fetch stream AFTER `reap` queued this
+            // read's copy, so the timeline reaching this value means the copy has completed.
+            // This is what a consumer's `wait` is gated on, and now the only thing published
+            // here — a `Signal::arm_on` used to follow, which is a `hipLaunchHostFunc` (a
+            // host round trip recorded INTO this stream) for a future nobody polled.
+            let t = job.tickets[u];
+            slot_tl[t.slot as usize].signal(fetch.raw(), t.value)?;
+        }
+        let e_io = std::time::Instant::now();
+        io_wait_ns.fetch_add(
+            e_io.duration_since(t_io).as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        // Emitted on the REAPER thread against the same shared anchor as the decode
+        // thread's spans, so a trace viewer draws them on one timeline. This is the pair
+        // whose overlap the whole streaming design is a bet on: io-wait bars should sit
+        // underneath the decode thread's gpu-wait bars, not beside them.
+        crate::telemetry::spans::record("io-wait/uring-reap", "reaper", t_io, e_io);
+        Ok(())
     }
 }
 
@@ -382,61 +449,6 @@ fn release(job: &ReapJob, slot_tl: &[Timeline]) {
     for t in &job.tickets {
         slot_tl[t.slot as usize].release(t.value);
     }
-}
-
-fn run_job(
-    streamer: &mut Streamer,
-    fetch: &Stream,
-    job: &ReapJob,
-    io_wait_ns: &AtomicU64,
-    slot_tl: &[Timeline],
-) -> Result<()> {
-    for (r, t) in job.reads.iter().zip(&job.tickets) {
-        // SAFETY: `dst` is an ALIGN-aligned device slot the pipeline keeps live until
-        // this read's signal resolves; the VQ blocks are VQ_ALIGN-aligned so the
-        // returned sub-offset is 0 (the slot start IS the block). `t.slot` came from
-        // `take_slot`, so its previous copy has retired.
-        let sub = unsafe { streamer.queue(r.fd, r.begin, r.len, r.dst, u32::from(t.slot))? };
-        debug_assert_eq!(
-            sub, 0,
-            "VQ expert read must be block-aligned (sub-offset 0)"
-        );
-    }
-    streamer.submit()?;
-    // Everything above is CPU (building and submitting SQEs); everything in the loop
-    // below is the thread parked in the kernel waiting for NVMe. Only the latter is
-    // io-wait, which is why the clock starts here and not at the top of `run_job`.
-    let t_io = std::time::Instant::now();
-    for _ in 0..job.reads.len() {
-        // SAFETY: `fetch` is a live stream; `reap` kicks this read's copy on it and
-        // returns the completed read's user_data — which is now the STAGING SLOT, so the
-        // batch position it belongs to has to be looked up. A batch is ≤ top_k reads, so
-        // the scan is cheaper than carrying a slot→position map.
-        let slot = unsafe { streamer.reap(fetch.raw())? };
-        let u = job
-            .tickets
-            .iter()
-            .position(|t| usize::from(t.slot) == slot)
-            .ok_or_else(|| anyhow!("completion for slot {slot}, which this batch never queued"))?;
-        // Publish the ticket: enqueued on the fetch stream AFTER `reap` queued this read's
-        // copy, so the timeline reaching this value means the copy has completed. This is
-        // what a consumer's `wait` is gated on, and now the only thing published here — a
-        // `Signal::arm_on` used to follow, which is a `hipLaunchHostFunc` (a host round trip
-        // recorded INTO this stream) for a future nobody polled.
-        let t = job.tickets[u];
-        slot_tl[t.slot as usize].signal(fetch.raw(), t.value)?;
-    }
-    let e_io = std::time::Instant::now();
-    io_wait_ns.fetch_add(
-        e_io.duration_since(t_io).as_nanos() as u64,
-        Ordering::Relaxed,
-    );
-    // Emitted on the REAPER thread against the same shared anchor as the decode
-    // thread's spans, so a trace viewer draws them on one timeline. This is the pair
-    // whose overlap the whole streaming design is a bet on: io-wait bars should sit
-    // underneath the decode thread's gpu-wait bars, not beside them.
-    crate::telemetry::spans::record("io-wait/uring-reap", "reaper", t_io, e_io);
-    Ok(())
 }
 
 #[cfg(test)]

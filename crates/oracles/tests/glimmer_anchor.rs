@@ -21,6 +21,11 @@
 //! Widths are **derived from each golden's own `tiny_config`**, never written as literals, and the
 //! fields that are supposed to be REAL are compared against the vendored `config.json` rather than
 //! against constants. A literal agrees with drift; a derived value fails on it.
+//!
+//! **Each `#[test]` below is a driver over named `check_*` helpers rather than one long body.**
+//! That is a code-health requirement, not taste — the CodeScene gate refuses a file with deeply
+//! nested test bodies or long unbroken runs of assertions, and a run of asserts with no name on it
+//! is exactly the shape that makes a failure read as "something in this file broke".
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
@@ -127,7 +132,7 @@ fn draft_goldens() -> impl Iterator<Item = &'static Vendored> {
 /// Three checks below started with the same four lines — load, parse the config, read the widths,
 /// name the file — and `build.rs`'s jscpd gate rejected them at 73 tokens. The duplication was
 /// real; this is the factoring, not an exemption.
-fn each_text(mut f: impl FnMut(&Vendored, &GoldenSet, &Value, (usize, usize, usize, usize))) {
+fn each_text(mut f: impl FnMut(&Vendored, &GoldenSet, &Value, Widths)) {
     for v in text_goldens() {
         let g = load(v);
         let c = cfg(&g);
@@ -137,14 +142,36 @@ fn each_text(mut f: impl FnMut(&Vendored, &GoldenSet, &Value, (usize, usize, usi
 }
 
 /// The four widths every shape below is built from, so that a config drift fails the gate instead
-/// of being agreed with. Read together because they are only meaningful together.
-fn widths(c: &Value) -> (usize, usize, usize, usize) {
-    (
-        num(c, "hidden_size"),
-        num(c, "num_attention_heads"),
-        num(c, "num_key_value_heads"),
-        num(c, "head_dim"),
-    )
+/// of being agreed with. Read together because they are only meaningful together — and carried as
+/// one value so that no shape check needs four more arguments to say what it expects.
+#[derive(Clone, Copy)]
+struct Widths {
+    hidden: usize,
+    heads: usize,
+    kv: usize,
+    head_dim: usize,
+}
+
+impl Widths {
+    /// The concatenated head width the output gate and `o_proj` work at. **Not `hidden`** — that
+    /// collision is what `the_tiny_widths_did_not_collapse_a_distinction` exists to refuse.
+    fn concat(self) -> usize {
+        self.heads * self.head_dim
+    }
+
+    /// The GQA broadcast factor: how many query heads share one KV head.
+    fn group(self) -> usize {
+        self.heads / self.kv
+    }
+}
+
+fn widths(c: &Value) -> Widths {
+    Widths {
+        hidden: num(c, "hidden_size"),
+        heads: num(c, "num_attention_heads"),
+        kv: num(c, "num_key_value_heads"),
+        head_dim: num(c, "head_dim"),
+    }
 }
 
 /// The tiny config a golden was produced under, parsed out of its own metadata.
@@ -172,82 +199,163 @@ fn real() -> Value {
     top["text_config"].clone()
 }
 
+/// One capture's shape, by name — the assertion this file makes most often, said once so that a
+/// call site is the tensor's name next to the widths it is derived from rather than five lines of
+/// macro. Where a mismatch means something a shape diff cannot say, the caller keeps its own
+/// `assert_eq!` and its message.
+fn shape_is(g: &GoldenSet, name: &str, want: &[usize]) {
+    assert_eq!(shape_of(g, name), want, "{name}");
+}
+
 // ------------------------------------------------------------------------------------------
+
+/// What the file says it IS: the model, the driver that wrote it, and an unperturbed run.
+fn check_the_golden_is_an_unperturbed_glimmer_run(v: &Vendored, g: &GoldenSet) {
+    let who = v.name;
+    assert_eq!(meta(g, "model"), "muse-glimmer", "{who}: model");
+    assert_eq!(
+        g.defect(),
+        "None",
+        "{who}: a vendored golden must be unperturbed"
+    );
+    assert_eq!(
+        meta(g, "driver"),
+        "glimmer_anchor_driver.py",
+        "{who}: driver"
+    );
+}
+
+/// The mode and salt the ENTRY's name carries, held against what the FILE says.
+///
+/// Two copies of one fact is the shape this port has already been bitten by, so the entry never
+/// restates either: the name is checked to be a prefix of the file's own mode, and to end with the
+/// file's own salt index.
+fn check_the_file_agrees_with_its_name(v: &Vendored, g: &GoldenSet) {
+    let who = v.name;
+    let (mode, salt) = (meta(g, "mode"), meta(g, "salt"));
+    assert!(is_mode(v, mode), "{who}: the file says mode={mode}");
+    // The salt is read off the file, and the entry name carries only its index.
+    let index = who.rsplit('-').next().unwrap();
+    assert!(salt.ends_with(index), "{who}: the file says salt={salt}");
+}
+
+/// The two declared deviations S2's tolerance decision starts from: `eager` attention, and fp32
+/// against a bf16 checkpoint. If either ever changes, the tolerances derived from these goldens
+/// are stale.
+fn check_the_declared_deviations(v: &Vendored, g: &GoldenSet) {
+    let who = v.name;
+    assert_eq!(meta(g, "attn_implementation"), "eager", "{who}: attn impl");
+    assert_eq!(meta(g, "dtype"), "torch.float32", "{who}: dtype");
+}
+
+/// `transformers_commit` is checked to be a full hex sha rather than merely present, because the
+/// driver's own fallback for "not installed from git" is the string `"unknown"`, which is
+/// non-empty and would satisfy a presence check.
+fn check_transformers_commit_is_a_full_sha(v: &Vendored, g: &GoldenSet) {
+    let (who, commit) = (v.name, meta(g, "transformers_commit"));
+    assert_eq!(
+        commit.len(),
+        40,
+        "{who}: transformers_commit is not a full sha: {commit:?}"
+    );
+    assert!(
+        commit.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{who}: transformers_commit is not hex: {commit:?}"
+    );
+}
+
+/// The five keys that name the environment a golden was produced under, as one comparable list.
+fn env_of(g: &GoldenSet) -> Vec<String> {
+    [
+        "torch",
+        "transformers",
+        "transformers_commit",
+        "numpy",
+        "python",
+    ]
+    .iter()
+    .map(|k| format!("{k}={}", meta(g, k)))
+    .collect()
+}
 
 /// The provenance every consumer has to be able to read off the file, **by value**.
 ///
 /// A golden separated from the versions that produced it cannot be re-derived, and these were
 /// produced by a stack that is not in the repo — transformers at a git revision, in a venv that
-/// exists on one machine. `transformers_commit` is checked to be a full hex sha rather than merely
-/// present, because the driver's own fallback for "not installed from git" is the string
-/// `"unknown"`, which is non-empty and would satisfy a presence check.
+/// exists on one machine.
 #[test]
 fn the_anchor_goldens_record_what_produced_them() {
-    let mut env = None;
+    let mut env: Option<(&str, Vec<String>)> = None;
     for v in GOLDENS {
         let g = load(v);
-        let who = v.name;
-
-        assert_eq!(meta(&g, "model"), "muse-glimmer", "{who}: model");
-        assert!(
-            is_mode(v, meta(&g, "mode")),
-            "{who}: the file says mode={}",
-            meta(&g, "mode")
-        );
-        // The salt is read off the file, and the entry name carries only its index.
-        assert!(
-            meta(&g, "salt").ends_with(v.name.rsplit('-').next().unwrap()),
-            "{who}: the file says salt={}",
-            meta(&g, "salt")
-        );
-        assert_eq!(
-            g.defect(),
-            "None",
-            "{who}: a vendored golden must be unperturbed"
-        );
-        assert_eq!(
-            meta(&g, "driver"),
-            "glimmer_anchor_driver.py",
-            "{who}: driver"
-        );
-        assert_eq!(meta(&g, "attn_implementation"), "eager", "{who}: attn impl");
-        // The declared deviation that S2's tolerance decision starts from: fp32 against a bf16
-        // checkpoint. If this ever changes, the tolerances derived from these goldens are stale.
-        assert_eq!(meta(&g, "dtype"), "torch.float32", "{who}: dtype");
-
-        let commit = meta(&g, "transformers_commit");
-        assert_eq!(
-            commit.len(),
-            40,
-            "{who}: transformers_commit is not a full sha: {commit:?}"
-        );
-        assert!(
-            commit.bytes().all(|b| b.is_ascii_hexdigit()),
-            "{who}: transformers_commit is not hex: {commit:?}"
-        );
-
+        check_the_golden_is_an_unperturbed_glimmer_run(v, &g);
+        check_the_file_agrees_with_its_name(v, &g);
+        check_the_declared_deviations(v, &g);
+        check_transformers_commit_is_a_full_sha(v, &g);
         // Every golden must come from ONE environment. Two files pinned to different transformers
         // revisions cannot be compared to each other, and a port that scored against both would be
         // scoring against two references.
-        let here: Vec<String> = [
-            "torch",
-            "transformers",
-            "transformers_commit",
-            "numpy",
-            "python",
-        ]
-        .iter()
-        .map(|k| format!("{k}={}", meta(&g, k)))
-        .collect();
+        let here = env_of(&g);
         match &env {
-            None => env = Some((who, here)),
+            None => env = Some((v.name, here)),
             Some((first, want)) => assert_eq!(
                 &here, want,
-                "{who} was produced under a different env than {first}"
+                "{} was produced under a different env than {first}",
+                v.name
             ),
         }
     }
     assert_eq!(GOLDENS.len(), 4, "two modes x two salts");
+}
+
+// ------------------------------------------------------------------------------------------
+
+/// Every tensor name the tiny model's whole parameter set must contain, built from the config's
+/// own layer count and returned sorted.
+///
+/// **A structural census, not a count.** It was `== num_hidden_layers` while the dump held
+/// `gate_proj` alone; a count would now be satisfied by 107 of the wrong tensors, and this file is
+/// the only thing between a re-vendored blob and every gate built on it. Naming each expected
+/// tensor is what makes a MISSING projection fail here rather than three files downstream, where
+/// the message would be about a shape.
+fn expected_weight_names(n_layers: usize) -> Vec<String> {
+    let mut want: Vec<String> = vec![
+        "model.language_model.embed_tokens.weight".into(),
+        "model.language_model.norm.weight".into(),
+        "lm_head.weight".into(),
+    ];
+    for l in 0..n_layers {
+        for t in rivoli_artifact::glimmer::GLIMMER_LAYER_TENSORS {
+            want.push(format!(
+                "{}.{l}.{t}.weight",
+                rivoli_artifact::glimmer::GLIMMER_LAYER_PREFIX
+            ));
+        }
+        // The pre-2026-08-13 name for `self_attn.gate_proj`, still emitted so the file that
+        // reads it did not have to move in the same commit that widened this dump.
+        want.push(format!("L{l}.attn.gate_proj.weight"));
+    }
+    want.sort();
+    want
+}
+
+/// One weight set: its pinned bytes, the run it came out of, and its whole tensor census.
+fn check_weight_set(v: &Vendored) {
+    v.check_bytes();
+    let g = load(v);
+    // Produced by the clean text run, which is what `--dump-weights` refuses to do otherwise —
+    // and that refusal lives in python, where no vendored byte can be held to it. This is where
+    // it is held.
+    assert_eq!(meta(&g, "mode"), "text", "{}: not from a text run", v.name);
+    assert_eq!(meta(&g, "defect"), "None", "{}: from a DEFECT run", v.name);
+    let want = expected_weight_names(num(&cfg(&g), "num_hidden_layers"));
+    let mut have: Vec<String> = g.floats.iter().map(|(n, _, _)| n.clone()).collect();
+    have.sort();
+    assert_eq!(
+        have, want,
+        "{}: the weight set is not the tiny model's whole parameter set",
+        v.name
+    );
 }
 
 /// The weight sets are the same bytes, from the same run, and the two salts really differ.
@@ -259,43 +367,7 @@ fn the_anchor_goldens_record_what_produced_them() {
 #[test]
 fn the_vendored_weight_sets_are_the_measured_ones() {
     for v in WEIGHT_SETS {
-        v.check_bytes();
-        let g = load(v);
-        // Produced by the clean text run, which is what `--dump-weights` refuses to do otherwise —
-        // and that refusal lives in python, where no vendored byte can be held to it. This is where
-        // it is held.
-        assert_eq!(meta(&g, "mode"), "text", "{}: not from a text run", v.name);
-        assert_eq!(meta(&g, "defect"), "None", "{}: from a DEFECT run", v.name);
-        // **A structural census, not a count.** It was `== num_hidden_layers` while the dump held
-        // `gate_proj` alone; a count would now be satisfied by 107 of the wrong tensors, and this
-        // file is the only thing between a re-vendored blob and every gate built on it. Naming
-        // each expected tensor is what makes a MISSING projection fail here rather than three
-        // files downstream, where the message would be about a shape.
-        let n_layers = num(&cfg(&g), "num_hidden_layers");
-        let mut want: Vec<String> = vec![
-            "model.language_model.embed_tokens.weight".into(),
-            "model.language_model.norm.weight".into(),
-            "lm_head.weight".into(),
-        ];
-        for l in 0..n_layers {
-            for t in rivoli_artifact::glimmer::GLIMMER_LAYER_TENSORS {
-                want.push(format!(
-                    "{}.{l}.{t}.weight",
-                    rivoli_artifact::glimmer::GLIMMER_LAYER_PREFIX
-                ));
-            }
-            // The pre-2026-08-13 name for `self_attn.gate_proj`, still emitted so the file that
-            // reads it did not have to move in the same commit that widened this dump.
-            want.push(format!("L{l}.attn.gate_proj.weight"));
-        }
-        let mut have: Vec<String> = g.floats.iter().map(|(n, _, _)| n.clone()).collect();
-        have.sort();
-        want.sort();
-        assert_eq!(
-            have, want,
-            "{}: the weight set is not the tiny model's whole parameter set",
-            v.name
-        );
+        check_weight_set(v);
     }
     assert_eq!(WEIGHT_SETS.len(), 2, "one weight set per salt");
     let (a, b) = (&WEIGHT_SETS[0], &WEIGHT_SETS[1]);
@@ -322,6 +394,23 @@ fn the_vendored_bytes_are_the_measured_ones() {
     }
 }
 
+// ------------------------------------------------------------------------------------------
+
+/// Every one of these is a number a kernel will hard-code or a formula it will evaluate, and
+/// getting any of them from the wrong place is a silent quality loss rather than a crash.
+const REAL_FIELDS: &[&str] = &[
+    "rms_norm_eps",
+    "post_norm_eps",
+    "qk_scale_factor",
+    "output_multiplier",
+    "final_logit_softcapping",
+    "num_key_value_heads",
+    "hidden_activation",
+    "attention_bias",
+    "attention_dropout",
+    "tie_word_embeddings",
+];
+
 /// **Every field the driver calls REAL must still equal the real checkpoint's**, read out of the
 /// vendored `config.json` rather than restated here.
 ///
@@ -331,23 +420,7 @@ fn the_vendored_bytes_are_the_measured_ones() {
 #[test]
 fn the_tiny_config_kept_the_real_values() {
     let want = real();
-    // Every one of these is a number a kernel will hard-code or a formula it will evaluate, and
-    // getting any of them from the wrong place is a silent quality loss rather than a crash.
-    const REAL_FIELDS: &[&str] = &[
-        "rms_norm_eps",
-        "post_norm_eps",
-        "qk_scale_factor",
-        "output_multiplier",
-        "final_logit_softcapping",
-        "num_key_value_heads",
-        "hidden_activation",
-        "attention_bias",
-        "attention_dropout",
-        "tie_word_embeddings",
-    ];
-    for v in text_goldens() {
-        let g = load(v);
-        let got = cfg(&g);
+    each_text(|v, _g, got, _| {
         for key in REAL_FIELDS {
             assert_eq!(
                 got[key], want[key],
@@ -368,88 +441,97 @@ fn the_tiny_config_kept_the_real_values() {
             "{}: the two eps collapsed",
             v.name
         );
-    }
-}
-
-/// The widths were shrunk in a way that keeps every structural distinction the real model has.
-///
-/// K3's anchor review found an assertion satisfied by the wrong reading too, because four widths
-/// had collided. These are the collisions that would matter here.
-#[test]
-fn the_tiny_widths_did_not_collapse_a_distinction() {
-    each_text(|v, g, c, (h, heads, kv, hd)| {
-        let who = v.name;
-        // The real model is 6656 vs 32*128 = 4096. A port that assumes they are equal — the usual
-        // assumption — passes on any tiny config where they are.
-        assert_ne!(
-            h,
-            heads * hd,
-            "{who}: hidden_size collapsed onto num_heads*head_dim"
-        );
-        assert_eq!(
-            h % heads,
-            0,
-            "{who}: the reference's own validate_architecture requires this"
-        );
-        assert!(
-            heads > kv && heads % kv == 0,
-            "{who}: GQA groups are not a clean ratio"
-        );
-        let group = heads / kv;
-        assert!(
-            group > 1,
-            "{who}: group 1 is MHA and exercises no broadcast at all"
-        );
-        assert_ne!(
-            group, kv,
-            "{who}: group and kv-head count are equal, so the two cannot be told apart"
-        );
-        assert_ne!(
-            num(c, "intermediate_size"),
-            h,
-            "{who}: SwiGLU width collapsed onto hidden"
-        );
-        // The window must be crossable: a sequence shorter than the window tests the dense path and
-        // passes vacuously, which is exactly how a `--attn dsa` A/B covered nothing on GLM.
-        let total = meta_usize(g, "prompt_len") + meta_usize(g, "decode_steps");
-        assert!(
-            num(c, "sliding_window") < total,
-            "{who}: window {} >= the {total} positions generated, so nothing ever crosses it",
-            num(c, "sliding_window")
-        );
     });
 }
 
-/// **The layer-type pattern and its NoPE coupling are the real rule, checked at BOTH depths.**
-///
-/// `layer_types` and `layer_rope_theta` are two independent arrays in the config, and the fact that
-/// binds them — a layer is full attention IF AND ONLY IF it is NoPE — is nowhere in the file. It is
-/// in `__post_init__`, which computes both from the same "every 4th counted backward from the last"
-/// rule. Trap #1 in `glimmer-architecture.md` §9 is a port that reads the top-level `rope_theta`
-/// and rotates all 52 layers; this is the assertion that would have caught it.
-///
-/// Checked at 8 layers from the goldens' own captured flags AND at 52 from the vendored real
-/// config, because a rule that holds only at the tiny depth is a coincidence.
-#[test]
-fn full_attention_layers_are_exactly_the_nope_layers() {
-    for v in text_goldens() {
-        let g = load(v);
-        let sliding = ints(&g, "layer_is_sliding");
-        let roped = ints(&g, "layer_is_roped");
-        assert_eq!(
-            sliding.len(),
-            num(&cfg(&g), "num_hidden_layers"),
-            "{}: layer census",
-            v.name
-        );
-        assert_eq!(
-            sliding, roped,
-            "{}: a layer slides IFF it is rotated",
-            v.name
-        );
-        check_the_backward_fourth_rule(sliding, v.name);
-    }
+// ------------------------------------------------------------------------------------------
 
+/// The width collisions that would let a wrong reading pass.
+///
+/// K3's anchor review found an assertion satisfied by the wrong reading too, because four widths
+/// had collided. These are the collisions that would matter here.
+fn check_no_width_collision(v: &Vendored, c: &Value, w: Widths) {
+    let who = v.name;
+    // The real model is 6656 vs 32*128 = 4096. A port that assumes they are equal — the usual
+    // assumption — passes on any tiny config where they are.
+    assert_ne!(
+        w.hidden,
+        w.concat(),
+        "{who}: hidden_size collapsed onto num_heads*head_dim"
+    );
+    assert_eq!(
+        w.hidden % w.heads,
+        0,
+        "{who}: the reference's own validate_architecture requires this"
+    );
+    assert!(
+        w.heads > w.kv && w.heads % w.kv == 0,
+        "{who}: GQA groups are not a clean ratio"
+    );
+    let group = w.group();
+    assert!(
+        group > 1,
+        "{who}: group 1 is MHA and exercises no broadcast at all"
+    );
+    assert_ne!(
+        group, w.kv,
+        "{who}: group and kv-head count are equal, so the two cannot be told apart"
+    );
+    assert_ne!(
+        num(c, "intermediate_size"),
+        w.hidden,
+        "{who}: SwiGLU width collapsed onto hidden"
+    );
+}
+
+/// The window must be crossable: a sequence shorter than the window tests the dense path and
+/// passes vacuously, which is exactly how a `--attn dsa` A/B covered nothing on GLM.
+fn check_the_window_is_crossable(v: &Vendored, g: &GoldenSet, c: &Value) {
+    let total = meta_usize(g, "prompt_len") + meta_usize(g, "decode_steps");
+    let win = num(c, "sliding_window");
+    assert!(
+        win < total,
+        "{}: window {win} >= the {total} positions generated, so nothing ever crosses it",
+        v.name
+    );
+}
+
+/// The widths were shrunk in a way that keeps every structural distinction the real model has.
+#[test]
+fn the_tiny_widths_did_not_collapse_a_distinction() {
+    each_text(|v, g, c, w| {
+        check_no_width_collision(v, c, w);
+        check_the_window_is_crossable(v, g, c);
+    });
+}
+
+// ------------------------------------------------------------------------------------------
+
+/// One golden's own captured layer flags: the census, and the IFF that binds the two arrays.
+fn check_the_captured_layer_flags(v: &Vendored, g: &GoldenSet) {
+    let sliding = ints(g, "layer_is_sliding");
+    let roped = ints(g, "layer_is_roped");
+    assert_eq!(
+        sliding.len(),
+        num(&cfg(g), "num_hidden_layers"),
+        "{}: layer census",
+        v.name
+    );
+    assert_eq!(
+        sliding, roped,
+        "{}: a layer slides IFF it is rotated",
+        v.name
+    );
+    check_the_backward_fourth_rule(sliding, v.name);
+}
+
+/// The same rule at the REAL 52 layers, from the vendored config, because a rule that holds only
+/// at the tiny depth is a coincidence.
+///
+/// There `layer_types` and `layer_rope_theta` are two independent arrays and the fact that binds
+/// them is nowhere in the file — it is in `__post_init__`, which computes both from the same
+/// "every 4th counted backward from the last" rule.
+fn check_the_real_configs_layer_pattern() {
     let want = real();
     let types: Vec<i64> = want["layer_types"]
         .as_array()
@@ -490,6 +572,168 @@ fn check_the_backward_fourth_rule(sliding: &[i64], who: &str) {
     );
 }
 
+/// **The layer-type pattern and its NoPE coupling are the real rule, checked at BOTH depths.**
+///
+/// `layer_types` and `layer_rope_theta` are two independent arrays in the config, and the fact that
+/// binds them — a layer is full attention IF AND ONLY IF it is NoPE — is nowhere in the file. It is
+/// in `__post_init__`, which computes both from the same "every 4th counted backward from the last"
+/// rule. Trap #1 in `glimmer-architecture.md` §9 is a port that reads the top-level `rope_theta`
+/// and rotates all 52 layers; this is the assertion that would have caught it.
+///
+/// Checked at 8 layers from the goldens' own captured flags AND at 52 from the vendored real
+/// config, because a rule that holds only at the tiny depth is a coincidence.
+#[test]
+fn full_attention_layers_are_exactly_the_nope_layers() {
+    for v in text_goldens() {
+        check_the_captured_layer_flags(v, &load(v));
+    }
+    check_the_real_configs_layer_pattern();
+}
+
+// ------------------------------------------------------------------------------------------
+
+/// One decode step, with the two lengths the KV ring is derived from.
+///
+/// Bundled rather than passed apart because every shape check below needs most of it, and eight
+/// loose arguments on each of them is what the code-health gate refuses.
+#[derive(Clone, Copy)]
+struct Step {
+    w: Widths,
+    /// Which step: 0 is the prefill.
+    t: usize,
+    /// Query rows this step — the whole prompt at `t == 0`, one token per decode step after.
+    q: usize,
+    prompt: usize,
+    win: usize,
+}
+
+impl Step {
+    /// The rows a layer's KV cache holds now. **Eviction, as a shape.** On a sliding layer the
+    /// prefill still sees the whole prompt and is windowed by the MASK; from the first decode step
+    /// the cache itself holds only `sliding_window` rows. A port may truncate during prefill
+    /// instead and get the same numbers — what it may not do is keep more than the window after it.
+    fn k_len(self, sliding: bool) -> usize {
+        if sliding && self.t > 0 {
+            self.win
+        } else {
+            self.prompt + self.t
+        }
+    }
+}
+
+/// The captures taken once per step, at the model's own two widths.
+fn check_step_captures(g: &GoldenSet, c: &Value, s: Step) {
+    let p = format!("t{}", s.t);
+    shape_is(g, &format!("{p}.rope.cos"), &[1, s.q, s.w.head_dim]);
+    shape_is(g, &format!("{p}.rope.sin"), &[1, s.q, s.w.head_dim]);
+    shape_is(g, &format!("{p}.embed_norm.out"), &[1, s.q, s.w.hidden]);
+    shape_is(g, &format!("{p}.final_norm.out"), &[1, s.q, s.w.hidden]);
+    shape_is(g, &format!("{p}.logits"), &[1, num(c, "vocab_size")]);
+}
+
+/// The captures that come back at one of the layer's two widths: the four sandwich norms and the
+/// two projections at hidden width, in the order the layer applies them — then the output gate and
+/// the gated value it multiplies, both at Q width and both BEFORE `o_proj`, which is the point of
+/// capturing `in_gated` separately.
+fn check_layer_width_captures(g: &GoldenSet, p: &str, s: Step) {
+    for what in [
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+        "mlp.down_proj",
+        "attn.o_proj",
+    ] {
+        shape_is(g, &format!("{p}.{what}.out"), &[1, s.q, s.w.hidden]);
+    }
+    for what in ["attn.gate_proj.out", "attn.o_proj.in_gated"] {
+        shape_is(g, &format!("{p}.{what}"), &[1, s.q, s.w.concat()]);
+    }
+}
+
+/// Q, K, the attention itself, and the ring the layer type implies.
+fn check_layer_attention_captures(g: &GoldenSet, p: &str, s: Step, klen: usize) {
+    let (heads, kv, hd) = (s.w.heads, s.w.kv, s.w.head_dim);
+    shape_is(g, &format!("{p}.qk_norm.q"), &[1, heads, s.q, hd]);
+    shape_is(g, &format!("{p}.qk_norm.k"), &[1, kv, s.q, hd]);
+    shape_is(g, &format!("{p}.attend.q"), &[1, heads, s.q, hd]);
+    shape_is(g, &format!("{p}.attend.out"), &[1, s.q, heads, hd]);
+    for what in ["attend.k_cache", "attend.v_cache"] {
+        let name = format!("{p}.{what}");
+        assert_eq!(
+            shape_of(g, &name),
+            vec![1, kv, klen, hd],
+            "{name}: the ring did not hold what the layer type implies"
+        );
+    }
+    shape_is(g, &format!("{p}.attend.mask"), &[1, 1, s.q, klen]);
+    let weights = format!("{p}.attend.weights");
+    assert_eq!(
+        shape_of(g, &weights),
+        vec![1, heads, s.q, klen],
+        "{weights}: GQA broadcast did not reach the head count"
+    );
+}
+
+/// **The rope captures exist on exactly the rotated layers**, which is the same coupling as
+/// `full_attention_layers_are_exactly_the_nope_layers` seen from the capture side: a NoPE layer
+/// that produced one would mean the reference rotated it.
+fn check_layer_rope_captures(g: &GoldenSet, p: &str, s: Step, roped: bool) {
+    let has_rope = g
+        .floats
+        .iter()
+        .any(|(n, _, _)| n == &format!("{p}.q.roped"));
+    assert_eq!(
+        has_rope, roped,
+        "{p}: rope captures present={has_rope} but layer_is_roped={roped}"
+    );
+    if !has_rope {
+        return;
+    }
+    for what in ["q.pre_rope", "q.roped"] {
+        shape_is(
+            g,
+            &format!("{p}.{what}"),
+            &[1, s.w.heads, s.q, s.w.head_dim],
+        );
+    }
+    for what in ["k.pre_rope", "k.roped"] {
+        shape_is(g, &format!("{p}.{what}"), &[1, s.w.kv, s.q, s.w.head_dim]);
+    }
+}
+
+/// One layer at one step, in the three groups its captures fall into.
+fn check_layer_captures(g: &GoldenSet, l: usize, s: Step, flags: (bool, bool)) {
+    let (sliding, roped) = flags;
+    let p = format!("t{}.L{l}", s.t);
+    check_layer_width_captures(g, &p, s);
+    check_layer_attention_captures(g, &p, s, s.k_len(sliding));
+    check_layer_rope_captures(g, &p, s, roped);
+}
+
+/// One text golden's whole capture set, step by step and layer by layer.
+fn check_text_captures(g: &GoldenSet, c: &Value, w: Widths) {
+    let prompt = meta_usize(g, "prompt_len");
+    let win = num(c, "sliding_window");
+    let layers = num(c, "num_hidden_layers");
+    let sliding = ints(g, "layer_is_sliding").to_vec();
+    let roped = ints(g, "layer_is_roped").to_vec();
+    for t in 0..=meta_usize(g, "decode_steps") {
+        let q = if t == 0 { prompt } else { 1 };
+        let s = Step {
+            w,
+            t,
+            q,
+            prompt,
+            win,
+        };
+        check_step_captures(g, c, s);
+        for l in 0..layers {
+            check_layer_captures(g, l, s, (sliding[l] == 1, roped[l] == 1));
+        }
+    }
+}
+
 /// Every per-operator fixture S2 will reach for is present, at the width its config implies.
 ///
 /// The shapes are computed from `tiny_config`, so this fails when the config drifts instead of
@@ -498,147 +742,31 @@ fn check_the_backward_fourth_rule(sliding: &[i64], who: &str) {
 /// which is eviction, observed rather than described.
 #[test]
 fn the_operator_fixtures_s2_needs_are_present() {
-    each_text(|_v, g, c, (h, heads, kv, hd)| {
-        let (layers, win) = (num(c, "num_hidden_layers"), num(c, "sliding_window"));
-        let (prompt, steps) = (meta_usize(g, "prompt_len"), meta_usize(g, "decode_steps"));
-        let sliding = ints(g, "layer_is_sliding").to_vec();
-        let roped = ints(g, "layer_is_roped").to_vec();
+    each_text(|_v, g, c, w| check_text_captures(g, c, w));
+}
 
-        for t in 0..=steps {
-            let q = if t == 0 { prompt } else { 1 };
-            let p = format!("t{t}");
-            assert_eq!(
-                shape_of(g, &format!("{p}.rope.cos")),
-                vec![1, q, hd],
-                "{p} rope.cos"
-            );
-            assert_eq!(
-                shape_of(g, &format!("{p}.rope.sin")),
-                vec![1, q, hd],
-                "{p} rope.sin"
-            );
-            assert_eq!(
-                shape_of(g, &format!("{p}.embed_norm.out")),
-                vec![1, q, h],
-                "{p} embed_norm"
-            );
-            assert_eq!(
-                shape_of(g, &format!("{p}.final_norm.out")),
-                vec![1, q, h],
-                "{p} final_norm"
-            );
-            assert_eq!(
-                shape_of(g, &format!("{p}.logits")),
-                vec![1, num(c, "vocab_size")],
-                "{p} logits"
-            );
+// ------------------------------------------------------------------------------------------
 
-            for l in 0..layers {
-                let p = format!("t{t}.L{l}");
-                // The four sandwich norms, in the order the layer applies them.
-                for what in [
-                    "input_layernorm",
-                    "post_attention_layernorm",
-                    "pre_feedforward_layernorm",
-                    "post_feedforward_layernorm",
-                    "mlp.down_proj",
-                    "attn.o_proj",
-                ] {
-                    assert_eq!(
-                        shape_of(g, &format!("{p}.{what}.out")),
-                        vec![1, q, h],
-                        "{p}.{what}"
-                    );
-                }
-                // The output gate and the gated value it multiplies, both at Q width, both BEFORE
-                // `o_proj` — which is the point of capturing `in_gated` separately.
-                for what in ["attn.gate_proj.out", "attn.o_proj.in_gated"] {
-                    assert_eq!(
-                        shape_of(g, &format!("{p}.{what}")),
-                        vec![1, q, heads * hd],
-                        "{p}.{what}"
-                    );
-                }
-                assert_eq!(
-                    shape_of(g, &format!("{p}.qk_norm.q")),
-                    vec![1, heads, q, hd],
-                    "{p} qk_norm.q"
-                );
-                assert_eq!(
-                    shape_of(g, &format!("{p}.qk_norm.k")),
-                    vec![1, kv, q, hd],
-                    "{p} qk_norm.k"
-                );
-                assert_eq!(
-                    shape_of(g, &format!("{p}.attend.q")),
-                    vec![1, heads, q, hd],
-                    "{p} attend.q"
-                );
-                assert_eq!(
-                    shape_of(g, &format!("{p}.attend.out")),
-                    vec![1, q, heads, hd],
-                    "{p} attend.out"
-                );
-
-                // Eviction, as a shape. On a sliding layer the prefill still sees the whole prompt
-                // and is windowed by the MASK; from the first decode step the cache itself holds
-                // only `sliding_window` rows. A port may truncate during prefill instead and get
-                // the same numbers — what it may not do is keep more than the window after it.
-                let klen = if sliding[l] == 1 && t > 0 {
-                    win
-                } else {
-                    prompt + t
-                };
-                for what in ["attend.k_cache", "attend.v_cache"] {
-                    assert_eq!(
-                        shape_of(g, &format!("{p}.{what}")),
-                        vec![1, kv, klen, hd],
-                        "{p}.{what}: the ring did not hold what the layer type implies"
-                    );
-                }
-                assert_eq!(
-                    shape_of(g, &format!("{p}.attend.mask")),
-                    vec![1, 1, q, klen],
-                    "{p} mask"
-                );
-                assert_eq!(
-                    shape_of(g, &format!("{p}.attend.weights")),
-                    vec![1, heads, q, klen],
-                    "{p} attend.weights: GQA broadcast did not reach the head count"
-                );
-
-                // **The rope captures exist on exactly the rotated layers**, which is the same
-                // coupling as `full_attention_layers_are_exactly_the_nope_layers` seen from the
-                // capture side: a NoPE layer that produced one would mean the reference rotated it.
-                let has_rope = g
-                    .floats
-                    .iter()
-                    .any(|(n, _, _)| n == &format!("{p}.q.roped"));
-                assert_eq!(
-                    has_rope,
-                    roped[l] == 1,
-                    "{p}: rope captures present={has_rope} but layer_is_roped={}",
-                    roped[l]
-                );
-                if has_rope {
-                    for what in ["q.pre_rope", "q.roped"] {
-                        assert_eq!(
-                            shape_of(g, &format!("{p}.{what}")),
-                            vec![1, heads, q, hd],
-                            "{p}.{what}"
-                        );
-                    }
-                    for what in ["k.pre_rope", "k.roped"] {
-                        assert_eq!(
-                            shape_of(g, &format!("{p}.{what}")),
-                            vec![1, kv, q, hd],
-                            "{p}.{what}"
-                        );
-                    }
-                }
-            }
-        }
-    });
+/// The int captures: two token lists at the lengths the metadata declares, and no others.
+fn check_int_captures(v: &Vendored, g: &GoldenSet, steps: usize) {
+    assert_eq!(
+        g.ints.len(),
+        4,
+        "{}: prompt.ids, emitted.ids and the two layer flags",
+        v.name
+    );
+    assert_eq!(
+        ints(g, "prompt.ids").len(),
+        meta_usize(g, "prompt_len"),
+        "{}",
+        v.name
+    );
+    assert_eq!(
+        ints(g, "emitted.ids").len(),
+        steps,
+        "{}: one token per step",
+        v.name
+    );
 }
 
 /// Nothing was captured beyond what the census implies.
@@ -648,41 +776,50 @@ fn the_operator_fixtures_s2_needs_are_present() {
 /// is derived rather than written: the count follows from the config and the step count.
 #[test]
 fn exactly_the_declared_captures_are_present() {
-    for v in text_goldens() {
-        let g = load(v);
-        let c = cfg(&g);
-        let layers = num(&c, "num_hidden_layers");
-        let steps = meta_usize(&g, "decode_steps") + 1;
-        let roped: usize = ints(&g, "layer_is_roped")
+    each_text(|v, g, c, _| {
+        let steps = meta_usize(g, "decode_steps") + 1;
+        let layers = num(c, "num_hidden_layers");
+        let roped = ints(g, "layer_is_roped")
             .iter()
             .filter(|r| **r == 1)
             .count();
-
         // Per step: cos, sin, embed_norm, final_norm, logits.
         // Per layer: 4 norms + mlp + o_proj.out + o_proj.in_gated + gate_proj + qk_norm x2
         //            + attend q/k/v/mask/weights/out = 16.
         // Per ROTATED layer: 4 more.
         let want = steps * (5 + layers * 16 + roped * 4);
         assert_eq!(g.floats.len(), want, "{}: float capture census", v.name);
-        assert_eq!(
-            g.ints.len(),
-            4,
-            "{}: prompt.ids, emitted.ids and the two layer flags",
-            v.name
-        );
-        assert_eq!(
-            ints(&g, "prompt.ids").len(),
-            meta_usize(&g, "prompt_len"),
-            "{}",
-            v.name
-        );
-        assert_eq!(
-            ints(&g, "emitted.ids").len(),
-            steps,
-            "{}: one token per step",
-            v.name
-        );
+        check_int_captures(v, g, steps);
+    });
+}
+
+// ------------------------------------------------------------------------------------------
+
+/// One captured tensor: finite, and not the degenerate all-equal tensor a broken draw produces.
+///
+/// Masks are legitimately two-valued and legitimately all-ones on a full layer's first row, so they
+/// are exempt from the spread check but not from finiteness.
+fn check_tensor_is_usable(v: &Vendored, name: &str, vals: &[f32]) {
+    let who = format!("{} {name}", v.name);
+    assert!(!vals.is_empty(), "{who}: empty tensor");
+    assert!(
+        vals.iter().all(|x| x.is_finite()),
+        "{who}: non-finite value"
+    );
+    if name.ends_with("attend.mask") {
+        return;
     }
+    let (lo, hi) = vals
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+    assert!(
+        hi > lo,
+        "{who}: every element is {lo}, which agrees with any implementation"
+    );
+    assert!(
+        hi.abs() < 1e6,
+        "{who}: magnitude {hi} — the draw has blown up"
+    );
 }
 
 /// The captured values are finite, and not the degenerate all-equal tensors a broken draw produces.
@@ -696,30 +833,83 @@ fn the_captured_values_are_finite_and_not_degenerate() {
     for v in GOLDENS {
         let g = load(v);
         for (name, _shape, vals) in &g.floats {
-            let who = format!("{} {name}", v.name);
-            assert!(!vals.is_empty(), "{who}: empty tensor");
-            assert!(
-                vals.iter().all(|x| x.is_finite()),
-                "{who}: non-finite value"
-            );
-            // Masks are legitimately two-valued and legitimately all-ones on a full layer's first
-            // row, so they are exempt from the spread check but not from finiteness.
-            if name.ends_with("attend.mask") {
-                continue;
-            }
-            let (lo, hi) = vals
-                .iter()
-                .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
-            assert!(
-                hi > lo,
-                "{who}: every element is {lo}, which agrees with any implementation"
-            );
-            assert!(
-                hi.abs() < 1e6,
-                "{who}: magnitude {hi} — the draw has blown up"
-            );
+            check_tensor_is_usable(v, name, vals);
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------
+
+/// The drafter's own two lengths, alongside the four widths its config implies.
+#[derive(Clone, Copy)]
+struct Draft {
+    w: Widths,
+    block: usize,
+    ctx: usize,
+}
+
+/// The captures taken once per draft file: the encoder path, the block, and the logits it borrows
+/// the target's vocabulary for.
+fn check_draft_toplevel_shapes(v: &Vendored, g: &GoldenSet, c: &Value, d: Draft) {
+    // The context is one column block per `target_layer_id`.
+    let targets = ints(g, "target_layer_ids").len();
+    shape_is(g, "draft.context_concat", &[1, d.ctx, targets * d.w.hidden]);
+    shape_is(g, "draft.encoder.out", &[1, d.ctx, d.w.hidden]);
+    shape_is(g, "draft.noise_embeds", &[1, d.block, d.w.hidden]);
+    assert_eq!(
+        ints(g, "draft.block_ids").len(),
+        d.block,
+        "{}: block ids",
+        v.name
+    );
+    // One anchor token plus masks in, `block - 1` candidates out: index 0 is sliced off.
+    assert_eq!(
+        ints(g, "draft.candidates").len(),
+        d.block - 1,
+        "{}: candidates",
+        v.name
+    );
+    // **The drafter's own config has no `vocab_size`**, because it owns neither the embedding
+    // nor the lm_head — it borrows the target's (section 11). So the logit width has to come
+    // from the TARGET's config, and asserting the absence is asserting the borrow.
+    assert!(
+        c["vocab_size"].is_null(),
+        "{}: the drafter has acquired a vocab of its own",
+        v.name
+    );
+    let vocab = num(&cfg(&load(text_goldens().next().unwrap())), "vocab_size");
+    shape_is(g, "draft.logits", &[1, d.block, vocab]);
+}
+
+/// One drafter layer. `glimmer-architecture.md` §11: Q comes from the block alone while K/V span
+/// `context + block` inside one call — a way a port goes wrong by reusing the target's attention
+/// path, and a shape.
+fn check_draft_layer_shapes(g: &GoldenSet, p: &str, d: Draft) {
+    let (w, block, ctx) = (d.w, d.block, d.ctx);
+    shape_is(
+        g,
+        &format!("{p}.attend.q"),
+        &[1, w.heads, block, w.head_dim],
+    );
+    for what in ["attend.k", "attend.v"] {
+        let name = format!("{p}.{what}");
+        assert_eq!(
+            shape_of(g, &name),
+            vec![1, w.kv, ctx + block, w.head_dim],
+            "{name}: K/V must span context+block while Q spans block alone"
+        );
+    }
+    shape_is(g, &format!("{p}.attend.mask"), &[1, 1, block, ctx + block]);
+    // Two norms per layer, not four: the drafter is plain pre-norm and has no post-FFN norm.
+    for what in ["input_layernorm", "post_attention_layernorm", "mlp"] {
+        shape_is(g, &format!("{p}.{what}.out"), &[1, block, w.hidden]);
+    }
+    let post_ffn = format!("{p}.post_feedforward_layernorm.out");
+    assert!(
+        g.floats.iter().all(|(n, _, _)| n != &post_ffn),
+        "{p}: the drafter has no post-FFN norm; a capture for one means it was built as a target \
+         layer"
+    );
 }
 
 /// **The DFlash golden has the shapes that make the drafter a drafter, not a small target.**
@@ -733,82 +923,14 @@ fn the_draft_golden_has_the_shapes_that_make_it_a_drafter() {
     for v in draft_goldens() {
         let g = load(v);
         let c = cfg(&g);
-        let (h, heads, kv, hd) = widths(&c);
-        let block = meta_usize(&g, "block_size");
-        let ctx = meta_usize(&g, "context_len");
-        let layers = num(&c, "num_hidden_layers");
-        let who = v.name;
-
-        let targets = ints(&g, "target_layer_ids");
-        assert_eq!(
-            shape_of(&g, "draft.context_concat"),
-            vec![1, ctx, targets.len() * h],
-            "{who}: the context is one column block per target_layer_id"
-        );
-        assert_eq!(
-            shape_of(&g, "draft.encoder.out"),
-            vec![1, ctx, h],
-            "{who}: encoder output"
-        );
-        assert_eq!(
-            shape_of(&g, "draft.noise_embeds"),
-            vec![1, block, h],
-            "{who}: the draft block"
-        );
-        assert_eq!(ints(&g, "draft.block_ids").len(), block, "{who}: block ids");
-        // One anchor token plus masks in, `block - 1` candidates out: index 0 is sliced off.
-        assert_eq!(
-            ints(&g, "draft.candidates").len(),
-            block - 1,
-            "{who}: candidates"
-        );
-        // **The drafter's own config has no `vocab_size`**, because it owns neither the embedding
-        // nor the lm_head — it borrows the target's (section 11). So the logit width has to come
-        // from the TARGET's config, and asserting the absence is asserting the borrow.
-        assert!(
-            c["vocab_size"].is_null(),
-            "{who}: the drafter has acquired a vocab of its own"
-        );
-        let vocab = num(&cfg(&load(text_goldens().next().unwrap())), "vocab_size");
-        assert_eq!(
-            shape_of(&g, "draft.logits"),
-            vec![1, block, vocab],
-            "{who}: logits"
-        );
-
-        for l in 0..layers {
-            let p = format!("draft.L{l}");
-            assert_eq!(
-                shape_of(&g, &format!("{p}.attend.q")),
-                vec![1, heads, block, hd],
-                "{p} Q"
-            );
-            for what in ["attend.k", "attend.v"] {
-                assert_eq!(
-                    shape_of(&g, &format!("{p}.{what}")),
-                    vec![1, kv, ctx + block, hd],
-                    "{p}.{what}: K/V must span context+block while Q spans block alone"
-                );
-            }
-            assert_eq!(
-                shape_of(&g, &format!("{p}.attend.mask")),
-                vec![1, 1, block, ctx + block],
-                "{p} mask"
-            );
-            // Two norms per layer, not four: the drafter is plain pre-norm and has no post-FFN norm.
-            for what in ["input_layernorm", "post_attention_layernorm", "mlp"] {
-                assert_eq!(
-                    shape_of(&g, &format!("{p}.{what}.out")),
-                    vec![1, block, h],
-                    "{p}.{what}"
-                );
-            }
-            assert!(
-                g.floats
-                    .iter()
-                    .all(|(n, _, _)| n != &format!("{p}.post_feedforward_layernorm.out")),
-                "{p}: the drafter has no post-FFN norm; a capture for one means it was built as a target layer"
-            );
+        let d = Draft {
+            w: widths(&c),
+            block: meta_usize(&g, "block_size"),
+            ctx: meta_usize(&g, "context_len"),
+        };
+        check_draft_toplevel_shapes(v, &g, &c, d);
+        for l in 0..num(&c, "num_hidden_layers") {
+            check_draft_layer_shapes(&g, &format!("draft.L{l}"), d);
         }
     }
 }
@@ -817,18 +939,16 @@ fn the_draft_golden_has_the_shapes_that_make_it_a_drafter() {
 /// port reusing the target's path fail rather than silently pass.
 #[test]
 fn the_drafter_does_not_share_the_targets_attention_shape() {
-    let target = cfg(&load(text_goldens().next().unwrap()));
-    let drafter = cfg(&load(draft_goldens().next().unwrap()));
-    let group = |c: &Value| num(c, "num_attention_heads") / num(c, "num_key_value_heads");
+    let target = widths(&cfg(&load(text_goldens().next().unwrap())));
+    let drafter = widths(&cfg(&load(draft_goldens().next().unwrap())));
     assert_ne!(
-        group(&target),
-        group(&drafter),
+        target.group(),
+        drafter.group(),
         "the two GQA group counts are equal, so a port that reuses the target's shape passes here \
          and fails on the real 16:1 against 4:1"
     );
     assert_eq!(
-        num(&target, "hidden_size"),
-        num(&drafter, "hidden_size"),
+        target.hidden, drafter.hidden,
         "the drafter borrows the target's embedding and lm_head, so the widths must match"
     );
     // The real pairing, from the vendored config, so the tiny ratio is not the only evidence.
@@ -839,13 +959,51 @@ fn the_drafter_does_not_share_the_targets_attention_shape() {
     );
 }
 
-/// **The weightless QK-norm's AXIS, from the goldens' own bytes.**
+// ------------------------------------------------------------------------------------------
+
+/// The worst `|mean(y²) − 1|` over every contiguous `d`-element run, and how many runs that was.
 ///
 /// A weightless RMS over `d` leaves `mean(y²) = mean(x²)/(mean(x²)+eps)`, i.e. 1 to within
-/// `eps/mean(x²)`. So every contiguous `head_dim` run of every `qk_norm.*` capture must have unit
-/// mean square — and that is a property only of a norm taken over THAT axis. A reference (or a port)
-/// normalising over the whole hidden state, over rows, or over the head COUNT leaves runs whose mean
-/// square is anything else, and every shape check still passes.
+/// `eps/mean(x²)`. That is a property only of a norm taken over THAT axis: a reference (or a port)
+/// normalising over the whole hidden state, over rows, or over the head COUNT leaves runs whose
+/// mean square is anything else, and every shape check still passes.
+fn worst_unit_mean_square(vals: &[f32], d: usize) -> (f64, usize) {
+    let mut worst = 0.0f64;
+    let mut runs = 0usize;
+    for row in vals.chunks(d) {
+        let m = row.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / d as f64;
+        worst = worst.max((m - 1.0).abs());
+        runs += 1;
+    }
+    (worst, runs)
+}
+
+/// Every `qk_norm` capture of one text golden, folded to the worst deviation and the row count.
+///
+/// The head count and `head_dim` are read off each capture's own shape first, so a golden whose
+/// axes moved fails here rather than being folded under the wrong reading.
+fn fold_qk_norm_rows(v: &Vendored, g: &GoldenSet, c: &Value, w: Widths) -> (f64, usize) {
+    let (mut worst, mut runs) = (0.0f64, 0usize);
+    for t in 0..=meta_usize(g, "decode_steps") {
+        for l in 0..num(c, "num_hidden_layers") {
+            for (side, heads) in [("q", w.heads), ("k", w.kv)] {
+                let name = format!("t{t}.L{l}.qk_norm.{side}");
+                let (shape, vals) = golden_read::float(g, &name);
+                assert_eq!(shape[1], heads, "{}: {name} head count", v.name);
+                assert_eq!(shape[3], w.head_dim, "{}: {name} head_dim", v.name);
+                let (dev, n) = worst_unit_mean_square(vals, w.head_dim);
+                worst = worst.max(dev);
+                runs += n;
+            }
+        }
+    }
+    (worst, runs)
+}
+
+/// **The weightless QK-norm's AXIS, from the goldens' own bytes.**
+///
+/// Every contiguous `head_dim` run of every `qk_norm.*` capture must have unit mean square — see
+/// `worst_unit_mean_square` for why that is a fact about the axis and nothing else.
 ///
 /// **Here rather than beside the kernel, because it needs no device.** `tests/glimmer_qk_norm.rs` is
 /// `#![cfg(feature = "rocm")]` end to end, and the only automated job in this repo is the FEATURELESS
@@ -857,25 +1015,10 @@ fn the_drafter_does_not_share_the_targets_attention_shape() {
 #[test]
 fn the_qk_norm_captures_are_normalised_over_head_dim_per_head() {
     let (mut worst, mut runs) = (0.0f64, 0usize);
-    each_text(|v, g, c, (_, heads, kv, hd)| {
-        let layers = num(c, "num_hidden_layers");
-        let steps = meta_usize(g, "decode_steps");
-        for t in 0..=steps {
-            for l in 0..layers {
-                for (side, h) in [("q", heads), ("k", kv)] {
-                    let name = format!("t{t}.L{l}.qk_norm.{side}");
-                    let (shape, vals) = golden_read::float(g, &name);
-                    assert_eq!(shape[1], h, "{}: {name} head count", v.name);
-                    assert_eq!(shape[3], hd, "{}: {name} head_dim", v.name);
-                    for row in vals.chunks(hd) {
-                        let m =
-                            row.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>() / hd as f64;
-                        worst = worst.max((m - 1.0).abs());
-                        runs += 1;
-                    }
-                }
-            }
-        }
+    each_text(|v, g, c, w| {
+        let (dev, n) = fold_qk_norm_rows(v, g, c, w);
+        worst = worst.max(dev);
+        runs += n;
     });
     println!("{runs} head rows, worst |mean(y^2) - 1| = {worst:e}");
     // The bound is the eps term itself, not a tolerance: a run's mean square falls below 1 by at
@@ -898,6 +1041,66 @@ fn the_qk_norm_captures_are_normalised_over_head_dim_per_head() {
         runs, 2304,
         "the axis census covered {runs} head rows, not 2,304"
     );
+}
+
+// ------------------------------------------------------------------------------------------
+
+/// What the Q/K scale sweep accumulates across every roped layer of every text golden.
+///
+/// `skipped` is carried rather than dropped because the NoPE skip below is what makes the sweep
+/// silent on those layers, and a skip that quietly covered EVERY layer would leave the ratio
+/// bounds vacuous — so the test asserts all three counters are non-zero.
+struct ScaleSweep {
+    lo: f32,
+    hi: f32,
+    pairs: usize,
+    k_elems: usize,
+    skipped: usize,
+}
+
+impl ScaleSweep {
+    /// Every roped layer of one golden, at every step.
+    ///
+    /// **NoPE layers have no `pre_rope` capture at all** — they skip the rotation (§8) and both
+    /// captures are taken inside its wrapper. Reading the name unconditionally is how this first
+    /// ran, and `float()` panicked, which is the gate working.
+    fn add_golden(&mut self, v: &Vendored, g: &GoldenSet, c: &Value) {
+        let layers = num(c, "num_hidden_layers");
+        let roped = ints(g, "layer_is_roped").to_vec();
+        for t in 0..=meta_usize(g, "decode_steps") {
+            for (l, &roped_l) in roped.iter().enumerate().take(layers) {
+                if roped_l == 0 {
+                    self.skipped += 1;
+                } else {
+                    self.add_layer(v, g, &format!("t{t}.L{l}"));
+                }
+            }
+        }
+    }
+
+    /// One roped layer at one step: Q's ratio against the norm output it came from, and K
+    /// bit-identical across the same boundary.
+    fn add_layer(&mut self, v: &Vendored, g: &GoldenSet, p: &str) {
+        let (_, qn) = golden_read::float(g, &format!("{p}.qk_norm.q"));
+        let (_, qs) = golden_read::float(g, &format!("{p}.q.pre_rope"));
+        assert_eq!(qn.len(), qs.len(), "{}: {p} q lengths", v.name);
+        // Exact zeros carry no ratio, and a zero norm output means the whole head was zero — which
+        // says nothing about the scale.
+        for (n, s) in qn.iter().zip(qs).filter(|(n, _)| **n != 0.0) {
+            let r = s / n;
+            self.lo = self.lo.min(r);
+            self.hi = self.hi.max(r);
+            self.pairs += 1;
+        }
+        let (_, kn) = golden_read::float(g, &format!("{p}.qk_norm.k"));
+        let (_, kp) = golden_read::float(g, &format!("{p}.k.pre_rope"));
+        assert_eq!(
+            kn, kp,
+            "{}: {p} K changed between the norm and the rotation — nothing may scale K (trap 3)",
+            v.name
+        );
+        self.k_elems += kn.len();
+    }
 }
 
 /// **Trap 3, refuted by the reference's own bytes: Q is scaled by 3.87 and K is not.**
@@ -928,48 +1131,24 @@ fn the_qk_norm_captures_are_normalised_over_head_dim_per_head() {
 #[test]
 fn the_reference_scales_q_by_qk_scale_factor_and_leaves_k_alone() {
     let want = real()["qk_scale_factor"].as_f64().expect("qk_scale_factor") as f32;
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    let (mut pairs, mut k_elems, mut skipped) = (0usize, 0usize, 0usize);
-    each_text(|v, g, c, _| {
-        let layers = num(c, "num_hidden_layers");
-        let steps = meta_usize(g, "decode_steps");
-        let roped = ints(g, "layer_is_roped").to_vec();
-        for t in 0..=steps {
-            for (l, &roped_l) in roped.iter().enumerate().take(layers) {
-                // **NoPE layers have no `pre_rope` capture at all** — they skip the rotation (§8)
-                // and both captures are taken inside its wrapper. Reading the name unconditionally
-                // is how this first ran, and `float()` panicked, which is the gate working.
-                if roped_l == 0 {
-                    skipped += 1;
-                    continue;
-                }
-                let (_, qn) = golden_read::float(g, &format!("t{t}.L{l}.qk_norm.q"));
-                let (_, qs) = golden_read::float(g, &format!("t{t}.L{l}.q.pre_rope"));
-                assert_eq!(qn.len(), qs.len(), "{}: t{t}.L{l} q lengths", v.name);
-                for (n, s) in qn.iter().zip(qs) {
-                    // Exact zeros carry no ratio, and a zero norm output means the whole head was
-                    // zero — which says nothing about the scale.
-                    if *n != 0.0 {
-                        let r = s / n;
-                        lo = lo.min(r);
-                        hi = hi.max(r);
-                        pairs += 1;
-                    }
-                }
-                let (_, kn) = golden_read::float(g, &format!("t{t}.L{l}.qk_norm.k"));
-                let (_, kp) = golden_read::float(g, &format!("t{t}.L{l}.k.pre_rope"));
-                assert_eq!(
-                    kn, kp,
-                    "{}: t{t}.L{l} K changed between the norm and the rotation — nothing may \
-                     scale K (trap 3)",
-                    v.name
-                );
-                k_elems += kn.len();
-            }
-        }
-    });
+    let mut sweep = ScaleSweep {
+        lo: f32::INFINITY,
+        hi: f32::NEG_INFINITY,
+        pairs: 0,
+        k_elems: 0,
+        skipped: 0,
+    };
+    each_text(|v, g, c, _| sweep.add_golden(v, g, c));
+    let ScaleSweep {
+        lo,
+        hi,
+        pairs,
+        k_elems,
+        skipped,
+    } = sweep;
     println!(
-        "q ratio over {pairs} elements: [{lo:.7}, {hi:.7}]; {k_elems} K elements unchanged; {skipped} NoPE cases skipped"
+        "q ratio over {pairs} elements: [{lo:.7}, {hi:.7}]; {k_elems} K elements unchanged; \
+         {skipped} NoPE cases skipped"
     );
     assert!(
         (lo - want).abs() < 1e-5 && (hi - want).abs() < 1e-5,

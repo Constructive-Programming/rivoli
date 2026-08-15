@@ -60,11 +60,34 @@ pub fn topk_into(scores: &[f32], k: usize, out: &mut Vec<usize>) {
     out.sort_by(cmp);
 }
 
-/// Host MoE routing: sigmoid the gate logits into `scores`, add the router `bias` into
-/// `choice`, and select the top-`top_k` into `sel`. A free fn over disjoint slices so the
-/// GPU engine can borrow `bias` out of `&Pin` while it mutably borrows its own routing
-/// scratch. Lives here, not in `gpu.rs`, because it is pure host math and testable without
-/// a backend.
+/// The "how" half of INV-1's input tuple: how many experts to take, and which affinity to
+/// score the gate logits with. One value because both arrive together from the model
+/// config, and neither may ever arrive from residency.
+#[derive(Debug, Clone, Copy)]
+pub struct RoutePolicy {
+    pub top_k: usize,
+    pub scoring: Scoring,
+}
+
+/// The router's per-token workspace, borrowed as ONE value. The caller owns all three
+/// buffers for the life of the decode — that is what makes routing allocate nothing per
+/// token — and never hands over one without the others, so they travel as a single
+/// argument (which is also what keeps `route_into` inside CodeScene's argument budget,
+/// 2026-08-15).
+pub struct RouteScratch<'a> {
+    /// `policy.scoring` applied to each gate logit.
+    pub scores: &'a mut [f32],
+    /// `scores + bias` — the vector the top-k actually selects on.
+    pub choice: &'a mut [f32],
+    /// The selected expert ids, `choice`-descending. Cleared and refilled per call.
+    pub sel: &'a mut Vec<usize>,
+}
+
+/// Host MoE routing: score the gate logits into `out.scores`, add the router `bias` into
+/// `out.choice`, and select the top-`policy.top_k` into `out.sel`. A free fn whose scratch
+/// borrows are bundled but still disjoint from `bias`, so the GPU engine can borrow `bias`
+/// out of `&Pin` while it mutably borrows its own routing scratch. Lives here, not in
+/// `gpu.rs`, because it is pure host math and testable without a backend.
 ///
 /// **Routing does not consult the cache, and that is now a load-bearing property.** The
 /// `top-m` cache-conditional substitution (arXiv:2412.00099) that used to live here was
@@ -73,22 +96,21 @@ pub fn topk_into(scores: &[f32], k: usize, out: &mut Vec<usize>) {
 /// change — policy, budget, placement — is output-bit-identical by construction. That is
 /// the acceptance test every cache change is held to, and re-introducing residency here
 /// would silently give it up. See docs/investigations/cache-conditional-routing.md for the retirement record.
-pub fn route_into(
-    gate_logits: &[u8],
-    bias: &[f32],
-    top_k: usize,
-    scoring: Scoring,
-    scores: &mut [f32],
-    choice: &mut [f32],
-    sel: &mut Vec<usize>,
-) {
+pub fn route_into(gate_logits: &[u8], bias: &[f32], policy: RoutePolicy, out: RouteScratch<'_>) {
+    let RouteScratch {
+        scores,
+        choice,
+        sel,
+    } = out;
     for (s, c) in gate_logits.chunks_exact(4).zip(scores.iter_mut()) {
-        *c = scoring.apply(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+        *c = policy
+            .scoring
+            .apply(f32::from_le_bytes([s[0], s[1], s[2], s[3]]));
     }
     for ((c, &s), &b) in choice.iter_mut().zip(scores.iter()).zip(bias) {
         *c = s + b;
     }
-    topk_into(choice, top_k, sel);
+    topk_into(choice, policy.top_k, sel);
 }
 
 /// Host math, backend-free by construction: top-k determinism, the flash-softmax
@@ -149,21 +171,27 @@ mod tests {
             // One call site, so ONLY the `Scoring` can differ between the two runs.
             let run = |scoring| {
                 let (mut s, mut c, mut sel) = (vec![0.0; 256], vec![0.0; 256], Vec::new());
-                route_into(&g, &bias, k, scoring, &mut s, &mut c, &mut sel);
+                let scratch = RouteScratch {
+                    scores: &mut s,
+                    choice: &mut c,
+                    sel: &mut sel,
+                };
+                route_into(&g, &bias, RoutePolicy { top_k: k, scoring }, scratch);
                 (s, sel)
             };
             let (s1, sel1) = run(Scoring::Sigmoid);
             let (s2, sel2) = run(Scoring::SqrtSoftplus);
+            // The shape is the part that must NOT move with the scoring function.
             assert_eq!(sel1.len(), k);
             assert_eq!(sel2.len(), k);
-            assert!(
-                s1.iter().all(|v| (0.0..=1.0).contains(v)),
-                "sigmoid escaped (0,1)"
-            );
-            assert!(
-                s2.iter().all(|v| v.is_finite() && *v >= 0.0),
-                "sqrt-softplus not finite"
-            );
+            // The ranges are the part that does. Reported as the offending VALUE rather
+            // than a bare bool, because "sigmoid escaped (0,1)" alone does not say by
+            // how much, and a bias trained against one scale applied to the other is the
+            // silent-wrong-experts failure this test exists for.
+            let escaped = s1.iter().find(|v| !(0.0..=1.0).contains(*v));
+            assert_eq!(escaped, None, "sigmoid escaped (0,1)");
+            let unbounded = s2.iter().find(|v| !v.is_finite() || **v < 0.0);
+            assert_eq!(unbounded, None, "sqrt-softplus not finite or negative");
             if sel1 != sel2 {
                 differed += 1;
             }
@@ -229,21 +257,29 @@ mod tests {
 
     #[test]
     fn bf16_known_patterns_and_rne() {
-        // Exact high-16-bit truncation for representable values.
-        assert_eq!(f32_to_bf16(0.0), 0x0000);
-        assert_eq!(f32_to_bf16(1.0), 0x3f80);
-        assert_eq!(f32_to_bf16(-2.0), 0xc000);
-        assert_eq!(bf16_to_f32(0x3f80), 1.0);
-        assert_eq!(bf16_to_f32(0xc000), -2.0);
-        // Round-to-nearest-even at the tie: 1.0 + 2^-8 sits exactly between two
+        // Narrowing: exact high-16-bit truncation for representable values, and
+        // round-to-nearest-even at the tie — 1.0 + 2^-8 sits exactly between two
         // bf16 values; the even neighbour is 1.0 (mantissa LSB 0), so it rounds
-        // DOWN to 0x3f80 rather than up to 0x3f81.
-        assert_eq!(f32_to_bf16(1.0 + 2f32.powi(-8)), 0x3f80);
-        // Just past the tie rounds up to the odd neighbour.
-        assert_eq!(f32_to_bf16(1.0 + 2f32.powi(-8) + 2f32.powi(-16)), 0x3f81);
-        // Non-finite: Inf survives; NaN stays a NaN.
-        assert_eq!(f32_to_bf16(f32::INFINITY), 0x7f80);
-        assert_eq!(bf16_to_f32(0x7f80), f32::INFINITY);
+        // DOWN to 0x3f80 rather than up to 0x3f81, and just past the tie it rounds
+        // up to the odd neighbour. Inf survives.
+        for (x, want) in [
+            (0.0f32, 0x0000u16),
+            (1.0, 0x3f80),
+            (-2.0, 0xc000),
+            (1.0 + 2f32.powi(-8), 0x3f80),
+            (1.0 + 2f32.powi(-8) + 2f32.powi(-16), 0x3f81),
+            (f32::INFINITY, 0x7f80),
+        ] {
+            assert_eq!(f32_to_bf16(x), want, "f32_to_bf16({x})");
+        }
+        // Widening back is a pure low-16 zero-fill, so it is exact for every pattern.
+        // These pin that the pattern sits in the HIGH half — the whole of the layout.
+        for (bits, want) in [(0x3f80u16, 1.0f32), (0xc000, -2.0), (0x7f80, f32::INFINITY)] {
+            assert_eq!(bf16_to_f32(bits), want, "bf16_to_f32({bits:#06x})");
+        }
+        // NaN is the one pattern `==` cannot state: it must stay a NaN rather than
+        // truncate into an Inf, which is exactly where `half` differs from the
+        // hand-rolled RNE it replaced.
         assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
     }
 
@@ -264,29 +300,38 @@ mod tests {
             }
             assert_eq!(f32_to_f16(v), b, "round trip failed for f16 bits {b:#06x}");
         }
-        // 2. Ties round to EVEN, in both directions. 1.0 + 2^-11 sits exactly between
-        //    1.0 (0x3c00, mantissa LSB 0) and the next fp16 up (0x3c01), so it rounds
-        //    DOWN; the tie above 0x3c01 rounds UP to the even 0x3c02.
-        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11)), 0x3c00);
-        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11) + 2f32.powi(-20)), 0x3c01);
-        assert_eq!(f32_to_f16(1.0 + 2f32.powi(-10) + 2f32.powi(-11)), 0x3c02);
-        // 3. Overflow saturates to inf, and only past the last tie: 65504 is fp16::MAX,
-        //    the tie at 65520 rounds up to inf, and just under it rounds back to MAX.
-        assert_eq!(f32_to_f16(65504.0), 0x7bff);
-        assert_eq!(f32_to_f16(65519.0), 0x7bff);
-        assert_eq!(f32_to_f16(65520.0), 0x7c00);
-        assert_eq!(f32_to_f16(f32::INFINITY), 0x7c00);
-        // 4. Underflow through the subnormals: 2^-24 is the smallest positive subnormal,
-        //    2^-25 is its tie and rounds to the even neighbour ZERO, and just above the
-        //    tie rounds up to it. Sign is preserved on the way to zero.
-        assert_eq!(f32_to_f16(2f32.powi(-24)), 0x0001);
-        assert_eq!(f32_to_f16(2f32.powi(-25)), 0x0000);
-        assert_eq!(f32_to_f16(2f32.powi(-25) + 2f32.powi(-40)), 0x0001);
-        assert_eq!(f32_to_f16(-2f32.powi(-30)), 0x8000);
-        // 5. The subnormal/normal seam: 2^-14 is the smallest NORMAL, and the largest
-        //    subnormal is one step below it. Off-by-one in the shift lands here.
-        assert_eq!(f32_to_f16(2f32.powi(-14)), 0x0400);
-        assert_eq!(f32_to_f16(2f32.powi(-14) - 2f32.powi(-24)), 0x03ff);
+        // Claims 2-5 are all one shape — an input and the bits it must produce — so they
+        // ride one table, each group keeping the argument that motivates its rows. A
+        // failure names the input, which a wall of bare `assert_eq!` lines does not.
+        for (x, want) in [
+            // 2. Ties round to EVEN, in both directions. 1.0 + 2^-11 sits exactly between
+            //    1.0 (0x3c00, mantissa LSB 0) and the next fp16 up (0x3c01), so it rounds
+            //    DOWN; the tie above 0x3c01 rounds UP to the even 0x3c02.
+            (1.0 + 2f32.powi(-11), 0x3c00u16),
+            (1.0 + 2f32.powi(-11) + 2f32.powi(-20), 0x3c01),
+            (1.0 + 2f32.powi(-10) + 2f32.powi(-11), 0x3c02),
+            // 3. Overflow saturates to inf, and only past the last tie: 65504 is
+            //    fp16::MAX, the tie at 65520 rounds up to inf, and just under it rounds
+            //    back to MAX. A true infinity lands on the same code as the saturation.
+            (65504.0, 0x7bff),
+            (65519.0, 0x7bff),
+            (65520.0, 0x7c00),
+            (f32::INFINITY, 0x7c00),
+            // 4. Underflow through the subnormals: 2^-24 is the smallest positive
+            //    subnormal, 2^-25 is its tie and rounds to the even neighbour ZERO, and
+            //    just above the tie rounds up to it. Sign is preserved on the way to
+            //    zero — the last row is NEGATIVE zero, not 0x0000.
+            (2f32.powi(-24), 0x0001),
+            (2f32.powi(-25), 0x0000),
+            (2f32.powi(-25) + 2f32.powi(-40), 0x0001),
+            (-2f32.powi(-30), 0x8000),
+            // 5. The subnormal/normal seam: 2^-14 is the smallest NORMAL, and the largest
+            //    subnormal is one step below it. Off-by-one in the shift lands here.
+            (2f32.powi(-14), 0x0400),
+            (2f32.powi(-14) - 2f32.powi(-24), 0x03ff),
+        ] {
+            assert_eq!(f32_to_f16(x), want, "f32_to_f16({x}) want {want:#06x}");
+        }
     }
 
     #[test]
@@ -403,15 +448,26 @@ mod tests {
                     let k = k.min(n);
                     let (mut s1, mut c1, mut sel1) = (vec![0.0; n], vec![0.0; n], Vec::new());
                     let (mut s2, mut c2, mut sel2) = (vec![0.0; n], vec![0.0; n], Vec::new());
-                    route_into(&g, &bias, k, Scoring::Sigmoid, &mut s1, &mut c1, &mut sel1);
+                    let live = RouteScratch {
+                        scores: &mut s1,
+                        choice: &mut c1,
+                        sel: &mut sel1,
+                    };
+                    let policy = RoutePolicy {
+                        top_k: k,
+                        scoring: Scoring::Sigmoid,
+                    };
+                    route_into(&g, &bias, policy, live);
                     route_into_pre(&g, &bias, k, &mut s2, &mut c2, &mut sel2);
                     assert_eq!(sel1, sel2, "selection drifted from the frozen routing");
                     assert_eq!(s1, s2, "scores drifted");
                     assert_eq!(c1, c2, "choice drifted");
-                    assert_eq!(sel1.len(), k, "selection must be exactly top_k");
+                    // Two claims the photograph cannot make on its own: agreeing with the
+                    // oracle would still be a pass if BOTH sides drifted the same way.
                     let mut d = sel1.clone();
                     d.sort_unstable();
                     d.dedup();
+                    assert_eq!(sel1.len(), k, "selection must be exactly top_k");
                     assert_eq!(d.len(), k, "selection must be DISTINCT experts");
                 }
             }

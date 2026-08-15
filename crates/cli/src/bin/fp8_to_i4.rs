@@ -61,23 +61,111 @@ struct Args {
     to: Option<usize>,
 }
 
-/// Quantize one expert (routed or shared) rooted at `base` straight from fp8 into
-/// `slot`, gate‖up‖down at the offsets `i4_slot_offsets` defines. `slot` is exactly
-/// one expert's unpadded bytes; the caller leaves the stride padding zero.
-fn build_block(
-    src: &Safetensors,
-    base: &str,
-    projs: &ExpertProjs,
+/// Bytes as GiB: every size this tool reports is a layer or a filesystem, and neither is
+/// legible in bytes.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
+/// Everything that is the same for every layer and every expert — the fp8 source, the `.i4`
+/// slot layout, the worker split. Hoisted out of the per-expert worker loop for the reason
+/// it always was: the name/shape pairing is the same for every expert of every layer. As
+/// one value it also keeps the per-expert call at `(base, slot)` instead of the
+/// six-argument list it had been.
+struct Encoder<'a> {
+    src: &'a Safetensors,
+    /// The fp8 `weight_scale_inv` tile size the artifact's manifest records — checked
+    /// against every projection by `dequant_fp8`, see [`main`].
     block: usize,
-    off: &[usize; 6],
-    slot: &mut [u8],
-) -> Result<()> {
-    for (k, &(proj, (o_dim, i_dim))) in projs.iter().enumerate() {
-        let w = src.dequant_fp8(&format!("{base}.{proj}"), o_dim, i_dim, block)?;
-        let (packed, scale) = quant_i4(&w, o_dim, i_dim);
-        write_i4_proj(slot, off, k, &packed, &scale);
+    projs: ExpertProjs,
+    off: [usize; 6],
+    n_experts: usize,
+    /// Expert blocks per layer: routed `0..n_experts`, then the shared expert.
+    blocks: usize,
+    stride: usize,
+    /// One expert's UNPADDED bytes. The gap up to `stride` is left as the caller found it,
+    /// which is zero — see the single zeroed allocation in [`main`].
+    ebytes: usize,
+    /// Experts per worker thread.
+    per: usize,
+    /// fp8 source bytes per expert: three projections of `hidden × moe_inter` at one byte
+    /// per weight. This tool is IO-bound on that read, so it is the numerator of the
+    /// per-layer rate line rather than the `.i4` bytes written.
+    fp8_bytes: usize,
+}
+
+impl<'a> Encoder<'a> {
+    fn new(cfg: &ModelConfig, src: &'a Safetensors, block: usize) -> Self {
+        let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
+        let blocks = ne + 1;
+        let threads = std::thread::available_parallelism().map_or(8, |t| t.get());
+        Encoder {
+            src,
+            block,
+            projs: expert_projs(h, m),
+            off: i4_slot_offsets(h, m),
+            n_experts: ne,
+            blocks,
+            stride: i4_expert_stride(h, m),
+            ebytes: i4_expert_bytes(h, m),
+            per: blocks.div_ceil(threads),
+            fp8_bytes: 3 * h * m,
+        }
     }
-    Ok(())
+
+    /// On-disk (and in-buffer) bytes of one layer: every expert block at its full stride.
+    fn layer_bytes(&self) -> u64 {
+        (self.blocks * self.stride) as u64
+    }
+
+    /// Workers actually spawned. `per` is a ceiling, so the last chunk can be short and this
+    /// can come out below `available_parallelism` — which is the number worth reporting.
+    fn workers(&self) -> usize {
+        self.blocks.div_ceil(self.per)
+    }
+
+    /// Quantize one expert (routed or shared) rooted at `base` straight from fp8 into
+    /// `slot`, gate‖up‖down at the offsets `i4_slot_offsets` defines. `slot` is exactly
+    /// one expert's unpadded bytes; the caller leaves the stride padding zero.
+    fn build_block(&self, base: &str, slot: &mut [u8]) -> Result<()> {
+        for (k, &(proj, (o_dim, i_dim))) in self.projs.iter().enumerate() {
+            let name = format!("{base}.{proj}");
+            let w = self.src.dequant_fp8(&name, o_dim, i_dim, self.block)?;
+            let (packed, scale) = quant_i4(&w, o_dim, i_dim);
+            write_i4_proj(slot, &self.off, k, &packed, &scale);
+        }
+        Ok(())
+    }
+
+    /// One worker's share of layer `l`: experts `ci·per ..`, one per `stride`-sized slot of
+    /// `chunk`. The error names the expert, since a checkpoint mismatch dies on the first.
+    fn fill_chunk(&self, chunk: &mut [u8], l: usize, ci: usize) -> Result<()> {
+        for (j, slot) in chunk.chunks_exact_mut(self.stride).enumerate() {
+            let e = ci * self.per + j;
+            let base = expert_base(l, e, self.n_experts);
+            self.build_block(&base, &mut slot[..self.ebytes])
+                .with_context(|| format!("expert {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Fill `buf` with every expert block of layer `l`, `per` experts to a worker. The split
+    /// is by disjoint `chunks_mut` slices, so the borrow checker witnesses that no two
+    /// workers can touch the same block.
+    fn convert_layer(&self, buf: &mut [u8], l: usize) -> Result<()> {
+        std::thread::scope(|s| -> Result<()> {
+            let handles: Vec<_> = buf
+                .chunks_mut(self.per * self.stride)
+                .enumerate()
+                .map(|(ci, chunk)| s.spawn(move || self.fill_chunk(chunk, l, ci)))
+                .collect();
+            for hd in handles {
+                hd.join().map_err(|_| anyhow!("encode worker panicked"))??;
+            }
+            Ok(())
+        })
+        .with_context(|| format!("convert layer {l}"))
+    }
 }
 
 /// Bytes available to an unprivileged writer on the filesystem holding `dir`.
@@ -96,24 +184,14 @@ fn free_bytes(dir: &str) -> Result<u64> {
     Ok(s.f_bavail as u64 * s.f_frsize as u64)
 }
 
-fn main() -> Result<()> {
-    let Args {
-        fp8_dir,
-        artifact_dir: art,
-        from: arg_from,
-        to: arg_to,
-    } = Args::parse();
-
-    let cfg = ModelConfig::load(&art).context("load artifact manifest")?;
-    let (h, m, ne) = (cfg.hidden, cfg.moe_inter, cfg.n_experts);
-    // The artifact records the fp8 tile size it was built with. Every projection's
-    // `weight_scale_inv` extent is then checked against it in `dequant_fp8`, so a
-    // checkpoint that disagrees — wrong dims, wrong tiling, wrong model — fails hard
-    // on the first expert rather than producing plausible-looking garbage.
-    let block = FormatMeta::load(&art)?.fp8_block;
-
-    let src = Safetensors::open_dir(&fp8_dir).context("open fp8 checkpoint")?;
-
+/// The `from..to` range to convert: the two flags defaulted against the artifact and the
+/// checkpoint, then checked against the MoE range.
+fn layer_range(
+    cfg: &ModelConfig,
+    src: &Safetensors,
+    arg_from: Option<usize>,
+    arg_to: Option<usize>,
+) -> Result<(usize, usize)> {
     // The MTP head is checkpoint layer `n_layers` — a full MoE layer, so it converts
     // through this exact loop with no special case. It was excluded only because the
     // bound below read `<= cfg.n_layers`, and that one comparison is why `--mode int4`
@@ -128,110 +206,89 @@ fn main() -> Result<()> {
         "layer range {from}..{to} outside the MoE range {}..{last}",
         cfg.dense_layers,
     );
+    Ok((from, to))
+}
 
-    let (stride, ebytes) = (i4_expert_stride(h, m), i4_expert_bytes(h, m));
-    let off = i4_slot_offsets(h, m);
-    // Hoisted out of the per-expert worker loop: the name/shape pairing is the same for
-    // every expert of every layer.
-    let projs = expert_projs(h, m);
-    let n = ne + 1; // routed 0..ne, then the shared expert
-    let layer_bytes = (n * stride) as u64;
-    let threads = std::thread::available_parallelism().map_or(8, |t| t.get());
-    let per = n.div_ceil(threads);
-    eprintln!(
-        "fp8_to_i4: layers {from}..{to}, {n} blocks/layer, {:.2} GiB/layer, {} workers",
-        layer_bytes as f64 / (1u64 << 30) as f64,
-        n.div_ceil(per)
+/// Refuse to start a layer that could not complete — a full `/` is far worse than an
+/// unfinished run, and the message names the flag that resumes.
+fn ensure_space(art: &str, layer_bytes: u64, l: usize) -> Result<()> {
+    // Peak extra usage is one layer: the tmp exists alongside the file it
+    // replaces, and the old blocks free at the rename.
+    let (free, need) = (free_bytes(art)?, layer_bytes + (1 << 30));
+    ensure!(
+        free >= need,
+        "only {:.1} GiB free on {art}, need {:.1} GiB for L{l:02}.i4 — aborting before the \
+         disk fills (resume with --from {l})",
+        gib(free),
+        gib(need)
     );
+    Ok(())
+}
 
-    // One buffer for every layer: each pass fully overwrites all `n` slots, and the
-    // stride padding stays zero from this single zeroed allocation.
-    let mut buf = vec![0u8; n * stride];
-    for l in from..to {
-        // The tmp name carries the pid for the reason `format::write_expert_layer` gives at
-        // length: agents share this machine and a convert takes no lock, so two runs into one
-        // artifact dir are reachable. On a FIXED `L{ll}.i4.tmp` both would `File::create` +
-        // truncate + write concurrently, and the rename would publish interleaved bytes —
-        // which, being two writes OF EQUAL LENGTH, yields a file of exactly the right length
-        // and sails through `open_routed`'s length check. This was the last fixed-name
-        // publisher in the tree (found by review 2026-08-10).
-        let path = format!("{art}/L{l:02}.i4");
-        let tmp = format!("{path}.{}.tmp", std::process::id());
-        // Drop a tmp left by an aborted run of THIS pid before measuring free space — it is
-        // the space this layer is about to reuse, and counting it would refuse the very
-        // resume the abort message recommends. Another pid's tmp is not ours to remove, and
-        // is now distinguishable.
-        let _ = std::fs::remove_file(&tmp);
-        // Peak extra usage is one layer: the tmp exists alongside the file it
-        // replaces, and the old blocks free at the rename. Refuse to start a layer
-        // that could not complete — a full `/` is far worse than an unfinished run.
-        let (free, need) = (free_bytes(&art)?, layer_bytes + (1 << 30));
-        ensure!(
-            free >= need,
-            "only {:.1} GiB free on {art}, need {:.1} GiB for L{l:02}.i4 — aborting before the \
-             disk fills (resume with --from {l})",
-            free as f64 / (1u64 << 30) as f64,
-            need as f64 / (1u64 << 30) as f64
-        );
+/// Publish `buf` at `path` the way the module header describes: write `tmp`, fsync, then
+/// `rename(2)` over the file being replaced, so a killed run never leaves a torn `.i4`.
+fn publish(tmp: &str, path: &str, buf: &[u8]) -> Result<()> {
+    let mut f = File::create(tmp).with_context(|| format!("create {tmp}"))?;
+    f.write_all(buf).with_context(|| format!("write {tmp}"))?;
+    f.sync_all().with_context(|| format!("fsync {tmp}"))?;
+    drop(f);
+    std::fs::rename(tmp, path).with_context(|| format!("rename {tmp} -> {path}"))
+}
 
-        let t = std::time::Instant::now();
-        std::thread::scope(|s| -> Result<()> {
-            let handles: Vec<_> = buf
-                .chunks_mut(per * stride)
-                .enumerate()
-                .map(|(ci, chunk)| {
-                    let (src, off, projs) = (&src, &off, &projs);
-                    s.spawn(move || -> Result<()> {
-                        for (j, slot) in chunk.chunks_exact_mut(stride).enumerate() {
-                            let e = ci * per + j;
-                            let base = expert_base(l, e, ne);
-                            build_block(src, &base, projs, block, off, &mut slot[..ebytes])
-                                .with_context(|| format!("expert {e}"))?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            for hd in handles {
-                hd.join().map_err(|_| anyhow!("encode worker panicked"))??;
-            }
-            Ok(())
-        })
-        .with_context(|| format!("convert layer {l}"))?;
+/// Convert layer `l` from fp8 into `buf` and publish it over `{art}/L{ll}.i4`.
+fn write_layer(enc: &Encoder<'_>, art: &str, buf: &mut [u8], l: usize) -> Result<()> {
+    // The tmp name carries the pid for the reason `format::write_expert_layer` gives at
+    // length: agents share this machine and a convert takes no lock, so two runs into one
+    // artifact dir are reachable. On a FIXED `L{ll}.i4.tmp` both would `File::create` +
+    // truncate + write concurrently, and the rename would publish interleaved bytes —
+    // which, being two writes OF EQUAL LENGTH, yields a file of exactly the right length
+    // and sails through `open_routed`'s length check. This was the last fixed-name
+    // publisher in the tree (found by review 2026-08-10).
+    let path = format!("{art}/L{l:02}.i4");
+    let tmp = format!("{path}.{}.tmp", std::process::id());
+    // Drop a tmp left by an aborted run of THIS pid before measuring free space — it is
+    // the space this layer is about to reuse, and counting it would refuse the very
+    // resume the abort message recommends. Another pid's tmp is not ours to remove, and
+    // is now distinguishable.
+    let _ = std::fs::remove_file(&tmp);
+    ensure_space(art, enc.layer_bytes(), l)?;
 
-        let mut f = File::create(&tmp).with_context(|| format!("create {tmp}"))?;
-        f.write_all(&buf).with_context(|| format!("write {tmp}"))?;
-        f.sync_all().with_context(|| format!("fsync {tmp}"))?;
-        drop(f);
-        std::fs::rename(&tmp, &path).with_context(|| format!("rename {tmp} -> {path}"))?;
-        let secs = t.elapsed().as_secs_f64();
-        eprintln!(
-            "  L{l:02}.i4 <- fp8 in {secs:.0}s ({:.0} MiB/s fp8 read)",
-            (n as f64 * 3.0 * (h * m) as f64) / secs / (1u64 << 20) as f64
-        );
-    }
+    let t = std::time::Instant::now();
+    enc.convert_layer(buf, l)?;
+    publish(&tmp, &path, buf)?;
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "  L{l:02}.i4 <- fp8 in {secs:.0}s ({:.0} MiB/s fp8 read)",
+        (enc.blocks * enc.fp8_bytes) as f64 / secs / (1u64 << 20) as f64
+    );
+    Ok(())
+}
 
-    // Record exactly what was rebuilt. A partial run stamps its own range (merging
-    // with an adjoining earlier run), so a resumed conversion still ends up claiming
-    // the whole set and a genuinely mixed artifact never claims to be uniform.
+/// Record exactly what was rebuilt. A partial run stamps its own range (merging
+/// with an adjoining earlier run), so a resumed conversion still ends up claiming
+/// the whole set and a genuinely mixed artifact never claims to be uniform.
+fn stamp_source(art: &str, fp8_dir: &str, range: [usize; 2]) -> Result<()> {
     I4Source {
         tool: "fp8_to_i4".into(),
         chain: "fp8->int4".into(),
-        src: std::fs::canonicalize(&fp8_dir)
+        src: std::fs::canonicalize(fp8_dir)
             .with_context(|| format!("canonicalize {fp8_dir}"))?
             .display()
             .to_string(),
-        layers: [from, to],
+        layers: range,
         group: Some(I4_GROUP),
     }
-    .stamp(&art)?;
-    // The merge above only fires against a PRIOR stamp, and a stamp is one JSON field that
-    // can go missing (this artifact's did — docs/investigations/int4-scales.md §Reproduction). Converting a
-    // subrange into an unstamped set then writes a claim NARROWER than the `.i4` on disk,
-    // which reads as "only these layers are fp8-derived" and is worse than no claim at all.
-    // Cost 2026-07-31: a --from 78 run stamped [78,79] over a full set and
-    // `moe_i4_real_data_vs_fp8_ground_truth` — which had been skipping on the absent stamp
-    // — started failing on layer 3. Say so; do not guess the range on the user's behalf.
+    .stamp(art)
+}
+
+/// The merge in [`stamp_source`] only fires against a PRIOR stamp, and a stamp is one JSON
+/// field that can go missing (this artifact's did — docs/investigations/int4-scales.md §Reproduction). Converting a
+/// subrange into an unstamped set then writes a claim NARROWER than the `.i4` on disk,
+/// which reads as "only these layers are fp8-derived" and is worse than no claim at all.
+/// Cost 2026-07-31: a --from 78 run stamped [78,79] over a full set and
+/// `moe_i4_real_data_vs_fp8_ground_truth` — which had been skipping on the absent stamp
+/// — started failing on layer 3. Say so; do not guess the range on the user's behalf.
+fn warn_if_stamp_understates(art: &str, cfg: &ModelConfig, from: usize, to: usize) {
     let on_disk: Vec<usize> = (cfg.dense_layers..=cfg.n_layers)
         .filter(|l| std::fs::metadata(format!("{art}/L{l:02}.i4")).is_ok())
         .collect();
@@ -245,6 +302,43 @@ fn main() -> Result<()> {
             hi + 1
         );
     }
+}
+
+fn main() -> Result<()> {
+    let Args {
+        fp8_dir,
+        artifact_dir: art,
+        from: arg_from,
+        to: arg_to,
+    } = Args::parse();
+
+    let cfg = ModelConfig::load(&art).context("load artifact manifest")?;
+    // The artifact records the fp8 tile size it was built with. Every projection's
+    // `weight_scale_inv` extent is then checked against it in `dequant_fp8`, so a
+    // checkpoint that disagrees — wrong dims, wrong tiling, wrong model — fails hard
+    // on the first expert rather than producing plausible-looking garbage.
+    let block = FormatMeta::load(&art)?.fp8_block;
+
+    let src = Safetensors::open_dir(&fp8_dir).context("open fp8 checkpoint")?;
+    let (from, to) = layer_range(&cfg, &src, arg_from, arg_to)?;
+
+    let enc = Encoder::new(&cfg, &src, block);
+    eprintln!(
+        "fp8_to_i4: layers {from}..{to}, {} blocks/layer, {:.2} GiB/layer, {} workers",
+        enc.blocks,
+        gib(enc.layer_bytes()),
+        enc.workers()
+    );
+
+    // One buffer for every layer: each pass fully overwrites all `n` slots, and the
+    // stride padding stays zero from this single zeroed allocation.
+    let mut buf = vec![0u8; enc.blocks * enc.stride];
+    for l in from..to {
+        write_layer(&enc, &art, &mut buf, l)?;
+    }
+
+    stamp_source(&art, &fp8_dir, [from, to])?;
+    warn_if_stamp_understates(&art, &cfg, from, to);
     eprintln!(
         "fp8_to_i4: done — layers {from}..{to} rebuilt from fp8 at group {I4_GROUP}, manifest i4_source stamped"
     );

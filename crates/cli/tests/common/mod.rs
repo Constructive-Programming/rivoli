@@ -13,14 +13,21 @@ pub fn walk(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            match p.is_dir() {
-                true => stack.push(p),
-                false if p.extension().is_some_and(|x| x == ext) => out.push(p),
-                false => {}
-            }
-        }
+        // Split each directory's entries in one pass instead of branching per entry inside the
+        // loop: `partition` keeps the descend/collect decision to a single flat expression, and
+        // the `filter` drops the third case (a file with the wrong extension) before it.
+        // The double `flatten` swallows an unreadable directory — `walk` feeds coverage checks
+        // that must not go red because a path vanished under them, and a directory that cannot
+        // be read contributes nothing either way.
+        let (subdirs, matches): (Vec<_>, Vec<_>) = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() || p.extension().is_some_and(|x| x == ext))
+            .partition(|p| p.is_dir());
+        stack.extend(subdirs);
+        out.extend(matches);
     }
     out
 }

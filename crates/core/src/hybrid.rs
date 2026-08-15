@@ -107,24 +107,42 @@ fn tier_if_hot(promote: bool) -> Tier {
     if promote { Tier::Hot } else { Tier::Cold }
 }
 
+/// Everything an admission writes into: the shared geometry (which carries the batch pin
+/// set) and the policy's own two resident sets. One value rather than three positional
+/// `&mut`s, because a policy never has one of the three without the other two.
+struct AdmitInto<'a> {
+    b: &'a mut TierGeomAndBudget,
+    cold: &'a mut OrderedSet,
+    hot: &'a mut OrderedSet,
+}
+
+/// Borrow one: geometry (field `b`, per [`impl_geom`]'s convention) plus the policy's own
+/// COLD and HOT sets, named.
+///
+/// A macro for [`impl_geom`]'s reason — nothing but a macro can name another type's fields.
+/// Spelling the three borrows out at both call sites instead is what CodeScene reported as
+/// duplication (2026-08-15); one token of glue keeps each `admit` four lines.
+macro_rules! admit_into {
+    ($p:ident, $cold:ident, $hot:ident) => {
+        AdmitInto {
+            b: &mut $p.b,
+            cold: &mut $p.$cold,
+            hot: &mut $p.$hot,
+        }
+    };
+}
+
 /// Close an admission: put `k` into `tier`'s resident set and record the victims.
 ///
 /// The tier→set dispatch plus [`TierGeomAndBudget::admitted`] is the tail of both the LRU and the 2Q
 /// `admit`; only the two sets differ, in the same way [`touch_either`]'s two do. ARC does
 /// not use it — its tier is decided inside the ghost branches, which touch their set there.
-fn place_in_tier(
-    b: &mut TierGeomAndBudget,
-    cold: &mut OrderedSet,
-    hot: &mut OrderedSet,
-    k: u32,
-    tier: Tier,
-    evicted: Vec<u32>,
-) -> Admission {
+fn place_in_tier(into: AdmitInto<'_>, k: u32, tier: Tier, evicted: Vec<u32>) -> Admission {
     match tier {
-        Tier::Cold => cold.touch(k),
-        Tier::Hot => hot.touch(k),
+        Tier::Cold => into.cold.touch(k),
+        Tier::Hot => into.hot.touch(k),
     }
-    b.admitted(k, tier, evicted)
+    into.b.admitted(k, tier, evicted)
 }
 
 /// The eviction half of every `admit`: shed victims by the policy's own `reclaim` rule
@@ -162,20 +180,27 @@ fn touch_either(a: &mut OrderedSet, b: &mut OrderedSet, k: u32) -> bool {
     false
 }
 
+/// The two tiers' slot sizes in BYTES — COLD (int3-VQ) and HOT (int4). Never meaningful
+/// apart: every byte sum here spends both, and `slots` divides by the smaller of them.
+#[derive(Clone, Copy, Debug)]
+pub struct TierStrides {
+    pub cold: usize,
+    pub hot: usize,
+}
+
 /// Construct a byte-aware hybrid policy. `split` is 2Q's Kin/Kout (ignored by lru/arc);
 pub fn policy_for(
     policy: &str,
     budget: usize,
-    cold_stride: usize,
-    hot_stride: usize,
+    strides: TierStrides,
     split: crate::cache::TwoQSplit,
 ) -> Option<Box<dyn HybridPolicy>> {
     // Strides clamped to ≥1 exactly as `Arena::new` clamps them: `slots` divides by the
     // smaller of the two, and the policy's byte accounting has to agree with the arena's.
     let g = TierGeomAndBudget {
         budget,
-        cold_stride: cold_stride.max(1),
-        hot_stride: hot_stride.max(1),
+        cold_stride: strides.cold.max(1),
+        hot_stride: strides.hot.max(1),
         pinned: HashSet::new(),
     };
     match policy {
@@ -265,7 +290,7 @@ impl HybridPolicy for HybridLru {
         let tier = tier_if_hot(self.freq.get(&k).copied().unwrap_or(0) >= LRU_HOT_THRESHOLD);
         let (incoming, budget) = (self.b.stride(tier), self.b.budget);
         let evicted = evict_until_fits(self, incoming, budget, HybridLru::evict_lru);
-        place_in_tier(&mut self.b, &mut self.cold, &mut self.hot, k, tier, evicted)
+        place_in_tier(admit_into!(self, cold, hot), k, tier, evicted)
     }
 
     fn resident_bytes(&self) -> usize {
@@ -343,7 +368,7 @@ impl HybridPolicy for HybridTwoQ {
         let tier = tier_if_hot(self.a1out.remove(k));
         let (incoming, budget) = (self.b.stride(tier), self.b.budget);
         let evicted = evict_until_fits(self, incoming, budget, HybridTwoQ::reclaim);
-        place_in_tier(&mut self.b, &mut self.a1in, &mut self.am, k, tier, evicted)
+        place_in_tier(admit_into!(self, a1in, am), k, tier, evicted)
     }
     fn protect(&mut self, k: u32) {
         self.b.pinned.insert(k);
@@ -385,38 +410,41 @@ impl HybridArc {
     fn t1_bytes(&self) -> usize {
         self.t1.len() * self.b.cold_stride
     }
+    /// Take the LRU unpinned key from the preferred tier, falling back to the other when
+    /// that one has no legal victim (empty OR all pinned this batch) — the fallback is what
+    /// keeps it from stalling or evicting a batch key. Reports whether the victim came from
+    /// COLD, which is the only thing the caller still needs: it picks the ghost.
+    fn take_unpinned(&mut self, prefer_cold: bool) -> Option<(u32, bool)> {
+        let (pin, t1, t2) = (&self.b.pinned, &mut self.t1, &mut self.t2);
+        let (first, second) = if prefer_cold { (t1, t2) } else { (t2, t1) };
+        match first.pop_lru_skip(pin) {
+            Some(v) => Some((v, prefer_cold)),
+            None => second.pop_lru_skip(pin).map(|v| (v, !prefer_cold)),
+        }
+    }
+    /// Remember a victim in the ghost for the tier it came from, bounded to a budget's
+    /// worth of keys (cheap; remembers returns).
+    fn remember_in_ghost(&mut self, v: u32, from_cold: bool) {
+        let bound = self.b.slots();
+        let ghost = if from_cold {
+            &mut self.b1
+        } else {
+            &mut self.b2
+        };
+        ghost.touch(v);
+        while ghost.len() > bound {
+            ghost.pop_lru();
+        }
+    }
     /// Evict one UNPINNED resident to a ghost, choosing the tier by `p`: shed COLD (T1)
     /// while it exceeds the target `p`, else shed HOT (T2). `in_b2` biases toward T1 at
-    /// the tie. Falls back to the other tier if the preferred one has no unpinned victim
-    /// (empty OR all pinned this batch), so it never stalls or evicts a batch key.
+    /// the tie.
     fn replace(&mut self, in_b2: bool) -> Option<u32> {
         let t1b = self.t1_bytes();
         let prefer_cold = t1b > self.p || (in_b2 && t1b == self.p);
-        let (v, from_cold) = if prefer_cold {
-            match self.t1.pop_lru_skip(&self.b.pinned) {
-                Some(v) => (Some(v), true),
-                None => (self.t2.pop_lru_skip(&self.b.pinned), false),
-            }
-        } else {
-            match self.t2.pop_lru_skip(&self.b.pinned) {
-                Some(v) => (Some(v), false),
-                None => (self.t1.pop_lru_skip(&self.b.pinned), true),
-            }
-        };
-        if let Some(v) = v {
-            let ghost = if from_cold {
-                &mut self.b1
-            } else {
-                &mut self.b2
-            };
-            ghost.touch(v);
-            // Bound each ghost to a budget's worth of keys (cheap; remembers returns).
-            let bound = self.b.slots();
-            while ghost.len() > bound {
-                ghost.pop_lru();
-            }
-        }
-        v
+        let (v, from_cold) = self.take_unpinned(prefer_cold)?;
+        self.remember_in_ghost(v, from_cold);
+        Some(v)
     }
 }
 impl HybridPolicy for HybridArc {
@@ -526,12 +554,14 @@ mod tests {
         }
     }
 
+    /// The strides every test here runs at: 3-byte COLD slots, 4-byte HOT ones.
+    const STRIDES: TierStrides = TierStrides { cold: 3, hot: 4 };
+
     fn each_policy() -> Vec<(&'static str, Box<dyn HybridPolicy>)> {
-        let (budget, cs, hs) = (100usize, 3usize, 4usize);
         ["lru", "2q", "arc"]
             .iter()
             .map(|&n| {
-                let p = policy_for(n, budget, cs, hs, TwoQSplit::default());
+                let p = policy_for(n, 100, STRIDES, TwoQSplit::default());
                 (n, p.expect("known policy"))
             })
             .collect()
@@ -557,7 +587,7 @@ mod tests {
         for name in ["2q", "arc"] {
             // budget 5 holds exactly one hot slot (4) — small enough that the 2nd admit
             // evicts the 1st, big enough that a HOT slot fits.
-            let mut p = policy_for(name, 5, 3, 4, TwoQSplit::default()).unwrap();
+            let mut p = policy_for(name, 5, STRIDES, TwoQSplit::default()).unwrap();
             p.begin_batch();
             assert!(!p.hit(10));
             assert_eq!(
@@ -583,7 +613,7 @@ mod tests {
     fn lru_admits_by_frequency() {
         // LRU has no ghost: placement is the decaying counter. First-seen COLD; a key
         // re-accessed after eviction crosses the threshold → HOT.
-        let mut p = policy_for("lru", 5, 3, 4, TwoQSplit::default()).unwrap();
+        let mut p = policy_for("lru", 5, STRIDES, TwoQSplit::default()).unwrap();
         p.begin_batch();
         assert!(!p.hit(10));
         assert_eq!(p.admit(10).tier, Tier::Cold);
@@ -600,7 +630,7 @@ mod tests {
         // A frequency-skewed workload (a hot core hit via the ghost) must drive ARC's
         // `p` DOWN from 0-start toward HOT... p rises on B1 hits (recency), falls on B2.
         // Here we just assert the hot core stays resident under churn (adaptivity works).
-        let mut p = policy_for("arc", 60, 3, 4, TwoQSplit::default()).unwrap();
+        let mut p = policy_for("arc", 60, STRIDES, TwoQSplit::default()).unwrap();
         let core: Vec<u32> = (0..5).collect();
         for round in 0..50u32 {
             for &k in &core {
@@ -622,60 +652,100 @@ mod tests {
     // admit() every miss). A miss's eviction must never drop a key touched earlier in
     // the SAME batch, else the pin can't resolve its slot ("expert not resident after
     // alloc"). The other tests drive keys one-at-a-time, so they never hit this.
+
+    /// xorshift64: deterministic and dependency-free, so a batch that fails replays.
+    fn xorshift(r: &mut u64) -> u64 {
+        *r ^= *r << 13;
+        *r ^= *r >> 7;
+        *r ^= *r << 17;
+        *r
+    }
+
+    /// Draw one batch of DISTINCT keys, ~half of them re-drawn from what is already
+    /// resident — that skew is what makes same-batch hits (and so same-batch pins) common.
+    fn draw_batch(rng: &mut u64, resident: &[u32]) -> Vec<u32> {
+        const KEYS: usize = 9;
+        let mut batch: Vec<u32> = Vec::new();
+        while batch.len() < KEYS {
+            let k = if !resident.is_empty() && xorshift(rng).is_multiple_of(2) {
+                resident[xorshift(rng) as usize % resident.len()]
+            } else {
+                (xorshift(rng) % 200) as u32
+            };
+            if !batch.contains(&k) {
+                batch.push(k);
+            }
+        }
+        batch
+    }
+
+    /// One policy under the batch protocol plus the independent residency tally its
+    /// assertions are checked against. A struct so each pass stays a small method instead
+    /// of a helper threading `name` through purely for the failure message.
+    struct BatchRun {
+        name: &'static str,
+        p: Box<dyn HybridPolicy>,
+        resident: HashSet<u32>,
+    }
+    impl BatchRun {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                p: policy_for(name, 60, STRIDES, TwoQSplit::default()).expect("known policy"),
+                resident: HashSet::new(),
+            }
+        }
+        /// Pass 1: hit-and-protect everything that lands; returns the misses, in order.
+        fn hit_pass(&mut self, batch: &[u32]) -> Vec<u32> {
+            self.p.begin_batch();
+            let mut misses = Vec::new();
+            for &k in batch {
+                if self.p.hit(k) {
+                    self.p.protect(k);
+                } else {
+                    misses.push(k);
+                }
+            }
+            misses
+        }
+        /// Pass 2: admit every miss. THE assertion — no admission may evict a key this
+        /// same batch already touched, or the pin cannot resolve its slot.
+        fn admit_pass(&mut self, batch: &[u32], misses: &[u32]) {
+            for &k in misses {
+                let a = self.p.admit(k);
+                for e in &a.evicted {
+                    assert!(
+                        !batch.contains(e),
+                        "{}: evicted {e}, a key touched in the current batch",
+                        self.name
+                    );
+                    self.resident.remove(e);
+                }
+                self.resident.insert(k);
+            }
+        }
+        fn one_batch(&mut self, rng: &mut u64) {
+            let rv: Vec<u32> = self.resident.iter().copied().collect();
+            let batch = draw_batch(rng, &rv);
+            let misses = self.hit_pass(&batch);
+            self.admit_pass(&batch, &misses);
+            for &k in &batch {
+                assert!(
+                    self.p.contains(k),
+                    "{}: batch key {k} not resident after its batch",
+                    self.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn batch_never_evicts_a_key_touched_this_batch() {
         for name in ["lru", "2q", "arc"] {
-            let (budget, cs, hs) = (60usize, 3usize, 4usize);
-            let mut p = policy_for(name, budget, cs, hs, TwoQSplit::default()).unwrap();
-            let mut resident: HashMap<u32, ()> = HashMap::new();
+            let mut run = BatchRun::new(name);
             let mut rng = 0x1234_5678u64;
-            let next = |r: &mut u64| {
-                *r ^= *r << 13;
-                *r ^= *r >> 7;
-                *r ^= *r << 17;
-                *r
-            };
             for _ in 0..5000 {
-                p.begin_batch();
-                let rv: Vec<u32> = resident.keys().copied().collect();
-                let mut batch: Vec<u32> = Vec::new();
-                while batch.len() < 9 {
-                    let k = if !rv.is_empty() && next(&mut rng) % 2 == 0 {
-                        rv[next(&mut rng) as usize % rv.len()]
-                    } else {
-                        (next(&mut rng) % 200) as u32
-                    };
-                    if !batch.contains(&k) {
-                        batch.push(k);
-                    }
-                }
-                let mut is_hit = vec![false; batch.len()];
-                for (i, &k) in batch.iter().enumerate() {
-                    if p.hit(k) {
-                        p.protect(k);
-                        is_hit[i] = true;
-                    }
-                }
-                for (i, &k) in batch.iter().enumerate() {
-                    if is_hit[i] {
-                        continue;
-                    }
-                    let a = p.admit(k);
-                    for e in &a.evicted {
-                        assert!(
-                            !batch.contains(e),
-                            "{name}: evicted {e}, a key touched in the current batch"
-                        );
-                        resident.remove(e);
-                    }
-                    resident.insert(k, ());
-                }
-                for &k in &batch {
-                    assert!(
-                        p.contains(k),
-                        "{name}: batch key {k} not resident after its batch"
-                    );
-                }
+                run.one_batch(&mut rng);
             }
         }
     }

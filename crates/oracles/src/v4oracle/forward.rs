@@ -697,6 +697,18 @@ pub struct Oracle {
     freqs_yarn_base_theta: Vec<(f32, f32)>,
 }
 
+/// One GEMV's extents: `[m, k]` activations against an `[n, k]` weight.
+///
+/// One parameter rather than three because the split-k dispatch predicate reads all three
+/// together and a swapped pair does not fail — it silently selects a DIFFERENT set of
+/// kernels, which is the whole hazard [`Oracle::splitk_selects`] exists to pin.
+#[derive(Clone, Copy)]
+struct GemvShape {
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
 impl Oracle {
     pub fn new(cfg: V4Config, defect: Defect) -> Self {
         // The two tables `Attention.__init__` builds. They differ ONLY in the pair below:
@@ -836,12 +848,12 @@ impl Oracle {
     /// consistently on both sides; at the recorded prompts (goldens 13 tokens, bench
     /// 218) prefill selects nothing. `k % 4 == 0` mirrors the launcher's guard that
     /// keeps the fold on the dword path the spec orders (every captured `k` is 4096).
-    fn splitk_selects(&self, m: usize, n: usize, k: usize, w: &WMat) -> bool {
+    fn splitk_selects(&self, sh: GemvShape, w: &WMat) -> bool {
         self.defect == Defect::SplitKFoldOrder
             && matches!(w, WMat::Fp8 { .. })
-            && m * n <= 2048
-            && k >= 4096
-            && k.is_multiple_of(4)
+            && sh.m * sh.n <= 2048
+            && sh.k >= 4096
+            && sh.k.is_multiple_of(4)
     }
 
     /// `model.py::linear` — dispatches on the weight's storage format. `x` is `[m, k]`
@@ -889,7 +901,7 @@ impl Oracle {
             }
         };
         let a = xq.as_deref().unwrap_or(x);
-        let splitk = self.splitk_selects(m, n, k, w);
+        let splitk = self.splitk_selects(GemvShape { m, n, k }, w);
 
         let mut out = vec![0.0f32; m * n];
         let mut wr = Vec::with_capacity(k);
@@ -1076,6 +1088,22 @@ fn precompute_freqs_cis(cfg: &V4Config, original_seq_len: usize, base: f32) -> V
 // helpers shared by the block body
 // ---------------------------------------------------------------------------------------
 
+/// `row.softmax(-1)` into `dst`, fp32, max-shifted. Contiguous and out-of-place, which is
+/// why it is not [`softmax_strided`]: the router reads its logits and writes a separate
+/// score buffer, and only `Defect::RouterSoftmax` reaches it at all.
+fn softmax_row(row: &[f32], dst: &mut [f32]) {
+    let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut s = 0.0f32;
+    for (i, &v) in row.iter().enumerate() {
+        let e = (v - mx).exp();
+        dst[i] = e;
+        s += e;
+    }
+    for v in dst.iter_mut() {
+        *v /= s;
+    }
+}
+
 /// Softmax over `n` elements strided by `stride`, in fp32, `-inf`-safe.
 fn softmax_strided(v: &mut [f32], n: usize, stride: usize, offset: usize) {
     let mut m = f32::NEG_INFINITY;
@@ -1128,8 +1156,24 @@ fn topk_idx(v: &[f32], k: usize) -> Vec<usize> {
 /// A block runs the pair twice, around attention and around the FFN, at identical types and
 /// shapes: crossing the two halves was a well-typed call before this type existed.
 struct HcMix {
+    /// The query rows this mixture was built for. Carried rather than passed again, because
+    /// `hc_post` used to take its own `s` and a mixture used at the wrong length is exactly
+    /// the well-typed mistake the struct above exists to preclude.
+    s: usize,
     post: Vec<f32>,
     comb: Vec<f32>,
+}
+
+/// One sublayer's mHC parameters — the `hc_{attn,ffn}_{fn,scale,base}` triple.
+///
+/// Three views of ONE learned block, always read together. Passed separately they let an
+/// attention `scale` reach an FFN `base`: same types, same shapes, silently wrong values,
+/// which is the same hazard [`HcMix`] closes on the other side of the sublayer.
+#[derive(Clone, Copy)]
+struct HcW<'a> {
+    fnw: &'a [f32],
+    scale: &'a [f32],
+    base: &'a [f32],
 }
 
 impl Oracle {
@@ -1139,63 +1183,79 @@ impl Oracle {
     /// combination logits. Note the FIRST normalisation pair is a row *softmax* followed by
     /// a column divide, and only the remaining `iters - 1` passes are plain row/column
     /// divides — that asymmetry is easy to lose in a port.
-    fn hc_split_sinkhorn(
-        &self,
-        mixes: &[f32],
-        scale: &[f32],
-        base: &[f32],
-    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let hc = self.cfg.hc_mult;
-        let eps = self.cfg.hc_eps;
-        let mut pre = vec![0.0f32; hc];
-        let mut post = vec![0.0f32; hc];
-        let mut comb = vec![0.0f32; hc * hc];
-        for j in 0..hc {
-            pre[j] = sigmoid(mixes[j] * scale[0] + base[j]) + eps;
-            post[j] = 2.0 * sigmoid(mixes[j + hc] * scale[1] + base[j + hc]);
-        }
-        for j in 0..hc {
-            for k in 0..hc {
-                comb[j * hc + k] =
-                    mixes[j * hc + k + 2 * hc] * scale[2] + base[j * hc + k + 2 * hc];
-            }
-        }
-        // comb = comb.softmax(-1) + eps
-        for j in 0..hc {
-            softmax_strided(&mut comb, hc, 1, j * hc);
-            for k in 0..hc {
-                comb[j * hc + k] += eps;
-            }
-        }
-        // The Sinkhorn passes: `comb / (comb.sum(-1) + eps)` and `comb / (comb.sum(-2) + eps)`
-        // differ only in which index they hold fixed, so one normaliser takes that as an
-        // index function. Two copies would be two places to get the eps or the axis wrong.
-        let norm = |c: &mut [f32], by_row: bool| {
-            let at = |fixed: usize, run: usize| {
-                if by_row {
-                    fixed * hc + run
-                } else {
-                    run * hc + fixed
-                }
-            };
-            for fixed in 0..hc {
-                let s: f32 = (0..hc).map(|r| c[at(fixed, r)]).sum();
-                for r in 0..hc {
-                    c[at(fixed, r)] /= s + eps;
-                }
-            }
-        };
-        norm(&mut comb, false);
+    fn hc_split_sinkhorn(&self, mixes: &[f32], w: HcW) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let (pre, post) = self.hc_gates(mixes, w);
+        let mut comb = self.hc_comb_logits(mixes, w);
+        self.hc_norm(&mut comb, false);
         let iters = if self.defect == Defect::SinkhornIterCountProbe {
             self.cfg.hc_sinkhorn_iters - 1
         } else {
             self.cfg.hc_sinkhorn_iters
         };
         for _ in 0..iters.saturating_sub(1) {
-            norm(&mut comb, true);
-            norm(&mut comb, false);
+            self.hc_norm(&mut comb, true);
+            self.hc_norm(&mut comb, false);
         }
         (pre, post, comb)
+    }
+
+    /// The two gate vectors `hc_split_sinkhorn` returns beside the combination matrix: the
+    /// `pre` weights that collapse the residual copies and the `post` weights that reopen
+    /// them. `post` carries the reference's factor of 2 and no eps; `pre` the reverse.
+    fn hc_gates(&self, mixes: &[f32], w: HcW) -> (Vec<f32>, Vec<f32>) {
+        let hc = self.cfg.hc_mult;
+        let eps = self.cfg.hc_eps;
+        let mut pre = vec![0.0f32; hc];
+        let mut post = vec![0.0f32; hc];
+        for j in 0..hc {
+            pre[j] = sigmoid(mixes[j] * w.scale[0] + w.base[j]) + eps;
+            post[j] = 2.0 * sigmoid(mixes[j + hc] * w.scale[1] + w.base[j + hc]);
+        }
+        (pre, post)
+    }
+
+    /// The combination matrix before any Sinkhorn pass: the `hc * hc` logits tail of
+    /// `mixes`, row-softmaxed and shifted by eps. That leading row *softmax* is the
+    /// asymmetry [`Oracle::hc_split_sinkhorn`]'s doc warns about — the remaining passes are
+    /// plain divides, so a port that starts the loop one pass early loses it silently.
+    fn hc_comb_logits(&self, mixes: &[f32], w: HcW) -> Vec<f32> {
+        let (hc, eps) = (self.cfg.hc_mult, self.cfg.hc_eps);
+        let mut comb = vec![0.0f32; hc * hc];
+        // `j * hc + k` walks `0..hc*hc` in order, so the flat index IS `[j][k]`; the reads
+        // and the order they happen in are the nested loops', with one level less nesting.
+        for (i, c) in comb.iter_mut().enumerate() {
+            *c = mixes[i + 2 * hc] * w.scale[2] + w.base[i + 2 * hc];
+        }
+        // comb = comb.softmax(-1) + eps. The row softmax reads and writes only its own row,
+        // so the eps shift is one pass afterwards rather than interleaved per row.
+        for j in 0..hc {
+            softmax_strided(&mut comb, hc, 1, j * hc);
+        }
+        for c in comb.iter_mut() {
+            *c += eps;
+        }
+        comb
+    }
+
+    /// One Sinkhorn pass. `comb / (comb.sum(-1) + eps)` and `comb / (comb.sum(-2) + eps)`
+    /// differ only in which index they hold fixed, so one normaliser takes that as an
+    /// index function. Two copies would be two places to get the eps or the axis wrong.
+    fn hc_norm(&self, c: &mut [f32], by_row: bool) {
+        let hc = self.cfg.hc_mult;
+        let eps = self.cfg.hc_eps;
+        let at = |fixed: usize, run: usize| {
+            if by_row {
+                fixed * hc + run
+            } else {
+                run * hc + fixed
+            }
+        };
+        for fixed in 0..hc {
+            let s: f32 = (0..hc).map(|r| c[at(fixed, r)]).sum();
+            for r in 0..hc {
+                c[at(fixed, r)] /= s + eps;
+            }
+        }
     }
 
     /// `torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)` — collapse one token's `hc_mult`
@@ -1229,40 +1289,46 @@ impl Oracle {
 
     /// `Block.hc_pre`. `h` is `[s, hc, dim]`; the rsqrt is over the FULL `hc * dim`
     /// flattened row, not per copy.
-    fn hc_pre(
-        &self,
-        h: &[f32],
-        s: usize,
-        fnw: &[f32],
-        scale: &[f32],
-        base: &[f32],
-    ) -> (Vec<f32>, HcMix) {
-        let (hc, dim, mix) = (self.cfg.hc_mult, self.cfg.dim, self.cfg.mix_hc());
+    fn hc_pre(&self, h: &[f32], s: usize, w: HcW) -> (Vec<f32>, HcMix) {
+        let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);
         let hcd = hc * dim;
         let mut y = vec![0.0f32; s * dim];
         let mut post = vec![0.0f32; s * hc];
         let mut comb = vec![0.0f32; s * hc * hc];
         for t in 0..s {
             let flat = &h[t * hcd..(t + 1) * hcd];
-            let var = flat.iter().map(|v| v * v).sum::<f32>() / hcd as f32;
-            let rs = if self.defect == Defect::HcPreNoRsqrt {
-                1.0
-            } else {
-                (var + self.cfg.norm_eps).sqrt().recip()
-            };
-            let mut mixes = vec![0.0f32; mix];
-            for (j, m) in mixes.iter_mut().enumerate() {
-                let w = &fnw[j * hcd..(j + 1) * hcd];
-                *m = flat.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() * rs;
-            }
-            let (pre, row_post, row_comb) = self.hc_split_sinkhorn(&mixes, scale, base);
+            let mixes = self.hc_mixes(flat, w.fnw);
+            let (pre, row_post, row_comb) = self.hc_split_sinkhorn(&mixes, w);
             self.hc_blend(&pre, flat, &mut y[t * dim..(t + 1) * dim]);
             post[t * hc..(t + 1) * hc].copy_from_slice(&row_post);
             comb[t * hc * hc..(t + 1) * hc * hc].copy_from_slice(&row_comb);
         }
         // `y.to(dtype)` — back to bf16.
         self.round_bf16(&mut y);
-        (y, HcMix { post, comb })
+        (y, HcMix { s, post, comb })
+    }
+
+    /// One token's `mix_hc()` mixture logits: `hc_*_fn @ flat * rsqrt(mean(flat^2) + eps)`.
+    ///
+    /// The rsqrt is over the FULL `hc * dim` flattened row, not per copy — the same
+    /// statistic scales every mix, which is what `Defect::HcPreNoRsqrt` drops. `hc_head`
+    /// carries its own copy of both the statistic and the mistake because the reference
+    /// spells it a second time there (model.py:712-713), and a port can get one right and
+    /// the other wrong.
+    fn hc_mixes(&self, flat: &[f32], fnw: &[f32]) -> Vec<f32> {
+        let hcd = flat.len();
+        let var = flat.iter().map(|v| v * v).sum::<f32>() / hcd as f32;
+        let rs = if self.defect == Defect::HcPreNoRsqrt {
+            1.0
+        } else {
+            (var + self.cfg.norm_eps).sqrt().recip()
+        };
+        let mut mixes = vec![0.0f32; self.cfg.mix_hc()];
+        for (j, m) in mixes.iter_mut().enumerate() {
+            let w = &fnw[j * hcd..(j + 1) * hcd];
+            *m = flat.iter().zip(w).map(|(a, b)| a * b).sum::<f32>() * rs;
+        }
+        mixes
     }
 
     /// `Block.hc_post`: `y[k] = post[k] * x + sum_j comb[j, k] * residual[j]`.
@@ -1271,35 +1337,81 @@ impl Oracle {
     /// index and the column normalisation over the SOURCE index. Transposing it keeps every
     /// row of the result a convex-ish combination of the same vectors and is therefore
     /// invisible to any magnitude check.
-    fn hc_post(&self, x: &[f32], residual: &[f32], mix: &HcMix, s: usize) -> Vec<f32> {
-        let HcMix { post, comb } = mix;
+    fn hc_post(&self, x: &[f32], residual: &[f32], mix: &HcMix) -> Vec<f32> {
+        let HcMix { s, post, comb } = mix;
         let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);
         let mut y = vec![0.0f32; s * hc * dim];
-        for t in 0..s {
+        for t in 0..*s {
             for k in 0..hc {
-                for d in 0..dim {
-                    let mut acc = post[t * hc + k] * x[t * dim + d];
-                    for j in 0..hc {
-                        let c = if self.defect == Defect::SinkhornCombTransposed {
-                            comb[t * hc * hc + k * hc + j]
-                        } else {
-                            comb[t * hc * hc + j * hc + k]
-                        };
-                        if self.defect != Defect::HcPostNoComb {
-                            acc += c * residual[(t * hc + j) * dim + d];
-                        }
-                    }
-                    if self.defect == Defect::HcPostNoComb {
-                        acc += residual[(t * hc + k) * dim + d];
-                    }
-                    y[(t * hc + k) * dim + d] = acc;
-                }
+                let cell = HcPostCell {
+                    x: &x[t * dim..(t + 1) * dim],
+                    residual: &residual[t * hc * dim..(t + 1) * hc * dim],
+                    col: self.hc_comb_col(&comb[t * hc * hc..(t + 1) * hc * hc], k),
+                    post: post[t * hc + k],
+                };
+                let dst = (t * hc + k) * dim;
+                self.hc_post_cell(&cell, k, &mut y[dst..dst + dim]);
             }
         }
         // `.type_as(x)` — the residual stream is bf16.
         self.round_bf16(&mut y);
         y
     }
+
+    /// The `comb` column one destination copy reads: `comb[j, k]` for every source `j`.
+    ///
+    /// `SinkhornCombTransposed` swaps the two indices. Decided ONCE per destination copy
+    /// rather than inside the `dim` loop, which is what keeps [`Oracle::hc_post`] off a
+    /// fifth level of nesting; the values, and the order they are consumed in, are the ones
+    /// the inline index expression produced.
+    fn hc_comb_col(&self, comb: &[f32], k: usize) -> Vec<f32> {
+        let hc = self.cfg.hc_mult;
+        (0..hc)
+            .map(|j| {
+                if self.defect == Defect::SinkhornCombTransposed {
+                    comb[k * hc + j]
+                } else {
+                    comb[j * hc + k]
+                }
+            })
+            .collect()
+    }
+
+    /// One `(token, destination copy)` cell of `hc_post`, over the whole `dim` width.
+    ///
+    /// `HcPostNoComb` replaces the mix with a plain residual add, so it is a branch here
+    /// rather than a zero column: a one-hot column would add `0.0 * residual[j]` terms that
+    /// are not free in IEEE (`0.0 * inf` is NaN, and `-0.0 + 0.0` is `+0.0`). The `d`-outer
+    /// / `j`-inner order, and therefore the summation order, is the one this always had.
+    fn hc_post_cell(&self, cell: &HcPostCell, k: usize, out: &mut [f32]) {
+        let dim = self.cfg.dim;
+        let no_comb = self.defect == Defect::HcPostNoComb;
+        for (d, o) in out.iter_mut().enumerate() {
+            let mut acc = cell.post * cell.x[d];
+            if no_comb {
+                acc += cell.residual[k * dim + d];
+            } else {
+                for (j, &c) in cell.col.iter().enumerate() {
+                    acc += c * cell.residual[j * dim + d];
+                }
+            }
+            *o = acc;
+        }
+    }
+}
+
+/// Everything one `(token, destination copy)` cell of `hc_post` reads. A struct because the
+/// four are only ever read together for one cell, and separating them is how a `k` reaches
+/// the wrong `post` — a well-typed mistake that changes values and nothing else.
+struct HcPostCell<'a> {
+    /// `x[t]`, the sublayer output row, `[dim]`.
+    x: &'a [f32],
+    /// `residual[t]`, all `hc` copies, `[hc * dim]`.
+    residual: &'a [f32],
+    /// `comb[·, k]` for this destination copy, `[hc]`.
+    col: Vec<f32>,
+    /// `post[t, k]`.
+    post: f32,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1734,6 +1846,48 @@ pub fn compress_topk(
     }
 }
 
+/// The tensors one `sparse_attn` call reads, in the shapes `Attention.forward` hands them.
+///
+/// One parameter because they are meaningless apart: `topk` indexes `kv`, `q` and `sink`
+/// are both per-head, and `m` is `topk`'s own row count. Split into six positional
+/// arguments, a swapped `q`/`kv` or a stale `scale` still type-checks.
+struct SparseAttnIn<'a> {
+    q: &'a [f32],
+    kv: &'a [f32],
+    sink: &'a [f32],
+    topk: &'a [Vec<i64>],
+    /// Query rows — the prompt length at prefill, 1 at decode.
+    m: usize,
+    scale: f32,
+}
+
+impl SparseAttnIn<'_> {
+    /// One head's logits over its selected slots, and the running max the online softmax
+    /// subtracts. A masked slot (`-1`) keeps its place as `-inf` so the caller can zip the
+    /// list against `idxs` — and contributes nothing to the max, which is what makes a
+    /// fully-masked query detectable as a non-finite one.
+    fn logits(&self, qh: &[f32], idxs: &[i64]) -> (Vec<f32>, f32) {
+        let d = qh.len();
+        let mut logits = Vec::with_capacity(idxs.len());
+        let mut mx = f32::NEG_INFINITY;
+        for &ix in idxs {
+            if ix < 0 {
+                logits.push(f32::NEG_INFINITY);
+                continue;
+            }
+            let k = &self.kv[ix as usize * d..(ix as usize + 1) * d];
+            let mut acc = 0.0f32;
+            for i in 0..d {
+                acc += qh[i] * k[i];
+            }
+            let l = acc * self.scale;
+            mx = mx.max(l);
+            logits.push(l);
+        }
+        (logits, mx)
+    }
+}
+
 impl Oracle {
     /// `kernel.py::sparse_attn`, as mathematics rather than as a tiling.
     ///
@@ -1742,62 +1896,13 @@ impl Oracle {
     /// matching term to `acc_o`. It is therefore a learned per-head leak of probability
     /// mass, not an extra key. Note that "sink as a real key with a zero value vector" is
     /// exactly this and NOT a defect, which is why no variant models it.
-    fn sparse_attn(
-        &self,
-        q: &[f32],
-        kv: &[f32],
-        sink: &[f32],
-        topk: &[Vec<i64>],
-        m: usize,
-        scale: f32,
-    ) -> Vec<f32> {
+    fn sparse_attn(&self, a: &SparseAttnIn) -> Vec<f32> {
         let (h, d) = (self.cfg.n_heads, self.cfg.head_dim);
-        let mut o = vec![0.0f32; m * h * d];
-        for t in 0..m {
-            let idxs = &topk[t];
+        let mut o = vec![0.0f32; a.m * h * d];
+        for t in 0..a.m {
             for hh in 0..h {
-                let qh = &q[(t * h + hh) * d..(t * h + hh + 1) * d];
-                let mut logits = Vec::with_capacity(idxs.len());
-                let mut mx = f32::NEG_INFINITY;
-                for &ix in idxs {
-                    if ix < 0 {
-                        logits.push(f32::NEG_INFINITY);
-                        continue;
-                    }
-                    let k = &kv[ix as usize * d..(ix as usize + 1) * d];
-                    let mut acc = 0.0f32;
-                    for i in 0..d {
-                        acc += qh[i] * k[i];
-                    }
-                    let l = acc * scale;
-                    mx = mx.max(l);
-                    logits.push(l);
-                }
-                // A fully-masked query would divide by a sum of `exp(-inf)` and write NaN
-                // goldens. Loud, and `assert` because release builds skip debug assertions.
-                assert!(mx.is_finite(), "query {t} head {hh} attends to nothing");
-                let mut sum = 0.0f32;
-                let mut acc = vec![0.0f32; d];
-                for (&ix, &l) in idxs.iter().zip(&logits) {
-                    if ix < 0 {
-                        continue;
-                    }
-                    let e = (l - mx).exp();
-                    sum += e;
-                    let k = &kv[ix as usize * d..(ix as usize + 1) * d];
-                    for i in 0..d {
-                        acc[i] += e * k[i];
-                    }
-                }
-                match self.defect {
-                    Defect::SkipAttnSink => {}
-                    Defect::AttnSinkNotMaxShifted => sum += sink[hh].exp(),
-                    _ => sum += (sink[hh] - mx).exp(),
-                }
                 let dst = (t * h + hh) * d;
-                for i in 0..d {
-                    o[dst + i] = acc[i] / sum;
-                }
+                o[dst..dst + d].copy_from_slice(&self.attn_head(a, t, hh));
             }
         }
         // `sparse_attn` writes a bf16 tensor.
@@ -1805,33 +1910,94 @@ impl Oracle {
         o
     }
 
-    /// `Attention.forward` (model.py:490-548).
-    fn attention(
-        &self,
-        step: &LayerCtx,
-        st: &mut LayerRings,
-        x: &[f32],
-        cap: &mut Capture,
-    ) -> Vec<f32> {
-        let LayerCtx {
-            lw,
-            layer,
-            s,
-            start_pos,
-            ..
-        } = *step;
-        let tag = step.tag();
-        let c = &self.cfg;
-        let (win, ratio, rd, d, nh) = (
-            c.window_size,
-            c.compress_ratio(layer),
-            c.rope_head_dim,
-            c.head_dim,
-            c.n_heads,
-        );
-        let freqs = self.freqs(layer);
+    /// One `(query row, head)` cell of `sparse_attn`: the online softmax over that head's
+    /// selected slots, returning the `head_dim`-wide output row.
+    fn attn_head(&self, a: &SparseAttnIn, t: usize, hh: usize) -> Vec<f32> {
+        let (h, d) = (self.cfg.n_heads, self.cfg.head_dim);
+        let idxs = &a.topk[t];
+        let qh = &a.q[(t * h + hh) * d..(t * h + hh + 1) * d];
+        let (logits, mx) = a.logits(qh, idxs);
+        // A fully-masked query would divide by a sum of `exp(-inf)` and write NaN
+        // goldens. Loud, and `assert` because release builds skip debug assertions.
+        assert!(mx.is_finite(), "query {t} head {hh} attends to nothing");
+        let mut sum = 0.0f32;
+        let mut acc = vec![0.0f32; d];
+        for (&ix, &l) in idxs.iter().zip(&logits) {
+            if ix < 0 {
+                continue;
+            }
+            let e = (l - mx).exp();
+            sum += e;
+            let k = &a.kv[ix as usize * d..(ix as usize + 1) * d];
+            for i in 0..d {
+                acc[i] += e * k[i];
+            }
+        }
+        sum += self.sink_mass(a.sink[hh], mx);
+        acc.iter().map(|v| v / sum).collect()
+    }
 
-        // -- q ---------------------------------------------------------------------------
+    /// The probability mass `attn_sink` leaks out of one head's softmax denominator.
+    ///
+    /// `SkipAttnSink` returns 0.0 rather than skipping the add, which is bit-identical
+    /// here: the slot achieving `mx` contributes `exp(0) = 1.0`, so `sum >= 1.0` whenever
+    /// the assert above passed and `sum + 0.0 == sum` exactly.
+    fn sink_mass(&self, sink_h: f32, mx: f32) -> f32 {
+        match self.defect {
+            Defect::SkipAttnSink => 0.0,
+            Defect::AttnSinkNotMaxShifted => sink_h.exp(),
+            _ => (sink_h - mx).exp(),
+        }
+    }
+
+    /// `Attention.forward` (model.py:490-548), as its six stages in the reference's order.
+    ///
+    /// The ORDER is the load-bearing part and is the reason the ring write and the
+    /// compressor are two calls rather than one: the reference writes the window entry
+    /// first in both phases (model.py:523-537), and a port that compresses first is wrong
+    /// only at the block boundary.
+    fn attention(&self, step: &LayerCtx, sk: &mut Sinks, x: &[f32]) -> Vec<f32> {
+        let LayerCtx { lw, s, .. } = *step;
+        let tag = step.tag();
+        let (d, nh) = (self.cfg.head_dim, self.cfg.n_heads);
+
+        let (qr, q) = self.attn_q(step, x);
+        sk.cap.push(&format!("{tag}.q"), &[s, nh, d], q.clone());
+        let kv = self.attn_kv(step, x);
+        sk.cap.push(&format!("{tag}.kv_entry"), &[s, d], kv.clone());
+        let topk = self.attn_select(step, sk, SelectIn { x, qr: &qr });
+
+        self.attn_ring_write(step, sk, &kv);
+        let full = self.attn_kv_view(step, sk, KvIn { x, kv: &kv });
+        let mut o = self.sparse_attn(&SparseAttnIn {
+            q: &q,
+            kv: &full,
+            sink: &lw.attn_sink,
+            topk: &topk,
+            m: s,
+            scale: (d as f32).powf(-0.5),
+        });
+
+        // Captured on BOTH sides of the de-rotation on purpose: without the pre-image, a
+        // de-rotation defect has no golden that must stay identical and the check loses its
+        // silent half.
+        sk.cap
+            .push(&format!("{tag}.attn_core_out"), &[s, nh, d], o.clone());
+        self.attn_derotate(step, &mut o);
+        sk.cap
+            .push(&format!("{tag}.attn_derot"), &[s, nh, d], o.clone());
+        self.attn_out_proj(step, &o)
+    }
+
+    /// The query path (model.py:497-505): `wq_a` → `q_norm` → `wq_b`, then the QK-norm and
+    /// RoPE. Returns BOTH the LoRA-rank `qr`, which the indexer consumes, and the per-head
+    /// `q` — they are one computation and the indexer taking a re-derived `qr` would be a
+    /// second place for the projection to drift.
+    fn attn_q(&self, step: &LayerCtx, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let (lw, layer, s, start_pos) = (step.lw, step.layer, step.s, step.start_pos);
+        let c = &self.cfg;
+        let (rd, d, nh) = (c.rope_head_dim, c.head_dim, c.n_heads);
+        let freqs = self.freqs(layer);
         let mut qr = self.linear(x, s, c.dim, &lw.wq_a);
         self.round_bf16(&mut qr);
         self.rmsnorm(&mut qr, c.q_lora_rank, &lw.q_norm);
@@ -1846,157 +2012,177 @@ impl Oracle {
             self.qk_norm(&mut q, d, &lw.q_norm);
         }
         for i in 0..s * nh {
-            self.rope_row(
-                &mut q[i * d..(i + 1) * d],
-                rd,
-                (start_pos + i / nh, freqs),
-                false,
-            );
+            let row = &mut q[i * d..(i + 1) * d];
+            self.rope_row(row, rd, (start_pos + i / nh, freqs), false);
         }
         if after {
             self.qk_norm(&mut q, d, &lw.q_norm);
         }
-        cap.push(&format!("{tag}.q"), &[s, nh, d], q.clone());
+        (qr, q)
+    }
 
-        // -- kv --------------------------------------------------------------------------
-        let mut kv = self.linear(x, s, c.dim, &lw.wkv);
+    /// The kv path (model.py:507-513): `wkv` → `kv_norm` → RoPE → the PARTIAL fp8
+    /// `act_quant` that leaves the positional dims at bf16.
+    fn attn_kv(&self, step: &LayerCtx, x: &[f32]) -> Vec<f32> {
+        let (lw, layer, s, start_pos) = (step.lw, step.layer, step.s, step.start_pos);
+        let (rd, d) = (self.cfg.rope_head_dim, self.cfg.head_dim);
+        let freqs = self.freqs(layer);
+        let mut kv = self.linear(x, s, self.cfg.dim, &lw.wkv);
         self.round_bf16(&mut kv);
         self.rmsnorm(&mut kv, d, &lw.kv_norm);
         for t in 0..s {
-            self.rope_row(
-                &mut kv[t * d..(t + 1) * d],
-                rd,
-                (start_pos + t, freqs),
-                false,
-            );
-            self.kv_act_quant(&mut kv[t * d..(t + 1) * d], d, rd);
+            let row = &mut kv[t * d..(t + 1) * d];
+            self.rope_row(row, rd, (start_pos + t, freqs), false);
+            self.kv_act_quant(row, d, rd);
         }
-        cap.push(&format!("{tag}.kv_entry"), &[s, d], kv.clone());
+        kv
+    }
 
-        // -- selection -------------------------------------------------------------------
-        let mut topk = window_topk(win, s, start_pos);
+    /// The slots each query may attend to: the sliding window always, plus the compressed
+    /// selection on a compressed layer. Records `.compress_idxs`.
+    fn attn_select(&self, step: &LayerCtx, sk: &mut Sinks, act: SelectIn) -> Vec<Vec<i64>> {
+        let (layer, s) = (step.layer, step.s);
+        let mut topk = window_topk(self.cfg.window_size, s, step.start_pos);
         // `window_topk` yields one row per query: `s` at prefill, and exactly 1 at decode,
         // where `s` is also 1. So the query count is `s` and there is no second extent --
         // and this is what ENFORCES the bsz=1 scope cut rather than merely stating it.
         assert_eq!(topk.len(), s, "query count and row count disagree");
-        if ratio != 0 {
-            let offset = if start_pos == 0 { s } else { win };
-            let extra = if let (Some(iw), Some(ics)) = (&lw.indexer, st.idx_comp.as_mut()) {
-                let mut sel_scores = Vec::new();
-                let e = self.indexer(
-                    step,
-                    iw,
-                    ics,
-                    x,
-                    &qr,
-                    offset,
-                    freqs,
-                    &mut cap.counters,
-                    &mut sel_scores,
-                );
-                let rows = if sel_scores.is_empty() { 0 } else { s };
-                let cols = sel_scores.len().checked_div(rows).unwrap_or(0);
-                cap.push(&format!("{tag}.indexer_scores"), &[rows, cols], sel_scores);
-                e
-            } else {
-                compress_topk(ratio, s, start_pos, offset)
-            };
+        if self.cfg.compress_ratio(layer) != 0 {
+            let extra = self.attn_compress_idxs(step, sk, act);
             let flat: Vec<i64> = extra.iter().flatten().copied().collect();
             let cols = extra.first().map_or(0, Vec::len);
-            cap.push_i(&format!("{tag}.compress_idxs"), &[extra.len(), cols], flat);
+            let tag = format!("{}.compress_idxs", step.tag());
+            sk.cap.push_i(&tag, &[extra.len(), cols], flat);
             for (row, e) in topk.iter_mut().zip(extra) {
                 row.extend(e);
             }
         }
+        topk
+    }
 
-        // -- cache, compression, attention -----------------------------------------------
-        // The ring write differs by phase; the compressor call does not, and its ORDER does:
-        // the reference writes the window entry first in both branches (model.py:523-537).
-        if start_pos == 0 {
-            if s <= win {
-                st.win_cache[..s * d].copy_from_slice(&kv[..s * d]);
-            } else if self.defect == Defect::PrefillRingWritesFirstWindow {
-                st.win_cache[..win * d].copy_from_slice(&kv[..win * d]);
-            } else {
-                // slot (t % win) holds position t, for the last `win` positions.
-                for t in (s - win)..s {
-                    let slot = t % win;
-                    st.win_cache[slot * d..(slot + 1) * d].copy_from_slice(&kv[t * d..(t + 1) * d]);
-                }
-            }
-            cap.counters.prefill_evicted = s.saturating_sub(win);
+    /// The compressed half of the selection: the indexer where the layer has one, and the
+    /// arithmetic `get_compress_topk_idxs` where it does not. `.indexer_scores` is recorded
+    /// here rather than by the caller because the score matrix exists on this branch only.
+    fn attn_compress_idxs(&self, step: &LayerCtx, sk: &mut Sinks, act: SelectIn) -> Vec<Vec<i64>> {
+        let (lw, layer, s, start_pos) = (step.lw, step.layer, step.s, step.start_pos);
+        // At prefill the compressed rows are appended to THIS call's kv at index `s`; at
+        // decode they follow the whole ring, so the offset is the window size.
+        let offset = if start_pos == 0 {
+            s
         } else {
-            let slot = start_pos % win;
-            st.win_cache[slot * d..(slot + 1) * d].copy_from_slice(&kv[..d]);
-        }
+            self.cfg.window_size
+        };
+        let Some((iw, ics)) = lw.indexer.as_ref().zip(sk.st.idx_comp.as_mut()) else {
+            return compress_topk(self.cfg.compress_ratio(layer), s, start_pos, offset);
+        };
+        let (freqs, cnt) = (self.freqs(layer), &mut sk.cap.counters);
+        let mut scores = Vec::new();
+        let e = self.indexer(
+            step,
+            iw,
+            ics,
+            act.x,
+            act.qr,
+            offset,
+            freqs,
+            cnt,
+            &mut scores,
+        );
+        let rows = if scores.is_empty() { 0 } else { s };
+        let cols = scores.len().checked_div(rows).unwrap_or(0);
+        let tag = format!("{}.indexer_scores", step.tag());
+        sk.cap.push(&tag, &[rows, cols], scores);
+        e
+    }
 
-        let compressed = match (ratio, &lw.compressor, st.comp.as_mut()) {
+    /// The sliding-window ring write, which differs by phase: at decode one slot, at
+    /// prefill the LAST `win` positions rotated so slot `t % win` holds position `t`
+    /// (model.py:526-528).
+    fn attn_ring_write(&self, step: &LayerCtx, sk: &mut Sinks, kv: &[f32]) {
+        let LayerCtx { s, start_pos, .. } = *step;
+        let (win, d) = (self.cfg.window_size, self.cfg.head_dim);
+        if start_pos != 0 {
+            let slot = start_pos % win;
+            sk.st.win_cache[slot * d..(slot + 1) * d].copy_from_slice(&kv[..d]);
+            return;
+        }
+        if s <= win {
+            sk.st.win_cache[..s * d].copy_from_slice(&kv[..s * d]);
+        } else if self.defect == Defect::PrefillRingWritesFirstWindow {
+            sk.st.win_cache[..win * d].copy_from_slice(&kv[..win * d]);
+        } else {
+            // slot (t % win) holds position t, for the last `win` positions.
+            for t in (s - win)..s {
+                let slot = t % win;
+                sk.st.win_cache[slot * d..(slot + 1) * d].copy_from_slice(&kv[t * d..(t + 1) * d]);
+            }
+        }
+        sk.cap.counters.prefill_evicted = s.saturating_sub(win);
+    }
+
+    /// Runs the attention's compressor — recording `.compressed` — and returns what the
+    /// attention then reads. At prefill that is the whole prompt's KV with THIS call's
+    /// compressed rows appended at index `s` (which is why the selection offset was `s`);
+    /// at decode it is the ring followed by the whole compressed region, which is the
+    /// reference's single `kv_cache` buffer split in two here.
+    fn attn_kv_view(&self, step: &LayerCtx, sk: &mut Sinks, act: KvIn) -> Vec<f32> {
+        let (lw, layer, s, start_pos) = (step.lw, step.layer, step.s, step.start_pos);
+        let d = self.cfg.head_dim;
+        let ratio = self.cfg.compress_ratio(layer);
+        let freqs = self.freqs(layer);
+        let compressed = match (ratio, &lw.compressor, sk.st.comp.as_mut()) {
             (0, _, _) => None,
             (_, Some(cw), Some(cs)) => {
-                self.compressor(cw, cs, x, s, start_pos, freqs, &mut cap.counters)
+                let cnt = &mut sk.cap.counters;
+                self.compressor(cw, cs, act.x, s, start_pos, freqs, cnt)
             }
             _ => None,
         };
         if let Some(z) = &compressed {
-            cap.push(&format!("{tag}.compressed"), &[z.len() / d, d], z.clone());
+            let tag = format!("{}.compressed", step.tag());
+            sk.cap.push(&tag, &[z.len() / d, d], z.clone());
         }
-
-        // What the attention reads. At prefill it is the whole prompt's KV with THIS call's
-        // compressed rows appended at index `s` (which is why the offset above was `s`); at
-        // decode it is the ring followed by the whole compressed region, which is the
-        // reference's single `kv_cache` buffer split in two here.
-        let full = if start_pos == 0 {
-            let mut f = kv.clone();
+        if start_pos == 0 {
+            let mut f = act.kv.to_vec();
             if let Some(z) = compressed {
                 f.extend(z);
             }
-            f
-        } else {
-            let mut f = st.win_cache.clone();
-            if let Some(cs) = st.comp.as_ref() {
-                f.extend_from_slice(&cs.cache);
-            }
-            f
-        };
-        let mut o = self.sparse_attn(&q, &full, &lw.attn_sink, &topk, s, (d as f32).powf(-0.5));
-
-        // -- output ----------------------------------------------------------------------
-        // Captured on BOTH sides of the de-rotation on purpose: without the pre-image, a
-        // de-rotation defect has no golden that must stay identical and the check loses its
-        // silent half.
-        cap.push(&format!("{tag}.attn_core_out"), &[s, nh, d], o.clone());
-        if self.defect != Defect::SkipOutputDerotation {
-            let inverse = self.defect != Defect::OutputDerotationForward;
-            for i in 0..s * nh {
-                self.rope_row(
-                    &mut o[i * d..(i + 1) * d],
-                    rd,
-                    (start_pos + i / nh, freqs),
-                    inverse,
-                );
-            }
+            return f;
         }
-        cap.push(&format!("{tag}.attn_derot"), &[s, nh, d], o.clone());
-
-        let g = c.o_groups;
-        let hpg = nh / g;
-        let gd = nh * d / g;
-        // `o.view(b, s, n_groups, -1)` over a head-major flattening: group `gi` is heads
-        // [gi*hpg, (gi+1)*hpg), each contributing its whole head_dim.
-        let mut og = vec![0.0f32; s * g * gd];
-        for t in 0..s {
-            for gi in 0..g {
-                for e in 0..gd {
-                    let (head, dim_i) = match self.defect {
-                        Defect::WoGroupsSplitHeadDim => (e / (d / g), gi * (d / g) + e % (d / g)),
-                        Defect::WoGroupsInterleaved => (gi + (e / d) * g, e % d),
-                        _ => (gi * hpg + e / d, e % d),
-                    };
-                    og[(t * g + gi) * gd + e] = o[(t * nh + head) * d + dim_i];
-                }
-            }
+        let mut f = sk.st.win_cache.clone();
+        if let Some(cs) = sk.st.comp.as_ref() {
+            f.extend_from_slice(&cs.cache);
         }
-        let r = c.o_lora_rank;
+        f
+    }
+
+    /// `apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)` (model.py:539), per head
+    /// and in place.
+    fn attn_derotate(&self, step: &LayerCtx, o: &mut [f32]) {
+        if self.defect == Defect::SkipOutputDerotation {
+            return;
+        }
+        let (layer, s, start_pos) = (step.layer, step.s, step.start_pos);
+        let c = &self.cfg;
+        let (rd, d, nh) = (c.rope_head_dim, c.head_dim, c.n_heads);
+        let freqs = self.freqs(layer);
+        let inverse = self.defect != Defect::OutputDerotationForward;
+        for i in 0..s * nh {
+            let row = &mut o[i * d..(i + 1) * d];
+            self.rope_row(row, rd, (start_pos + i / nh, freqs), inverse);
+        }
+    }
+
+    /// The grouped output projection (model.py:541-547): regroup into `o_groups`, the raw
+    /// `wo_a` einsum, then `wo_b`. `wo_a` goes through `wrow` rather than `linear` because
+    /// `Attention.forward` consumes it in an einsum, so there is no activation
+    /// quantization on this one.
+    fn attn_out_proj(&self, step: &LayerCtx, o: &[f32]) -> Vec<f32> {
+        let LayerCtx { lw, s, .. } = *step;
+        let c = &self.cfg;
+        let (g, r) = (c.o_groups, c.o_lora_rank);
+        let gd = c.n_heads * c.head_dim / g;
+        let og = self.o_groups_gather(o, s);
         let mut y = vec![0.0f32; s * g * r];
         let mut wr = Vec::with_capacity(gd);
         for gi in 0..g {
@@ -2013,11 +2199,141 @@ impl Oracle {
         self.round_bf16(&mut out);
         out
     }
+
+    /// `o.view(b, s, n_groups, -1)` — the `[s, g, gd]` regrouping the `wo_a` einsum reads.
+    fn o_groups_gather(&self, o: &[f32], s: usize) -> Vec<f32> {
+        let c = &self.cfg;
+        let (g, d, nh) = (c.o_groups, c.head_dim, c.n_heads);
+        let gd = nh * d / g;
+        let mut og = vec![0.0f32; s * g * gd];
+        for t in 0..s {
+            for gi in 0..g {
+                for e in 0..gd {
+                    let (head, dim_i) = self.o_group_src(gi, e);
+                    og[(t * g + gi) * gd + e] = o[(t * nh + head) * d + dim_i];
+                }
+            }
+        }
+        og
+    }
+
+    /// Which `(head, head_dim)` element of `o` group `gi`'s slot `e` reads.
+    ///
+    /// The reference's flattening is head-major, so group `gi` is the contiguous run of
+    /// heads `[gi*hpg, (gi+1)*hpg)`, each contributing its whole `head_dim`. Both
+    /// `WoGroups*` defects live entirely in this mapping: they are permutations of the same
+    /// 4096 numbers into the same number of dot products, so magnitudes, norms and every
+    /// summary statistic survive them and only the golden does not.
+    fn o_group_src(&self, gi: usize, e: usize) -> (usize, usize) {
+        let c = &self.cfg;
+        let (g, d) = (c.o_groups, c.head_dim);
+        let hpg = c.n_heads / g;
+        match self.defect {
+            Defect::WoGroupsSplitHeadDim => (e / (d / g), gi * (d / g) + e % (d / g)),
+            Defect::WoGroupsInterleaved => (gi + (e / d) * g, e % d),
+            _ => (gi * hpg + e / d, e % d),
+        }
+    }
+}
+
+/// The two mutable sinks a block body threads through every stage: the layer's caches and
+/// the golden recorder.
+///
+/// One parameter because they always travel together — no stage below is handed one without
+/// the other — and because a stage that took both separately plus its own inputs is exactly
+/// the argument pile-up that made `attention` a Brain Method.
+struct Sinks<'a> {
+    st: &'a mut LayerRings,
+    cap: &'a mut Capture,
+}
+
+/// The two activations the compressed selection reads: the block's normalised input `x`,
+/// which the indexer's own compressor and `weights_proj` consume, and the LoRA-rank query
+/// `qr`, which its `wq_b` consumes. Produced together by the q path, so passed together.
+#[derive(Clone, Copy)]
+struct SelectIn<'a> {
+    x: &'a [f32],
+    qr: &'a [f32],
+}
+
+/// The two activations the KV view is built from: the block's normalised input `x`, which
+/// the attention compressor pools, and this call's own KV entries.
+#[derive(Clone, Copy)]
+struct KvIn<'a> {
+    x: &'a [f32],
+    kv: &'a [f32],
 }
 
 // ---------------------------------------------------------------------------------------
 // MoE
 // ---------------------------------------------------------------------------------------
+
+/// `up`'s clamp, which the reference applies SYMMETRICALLY (model.py:606), and whether the
+/// bound bit. The count is EVENTS, not elements: one element contributes here and again in
+/// [`Oracle::clamp_gate`], which is what [`Counters::swiglu_clamp_events`] is named for.
+fn clamp_up(ui: f32, limit: f32) -> (f32, usize) {
+    let hit = usize::from(ui < -limit || ui > limit);
+    (ui.clamp(-limit, limit), hit)
+}
+
+/// `(weights, indices)`, both `[m, n_activated_experts]` — what `Gate.forward` returns.
+type RouterPick = (Vec<f32>, Vec<usize>);
+
+/// `expert id -> [(row, routing weight)]`, in ascending expert id.
+type ExpertRows = std::collections::BTreeMap<usize, Vec<(usize, f32)>>;
+
+/// One routing weight per ROW, applied across that row's whole width.
+///
+/// `Expert.forward` applies it to the SwiGLU intermediate, before the bf16 store that
+/// precedes `w2`; `RouteWeightAfterW2` moves the same multiply to the output. The two are
+/// identical in exact arithmetic and not identical here — which is why one function serves
+/// both sites rather than each spelling its own loop.
+fn scale_rows(v: &mut [f32], m: usize, w: &[f32]) {
+    let width = v.len() / m;
+    for t in 0..m {
+        for i in 0..width {
+            v[t * width + i] *= w[t];
+        }
+    }
+}
+
+/// The rows each expert must run, keyed by expert id.
+///
+/// A `BTreeMap` because `MoE.forward` accumulates in ASCENDING EXPERT ID, and re-ordering a
+/// 7-term f32 sum is one more thing a consumer would have to allow for.
+fn rows_by_expert(wts: &[f32], idx: &[usize], m: usize, k: usize) -> ExpertRows {
+    let mut by_expert = ExpertRows::default();
+    for t in 0..m {
+        for j in 0..k {
+            let row = (t, wts[t * k + j]);
+            by_expert.entry(idx[t * k + j]).or_default().push(row);
+        }
+    }
+    by_expert
+}
+
+/// One expert's rows gathered into a dense `[rows, dim]` batch, with their routing weights.
+/// The reference groups by expert before calling `Expert.forward`, so the gather belongs to
+/// `MoE.forward` rather than to the expert.
+fn gather_rows(x: &[f32], rows: &[(usize, f32)], dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut xs = Vec::with_capacity(rows.len() * dim);
+    let mut ws = Vec::with_capacity(rows.len());
+    for &(t, w) in rows {
+        xs.extend_from_slice(&x[t * dim..(t + 1) * dim]);
+        ws.push(w);
+    }
+    (xs, ws)
+}
+
+/// Add one expert's `[rows, dim]` output back into the `[m, dim]` accumulator, at the rows
+/// it was gathered from. f32 throughout — the accumulator is rounded once, at the end.
+fn scatter_add(y: &mut [f32], rows: &[(usize, f32)], o: &[f32], dim: usize) {
+    for (r, &(t, _)) in rows.iter().enumerate() {
+        for i in 0..dim {
+            y[t * dim + i] += o[r * dim + i];
+        }
+    }
+}
 
 impl Oracle {
     /// `Gate.forward`. Returns `(weights, indices)`, both `[m, n_activated_experts]`.
@@ -2028,60 +2344,76 @@ impl Oracle {
     /// - hash layers (`layer_id < n_hash_layers`) take their indices from
     ///   `tid2eid[input_id]` and bypass the scores entirely — but the gate still runs, and
     ///   its scores still become the weights.
-    pub fn gate(
-        &self,
-        step: &LayerCtx,
-        x: &[f32],
-        counters: &mut Counters,
-    ) -> (Vec<f32>, Vec<usize>) {
-        let LayerCtx {
-            lw,
-            s: m,
-            input_ids,
-            ..
-        } = *step;
-        let c = &self.cfg;
-        let k = c.n_activated_experts;
-        let logits = self.linear(x, m, c.dim, &lw.gate_w);
-        let n = c.n_routed_experts;
-        let is_softmax = self.defect == Defect::RouterSoftmax;
+    pub fn gate(&self, step: &LayerCtx, x: &[f32], cnt: &mut Counters) -> RouterPick {
+        let (lw, m) = (step.lw, step.s);
+        let logits = self.linear(x, m, self.cfg.dim, &lw.gate_w);
+        let original = self.router_scores(&logits, m, cnt);
+        let selection = self.router_selection(&original, lw.gate_bias.as_deref(), m);
+        self.router_topk(step, &original, &selection)
+    }
+
+    /// `original_scores`: `sqrt(softplus(logits))` per expert, or a plain `softmax` under
+    /// `RouterSoftmax`. These are the scores that become the WEIGHTS — the load-balancing
+    /// bias is absent from them, which is the half of model.py:577-585 that is easy to lose
+    /// and impossible to see afterwards.
+    fn router_scores(&self, logits: &[f32], m: usize, counters: &mut Counters) -> Vec<f32> {
+        let n = self.cfg.n_routed_experts;
         let mut original = vec![0.0f32; m * n];
         for t in 0..m {
             let row = &logits[t * n..(t + 1) * n];
-            if is_softmax {
-                let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut s = 0.0f32;
-                for (i, &v) in row.iter().enumerate() {
-                    let e = (v - mx).exp();
-                    original[t * n + i] = e;
-                    s += e;
-                }
-                for v in &mut original[t * n..(t + 1) * n] {
-                    *v /= s;
-                }
+            let dst = &mut original[t * n..(t + 1) * n];
+            if self.defect == Defect::RouterSoftmax {
+                softmax_row(row, dst);
             } else {
-                for (i, &v) in row.iter().enumerate() {
-                    if v.exp().is_infinite() {
-                        counters.softplus_overflows += 1;
-                    }
-                    let sp = if self.defect == Defect::RouterNoSoftplusThreshold {
-                        (1.0 + v.exp()).ln()
-                    } else {
-                        softplus(v)
-                    };
-                    original[t * n + i] = sp.sqrt();
-                }
+                self.softplus_row(row, dst, counters);
             }
         }
-        let mut selection = original.clone();
-        if let Some(b) = &lw.gate_bias {
+        original
+    }
+
+    /// `sqrt(softplus(·))`, and the overflow census `RouterNoSoftplusThreshold` is gated on.
+    /// The `threshold = 20` branch is load-bearing only where `e^x` reaches infinity — see
+    /// [`Counters::softplus_overflows`] for why counting logits above 20 is the wrong
+    /// instrument.
+    fn softplus_row(&self, row: &[f32], dst: &mut [f32], counters: &mut Counters) {
+        for (i, &v) in row.iter().enumerate() {
+            if v.exp().is_infinite() {
+                counters.softplus_overflows += 1;
+            }
+            let sp = if self.defect == Defect::RouterNoSoftplusThreshold {
+                (1.0 + v.exp()).ln()
+            } else {
+                softplus(v)
+            };
+            dst[i] = sp.sqrt();
+        }
+    }
+
+    /// The scores SELECTION reads: `original` shifted by the load-balancing bias on a layer
+    /// that has one. A separate buffer, not an in-place shift, because the un-shifted copy
+    /// is what the weights come from.
+    fn router_selection(&self, original: &[f32], bias: Option<&[f32]>, m: usize) -> Vec<f32> {
+        let n = self.cfg.n_routed_experts;
+        let mut selection = original.to_vec();
+        if let Some(b) = bias {
             for t in 0..m {
                 for i in 0..n {
                     selection[t * n + i] += b[i];
                 }
             }
         }
+        selection
+    }
 
+    /// Which experts each row routes to, and with what weight.
+    ///
+    /// Hash layers (`layer_id < n_hash_layers`) take their indices from `tid2eid[input_id]`
+    /// and bypass the scores entirely — but the gate still runs, and its scores still become
+    /// the weights.
+    fn router_topk(&self, step: &LayerCtx, orig: &[f32], selection: &[f32]) -> RouterPick {
+        let (lw, m, input_ids) = (step.lw, step.s, step.input_ids);
+        let c = &self.cfg;
+        let (k, n) = (c.n_activated_experts, c.n_routed_experts);
         let mut idx = vec![0usize; m * k];
         let mut wts = vec![0.0f32; m * k];
         for t in 0..m {
@@ -2093,27 +2425,39 @@ impl Oracle {
                 _ => topk_idx(&selection[t * n..(t + 1) * n], k),
             };
             let src = if self.defect == Defect::RouterBiasedWeights {
-                &selection
+                selection
             } else {
-                &original
+                orig
             };
             for (j, &e) in sel.iter().enumerate() {
                 idx[t * k + j] = e;
                 wts[t * k + j] = src[t * n + e];
             }
-            if !is_softmax && self.defect != Defect::RouterNoRenorm {
-                let s: f32 = wts[t * k..(t + 1) * k].iter().sum();
-                for v in &mut wts[t * k..(t + 1) * k] {
-                    *v /= s;
-                }
-            }
-            if self.defect != Defect::RouterNoScale {
-                for v in &mut wts[t * k..(t + 1) * k] {
-                    *v *= c.route_scale;
-                }
-            }
+            self.router_renorm(&mut wts[t * k..(t + 1) * k]);
         }
         (wts, idx)
+    }
+
+    /// `weights /= weights.sum()` then `* route_scale` (model.py:590-593).
+    ///
+    /// `RouterSoftmax` skips the renormalisation because a softmax row already sums to one
+    /// — that is the reference's own `score_func == "softplus"` guard, not a defect of its
+    /// own, which is why it shares the arm with `RouterNoRenorm` rather than being one.
+    ///
+    /// A disabled arm passes 1.0 rather than branching around the loop: `x / 1.0` and
+    /// `x * 1.0` are exact in IEEE for every input, so the three defect arms differ from the
+    /// clean one by value and never by rounding.
+    fn router_renorm(&self, wts: &mut [f32]) {
+        let skip = matches!(self.defect, Defect::RouterSoftmax | Defect::RouterNoRenorm);
+        let sum: f32 = if skip { 1.0 } else { wts.iter().sum() };
+        let scale = if self.defect == Defect::RouterNoScale {
+            1.0
+        } else {
+            self.cfg.route_scale
+        };
+        for v in wts.iter_mut() {
+            *v = *v / sum * scale;
+        }
     }
 
     /// `Expert.forward` — SwiGLU with `swiglu_limit = 10.0`.
@@ -2129,44 +2473,17 @@ impl Oracle {
         weight: Option<&[f32]>,
         counters: &mut Counters,
     ) -> Vec<f32> {
-        let c = &self.cfg;
-        let inter = c.moe_inter_dim;
-        let mut g = self.linear(x, m, c.dim, &e.w1);
-        let mut u = self.linear(x, m, c.dim, &e.w3);
+        let inter = self.cfg.moe_inter_dim;
+        let mut g = self.linear(x, m, self.cfg.dim, &e.w1);
+        let mut u = self.linear(x, m, self.cfg.dim, &e.w3);
         self.round_bf16(&mut g);
         self.round_bf16(&mut u);
-        let limit = match self.defect {
-            Defect::SwigluUnclamped => 0.0,
-            _ => c.swiglu_limit,
-        };
-        let mut h = vec![0.0f32; m * inter];
-        for i in 0..m * inter {
-            let (mut gi, mut ui) = (g[i], u[i]);
-            if limit > 0.0 {
-                if ui < -limit || ui > limit {
-                    counters.swiglu_clamp_events += 1;
-                }
-                if gi > limit || (self.defect == Defect::SwigluClampGateBothSides && gi < -limit) {
-                    counters.swiglu_clamp_events += 1;
-                }
-                ui = ui.clamp(-limit, limit);
-                gi = if self.defect == Defect::SwigluClampGateBothSides {
-                    gi.clamp(-limit, limit)
-                } else {
-                    gi.min(limit)
-                };
-            }
-            h[i] = silu(gi) * ui;
-        }
+        let mut h = self.swiglu(&g, &u, counters);
         let apply_before = self.defect != Defect::RouteWeightAfterW2;
         if let Some(w) = weight
             && apply_before
         {
-            for t in 0..m {
-                for i in 0..inter {
-                    h[t * inter + i] *= w[t];
-                }
-            }
+            scale_rows(&mut h, m, w);
         }
         self.round_bf16(&mut h);
         let mut out = self.linear(&h, m, inter, &e.w2);
@@ -2174,14 +2491,52 @@ impl Oracle {
         if let Some(w) = weight
             && !apply_before
         {
-            for t in 0..m {
-                for i in 0..c.dim {
-                    out[t * c.dim + i] *= w[t];
-                }
-            }
+            scale_rows(&mut out, m, w);
             self.round_bf16(&mut out);
         }
         out
+    }
+
+    /// The SwiGLU proper: `silu(clamp(gate)) * clamp(up)` elementwise (model.py:606-609).
+    ///
+    /// `SwigluUnclamped` sets `swiglu_limit = 0`, which is how the reference itself spells
+    /// "no clamp" — so the bound is tested rather than the branch removed.
+    fn swiglu(&self, g: &[f32], u: &[f32], counters: &mut Counters) -> Vec<f32> {
+        let limit = match self.defect {
+            Defect::SwigluUnclamped => 0.0,
+            _ => self.cfg.swiglu_limit,
+        };
+        let mut h = vec![0.0f32; g.len()];
+        for (i, o) in h.iter_mut().enumerate() {
+            let (mut gi, mut ui) = (g[i], u[i]);
+            if limit > 0.0 {
+                let (cu, eu) = clamp_up(ui, limit);
+                let (cg, eg) = self.clamp_gate(gi, limit);
+                counters.swiglu_clamp_events += eu + eg;
+                ui = cu;
+                gi = cg;
+            }
+            *o = silu(gi) * ui;
+        }
+        h
+    }
+
+    /// `gate`'s clamp, which the reference applies from ABOVE only (model.py:607), and
+    /// whether the bound bit. `SwigluClampGateBothSides` is the symmetric mistake: it
+    /// borrows `up`'s rule, which is one line above it in the reference.
+    fn clamp_gate(&self, gi: f32, limit: f32) -> (f32, usize) {
+        let both = self.defect == Defect::SwigluClampGateBothSides;
+        let hit = if both {
+            gi > limit || gi < -limit
+        } else {
+            gi > limit
+        };
+        let out = if both {
+            gi.clamp(-limit, limit)
+        } else {
+            gi.min(limit)
+        };
+        (out, usize::from(hit))
     }
 
     /// `MoE.forward`. Accumulates in f32 in ASCENDING EXPERT ID, then adds the shared
@@ -2201,34 +2556,16 @@ impl Oracle {
         );
 
         let mut y = vec![0.0f32; m * c.dim];
-        let mut by_expert: std::collections::BTreeMap<usize, Vec<(usize, f32)>> =
-            Default::default();
-        for t in 0..m {
-            for j in 0..k {
-                by_expert
-                    .entry(idx[t * k + j])
-                    .or_default()
-                    .push((t, wts[t * k + j]));
-            }
-        }
+        let by_expert = rows_by_expert(&wts, &idx, m, k);
         for (e, rows) in &by_expert {
             let Some(ew) = lw.experts.get(e) else {
                 // The driver loads exactly the experts a run reaches; a miss means the
                 // caller and the router disagree, which must not be papered over.
                 panic!("expert {e} was routed to but not loaded");
             };
-            let mut xs = Vec::with_capacity(rows.len() * c.dim);
-            let mut ws = Vec::with_capacity(rows.len());
-            for &(t, w) in rows {
-                xs.extend_from_slice(&x[t * c.dim..(t + 1) * c.dim]);
-                ws.push(w);
-            }
+            let (xs, ws) = gather_rows(x, rows, c.dim);
             let o = self.expert(ew, &xs, rows.len(), Some(&ws), &mut cap.counters);
-            for (r, &(t, _)) in rows.iter().enumerate() {
-                for i in 0..c.dim {
-                    y[t * c.dim + i] += o[r * c.dim + i];
-                }
-            }
+            scatter_add(&mut y, rows, &o, c.dim);
         }
         let sw = if self.defect == Defect::SharedExpertWeighted {
             Some(vec![c.route_scale; m])
@@ -2446,40 +2783,39 @@ impl Oracle {
     ) {
         let LayerCtx { lw, s, .. } = *step;
         let tag = step.tag();
-        cap.push(
-            &format!("{tag}.in"),
-            &[s, self.cfg.hc_mult, self.cfg.dim],
-            h.clone(),
-        );
+        let (hc, dim) = (self.cfg.hc_mult, self.cfg.dim);
+        let mut sk = Sinks { st, cap };
+        sk.cap.push(&format!("{tag}.in"), &[s, hc, dim], h.clone());
 
         let residual = h.clone();
-        let (mut x, mix) = self.hc_pre(h, s, &lw.hc_attn_fn, &lw.hc_attn_scale, &lw.hc_attn_base);
-        self.rmsnorm(&mut x, self.cfg.dim, &lw.attn_norm);
-        cap.push(
-            &format!("{tag}.attn_norm_out"),
-            &[s, self.cfg.dim],
-            x.clone(),
-        );
-        let a = self.attention(step, st, &x, cap);
-        cap.push(&format!("{tag}.attn_out"), &[s, self.cfg.dim], a.clone());
-        *h = self.hc_post(&a, &residual, &mix, s);
+        let attn_hc = HcW {
+            fnw: &lw.hc_attn_fn,
+            scale: &lw.hc_attn_scale,
+            base: &lw.hc_attn_base,
+        };
+        let (mut x, mix) = self.hc_pre(h, s, attn_hc);
+        self.rmsnorm(&mut x, dim, &lw.attn_norm);
+        sk.cap
+            .push(&format!("{tag}.attn_norm_out"), &[s, dim], x.clone());
+        let a = self.attention(step, &mut sk, &x);
+        sk.cap
+            .push(&format!("{tag}.attn_out"), &[s, dim], a.clone());
+        *h = self.hc_post(&a, &residual, &mix);
 
         let residual = h.clone();
-        let (mut x, mix) = self.hc_pre(h, s, &lw.hc_ffn_fn, &lw.hc_ffn_scale, &lw.hc_ffn_base);
-        self.rmsnorm(&mut x, self.cfg.dim, &lw.ffn_norm);
-        cap.push(
-            &format!("{tag}.ffn_norm_out"),
-            &[s, self.cfg.dim],
-            x.clone(),
-        );
-        let f = self.moe(step, &x, cap);
-        cap.push(&format!("{tag}.ffn_out"), &[s, self.cfg.dim], f.clone());
-        *h = self.hc_post(&f, &residual, &mix, s);
+        let ffn_hc = HcW {
+            fnw: &lw.hc_ffn_fn,
+            scale: &lw.hc_ffn_scale,
+            base: &lw.hc_ffn_base,
+        };
+        let (mut x, mix) = self.hc_pre(h, s, ffn_hc);
+        self.rmsnorm(&mut x, dim, &lw.ffn_norm);
+        sk.cap
+            .push(&format!("{tag}.ffn_norm_out"), &[s, dim], x.clone());
+        let f = self.moe(step, &x, sk.cap);
+        sk.cap.push(&format!("{tag}.ffn_out"), &[s, dim], f.clone());
+        *h = self.hc_post(&f, &residual, &mix);
 
-        cap.push(
-            &format!("{tag}.out"),
-            &[s, self.cfg.hc_mult, self.cfg.dim],
-            h.clone(),
-        );
+        sk.cap.push(&format!("{tag}.out"), &[s, hc, dim], h.clone());
     }
 }

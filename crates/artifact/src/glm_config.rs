@@ -178,7 +178,10 @@ impl ModelConfig {
     /// sparse mode is requested — dense/streaming decode must keep working on
     /// snapshots whose config predates the indexer fields.
     pub fn indexer_layout(&self) -> Result<Vec<bool>> {
-        if self.index_n_heads == 0 || self.index_head_dim == 0 || self.index_topk == 0 {
+        // The three dims arrive together or not at all (all three are `serde(default)`),
+        // so they are checked as one set: a zero in any of them means the snapshot
+        // predates the indexer fields.
+        if [self.index_n_heads, self.index_head_dim, self.index_topk].contains(&0) {
             anyhow::bail!(
                 "config.json has no DSA indexer dims (index_n_heads/index_head_dim/index_topk)"
             );
