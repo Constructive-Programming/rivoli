@@ -1,7 +1,6 @@
-// Scalar NUMERIC CODECS: one element in, one element out. bf16, fp8-e4m3, the OCP MX pair
-// e2m1/e8m0, and the two activation quantizers built on them. Split out of common.hpp
-// 2026-08-15 under the per-file line ceiling; every body and its measurements moved
-// verbatim.
+// Scalar NUMERIC CODECS: one element in, one element out. bf16, fp8-e4m3, and the OCP MX
+// e2m1 pair. Split out of common.hpp 2026-08-15 under the per-file line ceiling; every
+// body and its measurements moved verbatim.
 //
 // The bf16/e4m3 pair MUST stay bit-exact with math.rs (the CPU oracle the kernel tests
 // compare against), so one definition is a correctness property — that claim is the reason
@@ -10,11 +9,31 @@
 // what it cost the last time: THREE independent per-TU copies, and the only tool that ever
 // caught them was the compiler.
 //
-// What is here and what is NOT: this header owns the ELEMENT codec and the constants that
-// are part of a codec's own definition (the quantizer's block size and its ceiling —
-// ACT_QUANT_BLOCK/FP8_MAX, FP4_QUANT_BLOCK/FP4_MAX). The WEIGHT-LAYOUT constants
-// (I4_GROUP, F4_GROUP, VQ_*) stay in common.hpp beside the dot products that index rows
-// with them: those describe a packed row's stride, not how one number is spelled.
+// What is here and what is NOT. This header owns the ELEMENT codec and nothing else.
+// [NARROWED 2026-08-15, same day as the split above.] Three neighbours left, each to the
+// one place that consumes it, and the cut in every case is "does this describe how ONE
+// number is spelled, or what a BLOCK/ROW of them does":
+//
+//   * `e4m3_lut_build` → `dot_fp8.hpp`. It fills the 256-float LDS table `Fp8Row::lut`
+//     points at; its only callers are the fp8 GEMVs that then hand that table to the dot.
+//   * `e8m0f` → `dot_f4.hpp`. The e8m0 GROUP-SCALE decoder, whose only two callers are
+//     that file's dword pass and tail. Its e2m1 partner stays here, because `f2e2m1` and
+//     the indexer's fp4 round trip need it too — the pair's two halves have genuinely
+//     different scopes, which is why splitting them costs nothing.
+//   * `fast_round_scale` / `act_quant_roundtrip` / `fp4_quant_roundtrip` and the four
+//     block constants → `actquant.hpp`. Those are BLOCK operations composed of the codecs
+//     below, not codecs.
+//
+// The WEIGHT-LAYOUT constants (I4_GROUP, F4_GROUP, VQ_*) live with their own dot header,
+// beside the loop that indexes a packed row with them.
+//
+// **Argument budget.** CodeScene's Primitive Obsession rule fires on a file with >= 7
+// functions once the count of primitive-typed ARGUMENTS across them reaches 11 (measured
+// against cs 1.0.36, 2026-08-15). This file is 10 functions and **9** such arguments,
+// because a scalar codec's one argument IS a scalar and wrapping it would bury the
+// math.rs/oracle correspondence the file exists for. One slot of headroom: a new codec
+// that takes ONE primitive fits, a second one does not — at which point split the file
+// rather than wrapping arguments.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -76,15 +95,6 @@ __device__ __forceinline__ float e4m3f(unsigned char b) {
     return sign * (1.0f + mant * 0.125f) * exp2f((float)(exp - 7));
 }
 
-// Fill a 256-float LDS table with e4m3f(byte) so the hot GEMV decodes fp8 by an
-// LDS read instead of the branchy exp2f path (decode was compute-bound, not load-
-// width-bound — see the failed load-widening experiment). Bit-exact with e4m3f by
-// construction. Caller passes threadIdx.x and __syncthreads() before use; needs a
-// >=256-thread block (both callers launch ROWS_PER_BLOCK*WAVE = 256).
-__device__ __forceinline__ void e4m3_lut_build(float* lut, int tid) {
-    if (tid < 256) lut[tid] = e4m3f((unsigned char)tid);
-}
-
 // e2m1 nibble → f32. 1 sign / 2 exp (bias 1) / 1 mantissa; no infinities, no NaN, so a
 // bare arithmetic decode is TOTAL — every one of the 16 codes is a finite value.
 //
@@ -108,71 +118,6 @@ __device__ __forceinline__ float e2m1f(unsigned int nib) {
     unsigned int half = (0xC8643210u >> ((nib & 7u) << 2)) & 0xFu;
     float mag = 0.5f * (float)half;
     return __uint_as_float(__float_as_uint(mag) | ((nib & 8u) << 28));
-}
-
-// e8m0 scale byte → f32, `2^(b − 127)` (matches v4oracle::numerics::e8m0_decode).
-//
-// Both endpoints are spelled out rather than left to the exponent-field shift. 0xff is the
-// format's NaN, which is the right DECODE — reading it as `2^128` would be worse — but it
-// does not poison anything downstream: `moe_fixed`'s saturating clamp launders a NaN into a
-// finite ±2^14 (`fminf`/`fmaxf` return the non-NaN operand). So a 0xff scale byte must be
-// REJECTED AT LOAD, in S3, alongside the `tid2eid` range check that `parse_tid2eid`
-// performs host-side. (That obligation used to be stated at `moe.hip::moe_gate_v4` too;
-// the device router was DELETED 2026-08-09 — `f4gpu.rs::route_row` carries why — so this
-// is now the only place in `kernels/` that names it, which is the reason to keep it here
-// rather than fold it into the deleted kernel's note.)
-// b == 0 is 2^-127, which is BELOW f32's smallest normal, so `b << 23` would silently hand
-// back +0 — a whole 32-weight group zeroed with no error anywhere.
-//
-// These bytes come off the CHECKPOINT (`<proj>.scale`, copied verbatim by the `.f4`
-// repack), not from `fast_round_scale`, so "our quantizer cannot emit them" is not an
-// argument that applies here: the FORMAT permits both, and what the converter happened to
-// produce is not a property this decoder gets to assume.
-//
-// Branchless since 2026-08-08 (the M3a kernel-rate work): the two-`if` form compiled to an
-// exec-mask branch region inside the fp4 dot loop's every iteration. The selects below are
-// the same three cases — `umax` against the b == 0 subnormal is exact because every other
-// `b<<23` is strictly larger, and the 0xff arm ORs the quiet bit onto what is then
-// 0x7f800000, giving the identical 0x7fc00000 NaN. All 256 bytes are swept bitwise against
-// `v4oracle::numerics::e8m0_decode` by
-// `tests/f4_kernel.rs::the_branchless_decodes_match_the_oracle_bitwise`.
-__device__ __forceinline__ float e8m0f(unsigned char b) {
-    unsigned int t = (unsigned int)b << 23;
-    unsigned int bits = t > (1u << 22) ? t : (1u << 22);
-    bits |= (b == 0xff) ? (1u << 22) : 0u;
-    return __uint_as_float(bits);
-}
-
-// ── fp8 activation quantization (`kernel.py::act_quant`, inplace=True) ──────────
-//
-// Every quantized `Linear` in V4 quantizes its ACTIVATION to fp8 before the GEMM — fp4
-// weights included (`model.py::linear` line 120). So the numbers a `dot_f4` consumes are
-// not the layer's activations, they are `e4m3(x/s)·s` at block 128 with a power-of-two `s`.
-// Skipping it is silent: the magnitudes are within 2^-3 relative of the right ones.
-//
-// The shipped config sets `scale_fmt: "ue8m0"` (via `scale_dtype: "fp8"`, ModelArgs's
-// default), so the scale is ALWAYS rounded UP to a power of two. That is not a knob here —
-// a runtime `round_scale` would be a second code path with no caller.
-#define ACT_QUANT_BLOCK 128
-#define FP8_MAX 448.0f
-#define FP8_MAX_INV (1.0f / FP8_MAX)
-// `T.max(amax_local[i], 1e-4)` — keeps an all-zero block from dividing by zero.
-#define ACT_QUANT_AMAX_FLOOR 1e-4f
-
-// `fast_log2_ceil` / `fast_pow2` / `fast_round_scale` from kernel.py:22-38, by the same
-// IEEE-754 bit surgery. Transcribed, not reimplemented: `ceilf(log2f(x))` agrees with this
-// everywhere except that it rounds the log FIRST, so a value one ulp below a power of two
-// lands on a different binade — one factor-of-two error per group, invisible in aggregate.
-__device__ __forceinline__ float fast_round_scale(float amax, float max_inv) {
-    // Paired with `f2e4m3_rne`'s pragma below — see the argument there. Inert today (the
-    // product feeds a bitcast, not an add, so there is nothing to fuse); present so the
-    // two halves of `act_quant` carry the same property rather than one of them.
-#pragma clang fp contract(off)
-    unsigned int b;
-    float y = amax * max_inv;
-    __builtin_memcpy(&b, &y, sizeof(b));
-    int e = (int)((b >> 23) & 0xffu) - 127 + ((b & 0x7fffffu) ? 1 : 0);
-    return __uint_as_float((unsigned int)(e + 127) << 23);
 }
 
 // f32 → e4m3, round-to-nearest-EVEN, saturating at ±448.
@@ -262,22 +207,29 @@ __device__ __forceinline__ unsigned int e4m3_subnormal_mantissa(float a) {
     return (unsigned int)m;
 }
 
-// e4m3's NORMAL path, from the input magnitude's raw f32 bits `b` and its unbiased
-// exponent `e`: keep 3 mantissa bits, RNE on the 20 dropped ones, then re-bias. `sign` is
-// the caller's already-extracted sign bit, folded in here so this returns the finished
-// code rather than half of one.
+// A finite magnitude taken apart: its raw f32 bits, its unbiased exponent, and the sign
+// bit the caller already extracted. One decomposed float, which is why the three travel as
+// one value — `bits` and `exp` are two readings of the same word, and `sign` is the half
+// of the input `bits` no longer carries (it is the magnitude's bits, not the input's).
+struct SplitF32 {
+    unsigned int bits;
+    int exp;
+    unsigned char sign;
+};
+
+// e4m3's NORMAL path: keep 3 mantissa bits, RNE on the 20 dropped ones, then re-bias.
+// Returns the finished code rather than half of one, which is why the sign rides in.
 //
 // No `contract(off)`, and none needed: every operator below is integer.
-__device__ __forceinline__ unsigned char e4m3_normal_code(unsigned int b, int e,
-                                                          unsigned char sign) {
-    unsigned int mant = b & 0x7fffffu, m3 = mant >> 20, rem = mant & 0xfffffu;
+__device__ __forceinline__ unsigned char e4m3_normal_code(SplitF32 v) {
+    unsigned int mant = v.bits & 0x7fffffu, m3 = mant >> 20, rem = mant & 0xfffffu;
     if (rne_rounds_up(rem, 0x80000u, m3)) m3 += 1u;
-    int exp = e + 7;
+    int exp = v.exp + 7;
     if (m3 == 8u) { m3 = 0u; exp += 1; }
     // Unreachable given `f2e4m3_rne`'s `a >= 464` return (which caps m3 at 6 when exp is
     // 15); kept because it is the format's own bound and costs one compare.
-    if (exp >= 15 && m3 >= 7u) return sign | 0x7e;
-    return (unsigned char)(sign | (unsigned char)(exp << 3) | (unsigned char)m3);
+    if (exp >= 15 && m3 >= 7u) return v.sign | 0x7e;
+    return (unsigned char)(v.sign | (unsigned char)(exp << 3) | (unsigned char)m3);
 }
 
 __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
@@ -298,44 +250,8 @@ __device__ __forceinline__ unsigned char f2e4m3_rne(float x) {
         unsigned int mi = e4m3_subnormal_mantissa(a);
         return mi >= 8u ? (unsigned char)(sign | 0x08) : (unsigned char)(sign | mi);
     }
-    return e4m3_normal_code(b, e, sign);
+    return e4m3_normal_code(SplitF32{b, e, sign});
 }
-
-// One element of a block-128 group, fused quantize-then-dequantize: the value a V4 GEMM
-// actually sees. `e4m3f` is reused rather than rewritten because DECODE is unambiguous —
-// only the ENCODE rule differs between the two engines. What pins the pair is the round
-// trip, in `tests/f4_kernel.rs::act_quant_f8_is_bit_identical_to_the_oracle`, over all 254
-// finite codes. That test's own doc states what the round trip can and cannot prove.
-__device__ __forceinline__ float act_quant_roundtrip(float x, float s) {
-    // Written with comparisons, NOT `fminf`/`fmaxf`, so a NaN PROPAGATES. Those two return
-    // the non-NaN operand, which would sanitize a NaN activation into -448 — a large finite
-    // value where the oracle's `f32::clamp` keeps the NaN and `e4m3_encode` maps it to 0x7f.
-    // Unreachable from any fixture (no NaN inputs) and a NaN activation is already fatal
-    // upstream, but `act_quant_f8_is_bit_identical_to_the_oracle` claims BIT identity, and a
-    // known place where that does not hold is worth one line to remove rather than to note.
-    float q = x / s;
-    q = q < -FP8_MAX ? -FP8_MAX : (q > FP8_MAX ? FP8_MAX : q);
-    return e4m3f(f2e4m3_rne(q)) * s;
-}
-
-// ── fp4 ACTIVATION quantization (`kernel.py::fp4_act_quant`, inplace=True) ──────
-//
-// The indexer's simulator, not the expert weights' codec. `dot_f4_wave_r` in common.hpp
-// DECODES packed e2m1 nibbles that came off the checkpoint; this pair ENCODES an activation
-// and decodes it straight back, which is how `Indexer.forward` simulates fp4 in a bf16
-// tensor (model.py:376 and :422 — both `q` and the indexer's compressed kv go through it).
-//
-// Three constants differ from the fp8 block above and every one is silent-wrong if it
-// drifts: the block is **32**, not 128; the ceiling is **6**, not 448; and there is no
-// `round_scale` switch — `fp4_quant_kernel` has none, so the scale is ALWAYS rounded up to
-// a power of two. Mirrors `v4oracle::numerics::fp4_act_quant_inplace`.
-#define FP4_QUANT_BLOCK 32
-#define FP4_MAX 6.0f
-#define FP4_MAX_INV (1.0f / FP4_MAX)
-// `6 * 2^-126` — the fp4 kernel's amax floor, where `act_quant`'s is 1e-4. 2^-126 is f32's
-// smallest NORMAL (`f32::from_bits(1 << 23)` in the oracle), and `6 * 2^-126` is exactly
-// `1.5 * 2^-124`, so the product is exact rather than a decimal approximation of one.
-#define FP4_QUANT_AMAX_FLOOR (FP4_MAX * 1.17549435082228750797e-38f)
 
 // f32 → e2m1 nibble, round-to-nearest-EVEN, saturating at ±6.
 //
@@ -354,8 +270,8 @@ __device__ __forceinline__ float act_quant_roundtrip(float x, float s) {
 //
 // NaN gives code 0 with NaN's sign bit: every comparison against a NaN is false, so nothing
 // is counted. The oracle does the same thing for the same reason. Unreachable through
-// `fp4_quant_roundtrip`, whose clamp precedes it, and stated so the two agree by argument
-// and not by luck.
+// `fp4_quant_roundtrip` (actquant.hpp), whose clamp precedes it, and stated so the two
+// agree by argument and not by luck.
 __device__ __forceinline__ unsigned int f2e2m1(float x) {
     const float mid[7] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f};
     float a = fabsf(x);
@@ -363,17 +279,4 @@ __device__ __forceinline__ unsigned int f2e2m1(float x) {
 #pragma unroll
     for (int i = 0; i < 7; ++i) code += (a > mid[i] || (a == mid[i] && (i & 1))) ? 1u : 0u;
     return (signbit(x) ? 8u : 0u) | code;
-}
-
-// One element of a block-32 group, fused quantize-then-dequantize: the value the indexer's
-// einsum actually sees. `e2m1f` is reused rather than rewritten because DECODE is
-// unambiguous — only the ENCODE rule is a choice.
-//
-// Comparisons, NOT `fminf`/`fmaxf`, for the reason `act_quant_roundtrip` states: those
-// return the non-NaN operand and would launder a NaN into -6, where the oracle's
-// `f32::clamp` propagates it.
-__device__ __forceinline__ float fp4_quant_roundtrip(float x, float s) {
-    float q = x / s;
-    q = q < -FP4_MAX ? -FP4_MAX : (q > FP4_MAX ? FP4_MAX : q);
-    return e2m1f(f2e2m1(q)) * s;
 }

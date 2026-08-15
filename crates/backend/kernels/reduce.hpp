@@ -5,7 +5,10 @@
 // The geometry macros live HERE rather than in the umbrella because they are what the
 // reductions are parameterised by — `wave_sum`/`wave_max` fold over exactly WAVE lanes,
 // and ROWS_PER_BLOCK is the same block's other axis (8 waves = 8 output rows). Every
-// translation unit still sees both: common.hpp includes this header first.
+// translation unit still sees both, through common.hpp's umbrella — and each `dot_*.hpp`
+// includes this header directly, since a wave-cooperative dot is defined over exactly this
+// geometry. [CORRECTED 2026-08-15: this said common.hpp includes it FIRST, which was true
+// only while common.hpp held the dots itself.]
 //
 // No `#pragma clang fp contract(off)` anywhere below, and none is needed: the only
 // operators in this file are `+` and `fmaxf` over shuffles, so there is no multiply for an

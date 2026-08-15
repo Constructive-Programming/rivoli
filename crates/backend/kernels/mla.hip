@@ -162,13 +162,16 @@ __device__ __forceinline__ void mla_value_fp8_impl(
     // still worth 20% (33.7 → 27.0 us, 249 → 310 GB/s): with H*vh = 16384 threads and a
     // 34 us kernel, one 64-bit division per thread is not a rounding error. An earlier
     // version of this comment called it housekeeping; the bench disagreed.
-    float acc[R];
-    dot_fp8_wave_r<R>(clat + (size_t)head * kvl, H * kvl, kvb + row * (size_t)kvl,
-                      kvb_scale + (row >> blk_shift(block)) * sc_cols, kvl, block, lane, lut,
-                      acc);
+    // `clat` rows are `H·kvl` apart; the kv_b value row, its block-scale row and the LDS
+    // LUT travel as one `Fp8Row` (dot_fp8.hpp) — rowview.hpp carries the aliasing argument.
+    Acc<R> acc = dot_fp8_wave_r<R>(
+        RowsView{clat + (size_t)head * kvl, H * kvl},
+        Fp8Row{kvb + row * (size_t)kvl, kvb_scale + (row >> blk_shift(block)) * sc_cols, lut, kvl,
+               block},
+        lane);
     if (lane == 0) {
 #pragma unroll
-        for (int r = 0; r < R; ++r) ctx[(size_t)r * H * vh + (size_t)head * vh + j] = acc[r];
+        for (int r = 0; r < R; ++r) ctx[(size_t)r * H * vh + (size_t)head * vh + j] = acc.v[r];
     }
 }
 
@@ -250,7 +253,7 @@ extern "C" int rivoli_mla_value_fp8(
 // an unexplained delta into every comparison S2b makes, exactly as an fp8 `wo_a` would
 // (the plan's DECIDED note of 2026-08-05). These kernels are elementwise and
 // memory-bound, so the pragma costs nothing measurable; the fp8 dot below is
-// deliberately outside it — `dot_fp8_wave` is defined in `common.hpp`, included ABOVE
+// deliberately outside it — `dot_fp8_wave` is defined in `dot_fp8.hpp`, included ABOVE
 // this line, so it never enters the pragma's lexical scope; that is the mechanism, not
 // an accident of where the GEMV happens to sit in this file. It also already
 // re-associates, so contraction is not the dominant term there.
@@ -327,7 +330,7 @@ extern "C" __global__ void act_quant_f8_prefix(const float* src, float* dst, int
     for (int i = 0; i < block; ++i) amax = fmaxf(amax, fabsf(seg[i]));
     float s = fast_round_scale(amax, FP8_MAX_INV);
     // `act_quant_roundtrip`, not a local clamp-and-encode. This loop body WAS a fourth
-    // hand copy of `common.hpp`'s — the same divide, the same deliberate ternaries (which
+    // hand copy of `formats.hpp`'s — the same divide, the same deliberate ternaries (which
     // exist so a NaN PROPAGATES rather than being laundered into -448 by `fminf`/`fmaxf`),
     // the same encode — sitting eight lines under a note claiming the duplication was
     // lifted. Found by review, 2026-08-05.
@@ -491,9 +494,10 @@ extern "C" __global__ void gemv_fp8_bf16(const float* __restrict__ x,
     int r = (int)(id / n_out), j = (int)(id % n_out);
     int bsh = blk_shift(block);
     const float* xr = x + ((size_t)r * groups + (size_t)(j / (n_out / groups))) * (size_t)k;
-    float acc = dot_fp8_wave(xr, w + (size_t)j * k,
-                             wscale + (size_t)(j >> bsh) * ((k + block - 1) / block), k,
-                             block, (int)(threadIdx.x & (WAVE - 1)), lut);
+    float acc = dot_fp8_wave(
+        xr, Fp8Row{w + (size_t)j * k, wscale + (size_t)(j >> bsh) * ((k + block - 1) / block), lut,
+                   k, block},
+        (int)(threadIdx.x & (WAVE - 1)));
     if ((threadIdx.x & (WAVE - 1)) == 0) out[(size_t)r * n_out + j] = rbf16(acc);
 }
 

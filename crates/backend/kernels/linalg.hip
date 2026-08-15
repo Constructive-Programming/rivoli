@@ -35,14 +35,17 @@ __device__ __forceinline__ void gemv_fp8_impl(
     size_t o = (size_t)blockIdx.x * ROWS_PER_BLOCK + (threadIdx.x / WAVE);
     if (o >= (size_t)o_dim) return;
     int sc_cols = (i_dim + block - 1) / block;
-    float acc[R];
-    fp8_dot_strided_r<R>(x, i_dim, packed + o * (size_t)i_dim,
-                         scale + (o >> blk_shift(block)) * sc_cols, i_dim, block, lut, lane, WAVE,
-                         acc);
+    // `x` rows are `i_dim` apart; the weight row and the block-scale row it indexes travel
+    // as one `Fp8Row` (dot_fp8.hpp) — see rowview.hpp for what that costs in aliasing.
+    Acc<R> acc = fp8_dot_strided_r<R>(
+        RowsView{x, i_dim},
+        Fp8Row{packed + o * (size_t)i_dim, scale + (o >> blk_shift(block)) * sc_cols, lut, i_dim,
+               block},
+        LaneSpan{lane, WAVE});
 #pragma unroll
     for (int r = 0; r < R; ++r) {
         // Uniform across the wave: R is a compile-time constant.
-        float s = wave_sum(acc[r]);
+        float s = wave_sum(acc.v[r]);
         if (lane == 0) y[(size_t)r * o_dim + o] = s;
     }
 }
@@ -85,12 +88,14 @@ __device__ __forceinline__ void gemv_fp8_splitk_impl(
     // bought in mla_value_fp8 — why, and why it shipped anyway, in docs/measurement/perf-roadmap.md #2.
     const float* scalerow = scale + (o >> blk_shift(block)) * sc_cols;
     const int STRIDE = ROWS_PER_BLOCK * WAVE; // all 256 threads stride coalesced (split-K)
-    // Same strided fp8 MAC as dot_fp8_wave, but split-K across every wave in the block.
-    float acc[R];
-    fp8_dot_strided_r<R>(x, i_dim, wrow, scalerow, i_dim, block, lut, threadIdx.x, STRIDE, acc);
+    // Same strided fp8 MAC as dot_fp8_wave, but split-K across every wave in the block —
+    // which is the whole reason `LaneSpan` exists as a pair: wave-per-row passes
+    // `{lane, WAVE}` above, this passes all 256 threads striding coalesced.
+    Acc<R> acc = fp8_dot_strided_r<R>(RowsView{x, i_dim}, Fp8Row{wrow, scalerow, lut, i_dim, block},
+                                      LaneSpan{(int)threadIdx.x, STRIDE});
 #pragma unroll
     for (int r = 0; r < R; ++r) {
-        float s = wave_sum(acc[r]); // per-wave partial → its lane 0
+        float s = wave_sum(acc.v[r]); // per-wave partial → its lane 0
         if (lane == 0) part[r][wave] = s;
     }
     __syncthreads();
@@ -126,7 +131,7 @@ extern "C" __global__ void gemv_vq(
     if (o >= (size_t)o_dim) return;
     size_t rb = (size_t)(i_dim / VQ_DIM) * VQ_INDEX_BITS / 8; // vq_row_bytes
     size_t ng = (size_t)i_dim / VQ_GROUP;                     // vq_groups
-    float acc = dot_vq_wave(x, indices + o * rb, scales + o * ng, codebook, i_dim, lane);
+    float acc = dot_vq_wave(x, VqRow{indices + o * rb, scales + o * ng, codebook, i_dim}, lane);
     if (lane == 0) y[o] = acc;
 }
 
@@ -253,7 +258,7 @@ extern "C" __global__ void gemv_i4(
     if (o >= (size_t)o_dim) return;
     size_t rb = (size_t)((i_dim + 1) / 2);
     size_t ng = (size_t)((i_dim + I4_GROUP - 1) / I4_GROUP);
-    float dv = dot_i4_wave(x, packed + o * rb, scale + o * ng, i_dim, lane);
+    float dv = dot_i4_wave(x, I4Row{packed + o * rb, scale + o * ng, i_dim}, lane);
     if (lane == 0) y[o] = dv;
 }
 
@@ -320,7 +325,7 @@ extern "C" int rivoli_gemv_fp8(
     const float* x, const unsigned char* packed, const float* scale, int o_dim, int i_dim,
     int block, int nrow, float* y) {
     // NO `i_dim % 4` guard, unlike the Vulkan twin and unlike rivoli_mla_value_fp8's
-    // `kvl % 4` — a known gap, conditional on block >= 4. See common.hpp fp8_dot_strided.
+    // `kvl % 4` — a known gap, conditional on block >= 4. See dot_fp8.hpp fp8_dot_strided.
     if (o_dim <= 0 || i_dim <= 0 || block <= 0) return 1001;
     if (block & (block - 1)) return 1003;  // blk_shift needs a power-of-two tile
     if (nrow != 1 && nrow != 2) return 1004;

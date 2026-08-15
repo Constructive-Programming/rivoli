@@ -106,7 +106,7 @@ impl Oracle {
         counters: &mut Counters,
     ) -> Vec<f32> {
         let ExpertOperand { x, m, weight } = rows;
-        let inter = self.cfg.moe_inter_dim;
+        let _inter = self.cfg.moe_inter_dim; // kept: the reference reads it two lines down in model.py
         let mut g = self.linear(x, m, &e.w1);
         let mut u = self.linear(x, m, &e.w3);
         self.round_bf16(&mut g);

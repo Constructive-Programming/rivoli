@@ -34,9 +34,9 @@ use anyhow::{Context, Result, ensure};
 /// to the architecture this engine happens to run today: an artifact whose architecture we
 /// cannot name is one whose decode path we cannot choose, and choosing anyway is the exact
 /// failure this port is built to avoid — it does not crash, it produces fluent wrong text.
-
-/// [`arch_of`], also returning the config string it resolved — so a refusal can quote the
-/// file rather than only the enum variant.
+///
+/// Also returns the config string it resolved — so a refusal can quote the file rather
+/// than only the enum variant.
 fn arch_of_named(cfg: &serde_json::Value) -> Result<(Arch, String)> {
     let declared = cfg
         .get("model_type")

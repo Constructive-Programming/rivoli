@@ -8,7 +8,7 @@
 // slots) with no gather/repack. Per-projection codebooks: gate/up/down each decode
 // against their own codebook (down_proj's weight distribution differs). The routed
 // batch and the resident shared expert fold into ONE launch (shared appended,
-// weight 1.0). Composes dot_vq_wave (common.hpp) — no LDS staging (measured to
+// weight 1.0). Composes dot_vq_wave (dot_vq.hpp) — no LDS staging (measured to
 // regress: 64 KB LDS caps occupancy, the codebook stays L2-hot).
 
 #include "common.hpp"
@@ -73,15 +73,19 @@ __device__ __forceinline__ void moe_gateup_vq_impl(
     int j = (int)(r % inter);
     const ExpertDescVq d = descs[e];
     size_t rb = vq_rb(hidden), ng = vq_ng(hidden);
-    float g[R], u[R];
-    dot_vq_wave_r<R>(x, hidden, d.gate_indices + (size_t)j * rb, d.gate_scales + (size_t)j * ng,
-                     gate_cb, hidden, lane, g);
-    dot_vq_wave_r<R>(x, hidden, d.up_indices + (size_t)j * rb, d.up_scales + (size_t)j * ng,
-                     up_cb, hidden, lane, u);
+    // The R token rows are `hidden` apart; each projection's index row, scale row and the
+    // shared codebook travel as one `VqRow` (dot_vq.hpp).
+    RowsView xv{x, hidden};
+    Acc<R> g = dot_vq_wave_r<R>(
+        xv, VqRow{d.gate_indices + (size_t)j * rb, d.gate_scales + (size_t)j * ng, gate_cb, hidden},
+        lane);
+    Acc<R> u = dot_vq_wave_r<R>(
+        xv, VqRow{d.up_indices + (size_t)j * rb, d.up_scales + (size_t)j * ng, up_cb, hidden},
+        lane);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t)
-            h_out[((size_t)e * R + t) * inter + j] = siluf(g[t]) * u[t];
+            h_out[((size_t)e * R + t) * inter + j] = siluf(g.v[t]) * u.v[t];
     }
 }
 
@@ -104,9 +108,10 @@ __device__ __forceinline__ void moe_down_vq_impl(
     // This expert's R h-rows are ADJACENT (row-fastest), so the gather dot_vq_wave_r does
     // over them is stride `inter` and both rows share cache lines.
     const float* he = h_in + (size_t)e * R * inter;
-    float dv[R];
-    dot_vq_wave_r<R>(he, inter, d.down_indices + (size_t)o * rb, d.down_scales + (size_t)o * ng,
-                     down_cb, inter, lane, dv);
+    Acc<R> dv = dot_vq_wave_r<R>(
+        RowsView{he, inter},
+        VqRow{d.down_indices + (size_t)o * rb, d.down_scales + (size_t)o * ng, down_cb, inter},
+        lane);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t) {
@@ -116,7 +121,7 @@ __device__ __forceinline__ void moe_down_vq_impl(
             // never asked for this expert. Skipping is also bit-identical: adding zero to
             // an integer accumulator is a no-op.
             float w = wexpert[(size_t)e * R + t];
-            if (w != 0.0f) atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(w * dv[t]));
+            if (w != 0.0f) atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(w * dv.v[t]));
         }
     }
 }
@@ -308,7 +313,7 @@ extern "C" int rivoli_moe_acc_drain_to_s(float* out, unsigned long long* acc, in
 //     at 128×128 and rides the resident path. A descriptor one past the end is not the
 //     wrong bytes, it is the wrong ARITHMETIC — hence `n_desc` on the launcher.
 //
-// The six spans below are cast to `common.hpp::gu8p` (GLOBAL address space) at every use —
+// The six spans below are cast to `dot_f4.hpp::gu8p` (GLOBAL address space) at every use —
 // the typedef's comment carries the measurement and the rejected alternatives. The cast is
 // TRUE by construction: every span points at a device arena or heap allocation (f4gpu's
 // placement, `tests/f4_kernel.rs`'s `DeviceBuf`s), and host GTT memory is still the global
@@ -342,7 +347,7 @@ __device__ __forceinline__ size_t f4_ng(int i_dim) {
     return (size_t)((i_dim + F4_GROUP - 1) / F4_GROUP);
 }
 
-// The bf16 round-trip below is `common.hpp::rbf16`. It was a local `bf16r` with an
+// The bf16 round-trip below is `formats.hpp::rbf16`. It was a local `bf16r` with an
 // identical body until 2026-08-05 — `rbf16`/`bf16r` in one translation unit is a
 // transposition between two names for the same thing, in a file where picking the wrong
 // one would be invisible because both were correct. Every `Linear` in the reference
@@ -371,13 +376,16 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
     int j = (int)(r % inter);
     const ExpertDescF4 d = descs[e];
     size_t rb = (size_t)(hidden / 2), ng = f4_ng(hidden);
-    float g[R], u[R];
-    // `(gu8p)` on the four descriptor spans — flat_load → global_load, see the typedef and
-    // the struct's own note for why the cast is true.
-    dot_f4_wave_r<R>(x, hidden, (gu8p)d.gate_packed + (size_t)j * rb,
-                     (gu8p)d.gate_scale + (size_t)j * ng, hidden, lane, g);
-    dot_f4_wave_r<R>(x, hidden, (gu8p)d.up_packed + (size_t)j * rb,
-                     (gu8p)d.up_scale + (size_t)j * ng, hidden, lane, u);
+    // `(gu8p)` on the four descriptor spans — flat_load → global_load, see the typedef in
+    // dot_f4.hpp and the struct's own note for why the cast is true. Packed row and scale
+    // row travel as one `F4Row`; the R token rows are `hidden` apart.
+    RowsView xv{x, hidden};
+    Acc<R> g = dot_f4_wave_r<R>(
+        xv, F4Row{(gu8p)d.gate_packed + (size_t)j * rb, (gu8p)d.gate_scale + (size_t)j * ng, hidden},
+        lane);
+    Acc<R> u = dot_f4_wave_r<R>(
+        xv, F4Row{(gu8p)d.up_packed + (size_t)j * rb, (gu8p)d.up_scale + (size_t)j * ng, hidden},
+        lane);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t) {
@@ -389,7 +397,7 @@ __device__ __forceinline__ void moe_gateup_f4_impl(
             // would drift silently. The hoist was MEASURED bit-neutral, not assumed —
             // `tests/f4_kernel.rs::the_fp4_dispatch_hash_pins_the_clamp_hoist` carries the
             // hash and the argument.
-            float sw = swiglu_clamped(g[t], u[t], limit);
+            float sw = swiglu_clamped(g.v[t], u.v[t], limit);
             // ENFORCED, not inherited. `0 · finite` is exactly zero, but the gate has no
             // LOWER clamp, so a `w1` dot at -inf gives `silu = -inf · 0 = NaN`, and
             // `NaN · 0` is NaN, not 0. `moe_fixed` then turns that NaN into a FINITE extreme
@@ -432,13 +440,14 @@ __device__ __forceinline__ void moe_down_f4_impl(
     const ExpertDescF4 d = descs[e];
     size_t rb = (size_t)(inter / 2), ng = f4_ng(inter);
     const float* he = h_in + (size_t)e * R * inter;
-    float dv[R];
-    dot_f4_wave_r<R>(he, inter, (gu8p)d.down_packed + (size_t)o * rb,
-                     (gu8p)d.down_scale + (size_t)o * ng, inter, lane, dv);
+    Acc<R> dv = dot_f4_wave_r<R>(
+        RowsView{he, inter},
+        F4Row{(gu8p)d.down_packed + (size_t)o * rb, (gu8p)d.down_scale + (size_t)o * ng, inter},
+        lane);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t)
-            atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(rbf16(dv[t])));
+            atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(rbf16(dv.v[t])));
     }
 }
 
@@ -555,15 +564,15 @@ __device__ __forceinline__ void moe_gateup_i4_impl(
     int j = (int)(r % inter);
     const ExpertDescI4 d = descs[e];
     size_t rb_h = (size_t)((hidden + 1) / 2), ng_h = i4_ng(hidden);
-    float g[R], u[R];
-    dot_i4_wave_r<R>(x, hidden, d.gate_packed + (size_t)j * rb_h,
-                     d.gate_scale + (size_t)j * ng_h, hidden, lane, g);
-    dot_i4_wave_r<R>(x, hidden, d.up_packed + (size_t)j * rb_h,
-                     d.up_scale + (size_t)j * ng_h, hidden, lane, u);
+    RowsView xv{x, hidden};
+    Acc<R> g = dot_i4_wave_r<R>(
+        xv, I4Row{d.gate_packed + (size_t)j * rb_h, d.gate_scale + (size_t)j * ng_h, hidden}, lane);
+    Acc<R> u = dot_i4_wave_r<R>(
+        xv, I4Row{d.up_packed + (size_t)j * rb_h, d.up_scale + (size_t)j * ng_h, hidden}, lane);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t)
-            h_out[((size_t)e * R + t) * inter + j] = siluf(g[t]) * u[t];
+            h_out[((size_t)e * R + t) * inter + j] = siluf(g.v[t]) * u.v[t];
     }
 }
 
@@ -580,9 +589,9 @@ __device__ __forceinline__ void moe_down_i4_impl(
     const ExpertDescI4 d = descs[e];
     size_t rb_i = (size_t)((inter + 1) / 2), ng_i = i4_ng(inter);
     const float* he = h_in + (size_t)e * R * inter;
-    float dv[R];
-    dot_i4_wave_r<R>(he, inter, d.down_packed + (size_t)o * rb_i,
-                     d.down_scale + (size_t)o * ng_i, inter, lane, dv);
+    Acc<R> dv = dot_i4_wave_r<R>(
+        RowsView{he, inter},
+        I4Row{d.down_packed + (size_t)o * rb_i, d.down_scale + (size_t)o * ng_i, inter}, lane);
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < R; ++t) {
@@ -591,7 +600,7 @@ __device__ __forceinline__ void moe_down_i4_impl(
             // clamp turns NaN into a FINITE extreme. Adding zero to an integer accumulator
             // is a no-op, so skipping is also bit-identical.
             float w = wexpert[(size_t)e * R + t];
-            if (w != 0.0f) atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(w * dv[t]));
+            if (w != 0.0f) atomicAdd(&acc[(size_t)t * hidden + o], moe_fixed(w * dv.v[t]));
         }
     }
 }

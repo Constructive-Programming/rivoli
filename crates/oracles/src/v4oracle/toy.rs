@@ -111,7 +111,7 @@ fn fp4_group(seg: &[f32], sv: f32, row: &mut [u8], g: usize) {
         let nib = e2m1_encode((x / sv).clamp(-FP4_MAX, FP4_MAX));
         let k = g * 32 + i;
         let byte = &mut row[k / 2];
-        if k % 2 == 0 {
+        if k.is_multiple_of(2) {
             *byte = (*byte & 0xf0) | nib;
         } else {
             *byte = (*byte & 0x0f) | (nib << 4);

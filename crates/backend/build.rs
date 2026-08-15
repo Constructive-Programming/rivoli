@@ -28,9 +28,33 @@ const KERNELS: [&str; 12] = [
     "headtail",
 ];
 
-/// Named once because it is BOTH a rerun trigger and a staleness input — the two must
-/// never drift apart, or an edited header rebuilds nothing.
-const COMMON_HEADER: &str = "kernels/common.hpp";
+/// EVERY header under `kernels/`, DISCOVERED rather than listed — the result is BOTH a
+/// rerun trigger and a staleness input, and the two must never drift apart or an edited
+/// header rebuilds nothing.
+///
+/// It was one hard-coded entry (`common.hpp`) until 2026-08-15, and that was already a hole
+/// rather than a simplification: `formats.hpp` and `reduce.hpp` split out of it that
+/// morning and neither was added, so an edit to either recompiled NOTHING and linked the
+/// previous objects. The dot-family split the same day would have widened the hole to
+/// eight. Unlike `KERNELS` — where a missing name means a translation unit is never
+/// compiled, so the list has to be explicit and is checked by the linker — a missing HEADER
+/// name is silent, which is exactly the case for reading the directory instead. Sorted so
+/// the emitted `rerun-if-changed` lines do not churn with directory order.
+///
+/// A read failure yields an EMPTY list, which makes every object look stale and forces a
+/// full recompile: the safe direction. Returning "nothing changed" from an unreadable
+/// directory is the failure this function exists to prevent.
+fn headers() -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir("kernels")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "hpp"))
+        .map(|e| format!("kernels/{}", e.file_name().to_string_lossy()))
+        .collect();
+    out.sort();
+    out
+}
 
 /// True when `out` is missing or older than any of `deps` — the mtime comparison cargo
 /// does for its own targets, which build scripts do not get for free. Missing metadata
@@ -78,7 +102,8 @@ impl Toolchain {
     }
 
     /// Compile one kernel unless its object is already current, and return that object.
-    fn object(&self, kernel: &str) -> String {
+    /// `hdrs` is `headers()`, resolved once by the caller rather than re-read per kernel.
+    fn object(&self, kernel: &str, hdrs: &[&str]) -> String {
         let src = format!("kernels/{kernel}.hip");
         // The ARCH is part of the object's identity, not just its mtime: review 2026-08-15
         // found that switching RIVOLI_OFFLOAD_ARCH re-ran this script (rerun-if-env-changed)
@@ -86,10 +111,12 @@ impl Toolchain {
         // objects. Baking the arch into the filename makes a switched arch a cache MISS.
         let obj = format!("{}/{kernel}.{}.o", self.out_dir, self.arch);
         println!("cargo:rerun-if-changed={src}");
-        // SKIP an object that is newer than both its source and the shared header —
-        // without this every re-run recompiled all the kernels through hipcc, seconds of
-        // rebuild for a change that cannot affect a single one of them.
-        if stale(&obj, &[&src, COMMON_HEADER]) {
+        // SKIP an object that is newer than its source AND every shared header — without
+        // this every re-run recompiled all the kernels through hipcc, seconds of rebuild
+        // for a change that cannot affect a single one of them.
+        let mut deps: Vec<&str> = vec![&src];
+        deps.extend_from_slice(hdrs);
+        if stale(&obj, &deps) {
             self.run_hipcc(&src, &obj);
         }
         obj
@@ -144,8 +171,12 @@ fn main() {
     }
     let tc = Toolchain::from_env();
     // Headers are #included, not compiled units — track them so an edit forces a rebuild.
-    println!("cargo:rerun-if-changed={COMMON_HEADER}");
-    let objs: Vec<String> = KERNELS.iter().map(|k| tc.object(k)).collect();
+    let hdrs = headers();
+    let hdrs: Vec<&str> = hdrs.iter().map(String::as_str).collect();
+    for h in &hdrs {
+        println!("cargo:rerun-if-changed={h}");
+    }
+    let objs: Vec<String> = KERNELS.iter().map(|k| tc.object(k, &hdrs)).collect();
     archive(&tc.out_dir, &objs);
     emit_link_flags(&tc.out_dir);
 }

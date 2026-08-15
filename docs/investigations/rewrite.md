@@ -160,3 +160,29 @@ exists.
 
 M4's exit gate (unchanged from the plan): anchor decode gate green at the pre-measured
 tolerance; INV-1 red-proofed live; release.yml on.
+
+
+## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)
+
+Owner set three rules mid-stream: **CodeScene 10.0, whole tree, no exemptions** (then one
+sanctioned: numerics.rs floor 9.6, measured unfixable without burying the transliteration);
+**line caps** 800 soft / 1200 hard; scope extended to .hpp/.py. Executed as five parallel
+agent waves (32 + 5 + 11 + 3 + 1 max-effort agents, one file or territory each, exclusive
+territories, device/git forbidden, isolated target dirs) with coordinator integration
+between waves. Final state: every source file at CodeScene 10.0 (one exemption row, three
+deaths as its red-proof), longest file 785 lines, jscpd 0 with SIX ledgered exemptions,
+39/39 device oracles green after every kernel-adjacent wave.
+
+Things the waves surfaced beyond scores, each fixed and red-proofed in its commit:
+- build.rs tracked only common.hpp after the header split — edits to sibling headers
+  LINKED STALE KERNEL OBJECTS (the arch-staleness class again, one week after review
+  round 1 caught its RIVOLI_OFFLOAD_ARCH sibling).
+- CodeScene's measured mechanics, now written where they bind: Low Cohesion ~605
+  non-comment LOC at LCOM4>=3; Primitive Obsession >=7 fns AND >=11 primitive args;
+  arg counter skips tuple-typed params entirely (a false-green class, recorded, not
+  exploited); comments are free.
+- The old quant parameter-list jscpd exemption retired by the Fp8W/VqW/RowScaledW views
+  — the exact hop its own note priced.
+- Device-loop noalias strengthened, not lost, under the bundling the owner accepted:
+  accumulators return by value (SROA to registers), read-only spans keep __restrict__ on
+  members; rowview.hpp carries the table M5's benchmarks re-price.
