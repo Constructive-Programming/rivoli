@@ -52,10 +52,13 @@ appears that enum dispatch cannot fill.
 
 - **jscpd** — duplication is a build error, zero budget (`crates/cli/build.rs`, every
   build, both feature arms). Precondition: rustfmt-clean, or the result is a lower bound.
-  **6** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
-  where verbatim transcription of the reference is the point; two in `backend/hip.rs`,
-  the HIP ABI wall's extern declarations and its one hand-written launcher; one in
-  `core/routing.rs`, the frozen `route_into_pre` photograph — each argues in place;
+  **7** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
+  where verbatim transcription of the reference is the point; three across the HIP ABI
+  wall, which the 800-line ceiling split into `backend/hip.rs` — its extern declarations
+  and its one hand-written launcher — plus one per macro-invocation half,
+  `backend/hip_linalg.rs` and `backend/hip_blocks.rs`, since a marker pair cannot span
+  files; one in `core/routing.rs`, the frozen `route_into_pre` photograph — each argues
+  in place;
   `quant.rs`'s parameter-list exemption died 2026-08-15 when the `Fp8W`/`VqW`/
   `RowScaledW` views paid the hop its note had priced); the
   count is derived by `crates/cli/tests/docs.rs`, and marker text may appear only on a
@@ -64,6 +67,9 @@ appears that enum dispatch cannot fill.
   standing red-proof fixture must score < 10 every run; exemptions argued in place and
   checked at both ends. Warn-and-skip without a license locally; CI hard-fails via
   `RIVOLI_CS_REQUIRED=1`. Needs `CS_ACCESS_TOKEN` in the environment.
+- **line caps** — 1200 hard (`crates/cli/tests/line_limit.rs`, red-proofed), 800 soft
+  (`cargo:warning` from the cli build script on every build: the next edit to a warned
+  file should shrink it). CodeScene binds independently below both.
 - **clippy** `-D warnings`, `--all-targets`, plus the deviceless feature-union run once
   instrument features exist.
 - **docs registry** — status/scope/verdict front matter + INDEX agreement, test-enforced.

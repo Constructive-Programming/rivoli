@@ -46,7 +46,15 @@
 //! than borrowed from `src/artifact/`.
 
 pub mod attention;
+pub mod breakages;
+pub mod capture;
+pub mod compress;
 pub mod forward;
+pub mod hc;
+pub mod head;
+pub mod layer;
+pub mod moe;
 pub mod numerics;
+pub mod router;
 pub mod toy;
 pub mod weights;

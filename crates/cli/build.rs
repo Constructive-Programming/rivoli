@@ -92,6 +92,8 @@ fn main() {
         );
     }
 
+    soft_line_cap(&root);
+
     match out.status.code() {
         Some(0) => {}
         // BOTH streams: the clone list is on stdout, but an invocation-level complaint can
@@ -107,5 +109,36 @@ fn main() {
              `npx --no -- jscpd -c .jscpd.json crates` at the workspace root to see why.",
             out.status
         ),
+    }
+}
+
+/// The SOFT line cap: files over 800 lines warn on every build — the hard 1200 cap lives
+/// in `tests/line_limit.rs`. A build-script warning, not a test eprintln, because libtest
+/// captures test output and a captured warning is no warning (recorded lesson). The
+/// contract: the next edit to a warned file should shrink it, not grow it.
+fn soft_line_cap(root: &std::path::Path) {
+    const SOFT: usize = 800;
+    let mut stack = vec![root.join("crates")];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .extension()
+                .is_some_and(|x| ["rs", "hip", "hpp", "py", "sh"].iter().any(|e| x == *e))
+            {
+                let lines = std::fs::read_to_string(&p)
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                if lines > SOFT {
+                    println!(
+                        "cargo:warning={} is {lines} lines (soft cap {SOFT}) — the next \
+                         edit here should refactor it smaller, and 1200 is a hard gate",
+                        p.strip_prefix(root).unwrap_or(&p).display()
+                    );
+                }
+            }
+        }
     }
 }

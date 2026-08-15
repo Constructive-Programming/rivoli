@@ -11,8 +11,11 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 11] = [
+const KERNELS: [&str; 12] = [
     "linalg",
+    // Split out of `linalg.hip` 2026-08-15 (the per-token activation transforms), and
+    // listed next to it because the pair is one cut, not two subsystems.
+    "activation",
     "moe",
     "mla",
     "attn",

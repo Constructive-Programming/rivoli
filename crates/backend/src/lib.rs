@@ -15,6 +15,14 @@ pub mod abi;
 pub mod gpustream;
 #[cfg(feature = "rocm")]
 pub mod hip;
+// The ABI wall's two macro invocations, split out of `hip.rs` 2026-08-15 under the 800-line
+// file ceiling. PRIVATE and re-exported through `hip`, so the split is invisible from
+// outside: `rivoli_backend::hip::launch_*` is still the only path, and which of the two a
+// launcher is declared in stays an authoring decision rather than an API one.
+#[cfg(feature = "rocm")]
+mod hip_blocks;
+#[cfg(feature = "rocm")]
+mod hip_linalg;
 // The waist itself — Signal, block_on, NULL_STREAM, and the backend-neutral re-exports.
 // Its items sit at the crate root (`rivoli_backend::Stream`), exactly where the old tree's
 // `crate::backend::Stream` sat relative to its consumers.

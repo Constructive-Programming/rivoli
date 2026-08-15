@@ -49,142 +49,64 @@ Usage (`--ref` is the downloaded pinned reference, `--config` the vendored real 
 `--defect` perturbs the reference to prove a golden can go red — see `DEFECTS`. `--compare A B`
 scores two goldens against each other and **asserts the defect's declared green layers**, which
 is the half of `k3-port.md` §G rule 1 that a bare "something changed" check leaves out.
+
+What is left here is the generation path: the weights, the defects, the fp64 instruments and
+`main`. The tiny config, the container and the two scorers are `k3_anchor_lib.py`; `Capture` and
+the forward hooks are `k3_anchor_capture.py`; the two values no hook can see are
+`k3_anchor_taps.py`. Split out 2026-08-15 under the 800-line-per-file gate with every body moved
+unchanged -- these goldens cannot be regenerated without the pinned venv and a GPU, so a rewrite
+of one would be a change nothing could score. All three are re-exported below, because this
+file's name is the one `tests/k3-anchor.sh` and every recipe in `anchor.md` run.
 """
 
 import argparse
 import hashlib
 import importlib
 import json
-import math
 import os
 import pathlib
-import struct
 import sys
+
+# Imported for the SURFACE, not used here. `struct` went with the container and `math` with the
+# scorer in the 2026-08-15 split, but this file's importable names are what `tests/k3-anchor.sh`
+# and every recipe in `anchor.md` reach for, and a split is not allowed to narrow them.
+import math  # noqa: F401
+import struct  # noqa: F401
+
+# The moved halves, re-exported for the same reason. `k3_anchor_lib` is the deviceless side (no
+# torch, so `--compare` still runs without one); `k3_anchor_capture` holds the hooks, and
+# `k3_anchor_taps` the two values no hook can see. All three sit beside this file, which is
+# `sys.path[0]` whenever it runs as a script -- the only way it is ever run.
+from k3_anchor_capture import Capture, _fire, hook_model  # noqa: F401
+from k3_anchor_lib import (  # noqa: F401
+    CAPTURE_LAYERS,
+    EXPECT_GREEN,
+    MAGIC,
+    STRUCTURAL,
+    STRUCTURAL_LINEAR_ATTN,
+    TINY_LINEAR_ATTN,
+    TINY_TEXT,
+    _both_sections,
+    _kda_zero_based,
+    _s,
+    _score,
+    _u64,
+    build_config,
+    by_operator,
+    compare,
+    operator_of,
+    read_golden,
+    write_golden,
+)
+from k3_anchor_taps import (  # noqa: F401
+    _fold_mixing_normalised,
+    wrap_attn_res,
+    wrap_kda_ops,
+)
 
 # Bound by `main` so `--compare` runs with no torch, no fla and no GPU — the property that lets a
 # defect run be re-scored from vendored bytes on any machine.
 torch = None
-
-# ---------------------------------------------------------------------------------------------
-# The tiny config.
-
-# **Widths only, and no width may collapse a distinction the real config keeps.** That second
-# rule was learned the hard way: the first version of this table set `hidden_size` 128,
-# `intermediate_size` 128, `moe_intermediate_size` 32, `routed_expert_hidden_size` 64,
-# `kv_lora_rank` 16 and `qk_nope_head_dim` 16, which made FOUR pairs accidentally equal that the
-# real config separates —
-#
-#   | pair | tiny (old) | real |
-#   |---|---|---|
-#   | `kv_lora_rank` vs `qk_nope_head_dim` | 16 == 16 | 512 vs 128 |
-#   | `2 * moe_intermediate_size` vs `routed_expert_hidden_size` | 64 == 64 | 6144 vs 3584 |
-#   | `hidden_size` vs `intermediate_size` | 128 == 128 | 7168 vs 33792 |
-#   | `hidden_size` vs KDA `num_heads * head_dim` | 128 == 128 | 7168 vs 12288 |
-#
-# and each equality deletes a hazard. A port that read the KV latent width from
-# `qk_nope_head_dim`, or the shared expert's width from the latent instead of
-# `num_shared_experts * moe_intermediate_size` — the `[hidden, 2*moe_inter]` coupling this port
-# has a recorded trap for — produced a **bit-identical** fixture, not merely a shape-valid one.
-# Found by review 2026-08-11, before any kernel was scored against it.
-#
-# Equalities the real config DOES have are kept: `qk_nope_head_dim == v_head_dim` (128 == 128),
-# `num_attention_heads == linear_attn_config.num_heads` (96 == 96), and
-# `routed_expert_hidden_size == hidden_size / 2` (3584 == 7168/2).
-#
-# One residual collision, kept deliberately: MLA's `kv_b_proj` output
-# (`heads * (qk_nope + v_head)` = 128) equals the KDA projection width. Breaking it needs a
-# non-power-of-two head count, which fla's triton kernels block over and refuse, and a port that
-# confuses MLA's KV expansion with KDA's projection is confusing two different layer families.
-TINY_TEXT = {
-    "hidden_size": 192,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 4,
-    "intermediate_size": 256,
-    "moe_intermediate_size": 24,
-    "routed_expert_hidden_size": 96,
-    "q_lora_rank": 32,
-    "kv_lora_rank": 24,
-    "qk_nope_head_dim": 16,
-    "qk_rope_head_dim": 8,
-    "v_head_dim": 16,
-    "num_experts": 8,
-    "num_experts_per_token": 2,
-    "vocab_size": 256,
-    "max_position_embeddings": 64,
-    # The real ids (bos 163584, eos 163586, pad 163839) do not fit a 256-entry vocab, and
-    # `nn.Embedding` refuses a `padding_idx` outside `num_embeddings` rather than ignoring it.
-    # `pad` stays the last row so `padding_idx`'s zeroing still applies to it — see
-    # `init_weights`, which has to put that row back.
-    "bos_token_id": 250,
-    "eos_token_id": 251,
-    "pad_token_id": 255,
-}
-# `head_dim` stays a power of two: fla's triton kernels block over K and V and refuse degenerate
-# widths. `num_heads` 4 keeps the real config's `num_attention_heads == num_heads`.
-TINY_LINEAR_ATTN = {"head_dim": 32, "num_heads": 4}
-
-# Structural fields the tiny config MUST inherit unchanged, asserted at generation time AND
-# recorded in the golden as `structural_asserted` so `tests/k3_anchor.rs` can refuse to check a
-# field this list does not cover. Two lists that must agree, with nothing keeping them in step,
-# is the drift review found here on 2026-08-11: `gate_lower_bound` and `short_conv_kernel_size`
-# were claimed asserted on both sides and were asserted on neither.
-STRUCTURAL = [
-    "num_hidden_layers",
-    "first_k_dense_replace",
-    "moe_layer_freq",
-    "attn_res_block_size",
-    "num_shared_experts",
-    "routed_scaling_factor",
-    "latent_moe_use_norm",
-    "moe_renormalize",
-    "moe_router_activation_func",
-    "activation_situ_beta",
-    "activation_situ_linear_beta",
-    "hidden_act",
-    "mla_use_nope",
-    "mla_use_output_gate",
-    "rms_norm_eps",
-    "use_grouped_topk",
-    "num_expert_group",
-    "topk_group",
-    "topk_method",
-]
-# The same, one level down. `linear_attn_config` is REBUILT by a dict merge rather than inherited
-# whole, so its survivors need their own check -- and `gate_lower_bound` is a kernel kwarg with
-# its own defect run below, which makes it the last field that should have gone unasserted.
-STRUCTURAL_LINEAR_ATTN = ["gate_lower_bound", "short_conv_kernel_size", "use_full_rank_gate"]
-
-# Layers whose every submodule output is captured. Chosen for what each one IS, since G1b names
-# four coverage classes and these cover all of them plus the two structural boundaries:
-#   0  — KDA (1-based list holds 1) AND the only dense `mlp` layer AND an attn-res block start
-#   1  — the first MoE layer, KDA
-#   3  — the first MLA layer (1-based 4)
-#   12 — an attn-res block start that is not layer 0
-#   91 — MLA, and the first of the two consecutive MLA layers the real map ends with
-#   92 — the last layer, MLA
-CAPTURE_LAYERS = (0, 1, 3, 12, 91, 92)
-
-
-def build_config(cfg_mod, real_path):
-    """The tiny `KimiLinearConfig`, derived from the vendored real one."""
-    real = json.loads(pathlib.Path(real_path).read_text())["text_config"]
-    d = dict(real)
-    # `quantization_config` goes: it is what would make the experts MXFP4, and it is anchored on
-    # real bytes elsewhere. `dtype`/`architectures` go because they are load-time hints, and
-    # `_name_or_path` because it would put a stale path in the metadata.
-    for k in ("quantization_config", "dtype", "architectures", "_name_or_path", "auto_map"):
-        d.pop(k, None)
-    d.update(TINY_TEXT)
-    d["linear_attn_config"] = dict(real["linear_attn_config"], **TINY_LINEAR_ATTN)
-    cfg = cfg_mod.KimiLinearConfig(**d)
-    for k in STRUCTURAL:
-        got, want = getattr(cfg, k), real[k]
-        assert got == want, f"tiny config lost structural field {k}: {got!r} != real {want!r}"
-    for k in STRUCTURAL_LINEAR_ATTN + ["kda_layers", "full_attn_layers"]:
-        got, want = cfg.linear_attn_config[k], real["linear_attn_config"][k]
-        assert got == want, f"tiny config lost linear_attn_config.{k}: {got!r} != {want!r}"
-    return cfg
-
 
 # ---------------------------------------------------------------------------------------------
 # Deterministic weights.
@@ -433,392 +355,6 @@ DEFECTS = {
     "KdaBetaSigmoidOutside": defect_kda_beta_sigmoid_outside,
 }
 
-# **The captured layers each defect must leave BIT-IDENTICAL.** This is the half of `k3-port.md`
-# §G rule 1 that "something changed" does not cover, and until 2026-08-11 it lived only in a
-# markdown table that a human read. `--compare` asserts it.
-#
-# Only UPSTREAM layers can be listed: the goldens come from one forward pass, so a perturbation
-# at layer 3 reaches layer 92 by construction. A defect whose first touch is layer 0 has no green
-# layer at all, and that is recorded as an empty list rather than omitted, so a missing entry is
-# an error instead of a silent pass.
-EXPECT_GREEN = {
-    "MlaLoraEps1e5": [0, 1],          # KDA layers, upstream of the first MLA layer (3)
-    "MlaScaleFromNope": [0, 1],       # same
-    "ExpertW1W3Swap": [0],            # layer 0 has no routed experts
-    "RouterBiasInWeight": [0],        # same
-    "LatentNormAfterUp": [0],         # same
-    "DenseMlpGateUpSwap": [],         # layer 0's own dense MLP is the first thing it touches
-    "AttnResNormalisedValues": [],    # layer 0's MLP fold is the first
-    "KdaNoQkL2Norm": [],              # layer 0 is a KDA layer
-    "KdaGateLowerBoundOff": [],
-    "KdaStateLayout": [],
-    "KdaBetaSigmoidOutside": [],
-}
-
-
-# ---------------------------------------------------------------------------------------------
-# Capture.
-
-
-class Capture:
-    """Named tensors, split by element type the way `src/v4oracle/golden.rs` splits them."""
-
-    def __init__(self):
-        self.floats = []
-        self.ints = []
-        self.seen = set()
-        # Module names whose hook actually ran, recorded by the hook itself rather than inferred
-        # from tensor names. Inferring would be prefix-shadowed: `model.layers.92`'s own hook could
-        # look like it fired because `model.layers.92.self_attn` did.
-        self.fired = set()
-
-    def add(self, name, t):
-        if not isinstance(t, torch.Tensor):
-            return
-        t = t.detach().to("cpu")
-        shape = list(t.shape)
-        self.seen.add(name)
-        if t.dtype in (torch.int64, torch.int32):
-            self.ints.append((name, shape, t.reshape(-1).to(torch.int64).tolist()))
-        else:
-            self.floats.append((name, shape, t.reshape(-1).to(torch.float32).tolist()))
-
-    def add_any(self, name, out):
-        """Flatten a module's output, whatever shape of container it came in."""
-        if isinstance(out, (tuple, list)):
-            for i, o in enumerate(out):
-                self.add_any(f"{name}.{i}", o)
-        else:
-            self.add(name, out)
-
-
-def _fire(cap, name, out):
-    """Record that `name`'s hook ran, then capture its output."""
-    cap.fired.add(name)
-    cap.add_any(name, out)
-
-
-def hook_model(model, cap, layers):
-    """A forward hook on every submodule of the captured layers, plus the model-level tail.
-
-    Every submodule rather than a chosen few: at these widths the whole set is a few hundred
-    kilobytes, and a hand-picked list is a list someone has to remember to extend when a module
-    appears.
-
-    Returns `(handles, expected_names)`. The second half exists because a hook that never fires
-    is silent, and that silence cost this harness its AttnRes coverage for a day — see
-    `wrap_attn_res`.
-    """
-    # The trailing dot is load-bearing, and its absence was measured: an earlier version also
-    # matched the bare `model.layers.{i}`, so `model.layers.1` caught layers 10-19 and
-    # `model.layers.3` caught 30-39 -- 25 captured layers instead of 6. The layer's own output is
-    # reached by the exact-name test below instead.
-    prefixes = tuple(f"model.layers.{i}." for i in layers)
-    exact = tuple(f"model.layers.{i}" for i in layers)
-    tail = ("model.norm", "lm_head")
-    handles, expected = [], []
-    for name, mod in model.named_modules():
-        wanted = name in tail or name in exact or name.startswith(prefixes)
-        # Everything at or under `.experts` is excluded, and the reason is not size. `moe_infer`
-        # calls only the experts that WON tokens, so which expert modules fire is
-        # routing-dependent -- any defect that moves the routing changes the golden's tensor SET,
-        # and every such comparison then scores "absent on one side" rather than a number.
-        # Measured: the first defect matrix reported `inf` for most layers on four of five defects
-        # for exactly this reason, drowning the real signal. `topk_idx`/`topk_weight` and the block
-        # output are the routing fixture and are always present.
-        #
-        # `.experts` and not `.experts.`, so the `ModuleList` ITSELF goes too: its forward is never
-        # called, so its hook could never fire, and the silent-hook assertion at the end of `main`
-        # caught all five of them on its first run. `shared_experts` is untouched -- the substring
-        # needs a dot before `experts`, and there the preceding character is an underscore.
-        if not wanted or ".experts" in name:
-            continue
-        # The four AttnRes modules per layer are the OTHER never-fires case: `_apply_attn_res`
-        # reads their `.weight` directly instead of calling them. `wrap_attn_res` captures the
-        # fold; hooking them here would register four dead hooks per layer.
-        if name.endswith(("_res_norm", "_res_proj")):
-            continue
-        handles.append(mod.register_forward_hook(lambda m, i, o, n=name: _fire(cap, n, o)))
-        expected.append(name)
-    return handles, expected
-
-
-def wrap_attn_res(mod, model, cap, ctx, layers):
-    """Capture the AttnRes fold, which no forward hook can see.
-
-    **`_apply_attn_res` never calls its `proj` and `norm` modules** -- it reads
-    `proj.weight.squeeze(0)`, `norm.weight` and `norm.variance_epsilon` inline (reference
-    `:1075-1088`). A `register_forward_hook` only fires from `Module.__call__`, so the six
-    AttnRes modules per layer and the two model-level ones produced NOTHING, and the golden
-    contained no `*_res_*` tensor at all while three comments said otherwise. Found by review
-    2026-08-11 -- and AttnRes is S2 item 1, so the anchor was missing a fixture for the first
-    kernel the port writes.
-
-    It is a module-level free function, and all three call sites (twice per layer, once
-    model-level) resolve it from module globals at call time, so one `setattr` catches every
-    fold. Folds are named by the identity of the `proj` they were handed, which is what
-    distinguishes `self_attention_res` from `mlp_res` without depending on call order.
-    """
-    owners = {}
-    for name, m in model.named_modules():
-        if not name.endswith("_res_proj"):
-            continue
-        base = name[: -len("_proj")]
-        if base.startswith("model.output") or any(
-            base.startswith(f"model.layers.{i}.") for i in layers
-        ):
-            owners[id(m)] = base
-    orig = mod._apply_attn_res
-
-    def inner(prefix_sum, block_residual, proj, norm):
-        if ctx.get("attn_res_mix_normalised"):
-            out = _fold_mixing_normalised(prefix_sum, block_residual, proj, norm)
-        else:
-            out = orig(prefix_sum, block_residual, proj, norm)
-        tag = owners.get(id(proj))
-        if tag is not None and ctx["capturing"]:
-            cap.add(f"{tag}.in.prefix_sum", prefix_sum)
-            cap.add(f"{tag}.in.block_residual", block_residual)
-            cap.add(f"{tag}.out", out)
-        return out
-
-    mod._apply_attn_res = inner
-    return orig
-
-
-def _fold_mixing_normalised(prefix_sum, block_residual, proj, norm):
-    """`_apply_attn_res` with `k` mixed instead of `v_float` -- the `AttnResNormalisedValues` body.
-
-    A transcription of the reference's five lines with one substitution, which is the whole point
-    of the defect; every other defect here perturbs a weight or a kwarg instead.
-    """
-    v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    v_float = v.float()
-    k = v_float * torch.rsqrt(v_float.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon)
-    scores = (k * (norm.weight.float() * proj.weight.squeeze(0).float())).sum(-1)
-    probs = scores.softmax(-1).unsqueeze(1)
-    return torch.matmul(probs, k).squeeze(1).to(v.dtype)
-
-
-def wrap_kda_ops(mod, cap, ctx, layers):
-    """Record the KDA operator's own inputs and outputs, which no module hook can see.
-
-    `q`/`k`/`v` after the short convolutions, the log-space gate, `beta`, `A_log`, `dt_bias` in;
-    `o` and the recurrent state out. This IS the S2 KDA fixture: everything between these two
-    points lives in fla's triton kernel and in no document.
-
-    Installed BEFORE the warm prefill, and capture is gated on `ctx["capturing"]` instead.
-    Review 2026-08-11: with the wrapper installed after the warm pass, a `--defect` that only
-    sets a kernel kwarg perturbed exactly one call per layer, on a recurrent state the defect had
-    never touched -- so `in.initial_state` was bit-identical between the runs BY CONSTRUCTION and
-    the state-propagation claim was the one thing those defects could not test.
-    """
-
-    def wrap(fn, tag):
-        def inner(**kw):
-            kw = dict(kw, **ctx["kda_kwargs"])
-            if ctx["kda_fp32_island"]:
-                # **fla's KDA kernel cannot be compiled for fp64 at all** — it raises
-                # `fp_downcast_rounding should be set only for truncating fp conversions` on an
-                # internal fp32->fp64 conversion (measured 2026-08-11). So `--dtype float64` runs
-                # the whole model in double EXCEPT this operator, which stays fp32 with its inputs
-                # cast down and its outputs cast back. That makes the fp64 run a rounding-floor
-                # reference for every operator but this one; KDA's own floor comes from
-                # `--mode kda-equiv` instead, and would have needed a separate measurement anyway
-                # because the kernel returns an fp32 state whatever the input dtype.
-                # `q` by name, not "the first kwarg with a dtype". That took whatever the reference
-                # happened to pass first -- today `q`, but a revision putting `cu_seqlens` or a
-                # position index earlier would cast every KDA output to an INTEGER dtype, and the
-                # only symptom would be a wrong floor in a measurement nobody re-derives.
-                q = kw.get("q")
-                assert q is not None and q.is_floating_point(), (
-                    f"the fp32 island reads its dtype from `q`; got {type(q).__name__}. The "
-                    f"reference calls this op with all-keyword arguments, so a rename upstream "
-                    f"lands here rather than silently picking another kwarg's dtype."
-                )
-                dt = q.dtype
-                kw = {
-                    k: (v.float() if hasattr(v, "dtype") and v.is_floating_point() else v)
-                    for k, v in kw.items()
-                }
-                out = fn(**kw)
-                out = tuple(o.to(dt) if o is not None else None for o in out)
-            else:
-                out = fn(**kw)
-            if ctx.get("kda_transpose_out_state") and out[1] is not None:
-                out = (out[0], out[1].transpose(-1, -2).contiguous())
-            sink = ctx.get("equiv_sink")
-            if sink is not None:
-                which_all = ctx["kda_layer_ids"][ctx["kda_calls"]]
-                ctx["kda_calls"] += 1
-                sink.setdefault((tag, which_all), []).append(out[0].detach().float().cpu())
-                return out
-            if ctx["capturing"]:
-                # The nth KDA call of the capture pass is the nth KDA layer in index order, which
-                # the model guarantees by iterating `self.layers` in order.
-                which = ctx["kda_layer_ids"][ctx["kda_calls"]]
-                ctx["kda_calls"] += 1
-                if which in layers:
-                    for k in ("q", "k", "v", "g", "beta", "A_log", "dt_bias", "initial_state"):
-                        if kw.get(k) is not None:
-                            cap.add(f"model.layers.{which}.kda.{tag}.in.{k}", kw[k])
-                    cap.add(f"model.layers.{which}.kda.{tag}.out.o", out[0])
-                    if out[1] is not None:
-                        cap.add(f"model.layers.{which}.kda.{tag}.out.state", out[1])
-            return out
-
-        return inner
-
-    for tag in ("chunk_kda", "fused_recurrent_kda"):
-        setattr(mod, tag, wrap(getattr(mod, tag), tag))
-
-
-# ---------------------------------------------------------------------------------------------
-# The container. Byte-for-byte the layout `src/v4oracle/golden.rs` reads, under a K3 magic.
-
-MAGIC = b"RIVK3GLD"
-
-
-def _u64(v):
-    return struct.pack("<Q", v)
-
-
-def _s(x):
-    b = x.encode()
-    return _u64(len(b)) + b
-
-
-def read_golden(path):
-    """The inverse of [`write_golden`], for `--compare`.
-
-    Each tensor keeps its RAW payload bytes alongside the decoded values, because that is the
-    only exact equality test: `-0.0 == 0.0` in python and `NaN != NaN`, and `golden.rs` compares
-    `to_bits` for the same reason. No vendored tensor is non-finite today, so this is a guard
-    rather than a fix.
-    """
-    b = pathlib.Path(path).read_bytes()
-    assert b[:8] == MAGIC, f"{path}: not a rivoli K3 anchor golden"
-    o = [8]
-
-    def u64():
-        v = struct.unpack_from("<Q", b, o[0])[0]
-        o[0] += 8
-        return v
-
-    def s():
-        n = u64()
-        v = b[o[0]:o[0] + n].decode()
-        o[0] += n
-        return v
-
-    meta = [(s(), s()) for _ in range(u64())]
-    sections = []
-    for width, code in ((4, "f"), (8, "q")):
-        items = {}
-        for _ in range(u64()):
-            name = s()
-            shape = [u64() for _ in range(u64())]
-            n = u64()
-            raw = b[o[0]:o[0] + n * width]
-            vals = struct.unpack_from(f"<{n}{code}", b, o[0])
-            o[0] += n * width
-            # A duplicate name would collapse here, last-wins, and shrink the compared set --
-            # while the Rust reader keeps both. Latent today; loud now.
-            assert name not in items, f"{path}: duplicate tensor name {name}"
-            items[name] = (tuple(shape), vals, raw)
-        sections.append(items)
-    assert o[0] == len(b), f"{path}: {len(b) - o[0]} trailing bytes"
-    return dict(meta), sections[0], sections[1]
-
-
-# **Which operator each captured tensor belongs to.** Layer numbers alone cannot say: `self_attn`
-# is MLA on 24 layers and KDA on 69, so the classifier has to read the partition out of the
-# golden's own `tiny_config`. Used only by `--by-operator`, which is how the per-operator
-# tolerances in `anchor.md` are derived — a tolerance is a property of an OPERATOR, and a per-layer
-# report cannot state one.
-def operator_of(name, kda_layers):
-    if name.startswith("model.layers."):
-        parts = name.split(".")
-        layer, rest = int(parts[2]), ".".join(parts[3:])
-        kda = layer in kda_layers
-        if rest.startswith("kda."):
-            return "kda_op"
-        if rest.startswith("self_attn"):
-            return "kda_trunk" if kda else "mla"
-        if rest.startswith(("self_attention_res", "mlp_res")):
-            return "attn_res"
-        if rest.startswith("block_sparse_moe.routed_expert"):
-            return "moe_latent"
-        if rest.startswith("block_sparse_moe"):
-            return "moe_route"
-        if rest.startswith("mlp"):
-            return "dense_mlp"
-        if "layernorm" in rest:
-            return "norm"
-        return "residual"
-    if name.startswith("model.output_attn_res"):
-        return "attn_res"
-    if name == "model.norm":
-        return "norm"
-    return "head"
-
-
-def _score(items_a, items_b, key_of):
-    """Group two tensor sections by `key_of(name)` and score each group.
-
-    One scorer for both reports: `compare` groups by layer to ask about localisation,
-    `by_operator` groups by operator to ask about tolerance, and the arithmetic is identical.
-    """
-    per = {}
-    for name, (shape, y, raw_b) in items_b.items():
-        key = key_of(name)
-        n, diff, rel = per.get(key, (0, 0, 0.0))
-        shape_a, x, raw_a = items_a[name]
-        assert shape_a == shape, f"{name}: shape {shape_a} vs {shape}"
-        scale = max((abs(v) for v in y if math.isfinite(v)), default=0.0) or 1e-30
-        # Non-finite pairs are skipped rather than folded: python's `max` silently discards a NaN
-        # unless it comes first, which would read as agreement.
-        d = max(
-            (abs(p - q) for p, q in zip(x, y) if math.isfinite(p) and math.isfinite(q)),
-            default=0.0,
-        )
-        per[key] = (n + 1, diff + int(raw_a != raw_b), max(rel, d / scale))
-    return per
-
-
-def _both_sections(a_path, b_path):
-    """Load two goldens and refuse a tensor-set mismatch, which is a harness bug either way."""
-    ma, fa, ia = read_golden(a_path)
-    mb, fb, ib = read_golden(b_path)
-    if set(fa) != set(fb) or set(ia) != set(ib):
-        only = (set(fa) ^ set(fb)) | (set(ia) ^ set(ib))
-        raise SystemExit(
-            f"{a_path} and {b_path} capture different tensors ({len(only)} on one side only, "
-            f"e.g. {sorted(only)[:3]}) -- the harness is wrong, not the reference",
-        )
-    return (ma, mb), ((fa, fb), (ia, ib))
-
-
-def by_operator(a_path, b_path):
-    """Per-OPERATOR agreement between two goldens -- the shape a tolerance has to be stated in.
-
-    Two uses, and the tolerance table needs both: `fp32 vs fp64` gives the floor an independent
-    correct implementation cannot beat, and `None vs <defect>` gives the signal a tolerance has to
-    stay under. `anchor.md`'s table is these two numbers per operator.
-    """
-    (ma, mb), sections = _both_sections(a_path, b_path)
-    kda = _kda_zero_based(json.loads(ma["tiny_config"]))
-    per = {}
-    for items_a, items_b in sections:
-        for k, v in _score(items_a, items_b, lambda n: operator_of(n, kda)).items():
-            n, diff, rel = per.get(k, (0, 0, 0.0))
-            per[k] = (n + v[0], diff + v[1], max(rel, v[2]))
-    print(f"# {mb.get('defect')}/{mb.get('dtype')} vs {ma.get('defect')}/{ma.get('dtype')}")
-    print("operator\ttensors\tdiffering\tmax_rel")
-    for k in sorted(per):
-        n, diff, rel = per[k]
-        print(f"{k}\t{n}\t{diff}\t{rel:.3e}")
-
 
 # Every fla module in the KDA path, by class name so this file need not import fla. All three are
 # triton-backed and all three refuse fp64 — `ShortConvolution` and `FusedRMSNormGated` as much as
@@ -899,103 +435,6 @@ def kda_equiv(model, mdl_mod, ctx, seq, device, vocab):
     print("layer\tmax_rel")
     for layer, rel in rows[:6]:
         print(f"{layer}\t{rel:.3e}")
-
-
-def _kda_zero_based(cfg):
-    """`kda_layers` is 1-based on disk (`is_kda_layer` tests `layer_idx + 1`)."""
-    return {i - 1 for i in cfg["linear_attn_config"]["kda_layers"]}
-
-
-def compare(a_path, b_path):
-    """Score one defect run against the `None` golden, per captured layer, and GATE it.
-
-    Reported per LAYER rather than per tensor because that is what G1b asks about, and 800 tensor
-    lines cannot be read. Two things are asserted, which together are `k3-port.md` §G rule 1:
-
-      * the defect changed SOMETHING -- a defect that reddens nothing is not a defect;
-      * every layer in `EXPECT_GREEN[defect]` is BIT-IDENTICAL. Only upstream layers can be
-        there, since one forward pass propagates everything downstream.
-
-    The two tensor SETS must match exactly. They are a property of the config and the capture
-    list, never of the numbers -- so a mismatch is a broken harness, not a defect finding, and it
-    aborts. That distinction was measured into existence: while routed experts were captured
-    individually, four of five defects reported `inf` for most layers because a moved routing
-    fires a different set of expert modules.
-    """
-    (ma, mb), sections = _both_sections(a_path, b_path)
-    per = {}
-    layer_of = lambda n: n.split(".")[2] if n.startswith("model.layers.") else "model"  # noqa: E731
-    for items_a, items_b in sections:
-        for k, v in _score(items_a, items_b, layer_of).items():
-            n, diff, rel = per.get(k, (0, 0, 0.0))
-            per[k] = (n + v[0], diff + v[1], max(rel, v[2]))
-    defect = mb.get("defect")
-    print(f"# {defect} vs {ma.get('defect')}  mode={ma.get('mode')}")
-    print("layer\ttensors\tdiffering\tmax_rel")
-    for layer in sorted(per, key=lambda k: (k == "model", int(k) if k.isdigit() else 0)):
-        n, diff, rel = per[layer]
-        print(f"{layer}\t{n}\t{diff}\t{rel:.3e}")
-
-    if defect == ma.get("defect"):
-        return
-    if defect not in EXPECT_GREEN:
-        raise SystemExit(f"--defect {defect} has no EXPECT_GREEN entry; add one, even if empty")
-    if not any(diff for _, diff, _ in per.values()):
-        raise SystemExit(f"--defect {defect} changed NOTHING; that is not a defect run")
-
-    # A declared-green layer that was never CAPTURED used to score as green, because
-    # `per.get(layer, (0, 0, 0))[1]` reads an absent layer as zero differing tensors. The
-    # localisation claim would then rest on an empty set: drop a layer from CAPTURE_LAYERS, or name a
-    # layer outside it in EXPECT_GREEN, and the matrix prints, finds nothing reddened, and exits 0.
-    # Found by review 2026-08-11.
-    green = list(map(str, EXPECT_GREEN[defect]))
-    absent = [layer for layer in green if layer not in per]
-    if absent:
-        raise SystemExit(
-            f"--defect {defect} declares layer(s) {absent} green, but nothing captured them -- "
-            f"captured: {sorted(per)}. An uncaptured layer is not evidence of localisation.",
-        )
-    reddened = [layer for layer in green if per[layer][1]]
-    if reddened:
-        raise SystemExit(
-            f"--defect {defect} reddened layer(s) {reddened}, which are upstream of it and must "
-            f"stay bit-identical -- the localisation this golden claims is gone",
-        )
-
-    # And the POSITIVE half, which was only "something, somewhere, differs". EXPECT_GREEN encodes a
-    # boundary, so the first captured layer PAST it must actually redden -- otherwise a perturbation
-    # that missed its operator and only disturbed something downstream reads as a localised,
-    # detected defect while the arithmetic the cell prices was never exercised.
-    # Numeric keys only: `per` also holds "model" for the model-level fold, and sorting the whole
-    # key set by `int` raises on it. This arm had never executed when it was written -- every
-    # exercise of the comparator tripped an earlier gate first -- which is how the crash was found.
-    downstream = [
-        layer for layer in sorted((k for k in per if k.isdigit()), key=int) if layer not in green
-    ]
-    if downstream and not per[downstream[0]][1]:
-        raise SystemExit(
-            f"--defect {defect} left layer {downstream[0]} bit-identical, the first captured layer "
-            f"it does NOT declare green -- so whatever it changed, it was not this operator here. "
-            f"Either the perturbation missed, or EXPECT_GREEN names the wrong boundary.",
-        )
-
-
-def write_golden(path, meta, cap):
-    out = bytearray(MAGIC)
-    out += _u64(len(meta))
-    for k, v in meta:
-        out += _s(k) + _s(v)
-    for items, fmt in ((cap.floats, "<f"), (cap.ints, "<q")):
-        out += _u64(len(items))
-        for name, shape, vals in items:
-            out += _s(name) + _u64(len(shape))
-            for d in shape:
-                out += _u64(d)
-            out += _u64(len(vals))
-            for x in vals:
-                out += struct.pack(fmt, x)
-    pathlib.Path(path).write_bytes(bytes(out))
-    return len(out)
 
 
 # ---------------------------------------------------------------------------------------------

@@ -15,20 +15,29 @@ where it declares green, with green sets scoped to t0 because a defect that shif
 argmax contaminates every later step through the token it feeds back). The machinery is
 re-stated rather than imported: this file must stay runnable with only the venv on the
 path, and the glimmer driver's machinery carries glimmer-specific assertions.
+
+**SPLIT 2026-08-15** under the 800-line-per-file cap: the container, the scorers and the
+floors moved to `glm_anchor_lib.py` beside this file and are re-exported below, so the
+import surface is unchanged. "Re-stated rather than imported" above still holds and is
+still about the GLIMMER driver — the sibling is a GLM-only extraction of THIS file, not
+shared machinery, and it is why the split does not reintroduce the coupling that paragraph
+refuses.
 """
 
 import argparse
 import hashlib
 import json
-import pathlib
-import math
-import struct
-import sys
 
 import torch
 import torch.nn.functional as F
 
-MAGIC = b"RIVGMGLD"  # GLM golden; RIVGLGLD is Muse Glimmer's, RIVK3GLD Kimi-K3's.
+# `glm_anchor_driver` stays the ONE import surface after the split: glm-anchor.sh pulls
+# `DEFECTS` and `preflight_env` from here, `docs/measurement/glm-reference/anchor.md` and
+# `glm_anchor.rs` name only this file, and every name the container half used to define
+# must still resolve here. A wildcard says exactly that, and it is placed above every
+# definition below so this file's own names always win.
+from glm_anchor_lib import *  # noqa: F401,F403
+from glm_anchor_lib import _s, _u64  # noqa: F401 — underscored, so `import *` skips them
 
 # 12 > index_topk (4), so the DSA selection is REAL from mid-prompt on — the old tree's
 # lesson that a dsa run shorter than index_topk exercises only the dense fast path.
@@ -82,30 +91,8 @@ def tiny_config(C):
 
 
 # ---------------------------------------------------------------------------------------------
-# Capture container + deterministic weights (the glimmer driver's discipline restated).
-
-
-class Capture:
-    """Named tensors on their way past, in emission order; floats and ints kept apart."""
-
-    def __init__(self):
-        self.floats = []
-        self.ints = []
-        self.seen = set()
-
-    def add(self, name, tensor):
-        if name in self.seen:
-            raise AssertionError(f"capture {name!r} written twice; names must be unique")
-        self.seen.add(name)
-        t = tensor.detach().to(torch.float32).contiguous()
-        self.floats.append((name, list(t.shape), t.flatten().tolist()))
-
-    def add_ints(self, name, values):
-        if name in self.seen:
-            raise AssertionError(f"capture {name!r} written twice; names must be unique")
-        self.seen.add(name)
-        vals = [int(v) for v in values]
-        self.ints.append((name, [len(vals)], vals))
+# Deterministic weights (the glimmer driver's discipline restated; the Capture container
+# they feed is `glm_anchor_lib.Capture`).
 
 
 def _gen(name, salt):
@@ -197,11 +184,8 @@ def _norm_hook(cap, taps, what):
     return fn
 
 
-def install_taps(mdl, model, taps):
-    cap = taps.cap
-    layers = model.model.layers
-
-    # 1. Layer identity + per-layer attention I/O, published by wrapping Attention.forward.
+def _tap_attention(mdl, cap, taps):
+    """1. Layer identity + per-layer attention I/O, published by wrapping Attention.forward."""
     orig_attn = mdl.GlmMoeDsaAttention.forward
 
     def attn_forward(self, *a, **kw):
@@ -221,8 +205,10 @@ def install_taps(mdl, model, taps):
 
     taps.patch(mdl.GlmMoeDsaAttention, "forward", attn_forward)
 
-    # 2. The indexer boundary — sets the flag that disambiguates the TWO interleaved-rope
-    # calls a full layer makes (attention's and the indexer's own).
+
+def _tap_indexer(mdl, taps):
+    """2. The indexer boundary — sets the flag that disambiguates the TWO interleaved-rope
+    calls a full layer makes (attention's and the indexer's own)."""
     orig_idx = mdl.GlmMoeDsaIndexer.forward
 
     def idx_forward(self, *a, **kw):
@@ -234,7 +220,9 @@ def install_taps(mdl, model, taps):
 
     taps.patch(mdl.GlmMoeDsaIndexer, "forward", idx_forward)
 
-    # 3. Interleaved RoPE — the stated difference from DeepSeek-V3.2's half-split form.
+
+def _tap_rope(mdl, cap, taps):
+    """3. Interleaved RoPE — the stated difference from DeepSeek-V3.2's half-split form."""
     orig_rope = mdl.apply_rotary_pos_emb_interleave
 
     def rope_tap(q, k, cos, sin, *a, **kw):
@@ -248,8 +236,10 @@ def install_taps(mdl, model, taps):
 
     taps.patch(mdl, "apply_rotary_pos_emb_interleave", rope_tap)
 
-    # 4. The eager attend — inputs and outputs of the one matmul chain, so a broadcast
-    # defect and a projection defect stop looking identical one tensor later.
+
+def _tap_eager(mdl, cap, taps):
+    """4. The eager attend — inputs and outputs of the one matmul chain, so a broadcast
+    defect and a projection defect stop looking identical one tensor later."""
     orig_eager = mdl.eager_attention_forward
 
     def eager_tap(module, query, key, value, attention_mask, scaling, **kw):
@@ -266,7 +256,9 @@ def install_taps(mdl, model, taps):
 
     taps.patch(mdl, "eager_attention_forward", eager_tap)
 
-    # 5. The router — logits, weights, chosen experts, on every sparse layer.
+
+def _tap_router(mdl, cap, taps):
+    """5. The router — logits, weights, chosen experts, on every sparse layer."""
     orig_router = mdl.GlmMoeDsaTopkRouter.forward
 
     def router_tap(self, hidden_states):
@@ -280,8 +272,22 @@ def install_taps(mdl, model, taps):
 
     taps.patch(mdl.GlmMoeDsaTopkRouter, "forward", router_tap)
 
-    # 6. Module hooks — fire around whatever forward currently is (the glimmer lesson:
-    # a patched class method deletes its own evidence when a defect patches the same slot).
+
+def _mlp_hooks(layer, cap, taps):
+    """A sparse layer publishes the MoE sum AND both summands, so a defect in the shared
+    expert and a defect in the routed half stop having to be told apart by differencing."""
+    if type(layer.mlp).__name__ != "GlmMoeDsaMoE":
+        return [layer.mlp.register_forward_hook(_norm_hook(cap, taps, "mlp.out"))]
+    return [
+        layer.mlp.register_forward_hook(_norm_hook(cap, taps, "moe.out")),
+        layer.mlp.shared_experts.register_forward_hook(_norm_hook(cap, taps, "shared.out")),
+        layer.mlp.experts.register_forward_hook(_norm_hook(cap, taps, "experts.out")),
+    ]
+
+
+def _tap_layers(layers, cap, taps):
+    """6. Module hooks — fire around whatever forward currently is (the glimmer lesson:
+    a patched class method deletes its own evidence when a defect patches the same slot)."""
     handles = []
     for i, layer in enumerate(layers):
 
@@ -292,36 +298,27 @@ def install_taps(mdl, model, taps):
             return set_layer
 
         handles.append(layer.register_forward_pre_hook(with_layer(i)))
-        handles.append(
-            layer.input_layernorm.register_forward_hook(_norm_hook(cap, taps, "norm.in"))
-        )
+        handles.append(layer.input_layernorm.register_forward_hook(_norm_hook(cap, taps, "norm.in")))
         handles.append(
             layer.post_attention_layernorm.register_forward_hook(
                 _norm_hook(cap, taps, "norm.post_attn")
             )
         )
         attn = layer.self_attn
-        handles.append(
-            attn.q_a_layernorm.register_forward_hook(_norm_hook(cap, taps, "q_resid"))
-        )
-        handles.append(
-            attn.kv_a_layernorm.register_forward_hook(_norm_hook(cap, taps, "kv_latent"))
-        )
-        if type(layer.mlp).__name__ == "GlmMoeDsaMoE":
-            handles.append(
-                layer.mlp.register_forward_hook(_norm_hook(cap, taps, "moe.out"))
-            )
-            handles.append(
-                layer.mlp.shared_experts.register_forward_hook(
-                    _norm_hook(cap, taps, "shared.out")
-                )
-            )
-            handles.append(
-                layer.mlp.experts.register_forward_hook(_norm_hook(cap, taps, "experts.out"))
-            )
-        else:
-            handles.append(layer.mlp.register_forward_hook(_norm_hook(cap, taps, "mlp.out")))
+        handles.append(attn.q_a_layernorm.register_forward_hook(_norm_hook(cap, taps, "q_resid")))
+        handles.append(attn.kv_a_layernorm.register_forward_hook(_norm_hook(cap, taps, "kv_latent")))
+        handles += _mlp_hooks(layer, cap, taps)
     return handles
+
+
+def install_taps(mdl, model, taps):
+    cap = taps.cap
+    _tap_attention(mdl, cap, taps)
+    _tap_indexer(mdl, taps)
+    _tap_rope(mdl, cap, taps)
+    _tap_eager(mdl, cap, taps)
+    _tap_router(mdl, cap, taps)
+    return _tap_layers(model.model.layers, cap, taps)
 
 
 def _assert_taps_fired(taps, cfg, step):
@@ -612,226 +609,44 @@ def run(salt, defect, cap, dtype=torch.float32):
 
 
 # ---------------------------------------------------------------------------------------------
-# Container (byte-compatible with the glimmer container, distinct magic).
-
-
-def _u64(n):
-    return struct.pack("<Q", n)
-
-
-def _s(x):
-    b = x.encode()
-    return _u64(len(b)) + b
-
-
-def write_golden(path, meta, cap):
-    out = bytearray(MAGIC)
-    out += _u64(len(meta))
-    for k, v in meta:
-        out += _s(k) + _s(v)
-    for items, fmt in ((cap.floats, "<f"), (cap.ints, "<q")):
-        out += _u64(len(items))
-        for name, shape, vals in items:
-            out += _s(name) + _u64(len(shape))
-            for d in shape:
-                out += _u64(d)
-            out += _u64(len(vals))
-            for x in vals:
-                out += struct.pack(fmt, x)
-    pathlib.Path(path).write_bytes(bytes(out))
-    return len(out)
-
-
-def read_golden(path):
-    buf = pathlib.Path(path).read_bytes()
-    if buf[:8] != MAGIC:
-        raise ValueError(f"{path}: not a GLM golden (magic {buf[:8]!r})")
-    off = 8
-
-    def u64():
-        nonlocal off
-        v = struct.unpack_from("<Q", buf, off)[0]
-        off += 8
-        return v
-
-    def s():
-        nonlocal off
-        n = u64()
-        v = buf[off : off + n].decode()
-        off += n
-        return v
-
-    meta = {}
-    for _ in range(u64()):
-        k = s()
-        meta[k] = s()
-    tensors = {}
-    for fmt, size in (("<f", 4), ("<q", 8)):
-        for _ in range(u64()):
-            name = s()
-            shape = [u64() for _ in range(u64())]
-            n = u64()
-            vals = list(struct.unpack_from(f"<{n}{fmt[1]}", buf, off))
-            off += n * size
-            tensors[name] = (shape, vals)
-    return meta, tensors
-
-
-def environment():
-    import transformers
-
-    return [
-        ("python", sys.version.split()[0]),
-        ("torch", torch.__version__),
-        ("transformers", transformers.__version__),
-    ]
-
-
-def preflight_env(vendored):
-    """Refuse to run against a drifted environment, reading the pin OUT OF the vendored
-    golden rather than restating it here."""
-    meta, _ = read_golden(vendored)
-    drift = [
-        f"{k}: venv {v} != vendored {meta[k]}"
-        for k, v in environment()
-        if k in meta and meta[k] != v
-    ]
-    if drift:
-        raise SystemExit(
-            "environment drift against the vendored golden:\n  " + "\n  ".join(drift)
-        )
+# The two scorers, bound to what only this file owns. `glm_anchor_lib` must not import back
+# (the defect matrix and the run function live here), so the knot is tied in these two
+# lines rather than at the import — and the CLI-facing names and arities are unchanged.
 
 
 def compare(a_path, b_path):
     """Score two goldens and ASSERT the perturbed one's declared green set — both halves:
     something moved AND everything declared green held bit-identical."""
-    meta_a, ta = read_golden(a_path)
-    meta_b, tb = read_golden(b_path)
-    defect = meta_b.get("defect", "None")
-    if meta_a.get("defect", "None") != "None":
-        raise SystemExit(f"{a_path} is itself a defect run; A must be None")
-    _fn, green, extra_ok = DEFECTS[defect]
-    only_a, only_b = sorted(set(ta) - set(tb)), sorted(set(tb) - set(ta))
-    if only_a or (only_b and not extra_ok):
-        raise SystemExit(
-            f"tensor sets differ: only in A {only_a[:5]}, only in B {only_b[:5]}"
-            + ("" if extra_ok else "\n(the defect does not declare extra_ok)")
-        )
-    if extra_ok and not only_b:
-        raise SystemExit(f"defect {defect!r} declares extra_ok but produced no extra captures")
-
-    def is_green(name):
-        return any(g in name for g in green)
-
-    moved, held, violations = [], [], []
-    for name, (shape_a, va) in sorted(ta.items()):
-        if name not in tb:
-            continue
-        shape_b, vb = tb[name]
-        # Shape first: zip() silently truncates, so a length change under a defect would
-        # be scored only over the overlap and a divergent tail would read as held.
-        if shape_a != shape_b or len(va) != len(vb):
-            moved.append(name)
-            if is_green(name):
-                violations.append(f"{name}: declared green, SHAPE moved {shape_a}->{shape_b}")
-            continue
-        # NaN is not order-comparable, so max() DROPS it after the first element — the
-        # repo's own false-green class (`f32::max ignores NaN`). Any non-finite on either
-        # side is a divergence by definition; the clean side must be finite for the whole
-        # comparison to mean anything.
-        import math
-        if any(not math.isfinite(x) for x in va):
-            raise SystemExit(f"{a_path}: {name} carries a non-finite value in the CLEAN run")
-        if any(not math.isfinite(y) for y in vb):
-            d = float("inf")
-        else:
-            d = max((abs(x - y) for x, y in zip(va, vb)), default=0.0)
-        (moved if d > 0 else held).append(name)
-        if is_green(name) and d > 0:
-            violations.append(f"{name}: declared green, moved by {d:.3e}")
-    print(f"defect {defect!r}: {len(moved)} captures moved, {len(held)} held")
-    if not moved:
-        raise SystemExit(f"defect {defect!r} moved NOTHING — it is not a defect, or it did not apply")
-    if green and not any(is_green(n) for n in held):
-        raise SystemExit(f"defect {defect!r} declares green captures but none of them held")
-    if violations:
-        raise SystemExit(
-            f"{len(violations)} declared-green captures moved:\n  " + "\n  ".join(violations)
-        )
-    print(
-        f"  {sum(is_green(n) for n in held)} declared-green captures held"
-        if green
-        else "  (no green set)"
-    )
-
-
-def bucket_of(name):
-    """The operator bucket a capture belongs to — the granularity tolerances are keyed at."""
-    for tag in ("router.", "experts.out", "shared.out", "moe.out", "mlp.out", "attend.",
-                "q_resid", "kv_latent", "norm.", "logits", "attn.out",
-                ".index.q.post_rope", ".index.k.post_rope", ".attn.q.post_rope", ".attn.k.post_rope"):
-        if tag in name:
-            return {".index.q.post_rope": "rope_index", ".index.k.post_rope": "rope_index",
-                    ".attn.q.post_rope": "rope_attn", ".attn.k.post_rope": "rope_attn",
-                    "router.": "router", "experts.out": "moe", "shared.out": "moe",
-                    "moe.out": "moe", "mlp.out": "dense_mlp", "attend.": "attend",
-                    "q_resid": "lora_norm", "kv_latent": "lora_norm", "norm.": "norm",
-                    "logits": "logits", "attn.out": "attn_out"}[tag]
-    return "other"
+    return score_goldens(a_path, b_path, DEFECTS)
 
 
 def floors(vendored_path, salt):
-    """The fp32 rounding floor per operator bucket: the same reference at float64 against
-    the vendored fp32 golden. A tolerance for a kernel is chosen ABOVE its operator's
-    floor and BELOW its weakest targeting defect; a floor from one draw is half a
-    measurement (glimmer's attend floor differed 2.1x between draws), so run this at both
-    salts and take the worse."""
-    meta, ref = read_golden(vendored_path)
-    if meta.get("defect", "None") != "None":
-        raise SystemExit("floors must be measured against a CLEAN golden")
-    if meta.get("salt") != salt:
-        raise SystemExit(f"golden is salt {meta.get('salt')!r}, asked for {salt!r}")
-    cap = Capture()
-    run(salt, "None", cap, dtype=torch.float64)
-    by_bucket = {}
-    compared = 0
-    for name, shape, vals in cap.floats:
-        if name not in ref:
-            raise SystemExit(f"{name}: captured at f64 but absent from the golden")
-        rv = ref[name][1]
-        if len(rv) != len(vals):
-            raise SystemExit(f"{name}: length changed between dtypes")
-        d = 0.0
-        for x, y in zip(vals, rv):
-            if "mask" in name:
-                # The mask's sentinel is torch.finfo(dtype).min — dtype-dependent BY
-                # CONSTRUCTION (-3.4e38 at f32; -inf once the f64 sentinel is cast to
-                # f32 for capture). Selection is discrete, so what must agree across
-                # dtypes is the masked/kept CLASS of each position, never the sentinel:
-                # a floor for a mask would be a category error.
-                masked_x, masked_y = x < -1e30, y < -1e30
-                if masked_x != masked_y:
-                    raise SystemExit(f"{name}: the f64 run SELECTED differently ({x} vs {y})")
-                if not masked_x:
-                    d = max(d, abs(x - y))
-                continue
-            if not (math.isfinite(x) and math.isfinite(y)):
-                raise SystemExit(
-                    f"{name}: non-finite value in the floor comparison ({x} vs {y})"
-                )
-            d = max(d, abs(x - y))
-        b = bucket_of(name)
-        by_bucket[b] = max(by_bucket.get(b, 0.0), d)
-        compared += 1
-    if compared < 500:
-        raise SystemExit(f"only {compared} captures compared — the f64 run is incomplete")
-    print(f"fp32 floors at salt {salt} over {compared} captures:")
-    for b in sorted(by_bucket):
-        print(f"  {b:12s} {by_bucket[b]:.3e}")
-    return by_bucket
+    """The fp32 rounding floor per operator bucket, measured by re-running THIS driver at
+    float64 against the vendored fp32 golden."""
+    return measure_floors(vendored_path, salt, run)
 
 
-def main():
+def _config_meta(cfg):
+    return json.dumps({
+        "vocab_size": cfg.vocab_size, "hidden_size": cfg.hidden_size,
+        "intermediate_size": cfg.intermediate_size,
+        "moe_intermediate_size": cfg.moe_intermediate_size,
+        "num_hidden_layers": cfg.num_hidden_layers,
+        "num_attention_heads": cfg.num_attention_heads,
+        "n_routed_experts": cfg.n_routed_experts,
+        "num_experts_per_tok": cfg.num_experts_per_tok,
+        "kv_lora_rank": cfg.kv_lora_rank, "q_lora_rank": cfg.q_lora_rank,
+        "qk_rope_head_dim": cfg.qk_rope_head_dim,
+        "qk_nope_head_dim": cfg.qk_nope_head_dim, "v_head_dim": cfg.v_head_dim,
+        "first_k_dense_replace": cfg.first_k_dense_replace,
+        "index_topk": cfg.index_topk, "index_head_dim": cfg.index_head_dim,
+        "index_n_heads": cfg.index_n_heads,
+        "routed_scaling_factor": cfg.routed_scaling_factor,
+        "rms_norm_eps": cfg.rms_norm_eps,
+    })
+
+
+def _parse_args():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--salt", default="glm-anchor-1")
     ap.add_argument("--defect", default="None", choices=sorted(DEFECTS))
@@ -840,14 +655,10 @@ def main():
     ap.add_argument("--floors", metavar="VENDORED", help="measure fp32 floors against a clean golden")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--preflight-against", metavar="GOLDEN")
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    if args.compare:
-        compare(*args.compare)
-        return
-    if args.floors:
-        floors(args.floors, args.salt)
-        return
+
+def _emit(args):
     if args.preflight_against and not args.no_preflight:
         preflight_env(args.preflight_against)
     if not args.out:
@@ -860,28 +671,22 @@ def main():
         ("salt", args.salt),
         ("defect", args.defect),
         ("defect_note", note or ""),
-        ("config", json.dumps({
-            "vocab_size": cfg.vocab_size, "hidden_size": cfg.hidden_size,
-            "intermediate_size": cfg.intermediate_size,
-            "moe_intermediate_size": cfg.moe_intermediate_size,
-            "num_hidden_layers": cfg.num_hidden_layers,
-            "num_attention_heads": cfg.num_attention_heads,
-            "n_routed_experts": cfg.n_routed_experts,
-            "num_experts_per_tok": cfg.num_experts_per_tok,
-            "kv_lora_rank": cfg.kv_lora_rank, "q_lora_rank": cfg.q_lora_rank,
-            "qk_rope_head_dim": cfg.qk_rope_head_dim,
-            "qk_nope_head_dim": cfg.qk_nope_head_dim, "v_head_dim": cfg.v_head_dim,
-            "first_k_dense_replace": cfg.first_k_dense_replace,
-            "index_topk": cfg.index_topk, "index_head_dim": cfg.index_head_dim,
-            "index_n_heads": cfg.index_n_heads,
-            "routed_scaling_factor": cfg.routed_scaling_factor,
-            "rms_norm_eps": cfg.rms_norm_eps,
-        })),
+        ("config", _config_meta(cfg)),
         ("prompt_len", str(PROMPT_LEN)),
         ("decode_steps", str(DECODE_STEPS)),
     ] + environment()
     n = write_golden(args.out, meta, cap)
     print(f"wrote {args.out}: {n} bytes, {len(cap.floats)} float + {len(cap.ints)} int tensors")
+
+
+def main():
+    args = _parse_args()
+    if args.compare:
+        compare(*args.compare)
+    elif args.floors:
+        floors(args.floors, args.salt)
+    else:
+        _emit(args)
 
 
 if __name__ == "__main__":
