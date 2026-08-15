@@ -43,6 +43,7 @@
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
 
+use rivoli_artifact::quant::{Fp8W, RowScaledW};
 use rivoli_oracles::v4oracle::numerics::{bf16_decode, bf16_encode};
 
 // (`walk` stayed with its consumers — the cli crate's registry meta-gates own the one
@@ -495,7 +496,7 @@ pub fn gemv_fp8_case(
     let scale = block_scales(r, n_scales);
     let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
     let mut want = vec![0.0f32; o_dim];
-    rivoli_artifact::quant::matvec_fp8(&mut want, &x, &packed, &scale, i_dim, block);
+    rivoli_artifact::quant::matvec_fp8(&mut want, &x, Fp8W::new(&packed, &scale, block), i_dim);
     (packed, scale, x, want)
 }
 
@@ -519,7 +520,7 @@ pub fn i8_weights(r: &mut Lcg, o_dim: usize, i_dim: usize) -> (Vec<u8>, Vec<f32>
 /// weights differently and share only this step.
 pub fn want_i8(x: &[f32], packed: &[u8], scale: &[f32], o_dim: usize, i_dim: usize) -> Vec<f32> {
     let mut want = vec![0.0f32; o_dim];
-    rivoli_artifact::quant::matvec_i8(&mut want, x, packed, scale, o_dim, i_dim);
+    rivoli_artifact::quant::matvec_i8(&mut want, x, RowScaledW::new(packed, scale), [o_dim, i_dim]);
     want
 }
 

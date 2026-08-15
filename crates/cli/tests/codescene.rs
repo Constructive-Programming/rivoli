@@ -185,12 +185,16 @@ fn every_workspace_rust_file_scores_ten() {
                 failures.push(format!("{rel}: score {s}"));
             }
             Cs::NoScorableCode => {
-                // A stub is fine; a real file scoring null means cs skipped something big.
-                let lines = body.iter().filter(|&&b| b == b'\n').count();
+                // cs scores FUNCTIONS; a file with none (pure data: repr(C) mirrors,
+                // consts, module docs) legitimately scores null at any length — the
+                // first licensed run refused 79-line abi.rs on a line-count rule, which
+                // was the wrong classifier (2026-08-15). Vacuity is null WITH functions
+                // present: that means the reviewer skipped real code.
+                let fns = String::from_utf8_lossy(&body).matches("fn ").count();
                 assert!(
-                    lines < 60,
-                    "{rel}: cs found no scorable code in a {lines}-line file — the \
-                     reviewer is skipping real code, which is vacuity, not health"
+                    fns == 0,
+                    "{rel}: cs found no scorable code but the file declares {fns} fn(s) — \
+                     the reviewer is skipping real code, which is vacuity, not health"
                 );
                 reviewed += 1;
                 cache.insert(rel, hash.into());

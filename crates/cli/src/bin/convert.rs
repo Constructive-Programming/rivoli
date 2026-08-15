@@ -15,7 +15,7 @@ use rivoli_artifact::format::{
     finish_artifact, write_expert_layer,
 };
 use rivoli_artifact::quant::{
-    ExpertProjs, FP8_BLOCK, PROJ, VQ_DIM, VQ_K, expert_base, expert_projs, learn_codebook,
+    ExpertProjs, FP8_BLOCK, PROJ, VQ_DIM, VQ_K, VqW, expert_base, expert_projs, learn_codebook,
     quant_vq, read_f32, sample_subvectors, vq_expert_bytes, vq_proj_bytes, vq_row_bytes,
     write_le_scales,
 };
@@ -658,13 +658,15 @@ mod tests {
             matvec_vq(
                 &mut yl,
                 &x,
-                proj.indices,
-                &ps,
-                &cbs[k],
-                proj.o_dim,
-                proj.i_dim,
+                VqW::new(proj.indices, &ps, &cbs[k]),
+                [proj.o_dim, proj.i_dim],
             );
-            matvec_vq(&mut yr, &x, indices, scales, &cbs[k], *o_dim, *i_dim);
+            matvec_vq(
+                &mut yr,
+                &x,
+                VqW::new(indices, scales, &cbs[k]),
+                [*o_dim, *i_dim],
+            );
             assert_eq!(yl, yr);
         }
         let _ = &mut cbs;

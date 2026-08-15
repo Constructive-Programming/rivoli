@@ -37,6 +37,57 @@ fn debug_check_gemv(y: &[f32], x: &[f32], o_dim: usize, i_dim: usize) {
 /// row scale — and both spelled out the same `zip(chunks_exact(i_dim))` accumulate. The
 /// int4 and VQ oracles do NOT use it: their rows are packed sub-byte, so `i_dim` is not
 /// their row stride.
+/// A packed matrix and its scales, viewed as ONE value — the `Weights` fix the old
+/// parameter-list jscpd exemption named as the honest one, paid for by CodeScene's
+/// arg-count rule (2026-08-15) exactly as that note predicted ("if that hop is ever paid
+/// for another reason"). Per-format structs rather than an enum: every oracle is
+/// format-specific, and the pairing makes "i4 scales beside an i8 array" unrepresentable.
+pub struct Fp8W<'a> {
+    pub packed: &'a [u8],
+    pub scale: &'a [f32],
+    pub block: usize,
+}
+
+pub struct VqW<'a> {
+    pub indices: &'a [u8],
+    pub scales: &'a [u16],
+    pub codebook: &'a [f32],
+}
+
+/// The row/group-scaled byte view `matvec_i4` and `matvec_i8` share: same bytes-and-
+/// scales SHAPE, different interpretation — which lives in each oracle, not here. One
+/// struct, because two twin field lists were themselves the clone jscpd flagged.
+pub struct RowScaledW<'a> {
+    pub packed: &'a [u8],
+    pub scale: &'a [f32],
+}
+
+impl<'a> Fp8W<'a> {
+    pub fn new(packed: &'a [u8], scale: &'a [f32], block: usize) -> Self {
+        Fp8W {
+            packed,
+            scale,
+            block,
+        }
+    }
+}
+
+impl<'a> VqW<'a> {
+    pub fn new(indices: &'a [u8], scales: &'a [u16], codebook: &'a [f32]) -> Self {
+        VqW {
+            indices,
+            scales,
+            codebook,
+        }
+    }
+}
+
+impl<'a> RowScaledW<'a> {
+    pub fn new(packed: &'a [u8], scale: &'a [f32]) -> Self {
+        RowScaledW { packed, scale }
+    }
+}
+
 fn matvec_bytes(y: &mut [f32], packed: &[u8], i_dim: usize, row_dot: impl Fn(usize, &[u8]) -> f32) {
     for (o, (yo, row)) in y.iter_mut().zip(packed.chunks_exact(i_dim)).enumerate() {
         *yo = row_dot(o, row);
@@ -47,14 +98,12 @@ fn matvec_bytes(y: &mut [f32], packed: &[u8], i_dim: usize, row_dot: impl Fn(usi
 /// oracle the HIP `gemv_fp8` kernel (attention/dense projections) is validated
 /// against. `scale` is the F32 `weight_scale_inv`, one value per `block × block`
 /// tile: `w[o,i] = e4m3(packed[o·i_dim+i]) · scale[(o/block)·sc_cols + i/block]`.
-pub fn matvec_fp8(
-    y: &mut [f32],
-    x: &[f32],
-    packed: &[u8],
-    scale: &[f32],
-    i_dim: usize,
-    block: usize,
-) {
+pub fn matvec_fp8(y: &mut [f32], x: &[f32], w: Fp8W<'_>, i_dim: usize) {
+    let Fp8W {
+        packed,
+        scale,
+        block,
+    } = w;
     debug_assert_eq!(x.len(), i_dim);
     let sc_cols = i_dim.div_ceil(block);
     matvec_bytes(y, packed, i_dim, |o, row| {
@@ -412,13 +461,13 @@ fn get_idx(row: &[u8], k: usize) -> usize {
 /// i/block]`. The DeepSeek/GLM fp8 convention (mirrors colibri's converter); the
 /// `_inv` name is historical — it is the dequant multiplier. Offline (converter)
 /// use only: this materializes `o_dim·i_dim` f32.
-pub fn dequant_fp8_block(
-    packed: &[u8],
-    scale: &[f32],
-    o_dim: usize,
-    i_dim: usize,
-    block: usize,
-) -> Vec<f32> {
+pub fn dequant_fp8_block(w: Fp8W<'_>, shape: [usize; 2]) -> Vec<f32> {
+    let Fp8W {
+        packed,
+        scale,
+        block,
+    } = w;
+    let [o_dim, i_dim] = shape;
     debug_assert_eq!(packed.len(), o_dim * i_dim);
     let sc_cols = i_dim.div_ceil(block);
     debug_assert_eq!(scale.len(), o_dim.div_ceil(block) * sc_cols);
@@ -479,33 +528,47 @@ pub fn quantize_fp8_block(
     let mut scale = vec![0f32; sc_rows * sc_cols];
     for ob in 0..sc_rows {
         for ib in 0..sc_cols {
-            let (o_end, i_end) = (((ob + 1) * block).min(o_dim), ((ib + 1) * block).min(i_dim));
-            let mut amax = 0f32;
-            for o in ob * block..o_end {
-                for i in ib * block..i_end {
-                    let v = w[o * i_dim + i];
-                    ensure!(
-                        v.is_finite(),
-                        "weight [{o}, {i}] is {v}, which e4m3 would encode as a plausible \
-                         finite byte (NaN -> 0x7f, +-inf -> saturated +-448)"
-                    );
-                    amax = amax.max(v.abs());
-                }
-            }
-            let s = if amax == 0.0 {
-                1.0
-            } else {
-                amax / rivoli_core::num::E4M3_MAX
-            };
+            let os = ob * block..((ob + 1) * block).min(o_dim);
+            let is_ = ib * block..((ib + 1) * block).min(i_dim);
+            let s = block_amax_scale(w, i_dim, os.clone(), is_.clone())?;
             scale[ob * sc_cols + ib] = s;
-            for o in ob * block..o_end {
-                for i in ib * block..i_end {
+            for o in os {
+                for i in is_.clone() {
                     packed[o * i_dim + i] = rivoli_core::num::f32_to_e4m3(w[o * i_dim + i] / s);
                 }
             }
         }
     }
     Ok((packed, scale))
+}
+
+/// One block's e4m3 scale: amax over the block divided by the format max, with the
+/// finiteness refusal (NaN would encode as a plausible 0x7f, ±inf saturates to ±448 —
+/// silent both ways, so the refusal happens here, before any byte is written).
+fn block_amax_scale(
+    w: &[f32],
+    i_dim: usize,
+    os: std::ops::Range<usize>,
+    is_: std::ops::Range<usize>,
+) -> anyhow::Result<f32> {
+    use anyhow::ensure;
+    let mut amax = 0f32;
+    for o in os {
+        for i in is_.clone() {
+            let v = w[o * i_dim + i];
+            ensure!(
+                v.is_finite(),
+                "weight [{o}, {i}] is {v}, which e4m3 would encode as a plausible \
+                 finite byte (NaN -> 0x7f, +-inf -> saturated +-448)"
+            );
+            amax = amax.max(v.abs());
+        }
+    }
+    Ok(if amax == 0.0 {
+        1.0
+    } else {
+        amax / rivoli_core::num::E4M3_MAX
+    })
 }
 
 /// The closed-form group refit: least-squares `s = Σ w·c / Σ c·c` over the codebook
@@ -572,23 +635,26 @@ pub fn quant_vq(w: &[f32], o_dim: usize, i_dim: usize, codebook: &[f32]) -> (Vec
             idxs[t] = nearest(&sub);
         }
     };
+    // Per group: assign under the amax scale, refit in closed form, re-assign under the
+    // refitted scale; a degenerate fit keeps the amax pass.
+    let encode_group = |seg: &[f32]| -> (u16, [u16; SUBS]) {
+        let amax = seg.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let mut sb = f32_to_bf16(if amax > 0.0 { amax } else { 1.0 });
+        let mut idxs = [0u16; SUBS];
+        assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
+        if let Some(refit) = vq_refit(seg, &idxs, codebook)
+            && refit != sb
+        {
+            sb = refit;
+            assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
+        }
+        (sb, idxs)
+    };
     for o in 0..o_dim {
         let wr = &w[o * i_dim..(o + 1) * i_dim];
         let ir = &mut indices[o * rb..(o + 1) * rb];
         for grp in 0..ngroups {
-            let seg = &wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP];
-            let amax = seg.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-            let mut sb = f32_to_bf16(if amax > 0.0 { amax } else { 1.0 });
-            let mut idxs = [0u16; SUBS];
-            assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
-            // Refit against the chosen entries, then re-assign under the new scale.
-            // A degenerate fit keeps the amax scale and the first assignment.
-            if let Some(refit) = vq_refit(seg, &idxs, codebook)
-                && refit != sb
-            {
-                sb = refit;
-                assign(seg, 1.0 / bf16_to_f32(sb), &mut idxs);
-            }
+            let (sb, idxs) = encode_group(&wr[grp * VQ_GROUP..(grp + 1) * VQ_GROUP]);
             scales[o * ngroups + grp] = sb;
             for (t, &ix) in idxs.iter().enumerate() {
                 set_idx(ir, grp * SUBS + t, ix);
@@ -602,15 +668,13 @@ pub fn quant_vq(w: &[f32], o_dim: usize, i_dim: usize, codebook: &[f32]) -> (Vec
 /// codebook[idx(o,subvec)] · x[subvec]`. The scalar reference the HIP VQ kernel (M3)
 /// is validated against. Codebook entries and group scales decoded inline; no
 /// per-expert f32 materialization.
-pub fn matvec_vq(
-    y: &mut [f32],
-    x: &[f32],
-    indices: &[u8],
-    scales: &[u16],
-    codebook: &[f32],
-    o_dim: usize,
-    i_dim: usize,
-) {
+pub fn matvec_vq(y: &mut [f32], x: &[f32], w: VqW<'_>, shape: [usize; 2]) {
+    let VqW {
+        indices,
+        scales,
+        codebook,
+    } = w;
+    let [o_dim, i_dim] = shape;
     let ngroups = i_dim / VQ_GROUP;
     let nsub = i_dim / VQ_DIM;
     let rb = vq_row_bytes(i_dim);
@@ -691,7 +755,36 @@ pub fn learn_codebook(sample: &[f32], max_iters: usize) -> Vec<f32> {
 pub fn learn_codebook_k(sample: &[f32], max_iters: usize, k: usize) -> Vec<f32> {
     let n = sample.len() / VQ_DIM;
     assert!(n >= k, "sample {n} < k {k}");
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
+    let mut c = kmeans_pp_seed(sample, n, k);
+    let mut prev = f64::INFINITY;
+    for _ in 0..max_iters {
+        let (sum, cnt, dist) = assign_all(sample, n, &c, k);
+        for j in 0..k {
+            if cnt[j] > 0 {
+                for d in 0..VQ_DIM {
+                    c[j * VQ_DIM + d] = sum[j * VQ_DIM + d] / cnt[j] as f32;
+                }
+            }
+        }
+        if ((prev - dist) / dist.max(f64::MIN_POSITIVE)).abs() < 1e-4 {
+            break;
+        }
+        prev = dist;
+    }
+    c
+}
+
+/// Squared L2 between one subvector and one centroid — the inner product every phase of
+/// the k-means shares. One owner so the seeding's distance and the assignment's distance
+/// cannot drift (they were two inline copies before the 2026-08-15 decomposition).
+fn sqdist(v: &[f32], c: &[f32]) -> f32 {
+    v.iter().zip(c).map(|(&x, &y)| (x - y) * (x - y)).sum()
+}
+
+/// k-means++ seeding: each next centroid drawn proportionally to squared distance from
+/// the nearest already-chosen one. Deterministic xorshift, so conversion stays
+/// byte-stable across runs (the round-trip gate's whole claim).
+fn kmeans_pp_seed(sample: &[f32], n: usize, k: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; k * VQ_DIM];
     let mut rng = 0x2545_F491_4F6C_DD1Du64;
     let mut next = move || {
@@ -715,72 +808,72 @@ pub fn learn_codebook_k(sample: &[f32], max_iters: usize, k: usize) -> Vec<f32> 
         let seed = &sample[pick * VQ_DIM..(pick + 1) * VQ_DIM];
         c[j * VQ_DIM..(j + 1) * VQ_DIM].copy_from_slice(seed);
         for (i, md) in mind.iter_mut().enumerate() {
-            let v = &sample[i * VQ_DIM..(i + 1) * VQ_DIM];
-            let d: f32 = v.iter().zip(seed).map(|(&x, &y)| (x - y) * (x - y)).sum();
+            let d = sqdist(&sample[i * VQ_DIM..(i + 1) * VQ_DIM], seed);
             *md = if j == 0 { d } else { md.min(d) };
         }
     }
-    let mut prev = f64::INFINITY;
-    for _ in 0..max_iters {
-        let chunk = n.div_ceil(threads);
-        let parts: Vec<(Vec<f32>, Vec<u32>, f64)> = std::thread::scope(|s| {
-            let mut hs = Vec::new();
-            for t in 0..threads {
-                let (lo, hi) = (t * chunk, ((t + 1) * chunk).min(n));
-                if lo >= hi {
-                    break;
-                }
-                let c = &c;
-                hs.push(s.spawn(move || {
-                    let mut sum = vec![0.0f32; k * VQ_DIM];
-                    let mut cnt = vec![0u32; k];
-                    let mut dist = 0.0f64;
-                    for i in lo..hi {
-                        let v = &sample[i * VQ_DIM..(i + 1) * VQ_DIM];
-                        let mut best = (f32::INFINITY, 0usize);
-                        for j in 0..k {
-                            let cc = &c[j * VQ_DIM..(j + 1) * VQ_DIM];
-                            let d: f32 = v.iter().zip(cc).map(|(&x, &y)| (x - y) * (x - y)).sum();
-                            if d < best.0 {
-                                best = (d, j);
-                            }
-                        }
-                        dist += best.0 as f64;
-                        cnt[best.1] += 1;
-                        for d in 0..VQ_DIM {
-                            sum[best.1 * VQ_DIM + d] += v[d];
-                        }
-                    }
-                    (sum, cnt, dist)
-                }));
-            }
-            hs.into_iter().filter_map(|h| h.join().ok()).collect()
-        });
-        let mut sum = vec![0.0f32; k * VQ_DIM];
-        let mut cnt = vec![0u32; k];
-        let mut dist = 0.0f64;
-        for (ps, pc, pd) in parts {
-            for (a, b) in sum.iter_mut().zip(ps) {
-                *a += b;
-            }
-            for (a, b) in cnt.iter_mut().zip(pc) {
-                *a += b;
-            }
-            dist += pd;
-        }
-        for j in 0..k {
-            if cnt[j] > 0 {
-                for d in 0..VQ_DIM {
-                    c[j * VQ_DIM + d] = sum[j * VQ_DIM + d] / cnt[j] as f32;
-                }
-            }
-        }
-        if ((prev - dist) / dist.max(f64::MIN_POSITIVE)).abs() < 1e-4 {
-            break;
-        }
-        prev = dist;
-    }
     c
+}
+
+/// One assignment pass over `lo..hi`: per-centroid running sums, counts, and the total
+/// distance — the thread body of [`assign_all`].
+fn assign_partial(
+    sample: &[f32],
+    c: &[f32],
+    k: usize,
+    lo: usize,
+    hi: usize,
+) -> (Vec<f32>, Vec<u32>, f64) {
+    let mut sum = vec![0.0f32; k * VQ_DIM];
+    let mut cnt = vec![0u32; k];
+    let mut dist = 0.0f64;
+    for i in lo..hi {
+        let v = &sample[i * VQ_DIM..(i + 1) * VQ_DIM];
+        let mut best = (f32::INFINITY, 0usize);
+        for j in 0..k {
+            let d = sqdist(v, &c[j * VQ_DIM..(j + 1) * VQ_DIM]);
+            if d < best.0 {
+                best = (d, j);
+            }
+        }
+        dist += best.0 as f64;
+        cnt[best.1] += 1;
+        for d in 0..VQ_DIM {
+            sum[best.1 * VQ_DIM + d] += v[d];
+        }
+    }
+    (sum, cnt, dist)
+}
+
+/// The parallel assignment step: fan `assign_partial` across threads, merge the parts.
+/// Merge order over disjoint ranges is additive, so thread count cannot move the result.
+fn assign_all(sample: &[f32], n: usize, c: &[f32], k: usize) -> (Vec<f32>, Vec<u32>, f64) {
+    let threads = std::thread::available_parallelism().map_or(4, |t| t.get());
+    let chunk = n.div_ceil(threads);
+    let parts: Vec<(Vec<f32>, Vec<u32>, f64)> = std::thread::scope(|s| {
+        let mut hs = Vec::new();
+        for t in 0..threads {
+            let (lo, hi) = (t * chunk, ((t + 1) * chunk).min(n));
+            if lo < hi {
+                let c = &c;
+                hs.push(s.spawn(move || assign_partial(sample, c, k, lo, hi)));
+            }
+        }
+        hs.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let mut sum = vec![0.0f32; k * VQ_DIM];
+    let mut cnt = vec![0u32; k];
+    let mut dist = 0.0f64;
+    for (ps, pc, pd) in parts {
+        for (a, b) in sum.iter_mut().zip(ps) {
+            *a += b;
+        }
+        for (a, b) in cnt.iter_mut().zip(pc) {
+            *a += b;
+        }
+        dist += pd;
+    }
+    (sum, cnt, dist)
 }
 
 // ── int4 (group-scaled): the "warm expert" format ───────────────────────────
@@ -1023,28 +1116,15 @@ pub fn k3_expert_base(layer: usize, e: usize) -> String {
 // helper had just concatenated. A second constructor for a string the engine builds elsewhere is
 // a second thing to keep in step, and a test of it is a guard unable to fire.
 
-// jscpd:ignore-start — the four `matvec_*` oracles' PARAMETER LISTS. `matvec_i4` and
-// `matvec_i8` take character-identical arguments (`y, x, packed, scale, o_dim, i_dim`),
-// which rustfmt expands past 100 columns into eight lines — enough to clone against each
-// other and against a caller's. No BODY duplication remains: the shared row loop is
-// `matvec_bytes` and the shared entry contract is `debug_check_gemv`.
-//
-// The honest fix is a `Weights<'_>` sum type (`Fp8{packed,scale,block} | I4{..} | I8{..} |
-// Vq{..}`), which would also make "int4 scales with an int8 packed array" unrepresentable
-// — worth doing, but it rewrites call sites in convert, tests/kernel.rs and
-// tests/common. Renaming a parameter to break the hash was the alternative and is exactly
-// the masking this gate exists to undo.
+// (The parameter-list jscpd exemption that stood here died 2026-08-15: the `Fp8W`/`VqW`/
+// `I4W`/`I8W` views above ARE the fix its own note named, and with the lists gone there
+// is nothing left to exempt.)
 /// Reference int4 GEMV `y[o] = Σ_i x[i]·(nibble(o,i) − 8)·scale[o, i/I4_GROUP]` — the
 /// CPU oracle the `moe_gateup_i4`/`moe_down_i4` kernels validate against. `scale` is
 /// `o_dim · i4_groups(i_dim)` f32, row-major.
-pub fn matvec_i4(
-    y: &mut [f32],
-    x: &[f32],
-    packed: &[u8],
-    scale: &[f32],
-    o_dim: usize,
-    i_dim: usize,
-) {
+pub fn matvec_i4(y: &mut [f32], x: &[f32], w: RowScaledW<'_>, shape: [usize; 2]) {
+    let RowScaledW { packed, scale } = w;
+    let [o_dim, i_dim] = shape;
     let (rb, ng) = (i4_row_bytes(i_dim), i4_groups(i_dim));
     debug_check_gemv(y, x, o_dim, i_dim);
     debug_assert_eq!(scale.len(), o_dim * ng);
@@ -1064,14 +1144,9 @@ pub fn matvec_i4(
 /// Reference int8 GEMV `y[o] = scale[o] · Σ_i x[i]·(i8)packed[o·i_dim+i]` — the CPU
 /// oracle for the `gemv_i8` kernel (lm_head → logits). `packed` is raw bytes
 /// reinterpreted as signed, matching the kernel's `signed char`.
-pub fn matvec_i8(
-    y: &mut [f32],
-    x: &[f32],
-    packed: &[u8],
-    scale: &[f32],
-    o_dim: usize,
-    i_dim: usize,
-) {
+pub fn matvec_i8(y: &mut [f32], x: &[f32], w: RowScaledW<'_>, shape: [usize; 2]) {
+    let RowScaledW { packed, scale } = w;
+    let [o_dim, i_dim] = shape;
     debug_check_gemv(y, x, o_dim, i_dim);
     debug_assert_eq!(packed.len(), o_dim * i_dim);
     matvec_bytes(y, packed, i_dim, |o, row| {
@@ -1083,7 +1158,6 @@ pub fn matvec_i8(
         acc * scale[o]
     });
 }
-// jscpd:ignore-end
 
 /// Quantize `w[o_dim·i_dim]` (row-major) → group-scaled symmetric int4 (packed bytes
 /// plus `o_dim · i4_groups(i_dim)` f32 scales). Per group of [`I4_GROUP`] weights along
@@ -1333,7 +1407,7 @@ mod tests {
         // The GEMV oracle and the dense reconstruction must agree on the same bytes.
         let x: Vec<f32> = (0..i_dim).map(|_| rnd()).collect();
         let mut y = vec![0f32; o_dim];
-        matvec_i4(&mut y, &x, &packed, &scale, o_dim, i_dim);
+        matvec_i4(&mut y, &x, RowScaledW::new(&packed, &scale), [o_dim, i_dim]);
         for (o, &yo) in y.iter().enumerate() {
             let want: f32 = (0..i_dim).map(|i| back[o * i_dim + i] * x[i]).sum();
             assert!(
@@ -1627,7 +1701,7 @@ mod tests {
         }
         let (packed, scale) = quant_i4(&w, o, i);
         let mut got = vec![0.0f32; o];
-        matvec_i4(&mut got, &x, &packed, &scale, o, i);
+        matvec_i4(&mut got, &x, RowScaledW::new(&packed, &scale), [o, i]);
         // int4 group quant: err bounded by ~scale·Σ|x| worst case; check it tracks.
         let mx = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let err = want
@@ -1701,13 +1775,15 @@ mod tests {
             matvec_vq(
                 &mut y_load,
                 &x,
-                proj.indices,
-                &ps,
-                &cb,
-                proj.o_dim,
-                proj.i_dim,
+                VqW::new(proj.indices, &ps, &cb),
+                [proj.o_dim, proj.i_dim],
             );
-            matvec_vq(&mut y_ref, &x, indices, scales, &cb, *o_dim, *i_dim);
+            matvec_vq(
+                &mut y_ref,
+                &x,
+                VqW::new(indices, scales, &cb),
+                [*o_dim, *i_dim],
+            );
             assert_eq!(y_load, y_ref);
         }
     }
@@ -1743,7 +1819,7 @@ mod tests {
         let (idx, scales) = quant_vq(&w, 1, i_dim, &cb);
         let x: Vec<f32> = (0..i_dim).map(|i| (i + 1) as f32).collect();
         let mut y = [0.0f32];
-        matvec_vq(&mut y, &x, &idx, &scales, &cb, 1, i_dim);
+        matvec_vq(&mut y, &x, VqW::new(&idx, &scales, &cb), [1, i_dim]);
         // Expected = Σ_t codebook[entry(t)] · x_subvec(t), with scale 1.
         let mut exp = 0.0f32;
         for t in 0..nsub {
@@ -1790,7 +1866,7 @@ mod tests {
         // indexing and that e4m3 decode is wired. 0x38=1.0, 0x40=2.0, 0xB8=-1.0.
         let packed = [0x38u8, 0x40, 0xB8, 0x00]; // [[1, 2],[-1, 0]]
         let scale = [10.0f32, 100.0, 1000.0, 1.0]; // per element (block=1)
-        let out = dequant_fp8_block(&packed, &scale, 2, 2, 1);
+        let out = dequant_fp8_block(Fp8W::new(&packed, &scale, 1), [2, 2]);
         assert_eq!(out, [10.0, 200.0, -1000.0, 0.0]);
     }
 
@@ -1815,7 +1891,7 @@ mod tests {
         let (packed, scale) = quantize_fp8_block(&w, [o_dim, i_dim], block).unwrap();
         assert_eq!(packed.len(), o_dim * i_dim);
         assert_eq!(scale.len(), o_dim.div_ceil(block) * i_dim.div_ceil(block));
-        let back = dequant_fp8_block(&packed, &scale, o_dim, i_dim, block);
+        let back = dequant_fp8_block(Fp8W::new(&packed, &scale, block), [o_dim, i_dim]);
         for (k, (&want, &got)) in w.iter().zip(back.iter()).enumerate() {
             // Relative to the VALUE, with an absolute floor for the ones that land in e4m3's
             // subnormal range after scaling.
@@ -1837,7 +1913,7 @@ mod tests {
         assert_eq!(scale, [1.0], "an all-zero tile must not take a zero scale");
         assert!(packed.iter().all(|&b| b == 0));
         assert!(
-            dequant_fp8_block(&packed, &scale, 2, 2, 2)
+            dequant_fp8_block(Fp8W::new(&packed, &scale, 2), [2, 2])
                 .iter()
                 .all(|v| *v == 0.0)
         );
@@ -1870,7 +1946,7 @@ mod tests {
         let scale = [10.0f32, 100.0, 1000.0, 1.0];
         let x = [3.0f32, 5.0];
         let mut y = [0.0f32; 2];
-        matvec_fp8(&mut y, &x, &packed, &scale, 2, 1);
+        matvec_fp8(&mut y, &x, Fp8W::new(&packed, &scale, 1), 2);
         // row0: 10·3 + 200·5 = 1030 ; row1: -1000·3 + 0·5 = -3000
         assert_eq!(y, [1030.0, -3000.0]);
     }

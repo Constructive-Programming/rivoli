@@ -589,7 +589,12 @@ impl Safetensors {
         );
         let scale = crate::quant::read_f32(sb);
         Ok(crate::quant::dequant_fp8_block(
-            w, &scale, o_dim, i_dim, block,
+            crate::quant::Fp8W {
+                packed: w,
+                scale: &scale,
+                block,
+            },
+            [o_dim, i_dim],
         ))
     }
 }

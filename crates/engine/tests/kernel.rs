@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used)]
 
 use anyhow::Result;
-use rivoli_artifact::quant::{VQ_DIM, VQ_K, matvec_vq, quant_vq};
+use rivoli_artifact::quant::{RowScaledW, VQ_DIM, VQ_K, VqW, matvec_vq, quant_vq};
 use rivoli_backend::gpustream::HipStream;
 use rivoli_backend::hip::{
     ExpertDesc, attend_scratch_floats, device_sync, launch_argmax, launch_attend, launch_gemv_fp8,
@@ -543,7 +543,12 @@ fn gemv_vq_matches_oracle() {
     let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
 
     let mut want = vec![0.0f32; o_dim];
-    matvec_vq(&mut want, &x, &indices, &scales, &codebook, o_dim, i_dim);
+    matvec_vq(
+        &mut want,
+        &x,
+        VqW::new(&indices, &scales, &codebook),
+        [o_dim, i_dim],
+    );
 
     let (xb, ib, sb, cb) = (
         dev(&f32b(&x)),
@@ -856,11 +861,8 @@ fn moe_vq_matches_reference() {
         matvec_vq(
             out,
             inp,
-            &enc[ex][p].0,
-            &enc[ex][p].1,
-            &cbs[p],
-            o_dim,
-            i_dim,
+            VqW::new(&enc[ex][p].0, &enc[ex][p].1, &cbs[p]),
+            [o_dim, i_dim],
         )
     });
 
@@ -1078,7 +1080,12 @@ fn i4_reference(c: &I4Case) -> Vec<f32> {
     use rivoli_artifact::quant::matvec_i4;
     let enc = &c.enc;
     moe_reference(&c.x, &c.w, c.hidden, c.inter, |o, i, ex, p, od, id| {
-        matvec_i4(o, i, &enc[ex][p].0, &enc[ex][p].1, od, id)
+        matvec_i4(
+            o,
+            i,
+            RowScaledW::new(&enc[ex][p].0, &enc[ex][p].1),
+            [od, id],
+        )
     })
 }
 
@@ -1317,12 +1324,12 @@ fn moe_i4_real_data_matches_cpu() {
     let (up, us) = proj(1);
     let (dp, ds) = proj(2);
     let mut g = vec![0f32; inter];
-    matvec_i4(&mut g, &x, &gp, &gs, inter, hidden);
+    matvec_i4(&mut g, &x, RowScaledW::new(&gp, &gs), [inter, hidden]);
     let mut u = vec![0f32; inter];
-    matvec_i4(&mut u, &x, &up, &us, inter, hidden);
+    matvec_i4(&mut u, &x, RowScaledW::new(&up, &us), [inter, hidden]);
     let h: Vec<f32> = (0..inter).map(|j| silu(g[j]) * u[j]).collect();
     let mut want = vec![0f32; hidden];
-    matvec_i4(&mut want, &h, &dp, &ds, hidden, inter);
+    matvec_i4(&mut want, &h, RowScaledW::new(&dp, &ds), [hidden, inter]);
 
     let got = gpu_i4_expert(&blk, &off, &x, hidden, inter);
     let dot: f64 = want
@@ -2095,7 +2102,12 @@ fn gemv_i4_matches_oracle() {
     let (packed, scale) = rivoli_artifact::quant::quant_i4(&w, o_dim, i_dim);
     let x: Vec<f32> = (0..i_dim).map(|_| r.f()).collect();
     let mut want = vec![0.0f32; o_dim];
-    rivoli_artifact::quant::matvec_i4(&mut want, &x, &packed, &scale, o_dim, i_dim);
+    rivoli_artifact::quant::matvec_i4(
+        &mut want,
+        &x,
+        RowScaledW::new(&packed, &scale),
+        [o_dim, i_dim],
+    );
 
     let (xb, pb, sb) = (dev(&f32b(&x)), dev(&packed), dev(&f32b(&scale)));
     let mut yb = zeros(o_dim * 4);
