@@ -52,9 +52,39 @@ in the session memory.
    is currently swept deterministically over a range; proptest joins when the arena
    relocation properties port in M2+).
 
-## Next: M2 — GLM artifact + config + converter + the GLM anchor
+## M2 — GLM artifact + config + converter + the GLM anchor (IN PROGRESS 2026-08-15)
 
-Per the plan: safetensors reader, converter, tokenizer; generate the GLM anchor from the
-first-party HF stack (≥10 defects × 2 salts, `glimmer-anchor.sh`'s contract). Exit:
-anchor integrity green, defect matrix fully red-capable, converter round-trip
-byte-stable.
+Landed so far: `core::num` (conversions + `Scoring`), `artifact::{quant,format,schema,
+arch,glm_config}` (commit `46f2153` — sniffing is identity-only, presentation policy
+deliberately not ported), the three converters + `engine::device` (commit `73ecfa1`).
+Still owed: the GLM anchor, artifact tests, tokenizer (deferred — coupled to
+`dsv4_encoding`, arrives with the CLI at M4).
+
+**Anchor scouting, settled 2026-08-15:**
+- The fp8 source is `/swarm/storage/ai/openclaw/glm52-fp8` — `model_type: glm_moe_dsa`,
+  **no `auto_map`**, so the first-party stack is transformers-native (no remote code).
+- Fresh venv at `/home/rhansen/glm-anchor/venv`: torch 2.13.0+cpu, transformers 5.15.0,
+  `glm_moe_dsa` in `CONFIG_MAPPING_NAMES`. CPU-only, so the anchor needs no GPU and no
+  lock, same as Glimmer's.
+- NOTE: the old `/home/rhansen/glimmer-anchor/venv` (pinned in the old tree's anchor.md)
+  is GONE from the box — a Glimmer anchor regeneration would need its venv rebuilt at the
+  pinned transformers commit fe747d88 first.
+- Mechanisms the taps must capture, from reading `modeling_glm_moe_dsa.py`: MLA with
+  q-LoRA (`q_a_proj→q_a_layernorm→q_b_proj`) and kv-LoRA (`kv_a_proj_with_mqa` split
+  kv_lora_rank + qk_rope, `kv_a_layernorm` on the kv half only), **interleaved** RoPE
+  (both attention and indexer — V3.2 uses half-split, this does not), `expand_kv`
+  latent expansion, DSA indexer (own wq_b/wk/LayerNorm(eps 1e-6)/weights_proj; ReLU
+  scores; head-weighted sum; `indexer_types` full/shared with `prev_topk_indices`
+  cross-layer sharing), sigmoid router + `e_score_correction_bias` + group top-2 +
+  norm_topk + `routed_scaling_factor` (router `weight` is ZERO-init — a tiny model must
+  draw it, or every expert ties), MoE + shared expert, dense first `first_k_dense_replace`
+  layers. Config `__post_init__` computes `indexer_types` from freq/offset and forces
+  `head_dim = qk_rope_head_dim`.
+- Tiny-config non-degeneracy plan (every width distinct, lesson 30): vocab 61, hidden 48,
+  inter 96, moe_inter 24, layers 6 (2 dense + 4 sparse), heads 4, kv_heads 4, routed 10
+  top-3, shared 1, kv_lora 20, q_lora 28, qk_rope 8, qk_nope 14 (sum 22 ≠ kv_lora),
+  v_head 10, index_topk 4 (< PROMPT_LEN so the sparse path is exercised — the old dsa
+  fast-path-below-topk lesson), index_head_dim 16, index_n_heads 2.
+
+Exit unchanged: anchor integrity green, defect matrix (≥10 defects × 2 salts) fully
+red-capable, converter round-trip byte-stable.
