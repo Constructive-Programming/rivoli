@@ -6,4 +6,9 @@
 //! never a `--arch` flag; unknown architectures refuse at startup), the
 //! tokenizer, and the converters' sealed writer. Host-only and featureless:
 //! every test here runs in the featureless CI job.
+pub mod arch;
+pub mod format;
 pub mod glimmer;
+pub mod glm_config;
+pub mod quant;
+pub mod schema;

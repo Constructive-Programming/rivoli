@@ -15,4 +15,5 @@ pub mod arena;
 pub mod cache;
 pub mod hash;
 pub mod hybrid;
+pub mod num;
 pub mod residency;
