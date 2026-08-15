@@ -62,9 +62,9 @@ rivoli /var/db/rivoli/v4-f4-full                  -bench 512 --prompt "<the prom
 
 ## Storage: sequential ordering buys nothing at QD>=2
 
-`probes/seq_vs_random.c`, btrfs Data RAID0 across two NVMe (**`nvme1n1p3` + `nvme0n1p2`**,
-1.68 TiB, `ssd`, no compression), under the flock. Same 15.34 MB request size, 246 requests,
-same layer file, arm order alternated; mean of 4 reps, GB/s:
+`probes/seq_vs_random.c`, btrfs Data RAID0 across two NVMe (**`nvme1n1p3` + `nvme0n1p2`**, 1.68
+TiB, `ssd`, no compression), under the flock. Same 15.34 MB request, 246 requests, same layer file,
+arm order alternated; mean of 4 reps, GB/s:
 
 | QD | rand | seq | delta |
 |---|---|---|---|
@@ -72,33 +72,28 @@ same layer file, arm order alternated; mean of 4 reps, GB/s:
 | 2 | 13.96 | 13.88 | -0.6% |
 | 16 | 14.76 | 14.54 | -1.5% |
 
-At 15.34 MB the seek is already amortised. **These are the achieved rates to reason from — the
-7.0 GB/s quoted elsewhere is a `dd iflag=direct` queue-depth-1 figure** and understates what
-the io_uring path gets.
+At 15.34 MB the seek is already amortised. **These are the achieved rates to reason from**; the
+7.0 GB/s quoted elsewhere is a `dd iflag=direct` QD-1 figure and understates the io_uring path.
 
 ## Bugs found and fixed
 
 - **fp8 block scale mis-applied at `block < 4`** — `common.hpp::fp8_dot_strided` read four fp8
-  weights per lane as one dword and applied ONE scale to all four. Numerics, not perf; it sat
-  under every fp8 block-scaled GEMV. Fixed.
+  weights per lane as one dword and applied ONE scale to all four. Numerics, not perf. Fixed.
 
 ## `top-m` offline screen (CACHE_ROUTE, arXiv:2412.00099) — RETIRED, record moved
 
 **RETIRED 2026-08-14** under this file's line cap; `cache-conditional-routing.md` keeps the grid.
-
-### DECISION: `top-m` ships opt-in and UNCERTIFIED
-
-The shipped cell was **J=4/M=9** on `int3-vq`, 5,184 teacher-forced positions at `--max-mem 100`:
-**PPL 4.15252 against a 4.130637 baseline, 95% CI [−0.00207, +0.01263]**. The interval contains
-zero, so **INCONCLUSIVE** — which is neither "small cost confirmed" nor certified. That cell is
-the origin of the four-verdict vocabulary (PASS / FAIL / COST ESTABLISHED / INCONCLUSIVE) that
-`vulkan-port.md`'s staged acceptance gate reuses.
+**DECISION: opt-in and UNCERTIFIED.** The shipped cell was **J=4/M=9** on `int3-vq`, 5,184
+teacher-forced positions at `--max-mem 100`: **PPL 4.15252 against 4.130637, 95% CI [−0.00207,
++0.01263]** — the interval contains zero, so **INCONCLUSIVE**, which is neither "small cost
+confirmed" nor certified. Origin of the four-verdict vocabulary (PASS / FAIL / COST ESTABLISHED /
+INCONCLUSIVE). (Its own heading folded in here 2026-08-15, same line cap, same argument.)
 
 ## Per-kernel round: matched A/B, `examples/dot_bench` — RETIRED, verdict kept
 
 **RETIRED 2026-08-14** under the line cap: superseded as a DECISION by the in-engine section
-below, which is the number the merge rested on. `how-to-measure.md` owns the matched-A/B method;
-the body was the H=64 / qk_head_dim=256 run. Both subsections kept are cited ANCHORS.
+below. `how-to-measure.md` owns the matched-A/B method; the body was the H=64 / qk_head_dim=256
+run. Both subsections kept are cited ANCHORS.
 
 ### Section tokens recorded rounds invoke
 
@@ -123,9 +118,8 @@ interleaved base/fix. **`-bench` is a fixed-token bench even though decode is gr
 
 ### Closed questions
 
-- **`rmsnorm`'s `dim3(1)` launch is not a problem** — 7.7 us, 0.05% of the `tail` bucket. At
-  hidden=6144 there is not enough work for the geometry to matter. Measured; do not re-flag it
-  from the launch shape alone.
+- **`rmsnorm`'s launch geometry is not a problem** — 7.7 us, 0.05% of `tail`; at hidden=6144
+  there is not enough work for it to matter. (Was `dim3(1)`; `dim3(rows)` since 2026-08-15.)
 - **`mla_value` was not a healthy reference.** `mla_absorb`'s 99 GB/s was judged against
   "`mla_value`'s 254", but `mla_value` carried the same 64-bit divide, so the yardstick was
   depressed too. Post-fix 172.3 vs 310.3. **Check that a reference point is itself healthy
@@ -496,11 +490,17 @@ bf16 streaming curve**, "Say hello." at `--bench 24`, one `--max-mem` per arm:
 
 The pin is worth **5.1×**, and marginal bandwidth RISES with the streamed count (8.6 → 18.0 GB/s):
 per-fill fixed cost dominates a small streamed set and amortizes — S5's prefetch item, measured
-before its lever exists; `GLIMMER_STREAM_SLOTS` is 1. **Prefill is unbatched** (`m = 1`, `tq = 1`),
-0.416 s/token at 1201 and 0.561 at 7661 = **72 minutes to first token** on 7661 (§4.3).
+before its lever exists; `GLIMMER_STREAM_SLOTS` is 1. **Prefill was unbatched** (`m = 1`) at 0.416
+s/token over 1201 and 0.561 over 7661 = **72 min to first token** on 7661 (§4.3).
 
-**Teacher-forced quality — the S4 ladder, and the softcap priced** (`--ppl tests/ppl-corpus.txt`,
-762 tokens, `bin/ppl`, baseline bf16). Both format arms re-run back to back on ROCm **7.14.60850**:
+**Batching it is worth ~13% — 0.363 s/token over 1659, witness non-empty — and that REFUTES the
+estimate that made it S5's top item.** The arithmetic predicted 256×; `kvcompress.hip::gemm_bf16`
+is **one wave per OUTPUT ELEMENT** (`gw = r*n + c`, each wave reading the whole weight row
+independently for every `r`), so `m` rows are `m` GEMVs fused into one launch with no cross-row
+reuse. **The lever is a tiled GEMM** staging a weight tile in LDS; the batching is its
+precondition, and paid for itself by surfacing defects at 1.079e0 / 3.008e0 (§3.2).
+
+**Teacher-forced quality — the S4 ladder, softcap priced** (`--ppl tests/ppl-corpus.txt`, 762 tokens, `bin/ppl`, baseline bf16); both format arms re-run back to back on ROCm **7.14.60850**:
 
 | | PPL | mean dNLL | 95% CI (nats) | verdict |
 |---|---:|---:|---|---|

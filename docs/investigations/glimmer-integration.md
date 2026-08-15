@@ -767,6 +767,19 @@ paired-dNLL row whose interval does not straddle zero (or is recorded inconclusi
 | **NPU** | dense decode is one long sequential GEMV stream — the NPU-shaped workload; the npu-offload closure is **GLM-scoped by its own `scope:` field** | its own measurement, `scope: glimmer`, using the closure's method |
 | **fusion** (gate into attend, softcap into head GEMV) | one pass over [rows][4096] / 202048 floats each | price AFTER the fixtures exist to catch a fused wrong answer; S2 refused both for exactly that reason |
 
+> **S5's first result is a REFUTATION, 2026-08-15, and it is not in the table above at all.**
+> `glimmer-open-items.md` §4.3 had named batching the prefill math "the highest-value S5 item by a
+> wide margin" on the strength of prefill costing 0.416-0.561 s/token — a whole decode step per
+> prompt token. It is done, it is worth **~13%** (0.363 s/token over 1659), and the estimate was
+> wrong about the mechanism: `kvcompress.hip::gemm_bf16` is one wave per OUTPUT ELEMENT, so `m`
+> rows are `m` GEMVs fused into one launch with no cross-row weight reuse to capture. **The lever
+> is a tiled GEMM** staging a weight tile in LDS and reusing it down the rows; the batching is its
+> precondition and is kept for that, and for the two defects it surfaced (§3.2).
+>
+> The transferable part is not the kernel: **this stage's own rule is that every lever is priced
+> before it is built, and this one was priced from arithmetic over a kernel nobody had read.** A
+> weight-traffic estimate is a claim about a kernel's memory behaviour, and that is readable.
+
 **G5 — met when** tok/s is reported at ≥3 budgets × ≥2 formats with the witness discipline
 (sole tenant, flock, GTT sampled), the one-line tok/s model above is validated or corrected
 against those points, and each declined lever carries its measured reason here.
