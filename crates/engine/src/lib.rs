@@ -8,5 +8,7 @@
 //! structurally unciteable), and eval. Instrument features live here, each
 //! behind a feature AND a flag, never an env var.
 
+#[cfg(feature = "rocm")]
+pub mod device;
 pub mod fetch;
 pub mod telemetry;
