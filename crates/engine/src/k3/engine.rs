@@ -25,7 +25,7 @@
 //! | 8. MLA softmax scale over the FULL 192 | `geometry::Dims::mla_scale`, tested deviceless |
 //! | 9. the 64 unrotated rope dims are STILL SCORED | the cache row is `Dims::q_head` = 192 wide — the rope slot is appended into every row, so dropping the term is unrepresentable |
 //! | 10. MLA gates with NO norm; KDA norms THEN gates | two different launcher selections in `forward.rs` (`launch_sigmoid_gate` vs `launch_rmsnorm_gate_heads_f32`) |
-//! | 11. combining weights from the UNBIASED sigmoid | `state::combine_weights` cannot receive `choice`; tested deviceless |
+//! | 11. combining weights from the UNBIASED sigmoid | the ONE call site, `forward.rs::moe_ffn`'s `route` — `scores` and `choice` are both `Vec<f32>`, so the signature does NOT argue (a claim this table made falsely until review 2026-08-16); `combine_weights` itself is tested deviceless |
 //! | 12. RMSNorm the AGGREGATE; shared expert AFTER the up-projection, unweighted | `forward.rs::moe_ffn`'s drain_to → norm → up → shared order |
 //!
 //! # The MLA cache is masked-full-width, and that is a sizing decision
@@ -218,6 +218,12 @@ impl<'a> K3Engine<'a> {
             );
         }
         let f32s = |n: usize| DeviceBuf::new(n * size_of::<f32>());
+        let zeroed = |n: usize| -> Result<DeviceBuf> {
+            let mut b = DeviceBuf::new(n * size_of::<f32>())?;
+            // SAFETY: the fill is the allocation's own byte count, one line above.
+            unsafe { fill_u32(b.ptr_mut(), 0, n * size_of::<f32>())? };
+            Ok(b)
+        };
         let (hid, ch, ne) = (cfg.hidden, d.kda_ch, cfg.n_experts);
         let mut layers = Vec::with_capacity(n_layers);
         for l in 0..n_layers {
@@ -228,9 +234,16 @@ impl<'a> K3Engine<'a> {
                     win_k: f32s(ch * la.short_conv_kernel_size)?,
                     win_v: f32s(ch * la.short_conv_kernel_size)?,
                 },
+                // ZEROED at allocation, once — hipMalloc hands back recycled in-process
+                // memory, and the additive mask only makes an unwritten row unread when its
+                // garbage is FINITE: a NaN/inf K-row poisons pass 2's softmax denominator
+                // (`fmaxf` skips the NaN, `expf(NaN - m)` does not), and `0.0 * inf` in the
+                // V mix is NaN at weight zero. Review 2026-08-16; the reset path still
+                // skips re-zeroing, because rows a PREVIOUS sequence wrote are finite and
+                // the mask genuinely does the rest.
                 Attn::Mla(_) => LayerState::Mla {
-                    kc: f32s(cfg.n_heads * max_ctx * d.q_head)?,
-                    vc: f32s(cfg.n_heads * max_ctx * cfg.v_head_dim)?,
+                    kc: zeroed(cfg.n_heads * max_ctx * d.q_head)?,
+                    vc: zeroed(cfg.n_heads * max_ctx * cfg.v_head_dim)?,
                 },
             });
         }
@@ -324,9 +337,11 @@ impl<'a> K3Engine<'a> {
                             fill_u32(w.ptr_mut(), 0, win_bytes)?;
                         }
                     }
-                    // The caches need no zeroing: the mask is what makes an unwritten row
-                    // unread, and re-zeroing gigabytes per sequence is a cost with no
-                    // defect behind it. The MASK is the thing that must reset.
+                    // The caches need no RE-zeroing: they were zeroed once at allocation
+                    // (see `zeroed` — finite garbage is what the mask's weight-0 argument
+                    // requires), rows a previous sequence wrote are finite, and re-zeroing
+                    // gigabytes per sequence is a cost with no defect behind it. The MASK
+                    // is the thing that must reset.
                     LayerState::Mla { .. } => {}
                 }
             }

@@ -60,8 +60,12 @@ pub fn final_sources(n_layers: usize, res_block: usize) -> usize {
 ///
 /// `scores` and NEVER `choice`: the bias steers SELECTION only, and letting it reach the
 /// weights changes every routed magnitude by an amount that reads as ordinary variation
-/// (`k3:docs/reference/k3-architecture.md` §6). The signature cannot even receive `choice`,
-/// which is the type doing the arguing.
+/// (`k3:docs/reference/k3-architecture.md` §6). **The signature does NOT enforce that** —
+/// `scores` and `choice` are both `Vec<f32>` of length `n_experts`, so
+/// `combine_weights(&self.choice, ..)` compiles and runs wrong; this doc claimed the type
+/// argued until review 2026-08-16. The owner is the ONE call site in `forward.rs::moe_ffn`,
+/// and no gate sees a regression there (both parity arms would run the same wrong weights),
+/// so treat that call as load-bearing text.
 ///
 /// `out` is `[n_experts]` indexed by ABSOLUTE expert id and zero-filled first: the expert
 /// kernel skips a zero weight, so the zeros are what make a wrongly-computed launch range

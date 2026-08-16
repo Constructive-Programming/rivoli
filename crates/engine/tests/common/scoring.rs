@@ -44,6 +44,13 @@ pub struct Got<'a>(pub &'a [f32]);
 pub fn worst_rel(got: Got, want: Want) -> f32 {
     let (got, want) = (got.0, want.0);
     assert_eq!(got.len(), want.len(), "length");
+    // Two EMPTY slices would score 0.0 — a perfect match over zero elements, the
+    // examined-count-reaches-zero hole. No current caller can construct the pair (`float`
+    // panics on an absent name), but the primitive must not offer it (review 2026-08-16).
+    assert!(
+        !want.is_empty(),
+        "worst_rel over zero elements is not a comparison"
+    );
     let scale = want.iter().copied().fold(0.0f32, |m, w| m.max(w.abs()));
     // An all-zero reference has no scale to divide by; any difference is then infinitely relative,
     // and reporting infinity is more honest than dividing by an epsilon.

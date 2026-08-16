@@ -100,8 +100,12 @@ echo
 # rocm through feature unification, and on this box (hipcc present) every build cell below
 # stays green over it. Found live 2026-08-16: an M9 agent's "deviceless" workspace run
 # executed device binaries unlocked. A compile cell cannot see the leak; the resolve can.
+# The non-empty guard is load-bearing: a failed `cargo tree` (stderr discarded) yields
+# empty stdout, grep exits 1, and the bare negation would turn the cell GREEN on a broken
+# command — the eaten-exit false-green class, found by review 2026-08-16 in the very cell
+# that exists to catch the last false green.
 run "(no features) — rocm absent from the resolve" \
-  bash -c '! cargo tree -e features --no-default-features -p rivoli 2>/dev/null | grep -q "rocm"'
+  bash -c 'out=$(cargo tree -e features --no-default-features -p rivoli 2>/dev/null); [ -n "$out" ] && ! printf "%s" "$out" | grep -q "rocm"'
 run "(no features) — refusal stub" \
   env RUSTFLAGS="-D warnings" cargo check --release --quiet --workspace --all-targets --no-default-features
 

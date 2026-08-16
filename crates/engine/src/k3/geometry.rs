@@ -106,6 +106,18 @@ impl Dims {
              per-head reduction tree has no other shape",
             la.head_dim
         );
+        // The recurrence launcher refuses `lb < -5` (guard 1006 — fla's own accepted
+        // range, inclusive at the shipped -5.0). `validate` checks negativity and f32
+        // narrowing but deliberately not this: it is the KERNEL's range. Without the door
+        // check a config at, say, -8.0 pays the terabyte-class pin and dies at the first
+        // KDA layer of the first token with a bare guard code (review 2026-08-16).
+        ensure!(
+            (-5.0..0.0).contains(&(la.gate_lower_bound as f32)),
+            "linear_attn_config.gate_lower_bound {} is outside the recurrence kernel's \
+             accepted [-5, 0) — fla's own range, and the launcher would refuse it \
+             mid-prefill as guard 1006",
+            la.gate_lower_bound
+        );
         // `launch_short_conv_silu_f32` accepts taps in 2..=16 (guard 1002).
         ensure!(
             (2..=16).contains(&la.short_conv_kernel_size),
@@ -201,6 +213,19 @@ mod tests {
         let over_192 = (1.0 / (192f64).sqrt()) as f32;
         assert_eq!(d.mla_scale.to_bits(), over_192.to_bits());
         assert!((f64::from(d.mla_scale) - 1.0 / (128f64).sqrt()).abs() > 1e-3);
+    }
+
+    /// The lower-bound door: outside the recurrence kernel's `[-5, 0)` refuses BY NAME at
+    /// derive time; the shipped value (exactly -5.0, fla's inclusive end) passes. Without
+    /// this door a config at -8.0 pays the pin and dies at the first KDA layer with a bare
+    /// guard 1006 (review 2026-08-16; the door landed with this red-watched test).
+    #[test]
+    fn the_gate_lower_bound_door_matches_the_kernels_range() {
+        let mut cfg = real();
+        assert!(Dims::from_config(&cfg).is_ok(), "the shipped -5.0 is legal");
+        cfg.linear_attn_config.gate_lower_bound = -8.0;
+        let err = Dims::from_config(&cfg).expect_err("below the kernel's range");
+        assert!(err.to_string().contains("gate_lower_bound"), "{err:#}");
     }
 
     /// The context door: both bounds refuse, the interior passes. The upper bound is the
