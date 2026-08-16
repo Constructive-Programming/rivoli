@@ -104,7 +104,11 @@ impl<'a> Emit<'a> {
     /// streams from it and returns false when the client hangs up, otherwise a closed
     /// connection would keep the sole-tenant GPU busy for the rest of the budget.
     pub(crate) fn offer(&mut self, tok: u32, sink: &mut dyn FnMut(u32) -> bool) -> bool {
-        if self.eos.contains(&tok) {
+        // The zero-budget check lives HERE, at the protocol's one author, because the
+        // push-then-check shape below emits one token at ngen 0 (review 2026-08-16). Both
+        // CLI doors already refuse zero; this is for the library caller that computes
+        // `budget - prompt.len()` and lands on it.
+        if self.ngen == 0 || self.eos.contains(&tok) {
             return false;
         }
         self.ids.push(tok);

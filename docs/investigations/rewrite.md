@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The gates-first rewrite is through M0–M6 — gates armed and red-proofed before any code, anchors vendored before the engine, M3 closed on silicon with 38/38 kernel oracles, M4 decoded token-identically to the pinned reference, M5 made that comparison a scripted red-provable gate, and M6 shipped the tokenizer (chat framing token-identical, two provenance legs), the (arch × flag) legality table (a flipped cell fails to compile), enum Engine, serve, and the thin CLI — closed by a 12-cell smoke: six refusals with the table's own messages, a bench decode matching the recorded reference ids, and a live server answering all three endpoints.
+verdict: The gates-first rewrite is through M0–M7 — gates armed and red-proofed before any code, anchors vendored before the engine, M4 decoded token-identically to the pinned reference, M5 scripted that comparison as a red-provable gate, M6 shipped tokenizer + legality table + enum Engine + serve + the thin CLI behind a 12-cell smoke, and M7 landed the first DENSE model: Glimmer's artifact side (a real cross-checkpoint config defect found and closed), the streaming dense loop with P6 live, a clean 12/12 kernel inventory plus the six owed oracle suites (49 device tests green), and an anchor decode gate reproducing the first-party goldens on silicon — tolerances envelope-gated, red-proven on device twice.
 ---
 
 # The rewrite, milestone by milestone
@@ -314,6 +314,51 @@ reference; fix on demand with its own gate): special tokens inside message conte
 inject real framing ids; a mid-request engine error closes the connection with no HTTP
 error body; `chatcmpl-{created}` ids collide within one second; prose after a closed
 `</tool_call>` reaches non-stream clients but not streaming ones.
+
+
+## M7 — Muse Glimmer, the first dense model (CLOSED 2026-08-16)
+
+Three agent-built pieces, each re-verified at integration. **Artifact side** (`74aa630`):
+glimmer_config (found the reference's quantization_config guard checking the wrong
+nesting level — K3's real checkpoint nests it inside text_config; caught by reading real
+bytes, closed with both arms asserted), the string-rendering chat template with a 31-case
+byte pin from the reference stack's own driver, convert_glimmer (eos_token_ids' second
+caller arrives; json_truthy moves beside python_json — four port notes updated in place).
+**Engine** (`03c4ba7`): the dense loop split by cohesion, P6 live (the floor asked twice,
+slots=0 first, so a model that fits pays no phantom streaming slot; Glimmer's floor
+charges KV+scratch where GLM's historical --max-mem contract passes 0 — the reference
+shipped that KV uncounted as a live defect), kernel inventory CLEAN (12/12 launchers
+already ported byte-identical; M7's real debt was the six deferred oracle suites — 25
+tests, census 38 covered/15 deferred, all green on silicon), Engine::Glimmer with
+ArchCfg/RoutedSpec (a dense arm filling a routed knob is the lie the table exists to
+stop) and the Emit hoist (the emission protocol is not an architectural fact; loop
+BODIES stay separate per the plan's measured decision). Legality row: --mode on a dense
+model is FallbackLoudly, not Refuse, or the no-flags invocation dies — pinned by two
+tests, red-proven.
+
+**M7 EXIT EVIDENCE (2026-08-16).** `glimmer_anchor_decode.rs` + its deviceless widths
+half: the rewrite's engine reproduces the first-party goldens — 14 logit cells + 16
+per-layer branch cells + the P4 test (same prompt, roomy vs tight budget: bit-identical
+logits, and the tight arm must actually stream) — **3/3 green on silicon in 0.59 s**,
+both draws, 30-capture census asserted. Every tolerance carries provenance AND an
+envelope gate: a bound outside 2–5× of its measured envelope reddens the deviceless
+suite (catches the tolerance-picked-to-pass and the bound-under-its-floor both).
+Red-proven on device on ALL FOUR recipe rows (observed magnitudes in
+gate-red-proofs.md §4, each within 25% of old:'s prediction) — and the paying produced
+two operator false-greens, both the same trap: a mutation that orphaned a variable,
+warnings-deny failing the rebuild, and the build's exit eaten by a pipeline, so a STALE
+binary ran. The tells are recorded: a red-proof that refuses to go red, and a red with
+the WRONG failing test. Two mutations that provably cannot redden are recorded with
+measurements in the module doc (eps_post swap: 0.2–0.6× the bf16 floor; softcap off:
+TV unchanged) so nobody spends a GPU hour on them.
+
+**Standing debts, recorded with owners:** `output_multiplier` has no value assertion
+anywhere (argmax-invariant — no greedy gate can see it wrong; needs a logit-space gate);
+`kernel_glimmer_attend.rs` at 796/800; the three oracle files each spell their own
+fixture `draw` (shared home: tests/common); `old:tests/glimmer_tolerance.rs` never
+ported while `anchor.md` still claims its enforcement — correct or port with M8's
+tolerance work; the real-checkpoint tensor-name gate needs the shipped index.json (not
+on this machine).
 
 
 ## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)

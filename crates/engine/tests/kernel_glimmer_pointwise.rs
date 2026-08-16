@@ -239,17 +239,24 @@ fn the_softcap_matches_a_host_tanh_where_tanh_has_shape() {
 fn the_softcap_cannot_move_the_argmax() {
     let x = fill(VOCAB, 0x12, 400.0);
     let capped = softcap(&x, SHIPPED);
-    let (before, after) = (argmax(&x), argmax(&capped));
+    // A post-cap argmax, not THE argmax: at this scale the top of tanh is so flat that
+    // distinct top logits can round to the same f32 (top-two gap ~1.2e-6 against a 1.9e-6
+    // ulp — review 2026-08-16), so index equality reddens on a CORRECT kernel for ~1 in 3
+    // seeds. The mathematical claim is monotonicity: the pre-cap winner must still hold
+    // the post-cap maximum VALUE, ties included.
+    let best = capped.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     assert_eq!(
-        before, after,
-        "the softcap moved the argmax, so its invariance claim is false"
+        capped[argmax(&x)],
+        best,
+        "the softcap demoted the pre-cap argmax below the post-cap maximum, so its \
+         invariance claim is false"
     );
     let moved = x.iter().zip(&capped).filter(|(a, b)| a != b).count();
     assert!(
         moved > VOCAB / 2,
         "only {moved} of {VOCAB} logits changed at all"
     );
-    println!("argmax held at {before} while {moved} of {VOCAB} logits moved");
+    println!("pre-cap argmax kept the post-cap maximum while {moved} of {VOCAB} logits moved");
 }
 
 /// **The omission red proof, and the non-finite pass-through.**

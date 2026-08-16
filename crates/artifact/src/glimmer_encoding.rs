@@ -183,25 +183,17 @@ impl<'a> GlimmerChatOpts<'a> {
 /// to the rule below: a non-finite has no digits and a zero has no leading significant digit.
 ///
 /// `Option` rather than two early returns inside [`py_float`], so that the shared path there is
-/// one expression with no bumps in front of it. Non-finite never survives a JSON parse
-/// (`serde_json` rejects `NaN`/`Infinity` and the template's `tojson` would too), so the only
-/// way to reach that arm is a hand-built `Value`, which `serde_json::Number` also cannot hold —
-/// it is here because `{:?}` renders them as `NaN`/`inf` and Python as `nan`/`inf`.
+/// one expression with no bumps in front of it. ONLY zero is degenerate here: non-finite
+/// cannot arrive, because the sole route in is `atem_value`'s `Value::Number` arm and
+/// `serde_json::Number` cannot hold NaN/Infinity — arms for them would defend an input no
+/// caller can construct, which under P7 no gate could ever exercise (review 2026-08-16).
 ///
 /// Zero's SIGN is carried in the bit rather than in the digits — Python prints `-0.0` for
 /// negative zero — so `v == 0.0`, which is true for both, is not enough on its own.
 fn py_degenerate(v: f64) -> Option<&'static str> {
-    // One flat match over the four predicates rather than nested `if`s: the sign is a separate
-    // question from the class, so an `if class { if sign {..} else {..} }` shape puts the same
-    // two-level bump in front of every arm. `is_sign_negative` is don't-care on the NaN arm —
-    // Python prints `nan` for both — and is the WHOLE answer on the zero arms, since `v == 0.0`
-    // is true for negative zero too.
-    match (v.is_nan(), v.is_infinite(), v == 0.0, v.is_sign_negative()) {
-        (true, _, _, _) => Some("nan"),
-        (_, true, _, false) => Some("inf"),
-        (_, true, _, true) => Some("-inf"),
-        (_, _, true, false) => Some("0.0"),
-        (_, _, true, true) => Some("-0.0"),
+    match (v == 0.0, v.is_sign_negative()) {
+        (true, false) => Some("0.0"),
+        (true, true) => Some("-0.0"),
         _ => None,
     }
 }
@@ -562,18 +554,6 @@ fn tool_name(message: &Value, all: &[Value]) -> String {
     found.unwrap_or(id).into()
 }
 
-/// Render an OpenAI-shaped `messages` array as Muse Glimmer's chat framing.
-///
-/// **Messages are `Value`, not a typed model.** The template branches on seven optional fields
-/// (`reasoning_content`, `tool_calls`, `recipient`, `end_turn`, `name`, `tool_call_id`, and
-/// content-as-parts), most of which no caller sets; a struct carrying all of them would be
-/// more code than reading the keys, and the pinned cases are themselves JSON.
-///
-/// **An unrecognised role renders NOTHING.** The template's `if/elif` chain has no `else`, so
-/// a `developer` turn silently disappears. That is a deliberate divergence from GLM's port,
-/// which frames an unknown role as `user` on the argument that dropping content is worse —
-/// here the model's own file makes the other choice, and matching it is the whole point. The
-/// `unknown_role` case pins it.
 /// The system block the template SYNTHESISES when the caller supplies no system turn.
 ///
 /// Its own function because it is a different block from the one an explicit `system` message
@@ -720,6 +700,18 @@ fn end_token(messages: &[Value], i: usize, role: &str) -> &'static str {
     }
 }
 
+/// Render an OpenAI-shaped `messages` array as Muse Glimmer's chat framing.
+///
+/// **Messages are `Value`, not a typed model.** The template branches on seven optional fields
+/// (`reasoning_content`, `tool_calls`, `recipient`, `end_turn`, `name`, `tool_call_id`, and
+/// content-as-parts), most of which no caller sets; a struct carrying all of them would be
+/// more code than reading the keys, and the pinned cases are themselves JSON.
+///
+/// **An unrecognised role renders NOTHING.** The template's `if/elif` chain has no `else`, so
+/// a `developer` turn silently disappears. That is a deliberate divergence from GLM's port,
+/// which frames an unknown role as `user` on the argument that dropping content is worse —
+/// here the model's own file makes the other choice, and matching it is the whole point. The
+/// `unknown_role` case pins it.
 pub fn render(messages: &[Value], opts: &GlimmerChatOpts) -> String {
     let mut s = String::from("<|begin_of_text|>");
     let has_system = messages

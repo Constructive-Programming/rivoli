@@ -127,7 +127,7 @@ fn eos_ids(dir: &str) -> Result<Vec<u32>> {
 /// function is exactly "what is checked before the 53 GB write".
 ///
 /// Returns the ids, because `main`'s last act is comparing the artifact's against them.
-fn refuse_before_writing(src_dir: &str, out_dir: &str) -> Result<Vec<u32>> {
+fn refuse_before_writing(src_dir: &str, out_dir: &str) -> Result<(GlimmerConfig, Vec<u32>)> {
     // **Not into the source directory.** `SafeWriter::write` reads borrowed payloads at write
     // time, so the mapped shards are live while the output is being created; truncating a
     // file another mapping still holds is a SIGBUS — a fatal signal, not an error — with the
@@ -169,7 +169,10 @@ fn refuse_before_writing(src_dir: &str, out_dir: &str) -> Result<Vec<u32>> {
     // checkpoint in front of them — so the one line that lets them notice a wrong set is worth
     // more here than after a decode has run to its token limit.
     eprintln!("convert_glimmer: eos_token_id {ids:?}");
-    Ok(ids)
+    // The config the checks validated IS the config the manifest is built from — one
+    // parse, one value; a second read is the changed-during-the-run class this file's
+    // own EOS re-check paragraph treats as real (review 2026-08-16).
+    Ok((cfg, ids))
 }
 
 /// How many tensors the checkpoint's INDEX declares as vision, which is what makes the
@@ -227,8 +230,7 @@ fn ensure_complete(names: &[String], n_layers: usize) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let ids = refuse_before_writing(&args.src_dir, &args.out_dir)?;
-    let cfg = GlimmerConfig::load(&args.src_dir)?;
+    let (cfg, ids) = refuse_before_writing(&args.src_dir, &args.out_dir)?;
     let skipped = vision_count(&args.src_dir)?;
     std::fs::create_dir_all(&args.out_dir)?;
 
