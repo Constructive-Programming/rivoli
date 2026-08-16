@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: M15 wired the V4 lightning indexer end to end with ZERO new kernels — the pin places the 374 MB of attn.indexer.* it always counted, blocksel.rs drives the already-scored spread/scorer pair per step, and the 2052-token --ctx refusal is deleted; below that boundary the arm is the pre-M15 engine byte for byte (scored-vs-positional buffers proven identical), the engine's top-k reproduces the frozen oracle's selection set on every toy row (that gate red-proofed directly, by reversing the ranking comparator — the oracle-side tie flip provably could not have reddened it, since it moved the order and not the set), and the three --attn sparse cells flipped Refuse→FallbackLoudly. Device gates (ids A/B at ctx 2048, boundary-crossing smoke) and the NLL-vs-position gate (needs M10's --ppl) are owed and listed.
+verdict: M15 wired the V4 lightning indexer end to end with ZERO new kernels — the pin places the 374 MB of attn.indexer.* it always counted, blocksel.rs drives the already-scored spread/scorer pair per step, and the 2052-token --ctx refusal is deleted; below that boundary the arm is the pre-M15 engine byte for byte (scored-vs-positional buffers proven identical), the engine's top-k reproduces the frozen oracle's selection set on every toy row (that gate red-proofed directly, by reversing the ranking comparator — the oracle-side tie flip provably could not have reddened it, since it moved the order and not the set), and the three --attn sparse cells flipped Refuse→FallbackLoudly. ON SILICON 2026-08-16 the wiring ran for the first time and both device gates passed: the ids A/B at --ctx 2048 is byte-identical pre-vs-post INCLUDING headers with the same routing work on both arms (6217 hits / 1781 misses), and smoke-v4.sh is 3/3 — its ceiling cell prefilling 2474 tokens through the scored selection on an invocation that was refused at the door before M15, then decoding 32/32 ids identical to the recorded pre-M15 capture with --attn dsa warning and changing nothing. Owed: the NLL-vs-position gate (blocked on M10's --ppl) and a CodeScene score for blocksel.rs (CS_ACCESS_TOKEN unset, attempted twice, not guessed). No tok/s is claimed — dev-profile binaries, warm cache.
 ---
 
 # V4 scored block selection (M15)
@@ -55,9 +55,9 @@ hard-refused any `--ctx` at or above that at the door. The deviation's own text 
 |---|---|---|
 | (a) set equality | oracle-side: `crates/oracles/tests/v4_indexer_goldens.rs` — the exported score matrix DETERMINES the exported selection (list-equal, tie rule pinned) and below-cap rows keep every legal block. Engine-side: `crates/engine/tests/v4_scored_selection.rs` — `scored_rows` over the oracle's own exported scores reproduces the oracle's set on every row, truncation reached (anti-vacuity counters ≥ 3 rows), on the toy whose `index_topk = 2` puts the cap at 12 tokens | **GREEN**, deviceless, every `cargo test` |
 | (a′) below-cap byte identity | scored fill ≡ positional fill: adversarial synthetic scores (select.rs unit) AND real oracle scores (engine test), both phases | **GREEN**, deviceless |
-| (b) ids at `--ctx 2048` | byte-compare `--bench 32 --ctx 2048` pre-M15 (264758c) vs M15 — by the below-cap identity the claim is IDENTITY, strictly inside M8's registered standard | **OWED — GPU session** |
+| (b) ids at `--ctx 2048` | byte-compare `--bench 32 --ctx 2048` pre-M15 (264758c) vs M15 — by the below-cap identity the claim is IDENTITY, strictly inside M8's registered standard | **GREEN** 2026-08-16. Both arms dev-profile, isolated target dirs, `flock`ed, KFD witness 0 before and after each. `cmp` byte-identical INCLUDING headers, and both reported the same routing work (6217 hits / 1781 misses) — so the identity is of the work done, not only of the text. Capture committed as `tests/v4-bench32-ctx2048.ids` |
 | (c) NLL-vs-position across 2052 | needs M10's `--ppl` (teacher-forced NLL), unmerged in this tree | **BLOCKED on M10**; the deviceless half (keep-oldest ≠ scored on truncated rows — the sabotage's observability) is GREEN |
-| smoke | `tests/smoke-v4.sh`, 3 cells | **OWED — GPU session** (needs the recorded ids capture) |
+| smoke | `tests/smoke-v4.sh`, 3 cells | **GREEN 3/3** 2026-08-16, exit 0. Witness 0 before and after; during the run the only `/dev/kfd` holder was this suite's own `rivoli` (parent chain `flock` -> the script), so no arm is discarded |
 
 **Gate (b)'s standard, cited exactly**: `docs/investigations/rewrite.md` §M8 exit gate —
 cross-engine drift quantified with the reference's own instrument and calibrated against
@@ -67,6 +67,34 @@ resamples ties, it does not degrade"); M8 measured 30/32 argmax-identical with b
 at near-ties (gaps 0.21 and 1.40 against an agreeing median of 3.83). M15's below-cap
 claim is stronger than the standard: byte-identical selection buffers, so any id drift at
 `--ctx 2048` is a defect, not drift.
+
+## First silicon, 2026-08-16 — the scored path actually ran
+
+Nothing in `blocksel.rs` had ever executed before this run: `kernel_v4_indexer.rs` scores
+the kernels in isolation and the deviceless gate feeds `scored_rows` the oracle's scores,
+so the WIRING met a GPU for the first time here. What it proves, cell by cell:
+
+- **`refuse: mtp`** — `V4_MTP_NEEDS_A_KERNEL` fires with V4's own kernel-shaped reason
+  ("missing KERNEL, not a missing head"), i.e. the arm's other refusal did not drift while
+  its neighbour flipped.
+- **`ceiling gone`** — `--ctx 4096` with a ~2.5k-token prompt **prefilled 2474 tokens in
+  one whole-prompt pass** and decoded 12/12 finite ids. 2474 is inside the cell's asserted
+  2053–4083 window and read off the engine's own `PREFILL:` line, not the prompt's word
+  count. **This is the milestone**: past position 2052 the block set on all 21 indexed
+  layers is decided by the indexer's scores, and the identical invocation was REFUSED AT
+  THE DOOR before M15. The prefill is a single call, so the crossing happens inside one
+  `attention_block` sweep rather than accumulating over decode steps.
+- **`--attn dsa` falls back loudly** — the rewritten const appears verbatim in the live
+  `WARN` line, then the run decodes **32/32 ids identical to the recorded pre-M15
+  capture**. That is the strongest available form of "the flag toggles nothing": not that
+  the warning was printed, but that the text was unchanged by printing it.
+
+**No performance number is recorded from this session, and that is deliberate.** Both
+binaries are dev-profile, and the second arm of gate (b) ran with the first arm's page
+cache warm — the tok/s difference between them is a cache artifact, which the identical
+hit/miss counts confirm. A real V4 tok/s delta across the boundary needs `--release`,
+cold-cache symmetry and its own booking; it is not M15's to claim. The one number that IS
+evidence here is the token count, because it is a correctness fact.
 
 ## Red proofs (recorded in measurement/gate-red-proofs.md §5)
 
@@ -125,11 +153,15 @@ declined with the reason, rather than silently:
   (cached; three builds here). jscpd cannot see a 3-line clone under its `minLines: 5`.
   Declined as test-only, and because the fixture is what three of this milestone's red
   proofs were executed against.
-- **CodeScene was not run.** `cs` is installed but `CS_ACCESS_TOKEN` is unset on this box,
-  so the 10/10 hard gate is the one merge gate M15 leaves unverified. The two plausible
-  triggers are `blocksel::scored_selection` (~113 code lines, four phases — its own
-  comments already mark the split seams) and `scored_rows`'s six parameters. **Score
-  `crates/engine/src/v4/blocksel.rs` before merge.**
+- **CodeScene was not run.** Attempted twice — once host-side, once again in the GPU
+  session — and `CS_ACCESS_TOKEN` is unset both times, so `cs check` exits telling you to
+  set a PAT. (`cs` itself is installed, 1.0.36.) The 10/10 hard gate is therefore **the one
+  merge gate M15 leaves unverified**, and no score is guessed here in its place. The two
+  plausible triggers are `blocksel::scored_selection` (~113 code lines over four phases —
+  its own comments already mark where the seams would go) and `scored_rows`'s six
+  parameters. **Score `crates/engine/src/v4/blocksel.rs` before merge**; note that
+  `crates/cli/tests/codescene.rs` warns-and-skips without a license locally and hard-fails
+  in CI via `RIVOLI_CS_REQUIRED=1`, so this will surface there rather than here.
 
 ## Cost, stated
 

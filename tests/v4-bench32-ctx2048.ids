@@ -1,0 +1,50 @@
+# rivoli-ids v1 backend=rocm mode=int3-vq policy=2q attn=dense tokens=32
+# PROVENANCE. Produced by the engine's own --dump-ids, not by hand. Captured by the M15
+# coordinator on 2026-08-16 under `flock /var/run/sys-gpu.lock`, KFD witness 0 before and
+# after every arm, from a dev-profile build of the PRE-M15 pin (rw/main @ 264758c) in its
+# own CARGO_TARGET_DIR:
+#
+#   rivoli /var/db/rivoli/v4-f4-full --max-mem 100 --ctx 2048 --bench 32 --dump-ids <this>
+#
+# Gate (b) ran the identical command on the M15 build (wave/m15-v4-select) in the same
+# session: the two files were BYTE-IDENTICAL, headers included, and both arms reported the
+# same routing work (6217 expert hits, 1781 misses). So this is the pre-M15 capture by
+# CHOICE OF PROVENANCE, not because the two differ — --ctx 2048 sits below
+# positional_context_limit(512) = 2052, where IndexerBank::new builds nothing and the
+# scored arm is the positional one bit for bit. That is why smoke-v4.sh can treat any
+# drift here as a decode regression rather than as tolerable cross-version noise.
+#
+# NOT a performance record: dev-profile binaries, warm page cache on the second arm. The
+# tok/s from that session is deliberately absent from docs/measurement/ for both reasons.
+7230
+344
+834
+294
+270
+1473
+12734
+4218
+295
+6262
+14
+305
+270
+3287
+5095
+1910
+304
+18771
+305
+270
+1722
+2900
+64824
+418
+270
+3525
+339
+9544
+344
+270
+4654
+14
