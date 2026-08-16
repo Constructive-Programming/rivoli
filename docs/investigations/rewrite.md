@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The gates-first rewrite is through M0–M7 — gates armed and red-proofed before any code, anchors vendored before the engine, M4 decoded token-identically to the pinned reference, M5 scripted that comparison as a red-provable gate, M6 shipped tokenizer + legality table + enum Engine + serve + the thin CLI behind a 12-cell smoke, and M7 landed the first DENSE model: Glimmer's artifact side (a real cross-checkpoint config defect found and closed), the streaming dense loop with P6 live, a clean 12/12 kernel inventory plus the six owed oracle suites (49 device tests green), and an anchor decode gate reproducing the first-party goldens on silicon — tolerances envelope-gated, red-proven on device twice.
+verdict: The gates-first rewrite is through M0–M8 — gates armed and red-proofed before any code, anchors vendored before the engine, M4 decoded token-identically to the pinned reference, M5 scripted that comparison as a red-provable gate, M6 shipped tokenizer + legality table + enum Engine + serve + the thin CLI behind a 12-cell smoke, M7 landed the first DENSE model (Glimmer's streaming loop with P6 live, anchor decode reproducing first-party goldens on silicon), and M8 landed DeepSeek-V4: the second MoE arm through the factored seam, kernel census 53/53 with every oracle suite green on device, and forced-history parity with the pinned reference at 30/32 with both flips at near-ties — inside the reference's own registered drift standard.
 ---
 
 # The rewrite, milestone by milestone
@@ -355,10 +355,70 @@ TV unchanged) so nobody spends a GPU hour on them.
 **Standing debts, recorded with owners:** `output_multiplier` has no value assertion
 anywhere (argmax-invariant — no greedy gate can see it wrong; needs a logit-space gate);
 `kernel_glimmer_attend.rs` at 796/800; the three oracle files each spell their own
-fixture `draw` (shared home: tests/common); `old:tests/glimmer_tolerance.rs` never
-ported while `anchor.md` still claims its enforcement — correct or port with M8's
-tolerance work; the real-checkpoint tensor-name gate needs the shipped index.json (not
-on this machine).
+fixture `draw` (shared home: tests/common — PAID at M8, `common::draws`/`fill`);
+`old:tests/glimmer_tolerance.rs` never ported while `anchor.md` still claims its
+enforcement — correct or port with M8's tolerance work; the real-checkpoint tensor-name
+gate needs the shipped index.json (not on this machine).
+
+
+## M8 — DeepSeek-V4-Flash, the second MoE arm (CLOSED 2026-08-16)
+
+Commits `26a87b5` (artifact: `V4Config`, the dsv4 chat encoding gold-gated byte-for-byte,
+`convert_v4`), `89799cf` (deviceless: geometry/rope/KV-compress selection), `5640d07`
+(the arm: pin/engine/attn/kvcompress/moe/forward/decode, the third-arm factoring —
+`crate::resident` as the one placement author, `seam::Emit`, pool-owned trace — and the
+legality row atomic with the arm), `6e88f64` (nine kernel-oracle suites), `dad811c` (the
+round's review batch). The bsz=1 scope cut is ONE `ensure!` at
+`Extent::check_single_row_decode`, not 32 `debug_assert!`s.
+
+**Census 15 → 0: 53 launchers, 53 with oracles.** The suites were authored deviceless
+against the frozen oracle and paid first silicon contact here: 174 device tests green
+across 24 binaries, after one real disagreement that the KERNEL won — the rope suite red
+at err=3.886e-3 (one bf16 ulp at the fixture's scale) because the test's host reference
+skipped the bf16 store rounding both the kernel and the oracle perform; the host rounds
+now, and the round trip carries a format-derived 2^-8 bound instead of a ten-f32-ulp one
+its bf16-quantized intermediate could never meet. The compress-defects registry's
+two-message red proof was run as prescribed: a deleted `BELOW_RESOLUTION` row fails
+`NOT RECORDED`, a number changed by one fails `the record is stale`, green restored at
+the true record.
+
+**Review round (correctness + simplicity, read-only, device forbidden): 9 findings, 9
+applied.** The P1 was a defect-scope misclassification: `RopeBaseThetaEverywhere` was
+excluded from the compressor sweep with a reason ("keys off a ratio-0 layer") true only
+of its `if !compressed` twin — an excluded defect is never run, so the sweep could not
+catch its own hole. Measured on device after reclassification: it separates above the
+64-code floor on every cell. The two P2s were stale prose (the indexer suite disclaiming
+an oracle defect fixed 2026-08-05) and a vacuous proof (fresh-state determinism claimed
+as "reads no state" — now a NaN-poison bit-compare, plus the 256-token whole-multiple
+path's first value comparison against the oracle). Simplicity: dead `placement` fields,
+dead re-export, one dead defense, `tightest_ratio()` to one author, `a_kv_rows` carried
+beside its allocation, compressor widths off `Dims`.
+
+**Exit gate — parity against the pinned reference, by the reference's own standard.**
+The anchor question closed as an M4-style substitution: V4's first-party stack is
+tilelang + CUDA fast-hadamard (not runnable on this box), so the frozen oracle — itself
+gated against the 167 GB checkpoint — plus end-to-end parity with the old tree stands in
+for a first-party anchor. The rewrite's first V4 decode ran 2026-08-16
+(`rivoli /var/db/rivoli/v4-f4-full --bench 32 --ctx 2048`, dev profile, 6.42 tok/s,
+prefill 9 tokens — framing token-count-identical to the reference's). Free-run texts are
+word-identical except a position-1 fork (`That's` vs `That is`), converging immediately.
+Quantified with the reference's OWN drift instrument (a `teacher-forcing` build of the
+pin, built into its own target dir so the pinned parity binary is untouched;
+`-bench 32 --logit-dump --force-tokens <the rewrite's 32 ids>`): **30/32 positions the
+reference's argmax IS the rewrite's token**; the two flips sit at top-2 gaps 0.21 and
+1.40 against an agreeing-position median of 3.83, seven OTHER near-ties (< 1.5) did not
+flip, and both flipped tokens are the reference's rank-1 alternative. Calibration is
+`old:docs/investigations/v4-decode-decomposition.md` §M9's registered standard for
+intra-engine numeric drift (17/512 flips, flip-gap median 0.099 vs 3.19 overall, max
+|Δlogit| 8.14 — "the drift resamples ties, it does not degrade"): this cross-engine pair
+sits well inside it. Exact token identity was never the promise across kernels that are
+tolerance-gated rather than instruction-identical — M5 registered this exact fallback.
+
+Deliberately OUT of M8, each named in place: MTP (still deferred everywhere), the scored
+indexer selection (positional selection is the arm's declared deviation; the indexer
+weights are counted but not placed), bsz > 1 (the `ensure!`), a rewrite-side
+`--logit-dump` (the drift A/B above used the reference's; the rewrite grows one when a
+refactor needs a same-engine A/B).
 
 
 ## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)
