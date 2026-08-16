@@ -15,6 +15,10 @@ pub mod glimmer;
 #[cfg(feature = "rocm")]
 pub mod glm;
 pub mod indexer;
+// Ungated at the module and gated inside it, like `v4`: the fold schedule, the router
+// weighting and the composed widths are arithmetic over a config that touches no device,
+// and they are the half where a wrong answer is silent. `k3.rs` carries the arm's table.
+pub mod k3;
 /// The resident-set vocabulary every arm's pin shares — resolved weight types, the placers
 /// that build them, and the weights-only [`rivoli_core::residency::Floor`]. Gated here rather
 /// than inside, because every item takes a `DeviceTier`.

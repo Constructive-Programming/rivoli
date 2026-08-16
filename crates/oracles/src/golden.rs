@@ -86,6 +86,21 @@ impl GoldenSet {
         Self::read_anchor(r, MAGIC_GLIMMER)
     }
 
+    /// The KDA gate's lower bound out of a parsed K3 `tiny_config` — the one f64 the
+    /// recurrence launch takes.
+    ///
+    /// Beside the K3 reader rather than in a test harness because TWO harnesses need it
+    /// (the kernel suites' and the anchor gate's), each authored blind to the other, and
+    /// both spelled this JSON path verbatim — the 2026-08-16 integration's one jscpd
+    /// finding. The value ships at fla's own inclusive bound (`-5 <= lb < 0`), which is
+    /// why the launcher guard is `>=` (`k3:tests/k3_kernels.rs:2508`).
+    pub fn k3_gate_lower_bound(tiny: &serde_json::Value) -> f32 {
+        let lb = &tiny["linear_attn_config"]["gate_lower_bound"];
+        lb.as_f64()
+            .unwrap_or_else(|| panic!("tiny_config carries no linear_attn_config.gate_lower_bound"))
+            as f32
+    }
+
     /// A GLM-5.2 anchor golden.
     pub fn read_glm(r: &mut impl Read) -> Result<Self> {
         Self::read_anchor(r, MAGIC_GLM)

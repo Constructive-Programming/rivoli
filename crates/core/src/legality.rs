@@ -305,11 +305,6 @@ pub enum Outcome {
 // --- The table. One function per architecture, dispatched once; every message is a
 // --- named const so the verdicts read as rows rather than as prose.
 
-const NO_ENGINE_ARM: &str = "this architecture has no decode path in this build — GLM-5.2, \
-     Muse Glimmer-30B and DeepSeek-V4-Flash are the arms so far. Every flag refuses here \
-     rather than a chosen few, because a knob cannot be legal on a model that cannot decode \
-     at all";
-
 const DENSE_HAS_NO_ROUTED_FORMAT: &str = "--mode names how ROUTED EXPERTS are stored, and \
      this architecture is DENSE — it has no experts and no routing, and its weights are \
      bf16 throughout. The flag is ignored, and nothing in the run is stored in the format \
@@ -383,6 +378,29 @@ const V4_TRACE_PREFILL_IS_ONE_PASS: &str = "--trace still captures the routed-ex
      prefill lands as a single pseudo-token however long the prompt was. The DECODE half is \
      faithful; prefill reads/token derived from this file are not comparable with GLM's";
 
+const K3_FORMAT_IS_THE_CHECKPOINTS: &str = "--mode names how ROUTED EXPERTS are stored, and \
+     on this architecture the checkpoint decides: Kimi-K3 SHIPS its 896 experts per layer as \
+     MXFP4 (e2m1 nibbles, one e8m0 scale per 32 weights), repacked byte-for-byte into `.f4` \
+     with nothing quantized. The flag is ignored, and nothing in the run is stored in the \
+     format you named. What moves residency here is --max-mem, which decides how much of the \
+     ~1.3 TiB routed set is pinned";
+
+const K3_SPARSE_ATTN_HAS_NO_SUBSTRATE: &str = "streaming sinks, the DSA lightning indexer \
+     and MISA are all row selections over a dense KV cache, and 69 of this architecture's 93 \
+     layers keep NO rows at all — the KDA recurrence folds every position into a fixed \
+     [heads][128][128] state, so there is nothing for a selection to select from. The 24 \
+     gated MLA layers do keep rows, but this checkpoint ships no indexer to rank them, so \
+     `dsa` names weights that do not exist and the other two name an increment nobody has \
+     measured on a quarter of a model";
+
+const K3_MTP_NEEDS_TWO_KERNELS: &str = "speculative decode on this architecture is blocked \
+     by TWO missing kernels, which is more than either other refusal: the MXFP4 situ expert \
+     range is instantiated at one row only (its guard refuses nrow != 1), and a verify pass \
+     would also need a MULTI-TOKEN KDA recurrence — the chunked kernel whose port must \
+     reinstate the UT-transform inverse and the A_qk-diagonal retention together with gating \
+     fixtures. There is no draft head loaded either, but the kernels are what would have to \
+     arrive first";
+
 /// **The** legality decider. Total over `Arch × Flag` by the compiler: adding an
 /// architecture breaks this match, adding a flag breaks [`glm`], and either way the build
 /// stops until the new cell has an argued answer.
@@ -391,10 +409,56 @@ pub fn decide(arch: Arch, flag: Flag) -> Outcome {
         Arch::GlmMoeDsa => glm(flag),
         Arch::MuseGlimmer => muse_glimmer(flag),
         Arch::DeepseekV4 => deepseek_v4(flag),
-        // Not a wildcard over the flag axis: the reason is architecture-level, so the
-        // flag is genuinely not consulted. Splitting the dispatch this way is what keeps
-        // a `_` out of the table entirely.
-        Arch::KimiK3 => Outcome::Refuse(NO_ENGINE_ARM),
+        Arch::KimiK3 => kimi_k3(flag),
+    }
+}
+
+/// Kimi-K3's row of the table — M9's arm, and most of it is two facts worked out flag by
+/// flag: **the checkpoint chose the expert format**, and **69 of 93 layers are a recurrence,
+/// not an attention with rows to select.**
+///
+/// # `--mode` falls back loudly, forced the same way V4's was
+///
+/// `Support` would accept `--mode int4` on a run that stores nothing in int4 — the recorded
+/// command line carrying a knob nothing spent. `Refuse` would kill `rivoli K3DIR --bench 4`,
+/// an invocation with no `--mode` typed, because `main::requested_flags` submits the
+/// value-carrying flags on their RESOLVED value by design.
+///
+/// # `--attn dense` is `Support`, on Muse Glimmer's precedent and not V4's
+///
+/// Glimmer's cell is `Support` although 39 of its 52 layers slide, because `dense` names
+/// what its full layers genuinely do. K3's 24 MLA layers attend the whole causal prefix the
+/// same way — NoPE, unconditionally causal — and the KDA layers are not an attention row
+/// selection at all, so the flag contradicts nothing. V4's `FallbackLoudly` is the different
+/// case: there EVERY layer attends a window plus pooled blocks, so `dense` described no
+/// layer in the run.
+///
+/// # The rest
+///
+/// `--cache-policy` and `--max-mem` govern every token here even harder than on V4: the
+/// routed set is ~1.3 TiB against ~115 GiB of budget, so residency is never the tail of a
+/// working set. `--ctx` sizes the 24 MLA caches ONLY — the KDA state is context-free, which
+/// is this row's contribution to the header's "a flag earns a row when some architecture
+/// answers it differently". `--trace` is the one cell BETTER here than on GLM: this arm's
+/// prefill is already token-sequential (the recurrence forces it), so the v2 trace's
+/// token-major recovery is exact and nothing falls back. `--mtp` refuses with K3's OWN two
+/// blockers, because quoting GLM's or V4's wording would tell a user to wait for the wrong
+/// thing.
+fn kimi_k3(flag: Flag) -> Outcome {
+    match flag {
+        // Every value together: the checkpoint's format is the same whichever was typed.
+        Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid) => {
+            Outcome::FallbackLoudly(K3_FORMAT_IS_THE_CHECKPOINTS)
+        }
+        Flag::Attn(AttnKind::Dense) => Outcome::Support,
+        Flag::Attn(AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa) => {
+            Outcome::Refuse(K3_SPARSE_ATTN_HAS_NO_SUBSTRATE)
+        }
+        Flag::CachePolicy | Flag::MaxMem | Flag::Ctx => Outcome::Support,
+        // No fallback and no refusal: a token-sequential prefill IS token-major, so the
+        // capture is faithful and costs the run nothing to be honest about.
+        Flag::Trace => Outcome::Support,
+        Flag::Mtp => Outcome::Refuse(K3_MTP_NEEDS_TWO_KERNELS),
     }
 }
 
@@ -702,9 +766,10 @@ mod tests {
     fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
         let default_mode = parse_in(&MODES, "--mode", "int3-vq").expect("int3-vq parses");
         let default_attn = parse_in(&ATTNS, "--attn", "dense").expect("dense parses");
-        // The arms, named. A third one added without a row here is a third one nobody
-        // checked can start.
-        for arch in [Arch::GlmMoeDsa, Arch::MuseGlimmer, Arch::DeepseekV4] {
+        // Every architecture, because as of M9 every architecture HAS an arm — the day a
+        // fifth lands armless, restore a named list here excluding it (and `main`'s ARMS
+        // test is the cross-check that the two lists agree).
+        for arch in Arch::ALL {
             for flag in [Flag::Mode(default_mode), Flag::Attn(default_attn)] {
                 assert!(
                     !matches!(decide(arch, flag), Outcome::Refuse(_)),
@@ -765,6 +830,52 @@ mod tests {
         // The three knobs that are MORE real here than on GLM — the routed set cannot fit.
         for f in [Flag::CachePolicy, Flag::MaxMem, Flag::Ctx] {
             assert_eq!(v4(f), Outcome::Support, "{} must decode", f.spelling());
+        }
+    }
+
+    /// Kimi-K3's row, cell by cell, as of M9 — the same change-detector as the three above
+    /// and for the same reason: the total and anti-vacuity checks would not notice a cell
+    /// being flipped, which is the one edit that changes what the engine accepts.
+    ///
+    /// **The `--mode` cells are the load-bearing ones**, exactly as on V4: they must be
+    /// `FallbackLoudly` and not `Refuse`, because `main::requested_flags` submits
+    /// `Flag::Mode` on its RESOLVED value and a refusal would kill `rivoli K3DIR --bench 4`
+    /// on a flag the user never typed. `--attn dense` is `Support` on Glimmer's precedent
+    /// (the row's own doc carries the argument), and `--trace` is plain `Support` — the one
+    /// cell where this arm is strictly simpler than GLM, because a token-sequential prefill
+    /// has nothing to fall back FROM.
+    #[test]
+    fn kimi_k3_row_is_the_m9_truth() {
+        let k3 = |f| decide(Arch::KimiK3, f);
+        let refused = |f| matches!(k3(f), Outcome::Refuse(_));
+        every_mode_falls_back_loudly(Arch::KimiK3);
+        assert_eq!(k3(Flag::Attn(AttnKind::Dense)), Outcome::Support);
+        for kind in [AttnKind::Streaming, AttnKind::Dsa, AttnKind::Misa] {
+            assert!(refused(Flag::Attn(kind)), "{kind:?} must refuse");
+        }
+        // The MTP refusal is K3's OWN and must not quote either sibling's: GLM waits on a
+        // draft head, V4 on one kernel — a K3 user waits on TWO kernels, and the recurrence
+        // is the one no other arm has.
+        let Outcome::Refuse(mtp) = k3(Flag::Mtp) else {
+            panic!("--mtp must refuse on kimi-k3");
+        };
+        for other in [Arch::GlmMoeDsa, Arch::DeepseekV4] {
+            let Outcome::Refuse(theirs) = decide(other, Flag::Mtp) else {
+                panic!("--mtp must refuse on {}", other.name());
+            };
+            assert_ne!(mtp, theirs, "K3's --mtp wording must be its own");
+        }
+        assert!(
+            mtp.contains("KDA"),
+            "K3's --mtp reason must name the recurrence: {mtp:?}"
+        );
+        // --trace: Support, not GLM's FallbackLoudly — flipping this cell to a fallback
+        // would warn about a token-major degrade this arm cannot even perform.
+        assert_eq!(k3(Flag::Trace), Outcome::Support);
+        // The three knobs, of which --ctx is the header's own example of per-arch variance:
+        // it sizes the 24 MLA caches and the KDA state not at all.
+        for f in [Flag::CachePolicy, Flag::MaxMem, Flag::Ctx] {
+            assert_eq!(k3(f), Outcome::Support, "{} must decode", f.spelling());
         }
     }
 

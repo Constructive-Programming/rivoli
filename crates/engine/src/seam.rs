@@ -24,6 +24,7 @@ use anyhow::Result;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
+use rivoli_artifact::k3_config::K3Config;
 use rivoli_artifact::v4_config::V4Config;
 use rivoli_core::cache::TwoQSplit;
 
@@ -215,6 +216,9 @@ pub enum ArchCfg<'a> {
     Glm(&'a ModelConfig, RoutedFmt, PoolKnobs<'a>),
     Glimmer(&'a GlimmerConfig),
     V4(&'a V4Config, PoolKnobs<'a>),
+    /// Routed like V4 — a pool, no format choice (the checkpoint ships MXFP4) — so the
+    /// same `PoolKnobs` and the same absence of a `RoutedFmt`.
+    K3(&'a K3Config, PoolKnobs<'a>),
 }
 
 /// The decode engines, one variant per architecture that has a loop.
@@ -239,6 +243,7 @@ pub enum Engine<'a> {
     Glm(crate::glm::engine::GlmEngine<'a>),
     Glimmer(crate::glimmer::engine::GlimmerEngine<'a>),
     V4(crate::v4::engine::V4Engine<'a>),
+    K3(crate::k3::engine::K3Engine<'a>),
 }
 
 /// A backendless build has no arm at all, and says so in the type: `Infallible` makes the
@@ -300,6 +305,15 @@ impl<'a> Engine<'a> {
                 let e = crate::v4::engine::V4Engine::new(pin, cfg, spec.max_ctx)?;
                 Ok(Engine::V4(e))
             }
+            ArchCfg::K3(cfg, knobs) => {
+                // Same door discipline as V4's, different ceiling: K3's is the attend
+                // kernel's staging bound, and the pin behind it reads a terabyte-class
+                // artifact — the most expensive load in the tree to refuse late.
+                crate::k3::geometry::check_context(spec.max_ctx)?;
+                let pin = crate::k3::pin::K3Pin::build(dir, &cfg.text, pin_cfg(capacity, knobs))?;
+                let e = crate::k3::engine::K3Engine::new(pin, &cfg.text, spec.max_ctx)?;
+                Ok(Engine::K3(e))
+            }
         }
     }
 
@@ -344,6 +358,8 @@ impl<'a> Engine<'a> {
             Engine::Glimmer(e) => e.max_ctx(),
             #[cfg(feature = "rocm")]
             Engine::V4(e) => e.max_ctx(),
+            #[cfg(feature = "rocm")]
+            Engine::K3(e) => e.max_ctx(),
             #[cfg(not(feature = "rocm"))]
             Engine::Never(never, _) => match *never {},
         }
@@ -389,6 +405,7 @@ impl<'a> Engine<'a> {
                 }
                 Engine::Glimmer(e) => e.decode(req, sink),
                 Engine::V4(e) => e.decode(req, sink),
+                Engine::K3(e) => e.decode(req, sink),
             }
         }
     }

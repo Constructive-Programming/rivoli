@@ -15,11 +15,13 @@
 //! below has to defend against the other having been asked for too.
 
 use anyhow::{Context, Result, bail, ensure};
-use rivoli_artifact::format::RoutedFmt;
-use rivoli_artifact::glimmer_config::GlimmerConfig;
-use rivoli_artifact::glm_config::ModelConfig;
-use rivoli_artifact::tokenizer::Tokenizer;
-use rivoli_artifact::v4_config::V4Config;
+// One nested use for the artifact types: as five separate lines this preamble reproduced
+// another file's token for token the moment the K3 import landed, and the jscpd gate
+// reported the pair — an import list being the one duplication Rust cannot factor.
+use rivoli_artifact::{
+    format::RoutedFmt, glimmer_config::GlimmerConfig, glm_config::ModelConfig, k3_config::K3Config,
+    tokenizer::Tokenizer, v4_config::V4Config,
+};
 use rivoli_core::cache::TwoQSplit;
 use rivoli_core::legality::{ATTNS, Arch, AttnKind, Flag, MODES, Mode, Outcome, decide, name_in};
 use rivoli_engine::{ArchCfg, Engine, GenSpec, OpenSpec, PoolKnobs};
@@ -368,19 +370,30 @@ fn main() -> Result<()> {
             let cfg = V4Config::load(&a.model)?;
             open_and_run(&a, &tok, bench.as_ref(), ArchCfg::V4(&cfg, pool_knobs(&a)))
         }
-        // Unreachable through `check_legality`: `Flag::Mode` is submitted on every run and
-        // the table refuses it with NO_ENGINE_ARM for both of these — `the_arms_and_the_
-        // legality_table_agree_about_who_can_start` is what holds those two lists together.
-        // A `bail!` rather than an `unreachable!` for the reason the `(None, None)` arm
-        // below gives: being wrong about a contract should be a message, not a panic.
-        other => bail!(
-            "{} ({}) has no decode path in this build — rivoli_core::legality should have \
-             refused this run at the door",
-            other.name(),
-            other.summary()
-        ),
+        // The match went EXHAUSTIVE when this arm landed (M9): the "no decode path" bail
+        // that stood here would now be an unreachable pattern, which is the design working —
+        // a fifth architecture reopens the hole and the compiler reports it.
+        Arch::KimiK3 => {
+            // `--port` refuses at THIS door, before a terabyte-class pin. Not a legality
+            // row, because `--port` is the INVOCATION (the table's own scope rule) — but
+            // the same courtesy: the reason, not "invalid".
+            if a.port.is_some() {
+                bail!("{K3_PORT_HAS_NO_CHAT_ENCODING}");
+            }
+            let cfg = K3Config::load(&a.model)?;
+            open_and_run(&a, &tok, bench.as_ref(), ArchCfg::K3(&cfg, pool_knobs(&a)))
+        }
     }
 }
+
+/// Why a K3 artifact cannot serve. A named const like the legality rows' and for the same
+/// reason: the wording is data, cited by the refusal and pinned by a test.
+const K3_PORT_HAS_NO_CHAT_ENCODING: &str = "--port needs a chat encoding and Kimi-K3 ships \
+     NONE in any tree — its tokenizer_config.json has no chat_template, so `convert_k3` \
+     copies no template, and inventing a framing here would feed the model turn markers it \
+     never saw (an instruct model outside its turn structure never emits a stop token — the \
+     failure that invalidated 56 benchmark runs in the old tree). Use --bench, whose prompt \
+     is encoded RAW on this architecture.";
 
 /// GLM's routed FORMAT — the one knob V4 does not have.
 ///
@@ -480,7 +493,13 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
             vec![Message::user(text)],
             &EncodeOpts::new(ThinkingMode::Chat),
         ),
-        Arch::GlmMoeDsa | Arch::MuseGlimmer | Arch::KimiK3 => tok.encode_chat(text),
+        Arch::GlmMoeDsa | Arch::MuseGlimmer => tok.encode_chat(text),
+        // RAW, deliberately: K3 ships no chat template in ANY tree (`convert_k3`'s header
+        // records it), so there is no "its own framing" to render — this line inherited
+        // GLM's `encode_chat` until M9, which would have fed a K3 checkpoint `[gMASK]
+        // <sop>` markers it never saw. A base-model bench prompt is document continuation,
+        // and raw encoding is the honest spelling of that.
+        Arch::KimiK3 => tok.encode(text),
     }
 }
 
@@ -603,15 +622,17 @@ mod tests {
         }
     }
 
-    /// **The `bail!` in `main`'s architecture match is unreachable, and this is why.**
+    /// **The arms `main` dispatches to and the table's refusals must name the same set.**
     ///
-    /// `main` sniffs, runs `check_legality`, and only then dispatches on the architecture —
-    /// with an arm for two of the four. `check_legality` submits `--mode` and `--attn` on
-    /// every run, so the contract that keeps the bail unreachable is: an architecture with NO
-    /// arm must have one of those defaults refused. The converse — an architecture WITH an
-    /// arm must refuse neither — is `rivoli_core::legality`'s
-    /// `every_architecture_with_an_arm_decodes_with_no_flags_typed`, and [`ARMS`] below is
-    /// what ties the two lists together.
+    /// `main` sniffs, runs `check_legality`, and only then dispatches on the architecture.
+    /// Since M9 the match is exhaustive with a real arm per variant, so the "no decode
+    /// path" bail is gone — but the contract survives it: an architecture with NO arm must
+    /// have `--mode` or `--attn` refused (that is what kept the bail unreachable while one
+    /// existed), and an architecture WITH an arm must refuse neither, which is
+    /// `rivoli_core::legality`'s
+    /// `every_architecture_with_an_arm_decodes_with_no_flags_typed`. [`ARMS`] below is what
+    /// ties the two lists together, and a fifth architecture lands red here until both
+    /// sides answer for it.
     ///
     /// The defaults come from PARSING a bare invocation through the same two functions
     /// `main` uses, not from restating clap's `default_value` attributes — a restatement is
@@ -622,7 +643,12 @@ mod tests {
         // Hand-written, on the same argument as `legality::ARCH_COUNT`: no test can observe
         // a `match`'s arms, so the list is stated and the assertion is what binds it. Adding
         // an arm to `main` without a row here leaves that architecture unchecked.
-        const ARMS: [Arch; 3] = [Arch::GlmMoeDsa, Arch::MuseGlimmer, Arch::DeepseekV4];
+        const ARMS: [Arch; 4] = [
+            Arch::GlmMoeDsa,
+            Arch::MuseGlimmer,
+            Arch::DeepseekV4,
+            Arch::KimiK3,
+        ];
         let Ok(a) = <Args as clap::Parser>::try_parse_from(["rivoli", "DIR", "--bench", "1"])
         else {
             panic!("`rivoli DIR --bench 1` must parse — the invocation contract has moved");

@@ -139,16 +139,11 @@ pub fn betas(g: &GoldenSet) -> (f32, f32) {
 /// two conventions are visible instead of a literal at three sites (`k3:tests/k3_kernels.rs:1527`).
 pub const SHIPPED_BETAS: (f32, f32) = (4.0, 25.0);
 
-/// `-5.0`, read off the golden's own config rather than written down.
-///
-/// It lives in `linear_attn_config.gate_lower_bound` and is in the anchor driver's
-/// `STRUCTURAL_LINEAR_ATTN`. fla range-checks `-5 <= lower_bound < 0`, so the shipped value
-/// sits exactly on the inclusive end of its own accepted range — which is why the launcher's
-/// guard is `>= -5.0` and not `> -5.0` (`k3:tests/k3_kernels.rs:2508`).
+/// `-5.0`, read off the golden's own config rather than written down — through the reader's
+/// own accessor, where the bound's inclusive-end argument now lives (it was spelled here AND
+/// in the anchor gate's harness, which was the 2026-08-16 integration's one jscpd finding).
 pub fn lower_bound(g: &GoldenSet) -> f32 {
-    tiny(g)["linear_attn_config"]["gate_lower_bound"]
-        .as_f64()
-        .expect("gate_lower_bound") as f32
+    GoldenSet::k3_gate_lower_bound(&tiny(g))
 }
 
 /// Relative difference the way the anchor's `--by-operator` measures it, so the number
