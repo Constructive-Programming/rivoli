@@ -39,8 +39,8 @@
 // moment this file existed. `crates/cli/tests/glimmer_convert.rs` records reaching for the same
 // fix for the same reason.
 use rivoli_artifact::{
-    glimmer_config::GlimmerConfig, glm_config::ModelConfig, schema::parse_config,
-    v4_config::V4Config,
+    glimmer_config::GlimmerConfig, glm_config::ModelConfig, k3_config::K3Config,
+    schema::parse_config, v4_config::V4Config,
 };
 use serde_json::{Value, json};
 
@@ -63,6 +63,11 @@ const V4_SHIPPED: &str = include_str!("../../../docs/measurement/v4-reference/co
 /// V4 fields, which is the weaker reading this test exists to rule out.
 const GLIMMER_SHIPPED: &str =
     include_str!("../../../docs/measurement/glimmer-reference/config.json");
+
+/// Kimi-K3's shipped config — the OTHER MXFP4-expert checkpoint, so the V4↔K3 cross-parse
+/// pair below is the one where "same expert format, different decode path" makes the
+/// architecture check do real work.
+const K3_SHIPPED: &str = include_str!("../../../docs/measurement/k3-reference/config.json");
 
 fn shipped() -> Value {
     serde_json::from_str(V4_SHIPPED).unwrap()
@@ -407,6 +412,11 @@ fn v4_and_the_other_architectures_do_not_cross_parse() {
     // Glimmer is the third, and both directions run against its REAL file.
     assert!(parse_config::<GlimmerConfig>(V4_SHIPPED).is_err());
     assert!(parse_config::<V4Config>(GLIMMER_SHIPPED).is_err());
+    // K3 is the fourth (2026-08-16, with M9), both directions against its real file too —
+    // the pair matters because both checkpoints ship MXFP4 routed experts, so the two
+    // configs describe the same expert FORMAT around incompatible decode paths.
+    assert!(parse_config::<K3Config>(V4_SHIPPED).is_err());
+    assert!(parse_config::<V4Config>(K3_SHIPPED).is_err());
     // And a document that declares NEITHER field is refused rather than assumed to be this one.
     let mut doc = shipped();
     let obj = doc.as_object_mut().unwrap();

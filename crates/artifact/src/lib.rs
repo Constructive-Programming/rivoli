@@ -16,6 +16,7 @@ pub mod glimmer_config;
 /// pair that "the two must not converge", so they do not share a module.
 pub mod glimmer_encoding;
 pub mod glm_config;
+pub mod k3_config;
 pub mod quant;
 pub mod schema;
 pub mod tokenizer;

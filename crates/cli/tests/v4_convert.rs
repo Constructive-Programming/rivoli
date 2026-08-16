@@ -73,48 +73,25 @@ const HASH_LAYERS: usize = 2;
 
 const SHARD: &str = "model-00001-of-00001.safetensors";
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
+// > **MOVED 2026-08-16.** `f32_bytes`, `opaque_bytes`, `e8m0_bytes` and the dtype-driven
+// > byte policy lived here until `k3_convert.rs` became the fourth converter gate and
+// > `build.rs`'s jscpd reported each as a clone. They are `common::{f32_bytes,
+// > opaque_bytes, e8m0_bytes, tensor}` now, arguments travelling verbatim — including the
+// > measured e8m0 range (`0x76..=0x7e`, zero `0x00`/`0xff` over the shipped 43-layer set)
+// > that [`an_e8m0_nan_scale_byte_is_refused`] relies on.
 
-/// Deterministic filler bytes for a tensor the converter never interprets.
-///
-/// **Keyed on the NAME**, like `common::weights`, which is what makes a byte comparison mean
-/// something: a converter that wrote the right tensor's bytes under the wrong name, or the
-/// wrong tensor's under the right one, fails rather than passing on identical content.
-fn opaque_bytes(name: &str, n: usize) -> Vec<u8> {
-    common::weights(name, n)
-        .iter()
-        .map(|x| ((x * 1000.0) as i32).unsigned_abs() as u8)
-        .collect()
-}
-
-/// e8m0 exponent bytes, kept inside the range the shipped checkpoint actually uses.
-///
-/// Measured on the real 43-layer set: 9 distinct codes, all in `0x76..=0x7e`, with **zero**
-/// `0x00` and zero `0xff`. `0xff` is the format's NaN and `F4Expert::spans` refuses it — which
-/// [`an_e8m0_nan_scale_byte_is_refused`] relies on, so the good fixture must not contain one by
-/// accident.
-fn e8m0_bytes(name: &str, n: usize) -> Vec<u8> {
-    opaque_bytes(name, n)
-        .iter()
-        .map(|b| 0x76 + (b % 9))
-        .collect()
-}
-
+/// [`common::tensor`], except `I64`: V4's only I64 tensor is `tid2eid`, whose values must
+/// be LEGAL EXPERT IDS — bounded by this fixture's `EXPERTS` — so its bytes cannot come
+/// from the model-agnostic helper.
 fn tensor(name: &str, dtype: Dtype, shape: Vec<usize>) -> Tensor {
-    let n: usize = shape.iter().product();
-    let bytes = match dtype {
-        Dtype::Bf16 => common::bf16_bytes(&common::weights(name, n)),
-        Dtype::F32 => f32_bytes(&common::weights(name, n)),
-        Dtype::I64 => (0..n)
+    if dtype == Dtype::I64 {
+        let n: usize = shape.iter().product();
+        let bytes = (0..n)
             .flat_map(|i| ((i % EXPERTS) as i64).to_le_bytes())
-            .collect(),
-        Dtype::F8E8M0 => e8m0_bytes(name, n),
-        // F8E4M3, I8, U8 — bytes the converter copies and never decodes.
-        _ => opaque_bytes(name, n),
-    };
-    (name.to_string(), dtype, shape, bytes)
+            .collect();
+        return (name.to_string(), dtype, shape, bytes);
+    }
+    common::tensor(name, dtype, shape)
 }
 
 /// An fp8 pair in V4's spelling: `<base>.weight` (F8_E4M3) + `<base>.scale` (**F8_E8M0**), the
@@ -364,20 +341,9 @@ fn v4_config_json() -> serde_json::Value {
     })
 }
 
-/// The shard and its index, always written together — the index is what `open_indexed` selects
-/// shards by, so a refusal arm that dropped a tensor from one and left it in the other would be
-/// testing a truncated-file error instead of the guard it meant to.
-fn write_shard_and_index(src: &Path, tensors: &[Tensor]) {
-    common::write_shard(&src.join(SHARD), tensors);
-    let entries: Vec<(String, &str)> = tensors
-        .iter()
-        .map(|(n, _, _, _)| (n.clone(), SHARD))
-        .collect();
-    common::write_weight_map(src, &entries);
-}
-
 /// The whole synthetic checkpoint. Returns the tensors, so the round-trip test can compare the
-/// artifact against the bytes that went in.
+/// artifact against the bytes that went in. (`write_shard_and_index` moved to `common/` with
+/// the byte helpers above, same trigger.)
 fn write_fixture(src: &Path) -> Vec<Tensor> {
     let config = v4_config_json();
     common::write_config(src, &config);
@@ -386,7 +352,7 @@ fn write_fixture(src: &Path) -> Vec<Tensor> {
     let _: V4Config = rivoli_artifact::schema::parse_config(&config.to_string())
         .expect("the fixture config parses");
     let tensors = all_tensors();
-    write_shard_and_index(src, &tensors);
+    common::write_shard_and_index(src, SHARD, &tensors);
     // The three AUX files `finish_artifact` copies. Stubs: this converter reads none of them —
     // V4's stop tokens reach the engine through the copied `generation_config.json`, and there
     // is deliberately no `chat_template.jinja` (see `rivoli_artifact::v4_encoding`).
@@ -400,27 +366,13 @@ fn write_fixture(src: &Path) -> Vec<Tensor> {
     tensors
 }
 
-fn run(args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_convert_v4"))
-        .args(args)
-        .output()
-        .expect("run convert_v4")
-}
-
-/// The two positionals plus whatever flags the arm is about.
-fn invoke(src: &Path, out: &Path, extra: &[&str]) -> std::process::Output {
-    let mut args = vec![src.to_str().unwrap(), out.to_str().unwrap()];
-    args.extend_from_slice(extra);
-    run(&args)
-}
-
-fn convert(src: &Path, out: &Path, extra: &[&str]) -> String {
-    common::expect_success(&invoke(src, out, extra), "convert_v4")
-}
-
-fn refuses(src: &Path, out: &Path, extra: &[&str], want: &str) {
-    common::expect_refusal(&invoke(src, out, extra), want);
-}
+/// The binary under test — the run/convert/refuse plumbing is `common::ConvertBin`'s,
+/// factored there when `k3_convert.rs` became the fourth converter gate and jscpd reported
+/// the free-function quartet the first two gates each carried.
+const BIN: common::ConvertBin = common::ConvertBin {
+    exe: env!("CARGO_BIN_EXE_convert_v4"),
+    tool: "convert_v4",
+};
 
 #[test]
 fn convert_v4_writes_an_artifact_that_reopens_as_the_same_model() {
@@ -430,7 +382,7 @@ fn convert_v4_writes_an_artifact_that_reopens_as_the_same_model() {
 
     // `--verify` is the strong arm: the converter re-reads every `.f4` it wrote and
     // byte-compares each expert span against the source tensors.
-    let log = convert(&src, &out, &["--verify"]);
+    let log = BIN.at(&src, &out).convert(&["--verify"]);
     assert!(
         log.contains(&format!("experts={EXPERTS} layers 0..{LAYERS}")),
         "{log}"
@@ -466,7 +418,7 @@ fn convert_v4_writes_an_artifact_that_reopens_as_the_same_model() {
 
     // READ-ONLY re-verification of the finished artifact — the mode's own gate, and a second,
     // independent statement that the `.f4` bytes are the source's.
-    let log = convert(&src, &out, &["--verify-only"]);
+    let log = BIN.at(&src, &out).convert(&["--verify-only"]);
     assert!(log.contains("verify-only"), "{log}");
     common::clean(&root);
 }
@@ -532,8 +484,8 @@ fn two_converts_of_one_checkpoint_are_byte_identical() {
     let src = root.join("src");
     write_fixture(&src);
     let (a, b) = (root.join("out1"), root.join("out2"));
-    convert(&src, &a, &[]);
-    convert(&src, &b, &[]);
+    BIN.at(&src, &a).convert(&[]);
+    BIN.at(&src, &b).convert(&[]);
     let mut names = vec![
         "manifest.json".to_string(),
         "resident.safetensors".to_string(),
@@ -560,7 +512,7 @@ fn a_partial_range_is_recorded_and_never_rewrites_the_layer_count() {
     let root = common::scratch("v4-convert-range");
     let (src, out) = (root.join("src"), root.join("out"));
     write_fixture(&src);
-    convert(&src, &out, &["--from", "1", "--to", "3"]);
+    BIN.at(&src, &out).convert(&["--from", "1", "--to", "3"]);
 
     let art = out.to_str().unwrap();
     assert_eq!(f4_layer_range(art, LAYERS).unwrap(), 1..3);
@@ -592,12 +544,13 @@ fn convert_v4_refuses_before_it_writes() {
     // `out_dir == src_dir` is refused by path identity — `src/.` canonicalizes to the same
     // inode, so the trailing component must not fool it. The hazard is `SafeWriter`'s and the
     // guard is now its own; see `SafeWriter::refuse_writing_into_source`.
-    refuses(&src, &src.join("."), &[], "SIGBUS");
+    BIN.at(&src, &src.join(".")).refuses(&[], "SIGBUS");
 
     // A range outside the model is REFUSED, not clamped: `--to 999` silently converting 4
     // layers would look like it did what was asked.
-    refuses(&src, &out, &["--to", "99"], "is not inside");
-    refuses(&src, &out, &["--from", "3", "--to", "3"], "is not inside");
+    BIN.at(&src, &out).refuses(&["--to", "99"], "is not inside");
+    BIN.at(&src, &out)
+        .refuses(&["--from", "3", "--to", "3"], "is not inside");
 
     // A checkpoint whose CONFIG disagrees with its TENSORS. Nothing downstream would catch it:
     // every tensor here is copied verbatim and the manifest carries the config verbatim, so a
@@ -608,7 +561,7 @@ fn convert_v4_refuses_before_it_writes() {
     let mut doc: serde_json::Value = serde_json::from_slice(&good).unwrap();
     doc["num_attention_heads"] = json!(HEADS * 2);
     std::fs::write(src.join("config.json"), doc.to_string()).unwrap();
-    refuses(&src, &out, &[], "config implies");
+    BIN.at(&src, &out).refuses(&[], "config implies");
     std::fs::write(src.join("config.json"), &good).unwrap();
 
     // A layer whose ROUTER tensor disagrees with `num_hash_layers`. Driven off the config, so
@@ -617,8 +570,8 @@ fn convert_v4_refuses_before_it_writes() {
     let mut kept = all_tensors();
     let dropped = format!("layers.{}.ffn.gate.tid2eid", HASH_LAYERS - 1);
     kept.retain(|(n, _, _, _)| *n != dropped);
-    write_shard_and_index(&src, &kept);
-    refuses(&src, &out, &[], &dropped);
+    common::write_shard_and_index(&src, SHARD, &kept);
+    BIN.at(&src, &out).refuses(&[], &dropped);
     common::clean(&root);
 }
 
@@ -646,11 +599,12 @@ fn an_e8m0_nan_scale_byte_is_refused() {
     // pass a message that read `[0][0]` whatever the arithmetic was.
     let idx = f4_groups(HIDDEN) + 1;
     hit.3[idx] = 0xff;
-    write_shard_and_index(&src, &poisoned);
+    common::write_shard_and_index(&src, SHARD, &poisoned);
 
     // Named down to the row and group, because that is the whole value of refusing here rather
     // than letting the kernel launder it.
-    refuses(&src, &out, &[], &format!("{target}[1][1]"));
-    refuses(&src, &out, &[], &format!("{F4_GROUP}-weight group"));
+    BIN.at(&src, &out).refuses(&[], &format!("{target}[1][1]"));
+    BIN.at(&src, &out)
+        .refuses(&[], &format!("{F4_GROUP}-weight group"));
     common::clean(&root);
 }

@@ -436,4 +436,12 @@ fn glimmer_and_the_other_architectures_do_not_cross_parse() {
         err.contains("MuseGlimmer") && err.contains("kimi_k3"),
         "must refuse on the architecture, naming both sides: {err}"
     );
+    // The reverse K3 direction, completing the pair (2026-08-16, with M9's `K3Config`).
+    // The port note above explains why only half could exist before: this half needed the
+    // Rust type, and now that it exists the wrapper-shaped pair is asserted both ways.
+    assert!(
+        parse_config::<rivoli_artifact::k3_config::K3Config>(GLIMMER_SHIPPED).is_err(),
+        "a Glimmer document must not parse as K3 — both are ConditionalGeneration wrappers \
+         around a text_config, which is exactly why the discriminant has to do the work"
+    );
 }

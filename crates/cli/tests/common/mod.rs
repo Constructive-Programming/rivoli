@@ -154,6 +154,135 @@ pub fn write_weight_map(dir: &std::path::Path, entries: &[(String, &str)]) {
     .expect("write the fixture index");
 }
 
+// ── converter-gate plumbing, second growth ───────────────────────────────────────────────
+//
+// The five below arrived on 2026-08-16, when `k3_convert.rs` became the FOURTH converter
+// gate and `build.rs`'s jscpd reported each of them as a clone against `v4_convert.rs` —
+// eleven regions in one report, all fixture plumbing. Same growth rule, same trigger.
+
+/// Little-endian f32 bytes — the encoding of an F32 fixture tensor.
+pub fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Deterministic filler bytes for a tensor a converter copies and never interprets.
+///
+/// **Keyed on the NAME**, like [`weights`], which is what makes a byte comparison mean
+/// something: a converter that wrote the right tensor's bytes under the wrong name, or the
+/// wrong tensor's under the right one, fails rather than passing on identical content.
+pub fn opaque_bytes(name: &str, n: usize) -> Vec<u8> {
+    weights(name, n)
+        .iter()
+        .map(|x| ((x * 1000.0) as i32).unsigned_abs() as u8)
+        .collect()
+}
+
+/// e8m0 exponent bytes, kept inside the range the shipped V4 checkpoint actually uses.
+///
+/// Measured on the real 43-layer set: 9 distinct codes, all in `0x76..=0x7e`, with **zero**
+/// `0x00` and zero `0xff`. `0xff` is the format's NaN and `F4Expert::spans` refuses it —
+/// which both models' NaN-refusal arms rely on, so a good fixture must not contain one by
+/// accident. K3 declares its scale bytes plain `U8`, so there the range is a property of
+/// the VALUES, not of the dtype.
+pub fn e8m0_bytes(name: &str, n: usize) -> Vec<u8> {
+    opaque_bytes(name, n)
+        .iter()
+        .map(|b| 0x76 + (b % 9))
+        .collect()
+}
+
+/// One fixture tensor with the byte policy every converter gate shares: bf16 and f32 get
+/// deterministic VALUES, e8m0 scales stay in the measured range, and anything else is
+/// opaque filler. A gate with a model-specific dtype (V4's `tid2eid` is `I64` with values
+/// bounded by its expert count) intercepts that dtype and delegates the rest here.
+pub fn tensor(name: &str, dtype: rivoli_artifact::format::Dtype, shape: Vec<usize>) -> Tensor {
+    use rivoli_artifact::format::Dtype;
+    let n: usize = shape.iter().product();
+    let bytes = match dtype {
+        Dtype::Bf16 => bf16_bytes(&weights(name, n)),
+        Dtype::F32 => f32_bytes(&weights(name, n)),
+        Dtype::F8E8M0 => e8m0_bytes(name, n),
+        // F8E4M3, I8, U8 — bytes the converters copy and never decode.
+        _ => opaque_bytes(name, n),
+    };
+    (name.to_string(), dtype, shape, bytes)
+}
+
+/// The shard and its index, always written together — the index is what `open_indexed`
+/// selects shards by, so a refusal arm that dropped a tensor from one and left it in the
+/// other would be testing a truncated-file error instead of the guard it meant to.
+pub fn write_shard_and_index(src: &std::path::Path, shard: &str, tensors: &[Tensor]) {
+    write_shard(&src.join(shard), tensors);
+    let entries: Vec<(String, &str)> = tensors
+        .iter()
+        .map(|(n, _, _, _)| (n.clone(), shard))
+        .collect();
+    write_weight_map(src, &entries);
+}
+
+/// One converter binary under test: its `CARGO_BIN_EXE_*` path and the name its log lines
+/// and refusals speak as. As free functions each gate had its own copy of the
+/// run/convert/refuse triple, differing only in these two strings, and jscpd reported all
+/// of them.
+pub struct ConvertBin {
+    pub exe: &'static str,
+    pub tool: &'static str,
+}
+
+impl ConvertBin {
+    /// This binary aimed at one `src`/`out` pair — the pair is fixed for a whole test arm
+    /// while the flags vary per invocation, which is the abstraction the flat
+    /// five-argument `refuses(src, out, extra, want)` was missing (CodeScene priced that
+    /// form at arity 5, and it was right: the pair and the flags are different KINDS of
+    /// argument).
+    pub fn at<'a>(&'a self, src: &'a std::path::Path, out: &'a std::path::Path) -> ConvertRun<'a> {
+        ConvertRun {
+            bin: self,
+            src,
+            out,
+        }
+    }
+}
+
+/// [`ConvertBin::at`]'s result: one converter, one directory pair, many invocations.
+pub struct ConvertRun<'a> {
+    bin: &'a ConvertBin,
+    src: &'a std::path::Path,
+    out: &'a std::path::Path,
+}
+
+impl ConvertRun<'_> {
+    /// The two positional dirs plus whatever flags this arm is about.
+    pub fn invoke(&self, extra: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new(self.bin.exe);
+        cmd.arg(self.src).arg(self.out).args(extra);
+        cmd.output()
+            .unwrap_or_else(|e| panic!("running {} failed outright: {e}", self.bin.tool))
+    }
+
+    /// A run that must SUCCEED; hands back stderr for the log assertions.
+    #[track_caller]
+    pub fn convert(&self, extra: &[&str]) -> String {
+        expect_success(&self.invoke(extra), self.bin.tool)
+    }
+
+    /// A run that must REFUSE, for the reason named — a refusal firing for an unrelated
+    /// cause must fail, which is `expect_refusal`'s contract.
+    #[track_caller]
+    pub fn refuses(&self, extra: &[&str], want: &str) {
+        expect_refusal(&self.invoke(extra), want);
+    }
+}
+
+/// A scratch root plus the `src`/`out` pair every converter arm starts from — factored
+/// because the three-line spelling recurred at every `#[test]` head in two gate files, and
+/// the runs between the differing tag literals were themselves over jscpd's floor.
+pub fn scratch_src_out(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let root = scratch(tag);
+    let (src, out) = (root.join("src"), root.join("out"));
+    (root, src, out)
+}
+
 /// Little-endian f32 bytes as values — what an artifact's widened tensor decodes to.
 pub fn as_f32(bytes: &[u8]) -> Vec<f32> {
     bytes

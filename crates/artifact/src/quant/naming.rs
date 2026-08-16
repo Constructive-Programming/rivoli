@@ -114,8 +114,10 @@ pub fn v4_expert_base(layer: usize, e: usize, n_experts: usize) -> String {
 //
 // Read off the checkpoint's own `model.safetensors.index.json` (497,220 tensors, 96 shards,
 // revision `9f62e4e9fffbd0a83ddd60e1c209d828994b3569`) on 2026-08-10, reduced to families and
-// vendored at `docs/measurement/k3-reference/tensor-families.tsv`. `tests/k3_names.rs` pins
-// every string below against that file.
+// vendored at `docs/measurement/k3-reference/tensor-families.tsv`.
+// `crates/artifact/tests/k3_names.rs` pins every string below against that file — until
+// 2026-08-16 this line cited the k3 tree's census while nothing in THIS tree ran it, which
+// is a stale claim of a gate; the census and the TSV were vendored together to close it.
 //
 // **Nothing here was inferred from the reference implementation's variable names**, which is a
 // rule this port learned the expensive way in `model.rs`: the C reference calls K3's config

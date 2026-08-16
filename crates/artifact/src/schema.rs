@@ -152,15 +152,16 @@ pub fn load_config<T: ArchConfig>(dir: &str) -> Result<T> {
 
 // > **UPDATED 2026-08-16.** This read "(`ensure_f32_positive` returns with K3Config at M9 —
 // > its only caller.)". It arrived at **M7** instead, with `GlimmerConfig`: the anticipated
-// > shape was right and the milestone was wrong. K3 is still the other caller, which is what
-// > keeps this shared rather than inlined into `glimmer_config.rs`.
+// > shape was right and the milestone was wrong. `K3TextConfig::validate` became the second
+// > caller later the same day (M9), which is what keeps this shared rather than inlined
+// > into `glimmer_config.rs`.
 
 /// Every f64 a kernel narrows to f32, checked in the **f32 domain** rather than only in the
 /// f64 the JSON carries. Underflow (`x <= 2^-150` -> `0.0f32`) collapses the value; overflow
 /// (`x > ~3.4e38` -> `inf`, which passes any bare `> 0.0` test) is the silent one. A `1e-46`
 /// eps passes an f64 positivity test and reaches every RMSNorm as `0.0f32`.
 ///
-/// Shared by `GlimmerTextConfig` and (at M9) `K3TextConfig` because it is one rule about the
+/// Shared by `GlimmerTextConfig` and `K3TextConfig` because it is one rule about the
 /// hardware, not a coincidence of two checkpoints — which is what separates it from the
 /// dimension serde renames in each config, where the shared text IS a coincidence and stays
 /// exempted rather than factored. Factored in the old tree 2026-08-11, when Glimmer's arrival
@@ -222,9 +223,11 @@ pub(crate) fn ensure_group_aligned(
 /// part of either call. The interesting part is *which width* is `expert_in` — `cfg.hidden` on
 /// V4, the 3584 latent on K3 — which is what the one-line call sites show.
 ///
-/// One caller today ([`crate::v4_config::V4Config::validate`]); K3's arrives at M9. It is here
-/// rather than inline in `v4_config.rs` for the reason [`ensure_f32_positive`] is: the rule is
-/// about the FORMAT, which two architectures share, not about either checkpoint.
+/// Two callers ([`crate::v4_config::V4Config::validate`] and, since M9 the same day,
+/// [`crate::k3_config::K3TextConfig::validate`] — which is the caller whose `expert_in` is
+/// NOT `hidden`). It is here rather than inline in `v4_config.rs` for the reason
+/// [`ensure_f32_positive`] is: the rule is about the FORMAT, which two architectures share,
+/// not about either checkpoint.
 pub(crate) fn ensure_f4_group_aligned(expert_in: usize, moe_inter: usize) -> Result<()> {
     ensure_group_aligned(
         expert_in,
