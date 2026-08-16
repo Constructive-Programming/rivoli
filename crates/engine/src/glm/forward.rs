@@ -142,7 +142,12 @@ impl GlmEngine<'_> {
             self.run_layer(l, rows, xp).await?;
         }
         if span.tail > 0 {
+            // Launch time only; the tail's execution (final norm → lm_head, the single
+            // largest read in the pass) drains inside the argmax D2H, which
+            // `decode.rs::argmax_rows` stamps into the same Head bucket.
+            let t = std::time::Instant::now();
             self.tail(rows, span.tail, xp)?;
+            self.prof.lap(crate::telemetry::Phase::Head, t);
         }
         Ok(())
     }
@@ -201,16 +206,32 @@ impl GlmEngine<'_> {
     /// One layer: attention, the MLP sublayer, the end-of-layer join, and the
     /// non-finite probe. The join protects the reused descs/wexpert/moe_out buffers
     /// before the next layer overwrites them, and surfaces faults.
+    ///
+    /// The phase stamps here and in `mlp.rs` ride joins the layer already pays —
+    /// `telemetry::ProfileSummary` documents what each bucket covers on this arm. The
+    /// attend span below is LAUNCH time only (attention() never blocks); the execution
+    /// it launched drains inside the gate-logits D2H, which `route_layer` stamps into
+    /// the same bucket.
     async fn run_layer(&mut self, l: usize, rows: Rows, xp: ResidualBase) -> Result<()> {
+        use crate::telemetry::Phase;
+        let t = std::time::Instant::now();
         self.attention(l, rows, xp)?;
+        let t = self.prof.lap(Phase::Attend, t);
         match &self.pin.layers[l].mlp {
             LayerMlp::Dense(m) => {
                 let m = *m; // Copy — ends the &pin borrow
                 self.dense_sublayer(m, rows, xp)?;
+                self.prof.lap(Phase::Ffn, t);
             }
+            // The MoE sublayer stamps its own segments (attend for the gate D2H, ffn
+            // for host routing + the compute await, fetch-wait for the miss-stream
+            // residual), so `t` deliberately goes unread on this arm — the µs of glue
+            // before its first stamp land in `other`, which the bucket-sum gate bounds.
             LayerMlp::Moe { .. } => self.moe_sublayer(l, rows, xp).await?,
         }
+        let t = std::time::Instant::now();
         device_sync()?;
+        self.prof.lap(Phase::Ffn, t);
         // Localise a non-finite residual to the earliest (pos, layer) that produced
         // one. `atomicCAS(flag, 0, tag)` keeps the FIRST; tag 0 is reserved for
         // "clean" so the tag is offset by 1. One tiny kernel per layer, no sync.

@@ -101,10 +101,9 @@ fn set_run_attributes<S: Span>(span: &mut S, run: &RunInfo) {
         run.cache_policy.clone(),
     ));
     span.set_attribute(KeyValue::new("rivoli.attn", run.attn.clone()));
-    span.set_attribute(KeyValue::new("rivoli.moe_gain", f64::from(run.moe_gain)));
-    span.set_attribute(KeyValue::new("rivoli.sinks", run.sinks as i64));
-    span.set_attribute(KeyValue::new("rivoli.window", run.window as i64));
-    span.set_attribute(KeyValue::new("rivoli.misa_heads", run.misa_heads as i64));
+    // `moe_gain`/`sinks`/`window`/`misa_heads` left with their `RunInfo` fields
+    // (2026-08-16): no flag in this tree fills them, and an attribute that is always its
+    // default is a knob the recorded run never had. Each returns with its flag.
     // Absent rather than zero where zero would read as a measurement: an auto-sized
     // budget is not "0 GiB", and a run with no `-bench` did not generate 0 tokens.
     if let Some(g) = run.max_mem_gib {
@@ -373,9 +372,15 @@ fn export_metrics(summary: &ProfileSummary, tokens: usize, run: &RunInfo) -> Res
     Ok(())
 }
 
-/// The class and phase axes, all on one `rivoli.ms_per_tok` gauge separated by a
-/// `class` attribute — the class spans OVERLAP, so a stacked panel would LIE, and the
-/// dashboard draws them as separate lines for exactly that reason.
+/// The phase axis, all on one `rivoli.ms_per_tok` gauge separated by a `phase`
+/// attribute. Unlike the old tree's class spans these DISJOINTLY partition wall
+/// (`other` is the measured remainder and the bucket-sum gate bounds it), so a stacked
+/// panel is honest here — the first time in this engine's telemetry that has been true.
+///
+/// The old `class`/`thread` axis (gpu-wait / io-wait / cpu splits) went with the
+/// `ProfileSummary` fields behind it: those described instruments this tree's arms do
+/// not carry yet, and a gauge fed a structural zero charts as a measurement of nothing.
+/// Each series returns with the instrument that fills it.
 fn record_class_gauges(
     m: &opentelemetry::metrics::Meter,
     summary: &ProfileSummary,
@@ -383,46 +388,26 @@ fn record_class_gauges(
 ) {
     // ms/token, the unit every number in the PROFILE line is already in.
     let per_tok = m.f64_gauge("rivoli.ms_per_tok").build();
-    let g = |v: f64, class: &'static str, thread: &'static str| {
+    let g = |v: f64, phase: &'static str| {
         let attrs: Vec<KeyValue> = run_labels
             .iter()
             .cloned()
-            .chain([
-                KeyValue::new("class", class),
-                KeyValue::new("thread", thread),
-            ])
+            .chain([KeyValue::new("phase", phase)])
             .collect();
         per_tok.record(v, &attrs);
     };
-    g(summary.gpu_wait_ms, "gpu-wait", "decode");
-    g(summary.io_wait_ms, "io-wait", "reaper");
-    g(summary.cpu_ms, "cpu", "decode");
-    g(summary.cpu_launch_ms, "cpu/launch", "decode");
-    g(summary.cpu_route_ms, "cpu/route", "decode");
-    g(summary.cpu_submit_ms, "cpu/submit", "decode");
-    // `cpu/tokio-poll` was dropped 2026-08-01 with the field behind it. The expert
-    // stream's poll time stopped being a term when the launches were enqueued straight
-    // onto the compute stream (`gpu.rs`, `cpu_ns`) — but the removal never reached this
-    // line, because nothing in CI compiles `--features otlp`, so the feature had not
-    // built since. If a series disappears from the dashboard, this is where it went.
-    // The phase axis — these DO partition wall, and may be stacked.
-    g(summary.route_ms, "phase/route", "decode");
-    g(summary.moe_wall_ms, "phase/moe", "decode");
-    g(
-        (summary.wall_ms - summary.route_ms - summary.moe_wall_ms).max(0.0),
-        "phase/tail",
-        "decode",
-    );
-    g(summary.wall_ms, "wall", "decode");
-    // Sub-splits worth their own series.
-    g(summary.route_wait_ms, "split/route-gpu-wait", "decode");
-    g(summary.tail_wait_ms, "split/tail-wait", "decode");
-    g(summary.tail_gpu_ms, "split/tail-gpu", "decode");
-    g(summary.compute_gpu_ms, "split/moe-compute-gpu", "decode");
+    g(summary.attend_ms, "attend");
+    g(summary.ffn_ms, "ffn");
+    g(summary.fetch_wait_ms, "fetch-wait");
+    g(summary.head_ms, "head");
+    g(summary.other_ms, "other");
+    g(summary.wall_ms, "wall");
 }
 
 /// The scalars carry run identity and nothing else — `tok_per_s` is THE ranking
 /// number, so it is the one series that must never merge two configurations.
+/// (`gb_per_tok`/`miss_per_tok` left with their fields, 2026-08-16 — nothing measures
+/// bytes per token in this tree yet; they return with the counter that does.)
 fn record_scalar_gauges(
     m: &opentelemetry::metrics::Meter,
     summary: &ProfileSummary,
@@ -435,12 +420,6 @@ fn record_scalar_gauges(
     m.f64_gauge("rivoli.hit_pct")
         .build()
         .record(summary.hit_pct, run_labels);
-    m.f64_gauge("rivoli.gb_per_tok")
-        .build()
-        .record(summary.gb_per_tok, run_labels);
-    m.f64_gauge("rivoli.miss_per_tok")
-        .build()
-        .record(summary.miss_per_tok, run_labels);
     m.u64_gauge("rivoli.tokens")
         .build()
         .record(tokens as u64, run_labels);

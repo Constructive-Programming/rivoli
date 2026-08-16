@@ -46,7 +46,7 @@ fn main() -> Result<()> {
         },
     )?;
     let mut eng = rivoli_engine::glm::engine::GlmEngine::new(pin, &cfg, 4096)?;
-    let (out, stats) = eng.generate(
+    let out = eng.generate(
         rivoli_engine::GenSpec {
             prompt: &prompt,
             ngen,
@@ -57,12 +57,13 @@ fn main() -> Result<()> {
             true
         },
     )?;
+    let s = &out.stats;
     eprintln!(
         "generated {} ids at {:.2} tok/s ({} hits / {} misses)",
-        out.len(),
-        stats.tok_s,
-        stats.hits,
-        stats.misses
+        out.ids.len(),
+        s.tok_s,
+        s.hits,
+        s.misses
     );
     Ok(())
 }

@@ -27,17 +27,17 @@ impl GlimmerEngine<'_> {
     /// weight slab with that layer's kernels still in flight. The success path is already
     /// joined by `sample`; this covers the rest.
     ///
-    /// **Returns [`Decoded`], where `GlmEngine::generate` still returns the bare tuple.** That
-    /// named pair is what `Decoded`'s own doc argues for — `.0`/`.1` read the same whichever
-    /// way round they are, which is how a swapped destructuring survives review — and this
-    /// loop was written after the type existed. The seam carries the asymmetry and the note
-    /// about closing it.
+    /// **Returns [`Decoded`], which every arm now does** — this loop was written after the
+    /// type existed and GLM's `generate` joined it with M10, closing the asymmetry the seam
+    /// used to carry a note about. The named struct is what `Decoded`'s own doc argues for:
+    /// `.0`/`.1` read the same whichever way round they are, which is how a swapped
+    /// destructuring survives review.
     pub fn decode(&mut self, spec: GenSpec<'_>, sink: TokenSink<'_>) -> Result<Decoded> {
-        let r = self.decode_inner(&spec, sink);
-        if r.is_err() {
-            let _ = device_sync();
-        }
-        r
+        // `inspect_err`, not a `match`: join the device on ANY error before the caller
+        // can drop buffers whose kernels may still be in flight. `GlimmerEngine` has no
+        // `Drop` and its field order frees the weight slab first — see this method's doc.
+        self.decode_inner(&spec, sink)
+            .inspect_err(|_| drop(device_sync()))
     }
 
     /// [`Self::decode`]'s body. Split out so the join above covers every `?` in it rather
@@ -82,6 +82,9 @@ impl GlimmerEngine<'_> {
         );
 
         let decode_wall = std::time::Instant::now();
+        // The phase counters rebase with the slot counters: stats describe steady-state
+        // decode, and the prefill's fills are warm-up.
+        let prof0 = self.prof;
         // Whether the stop token is emitted, whether the sink may end the run, and when the
         // budget binds are all [`Emit`]'s — see its doc for the `old:` defect that made
         // sharing them mandatory rather than tidy. `cur` is the token AT `pos`, decided but
@@ -98,7 +101,51 @@ impl GlimmerEngine<'_> {
         // granularity — see `DecodeStats`, which is where the counts-are-not-comparable
         // warning belongs rather than in this one log line.
         let (h, f) = self.slot_stats();
-        let (ids, stats) = emit.finish(decode_wall.elapsed(), h - h0, f - f0);
-        Ok(Decoded { ids, stats })
+        let ph = self.prof.since(&prof0);
+        Ok(emit.finish(decode_wall.elapsed(), h - h0, f - f0, &ph))
+    }
+
+    /// Teacher-forced scoring on the Glimmer arm — `prefill_and_sample` then
+    /// `hidden_state`/`sample_x`, `decode_inner`'s own calls. The scored row comes from
+    /// [`Self::logits`]: post-softcap, the model's real distribution, whose doc names
+    /// TF scoring as the one gate that can SEE the softcap at all. It is read after the
+    /// `device_sync` that `sample` already pays, so no join is added to measure.
+    #[cfg(feature = "teacher-forcing")]
+    pub fn score(&mut self, ids: &[u32]) -> Result<crate::seam::Scored> {
+        crate::score::admit(ids, self.max_ctx())?;
+        // Same error discipline as `decode`, and the same one-liner.
+        self.score_inner(ids).inspect_err(|_| drop(device_sync()))
+    }
+
+    /// [`Self::score`]'s body, split out so the error join covers every `?` in it.
+    #[cfg(feature = "teacher-forcing")]
+    fn score_inner(&mut self, ids: &[u32]) -> Result<crate::seam::Scored> {
+        // Position 0 through `prefill_and_sample`, unlike GLM's `score`, which was moved
+        // onto `forward` on 2026-08-16 so its first row came off the same schedule as
+        // every other. The asymmetry is deliberate and narrow: GLM is the arm the
+        // TF-alignment gate pairs against a pinned reference, so a first row from a
+        // different schedule would be charged to the engine; this arm has no such
+        // comparison, and `prefill_and_sample` is also where its slot placement happens,
+        // so bypassing it for one token would be the larger change. If a Glimmer
+        // reference pairing ever lands, move this to `hidden_state`/`sample_x` first.
+        let mut own = self.prefill_and_sample(&ids[..1])?;
+        // Counters rebase AFTER position 0, matching `decode_inner` and the other three
+        // arms — and it matters more here than anywhere: on this arm the first forward is
+        // where every streamed layer pays its 967.942 MB slot fill, so reading them before
+        // it would put the whole warm-up into the `.nll` header's `hit_pct` while
+        // `--bench`'s own hits/misses excluded it, and the two would disagree about the
+        // same run (review, 2026-08-16).
+        let (h0, f0) = self.slot_stats();
+        let tally = crate::score::walk(ids, |next| {
+            let row = self.logits()?;
+            let scored_own = own;
+            if let Some((t, pos)) = next {
+                self.hidden_state(t, pos)?;
+                own = self.sample_x()?;
+            }
+            Ok((row, scored_own))
+        })?;
+        let (h, f) = self.slot_stats();
+        tally.into_scored(h - h0, f - f0)
     }
 }

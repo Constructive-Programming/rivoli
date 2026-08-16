@@ -122,6 +122,11 @@ pub struct GlmEngine<'a> {
     /// the residents finish, putting the GPU's wake latency on the critical path
     /// (measured +382 µs per layer-with-misses in the old tree).
     pub(super) miss_stream: HipStream,
+    /// Decode-thread phase spans, stamped by `forward.rs`/`mlp.rs`/`decode.rs` around
+    /// this arm's existing joins (the gate D2H, the two stream awaits, the layer sync,
+    /// the argmax D2H — no sync was added to measure). `generate` rebases with
+    /// `Phases::since` exactly as it rebases the hit counters.
+    pub(super) prof: crate::telemetry::Phases,
 }
 
 impl<'a> GlmEngine<'a> {
@@ -243,6 +248,7 @@ impl<'a> GlmEngine<'a> {
             argmax_host: Vec::with_capacity(ARGMAX_BYTES),
             compute_stream: HipStream::compute()?,
             miss_stream: HipStream::miss()?,
+            prof: crate::telemetry::Phases::default(),
             pin,
         })
     }

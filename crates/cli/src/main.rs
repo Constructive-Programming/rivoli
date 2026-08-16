@@ -10,11 +10,12 @@
 //! a device lives behind `rivoli_engine::Engine::open` — including the refusal a build with
 //! no compute backend gives, which is why there is not one `#[cfg]` in this file.
 //!
-//! A run is exactly one of two things — `--bench N` (decode N tokens, print, exit) or
-//! `--port P` (serve until killed) — and clap enforces the exclusivity, so neither branch
-//! below has to defend against the other having been asked for too.
+//! A run is exactly one of three things — `--bench N` (decode N tokens, print, exit),
+//! `--ppl FILE` (teacher-forced scoring, the quality instrument) or `--port P` (serve
+//! until killed) — and clap enforces the exclusivity, so no branch below has to defend
+//! against another having been asked for too.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 // One nested use for the artifact types: as five separate lines this preamble reproduced
 // another file's token for token the moment the K3 import landed, and the jscpd gate
 // reported the pair — an import list being the one duplication Rust cannot factor.
@@ -23,19 +24,22 @@ use rivoli_artifact::{
     tokenizer::Tokenizer, v4_config::V4Config,
 };
 use rivoli_core::cache::TwoQSplit;
-use rivoli_core::legality::{ATTNS, Arch, AttnKind, Flag, MODES, Mode, Outcome, decide, name_in};
-use rivoli_engine::{ArchCfg, Engine, GenSpec, OpenSpec, PoolKnobs};
+use rivoli_core::legality::{ATTNS, Arch, AttnKind, Flag, MODES, Mode, Outcome, decide};
+use rivoli_engine::{ArchCfg, Engine, OpenSpec, PoolKnobs};
 use std::collections::HashSet;
-use std::io::Write as _;
 
-// Private to the binary rather than `pub` in `lib.rs`: `serve` has exactly one consumer,
+// Private to the binary rather than `pub` in `lib.rs`: these have exactly one consumer,
 // the `rivoli` process, and publishing it would invent a crate API nobody imports. Its
 // tests still run under `cargo test --workspace`, which builds and tests bin targets.
 //
-// BELOW the imports, not above: `mod serve;` sitting directly on top of this file's
-// `use anyhow::{Context, Result, bail, ensure}; use rivoli_artifact::format::RoutedFmt;`
-// reproduced `routed.rs`'s preamble token for token, and the jscpd gate reported it (46
-// tokens, 2026-08-16). rustfmt sorts the `use` list, so the only movable item is this one.
+// BELOW the imports, not above: with `mod serve;` on top, this file's opening
+// `use anyhow::{...}; use rivoli_artifact::format::RoutedFmt;` reproduced `routed.rs`'s
+// preamble token for token and the jscpd gate reported it (46 tokens, 2026-08-16).
+// rustfmt sorts the `use` list, so the module lines are the only movable item. The
+// anyhow list shrank when `--bench` moved to `bench.rs`; the placement stays, because
+// what made the clone was the ADJACENCY, not the exact import set.
+mod bench;
+mod nll;
 mod serve;
 
 // NOTE: doc comments on this struct and its fields are USER-FACING — clap renders them as
@@ -74,8 +78,29 @@ struct Args {
     // `--bench 0` would still generate one token (review 2026-08-16); zero is refused at
     // the door, matching serve's max_tokens floor.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..),
-          conflicts_with = "port", required_unless_present = "port")]
+          conflicts_with = "port", required_unless_present_any = ["port", "ppl"])]
     bench: Option<u64>,
+
+    /// Score this text file TEACHER-FORCED — per-token NLL over a fixed corpus, the
+    /// producer for bin/ppl's paired-dNLL comparison — and write one NLL per predicted
+    /// token to --ppl-out. Encoded RAW (a text to score, not a turn to answer). Needs a
+    /// `--features teacher-forcing` build; a stock binary refuses at startup with the
+    /// reason.
+    // A third invocation beside --bench and --port, exclusive with both: a scoring run
+    // walks a fixed corpus instead of decoding, so a token budget is meaningless and a
+    // server has no corpus. `requires = "ppl_out"` mirrors the reference engine: the
+    // per-token .nll file IS the deliverable (the PPL: line alone cannot be paired), so
+    // a run that would discard it is refused at parse. The feature gate is checked at
+    // the DOOR (`Engine::ensure_scoring`, before the tokenizer's vocab parse), not by
+    // hiding the flag — main.rs stays free of #[cfg], and a visible flag that names its
+    // build requirement beats one that vanishes.
+    #[arg(long, value_name = "TEXT_FILE", requires = "ppl_out",
+          conflicts_with_all = ["bench", "port", "think", "prompt", "dump_ids", "trace", "mtp"])]
+    ppl: Option<String>,
+
+    /// Where --ppl writes its per-token NLLs (the `# rivoli-nll v1` file bin/ppl reads).
+    #[arg(long, value_name = "PATH", requires = "ppl")]
+    ppl_out: Option<String>,
 
     /// Serve an OpenAI-compatible HTTP API on 127.0.0.1:PORT until killed — this is how
     /// llama-swap (and any OpenAI client) calls the engine. `POST /v1/chat/completions`
@@ -284,34 +309,6 @@ fn routed_fmt(mode: Mode) -> Option<RoutedFmt> {
     }
 }
 
-/// Write the id stream under a header naming the arm that produced it.
-///
-/// The header is why this exists at all: two dump files from different modes, policies or
-/// attention settings must not be silently comparable. `backend=rocm` is spelled into the
-/// literal because a build that reaches here has one — a backendless build refuses at
-/// `Engine::open`, long before a token exists to dump. It is still EMITTED, because a
-/// field that vanishes once it becomes constant makes old dumps unreadable against new
-/// ones; a second backend puts the `{}` back.
-fn write_ids(path: &str, a: &Args, ids: &[u32]) -> Result<()> {
-    let mut w = std::io::BufWriter::new(
-        std::fs::File::create(path).with_context(|| format!("create {path}"))?,
-    );
-    writeln!(
-        w,
-        "# rivoli-ids v1 backend=rocm mode={} policy={} attn={} tokens={}",
-        name_in(&MODES, a.mode),
-        a.cache_policy,
-        name_in(&ATTNS, a.attn),
-        ids.len(),
-    )?;
-    for id in ids {
-        writeln!(w, "{id}")?;
-    }
-    w.flush().context("flush --dump-ids")?;
-    tracing::info!("wrote {} token ids to {path}", ids.len());
-    Ok(())
-}
-
 fn main() -> Result<()> {
     // Logs on stderr: stdout carries the generated TEXT, and a log line interleaved into
     // it would corrupt the one output a reader (or a diff of two arms) is looking at.
@@ -336,16 +333,29 @@ fn main() -> Result<()> {
     // The door check, BEFORE the tokenizer's 19 MB vocab parse and the prompt encode: a
     // backendless build refuses here or the seam doc's "at the door" claim is prose.
     Engine::ensure_backend()?;
+    // Same door, same reason, for the scoring instrument: a stock build (no
+    // `teacher-forcing`) refuses `--ppl` before anything expensive happens, citing the
+    // one authority (`rivoli_engine::seam::TF_SCORING_NOT_BUILT`) that `Engine::score`
+    // itself would cite minutes later.
+    if a.ppl.is_some() {
+        Engine::ensure_scoring()?;
+    }
 
     let tok = Tokenizer::load(&a.model)?;
-    // `--bench` resolves its input BEFORE the engine opens, so a run that outgrows the KV
-    // slab is refused before any weight is placed rather than failing in the token loop,
-    // minutes in. `--port` has no prompt to check here: every request brings its own, and
-    // `serve` checks each against `Engine::max_ctx` and answers 400.
+    // `--bench` and `--ppl` resolve their input BEFORE the engine opens, so a run that
+    // outgrows the KV slab is refused before any weight is placed rather than failing in
+    // the token loop, minutes in. `--port` has no prompt to check here: every request
+    // brings its own, and `serve` checks each against `Engine::max_ctx` and answers 400.
     let bench = a
         .bench
-        .map(|ngen| bench_input(&tok, arch, &a, ngen as usize))
+        .map(|ngen| bench::bench_input(&tok, arch, &a, ngen as usize))
         .transpose()?;
+    let ppl = a
+        .ppl
+        .as_deref()
+        .map(|path| nll::ppl_input(&tok, path, &a))
+        .transpose()?;
+    let inv = invocation(&a, bench.as_ref(), ppl.as_ref())?;
 
     // **Each arm owns its config for the whole run, because the engine borrows it.** The
     // arms are two lines apiece and then rejoin: `open_and_run` is the shared tail, so a
@@ -354,21 +364,21 @@ fn main() -> Result<()> {
         Arch::GlmMoeDsa => {
             let cfg = ModelConfig::load(&a.model)?;
             let arch_cfg = ArchCfg::Glm(&cfg, glm_fmt(&a)?, pool_knobs(&a));
-            open_and_run(&a, &tok, bench.as_ref(), arch_cfg)
+            open_and_run(&a, &tok, inv, arch_cfg)
         }
         // No `RoutedSpec`: a dense model has no routed pool to configure, and the legality
         // table has already told the user so for each of the flags that would have filled
         // one in.
         Arch::MuseGlimmer => {
             let cfg = GlimmerConfig::load(&a.model)?;
-            open_and_run(&a, &tok, bench.as_ref(), ArchCfg::Glimmer(&cfg))
+            open_and_run(&a, &tok, inv, ArchCfg::Glimmer(&cfg))
         }
         // `PoolKnobs` and not `RoutedSpec`: this architecture HAS a routed pool and does not
         // have a routed FORMAT — the checkpoint's experts are `.f4` and there is nothing for
         // `--mode` to select, which is what the three `FallbackLoudly` cells told the user.
         Arch::DeepseekV4 => {
             let cfg = V4Config::load(&a.model)?;
-            open_and_run(&a, &tok, bench.as_ref(), ArchCfg::V4(&cfg, pool_knobs(&a)))
+            open_and_run(&a, &tok, inv, ArchCfg::V4(&cfg, pool_knobs(&a)))
         }
         // The match went EXHAUSTIVE when this arm landed (M9): the "no decode path" bail
         // that stood here would now be an unreachable pattern, which is the design working —
@@ -381,7 +391,7 @@ fn main() -> Result<()> {
                 bail!("{K3_PORT_HAS_NO_CHAT_ENCODING}");
             }
             let cfg = K3Config::load(&a.model)?;
-            open_and_run(&a, &tok, bench.as_ref(), ArchCfg::K3(&cfg, pool_knobs(&a)))
+            open_and_run(&a, &tok, inv, ArchCfg::K3(&cfg, pool_knobs(&a)))
         }
     }
 }
@@ -418,17 +428,42 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
     }
 }
 
+/// The one thing this process will do, resolved from the three exclusive flags. A closed
+/// enum rather than three `Option`s threaded side by side, so `open_and_run`'s dispatch
+/// is exhaustive and a fourth invocation breaks the match instead of falling through.
+enum Invocation<'a> {
+    Bench(&'a bench::Bench<'a>),
+    Ppl(&'a nll::Ppl),
+    Serve(u16),
+}
+
+/// Resolve the invocation, or report the contract undone.
+fn invocation<'a>(
+    a: &Args,
+    bench: Option<&'a bench::Bench<'a>>,
+    ppl: Option<&'a nll::Ppl>,
+) -> Result<Invocation<'a>> {
+    match (bench, ppl, a.port) {
+        (Some(b), None, None) => Ok(Invocation::Bench(b)),
+        (None, Some(p), None) => Ok(Invocation::Ppl(p)),
+        (None, None, Some(port)) => Ok(Invocation::Serve(port)),
+        // Unreachable through clap (`--bench` is `required_unless_present_any = ["port",
+        // "ppl"]` and the three conflict pairwise), and a `bail!` rather than a
+        // `debug_assert!`: this is the one place the contract is read, and under
+        // `--release` a debug assert would enforce nothing at all.
+        _ => bail!(
+            "exactly one of --bench, --ppl and --port must be given, which clap should \
+             have refused — the exclusivity attributes on `Args` have come undone"
+        ),
+    }
+}
+
 /// Open the engine on `cfg`'s arm and run whichever invocation was asked for.
 ///
 /// **The shared tail.** Everything below the seam is architecture-shaped and everything here
 /// is not, so this function names no architecture — which is what makes "a third arm is two
 /// lines in `main`" true rather than aspirational.
-fn open_and_run(
-    a: &Args,
-    tok: &Tokenizer,
-    bench: Option<&Bench<'_>>,
-    cfg: ArchCfg<'_>,
-) -> Result<()> {
+fn open_and_run(a: &Args, tok: &Tokenizer, inv: Invocation<'_>, cfg: ArchCfg<'_>) -> Result<()> {
     let mut eng = Engine::open(
         &a.model,
         cfg,
@@ -437,9 +472,10 @@ fn open_and_run(
             max_ctx: a.ctx,
         },
     )?;
-    match (bench, a.port) {
-        (Some(b), _) => run_bench(&mut eng, tok, a, b),
-        (None, Some(port)) => serve::serve(
+    match inv {
+        Invocation::Bench(b) => bench::run_bench(&mut eng, tok, a, b),
+        Invocation::Ppl(p) => nll::run_ppl(&mut eng, a, p),
+        Invocation::Serve(port) => serve::serve(
             &mut eng,
             tok,
             &serve::Opts {
@@ -452,102 +488,6 @@ fn open_and_run(
                 think: a.think,
             },
         ),
-        // Unreachable through clap (`--bench` is `required_unless_present = "port"`), and a
-        // `bail!` rather than a `debug_assert!`: this is the one place the two-flag contract
-        // is read, and under `--release` a debug assert would enforce nothing at all.
-        (None, None) => bail!(
-            "neither --bench nor --port was given, which clap should have refused — the \
-             exclusivity attributes on `Args::bench` have come undone"
-        ),
-    }
-}
-
-/// The `--bench` arm's fixed input, resolved before any weight is placed.
-struct Bench<'a> {
-    /// Printed back on stdout ahead of the completion, so the two read together.
-    text: &'a str,
-    ids: Vec<u32>,
-    ngen: usize,
-}
-
-/// Frame the bench prompt in the architecture's OWN chat template.
-///
-/// **The two encoders share no framing**, which is why this is a match and not a default:
-/// GLM builds a token-ID list from ids looked up by name, DeepSeek-V4 builds a string with its
-/// markers written out and then tokenizes it. Feeding a V4 checkpoint GLM's `[gMASK] <sop>`
-/// prefix is not a near-miss — it is text the model never saw, and an instruct model outside
-/// its turn structure does document continuation and never emits a stop token, which is the
-/// failure that invalidated 56 benchmark runs in the old tree.
-///
-/// **Muse Glimmer takes GLM's framing here and that is a KNOWN GAP, not a decision.**
-/// `rivoli_artifact::glimmer_encoding` exists and is not wired to this door; it predates this
-/// arm and is left exactly as it was, because changing it is a Glimmer change owed its own
-/// id-pinned comparison rather than a line inside a V4 port.
-fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
-    use rivoli_artifact::v4_encoding::{EncodeOpts, Message, ThinkingMode};
-    match arch {
-        // `ThinkingMode::Chat` — the same default `ChatOpts::thinking` takes and for the same
-        // measured reason: at a few tok/s a reasoning block is tens of seconds of silence
-        // before the first word, and a `--bench` run is timing the decode, not the reasoning.
-        Arch::DeepseekV4 => tok.encode_dsv4(
-            vec![Message::user(text)],
-            &EncodeOpts::new(ThinkingMode::Chat),
-        ),
-        Arch::GlmMoeDsa | Arch::MuseGlimmer => tok.encode_chat(text),
-        // RAW, deliberately: K3 ships no chat template in ANY tree (`convert_k3`'s header
-        // records it), so there is no "its own framing" to render — this line inherited
-        // GLM's `encode_chat` until M9, which would have fed a K3 checkpoint `[gMASK]
-        // <sop>` markers it never saw. A base-model bench prompt is document continuation,
-        // and raw encoding is the honest spelling of that.
-        Arch::KimiK3 => tok.encode(text),
-    }
-}
-
-fn bench_input<'a>(tok: &Tokenizer, arch: Arch, a: &'a Args, ngen: usize) -> Result<Bench<'a>> {
-    let text = a.prompt.as_deref().unwrap_or(BENCH_PROMPT);
-    let ids = frame_prompt(tok, arch, text)?;
-    // The KV slab is sized once from `--ctx`; a run that outgrows it fails somewhere in the
-    // token loop, minutes in, so it is refused here instead.
-    ensure!(
-        ids.len() + ngen <= a.ctx,
-        "{} prompt + {ngen} generated tokens exceed --ctx {} — raise it (~51 KB of device \
-         memory per token) or shorten the run",
-        ids.len(),
-        a.ctx
-    );
-    Ok(Bench { text, ids, ngen })
-}
-
-fn run_bench(eng: &mut Engine<'_>, tok: &Tokenizer, a: &Args, b: &Bench<'_>) -> Result<()> {
-    let out = eng.generate(
-        GenSpec {
-            prompt: &b.ids,
-            ngen: b.ngen,
-            eos: &tok.eos,
-        },
-        &mut |_| true,
-    )?;
-
-    // stdout: the prompt and its completion, the way the reference engine reports a bench —
-    // reading them together is what tells you whether the run answered the question.
-    println!("{}{}", b.text, tok.decode_all(&out.ids)?);
-    // stderr, and NOT through `tracing`: the engine logs its own DECODE line at `info`, but
-    // a benchmark number that disappears under `RUST_LOG=warn` is a number someone will one
-    // day fail to find. The prompt length is here and not there, which is the other half of
-    // why this is not a restatement: decode stats deliberately EXCLUDE the prefill.
-    eprintln!(
-        "BENCH {:.2} tok/s | {} prompt + {} generated tokens in {:.1} s | {} expert hits, \
-         {} misses",
-        out.stats.tok_s,
-        b.ids.len(),
-        out.ids.len(),
-        out.stats.decode_s,
-        out.stats.hits,
-        out.stats.misses
-    );
-    match &a.dump_ids {
-        Some(path) => write_ids(path, a, &out.ids),
-        None => Ok(()),
     }
 }
 
@@ -565,12 +505,49 @@ mod tests {
     /// here so this cannot pass by refusing everything.
     #[test]
     fn exactly_one_of_bench_and_port_and_the_bench_only_flags_say_so() {
-        let refused: [&[&str]; 5] = [
-            &["rivoli", "DIR"],                                       // neither
-            &["rivoli", "DIR", "--bench", "4", "--port", "8080"],     // both
+        let refused: [&[&str]; 10] = [
+            &["rivoli", "DIR"],                                       // no invocation
+            &["rivoli", "DIR", "--bench", "4", "--port", "8080"],     // two invocations
             &["rivoli", "DIR", "--bench", "4", "--think"],            // --think is server-only
             &["rivoli", "DIR", "--port", "8080", "--prompt", "x"],    // requests bring prompts
             &["rivoli", "DIR", "--port", "8080", "--dump-ids", "/x"], // one run, many replies
+            // --ppl is its own invocation: exclusive with the other two, inseparable
+            // from --ppl-out (the .nll file IS the deliverable), and --ppl-out without
+            // --ppl has nothing to write.
+            &["rivoli", "DIR", "--ppl", "c.txt"],
+            &["rivoli", "DIR", "--ppl-out", "/x.nll"],
+            &[
+                "rivoli",
+                "DIR",
+                "--bench",
+                "4",
+                "--ppl",
+                "c.txt",
+                "--ppl-out",
+                "/x.nll",
+            ],
+            &[
+                "rivoli",
+                "DIR",
+                "--port",
+                "8080",
+                "--ppl",
+                "c.txt",
+                "--ppl-out",
+                "/x.nll",
+            ],
+            // A scoring run never decodes free-running text, so a trace of "the decode's
+            // expert selections" would be a file about a run that did not happen.
+            &[
+                "rivoli",
+                "DIR",
+                "--ppl",
+                "c",
+                "--ppl-out",
+                "/x",
+                "--trace",
+                "/t",
+            ],
         ];
         for argv in refused {
             assert!(
@@ -578,10 +555,25 @@ mod tests {
                 "clap accepted {argv:?}, which is not a legal invocation"
             );
         }
-        let accepted: [&[&str]; 3] = [
+        let accepted: [&[&str]; 5] = [
             &["rivoli", "DIR", "--bench", "4"],
             &["rivoli", "DIR", "--port", "8080"],
             &["rivoli", "DIR", "--port", "8080", "--think"],
+            &["rivoli", "DIR", "--ppl", "c.txt", "--ppl-out", "/x.nll"],
+            // The sweep knobs stay legal under --ppl — mode/policy/budget ARE the cells
+            // a paired comparison distinguishes.
+            &[
+                "rivoli",
+                "DIR",
+                "--ppl",
+                "c",
+                "--ppl-out",
+                "/x",
+                "--mode",
+                "int4",
+                "--max-mem",
+                "70",
+            ],
         ];
         for argv in accepted {
             assert!(

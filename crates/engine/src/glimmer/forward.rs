@@ -334,7 +334,14 @@ impl GlimmerEngine<'_> {
     /// and break the real one — position-dependent wrong text, no compile error, no fence to
     /// catch it. The `Handles` resolution is the only thing keeping that unreachable today.
     fn layer(&mut self, x: *mut f32, h: &Handles, at: At) -> Result<()> {
+        use crate::telemetry::Phase;
         let w = self.attn_window(at.layer, at.pos)?;
+        // Phase stamps: LAUNCH time only on this arm — the whole chain is null-stream
+        // with no per-layer join (see the module header), so execution drains at
+        // `sample`'s `device_sync` and lands in `head`. The split is still worth its
+        // two stamps: launch cost is real host time, and the moment this loop gains a
+        // per-layer join the buckets are already standing where it will land.
+        let t = std::time::Instant::now();
         // SAFETY: every pointer in `h` is live in the pin and stays at its address for as long
         // as its slot holds layer `l` — which is the whole of this function, per the section
         // above.
@@ -342,11 +349,14 @@ impl GlimmerEngine<'_> {
         self.attention(at, &w, h)?;
         // SAFETY: as above.
         unsafe { self.branch_add(x, h.post_attn_ln)? };
+        let t = self.prof.lap(Phase::Attend, t);
         // SAFETY: as above.
         unsafe { self.pre_norm(x, h.pre_ffn_ln)? };
         self.mlp(h)?;
         // SAFETY: as above.
-        unsafe { self.branch_add(x, h.post_ffn_ln) }
+        let r = unsafe { self.branch_add(x, h.post_ffn_ln) };
+        self.prof.lap(Phase::Ffn, t);
+        r
     }
 
     /// Look `token` up in the embedding matrix and leave the NORMED row in `dst`.
@@ -390,7 +400,12 @@ impl GlimmerEngine<'_> {
         let x = self.x.ptr() as *mut f32;
         self.embed(token, x)?;
         for l in 0..self.cfg.n_layers {
+            // The pin request is where a STREAMED layer pays its synchronous 967.942 MB
+            // host memcpy (a pinned layer returns immediately) — this arm's real
+            // fetch-wait, and the number P6's partition trades against.
+            let t = std::time::Instant::now();
             let h = Handles::of(self.pin.layer(l)?);
+            self.prof.lap(crate::telemetry::Phase::FetchWait, t);
             self.layer(x, &h, At { layer: l, pos })?;
         }
         Ok(())
@@ -486,6 +501,10 @@ impl GlimmerEngine<'_> {
     /// same with or without it. It is here because every probability depends on it — and that
     /// is why a greedy gate cannot be this path's evidence.
     fn sample(&mut self, x: *const f32) -> Result<u32> {
+        // Head bucket: on this arm the `device_sync` below is the ONLY per-token join,
+        // so this span drains the entire layer stack's execution, not just the head
+        // chain — stated on `telemetry::ProfileSummary`'s field table.
+        let t = std::time::Instant::now();
         let (hidden, vocab) = (self.cfg.hidden, self.cfg.vocab);
         // SAFETY: `x` is the `hidden` f32 the layer loop left; `final_norm` is `hidden` f32 in
         // the pin; `logits` is `vocab` writable f32; `pick` is 8 bytes taking one i32 then one
@@ -520,6 +539,7 @@ impl GlimmerEngine<'_> {
             )?;
         }
         device_sync()?;
+        self.prof.lap(crate::telemetry::Phase::Head, t);
         self.sampled = true;
         self.read_pick()
     }

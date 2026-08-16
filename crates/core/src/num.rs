@@ -12,6 +12,24 @@ pub fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
+/// LE bytes → f32s; `None` on a ragged tail. The one decoder for device readbacks that
+/// arrive as raw bytes — a short read silently truncated to whole floats would score a
+/// partial row as a real one, so the raggedness is the caller's refusal to spell, not
+/// this function's to hide. (Was three near-identical private copies across the engine —
+/// K3's `logits()`, Glimmer's `read_f32`, the scorer — until the duplication gate
+/// reported the third, 2026-08-16.)
+pub fn f32s_le(bytes: &[u8]) -> Option<Vec<f32>> {
+    let quads = bytes.chunks_exact(4);
+    if !quads.remainder().is_empty() {
+        return None;
+    }
+    Some(
+        quads
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+    )
+}
+
 /// Logistic sigmoid — the MoE router's scoring function (scoring_func=sigmoid).
 #[inline]
 pub(crate) fn sigmoid(x: f32) -> f32 {
@@ -179,5 +197,24 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
         f32::NAN
     } else {
         sign * (1.0 + mant / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
+#[cfg(test)]
+mod f32s_le_tests {
+    #![allow(clippy::unwrap_used)] // tests: panic-on-failure is the idiom
+    use super::f32s_le;
+
+    /// Whole rows decode; a ragged tail refuses rather than truncating to a shorter,
+    /// silently-wrong row (the failure a logit-row consumer cannot see).
+    #[test]
+    fn whole_rows_decode_and_ragged_tails_refuse() {
+        let bytes: Vec<u8> = [1.5f32, -2.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(f32s_le(&bytes).unwrap(), vec![1.5, -2.0]);
+        assert_eq!(f32s_le(&[]).unwrap(), Vec::<f32>::new());
+        assert!(f32s_le(&bytes[..7]).is_none());
     }
 }

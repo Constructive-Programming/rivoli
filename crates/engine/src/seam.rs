@@ -38,9 +38,10 @@ pub struct GenSpec<'a> {
     pub eos: &'a [u32],
 }
 
-/// What a decode measured about itself. Minimal on purpose: the old engine's per-phase
-/// `Profile` is deferred to the first benchmark — but a run still reports the two numbers
-/// that make its cost citeable.
+/// What a decode measured about itself — the two numbers that make its cost citeable.
+/// The per-phase decomposition that used to be "deferred to the first benchmark" landed
+/// with M10 and rides [`Decoded::profile`] alongside this, not inside it: these are the
+/// run's cost, that is where the cost went.
 pub struct DecodeStats {
     pub decode_s: f64,
     pub tok_s: f64,
@@ -62,7 +63,43 @@ pub struct DecodeStats {
 pub struct Decoded {
     pub ids: Vec<u32>,
     pub stats: DecodeStats,
+    /// The per-token phase decomposition of `stats.decode_s` — built by [`Emit::finish`]
+    /// from the spans the arm's loop stamped, so an arm cannot ship ids without also
+    /// shipping where their time went. `main` hands it to `telemetry::export_decode`.
+    pub profile: crate::telemetry::ProfileSummary,
 }
+
+/// What a teacher-forced scoring run produced (`Engine::score`) — one NLL per forced
+/// position, plus what the run verified and spent along the way.
+///
+/// Ungated even though only a `teacher-forcing` build can construct one, for the same
+/// reason [`Engine`] has a featureless variant: `Engine::score`'s SIGNATURE must exist in
+/// every build so `main.rs` stays free of `#[cfg]`, and a signature needs its types.
+pub struct Scored {
+    /// `-ln p(ids[i+1] | ids[..=i])` for every position that has a target — `ids.len()-1`
+    /// entries. f32 because that is what the `.nll` v1 format has always carried; the
+    /// softmax itself accumulates in f64 (see `score::nll_of`).
+    pub nlls: Vec<f32>,
+    /// Positions where the engine's OWN argmax equalled the forced target. Reported, not
+    /// gated: on ordinary text this is just next-token accuracy. The per-position check
+    /// that IS load-bearing — host argmax over the D2H'd row must equal the device
+    /// argmax — lives in `score::score_row` and refuses the whole run on a mismatch.
+    pub agree: usize,
+    /// Weight-fetch hits/misses over the scoring run, at the arm's own granularity —
+    /// [`DecodeStats`]'s caveat applies verbatim. They feed the `.nll` header's
+    /// `hit_pct`, which is how a cache-starved scoring run stays distinguishable from a
+    /// warm one in the file itself.
+    pub hits: u64,
+    pub misses: u64,
+}
+
+/// Why a build without the `teacher-forcing` feature refuses `--ppl`. One authority: the
+/// CLI door check and `Engine::score`'s own guard both cite this, so the two refusals
+/// cannot drift apart.
+pub const TF_SCORING_NOT_BUILT: &str = "teacher-forced scoring (--ppl) is not in this \
+     build. Rebuild with `--features teacher-forcing` — instruments live behind a cargo \
+     feature AND a flag, and the stock binary carries neither the extra logits D2H nor \
+     the code that spends it.";
 
 /// The token-emission protocol every decode loop shares — **one author for "is this token
 /// output?", "may the run continue?" and "what did the run measure?".**
@@ -119,18 +156,22 @@ impl<'a> Emit<'a> {
         sink(tok) && self.ids.len() < self.ngen
     }
 
-    /// Close the run: the ids, and the stats over `decode`.
+    /// Close the run: the ids, the stats over `decode`, and the phase profile — built and
+    /// REPORTED here, at the protocol's one author, so no arm can ship a decode whose
+    /// buckets were silently never printed.
     ///
     /// The elapsed time is the ARM's, not a clock this owns, and that is deliberate: stats
     /// describe steady-state decode and must EXCLUDE the cold prefill, so the instant they
-    /// start from is a point inside the arm's own flow (GLM's is inside its `block_on`). A
-    /// clock here would have to be told when to start, which is the same fact spelled twice.
+    /// start from is a point inside the arm's own flow (GLM's is inside its `block_on`).
+    /// `phases` is rebased by the arm for the same reason, with `Phases::since`, exactly
+    /// as `hits`/`misses` arrive as deltas.
     pub(crate) fn finish(
         self,
         decode: std::time::Duration,
         hits: u64,
         misses: u64,
-    ) -> (Vec<u32>, DecodeStats) {
+        phases: &crate::telemetry::Phases,
+    ) -> Decoded {
         let decode_s = decode.as_secs_f64();
         let stats = DecodeStats {
             decode_s,
@@ -146,7 +187,15 @@ impl<'a> Emit<'a> {
             stats.hits,
             stats.misses,
         );
-        (self.ids, stats)
+        let hit_pct = 100.0 * hits as f64 / (hits + misses).max(1) as f64;
+        let profile =
+            crate::telemetry::ProfileSummary::from_decode(phases, decode, self.ids.len(), hit_pct);
+        profile.report();
+        Decoded {
+            ids: self.ids,
+            stats,
+            profile,
+        }
     }
 }
 
@@ -369,14 +418,15 @@ impl<'a> Engine<'a> {
     /// false from it to stop early. The delegating match is the whole seam — everything
     /// architecture-shaped is on the other side of it.
     ///
-    /// **The match yields the arm's own `(ids, stats)` and the `Decoded` is built ONCE
-    /// below it.** Wrapping inside each arm reads more naturally and is exactly the shape
-    /// `build.rs`'s jscpd gate reported the moment the second arm landed: two arms whose
-    /// bodies were the same twenty tokens. Hoisting the construction is also the honest
-    /// factoring — the arms differ in which loop runs, not in what a decode result is.
+    /// **Every arm now returns [`Decoded`] itself**, so the match is four forwarding
+    /// lines. It used to yield `(ids, stats)` and build the struct once below, because
+    /// jscpd reported the two wrapping arms as the same twenty tokens; M10 gave `Decoded`
+    /// a third field and moved GLM onto it, which left the arms textually distinct (each
+    /// names its own method) and the hoist with nothing to do.
     ///
     /// **The two builds are separate blocks rather than one `#[cfg]`-attributed match**,
-    /// which is the shape every other method here uses. Hoisting forced it: featureless,
+    /// which is the shape every other method here uses. The hoist forced it originally
+    /// and it is kept for its own sake: featureless,
     /// the only surviving arm is the uninhabited one, so the match diverges and the `Ok`
     /// after it is `unreachable_code` — an error under this workspace's `-D warnings`. The
     /// split says the same thing without asking the compiler to reason about a match that
@@ -391,23 +441,68 @@ impl<'a> Engine<'a> {
         #[cfg(feature = "rocm")]
         {
             match self {
-                // **The two arms return different shapes, and that is history rather than
-                // design.** [`Decoded`]'s own doc argues for the named pair over the tuple —
-                // `.0`/`.1` read the same whichever way round they are, which is how a
-                // swapped destructuring survives review. Glimmer's loop was written after
-                // that type existed and returns it; GLM's predates it. GLM should follow
-                // when that file is next opened, at which point this match collapses to two
-                // identical forwarding arms — which the duplication gate will then have an
-                // opinion about, and the answer will be to hoist the whole match.
-                Engine::Glm(e) => {
-                    let (ids, stats) = e.generate(req, sink)?;
-                    Ok(Decoded { ids, stats })
-                }
+                // GLM adopted [`Decoded`] on 2026-08-16, closing the note that stood here
+                // ("GLM should follow when that file is next opened" — M10 opened it for
+                // the phase profile). Its method keeps the name `generate` (it is the one
+                // arm whose loop wraps a prefill *and* a decode in a single async flow),
+                // which is also what keeps these four arms token-distinct for the
+                // duplication gate.
+                Engine::Glm(e) => e.generate(req, sink),
                 Engine::Glimmer(e) => e.decode(req, sink),
                 Engine::V4(e) => e.decode(req, sink),
                 Engine::K3(e) => e.decode(req, sink),
             }
         }
+    }
+
+    /// Teacher-forced scoring: one NLL per position of `ids`, each row scored against the
+    /// token that is then FORCED as the consumed input — the producer `bin/ppl`'s paired
+    /// statistics consume. See `crate::score` for the scoring arithmetic and the
+    /// per-position device-vs-host argmax coherence check every run carries.
+    ///
+    /// **The scoring loop is the decode loop.** Each arm's `score` calls the same
+    /// prefill/forward/argmax methods `generate` calls, in the same order, on the same
+    /// scratch — the one addition is a read-only D2H of the logits row. That construction
+    /// (rather than a parallel forward path) is what makes a `--ppl` number evidence about
+    /// the engine that decodes; the P4-at-NLL gate and the coherence check are what verify
+    /// it stayed true.
+    ///
+    /// Three builds, three bodies, same shape as [`Self::generate`]'s split: backendless
+    /// diverges on the uninhabited variant; a rocm build without `teacher-forcing` refuses
+    /// with [`TF_SCORING_NOT_BUILT`] (the same text the CLI door cites); the instrumented
+    /// build dispatches.
+    pub fn score(&mut self, ids: &[u32]) -> Result<Scored> {
+        #[cfg(not(feature = "rocm"))]
+        {
+            let Engine::Never(never, _) = self;
+            let _ = ids;
+            match *never {}
+        }
+        #[cfg(all(feature = "rocm", not(feature = "teacher-forcing")))]
+        {
+            let _ = ids;
+            anyhow::bail!(TF_SCORING_NOT_BUILT)
+        }
+        #[cfg(all(feature = "rocm", feature = "teacher-forcing"))]
+        {
+            match self {
+                Engine::Glm(e) => e.score(ids),
+                Engine::Glimmer(e) => e.score(ids),
+                Engine::V4(e) => e.score(ids),
+                Engine::K3(e) => e.score(ids),
+            }
+        }
+    }
+
+    /// Whether this build can teacher-force at all — the `--ppl` door check, called by
+    /// `main` BEFORE the tokenizer loads and the engine opens, for the same reason
+    /// [`Self::ensure_backend`] is: a refusal that arrives after a nine-gigabyte pin is a
+    /// refusal delivered minutes late.
+    pub fn ensure_scoring() -> Result<()> {
+        #[cfg(not(feature = "teacher-forcing"))]
+        anyhow::bail!(TF_SCORING_NOT_BUILT);
+        #[cfg(feature = "teacher-forcing")]
+        Ok(())
     }
 }
 

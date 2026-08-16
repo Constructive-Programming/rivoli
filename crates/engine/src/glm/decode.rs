@@ -10,7 +10,7 @@ use rivoli_backend::launch_argmax;
 // The request and result shapes live at the seam, not here: neither names anything
 // GLM-shaped, and `Engine::generate` must be able to name both in a build where this
 // module does not exist at all.
-use crate::seam::{DecodeStats, Emit, GenSpec};
+use crate::seam::{Decoded, Emit, GenSpec, TokenSink};
 
 impl GlmEngine<'_> {
     /// Greedy argmax over each of the pass's `n` logit rows — reduced ON DEVICE, so
@@ -20,6 +20,7 @@ impl GlmEngine<'_> {
     /// same `!value.is_finite()` check.
     fn argmax_rows(&mut self, n: usize) -> Result<[u32; MAXROW]> {
         debug_assert!((1..=MAXROW).contains(&n));
+        let t = std::time::Instant::now();
         for r in 0..n {
             // SAFETY: logits is MAXROW·vocab device f32 (written + joined); argmax_dev
             // owns ARGMAX_BYTES, and r < n ≤ MAXROW keeps both slots in bounds.
@@ -33,8 +34,11 @@ impl GlmEngine<'_> {
             }
         }
         // The one blocking call the whole tail phase hides behind: this D2H drains the
-        // final rmsnorm, lm_head AND argmax.
+        // final rmsnorm, lm_head AND argmax — which is why its span (stamped below,
+        // into Head with the tail launches from `forward.rs`) is the tail's real cost,
+        // not the launches'.
         self.argmax_dev.copy_out_into(&mut self.argmax_host)?;
+        self.prof.lap(crate::telemetry::Phase::Head, t);
         debug_assert_eq!(
             self.argmax_host.len(),
             ARGMAX_BYTES,
@@ -121,21 +125,18 @@ impl GlmEngine<'_> {
     /// single current-thread runtime — `forward` awaits the expert stream inline, so
     /// there is no per-layer block_on. The token loop is serial by data dependency
     /// (T+1 needs T's argmax); this is the shape speculative decode later slots into.
-    pub fn generate(
-        &mut self,
-        spec: GenSpec<'_>,
-        on_tok: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<(Vec<u32>, DecodeStats)> {
+    pub fn generate(&mut self, spec: GenSpec<'_>, on_tok: TokenSink<'_>) -> Result<Decoded> {
         ensure!(!spec.prompt.is_empty(), "empty prompt");
         // The emission protocol — which tokens are output, and when the run may continue —
         // is [`Emit`]'s, shared with every other arm. What stays here is this loop's own
         // shape: one `block_on` around the whole flow, because `forward` awaits the expert
         // stream inline and a per-layer `block_on` is what that avoids.
         let mut emit = Emit::new(&spec);
-        let (hit0, miss0, decode_wall) = rivoli_backend::block_on(async {
+        let (hit0, miss0, prof0, decode_wall) = rivoli_backend::block_on(async {
             let mut pos = self.prefill(spec.prompt).await?;
-            // Stats describe steady-state DECODE, not the cold prefill.
-            let (hit0, miss0) = (self.hits(), self.misses());
+            // Stats describe steady-state DECODE, not the cold prefill — the phase
+            // counters rebase here for exactly the reason the hit counters do.
+            let (hit0, miss0, prof0) = (self.hits(), self.misses(), self.prof);
             let decode_wall = std::time::Instant::now();
             // `cur` is the token AT `pos`, decided but not yet fed through the model.
             let mut cur = self.argmax()?;
@@ -145,8 +146,59 @@ impl GlmEngine<'_> {
                 pos += 1;
                 cur = self.argmax()?;
             }
-            Ok::<_, anyhow::Error>((hit0, miss0, decode_wall.elapsed()))
+            Ok::<_, anyhow::Error>((hit0, miss0, prof0, decode_wall.elapsed()))
         })?;
-        Ok(emit.finish(decode_wall, self.hits() - hit0, self.misses() - miss0))
+        let ph = self.prof.since(&prof0);
+        Ok(emit.finish(decode_wall, self.hits() - hit0, self.misses() - miss0, &ph))
+    }
+
+    /// Teacher-forced scoring: walk `ids`, score each position's logits against the true
+    /// next token, then FORCE that token as the consumed input. **The loop is
+    /// `generate`'s loop** — the same `prefill`/`forward`/`argmax` calls on the same
+    /// scratch, so the number it produces is about the engine that decodes; the one
+    /// addition is a read-only D2H of the logits row. `crate::score::score_row` checks
+    /// on every position that the row read back argmaxes (on the host, with the device
+    /// kernel's own tie rule) to the token the device picked — the guard against
+    /// scoring a stale or mis-addressed row.
+    #[cfg(feature = "teacher-forcing")]
+    pub fn score(&mut self, ids: &[u32]) -> Result<crate::seam::Scored> {
+        use anyhow::Context as _;
+        crate::score::admit(ids, self.max_ctx())?;
+        // Bespoke async loop rather than `score::walk`, deliberately: this arm's whole
+        // decode runs inside ONE `block_on` (`generate`'s shape), and a per-token
+        // `block_on` under the shared sync walk would be a different runtime pattern
+        // than the engine being measured. The scoring protocol itself still has one
+        // author — `Tally` — so the arithmetic cannot drift.
+        let vocab = self.cfg.vocab;
+        let mut raw = Vec::with_capacity(vocab * 4);
+        let mut tally = crate::score::Tally::new(ids.len());
+        rivoli_backend::block_on(async {
+            // Position 0 goes through `forward`, NOT `prefill` — deliberately, and it is
+            // the difference between a comparable number and a confounded one. `prefill`
+            // is layer-major by default (`prefill_layer_major`), a different schedule
+            // plus a host round-trip of the residual row; every OTHER scored position
+            // comes from `forward`, and so does every position in the pinned reference's
+            // own `nll_forced` (`old:src/gpu.rs`, which walks `forward(tok, pos)` from
+            // pos 0 with no prefill at all). Prefilling position 0 here would make the
+            // FIRST scored row the only one produced by a different schedule — which the
+            // TF-alignment gate would then have to charge to the engine.
+            self.forward(ids[0], 0).await?;
+            self.flush_trace()?;
+            let mut pos = 1;
+            let (hit0, miss0) = (self.hits(), self.misses());
+            for (i, &target) in ids.iter().enumerate().skip(1) {
+                let own = self.argmax()?;
+                // Row 0 of the logits buffer — the row `argmax` just reduced.
+                self.logits.copy_out_prefix(&mut raw, vocab * 4)?;
+                let row = rivoli_core::num::f32s_le(&raw).context("ragged logit row")?;
+                tally.push(&row, own, target)?;
+                if i + 1 < ids.len() {
+                    self.forward(target, pos).await?;
+                    self.flush_trace()?;
+                    pos += 1;
+                }
+            }
+            tally.into_scored(self.hits() - hit0, self.misses() - miss0)
+        })
     }
 }

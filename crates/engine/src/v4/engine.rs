@@ -318,6 +318,10 @@ pub struct V4Engine<'a> {
     /// constructor and left there, a cumulative hit rate reads as a residency change.
     pub(super) hits0: u64,
     pub(super) misses0: u64,
+    /// Decode-thread phase spans — `forward.rs`/`decode.rs` stamp them around
+    /// this arm's existing joins (the gate D2H, the per-layer `device_sync`s, the argmax
+    /// join). See `telemetry::ProfileSummary` for what each bucket covers on V4.
+    pub(super) prof: crate::telemetry::Phases,
 }
 
 impl<'a> V4Engine<'a> {
@@ -442,6 +446,7 @@ impl<'a> V4Engine<'a> {
             shared_stream: HipStream::shared()?,
             hits0: pin.routed.hits(),
             misses0: pin.routed.misses(),
+            prof: crate::telemetry::Phases::default(),
             pin,
             cfg,
         };

@@ -119,8 +119,14 @@ impl GlmEngine<'_> {
                 NULL_STREAM,
             )?
         };
-        // The gate-logits D2H is the layer's one blocking join on the host path.
+        // The gate-logits D2H is the layer's one blocking join on the host path. Its
+        // span goes to the ATTEND bucket: what it drains is the attention execution the
+        // layer launched (plus this gate GEMV's own — a 6144×256 f32 GEMV, small
+        // against MLA over a growing KV; the approximation is stated on
+        // `telemetry::ProfileSummary`).
+        let t = std::time::Instant::now();
         self.gate_logits.copy_out_into(&mut self.gate_logits_host)?;
+        let t = self.prof.lap(crate::telemetry::Phase::Attend, t);
         // Descending, so `scores`/`choice` are left holding ROW 0 for the trace window
         // below — the trace measures the router against the real token, and row 0 is
         // the real token.
@@ -144,6 +150,9 @@ impl GlmEngine<'_> {
         }
         self.build_union(rows.nrow);
         self.pin.routed.record_candidates(&self.choice);
+        // Host routing — sigmoid/bias/top-k over 256 experts per row plus the union
+        // build — is FFN-side work.
+        self.prof.lap(crate::telemetry::Phase::Ffn, t);
         Ok(())
     }
 
@@ -186,6 +195,7 @@ impl GlmEngine<'_> {
     /// the batch, launch. The UNION, not one row's picks: every expert any row routed
     /// to must be resident before the batch launches.
     async fn moe_layer(&mut self, l: usize, rows: Rows) -> Result<()> {
+        let t = std::time::Instant::now();
         let (out, choice, union) = (&mut self.resolved, &self.choice, &self.union);
         self.pin.routed.submit(
             Selection {
@@ -196,6 +206,8 @@ impl GlmEngine<'_> {
             out,
         )?;
         self.stage_batch(l, rows)?;
+        // Pool submit + host staging + the two H2D uploads — FFN-side host work.
+        self.prof.lap(crate::telemetry::Phase::Ffn, t);
         self.launch_moe(rows).await
     }
 
@@ -278,6 +290,7 @@ impl GlmEngine<'_> {
         // bounds for nrow ≤ MAXROW.
         let acc_miss = unsafe { acc.add(rows.nrow * self.cfg.hidden) };
         let (cs_raw, ms_raw) = (self.compute_stream.raw(), self.miss_stream.raw());
+        let t = std::time::Instant::now();
         self.launch_residents(MoeLane {
             acc,
             stream: cs_raw,
@@ -288,11 +301,22 @@ impl GlmEngine<'_> {
             stream: ms_raw,
             nrow: rows.nrow,
         })?;
+        self.prof.lap(crate::telemetry::Phase::Ffn, t);
         // BOTH streams, because neither waits for the other: with a fixed-point
         // accumulator nothing between them needs ordering, and the only consumer of
         // all experts (the drain) runs after this returns.
+        //
+        // The two awaits are also the phase profile's one honest window onto fetch
+        // exposure, with no sync added: the compute stream carries resident experts
+        // (compute-bound), the miss stream's experts are gated on their own fetches —
+        // so the RESIDUAL wait on the miss stream after the compute await returned is
+        // fetch cost the resident compute did NOT hide. 0 means fully hidden, which is
+        // the overlap the whole engine is built on.
+        let t = std::time::Instant::now();
         stream_signal(cs_raw)?.await;
+        let t = self.prof.lap(crate::telemetry::Phase::Ffn, t);
         stream_signal(ms_raw)?.await;
+        self.prof.lap(crate::telemetry::Phase::FetchWait, t);
         Ok(())
     }
 
