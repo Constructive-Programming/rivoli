@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The gates-first rewrite is through M0–M8 — gates armed and red-proofed before any code, anchors vendored before the engine, M4 decoded token-identically to the pinned reference, M5 scripted that comparison as a red-provable gate, M6 shipped tokenizer + legality table + enum Engine + serve + the thin CLI behind a 12-cell smoke, M7 landed the first DENSE model (Glimmer's streaming loop with P6 live, anchor decode reproducing first-party goldens on silicon), and M8 landed DeepSeek-V4: the second MoE arm through the factored seam, kernel census 53/53 with every oracle suite green on device, and forced-history parity with the pinned reference at 30/32 with both flips at near-ties — inside the reference's own registered drift standard.
+verdict: THE PLAN IS COMPLETE, M0-M9 — gates armed and red-proofed before any code, anchors before engines, and all four architectures decoding through one seam: GLM token-identical to the pinned reference (M4/M5's scripted parity gate), Glimmer reproducing its first-party goldens on silicon (M7), DeepSeek-V4 at forced-history parity 30/32 with both flips at near-ties (M8), and Kimi-K3 — the decode loop no tree ever had — closing M9 with the kernel census at 60/60/0, the KDA boundary at 2.265e-7 against the reference's own captures, and a five-row red-proof plan paid in full. The build is the rocm build; the deviceless arm is --no-default-features and a gate proves it.
 ---
 
 # The rewrite, milestone by milestone
@@ -421,6 +421,69 @@ indexer selection (positional selection is the arm's declared deviation; the ind
 weights are counted but not placed), bsz > 1 (the `ensure!`), a rewrite-side
 `--logit-dump` (the drift A/B above used the reference's; the rewrite grows one when a
 refactor needs a same-engine A/B).
+
+
+## M9 — Kimi-K3, the final milestone (CLOSED 2026-08-16). THE PLAN IS COMPLETE.
+
+Commits `58aac6e` (backend: the KDA/SiTU/AttnRes/MHA kernels ported from `wt/k3-s1a`'s
+S2 work; seven launchers into the census as live deferrals; the FP4 factoring's
+bit-neutrality confirmed on THIS silicon by the V4 decode reproducing its exact 32 ids),
+`9f61570` (artifact: `K3Config` with 20 red-watched gates, `convert_k3` grown a
+trunk-shape confrontation the reference never had, the tensor-name census vendored — and
+a stale gate claim found IN THE REWRITE and closed: `quant/naming.rs` citing a census
+that existed only in another tree), `f29f922` (seven kernel-oracle suites, 43/43 on
+first silicon, census **60/60/0**, tolerance table rule-gated at 10x-at-2sf over
+measured floors, red proofs paid on two kernels plus a wrong-site plant that became its
+own specificity evidence), `97b3de4` (the arm — see below), `e6e2773` + `1cc2a40` (the
+round's two review batches). Mid-round the build itself changed shape: **the rocm fuse**
+(`26423a0`, owner rule: `default = ["rocm"]`, a bare build IS the engine) and its leak
+fix (`97b5116`: `--no-default-features` re-armed rocm through the dep edges until every
+edge carried `default-features = false`; the matrix's new resolve cell — red-proven both
+ways, then hardened again when review found its own false green).
+
+**The arm is the first-authored piece: no tree ever had a K3 decode loop.** The old
+branch stopped at anchor-scored kernels; the rewrite composed them — 69 KDA + 24 gated
+MLA + latent MoE + AttnRes folds, token-sequential prefill, the seam's fourth variant,
+the legality row atomic with it (4-arm agreement test). The twelve traps of
+`k3:docs/reference/k3-architecture.md` §10 each carry a named owner in `k3/engine.rs`'s
+header — a table review then improved: trap 11's claimed owner did not bind (two
+`Vec<f32>` cannot argue), and the header now says the one call site is load-bearing text.
+
+**Exit gate, first silicon 2026-08-16, red-proof plan paid in full.** The KDA recurrence
+boundary against the reference's own captures: worst disagreement **2.265e-7** vs the
+`kda_op` bound 6.3e-4, non-zero by the anti-vacuity assert. The composition,
+structurally, on a synthetic F4-legal tiny model through the real parser and converter
+primitives: P4 bit-identity across pool budgets that provably differ (147456 vs 24576 B,
+16 tight-arm misses), second-generate identity, carried-state == replayed-prefix. First
+contact found one real defect (the synthetic config lacked the top-level wrapper pair
+the sniff requires — the parse sits in a binary its author could never run). All five
+red-proof rows observed: freshness (source refuses; no stale green), transpose dropped
+1.300e0, k/v swap 7.041e-1, the lb guard's 1006 — whose first plant orphaned its
+variable and was itself refused by warnings-deny — and the budget discriminator.
+
+**Reviews: 5 correctness + 15 simplicity findings, 20/20 applied.** The P1: the MLA
+caches were allocated uninitialized while the mask argument held only for FINITE garbage
+— NaN in recycled device memory poisons the softmax denominator; zeroed once at
+allocation now. The rest: the lb door with a red-watched test, the resolve cell's
+non-empty guard, `worst_rel`'s zero-elements refusal, and the simplification batch
+(`legality.rs` 897 → 575 via the tests split; `score_all` closing its own stated
+invariant; `to_key_major`'s lost length assert restored).
+
+**The two anchor vendorings, reconciled by role.** S1b (226 tensors, `crates/oracles`)
+backs the anchor-integrity suite, the tolerance table, and the decode gate's KDA
+fixtures; the S2 recapture (290 tensors, `crates/engine/tests/k3/`) carries the 64
+operator captures five kernel suites need and S1b never had. Both FNV-pinned, consumers
+disjoint, the kernel-side table documenting where it diverges. **Standing debt, named:**
+the oracles table's older rows are one-draw floors (its own doc says so); the both-draw
+refresh pairs with its measurement doc and belongs to whoever next touches the anchor
+suite. Also standing: `moe_fixed`'s ±2^19 range is inherited from V4's precedent with no
+K3-specific measurement yet.
+
+Deliberately OUT of M9, each named in place: a real-checkpoint decode (no K3 checkpoint
+on this box; the pin reads ~1.3 TiB when one arrives, `--ctx ≤ 8192`), the three
+declared performance costs (shared-MLP stream overlap, the strided attend that kills the
+masked-full-width waste, chunked-KDA prefill with the UT-transform inverse), a chat
+encoding (`--port` refuses; none exists in any tree), MTP.
 
 
 ## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)
