@@ -67,7 +67,16 @@ pub fn messages_to_turns(body: &Value) -> Result<Vec<(String, String)>> {
     ensure!(!msgs.is_empty(), "`messages` is empty");
     let mut turns: Vec<(String, String)> = Vec::with_capacity(msgs.len());
     for (i, m) in msgs.iter().enumerate() {
-        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        // **Refused, not defaulted to `"user"`** (review, 2026-08-17). The default made this
+        // function and `glimmer_encoding::render` disagree about what the role IS: render
+        // reads the same key with `unwrap_or("")`, and `""` hits its `_ => String::new()` arm,
+        // so a message with an absent or non-string `role` passed validation here and then
+        // rendered as NOTHING there — a 200 with a plausible reply and the user's question
+        // never in the prompt. Architecture-dependent too, since GLM's arm framed it fine.
+        let role = m
+            .get("role")
+            .and_then(Value::as_str)
+            .with_context(|| format!("messages[{i}] has no string `role`"))?;
         ensure!(
             ROLES.contains(&role),
             "messages[{i}].role is {role:?}; this server frames {ROLES:?} only"
@@ -227,7 +236,10 @@ pub fn streamable(text: &str) -> &str {
     text
 }
 
-/// Split a generation into `(reasoning, content)`.
+/// Split a GLM-FRAMED generation into `(reasoning, content)` — and DeepSeek-V4's and K3's,
+/// which take GLM's framing on this door (see `super::frame_prompt`). Muse Glimmer's reader is
+/// `super::glimmer::split_glimmer`, which needs no `thinking` flag because its channels are
+/// named in the generated text.
 ///
 /// With thinking ON the prompt ends at an OPEN `<think>`, so the model emits its reasoning
 /// first and closes it — everything after `</think>` is the answer. With thinking off the

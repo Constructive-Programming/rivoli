@@ -27,6 +27,7 @@ use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_artifact::k3_config::K3Config;
 use rivoli_artifact::v4_config::V4Config;
 use rivoli_core::cache::TwoQSplit;
+use rivoli_core::legality::Arch;
 
 /// One generation request. Bundled (like the pool's `PoolCfg`) so `generate`'s signature
 /// stays readable and a new knob cannot push it past the argument budget.
@@ -219,6 +220,33 @@ pub enum ArchCfg<'a> {
     /// Routed like V4 — a pool, no format choice (the checkpoint ships MXFP4) — so the
     /// same `PoolKnobs` and the same absence of a `RoutedFmt`.
     K3(&'a K3Config, PoolKnobs<'a>),
+}
+
+impl ArchCfg<'_> {
+    /// Which architecture this config IS.
+    ///
+    /// **Here rather than at the call site.** `main` already matched on `Arch` once to pick
+    /// which config type to load, and `serve` needs the same fact to pick a chat template
+    /// (M11b). Threading it back out as a fifth parameter to `open_and_run` made three of
+    /// `main`'s four arms clones of each other and the duplication gate refused the build —
+    /// correctly: the answer was already inside the value being passed. jscpd's own report,
+    /// quoted so the claim is checkable rather than inherited:
+    ///
+    /// ```text
+    /// main.rs [370:9 - 375:3] (5 lines, 38 tokens) <-> main.rs [363:14 - 364:8]
+    /// main.rs [389:9 - 394:3] (5 lines, 38 tokens) <-> main.rs [363:14 - 364:8]
+    /// ```
+    ///
+    /// A total match over an enum with one variant per architecture, so a fifth arm is a
+    /// compile error here rather than a wrong default anywhere downstream.
+    pub fn arch(&self) -> Arch {
+        match self {
+            Self::Glm(..) => Arch::GlmMoeDsa,
+            Self::Glimmer(..) => Arch::MuseGlimmer,
+            Self::V4(..) => Arch::DeepseekV4,
+            Self::K3(..) => Arch::KimiK3,
+        }
+    }
 }
 
 /// The decode engines, one variant per architecture that has a loop.

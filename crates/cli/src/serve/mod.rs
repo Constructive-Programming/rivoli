@@ -15,15 +15,28 @@
 //! already send and read — `enable_thinking`/`reasoning_content`, `tools`/`tool_calls` —
 //! and nothing here renders, orchestrates or loops.
 //!
-//! **Nothing here is model-shaped.** The engine arrives as `rivoli_engine::Engine`, the one
-//! seam, and every architecture-specific decision — which kernels, which KV layout, whether
-//! speculative decode exists — is on the far side of it. There is not one `#[cfg]` in this
-//! module for the same reason `main.rs` has none: `Engine` is a type in the featureless
-//! build too (an uninhabited one), so this whole subtree compiles, lints and runs its tests
-//! under a plain `cargo test --workspace`.
+//! **Almost nothing here is model-shaped, and the exception is named.** The engine arrives as
+//! `rivoli_engine::Engine`, the one seam, and every architecture-specific decision — which
+//! kernels, which KV layout, whether speculative decode exists — is on the far side of it.
+//! There is not one `#[cfg]` in this module for the same reason `main.rs` has none: `Engine`
+//! is a type in the featureless build too (an uninhabited one), so this whole subtree
+//! compiles, lints and runs its tests under a plain `cargo test --workspace`. All still true.
 //!
-//! Split by cohesion, three files:
+//! > **AMENDED 2026-08-17 (M11b).** This said "Nothing here is model-shaped", full stop, and
+//! > that had stopped being true in the worst way: with no architecture here, **every** request
+//! > was framed with GLM's chat template and read back with GLM's markers, Muse Glimmer's
+//! > included. Framing cannot go behind the seam — a template is a property of the CHECKPOINT,
+//! > and `Tokenizer` holds one vocabulary and no opinion about turns — so [`Opts::arch`]
+//! > carries it. **Two matches, both exhaustive, both one function**: [`frame_prompt`] on the
+//! > way in and [`split_channels`] on the way out. Feeding an instruct model another model's turn
+//! > markers puts it outside its turn structure, where its stop ids are unreachable and decode
+//! > runs to the limit every time — the failure behind the old tree's 56-run retraction.
+//!
+//! Split by cohesion, four files:
 //! - [`http`] — the HTTP/1.1 and SSE wire format, generic over `BufRead`/`Write`.
+//! - [`glimmer`] — Muse Glimmer's request framing and reply channels, split out at M11b
+//!   when the two halves pushed `oai` past the 800-line soft cap; the cut is by MODEL, since
+//!   `oai` is GLM-shaped end to end.
 //! - [`oai`] — the OpenAI chat-completion semantics: `messages` → template turns, tool-call
 //!   parsing, think splitting, streaming deltas. Pure functions, and where the tests are.
 //! - this file — the socket loop and one request's lifecycle, the only part that needs an
@@ -50,11 +63,13 @@
 //! ceiling is read back from the engine (`Engine::max_ctx`) rather than carried here a
 //! second time — see that method for why a copy would be free to drift.
 
+mod glimmer;
 mod http;
 mod oai;
 
 use anyhow::{Context, Result, ensure};
 use rivoli_artifact::tokenizer::{ChatOpts, Tokenizer};
+use rivoli_core::legality::Arch;
 use rivoli_engine::{Decoded, Engine, GenSpec};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
@@ -68,6 +83,15 @@ pub struct Opts {
     /// `--think`: reason before answering unless the request says otherwise. Why the
     /// default inverts the checkpoint's is `ChatOpts::thinking`'s argument — one home.
     pub think: bool,
+    /// **Which chat template frames a request and reads its reply back** — the one
+    /// architecture-shaped fact this module carries. See the header's dated amendment.
+    ///
+    /// An `Arch` rather than a pair of closures: `rivoli_core::legality` already owns the
+    /// enum, both matches below are EXHAUSTIVE, and a fifth architecture is then a compile
+    /// error rather than whichever arm someone wrote first. That exhaustiveness is the whole
+    /// value — an `if arch == MuseGlimmer { … } else { …GLM… }` would have left DeepSeek-V4
+    /// silently framed with GLM's markers, which is what this field exists to stop.
+    pub arch: Arch,
 }
 
 // NOTE on what `Opts` does NOT carry. The reference server passed `mtp`/`mtp_min_conf`
@@ -163,9 +187,17 @@ struct Ask {
     prompt_ids: Vec<u32>,
     ngen: usize,
     stream: bool,
-    /// Whether the prompt left `<think>` open, which is the only way to know how to
-    /// read the generation back — see `oai::split_think`.
+    /// Whether the prompt left `<think>` open, which on GLM's framing is the only way to
+    /// know how to read the generation back — see `oai::split_think`. Inert on Glimmer, whose
+    /// channels are named in the generated text (`oai::split_glimmer`).
     think: bool,
+    /// Which template framed this request, carried so the reply is read back with the SAME
+    /// one. On `Ask` rather than threaded through `stream_epilogue`/`json_reply`/the streaming
+    /// closure, because it is a property OF THE REQUEST that the reader needs, exactly like
+    /// `think` beside it — and because the mismatch this prevents is silent: a Glimmer reply
+    /// read with GLM's markers yields an empty `content` or leaks `to=user<|message|>` to the
+    /// user's screen.
+    arch: Arch,
     /// Who is answering — see [`oai::Completion`] for why the three fields travel together.
     who: oai::Completion,
 }
@@ -224,23 +256,94 @@ fn thinking_mode(body: &Value, default: bool) -> (bool, Option<&str>) {
     (think, effort)
 }
 
+/// Frame one request in the CHECKPOINT's own chat template.
+///
+/// **Exhaustive, and the arms differ in SHAPE rather than in a parameter.** GLM flattens
+/// `messages` into `(role, content)` turns and builds a token-ID list; Muse Glimmer renders
+/// the raw array to a STRING, because its template reads seven optional per-message fields
+/// (`tool_calls`, `reasoning_content`, `recipient`, `end_turn`, `name`, `tool_call_id`,
+/// content-as-parts) that a flattened turn has already discarded.
+///
+/// **`messages_to_turns` runs on BOTH arms, and on the Glimmer one only for its refusals** —
+/// its flattened output is discarded there. Named because "called for side effects" deserves
+/// to be: it refuses a `messages` that is absent, not an array, or empty; a role outside
+/// `system|developer|user|assistant|tool`; and a `tool_calls` entry with no `function.name`.
+/// The first two are exactly the holes Glimmer's no-`else` role chain leaves open — an
+/// unrecognised role renders as NOTHING there. The third is STRICTER than Glimmer's template,
+/// which renders a nameless call as `to=`: a 400 naming the message index beats a prompt
+/// teaching the model that nameless calls are normal.
+///
+/// **DeepSeek-V4 and Kimi-K3 take GLM's framing, and that is a KNOWN GAP, not a decision** —
+/// the same shape `main.rs::frame_prompt` carried for Glimmer until this milestone closed it.
+/// V4 has its own encoder (`tok.encode_dsv4`, which `--bench` already uses) and no multi-turn
+/// path from an OpenAI body; K3 ships no template in any tree and `main` refuses `--port` for
+/// it before reaching here, so its arm is unreachable and kept only for the exhaustiveness
+/// that makes the V4 gap visible. Closing V4's needs its own id-pinned comparison, exactly as
+/// this one did.
+fn frame_prompt(
+    body: &Value,
+    tok: &Tokenizer,
+    arch: Arch,
+    (tools, think, effort): (Option<&Value>, bool, Option<&str>),
+) -> Result<Vec<u32>> {
+    let turns = oai::messages_to_turns(body)?;
+    match arch {
+        Arch::MuseGlimmer => tok.encode(&glimmer::glimmer_prompt(
+            body,
+            (think, effort),
+            &rivoli_artifact::glimmer_encoding::utc_date(std::time::SystemTime::now()),
+        )?),
+        Arch::GlmMoeDsa | Arch::DeepseekV4 | Arch::KimiK3 => tok.encode_chat_turns(
+            &turns
+                .iter()
+                .map(|(r, c)| (r.as_str(), c.as_str()))
+                .collect::<Vec<_>>(),
+            &ChatOpts {
+                thinking: think,
+                reasoning_effort: effort,
+                tools,
+            },
+        ),
+    }
+}
+
+/// Split a generation into `(reasoning, content)` using the CHECKPOINT's own channel marking.
+///
+/// Feeds [`ReadBack`], which then asks the tool-call question on top.
+///
+/// The mirror of [`frame_prompt`], and it has to be: a reply framed with one model's markers
+/// and read with another's yields either an empty `content` (the split looks for a `</think>`
+/// that is not there and calls everything reasoning) or one that leaks raw
+/// `to=user<|message|>` into the user's screen. Wiring the request half alone was written and
+/// then REVERTED during M11b for exactly that reason; the two halves land together or not
+/// at all.
+///
+/// **`complete` is the parameter the P0 was made of.** `false` comes from `stream_decode`,
+/// once per generated token, on a PREFIX; `true` from [`read_back`], once, on the finished
+/// text. `oai::split_glimmer`'s doc carries why a prefix must not take the whole-text fallback
+/// — it streamed the raw turn header and then wedged the channel for the rest of the request.
+///
+/// Owned `String`s rather than `&str` slices, because Glimmer's channels are interleaved turns
+/// that have to be concatenated while GLM's are one span each. That is an allocation per token
+/// in the streaming arm, not per reply — on a path that already re-decodes the whole prefix
+/// every token at a few tok/s, which is the measurement that makes it not worth thinking
+/// about.
+fn split_channels(text: &str, ask: &Ask, complete: bool) -> (String, String) {
+    match ask.arch {
+        Arch::MuseGlimmer => glimmer::split_glimmer(text, complete),
+        Arch::GlmMoeDsa | Arch::DeepseekV4 | Arch::KimiK3 => {
+            let (r, c) = oai::split_think(text, ask.think);
+            (r.to_string(), c.to_string())
+        }
+    }
+}
+
 fn parse_ask(body: &[u8], cx: &Ctx<'_, '_>) -> Result<Ask> {
     let (tok, opts) = (cx.tok, cx.opts);
     let body: Value = serde_json::from_slice(body).context("body is not JSON")?;
     let tools = tool_declarations(&body)?;
-    let turns = oai::messages_to_turns(&body)?;
     let (think, effort) = thinking_mode(&body, opts.think);
-    let prompt_ids = tok.encode_chat_turns(
-        &turns
-            .iter()
-            .map(|(r, c)| (r.as_str(), c.as_str()))
-            .collect::<Vec<_>>(),
-        &ChatOpts {
-            thinking: think,
-            reasoning_effort: effort,
-            tools,
-        },
-    )?;
+    let prompt_ids = frame_prompt(&body, tok, opts.arch, (tools, think, effort))?;
     let asked = body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
@@ -259,6 +362,7 @@ fn parse_ask(body: &[u8], cx: &Ctx<'_, '_>) -> Result<Ask> {
         stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
         prompt_ids,
         think,
+        arch: opts.arch,
         who: oai::Completion {
             id: format!("chatcmpl-{created}"),
             created,
@@ -341,13 +445,13 @@ fn stream_decode(w: &mut impl Write, cx: &mut Ctx<'_, '_>, ask: &Ask) -> Result<
         let Ok(full) = tok.decode_all(&acc) else {
             return true;
         };
-        let (reasoning, content) = oai::split_think(&full, ask.think);
+        let (reasoning, content) = split_channels(&full, ask, false);
         for (field, sent, target) in [
-            ("reasoning_content", &mut sent_r, reasoning),
+            ("reasoning_content", &mut sent_r, reasoning.as_str()),
             // Prose only. Tool calls leave as one structured delta once the whole
             // reply is parseable — streaming their markup would hand the client
             // `<tool_call>` to render as text.
-            ("content", &mut sent_c, oai::streamable(content)),
+            ("content", &mut sent_c, oai::streamable(&content)),
         ] {
             let Some(d) = oai::delta(sent, target) else {
                 continue;
@@ -372,15 +476,24 @@ fn stream_decode(w: &mut impl Write, cx: &mut Ctx<'_, '_>, ask: &Ask) -> Result<
 /// ONE reader for both arms: the streaming epilogue and the JSON body ask the same three
 /// questions of the same text, and answering them twice is how the two would come to
 /// disagree about where the reasoning ended.
-struct ReadBack<'t> {
-    reasoning: &'t str,
+struct ReadBack {
+    /// Owned, not borrowed, since M11b: Glimmer's reasoning is CONCATENATED from however many
+    /// `to=self` turns the model emitted, so there is no single slice of the generation to
+    /// point at. GLM's one span pays a copy per reply on a path that spends seconds per token.
+    reasoning: String,
     prose: String,
     calls: Vec<Value>,
 }
 
-fn read_back<'t>(text: &'t str, ask: &Ask) -> ReadBack<'t> {
-    let (reasoning, content) = oai::split_think(text, ask.think);
-    let (prose, calls) = oai::parse_tool_calls(content, &ask.who.id);
+fn read_back(text: &str, ask: &Ask) -> ReadBack {
+    let (reasoning, content) = split_channels(text, ask, true);
+    // **`parse_tool_calls` reads GLM's `<tool_call>` markup and runs on every arm, which is
+    // sound only because no arm is TAUGHT another syntax.** `oai::glimmer_prompt` deliberately
+    // withholds `tools` from Glimmer's template for exactly this reason — see its doc. On a
+    // Glimmer reply this therefore finds nothing and passes the prose through, which is the
+    // honest outcome; the day ATEM is advertised, this line is the thing that must change with
+    // it.
+    let (prose, calls) = oai::parse_tool_calls(&content, &ask.who.id);
     ReadBack {
         reasoning,
         prose,
@@ -487,6 +600,48 @@ fn warn_sampling_ignored() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The arch DISPATCH, which is the pairing the M11b revert was about.**
+    ///
+    /// Both leaves are gated in `oai` — `split_glimmer` by six cases plus a prefix-monotonicity
+    /// sweep, `split_think` by its own test — and until this existed the `match` that pairs a
+    /// request's framing with its reply's reader was not. That is precisely the seam that
+    /// failed: the reverted draft framed Glimmer requests with Glimmer's template and read the
+    /// replies back with GLM's, and every leaf test stayed green while doing it.
+    ///
+    /// One text, both arms, opposite answers. Glimmer's markers are inert to `split_think`
+    /// (it hunts `</think>`), so a mis-wired dispatch shows up as the raw turn header reaching
+    /// `content` — exactly what a user would have seen.
+    #[test]
+    fn the_reply_is_read_back_with_the_same_template_that_framed_it() {
+        let ask = |arch| Ask {
+            prompt_ids: vec![],
+            ngen: 1,
+            stream: false,
+            think: true,
+            arch,
+            who: oai::Completion {
+                id: String::new(),
+                created: 0,
+                model: String::new(),
+            },
+        };
+        let reply = " to=user<|message|>hi<|eot|>";
+        assert_eq!(
+            split_channels(reply, &ask(Arch::MuseGlimmer), true),
+            (String::new(), "hi".to_string()),
+            "the Glimmer arm must strip the turn markers"
+        );
+        // GLM's reader is told `thinking: true` and finds no `</think>`, so it calls the whole
+        // thing reasoning and leaves content EMPTY — the visible signature of a mis-wired
+        // dispatch, and the reason this pairing needs its own gate.
+        assert_eq!(
+            split_channels(reply, &ask(Arch::GlmMoeDsa), true),
+            (reply.to_string(), String::new()),
+            "the GLM arm must be left alone; if this ever equals the Glimmer answer, the \
+             dispatch has collapsed and nothing else here would notice"
+        );
+    }
 
     /// The ceiling contract, stated on the arithmetic rather than on a socket: one slot is
     /// reserved beyond the prompt for the token the last forward produces, and a prompt

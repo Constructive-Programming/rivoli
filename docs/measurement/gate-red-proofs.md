@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M11's fp8 gates are PAID deviceless — layer_bytes stripped of its scale grid, sniff falling back to the compiled-in block, the converter at the wrong block and with one projection class skipped, and the parity script over six runs including both refusals and a green baseline — while its DEVICE half is OWED with recipes written down: the anti-fallback assert in glimmer_fp8_decode.rs. Slot::fill's third-zip-leg guard was RETIRED rather than proven - the parameter it checked was deleted, so the truncation has no shape.
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M11's fp8 gates are PAID deviceless — layer_bytes stripped of its scale grid, sniff falling back to the compiled-in block, the converter at the wrong block and with one projection class skipped, and the parity script over six runs including both refusals and a green baseline — while its DEVICE half is OWED with recipes written down: the anti-fallback assert in glimmer_fp8_decode.rs. Slot::fill's third-zip-leg guard was RETIRED rather than proven - the parameter it checked was deleted, so the truncation has no shape. M11b's id pin is PAID on the real 27 MB tokenizer, 31 of 31 cases identical to apply_chat_template and red-proofed by closing a system turn with the non-stop token; its serve door ships BOTH halves (request framing and reply channel-splitting) after the request-half-only version was written and reverted as a regression, behind SIX red-proofed pure gates including the arch dispatch itself; a prefix-monotonicity property caught two streaming P0s that no non-streaming gate could see - a raw turn header streamed then the channel wedged forever, and a partial <|eot|> at the prefix boundary. Only the live SSE round-trip is OWED on the GPU.
 ---
 
 # M0 gate red proofs
@@ -261,3 +261,152 @@ booking sole-tenant device time to demonstrate a failure the type system can ref
 `Slot::new`'s `ensure!(addrs().len() == tensors.len())` **stays** and is not in the same
 class: it compares two genuinely independent walks — the pin's field-by-field placement
 against the config-driven tail list — which can diverge with nobody noticing.
+
+## 6. Muse Glimmer chat framing (added 2026-08-17, M11b)
+
+Until M11b every Glimmer prompt — bench and serve — was framed with **GLM's** chat template.
+`glimmer_encoding.rs` had existed since the port and was wired to nothing; `main.rs`'s own
+comment called it "a KNOWN GAP, not a decision" and said the change was owed an id-pinned
+comparison first. This is that comparison.
+
+### 6a. The id pin — PAID, deviceless
+
+`crates/artifact/tests/glimmer_template.rs::rendered_prompts_tokenize_to_the_vendored_ids`
+runs `render` → `Tokenizer::encode` → `case["ids"]` over all 31 vendored cases, on the
+checkpoint's own 27 MB `tokenizer.json`.
+
+```
+RIVOLI_GLIMMER_ARTIFACT=/swarm/storage/ai/rivoli/glimmer-30b-fp8   cargo test -p rivoli-artifact --test glimmer_template --no-default-features -- --nocapture
+  id pin: 31 cases tokenized identically to apply_chat_template
+test result: ok. 5 passed                                                        (green)
+```
+
+**This closes a gap that had been recorded as owed and unclosable.** The sibling census test's dated
+correction states the property — every special resolves to ONE id — is "true and UNVERIFIED",
+and names the exact run that would close it, adding "the tiny fixture has none". A real
+tokenizer is on this box now, and the run is above.
+
+**Red proof.** Planted: `system_tail` closes with `<|eom|>` instead of `<|eot|>` — a one-token
+change, and the one that decides whether a decode can STOP (only `<|eot|>` is a stop id).
+
+```
+case `plain_user` diverges at id 49 (got 57 ids, want 57)
+  got  ...[392, 2540, 706, 392, 1556, 4205, 200007, 200022, …]
+  want ...[392, 2540, 706, 392, 1556, 4205, 200008, 200022, …]      FAILED   (red)
+revert (sha256 verified) → 5 passed                                          (green again)
+```
+
+**What the id half adds over the byte pin beside it**, since any `render` mutation reddens
+both: the byte pin never calls a tokenizer, so it cannot see whether `<|start|>` became one
+id or five ordinary pieces — that is decided by the `tokenizers` crate reading the
+checkpoint's added-token table, outside this crate entirely. The reddening above shows ids
+200007/200008 as SINGLE tokens, which is the property being pinned.
+
+**Without `RIVOLI_GLIMMER_ARTIFACT` the test asserts its own reason** rather than returning
+green having compared nothing: the 31 cases must still be present. An `eprintln!` skip would
+be invisible under libtest capture, which is why "it skips loudly" is not a thing here.
+
+### 6b. The serve door's six pure gates — PAID, deviceless
+
+**The request half alone was written and then REVERTED.** Review found that framing a Glimmer
+request with Glimmer's template while reading its reply back with GLM's would produce, for
+every served reply, either an empty `content` (the GLM split hunts a `</think>` that is not
+there and calls everything reasoning) or one leaking raw `to=user<|message|>` onto the user's
+screen. That is a REGRESSION on a door that worked, and worse than the defect it was fixing.
+**Both halves land together or neither does**, and `serve::split_channels`'s doc says so where
+the next reader will be.
+
+Both halves are pure functions of the request body and the generated text, so they live in
+`serve/oai.rs` — the module whose header says it is where the pure functions and the tests are
+— rather than beside their callers. (The first draft of this line justified that with "`frame_prompt`
+takes a `&Ctx` holding `&mut Engine`" — false, and believing it is what left the dispatch
+ungated; the real reason is that `frame_prompt` needs a 27 MB tokenizer.) Six gates, `cargo test -p rivoli --bin rivoli` — five
+in `serve/glimmer.rs`, one in `serve/mod.rs`. **Each was planted, observed red, reverted, and
+`sha256sum`-verified**, per this document's own standard for the word PAID:
+
+| gate | planted defect → observed red |
+|---|---|
+| `a_developer_turn_is_framed_as_a_system_turn_and_not_dropped` | rewrite disabled → FAILED. Glimmer's role chain has no `else`, so an unmapped `developer` turn renders as NOTHING — instructions dropped behind a 200 |
+| `the_reasoning_strength_maps_the_request_over_the_servers_default` | `if think { effort }` → `effort.or(…)` → FAILED. All five cells; **two are rivoli's invention** on a template with no thinking boolean, and an invented mapping with no gate is prose |
+| `a_body_without_messages_is_refused` | `.context(…)?` → `.unwrap_or_default()` → FAILED. Otherwise `render` emits a system block and a bare generation prompt, and the model answers nobody |
+| `split_glimmer_reads_the_recipient_and_never_swallows_a_reply` | two hardenings, quoted below. Eight cases, including the one that matters: text with no markers comes back WHOLE as content, because an empty `content` reads as a working server returning nothing |
+| `every_prefix_of_a_generation_grows_both_channels_monotonically` | **needed no plant — it went red on the tree it was written for, twice.** See §6b-P0 |
+| `the_reply_is_read_back_with_the_same_template_that_framed_it` (`serve/mod.rs`) | arms crossed → FAILED with `left: (" to=user<\|message\|>hi<\|eot\|>", "")` — content empty, the whole raw turn in reasoning. This is the DISPATCH, and until it existed both leaves were gated and the `match` pairing them was not |
+
+#### 6b-P0. The streaming defect the monotonicity gate caught, and the one it caught next
+
+**A P0 found by review before it shipped, then a second one found by the gate written for the
+first.** Both were in `split_glimmer`, both streaming-only, and the non-streaming path was
+correct throughout — so §6c's owed device recipe, a plain `curl`, would have come back green
+over a broken door.
+
+1. **The whole-text fallback fired on PREFIXES.** `render` ends the prompt at
+   `<|start|>assistant`, so the first tokens a model emits are the turn header ` to=user` —
+   several tokens before `<|message|>`. With no `<|message|>` yet, the fallback returned the
+   raw header as content and `stream_decode` sent it. Then `<|message|>` arrived, content
+   collapsed to the body, `strip_prefix(" to=user")` failed on it and on every token after, and
+   `sent_c` froze. **Every streamed Glimmer reply would have been the literal text ` to=user`
+   and nothing else, `finish_reason: "stop"`.** Fixed by `complete: bool`.
+2. **A partial marker at the prefix boundary.** With (1) fixed, the new gate went red anyway:
+   `prefix 36 reported content "The sky is blue.<", which the finished "The sky is blue." does
+   not start with`. The `<` is three tokens short of `<|eot|>`; emitting it wedges the channel
+   exactly as the header did. Fixed by `trim_partial_marker`, which is `delta`'s U+FFFD rule
+   for markers instead of codepoints.
+
+The gate is therefore its own red proof twice over, which is stronger evidence than a plant:
+it caught duplication of a failure mode nobody had thought of yet. **Write the property, not
+the cases** — a hand-written case list starts at a `<|message|>`, and both defects lived
+strictly before one.
+
+**Two operator false-greens while paying the dispatch proof, both the §4 trap again.** The
+first mutation (`Arch::MuseGlimmer if false`) made the match non-exhaustive; the second
+orphaned `complete`. Both were BUILD failures under `warnings = deny`, and both classifiers
+read "no FAILED in the output" as green. The tell was a red-proof that refused to go red — the
+signal §4 already names. A mutation for a red proof has to keep the tree COMPILING, which on a
+`-D warnings` crate means keeping every binding live.
+
+**`split_glimmer`'s two hardenings are red-proofed**, both planted, observed red, reverted,
+sha256 verified identical:
+
+```
+# "earliest terminator wins" -> "try <|eot|>, else <|eom|>"
+  left: ("", "A<|eom|>B")     right: ("", "A")                            FAILED  (red)
+# `header.trim() == "to=self"` -> `header.contains("to=self")`
+  left: ("CALL", "")          right: ("", "CALL")                         FAILED  (red)
+revert both -> 1 passed                                                          (green again)
+```
+
+Read the left-hand sides: the first LEAKS `<|eom|>` into the text a user sees, which is the
+whole class this function exists to stop; the second files a `to=selfcheck.run` tool call as
+reasoning and drops it out of `content` entirely. Neither is hypothetical — both were the
+naive spelling, and both were written that way first.
+
+**Two scope lines are drawn in code and stated, not left to be discovered:**
+
+- **`tools` is withheld from Glimmer's template.** It would render the ATEM
+  `<atem:function_calls>` preamble while `oai::parse_tool_calls` reads GLM's `<tool_call>`
+  markup and nothing else — so every tool use would return as prose with
+  `finish_reason: "stop"`, a confidently wrong answer. A Glimmer tool request gets an honest
+  untooled reply until an ATEM parser is ported.
+- **DeepSeek-V4 still takes GLM's framing on the serve door**, and Kimi-K3's arm is
+  unreachable (`main` refuses `--port` for it first). Both matches are EXHAUSTIVE, which is
+  what makes the V4 gap visible instead of hidden behind an `if arch == MuseGlimmer` — the
+  shape the first draft had, and the reason it was rejected.
+
+### 6c. The serve round-trip — OWED, device
+
+What §6b cannot reach: that a real decode through the real template TERMINATES. Needs a live
+`Engine`, hence the GPU. Recipe, under the flock, dev profile:
+
+```
+rivoli /swarm/storage/ai/rivoli/glimmer-30b-fp8 --port 18174 &
+curl -s localhost:18174/v1/chat/completions -d '{"model":"g","messages":[{"role":"user","content":"Say hello."}],"max_tokens":16}'
+```
+
+Green = a reply that TERMINATES on `<|eot|>` rather than running to `max_tokens`. Red proof:
+point the arm at `encode_chat_turns` (the pre-M11b behaviour) and watch the reply run to the
+limit — the old tree's 56-run retraction is that failure at scale.
+
+**The second cell is the reply's SHAPE**: `content` non-empty, carrying no `<|message|>`,
+`to=user` or `<|eot|>` fragment. That is the half §6b's `split_glimmer` gates on synthetic
+text and only a real decode can gate on real output.

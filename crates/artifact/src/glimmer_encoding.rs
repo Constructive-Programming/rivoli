@@ -36,8 +36,12 @@
 //! is GLM's and builds a token-ID list. GLM's shape avoids depending on the tokenizer matching
 //! specials inside text; here that dependency is carried, and the vendored cases record the
 //! ids alongside the string so it can be measured rather than assumed. See
-//! `glimmer_template.rs`'s own dated correction for what that pin does and does not establish
-//! while no Glimmer tokenizer is on this machine.
+//! `glimmer_template.rs`'s own dated correction for what that pin does and does not establish.
+//!
+//! > **AMENDED 2026-08-17 (M11b).** That sentence ended "while no Glimmer tokenizer is on this
+//! > machine". One is, and the ids are no longer taken on faith:
+//! > `rendered_prompts_tokenize_to_the_vendored_ids` runs this module's output through the
+//! > shipped tokenizer and compares against `apply_chat_template`'s own ids, 31 of 31.
 
 use serde_json::Value;
 
@@ -467,8 +471,24 @@ fn atem(call: &Value) -> String {
     // calling it without arguments is normal. The template refuses this shape by name (`a JSON
     // string cannot be parsed in the HF jinja sandbox`), and that refusal is about JINJA's
     // sandbox rather than about the shape being meaningless — outside the sandbox it parses fine.
-    // `atem`'s doc deferred to "`serve`-side validation"; there is no Glimmer serve path, so the
-    // deferral had no destination and the silent drop was the entire behaviour.
+    // `atem`'s doc deferred to "`serve`-side validation"; there was no Glimmer serve path, so
+    // the deferral had no destination and the silent drop was the entire behaviour.
+    //
+    // > **THERE IS ONE NOW, 2026-08-17 (M11b)** — `cli/src/serve/oai.rs::glimmer_prompt`
+    // > renders this module for `Arch::MuseGlimmer`, and the parse above stopped being
+    // > defence-in-depth the moment that door opened.
+    // >
+    // > **And it is reachable even though serve withholds `tools`.** That withholding stops the
+    // > ATEM *preamble* (the schemas and the worked example), which `GlimmerChatOpts::tools`
+    // > gates. It does NOT stop this function: `assistant_calls` runs whenever a MESSAGE in the
+    // > history carries `tool_calls`, which is exactly what an OpenAI client replaying a
+    // > tool-using conversation sends. So a real request reaches this line with a JSON-string
+    // > `arguments`, and without the parse every replayed call would come back to the model as
+    // > a correct call with every argument gone.
+    // >
+    // > The deferral finally has a destination too — refusing a malformed `arguments` belongs
+    // > at `serve` — and it is still not written. Parsing the wire format's own spelling is the
+    // > behaviour that matters; refusing the rest is a smaller, later question.
     let raw = function_of(call).get("arguments");
     let parsed = raw
         .and_then(Value::as_str)

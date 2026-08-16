@@ -1,7 +1,7 @@
 ---
 status: data
 scope: glimmer
-verdict: M11's fp8 arm, measured where it can be measured without a GPU. The artifact arithmetic RECONCILES to the byte — layer_bytes predicts 967.942 MB bf16 and 484.142 MB fp8, totals 55.712 GB and 30.555 GB, and the two artifacts on NFS are 55,712,428,144 B and 30,554,903,564 B, i.e. the prediction plus a safetensors header that grows by 141 B for each of the 416 scale tensors fp8 adds. The pre-registered quality band is Q2's, DERIVED not measured: the old tree's int4-to-hybrid PPL gap 5.120 to 5.189 is 0.013387 nats of log-PPL, and the old tree's own fp8-vs-bf16 paired run (-0.00026, 95% CI [-0.00701, +0.00649]) sits inside it with 2.06x of margin on the upper bound. CONVERTER BYTE-PARITY IS PAID: this tree's --fp8 reproduces the old tree's 30,554,903,564-byte artifact and all five aux files with identical sha256, so the two converters agree on every tile scale and every e4m3 rounding with no tolerance anywhere. TWO gates remain unpaid and each is named with what blocks it: paired dNLL (blocked on M10's --ppl, which has zero commits) and tok/s plus partition bit-identity (need the GPU). The old tree's 4.714 tok/s fp8 figure is NOT a baseline to beat or cite - it was recorded with a non-empty contention witness and discarded by its own author.
+verdict: M11's fp8 arm, measured where it can be measured without a GPU. The artifact arithmetic RECONCILES to the byte — layer_bytes predicts 967.942 MB bf16 and 484.142 MB fp8, totals 55.712 GB and 30.555 GB, and the two artifacts on NFS are 55,712,428,144 B and 30,554,903,564 B, i.e. the prediction plus a safetensors header that grows by 141 B for each of the 416 scale tensors fp8 adds. The pre-registered quality band is Q2's, DERIVED not measured: the old tree's int4-to-hybrid PPL gap 5.120 to 5.189 is 0.013387 nats of log-PPL, and the old tree's own fp8-vs-bf16 paired run (-0.00026, 95% CI [-0.00701, +0.00649]) sits inside it with 2.06x of margin on the upper bound. CONVERTER BYTE-PARITY IS PAID: this tree's --fp8 reproduces the old tree's 30,554,903,564-byte artifact and all five aux files with identical sha256, so the two converters agree on every tile scale and every e4m3 rounding with no tolerance anywhere. TWO gates remain unpaid and each is named with what blocks it: paired dNLL (blocked on M10's --ppl, which has zero commits) and tok/s plus partition bit-identity (need the GPU). The old tree's 4.714 tok/s fp8 figure is NOT a baseline to beat or cite - it was recorded with a non-empty contention witness and discarded by its own author. Determinism on this arm is VERIFIED, not assumed: two teacher-forced passes with identical flags gave byte-identical NLL bodies and PPL 7.008490 both times, fully pinned at 52/52 - against GLM, which differs on 555 of 762 positions under the same harness - so the fp8-vs-bf16 dNLL needs no noise-floor term but must be run fully pinned and without --mode.
 ---
 
 # Muse Glimmer fp8 — M11
@@ -38,6 +38,35 @@ rewrite's Glimmer arm is a different engine through a different seam.
 
 **An interval straddling zero is inconclusive, not a pass** — the rule this repo has broken
 before. The band is on the magnitude; the power question is `bin/ppl`'s own.
+
+### The baseline does not move on this arm — verified, not assumed
+
+A pre-registered ε means nothing if the thing it measures wobbles on its own, and on this
+engine that is a live question: **GLM scored twice with identical flags differs on 555 of 762
+NLL positions** (PPL 5.200080 vs 5.209284, hit% 78.2643 vs 78.2352), so a paired dNLL there
+currently sits on a baseline with a ~0.009 PPL noise floor — about a tenth of the effect sizes
+the quality ladder needs to resolve.
+
+**Glimmer was controlled separately and is deterministic.** Two teacher-forced passes over the
+same corpus, identical flags, `--max-mem 70`, ~35 minutes apart: **byte-identical NLL bodies**,
+PPL **7.008490** to every digit on both, 761 scored positions,
+`partition: 52 of 52 layers pinned, 0 streamed (51.9 GiB tier)`, hit 0.00%. (Run by the wave
+coordinator 2026-08-17, not by this track.)
+
+That is the assumption a reader would otherwise take on faith, and it has two consequences
+this track is bound by:
+
+- **No noise-floor term is needed beside ε on this arm.** A measured fp8-vs-bf16 difference is
+  the format's, not the engine's.
+- **The A/B must run FULLY PINNED**, at a budget where all 52 layers pin, as the control was.
+  The wobble lives in the streaming path — arena relocation and expert tickets, neither of
+  which a 52/52 Glimmer pin has — so scoring fp8 at a budget that forces streaming puts the
+  run back outside what the control covers. fp8 makes that easier, not harder: 28.5 GiB pins
+  where bf16 needs 51.9.
+- **`--mode` must not appear on a recorded Glimmer command line.** The control used
+  `--mode int3-vq` out of habit; the engine correctly warned the flag is meaningless on a
+  dense arch, but it would have written a false mode label into the `.nll` header, which is a
+  provenance defect even on a run that is right.
 
 ## 2. What the bytes already say, with no GPU
 

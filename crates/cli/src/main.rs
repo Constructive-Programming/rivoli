@@ -19,8 +19,8 @@ use anyhow::{Context, Result, bail, ensure};
 // another file's token for token the moment the K3 import landed, and the jscpd gate
 // reported the pair — an import list being the one duplication Rust cannot factor.
 use rivoli_artifact::{
-    format::RoutedFmt, glimmer_config::GlimmerConfig, glm_config::ModelConfig, k3_config::K3Config,
-    tokenizer::Tokenizer, v4_config::V4Config,
+    format::RoutedFmt, glimmer_config::GlimmerConfig, glimmer_encoding, glm_config::ModelConfig,
+    k3_config::K3Config, tokenizer::Tokenizer, v4_config::V4Config,
 };
 use rivoli_core::cache::TwoQSplit;
 use rivoli_core::legality::{ATTNS, Arch, AttnKind, Flag, MODES, Mode, Outcome, decide, name_in};
@@ -422,13 +422,19 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
 ///
 /// **The shared tail.** Everything below the seam is architecture-shaped and everything here
 /// is not, so this function names no architecture — which is what makes "a third arm is two
-/// lines in `main`" true rather than aspirational.
+/// lines in `main`" true rather than aspirational. M11b needed the architecture in
+/// `serve::Opts` — chat framing is a property of the CHECKPOINT and sits outside the engine
+/// seam — and it comes from `cfg.arch()` rather than a fifth parameter, because the config
+/// already knows which architecture it is.
 fn open_and_run(
     a: &Args,
     tok: &Tokenizer,
     bench: Option<&Bench<'_>>,
     cfg: ArchCfg<'_>,
 ) -> Result<()> {
+    // Read BEFORE the config moves into `Engine::open`. `ArchCfg` is not `Copy`, so this
+    // ordering is the borrow checker's, not a preference.
+    let arch = cfg.arch();
     let mut eng = Engine::open(
         &a.model,
         cfg,
@@ -450,6 +456,10 @@ fn open_and_run(
                     .file_name()
                     .map_or_else(|| "rivoli".into(), |n| n.to_string_lossy().into_owned()),
                 think: a.think,
+                // Which chat template frames a request, and reads the reply back — see
+                // `serve::Opts::arch`. Read off the config rather than matched here, which is
+                // what keeps this function's "names no architecture" claim true.
+                arch,
             },
         ),
         // Unreachable through clap (`--bench` is `required_unless_present = "port"`), and a
@@ -479,10 +489,15 @@ struct Bench<'a> {
 /// its turn structure does document continuation and never emits a stop token, which is the
 /// failure that invalidated 56 benchmark runs in the old tree.
 ///
-/// **Muse Glimmer takes GLM's framing here and that is a KNOWN GAP, not a decision.**
-/// `rivoli_artifact::glimmer_encoding` exists and is not wired to this door; it predates this
-/// arm and is left exactly as it was, because changing it is a Glimmer change owed its own
-/// id-pinned comparison rather than a line inside a V4 port.
+/// > **THE GLIMMER GAP IS CLOSED, M11b 2026-08-17.** This said: "Muse Glimmer takes GLM's
+/// > framing here and that is a KNOWN GAP, not a decision. `rivoli_artifact::glimmer_encoding`
+/// > exists and is not wired to this door; it predates this arm and is left exactly as it was,
+/// > because changing it is a Glimmer change owed its own id-pinned comparison rather than a
+/// > line inside a V4 port." The comparison exists now
+/// > (`glimmer_template.rs::rendered_prompts_tokenize_to_the_vendored_ids`, 31/31 cases
+/// > `render` → the shipped tokenizer → `apply_chat_template`'s own ids), so the arm is split
+/// > and Glimmer renders its own template. **This CHANGES Glimmer bench ids**, which is why it
+/// > is its own commit and why no fp8 A/B may straddle it.
 fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
     use rivoli_artifact::v4_encoding::{EncodeOpts, Message, ThinkingMode};
     match arch {
@@ -493,7 +508,41 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
             vec![Message::user(text)],
             &EncodeOpts::new(ThinkingMode::Chat),
         ),
-        Arch::GlmMoeDsa | Arch::MuseGlimmer => tok.encode_chat(text),
+        // **A STRING then tokenized, unlike GLM's id list** — Glimmer's template is a hand-port
+        // that emits `<|start|>`/`<|message|>`/`<|eot|>` as literal text, and that those become
+        // single ids is the shipped tokenizer's doing rather than this crate's. That dependency
+        // is measured, not assumed: the id pin cited above runs `Tokenizer::encode` over
+        // `render`'s bytes and compares against the ids `apply_chat_template` produced.
+        //
+        // **The date reaches the prompt, and the consequence is stated rather than dodged.**
+        // The template's synthesised system block carries `Current date: YYYY-MM-DD.`, so a
+        // Glimmer bench framed today and the same bench framed tomorrow differ in a handful of
+        // ids. `utc_date`'s own doc puts that decision here — "the CLI, which is where 'what
+        // day is it' is a legitimate question" — and the alternative, passing `""`, renders a
+        // system block no reference renderer can produce. Prompt LENGTH is invariant (the date
+        // is always ten characters), so tok/s is unaffected; what a recorded run must carry is
+        // the DATE, which is why this arm logs it. Without that line a recorded Glimmer bench
+        // is unreproducible for a reason nothing in its output names.
+        Arch::MuseGlimmer => {
+            let date = glimmer_encoding::utc_date(std::time::SystemTime::now());
+            tracing::info!("glimmer framing: own chat template, current_date {date}");
+            tok.encode(&glimmer_encoding::render(
+                &[serde_json::json!({"role": "user", "content": text})],
+                &glimmer_encoding::GlimmerChatOpts {
+                    // **`"none"`, on the V4 arm's argument two lines up, not the template's
+                    // default `"high"`.** Glimmer's Jinja has no thinking boolean — it always
+                    // renders `Reasoning strength: <s>.` — so a bench that said nothing would
+                    // opt INTO maximal reasoning, and `--bench N` would spend its whole budget
+                    // in the `to=self` channel: a transcript of the model thinking rather than
+                    // answering, which is exactly what `ThinkingMode::Chat` above exists to
+                    // avoid. Review 2026-08-17 found the two arms disagreeing with nothing
+                    // written down; this is the agreement.
+                    reasoning_strength: Some("none"),
+                    ..glimmer_encoding::GlimmerChatOpts::new(&date)
+                },
+            ))
+        }
+        Arch::GlmMoeDsa => tok.encode_chat(text),
         // RAW, deliberately: K3 ships no chat template in ANY tree (`convert_k3`'s header
         // records it), so there is no "its own framing" to render — this line inherited
         // GLM's `encode_chat` until M9, which would have fed a K3 checkpoint `[gMASK]
