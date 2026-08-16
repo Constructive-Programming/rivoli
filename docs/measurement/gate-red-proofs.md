@@ -212,6 +212,35 @@ Row 1 is the one that matters: a green anti-fallback assert is the ONLY structur
 that fp8 arithmetic ran, and it has never been red. Until it is, read a green on this file
 as "the two artifacts differ", not as "the fp8 kernel is dispatched".
 
+### 5e-bis. An operator false-green during the paying, and it is a NEW combination
+
+Recorded on the same rule as §4's pair. Between two of the runs above, `cargo check
+--workspace --all-targets` **failed** with
+
+```
+error: failed to run custom build command for `rivoli v0.1.0 (…/wave-m11/crates/cli)`
+  process didn't exit successfully: … build-script-build (exit status: 101)
+  --- stdout
+  cargo:rerun-if-changed=…/wave-m19/crates
+```
+
+and the failure was invisible, because the command was `cargo check … | grep -E
+'^(error|warning)' -A 5 | head -20; echo "CHECK OK"` — the grep matched, `head` swallowed the
+rest, and the unconditional `echo` printed a green that nothing had established. **A commit
+was made on it.** (It was sound; that is luck, not evidence.)
+
+The cause is the fourth shared resource: `CARGO_TARGET_DIR` is one directory for every
+worktree on this box, and `crates/cli/build.rs` bakes `env!("CARGO_MANIFEST_DIR")` at its own
+compile time. A sibling worktree (`wave-m19`) compiled the build script last, so cargo reused
+ITS binary, which scanned a `crates` directory this checkout does not have and panicked. The
+jscpd gate did not run for that invocation at all.
+
+**Two rules, both already in this repo's notes, that only bite together:** read the exit code
+UNPIPED, and isolate `CARGO_TARGET_DIR` for any run whose green you intend to cite. Every gate
+in §5 was re-run afterwards under `CARGO_TARGET_DIR=/var/db/rivoli/m11/verify-target` with the
+exit code captured directly — deviceless suite exit 0 (**298 passed, 0 failed, 81 binaries**),
+clippy exit 0 on both arms, `cargo fmt --check` exit 0, jscpd exit 0 (0 clones).
+
 ### 5f. `Slot::fill`'s third zip leg — RETIRED rather than proven
 
 A gate that cannot exist needs no red proof, and this one stopped existing the same day it
