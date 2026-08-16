@@ -25,7 +25,12 @@ things a fixture cannot tell you.
 - **The converter could not finish**, for one reason, now fixed: it copied `tokenizer.json`,
   and Kimi-K3 has none.
 - **The first K3 decode is not blocked on the GPU.** It is blocked on a tiktoken tokenizer
-  loader. See §4.
+  loader — deviceless work, and now the critical path, since the artifact will exist long
+  before anything can open it. §4 for the diagnosis, §7 for the scope and its gate design.
+- **A concurrent GPU pin starves this job, and starvation reads as death.** GTT is system RAM
+  here, so a ~115 GiB pin and a large streaming CPU job cannot share the machine — and the
+  flock does not express it, because this job never touches the device. Two observers called
+  a live process dead off an empty `ps | grep`. §5.
 - Conversion is running; §5 carries the census to assert it against.
 
 ## 1. Config, field by field
@@ -255,6 +260,40 @@ to size the job, not to be cited; the real total belongs here when the run ends.
 is NFS-hosted by the owner's Q1 decision, correctness-first, with **decode perf explicitly
 disclaimed** — none of these numbers say anything about tok/s.
 
+### A concurrent GPU pin starves this job — and starvation reads exactly like death
+
+Mid-run the converter stopped emitting log lines for roughly 40 minutes. Two observers
+independently concluded it had been killed, and **both were wrong**: it was alive the whole
+time, at its original PID, and resumed on its own.
+
+What actually happened is the scheduling constraint worth keeping. **On this box GTT is
+system RAM**, so a decode's pin is not device-side — a ~115 GiB pin took 123 of 124 GB, drove
+`buff/cache` from 98 GB to 1 GB, and pushed the machine into swap. This converter's own
+anonymous footprint is bounded and small (the 1 GiB `LAYER_WINDOW`), but it moves ~47 GiB per
+layer through the page cache and mmaps 94 shards. With no cache left it made progress far too
+slowly to log. A large pin and a large streaming CPU job **cannot run concurrently on this
+machine**, and the GPU flock does not express that: the flock guards the *device*, and this
+job never takes it because it never touches the device.
+
+> **The diagnostic error is the more useful half.** Both observers ran a *pattern* probe
+> (`ps … | grep convert_k3`) which returned nothing while that exact process was running, and
+> read the empty result as death. One then fitted an OOM-kill narrative to it — a 115 GiB pin
+> starting within seconds of the last log line — and recorded it as fact. Nothing was killed;
+> there was no OOM. Had a restart been issued, a second converter would have started writing
+> into the same output directory while the first was mid-layer.
+>
+> The rule this yields: **an empty pattern probe is not evidence of absence.** Liveness is
+> `/proc/<pid>/stat` for the PID you launched and recorded — it carries `ppid`, `pgrp`,
+> `session` and state in one read and cannot match the wrong thing. Detachment likewise is
+> read there (`ppid=1`, `pgrp == session == pid`, `tty=0`), not inferred from having typed
+> `setsid`. The launch verification here was correct and was doubted anyway, because the later
+> probe was believed over the earlier evidence.
+
+**Owed, and deliberately not applied to the running job:** the converter should tee a
+timestamp and `free -g` into its log once per layer. Both misreadings came from having only
+"no new log lines" to go on; a per-layer memory line separates *starved* from *dead* without
+any process probe at all. It is additive and belongs to whoever next touches this tool.
+
 ## 6. The gates added here, and their red proofs
 
 Three, each shown red before its green was believed (P7):
@@ -271,11 +310,78 @@ superset of the names the test spells — it could not see `tokenizer.json` comi
 sidecar's bytes are also compared against the source's, since presence under a right name says
 nothing about content.
 
+## 7. Scoping the tiktoken loader (the critical path; not started)
+
+The artifact will exist hours before anything can open it (§4), and closing that needs no
+GPU. Scope and gate design only — nothing here is implemented.
+
+**Separate the two questions first, because conflating them is the trap.** K3 ships *two*
+first-party Python files and they are not the same milestone:
+
+| file | what it defines | milestone |
+|---|---|---|
+| `tokenization_kimi.py` + `tiktoken.model` | **the tokenizer** — text ↔ ids | this one, and it is small |
+| `encoding_k3.py` | **the chat framing** — messages → XTML → text | later, still refused |
+
+So `encoding_k3.py` is *not* the id-pinned source for the loader. It renders a string; the
+tokenizer turns strings into ids. A loader gated against `encoding_k3.py` would be gated
+against the wrong reference.
+
+### What the loader needs, and it is fully specified
+
+`TikTokenTokenizer` is ~60 lines of construction, all of it data this artifact now carries:
+
+- `mergeable_ranks` = the 163,584 `<base64> <rank>` lines of `tiktoken.model`.
+- **special tokens are positional, not listed**: ids `163584..163840` — `num_base_tokens ..
+  num_base_tokens + 256` — named from `added_tokens_decoder` where an entry exists and
+  `<|reserved_token_{i}|>` where it does not. The 16 named ones are in
+  `tokenizer_config.json`. This is why both files had to be copied.
+- `n_vocab` = 163,840, which is `vocab_size` — a free cross-check against the config.
+- a `pat_str` of 8 alternatives.
+
+### The two traps, both in `pat_str`
+
+1. **`\s+(?!\S)` is a negative lookahead.** Rust's `regex` crate does not support lookaround
+   at all, so the obvious dependency is the wrong one; `fancy-regex` is the shape that can
+   express this. Silently dropping the alternative changes trailing-whitespace tokenization —
+   different ids, no error.
+2. **`[\p{Lu}…&&[^\p{Han}]]` is character-class intersection.** Rust `regex` does support
+   `&&`, which makes this look safe, but it must be confirmed through whatever engine handles
+   trap 1 rather than assumed to survive the switch.
+
+Both traps corrupt ids without failing, which is the class this repo gates rather than tests.
+
+### Gate design
+
+The house already has the right shape twice — `v4_encoding_gold.rs` and Glimmer's
+`glimmer_template_driver.py` + `glimmer-chat-cases.json` (112.8 KB of vendored cases). Follow
+it:
+
+1. **Vendor id-pinned cases generated by the first-party stack**, `tokenization_kimi.py`
+   against the shipped `tiktoken.model` — never a transliteration, per the anchor rule. Cases
+   must cover what the traps break: trailing and interior whitespace runs, `\r\n`, Han text,
+   Han adjacent to Latin (the intersection clauses exist for exactly this), digit runs longer
+   than 3, the `'s`/`'ll` contractions in both cases, and every one of the 16 named special
+   tokens plus at least one `<|reserved_token_N|>`.
+2. **Round-trip is necessary but far too weak on its own** — a consistently wrong encoder
+   round-trips perfectly. The gate is *id equality against the vendored goldens*.
+3. **Assert the boundary explicitly**: `n_vocab == 163840 == config.vocab_size`, and
+   `<|end_of_msg|> == 163586 == generation_config.eos_token_id`. A loader that is right about
+   text and wrong about where the special block starts produces fluent output that never
+   stops.
+4. **Red proofs**, each shown red before the green is believed: drop the `\s+(?!\S)`
+   alternative; drop one `&&[^\p{Han}]]` intersection; shift the special-token base by one.
+   Each must redden id equality, and #3 must additionally redden the boundary assertion.
+5. Deviceless, so it runs in CI unlike everything else on this arm.
+
+The eos discrepancy in §3 is a live hazard for step 3: `tokenizer_config.json` says `[EOS]`
+163585 and the two generation-side files say 163586. Pin 163586 and pin the disagreement.
+
 ## Open, in order
 
 1. **Tiktoken tokenizer loader** — deviceless, blocks every K3 decode (§4).
 2. **First K3 decode**, correctness-only, once (1) lands: ids finite, `--ctx` at or under the
    `ATTEND_MAX_KV` 8192 ceiling, small token count.
-3. **Chat encoding** — `encoding_k3.py` is a legitimate first-party source, and a port needs
+3. **Chat encoding** (after 1) — `encoding_k3.py` is a legitimate first-party source, and a port needs
    an id-pinned golden against it rather than a hand-read. Not started; `--port` still
    refuses, on a message corrected the same day to stop claiming K3 ships no encoder.
