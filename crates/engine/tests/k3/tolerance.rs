@@ -73,20 +73,13 @@ pub const K3_KERNEL: &[Tol] = &[
     row("dense_mlp", 9.374e-7, 1.28e0, 9.4e-6),
 ];
 
-/// A `Rel` row as `(operator, floor, weakest_defect, tolerance)` — the column order the doc
-/// above states them in. A constructor rather than nine struct literals for two reasons: the
-/// rows READ as the table the doc describes, and the two rows the 2026-08-12 re-measure did
-/// NOT move (`kda_op`, `dense_mlp`) are byte-identical to the anchor table's next door,
-/// which `build.rs`'s jscpd gate correctly reported as clones of struct-literal spellings —
-/// the shape had to change, and this is the shape that also reads better.
-const fn row(operator: &'static str, floor: f32, weakest_defect: f32, tol: f32) -> Tol {
-    Tol {
-        operator,
-        floor,
-        weakest_defect,
-        policy: Policy::Rel(tol),
-    }
-}
+/// The row constructor the table above is written in. Its own argument lives with the body in
+/// `shape::rel_row` (the `#[path]`-shared apparatus, where it moved 2026-08-16 when the DFlash
+/// draft-oracle table became the second file to write it verbatim); what is only true HERE is
+/// that the two rows the 2026-08-12 re-measure did NOT move — `kda_op`, `dense_mlp` — are
+/// byte-identical to the anchor table's next door, which `build.rs`'s jscpd gate correctly
+/// reported as clones of struct-literal spellings. That is what forced the shape.
+use super::shape::rel_row as row;
 
 /// The `Rel` threshold for an operator, with the two failures kept distinct.
 ///

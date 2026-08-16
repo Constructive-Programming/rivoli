@@ -1,7 +1,7 @@
 //! **The TEXT goldens' structure: the tiny config, the widths it declares, the layer pattern, and
 //! the capture census both ways.**
 //!
-//! One of the four binaries the Muse Glimmer S1b anchor gate is split across — `glimmer_anchor.rs`
+//! One of the binaries the Muse Glimmer S1b anchor gate is split across — `glimmer_anchor.rs`
 //! carries the framing, the byte pins and the argument for why a fixture-integrity gate is worth
 //! having; `glimmer_anchor_common/mod.rs` carries the tables and the accessors. Nothing here reads a
 //! value: every assertion below is about a SHAPE, a name, or a count, all of them derived from each
@@ -9,7 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #[path = "glimmer_anchor_common/mod.rs"]
-mod anchor; // keep this preamble blank-line-free: spread out, the four are a jscpd clone
+mod anchor; // keep this preamble blank-line-free: spread out, these are a jscpd clone
 use anchor::{
     GoldenSet, Vendored, Widths, cfg, each_text, ints, load, meta_usize, num, real, shape_is,
     shape_of, text_goldens,

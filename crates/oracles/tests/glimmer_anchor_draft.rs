@@ -1,7 +1,7 @@
 //! **The DRAFT goldens: the shapes that make the DFlash drafter a drafter rather than a small
 //! target.**
 //!
-//! One of the four binaries the Muse Glimmer S1b anchor gate is split across — `glimmer_anchor.rs`
+//! One of the binaries the Muse Glimmer S1b anchor gate is split across — `glimmer_anchor.rs`
 //! carries the framing and the byte pins, `glimmer_anchor_common/mod.rs` the tables and accessors.
 //! Every way a port goes wrong here is a way of REUSING the target's attention path, and each of
 //! those is visible as a shape: Q over the block alone against K/V over `context + block`, a context
@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #[path = "glimmer_anchor_common/mod.rs"]
-mod anchor; // keep this preamble blank-line-free: spread out, the four are a jscpd clone
+mod anchor; // keep this preamble blank-line-free: spread out, these are a jscpd clone
 use anchor::{
     GoldenSet, Vendored, Widths, cfg, draft_goldens, ints, load, meta_usize, num, real, shape_is,
     shape_of, text_goldens, widths,

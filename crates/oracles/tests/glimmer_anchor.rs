@@ -37,7 +37,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #[path = "glimmer_anchor_common/mod.rs"]
-mod anchor; // keep this preamble blank-line-free: spread out, the four are a jscpd clone
+mod anchor; // keep this preamble blank-line-free: spread out, these are a jscpd clone
 use anchor::golden_read;
 use anchor::{GOLDENS, GoldenSet, Vendored, cfg, is_mode, load, meta, num};
 
