@@ -94,6 +94,14 @@ echo
 # Every cell pins its EXACT feature set with --no-default-features: since the fuse (owner
 # rule 2026-08-16) `default = ["rocm"]`, so without the pin every cell would silently
 # include the backend and the deviceless half of the matrix would collapse into one build.
+#
+# The resolve check FIRST, and it is not a formality: --no-default-features strips only the
+# TOP crate's defaults — an inter-crate dep edge without `default-features = false` re-arms
+# rocm through feature unification, and on this box (hipcc present) every build cell below
+# stays green over it. Found live 2026-08-16: an M9 agent's "deviceless" workspace run
+# executed device binaries unlocked. A compile cell cannot see the leak; the resolve can.
+run "(no features) — rocm absent from the resolve" \
+  bash -c '! cargo tree -e features --no-default-features -p rivoli 2>/dev/null | grep -q "rocm"'
 run "(no features) — refusal stub" \
   env RUSTFLAGS="-D warnings" cargo check --release --quiet --workspace --all-targets --no-default-features
 

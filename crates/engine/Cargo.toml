@@ -36,7 +36,9 @@ workspace = true
 rivoli-core = { path = "../core" }
 rivoli-artifact = { path = "../artifact" }
 rivoli-oracles = { path = "../oracles" }
-rivoli-backend = { path = "../backend" }
+# default-features = false for cli/Cargo.toml's reason: the deviceless arm must not
+# re-arm rocm through this edge.
+rivoli-backend = { path = "../backend", default-features = false }
 anyhow = "1"
 # preserve_order is load-bearing: tool-schema key order is a trained token sequence.
 serde_json = { version = "1", features = ["preserve_order"] }

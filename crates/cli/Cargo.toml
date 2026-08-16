@@ -20,7 +20,12 @@ stale-sel = ["rivoli-engine/stale-sel"]
 workspace = true
 
 [dependencies]
-rivoli-engine = { path = "../engine" }
+# default-features = false on every edge to a defaulted crate: without it, feature
+# unification re-arms rocm THROUGH the dep even under --no-default-features, and the
+# "deviceless" arm silently builds the device (found by an M9 agent 2026-08-16 — its
+# unlocked device run under a battery is the incident that surfaced this). The crate's
+# own default = ["rocm"] then forwards through the named feature only.
+rivoli-engine = { path = "../engine", default-features = false }
 rivoli-core = { path = "../core" }
 anyhow = "1"
 libc = "0.2"
@@ -30,7 +35,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rivoli-artifact = { path = "../artifact" }
-rivoli-backend = { path = "../backend" }
+rivoli-backend = { path = "../backend", default-features = false }
 clap = { version = "4", default-features = false, features = [
     "std",
     "derive",
