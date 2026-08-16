@@ -32,7 +32,6 @@ use rivoli_artifact::format as fmt;
 use rivoli_artifact::glimmer::{GLIMMER_LAYER_PREFIX, GLIMMER_LAYER_TENSORS};
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::schema::parse_config;
-use rivoli_core::num::bf16_to_f32;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Command;
@@ -77,13 +76,15 @@ const TEXT_SHARD: &str = "model-00001-of-00002.safetensors";
 const VISION_SHARD: &str = "model-00002-of-00002.safetensors";
 const GEN: &str = "generation_config.json";
 
-/// One tensor of the fixture: name, shape, and the bf16 bytes the artifact must reproduce.
-type Tensor = (String, Vec<usize>, Vec<u8>);
-
-fn tensor(name: &str, shape: Vec<usize>) -> Tensor {
+/// One tensor of the fixture. `common::Tensor` carries a dtype, which this model does not need
+/// — every tensor here is bf16 — but the type moved to `common` on 2026-08-16 when
+/// `v4_convert.rs` became the third converter gate and jscpd reported the shard writer as a
+/// clone. The dtype is spelled once, here.
+fn tensor(name: &str, shape: Vec<usize>) -> common::Tensor {
     let n: usize = shape.iter().product();
     (
         name.to_string(),
+        fmt::Dtype::Bf16,
         shape,
         common::bf16_bytes(&common::weights(name, n)),
     )
@@ -93,9 +94,9 @@ fn tensor(name: &str, shape: Vec<usize>) -> Tensor {
 ///
 /// `layer_tensor_shape` is the single statement of what each of the twelve is; asking it here
 /// means the fixture cannot disagree with the schema the converter validates against.
-fn text_tensors(cfg: &GlimmerConfig) -> Vec<Tensor> {
+fn text_tensors(cfg: &GlimmerConfig) -> Vec<common::Tensor> {
     let t = &cfg.text;
-    let mut out: Vec<Tensor> = GLOBALS
+    let mut out: Vec<common::Tensor> = GLOBALS
         .iter()
         .map(|n| {
             let shape = if n.ends_with("norm.weight") {
@@ -118,14 +119,6 @@ fn text_tensors(cfg: &GlimmerConfig) -> Vec<Tensor> {
     out
 }
 
-fn write_shard(path: &Path, tensors: &[Tensor]) {
-    let mut w = fmt::SafeWriter::new();
-    for (name, shape, bytes) in tensors {
-        w.add(name.clone(), fmt::Dtype::Bf16, shape.clone(), &bytes[..]);
-    }
-    w.write(path.to_str().unwrap()).unwrap();
-}
-
 /// `model.safetensors.index.json`: `text` in the first shard, [`VISION`] alone in the second.
 ///
 /// **Written from the tensor list rather than alongside it**, and re-written whenever that list
@@ -133,19 +126,13 @@ fn write_shard(path: &Path, tensors: &[Tensor]) {
 /// dropped a tensor from the shard and left it in the index would be testing a truncated-file
 /// error instead of the completeness walk. The vision half is the constant either way: it is
 /// never opened, which is the whole point of counting it here.
-fn write_index(src: &Path, text: &[Tensor]) {
-    let mut map = serde_json::Map::new();
-    for (n, _, _) in text {
-        map.insert(n.clone(), json!(TEXT_SHARD));
-    }
-    for n in VISION {
-        map.insert(n.to_string(), json!(VISION_SHARD));
-    }
-    std::fs::write(
-        src.join("model.safetensors.index.json"),
-        json!({ "weight_map": map }).to_string(),
-    )
-    .unwrap();
+fn write_index(src: &Path, text: &[common::Tensor]) {
+    let mut entries: Vec<(String, &str)> = text
+        .iter()
+        .map(|(n, _, _, _)| (n.clone(), TEXT_SHARD))
+        .collect();
+    entries.extend(VISION.map(|n| (n.to_string(), VISION_SHARD)));
+    common::write_weight_map(src, &entries);
 }
 
 /// The HF `config.json` the converter reads — the wrapper, its `text_config`, and the sibling
@@ -214,22 +201,17 @@ fn write_eos(dir: &Path, ids: &[u32]) {
 
 /// The whole synthetic checkpoint. Returns the text tensors, so the round-trip test can compare
 /// the artifact against the bytes that went in.
-fn write_fixture(src: &Path) -> Vec<Tensor> {
-    std::fs::create_dir_all(src).unwrap();
+fn write_fixture(src: &Path) -> Vec<common::Tensor> {
     let config = glimmer_config_json();
-    std::fs::write(
-        src.join("config.json"),
-        serde_json::to_vec_pretty(&config).unwrap(),
-    )
-    .unwrap();
+    common::write_config(src, &config);
     // Parsed back rather than built from the constants: the fixture's shapes then come from the
     // same `validate`d config the converter will read, and a config this test writes that the
     // schema would refuse fails HERE rather than as a confusing converter error.
     let cfg: GlimmerConfig = parse_config(&config.to_string()).expect("the fixture config parses");
     let text = text_tensors(&cfg);
-    let vision: Vec<Tensor> = VISION.iter().map(|n| tensor(n, vec![8, HIDDEN])).collect();
-    write_shard(&src.join(TEXT_SHARD), &text);
-    write_shard(&src.join(VISION_SHARD), &vision);
+    let vision: Vec<common::Tensor> = VISION.iter().map(|n| tensor(n, vec![8, HIDDEN])).collect();
+    common::write_shard(&src.join(TEXT_SHARD), &text);
+    common::write_shard(&src.join(VISION_SHARD), &vision);
 
     write_index(src, &text);
 
@@ -259,13 +241,7 @@ fn run(src: &Path, out: &Path) -> std::process::Output {
 /// The `want` check is the point: a refusal test that only asserts non-zero exit passes when the
 /// binary fails for an unrelated reason, which is how a guard gets deleted without a red test.
 fn refuses(src: &Path, out: &Path, want: &str) {
-    let o = run(src, out);
-    let err = String::from_utf8_lossy(&o.stderr).to_string();
-    assert!(
-        !o.status.success() && err.contains(want),
-        "expected a refusal naming {want:?}, got status {:?}:\n{err}",
-        o.status.code()
-    );
+    common::expect_refusal(&run(src, out), want);
 }
 
 #[test]
@@ -274,9 +250,7 @@ fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
     let (src, out) = (root.join("src"), root.join("out"));
     let tensors = write_fixture(&src);
 
-    let o = run(&src, &out);
-    let log = String::from_utf8_lossy(&o.stderr).to_string();
-    assert!(o.status.success(), "convert_glimmer failed:\n{log}");
+    let log = common::expect_success(&run(&src, &out), "convert_glimmer");
 
     // The counts are the OBSERVATION that the vision half was excluded, rather than the
     // assumption — and the 3 comes from the index, since the shard holding them was never
@@ -307,25 +281,14 @@ fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
             "{name} is vision and must not be in the artifact"
         );
     }
-    for (name, shape, bytes) in &tensors {
+    for t @ (name, _, _, _) in &tensors {
+        // Widened, and widened CORRECTLY — not merely present at the right length. A
+        // byte-length check alone passes on a zeroed tensor; `common::assert_widened` compares
+        // values, and both helpers moved there when `v4_convert.rs` needed the same pair.
         if name.ends_with("norm.weight") {
-            // Widened, and widened CORRECTLY — not merely present at the right length. A
-            // byte-length check alone passes on a zeroed tensor.
-            let (got, got_shape) = art.typed(name, fmt::Dtype::F32).unwrap();
-            assert_eq!(got_shape, &shape[..], "{name} shape");
-            let want: Vec<f32> = bytes
-                .chunks_exact(2)
-                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let got: Vec<f32> = got
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            assert_eq!(got, want, "{name} widened to the wrong values");
+            common::assert_widened(&art, t);
         } else {
-            let (got, got_shape) = art.typed(name, fmt::Dtype::Bf16).unwrap();
-            assert_eq!(got_shape, &shape[..], "{name} shape");
-            assert_eq!(got, &bytes[..], "{name} is not byte-identical");
+            common::assert_verbatim(&art, t);
         }
     }
     // Every aux file reached the artifact. `finish_artifact` refuses a failed copy, so this is
@@ -339,7 +302,7 @@ fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
     ] {
         assert!(out.join(aux).exists(), "{aux} missing from the artifact");
     }
-    let _ = std::fs::remove_dir_all(&root);
+    common::clean(&root);
 }
 
 /// The guards that fire before 55 GB is written. Each arm restores the fixture, so every
@@ -367,18 +330,18 @@ fn convert_glimmer_refuses_before_it_writes() {
     // the shard AND from the index, since the index is what selects the shards.
     let dropped = format!("{GLIMMER_LAYER_PREFIX}.2.mlp.up_proj.weight");
     let cfg = GlimmerConfig::load(src.to_str().unwrap()).unwrap();
-    let kept: Vec<Tensor> = text_tensors(&cfg)
+    let kept: Vec<common::Tensor> = text_tensors(&cfg)
         .into_iter()
-        .filter(|(n, _, _)| *n != dropped)
+        .filter(|(n, _, _, _)| *n != dropped)
         .collect();
-    write_shard(&src.join(TEXT_SHARD), &kept);
+    common::write_shard(&src.join(TEXT_SHARD), &kept);
     write_index(&src, &kept);
     refuses(&src, &out, &dropped);
     assert!(
         !out.join("resident.safetensors").exists(),
         "the artifact must not exist after a refusal"
     );
-    let _ = std::fs::remove_dir_all(&root);
+    common::clean(&root);
 }
 
 /// **Both EOS ids reach the artifact, and a file that exists but says nothing is refused.**
@@ -406,8 +369,7 @@ fn both_eos_ids_reach_the_artifact_and_an_unusable_generation_config_is_refused(
     let ids = [1u32, (VOCAB - 2) as u32];
     write_eos(&src, &ids);
     let want = std::fs::read(src.join(GEN)).unwrap();
-    let o = run(&src, &out);
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    common::expect_success(&run(&src, &out), "convert_glimmer");
     assert_eq!(
         std::fs::read(out.join(GEN)).expect("generation_config in the artifact"),
         want,
@@ -445,5 +407,5 @@ fn both_eos_ids_reach_the_artifact_and_an_unusable_generation_config_is_refused(
             "{what}: the converter got past the EOS check"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
+    common::clean(&root);
 }

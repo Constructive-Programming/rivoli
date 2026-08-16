@@ -37,43 +37,18 @@ const GLIMMER_SHIPPED: &str =
 /// enough that only the discriminant separates them.
 const K3_SHIPPED: &str = include_str!("../../../docs/measurement/k3-reference/config.json");
 
-/// The refusal message for the shipped config with one value replaced, or a panic naming the
-/// mutation that was wrongly ACCEPTED. The panic is the point: a refusal test whose subject
-/// silently parses is the false green this file exists to prevent.
-///
-/// Goes through `parse_config` — the same entry the binary uses. A test that constructed a
-/// `GlimmerTextConfig` literal would skip both the architecture check and `validate`, which are
-/// the two things under test.
-fn glimmer_err(pointer: &str, value: Value) -> String {
-    let mut doc: Value = serde_json::from_str(GLIMMER_SHIPPED).unwrap();
-    let slot = doc
-        .pointer_mut(pointer)
-        .unwrap_or_else(|| panic!("{pointer} is not a path in the shipped config"));
-    *slot = value;
-    match parse_config::<GlimmerConfig>(&doc.to_string()) {
-        Ok(_) => panic!("{pointer} was mutated to a wrong value and the config still parsed"),
-        Err(e) => format!("{e:#}"),
-    }
-}
+/// > **MOVED 2026-08-16.** `glimmer_err` and `each_refusal` lived here until `v4_config.rs`
+/// > became the second gate built on the same two ideas and `build.rs`'s jscpd reported all four
+/// > of their regions as clones. They are now `common::refusal::<T>` / `common::each_refusal::<T>`,
+/// > generic over `ArchConfig`, with their arguments travelling verbatim. The two thin wrappers
+/// > below keeps every call site in this file reading as it did. `glimmer_err` itself is gone:
+/// > `each_refusal` was its only caller, and a wrapper with none is dead surface `-D warnings`
+/// > reports on sight.
+mod common;
 
-/// Every `(pointer, value, want)` row: mutate the shipped config there, and require the
-/// refusal's MESSAGE to contain `want`.
-///
-/// **The message check is the row's whole content.** A refusal that happens to fire for an
-/// unrelated reason would satisfy a bare `is_err()`, which is how a guard gets deleted without a
-/// red test — and the old tree records a case where two rows shared a `want` substring and
-/// transposing an argument left both green. One function rather than a loop per test because
-/// jscpd reported the two loop tails as a clone the moment the second table existed, and the
-/// argument the tail carries is not one to have twice.
+/// [`common::each_refusal`], likewise.
 fn each_refusal(rows: &[(&str, Value, &str)]) {
-    for (pointer, value, want) in rows {
-        let err = glimmer_err(pointer, value.clone());
-        assert!(
-            err.contains(want),
-            "{pointer} = {value} refused, but not for the reason under test\n  \
-             wanted the message to contain: {want}\n  got: {err}"
-        );
-    }
+    common::each_refusal::<GlimmerConfig>(GLIMMER_SHIPPED, rows);
 }
 
 /// **Every field the schema declares is REQUIRED — enforced, not just claimed.**

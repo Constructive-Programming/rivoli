@@ -206,6 +206,42 @@ impl<'a> SafeWriter<'a> {
         Ok(())
     }
 
+    /// Refuse an output directory that IS the source directory, before anything is read.
+    ///
+    /// **This is [`Self::write`]'s hazard, which is why it lives here and not in a converter.**
+    /// A borrowed payload is read at write time, not at `add` time, so the mapped shards are
+    /// live while the output is being created; truncating a file another mapping still holds is
+    /// a SIGBUS — a fatal signal, not an error — with the output left half-formed. `write`
+    /// renames a sibling into place for exactly that reason, and this refuses the case that
+    /// argument does not cover: an output whose *directory* is the source's, where a converter
+    /// is about to create `resident.safetensors` (and, for the `.f4` models, `L{ll}.f4`) beside
+    /// the shards it is reading.
+    ///
+    /// > **FACTORED 2026-08-16.** `convert_glimmer` carried this `ensure!` inline; `convert_v4`
+    /// > was written with the same guard and the same words, and `build.rs`'s jscpd reported the
+    /// > pair at 104 tokens on the first build. Neither converter is the owner of the argument —
+    /// > `SafeWriter` is — so it moved rather than being exempted, which is the response this
+    /// > repo prescribes.
+    ///
+    /// Compared through `canonicalize`, so `out/.`, a symlink and a relative path all resolve.
+    /// Two paths that BOTH fail to canonicalize compare equal as `None` and are refused; that is
+    /// the safe direction, and an out_dir that does not exist yet still canonicalizes to `None`
+    /// only when its parent is also unreadable, which is a failure either way.
+    ///
+    /// Takes [`ArtifactDirs`] rather than two `&str`, for the reason that type already gives:
+    /// the pair travels together and swapping them is a plausible, silent call-site error — and
+    /// here a swap would refuse nothing while looking like it checked. (It is also what keeps
+    /// this module under the code-health gate's string-argument ratio, which the two-`&str` form
+    /// pushed it over the moment it landed.)
+    pub fn refuse_writing_into_source(dirs: &super::meta::ArtifactDirs<'_>) -> Result<()> {
+        ensure!(
+            std::fs::canonicalize(dirs.src).ok() != std::fs::canonicalize(dirs.out).ok(),
+            "out_dir and src_dir resolve to the same directory; the writer maps the source while \
+             it writes, and overwriting a mapped shard is a SIGBUS rather than an error"
+        );
+        Ok(())
+    }
+
     pub fn write(&self, path: &str) -> Result<()> {
         use std::io::Write;
         let mut hdr = serde_json::Map::new();

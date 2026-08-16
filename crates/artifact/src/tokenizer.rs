@@ -18,6 +18,22 @@
 //! because GLM's [`tools_system_turn`] and [`tool_call_markup`] need it, and which V4's port
 //! should reach for rather than write again.
 //!
+//! > **UPDATED 2026-08-16. M8 LANDED and the seam held.** [`crate::v4_encoding`] is the other
+//! > side, split across four files because the reference module is 2822 lines against this
+//! > tree's 800-line cap. It reaches for [`python_json`] and [`json_truthy`] exactly as
+//! > predicted and writes neither again — so the pair below now has THREE callers in three
+//! > modules and `pub(crate)` is load-bearing twice over.
+//! >
+//! > **`encode_dsv4` itself did NOT come with it, deliberately.** In the reference it is one
+//! > line on this type — `self.encode(&dsv4_encoding::encode_messages(messages, opts)?)` — and
+//! > its only caller is `main.rs`'s V4 `-bench` branch, which this tree does not have yet.
+//! > Adding it now would put a `pub fn` with no caller on [`Tokenizer`], which is the shape
+//! > this header's own `json_truthy` paragraph and `encode_chat_continuation`'s deletion note
+//! > both argue against. It lands with the V4 engine arm, beside the caller that needs it;
+//! > until then `crates/artifact/tests/v4_encoding_gold.rs` exercises the same composition
+//! > (`Tokenizer::encode` over `encode_messages`'s string) and pins that every framing token
+//! > survives it as ONE id, which is the only property the wrapper would have added.
+//!
 //! `json_truthy` did NOT come with it, deliberately: in the reference its only callers are
 //! `dsv4_encoding` and `glimmer_encoding`, so porting it now would land a function with no
 //! caller — and `warnings = deny` makes that a build error, which is the correct pressure.
@@ -29,6 +45,12 @@
 //! > [`json_truthy`] is below, beside [`python_json`], with one caller. The paragraph above is
 //! > kept rather than rewritten because it records why the item was *withheld*, which is the
 //! > half a reader cannot reconstruct from the code being present.
+//! >
+//! > **UPDATED AGAIN 2026-08-16, same day: M8 brought the second caller.**
+//! > [`crate::v4_encoding::message`] tests `wo_eos` and a stray `tools` key with it and
+//! > [`crate::v4_encoding::render`] tests `response_format` — which is the `if response_format:`
+//! > this function's own doc was written against. The prediction that two ports would otherwise
+//! > get Python's truth table right independently is now a fact with three witnesses.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -154,9 +176,11 @@ impl serde_json::ser::Formatter for PythonSpacing {
     }
 }
 
-/// `pub(crate)` because `artifact::dsv4_encoding` needs the identical spacing for DeepSeek's
+/// `pub(crate)` because `crate::v4_encoding` needs the identical spacing for DeepSeek's
 /// tool schemas — its reference implementation renders them with the same `json.dumps`. A
 /// second copy would be a `build.rs` duplication error, and worse, a second thing to fix.
+/// (Named `artifact::dsv4_encoding` here until M8, which renamed the module `v4_encoding` for
+/// the reason its header gives; the path is corrected rather than the claim.)
 ///
 /// > **PORT NOTE 2026-08-16.** That consumer arrives with M8 and the Glimmer one with M7;
 /// > until then the only caller is this module. It is `pub(crate)` now for the reason above
@@ -169,6 +193,14 @@ impl serde_json::ser::Formatter for PythonSpacing {
 /// > [`crate::glimmer_encoding`] renders Muse Glimmer's ATEM tool schemas through this, so
 /// > there are two callers in two modules and the `pub(crate)` is load-bearing rather than
 /// > anticipatory.
+/// >
+/// > **UPDATED AGAIN 2026-08-16: the consumer this comment was WRITTEN for arrived.**
+/// > `crate::v4_encoding::render` renders DeepSeek's tool schemas and its `## Response Format:`
+/// > block through this, and `v4_encoding::tests::boundary`'s
+/// > `numeric_rendering_diverges_from_python` pins the one thing it does NOT reproduce —
+/// > Python's number repr — as a measured table rather than an unstated gap. That test is the
+/// > only gate on this function's limits; see `v4_encoding`'s header for why the complete fix
+/// > (`serde_json/arbitrary_precision`) is crate-wide and is recorded rather than half-done.
 pub(crate) fn python_json(v: &Value) -> String {
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonSpacing);

@@ -44,6 +44,30 @@ impl FormatMeta {
         }
     }
 
+    /// The checkpoint's own `config.json`, with this build's `format` section stamped in —
+    /// the manifest a converter publishes, before any per-tool provenance is added.
+    ///
+    /// **Shared because jscpd said so, which is this tree's rule for when a helper is shared.**
+    /// `convert_v4` arrived at M8 as the second converter that READS `config.json` (rather than
+    /// re-serializing an already-parsed value, which is what `convert` does), and `build.rs`
+    /// reported this exact pair of statements as a clone against `convert_glimmer` on the first
+    /// compile. The contract it names is the one all three converters honour: *the manifest is
+    /// the source config plus `format`*, so `<Arch>Config::load` reads the artifact exactly as
+    /// it read the source and `arch::from_manifest_str` finds the same discriminant.
+    ///
+    /// `FormatMeta::current` stamps the compiled-in VQ parameters even on an artifact that has
+    /// no VQ tensors. That is inert rather than a lie: [`Self::load`] compares them against the
+    /// same constants, so they always agree, and a "nullable VQ section" turned out to be work
+    /// nothing needed. `fp8_block` likewise describes a format a bf16 artifact does not use yet.
+    pub fn manifest_from_config(src_dir: &str, fp8_block: usize) -> Result<serde_json::Value> {
+        let path = format!("{src_dir}/config.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)
+                .with_context(|| format!("parse {path}"))?;
+        manifest["format"] = serde_json::to_value(Self::current(fp8_block))?;
+        Ok(manifest)
+    }
+
     /// Read `<dir>/manifest.json`'s `format` section and check it matches this build
     /// (VQ params are compiled into the kernels, so a mismatch is unrunnable).
     pub fn load(dir: &str) -> Result<Self> {

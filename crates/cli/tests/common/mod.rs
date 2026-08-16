@@ -99,3 +99,173 @@ pub fn scratch(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&d).expect("create scratch dir");
     d
 }
+
+// ── converter-gate plumbing ──────────────────────────────────────────────────────────────
+//
+// The five below arrived on 2026-08-16, when `v4_convert.rs` became the THIRD converter gate
+// and `build.rs`'s jscpd reported each of them as a clone against `glimmer_convert.rs`. Same
+// rule as the three above, and the same trigger: this file grows when a second test needs the
+// same helper, and each move is the duplication gate saying a copy exists.
+//
+// They are plumbing, not judgement. Every one of them writes bytes or reads bytes back; not one
+// of them decides what a converter should have done, which stays in each gate where its
+// argument is.
+
+/// One tensor of a synthetic checkpoint: name, dtype, shape, bytes.
+///
+/// **Carries its DTYPE**, where the Glimmer gate's local type did not — that model's fixture is
+/// bf16 throughout, V4's is five dtypes, and a shared type that assumed one would make the V4
+/// gate spell its own writer again. The name is first because it is the key every byte
+/// comparison is made under.
+pub type Tensor = (String, rivoli_artifact::format::Dtype, Vec<usize>, Vec<u8>);
+
+/// Write one `*.safetensors` shard through the same `SafeWriter` the converters use.
+///
+/// Through the real writer rather than by hand: a fixture built by a second serializer would
+/// test that serializer, and the header layout is exactly the thing a converter round-trip must
+/// not have to re-derive.
+pub fn write_shard(path: &std::path::Path, tensors: &[Tensor]) {
+    let mut w = rivoli_artifact::format::SafeWriter::new();
+    for (name, dtype, shape, bytes) in tensors {
+        w.add(name.clone(), *dtype, shape.clone(), &bytes[..]);
+    }
+    // `to_string_lossy` rather than `to_str().unwrap()`: this module is compiled into the
+    // META-GATES too, which carry no file-level `unwrap` allow, and a scratch path is ASCII by
+    // construction so the lossy branch is unreachable.
+    w.write(&path.to_string_lossy())
+        .expect("write a fixture shard");
+}
+
+/// `model.safetensors.index.json` from `(tensor, shard)` pairs.
+///
+/// **Written FROM the tensor list rather than alongside it**, and re-written whenever that list
+/// changes, because the index is what `open_indexed` selects shards by — a refusal test that
+/// dropped a tensor from the shard and left it in the index would be testing a truncated-file
+/// error instead of the guard it meant to.
+pub fn write_weight_map(dir: &std::path::Path, entries: &[(String, &str)]) {
+    let map: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|(n, shard)| (n.clone(), serde_json::json!(shard)))
+        .collect();
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::json!({ "weight_map": map }).to_string(),
+    )
+    .expect("write the fixture index");
+}
+
+/// Little-endian f32 bytes as values — what an artifact's widened tensor decodes to.
+pub fn as_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Little-endian bf16 bytes as values — what the SOURCE tensor a widened one came from holds.
+///
+/// The pair with [`as_f32`] is what makes a widening assertion mean something: a byte-length
+/// check alone passes on a zeroed tensor, and `add_widened` is where a converter can be
+/// plausibly wrong.
+pub fn as_bf16(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| rivoli_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
+/// Assert a converter run REFUSED, and refused for the reason named.
+///
+/// The `want` check is the point: a refusal test that only asserts non-zero exit passes when the
+/// binary fails for an unrelated reason, which is how a guard gets deleted without a red test.
+#[track_caller]
+pub fn expect_refusal(o: &std::process::Output, want: &str) {
+    let err = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(
+        !o.status.success() && err.contains(want),
+        "expected a refusal naming {want:?}, got status {:?}:\n{err}",
+        o.status.code()
+    );
+}
+
+/// Assert a converter run SUCCEEDED, and hand back its stderr for the log assertions.
+///
+/// The log is returned rather than discarded because a converter's counted lines ("3 vision
+/// tensors skipped", "experts=4 layers 0..4") are what turn an exclusion from an assumption
+/// into an observation.
+#[track_caller]
+pub fn expect_success(o: &std::process::Output, what: &str) -> String {
+    let log = String::from_utf8_lossy(&o.stderr).to_string();
+    assert!(o.status.success(), "{what} failed:\n{log}");
+    log
+}
+
+/// Write the fixture's `config.json`, pretty — the file every converter's `load_config` reads.
+///
+/// Pretty rather than compact so a failing fixture can be diffed by eye, and shared because both
+/// converter gates do exactly this and jscpd reported the pair.
+pub fn write_config(src: &std::path::Path, config: &serde_json::Value) {
+    std::fs::create_dir_all(src).expect("create the fixture directory");
+    std::fs::write(
+        src.join("config.json"),
+        serde_json::to_vec_pretty(config).expect("serialize the fixture config"),
+    )
+    .expect("write the fixture config");
+}
+
+/// The artifact's bytes for `name`, with its shape already confronted with the source's.
+///
+/// The shape check is here rather than at each caller because that is the half a comparison
+/// cannot make: two tensors of the same LENGTH and different shapes compare byte-equal.
+#[track_caller]
+fn typed_with_shape<'a>(
+    art: &'a rivoli_artifact::format::Safetensors,
+    name: &str,
+    dtype: rivoli_artifact::format::Dtype,
+    shape: &[usize],
+) -> &'a [u8] {
+    let (got, got_shape) = art
+        .typed(name, dtype)
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(got_shape, shape, "{name} shape");
+    got
+}
+
+/// One artifact tensor that must be the source's bytes, unchanged, under the same dtype.
+///
+/// Takes the whole [`Tensor`] rather than its four parts: five arguments is over the
+/// code-health gate's threshold, and the tuple already IS the value — a call that passed a
+/// dtype other than the source tensor's own would be asking a different question than "did this
+/// arrive unchanged".
+#[track_caller]
+pub fn assert_verbatim(art: &rivoli_artifact::format::Safetensors, t: &Tensor) {
+    let (name, dtype, shape, bytes) = t;
+    let got = typed_with_shape(art, name, *dtype, shape);
+    assert_eq!(got, &bytes[..], "{name} is not byte-identical");
+}
+
+/// One artifact tensor that must be the source's bf16 tensor widened to f32 — **by VALUE**.
+///
+/// A byte-length check alone passes on a zeroed tensor, and `SafeWriter::add_widened` is where a
+/// converter can be plausibly wrong, so the comparison is `as_f32(artifact)` against
+/// `as_bf16(source)` rather than anything about sizes.
+#[track_caller]
+pub fn assert_widened(art: &rivoli_artifact::format::Safetensors, t: &Tensor) {
+    let (name, _, shape, bytes) = t;
+    let got = typed_with_shape(art, name, rivoli_artifact::format::Dtype::F32, shape);
+    assert_eq!(
+        as_f32(got),
+        as_bf16(bytes),
+        "{name} widened to the wrong values"
+    );
+}
+
+/// Remove a [`scratch`] root at the end of a passing test.
+///
+/// Best-effort and infallible on purpose: a failed test should LEAVE its fixture behind to be
+/// looked at, which is what happens automatically since the panic skips this call. Named rather
+/// than spelled inline because the three-line `let _ = remove_dir_all(&root);` tail was itself
+/// what jscpd matched between two gates (2026-08-16).
+pub fn clean(root: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(root);
+}

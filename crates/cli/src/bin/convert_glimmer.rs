@@ -128,16 +128,14 @@ fn eos_ids(dir: &str) -> Result<Vec<u32>> {
 ///
 /// Returns the ids, because `main`'s last act is comparing the artifact's against them.
 fn refuse_before_writing(src_dir: &str, out_dir: &str) -> Result<(GlimmerConfig, Vec<u32>)> {
-    // **Not into the source directory.** `SafeWriter::write` reads borrowed payloads at write
-    // time, so the mapped shards are live while the output is being created; truncating a
-    // file another mapping still holds is a SIGBUS — a fatal signal, not an error — with the
-    // output left half-formed. `write` renames a sibling into place for exactly this reason,
-    // and this refuses the case that argument does not cover.
-    ensure!(
-        std::fs::canonicalize(src_dir).ok() != std::fs::canonicalize(out_dir).ok(),
-        "out_dir and src_dir resolve to the same directory; the writer maps the source while \
-         it writes, and overwriting a mapped shard is a SIGBUS rather than an error"
-    );
+    // **Not into the source directory.** The argument — and the words — moved to
+    // `SafeWriter::refuse_writing_into_source` on 2026-08-16, when `convert_v4` became the
+    // second converter with the same guard and jscpd reported the pair. It is the WRITER's
+    // hazard, not this binary's, so it belongs beside `SafeWriter::write`.
+    SafeWriter::refuse_writing_into_source(&ArtifactDirs {
+        out: out_dir,
+        src: src_dir,
+    })?;
     for aux in REQUIRED_AUX {
         let p = std::path::Path::new(src_dir).join(aux);
         ensure!(
@@ -272,15 +270,13 @@ fn main() -> Result<()> {
     // The manifest is the checkpoint's own `config.json` plus the `format` section, so
     // `GlimmerConfig::load` reads the artifact exactly as it read the source — the wrapper and
     // its `text_config` intact, which is what `arch::from_manifest_str` needs.
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(format!("{}/config.json", args.src_dir))?)?;
-    // `FormatMeta::current` stamps the compiled-in VQ parameters even though this artifact has
-    // no VQ tensors. That is inert rather than a lie: `FormatMeta::load` compares them against
-    // the same constants, so they always agree, and a "nullable VQ section" turned out to be
-    // work nothing needed. `fp8_block` likewise describes a format this artifact does not use
-    // yet — it is what the fp8 pass will write.
-    manifest["format"] =
-        serde_json::to_value(FormatMeta::current(rivoli_artifact::quant::FP8_BLOCK))?;
+    //
+    // > **MOVED 2026-08-16.** These two statements were spelled out here, with the `FormatMeta`
+    // > paragraph beside them; `convert_v4` became the second converter to read `config.json`
+    // > and jscpd reported the pair as a clone. They are now
+    // > `FormatMeta::manifest_from_config`, which carries both arguments verbatim.
+    let manifest =
+        FormatMeta::manifest_from_config(&args.src_dir, rivoli_artifact::quant::FP8_BLOCK)?;
     finish_artifact(
         "convert_glimmer",
         ArtifactDirs {

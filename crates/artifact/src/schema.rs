@@ -209,5 +209,27 @@ pub(crate) fn ensure_group_aligned(
     Ok(())
 }
 
-// (`ensure_f4_group_aligned`, the V4/K3 wrapper over the same check, returns with its
-// first consumer at M8 — a helper with no caller is a warning under -D warnings, not a seam.)
+// > **ARRIVED 2026-08-16 with M8's `V4Config`.** This read "(`ensure_f4_group_aligned`, the
+// > V4/K3 wrapper over the same check, returns with its first consumer at M8 — a helper with
+// > no caller is a warning under -D warnings, not a seam.)". The consumer is now real and the
+// > prediction held: it landed at M8, unchanged in shape.
+
+/// [`ensure_group_aligned`] at [`crate::quant::F4_GROUP`] — the routed-expert scheme both
+/// `.f4` models use, so both configs' `validate` want the same four arguments.
+///
+/// Wrapped rather than restated at each call: the five-line form was a duplication-gate failure
+/// the moment K3 became the second caller in the old tree, and the group is not the interesting
+/// part of either call. The interesting part is *which width* is `expert_in` — `cfg.hidden` on
+/// V4, the 3584 latent on K3 — which is what the one-line call sites show.
+///
+/// One caller today ([`crate::v4_config::V4Config::validate`]); K3's arrives at M9. It is here
+/// rather than inline in `v4_config.rs` for the reason [`ensure_f32_positive`] is: the rule is
+/// about the FORMAT, which two architectures share, not about either checkpoint.
+pub(crate) fn ensure_f4_group_aligned(expert_in: usize, moe_inter: usize) -> Result<()> {
+    ensure_group_aligned(
+        expert_in,
+        moe_inter,
+        crate::quant::F4_GROUP,
+        stringify!(F4_GROUP),
+    )
+}

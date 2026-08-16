@@ -19,3 +19,10 @@ pub mod glm_config;
 pub mod quant;
 pub mod schema;
 pub mod tokenizer;
+pub mod v4_config;
+/// DeepSeek-V4's prompt encoding. A sibling of [`tokenizer`]'s GLM surface for the same reason
+/// [`glimmer_encoding`] is: V4's encoder builds a **string** that is tokenized afterwards where
+/// GLM's builds a token-ID list, and the old tree's own header says of that pair that "the two
+/// must not converge". It is a directory rather than a file because the reference module is
+/// 2822 lines against this tree's 800-line cap — see its header for the split.
+pub mod v4_encoding;
