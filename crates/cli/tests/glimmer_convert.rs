@@ -218,13 +218,14 @@ fn write_fixture(src: &Path) -> Vec<common::Tensor> {
     // The four AUX files. Stub contents except `generation_config.json`, whose ids are the one
     // thing the converter reads rather than copies — and both are inside VOCAB, since an id past
     // it is a stop token no argmax can return and is its own refusal below.
-    for (name, body) in [
-        ("tokenizer.json", "{\"model\":{\"type\":\"BPE\"}}"),
-        ("tokenizer_config.json", "{}"),
-        ("chat_template.jinja", "{{ messages }}"),
-    ] {
-        std::fs::write(src.join(name), body).unwrap();
-    }
+    common::write_aux(
+        src,
+        &[
+            ("tokenizer.json", "{\"model\":{\"type\":\"BPE\"}}"),
+            ("tokenizer_config.json", "{}"),
+            ("chat_template.jinja", "{{ messages }}"),
+        ],
+    );
     write_eos(src, &[(VOCAB - 3) as u32, (VOCAB - 1) as u32]);
     text
 }

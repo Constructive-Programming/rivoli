@@ -356,13 +356,14 @@ fn write_fixture(src: &Path) -> Vec<Tensor> {
     // The three AUX files `finish_artifact` copies. Stubs: this converter reads none of them —
     // V4's stop tokens reach the engine through the copied `generation_config.json`, and there
     // is deliberately no `chat_template.jinja` (see `rivoli_artifact::v4_encoding`).
-    for (name, body) in [
-        ("tokenizer.json", r#"{"model":{"type":"BPE"}}"#),
-        ("tokenizer_config.json", "{}"),
-        ("generation_config.json", r#"{"eos_token_id": 1}"#),
-    ] {
-        std::fs::write(src.join(name), body).unwrap();
-    }
+    common::write_aux(
+        src,
+        &[
+            ("tokenizer.json", r#"{"model":{"type":"BPE"}}"#),
+            ("tokenizer_config.json", "{}"),
+            ("generation_config.json", r#"{"eos_token_id": 1}"#),
+        ],
+    );
     tensors
 }
 

@@ -386,14 +386,41 @@ fn main() -> Result<()> {
     }
 }
 
-/// Why a K3 artifact cannot serve. A named const like the legality rows' and for the same
-/// reason: the wording is data, cited by the refusal and pinned by a test.
-const K3_PORT_HAS_NO_CHAT_ENCODING: &str = "--port needs a chat encoding and Kimi-K3 ships \
-     NONE in any tree — its tokenizer_config.json has no chat_template, so `convert_k3` \
-     copies no template, and inventing a framing here would feed the model turn markers it \
+/// Why a K3 artifact cannot serve. A named const like the legality rows', because the wording
+/// is data rather than a string literal buried in a branch.
+///
+/// > **CORRECTED 2026-08-16, on first contact with the real checkpoint.** The message said
+/// > Kimi-K3 "ships NONE in any tree", and that is false: `encoding_k3.py` (647 lines) is a
+/// > FIRST-PARTY chat encoder, shipped in the checkpoint beside the weights. The refusal is
+/// > unchanged and is now better supported — what K3 lacks is a `chat_template`, which is a
+/// > narrower and checkable claim — but a refusal that misstates the checkpoint teaches the
+/// > next reader the wrong thing about what porting would cost.
+/// >
+/// > The doc line here also claimed the wording was "pinned by a test". Nothing references
+/// > this const but the `bail!` above — `grep` it. That half is deleted rather than fixed:
+/// > the only test such a string admits asserts it equals itself, which this tree deletes on
+/// > sight (`quant/naming.rs`'s removed `k3_expert_proj` carries the argument). The pin that
+/// > would mean something is a smoke cell invoking `--port`, and K3 has no smoke script yet.
+/// >
+/// > **And the last sentence was corrected twice in one day.** It read "Use --bench, whose
+/// > prompt is encoded RAW on this architecture" — true when written, and made false by this
+/// > same commit: dropping `tokenizer.json` from `convert_k3`'s aux list (correctly — K3
+/// > ships none) means `Tokenizer::load` at the top of `run` refuses every K3 artifact before
+/// > the arch match, so `--bench` does not work either and **the `bail!` above is currently
+/// > unreachable**. Caught by review. A refusal that tells the user to do something that also
+/// > fails is worse than no advice, and "the fix removed the reader's only working path" is
+/// > exactly what a correction pass is for.
+const K3_PORT_HAS_NO_CHAT_ENCODING: &str = "--port needs a chat encoding and this build has \
+     none for Kimi-K3. The checkpoint ships no `chat_template` (its tokenizer_config.json has \
+     no such key and there is no .jinja), so `convert_k3` copies no template. It DOES ship a \
+     first-party encoder, `encoding_k3.py` — an XTML framing over <|open|>/<|sep|>/<|close|>/\
+     <|end_of_msg|> — and porting THAT, gated against its own output, is the only honest way \
+     to fill this in; hand-inventing a framing here would feed the model turn markers it \
      never saw (an instruct model outside its turn structure never emits a stop token — the \
-     failure that invalidated 56 benchmark runs in the old tree). Use --bench, whose prompt \
-     is encoded RAW on this architecture.";
+     failure that invalidated 56 benchmark runs in the old tree). Note that --bench does not \
+     work around this today either: K3's vocabulary is tiktoken and this build loads only \
+     tokenizer.json, so no K3 artifact opens at all until that lands — see \
+     docs/investigations/k3-first-checkpoint.md section 4.";
 
 /// GLM's routed FORMAT — the one knob V4 does not have.
 ///
@@ -494,11 +521,22 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
             &EncodeOpts::new(ThinkingMode::Chat),
         ),
         Arch::GlmMoeDsa | Arch::MuseGlimmer => tok.encode_chat(text),
-        // RAW, deliberately: K3 ships no chat template in ANY tree (`convert_k3`'s header
-        // records it), so there is no "its own framing" to render — this line inherited
-        // GLM's `encode_chat` until M9, which would have fed a K3 checkpoint `[gMASK]
-        // <sop>` markers it never saw. A base-model bench prompt is document continuation,
-        // and raw encoding is the honest spelling of that.
+        // RAW, deliberately. This line inherited GLM's `encode_chat` until M9, which would
+        // have fed a K3 checkpoint `[gMASK] <sop>` markers it never saw; a bench prompt is
+        // document continuation, and raw encoding is the honest spelling of that.
+        //
+        // > **CORRECTED 2026-08-16.** This said "K3 ships no chat template in ANY tree
+        // > (`convert_k3`'s header records it), so there is no 'its own framing' to render".
+        // > Both halves were wrong. The checkpoint ships `encoding_k3.py`, a first-party XTML
+        // > renderer, so a framing to render DOES exist — it is a `chat_template` that does
+        // > not, which is the narrower true claim ([`K3_PORT_HAS_NO_CHAT_ENCODING`] carries
+        // > it). And the cross-reference was dangling: `convert_k3`'s module header records
+        // > no such thing; the note lives beside its `AUX` list. Found by review the same day
+        // > the refusal above was corrected — one claim, two copies, and only the copy the
+        // > user sees had been fixed.
+        //
+        // Raw stays right regardless: rendering XTML here would need the encoder ported and
+        // gated against its own output, which is a milestone, not a line.
         Arch::KimiK3 => tok.encode(text),
     }
 }

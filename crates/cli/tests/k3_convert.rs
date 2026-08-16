@@ -301,11 +301,26 @@ fn write_fixture(src: &Path) -> Vec<Tensor> {
         .expect("the fixture config parses");
     let tensors = all_tensors();
     common::write_shard_and_index(src, SHARD, &tensors);
-    // The TWO aux files `finish_artifact` copies — not three, unlike V4's: this checkpoint
-    // ships NO `chat_template.jinja` and no chat encoding exists in any tree for it (the
-    // engine arm refuses `--port`), and no `generation_config.json` is read either.
-    std::fs::write(src.join("tokenizer.json"), r#"{"model":{"type":"BPE"}}"#).unwrap();
-    std::fs::write(src.join("tokenizer_config.json"), "{}").unwrap();
+    // The three aux files, each name read off `/swarm/storage/ai/rivoli/kimi-k3-src` on
+    // 2026-08-16 rather than chosen — **this fixture used to write a `tokenizer.json`, which
+    // Kimi-K3 does not ship**, and that is why a converter unable to finish against the real
+    // source passed every gate in this file. The account is `convert_k3`'s `AUX` and
+    // `docs/investigations/k3-first-checkpoint.md` §3; what belongs here is the rule it
+    // yields: a fixture may not invent an input the real checkpoint lacks.
+    //
+    // `tiktoken.model` gets a real `<base64> <rank>` line rather than `{}` because the
+    // sidecar assertions below compare artifact bytes to source bytes.
+    common::write_aux(
+        src,
+        &[
+            ("tiktoken.model", "IQ== 0\n"),
+            (
+                "tokenizer_config.json",
+                r#"{"tokenizer_class":"TikTokenTokenizer"}"#,
+            ),
+            ("generation_config.json", r#"{"eos_token_id":163586}"#),
+        ],
+    );
     tensors
 }
 
@@ -348,10 +363,40 @@ fn convert_k3_writes_an_artifact_that_reopens_as_the_same_model() {
 
     assert_resident_is_a_verbatim_passthrough(&out, &tensors);
 
-    // Both aux files reached the artifact — TWO, not V4's three; the fixture's comment on
-    // the missing `chat_template.jinja` and `generation_config.json` carries why.
-    for aux in ["tokenizer.json", "tokenizer_config.json"] {
-        assert!(out.join(aux).is_file(), "{aux} did not reach the artifact");
+    // **The sidecar SET, exactly — not three presence checks.** Stated as a set on review's
+    // argument (2026-08-16): a per-name `is_file()` loop is green under any list that is a
+    // superset of the names the test happens to spell, so it cannot see a `tokenizer.json`
+    // coming back, and no pair of different lists can both satisfy an equality. It also
+    // catches the opposite direction a presence loop is blind to by construction — a file
+    // copied into the artifact that nothing listed.
+    //
+    // `tokenizer.json` is what this is really about. Kimi-K3 ships a tiktoken vocabulary and
+    // has none, so a `tokenizer.json` in a K3 artifact can only have been invented; the
+    // converter named one until 2026-08-16 and no gate here could tell, because the fixture
+    // wrote the file the converter named.
+    let mut sidecars: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| !n.ends_with(".f4") && n != "manifest.json" && n != "resident.safetensors")
+        .collect();
+    sidecars.sort();
+    assert_eq!(
+        sidecars,
+        [
+            "generation_config.json",
+            "tiktoken.model",
+            "tokenizer_config.json"
+        ],
+        "the artifact's sidecar set is not the three files Kimi-K3 ships"
+    );
+    // And each is the SOURCE's bytes. Presence under a right name says nothing about content,
+    // and `tiktoken.model` is the one whose content is the whole point — a vocabulary.
+    for aux in &sidecars {
+        assert_eq!(
+            std::fs::read(out.join(aux)).unwrap(),
+            std::fs::read(src.join(aux)).unwrap(),
+            "{aux} reached the artifact with different bytes than the source"
+        );
     }
 
     // READ-ONLY re-verification of the finished artifact — the mode's own gate.
@@ -474,8 +519,32 @@ fn convert_k3_refuses_before_it_writes() {
     // `out_dir == src_dir` — the SafeWriter SIGBUS hazard, refused by path identity.
     BIN.at(&src, &src.join(".")).refuses(&[], "SIGBUS");
 
+    // **Each aux file is refused BEFORE any weight is read.** This is the guard the real
+    // 2026-08-16 defect needed and did not have: the list named `tokenizer.json`, Kimi-K3
+    // ships none, and `finish_artifact` would have said so only after the whole 1.3 TiB
+    // write. Every name is removed in turn rather than one representative, because a loop
+    // over a list is exactly where one entry silently stops being checked — and each is
+    // restored, so the refusal is attributable to the file named and the fixture survives
+    // for the arms below.
+    for aux in [
+        "tiktoken.model",
+        "tokenizer_config.json",
+        "generation_config.json",
+    ] {
+        let p = src.join(aux);
+        let keep = std::fs::read(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        BIN.at(&src, &out)
+            .refuses(&[], &format!("{aux} is missing"));
+        std::fs::write(&p, &keep).unwrap();
+    }
     // The dense prefix: `--from 0` would ask `F4Expert` for tensors that do not exist — a
     // confusing "tensor not found" instead of the real answer.
+    //
+    // It doubles as the aux loop's ANTI-VACUITY row, which is why the ordering is worth
+    // knowing: `require_aux` runs before `K3Config::load` and `bounded_range`, so reaching a
+    // "dense prefix" refusal proves the fixture's three aux files satisfied the gate. Without
+    // that, the three rows above would be green against a converter that refused everything.
     BIN.at(&src, &out).refuses(&["--from", "0"], "dense prefix");
     // A range outside the model is REFUSED, not clamped.
     BIN.at(&src, &out).refuses(&["--to", "99"], "is not inside");
@@ -508,6 +577,23 @@ fn convert_k3_refuses_before_it_writes() {
     // Refused by the missing tensor's NAME — the confrontation speaks before the repack
     // loop or the resident writer would have touched the missing layer.
     BIN.at(&src, &out).refuses(&[], &dropped);
+
+    // **A tensor outside `language_model.` never reaches the artifact** — the guard that
+    // replaces `skipped_vision`, which cannot do this job. On the real checkpoint the 168
+    // vision tensors sit alone in shards 95/96, so `in_scope` never opens them and the
+    // counter is structurally 0 however broken the filter is (measured 2026-08-16,
+    // `docs/investigations/k3-first-checkpoint.md` §2). `is_vision` is the SAME function in
+    // `in_scope` and in the resident loop, so one break disables both ends together.
+    //
+    // The injected name is deliberately NOT a `vision_tower.`/`mm_projector.` one: those are
+    // rejected by `is_vision` and would test that function rather than this guard. A
+    // model-level name carrying no `layers.` passes `in_scope` untouched, which is exactly
+    // the path a renamed or newly-added multimodal family would take.
+    let mut stray = all_tensors();
+    let alien = "audio_tower.encoder.proj.weight".to_string();
+    stray.push(tensor(&alien, Dtype::Bf16, vec![4, HIDDEN]));
+    common::write_shard_and_index(&src, SHARD, &stray);
+    BIN.at(&src, &out).refuses(&[], &alien);
     common::clean(&root);
 }
 
