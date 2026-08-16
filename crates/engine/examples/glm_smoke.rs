@@ -32,12 +32,14 @@ fn main() -> Result<()> {
         .map(|s| s.parse::<u32>().context("token id"))
         .collect::<Result<_>>()?;
     let cfg = rivoli_artifact::glm_config::ModelConfig::load(dir)?;
+    // The routed FORMAT is GLM's own argument and the three pool knobs are the shared
+    // `PinCfg` — see `rivoli_engine::PoolKnobs` for why V4 has the second and not the first.
     let pin = rivoli_engine::glm::pin::GlmPin::build(
         dir,
         &cfg,
-        rivoli_engine::glm::pin::GlmPinCfg {
+        rivoli_artifact::format::RoutedFmt::Vq3,
+        rivoli_engine::resident::PinCfg {
             capacity,
-            fmt: rivoli_artifact::format::RoutedFmt::Vq3,
             cache_policy: "2q",
             two_q: rivoli_core::cache::TwoQSplit::default(),
             trace_path: None,

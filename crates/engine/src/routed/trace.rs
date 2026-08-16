@@ -23,23 +23,6 @@ use anyhow::{Context, Result};
 /// defensible, and only ~380 bytes a line.
 pub const TRACE_WINDOW: usize = 32;
 
-/// The trace sink's inputs: the ranked top-[`TRACE_WINDOW`] candidate expert ids and the
-/// full per-expert `choice` array they index into. Pass [`RankWindow::OFF`] when not
-/// tracing — nothing else reads them.
-#[derive(Clone, Copy)]
-pub struct RankWindow<'a> {
-    pub window: &'a [usize],
-    pub choice: &'a [f32],
-}
-
-impl RankWindow<'_> {
-    /// The not-tracing value: both slices empty, so the sink writes nothing.
-    pub const OFF: RankWindow<'static> = RankWindow {
-        window: &[],
-        choice: &[],
-    };
-}
-
 /// Open the `--trace` sink and write the version header. The header is deliberately
 /// unparseable as data: `replay` reads each line for whitespace-separated u32s and drops
 /// the empty ones, so this line contributes nothing and a v2 trace replays through a v1
@@ -58,6 +41,23 @@ impl RoutedPool {
     /// on this so a non-tracing decode pays literally nothing for trace v2.
     pub fn tracing(&self) -> bool {
         self.trace.is_some()
+    }
+
+    /// Record this routing decision's candidate window — the ranked top-[`TRACE_WINDOW`]
+    /// experts — for the line [`RoutedPool::write_trace`] is about to write.
+    ///
+    /// **The buffer is the POOL's, not the caller's**, and that is the whole of this change:
+    /// the candidate window is trace state, its width is the trace's constant, and both routed
+    /// arms were holding a `Vec<usize>` that nothing but the trace ever read. Keeping it here
+    /// means an arm's routing code names it exactly once, and `submit` no longer takes a
+    /// window it could be handed out of step with the selection.
+    ///
+    /// The gate is here and not at the caller for the reason [`RoutedPool::tracing`] exists at
+    /// all: a stock decode must pay literally nothing for trace v2.
+    pub fn record_candidates(&mut self, choice: &[f32]) {
+        if self.trace.is_some() {
+            rivoli_core::routing::topk_into(choice, TRACE_WINDOW, &mut self.window);
+        }
     }
 
     /// Flush the trace sink. Called per token, because the trace CANNOT rely on
@@ -83,12 +83,12 @@ impl RoutedPool {
     /// `bin/replay` hard-fails a trace where that prefix does not hold. Reordering
     /// `sel` for any local reason (coalescing reads by expert id, say) would silently
     /// change the meaning of every captured trace. The debug_assert is the tripwire.
-    pub(super) fn write_trace(&mut self, sel: Selection<'_>, win: RankWindow<'_>) -> Result<()> {
+    pub(super) fn write_trace(&mut self, sel: Selection<'_>, choice: &[f32]) -> Result<()> {
         debug_assert!(
-            win.window.is_empty() || win.window.starts_with(sel.experts),
+            self.window.is_empty() || self.window.starts_with(sel.experts),
             "trace v2: the candidate window must be the ranking that produced `sel`"
         );
-        let Some(w) = &mut self.trace else {
+        let (window, Some(w)) = (&self.window, &mut self.trace) else {
             return Ok(());
         };
         use std::io::Write;
@@ -104,9 +104,8 @@ impl RoutedPool {
         // cheap now and unrecoverable later without another capture; and the deferred
         // route-KL counter needs the mass distribution.
         write!(w, " |").context("write trace")?;
-        for &e in win.window {
-            write!(w, " {}:{:.6}", expert_key(sel.layer, e), win.choice[e])
-                .context("write trace")?;
+        for &e in window {
+            write!(w, " {}:{:.6}", expert_key(sel.layer, e), choice[e]).context("write trace")?;
         }
         writeln!(w).context("write trace")
     }

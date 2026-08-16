@@ -129,6 +129,18 @@ mod ffi {
 #[cfg(feature = "rocm")]
 pub use tier::{DeviceBuf, DeviceTier, VmmBuf, mem_info};
 
+/// `&[T]` as little-endian bytes, for a device upload.
+///
+/// Host is little-endian and so is the device, so this is a REINTERPRETATION and not a
+/// conversion — which is why it is sound for the plain-old-data types every caller passes
+/// (`f32`, `i32`, the expert descriptors). It lives here, beside [`DeviceBuf::copy_in_at`],
+/// because that is the only thing it is ever an argument to; it was written once per arm
+/// until the third one needed it.
+pub fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    // SAFETY: plain-old-data slices reinterpret as bytes; len scales by size_of.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
 #[cfg(feature = "rocm")]
 mod tier {
     use super::ffi::*;

@@ -44,10 +44,17 @@
 //!    reference MODEL, which is the direction that matters.
 //! 2. **The compressed-block selection is positional, not scored.** The trained-in indexer
 //!    ranks blocks; this arm takes every causally-legal one. The two agree on the SET below
-//!    [`select::positional_context_limit`] and [`engine::V4Engine::new`] refuses a context
-//!    above it, so the shortcut is bounded by a startup check rather than by a comment. They
-//!    never agree on the score ORDER, which the online softmax folds in — a deliberate
-//!    difference and a floor under any tolerance a scoring run may claim.
+//!    [`select::positional_context_limit`] and [`engine::check_context`] refuses a context at
+//!    or above it — at the door, before the pin reads nine gigabytes — so the shortcut is
+//!    bounded by a startup check rather than by a comment. They never agree on the score
+//!    ORDER, which the online softmax folds in: a deliberate difference and a floor under any
+//!    tolerance a scoring run may claim.
+//!
+//!    **This is the one deviation a USER meets.** At the shipped `index_topk` the ceiling is
+//!    2052, so the CLI's 4096 `--ctx` default is refused and a V4 run must name a smaller one.
+//!    Clamping instead would contradict `rivoli_core::legality`'s `Support` on that flag and
+//!    silently truncate a conversation the user sized deliberately; `check_context` carries
+//!    the argument, and the ceiling goes away when the indexer does.
 //! 3. **The MoE output is not bf16-rounded** between the accumulator drain and the residual.
 //!    The fixed-point accumulator is the arithmetic here; rounding it would be a second
 //!    quantization the kernel does not perform.
@@ -61,15 +68,43 @@ pub mod geometry;
 pub mod rope;
 pub mod select;
 
-// **The device half is not here yet, and this arm is therefore not reachable from
-// `Engine::open`.** `rivoli_core::legality` still refuses every flag on this architecture
-// with `NO_ENGINE_ARM`, which is the honest state: the table and `main`'s dispatch are held
-// together by `main`'s `the_arms_and_the_legality_table_agree_about_who_can_start`, so the
-// row opens in the same commit the loop lands and not before. What is here is the half that
-// needs no device — and it is deliberately the half that landed first, because it is where a
-// wrong answer is silent (a rotary table with the wrong base, a block selected one step
-// early, a pooled row placed by a counter instead of by its position) and because the device
-// half is a caller of all three.
+#[cfg(feature = "rocm")]
+pub mod attn;
+#[cfg(feature = "rocm")]
+pub mod decode;
+/// The device half. Gated, unlike the three above, for the reason this module's own comment
+/// gives: these need a backend, and a featureless build has none to give them.
+#[cfg(feature = "rocm")]
+pub mod engine;
+#[cfg(feature = "rocm")]
+pub mod forward;
+#[cfg(feature = "rocm")]
+pub mod kvcompress;
+#[cfg(feature = "rocm")]
+pub mod moe;
+#[cfg(feature = "rocm")]
+pub mod pin;
+
+// **The deviceless half landed FIRST, alone, and deliberately** — it is where a wrong answer
+// is silent (a rotary table with the wrong base, a block selected one step early, a pooled
+// row placed by a counter instead of by its position), and the device half is a caller of all
+// three.
+//
+// > **UPDATED: the device half landed and this arm is REACHABLE.** [`pin`] places the
+// > resident set and opens the `.f4` pool; [`engine`], [`kvcompress`], [`attn`], [`moe`],
+// > [`forward`] and [`decode`] are the loop; `Engine::V4` and
+// > `rivoli_core::legality::deepseek_v4` landed in the SAME commit, which they had to —
+// > `main`'s `the_arms_and_the_legality_table_agree_about_who_can_start` asserts
+// > `!refused == has_arm` over every architecture, so a row without a loop and a loop without
+// > a row are each a red tree.
+//
+// **What is still NOT here, and each is a decision rather than an omission:** the trained-in
+// indexer (deviation 2 — the pin does not place its weights, and the positional selection is
+// bounded by [`select::positional_context_limit`] at startup); the reference's per-phase
+// `Profile` and its four split instruments; and the probe API its per-layer oracle comparison
+// drove. The last two are the same narrowing [`crate::glm`] took, for the reason [`engine`]'s
+// header gives: a bucket that reads zero because nothing filled it is this repo's named
+// telemetry trap.
 
 /// Token rows one routed-expert dispatch carries. **One, and it is the kernel's number
 /// rather than this loop's preference.**

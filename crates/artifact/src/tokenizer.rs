@@ -33,6 +33,11 @@
 //! > until then `crates/artifact/tests/v4_encoding_gold.rs` exercises the same composition
 //! > (`Tokenizer::encode` over `encode_messages`'s string) and pins that every framing token
 //! > survives it as ONE id, which is the only property the wrapper would have added.
+//! >
+//! > **UPDATED: the V4 ENGINE ARM landed and brought its caller.** [`Tokenizer::encode_dsv4`]
+//! > is below, one line, with `main.rs`'s V4 `--bench` branch as the caller the paragraph
+//! > above said it would wait for. The composition test stays: it pins the property the
+//! > wrapper does not add, which is that every framing token survives tokenization as one id.
 //!
 //! `json_truthy` did NOT come with it, deliberately: in the reference its only callers are
 //! `dsv4_encoding` and `glimmer_encoding`, so porting it now would land a function with no
@@ -506,6 +511,26 @@ impl Tokenizer {
             out.push(sp.think_close);
         }
         Ok(out)
+    }
+
+    /// DeepSeek-V4's turn framing: [`crate::v4_encoding::encode_messages`] builds the STRING
+    /// and this tokenizes it.
+    ///
+    /// **The two encoders share no framing, and that is why this is a delegation rather than a
+    /// second [`Self::encode_chat_turns`].** GLM builds a token-ID list directly, from ids
+    /// looked up by name, so it never depends on the tokenizer choosing to match `[gMASK]` as
+    /// a special token inside a string. V4 builds a string with its markers written out and
+    /// relies on exactly that match — which is a real dependency on the vocab, and the reason
+    /// `crates/artifact/tests/v4_encoding_gold.rs` pins that every framing token survives this
+    /// composition as ONE id rather than several. The old tree's own module header says of the
+    /// pair that "the two must not converge"; keeping this a one-liner over a separate
+    /// renderer is what honours that.
+    pub fn encode_dsv4(
+        &self,
+        messages: Vec<crate::v4_encoding::Message>,
+        opts: &crate::v4_encoding::EncodeOpts,
+    ) -> Result<Vec<u32>> {
+        self.encode(&crate::v4_encoding::encode_messages(messages, opts)?)
     }
 
     /// Encode prompt text to token ids with NO special tokens — raw continuation.

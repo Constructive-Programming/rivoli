@@ -24,6 +24,7 @@ use anyhow::Result;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
+use rivoli_artifact::v4_config::V4Config;
 use rivoli_core::cache::TwoQSplit;
 
 /// One generation request. Bundled (like the pool's `PoolCfg`) so `generate`'s signature
@@ -164,16 +165,32 @@ pub struct OpenSpec {
     pub max_ctx: usize,
 }
 
-/// The routed-expert pool's startup knobs. GLM's alone: they describe a pool, and an
-/// architecture with no routed experts has none to describe.
-pub struct RoutedSpec<'a> {
-    /// The run's ONE routed format. `--mode hybrid` has no value here at all, which is
-    /// why `rivoli_core::legality` refuses it rather than resolving it to one of these.
-    pub fmt: RoutedFmt,
+/// The routed-expert pool's startup knobs — the three that describe a POOL, which both routed
+/// arms have and a dense architecture has none of.
+///
+/// **The routed FORMAT is deliberately not here**, and its absence is what makes this one type
+/// rather than two. GLM chooses between `.vq3` and `.i4` with `--mode`; V4's experts are `.f4`
+/// because that is what the checkpoint stores, so it has nothing to choose and a field it
+/// always filled the same way would be exactly the "recorded command line carrying a knob
+/// nothing spent" `rivoli_core::legality` exists to stop. GLM carries its format as its own
+/// arm of [`ArchCfg`] — one extra value on the architecture that has the choice, rather than
+/// an `Option` two arms fill differently and a third could forget.
+pub struct PoolKnobs<'a> {
     pub cache_policy: &'a str,
     pub two_q: TwoQSplit,
     pub trace_path: Option<&'a str>,
 }
+
+/// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
+/// **Returning false stops the run** — `serve` returns false when the client hangs up,
+/// otherwise a closed connection would keep the sole-tenant GPU busy for the rest of the
+/// budget.
+///
+/// An alias and not a spelled-out type at each of the four `decode`/`generate` signatures: at
+/// full width it pushes every one of them past this workspace's line limit, and rustfmt then
+/// breaks them into a five-line block that is byte-identical across two arms — which is what
+/// `build.rs`'s duplication gate reported the moment the third arm landed.
+pub type TokenSink<'a> = &'a mut dyn FnMut(u32) -> bool;
 
 /// The sniffed architecture together with its config and its own startup knobs — the one
 /// value [`Engine::open`] dispatches on.
@@ -192,8 +209,12 @@ pub struct RoutedSpec<'a> {
 /// wrapper around it was Glimmer's, and the wrapper is where `dtype` and
 /// `quantization_config` are asserted. The engine reads `.text` on the other side of this.
 pub enum ArchCfg<'a> {
-    Glm(&'a ModelConfig, RoutedSpec<'a>),
+    /// The routed format rides HERE and not in [`PoolKnobs`] — see that type for why.
+    /// `Mode::Hybrid` has no [`RoutedFmt`] at all, which is why `rivoli_core::legality`
+    /// refuses it rather than resolving it to one of the two real formats.
+    Glm(&'a ModelConfig, RoutedFmt, PoolKnobs<'a>),
     Glimmer(&'a GlimmerConfig),
+    V4(&'a V4Config, PoolKnobs<'a>),
 }
 
 /// The decode engines, one variant per architecture that has a loop.
@@ -217,6 +238,7 @@ pub enum ArchCfg<'a> {
 pub enum Engine<'a> {
     Glm(crate::glm::engine::GlmEngine<'a>),
     Glimmer(crate::glimmer::engine::GlimmerEngine<'a>),
+    V4(crate::v4::engine::V4Engine<'a>),
 }
 
 /// A backendless build has no arm at all, and says so in the type: `Infallible` makes the
@@ -250,18 +272,8 @@ impl<'a> Engine<'a> {
         // architecture would look like a residency difference in every log line it produced.
         let capacity = device_budget(spec.max_mem_gib)?;
         match cfg {
-            ArchCfg::Glm(cfg, routed) => {
-                let pin = crate::glm::pin::GlmPin::build(
-                    dir,
-                    cfg,
-                    crate::glm::pin::GlmPinCfg {
-                        capacity,
-                        fmt: routed.fmt,
-                        cache_policy: routed.cache_policy,
-                        two_q: routed.two_q,
-                        trace_path: routed.trace_path,
-                    },
-                )?;
+            ArchCfg::Glm(cfg, fmt, knobs) => {
+                let pin = crate::glm::pin::GlmPin::build(dir, cfg, fmt, pin_cfg(capacity, knobs))?;
                 let e = crate::glm::engine::GlmEngine::new(pin, cfg, spec.max_ctx)?;
                 Ok(Engine::Glm(e))
             }
@@ -277,6 +289,16 @@ impl<'a> Engine<'a> {
                     spec.max_ctx,
                 )?;
                 Ok(Engine::Glimmer(e))
+            }
+            ArchCfg::V4(cfg, knobs) => {
+                // BEFORE the pin, which reads nine gigabytes: this arm's positional block
+                // selection has a context ceiling, and a run that exceeds it should learn so
+                // at the door rather than after the load. `check_context` carries why the
+                // answer is a refusal and not a clamp.
+                crate::v4::engine::check_context(cfg, spec.max_ctx)?;
+                let pin = crate::v4::pin::V4Pin::build(dir, cfg, pin_cfg(capacity, knobs))?;
+                let e = crate::v4::engine::V4Engine::new(pin, cfg, spec.max_ctx)?;
+                Ok(Engine::V4(e))
             }
         }
     }
@@ -320,6 +342,8 @@ impl<'a> Engine<'a> {
             Engine::Glm(e) => e.max_ctx(),
             #[cfg(feature = "rocm")]
             Engine::Glimmer(e) => e.max_ctx(),
+            #[cfg(feature = "rocm")]
+            Engine::V4(e) => e.max_ctx(),
             #[cfg(not(feature = "rocm"))]
             Engine::Never(never, _) => match *never {},
         }
@@ -341,11 +365,7 @@ impl<'a> Engine<'a> {
     /// after it is `unreachable_code` — an error under this workspace's `-D warnings`. The
     /// split says the same thing without asking the compiler to reason about a match that
     /// has no reachable arms.
-    pub fn generate(
-        &mut self,
-        req: GenSpec<'_>,
-        sink: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<Decoded> {
+    pub fn generate(&mut self, req: GenSpec<'_>, sink: TokenSink<'_>) -> Result<Decoded> {
         #[cfg(not(feature = "rocm"))]
         {
             let Engine::Never(never, _) = self;
@@ -368,8 +388,23 @@ impl<'a> Engine<'a> {
                     Ok(Decoded { ids, stats })
                 }
                 Engine::Glimmer(e) => e.decode(req, sink),
+                Engine::V4(e) => e.decode(req, sink),
             }
         }
+    }
+}
+
+/// The run's budget joined to the pool knobs — what a routed pin takes.
+///
+/// One function because both routed arms build the identical four-field value out of the same
+/// two inputs, and the literal is five lines under rustfmt's `struct_lit_width`.
+#[cfg(feature = "rocm")]
+fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_> {
+    crate::resident::PinCfg {
+        capacity,
+        cache_policy: knobs.cache_policy,
+        two_q: knobs.two_q,
+        trace_path: knobs.trace_path,
     }
 }
 

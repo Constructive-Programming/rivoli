@@ -84,9 +84,6 @@ pub struct GlmEngine<'a> {
     // Host routing/argmax scratch, reused every layer so the hot path allocates nothing.
     pub(super) scores: Vec<f32>,
     pub(super) choice: Vec<f32>,
-    /// Trace-only: the ranked top-`TRACE_WINDOW` candidates. Stays empty unless
-    /// `--trace` is on, and `--trace` is fixed for the run.
-    pub(super) window: Vec<usize>,
     /// Per-expert routing weights for the current layer, laid out `[descriptor][row]` —
     /// the layout the down-projection kernel reads as `wexpert[e*R + t]`. A row that
     /// did not route to a union expert carries 0.0 there, and the kernel SKIPS a zero
@@ -233,7 +230,6 @@ impl<'a> GlmEngine<'a> {
             n_kv_blocks,
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],
-            window: Vec::new(), // grown once by the first traced layer; empty otherwise
             wexpert: Vec::with_capacity(slots * MAXROW),
             sel_row: std::array::from_fn(|_| Vec::with_capacity(cfg.top_k)),
             wrow: std::array::from_fn(|_| Vec::with_capacity(cfg.top_k)),

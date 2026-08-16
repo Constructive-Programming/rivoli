@@ -305,9 +305,10 @@ pub enum Outcome {
 // --- The table. One function per architecture, dispatched once; every message is a
 // --- named const so the verdicts read as rows rather than as prose.
 
-const NO_ENGINE_ARM: &str = "this architecture has no decode path in this build — GLM-5.2 \
-     and Muse Glimmer-30B are the arms so far. Every flag refuses here rather than a chosen \
-     few, because a knob cannot be legal on a model that cannot decode at all";
+const NO_ENGINE_ARM: &str = "this architecture has no decode path in this build — GLM-5.2, \
+     Muse Glimmer-30B and DeepSeek-V4-Flash are the arms so far. Every flag refuses here \
+     rather than a chosen few, because a knob cannot be legal on a model that cannot decode \
+     at all";
 
 const DENSE_HAS_NO_ROUTED_FORMAT: &str = "--mode names how ROUTED EXPERTS are stored, and \
      this architecture is DENSE — it has no experts and no routing, and its weights are \
@@ -350,6 +351,38 @@ const TRACE_IS_TOKEN_MAJOR: &str = "--trace forces the prefill back to TOKEN-MAJ
      engine measured layer-major prefill at 2.15x token-major, and 28.20 reads/token \
      against 159.56; both are that engine's numbers, not this one's)";
 
+const V4_FORMAT_IS_THE_CHECKPOINTS: &str = "--mode names how ROUTED EXPERTS are stored, and \
+     on this architecture the checkpoint decides: the experts are `.f4` (e2m1 nibbles, one \
+     e8m0 scale per 32 weights) and there is no second container to choose between. The flag \
+     is ignored, and nothing in the run is stored in the format you named. What DOES move \
+     residency here is --max-mem, which decides how many of the 137 GiB of experts are pinned";
+
+const V4_ATTENTION_IS_WINDOW_PLUS_BLOCKS: &str = "--attn names how attention SELECTS the rows \
+     it reads, and this architecture does not offer the choice: every layer attends a \
+     sliding_window ring PLUS the pooled blocks its per-layer KV compressor emitted, which is \
+     neither the dense causal prefix nor any of the three sparse selections. `dense` is \
+     ignored rather than honoured — there is no dense path here to fall back to";
+
+const V4_SPARSE_ATTN_IS_NOT_A_CHOICE: &str = "streaming sinks, the DSA lightning indexer and \
+     MISA are all row selections over a DENSE cache, and this architecture's cache is a ring \
+     plus pooled blocks. Its own indexer ranks COMPRESSED BLOCKS, is a different object from \
+     GLM's, and is not placed in the resident pin at all — this arm selects blocks \
+     positionally, which is why it refuses a context past 4*(index_topk+1)";
+
+const V4_MTP_NEEDS_A_KERNEL: &str = "speculative decode on this architecture is blocked by a \
+     missing KERNEL, not a missing head, and that is which of the two would have to arrive \
+     first. moe.hip instantiates the FP4 expert range at R=1 only and its guard refuses \
+     anything else, so a V4 decode is structurally single-row: there is no verify pass to \
+     batch whatever a draft head might later offer, and no two-row FP4 kernel could be scored \
+     against an oracle that is bsz=1 only";
+
+const V4_TRACE_PREFILL_IS_ONE_PASS: &str = "--trace still captures the routed-expert access \
+     stream, but this architecture's prefill is ONE whole-prompt pass — attention is its only \
+     cross-token operation, so the ring seeding and the block pooling both take every row at \
+     once. A v2 trace recovers its token delimiter from the layer id descending, so the whole \
+     prefill lands as a single pseudo-token however long the prompt was. The DECODE half is \
+     faithful; prefill reads/token derived from this file are not comparable with GLM's";
+
 /// **The** legality decider. Total over `Arch × Flag` by the compiler: adding an
 /// architecture breaks this match, adding a flag breaks [`glm`], and either way the build
 /// stops until the new cell has an argued answer.
@@ -357,10 +390,11 @@ pub fn decide(arch: Arch, flag: Flag) -> Outcome {
     match arch {
         Arch::GlmMoeDsa => glm(flag),
         Arch::MuseGlimmer => muse_glimmer(flag),
+        Arch::DeepseekV4 => deepseek_v4(flag),
         // Not a wildcard over the flag axis: the reason is architecture-level, so the
         // flag is genuinely not consulted. Splitting the dispatch this way is what keeps
         // a `_` out of the table entirely.
-        Arch::DeepseekV4 | Arch::KimiK3 => Outcome::Refuse(NO_ENGINE_ARM),
+        Arch::KimiK3 => Outcome::Refuse(NO_ENGINE_ARM),
     }
 }
 
@@ -434,11 +468,80 @@ fn muse_glimmer(flag: Flag) -> Outcome {
     }
 }
 
+/// DeepSeek-V4-Flash's row of the table — and most of it is one fact worked out flag by flag:
+/// **this architecture chooses neither its expert format nor its attention selection.**
+///
+/// # Both value-carrying flags fall back loudly, and the choice is forced the same way
+/// Glimmer's `--mode` was
+///
+/// `Support` is out for either: it would accept `--mode int4` on a run that stores nothing in
+/// int4, and `--attn dense` on a run that attends a ring plus pooled blocks — precisely the
+/// "recorded command line carrying a knob nothing spent" this table exists to prevent.
+///
+/// `Refuse` is out too, and the reason lives in the CALLER. `main::requested_flags` submits
+/// the value-carrying flags on their RESOLVED value by design, so that a default which ever
+/// became illegal is caught rather than exempted by never having been typed. A refusal on
+/// either default would therefore kill `rivoli V4DIR --bench 4` — an invocation with no
+/// `--mode` and no `--attn` in it at all — on flags the user never typed.
+///
+/// [`Outcome::FallbackLoudly`] is exactly "the run proceeds, but not as asked, and the caller
+/// must SAY it". The cost is two warn lines per V4 run; the alternative is a silent drop.
+///
+/// # The rest
+///
+/// `--cache-policy` and `--max-mem` are real here and for a sharper reason than on GLM: the
+/// `.f4` set is 137 GiB against ~115 GiB of budget, so this arm CANNOT be fully resident on
+/// any configuration this machine has and the policy governs every token. `--ctx` is doubly
+/// real — it sizes the KV ring and the compressed region, and it is the number
+/// `V4Engine::new` checks against the positional-selection ceiling.
+fn deepseek_v4(flag: Flag) -> Outcome {
+    match flag {
+        // Every value together: the checkpoint's format is the same whichever was typed.
+        Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid) => {
+            Outcome::FallbackLoudly(V4_FORMAT_IS_THE_CHECKPOINTS)
+        }
+        Flag::Attn(AttnKind::Dense) => Outcome::FallbackLoudly(V4_ATTENTION_IS_WINDOW_PLUS_BLOCKS),
+        Flag::Attn(AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa) => {
+            Outcome::Refuse(V4_SPARSE_ATTN_IS_NOT_A_CHOICE)
+        }
+        // The three knobs that are MORE real here than on GLM: the `.f4` set cannot fit on
+        // this machine, so residency governs every token rather than the tail of a working
+        // set — and `--ctx` sizes both the KV ring and the compressed region.
+        Flag::CachePolicy | Flag::MaxMem | Flag::Ctx => Outcome::Support,
+        Flag::Trace => Outcome::FallbackLoudly(V4_TRACE_PREFILL_IS_ONE_PASS),
+        // NOT the shared `MTP_DEFERRED`: that one says the head is not loaded and the verify
+        // pass is not built, and describes a decode-loop increment on a batch shape already
+        // designed in. Here the blocker is one instantiation lower down and no other arm
+        // shares it, so quoting GLM's wording would tell a user to wait for the wrong thing.
+        Flag::Mtp => Outcome::Refuse(V4_MTP_NEEDS_A_KERNEL),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)] // tests: panic-on-failure is the idiom
 
     use super::*;
+
+    /// **Every `--mode` value degrades and SAYS so**, on an architecture with no routed
+    /// format to select — whether because it is dense (Glimmer) or because the checkpoint
+    /// already chose (V4).
+    ///
+    /// Not a refusal, and the reason lives in the caller: `main::requested_flags` submits
+    /// `Flag::Mode` on its RESOLVED value, so a refusal here would kill `rivoli DIR --bench 4`
+    /// — an invocation carrying no `--mode` at all — on a flag the user never typed. Asserted
+    /// for both arms through one helper because the property is one property; the two rows'
+    /// own tests still name it, so a reader of either sees the claim.
+    fn every_mode_falls_back_loudly(arch: Arch) {
+        for (name, m) in MODES {
+            assert!(
+                matches!(decide(arch, Flag::Mode(m)), Outcome::FallbackLoudly(_)),
+                "--mode {name} must fall back loudly on {}, not refuse or silently pass: a \
+                 refusal breaks the no-flags invocation",
+                arch.name()
+            );
+        }
+    }
 
     /// `ordinals` must be exactly `0..n`, each once. This is the guard that makes an
     /// `ALL` list's completeness checkable: a forgotten variant either collides with an
@@ -564,13 +667,7 @@ mod tests {
         let refused = |f| matches!(g(f), Outcome::Refuse(_));
         // No routed format exists, so every --mode value degrades and SAYS so. Not a
         // refusal: see this test's doc and `muse_glimmer`'s.
-        for (name, m) in MODES {
-            assert!(
-                matches!(g(Flag::Mode(m)), Outcome::FallbackLoudly(_)),
-                "--mode {name} must fall back loudly on a dense model, not refuse or \
-                 silently pass: a refusal breaks the no-flags invocation"
-            );
-        }
+        every_mode_falls_back_loudly(Arch::MuseGlimmer);
         // Dense attention is what this model DOES, not a placeholder.
         assert_eq!(g(Flag::Attn(AttnKind::Dense)), Outcome::Support);
         for kind in [AttnKind::Streaming, AttnKind::Dsa, AttnKind::Misa] {
@@ -607,7 +704,7 @@ mod tests {
         let default_attn = parse_in(&ATTNS, "--attn", "dense").expect("dense parses");
         // The arms, named. A third one added without a row here is a third one nobody
         // checked can start.
-        for arch in [Arch::GlmMoeDsa, Arch::MuseGlimmer] {
+        for arch in [Arch::GlmMoeDsa, Arch::MuseGlimmer, Arch::DeepseekV4] {
             for flag in [Flag::Mode(default_mode), Flag::Attn(default_attn)] {
                 assert!(
                     !matches!(decide(arch, flag), Outcome::Refuse(_)),
@@ -617,6 +714,57 @@ mod tests {
                     flag.spelling()
                 );
             }
+        }
+    }
+
+    /// DeepSeek-V4-Flash's row, cell by cell, as of M8 — the same change-detector as the two
+    /// above and for the same reason: the total and anti-vacuity checks would not notice a
+    /// cell being flipped, which is the one edit that changes what the engine accepts.
+    ///
+    /// **The five `FallbackLoudly` cells are the load-bearing ones**, and they are two facts
+    /// rather than one. `--mode` degrades because the checkpoint owns the routed format;
+    /// `--attn dense` degrades because this architecture attends a window plus pooled blocks
+    /// and has no dense path to honour. Both are asserted positively rather than left to the
+    /// reader, because "it still decodes with no flags" is not visible from any other test
+    /// here — and a refusal on either would break the no-flags invocation.
+    #[test]
+    fn deepseek_v4_row_is_the_m8_truth() {
+        let v4 = |f| decide(Arch::DeepseekV4, f);
+        let refused = |f| matches!(v4(f), Outcome::Refuse(_));
+        every_mode_falls_back_loudly(Arch::DeepseekV4);
+        assert!(
+            matches!(v4(Flag::Attn(AttnKind::Dense)), Outcome::FallbackLoudly(_)),
+            "--attn dense must fall back loudly: this arm attends a window plus pooled \
+             blocks, so `dense` names something the run does not do — and refusing the \
+             DEFAULT would break the no-flags invocation"
+        );
+        for kind in [AttnKind::Streaming, AttnKind::Dsa, AttnKind::Misa] {
+            assert!(refused(Flag::Attn(kind)), "{kind:?} must refuse");
+        }
+        // The MTP refusal is V4's OWN, not the shared deferral: a user told to wait for a
+        // draft head would be waiting for the wrong thing.
+        assert!(refused(Flag::Mtp), "speculative decode must refuse");
+        let Outcome::Refuse(mtp) = v4(Flag::Mtp) else {
+            panic!("--mtp must refuse on deepseek-v4");
+        };
+        let Outcome::Refuse(glm_mtp) = decide(Arch::GlmMoeDsa, Flag::Mtp) else {
+            panic!("--mtp must refuse on glm-moe-dsa");
+        };
+        assert_ne!(
+            mtp, glm_mtp,
+            "V4's --mtp deferral must not quote GLM's: the blocker is a missing KERNEL, not \
+             a missing head, and the two are different waits"
+        );
+        assert!(
+            mtp.contains("KERNEL"),
+            "V4's --mtp reason must name the kernel: {mtp:?}"
+        );
+        // --trace degrades rather than refusing: the capture is still written and its decode
+        // half is faithful.
+        assert!(matches!(v4(Flag::Trace), Outcome::FallbackLoudly(_)));
+        // The three knobs that are MORE real here than on GLM — the routed set cannot fit.
+        for f in [Flag::CachePolicy, Flag::MaxMem, Flag::Ctx] {
+            assert_eq!(v4(f), Outcome::Support, "{} must decode", f.spelling());
         }
     }
 

@@ -5,16 +5,17 @@
 
 use super::engine::{GlmEngine, MOE_ACC_ROWS};
 use super::forward::{ResidualBase, Rows};
+use crate::device::as_le_bytes;
 use crate::fetch::asyncfetch::Ticket;
 use crate::glm::pin::{Fp8Mlp, Fp8Weight, LayerMlp};
-use crate::routed::{ExpertSlot, RankWindow, Selection, TRACE_WINDOW};
+use crate::routed::{ExpertSlot, Selection};
 use anyhow::Result;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_backend::{
     ExpertDesc, NULL_STREAM, launch_gemv_f32, launch_gemv_fp8, launch_moe_acc_drain,
     launch_moe_expert_range, launch_moe_expert_range_i4, launch_swiglu, launch_vadd, stream_signal,
 };
-use rivoli_core::routing::{RoutePolicy, RouteScratch, route_into, topk_into};
+use rivoli_core::routing::{RoutePolicy, RouteScratch, route_into};
 
 /// One MoE dispatch's per-call operands; everything else comes off the engine.
 #[derive(Clone, Copy)]
@@ -36,13 +37,6 @@ fn desc_of(m: &ExpertSlot) -> ExpertDesc {
         down_indices: m.down.packed,
         down_scales: m.down.scale as *const u16,
     }
-}
-
-/// `&[T]` as little-endian bytes for a device upload (T is plain-old-data here: f32 /
-/// `ExpertDesc`).
-fn as_le_bytes<T: Copy>(v: &[T]) -> &[u8] {
-    // SAFETY: plain-old-data slices reinterpret as bytes; len scales by size_of.
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 impl GlmEngine<'_> {
@@ -149,12 +143,7 @@ impl GlmEngine<'_> {
             self.weigh_row(r);
         }
         self.build_union(rows.nrow);
-        // Trace v2 only: re-rank the same `choice` array to the wider candidate window
-        // the offline (J, M) grid needs. Behind the trace gate so a stock decode is
-        // byte-for-byte the work it was.
-        if self.pin.routed.tracing() {
-            topk_into(&self.choice, TRACE_WINDOW, &mut self.window);
-        }
+        self.pin.routed.record_candidates(&self.choice);
         Ok(())
     }
 
@@ -197,14 +186,13 @@ impl GlmEngine<'_> {
     /// the batch, launch. The UNION, not one row's picks: every expert any row routed
     /// to must be resident before the batch launches.
     async fn moe_layer(&mut self, l: usize, rows: Rows) -> Result<()> {
-        let (out, window, choice, union) =
-            (&mut self.resolved, &self.window, &self.choice, &self.union);
+        let (out, choice, union) = (&mut self.resolved, &self.choice, &self.union);
         self.pin.routed.submit(
             Selection {
                 layer: l,
                 experts: union,
             },
-            RankWindow { window, choice },
+            choice,
             out,
         )?;
         self.stage_batch(l, rows)?;

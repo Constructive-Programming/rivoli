@@ -16,34 +16,26 @@
 //! (residency moves bytes — never arithmetic, and in this tree never a format either).
 
 use crate::device::DeviceTier;
-use crate::routed::{ExpertSlot, MAX_BATCH, PoolCfg, RoutedGeom, RoutedPool, pool_budget, slot_at};
-use anyhow::{Context, Result, ensure};
+// `Fp8Weight` and its placers moved to `crate::resident` when the V4 arm needed the same
+// three (M8) — same types, same bodies, one home. Re-exported below so every
+// `crate::glm::pin::Fp8Weight` path in this arm is unchanged.
+use crate::resident::{
+    Batch, PinCfg, PoolPlan, dims2, place_f32, place_fp8, safetensors_bytes, stream_units,
+};
+use crate::routed::{ExpertSlot, RoutedGeom, RoutedPool, slot_at};
+use anyhow::{Result, ensure};
 use rivoli_artifact::format::{
     Dtype, ExpertSet, FormatMeta, RoutedFmt, Safetensors, SetDims, load_codebooks,
 };
 use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_artifact::quant::vq::{VQ_DIM, VQ_K};
-use rivoli_core::residency::{Bytes, Floor, Partition, Refusal, Unit, UnitId, partition};
+use rivoli_core::residency::{Partition, Unit};
 
-/// An fp8-e4m3 block-scaled weight resolved to device addresses, with the dims the
-/// launch site needs. Dims ride the weight (taken from the tensor's own shape at place
-/// time) rather than `cfg`, so a mis-shaped artifact fails at load, not at launch.
-#[derive(Clone, Copy)]
-pub struct Fp8Weight {
-    pub packed: *const u8,
-    pub scale: *const f32,
-    pub block: usize,
-    pub o_dim: usize,
-    pub i_dim: usize,
-}
-
-/// A dense layer's three-projection MLP, all fp8.
-#[derive(Clone, Copy)]
-pub struct Fp8Mlp {
-    pub gate: Fp8Weight,
-    pub up: Fp8Weight,
-    pub down: Fp8Weight,
-}
+/// `Fp8Weight` and `Fp8Mlp` moved to [`crate::resident`] when the V4 arm needed the same
+/// two (M8) — same types, same bodies, one home. Re-exported so every
+/// `crate::glm::pin::Fp8Weight` path in this arm is unchanged. A dense GLM layer's MLP and
+/// V4's resident shared expert ARE the same object; see [`Fp8Mlp`]'s own note.
+pub use crate::resident::{Fp8Mlp, Fp8Weight};
 
 /// An int8 per-row-scaled weight (embed / lm_head).
 #[derive(Clone, Copy)]
@@ -80,21 +72,6 @@ pub struct LayerPin {
     pub mlp: LayerMlp,
 }
 
-/// What [`GlmPin::build`] needs beyond the artifact: the run's budget and the pool
-/// knobs. Bundled for the same reason as [`PoolCfg`]: every field is a startup-time
-/// decision.
-#[derive(Clone, Copy)]
-pub struct GlmPinCfg<'a> {
-    /// Total device budget (`--max-mem`, auto-discovered when absent).
-    pub capacity: usize,
-    /// The run's ONE routed format (M4: `Vq3` or `I4`; hybrid returns as a
-    /// `FormatPlan`, not as a pool property).
-    pub fmt: RoutedFmt,
-    pub cache_policy: &'a str,
-    pub two_q: rivoli_core::cache::TwoQSplit,
-    pub trace_path: Option<&'a str>,
-}
-
 /// The GLM resident weight set + cold-expert streaming pool.
 pub struct GlmPin<'a> {
     cfg: &'a ModelConfig,
@@ -122,57 +99,6 @@ pub struct GlmPin<'a> {
     /// decision rather than re-deriving it.
     pub placement: Partition,
     pub routed: RoutedPool,
-}
-
-/// Place an F32 tensor (norms, router gate) into the tier.
-fn place_f32(tier: &mut DeviceTier, st: &Safetensors, name: &str) -> Result<*const f32> {
-    let (bytes, _) = st.typed(name, Dtype::F32)?;
-    // f32 LE host == LE device.
-    Ok(tier.place(bytes)? as *const f32)
-}
-
-/// Place an fp8-e4m3 block-scaled weight (`<name>.weight` F8E4M3 + `.weight_scale_inv`
-/// F32) into the tier. Dims come from the weight's `[o_dim, i_dim]` shape.
-///
-/// **The SCALE GRID's shape is checked.** The kernel indexes
-/// `scale[(o/block)·sc_cols + i/block]` with `sc_cols` derived from `i_dim` — so a grid
-/// stored `[sc_cols, sc_rows]` has every tile taking a neighbour's scale (fluent wrong
-/// text, no error), and a SHORTER grid has the kernel reading past the placement into
-/// the next tensor's e4m3 bytes reinterpreted as f32. Found by review in the old tree
-/// on the Glimmer fp8 path, where the check ran only for streamed layers and the
-/// shipping partition pinned all 52 — it iterated zero times.
-fn place_fp8(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
-    name: &str,
-    block: usize,
-) -> Result<Fp8Weight> {
-    let (w, shape) = st.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
-    let (o_dim, i_dim) = dims2(&format!("{name}.weight"), shape)?;
-    let (sc, sshape) = st.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
-    let want = [o_dim.div_ceil(block), i_dim.div_ceil(block)];
-    ensure!(
-        sshape == want,
-        "{name}.weight_scale_inv is {sshape:?}, but a [{o_dim}, {i_dim}] weight at \
-         block {block} implies {want:?} — a grid of the wrong extent mis-tiles silently"
-    );
-    let packed = tier.place(w)?;
-    let scale = tier.place(sc)?;
-    Ok(Fp8Weight {
-        packed,
-        scale: scale as *const f32,
-        block,
-        o_dim,
-        i_dim,
-    })
-}
-
-/// A weight matrix's `(o_dim, i_dim)`, refusing anything that is not 2-D. Every placer
-/// that carries dims takes them from the tensor's own shape rather than from `cfg`, so
-/// this is the one place the rank is confronted.
-fn dims2(name: &str, shape: &[usize]) -> Result<(usize, usize)> {
-    ensure!(shape.len() == 2, "{name}: expected 2-D, got {shape:?}");
-    Ok((shape[0], shape[1]))
 }
 
 /// Place an int8 per-row weight (`<name>` I8 + `<name>.scale` F32) into the tier
@@ -207,29 +133,13 @@ fn place_dense_mlp(
 /// Device bytes the always-resident set occupies — everything read every token EXCEPT
 /// the routed experts.
 ///
-/// **It is the artifact's own `*.safetensors` byte length, not a second derivation of
-/// the placement layout.** The converter writes `resident.safetensors` from exactly the
-/// tensor list [`GlmPin::build`] places, so the file IS the footprint — the old tree
-/// replaced 73 lines of per-shard re-derivation with this, because the copy nothing
-/// executed was free to drift. The bias is deliberate: over-count only shrinks the
-/// routed pool; under-count is what `DeviceTier::place` bails on. It over-counts by each
-/// file's header and by the ~77 KB of router bias (read to the HOST, never placed).
-///
-/// `indexer.safetensors` is skipped whole — that IS the per-tensor `.indexer` filter
-/// (the old converter writes nothing else into it), and M4 places no indexer. On top of
-/// the files: one shared expert block per MoE layer (carved from the routed slab, which
-/// no safetensors holds) and, under VQ, the three fp16 codebooks.
+/// The file total and its bias are [`safetensors_bytes`]'s; `indexer.safetensors` is the
+/// `skip` it takes, which IS the per-tensor `.indexer` filter (the old converter writes
+/// nothing else into it) and M4 places no indexer. What is GLM's own, and therefore here:
+/// one shared expert block per MoE layer (carved from the routed slab, which no safetensors
+/// holds) and, under VQ, the three fp16 codebooks.
 fn resident_bytes(dir: &str, cfg: &ModelConfig, fmt: RoutedFmt) -> Result<usize> {
-    let mut total = 0usize;
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read dir {dir}"))? {
-        let p = entry.with_context(|| format!("read dir {dir}"))?.path();
-        let is_st = p.extension().is_some_and(|x| x == "safetensors");
-        let skipped = p.file_name().is_some_and(|n| n == "indexer.safetensors");
-        if !is_st || skipped {
-            continue;
-        }
-        total += p.metadata().with_context(|| format!("stat {p:?}"))?.len() as usize;
-    }
+    let total = safetensors_bytes(dir, Some("indexer.safetensors"))?;
     let shared = expert_bytes(cfg, fmt)?;
     let cbs = if fmt == RoutedFmt::Vq3 {
         3 * VQ_K * VQ_DIM * 2
@@ -257,39 +167,23 @@ fn expert_bytes(cfg: &ModelConfig, fmt: RoutedFmt) -> Result<usize> {
     }
 }
 
-/// The routed experts as residency units, layer-major — the priority order handed to
+/// The routed experts as residency units, LAYER-MAJOR — the priority order handed to
 /// `partition()`. Layer-major because decode's access is cyclic over layers: pinning a
 /// prefix of it is the static partition that cyclic access makes optimal (the Belady
 /// degenerate), and any per-expert evidence that beats uniform arrives later as a
 /// reordering of this list, never as a second placement author.
+///
+/// The construction is [`stream_units`]'s and the ORDER is this function's, which is the
+/// whole split: GLM's list skips the dense layers and V4's spans the artifact's own range,
+/// and neither fact belongs in a shared helper.
 fn expert_units(cfg: &ModelConfig, unit: usize) -> Vec<Unit> {
-    let unit = u64::try_from(unit).unwrap_or(u64::MAX);
-    let bytes = std::num::NonZeroU64::new(unit).unwrap_or(std::num::NonZeroU64::MIN);
-    let moe_layers = cfg.n_layers - cfg.dense_layers;
-    (0..moe_layers * cfg.n_experts)
-        .map(|i| Unit {
-            id: UnitId(u32::try_from(i).unwrap_or(u32::MAX)),
-            bytes,
-        })
-        .collect()
+    stream_units((cfg.n_layers - cfg.dense_layers) * cfg.n_experts, unit)
 }
 
 impl<'a> GlmPin<'a> {
     /// Build the resident set from the artifact directory `dir`, placing by
     /// `partition()`. See the module doc for the split of authorship.
-    pub fn build(dir: &str, cfg: &'a ModelConfig, pin: GlmPinCfg<'_>) -> Result<Self> {
-        // One-time bound for `RoutedPool::submit`'s fixed scratch. A batched forward
-        // submits the UNION of every token row's picks, so the worst case is
-        // `top_k · MAXROW + n_shared`, not one row's picks.
-        let max_batch = cfg.top_k * super::MAXROW + cfg.n_shared;
-        ensure!(
-            max_batch <= MAX_BATCH,
-            "top_k {} x {} rows + n_shared {} = {max_batch} exceeds the \
-             {MAX_BATCH}-slot batch scratch",
-            cfg.top_k,
-            super::MAXROW,
-            cfg.n_shared
-        );
+    pub fn build(dir: &str, cfg: &'a ModelConfig, fmt: RoutedFmt, pin: PinCfg<'_>) -> Result<Self> {
         // Open the artifact: format meta (fp8 block), the resident safetensors,
         // codebooks, and the one streaming source. `open_dir` merges every
         // *.safetensors; the routed slab files are not safetensors and are ignored.
@@ -302,50 +196,29 @@ impl<'a> GlmPin<'a> {
             cfg.hidden,
             cfg.moe_inter,
         );
-        let src = ExpertSet::open_routed(dir, pin.fmt, dims)?;
+        let src = ExpertSet::open_routed(dir, fmt, dims)?;
         let geom = RoutedGeom::new(&src)?;
 
-        // THE PLACEMENT DECISION — one call, one author. The floor is what the run
-        // pays before any expert is resident: the always-resident set (plus slack for
-        // per-reservation alignment padding) and the pool's minimum batch slots. KV
-        // and scratch are 0 here NOT because they are free but because GLM's
-        // `--max-mem` has always budgeted weights only (every recorded benchmark
-        // reads it that way); folding them in is a semantic change to the flag,
-        // owed its own measured change when the loop owns KV allocation.
+        // THE PLACEMENT DECISION — one call, one author, and it runs before any device
+        // allocation. The tier's SLACK is per-reservation alignment padding, which
+        // `DeviceTier::place` charges at 256 B a placement.
         const SLACK: usize = 256 << 20; // 256 MiB
-        let resident = resident_bytes(dir, cfg, pin.fmt)?;
+        let resident = resident_bytes(dir, cfg, fmt)?;
         let tier_cap = resident + SLACK;
         let unit = src.expert_slot();
-        let floor = Floor {
-            always_resident: Bytes(tier_cap as u64),
-            kv_at_max_ctx: Bytes(0),
-            scratch: Bytes(0),
-            slot_bytes: Bytes((max_batch * unit) as u64),
-        };
         let units = expert_units(cfg, unit);
-        let placement = partition(&units, Bytes(pin.capacity as u64), floor)
-            .map_err(|r: Refusal| anyhow::anyhow!("{r} (GLM pin, --max-mem)"))?;
-        // Execute: the pool's byte budget IS the partition — batch slots plus the
-        // pinned prefix. `pool_budget`'s O_DIRECT rounding still applies (the arena
-        // anchors HOT slots at the high end, so an unaligned budget would misalign
-        // every hot-slot DMA destination).
-        let budget = pool_budget(
-            tier_cap + (max_batch + placement.pinned.len()) * unit,
-            tier_cap,
-        );
-        tracing::info!(
-            "partition: {} of {} routed experts fit resident beyond the {max_batch} \
-             batch slots ({:.1} GiB pool)",
-            placement.pinned.len(),
-            units.len(),
-            budget as f64 / (1u64 << 30) as f64,
-        );
+        // A batched forward submits the UNION of every token row's picks, and folds the ONE
+        // routed-format shared expert in beside them — so the scratch bound is
+        // `top_k * MAXROW + n_shared` and not one row's picks. `Batch::union` is where that
+        // bound is checked, at startup, with the friendly message.
+        let batch = Batch::union(cfg.top_k, super::MAXROW, cfg.n_shared, unit)?;
+        let (placement, pool) = PoolPlan::new("GLM", &units, tier_cap, batch).decide(pin)?;
         let mut tier = DeviceTier::new(tier_cap)?;
 
         // Codebooks resident (gate/up/down), narrowed f32 → fp16 at load. VQ only —
         // int4 decodes without a codebook.
         let mut codebooks = [std::ptr::null(); 3];
-        if pin.fmt == RoutedFmt::Vq3 {
+        if fmt == RoutedFmt::Vq3 {
             let cbs = load_codebooks(dir)?;
             for (i, cb) in cbs.iter().enumerate() {
                 let half: Vec<u8> = cb
@@ -362,17 +235,7 @@ impl<'a> GlmPin<'a> {
         let final_norm = place_f32(&mut tier, &st, "model.norm.weight")?;
         let (layers, moe_bias) = place_layers(&mut tier, &st, cfg, &src, block)?;
 
-        let routed = RoutedPool::new(
-            PoolCfg {
-                budget,
-                top_k: cfg.top_k,
-                max_batch,
-                policy: pin.cache_policy,
-                two_q: pin.two_q,
-                trace: pin.trace_path,
-            },
-            geom,
-        )?;
+        let routed = RoutedPool::new(pool, geom)?;
 
         Ok(Self {
             cfg,

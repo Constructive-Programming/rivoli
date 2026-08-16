@@ -19,9 +19,10 @@ use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_artifact::tokenizer::Tokenizer;
+use rivoli_artifact::v4_config::V4Config;
 use rivoli_core::cache::TwoQSplit;
 use rivoli_core::legality::{ATTNS, Arch, AttnKind, Flag, MODES, Mode, Outcome, decide, name_in};
-use rivoli_engine::{ArchCfg, Engine, GenSpec, OpenSpec, RoutedSpec};
+use rivoli_engine::{ArchCfg, Engine, GenSpec, OpenSpec, PoolKnobs};
 use std::collections::HashSet;
 use std::io::Write as _;
 
@@ -341,7 +342,7 @@ fn main() -> Result<()> {
     // `serve` checks each against `Engine::max_ctx` and answers 400.
     let bench = a
         .bench
-        .map(|ngen| bench_input(&tok, &a, ngen as usize))
+        .map(|ngen| bench_input(&tok, arch, &a, ngen as usize))
         .transpose()?;
 
     // **Each arm owns its config for the whole run, because the engine borrows it.** The
@@ -350,12 +351,8 @@ fn main() -> Result<()> {
     match arch {
         Arch::GlmMoeDsa => {
             let cfg = ModelConfig::load(&a.model)?;
-            open_and_run(
-                &a,
-                &tok,
-                bench.as_ref(),
-                ArchCfg::Glm(&cfg, glm_routed(&a)?),
-            )
+            let arch_cfg = ArchCfg::Glm(&cfg, glm_fmt(&a)?, pool_knobs(&a));
+            open_and_run(&a, &tok, bench.as_ref(), arch_cfg)
         }
         // No `RoutedSpec`: a dense model has no routed pool to configure, and the legality
         // table has already told the user so for each of the flags that would have filled
@@ -363,6 +360,13 @@ fn main() -> Result<()> {
         Arch::MuseGlimmer => {
             let cfg = GlimmerConfig::load(&a.model)?;
             open_and_run(&a, &tok, bench.as_ref(), ArchCfg::Glimmer(&cfg))
+        }
+        // `PoolKnobs` and not `RoutedSpec`: this architecture HAS a routed pool and does not
+        // have a routed FORMAT — the checkpoint's experts are `.f4` and there is nothing for
+        // `--mode` to select, which is what the three `FallbackLoudly` cells told the user.
+        Arch::DeepseekV4 => {
+            let cfg = V4Config::load(&a.model)?;
+            open_and_run(&a, &tok, bench.as_ref(), ArchCfg::V4(&cfg, pool_knobs(&a)))
         }
         // Unreachable through `check_legality`: `Flag::Mode` is submitted on every run and
         // the table refuses it with NO_ENGINE_ARM for both of these — `the_arms_and_the_
@@ -378,21 +382,27 @@ fn main() -> Result<()> {
     }
 }
 
-/// GLM's routed-pool knobs, gathered in the one place they are legal.
+/// GLM's routed FORMAT — the one knob V4 does not have.
 ///
 /// `--mode hybrid` has no [`RoutedFmt`] at all, which is why `legality::decide` refuses it
-/// rather than resolving it to one of the two real formats; reaching the `context` below
-/// means that refusal did not fire.
-fn glm_routed(a: &Args) -> Result<RoutedSpec<'_>> {
-    let fmt = routed_fmt(a.mode).context(
-        "--mode hybrid reached the format mapping — legality::decide must refuse it first",
-    )?;
-    Ok(RoutedSpec {
-        fmt,
+/// rather than resolving it to one of the two real formats; reaching the `context` below means
+/// that refusal did not fire.
+fn glm_fmt(a: &Args) -> Result<RoutedFmt> {
+    routed_fmt(a.mode)
+        .context("--mode hybrid reached the format mapping — legality::decide must refuse it first")
+}
+
+/// The routed pool's three knobs, gathered in the one place they are legal.
+///
+/// Shared by both routed arms because they describe a POOL and both have one — see
+/// [`PoolKnobs`]. Whether the flags that fill it are legal on this architecture is the
+/// legality table's question and has already been asked by the time this runs.
+fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
+    PoolKnobs {
         cache_policy: &a.cache_policy,
         two_q: TwoQSplit::default(),
         trace_path: a.trace.as_deref(),
-    })
+    }
 }
 
 /// Open the engine on `cfg`'s arm and run whichever invocation was asked for.
@@ -447,9 +457,36 @@ struct Bench<'a> {
     ngen: usize,
 }
 
-fn bench_input<'a>(tok: &Tokenizer, a: &'a Args, ngen: usize) -> Result<Bench<'a>> {
+/// Frame the bench prompt in the architecture's OWN chat template.
+///
+/// **The two encoders share no framing**, which is why this is a match and not a default:
+/// GLM builds a token-ID list from ids looked up by name, DeepSeek-V4 builds a string with its
+/// markers written out and then tokenizes it. Feeding a V4 checkpoint GLM's `[gMASK] <sop>`
+/// prefix is not a near-miss — it is text the model never saw, and an instruct model outside
+/// its turn structure does document continuation and never emits a stop token, which is the
+/// failure that invalidated 56 benchmark runs in the old tree.
+///
+/// **Muse Glimmer takes GLM's framing here and that is a KNOWN GAP, not a decision.**
+/// `rivoli_artifact::glimmer_encoding` exists and is not wired to this door; it predates this
+/// arm and is left exactly as it was, because changing it is a Glimmer change owed its own
+/// id-pinned comparison rather than a line inside a V4 port.
+fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
+    use rivoli_artifact::v4_encoding::{EncodeOpts, Message, ThinkingMode};
+    match arch {
+        // `ThinkingMode::Chat` — the same default `ChatOpts::thinking` takes and for the same
+        // measured reason: at a few tok/s a reasoning block is tens of seconds of silence
+        // before the first word, and a `--bench` run is timing the decode, not the reasoning.
+        Arch::DeepseekV4 => tok.encode_dsv4(
+            vec![Message::user(text)],
+            &EncodeOpts::new(ThinkingMode::Chat),
+        ),
+        Arch::GlmMoeDsa | Arch::MuseGlimmer | Arch::KimiK3 => tok.encode_chat(text),
+    }
+}
+
+fn bench_input<'a>(tok: &Tokenizer, arch: Arch, a: &'a Args, ngen: usize) -> Result<Bench<'a>> {
     let text = a.prompt.as_deref().unwrap_or(BENCH_PROMPT);
-    let ids = tok.encode_chat(text)?;
+    let ids = frame_prompt(tok, arch, text)?;
     // The KV slab is sized once from `--ctx`; a run that outgrows it fails somewhere in the
     // token loop, minutes in, so it is refused here instead.
     ensure!(
@@ -585,7 +622,7 @@ mod tests {
         // Hand-written, on the same argument as `legality::ARCH_COUNT`: no test can observe
         // a `match`'s arms, so the list is stated and the assertion is what binds it. Adding
         // an arm to `main` without a row here leaves that architecture unchecked.
-        const ARMS: [Arch; 2] = [Arch::GlmMoeDsa, Arch::MuseGlimmer];
+        const ARMS: [Arch; 3] = [Arch::GlmMoeDsa, Arch::MuseGlimmer, Arch::DeepseekV4];
         let Ok(a) = <Args as clap::Parser>::try_parse_from(["rivoli", "DIR", "--bench", "1"])
         else {
             panic!("`rivoli DIR --bench 1` must parse — the invocation contract has moved");

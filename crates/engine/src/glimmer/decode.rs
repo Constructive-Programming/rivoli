@@ -9,7 +9,7 @@
 //! `pin::Slot::fill`'s upgrade path) this grows the same shape GLM already has.
 
 use super::engine::GlimmerEngine;
-use crate::seam::{Decoded, Emit, GenSpec};
+use crate::seam::{Decoded, Emit, GenSpec, TokenSink};
 use anyhow::{Result, ensure};
 use rivoli_backend::device_sync;
 
@@ -32,11 +32,7 @@ impl GlimmerEngine<'_> {
     /// way round they are, which is how a swapped destructuring survives review — and this
     /// loop was written after the type existed. The seam carries the asymmetry and the note
     /// about closing it.
-    pub fn decode(
-        &mut self,
-        spec: GenSpec<'_>,
-        sink: &mut dyn FnMut(u32) -> bool,
-    ) -> Result<Decoded> {
+    pub fn decode(&mut self, spec: GenSpec<'_>, sink: TokenSink<'_>) -> Result<Decoded> {
         let r = self.decode_inner(&spec, sink);
         if r.is_err() {
             let _ = device_sync();

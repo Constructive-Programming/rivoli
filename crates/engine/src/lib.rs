@@ -15,6 +15,11 @@ pub mod glimmer;
 #[cfg(feature = "rocm")]
 pub mod glm;
 pub mod indexer;
+/// The resident-set vocabulary every arm's pin shares — resolved weight types, the placers
+/// that build them, and the weights-only [`rivoli_core::residency::Floor`]. Gated here rather
+/// than inside, because every item takes a `DeviceTier`.
+#[cfg(feature = "rocm")]
+pub mod resident;
 #[cfg(feature = "rocm")]
 pub mod routed;
 pub mod seam;
@@ -27,4 +32,4 @@ pub mod v4;
 // The seam's vocabulary, hoisted to the crate root: `rivoli_engine::Engine` is what a
 // consumer programs against, and making it name the module the enum happens to live in is
 // one more detail the second consumer could get wrong.
-pub use seam::{ArchCfg, DecodeStats, Decoded, Engine, GenSpec, OpenSpec, RoutedSpec};
+pub use seam::{ArchCfg, DecodeStats, Decoded, Engine, GenSpec, OpenSpec, PoolKnobs, TokenSink};

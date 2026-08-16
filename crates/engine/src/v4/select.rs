@@ -41,14 +41,19 @@ impl Extent {
         self.start_pos == 0
     }
 
-    /// Rows the SELECTION has: every query row at prefill, one at decode.
-    fn rows(self) -> usize {
+    /// Query rows this call actually drives: every prompt row at prefill, exactly one at
+    /// decode.
+    ///
+    /// `pub` because the attention block's every launch is sized by it and re-deriving
+    /// `if is_prefill { seqlen } else { 1 }` there would be a second copy of the phase
+    /// discriminant — the thing this type exists to hold once.
+    pub fn query_rows(self) -> usize {
         if self.is_prefill() { self.seqlen } else { 1 }
     }
 
     /// One past the last position this call touches.
     fn end_pos(self) -> usize {
-        self.start_pos + self.rows()
+        self.start_pos + self.query_rows()
     }
 
     /// **The bsz=1 scope cut, as a live check rather than a comment.**
@@ -58,9 +63,15 @@ impl Extent {
     /// and no error — every row after the first would then be scored against row 0's index
     /// set. The reference stated this as two `debug_assert!`s and its own docs called them
     /// "what ENFORCES the scope cut"; they were then measured compiled out of every binary
-    /// anyone ran. This is an `ensure!` for that reason, and it is stated ONCE, at the
-    /// boundary both public entry points pass through, rather than in each arm.
-    fn check_single_row_decode(self) -> Result<()> {
+    /// anyone ran. This is an `ensure!` for that reason, and it is stated ONCE, here, rather
+    /// than in each arm.
+    ///
+    /// **`pub` because the compressor is a third entry point**, not because anything outside
+    /// wants it: `super::kvcompress::LayerCompressor::run` branches on the same phase and
+    /// ignores `seqlen` in its decode arm exactly as [`should_compress`] and [`compress_dst`]
+    /// do, and the reference stated the cut a second time there. One `ensure!` with three
+    /// callers is the shape; three `ensure!`s is how two of them drift.
+    pub fn check_single_row_decode(self) -> Result<()> {
         ensure!(
             self.is_prefill() || self.seqlen == 1,
             "v4 selection: decode consumes one query row (the bsz=1 scope cut), got {}",
@@ -259,7 +270,7 @@ impl Sel {
         } else {
             self.win
         };
-        Ok((self.at.rows(), win_cols + self.n_comp()?))
+        Ok((self.at.query_rows(), win_cols + self.n_comp()?))
     }
 
     /// Compressed columns — the causally-complete block count, refused past the point where

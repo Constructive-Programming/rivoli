@@ -45,20 +45,13 @@ use rivoli_core::residency::{Bytes, Partition, Refusal, Unit, UnitId, partition}
 
 /// A bf16 weight matrix resolved to a device address, with the dims the launch site needs.
 ///
-/// Dims ride the weight (taken from the tensor's own shape at place time) rather than from
-/// `cfg`, so a mis-shaped artifact fails at load and not at launch — the rule every placer in
-/// [`crate::glm::pin`] already follows.
-///
-/// `*const u16` and not `*const u8`, which is what every launcher that consumes one already
-/// declares: bf16 is the element type, so the pointer that names it should be the one the ABI
-/// wall takes. The refill path casts to `*const u8` at [`GlimmerLayerPin::addrs`], where the
-/// unit genuinely IS the byte.
-#[derive(Clone, Copy)]
-pub struct Bf16Weight {
-    pub packed: *const u16,
-    pub o_dim: usize,
-    pub i_dim: usize,
-}
+/// Moved to [`crate::resident`] at M8, when V4's `embed`/`head` needed the identical three
+/// fields; re-exported here so every `crate::glimmer::pin::Bf16Weight` path is unchanged.
+/// What did NOT move is this arm's [`place_proj`] — it checks the tensor against the shape
+/// its config implies, which is Glimmer's own artifact contract rather than the intersection
+/// the shared module holds. The refill path casts to `*const u8` at
+/// [`GlimmerLayerPin::addrs`], where the unit genuinely IS the byte.
+pub use crate::resident::Bf16Weight;
 
 /// One Muse Glimmer decoder layer's weights, resolved — **whether the budget pinned it or a
 /// slot holds it.**
