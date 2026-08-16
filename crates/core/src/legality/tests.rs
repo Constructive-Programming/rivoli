@@ -25,8 +25,10 @@ fn every_mode_falls_back_loudly(arch: Arch) {
     }
 }
 
-/// The three sparse selections refuse on every row that carries them — the loop all four
-/// row tests need, hoisted beside [`every_mode_falls_back_loudly`] on its precedent.
+/// The three sparse selections refuse on every row that still DEFERS them — GLM, Glimmer
+/// and K3, hoisted beside [`every_mode_falls_back_loudly`] on its precedent. V4 left this
+/// list at M15: its sparse cells fall back loudly onto the native scored selection, and
+/// its row test pins that flip cell by cell.
 fn sparse_selections_refuse(arch: Arch) {
     for kind in [AttnKind::Streaming, AttnKind::Dsa, AttnKind::Misa] {
         assert!(
@@ -204,16 +206,20 @@ fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
     }
 }
 
-/// DeepSeek-V4-Flash's row, cell by cell, as of M8 — the same change-detector as the two
+/// DeepSeek-V4-Flash's row, cell by cell, as of M15 — the same change-detector as the two
 /// above and for the same reason: the total and anti-vacuity checks would not notice a
 /// cell being flipped, which is the one edit that changes what the engine accepts.
 ///
-/// **The five `FallbackLoudly` cells are the load-bearing ones**, and they are two facts
+/// **The eight `FallbackLoudly` cells are the load-bearing ones**, and they are two facts
 /// rather than one: `--mode` degrades because the checkpoint owns the routed format, and
-/// `--attn dense` because this architecture attends a window plus pooled blocks. The
-/// no-flags argument is [`muse_glimmer`]'s doc and the property test above.
+/// ALL FOUR `--attn` values because the checkpoint owns the attention — a window plus
+/// pooled blocks, with the trained-in block indexer ranking the blocks natively since M15.
+/// The sparse three were `Refuse` from M8 until then (the indexer was counted-not-placed
+/// and the positional stand-in imposed the 2052 ceiling); the flip is recorded here, cell
+/// by cell, with [`deepseek_v4`]'s row doc carrying the argument. The no-flags half is
+/// [`muse_glimmer`]'s doc and the property test above.
 #[test]
-fn deepseek_v4_row_is_the_m8_truth() {
+fn deepseek_v4_row_is_the_m15_truth() {
     let v4 = |f| decide(Arch::DeepseekV4, f);
     every_mode_falls_back_loudly(Arch::DeepseekV4);
     assert!(
@@ -222,7 +228,20 @@ fn deepseek_v4_row_is_the_m8_truth() {
          blocks, so `dense` names something the run does not do — and refusing the \
          DEFAULT would break the no-flags invocation"
     );
-    sparse_selections_refuse(Arch::DeepseekV4);
+    // The three sparse values fall back together onto the ONE const, exactly as the three
+    // `--mode` values do — the checkpoint's attention is the same whichever was typed.
+    for kind in [AttnKind::Streaming, AttnKind::Dsa, AttnKind::Misa] {
+        assert_eq!(
+            v4(Flag::Attn(kind)),
+            Outcome::FallbackLoudly(V4_SPARSE_ATTN_IS_NOT_A_CHOICE),
+            "--attn {kind:?} must proceed loudly: the scored selection is native, so a \
+             refusal would kill exactly the runs the flag's intent describes"
+        );
+    }
+    assert!(
+        V4_SPARSE_ATTN_IS_NOT_A_CHOICE.contains("no context ceiling"),
+        "the const must say the 2052 ceiling is gone — its old text cited the refusal"
+    );
     // The MTP refusal is V4's OWN, not the shared deferral: a user told to wait for a
     // draft head would be waiting for the wrong thing. Pinned to the named const, so
     // quoting GLM's wording is a red diff here rather than a drift.

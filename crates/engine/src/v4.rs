@@ -31,30 +31,29 @@
 //! `rivoli-core` (the partition, the router), `rivoli-backend` (the launchers) and
 //! [`crate::routed`] (the streaming pool), which is the seam the sharing was designed for.
 //!
-//! # The three deviations from the reference, declared rather than discovered
+//! # The deviations from the reference, declared rather than discovered
 //!
-//! Each is inherited from the reference engine, which measured it; none is a defect this port
-//! introduced, and each names the oracle defect it corresponds to so a future scoring run
-//! recognises it instead of chasing it.
+//! Each was inherited from the reference engine, which measured it; none is a defect this
+//! port introduced, and each names the oracle defect it corresponds to so a future scoring
+//! run recognises it instead of chasing it.
 //!
 //! 1. **The shared expert's SwiGLU is clamped**, where the reference engine's was not
 //!    (`v4oracle::Defect::SwigluUnclamped`). This arm calls `launch_swiglu_clamped_bf16` with
 //!    the config's `swiglu_limit`, which is the kernel written for exactly this and the reason
 //!    it exists. That is a divergence FROM the reference ENGINE and a convergence WITH the
 //!    reference MODEL, which is the direction that matters.
-//! 2. **The compressed-block selection is positional, not scored.** The trained-in indexer
-//!    ranks blocks; this arm takes every causally-legal one. The two agree on the SET below
-//!    [`select::positional_context_limit`] and [`engine::check_context`] refuses a context at
-//!    or above it — at the door, before the pin reads nine gigabytes — so the shortcut is
-//!    bounded by a startup check rather than by a comment. They never agree on the score
-//!    ORDER, which the online softmax folds in: a deliberate difference and a floor under any
-//!    tolerance a scoring run may claim.
-//!
-//!    **This is the one deviation a USER meets.** At the shipped `index_topk` the ceiling is
-//!    2052, so the CLI's 4096 `--ctx` default is refused and a V4 run must name a smaller one.
-//!    Clamping instead would contradict `rivoli_core::legality`'s `Support` on that flag and
-//!    silently truncate a conversation the user sized deliberately; `check_context` carries
-//!    the argument, and the ceiling goes away when the indexer does.
+//! 2. **RETIRED 2026-08-16 (M15).** This read "the compressed-block selection is positional,
+//!    not scored", carried a startup refusal of any `--ctx` past
+//!    [`select::positional_context_limit`] (2052 at the shipped `index_topk`), and promised
+//!    "the ceiling goes away when the indexer does". It did: [`pin`] places the
+//!    `attn.indexer.*` weights, [`blocksel`] runs the trained-in indexer through the
+//!    already-scored kernels, and the selection past the boundary is its top-`index_topk`
+//!    by score. What remains deliberate rather than deviant: below the boundary the top-k
+//!    keeps every causally-legal block, so the positional fill is the SAME selection for
+//!    less work and is still what runs — byte for byte the pre-M15 arm, which is what keeps
+//!    the M8 parity record binding — and the selection is attended in ascending block order
+//!    rather than the reference's score order, a summation-order difference inside the
+//!    online softmax of the same set ([`select::scored_rows`] carries the argument).
 //! 3. **The MoE output is not bf16-rounded** between the accumulator drain and the residual.
 //!    The fixed-point accumulator is the arithmetic here; rounding it would be a second
 //!    quantization the kernel does not perform.
@@ -70,6 +69,8 @@ pub mod select;
 
 #[cfg(feature = "rocm")]
 pub mod attn;
+#[cfg(feature = "rocm")]
+pub mod blocksel;
 #[cfg(feature = "rocm")]
 pub mod decode;
 /// The device half. Gated, unlike the three above, for the reason this module's own comment
@@ -98,13 +99,12 @@ pub mod pin;
 // > `!refused == has_arm` over every architecture, so a row without a loop and a loop without
 // > a row are each a red tree.
 //
-// **What is still NOT here, and each is a decision rather than an omission:** the trained-in
-// indexer (deviation 2 — the pin does not place its weights, and the positional selection is
-// bounded by [`select::positional_context_limit`] at startup); the reference's per-phase
-// `Profile` and its four split instruments; and the probe API its per-layer oracle comparison
-// drove. The last two are the same narrowing [`crate::glm`] took, for the reason [`engine`]'s
-// header gives: a bucket that reads zero because nothing filled it is this repo's named
-// telemetry trap.
+// **What is still NOT here, and each is a decision rather than an omission:** the
+// reference's per-phase `Profile` and its four split instruments, and the probe API its
+// per-layer oracle comparison drove. Both are the same narrowing [`crate::glm`] took, for
+// the reason [`engine`]'s header gives: a bucket that reads zero because nothing filled it
+// is this repo's named telemetry trap. (The trained-in indexer headed this list until M15;
+// [`blocksel`] is where it lives now.)
 
 /// Token rows one routed-expert dispatch carries. **One, and it is the kernel's number
 /// rather than this loop's preference.**

@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record).
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M15's scored selection carries six deviceless proofs on BOTH sides of its gate: a tie-rule flip reddening the oracle-side list-equality on a real tie (left [[9,8]] vs right [[8,9]]) — which the engine-side set gate provably could not have caught, since the set was unchanged — a reversed ranking comparator reddening that engine-vs-oracle gate (left {16,18} vs right {17,18}) while the below-cap identity stayed green, a dropped ascending emit reddening the below-cap byte-identity on both real and adversarial scores, a removed per-row rectangle check accepting a compensating-ragged buffer the aggregate total was blind to, and two standing fixtures pinning score-perturbation resolution above the boundary against provable inertness below it plus the keep-oldest sabotage's observability.
 ---
 
 # M0 gate red proofs
@@ -115,3 +115,51 @@ deny` failed the rebuild, and the build's exit code had been eaten by `| tail` /
 with the WRONG failure (row 1 reddened the partition test, not the logits). Debug the
 harness before the tree: check the build's exit UNPIPED, and read WHICH test failed, not
 just that one did.
+
+## 5. V4 scored-selection set gate (added 2026-08-16, M15, deviceless)
+
+The M15 gate compares the engine's top-k (`v4::select::scored_rows`) against the frozen
+oracle's own `Indexer.forward` exports on the toy (`index_topk = 2`, cap = 12 tokens, so
+truncation is REACHED and counted — the "set-invariant goldens" trap the shipped 512 sets
+below 2052 tokens). Six proofs; the four executed ones were reverted and the tree re-run
+green, and proofs 2 and 3 stand as fixtures.
+
+**Proofs 1-3 redden the ORACLE-side file; 4-6 redden the gate that actually compares the
+engine to it.** That split is the point: proof 1's tie flip produced the same SET
+(`[[9,8]]` vs `[[8,9]]`), so the engine-side set-equality gate could not have caught it —
+and equally, nothing in proofs 1-3 shows the engine-side gate resolves anything at all.
+A gate is proven by a perturbation of the code IT scores.
+
+1. **Tie-rule flip** (`crates/oracles/tests/v4_indexer_goldens.rs`): the recompute's
+   tie-break flipped from `.then(a.cmp(&b))` to `.then(b.cmp(&a))`. Observed red on a REAL
+   tie in the fixture — `left: [[9, 8]] right: [[8, 9]]` — proving the list-equality gate
+   resolves the tie rule, not merely the score order. Reverted, green (2 passed).
+2. **Score perturbation, both directions** (standing fixture in the same file): promoting
+   the best currently-excluded legal block past the winners MOVES the recomputed set above
+   the boundary (resolution), and the same promotion on a below-cap row provably cannot
+   (specificity — the below-cap identity as an executable).
+3. **Keep-oldest sabotage** (`crates/engine/tests/v4_scored_selection.rs`, standing): the
+   `min(k, limit)`-oldest selection — the exact bug `positional_context_limit` documents —
+   disagrees with the scored set on truncated rows of every boundary-crossing fixture.
+   This is the deviceless half of the M15 NLL-cliff red-proof: if it ever stops
+   disagreeing, a sabotaged NLL run would BE the scored run and the cliff check would pass
+   vacuously.
+4. **Ranking comparator reversed** (`v4::select::scored_rows`, the code the engine-side
+   gate scores): `row[b].total_cmp(&row[a])` flipped to `row[a].total_cmp(&row[b])`, i.e.
+   keep the LOWEST-scoring blocks. `the_engines_selection_over_the_oracles_scores_names_
+   the_oracles_set` went red on a real prefill row — `left: {16, 18} right: {17, 18}` —
+   and the below-cap identity test stayed GREEN, which is the specificity half: below the
+   cap the scores must not reach the selection at all. Reverted, 3 passed.
+5. **Ascending re-sort removed** (same function, `sel.sort_unstable()` deleted so survivors
+   come out in score order): both below-cap byte-identity tests went red — the engine one
+   on real oracle scores, the `select.rs` unit one on adversarial synthetic scores — plus
+   the set gate's own layout assert (`row 7: not ascending`). This is what proves the
+   ascending emit is load-bearing rather than tidiness, since the SET is unchanged by it.
+   Reverted, green.
+6. **Per-row rectangle check removed** (`v4::select::assemble`, leaving the aggregate
+   `rows * cols` total that stood alone before this proof): the compensating-ragged case
+   added to `a_ragged_scored_row_is_refused_by_the_rectangle_check` — comp widths 2, 1, 3
+   over a 3-row prefill, summing to exactly `3 * comp[0].len()` — was ACCEPTED as a valid
+   `(3, 5)` rectangle. So the total was blind to raggedness whose entry count happens to
+   balance, which `gather_scored` can be handed because its compressed rows come from a
+   CALLER. The per-row width check is the fix and this is its proof; restored, 11 passed.

@@ -1,10 +1,10 @@
-// The V4-Flash Hadamard+fp4 spread (`act_quant_f4_rotated` — the live kernel here,
-// launched by `kvcompress.rs::compress` as the compressor's finish), and the NOT-YET-WIRED
-// block scorer `Indexer.forward` (model.py:409-441) the file is named for — see the note at
-// `index_score_blocks` for why the scorer is staged work, not dead code.
+// The V4-Flash Hadamard+fp4 spread (`act_quant_f4_rotated`, the compressor finish AND the
+// indexer's q spread) and the block scorer `index_score_blocks` (`Indexer.forward`,
+// model.py:409-441) the file is named for. Both LIVE since M15: `v4/blocksel.rs` drives
+// the scored compressed-block selection through them.
 //
-// S2c-indexer of docs/investigations/v4-flash-port.md. Scored against `src/v4oracle/`'s
-// `Oracle::indexer` by `tests/blockindex_kernel.rs`.
+// S2c-indexer of the old tree's docs/investigations/v4-flash-port.md. Scored against the
+// frozen `v4oracle`'s `Oracle::indexer` by `crates/engine/tests/kernel_v4_indexer.rs`.
 //
 // WHAT IS HERE AND WHY IT IS ONE FILE. `rotate_activation` + `fp4_act_quant` is applied at
 // TWO places in the reference — to the indexer's `q` rows (:420-422) and to its nested
@@ -221,18 +221,15 @@ extern "C" __global__ void act_quant_f4_rotated(float* __restrict__ x, int d) {
 // Scoped to the scoring kernel: `act_quant_f4_rotated` above has no multiply-add to fuse (the
 // Hadamard is pure adds and subtracts, and the fp4 scale is a single multiply), so widening
 // the pragma would suppress nothing and would suggest it had.
-// **NOT WIRED INTO THE ENGINE, AND NOT DEAD — IT IS THE FIX FOR A LIVE LIMITATION.**
-// `f4gpu.rs` selects compressed blocks POSITIONALLY, which agrees with `Indexer.forward` on
-// the block SET only below `positional_context_limit(index_topk)` = 4·(512+1) = **2052
-// tokens**, and `F4Engine::new` refuses at startup above it rather than silently attending
-// the oldest blocks forever. This kernel is what lifts that ceiling: it is already scored
-// bit-identical against the checkpoint's own compressed KV by
-// `tests/blockindex_kernel.rs::indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv`.
-//
-// Recorded because "no caller" reads as "delete me": this is staged work behind a
-// documented engine limitation, and deleting it would throw away the bit-exactness
-// evidence with the kernel. (Proposed for deletion 2026-08-09 and spared on exactly that
-// distinction — contrast `f4gpu.rs::route_row`'s deleted device router.)
+// **WIRED INTO THE ENGINE AT M15 (2026-08-16)** — `v4/blocksel.rs` launches this per step
+// once the causal block count outgrows `index_topk`, which is exactly the ceiling
+// (`positional_context_limit(index_topk)` = 4·(512+1) = **2052 tokens**) the engine used
+// to refuse at startup. The note that stood here for a year of tree-time — "not wired,
+// not dead, staged behind a documented limitation; spared from deletion 2026-08-09 on
+// that distinction" — is kept in this shortened form because it was RIGHT: the kernel
+// arrived scored (bit-identical against the checkpoint's own compressed KV,
+// `tests/kernel_v4_indexer.rs::indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv`)
+// and the wiring milestone added no kernel work at all.
 #pragma clang fp contract(off)
 extern "C" __global__ void index_score_blocks(const float* __restrict__ q,
                                               const float* __restrict__ kv,

@@ -87,10 +87,6 @@ struct Weights {
 /// which preserves exactly the property the separation exists for.
 #[derive(Clone, Copy)]
 struct AttnCall {
-    /// The selection's column count — how many entries the attend kernel reads per query row.
-    /// Resolved with the pointers because it comes from the SAME upload they index and a
-    /// second derivation would be a second chance to disagree with it.
-    topk: usize,
     /// `[m, dim]` — the pre-attention norm's output. Not modified.
     x: *const f32,
     /// `[m, dim]` — the activation-quantized copy of `x`.
@@ -114,19 +110,23 @@ struct AttnCall {
 
 impl V4Engine<'_> {
     /// The whole attention sublayer for `layer` over the rows `at` names: the compressor and
-    /// its placements, the selection, then the four phases.
+    /// its placements, the q/kv projections, the selection, then the attend and the output.
     ///
     /// The order is the reference's (`Attention.forward`) and it is not optional — see this
-    /// module's first obligation.
+    /// module's first obligation. The selection moved BEHIND `qkv_project` with M15, which
+    /// is also the reference's order: the indexer consumes this step's `qr`, so a selection
+    /// built before the q chain could never be scored. The positional path does not care
+    /// where it runs; the scored one does.
     pub(super) fn attention_block(&mut self, layer: usize, at: Extent) -> Result<()> {
         self.dims.validate()?;
         self.compress_and_place(layer, at)?;
-        let (_, topk) = self.upload_selection(layer, at)?;
         let li = layer - self.range.start;
-        let c = self.attn_call(li, topk)?;
+        let c = self.attn_call(li)?;
         let w = self.attn_weights(layer)?;
         self.qkv_project(w, c, at)?;
-        self.attend_rows(w, c, at)?;
+        let scored = self.scored_selection(layer, at)?;
+        let (_, topk) = self.upload_selection(layer, at, scored)?;
+        self.attend_rows(w, c, at, topk)?;
         self.output_project(w, c, at)
     }
 
@@ -138,7 +138,16 @@ impl V4Engine<'_> {
     /// produced a selection over the wrong slot space that matched its own shape and passed
     /// every guard — in-bounds reads, no crash, fluent wrong text. One construction site is the
     /// version of that fix with nothing left to override.
-    fn upload_selection(&mut self, layer: usize, at: Extent) -> Result<(usize, usize)> {
+    ///
+    /// `scored` is [`V4Engine::scored_selection`]'s answer: `Some` rows go through
+    /// [`Sel::gather_scored`], `None` means the positional fill is the same selection for
+    /// less work (or the only one, on an unindexed layer) and goes through [`Sel::gather`].
+    fn upload_selection(
+        &mut self,
+        layer: usize,
+        at: Extent,
+        scored: Option<Vec<Vec<i32>>>,
+    ) -> Result<(usize, usize)> {
         let sel = Sel {
             win: self.dims.window,
             kind: self.layers[layer - self.range.start].kind,
@@ -146,9 +155,11 @@ impl V4Engine<'_> {
             at,
         };
         self.idx_host.clear();
-        let shape = sel
-            .gather(&mut self.idx_host)
-            .map_err(|e| e.context(format!("layer {layer} selection at {at:?}")))?;
+        let shape = match &scored {
+            Some(rows) => sel.gather_scored(rows, &mut self.idx_host),
+            None => sel.gather(&mut self.idx_host),
+        }
+        .map_err(|e| e.context(format!("layer {layer} selection at {at:?}")))?;
         self.idx_dev.copy_in_at(0, as_le_bytes(&self.idx_host))?;
         Ok(shape)
     }
@@ -170,10 +181,14 @@ impl V4Engine<'_> {
     }
 
     /// Resolve the layer's scratch and cache pointers once.
-    fn attn_call(&mut self, li: usize, topk: usize) -> Result<AttnCall> {
+    ///
+    /// The selection's column count is NOT here: since the selection moved behind the q
+    /// chain it does not exist yet when the pointers are resolved, so it travels from
+    /// `upload_selection`'s return straight into `attend_rows` — one producer, one hop,
+    /// nothing to disagree with.
+    fn attn_call(&mut self, li: usize) -> Result<AttnCall> {
         let freqs = self.rope.for_layer(self.layers[li].kind)?;
         Ok(AttnCall {
-            topk,
             x: self.xw.ptr().cast(),
             xq: self.xq.ptr_mut().cast(),
             qr: self.a_qr.ptr_mut().cast(),
@@ -263,7 +278,7 @@ impl V4Engine<'_> {
     /// TAIL, so that buffer IS the concatenation; at decode the compressed region is the
     /// cache's tail behind the ring. Both are one contiguous buffer the kernel indexes
     /// straight into.
-    fn attend_rows(&mut self, w: Weights, p: AttnCall, at: Extent) -> Result<()> {
+    fn attend_rows(&mut self, w: Weights, p: AttnCall, at: Extent, topk: usize) -> Result<()> {
         let d = self.dims;
         let (nh, hd, m) = (d.n_heads, d.head_dim, at.query_rows());
         // SAFETY: every copy below stays inside `cache[0, window)` — the ring region — and the
@@ -271,7 +286,8 @@ impl V4Engine<'_> {
         let kv_src: *const f32 = unsafe { self.write_ring(p, at)? };
         // SAFETY: `q` is `m * nh * hd`, `kv_src` covers every row the selection names (this
         // module's second obligation), `attn_sink` is `nh` resident f32, `idxs` is the
-        // `m * topk` buffer just uploaded, and `o` is `m * nh * hd`.
+        // `m * topk` buffer just uploaded — `topk` IS that upload's column count, handed
+        // straight from `upload_selection`'s return — and `o` is `m * nh * hd`.
         unsafe {
             launch_gather_attn_shared_kv(
                 p.q,
@@ -281,7 +297,7 @@ impl V4Engine<'_> {
                 m,
                 nh,
                 hd,
-                p.topk,
+                topk,
                 (hd as f32).powf(-0.5),
                 p.o,
                 NULL_STREAM,

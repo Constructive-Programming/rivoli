@@ -13,10 +13,10 @@
 //! **Every device buffer is allocated once, here.** A decode allocates nothing on the hot
 //! path, which is `crate::glm::engine`'s rule and the reason both engines' `new` are long.
 
+use super::blocksel::IndexerBank;
 use super::geometry::{Dims, LayerKind, tightest_ratio};
 use super::kvcompress::LayerCompressor;
 use super::rope::{self, Params};
-use super::select::positional_context_limit;
 use crate::device::{DeviceBuf, as_le_bytes};
 use crate::resident::Fp8Weight;
 use crate::routed::{ExpertSlot, ResolvedBatch};
@@ -262,6 +262,11 @@ pub struct V4Engine<'a> {
     pub(super) a_y: DeviceBuf,
     pub(super) idx_host: Vec<i32>,
     pub(super) idx_dev: DeviceBuf,
+    /// The scored-selection bank — `None` exactly when `max_ctx` sits below
+    /// `positional_context_limit`, where the positional fill is the same bytes for less
+    /// work and the engine is the pre-M15 arm bit for bit. `super::blocksel` owns the
+    /// pipeline; this engine owns only the lifetime and the reset.
+    pub(super) indexer: Option<IndexerBank>,
 
     pub(super) gate_logits: DeviceBuf,
     pub(super) gl_host: Vec<u8>,
@@ -363,10 +368,6 @@ impl<'a> V4Engine<'a> {
                 range.end
             );
         }
-        // Checked a SECOND time here: `Engine::open` refuses this at the door, before the pin
-        // reads nine gigabytes, and a hand-built caller never passed that door.
-        check_context(cfg, max_ctx)?;
-
         let dims = Dims::from_config(cfg).context("v4 attention dims from the artifact")?;
         let (dim, hc, hd) = (cfg.hidden, cfg.hc_mult, cfg.head_dim);
         let (nhd, n_desc) = (cfg.n_heads * hd, cfg.n_experts);
@@ -379,6 +380,7 @@ impl<'a> V4Engine<'a> {
         let idx_cols = cfg.sliding_window + max_ctx.div_ceil(tightest);
         let a_kv_rows = max_m + max_m.div_ceil(tightest);
         let mut layers = Vec::with_capacity(range.len());
+        let mut kinds = Vec::with_capacity(range.len());
         for l in range.clone() {
             let kind =
                 LayerKind::from_config(cfg, l).with_context(|| format!("classifying layer {l}"))?;
@@ -388,7 +390,11 @@ impl<'a> V4Engine<'a> {
             // (`Geom::attention` and the pin's `Option`) are ASSERTED to agree there.
             let cw = pin.layer(l)?.compressor;
             layers.push(DeviceLayer::new(cfg, kind, max_ctx, max_m, cw.as_ref())?);
+            kinds.push((l, kind));
         }
+        // The scored-selection bank, built from the same classification the layers were —
+        // `None` below the boundary, where its absence IS the below-cap byte-identity.
+        let indexer = IndexerBank::new(&pin, cfg, &kinds, max_ctx, max_m)?;
 
         let mut e = Self {
             dims,
@@ -415,6 +421,7 @@ impl<'a> V4Engine<'a> {
             a_y: f32s(max_m * cfg.o_groups * cfg.o_lora_rank)?,
             idx_host: Vec::with_capacity(max_m * idx_cols),
             idx_dev: DeviceBuf::new(max_m * idx_cols * size_of::<i32>())?,
+            indexer,
             gate_logits: f32s(max_m * n_desc)?,
             gl_host: Vec::new(),
             scores: vec![0.0; n_desc],
@@ -467,6 +474,10 @@ impl<'a> V4Engine<'a> {
         for st in &mut self.layers {
             st.reset(self.cfg)?;
         }
+        // The indexer's pooling state and cache are per-sequence exactly like the layers'.
+        if let Some(bank) = &mut self.indexer {
+            bank.reset()?;
+        }
         // `launch_moe_acc_drain` resets `acc` to zero as it converts, so this is only the
         // FIRST use's initialisation — but `hipMalloc` does not zero, and an accumulator that
         // starts at garbage adds a fixed-point garbage vector to layer 0's first token and
@@ -502,43 +513,12 @@ impl<'a> V4Engine<'a> {
     }
 }
 
-/// Refuse a context at or past the point where a POSITIONAL compressed selection stops
-/// agreeing with the trained-in indexer.
-///
-/// Called at the DOOR — `Engine::open`'s V4 arm runs this before `V4Pin::build` reads nine
-/// gigabytes — and again inside [`V4Engine::new`], which is not redundant: a caller that
-/// constructs the engine directly never passed the door.
-/// [`super::select::Sel::shape`] refuses it a third time at the call, per query, which is the
-/// only one of the three that sees a hand-built selection.
-///
-/// **`<`, not `<=`.** The selection refuses when the block count EXCEEDS `index_topk`, i.e. at
-/// `end_pos >= limit`, and `forward` admits `start_pos + m == max_ctx`. So `max_ctx == limit`
-/// would pass here and still refuse at the last position. The decode loop's own accounting
-/// never reaches it, which is exactly the kind of slack that makes a boundary bug invisible
-/// until someone drives `forward` directly.
-///
-/// **The shipped `--ctx` default does not satisfy this**, and that is deliberate rather than a
-/// bug in either: at `index_topk = 512` the ceiling is 2052, so `rivoli V4DIR --bench 4` on
-/// the CLI's 4096 default is REFUSED with this message, which names the flag and the number.
-/// Clamping instead would contradict `rivoli_core::legality`'s `Support` on `--ctx` — a user
-/// who asked for a 4096-token conversation and got 2048 would have it silently truncated —
-/// and the flag is the knob, so the refusal is the honest answer until the indexer runs.
-pub fn check_context(cfg: &V4Config, max_ctx: usize) -> Result<()> {
-    let limit = positional_context_limit(cfg.index_topk);
-    let indexed = (0..cfg.n_layers)
-        .filter(|&l| cfg.layer_has_indexer(l).unwrap_or(false))
-        .count();
-    ensure!(
-        max_ctx < limit,
-        "--ctx {max_ctx} reaches {limit}, past which the compressed block set is decided by \
-         the lightning indexer's SCORES. This arm selects blocks POSITIONALLY, which agrees \
-         with the indexer on the block SET only below that length; above it, keeping the \
-         first {} blocks keeps the OLDEST and silently stops attending everything newer, on \
-         the {indexed} indexed layer(s). Pass --ctx below {limit}.",
-        cfg.index_topk,
-    );
-    Ok(())
-}
+// `check_context` — the startup refusal of any `--ctx` at or past
+// `positional_context_limit` — was DELETED with M15's scored selection, which is the
+// "the ceiling goes away when the indexer does" its own doc promised. The boundary itself
+// did not go anywhere: `IndexerBank::new` plans around it (below it the bank is `None` and
+// the arm is the pre-M15 one bit for bit), and `Sel::shape` still refuses a POSITIONAL
+// fill past it, because that fill is as wrong as it ever was.
 
 /// A `groups = 1` fp8-e4m3 GEMV with a bf16-rounded output — every projection on this arm
 /// except the grouped output one.

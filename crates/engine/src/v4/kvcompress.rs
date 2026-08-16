@@ -55,7 +55,7 @@ use std::ffi::c_void;
 /// would be strictly better — it would REPLACE the f32 rather than adding to it — but that
 /// changes `CompressorWeights`' field types and every reader with them, and this is the
 /// engine's bug to fix, not the loader's.
-fn narrow_to_bf16(src: *const f32, n: usize) -> Result<DeviceBuf> {
+pub(super) fn narrow_to_bf16(src: *const f32, n: usize) -> Result<DeviceBuf> {
     let mut bytes = Vec::new();
     // SAFETY: `src` is a pin placement of at least `n` f32 (its `[cd, dim]` extent, computed
     // by the caller from the same `Geom` the kernel is handed), and no kernel is in flight —
@@ -92,6 +92,22 @@ pub(super) struct CompInput {
     pub norm: *const f32,
     /// This layer's rotary table, interleaved `(cos, sin)`.
     pub freqs: *const f32,
+}
+
+impl CompInput {
+    /// Assemble from a pin's [`CompressorWeights`] plus the two per-call pointers. The one
+    /// construction site for BOTH compressors (attention here, the indexer's in
+    /// `super::blocksel`): the `ape`/`norm` unpacking is where a swapped pair would be
+    /// finite and silent, so it happens once.
+    pub(super) fn of(x: *const f32, dim: usize, cw: &CompressorWeights, freqs: *const f32) -> Self {
+        Self {
+            x,
+            dim,
+            ape: cw.ape,
+            norm: cw.norm,
+            freqs,
+        }
+    }
 }
 
 /// One compressed layer's compressor: geometry, narrowed weights, pooling state, scratch.
@@ -142,12 +158,37 @@ impl LayerCompressor {
             );
             return Ok(None);
         };
+        Ok(Some(Self::build(geom, cfg.hidden, max_m, cw)?))
+    }
+
+    /// The INDEXER's nested compressor — [`Geom::indexer`]'s Hadamard-fp4 finish over
+    /// `index_head_dim`, where [`LayerCompressor::new`] builds the attention one. Fallible
+    /// rather than `Option`: the caller (`super::blocksel`) reaches here only for a layer
+    /// whose pin carries indexer weights, so a `None` geometry is a classification bug and
+    /// not a layer class.
+    pub(super) fn indexer(
+        cfg: &V4Config,
+        kind: LayerKind,
+        max_m: usize,
+        cw: &CompressorWeights,
+    ) -> Result<Self> {
+        let eps = cfg.rms_norm_eps as f32;
+        let geom = Geom::indexer(kind, cfg.index_head_dim, cfg.qk_rope_head_dim, eps)
+            .context("an indexer compressor on a layer whose class has no indexer")?;
+        Self::build(geom, cfg.hidden, max_m, cw)
+    }
+
+    /// The shared construction: narrow the two GEMM weights, allocate state and scratch at
+    /// the geometry's widths, reset. One body for both constructors, because the widths are
+    /// exactly where the attention and indexer compressors differ and two spellings of this
+    /// arithmetic is how one of them drifts.
+    fn build(geom: Geom, hidden: usize, max_m: usize, cw: &CompressorWeights) -> Result<Self> {
         let f32s = |n: usize| DeviceBuf::new(n * size_of::<f32>());
         let (cd, d, ratio) = (geom.cd(), geom.d(), geom.ratio());
         let mut c = Self {
             geom,
-            w_kv: narrow_to_bf16(cw.wkv, cd * cfg.hidden)?,
-            w_gate: narrow_to_bf16(cw.wgate, cd * cfg.hidden)?,
+            w_kv: narrow_to_bf16(cw.wkv, cd * hidden)?,
+            w_gate: narrow_to_bf16(cw.wgate, cd * hidden)?,
             state_kv: f32s(geom.state_len())?,
             state_score: f32s(geom.state_len())?,
             proj_kv: f32s(max_m * cd)?,
@@ -156,7 +197,26 @@ impl LayerCompressor {
             scratch_rows: max_m,
         };
         c.reset()?;
-        Ok(Some(c))
+        Ok(c)
+    }
+
+    /// Where the emitted blocks landed — what a placer copies FROM after [`Self::run`]
+    /// reported a non-zero count. A method rather than a public field so the buffer cannot
+    /// be written around the emit path.
+    pub(super) fn emitted(&self) -> *const u8 {
+        self.blocks.ptr()
+    }
+
+    /// This compressor's block width — [`Geom::d`], re-exposed so a caller sizing a
+    /// destination for [`Self::emitted`] reads the width off the SAME geometry the emit
+    /// used rather than carrying a second copy of it.
+    pub(super) fn d(&self) -> usize {
+        self.geom.d()
+    }
+
+    /// This compressor's stride — [`Geom::ratio`], same argument as [`Self::d`].
+    pub(super) fn ratio(&self) -> usize {
+        self.geom.ratio()
     }
 
     /// `kv_state` zeroed, `score_state` `-inf`.
@@ -196,7 +256,16 @@ impl LayerCompressor {
     /// `stream`'s completion — not merely the call, which returns as soon as the last
     /// operation is ENQUEUED. This synchronizes nothing. `stream` is a live `hipStream_t`, or
     /// null for the default stream.
-    unsafe fn run(&mut self, w: CompInput, at: Extent, stream: *mut c_void) -> Result<usize> {
+    ///
+    /// `pub(super)` since M15: `super::blocksel` drives the indexer's compressor through
+    /// exactly this call, under exactly this contract — a second launch sequence there would
+    /// be the two-files drift this module's header records.
+    pub(super) unsafe fn run(
+        &mut self,
+        w: CompInput,
+        at: Extent,
+        stream: *mut c_void,
+    ) -> Result<usize> {
         at.check_single_row_decode()?;
         ensure!(
             at.seqlen <= self.scratch_rows,
@@ -470,14 +539,8 @@ impl V4Engine<'_> {
         let c = self.layers[li].comp.as_mut().with_context(|| {
             format!("layer {layer} compresses but its DeviceLayer has no compressor state")
         })?;
-        let w = CompInput {
-            x,
-            dim,
-            ape: cw.ape,
-            norm: cw.norm,
-            // The layer's rotary table, resolved through the ONE site.
-            freqs,
-        };
+        // `freqs` is the layer's rotary table, resolved through the ONE site above.
+        let w = CompInput::of(x, dim, &cw, freqs);
         // SAFETY: every pointer above is either a pin placement outliving this engine or a
         // `DeviceBuf` field of `self`, at the shape `CompInput` documents. The null stream is
         // what the rest of this arm's attention path runs on.
