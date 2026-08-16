@@ -1,0 +1,52 @@
+The transformer architecture processes a sentence by first converting each token into a
+dense vector, then repeatedly mixing those vectors with attention and reshaping them with
+feed-forward layers. Attention lets every position look at every other position and decide,
+per head, which ones matter. Because the mixing is a weighted sum rather than a recurrence,
+all positions are processed in parallel, which is the property that made these models
+practical to train at scale.
+
+A mixture-of-experts layer replaces the single feed-forward block with many smaller ones and
+a router that selects a handful per token. The parameter count grows without the per-token
+compute growing with it, since only the selected experts run. The router is a small linear
+layer whose logits are turned into scores; the highest-scoring experts are chosen and their
+outputs are combined using those same scores as weights. Load balancing is usually
+encouraged with a bias term that nudges the ranking away from collapsing onto a few popular
+experts.
+
+Quantization reduces the memory each expert occupies. Vector quantization replaces groups of
+weights with indices into a learned codebook, so a block of values costs a few bits each
+plus one scale. Integer quantization instead stores a small integer per weight together with
+a per-row or per-block scale factor. The first is smaller but its dot product becomes a
+random gather, which is limited by cache behaviour rather than arithmetic; the second is
+larger but decodes sequentially and runs faster per element.
+
+On a machine where the weights do not all fit in memory at once, the experts must be
+streamed from storage as they are selected. A cache holds the most useful subset. When a
+requested expert is absent the engine stalls on a read of many megabytes, and the cost of
+that stall dominates everything else the layer does. This is why the policy governing which
+experts stay resident matters as much as the arithmetic, and why a policy that changes which
+experts are selected in the first place is worth measuring carefully.
+
+Rivers carved the valley slowly, and the town at its mouth grew up around a single bridge.
+In winter the water ran high and brown; in late summer it fell until the gravel bars showed
+through, and children walked out to islands that had been invisible in June. The bridge was
+replaced twice, once after a flood and once because the road was widened, but the crossing
+itself stayed where it had always been, which is how such places usually persist.
+
+She had not expected the letter, and read it twice before setting it down. It said very
+little: that the house had sold, that the furniture would be kept in storage until spring,
+and that nobody needed her to decide anything yet. That last sentence was the one she
+returned to. It was meant kindly, she thought, and it was almost certainly untrue.
+
+The proof proceeds by induction on the structure of the term. In the base case the term is a
+variable and the property holds trivially. For the inductive step, assume the property holds
+for every proper subterm. Each formation rule then preserves it, since the rule's conclusion
+mentions only the subterms' types and the property is closed under substitution. The
+remaining case, application, requires the substitution lemma proved above, and with it the
+argument closes.
+
+Prices fell through the second quarter before recovering in September, though not to their
+previous level. Analysts disagreed about the cause. The simplest explanation was that
+inventories had been built up in anticipation of demand that did not arrive, and that the
+correction was therefore mechanical rather than a signal about consumption. The alternative
+view, that the earlier prices had been wrong, was harder to argue and harder to refute.

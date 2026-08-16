@@ -82,6 +82,15 @@ appears that enum dispatch cannot fill.
   flock + descendant-pid witness per arm, never builds. On-demand (GPU, ~1 h), not CI.
   Red-proofed 2026-08-15 by a gate-codebook inversion, after two measured sub-threshold
   rungs (1-ulp: erased by fp16 narrowing; one sign flip: under argmax margins).
+- **ppl gates** — `tests/ppl-gates.sh`: three cells over the M10 instruments — `profile`
+  (the stamped phase buckets account for the decode wall, per-bucket census + a re-derived
+  remainder), `p4` (P4 at NLL: two `--max-mem` values must not move one NLL bit in
+  int3-vq, with differing `hit_pct` as the anti-vacuity check), `tf` (paired dNLL against
+  the pinned reference inside a pre-registered ±ln(1.01) equivalence band; INCONCLUSIVE is
+  never a pass). `--expect-red[=FRAGMENT]` inverts the classification so a red proof is
+  judged by the gate's own code. On-demand (GPU, ~30 min + ~6 min per red-proof), not CI.
+  Shares `tests/gpu-witness.sh` with the parity gate. Classifier half red-proofed
+  2026-08-16 deviceless; the engine half is OWED (`docs/measurement/gate-red-proofs.md` §5).
 - **smoke** — `tests/smoke-glm.sh`: the CLI end to end — every legality refusal asserted
   against the table's own message fragments, the bench cell pinned to the recorded
   reference ids, a live serve round-trip (readiness, /v1/models, non-stream, SSE).

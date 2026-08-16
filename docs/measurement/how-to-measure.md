@@ -97,6 +97,35 @@ hit rate to apply.
 
 ## What the time IS — the CLASS axis (always on, `class/tok`)
 
+> **CORRECTED 2026-08-16 (M10): the `class/tok` line does not exist in this tree.** Every
+> field behind it — `gpu_wait_ms`, `io_wait_ms`, the `cpu` split, the `route`/`tail`
+> sub-splits, `moe_us_by_miss` — described instruments the OLD engine carried (reaper-ring
+> stamps, HIP-event brackets, the DSA indexer's own timeline) and the rewrite carries none
+> of them yet. They were removed from `ProfileSummary` rather than ported as zeroes,
+> because a bucket that reads 0 because nothing filled it is worse than an absent one.
+>
+> What is always on here instead is the **PHASE** line, four disjoint decode-thread
+> buckets plus a measured remainder:
+>
+> ```
+> PROFILE/tok: wall <W>ms = attend <A> + ffn <F> + fetch-wait <X> + head <H> + other <O>
+>              | named <P>% of wall
+> ```
+>
+> Unlike the class spans below these DISJOINTLY partition wall, so they may be stacked and
+> `other` is the honest unattributed remainder rather than a residual absorbing every
+> error. **What each bucket covers is per-arm** — set by where that arm's existing sync
+> points already sit, because no sync was added to sharpen them (a sync would change the
+> thing being measured) — and the per-arm table lives on `ProfileSummary`'s doc in
+> `crates/engine/src/telemetry.rs`, not here, so it cannot drift from the code that stamps
+> it. `tests/ppl-gates.sh`'s `profile` cell bounds `other` and censuses the buckets for
+> zero; its red proofs are in [gate-red-proofs.md](gate-red-proofs.md) §5.
+>
+> **The method below is still the method** — that a bracket mixing host compute with
+> blocking waits localises cost without explaining it, and that a mechanism attributed to a
+> hot kernel without reading its ISA is a hypothesis. Each removed split returns with the
+> instrument that measures it, and the paragraphs below say what each one was for.
+
 The phase buckets below (`route` / `moe-gpu` / `tail`) say **where** time goes. They are
 *regions*, and each mixes host compute with blocking waits — which is why `tail` spent this
 document's whole life with most of itself attributable to no kernel. The `class/tok` line

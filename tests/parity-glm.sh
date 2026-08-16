@@ -55,64 +55,20 @@ echo "   ref: $(stat -c '%y' "$REF_BIN") $REF_BIN"
 echo "   new: $(stat -c '%y' "$NEW_BIN") $NEW_BIN"
 
 # --- contention witness -------------------------------------------------------------
-# The flock is advisory and other tenants skip it, so every arm carries a witness:
-# KFD tenants sampled every 5 s while the arm runs. Ours is identified by DESCENT from
-# the arm's own pid — never by binary path, because on this shared machine a peer
-# agent may run the identical pinned reference binary, and a path whitelist would wave
-# it through (the exact false-green the witness exists to prevent). Each entry is
-# resolved against /proc before being believed (the empty-dir/phantom trap).
-descends_from() { # $1 = candidate pid, $2 = ancestor pid
-    local p=$1
-    while [ "$p" -gt 1 ] 2>/dev/null; do
-        [ "$p" = "$2" ] && return 0
-        p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null) || return 1
-        [ -n "$p" ] || return 1
-    done
-    return 1
-}
-
-witness() { # $1 = out-file, $2 = arm pid; runs until killed
-    while :; do
-        find /sys/class/kfd/kfd/proc/ -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null |
-            while read -r p; do
-                [ -d "/proc/$p" ] || continue
-                descends_from "$p" "$2" && continue
-                cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || true
-                echo "pid=$p cmd=${cmd:-?}" >>"$1"
-            done
-        sleep 5
-    done
-}
-
-gtt_used() { # KFD is blind to Vulkan tenants (llama-swap once held 1.6 GB with zero KFD
-    # entries), so the pre-arm baseline reads the allocator itself.
-    cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | awk '{s+=$1} END {print s+0}'
-}
-
-run_arm() { # $1 = arm name, $2 = stdout file, $3 = stderr file, rest = command.
-    # The arm's streams are redirected HERE, on the flock'd command only, so DISCARD
-    # diagnostics reach the terminal instead of being buried in the arm's log.
-    local wfile="$SCRATCH/witness-$1" wpid apid gtt rc=0
-    gtt=$(gtt_used)
-    if [ "$gtt" -gt $((2 << 30)) ]; then
-        echo "DISCARD arm '$1': $((gtt >> 20)) MiB GTT already held before the arm started — a ghost tenant (Vulkan/llama-swap?) KFD cannot see" >&2
-        exit 3
-    fi
-    : >"$wfile"
-    flock "$LOCK" "${@:4}" >"$2" 2>"$3" &
-    apid=$!
-    witness "$wfile" "$apid" &
-    wpid=$!
-    wait "$apid" || rc=$?
-    kill "$wpid" 2>/dev/null || true
-    wait "$wpid" 2>/dev/null || true
-    if [ -s "$wfile" ]; then
-        echo "DISCARD arm '$1': foreign GPU tenant witnessed:" >&2
-        sort -u "$wfile" >&2
-        exit 3
-    fi
-    return "$rc"
-}
+# `descends_from`/`witness`/`gtt_used`/`run_arm` lived HERE until 2026-08-16, when
+# ppl-gates.sh needed the same four and copying them would have been the duplication this
+# house forbids. The argument for each is in the helper, at the code.
+#
+# **The move was not purely an extraction and this gate gained a refusal by it.** The old
+# `gtt_used` summed its sysfs glob through `awk '{print s+0}'`, which returns a bare 0 both
+# for "no GPU tenant" and for "that path does not exist" — an unarmed ghost-tenant guard
+# reading exactly like a clean box, and `docs/measurement/baseline-2026-08-16.md` records
+# two arms taken in that state. The helper's version prints nothing when no node matched
+# and `run_arm` turns that into `exit 2`. So this script now REFUSES on a box where the
+# card index moved, where before it would have run and reported a number. The codes
+# themselves (2 setup, 3 discarded) are unchanged.
+# shellcheck source=tests/gpu-witness.sh
+. "$(dirname "$0")/gpu-witness.sh"
 
 # --- arm B, shared by green and red-proof -------------------------------------------
 decode_new() { # $1 = artifact dir, $2 = out ids file; prompt ids read from $SCRATCH/prompt-ids
