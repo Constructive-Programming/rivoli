@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Forwarded down the DAG: `--features rocm` at any level arms the one backend.
+# THE BUILD IS THE ROCM BUILD (owner rule 2026-08-16) — see crates/engine/Cargo.toml for
+# the whole note. Deviceless arm: `--no-default-features`.
+default = ["rocm"]
+# Forwarded down the DAG: `rocm` at any level arms the one backend.
 rocm = ["rivoli-engine/rocm"]
 otlp = ["rivoli-engine/otlp"]
 teacher-forcing = ["rivoli-engine/teacher-forcing"]

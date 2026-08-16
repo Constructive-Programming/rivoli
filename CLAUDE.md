@@ -91,9 +91,18 @@ appears that enum dispatch cannot fill.
 
 ## Build and test
 
+**The build IS the rocm build** (owner rule 2026-08-16): `default = ["rocm"]` at every
+level of the DAG, so a bare `cargo build` is the real engine and a bare
+`cargo test --workspace` is a GPU arm — flock it and serialize it like any device suite.
+The deviceless refusal-stub arm is `--no-default-features`; it is what CI's hipcc-less
+runner builds, and the feature matrix pins every cell's exact set with it.
+
 ```bash
-cargo test --workspace            # dev profile: debug_assert! is LIVE. Default to this.
-cargo clippy --workspace --all-targets
+flock /var/run/sys-gpu.lock -c 'cargo test --workspace -- --test-threads=1'
+                                  # dev profile, host + device in one battery.
+cargo test --workspace --no-default-features   # the deviceless arm (CI's build); safe anywhere
+cargo clippy --workspace --all-targets                        # rocm arm
+cargo clippy --workspace --all-targets --no-default-features  # stub arm
 cargo build --release             # benchmarks and performance evaluation ONLY
 ```
 

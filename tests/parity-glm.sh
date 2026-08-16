@@ -42,7 +42,7 @@ MEM=${3:-100}
 # the comparison (measured in the old tree: ms/miss 1.36 -> 5.14). Both binaries must
 # arrive prebuilt or the gate refuses.
 [ -x "$REF_BIN" ] || { echo "FAIL: reference binary missing: $REF_BIN (build it elsewhere first — this gate never builds)" >&2; exit 2; }
-[ -x "$NEW_BIN" ] || { echo "FAIL: rewrite binary missing: $NEW_BIN (cargo build --features rocm --example glm_smoke BEFORE the gate, never between arms)" >&2; exit 2; }
+[ -x "$NEW_BIN" ] || { echo "FAIL: rewrite binary missing: $NEW_BIN (cargo build --example glm_smoke BEFORE the gate — rocm is default since the 2026-08-16 fuse — never between arms)" >&2; exit 2; }
 [ -e "$LOCK" ] || { echo "FAIL: GPU lock file missing: $LOCK" >&2; exit 66; }
 [ -d "$ARTIFACT" ] || { echo "FAIL: artifact dir missing: $ARTIFACT" >&2; exit 2; }
 

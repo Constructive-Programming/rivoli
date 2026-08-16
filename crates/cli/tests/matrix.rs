@@ -41,10 +41,13 @@ fn the_feature_matrix_lists_match_the_manifests() {
         .split("\n[")
         .next()
         .expect("features table body");
+    // `default` is cargo's reserved default-set name, not a feature the matrix can toggle
+    // — since the fuse (owner rule 2026-08-16) it names `["rocm"]` and every matrix cell
+    // pins its exact set with `--no-default-features` instead.
     let mut declared: Vec<String> = feats
         .lines()
         .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim().to_string()))
-        .filter(|k| !k.starts_with('#') && k != "rocm")
+        .filter(|k| !k.starts_with('#') && k != "rocm" && k != "default")
         .collect();
     declared.sort();
     let mut optional = sh_array(&script, "OPTIONAL");
@@ -73,7 +76,7 @@ fn the_feature_matrix_lists_match_the_manifests() {
     let mut declared_backends: Vec<String> = bfeats
         .lines()
         .filter_map(|l| l.split_once(" = ").map(|(k, _)| k.trim().to_string()))
-        .filter(|k| !k.starts_with('#'))
+        .filter(|k| !k.starts_with('#') && k != "default")
         .collect();
     declared_backends.sort();
     let mut backends = sh_array(&script, "BACKENDS");

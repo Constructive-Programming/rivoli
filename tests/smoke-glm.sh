@@ -21,7 +21,7 @@ LOCK=/var/run/sys-gpu.lock
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/smoke-glm.XXXXXX")
 PORT=${SMOKE_PORT:-18173}
 
-[ -x "$BIN" ] || { echo "FAIL: rivoli binary missing: $BIN (build --features rocm first)" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "FAIL: rivoli binary missing: $BIN (cargo build first — rocm is default since the 2026-08-16 fuse)" >&2; exit 1; }
 [ -e "$LOCK" ] || { echo "FAIL: GPU lock file missing: $LOCK" >&2; exit 66; }
 
 pass=0

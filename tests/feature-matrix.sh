@@ -91,13 +91,16 @@ echo
 # The backend cells below deliberately keep the looser bar: no CI job builds a backend at
 # all, so there is no bar to match them to, and raising it here would be an unreviewed
 # change to a build nothing else checks.
+# Every cell pins its EXACT feature set with --no-default-features: since the fuse (owner
+# rule 2026-08-16) `default = ["rocm"]`, so without the pin every cell would silently
+# include the backend and the deviceless half of the matrix would collapse into one build.
 run "(no features) — refusal stub" \
-  env RUSTFLAGS="-D warnings" cargo check --release --quiet --workspace --all-targets
+  env RUSTFLAGS="-D warnings" cargo check --release --quiet --workspace --all-targets --no-default-features
 
 while IFS= read -r sub; do
   for b in "${BACKENDS[@]}"; do
     feats="$b${sub:+,${sub// /,}}"
-    run "check  --features $feats" cargo check --release --quiet -p rivoli --all-targets --features "$feats"
+    run "check  --features $feats" cargo check --release --quiet -p rivoli --all-targets --no-default-features --features "$feats"
   done
 done < <(combos)
 
@@ -105,7 +108,7 @@ done < <(combos)
 # cheap tests pass under it too, not just that it type-checks.
 UNION="${BACKENDS[0]},$(IFS=,; echo "${OPTIONAL[*]}")"
 run "test   --features $UNION ${CHEAP_TESTS[*]}" \
-  cargo test --release --quiet -p rivoli --features "$UNION" "${CHEAP_TESTS[@]}"
+  cargo test --release --quiet -p rivoli --no-default-features --features "$UNION" "${CHEAP_TESTS[@]}"
 
 echo
 echo "----- $PASS passed, $FAIL failed"

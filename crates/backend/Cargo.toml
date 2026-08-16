@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# The only backend. A featureless build compiles this crate down to `abi` alone — that is
-# the refusal-stub configuration CI tests, not breakage.
+# THE BUILD IS THE ROCM BUILD (owner rule 2026-08-16) — see crates/engine/Cargo.toml for
+# the whole note. Deviceless arm: `--no-default-features`.
+default = ["rocm"]
+# The only backend. A `--no-default-features` build compiles this crate down to `abi`
+# alone — that is the refusal-stub configuration CI tests, not breakage.
 rocm = ["dep:atomic-waker", "dep:anyhow"]
 
 [dependencies]
