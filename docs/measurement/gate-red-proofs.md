@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M15's scored selection carries six deviceless proofs on BOTH sides of its gate: a tie-rule flip reddening the oracle-side list-equality on a real tie (left [[9,8]] vs right [[8,9]]) — which the engine-side set gate provably could not have caught, since the set was unchanged — a reversed ranking comparator reddening that engine-vs-oracle gate (left {16,18} vs right {17,18}) while the below-cap identity stayed green, a dropped ascending emit reddening the below-cap byte-identity on both real and adversarial scores, a removed per-row rectangle check accepting a compensating-ragged buffer the aggregate total was blind to, and two standing fixtures pinning score-perturbation resolution above the boundary against provable inertness below it plus the keep-oldest sabotage's observability.
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M15's scored selection carries seven deviceless proofs on BOTH sides of its gate: a tie-rule flip reddening the oracle-side list-equality on a real tie (left [[9,8]] vs right [[8,9]]) — which the engine-side set gate provably could not have caught, since the set was unchanged — a reversed ranking comparator reddening that engine-vs-oracle gate (left {16,18} vs right {17,18}) while the below-cap identity stayed green, a dropped ascending emit reddening the below-cap byte-identity on both real and adversarial scores, a removed per-row rectangle check accepting a compensating-ragged buffer the aggregate total was blind to, and two standing fixtures pinning score-perturbation resolution above the boundary against provable inertness below it plus the keep-oldest sabotage's observability.
 ---
 
 # M0 gate red proofs
@@ -121,7 +121,7 @@ just that one did.
 The M15 gate compares the engine's top-k (`v4::select::scored_rows`) against the frozen
 oracle's own `Indexer.forward` exports on the toy (`index_topk = 2`, cap = 12 tokens, so
 truncation is REACHED and counted — the "set-invariant goldens" trap the shipped 512 sets
-below 2052 tokens). Six proofs; the four executed ones were reverted and the tree re-run
+below 2052 tokens). Seven proofs; the five executed ones were reverted and the tree re-run
 green, and proofs 2 and 3 stand as fixtures.
 
 **Proofs 1-3 redden the ORACLE-side file; 4-6 redden the gate that actually compares the
@@ -156,7 +156,17 @@ A gate is proven by a perturbation of the code IT scores.
    the set gate's own layout assert (`row 7: not ascending`). This is what proves the
    ascending emit is load-bearing rather than tidiness, since the SET is unchanged by it.
    Reverted, green.
-6. **Per-row rectangle check removed** (`v4::select::assemble`, leaving the aggregate
+6. **Prefill capture dropped from the oracle-side fixture** (`steps()` in
+   `v4_indexer_goldens.rs`, standing in as the rename that would silently drop it): claim
+   1 — "below the cap the indexer keeps every block it is offered", the premise the whole
+   below-cap byte-identity argument rests on — examined ZERO rows while the existing
+   `truncated_rows >= 5` floor was still met by the four decode steps alone, because every
+   decode row here sits above the cap. Observed red only after adding the second floor:
+   `only 0 non-empty below-cap rows — the prefill capture is gone and claim 1 examined
+   nothing`. Reverted, 2 passed. **The lesson is the general one:** two claims on opposite
+   sides of a boundary need two counters, because either side's examined-count can reach
+   zero while the other's floor still passes.
+7. **Per-row rectangle check removed** (`v4::select::assemble`, leaving the aggregate
    `rows * cols` total that stood alone before this proof): the compensating-ragged case
    added to `a_ragged_scored_row_is_refused_by_the_rectangle_check` — comp widths 2, 1, 3
    over a 3-row prefill, summing to exactly `3 * comp[0].len()` — was ACCEPTED as a valid

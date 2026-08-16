@@ -70,7 +70,7 @@ claim is stronger than the standard: byte-identical selection buffers, so any id
 
 ## Red proofs (recorded in measurement/gate-red-proofs.md §5)
 
-Six, on **both** sides of the gate — the split matters, because a perturbation of the
+Seven, on **both** sides of the gate — the split matters, because a perturbation of the
 oracle-side recompute says nothing about whether the engine-side comparison resolves
 anything, and the tie flip proves it: it changed the ORDER and not the SET, so the
 engine-side set-equality gate could not have seen it.
