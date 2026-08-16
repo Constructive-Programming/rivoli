@@ -2,19 +2,27 @@
 //! Ported from `old:src/bin/convert_glimmer.rs` (`wt/glimmer-s2` @ 6b7f496), comments
 //! travelling with their code.
 //!
-//! **This converter quantizes nothing, on purpose.** Glimmer ships BF16 and nothing else, so
-//! unlike GLM (fp8), DeepSeek-V4 (fp8 + e8m0) and Kimi-K3 (mxfp4) there is no publisher
-//! decision to copy — `quantize_fp8_block` exists, but choosing its scales is *rivoli's*
-//! quality decision and it has no measurement behind it yet. So the first artifact is
-//! **bf16 verbatim**: 53.02 GB/token against fp8's 26.51, and zero new arithmetic between the
-//! checkpoint and the kernels. The old tree's `glimmer-port.md` S1a item 2 carries the dNLL
-//! gate the fp8 halving has to pass before it becomes the default, and this file is the
-//! reference arm that gate is measured against.
+//! **Default: quantizes nothing.** Glimmer ships BF16 and nothing else, so unlike GLM (fp8),
+//! DeepSeek-V4 (fp8 + e8m0) and Kimi-K3 (mxfp4) there is no publisher decision to copy —
+//! choosing the scales is *rivoli's* quality decision. So the default artifact is **bf16
+//! verbatim**, and it is the reference arm every other rung of the ladder is measured against.
 //!
-//! It is also why this converter has no memory problem. `SafeWriter` holds `Cow<'a, [u8]>`
-//! and `copy_verbatim` **borrows the mapped source**, so a 55.7 GB resident set streams
-//! through without a host copy. An fp8 pass would produce owned bytes and put ~26 GB in RAM;
-//! that is the two-pass work item, and going bf16 first defers it rather than solving it.
+//! > **AMENDED 2026-08-16 (M11), following the reference's own S4 amendment.** This said
+//! > "quantizes nothing, on purpose", full stop, and deferred the fp8 pass as "the two-pass
+//! > work item". `--fp8` now exists and this file is both arms — ported from the reference,
+//! > which measured the pair on the old engine (its `benchmarks.md` S4 ladder: fp8-vs-bf16
+//! > paired mean dNLL −0.00026, 95% CI [−0.00701, +0.00649] on the 762-token corpus — a pass,
+//! > not an underpowered null). What has NOT changed: bf16 stays the DEFAULT, because it is
+//! > the arm with no arithmetic of ours between the checkpoint and the kernels, and a ladder
+//! > needs a rung nothing was done to. Which format ships as the default for decoding is
+//! > settled by this tree re-measuring that dNLL through its own seam, not here.
+//!
+//! **`--fp8` costs host memory that the bf16 pass does not, and the asymmetry is structural.**
+//! `SafeWriter` holds `Cow<'a, [u8]>` and `copy_verbatim` **borrows the mapped source**, so a
+//! 55.7 GB bf16 resident set streams through with no host copy at all. Quantized bytes are
+//! produced rather than borrowed, so `--fp8` holds ~25.2 GB before the write. That is accepted
+//! for a one-off offline conversion on this host; `SafeWriter::add_quantized_fp8` carries the
+//! upgrade path.
 //!
 //! Separate from `bin/convert` because it shares almost nothing with it: no codebook to learn,
 //! no VQ encode, no fp8 dequant, no expert files at all. A dense model's artifact is one
@@ -75,12 +83,16 @@ const REQUIRED_AUX: [&str; 2] = [GEN, "chat_template.jinja"];
 // and `convert.rs` carries six fields, so neither run matches at 15 tokens. Recorded rather than
 // carried over: an exemption that suppresses nothing is a hole in the gate.
 #[derive(Parser)]
-#[command(about = "Build a Muse Glimmer artifact (bf16 verbatim) from an HF checkpoint")]
+#[command(about = "Build a Muse Glimmer artifact (bf16 verbatim, or --fp8) from an HF checkpoint")]
 struct Args {
     /// The HF checkpoint directory: `config.json` + `model.safetensors.index.json` + shards.
     src_dir: String,
     /// Where to write `resident.safetensors` and `manifest.json`.
     out_dir: String,
+    /// Quantize the per-layer projections to fp8-e4m3 at `FP8_BLOCK`. `embed_tokens`,
+    /// `lm_head` and every norm are unaffected — see [`is_layer_proj`].
+    #[arg(long)]
+    fp8: bool,
 }
 
 /// The EOS ids `generation_config.json` carries, refusing a file that exists and says nothing.
@@ -240,9 +252,23 @@ fn main() -> Result<()> {
     let src = Safetensors::open_indexed(&args.src_dir, want)?;
 
     let mut w = SafeWriter::new();
-    let (mut verbatim, mut widened) = (0usize, 0usize);
+    let (mut verbatim, mut widened, mut quantized) = (0usize, 0usize, 0usize);
     let mut names: Vec<String> = src.names().iter().map(|s| s.to_string()).collect();
     names.sort();
+    // **The all-or-nothing check, made BEFORE the pass rather than after it** (review,
+    // 2026-08-16). `is_layer_proj` is a pure predicate over `names`, and `names` is complete
+    // here, so the same claim the post-loop `ensure!` makes is decidable now — for free, in
+    // milliseconds, instead of after ~34 GB of owned bytes and a multi-hour quantization pass.
+    // That ordering is this file's own discipline (`refuse_before_writing`); the post-loop
+    // check stays, because this one says the NAMES imply the count and that one says the loop
+    // actually took the branch.
+    let want_quantized = expected_quantized(&cfg.text, args.fp8)?;
+    ensure!(
+        names.iter().filter(|n| is_layer_proj(n)).count() * usize::from(args.fp8) == want_quantized,
+        "this checkpoint has {} layer projections; its {} layers imply {want_quantized}",
+        names.iter().filter(|n| is_layer_proj(n)).count(),
+        cfg.text.n_layers
+    );
     for name in &names {
         if is_vision(name) {
             continue; // counted from the index above, not from whichever shards were opened
@@ -250,6 +276,12 @@ fn main() -> Result<()> {
         if is_norm(name) {
             w.add_widened(&src, name)?;
             widened += 1;
+        } else if args.fp8 && is_layer_proj(name) {
+            let base = name
+                .strip_suffix(".weight")
+                .with_context(|| format!("{name} is a layer projection with no `.weight` tail"))?;
+            w.add_quantized_fp8(&src, base, rivoli_artifact::quant::FP8_BLOCK)?;
+            quantized += 1;
         } else {
             // Verbatim, and asserted BF16 rather than "whatever it is": `copy_verbatim` refuses
             // any other dtype, so an fp8 or 4-bit export of this model refuses here instead of
@@ -258,13 +290,37 @@ fn main() -> Result<()> {
             verbatim += 1;
         }
     }
+    // **The count is asserted, not printed and trusted.** `is_layer_proj` is two string
+    // predicates over names this binary does not control; if either ever stopped matching, the
+    // artifact would come out with some projections bf16 and some fp8, and the pin's header
+    // loop would refuse it — correctly, but hours later and with a message about one tensor
+    // rather than about the pass that skipped it.
+    //
+    // **The expected count is DERIVED, not the literal `8`** (review, 2026-08-16). It is the
+    // rank-2 entries of `GLIMMER_LAYER_TENSORS` — the same discriminator `geometry::layer_bytes`,
+    // `pin::layer_tails`, `pin::check_layer_headers` and `glimmer_anchor::stored` all branch on
+    // — so this joins those four rather than becoming a fifth authority on "how many
+    // projections a layer has". Writing `8` here would have been the very spelling
+    // `is_layer_proj`'s own doc declines to add below.
+    //
+    // Guarded on `args.fp8` rather than carrying an `else { 0 }` arm: `quantized` is only
+    // incremented inside the `args.fp8 &&` branch above, so that arm could never fail — and its
+    // failure message names a flag the run did not pass.
+    if args.fp8 {
+        ensure!(
+            quantized == want_quantized,
+            "--fp8 quantized {quantized} tensors; this checkpoint's {} layers imply \
+             {want_quantized}",
+            cfg.text.n_layers
+        );
+    }
     ensure_complete(&names, cfg.text.n_layers)?;
 
     let out = format!("{}/resident.safetensors", args.out_dir);
     w.write(&out).with_context(|| format!("write {out}"))?;
     eprintln!(
-        "convert_glimmer: {verbatim} tensors bf16 verbatim, {widened} norms widened to f32, \
-         {skipped} vision tensors skipped -> {out}"
+        "convert_glimmer: {verbatim} tensors bf16 verbatim, {quantized} projections quantized \
+         to fp8, {widened} norms widened to f32, {skipped} vision tensors skipped -> {out}"
     );
 
     // The manifest is the checkpoint's own `config.json` plus the `format` section, so
@@ -342,4 +398,39 @@ fn is_vision(name: &str) -> bool {
 /// else this can catch today; if one ever appears it is a norm and this is still right.
 fn is_norm(name: &str) -> bool {
     name.ends_with("norm.weight")
+}
+
+/// The eight per-layer projections — everything `--fp8` quantizes, and nothing else.
+///
+/// **`embed_tokens` and `lm_head` are deliberately NOT here**, though they are 5.380 GB of the
+/// 55.712: requantizing two tensors read once per token each is its own quality question with
+/// a dNLL measurement attached, and this pass does not take it up.
+///
+/// Composed from two existing predicates rather than listing eight suffixes, which would be a
+/// fourth spelling of [`GLIMMER_LAYER_TENSORS`]; the count assertion at the call site is what
+/// makes "these are the eight" an observation.
+fn is_layer_proj(name: &str) -> bool {
+    name.starts_with(GLIMMER_LAYER_PREFIX) && !is_norm(name)
+}
+
+/// How many tensors `--fp8` must quantize: the rank-2 entries of [`GLIMMER_LAYER_TENSORS`],
+/// times the layer count. Zero without the flag.
+///
+/// **DERIVED, never the literal `8`.** The rank is the same discriminator
+/// `geometry::layer_bytes`, `pin::layer_tails`, `pin::check_layer_headers` and
+/// `glimmer_anchor::stored` all branch on, so this joins those four rather than becoming a
+/// fifth authority on how many projections a layer has — which is precisely the extra
+/// spelling [`is_layer_proj`]'s own doc declines to add.
+fn expected_quantized(
+    cfg: &rivoli_artifact::glimmer_config::GlimmerTextConfig,
+    fp8: bool,
+) -> Result<usize> {
+    if !fp8 {
+        return Ok(0);
+    }
+    let mut per_layer = 0usize;
+    for t in GLIMMER_LAYER_TENSORS {
+        per_layer += usize::from(cfg.layer_tensor_shape(t)?.len() == 2);
+    }
+    Ok(per_layer * cfg.n_layers)
 }

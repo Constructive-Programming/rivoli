@@ -58,7 +58,11 @@ impl FormatMeta {
     /// `FormatMeta::current` stamps the compiled-in VQ parameters even on an artifact that has
     /// no VQ tensors. That is inert rather than a lie: [`Self::load`] compares them against the
     /// same constants, so they always agree, and a "nullable VQ section" turned out to be work
-    /// nothing needed. `fp8_block` likewise describes a format a bf16 artifact does not use yet.
+    /// nothing needed. `fp8_block` is inert the same way on a bf16 Glimmer artifact — and
+    /// LOAD-BEARING on an `--fp8` one, where `add_quantized_fp8` writes grids at exactly this
+    /// block and the Glimmer pin reads the stamp back as the block it dequantizes with (M11).
+    /// Stamped from the same constant the quantizer is handed, so the two cannot disagree
+    /// here; the load-side check is for an artifact written by a DIFFERENT build.
     pub fn manifest_from_config(src_dir: &str, fp8_block: usize) -> Result<serde_json::Value> {
         let path = format!("{src_dir}/config.json");
         let mut manifest: serde_json::Value =

@@ -13,14 +13,14 @@
 //! producer is on a real one: 99.9% of a 2M-element operand read stale. The conclusion it
 //! draws is **not** "never pass null" — it is that every launch touching one buffer must be on
 //! ONE stream, and that a compute stream at two call sites inside an otherwise null-stream
-//! layer is the same bug inverted. **Four of the launchers this chain drives take no stream
-//! parameter at all** — `rmsnorm_single`, `rope_split_half`, `vadd` and `argmax` — so a
-//! "compute stream" loop would be exactly that inversion: a real stream at the launches that
-//! accept one and the legacy default at the four that cannot.
+//! layer is the same bug inverted. **Five of the launchers this chain drives take no stream
+//! parameter at all** — `rmsnorm_single`, `rope_split_half`, `vadd`, `argmax` and
+//! `gemv_fp8` — so a "compute stream" loop would be exactly that inversion: a real stream at
+//! the launches that accept one and the legacy default at the five that cannot.
 //!
 //! So the whole chain is null, uniformly, and the legacy stream's own ordering carries the
 //! dependencies. **The cost is that nothing overlaps**, and the change is not "pass a stream
-//! here", it is giving those four launchers one first. Until then a stream argument in this
+//! here", it is giving those five launchers one first. Until then a stream argument in this
 //! file would be decoration that reads as a guarantee.
 //!
 //! > `old:` carried this argument with SIX launchers named, two of them wrong —
@@ -28,38 +28,65 @@
 //! > writing it into the inventory put a forbidden kernel on the next milestone's to-do list.
 //! > The decision is unaffected; a closure gets inherited together with its justification, so
 //! > the corrected list is the one that travels.
+//!
+//! > **COUNT CORRECTED 2026-08-16 (M11), by review, and it is the same failure again one
+//! > milestone later.** `--fp8` added `launch_gemv_fp8` to this chain — the fifth launcher
+//! > with no stream parameter — and the diff that added it wrote the correct LOCAL claim on
+//! > `proj` while leaving this inventory saying "four". An inventory a reader is sent to for
+//! > the decision has to be re-counted by whoever adds a launcher; census re-derived from
+//! > `hip_linalg.rs` on this date, all thirteen launchers this file drives.
 
 use super::engine::GlimmerEngine;
 use super::geometry::{PREFILL_CHUNK, Window, qk_scales};
-use super::pin::{Bf16Weight, GlimmerLayerPin};
+use super::pin::{GlimmerLayerPin, ProjPin};
 use anyhow::{Result, ensure};
 use rivoli_backend::{
     NULL_STREAM, device_sync, launch_argmax, launch_embed_bf16_row_bcast, launch_gemm_bf16,
-    launch_gqa_attend, launch_logit_softcap, launch_rmsnorm_centered_single, launch_rmsnorm_single,
-    launch_rmsnorm_weightless_batch, launch_rope_split_half, launch_sigmoid_gate, launch_swiglu,
-    launch_vadd,
+    launch_gemv_fp8, launch_gqa_attend, launch_logit_softcap, launch_rmsnorm_centered_single,
+    launch_rmsnorm_single, launch_rmsnorm_weightless_batch, launch_rope_split_half,
+    launch_sigmoid_gate, launch_swiglu, launch_vadd,
 };
 
-/// One bf16 projection applied to a single row: `out = w · x`, `w` being `[o_dim, i_dim]`.
+/// One projection applied to a single row: `out = w · x`, `w` being `[o_dim, i_dim]` in the
+/// pin's own format — **the only place the layer loop looks inside a [`ProjPin`].**
 ///
-/// A GEMM at `m = 1` rather than a GEMV because there is no bf16 GEMV in the tree and adding
-/// one is arithmetic to price, not to assume. The shape check is here rather than trusted:
-/// every caller below passes a buffer sized from the config, and a projection whose `i_dim`
-/// disagrees with the activation it is handed reads past the end of a live allocation and
-/// stays fluent.
+/// The bf16 arm is a GEMM at `m = 1` rather than a GEMV because there is no bf16 GEMV in the
+/// tree and adding one is arithmetic to price, not to assume. The fp8 arm is
+/// [`launch_gemv_fp8`] at `nrow = 1` — the same f32-in/f32-out contract with the block scales
+/// applied inside, and the launcher GLM's resident projections already ride. **Deliberately
+/// NOT [`rivoli_backend::launch_gemv_fp8_bf16`]**: that one rounds its output to bf16 because
+/// V4's reference does; Glimmer's reference keeps f32 activations end to end, and adding a
+/// rounding the bf16 arm doesn't have would put arithmetic between the two rungs that the
+/// paired-dNLL gate could not attribute to the weights. Both launchers enqueue on the default
+/// stream — the same stream every `NULL_STREAM` launch in this file uses, so ordering is
+/// unchanged.
+///
+/// The shape check is here rather than trusted: every caller below passes a buffer sized from
+/// the config, and a projection whose `i_dim` disagrees with the activation it is handed
+/// reads past the end of a live allocation and stays fluent.
 ///
 /// # Safety
-/// `x` is `w.i_dim` live f32, `out` is `w.o_dim` writable f32, the two do not alias, and both
-/// outlive the next [`device_sync`].
-unsafe fn proj(x: *const f32, w: &Bf16Weight, out: *mut f32, i_dim: usize) -> Result<()> {
+/// `x` is the projection's `i_dim` live f32, `out` its `o_dim` writable f32, the two do not
+/// alias, and both outlive the next [`device_sync`].
+unsafe fn proj(x: *const f32, w: &ProjPin, out: *mut f32, i_dim: usize) -> Result<()> {
+    let want = match w {
+        ProjPin::Bf16(w) => w.i_dim,
+        ProjPin::Fp8(w) => w.i_dim,
+    };
     ensure!(
-        w.i_dim == i_dim,
-        "projection expects an activation of {} but was handed {i_dim} — a shape mismatch \
-         here reads past the end of a live buffer and produces fluent wrong text",
-        w.i_dim
+        want == i_dim,
+        "projection expects an activation of {want} but was handed {i_dim} — a shape mismatch \
+         here reads past the end of a live buffer and produces fluent wrong text"
     );
     // SAFETY: the caller's contract, plus the `i_dim` agreement checked above.
-    unsafe { launch_gemm_bf16(x, w.packed, out, 1, w.o_dim, w.i_dim, NULL_STREAM) }
+    match w {
+        ProjPin::Bf16(w) => unsafe {
+            launch_gemm_bf16(x, w.packed, out, 1, w.o_dim, w.i_dim, NULL_STREAM)
+        },
+        ProjPin::Fp8(w) => unsafe {
+            launch_gemv_fp8(x, w.packed, w.scale, w.o_dim, w.i_dim, w.block, 1, out)
+        },
+    }
 }
 
 /// One layer's twelve device handles, resolved from the pin ONCE per layer.
@@ -85,14 +112,14 @@ pub(super) struct Handles {
     post_attn_ln: *const f32,
     pre_ffn_ln: *const f32,
     post_ffn_ln: *const f32,
-    q: Bf16Weight,
-    k: Bf16Weight,
-    v: Bf16Weight,
-    o: Bf16Weight,
-    attn_gate: Bf16Weight,
-    mlp_gate: Bf16Weight,
-    mlp_up: Bf16Weight,
-    mlp_down: Bf16Weight,
+    q: ProjPin,
+    k: ProjPin,
+    v: ProjPin,
+    o: ProjPin,
+    attn_gate: ProjPin,
+    mlp_gate: ProjPin,
+    mlp_up: ProjPin,
+    mlp_down: ProjPin,
 }
 
 impl Handles {
@@ -498,7 +525,11 @@ impl GlimmerEngine<'_> {
                 self.eps_pre,
                 self.xn.ptr() as *mut f32,
             )?;
-            let head = self.pin.head;
+            // The head stays bf16 in BOTH artifact formats — requantizing a tensor read once
+            // per token is a quality question `--fp8` deliberately does not take up — so it is
+            // wrapped rather than stored as a `ProjPin`: the pin's field says what the
+            // artifact guarantees, and this site says how the shared helper consumes it.
+            let head = ProjPin::Bf16(self.pin.head);
             proj(
                 self.xn.ptr() as *const f32,
                 &head,

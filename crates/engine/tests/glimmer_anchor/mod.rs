@@ -31,7 +31,15 @@
 #[path = "../../../oracles/tests/common/golden_read.rs"]
 pub mod golden_read;
 
-pub use golden_read::{GoldenSet, float, ints};
+// Named by `Anchor`'s own field types and used by `GoldenSet::read_glimmer` below, so this
+// one is live in every consumer and takes no allow — keeping it out of the allow below is
+// what leaves it reportable if `read_glimmer` ever moves out.
+pub use golden_read::GoldenSet;
+// The capture readers. The file-level `dead_code` allow does not reach re-exports, so a
+// consumer binary that needs neither (the fp8 decode gate reads no captures) trips
+// `unused_imports` instead — the allow covers exactly those two and no more.
+#[allow(unused_imports)]
+pub use golden_read::{float, ints};
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::schema::parse_config;
 use serde_json::Value;
@@ -248,7 +256,7 @@ pub const ENVELOPES: [(&str, f32, f32); 4] = [
 ///
 /// A 1-D layer tensor is a norm and the artifact holds norms at f32; everything else is a
 /// projection and stays bf16. That is the same discriminator `glimmer::geometry::layer_bytes`
-/// charges the budget by (`if shape.len() == 1 { 4 } else { 2 }`) and the same one
+/// charges the budget by (the rank, which is what `layer_bytes` still branches on — the expression this used to quote verbatim became a `match (rank, fmt)` at M11, which is how a quoted fragment rots) and the same one
 /// `pin::place_norm`/`place_proj` demand at load, so this fixture cannot disagree with the
 /// engine about which is which. It is deliberately NOT a copy of `convert_glimmer::is_norm`'s
 /// name-suffix test: two spellings of one rule is how the two drift, and the rank is the one
@@ -282,4 +290,129 @@ pub fn stored(shape: &[usize], vals: &[f32]) -> (rivoli_artifact::format::Dtype,
 /// with a name it has never heard of, which is that walk doing its job.
 pub fn is_alias(name: &str) -> bool {
     name.starts_with('L')
+}
+
+/// An artifact directory that removes itself on drop.
+///
+/// **Panic-safe, which a `remove_dir_all` at the end of a test is not** — a failing
+/// assertion skips it and leaves the fixture behind, and the next run with the same pid
+/// reuses it. `tag` carries the salt so the two arms cannot collide.
+///
+/// Moved here from `glimmer_anchor_decode.rs` at M11 with [`write_artifact`] and
+/// [`budgets`], when the fp8 decode gate became their second consumer.
+pub struct Artifact(pub std::path::PathBuf);
+
+impl Artifact {
+    pub fn path(&self) -> &str {
+        self.0.to_str().expect("the artifact path is utf-8")
+    }
+}
+
+impl Drop for Artifact {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Write the reference's own parameters as a Muse Glimmer artifact.
+///
+/// The config is the shipped wrapper with `text_config` replaced by the golden's own
+/// `tiny_config`, so every scalar the loop reads — both epsilons, `qk_scale_factor`,
+/// `output_multiplier`, `final_logit_softcapping`, `sliding_window`, `layer_types`,
+/// `layer_rope_theta` — comes from the run that produced the logits rather than from this
+/// file.
+///
+/// **The projections go out as bf16, which is where the decode gate's floor comes from.**
+/// Rounding here is the same rounding `convert_glimmer`'s default arm would do, applied where
+/// it can be seen. Since M11 that is a property of THIS writer rather than of Glimmer
+/// artifacts in general — `glimmer_fp8_decode::quantize_artifact` derives the fp8 artifact
+/// from the one this produces, so bf16 stays the rung nothing was done to.
+pub fn write_artifact(a: &Anchor) -> Artifact {
+    let root = std::env::temp_dir().join(format!(
+        "rivoli-glimmer-anchor-{}-{}",
+        a.name,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create the artifact directory");
+
+    let mut w = rivoli_artifact::format::SafeWriter::new();
+    let mut placed = 0usize;
+    for (name, shape, vals) in a.weights.floats.iter().filter(|(n, _, _)| !is_alias(n)) {
+        let (dt, bytes) = stored(shape, vals);
+        w.add(name.clone(), dt, shape.clone(), bytes);
+        placed += 1;
+    }
+    w.write(&format!("{}/resident.safetensors", root.display()))
+        .expect("write the artifact weights");
+
+    std::fs::write(root.join("config.json"), a.config_json().to_string())
+        .expect("write the config");
+    let art = Artifact(root);
+    // The engine's own loader, on the bytes just written: a config this fixture got wrong
+    // fails HERE, with the schema's own message, rather than as a wrong number later.
+    let back = GlimmerConfig::load(art.path()).expect("the artifact re-opens as a Glimmer one");
+    assert_eq!(
+        placed,
+        3 + back.text.n_layers * rivoli_artifact::glimmer::GLIMMER_LAYER_TENSORS.len(),
+        "{}: the artifact is not the whole parameter set",
+        a.name
+    );
+    art
+}
+
+/// The budget that pins every layer, and the one that forces a streaming split — both
+/// derived from the engine's own footprint arithmetic rather than picked, in the artifact's
+/// own [`geometry::ProjFmt`].
+///
+/// `floor_of` states everything a run pays before one weight is resident; adding `k` layers'
+/// worth of bytes to it is a budget that admits about `k` of them. Returns
+/// `(all_resident, about_three_layers)`.
+///
+/// **The over-estimate belongs to ONE consumer.** `glimmer_anchor_decode::one_forward` opens
+/// at `prompt.len() + 1` while this is handed an anchor's FULL run (prompt plus every emitted
+/// token), so the floor it charges is a slight over-estimate and the split arm may pin one
+/// more layer than three. `glimmer_fp8_decode::decode` opens at exactly the `n_ctx` it budgets
+/// for and has no such slack. That is deliberate and the callers do not
+/// predict the split: the roomy arm asserts nothing streams, the tight arm asserts that
+/// something is pinned AND something streams AND a slot was filled. A test that asserted "3
+/// and 5" would be asserting `partition`'s answer, which is `rivoli-core`'s own gate to keep —
+/// what the decode gates need is that both residency paths were entered.
+pub fn budgets(
+    t: &rivoli_artifact::glimmer_config::GlimmerTextConfig,
+    n_ctx: usize,
+    fmt: rivoli_engine::glimmer::geometry::ProjFmt,
+) -> (usize, usize) {
+    use rivoli_engine::glimmer::geometry;
+    let layer = geometry::layer_bytes(t, fmt).expect("a layer's bytes");
+    let roomy = geometry::floor_of(t, n_ctx, 0, fmt).expect("the slotless floor");
+    let tight =
+        geometry::floor_of(t, n_ctx, geometry::STREAM_SLOTS, fmt).expect("the slotted floor");
+    (
+        roomy.total().0 as usize + t.n_layers * layer,
+        tight.total().0 as usize + 3 * layer,
+    )
+}
+
+/// The tight arm's anti-vacuity, shared by both decode gates: unless something is pinned AND
+/// something streams AND a slot actually filled, the "split" arm is the resident arm wearing
+/// a different budget, and the P4 comparison that follows compares an arm with itself.
+///
+/// Prints the split it observed — both gates want the number under `--nocapture`, and the
+/// print travelling with the assertion is also what kept jscpd from reporting the pair of
+/// call sites as a clone of each other.
+pub fn assert_split_entered(name: &str, residency: (usize, usize), stats: (u64, u64)) {
+    // **Both pairs arrive straight from the engine's own accessors, not re-typed by a caller.**
+    // The assertion below is SYMMETRIC in `pinned` and `streamed`, so two bare `usize`
+    // parameters would let a transposed call pass with only the printed line wrong — the
+    // hazard `glimmer::forward::At`'s doc states in as many words. Taking the tuples means the
+    // only ordering left is the one `residency()`/`slot_stats()` fix (review, 2026-08-16).
+    let (pinned, streamed) = residency;
+    let (hits, fills) = stats;
+    println!("  {name}: {pinned} pinned / {streamed} streamed, {fills} slot fills, {hits} hits");
+    assert!(
+        pinned > 0 && streamed > 0 && fills > 0,
+        "{name}: the tight budget pinned {pinned} and streamed {streamed} with {fills} fills \
+         — this arm must exercise BOTH the resident and the streaming path"
+    );
 }

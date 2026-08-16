@@ -229,11 +229,35 @@ fn write_fixture(src: &Path) -> Vec<common::Tensor> {
     text
 }
 
-fn run(src: &Path, out: &Path) -> std::process::Output {
+fn run_with(src: &Path, out: &Path, extra: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_convert_glimmer"))
         .args([src.to_str().unwrap(), out.to_str().unwrap()])
+        .args(extra)
         .output()
         .expect("run convert_glimmer")
+}
+
+fn run(src: &Path, out: &Path) -> std::process::Output {
+    run_with(src, out, &[])
+}
+
+/// Assert every formatted count fragment reached the log. The counts are the OBSERVATION that
+/// each tensor class took its intended path; both converter arms make the same kind of claim,
+/// so the assertion is spelled once.
+///
+/// **Each fragment carries its leading `", "`**, because `contains` on a bare count is
+/// satisfied by any number ending in it — `"32 projections quantized"` matches a log reading
+/// `132 projections quantized` (review, 2026-08-16). The converter emits every count after a
+/// comma-space, so anchoring there costs two characters and removes the whole class.
+fn expect_counts(log: &str, wants: &[&str]) {
+    // A loop over a caller-supplied list passes on an empty one, which is the "examined count
+    // can silently reach zero" shape this repo does not accept as a check — unreachable from
+    // today's two literal call sites, asserted anyway because that is what makes it unreachable
+    // from tomorrow's.
+    assert!(!wants.is_empty(), "expect_counts examined nothing");
+    for w in wants {
+        assert!(log.contains(w), "missing `{w}` in:\n{log}");
+    }
 }
 
 /// `run`, expecting a refusal whose message names `want`.
@@ -251,18 +275,21 @@ fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
 
     let log = common::expect_success(&run(&src, &out), "convert_glimmer");
 
-    // The counts are the OBSERVATION that the vision half was excluded, rather than the
+    // The vision count is the OBSERVATION that that half was excluded, rather than the
     // assumption — and the 3 comes from the index, since the shard holding them was never
-    // opened. Four norms per layer plus the model-level one is what gets widened.
-    assert!(log.contains("3 vision tensors skipped"), "{log}");
-    assert!(
-        log.contains(&format!("{} norms widened", LAYERS * 4 + 1)),
-        "{log}"
-    );
-    // Both ids printed, so an operator can notice a wrong set before a decode runs to its limit.
-    assert!(
-        log.contains(&format!("eos_token_id [{}, {}]", VOCAB - 3, VOCAB - 1)),
-        "{log}"
+    // opened. Four norms per layer plus the model-level one is what gets widened. Both EOS
+    // ids printed, so an operator can notice a wrong set before a decode runs to its limit.
+    expect_counts(
+        &log,
+        &[
+            ", 3 vision tensors skipped",
+            // The bf16 arm's own NEGATIVE: nothing was quantized. The binary's `ensure!` is
+            // what enforces it, but without this line nothing in this test would notice
+            // `--fp8` becoming the default or the flag ceasing to gate the branch.
+            ", 0 projections quantized to fp8",
+            &format!(", {} norms widened", LAYERS * 4 + 1),
+            &format!("eos_token_id [{}, {}]", VOCAB - 3, VOCAB - 1),
+        ],
     );
 
     // It re-opens as the same model: the manifest still carries the wrapper and its text_config,
@@ -300,6 +327,99 @@ fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
         "chat_template.jinja",
     ] {
         assert!(out.join(aux).exists(), "{aux} missing from the artifact");
+    }
+    common::clean(&root);
+}
+
+/// `--fp8` quantizes the layer projections and NOTHING else, and the bytes it writes are
+/// [`rivoli_artifact::quant::quantize_fp8_block`]'s own.
+///
+/// **The value check is byte-equality against the library, not a tolerance.** The converter's
+/// unit of work is selection and plumbing — WHICH tensors take which path — while the scale
+/// choice itself is `quantize_fp8_block`'s and is unit-tested beside it (round-trip within
+/// e4m3's half-ULP, the all-zero-tile scale, the non-finite refusal). Re-running the quantizer
+/// here over the values the converter reads (the fixture's f32s through the bf16 round-trip,
+/// since the checkpoint stores bf16) and demanding identical bytes pins the whole path with no
+/// tolerance to hide a wrong block, a transposed shape or a skipped tile behind.
+///
+/// The fixture's dims are all at or under the 128 block, so every grid here is `[1, 1]` —
+/// except `INTER` = 96, deliberately: at any block **strictly below 96** the `[96, 64]` MLP
+/// projections grow a second grid row and the shape assertion below reddens. That is what
+/// discriminates the shipped 128 from the plausible wrong constants below it — 64 gives a
+/// `[2, 1]` grid, 32 a `[3, 2]` (`HIDDEN` = 64 tiles on the second axis too at 32, which the
+/// first draft of this sentence got wrong) — and the discrimination is over exactly those: at 96 itself
+/// `div_ceil(96, 96) == 1` and this fixture would NOT redden, which no candidate constant
+/// makes matter but which the sentence has to say to be true. Multi-tile value behaviour is
+/// the quantizer's own test's job (it runs 5×7 at block 2); the real-checkpoint byte-parity
+/// gate covers the block at real dims.
+#[test]
+fn convert_glimmer_fp8_quantizes_the_projections_and_nothing_else() {
+    let (root, src, out) = common::scratch_src_out("glimmer-convert-fp8");
+    let tensors = write_fixture(&src);
+
+    let log = common::expect_success(&run_with(&src, &out, &["--fp8"]), "convert_glimmer --fp8");
+    // 8 projections per layer quantized; the norms widen exactly as in the bf16 arm.
+    expect_counts(
+        &log,
+        &[
+            &format!(", {} projections quantized to fp8", LAYERS * 8),
+            &format!(", {} norms widened", LAYERS * 4 + 1),
+        ],
+    );
+
+    let block = rivoli_artifact::quant::FP8_BLOCK;
+    // **The stamp the pin will dequantize at, read back off this run's own artifact.** The
+    // bf16 arm calls `FormatMeta::load` too, but only to prove the manifest parses; here the
+    // VALUE is load-bearing — `ProjFmt::sniff` returns exactly this number and every scale
+    // lookup in the engine tiles by it, so a converter that quantized at one block and stamped
+    // another would produce an artifact that mis-tiles silently at every projection whose dims
+    // happen to give the same grid shape. Added 2026-08-16: the fp8 arm had dropped the load
+    // its bf16 sibling makes, leaving the one seam `meta.rs`'s doc claims unchecked.
+    assert_eq!(
+        fmt::FormatMeta::load(out.to_str().unwrap())
+            .unwrap()
+            .fp8_block,
+        block,
+        "the artifact's stamped fp8_block is not the block it was quantized at"
+    );
+    let art =
+        fmt::Safetensors::open_file(out.join("resident.safetensors").to_str().unwrap()).unwrap();
+    for t @ (name, _, shape, _) in &tensors {
+        if name.ends_with("norm.weight") {
+            common::assert_widened(&art, t);
+        } else if name.starts_with(GLIMMER_LAYER_PREFIX) {
+            // The values the converter quantized: the fixture's f32s AFTER the bf16 round-trip,
+            // because the shard stores bf16 and `add_quantized_fp8` widens what it reads.
+            let n: usize = shape.iter().product();
+            let vals: Vec<f32> = common::weights(name, n)
+                .iter()
+                .map(|&v| rivoli_core::num::bf16_to_f32(rivoli_core::num::f32_to_bf16(v)))
+                .collect();
+            let (want_p, want_s) =
+                rivoli_artifact::quant::quantize_fp8_block(&vals, [shape[0], shape[1]], block)
+                    .unwrap();
+            let (got_p, pshape) = art.typed(name, fmt::Dtype::F8E4M3).unwrap();
+            assert_eq!(pshape, &shape[..], "{name}: packed shape");
+            assert_eq!(
+                got_p,
+                &want_p[..],
+                "{name}: packed bytes are not the quantizer's"
+            );
+            let sname = name.replace(".weight", ".weight_scale_inv");
+            let (got_s, sshape) = art.typed(&sname, fmt::Dtype::F32).unwrap();
+            let want_grid = [shape[0].div_ceil(block), shape[1].div_ceil(block)];
+            assert_eq!(sshape, want_grid, "{sname}: grid shape");
+            let want_sb: Vec<u8> = want_s.iter().flat_map(|s| s.to_le_bytes()).collect();
+            assert_eq!(
+                got_s,
+                &want_sb[..],
+                "{sname}: scale bytes are not the quantizer's"
+            );
+        } else {
+            // `embed_tokens` and `lm_head`: requantizing two tensors read once per token each
+            // is its own quality question — they stay bf16 verbatim.
+            common::assert_verbatim(&art, t);
+        }
     }
     common::clean(&root);
 }

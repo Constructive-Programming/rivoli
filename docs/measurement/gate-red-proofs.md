@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record).
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M11's fp8 gates are PAID deviceless — layer_bytes stripped of its scale grid, sniff falling back to the compiled-in block, the converter at the wrong block and with one projection class skipped, and the parity script over six runs including both refusals and a green baseline — while its DEVICE half is OWED with recipes written down: the anti-fallback assert in glimmer_fp8_decode.rs. Slot::fill's third-zip-leg guard was RETIRED rather than proven - the parameter it checked was deleted, so the truncation has no shape.
 ---
 
 # M0 gate red proofs
@@ -115,3 +115,120 @@ deny` failed the rebuild, and the build's exit code had been eaten by `| tail` /
 with the WRONG failure (row 1 reddened the partition test, not the logits). Debug the
 harness before the tree: check the build's exit UNPIPED, and read WHICH test failed, not
 just that one did.
+
+## 5. Muse Glimmer fp8 (added 2026-08-16, M11)
+
+Five gates arrive with `--fp8`: three deviceless (two in `glimmer/geometry.rs`'s test
+module, one in `crates/cli/tests/glimmer_convert.rs`), one shell (`tests/convert-parity-
+glimmer-fp8.sh`), one on device (`crates/engine/tests/glimmer_fp8_decode.rs`). **The four
+deviceless ones are PAID below; the device one is OWED and its recipe is written down.**
+
+**Reverts were hand-edits, verified by `sha256sum -c`, not `git checkout`** — this branch's
+work is uncommitted, so the restore command the sections above use would have discarded it.
+The hash file is the evidence the tree came back byte-identical; every proof below was
+followed by `sha256sum -c` reporting `OK` for the mutated file.
+
+### 5a. `layer_bytes` charges the fp8 scale grid
+
+Planted: the `ProjFmt::Fp8` arm reduced to `n` — the packed byte per weight with the f32
+grid dropped, which is the size a reader who thought "fp8 is one byte" would write and
+which under-reserves the tier by exactly what `DeviceTier::place` then bails on.
+
+```
+test glimmer::geometry::geometry_tests::layer_bytes_charges_each_format_its_own_size ... FAILED
+assertion `left == right` failed
+  left: 33792     (1_024 + 32_768,        the grid omitted)
+ right: 33824     (1_024 + 32_768 + 8*4,  eight [1,1] grids)     (red)
+revert → 8 passed                                                (green again)
+```
+
+### 5b. `ProjFmt::sniff` reads the stamp, never a compiled-in constant
+
+Planted: `FormatMeta::load(dir).map(|m| m.fp8_block).unwrap_or(quant::FP8_BLOCK)` — the
+plausible defect, since the default IS what the converter stamps today and the fallback is
+invisible until someone converts at another block.
+
+```
+test glimmer::geometry::geometry_tests::sniff_reads_the_dtype_and_consults_the_manifest_only_for_fp8 ... FAILED
+assertion failed: ProjFmt::sniff(&dir, &st).is_err()               (red — the stampless
+                                                                    fp8 fixture was accepted)
+revert → 8 passed                                                  (green again)
+```
+
+### 5c. The converter quantizes the projections, at the shipped block, and nothing else
+
+Two mutations, each reddening a different assertion of the one test.
+
+```
+# (i) the wrong block constant — `add_quantized_fp8(&src, base, 64)`
+assertion `left == right` failed: model.language_model.layers.0.mlp.gate_proj.weight_scale_inv: grid shape
+  left: [2, 1]                                                     (red)
+ right: [1, 1]
+```
+
+That is the fixture's discrimination claim paying out on exactly the tensor it names: `INTER`
+= 96 against a 64 block gives `div_ceil(96, 64) == 2`. It also fixes the boundary the test's
+own doc used to get wrong — the second grid row appears at any block **strictly below** 96,
+not at 96, where `div_ceil(96, 96) == 1`.
+
+```
+# (ii) one projection class skipped — `&& !name.ends_with("mlp.down_proj.weight")`
+Error: --fp8 quantized 28 tensors; this checkpoint's 4 layers imply 32   (red — the
+                                                                          converter's own
+                                                                          count `ensure!`)
+revert (both) → 4 passed                                                 (green again)
+```
+
+### 5d. `tests/convert-parity-glimmer-fp8.sh`
+
+Its header prescribed a red proof and claimed "the M11 record logs both runs" before any
+record existed. Five runs, on six-file scratch directories holding one line each (the script
+is a byte comparator; artifact-shaped content would not exercise anything more of it):
+
+| run | input | result |
+|---|---|---|
+| green baseline | two distinct, identical dirs | `PARITY: every file byte-identical`, exit **0** |
+| one byte flipped | `resident.safetensors` last byte `s`→`S` | `DIFFER` + `PARITY FAILED`, exit **1** |
+| self-comparison | same dir twice | `REFUSED: both arguments resolve to …`, exit **66** |
+| self-comparison, respelled | `dir` vs `dir/.` | same refusal, exit **66** — `realpath` earns its place |
+| symlinked member | distinct dirs, `resident.safetensors` a symlink to the ref's | `REFUSED: resident.safetensors resolves to the same file in both directories`, exit **66** |
+| missing member | `chat_template.jinja` absent from cand | `chat_template.jinja: MISSING (cand)` + `PARITY FAILED`, exit **1** |
+
+The green baseline is listed deliberately: a gate proven only red is a gate that might be
+unconditionally red, which is the same false evidence in the other direction.
+
+### 5e. `glimmer_fp8_decode.rs` — OWED, device
+
+The gate makes two claims and each needs its own mutation. Run under the flock,
+`-- --test-threads=1 --nocapture`, dev profile; revert by hand-edit and `sha256sum -c`.
+
+| # | mutation | must redden |
+|---|---|---|
+| 1 | `proj`'s `ProjPin::Fp8` arm dispatched to `launch_gemm_bf16` on `w.packed` cast to `*const u16` — the named silent-fallback failure, made real | the anti-fallback assert (`differing > 0`) |
+| 2 | `Slot::fill`'s destination walk shortened by one (`.take(self.tensors.len() - 1)`) so the last tensor keeps layer 0's bytes | the P4 assert (`split.logits == all.logits`) |
+| 3 | `quantize_artifact`'s grid census asserted against a fixture whose `inter` is under the block | the census assert — this one is a standing claim about coverage, not a defect |
+
+Row 1 is the one that matters: a green anti-fallback assert is the ONLY structural evidence
+that fp8 arithmetic ran, and it has never been red. Until it is, read a green on this file
+as "the two artifacts differ", not as "the fp8 kernel is dispatched".
+
+### 5f. `Slot::fill`'s third zip leg — RETIRED rather than proven
+
+A gate that cannot exist needs no red proof, and this one stopped existing the same day it
+was written. Kept as a record because the sequence is the lesson.
+
+Correctness review found `Slot::fill`'s `.zip(&self.lens).zip(tails)` unguarded: `tails`
+arrived as a parameter, a short one truncates a zip **silently**, and `Slot::new` asserted
+only `addrs == lens`. The first fix was a runtime `ensure!` comparing the two lengths — a
+real check, and one whose red proof needs a `DeviceTier` and therefore a contended GPU.
+
+The shipped fix instead **deleted the parameter**: `Slot` now holds `Vec<(String, usize)>`,
+name beside length, built by `Slot::new` from `layer_tails` and never handed in from
+outside. `fill` zips two sequences that are both the slot's own and were built together, and
+there is no third leg to be short. `GlimmerPin` lost its `tails` field with it.
+
+**A guard you can delete beats a guard you must prove**, and on this box "must prove" meant
+booking sole-tenant device time to demonstrate a failure the type system can refuse instead.
+`Slot::new`'s `ensure!(addrs().len() == tensors.len())` **stays** and is not in the same
+class: it compares two genuinely independent walks — the pin's field-by-field placement
+against the config-driven tail list — which can diverge with nobody noticing.
