@@ -2,20 +2,22 @@
 //! (fp8/int8/f32 linalg, VQ-int3 and int4 MoE, MLA, fwd glue). Without the feature
 //! the whole module compiles away.
 //!
-//! # The wall is three files, and this one is its shared half
+//! # The wall is four files, and this one is its shared quarter
 //!
-//! Split 2026-08-15 under the 800-line file ceiling, by cohesion rather than by line count:
+//! Split 2026-08-15 under the 800-line file ceiling (and again 2026-08-16, when M9's
+//! launchers pushed the fused-block half past it), by cohesion rather than by line count:
 //! this file keeps what every launcher needs — the descriptor structs, the `launchers!` DSL
 //! that emits both halves of the ABI wall from one declaration, and the return-code check —
 //! plus the handful of entry points that are not launchers at all (the device sync, the two
-//! device-to-device copies, the fill, the scratch sizing). The two macro invocations moved
+//! device-to-device copies, the fill, the scratch sizing). The macro invocations moved
 //! out whole:
 //!
 //! - `hip_linalg.rs` — the PRIMITIVE wall: one launch per matvec, matmul, embedding row,
 //!   elementwise op, activation quantizer, normalization or RoPE.
-//! - `hip_blocks.rs` — the FUSED-BLOCK wall: one launch per model sub-block — streaming MoE
-//!   ranges and their accumulator, mHC, MLA/GQA attention, the sparse indexer, the KV
-//!   compressor.
+//! - `hip_blocks.rs` — the RESIDUAL-STREAM blocks: streaming MoE ranges and their
+//!   accumulator, and the residual mixers (mHC, K3's attn_res).
+//! - `hip_attn.rs` — the ATTENTION blocks: MLA/GQA/MHA attention, the KV slabs, the sparse
+//!   indexer, the KV compressor, and the KDA recurrent-state family.
 //!
 //! Both are re-exported here, so `rivoli_backend::hip::launch_*` and `waist.rs`'s
 //! `pub use crate::hip::*` resolve exactly as they did when this was one file — which module
@@ -33,6 +35,7 @@ use std::ffi::c_void;
 // the two that already exist (the declaration and `kernel_coverage.rs`'s census) are both
 // checked. This one would not be — a launcher left out of it would simply be invisible to
 // every consumer, which is the failure mode a wall like this cannot afford.
+pub use crate::hip_attn::*;
 pub use crate::hip_blocks::*;
 pub use crate::hip_linalg::*;
 

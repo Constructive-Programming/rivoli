@@ -21,8 +21,8 @@
 // | dot_vq.hpp    | VQ-int3 codebook dot                                              |
 //
 // What stayed HERE is what none of them owns and what more than one of them serves: the
-// fixed-point MoE accumulator, the clamped SwiGLU both expert paths share, and the
-// `mla_absorb_fp8` grid bound.
+// fixed-point MoE accumulator, the clamped SwiGLU both of V4's expert paths share, the
+// SiTU-GLU both of K3's do (M9), and the `mla_absorb_fp8` grid bound.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -77,7 +77,9 @@ __device__ __forceinline__ unsigned long long moe_fixed(float v) {
 // None of the three carries a `contract(off)` pragma, and none needs one: `rbf16`
 // (formats.hpp) is bit surgery, `block_sum_lds`'s (reduce.hpp) only operator is `+`, and
 // `swiglu_clamped`'s below only `+` is `1.0f + expf(...)`, whose addends are a constant and
-// a call return — there is no multiply for an FMA to absorb in any of them. That is NOT
+// a call return — there is no multiply for an FMA to absorb in any of them. (`situ_glu`,
+// M9, is the same case as `swiglu_clamped`: its only `+` is the sigmoid denominator's
+// constant-plus-call, so the argument covers it unchanged.) That is NOT
 // true of `e4m3_subnormal_mantissa` in formats.hpp, which does carry one — see the note
 // there for what an ISA diff caught. [CORRECTED 2026-08-15: this named `f2e4m3_rne`, which
 // held the pragma until that function was split; it travelled down to the one branch with
@@ -87,7 +89,7 @@ __device__ __forceinline__ unsigned long long moe_fixed(float v) {
 // bf16 store: `silu(min(bf16(g), L)) · clamp(bf16(u), ±L)` (model.py:601-608).
 //
 // ONE definition, because there are two callers and they must agree bit for bit or the
-// comparison the whole port rests on stops meaning anything: `moe.hip::moe_gateup_f4_impl`
+// comparison the whole port rests on stops meaning anything: `moe_f4.hip::moe_gateup_f4_impl`
 // (the fp4 ROUTED experts) and `activation.hip::swiglu_clamped_bf16` (the fp8 SHARED
 // expert). `MoE.__init__` passes `swiglu_limit` to `shared_experts` as well as to the
 // routed ones (model.py:632), so the two run the same arithmetic on different weight
@@ -124,6 +126,54 @@ __device__ __forceinline__ float swiglu_clamped(float g, float u, float limit) {
     ut = fminf(fmaxf(ut, -limit), limit);
     gt = fminf(gt, limit);  // ASYMMETRIC: no lower clamp on the gate
     return gt * (1.0f / (1.0f + expf(-gt))) * ut;
+}
+
+// **SiTU-GLU — Kimi-K3's activation**, `k3-architecture.md` §8 and the reference's
+// `SituAndMul.forward` (ported verbatim from `k3:kernels/common.hpp`, M9):
+//
+//     a = b1 · tanh(gate / b1) · sigmoid(gate)      b1 = activation_situ_beta        = 4
+//     u = b2 · tanh(up   / b2)                      b2 = activation_situ_linear_beta = 25
+//     y = a · u                                     so |y| <= b1·b2 = 100
+//
+// USED BY: Kimi-K3 only, and by all three of its MLP shapes — the dense layer 0, the shared
+// MLP, and every routed expert. GLM-5.2 and DeepSeek-V4-Flash use `swiglu_clamped` above and
+// never reach this.
+//
+// It lives HERE, next to `swiglu_clamped`, for that helper's own reason: `activation.hip`'s
+// dense launcher and `moe_f4.hip`'s fused fp4 expert kernel must run the identical
+// arithmetic, and `kernels/` is not watched by the jscpd gate, so a second copy would drift
+// in silence. The plan says the same thing from the other end — "an implementer who changes
+// the dense path alone watches it go right and every routed expert stay wrong".
+//
+// **It is NOT `swiglu_clamped` with different constants, and the merge that parameterises one
+// into the other must never happen** — the identical hazard that entry already carries. Four
+// differences, each of which is a defect a fixture can name:
+//
+//  1. **The sigmoid takes the UNCAPPED gate.** `tanh(g/b1)` bounds the first factor and
+//     `sigmoid(g)` is handed the raw dot, so the two factors saturate at different rates.
+//     Feeding the capped value to the sigmoid is smooth, plausible and wrong everywhere the
+//     gate is large.
+//  2. **`up` is transformed, not clamped.** `b2·tanh(up/b2)` saturates smoothly; a clamp is
+//     piecewise-linear with a corner. They agree only near zero.
+//  3. **Neither operand is bf16-rounded here.** `swiglu_clamped` rounds first because V4's
+//     `Expert.forward` reads its operands back from a bf16 `Linear` store explicitly. K3's
+//     `SituAndMul` does `.to(torch.float32)`, which is a widening no-op — whatever rounding
+//     the real model does happened at the projection, and rivoli's trunk carries f32
+//     activations throughout. Rounding here would be a step the reference does not take.
+//  4. **The product is returned UNROUNDED**, and the rounding is the caller's. `moe_f4.hip`'s
+//     fp4 caller stores `rbf16(y)` — pass 1's bf16 store — and applies the routing weight in
+//     pass 2, while the dense and shared callers have no routing weight and no store here at
+//     all. (CORRECTED 2026-08-12: this said "the fp4 caller folds the routing weight in and
+//     rounds `bf16(y·w)`", which item 4b moved to pass 2. The conclusion was right and the
+//     premise had become false — and re-folding `w` into pass 1 is exactly the defect
+//     `folding_the_routing_weight_before_w2_is_not_the_same_function` exists to price.)
+//
+// `1.0f/(1.0f+expf(-g))` and not a multiply form: `torch.sigmoid` is the division form, and
+// unlike `F.silu` there is no `x·sigmoid(x)` idiom here to match — the sigmoid's argument is
+// not the factor it multiplies.
+__device__ __forceinline__ float situ_glu(float g, float u, float b1, float b2) {
+    const float a = b1 * tanhf(g / b1) * (1.0f / (1.0f + expf(-g)));
+    return a * (b2 * tanhf(u / b2));
 }
 
 // i-quads per head in `mla_absorb_fp8` — one thread each. Shared by the kernel (which

@@ -15,10 +15,13 @@ pub mod abi;
 pub mod gpustream;
 #[cfg(feature = "rocm")]
 pub mod hip;
-// The ABI wall's two macro invocations, split out of `hip.rs` 2026-08-15 under the 800-line
-// file ceiling. PRIVATE and re-exported through `hip`, so the split is invisible from
-// outside: `rivoli_backend::hip::launch_*` is still the only path, and which of the two a
-// launcher is declared in stays an authoring decision rather than an API one.
+// The ABI wall's macro invocations, split out of `hip.rs` 2026-08-15 under the 800-line
+// file ceiling — and a third, `hip_attn`, split out of `hip_blocks` 2026-08-16 when the M9
+// launchers landed. PRIVATE and re-exported through `hip`, so the split is invisible from
+// outside: `rivoli_backend::hip::launch_*` is still the only path, and which invocation file
+// a launcher is declared in stays an authoring decision rather than an API one.
+#[cfg(feature = "rocm")]
+mod hip_attn;
 #[cfg(feature = "rocm")]
 mod hip_blocks;
 #[cfg(feature = "rocm")]

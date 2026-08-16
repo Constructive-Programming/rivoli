@@ -11,14 +11,26 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 12] = [
+const KERNELS: [&str; 15] = [
     "linalg",
     // Split out of `linalg.hip` 2026-08-15 (the per-token activation transforms), and
     // listed next to it because the pair is one cut, not two subsystems.
     "activation",
+    // Split out of `activation.hip` 2026-08-16 (the residual-stream mixers: V4's mHC pair
+    // and K3's attn_res) — same one-cut argument, listed next to its source.
+    "residual",
     "moe",
+    // Split out of `moe.hip` 2026-08-16 (the FP4 routed-expert family, V4's pair and K3's
+    // situ pair) — same argument again.
+    "moe_f4",
     "mla",
     "attn",
+    // NEW with M9: Kimi-K3's gated-delta-rule family (recurrence, short conv, gated head
+    // norm), ported verbatim from `k3:kernels/recurrent.hip`. A `.hip` absent from this
+    // list is silently never built and the archive then fails to link — which is the loud
+    // half; the QUIET half this list once shipped was a stale object from an untracked
+    // header, and `headers()` below is what closed it.
+    "recurrent",
     "fwd",
     "vmm",
     "indexer",

@@ -113,6 +113,14 @@ extern "C" __global__ void vadd(float* __restrict__ x, const float* __restrict__
 // residual. Reviewed 2026-08-12 and left as-is: the limits are what sigmoid converges to, a
 // NaN `g` still propagates, and the softcap keeps the terminal detector. Recorded so the
 // choice is a decision and not an accident.
+//
+// USED BY Kimi-K3 too (M9): its gated MLA applies exactly this — `attn *= sigmoid(gate)`,
+// division form, between `attn.hip::mha_attend` and `o_proj` (`k3-architecture.md` §5). The
+// k3 tree carried its own out-of-place copy (`k3:kernels/attn.hip`); the M9 port deliberately
+// did NOT bring it, because a second entry point differing only in writing to a third buffer
+// is the `swiglu`/`swiglu_clamped_bf16` merge hazard in reverse. What K3's MLA must NOT use
+// is `recurrent.hip::rmsnorm_gate_heads_f32` — MLA gates with NO norm, KDA norms then gates,
+// and that ordering is `k3-architecture.md` trap 10.
 extern "C" __global__ void sigmoid_gate(
     float* __restrict__ x, const float* __restrict__ g, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

@@ -83,6 +83,16 @@ __device__ __forceinline__ float rbf16(float x) { return bf16f(f2bf16(x)); }
 // both end in `rbf16`); `bf16` elsewhere in a name is the INPUT dtype (`gemm_bf16` weights,
 // `embed_bf16_row_bcast` source table). If a new kernel would break that split, rename
 // rather than adding a third sense.
+//
+// **And what a trailing `_f32` means, because the split above does not cover it.** Settled
+// here 2026-08-12 (ported with M9 from `k3:kernels/common.hpp`) rather than in one kernel's
+// comment, on this block's own instruction to resolve a new sense at the rule: a trailing
+// `_f32` names the STORE (`activation.hip::situ_glu_f32`,
+// `recurrent.hip::gated_delta_recurrent_f32`) **unless the kernel is a member of a
+// `gemv_<weight-format>` family**, where the suffix has always named the weight dtype
+// instead (`gemv_f32` against `gemv_fp8`/`_i4`/`_i8`/`_vq`, whose weights really are
+// `float`). That exception is the whole of the ambiguity; naming it is cheaper than
+// renaming either side, and leaving it unnamed is how a third sense arrives.
 
 // fp8-e4m3 → f32 (matches math.rs::e4m3_to_f32). 1 sign / 4 exp (bias 7) / 3 mant;
 // exp==0 subnormal = sign·(m/8)·2^-6; (exp==15, mant==7) = NaN.

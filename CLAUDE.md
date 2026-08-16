@@ -52,12 +52,13 @@ appears that enum dispatch cannot fill.
 
 - **jscpd** — duplication is a build error, zero budget (`crates/cli/build.rs`, every
   build, both feature arms). Precondition: rustfmt-clean, or the result is a lower bound.
-  **7** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
-  where verbatim transcription of the reference is the point; three across the HIP ABI
+  **8** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
+  where verbatim transcription of the reference is the point; four across the HIP ABI
   wall, which the 800-line ceiling split into `backend/hip.rs` — its extern declarations
-  and its one hand-written launcher — plus one per macro-invocation half,
-  `backend/hip_linalg.rs` and `backend/hip_blocks.rs`, since a marker pair cannot span
-  files; one in `core/routing.rs`, the frozen `route_into_pre` photograph — each argues
+  and its one hand-written launcher — plus one per macro-invocation file,
+  `backend/hip_linalg.rs`, `backend/hip_blocks.rs` and `backend/hip_attn.rs` (the third
+  invocation file, split out 2026-08-16 with M9's launchers), since a marker pair cannot
+  span files; one in `core/routing.rs`, the frozen `route_into_pre` photograph — each argues
   in place;
   `quant.rs`'s parameter-list exemption died 2026-08-15 when the `Fp8W`/`VqW`/
   `RowScaledW` views paid the hop its note had priced); the

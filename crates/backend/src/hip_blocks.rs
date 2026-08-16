@@ -1,11 +1,15 @@
-//! The FUSED-BLOCK half of the HIP ABI wall: one launch per model sub-block — a streaming
-//! MoE expert range and the fixed-point accumulator it lands in, the mHC multi-copy
-//! residual, MLA and GQA attention over the KV slabs, the sparse lightning indexer, and the
-//! KV compressor.
+//! The RESIDUAL-STREAM third of the HIP ABI wall's fused-block half: one launch per model
+//! sub-block on the token's spine — a streaming MoE expert range and the fixed-point
+//! accumulator it lands in, and the residual mixers (V4's mHC multi-copy pair, K3's
+//! `attn_res`).
 //!
 //! Split out of `hip.rs` 2026-08-15 under the 800-line file ceiling; a move, not a rewrite —
 //! every declaration is byte-identical to the one it replaced and `hip.rs` re-exports this
-//! module, so `rivoli_backend::hip::launch_attend` resolves as before.
+//! module, so `rivoli_backend::hip::launch_moe_expert_range` resolves as before. Split AGAIN
+//! 2026-08-16 under the same ceiling when the M9 (Kimi-K3) launchers landed: the attention
+//! blocks — MLA/GQA/MHA, the sparse indexer, the KV compressor, and the KDA recurrent-state
+//! family — moved whole to `hip_attn.rs`, on the cut "what mixes the residual stream" against
+//! "what reads or writes per-position context state".
 //!
 //! What separates these from `hip_linalg.rs`'s primitives is a contract, not a size: a block
 //! launcher owns intermediate device buffers the caller must size but never reads (`h`,
@@ -13,17 +17,17 @@
 //! neighbours rather than individually, and its `# Safety` block is where the sizing relation
 //! between those buffers is written down. A primitive has operands; these have a layout.
 
-use crate::abi::{CompFinish, CompGeom};
 use crate::hip::{ExpertDesc, ExpertDescF4, abi_ty, ensure_hip_status, launchers};
 use anyhow::Result;
 use std::ffi::c_void;
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
-// twenty rewritten comments.
+// twenty rewritten comments. (`CompFinish`/`CompGeom` and the attention-side links left with
+// their launchers in the 2026-08-16 split.)
 #[allow(unused_imports)]
 use crate::{
-    hip::{attend_scratch_floats, device_sync},
-    hip_linalg::{launch_act_quant_f8, launch_act_quant_f8_prefix, launch_vadd},
+    hip::device_sync,
+    hip_linalg::{launch_act_quant_f8, launch_vadd},
 };
 
 // jscpd:ignore-start
@@ -40,9 +44,13 @@ use crate::{
 //                                       range convention. Measured 2026-08-15 with the
 //                                       markers deleted: four of the region's clones are
 //                                       runs inside this trio.
-//   `mla_absorb_fp8` / `mla_value_fp8`  share the fp8 block-scaled `kv_b` operand list. They
-//                                       are the two halves of one absorb-attend-value chain
-//                                       and read as a pair or not at all.
+//   `moe_expert_range_f4` / `_f4_situ`  (M9) share everything down to `wexpert` and then
+//                                       diverge — `swiglu_limit` against the two betas. The
+//                                       separation IS the two models' arithmetic and the
+//                                       declarations carry it; the shared prefix is the
+//                                       collision. (`mla_absorb_fp8`/`mla_value_fp8`, listed
+//                                       here until 2026-08-16, moved to `hip_attn.rs` with
+//                                       their chain — that file's marker carries them now.)
 //
 // Factoring either group behind a shared prefix is the thing this wall exists to prevent:
 // you could no longer read the C signature off the Rust declaration, and for the MoE trio it
@@ -175,6 +183,70 @@ launchers! {
         descs: *const ExpertDescF4,
         wexpert: *const f32,
         swiglu_limit: f32,
+        h: *mut f32,
+        acc: *mut u64,
+        nrow: usize as i32,
+        stream: *mut c_void,
+    );
+
+    /// **Kimi-K3's routed expert range** — the fp4 pair with SiTU-GLU fused and the routing weight
+    /// applied AFTER `w2`. `k3-architecture.md` §6, plan §3b; ported from `k3:src/backend/hip.rs`
+    /// (M9).
+    ///
+    /// Four differences from [`launch_moe_expert_range_f4`], each of which passes every length
+    /// check if it is got wrong, and each argued at the kernel it lives in (`moe_f4.hip`):
+    ///
+    /// 1. **`situ_glu`, not `swiglu_clamped`** — and no `swiglu_limit`, because SiTU-GLU's
+    ///    saturation is `tanh` inside the function rather than a parameter. The two **betas** are
+    ///    refused instead (1006): `<= 0`, NaN and `+/-inf` all fail quietly, `+inf` most quietly of
+    ///    all, since `b·tanh(x/b) -> x`.
+    /// 2. **The routing weight is applied in pass 2**, to the bf16 `w2` output — `rbf16(dv)·w`, not
+    ///    `rbf16(dv·w)`. The reference is `moe_infer`'s
+    ///    `.type(topk_weight.dtype).mul_(topk_weight).sum(dim=1)` on the expert's full output.
+    ///    `w2` is linear, so this looks like a free reassociation of V4's fold; it is not, because a
+    ///    bf16 store sits between the passes and pass 2 sums in fixed point.
+    /// 3. **TWO launches, not three.** No `act_quant_f8` between the passes: K3's `w2` takes a plain
+    ///    fp32 activation (§6's `k3_matmul_mxfp4(edn, act, ...)`), where V4's fp8 `Linear`
+    ///    quantizes its own input. Quantizing here would add an error the reference does not have.
+    /// 4. **`expert_in` is the LATENT width** (3584), not `cfg.hidden` (7168) — the experts run in
+    ///    latent space, and it is both `w1`/`w3`'s reduction dim and `w2`'s output dim. S1a item 3
+    ///    renamed the k3 tree's Rust expert-geometry layer to `expert_in` for this distinction; a
+    ///    caller binding `cfg.hidden` positionally here computes a wrong row and is refused by
+    ///    nothing.
+    ///
+    /// `acc` is the latent-wide accumulator [`launch_moe_acc_drain_to`] drains, not the residual.
+    ///
+    /// # Safety
+    /// `x` is `expert_in` live f32 and **16-byte aligned** (an unchecked obligation of the `float4`
+    /// loads in `dot_f4_wave_r`, exactly as the fp8 twin requires). `descs` is `n_desc`
+    /// `ExpertDescF4`, whose spans must cover `inter x expert_in` fp4 weights and their group-32
+    /// scales. `wexpert` is `>= e_start + e_count` f32, `h` is `>= (e_start + e_count) * inter` f32,
+    /// `acc` is `expert_in` u64. All outlive `stream`'s completion; `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
+    ///
+    /// **`h` must be 16-byte aligned too, and it is the one a caller is likely to get wrong.** Pass
+    /// 2 issues the same `float4` loads on `h_in + e * inter`, so a caller that sub-slices `h` out
+    /// of a shared per-layer scratch arena at an unaligned offset faults inside `dot_f4_wave_r`
+    /// rather than falling back to the scalar tail — and only at the real widths, where
+    /// `inter >= 256` enters the fast path. `x` and `h` must also **not alias**: both are
+    /// `__restrict__` in the kernel. Both sentences are in the fp8 twin's doc and were dropped from
+    /// this one; restored 2026-08-12 by review, and no fixture allocates `h` unaligned, so neither
+    /// has a negative test.
+    ///
+    /// `nrow` must be 1 (guard 1003) — K3 has no speculative decode (`num_nextn_predict_layers` is
+    /// 0), and pass 1 is the one kernel of the pair that is NOT row-templated, so `nrow > 1` is a
+    /// two-kernel change rather than a parameter.
+    launch_moe_expert_range_f4_situ -> rivoli_moe_expert_range_f4_situ, "moe_expert_range_f4_situ" (
+        x: *const f32,
+        expert_in: usize as i32,
+        inter: usize as i32,
+        e_start: usize as i32,
+        e_count: usize as i32,
+        n_desc: usize as i32,
+        descs: *const ExpertDescF4,
+        wexpert: *const f32,
+        b1: f32,
+        b2: f32,
         h: *mut f32,
         acc: *mut u64,
         nrow: usize as i32,
@@ -335,341 +407,39 @@ launchers! {
         stream: *mut c_void,
     );
 
-    // ── attention: MLA, GQA, and the KV slabs they read ─────────────────────────────────────
+    // ── Block Attention Residuals — Kimi-K3's residual mixer (M9) ───────────────────────────
 
-    /// MLA absorb: `qabs[head][i] = Σ_d q[head·qh+d]·kv_b[rbase+d][i]` over kv_b's `nope`
-    /// absorb rows (rbase = head·(nope+vh)), head-batched. kv_b fp8-e4m3 block-scaled.
+    /// Kimi-K3's Block Attention Residual fold: `out = softmax(<RMSNorm(src_s), fold>) @ src`.
+    /// Ported from `k3:src/backend/hip.rs` (M9).
+    ///
+    /// `src` is `[tokens][nsrc][n]` and `out` is `[tokens][n]`. The softmax mixes the sources
+    /// **unnormalised** — `kernels/residual.hip` carries the argument and the defect that prices
+    /// it.
+    ///
+    /// **`src_stride` is the element distance between tokens in `src`, and it is NOT `nsrc·n`.**
+    /// `k3-architecture.md` §3 sizes the arena at `[T][9][hidden]` — nine slots per token whatever
+    /// the current depth — so a caller with that layout passes `9·n` while the live stack is
+    /// `nsrc·n`. A stride below `nsrc·n` is refused (1005): it would overlap consecutive tokens.
+    ///
+    /// `nsrc` outside `1..=16` is refused (1003) rather than clamped, because a stack larger than
+    /// one snapshot per `attn_res_block_size` layers plus the prefix sum means the caller's block
+    /// bookkeeping is wrong, and an EMPTY stack means §3's layer-level emptiness guard went
+    /// missing. Neither is a case this kernel should quietly define.
     ///
     /// # Safety
-    /// Async device pointers live until the next [`device_sync`]: `q` (`h·qh` f32),
-    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `qabs` (`h·kvl` f32).
-    launch_mla_absorb_fp8 -> rivoli_mla_absorb_fp8, "mla_absorb_fp8" (
-        q: *const f32,
-        kvb: *const u8,
-        kvb_scale: *const f32,
-        h: usize as i32,
-        qh: usize as i32,
-        nope: usize as i32,
-        vh: usize as i32,
-        kvl: usize as i32,
-        block: usize as i32,
-        nrow: usize as i32,
-        qabs: *mut f32,
-    );
-
-    /// MLA value: `ctx[head][j] = Σ_i clat[head][i]·kv_b[rbase+nope+j][i]` over kv_b's `vh`
-    /// value rows, head-batched. kv_b fp8-e4m3 block-scaled.
-    ///
-    /// # Safety
-    /// Async device pointers live until the next [`device_sync`]: `clat` (`h·kvl` f32),
-    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `ctx` (`h·vh` f32).
-    launch_mla_value_fp8 -> rivoli_mla_value_fp8, "mla_value_fp8" (
-        clat: *const f32,
-        kvb: *const u8,
-        kvb_scale: *const f32,
-        h: usize as i32,
-        nope: usize as i32,
-        vh: usize as i32,
-        kvl: usize as i32,
-        block: usize as i32,
-        nrow: usize as i32,
-        ctx: *mut f32,
-    );
-
-    /// MLA flash attention `clat = Σ_t softmax((qabs·L_t + qrope·R_t)·scale)·L_t` over
-    /// the fp8-e4m3 latent cache (per-128 block scales) + bf16 roped key, head-batched,
-    /// split-KV when `partial` is non-null.
-    ///
-    /// `rows` (nullable) lists the `nr` attended token indices for DSA sparse attention;
-    /// null = dense over the whole `0..nr` causal prefix.
-    ///
-    /// # Safety
-    /// Async device pointers live until the next [`device_sync`]: `qabs` (`h·kvl` f32),
-    /// `qrope` (`h·rope` f32), `lc8`/`lscale`/`rc` the KV cache (indexed by token — up to
-    /// `pos+1` rows; `n_blocks = kvl/128`), `rows` (`nr` u32 or null), `clat` (`h·kvl`
-    /// f32), `partial` ([`attend_scratch_floats`] f32 or null = single split).
-    launch_attend -> rivoli_mla_attend, "mla_attend" (
-        qabs: *const f32,
-        qrope: *const f32,
-        lc8: *const u8,
-        lscale: *const f32,
-        rc: *const u16,
-        rows: *const u32,
-        h: usize as i32,
-        nr: usize as i32,
-        kvl: usize as i32,
-        rope: usize as i32,
-        n_blocks: usize as i32,
-        scale: f32,
-        clat: *mut f32,
-        partial: *mut f32,
-    );
-
-    /// Append one token's latent (fp8-e4m3 + per-128 block scale) + roped key (bf16) to
-    /// the KV slabs at row `pos`. `kvl` must be a multiple of 128 in `[128, 1024]`.
-    ///
-    /// # Safety
-    /// Device pointers live until the next [`device_sync`]: `latent` (`kvl` f32), `rope`
-    /// (`ropn` f32), `lc8`/`lscale`/`rc` the KV slabs (row `pos` in-bounds; `n_blocks =
-    /// kvl/128`).
-    launch_append_kv -> rivoli_append_kv, "append_kv" (
-        latent: *const f32,
-        rope: *const f32,
-        lc8: *mut u8,
-        lscale: *mut f32,
-        rc: *mut u16,
-        pos: usize as i32,
-        kvl: usize as i32,
-        ropn: usize as i32,
-        n_blocks: usize as i32,
-    );
-
-    /// Gather each head's roped query segment: `qrope[head·ropn+d] = q[head·qh+nope+d]`.
-    ///
-    /// # Safety
-    /// Device pointers live until the next [`device_sync`]: `q` (`h·qh` f32), `qrope`
-    /// (`h·ropn` f32).
-    launch_gather_rope -> rivoli_gather_rope, "gather_rope" (
-        q: *const f32,
-        qrope: *mut f32,
-        h: usize as i32,
-        qh: usize as i32,
-        nope: usize as i32,
-        ropn: usize as i32,
-    );
-
-    /// `kernel.py::sparse_attn` — MQA over one `d`-wide entry that is both key and value for
-    /// all `h` heads, gathered by `idxs` (`-1` masks a slot), with `sink` entering the
-    /// softmax DENOMINATOR only.
-    ///
-    /// # Safety
-    /// Device pointers must outlive `stream`'s completion: `q` (`m * h * d` f32), `kv` (`d` f32
-    /// per row, indexed by `idxs`, so at least `max(idxs) + 1` rows), `sink` (`h` f32), `idxs`
-    /// (`m * topk` i32), `o` (`m * h * d` f32). `stream` is a live `hipStream_t`, or null for
-    /// the default stream.
-    launch_gather_attn_shared_kv -> rivoli_gather_attn_shared_kv, "gather_attn_shared_kv" (
-        q: *const f32,
-        kv: *const f32,
-        sink: *const f32,
-        idxs: *const i32,
-        m: usize as i32,
-        h: usize as i32,
-        d: usize as i32,
-        topk: usize as i32,
-        scale: f32,
-        o: *mut f32,
-        stream: *mut c_void,
-    );
-
-    /// Grouped-query attention with a derived causal bound — Muse Glimmer's 32Q/2KV layers.
-    ///
-    /// Q head `i` reads KV head `i / (hq / hkv)`, which is a per-head BLOCK and not an
-    /// interleave; `win > 0` bounds each query to `[pos - win + 1, pos]` INCLUSIVE of its own
-    /// position; `win == 0` is a global layer and attends the whole causal prefix. No mask is
-    /// taken — the bound is derived, because Glimmer's 131072 context makes a `[tq][s]` mask
-    /// larger than the model. The kernel comment carries the four traps.
-    ///
-    /// **`start_pos` is the absolute position of query row 0, and the cache must be indexed to
-    /// match — the two modes index it differently.** With `ring_cap != 0`, slot is
-    /// `position % ring_cap`, so `start_pos` stays absolute and the ring may hold any window of
-    /// history. With `ring_cap == 0` the slot IS the position, so the cache must run from
-    /// position 0: a caller that trims a linear cache to its last `win` rows and leaves
-    /// `start_pos` absolute reads past the end, and one that trims without also shifting
-    /// `start_pos` attends the wrong rows fluently. `tests/glimmer_attend.rs` does exactly that
-    /// shift, deliberately, because the reference hands it a trimmed cache — see `Fixture`.
-    /// Both engine paths avoid the question: a global layer holds the whole prefix, a sliding
-    /// layer uses the ring.
-    ///
-    /// # Safety
-    /// Device pointers must outlive `stream`'s completion: `q` (`tq * hq * d` f32), `k` and `v`
-    /// (each `hkv * d` f32 per slot, so at least `ring_cap` slots with a ring and
-    /// `start_pos + tq` without), `out` (`tq * hq * d` f32), none aliasing another (every
-    /// kernel parameter is `__restrict__`). `stream` is a live `hipStream_t`, or null for the
-    /// default stream.
-    ///
-    /// A ring must be at least `win + tq - 1` slots, which the launcher enforces: one launch
-    /// dereferences the UNION of its rows' windows, so `tq` query rows need `win + tq - 1`
-    /// positions live at once and a `win`-slot ring overwrites its own oldest row mid-launch.
-    /// Decode (`tq == 1`) is the case where `ring_cap == win` suffices, and it is the only case
-    /// the goldens can reach.
-    launch_gqa_attend -> rivoli_gqa_attend, "gqa_attend" (
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        hq: usize as i32,
-        hkv: usize as i32,
-        d: usize as i32,
-        tq: usize as i32,
-        start_pos: usize as i32,
-        win: usize as i32,
-        ring_cap: usize as i32,
-        scale: f32,
+    /// `src` is `tokens·nsrc·n` f32, `fold` is `n` f32 and `out` is `tokens·n` f32, all live until
+    /// the next [`device_sync`]. `out` must NOT alias `src`: every thread reads all `nsrc` sources
+    /// for its column after the block has already written scores, and a caller aliasing them would
+    /// have the mixing loop read values it has itself overwritten.
+    launch_attn_res -> rivoli_attn_res, "attn_res" (
+        src: *const f32,
+        fold: *const f32,
+        tokens: usize as i32,
+        nsrc: usize as i32,
+        n: usize as i32,
+        src_stride: usize,
+        eps: f32,
         out: *mut f32,
-        stream: *mut c_void,
-    );
-
-    // ── the sparse lightning indexer (DSA / MISA) ───────────────────────────────────────────
-
-    /// Append one indexer key row (bf16) at `pos`: `kcache[pos·hd+i] = bf16(k[i])`.
-    ///
-    /// # Safety
-    /// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `kcache`
-    /// (row `pos` in-bounds).
-    launch_index_append -> rivoli_index_append, "index_append" (
-        k: *const f32,
-        kcache: *mut u16,
-        pos: usize as i32,
-        hd: usize as i32,
-    );
-
-    /// Score every cached token against the indexer query heads:
-    /// `scores[t] = Σ_{h∈active} w[h]·wscale·ReLU((q_h·k_t)·dscale)`. `heads` (nullable)
-    /// lists the `nact` active heads (MISA); null = all `nh` heads (DSA).
-    ///
-    /// # Safety
-    /// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
-    /// f32), `kcache` (`nt·hd` bf16), `heads` (`nact` u32 or null), `scores` (`nt` f32).
-    launch_index_score -> rivoli_index_score, "index_score" (
-        q: *const f32,
-        w: *const f32,
-        kcache: *const u16,
-        heads: *const u32,
-        nt: usize as i32,
-        nh: usize as i32,
-        nact: usize as i32,
-        hd: usize as i32,
-        wscale: f32,
-        dscale: f32,
-        scores: *mut f32,
-    );
-
-    /// Select the DSA attend row set on device: `rows[0..min(k,nt))`, ASCENDING by index.
-    ///
-    /// Writes device-side only — no D2H, no host top-k, and no `device_sync`: the attend
-    /// consumes `rows` on the same stream, so program order is the whole requirement.
-    ///
-    /// **Intended** to be bit-identical to the `topk_into(..) + sort_unstable()` it
-    /// replaces; `tests/kernel.rs::index_topk_matches_host_selection` is the gate for that
-    /// claim. The tiebreak rule and its rationale live at the kernel, once.
-    ///
-    /// # Safety
-    /// Device pointers live until the next [`device_sync`]: `scores` (`nt` f32), `rows`
-    /// (at least `min(k, nt)` u32 — the kernel writes exactly that many).
-    launch_index_topk -> rivoli_index_topk, "index_topk" (
-        scores: *const f32,
-        nt: usize as i32,
-        k: usize as i32,
-        rows: *mut u32,
-    );
-
-    /// Fold token `t`'s indexer key into its MISA block pool running mean.
-    ///
-    /// # Safety
-    /// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `pool`
-    /// (block `t/MISA_BLOCK` in-bounds).
-    launch_index_pool_push -> rivoli_index_pool_push, "index_pool_push" (
-        k: *const f32,
-        pool: *mut f32,
-        t: usize as i32,
-        hd: usize as i32,
-    );
-
-    /// MISA head-router estimate `e[j] = mean_b |w[j]·ReLU(q_j·k̄_b)|` over the block pool.
-    ///
-    /// # Safety
-    /// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
-    /// f32), `pool` (`m_blocks·hd` f32), `e` (`nh` f32).
-    launch_index_head_route -> rivoli_index_head_route, "index_head_route" (
-        q: *const f32,
-        w: *const f32,
-        pool: *const f32,
-        m_blocks: usize as i32,
-        nh: usize as i32,
-        hd: usize as i32,
-        e: *mut f32,
-    );
-
-    // ── the KV compressor ───────────────────────────────────────────────────────────────────
-
-    /// The state deposit of `Compressor.forward` — **both phases**, which are one operation
-    /// distinguished only by `slot0`.
-    ///
-    /// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
-    /// decode deposits its single row at slot `start_pos % ratio`. See
-    /// `kernels/kvcompress.hip::kv_compress_deposit` for why that is a unification and not a
-    /// coincidence.
-    ///
-    /// Must be launched on **every** call, including one that emits no block: the reference
-    /// writes the state and only then returns `None`. At ratio 128 that is every prompt under
-    /// 128 tokens and 127 of every 128 decode steps.
-    ///
-    /// Refuses `s <= 0` (guard 1005) and a `slot0` whose run would leave the `[ratio, cd]`
-    /// `ape` table (guard 1008).
-    ///
-    /// # Safety
-    /// `kv`/`score` are `s · p.cd()` live f32; `ape` is `p.ratio() · p.cd()`; the two state
-    /// buffers are `p.state_len()` writable f32. None may alias another — every kernel
-    /// parameter is `__restrict__`. `p` is read host-side before the launch; the device buffers
-    /// must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or null for the
-    /// default stream.
-    launch_kv_compress_deposit -> rivoli_kv_compress_deposit, "kv_compress_deposit" (
-        kv: *const f32,
-        score: *const f32,
-        ape: *const f32,
-        kv_state: *mut f32,
-        score_state: *mut f32,
-        p: &CompGeom as *const CompGeom,
-        s: usize as i32,
-        slot0: usize as i32,
-        stream: *mut c_void,
-    );
-
-    /// Prefill pooling for `nblk` compressed blocks — `overlap_transform`, the per-feature
-    /// softmax over the pooling window, the bf16 store, `RMSNorm`, and the RoPE at each block's
-    /// FIRST absolute position.
-    ///
-    /// Does **not** run `act_quant`; call [`launch_act_quant_f8_prefix`] over dims `[0, d - rd)` at
-    /// block 64 afterwards, which is the order and the partial extent model.py:373-378 uses.
-    ///
-    /// Refuses `nblk <= 0` (guard 1006) rather than launching nothing and returning success,
-    /// which would hand the caller an unwritten `out`.
-    ///
-    /// # Safety
-    /// `kv`/`score` are at least `nblk · p.ratio() · p.cd()` live f32; `ape` is
-    /// `p.ratio() · p.cd()`; `f` satisfies [`CompFinish`]'s field contract with `out` sized
-    /// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
-    /// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
-    /// null for the default stream.
-    launch_kv_compress_prefill -> rivoli_kv_compress_prefill, "kv_compress_prefill" (
-        kv: *const f32,
-        score: *const f32,
-        ape: *const f32,
-        f: &CompFinish as *const CompFinish,
-        p: &CompGeom as *const CompGeom,
-        nblk: usize as i32,
-        stream: *mut c_void,
-    );
-
-    /// Pool one COMPLETED decode window out of the compressor state into a single block, and
-    /// slide the window.
-    ///
-    /// Reads no activation: this step's row was already deposited by
-    /// [`launch_kv_compress_deposit`], `ape` included. Call **only** when
-    /// `(start_pos + 1) % ratio == 0`; the launcher refuses otherwise (guard 1009) rather than
-    /// pooling a half-filled window into finite, plausible, wrong numbers.
-    ///
-    /// # Safety
-    /// The two state buffers are `p.state_len()` f32 and are read-modify-written; `f` satisfies
-    /// [`CompFinish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
-    /// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
-    /// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_kv_compress_decode -> rivoli_kv_compress_decode, "kv_compress_decode" (
-        kv_state: *mut f32,
-        score_state: *mut f32,
-        f: &CompFinish as *const CompFinish,
-        p: &CompGeom as *const CompGeom,
-        start_pos: usize as i32,
-        stream: *mut c_void,
     );
 }
 // jscpd:ignore-end

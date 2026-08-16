@@ -462,6 +462,39 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// **SiTU-GLU over a gate/up pair — Kimi-K3's activation**, `k3-architecture.md` §8:
+    /// `y = (b1·tanh(g/b1)·sigmoid(g)) · (b2·tanh(u/b2))`, so `|y| <= b1·b2` (100 at the shipped
+    /// 4 and 25). The arithmetic is `kernels/common.hpp::situ_glu` and is argued there; ported
+    /// from `k3:src/backend/hip.rs` (M9).
+    ///
+    /// **Not [`launch_swiglu_clamped_bf16`] with different constants.** The sigmoid takes the
+    /// UNCAPPED gate, `up` is transformed rather than clamped, neither operand is bf16-rounded,
+    /// and the store is f32. Merging the two behind a parameter is the refactor `common.hpp`
+    /// warns against for `swiglu`/`swiglu_clamped` — the same hazard, one model over.
+    ///
+    /// **This is the DENSE path only** — layer 0's MLP and the shared MLP. The routed experts
+    /// fuse the same helper inside `moe_f4.hip`'s fp4 expert kernel and never come through here,
+    /// so a change made here alone leaves every routed expert wrong (plan §3b).
+    ///
+    /// Both betas must be finite and positive; `<= 0`, NaN and `+/-inf` are refused (1006, the
+    /// same code the `swiglu_limit` guards return for the same shape of check). A zero or NaN
+    /// beta does not degrade gracefully — it makes `tanh(x/b)` saturate or go NaN for every
+    /// element, which no magnitude check on the output would catch.
+    ///
+    /// # Safety
+    /// `g`, `u` and `h` are each `n` f32 and must outlive `stream`'s completion. `h` may alias
+    /// `g` or `u` — every thread reads both, then writes once, and that write depends on both
+    /// reads. `stream` is a live `hipStream_t`, or null for the default stream.
+    launch_situ_glu_f32 -> rivoli_situ_glu_f32, "situ_glu_f32" (
+        g: *const f32,
+        u: *const f32,
+        n: usize as i32,
+        b1: f32,
+        b2: f32,
+        h: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// `x[i] *= sigmoid(g[i])` — Muse Glimmer's attention output gate, applied between the attend
     /// and `o_proj`.
     ///
@@ -471,6 +504,13 @@ launchers! {
     /// signature can prevent it — `tests/glimmer_gate.rs` is what holds a caller to it.
     ///
     /// Not [`launch_swiglu`]: that is `silu(g)*u`, which carries an extra factor of `g`.
+    ///
+    /// USED BY Kimi-K3's gated MLA too (M9): §5's output gate is this same arithmetic at the
+    /// same seam — between [`launch_mha_attend`](crate::hip_attn::launch_mha_attend) and
+    /// `o_proj` — so the k3 tree's out-of-place copy was deliberately NOT ported
+    /// (`kernels/fwd.hip` records the decision, and trap 10's twin is
+    /// [`launch_rmsnorm_gate_heads_f32`](crate::hip_attn::launch_rmsnorm_gate_heads_f32),
+    /// which norms first and must not be reached for here).
     ///
     /// A `g` of ±Inf gates by the LIMIT (exactly 1 or 0) — finite output from non-finite input,
     /// a reviewed decision recorded on the kernel.

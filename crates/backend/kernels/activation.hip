@@ -1,7 +1,6 @@
 // Per-token activation transforms — what the forward pass does to the activation stream
-// BETWEEN the projections: RMSNorm in its three forms, RoPE in its two, the SwiGLU
-// combines, `act_quant`'s fused quantize-dequantize, and DeepSeek-V4's mHC residual
-// mixing.
+// BETWEEN the projections: RMSNorm in its three forms, RoPE in its two, and the gated
+// combines (SwiGLU's two, SiTU-GLU) plus `act_quant`'s fused quantize-dequantize.
 //
 // **Split out of `linalg.hip` on 2026-08-15**, which was 1125 lines against an 800-line
 // cap. Whole and verbatim: same symbols, same launcher signatures, same `common.hpp`, so
@@ -13,11 +12,11 @@
 // is why none of them has a split-K variant and why their launch geometry is a function of
 // `n`, never of a weight layout.
 //
-// `hc_pre` is the one member that has to be ARGUED rather than seen: it does contract
-// against a learned `fnw`. At 1.57 MB per layer against lm_head's 952 MB that is a
-// per-token reduction and not a projection, and its output is the residual stream itself,
-// which is the axis this file is cut on. It sits here with `hc_post`, whose `post`/`comb`
-// it produces — splitting the pair would put half a residual contract in each file.
+// **The mHC pair moved on to `residual.hip` 2026-08-16** — again whole and verbatim, again
+// under the 800-line cap, when K3's residual mixer (`attn_res`) would have pushed this file
+// past it. `hc_pre` was already the member this header had to ARGUE into the file ("its
+// output is the residual stream itself"); the residual mixers are now that argument's own
+// translation unit, and what stays here is exactly what the first paragraph names.
 //
 // All pointers device-resident; launchers only launch (the caller joins via
 // `linalg.hip::rivoli_device_sync`). Return codes: 0 ok, POSITIVE arg guard,
@@ -102,6 +101,41 @@ extern "C" __global__ void swiglu_clamped_bf16(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     h[i] = rbf16(swiglu_clamped(g[i], u[i], limit));
+}
+
+// **SiTU-GLU over a gate/up pair, Kimi-K3's dense layer 0 and shared MLP.** The arithmetic is
+// `common.hpp::situ_glu`; everything interesting is argued there. Ported verbatim from
+// `k3:kernels/linalg.hip` (M9); it sits third in this file's combine family for the same
+// side-by-side reason the two above give.
+//
+// USED BY: Kimi-K3 only. The routed experts do NOT come through here — `moe_f4.hip` fuses the
+// same helper inside the fp4 expert kernel, because there is no separate activation launch on
+// the `.f4` path. Both call sites exist on purpose and the plan (§3b) says why: change one and
+// the dense path goes right while every routed expert stays wrong.
+//
+// **`_f32` names the STORE, extending the `_bf16` convention rather than adding a sense to it**
+// (`formats.hpp`'s naming note). It is spelled out because which store a kernel performs is
+// precisely what this port got wrong once already: `mla.hip::rmsnorm_batch` was named for K3's
+// latent norm on the strength of being width-generic, and its bf16 store put it 5.2x outside
+// that operator's tolerance (S2 item 3, 2026-08-12). An unmarked name invites the same reading.
+// K3's `SituAndMul` returns `.to(x.dtype)`, a no-op against the fp32 anchor, and rivoli's trunk
+// carries f32 activations throughout.
+//
+// `g` and `u` as separate pointers, not one `[gate|up]` buffer. §8 describes the concatenated
+// layout because that is what the reference's `SituAndMul` is handed — `torch.cat` of two
+// projections it is about to split again — and a port with two projection outputs already has
+// them apart. Taking them apart makes the split point an argument instead of an implied stride,
+// which is the half of this that a caller can get wrong.
+//
+// `h` may alias `g`: every thread reads exactly its own two elements before writing, so the
+// overwrite is unobservable. `swiglu_clamped_bf16` above documents the same aliasing for the
+// same reason, and it is what saves a scratch buffer per layer.
+extern "C" __global__ void situ_glu_f32(const float* __restrict__ g,
+                                        const float* __restrict__ u, int n, float b1, float b2,
+                                        float* __restrict__ h) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    h[i] = situ_glu(g[i], u[i], b1, b2);
 }
 
 // y[i] = x[i]·(1/sqrt(mean(x²)+eps))·w[i] — RMSNorm, matching math.rs. One block
@@ -296,187 +330,9 @@ extern "C" __global__ void act_quant_f8(float* __restrict__ v, size_t nblk) {
     for (int i = lane; i < ACT_QUANT_BLOCK; i += WAVE) seg[i] = act_quant_roundtrip(seg[i], s);
 }
 
-// ── mHC: hyper-connections (`model.py::Block.hc_pre` / `hc_post`) ───────────────
-//
-// V4 does not carry ONE residual stream, it carries `HC_MULT` copies. `hc_pre` reduces
-// them to one with learned Sinkhorn-normalised weights before the attention/MoE sublayer;
-// `hc_post` expands the sublayer's single output back to `HC_MULT`, mixing in the
-// pre-sublayer copies through a learned combination matrix. A plain residual add in place
-// of `hc_post` runs, converges to nothing useful, and never errors.
-//
-// **HC_MULT IS A CHECKPOINT CONSTANT WEARING A GENERIC NAME, AND THAT IS THE INVERSE OF THE
-// HAZARD THE `v4_*` RENAMES OF 2026-08-09 ADDRESSED.** Naming a reusable mechanism after the
-// model that introduced it tells the reader it is narrower than it is; naming a model's own
-// constant generically tells them it is wider. Both put the same wrong idea in the same
-// reader's head, so this one is documented rather than renamed:
-//
-// USED BY: DeepSeek-V4-Flash-0731 only, at the value 4. `hc_split_sinkhorn`'s
-// `mix_hc = (2 + hc)·hc` layout is how the mHC weights are PACKED on disk, so **another
-// value is a different checkpoint, not a tuning knob** — there is no configuration of this
-// engine in which changing it is meaningful. The launchers refuse anything else rather than
-// pretending to generalise.
-//
-// `headtail.hip::hc_head_collapse_gate` takes the same quantity as a runtime `hc` parameter, and
-// that is not an inconsistency to fix in either direction: the collapse genuinely is
-// width-agnostic, and this packing genuinely is not.
-#define HC_MULT 4
-#define HC_MIX ((2 + HC_MULT) * HC_MULT)
-
-// The width `hc_pre`'s sum-of-squares reduction is FROZEN at, independent of blockDim.
-// That phase's arithmetic depends on block shape twice over — a blockDim-strided comb
-// into a blockDim-leaf LDS tree — so when the launch widened from 256 to 1024 threads
-// (2026-08-08, the M5 hcn fix; docs/investigations/v4-decode-decomposition.md) the stride
-// and the tree kept the old geometry, or every historic golden and the byte-identity A/B
-// gate would have moved. Threads ≥ HC_RED idle through this phase; the mixes phase below
-// is where the extra waves earn their launch.
-#define HC_RED 256
-
-// `kernel.py::hc_split_sinkhorn` for one token, on ONE thread.
-//
-// Serial because it is 24 inputs and a 4x4 matrix: the whole routine is ~640 flops, and a
-// parallel version would have to reproduce the reference's summation order across lanes to
-// stay comparable at all. Note the asymmetry a port loses first — the FIRST normalisation
-// is a row *softmax* followed by a column divide, and only the remaining `iters - 1`
-// passes are plain row/column divides.
-//
-// `iters` is a parameter, not a constant, so the count comes from `config.json` through
-// `V4Config` and cannot drift. What the kernel tests gate is that the parameter is live —
-// 2 vs 20 moves the output.
-//
-// CORRECTED 2026-08-07: this said the count is "NOT gated by any numerical comparison: at
-// 20 passes a 4x4 positive matrix is far past convergence, so 19 and 20 agree bit-for-bit
-// and no golden can tell them apart". That holds for the toy fixture the kernel tests use,
-// not for the checkpoint, where 19 vs 20 moves 39,893/53,248 of `L0.pre.ffn_norm_out`. See
-// `tests/v4_oracle.rs::sinkhorn_has_converged_long_before_iteration_20`.
-__device__ __forceinline__ void hc_sinkhorn(
-    const float* __restrict__ mixes, const float* __restrict__ scale,
-    const float* __restrict__ base, int iters, float eps, float* __restrict__ pre,
-    float* __restrict__ post, float* __restrict__ comb) {
-    // `2 * sigmoid(x)`, not `2 / (1 + e^-x)`: the reference multiplies the finished
-    // sigmoid, and folding the 2 into the numerator moves the rounding.
-    for (int j = 0; j < HC_MULT; ++j) {
-        pre[j] = 1.0f / (1.0f + expf(-(mixes[j] * scale[0] + base[j]))) + eps;
-        post[j] = 2.0f * (1.0f / (1.0f + expf(-(mixes[j + HC_MULT] * scale[1]
-                                                + base[j + HC_MULT]))));
-    }
-    for (int j = 0; j < HC_MULT * HC_MULT; ++j)
-        comb[j] = mixes[j + 2 * HC_MULT] * scale[2] + base[j + 2 * HC_MULT];
-    // comb = comb.softmax(-1) + eps, row by row. Max/exp/sum in the reference's own order.
-    for (int j = 0; j < HC_MULT; ++j) {
-        float* row = comb + j * HC_MULT;
-        float m = row[0];
-        for (int t = 1; t < HC_MULT; ++t) m = fmaxf(m, row[t]);
-        float s = 0.0f;
-        for (int t = 0; t < HC_MULT; ++t) { row[t] = expf(row[t] - m); s += row[t]; }
-        for (int t = 0; t < HC_MULT; ++t) row[t] = row[t] / s + eps;
-    }
-    // `comb / (comb.sum(-1) + eps)` and `comb / (comb.sum(-2) + eps)` differ only in which
-    // index they hold fixed, so one normaliser takes that as a (hold, run) stride pair. Two
-    // copies would be two places to get the eps or the axis wrong.
-    auto norm = [&](int hold, int run) {
-        for (int fixed = 0; fixed < HC_MULT; ++fixed) {
-            float* c = comb + fixed * hold;
-            float s = 0.0f;
-            for (int r = 0; r < HC_MULT; ++r) s += c[r * run];
-            for (int r = 0; r < HC_MULT; ++r) c[r * run] /= s + eps;
-        }
-    };
-    // The reference's own sequence: ONE column pass, then `iters - 1` row/column PAIRS.
-    // Written out rather than folded into a `2·iters − 1` loop with a parity switch — the
-    // switch IS the axis, and swapping its two strides is exactly as silent as two loops
-    // disagreeing, while this reads against `Oracle::sinkhorn` line for line.
-    norm(1, HC_MULT);  // column: hold the dest index, run over the source
-    for (int i = 1; i < iters; ++i) {
-        norm(HC_MULT, 1);  // row: hold the source index, run over the dest
-        norm(1, HC_MULT);
-    }
-}
-
-// `Block.hc_pre`: one block per token. `h` is [s, HC_MULT, dim]; the rsqrt is over the FULL
-// HC_MULT·dim flattened row, not per copy — a per-copy norm is a different (and plausible)
-// statistic that leaves every magnitude in range.
-//
-// Returns the reduced `y` [s, dim] plus the `post`/`comb` the matching `hc_post` needs, so
-// the Sinkhorn runs ONCE per token per sublayer rather than twice.
-extern "C" __global__ void hc_pre(
-    const float* __restrict__ h, const float* __restrict__ fnw, const float* __restrict__ scale,
-    const float* __restrict__ base, int dim, int iters, float norm_eps, float hc_eps,
-    float* __restrict__ y, float* __restrict__ post_out, float* __restrict__ comb_out) {
-    __shared__ float red[HC_RED];
-    __shared__ float mixes[HC_MIX];
-    __shared__ float pre[HC_MULT], post[HC_MULT], comb[HC_MULT * HC_MULT];
-    int t = threadIdx.x, nt = blockDim.x;
-    size_t hcd = (size_t)HC_MULT * dim;
-    const float* flat = h + (size_t)blockIdx.x * hcd;
-
-    // Sum of squares at HC_RED wide, NOT nt: stride and tree are this phase's arithmetic
-    // (see HC_RED above). The unroll is schedule-only — the acc chain keeps its order, the
-    // compiler hoists the now-independent loads; at 256 threads the stock ISA held ONE load
-    // per `s_waitcnt vmcnt(0)`, so latency-hiding depth was the whole cost. Depth 8 is
-    // UNTUNED: the first depth checked already clustered the loads in the emitted ISA
-    // (`s_clause` batches, staggered `vmcnt(7..0)`), here and in the mixes loop below.
-    if (t < HC_RED) {
-        float local = 0.0f;
-#pragma unroll 8
-        for (size_t i = t; i < hcd; i += HC_RED) local += flat[i] * flat[i];
-        red[t] = local;
-    }
-    __syncthreads();
-    for (int s = HC_RED / 2; s > 0; s >>= 1) {
-        if (t < s) red[t] += red[t + s];
-        __syncthreads();
-    }
-    float rs = 1.0f / sqrtf(red[0] / (float)hcd + norm_eps);
-
-    // One wave per mix row — ONE round at 1024 threads (HC_MIX = 24, 32 waves; 8 idle).
-    // Which wave computes row `j` is not part of the arithmetic: the row's unit is the
-    // lane-strided comb + `wave_sum` ladder below, bit-identical wherever it runs. At 256
-    // threads this loop was the measured hcn sink — 8 waves × 3 serial rows, ~2 KB in
-    // flight against 1.57 MB of `fnw` (M5's read: ~350–400 µs of the ~400 µs launch).
-    int lane = t & (WAVE - 1), w = t / WAVE, nw = nt / WAVE;
-    for (int j = w; j < HC_MIX; j += nw) {
-        const float* wr = fnw + (size_t)j * hcd;
-        float acc = 0.0f;
-#pragma unroll 8
-        for (size_t i = lane; i < hcd; i += WAVE) acc += flat[i] * wr[i];
-        acc = wave_sum(acc);
-        if (lane == 0) mixes[j] = acc * rs;
-    }
-    __syncthreads();
-    if (t == 0) hc_sinkhorn(mixes, scale, base, iters, hc_eps, pre, post, comb);
-    __syncthreads();
-
-    // y[d] = Σ_c pre[c]·flat[c·dim + d], then back to bf16 (`y.to(dtype)`).
-    float* yo = y + (size_t)blockIdx.x * dim;
-    for (int d = t; d < dim; d += nt) {
-        float acc = 0.0f;
-        for (int c = 0; c < HC_MULT; ++c) acc += pre[c] * flat[(size_t)c * dim + d];
-        yo[d] = rbf16(acc);
-    }
-    if (t < HC_MULT) post_out[(size_t)blockIdx.x * HC_MULT + t] = post[t];
-    if (t < HC_MULT * HC_MULT) comb_out[(size_t)blockIdx.x * HC_MULT * HC_MULT + t] = comb[t];
-}
-
-// `Block.hc_post`: y[t][k][d] = post[t][k]·x[t][d] + Σ_j comb[t][j][k]·residual[t][j][d].
-//
-// `comb` is indexed [SOURCE, DEST] — the Sinkhorn row-softmax runs over the dest index and
-// the column normalisation over the source index. Transposing it keeps every output row a
-// combination of the same vectors, so it survives every magnitude and norm check
-// (`v4oracle::Defect::SinkhornCombTransposed`); only a numerical comparison sees it.
-extern "C" __global__ void hc_post(
-    const float* __restrict__ x, const float* __restrict__ residual,
-    const float* __restrict__ post, const float* __restrict__ comb, int s, int dim,
-    float* __restrict__ y) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (size_t)s * HC_MULT * dim) return;
-    int d = (int)(i % dim);
-    int k = (int)((i / dim) % HC_MULT);
-    size_t tok = i / dim / HC_MULT;
-    float acc = post[tok * HC_MULT + k] * x[tok * dim + d];
-    for (int j = 0; j < HC_MULT; ++j)
-        acc += comb[(tok * HC_MULT + j) * HC_MULT + k] * residual[(tok * HC_MULT + j) * dim + d];
-    y[i] = rbf16(acc);  // `.type_as(x)` — the residual stream is bf16
-}
+// The mHC residual mixers (`hc_pre`/`hc_post`, their Sinkhorn, and the HC_* constants)
+// lived here until 2026-08-16; they moved WHOLE to `residual.hip` beside Kimi-K3's
+// `attn_res`, under the 800-line cap. See that file's header for the cut.
 
 // The rotation itself, shared by the two kernels below. Both compute the SAME pair rotation at
 // the same frequency; they differ only in which two elements of the segment are the pair, which
@@ -551,8 +407,8 @@ extern "C" int rivoli_swiglu(const float* g, const float* u, int n, float* h, vo
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-// Takes a STREAM, as `rivoli_swiglu` directly above does since M7. Same reason `rivoli_hc_pre` gives
-// below: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so the null stream does
+// Takes a STREAM, as `rivoli_swiglu` directly above does since M7. Same reason
+// `residual.hip::rivoli_hc_pre` gives: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so the null stream does
 // not implicitly order against them, and this runs between two `rivoli_gemv_fp8_bf16` launches
 // that are now stream-parameterised. A null-stream combine between two stream-ordered GEMVs
 // reads `g`/`u` before they are written — an unordered activation, which is a silent wrong.
@@ -595,6 +451,35 @@ extern "C" int rivoli_swiglu_clamped_bf16(const float* g, const float* u, int n,
     hipGetLastError();
     hipLaunchKernelGGL(swiglu_clamped_bf16, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
                        (hipStream_t)stream, g, u, n, limit, h);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// `stream` is trailing and nullptr is the null stream, the `rivoli_swiglu` contract — from the
+// day S3 writes K3's layer loop this sits between two stream-ordered GEMVs, and a null-stream
+// combine there is the unordered-activation bug the launcher above describes.
+//
+// **Both betas must be finite and POSITIVE**, refused as 1006 rather than clamped — the same
+// code AND the same expression as the two `swiglu_limit` guards, on the same argument, so a
+// reader who learned it there gets it here. `!(b > 0.0f && b < INFINITY)` covers all four
+// rejected values at once, and each one fails differently and quietly:
+//
+//   * `NaN` — `tanhf(x/NaN)` is NaN for every element, a silently dead activation. `b <= 0.0f`
+//     would ADMIT it, which is why the negated-positive form is the one used.
+//   * `0` — `tanhf(g/0)` is `tanhf(±inf) = ±1` for `g != 0` and NaN exactly at `g == 0`, so a
+//     zero beta corrupts the elements a magnitude check would look at last.
+//   * `+inf` — the quiet spelling of "no saturation": `b·tanh(x/b) -> x` as `b -> inf`, so the
+//     activation degrades to a plain product with nothing to notice. This is the value the
+//     `swiglu_limit` guard was found admitting on 2026-08-05 after its first fix closed the
+//     `<= 0` case and left the one beside it open.
+//   * negative — flips the sign of the saturating branch.
+extern "C" int rivoli_situ_glu_f32(const float* g, const float* u, int n, float b1, float b2,
+                                   float* h, void* stream) {
+    if (n <= 0) return 1001;
+    if (!(b1 > 0.0f && b1 < INFINITY) || !(b2 > 0.0f && b2 < INFINITY)) return 1006;
+    hipGetLastError();
+    hipLaunchKernelGGL(situ_glu_f32, dim3((unsigned)((n + 255) / 256)), dim3(256), 0,
+                       (hipStream_t)stream, g, u, n, b1, b2, h);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
@@ -659,50 +544,6 @@ extern "C" int rivoli_act_quant_f8(float* v, int n_rows, int row_len, void* stre
     hipGetLastError();
     hipLaunchKernelGGL(act_quant_f8, dim3((nblk + waves - 1) / waves), dim3(256), 0,
                        (hipStream_t)stream, v, nblk);
-    hipError_t e = hipGetLastError();
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
-// One block per token, 1024 threads — one WAVE per `HC_MIX = 24` mix row, in one round.
-// 256 until 2026-08-08: at decode (s = 1) that was ONE 8-wave workgroup for the whole
-// device, and M4 measured the hcn bucket at 41.2 ms/token against 0.8 ms of bytes — the
-// mixes GEMV walking 3 rows per wave with two loads in flight per `s_waitcnt vmcnt(0)`.
-// The sum-of-squares phase stays at `HC_RED` (see its comment — that freeze is what makes
-// the widening schedule-only). 24 waves is the parallelism CEILING here: a row's reduction
-// order is one lane-strided comb + one `wave_sum` ladder, so a second wave cannot share a
-// row without moving bits; more width has to come from splitting the kernel, not the block.
-//
-// Takes a STREAM, unlike `rmsnorm_single`/`swiglu` above. rivoli's streams are created
-// `hipStreamNonBlocking` (`async.hip`), so the null stream does NOT implicitly order against
-// them: an mHC result on stream 0 feeding an FP4 expert range on a caller stream would be
-// unordered, and an unordered residual is a silent wrong.
-//
-// `hc` is taken and CHECKED rather than assumed: the caller reads it from `V4Config`, so a
-// checkpoint with a different `hc_mult` fails here instead of silently reading the mHC
-// weights at the wrong stride (`mix_hc = (2 + hc)·hc` is the packing).
-extern "C" int rivoli_hc_pre(
-    const float* h, const float* fnw, const float* scale, const float* base, int s, int hc,
-    int dim, int iters, float norm_eps, float hc_eps, float* y, float* post, float* comb,
-    void* stream) {
-    if (s <= 0 || dim <= 0) return 1001;
-    if (hc != HC_MULT) return 1002;
-    if (iters < 1) return 1003;
-    hipGetLastError();
-    hipLaunchKernelGGL(hc_pre, dim3(s), dim3(1024), 0, (hipStream_t)stream, h, fnw, scale, base,
-                       dim, iters, norm_eps, hc_eps, y, post, comb);
-    hipError_t e = hipGetLastError();
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
-extern "C" int rivoli_hc_post(
-    const float* x, const float* residual, const float* post, const float* comb, int s, int hc,
-    int dim, float* y, void* stream) {
-    if (s <= 0 || dim <= 0) return 1001;
-    if (hc != HC_MULT) return 1002;
-    size_t n = (size_t)s * HC_MULT * dim;
-    hipGetLastError();
-    hipLaunchKernelGGL(hc_post, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream, x,
-                       residual, post, comb, s, dim, y);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

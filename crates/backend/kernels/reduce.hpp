@@ -65,6 +65,16 @@ __device__ __forceinline__ float wave_max(float v) {
 // spelling without it: one extra block barrier per token per norm, on the decode path.
 // UNMEASURED — these kernels are bandwidth-bound so the expectation is that it is free,
 // but that is an expectation, in the same sense as `mla.hip`'s pragma note.
+//
+// > **CORRECTED 2026-08-12 by review (ported with M9 from `k3:kernels/common.hpp`).** Two of
+// > the statements above were falsified by `recurrent.hip::gated_delta_recurrent_f32` and
+// > neither was updated where a reader consults them. It launches `dim3(head_dim)` — **32**
+// > at the anchor's widths and **128** at the model's, so "every caller launches 256" is no
+// > longer true and the power-of-two precondition is now load-bearing rather than
+// > incidentally satisfied (that launcher's guard 1003 is what enforces it). And it
+// > **reduces twice back to back**, so the trailing barrier this function was given
+// > speculatively has its caller. The recurrence says so from its own side; this is the
+// > definition site, and the definition is where the precondition gets checked.
 __device__ __forceinline__ float block_sum_lds(float v, float* red) {
     red[threadIdx.x] = v;
     __syncthreads();
