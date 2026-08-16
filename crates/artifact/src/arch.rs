@@ -8,15 +8,10 @@
 //! stays here, with the manifest reader. That is the split `ModelConfig::scoring` already
 //! uses: core owns the vocabulary, this crate maps its raw input into it.
 //!
-//! There is deliberately **no `--model`/`--arch` flag** — see the enum's own doc for why.
-//! An unrecognised value REFUSES at startup; falling back to GLM is the specific mistake
-//! worth naming, because it is the only value that would look like it worked.
-//!
-//! The old tree's `arch.rs` also carried presentation policy (`attn_modes`,
-//! `hidden_flags` — what `--help` shows per arch). That half is deliberately NOT ported:
-//! `rivoli_core::legality::decide` replaces it with one decider, because two places that
-//! can independently judge a configuration is the silent-wrong hazard the old file itself
-//! warned about.
+//! There is deliberately **no `--model`/`--arch` flag**, an unrecognised value refuses at
+//! startup, and the old tree's presentation policy (`attn_modes`, `hidden_flags`) is not
+//! ported — `rivoli_core::legality` owns all three arguments; this header does not repeat
+//! them (a second copy is the next drifted doc).
 
 pub use rivoli_core::legality::Arch;
 

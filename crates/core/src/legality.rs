@@ -196,6 +196,11 @@ pub fn name_in<T: Copy + PartialEq>(table: &[(&'static str, T)], v: T) -> &'stat
 ///   test all widen. **The rule: a flag earns a row when some architecture would answer it
 ///   differently, and not before.** A flag that later grows per-arch variance gets its row
 ///   then, which is also when there is something true to write in the cell.
+/// - `--prompt` and `--dump-ids` had rows at first and lost them to the same rule
+///   (review 2026-08-16): a prompt and an id dump are IO facts of the invocation, and no
+///   architecture that decodes at all could answer either differently. `--ctx` stays: the
+///   KV ceiling is answered per-architecture in principle — K3's recurrent KDA state has
+///   no per-token KV growth at all, so its cell would not read like GLM's.
 ///
 /// Note the asymmetry among the rows that do exist: `Mode` and `Attn` carry their value
 /// because the answer differs per value (int4 decodes, hybrid does not), while
@@ -208,10 +213,8 @@ pub enum Flag {
     CachePolicy,
     MaxMem,
     Ctx,
-    Prompt,
     Trace,
     Mtp,
-    DumpIds,
 }
 
 /// Where the valueless flags' ordinals start.
@@ -220,7 +223,7 @@ const VALUELESS: usize = MODES.len() + ATTNS.len();
 /// How many (arch, flag) columns exist. Same contract as [`ARCH_COUNT`]: the `7` is the
 /// count of valueless [`Flag`] variants and is hand-written so that adding one cannot
 /// quietly skip [`Flag::ALL`].
-const FLAG_COUNT: usize = VALUELESS + 7;
+const FLAG_COUNT: usize = VALUELESS + 5;
 
 impl Flag {
     /// Every flag value the CLI can present, exactly once — the product test's second
@@ -237,10 +240,8 @@ impl Flag {
         Flag::CachePolicy,
         Flag::MaxMem,
         Flag::Ctx,
-        Flag::Prompt,
         Flag::Trace,
         Flag::Mtp,
-        Flag::DumpIds,
     ];
 
     /// Dense index over the whole flag domain — see [`Arch::ordinal`] for why this is an
@@ -267,10 +268,8 @@ impl Flag {
             Flag::CachePolicy => VALUELESS,
             Flag::MaxMem => VALUELESS + 1,
             Flag::Ctx => VALUELESS + 2,
-            Flag::Prompt => VALUELESS + 3,
-            Flag::Trace => VALUELESS + 4,
-            Flag::Mtp => VALUELESS + 5,
-            Flag::DumpIds => VALUELESS + 6,
+            Flag::Trace => VALUELESS + 3,
+            Flag::Mtp => VALUELESS + 4,
         }
     }
 
@@ -283,10 +282,8 @@ impl Flag {
             Flag::CachePolicy => "--cache-policy".to_string(),
             Flag::MaxMem => "--max-mem".to_string(),
             Flag::Ctx => "--ctx".to_string(),
-            Flag::Prompt => "--prompt".to_string(),
             Flag::Trace => "--trace".to_string(),
             Flag::Mtp => "--mtp".to_string(),
-            Flag::DumpIds => "--dump-ids".to_string(),
         }
     }
 }
@@ -361,9 +358,7 @@ fn glm(flag: Flag) -> Outcome {
         // `RoutedPool::tracing()`); the table is what makes it something the user is
         // TOLD rather than something buried in an info line.
         Flag::Trace => Outcome::FallbackLoudly(TRACE_IS_TOKEN_MAJOR),
-        Flag::CachePolicy | Flag::MaxMem | Flag::Ctx | Flag::Prompt | Flag::DumpIds => {
-            Outcome::Support
-        }
+        Flag::CachePolicy | Flag::MaxMem | Flag::Ctx => Outcome::Support,
     }
 }
 
@@ -473,13 +468,7 @@ mod tests {
         assert!(refused(Flag::Mtp), "speculative decode must refuse");
         // --trace is the one degrade-and-say-so cell.
         assert!(matches!(glm(Flag::Trace), Outcome::FallbackLoudly(_)));
-        for f in [
-            Flag::CachePolicy,
-            Flag::MaxMem,
-            Flag::Ctx,
-            Flag::Prompt,
-            Flag::DumpIds,
-        ] {
+        for f in [Flag::CachePolicy, Flag::MaxMem, Flag::Ctx] {
             assert_eq!(glm(f), Outcome::Support, "{} must decode", f.spelling());
         }
     }

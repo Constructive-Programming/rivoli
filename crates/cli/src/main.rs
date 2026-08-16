@@ -67,9 +67,12 @@ struct Args {
     // present` make "neither" and "both" usage errors, rendered by clap's own error path
     // with the usage line attached. A hand-written message would say the same thing worse
     // and would not appear in `--help`.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(usize),
+    // `.range(1..)`: the decode loop decides token T before checking the budget, so
+    // `--bench 0` would still generate one token (review 2026-08-16); zero is refused at
+    // the door, matching serve's max_tokens floor.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..),
           conflicts_with = "port", required_unless_present = "port")]
-    bench: Option<usize>,
+    bench: Option<u64>,
 
     /// Serve an OpenAI-compatible HTTP API on 127.0.0.1:PORT until killed — this is how
     /// llama-swap (and any OpenAI client) calls the engine. `POST /v1/chat/completions`
@@ -81,14 +84,11 @@ struct Args {
     #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
     port: Option<u16>,
 
-    /// `--port`: reason before answering, unless the request says otherwise.
-    ///
-    /// The checkpoint is a thinking model — its template ends the prompt at an OPEN
-    /// `<think>` by default, and the model fills it before answering. rivoli defaults the
-    /// other way: at ~2.7 tok/s a reasoning block is tens of seconds of silence, and most
-    /// OpenAI clients have no way to turn it off once it is on. A request's
+    /// `--port`: reason before answering, unless the request says otherwise. A request's
     /// `enable_thinking` (or `reasoning_effort`) overrides this in either direction, and
     /// the reasoning comes back in `reasoning_content`, never mixed into `content`.
+    // Why the default inverts the checkpoint's: `ChatOpts::thinking` owns that argument —
+    // one home, because a copy here already started drifting once (review 2026-08-16).
     // `conflicts_with` and not `requires = "port"`: the `requires` form was tried and is
     // INERT here — `rivoli DIR --bench 4 --think` sailed past clap and loaded a model
     // (probed 2026-08-16, clap 4.6.6). An attribute that cannot refuse anything is
@@ -141,7 +141,11 @@ struct Args {
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
     /// window) for the offline residency sim. Forces a token-major prefill — see the
     /// warning it prints.
-    #[arg(long, value_name = "PATH")]
+    // `conflicts_with = "port"` for the reason --prompt and --dump-ids already refuse
+    // there: one run, many replies — a served process would append every request's
+    // selections into ONE v2 trace with no request delimiter, and the offline sim would
+    // read it as a single decode (review 2026-08-16).
+    #[arg(long, value_name = "PATH", conflicts_with = "port")]
     trace: Option<String>,
 
     /// Speculative decode with the multi-token-prediction head. Refused at startup with
@@ -197,7 +201,10 @@ type Explicit = HashSet<String>;
 fn parse_args() -> (Args, Explicit) {
     use clap::{CommandFactory, FromArgMatches, parser::ValueSource};
     // Only an exact `-bench` matches, so `-b`, `--bench` and a positional path are all
-    // untouched.
+    // untouched. Known residual, port-faithful: the map has no position awareness, so a
+    // VALUE that is literally `-bench` (e.g. `--prompt -bench`) is rewritten too and
+    // clap then errors loudly — same behavior as the reference, wrong input impossible
+    // to reach without asking for it.
     let argv: Vec<String> = std::env::args()
         .map(|a| if a == "-bench" { "--bench".into() } else { a })
         .collect();
@@ -220,14 +227,12 @@ fn parse_args() -> (Args, Explicit) {
 /// The presence flags, paired with the clap id that reports them typed.
 /// `presence_flag_ids_name_real_arguments` pins each string to a real argument, so renaming
 /// a field cannot silently stop a flag from ever being checked.
-const PRESENCE: [(&str, Flag); 7] = [
+const PRESENCE: [(&str, Flag); 5] = [
     ("cache_policy", Flag::CachePolicy),
     ("max_mem", Flag::MaxMem),
     ("ctx", Flag::Ctx),
-    ("prompt", Flag::Prompt),
     ("trace", Flag::Trace),
     ("mtp", Flag::Mtp),
-    ("dump_ids", Flag::DumpIds),
 ];
 
 /// Everything this run asks for, in the legality table's vocabulary.
@@ -325,6 +330,9 @@ fn main() -> Result<()> {
     let arch = <ModelConfig as ArchConfig>::ARCH;
     tracing::info!("{}: {} ({})", a.model, arch.name(), arch.summary());
     check_legality(arch, &requested_flags(&a, &explicit))?;
+    // The door check, BEFORE the tokenizer's 19 MB vocab parse and the prompt encode: a
+    // backendless build refuses here or the seam doc's "at the door" claim is prose.
+    Engine::ensure_backend()?;
     let fmt = routed_fmt(a.mode).context(
         "--mode hybrid reached the format mapping — legality::decide must refuse it first",
     )?;
@@ -336,7 +344,7 @@ fn main() -> Result<()> {
     // `serve` checks each against `Engine::max_ctx` and answers 400.
     let bench = a
         .bench
-        .map(|ngen| bench_input(&tok, &a, ngen))
+        .map(|ngen| bench_input(&tok, &a, ngen as usize))
         .transpose()?;
 
     let mut eng = Engine::open(

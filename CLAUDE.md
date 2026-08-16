@@ -81,6 +81,10 @@ appears that enum dispatch cannot fill.
   flock + descendant-pid witness per arm, never builds. On-demand (GPU, ~1 h), not CI.
   Red-proofed 2026-08-15 by a gate-codebook inversion, after two measured sub-threshold
   rungs (1-ulp: erased by fp16 narrowing; one sign flip: under argmax margins).
+- **smoke** — `tests/smoke-glm.sh`: the CLI end to end — every legality refusal asserted
+  against the table's own message fragments, the bench cell pinned to the recorded
+  reference ids, a live serve round-trip (readiness, /v1/models, non-stream, SSE).
+  On-demand (GPU, ~45 min), not CI. Red-proofed 2026-08-16 (wrong fragment reddens).
 - Landing later, each with the thing that makes it non-vacuous: INV-n registry (first
   invariant, M1), feature matrix (first feature, M1), kernel census (first launcher, M3),
   refactor gates (first capture).

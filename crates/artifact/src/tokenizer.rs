@@ -303,38 +303,11 @@ impl Tokenizer {
         self.encode_chat_turns(&[("user", text)], &ChatOpts::default())
     }
 
-    /// The tokens that CONTINUE an in-progress conversation with one more user turn:
-    /// `<|user|>{text} <|assistant|> <think> </think>`, to be fed at the current position
-    /// after the model has emitted its turn-ending token. `-bench`'s follow-up script is
-    /// the only caller — the server re-decodes the whole prefix instead (`serve.rs`), which
-    /// is fine per request and quadratic over a scripted run.
-    ///
-    /// **Derived from [`Self::encode_chat`] rather than re-emitting the framing**, so it
-    /// cannot drift from the template the way a second hand-port would; this file's own
-    /// header records that the last drift went unnoticed for months. The only edit is
-    /// dropping the two-token `[gMASK] <sop>` conversation prefix, which the model has
-    /// already seen and which mid-stream would put it somewhere it never saw in training.
-    ///
-    /// This lands byte-identical to what `encode_chat_turns` would emit for the whole
-    /// conversation, because with `thinking` off (the default) the generation prompt
-    /// `<|assistant|> <think> </think>` is exactly the framing an assistant HISTORY turn
-    /// gets. One documented divergence: the template `.trim()`s history content and
-    /// generated text is not re-trimmed, so a turn ending in whitespace differs by that
-    /// whitespace. Harmless here, and the alternative is re-tokenizing the output.
-    pub fn encode_chat_continuation(&self, text: &str) -> Result<Vec<u32>> {
-        let full = self.encode_chat(text)?;
-        // The fallback path (an artifact whose tokenizer predates the chat tokens) returns
-        // a RAW encoding with no prefix, and blindly dropping two tokens there would eat
-        // real text. Check for the prefix instead of assuming it.
-        let prefix = [
-            self.inner.token_to_id("[gMASK]"),
-            self.inner.token_to_id("<sop>"),
-        ];
-        match (prefix, full.first(), full.get(1)) {
-            ([Some(g), Some(s)], Some(&a), Some(&b)) if g == a && s == b => Ok(full[2..].to_vec()),
-            _ => Ok(full),
-        }
-    }
+    // `encode_chat_continuation` (the reference's mid-conversation follow-up framing) is
+    // NOT ported: its only caller is `-bench`'s follow-up script, which this tree does not
+    // have. Same rule the header applies to `json_truthy` — a function with no caller is
+    // dead surface `warnings = deny` cannot see behind `pub`. It is `encode_chat` minus
+    // the two-token `[gMASK] <sop>` prefix; re-derive it WITH its caller.
 
     /// The system turns the template emits BEFORE the conversation — reasoning effort, then
     /// the tool declarations — in that order, which is the order the model saw them in
@@ -549,7 +522,11 @@ mod tests {
     /// (both spellings reach `Tokenizer::load` as "no stop tokens" and diverge only here).
     #[test]
     fn a_missing_eos_key_is_empty_and_an_absent_file_is_an_error() {
-        let dir = std::env::temp_dir().join("rivoli-tok-eos");
+        // Salted by pid, and created FRESH: a fixed path poisons every later run if an
+        // assertion panics after the first write, and this machine runs several test
+        // trees concurrently against one /tmp (review 2026-08-16).
+        let dir = std::env::temp_dir().join(format!("rivoli-tok-eos-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_str().unwrap();
         assert!(eos_token_ids(d).is_err(), "no generation_config.json yet");

@@ -98,7 +98,7 @@ pub enum Engine<'a> {
 /// come out of the same pool. `--max-mem` is honoured literally — the user asked for that
 /// size and is allowed to OOM at pin build — and the auto path just leaves this much free.
 #[cfg(feature = "rocm")]
-pub const OS_RESERVE: u64 = 16 << 30;
+pub(crate) const OS_RESERVE: u64 = 16 << 30;
 
 impl<'a> Engine<'a> {
     /// Open `dir` as a decode engine.
@@ -131,18 +131,29 @@ impl<'a> Engine<'a> {
         )?))
     }
 
-    /// The refusal a build with no compute backend gives, at the door.
-    ///
-    /// FIRST, before anything expensive: the old tree's version discovered memory, loaded
-    /// the manifest, built the tokenizer and encoded the prompt before admitting it could
-    /// not decode.
+    /// The refusal a build with no compute backend gives.
     #[cfg(not(feature = "rocm"))]
     pub fn open(dir: &str, cfg: &'a ModelConfig, spec: OpenSpec<'_>) -> Result<Engine<'a>> {
         let _ = (dir, cfg, spec);
+        Self::ensure_backend()?;
+        unreachable!("ensure_backend errored above in a backendless build")
+    }
+
+    /// Whether this build can decode AT ALL — the door check.
+    ///
+    /// The old tree's backendless binary discovered memory, loaded the manifest, built
+    /// the tokenizer and encoded the prompt before admitting it could not decode; then
+    /// this tree's first CLI did the tokenizer-and-prompt half of that again (review
+    /// 2026-08-16 — the seam doc claimed the fix, the call order had drifted). main calls
+    /// THIS before touching the tokenizer, so the claim is now a call site, not prose.
+    pub fn ensure_backend() -> Result<()> {
+        #[cfg(not(feature = "rocm"))]
         anyhow::bail!(
             "rivoli was built with NO compute backend and cannot decode. Rebuild with \
              `--features rocm` (HIP/ROCm), the only backend."
-        )
+        );
+        #[cfg(feature = "rocm")]
+        Ok(())
     }
 
     /// The KV ceiling this engine was BUILT with, in tokens.

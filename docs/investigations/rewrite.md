@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: The gates-first rewrite is through M0–M5 — gates armed and red-proofed before any code, anchors vendored before the engine (GLM's generated fresh, 26/26 defect cells), substrate and artifact layers ported with both feature arms verified, M3 closed on silicon with 38/38 kernel oracles, M4's single-format decode loop closed on token parity with the pinned reference, and M5 turned that comparison into a scripted gate — tests/parity-glm.sh, 32/32 greedy ids identical with clean contention witnesses, red-proofed by a measured perturbation ladder whose two sub-threshold rungs are recorded as the gate's sensitivity floor.
+verdict: The gates-first rewrite is through M0–M6 — gates armed and red-proofed before any code, anchors vendored before the engine, M3 closed on silicon with 38/38 kernel oracles, M4 decoded token-identically to the pinned reference, M5 made that comparison a scripted red-provable gate, and M6 shipped the tokenizer (chat framing token-identical, two provenance legs), the (arch × flag) legality table (a flipped cell fails to compile), enum Engine, serve, and the thin CLI — closed by a 12-cell smoke: six refusals with the table's own messages, a bench decode matching the recorded reference ids, and a live server answering all three endpoints.
 ---
 
 # The rewrite, milestone by milestone
@@ -271,6 +271,49 @@ has no tokenizer until M6.
 
 Deliberately OUT of M5: multi-prompt sweeps (the gate takes `PARITY_PROMPT`; a corpus
 sweep belongs to the first refactor that needs one), MTP (still deferred), dsa.
+
+
+## M6 — tokenizer, enum Engine, serve, the thin CLI (CLOSED 2026-08-16)
+
+Four commits, each agent-built in its own detached worktree and re-verified at
+integration: the GLM tokenizer (chat framing token-identical to the reference, two
+provenance legs — the reference binary's logged runs AND name-by-name resolution in the
+artifact's own tokenizer.json; red-proven by one perturbed id reddening two tests), the
+engine seam (`enum Engine<'a>`, main owns the borrow chain; the `(arch × flag)` legality
+table in core with a four-way red proof, one rung unplanned: a flipped cell FAILS TO
+COMPILE because the orphaned refusal message is dead code under warnings-deny), serve
+(three files under the cap, zero cfg, zero Engine-arm matches; the port found clap
+4.6.6's `requires` INERT — `--bench 4 --think` sailed through — replaced with
+`conflicts_with` plus a parse test that reddens on the old spelling), and the exit gate.
+
+**M6 EXIT EVIDENCE (2026-08-16).** `tests/smoke-glm.sh`, 12 cells green in one run:
+six refusals firing with the legality table's own message fragments (hybrid, dsa,
+streaming, mtp, and both clap exclusivities), bench decoding `[13041, 1052, 0, 358]` —
+token-identical to M4's recorded reference run through the full
+tokenizer→seam→engine chain with the same 1253/547 hit/miss split — and a live server:
+port-opens-when-loaded readiness, /v1/models, a non-stream completion answering
+`'Hi there! I'`, SSE frames with the `[DONE]` terminator, clean shutdown. Red-proofed:
+a wrong message fragment reddens a refusal cell (run and shown), and the serve cell now
+traps EXIT so a red cannot orphan a flock-holding server.
+
+**Review round (correctness + simplicity on the whole M6 diff), applied:** the
+featureless refusal moved to the actual door (`Engine::ensure_backend()` before the 19 MB
+tokenizer parse — the seam doc claimed it, the call order had drifted; now proven live),
+`--bench 0`/`max_tokens: 0` refused (the loop decides a token before checking the
+budget, so zero generated ONE), `--trace` refuses under `--port` (one v2 trace across
+many requests has no request delimiter), `encode_chat_continuation` deleted (its only
+caller does not exist in this tree — the module's own port rule), `Flag::Prompt`/
+`Flag::DumpIds` rows deleted by the table's own admission rule (`Ctx` stays: K3's
+recurrent KDA state answers it differently in principle), the `--think` rationale folded
+to its one home (`ChatOpts::thinking`), the eos test fixture salted by pid. Declined
+with arguments in place: the `-bench` value-position rewrite (reference-faithful,
+documented) and `room_for`'s conservative off-by-2 (reference arithmetic, errs safe).
+
+**Known-inherited serve behaviors, recorded not fixed** (each verbatim from the
+reference; fix on demand with its own gate): special tokens inside message content
+inject real framing ids; a mid-request engine error closes the connection with no HTTP
+error body; `chatcmpl-{created}` ids collide within one second; prose after a closed
+`</tool_call>` reaches non-stream clients but not streaming ones.
 
 
 ## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)

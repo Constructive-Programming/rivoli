@@ -65,10 +65,8 @@ pub struct Opts {
     pub port: u16,
     /// Reported back as `model` when the request does not name one.
     pub model_id: String,
-    /// `--think`: reason before answering unless the request says otherwise. Off by
-    /// default even though the checkpoint's template defaults it ON, because at ~2.7 tok/s
-    /// a reasoning block is tens of seconds of silence and most OpenAI clients cannot ask
-    /// for it to stop. A request's `enable_thinking` overrides this either way.
+    /// `--think`: reason before answering unless the request says otherwise. Why the
+    /// default inverts the checkpoint's is `ChatOpts::thinking`'s argument — one home.
     pub think: bool,
 }
 
@@ -193,22 +191,19 @@ impl Ask {
 /// rather than faked, because nothing here can force the model's hand and a client that
 /// asked for a guaranteed call must not get prose that looks like compliance.
 fn tool_declarations(body: &Value) -> Result<Option<&Value>> {
-    let choice = body.get("tool_choice");
-    match choice.and_then(Value::as_str) {
-        None | Some("auto") | Some("none") => {}
+    // One match over the whole value: the string form, the object form (naming a
+    // function), and anything else (a number, an array) all land in an arm — the old
+    // two-check shape silently ignored the last group (review 2026-08-16).
+    let none = match body.get("tool_choice") {
+        None => false,
+        Some(Value::String(s)) if s == "auto" => false,
+        Some(Value::String(s)) if s == "none" => true,
         Some(other) => anyhow::bail!(
-            "`tool_choice` {other:?} is not supported — this server can do \"auto\" or \
+            "`tool_choice` {other} is not supported — this server can do \"auto\" or \
              \"none\"; it cannot force a call"
         ),
-    }
-    ensure!(
-        !choice.is_some_and(Value::is_object),
-        "`tool_choice` naming a specific function is not supported — this server cannot \
-         force a call; use \"auto\""
-    );
-    Ok(body
-        .get("tools")
-        .filter(|_| choice.and_then(Value::as_str) != Some("none")))
+    };
+    Ok(body.get("tools").filter(|_| !none))
 }
 
 /// Whether to reason first, and at what stated effort.
@@ -251,6 +246,10 @@ fn parse_ask(body: &[u8], cx: &Ctx<'_, '_>) -> Result<Ask> {
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(Value::as_u64)
         .map_or(DEFAULT_MAX_TOKENS, |n| n as usize);
+    // The decode loop decides token T before checking the budget, so 0 would come back
+    // as one token labelled `finish_reason: "length"` — a reply the client asked not to
+    // get. Refused as a 400 instead (review 2026-08-16).
+    ensure!(asked >= 1, "max_tokens must be at least 1, got {asked}");
     if body.get("temperature").is_some() || body.get("top_p").is_some() {
         warn_sampling_ignored();
     }
