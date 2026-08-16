@@ -16,12 +16,12 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::format::RoutedFmt;
+use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
-use rivoli_artifact::schema::ArchConfig;
 use rivoli_artifact::tokenizer::Tokenizer;
 use rivoli_core::cache::TwoQSplit;
 use rivoli_core::legality::{ATTNS, Arch, AttnKind, Flag, MODES, Mode, Outcome, decide, name_in};
-use rivoli_engine::{Engine, GenSpec, OpenSpec};
+use rivoli_engine::{ArchCfg, Engine, GenSpec, OpenSpec, RoutedSpec};
 use std::collections::HashSet;
 use std::io::Write as _;
 
@@ -321,21 +321,18 @@ fn main() -> Result<()> {
         .init();
     let (a, explicit) = parse_args();
 
-    // The sniff. `ModelConfig::load` resolves what the artifact DECLARES (`model_type` and
-    // `architectures`, which must agree) and refuses anything that is not this schema's
-    // architecture before serde reads a single dimension. So a config in hand is itself the
-    // evidence of which architecture this is, and the constant below is a consequence of the
-    // load rather than a second, independent guess that could disagree with it.
-    let cfg = ModelConfig::load(&a.model)?;
-    let arch = <ModelConfig as ArchConfig>::ARCH;
+    // **The sniff, and it reads the manifest rather than a loaded config.** Until M7 this
+    // was `ModelConfig::load` followed by `<ModelConfig as ArchConfig>::ARCH` — the config
+    // in hand WAS the evidence, because that load refuses every other architecture before
+    // serde reads a dimension. With two arms that shape can only ever answer "GLM": which
+    // config type to load is now the question, so it cannot also be the answer. The
+    // per-type refusal stays behind this as the check that sniff and parse agreed.
+    let arch = rivoli_artifact::schema::arch_of_artifact(&a.model)?;
     tracing::info!("{}: {} ({})", a.model, arch.name(), arch.summary());
     check_legality(arch, &requested_flags(&a, &explicit))?;
     // The door check, BEFORE the tokenizer's 19 MB vocab parse and the prompt encode: a
     // backendless build refuses here or the seam doc's "at the door" claim is prose.
     Engine::ensure_backend()?;
-    let fmt = routed_fmt(a.mode).context(
-        "--mode hybrid reached the format mapping — legality::decide must refuse it first",
-    )?;
 
     let tok = Tokenizer::load(&a.model)?;
     // `--bench` resolves its input BEFORE the engine opens, so a run that outgrows the KV
@@ -347,23 +344,81 @@ fn main() -> Result<()> {
         .map(|ngen| bench_input(&tok, &a, ngen as usize))
         .transpose()?;
 
+    // **Each arm owns its config for the whole run, because the engine borrows it.** The
+    // arms are two lines apiece and then rejoin: `open_and_run` is the shared tail, so a
+    // third architecture cannot acquire a second bench loop or a second `serve` call.
+    match arch {
+        Arch::GlmMoeDsa => {
+            let cfg = ModelConfig::load(&a.model)?;
+            open_and_run(
+                &a,
+                &tok,
+                bench.as_ref(),
+                ArchCfg::Glm(&cfg, glm_routed(&a)?),
+            )
+        }
+        // No `RoutedSpec`: a dense model has no routed pool to configure, and the legality
+        // table has already told the user so for each of the flags that would have filled
+        // one in.
+        Arch::MuseGlimmer => {
+            let cfg = GlimmerConfig::load(&a.model)?;
+            open_and_run(&a, &tok, bench.as_ref(), ArchCfg::Glimmer(&cfg))
+        }
+        // Unreachable through `check_legality`: `Flag::Mode` is submitted on every run and
+        // the table refuses it with NO_ENGINE_ARM for both of these — `the_arms_and_the_
+        // legality_table_agree_about_who_can_start` is what holds those two lists together.
+        // A `bail!` rather than an `unreachable!` for the reason the `(None, None)` arm
+        // below gives: being wrong about a contract should be a message, not a panic.
+        other => bail!(
+            "{} ({}) has no decode path in this build — rivoli_core::legality should have \
+             refused this run at the door",
+            other.name(),
+            other.summary()
+        ),
+    }
+}
+
+/// GLM's routed-pool knobs, gathered in the one place they are legal.
+///
+/// `--mode hybrid` has no [`RoutedFmt`] at all, which is why `legality::decide` refuses it
+/// rather than resolving it to one of the two real formats; reaching the `context` below
+/// means that refusal did not fire.
+fn glm_routed(a: &Args) -> Result<RoutedSpec<'_>> {
+    let fmt = routed_fmt(a.mode).context(
+        "--mode hybrid reached the format mapping — legality::decide must refuse it first",
+    )?;
+    Ok(RoutedSpec {
+        fmt,
+        cache_policy: &a.cache_policy,
+        two_q: TwoQSplit::default(),
+        trace_path: a.trace.as_deref(),
+    })
+}
+
+/// Open the engine on `cfg`'s arm and run whichever invocation was asked for.
+///
+/// **The shared tail.** Everything below the seam is architecture-shaped and everything here
+/// is not, so this function names no architecture — which is what makes "a third arm is two
+/// lines in `main`" true rather than aspirational.
+fn open_and_run(
+    a: &Args,
+    tok: &Tokenizer,
+    bench: Option<&Bench<'_>>,
+    cfg: ArchCfg<'_>,
+) -> Result<()> {
     let mut eng = Engine::open(
         &a.model,
-        &cfg,
+        cfg,
         OpenSpec {
             max_mem_gib: a.max_mem,
-            fmt,
-            cache_policy: &a.cache_policy,
-            two_q: TwoQSplit::default(),
-            trace_path: a.trace.as_deref(),
             max_ctx: a.ctx,
         },
     )?;
-    match (&bench, a.port) {
-        (Some(b), _) => run_bench(&mut eng, &tok, &a, b),
+    match (bench, a.port) {
+        (Some(b), _) => run_bench(&mut eng, tok, a, b),
         (None, Some(port)) => serve::serve(
             &mut eng,
-            &tok,
+            tok,
             &serve::Opts {
                 port,
                 // The artifact directory's own name, so `/v1/models` and the echoed
@@ -507,6 +562,55 @@ mod tests {
             assert!(
                 id != "mode" && id != "attn",
                 "{id} is judged by value, not presence"
+            );
+        }
+    }
+
+    /// **The `bail!` in `main`'s architecture match is unreachable, and this is why.**
+    ///
+    /// `main` sniffs, runs `check_legality`, and only then dispatches on the architecture —
+    /// with an arm for two of the four. `check_legality` submits `--mode` and `--attn` on
+    /// every run, so the contract that keeps the bail unreachable is: an architecture with NO
+    /// arm must have one of those defaults refused. The converse — an architecture WITH an
+    /// arm must refuse neither — is `rivoli_core::legality`'s
+    /// `every_architecture_with_an_arm_decodes_with_no_flags_typed`, and [`ARMS`] below is
+    /// what ties the two lists together.
+    ///
+    /// The defaults come from PARSING a bare invocation through the same two functions
+    /// `main` uses, not from restating clap's `default_value` attributes — a restatement is
+    /// free to drift from what the binary actually asks for, which is the whole failure this
+    /// file's other parse tests exist for.
+    #[test]
+    fn the_arms_and_the_legality_table_agree_about_who_can_start() {
+        // Hand-written, on the same argument as `legality::ARCH_COUNT`: no test can observe
+        // a `match`'s arms, so the list is stated and the assertion is what binds it. Adding
+        // an arm to `main` without a row here leaves that architecture unchecked.
+        const ARMS: [Arch; 2] = [Arch::GlmMoeDsa, Arch::MuseGlimmer];
+        let Ok(a) = <Args as clap::Parser>::try_parse_from(["rivoli", "DIR", "--bench", "1"])
+        else {
+            panic!("`rivoli DIR --bench 1` must parse — the invocation contract has moved");
+        };
+        let defaults = requested_flags(&a, &Explicit::new());
+        assert_eq!(
+            defaults.len(),
+            2,
+            "a no-flag run asks for --mode and --attn and nothing else; got {defaults:?}"
+        );
+        for arch in Arch::ALL {
+            let refused = defaults
+                .iter()
+                .any(|&f| matches!(decide(arch, f), Outcome::Refuse(_)));
+            let has_arm = ARMS.contains(&arch);
+            assert_eq!(
+                !refused,
+                has_arm,
+                "{}: main {} a decode arm, but the table {} the flags a bare invocation \
+                 asks for — one of the two is wrong, and the visible symptom is either a \
+                 model that cannot be started or `main`'s \"should have refused at the \
+                 door\" bail becoming reachable",
+                arch.name(),
+                if has_arm { "has" } else { "has no" },
+                if refused { "refuses" } else { "accepts" },
             );
         }
     }

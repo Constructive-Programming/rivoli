@@ -80,9 +80,33 @@ fn config_path(dir: &str) -> String {
     }
 }
 
-// (`arch_of_artifact` — the one-call sniffing entry `Engine::open` will use — returns
-// with its caller at M4; a pub fn with no caller is the shape this file already deleted
-// twice. `arch_of_named` below is the whole mechanism.)
+/// Which architecture `<dir>` holds, from its manifest alone — **the sniff, and the only
+/// one.**
+///
+/// > **ARRIVED 2026-08-16 with `main`'s second arm.** This was a comment reserving the name
+/// > ("returns with its caller at M4; a pub fn with no caller is the shape this file already
+/// > deleted twice"). The caller is now real: with two engine arms, `main` has to know which
+/// > config type to load BEFORE it loads one, and the previous shape — load `ModelConfig`,
+/// > read `ArchConfig::ARCH` off the type — could only ever answer "GLM", because that load
+/// > refuses everything else.
+///
+/// It reads the same `model_type`/`architectures` pair [`parse_config`] does, through the
+/// same [`arch_of_named`], so the sniff and the parse cannot disagree about a file: a
+/// directory this accepts as Glimmer is one `GlimmerConfig::load` will accept, and the
+/// per-type refusal stays in place behind it as the check that the two agreed.
+///
+/// Deliberately NOT a `--model`/`--arch` flag: the artifact IS the model, and a flag naming
+/// the architecture is a flag that can disagree with the weights it describes. Disagreeing is
+/// not a crash — it launches the wrong decode path and produces fluent wrong text.
+pub fn arch_of_artifact(dir: &str) -> Result<Arch> {
+    let path = config_path(dir);
+    let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {path}"))?;
+    Ok(arch_of_named(&doc)
+        .with_context(|| format!("sniff {path}"))?
+        .0)
+}
 
 /// A config schema that describes exactly one architecture.
 ///

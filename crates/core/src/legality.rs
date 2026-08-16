@@ -306,8 +306,27 @@ pub enum Outcome {
 // --- named const so the verdicts read as rows rather than as prose.
 
 const NO_ENGINE_ARM: &str = "this architecture has no decode path in this build — GLM-5.2 \
-     is the only arm so far. Every flag refuses here rather than a chosen few, because a \
-     knob cannot be legal on a model that cannot decode at all";
+     and Muse Glimmer-30B are the arms so far. Every flag refuses here rather than a chosen \
+     few, because a knob cannot be legal on a model that cannot decode at all";
+
+const DENSE_HAS_NO_ROUTED_FORMAT: &str = "--mode names how ROUTED EXPERTS are stored, and \
+     this architecture is DENSE — it has no experts and no routing, and its weights are \
+     bf16 throughout. The flag is ignored, and nothing in the run is stored in the format \
+     you named. Residency here is a partition of whole LAYERS (--max-mem decides how many \
+     are pinned), never a choice of arithmetic";
+
+const DENSE_CACHE_POLICY_IS_ONE_ANSWER: &str = "a dense model reads its layers in fixed \
+     cyclic order, which is LRU's pathological case: at any deficit LRU evicts exactly the \
+     layer needed next and the hit rate is 0, not pinned/n_layers. Belady on a cyclic scan \
+     degenerates to holding a fixed subset, and every fixed subset of size k has the same \
+     hit rate k/n — so all three policies are the same answer here and the pin is a static \
+     prefix. Use --max-mem, which is the knob that actually moves it";
+
+const DENSE_HAS_NO_EXPERT_TRACE: &str = "--trace captures the ROUTED-EXPERT access stream \
+     for the offline residency sim, and a dense model makes no routing decisions to record \
+     — every layer is read every token, so the trace is derivable from the layer count and \
+     carries no information. Accepting it would write a file whose emptiness reads as a \
+     measurement";
 
 const HYBRID_IS_A_PLAN: &str = "int4 for hot experts and vq3 for cold ones returns as an \
      explicit FormatPlan, not as a pool property. In the old tree the cache picked each \
@@ -337,10 +356,11 @@ const TRACE_IS_TOKEN_MAJOR: &str = "--trace forces the prefill back to TOKEN-MAJ
 pub fn decide(arch: Arch, flag: Flag) -> Outcome {
     match arch {
         Arch::GlmMoeDsa => glm(flag),
+        Arch::MuseGlimmer => muse_glimmer(flag),
         // Not a wildcard over the flag axis: the reason is architecture-level, so the
         // flag is genuinely not consulted. Splitting the dispatch this way is what keeps
         // a `_` out of the table entirely.
-        Arch::DeepseekV4 | Arch::KimiK3 | Arch::MuseGlimmer => Outcome::Refuse(NO_ENGINE_ARM),
+        Arch::DeepseekV4 | Arch::KimiK3 => Outcome::Refuse(NO_ENGINE_ARM),
     }
 }
 
@@ -362,8 +382,62 @@ fn glm(flag: Flag) -> Outcome {
     }
 }
 
+/// Muse Glimmer-30B's row of the table — the first DENSE architecture here, and most of
+/// this row is that one fact worked out flag by flag.
+///
+/// # `--mode` falls back loudly rather than refusing, and the choice is forced
+///
+/// A dense model has no routed format, so `Support` is out: it would accept `--mode int4`
+/// on a run that stores nothing in int4, which is precisely the "recorded command line
+/// carrying a knob nothing spent" this table exists to prevent.
+///
+/// `Refuse` is out too, and for a reason that lives in the CALLER rather than here.
+/// `--mode` carries a clap default, and `main::requested_flags` submits the value-carrying
+/// flags on their RESOLVED value by design — so that a default which ever became illegal is
+/// caught rather than exempted by never having been typed. A refusal here would therefore
+/// kill `rivoli GLIMMER_DIR --bench 4`, an invocation with no `--mode` in it at all, on a
+/// flag the user never typed. Making it presence-judged instead would mean two authorities
+/// deciding when a value matters, which is the shape this module was written to end.
+///
+/// [`Outcome::FallbackLoudly`] is exactly "the run proceeds, but not as asked, and the
+/// caller must SAY it". The cost is one warn line per Glimmer run; the alternative is a
+/// silent drop, and this table's whole premise is that a silent drop is worse than noise.
+///
+/// # The rest
+///
+/// `--cache-policy` and `--trace` are presence-judged (`main::PRESENCE`), so refusing them
+/// costs an untyped run nothing and tells a typed one why. `--attn dense` is genuinely what
+/// this model does — GQA 32Q/2KV over the whole causal prefix on its full layers — so it is
+/// the one attention cell here that is `Support` on its own merits rather than by default.
+fn muse_glimmer(flag: Flag) -> Outcome {
+    match flag {
+        // Every value, together: on a dense model they do not differ, which is the same
+        // shape the header notes for `CachePolicy` on any architecture.
+        Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid) => {
+            Outcome::FallbackLoudly(DENSE_HAS_NO_ROUTED_FORMAT)
+        }
+        Flag::Attn(AttnKind::Dense) => Outcome::Support,
+        // The three sparse selections are GLM-shaped in different ways — `dsa` names a
+        // trained-in indexer this checkpoint does not ship at all — but the deferral is the
+        // same one, so it quotes the same reason rather than inventing a second wording.
+        Flag::Attn(AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa) => {
+            Outcome::Refuse(SPARSE_ATTN_DEFERRED)
+        }
+        Flag::CachePolicy => Outcome::Refuse(DENSE_CACHE_POLICY_IS_ONE_ANSWER),
+        Flag::Trace => Outcome::Refuse(DENSE_HAS_NO_EXPERT_TRACE),
+        Flag::Mtp => Outcome::Refuse(MTP_DEFERRED),
+        // `--max-mem` is the knob that decides how many of the 52 layers are pinned, and
+        // `--ctx` sizes a KV cache this arm's floor CHARGES for (unlike GLM's, which
+        // budgets weights only) — so both are not merely accepted here, they are the two
+        // numbers the partition is a function of.
+        Flag::MaxMem | Flag::Ctx => Outcome::Support,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)] // tests: panic-on-failure is the idiom
+
     use super::*;
 
     /// `ordinals` must be exactly `0..n`, each once. This is the guard that makes an
@@ -470,6 +544,79 @@ mod tests {
         assert!(matches!(glm(Flag::Trace), Outcome::FallbackLoudly(_)));
         for f in [Flag::CachePolicy, Flag::MaxMem, Flag::Ctx] {
             assert_eq!(glm(f), Outcome::Support, "{} must decode", f.spelling());
+        }
+    }
+
+    /// Muse Glimmer's row, cell by cell, as of M7 — the same change-detector as
+    /// [`glm_row_is_the_m6_truth`] and for the same reason: the total and anti-vacuity
+    /// checks above would not notice a cell being flipped, which is the one edit that
+    /// changes what the engine accepts.
+    ///
+    /// **The `--mode` cells are the load-bearing ones.** They must be `FallbackLoudly` and
+    /// not `Refuse`: `main::requested_flags` submits `Flag::Mode` on its RESOLVED value, so
+    /// a refusal here would kill `rivoli GLIMMER_DIR --bench 4` — an invocation carrying no
+    /// `--mode` at all — on a flag the user never typed. That is asserted positively below
+    /// rather than left to the reader, because "it still decodes with no flags" is not
+    /// visible from any other test in this file.
+    #[test]
+    fn muse_glimmer_row_is_the_m7_truth() {
+        let g = |f| decide(Arch::MuseGlimmer, f);
+        let refused = |f| matches!(g(f), Outcome::Refuse(_));
+        // No routed format exists, so every --mode value degrades and SAYS so. Not a
+        // refusal: see this test's doc and `muse_glimmer`'s.
+        for (name, m) in MODES {
+            assert!(
+                matches!(g(Flag::Mode(m)), Outcome::FallbackLoudly(_)),
+                "--mode {name} must fall back loudly on a dense model, not refuse or \
+                 silently pass: a refusal breaks the no-flags invocation"
+            );
+        }
+        // Dense attention is what this model DOES, not a placeholder.
+        assert_eq!(g(Flag::Attn(AttnKind::Dense)), Outcome::Support);
+        for kind in [AttnKind::Streaming, AttnKind::Dsa, AttnKind::Misa] {
+            assert!(refused(Flag::Attn(kind)), "{kind:?} must refuse");
+        }
+        // The three routed-pool knobs. Each is presence-judged by `main`, so refusing them
+        // costs an untyped run nothing.
+        assert!(refused(Flag::CachePolicy), "a cyclic scan has one policy");
+        assert!(
+            refused(Flag::Trace),
+            "there is no routed-expert stream to trace"
+        );
+        assert!(refused(Flag::Mtp), "speculative decode must refuse");
+        // The two numbers the partition is a function of.
+        for f in [Flag::MaxMem, Flag::Ctx] {
+            assert_eq!(g(f), Outcome::Support, "{} must decode", f.spelling());
+        }
+    }
+
+    /// The claim the row above rests on, stated as the property rather than as cell
+    /// values: **an architecture that has an engine arm must decode with NO flags typed.**
+    ///
+    /// `main` submits `Flag::Mode` and `Flag::Attn` on their resolved defaults and nothing
+    /// else, so a `Refuse` on either default is a model that cannot be run without knowing
+    /// which flag to work around. GLM has satisfied this since M4 by accident of every
+    /// default being `Support`; Glimmer satisfies it by a deliberate `FallbackLoudly`, and
+    /// the next arm will meet the same bar or fail here.
+    ///
+    /// The defaults are spelled from [`MODES`]/[`ATTNS`] rather than as variants, because
+    /// what is being pinned is the pair `main`'s clap attributes actually resolve to.
+    #[test]
+    fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
+        let default_mode = parse_in(&MODES, "--mode", "int3-vq").expect("int3-vq parses");
+        let default_attn = parse_in(&ATTNS, "--attn", "dense").expect("dense parses");
+        // The arms, named. A third one added without a row here is a third one nobody
+        // checked can start.
+        for arch in [Arch::GlmMoeDsa, Arch::MuseGlimmer] {
+            for flag in [Flag::Mode(default_mode), Flag::Attn(default_attn)] {
+                assert!(
+                    !matches!(decide(arch, flag), Outcome::Refuse(_)),
+                    "{} refuses {} — the default invocation `rivoli DIR --bench N` cannot \
+                     start on an architecture that HAS an engine arm",
+                    arch.name(),
+                    flag.spelling()
+                );
+            }
         }
     }
 

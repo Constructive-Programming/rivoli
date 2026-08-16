@@ -22,6 +22,7 @@
 
 use anyhow::Result;
 use rivoli_artifact::format::RoutedFmt;
+use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_core::cache::TwoQSplit;
 
@@ -41,6 +42,11 @@ pub struct GenSpec<'a> {
 pub struct DecodeStats {
     pub decode_s: f64,
     pub tok_s: f64,
+    /// Weight fetches that found what they needed already resident, and those that did not —
+    /// **at the ARM's own streaming granularity**, which is the one thing these two fields do
+    /// not carry. GLM counts routed experts (~2 MB apiece); Glimmer counts whole layer slots
+    /// (967.942 MB apiece). The RATIO is comparable across arms and the counts are not, so no
+    /// report may put them in one column.
     pub hits: u64,
     pub misses: u64,
 }
@@ -56,30 +62,157 @@ pub struct Decoded {
     pub stats: DecodeStats,
 }
 
-/// What [`Engine::open`] needs beyond the artifact and its config: the run's device
-/// budget, the routed format it decodes with, the cache knobs, and the context it will
-/// allocate KV for. Bundled for the same reason as [`GenSpec`].
-pub struct OpenSpec<'a> {
+/// The token-emission protocol every decode loop shares — **one author for "is this token
+/// output?", "may the run continue?" and "what did the run measure?".**
+///
+/// The arms' LOOPS are deliberately separate and stay so: GLM's is one async flow wrapped
+/// around a streamed expert pool, Glimmer's is synchronous because its fill is a host memcpy
+/// with nothing to await. What is not an architectural fact is the protocol around them, and
+/// it must not be reimplemented per arm.
+///
+/// **`old:` has the receipt.** Its Glimmer driver pushed the stop token and then tested for
+/// it, so an EOS-terminated run rendered the marker into the printed completion and reported
+/// one token more than it produced — two decode drivers in one binary disagreeing about
+/// whether the terminator is output, which a golden comparison inherits silently. That is a
+/// second-authority bug, and the fix is one authority rather than a second careful copy.
+/// `build.rs`'s duplication gate reported the second copy the moment this arm landed, which
+/// is the gate arriving at the same conclusion.
+///
+/// `#[cfg(feature = "rocm")]` because its only consumers are the arms, which are — exactly
+/// like [`OS_RESERVE`] below. A backendless build has no loop to run this protocol for.
+#[cfg(feature = "rocm")]
+pub(crate) struct Emit<'a> {
+    eos: &'a [u32],
+    ngen: usize,
+    ids: Vec<u32>,
+}
+
+#[cfg(feature = "rocm")]
+impl<'a> Emit<'a> {
+    pub(crate) fn new(spec: &GenSpec<'a>) -> Self {
+        Self {
+            eos: spec.eos,
+            ngen: spec.ngen,
+            ids: Vec::with_capacity(spec.ngen),
+        }
+    }
+
+    /// Offer the token decided at the current position. **False means stop.**
+    ///
+    /// A stop token ends the run WITHOUT being pushed or handed to `sink` — it is not part of
+    /// the output. `sink` sees every emitted token before the next forward starts: `serve`
+    /// streams from it and returns false when the client hangs up, otherwise a closed
+    /// connection would keep the sole-tenant GPU busy for the rest of the budget.
+    pub(crate) fn offer(&mut self, tok: u32, sink: &mut dyn FnMut(u32) -> bool) -> bool {
+        if self.eos.contains(&tok) {
+            return false;
+        }
+        self.ids.push(tok);
+        // `sink` is called before the budget is consulted, exactly as the two hand-written
+        // loops did: the caller is told about the token it just got even when it is the last.
+        sink(tok) && self.ids.len() < self.ngen
+    }
+
+    /// Close the run: the ids, and the stats over `decode`.
+    ///
+    /// The elapsed time is the ARM's, not a clock this owns, and that is deliberate: stats
+    /// describe steady-state decode and must EXCLUDE the cold prefill, so the instant they
+    /// start from is a point inside the arm's own flow (GLM's is inside its `block_on`). A
+    /// clock here would have to be told when to start, which is the same fact spelled twice.
+    pub(crate) fn finish(
+        self,
+        decode: std::time::Duration,
+        hits: u64,
+        misses: u64,
+    ) -> (Vec<u32>, DecodeStats) {
+        let decode_s = decode.as_secs_f64();
+        let stats = DecodeStats {
+            decode_s,
+            tok_s: self.ids.len() as f64 / decode_s.max(1e-9),
+            hits,
+            misses,
+        };
+        tracing::info!(
+            "DECODE: {} tokens in {:.1} s = {:.2} tok/s | {} hits / {} misses",
+            self.ids.len(),
+            stats.decode_s,
+            stats.tok_s,
+            stats.hits,
+            stats.misses,
+        );
+        (self.ids, stats)
+    }
+}
+
+/// What [`Engine::open`] needs REGARDLESS of architecture: the run's device budget and the
+/// context it will allocate KV for. Bundled for the same reason as [`GenSpec`].
+///
+/// **The routed knobs left this struct at M7**, when the second arm arrived. They were four
+/// of its six fields and all four are GLM-shaped — a format, a cache policy, a 2Q split and
+/// a routed-expert trace path — so a dense arm made to fill them in would be filling in
+/// fields nothing spends, which is the exact lie `rivoli_core::legality` exists to stop.
+/// They now ride with the config that makes them meaningful, in [`ArchCfg::Glm`].
+pub struct OpenSpec {
     /// `--max-mem` in GiB, taken LITERALLY when present. `None` auto-sizes; see
     /// [`OS_RESERVE`].
     pub max_mem_gib: Option<u64>,
+    /// KV-slab capacity in tokens — a hard per-run ceiling, allocated once at startup.
+    pub max_ctx: usize,
+}
+
+/// The routed-expert pool's startup knobs. GLM's alone: they describe a pool, and an
+/// architecture with no routed experts has none to describe.
+pub struct RoutedSpec<'a> {
     /// The run's ONE routed format. `--mode hybrid` has no value here at all, which is
     /// why `rivoli_core::legality` refuses it rather than resolving it to one of these.
     pub fmt: RoutedFmt,
     pub cache_policy: &'a str,
     pub two_q: TwoQSplit,
     pub trace_path: Option<&'a str>,
-    /// KV-slab capacity in tokens — a hard per-run ceiling, allocated once at startup.
-    pub max_ctx: usize,
+}
+
+/// The sniffed architecture together with its config and its own startup knobs — the one
+/// value [`Engine::open`] dispatches on.
+///
+/// **A closed enum for the same reason [`Engine`] is one**, and it is the other half of the
+/// same seam: `Engine` is what a decode loop looks like from outside, this is what opening
+/// one looks like. Adding an architecture breaks both matches until the new arm is handled.
+///
+/// **Each config type is already evidence of which architecture this is** — `ModelConfig`
+/// and `GlimmerConfig` both refuse every other architecture by name before serde reads a
+/// dimension (`rivoli_artifact::schema::parse_config`), so holding one is a proof rather
+/// than a claim, and there is deliberately no `--arch` flag that could disagree with it.
+/// That is why this carries the config and not an `Arch` beside one.
+///
+/// `GlimmerConfig`, not its `text_config`: a bare text dict is not evidence that the
+/// wrapper around it was Glimmer's, and the wrapper is where `dtype` and
+/// `quantization_config` are asserted. The engine reads `.text` on the other side of this.
+pub enum ArchCfg<'a> {
+    Glm(&'a ModelConfig, RoutedSpec<'a>),
+    Glimmer(&'a GlimmerConfig),
 }
 
 /// The decode engines, one variant per architecture that has a loop.
 ///
-/// GLM-5.2 is the only arm today; `rivoli_core::legality::decide` is what tells a user of
-/// another artifact that, in the same breath as it tells them why.
+/// GLM-5.2 (MoE, streamed experts) and Muse Glimmer-30B (dense, streamed whole layers);
+/// `rivoli_core::legality::decide` is what tells a user of a third artifact that there is
+/// no arm for it, in the same breath as it tells them why.
+///
+/// **`large_enum_variant` is allowed, and boxing would be the wrong fix here.** The arms are
+/// 1792 and 632 bytes (clippy, 2026-08-16), so the enum is the larger of the two — and that
+/// lint is about values that get copied, collected or passed by value on a hot path. This one
+/// is constructed exactly ONCE per process, moved once out of [`Engine::open`] onto `main`'s
+/// stack, and reached through `&mut` for the rest of the run; `serve` holds the same single
+/// value across every request. A `Box` would buy a 1.8 KB startup memcpy back and pay for it
+/// with a heap allocation and an indirection on each of the two methods below.
+///
+/// What would change the answer: an `Engine` stored per request, per session or in a
+/// collection. If one ever is, box the arms rather than widening this allowance.
 #[cfg(feature = "rocm")]
+#[allow(clippy::large_enum_variant)]
 pub enum Engine<'a> {
     Glm(crate::glm::engine::GlmEngine<'a>),
+    Glimmer(crate::glimmer::engine::GlimmerEngine<'a>),
 }
 
 /// A backendless build has no arm at all, and says so in the type: `Infallible` makes the
@@ -101,39 +234,52 @@ pub enum Engine<'a> {
 pub(crate) const OS_RESERVE: u64 = 16 << 30;
 
 impl<'a> Engine<'a> {
-    /// Open `dir` as a decode engine.
+    /// Open `dir` as a decode engine, on the arm `cfg` names.
     ///
-    /// `cfg` is borrowed for the engine's whole life, so the caller must keep it — that
-    /// borrow is what makes "the config this engine was built for" un-swappable.
-    ///
-    /// It is the GLM config type because GLM is the only arm, and `ModelConfig::load`
-    /// refuses every other architecture before serde reads a dimension — so holding one is
-    /// already evidence of which arm this is. A second architecture brings its own config
-    /// type and turns this into a dispatch on the sniffed [`rivoli_core::legality::Arch`];
-    /// nothing here blocks that, because the caller sniffs before it opens.
+    /// The config inside `cfg` is borrowed for the engine's whole life, so the caller must
+    /// keep it — that borrow is what makes "the config this engine was built for"
+    /// un-swappable. See [`ArchCfg`] for why the dispatch is on the config's TYPE rather
+    /// than on an `Arch` handed alongside it.
     #[cfg(feature = "rocm")]
-    pub fn open(dir: &str, cfg: &'a ModelConfig, spec: OpenSpec<'_>) -> Result<Engine<'a>> {
-        let pin = crate::glm::pin::GlmPin::build(
-            dir,
-            cfg,
-            crate::glm::pin::GlmPinCfg {
-                capacity: device_budget(spec.max_mem_gib)?,
-                fmt: spec.fmt,
-                cache_policy: spec.cache_policy,
-                two_q: spec.two_q,
-                trace_path: spec.trace_path,
-            },
-        )?;
-        Ok(Engine::Glm(crate::glm::engine::GlmEngine::new(
-            pin,
-            cfg,
-            spec.max_ctx,
-        )?))
+    pub fn open(dir: &str, cfg: ArchCfg<'a>, spec: OpenSpec) -> Result<Engine<'a>> {
+        // One budget for every arm, computed before the match: a budget that differed by
+        // architecture would look like a residency difference in every log line it produced.
+        let capacity = device_budget(spec.max_mem_gib)?;
+        match cfg {
+            ArchCfg::Glm(cfg, routed) => {
+                let pin = crate::glm::pin::GlmPin::build(
+                    dir,
+                    cfg,
+                    crate::glm::pin::GlmPinCfg {
+                        capacity,
+                        fmt: routed.fmt,
+                        cache_policy: routed.cache_policy,
+                        two_q: routed.two_q,
+                        trace_path: routed.trace_path,
+                    },
+                )?;
+                let e = crate::glm::engine::GlmEngine::new(pin, cfg, spec.max_ctx)?;
+                Ok(Engine::Glm(e))
+            }
+            // `open` rather than a pin-then-new pair: Glimmer's floor CHARGES for its KV
+            // cache and activation scratch, so the two footprints must be computed once and
+            // used by both the partition and the allocation. Splitting the call here would
+            // hand the pin one number and the constructor another.
+            ArchCfg::Glimmer(cfg) => {
+                let e = crate::glimmer::engine::GlimmerEngine::open(
+                    dir,
+                    &cfg.text,
+                    capacity,
+                    spec.max_ctx,
+                )?;
+                Ok(Engine::Glimmer(e))
+            }
+        }
     }
 
     /// The refusal a build with no compute backend gives.
     #[cfg(not(feature = "rocm"))]
-    pub fn open(dir: &str, cfg: &'a ModelConfig, spec: OpenSpec<'_>) -> Result<Engine<'a>> {
+    pub fn open(dir: &str, cfg: ArchCfg<'a>, spec: OpenSpec) -> Result<Engine<'a>> {
         let _ = (dir, cfg, spec);
         Self::ensure_backend()?;
         unreachable!("ensure_backend errored above in a backendless build")
@@ -168,6 +314,8 @@ impl<'a> Engine<'a> {
         match self {
             #[cfg(feature = "rocm")]
             Engine::Glm(e) => e.max_ctx(),
+            #[cfg(feature = "rocm")]
+            Engine::Glimmer(e) => e.max_ctx(),
             #[cfg(not(feature = "rocm"))]
             Engine::Never(never, _) => match *never {},
         }
@@ -176,21 +324,46 @@ impl<'a> Engine<'a> {
     /// Greedy-decode `req`, streaming each token to `sink` the moment it lands; return
     /// false from it to stop early. The delegating match is the whole seam — everything
     /// architecture-shaped is on the other side of it.
+    ///
+    /// **The match yields the arm's own `(ids, stats)` and the `Decoded` is built ONCE
+    /// below it.** Wrapping inside each arm reads more naturally and is exactly the shape
+    /// `build.rs`'s jscpd gate reported the moment the second arm landed: two arms whose
+    /// bodies were the same twenty tokens. Hoisting the construction is also the honest
+    /// factoring — the arms differ in which loop runs, not in what a decode result is.
+    ///
+    /// **The two builds are separate blocks rather than one `#[cfg]`-attributed match**,
+    /// which is the shape every other method here uses. Hoisting forced it: featureless,
+    /// the only surviving arm is the uninhabited one, so the match diverges and the `Ok`
+    /// after it is `unreachable_code` — an error under this workspace's `-D warnings`. The
+    /// split says the same thing without asking the compiler to reason about a match that
+    /// has no reachable arms.
     pub fn generate(
         &mut self,
         req: GenSpec<'_>,
         sink: &mut dyn FnMut(u32) -> bool,
     ) -> Result<Decoded> {
-        match self {
-            #[cfg(feature = "rocm")]
-            Engine::Glm(e) => {
-                let (ids, stats) = e.generate(req, sink)?;
-                Ok(Decoded { ids, stats })
-            }
-            #[cfg(not(feature = "rocm"))]
-            Engine::Never(never, _) => {
-                let _ = (req, sink);
-                match *never {}
+        #[cfg(not(feature = "rocm"))]
+        {
+            let Engine::Never(never, _) = self;
+            let _ = (req, sink);
+            match *never {}
+        }
+        #[cfg(feature = "rocm")]
+        {
+            match self {
+                // **The two arms return different shapes, and that is history rather than
+                // design.** [`Decoded`]'s own doc argues for the named pair over the tuple —
+                // `.0`/`.1` read the same whichever way round they are, which is how a
+                // swapped destructuring survives review. Glimmer's loop was written after
+                // that type existed and returns it; GLM's predates it. GLM should follow
+                // when that file is next opened, at which point this match collapses to two
+                // identical forwarding arms — which the duplication gate will then have an
+                // opinion about, and the answer will be to hoist the whole match.
+                Engine::Glm(e) => {
+                    let (ids, stats) = e.generate(req, sink)?;
+                    Ok(Decoded { ids, stats })
+                }
+                Engine::Glimmer(e) => e.decode(req, sink),
             }
         }
     }

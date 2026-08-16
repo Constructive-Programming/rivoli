@@ -11,6 +11,7 @@
 #[cfg(feature = "rocm")]
 pub mod device;
 pub mod fetch;
+pub mod glimmer;
 #[cfg(feature = "rocm")]
 pub mod glm;
 pub mod indexer;
@@ -22,4 +23,4 @@ pub mod telemetry;
 // The seam's vocabulary, hoisted to the crate root: `rivoli_engine::Engine` is what a
 // consumer programs against, and making it name the module the enum happens to live in is
 // one more detail the second consumer could get wrong.
-pub use seam::{DecodeStats, Decoded, Engine, GenSpec, OpenSpec};
+pub use seam::{ArchCfg, DecodeStats, Decoded, Engine, GenSpec, OpenSpec, RoutedSpec};

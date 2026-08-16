@@ -10,7 +10,7 @@ use rivoli_backend::launch_argmax;
 // The request and result shapes live at the seam, not here: neither names anything
 // GLM-shaped, and `Engine::generate` must be able to name both in a build where this
 // module does not exist at all.
-use crate::seam::{DecodeStats, GenSpec};
+use crate::seam::{DecodeStats, Emit, GenSpec};
 
 impl GlmEngine<'_> {
     /// Greedy argmax over each of the pass's `n` logit rows — reduced ON DEVICE, so
@@ -127,7 +127,11 @@ impl GlmEngine<'_> {
         on_tok: &mut dyn FnMut(u32) -> bool,
     ) -> Result<(Vec<u32>, DecodeStats)> {
         ensure!(!spec.prompt.is_empty(), "empty prompt");
-        let mut generated = Vec::with_capacity(spec.ngen);
+        // The emission protocol — which tokens are output, and when the run may continue —
+        // is [`Emit`]'s, shared with every other arm. What stays here is this loop's own
+        // shape: one `block_on` around the whole flow, because `forward` awaits the expert
+        // stream inline and a per-layer `block_on` is what that avoids.
+        let mut emit = Emit::new(&spec);
         let (hit0, miss0, decode_wall) = rivoli_backend::block_on(async {
             let mut pos = self.prefill(spec.prompt).await?;
             // Stats describe steady-state DECODE, not the cold prefill.
@@ -135,14 +139,7 @@ impl GlmEngine<'_> {
             let decode_wall = std::time::Instant::now();
             // `cur` is the token AT `pos`, decided but not yet fed through the model.
             let mut cur = self.argmax()?;
-            loop {
-                if spec.eos.contains(&cur) {
-                    break;
-                }
-                generated.push(cur);
-                if !on_tok(cur) || generated.len() >= spec.ngen {
-                    break;
-                }
+            while emit.offer(cur, on_tok) {
                 self.forward(cur, pos).await?;
                 self.flush_trace()?;
                 pos += 1;
@@ -150,21 +147,6 @@ impl GlmEngine<'_> {
             }
             Ok::<_, anyhow::Error>((hit0, miss0, decode_wall.elapsed()))
         })?;
-        let decode_s = decode_wall.as_secs_f64();
-        let stats = DecodeStats {
-            decode_s,
-            tok_s: generated.len() as f64 / decode_s.max(1e-9),
-            hits: self.hits() - hit0,
-            misses: self.misses() - miss0,
-        };
-        tracing::info!(
-            "DECODE: {} tokens in {:.1} s = {:.2} tok/s | {} hits / {} misses",
-            generated.len(),
-            stats.decode_s,
-            stats.tok_s,
-            stats.hits,
-            stats.misses,
-        );
-        Ok((generated, stats))
+        Ok(emit.finish(decode_wall, self.hits() - hit0, self.misses() - miss0))
     }
 }

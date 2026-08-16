@@ -26,13 +26,9 @@ mod common;
 /// milestone and the old-tree oracle file that covers it there, so the port task is
 /// written down where the gap is enforced.
 const DEFERRED: &[(&str, &str)] = &[
-    // Muse Glimmer (M7) — old:tests/glimmer_{attend,chain,gate,head,norm,...}.rs
-    ("gqa_attend", "M7: old:tests/glimmer_attend.rs"),
-    ("logit_softcap", "M7: old:tests/glimmer_head.rs"),
-    ("rmsnorm_centered_single", "M7: old:tests/glimmer_norm.rs"),
-    ("rmsnorm_weightless_batch", "M7: old:tests/glimmer_norm.rs"),
-    ("rope_split_half", "M7: old:tests/glimmer_chain.rs"),
-    ("sigmoid_gate", "M7: old:tests/glimmer_gate.rs"),
+    // (Muse Glimmer's six rows retired 2026-08-16 with M7's oracles — `kernel_glimmer_norm.rs`,
+    // `kernel_glimmer_attend.rs` and `kernel_glimmer_pointwise.rs` under `crates/engine/tests`.
+    // The table can only shrink, and this is what that looks like.)
     // DeepSeek-V4-Flash (M8) — old:tests/{f4_kernel,f4_attn,kvcompress_kernel,blockindex_kernel}.rs
     ("act_quant_f4_rotated", "M8: old:tests/kvcompress_kernel.rs"),
     ("act_quant_f8", "M8: old:tests/f4_kernel.rs"),
