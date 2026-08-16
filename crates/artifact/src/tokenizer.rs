@@ -24,6 +24,11 @@
 //! It moves with whichever of those two ports lands first, and *beside* `python_json`, for
 //! the reason the reference records at its declaration: two ports getting Python's truth
 //! table right independently is not something to have twice.
+//!
+//! > **UPDATED 2026-08-16. It has moved — M7 (`glimmer_encoding`) landed first.**
+//! > [`json_truthy`] is below, beside [`python_json`], with one caller. The paragraph above is
+//! > kept rather than rewritten because it records why the item was *withheld*, which is the
+//! > half a reader cannot reconstruct from the code being present.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
@@ -65,6 +70,14 @@ pub struct Tokenizer {
 /// > converter that reads them lands with M7. The item stays `pub` and free because that is
 /// > the shape the second caller needs, and moving it later is the change that invites the
 /// > second copy.
+/// >
+/// > **UPDATED 2026-08-16, same day: the anticipated shape arrived.**
+/// > `crates/cli/src/bin/convert_glimmer.rs::eos_ids` is the second caller, and it is exactly
+/// > the one described — it wraps this in a non-empty `ensure!` and a vocabulary-bound check,
+/// > because a Glimmer artifact whose only stop tokens are unusable cannot terminate a decode
+/// > at all. It calls this rather than re-parsing the file, so the gate and the engine read
+/// > `eos_token_id` the same way by construction rather than by a comment claiming they
+/// > "match". The `pub`-and-free shape is now load-bearing rather than anticipatory.
 ///
 /// **A MISSING key is `Ok(vec![])`, not an error.** It is the same outcome as an empty array — no
 /// stop tokens — and both callers act on the outcome rather than on how it was spelled. Only an
@@ -151,12 +164,45 @@ impl serde_json::ser::Formatter for PythonSpacing {
 /// > way to see, and the old tree measured exactly that outcome (Glimmer wrote a second copy
 /// > of its neighbour `json_truthy`, and the duplication gate reported it on the first
 /// > compile, 2026-08-14).
+/// >
+/// > **UPDATED 2026-08-16, same day: M7 landed and the speculation is now a fact.**
+/// > [`crate::glimmer_encoding`] renders Muse Glimmer's ATEM tool schemas through this, so
+/// > there are two callers in two modules and the `pub(crate)` is load-bearing rather than
+/// > anticipatory.
 pub(crate) fn python_json(v: &Value) -> String {
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonSpacing);
     match serde::Serialize::serialize(v, &mut ser) {
         Ok(()) => String::from_utf8(buf).unwrap_or_default(),
         Err(_) => v.to_string(),
+    }
+}
+
+/// Python truthiness, which is what a bare `{%- if x -%}` in a Jinja chat template tests and
+/// what `if response_format:` tests in DeepSeek's Python one.
+///
+/// `false`, `0`, `0.0`, `""`, `[]`, `{}` and `null` are false; everything else — including the
+/// STRING `"false"` and the string `"0"` — is true.
+///
+/// **Beside [`python_json`] because it is the same kind of thing: a Python semantic this crate
+/// has to reproduce exactly, owned by neither model.** In the old tree it began as
+/// `dsv4_encoding::json_truthy`; Glimmer's port needed it for `{%- if tools -%}` and
+/// `end_turn`, wrote a second copy, and `build.rs` reported the clone on the first compile
+/// (2026-08-14). Two ports getting Python's truth table right independently is not something
+/// to have twice.
+///
+/// > **PORT NOTE 2026-08-16.** This module's header said this item "moves with whichever of
+/// > those two ports lands first, and *beside* `python_json`". **M7 landed first**, so it is
+/// > here, and `glimmer_encoding` is its one caller until M8 brings V4's. The header has been
+/// > updated in place rather than left describing a decision that has been made.
+pub(crate) fn json_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
     }
 }
 

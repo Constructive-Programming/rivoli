@@ -9,6 +9,12 @@
 pub mod arch;
 pub mod format;
 pub mod glimmer;
+pub mod glimmer_config;
+/// Muse Glimmer's prompt encoding. A sibling of [`tokenizer`]'s GLM surface rather than a
+/// member of it, and the split is the models': GLM's encoder builds a token-ID list, Glimmer's
+/// builds a **string** that is tokenized afterwards. The old tree's own header says of that
+/// pair that "the two must not converge", so they do not share a module.
+pub mod glimmer_encoding;
 pub mod glm_config;
 pub mod quant;
 pub mod schema;

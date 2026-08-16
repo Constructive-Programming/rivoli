@@ -126,7 +126,31 @@ pub fn load_config<T: ArchConfig>(dir: &str) -> Result<T> {
     parse_config(&text).with_context(|| format!("parse {path}"))
 }
 
-// (`ensure_f32_positive` returns with K3Config at M9 — its only caller.)
+// > **UPDATED 2026-08-16.** This read "(`ensure_f32_positive` returns with K3Config at M9 —
+// > its only caller.)". It arrived at **M7** instead, with `GlimmerConfig`: the anticipated
+// > shape was right and the milestone was wrong. K3 is still the other caller, which is what
+// > keeps this shared rather than inlined into `glimmer_config.rs`.
+
+/// Every f64 a kernel narrows to f32, checked in the **f32 domain** rather than only in the
+/// f64 the JSON carries. Underflow (`x <= 2^-150` -> `0.0f32`) collapses the value; overflow
+/// (`x > ~3.4e38` -> `inf`, which passes any bare `> 0.0` test) is the silent one. A `1e-46`
+/// eps passes an f64 positivity test and reaches every RMSNorm as `0.0f32`.
+///
+/// Shared by `GlimmerTextConfig` and (at M9) `K3TextConfig` because it is one rule about the
+/// hardware, not a coincidence of two checkpoints — which is what separates it from the
+/// dimension serde renames in each config, where the shared text IS a coincidence and stays
+/// exempted rather than factored. Factored in the old tree 2026-08-11, when Glimmer's arrival
+/// made jscpd report it; it arrives here already factored, for the same reason.
+pub(crate) fn ensure_f32_positive(items: &[(&str, f64)]) -> Result<()> {
+    for &(what, x) in items {
+        let narrowed = x as f32;
+        ensure!(
+            narrowed > 0.0 && narrowed.is_finite(),
+            "{what} {x} narrows to {narrowed} in f32, the domain the kernels work in"
+        );
+    }
+    Ok(())
+}
 
 /// Both of an expert's input widths must divide the group-scale span exactly.
 ///

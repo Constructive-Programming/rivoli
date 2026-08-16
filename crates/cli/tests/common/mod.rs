@@ -44,3 +44,58 @@ pub fn repo_root() -> std::path::PathBuf {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default()
 }
+
+// ── converter-gate fixtures ─────────────────────────────────────────────────────────────
+//
+// The three below arrived here on 2026-08-16, when `glimmer_convert.rs` became the second
+// converter gate and `build.rs`'s jscpd reported all three as clones of `glm_convert.rs`'s
+// copies. That is this file's stated growth rule working exactly as written — it grows when a
+// second test needs the same helper, and each move is the duplication gate saying a copy
+// exists. They are fixture plumbing, shared by construction rather than by coincidence: a
+// converter gate needs deterministic weights, their bf16 encoding, and a scratch directory.
+
+/// Deterministic pseudo-weights: a cheap hash of (name, index) — no RNG dependency, and values
+/// in a plausible ±0.1 range so fp8 block scales stay finite.
+///
+/// **Keyed on the NAME**, which is what makes a byte comparison mean something: a converter
+/// that wrote the right tensor's bytes under the wrong name, or the wrong tensor's under the
+/// right one, fails rather than passing on identical content.
+pub fn weights(name: &str, n: usize) -> Vec<f32> {
+    let seed = rivoli_core::hash::fnv1a(name.as_bytes());
+    (0..n)
+        .map(|i| {
+            let h = rivoli_core::hash::fnv1a(&(seed ^ i as u64).to_le_bytes());
+            ((h % 2001) as f32 / 1000.0 - 1.0) * 0.1
+        })
+        .collect()
+}
+
+pub fn bf16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|&x| rivoli_core::num::f32_to_bf16(x).to_le_bytes())
+        .collect()
+}
+
+/// A scratch root under `$TMPDIR`, **removed first**.
+///
+/// The `remove_dir_all` is load-bearing rather than tidiness: a stale `out1`/`out2` from a
+/// killed run would satisfy a determinism compare vacuously, and a stale artifact directory
+/// would satisfy a refusal test's "the output must not exist" in reverse.
+///
+/// `tag` carries the caller's own model and arm (`"glm-convert-rt"`), so one helper serves every
+/// gate without the names colliding. Shaped unlike `ppl.rs`'s `tmp()` on purpose — jscpd matched
+/// those two temp-dir helpers at 27 tokens once already.
+///
+/// `#[expect(clippy::expect_used)]` rather than a file-level allow: this module is compiled into
+/// the meta-gates too, and a scratch directory that cannot be created is a broken harness that
+/// should die loudly rather than a test failure to report.
+#[expect(
+    clippy::expect_used,
+    reason = "a harness that cannot make a temp dir must die loudly"
+)]
+pub fn scratch(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("rivoli-{tag}-{}", std::process::id()));
+    assert!(!d.exists() || std::fs::remove_dir_all(&d).is_ok());
+    std::fs::create_dir_all(&d).expect("create scratch dir");
+    d
+}

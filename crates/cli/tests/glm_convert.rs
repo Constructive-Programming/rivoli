@@ -22,9 +22,11 @@ use rivoli_artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors};
 use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_artifact::quant::{FP8_BLOCK, quantize_fp8_block};
 use rivoli_artifact::schema::load_config;
-use rivoli_core::num::f32_to_bf16;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
+
+mod common;
+use common::{bf16_bytes, scratch, weights};
 
 // Tiny but non-degenerate, and sized for the converter's own floors: hidden and
 // moe_inter must be multiples of VQ_GROUP (64), and the codebook learner needs at least
@@ -43,24 +45,9 @@ const QK_NOPE: usize = 16;
 const V_HEAD: usize = 16;
 const HEADS: usize = 2;
 
-/// Deterministic pseudo-weights: a cheap hash of (name, index) — no RNG dependency, and
-/// values in a plausible ±0.1 range so fp8 block scales stay finite.
-fn weights(name: &str, n: usize) -> Vec<f32> {
-    let seed = rivoli_core::hash::fnv1a(name.as_bytes());
-    (0..n)
-        .map(|i| {
-            let h = rivoli_core::hash::fnv1a(&(seed ^ i as u64).to_le_bytes());
-            ((h % 2001) as f32 / 1000.0 - 1.0) * 0.1
-        })
-        .collect()
-}
-
-fn bf16_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter()
-        .flat_map(|&x| f32_to_bf16(x).to_le_bytes())
-        .collect()
-}
-
+/// `f32_bytes` stays here: it encodes the fp8 scale blocks and this is its only caller. Its
+/// two neighbours (`weights`, `bf16_bytes`) moved to `common` on 2026-08-16, when
+/// `glimmer_convert.rs` became the second converter gate and jscpd reported them as clones.
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -230,16 +217,6 @@ fn write_fixture(dir: &Path) {
     write_sidecars(dir);
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    // (Shaped unlike ppl.rs's `tmp()` on purpose — jscpd matched the two temp-dir
-    // helpers at 27 tokens; the remove_dir_all here is also load-bearing, since a stale
-    // out1/out2 from a killed run would satisfy the determinism compare vacuously.)
-    let d = std::env::temp_dir().join(format!("rivoli-glm-convert-{tag}-{}", std::process::id()));
-    assert!(!d.exists() || std::fs::remove_dir_all(&d).is_ok());
-    std::fs::create_dir_all(&d).expect("create scratch dir");
-    d
-}
-
 fn run_convert(src: &Path, out: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_convert"))
         .args([src.to_str().unwrap(), out.to_str().unwrap()])
@@ -253,7 +230,7 @@ fn run_convert(src: &Path, out: &Path) -> std::process::Output {
 
 #[test]
 fn convert_writes_an_artifact_that_reopens_and_is_deterministic() {
-    let root = scratch("rt");
+    let root = scratch("glm-convert-rt");
     let src = root.join("src");
     write_fixture(&src);
 
@@ -302,7 +279,7 @@ fn convert_writes_an_artifact_that_reopens_and_is_deterministic() {
 fn a_checkpoint_without_generation_config_is_refused() {
     // The lesson-34 gate: the artifact carries the stop tokens or the converter fails —
     // never a warning (the old tree shipped 56 unterminated runs on exactly this).
-    let root = scratch("noeos");
+    let root = scratch("glm-convert-noeos");
     let src = root.join("src");
     write_fixture(&src);
     std::fs::remove_file(src.join("generation_config.json")).unwrap();
