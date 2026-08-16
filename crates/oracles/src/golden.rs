@@ -101,6 +101,19 @@ impl GoldenSet {
             as f32
     }
 
+    /// A K3 anchor golden's own `tiny_config`, parsed as raw JSON — deliberately NOT
+    /// through `K3Config`, whose `validate` rightly refuses the tiny widths.
+    ///
+    /// Beside [`GoldenSet::k3_gate_lower_bound`] and on its precedent: the kernel harness
+    /// and the anchor gate each spelled this parse verbatim, authored blind to each other
+    /// (hoisted 2026-08-16, the simplification pass).
+    pub fn k3_tiny_config(&self) -> serde_json::Value {
+        let raw = self
+            .meta_get("tiny_config")
+            .unwrap_or_else(|| panic!("this golden carries no tiny_config metadata"));
+        serde_json::from_str(raw).unwrap_or_else(|e| panic!("tiny_config is not JSON: {e}"))
+    }
+
     /// A GLM-5.2 anchor golden.
     pub fn read_glm(r: &mut impl Read) -> Result<Self> {
         Self::read_anchor(r, MAGIC_GLM)

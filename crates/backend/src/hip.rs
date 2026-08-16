@@ -95,6 +95,28 @@ pub struct ExpertDescF4 {
     pub down_scale: *const u8,
 }
 
+impl ExpertDescF4 {
+    /// A descriptor that faults if it is ever read.
+    ///
+    /// Launch-order descriptor tables are sized `n_experts`, so most entries sit past any
+    /// one token's selection and no launch names them. Filling those with nulls rather than
+    /// with a copy of some resolved expert is the difference between a fault and a
+    /// plausible wrong weight the day a range is computed wrongly. On the type because
+    /// every arm with an F4 table wants the same defence — the V4 and K3 engines each
+    /// carried a verbatim copy under its own name.
+    pub fn null() -> Self {
+        let n = std::ptr::null();
+        Self {
+            gate_packed: n,
+            gate_scale: n,
+            up_packed: n,
+            up_scale: n,
+            down_packed: n,
+            down_scale: n,
+        }
+    }
+}
+
 /// The four device buffers the sparse indexer's scoring reads and writes — the pointer half
 /// of [`launch_index_score_blocks`], whose `# Safety` section remains the single home for
 /// their sizing and non-aliasing contract.

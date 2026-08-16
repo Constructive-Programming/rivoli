@@ -18,7 +18,7 @@
 //! every layer, which is one seventh of the FFN and reads as ordinary drift.
 
 use super::ROWS;
-use super::engine::{MOE_ACC_ROWS, V4Engine, desc_never_read, desc_of_f4, gemv_fp8};
+use super::engine::{MOE_ACC_ROWS, V4Engine, desc_of_f4, gemv_fp8};
 use super::geometry::FP8_BLOCK;
 use crate::device::as_le_bytes;
 use crate::routed::Selection;
@@ -260,7 +260,7 @@ impl V4Engine<'_> {
     /// duplicate pick (reachable only through a hash row) gets one compact slot per occurrence
     /// and accumulates once each — the same total.
     fn stage_launch_order(&mut self) -> usize {
-        self.descs_host.fill(desc_never_read());
+        self.descs_host.fill(ExpertDescF4::null());
         let mut n_res = 0;
         let mut c = 0;
         for resident in [true, false] {

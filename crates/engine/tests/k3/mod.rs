@@ -44,7 +44,7 @@ pub mod tolerance;
 // reads a golden tensor by name. The allow is on this ONE re-export, so a genuinely dead
 // `use` elsewhere still reports.
 #[allow(unused_imports)]
-pub use golden_read::{GoldenSet, Vendored, float};
+pub use golden_read::{GoldenSet, Vendored, float, to_key_major};
 
 // **The suites import this harness with `use k3::*;`, and the glob is a jscpd decision, not
 // laziness.** An import LIST is the one duplication Rust gives you no way to factor
@@ -101,22 +101,17 @@ pub fn load(bytes: &[u8]) -> GoldenSet {
     GoldenSet::read_k3(&mut &bytes[..]).expect("the vendored golden must load")
 }
 
-/// The config the reference was built from, as the golden itself carries it.
-///
-/// One parse with several readers ([`eps`], [`betas`], [`lower_bound`]), because every one
-/// of them is making the same argument: a constant a fixture hardcoded would agree with
-/// itself if the reference's value ever moved. `crates/oracles/tests/k3_anchor.rs` pins the
-/// tiny config's structural fields against the real checkpoint's, so reading them here says
-/// "the model's value", not "the file's" (`k3:tests/k3_kernels.rs:124`).
-pub fn tiny(g: &GoldenSet) -> serde_json::Value {
-    serde_json::from_str(g.meta_get("tiny_config").expect("tiny_config")).expect("valid json")
-}
-
-/// The eps the reference's RMSNorm used, read off the golden's own `tiny_config` — not a
-/// literal `1e-5`. The reference reads `norm.variance_epsilon`, which is
-/// `config.rms_norm_eps` (`k3:tests/k3_kernels.rs:114`).
+/// The eps the reference's RMSNorm used, read off the golden's own `tiny_config`
+/// ([`GoldenSet::k3_tiny_config`]) — not a literal `1e-5`, because a constant a fixture
+/// hardcoded would agree with itself if the reference's value ever moved.
+/// `crates/oracles/tests/k3_anchor.rs` pins the tiny config's structural fields against
+/// the real checkpoint's, so reading it here says "the model's value", not "the file's".
+/// The reference reads `norm.variance_epsilon`, which is `config.rms_norm_eps`
+/// (`k3:tests/k3_kernels.rs:114`).
 pub fn eps(g: &GoldenSet) -> f32 {
-    tiny(g)["rms_norm_eps"].as_f64().expect("rms_norm_eps") as f32
+    g.k3_tiny_config()["rms_norm_eps"]
+        .as_f64()
+        .expect("rms_norm_eps") as f32
 }
 
 /// The two SiTU betas, read off the golden's own `tiny_config` — they are STRUCTURAL, so
@@ -124,7 +119,7 @@ pub fn eps(g: &GoldenSet) -> f32 {
 /// abbreviating it to `activation_linear_beta` is a mistake the k3 port made once, in S1a,
 /// where it would have refused every real checkpoint (`k3:tests/k3_kernels.rs:1520`).
 pub fn betas(g: &GoldenSet) -> (f32, f32) {
-    let c = tiny(g);
+    let c = g.k3_tiny_config();
     let f = |k: &str| c[k].as_f64().unwrap_or_else(|| panic!("{k} missing")) as f32;
     (f("activation_situ_beta"), f("activation_situ_linear_beta"))
 }
@@ -138,13 +133,6 @@ pub fn betas(g: &GoldenSet) -> (f32, f32) {
 /// captured output, so pinning the shipped pair is the right thing there. One symbol so the
 /// two conventions are visible instead of a literal at three sites (`k3:tests/k3_kernels.rs:1527`).
 pub const SHIPPED_BETAS: (f32, f32) = (4.0, 25.0);
-
-/// `-5.0`, read off the golden's own config rather than written down — through the reader's
-/// own accessor, where the bound's inclusive-end argument now lives (it was spelled here AND
-/// in the anchor gate's harness, which was the 2026-08-16 integration's one jscpd finding).
-pub fn lower_bound(g: &GoldenSet) -> f32 {
-    GoldenSet::k3_gate_lower_bound(&tiny(g))
-}
 
 /// Relative difference the way the anchor's `--by-operator` measures it, so the number
 /// compared here is the number the tolerance was measured in.
@@ -299,7 +287,7 @@ pub fn host_situ(gate: &[f32], up: &[f32], betas: (f32, f32), capped_sigmoid: bo
 /// saturates to ±1 except exactly at `x == 0`, where it is NaN; `+inf` is the silent
 /// spelling of "no saturation", since `b·tanh(x/b) -> x`; negative flips the saturating
 /// branch (`k3:tests/k3_kernels.rs:1756`).
-pub const BAD_BETAS: [(f32, f32, &str); 7] = [
+const BAD_BETAS: [(f32, f32, &str); 7] = [
     (0.0, 25.0, "b1 = 0"),
     (4.0, 0.0, "b2 = 0"),
     (-4.0, 25.0, "b1 negative"),

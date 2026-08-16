@@ -27,8 +27,8 @@
 //! landing: overlapping it is a measured change, and the join discipline it would need is
 //! exactly the class of bug the house records most.
 
-use super::engine::{K3Engine, LayerState, null_desc};
-use super::geometry::{MLA_LORA_EPS, MOE_ACC_ROWS, head_norm_eps};
+use super::engine::{K3Engine, LayerState, MOE_ACC_ROWS};
+use super::geometry::MLA_LORA_EPS;
 use super::pin::{Attn, Ffn, SituMlp};
 use super::state::{combine_weights, final_sources, fold_at};
 use crate::device::as_le_bytes;
@@ -144,7 +144,13 @@ impl K3Engine<'_> {
         // unlike the mlp fold below.
         match f.entry_sources {
             Some(nsrc) => self.fold_into_h(self.pin.layer(l)?.attn_fold, nsrc)?,
-            None => self.copy_pref_to_h(p.stack)?,
+            None => {
+                // `entry_sources` is `None` only at layer 0, before any push, so the prefix
+                // row IS row 0 (`state::fold_at`) — checked on the dev profile, where the
+                // suites run.
+                debug_assert_eq!(p.stack, 0, "an empty entry fold implies an empty stack");
+                self.copy_pref_to_h()?;
+            }
         }
         let mut p = p;
         if f.push {
@@ -199,19 +205,13 @@ impl K3Engine<'_> {
         }
     }
 
-    /// `h = pref`, the layer-0 case where there is no stack to fold.
-    fn copy_pref_to_h(&mut self, stack: usize) -> Result<()> {
+    /// `h = pref`, the layer-0 case where there is no stack to fold — the prefix row is
+    /// arena row 0, per the call site's invariant.
+    fn copy_pref_to_h(&mut self) -> Result<()> {
         let bytes = self.cfg.hidden * size_of::<f32>();
-        // SAFETY: row `stack` is in the arena (`stack <= res_blocks` always) and `hbuf` is
-        // `bytes` writable; null-stream ordering keeps this behind the embed gather.
-        unsafe {
-            memcpy_dtod_async(
-                self.hbuf.ptr_mut(),
-                self.arena.ptr().add(stack * bytes),
-                bytes,
-                NULL_STREAM,
-            )
-        }
+        // SAFETY: row 0 is in the arena and `hbuf` is `bytes` writable; null-stream
+        // ordering keeps this behind the embed gather.
+        unsafe { memcpy_dtod_async(self.hbuf.ptr_mut(), self.arena.ptr(), bytes, NULL_STREAM) }
     }
 
     /// `xn = rmsnorm(hbuf, w)` at the model eps.
@@ -309,13 +309,17 @@ impl K3Engine<'_> {
                 NULL_STREAM,
             )?;
             // Norm, THEN gate, then project — the opposite order from the MLA path below.
+            // The eps is the MODEL-WIDE `rms_norm_eps`, not `MLA_LORA_EPS`: the gate-norm
+            // fixtures read it off the golden's own tiny config and the device kernel
+            // matched the first-party `o_norm` captures under `kda_op`'s tolerance — so
+            // 1e-5 here is anchored, where the LoRA norms' 1e-6 had to be read.
             launch_rmsnorm_gate_heads_f32(
                 self.ko.ptr().cast(),
                 self.gate.ptr().cast(),
                 w.o_norm,
                 la.num_heads,
                 la.head_dim,
-                head_norm_eps(self.cfg),
+                self.cfg.rms_norm_eps as f32,
                 self.kon.ptr_mut().cast(),
                 NULL_STREAM,
             )?;
@@ -597,7 +601,7 @@ impl K3Engine<'_> {
         // Descriptor table refilled with FAULTING nulls first — a stale entry names a pool
         // slot the policy may since have evicted, which is plausible wrong weights at
         // exactly the right addresses on the one path the ticket protocol cannot help.
-        self.descs_host.fill(null_desc());
+        self.descs_host.fill(rivoli_backend::ExpertDescF4::null());
         for (c, &i) in self.launch_idx.iter().enumerate() {
             let (g, u, dn) = {
                 let s = &self.resolved.slots[i];

@@ -19,7 +19,9 @@ registry + derived exemption ledger + CI; anchors (Glimmer ×6, K3 ×2), frozen 
 `bin/ppl` + corpora. Exit gate: `docs/measurement/gate-red-proofs.md` — every gate shown
 red, two of them fired unplanted during the port itself (the jscpd fnv1a catch, the
 ledger's 0→3 refusal). OWED: the CodeScene score-half red proof, blocked on
-`CS_ACCESS_TOKEN`.
+`CS_ACCESS_TOKEN` — **PAID during the quality mandate** (the vendored `bad.rs.txt`
+standing red-proof scores below ten on every armed run since; this line stayed "owed"
+long after, corrected 2026-08-16).
 
 ## M1 — substrate (DONE 2026-08-15, three items deferred)
 

@@ -398,7 +398,9 @@ fn assert_resident_is_a_verbatim_passthrough(out: &Path, tensors: &[Tensor]) {
 /// the second run would compare a file against itself.
 #[test]
 fn two_converts_of_one_checkpoint_are_byte_identical() {
-    let (root, src, _unused) = common::scratch_src_out("k3-convert-det");
+    // Not `scratch_src_out`: this test writes out1/out2, so the helper's `out` has no role.
+    let root = common::scratch("k3-convert-det");
+    let src = root.join("src");
     write_fixture(&src);
     let outs = [root.join("out1"), root.join("out2")];
     for o in &outs {

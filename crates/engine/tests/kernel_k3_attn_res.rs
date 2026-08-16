@@ -183,15 +183,18 @@ fn host_fold(f: &FoldIn, normalised: bool) -> Vec<f32> {
     out.into_iter().map(|x| x as f32).collect()
 }
 
-/// One scoring site's whole context. The tolerance rides along rather than being looked up
-/// per test: it is a property of the OPERATOR, so every site that scores `attn_res` must use
-/// the same one, and two call sites reading the table independently is how they stop
-/// agreeing (`k3:tests/k3_kernels.rs:428`).
+/// The suite's one spelling of its operator row: the tolerance is a property of the
+/// OPERATOR, so every site that scores `attn_res` reads THIS and two sites cannot drift
+/// on which row is the suite's (`k3:tests/k3_kernels.rs:428`).
+fn attn_res_tol() -> f32 {
+    tolerance::rel_tolerance("attn_res")
+}
+
+/// One scoring site's whole context.
 struct Fold<'a> {
     salt: &'a str,
     tag: &'a str,
     eps: f32,
-    tol: f32,
     c: Case,
 }
 
@@ -200,7 +203,6 @@ struct Fold<'a> {
 /// A closure rather than a returned Vec keeps each golden's borrow alive exactly as long as
 /// the cases it lends out (`k3:tests/k3_kernels.rs:405`).
 fn for_each_fold(mut f: impl FnMut(Fold)) {
-    let tol = tolerance::rel_tolerance("attn_res");
     for (salt, bytes) in GOLDENS {
         let g = load(bytes);
         let eps = eps(&g);
@@ -209,7 +211,6 @@ fn for_each_fold(mut f: impl FnMut(Fold)) {
                 salt,
                 tag,
                 eps,
-                tol,
                 c: case(&g, tag),
             });
         }
@@ -288,31 +289,23 @@ fn the_kernel_tolerance_rows_follow_their_rule() {
 /// **The kernel reproduces every fold the anchor captured, at both draws.**
 #[test]
 fn attn_res_matches_the_anchor_at_every_fold() {
+    let tol = attn_res_tol();
     for_each_fold(|f| {
-        let r = rel(&device(&fold_arena(&f)), &f.c.want);
-        // The kernel agrees with the golden to 3.08e-7 worst over both draws (several folds
-        // are bit-exact) — ~230x BELOW `attn_res`'s own fp32 floor of 7.052e-5 and ~2,300x
+        let got = device(&fold_arena(&f));
+        // Through `score_all`, so the two bars land in the factored order. The kernel
+        // agrees with the golden to 3.08e-7 worst over both draws (several folds are
+        // bit-exact) — ~230x BELOW `attn_res`'s own fp32 floor of 7.052e-5 and ~2,300x
         // below the 7.1e-4 tolerance. Not luck: the floor was measured on whole-model
         // fp32-vs-fp64 runs, so it carries upstream drift, while this fixture hands the
         // kernel the reference's OWN inputs and measures the operator alone
         // (`k3:tests/k3_kernels.rs:501`).
-        tripwire(
-            r,
+        score_all(
+            &format!("{} {} (nsrc={}, hidden={})", f.salt, f.tag, f.c.nsrc, f.c.n),
             Bars {
-                tol: f.tol,
+                tol,
                 observed: 3.08e-7,
             },
-            &format!("{} {}", f.salt, f.tag),
-        );
-        assert!(
-            r <= f.tol,
-            "{} {}: relative difference {r:e} exceeds the measured tolerance {:e} (nsrc={}, \
-             hidden={})",
-            f.salt,
-            f.tag,
-            f.tol,
-            f.c.nsrc,
-            f.c.n
+            &[("out", &got, &f.c.want)],
         );
     });
 }
@@ -363,6 +356,7 @@ fn every_fold_mixes_the_depth_the_layer_loop_implies() {
 /// (`k3:tests/k3_kernels.rs:565`).
 #[test]
 fn mixing_the_normalised_sources_goes_red() {
+    let tol = attn_res_tol();
     for_each_fold(|f| {
         let c = &f.c;
         let fin = FoldIn {
@@ -374,19 +368,18 @@ fn mixing_the_normalised_sources_goes_red() {
         };
         let clean = rel(&host_fold(&fin, false), &c.want);
         assert!(
-            clean <= f.tol,
+            clean <= tol,
             "{} {}: the host oracle itself is {clean:e} from the golden",
             f.salt,
             f.tag
         );
         let defect = rel(&host_fold(&fin, true), &c.want);
         assert!(
-            defect > f.tol,
-            "{} {}: mixing the normalised sources differs by only {defect:e}, inside the {:e} \
-             tolerance — this fixture cannot see the trap it exists to catch",
+            defect > tol,
+            "{} {}: mixing the normalised sources differs by only {defect:e}, inside the \
+             {tol:e} tolerance — this fixture cannot see the trap it exists to catch",
             f.salt,
-            f.tag,
-            f.tol
+            f.tag
         );
     });
 }
@@ -403,7 +396,7 @@ fn mixing_the_normalised_sources_goes_red() {
 /// evidence rather than asserting a fresh claim (`k3:tests/k3_kernels.rs:610`).
 #[test]
 fn attn_res_at_real_widths_and_multiple_tokens() {
-    let tol = tolerance::rel_tolerance("attn_res");
+    let tol = attn_res_tol();
     let mut r = Lcg(0xA77E);
     // 192 reproduces the goldens' width so a failure is attributable to the synthetic data
     // rather than the width; 257 wraps the loop exactly once with a one-thread tail; 1000
@@ -495,21 +488,17 @@ fn sweep_cell(cell: Cell, nsrc: usize, r: &mut Lcg, tol: f32) {
              mixing loop is a copy and this cell tests nothing it claims to"
         );
         let want = host_fold(&fin, false);
-        let d = rel(&got[t * n..(t + 1) * n], &want);
-        assert!(
-            d <= tol,
-            "n={n} tokens={tokens} nsrc={nsrc} token {t}: {d:e} exceeds {tol:e}"
-        );
         // This sweep scores two correct implementations against each other, so its realised
         // difference is ~1e-7 and the operator tolerance is three orders of slack that moved
-        // when an unrelated floor did — the tripwire is the bar (`k3:tests/k3_kernels.rs:702`).
-        tripwire(
-            d,
+        // when an unrelated floor did — the tripwire inside `score_all` is the bar
+        // (`k3:tests/k3_kernels.rs:702`).
+        score_all(
+            &format!("the attn_res width sweep at n={n} tokens={tokens} nsrc={nsrc} token {t}"),
             Bars {
                 tol,
                 observed: ATTN_RES_SWEEP_WORST,
             },
-            "the attn_res width sweep",
+            &[("out", &got[t * n..(t + 1) * n], &want)],
         );
     }
     // Anti-vacuity: with `tokens > 1` a kernel that wrote only block 0 would leave the rest

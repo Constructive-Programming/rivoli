@@ -141,21 +141,18 @@ fn situ_launch(
 #[test]
 fn situ_glu_matches_the_anchor_at_every_mlp() {
     for_each_situ(|salt, layer, tol, betas, s| {
-        let r = rel(
-            &ok(situ_launch(&s.gate, &s.up, betas, false), "situ_glu_f32"),
-            &s.want,
-        );
-        assert!(r <= tol, "{salt} layer {layer}: {r:e} exceeds {tol:e}");
-        // Measured worst over both draws and all six MLPs: 1.454e-7, at salt 2 layer 12 —
-        // 65x under `dense_mlp`'s 9.4e-6, the tightest tolerance in the table and the one
-        // that binds the only cell here the anchor actually buckets that way.
-        tripwire(
-            r,
+        let got = ok(situ_launch(&s.gate, &s.up, betas, false), "situ_glu_f32");
+        // Through `score_all`, so the two bars land in the factored order. Measured worst
+        // over both draws and all six MLPs: 1.454e-7, at salt 2 layer 12 — 65x under
+        // `dense_mlp`'s 9.4e-6, the tightest tolerance in the table and the one that binds
+        // the only cell here the anchor actually buckets that way.
+        score_all(
+            &format!("{salt} layer {layer}"),
             Bars {
                 tol,
                 observed: SITU_OBSERVED_WORST,
             },
-            &format!("{salt} layer {layer}"),
+            &[("act", &got, &s.want)],
         );
     });
 }

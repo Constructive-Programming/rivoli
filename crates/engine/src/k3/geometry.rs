@@ -25,30 +25,12 @@ use rivoli_artifact::k3_config::K3TextConfig;
 /// value they attest.
 pub const MLA_LORA_EPS: f32 = 1e-6;
 
-/// The KDA head norm's epsilon is the MODEL-WIDE `rms_norm_eps`, not [`MLA_LORA_EPS`].
-///
-/// Not a constant, because it is the config's number — this is the record of WHICH eps that
-/// operator takes, next to the one that is not. Provenance: `k3:tests/k3_kernels.rs`'s
-/// `gate_norm` fixtures read `rms_norm_eps` off the golden's own tiny config and the device
-/// kernel matched the first-party `o_norm` captures under `kda_op`'s tolerance — so 1e-5 at
-/// the head norm is anchored, where the LoRA norms' 1e-6 had to be read.
-pub fn head_norm_eps(cfg: &K3TextConfig) -> f32 {
-    cfg.rms_norm_eps as f32
-}
-
 /// The attend kernel's staging ceiling: `launch_mha_attend` stages one score row per KV
 /// position in LDS and its guard 1004 refuses `kv > 8192` (`ATTEND_MAX_KV`,
 /// `crates/backend/src/hip_attn.rs`). This arm attends the FULL allocated cache behind an
 /// additive mask (see `engine.rs`), so `kv == max_ctx` on every call and the kernel's bound
 /// becomes a `--ctx` ceiling, refused at the door rather than at the first MLA layer.
 pub const ATTEND_MAX_KV: usize = 8192;
-
-/// Rows of the fixed-point MoE accumulator — one per STREAM (residents on the compute
-/// stream, misses on the miss stream), same value and same no-cross-stream-join reason as
-/// `crate::v4::engine::MOE_ACC_ROWS`. Lives in geometry because [`Dims::from_config`] sizes
-/// nothing from it but `engine.rs` and the widths gate both read it, and the deviceless
-/// build has no `engine.rs`.
-pub const MOE_ACC_ROWS: usize = 2;
 
 /// Every composed width the loop reads, derived once and refused early.
 ///
@@ -57,6 +39,7 @@ pub const MOE_ACC_ROWS: usize = 2;
 /// the 3584 latent, the 192 full head width vs the 128 nope half, the 12288 KDA channel
 /// count that three different tensors share. Deriving each ONCE, beside the ensure that
 /// makes it safe, is what keeps a call site from recomputing one wrongly.
+// `Debug` is load-bearing: the door tests below use `expect_err`, whose bound is `T: Debug`.
 #[derive(Debug, Clone, Copy)]
 pub struct Dims {
     /// KDA channels: `num_heads * head_dim` = 12288 — the width of q/k/v/g projections, the
@@ -243,10 +226,11 @@ mod tests {
 
     /// [`MLA_LORA_EPS`] is first-party's 1e-6, not the C's 1e-5 — the divergence the
     /// tolerance table proves unmeasurable (`mla` is `ExactOnly` at 1.3x its floor), pinned
-    /// as a value so widening it to the model eps is a red test and not a silent drift.
+    /// as a value so widening it to the model eps is a red test and not a silent drift. The
+    /// model-wide eps beside it, so the two numbers this arm norms under sit in one test.
     #[test]
     fn the_lora_eps_is_first_partys() {
         assert_eq!(MLA_LORA_EPS, 1e-6);
-        assert!((f64::from(head_norm_eps(&real())) - 1e-5).abs() < 1e-12);
+        assert!((real().rms_norm_eps - 1e-5).abs() < 1e-12);
     }
 }

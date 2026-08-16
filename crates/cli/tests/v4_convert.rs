@@ -376,8 +376,7 @@ const BIN: common::ConvertBin = common::ConvertBin {
 
 #[test]
 fn convert_v4_writes_an_artifact_that_reopens_as_the_same_model() {
-    let root = common::scratch("v4-convert-rt");
-    let (src, out) = (root.join("src"), root.join("out"));
+    let (root, src, out) = common::scratch_src_out("v4-convert-rt");
     let tensors = write_fixture(&src);
 
     // `--verify` is the strong arm: the converter re-reads every `.f4` it wrote and
@@ -509,8 +508,7 @@ fn two_converts_of_one_checkpoint_are_byte_identical() {
 /// MODEL and every per-layer table in the config would be re-indexed under it.
 #[test]
 fn a_partial_range_is_recorded_and_never_rewrites_the_layer_count() {
-    let root = common::scratch("v4-convert-range");
-    let (src, out) = (root.join("src"), root.join("out"));
+    let (root, src, out) = common::scratch_src_out("v4-convert-range");
     write_fixture(&src);
     BIN.at(&src, &out).convert(&["--from", "1", "--to", "3"]);
 
@@ -537,8 +535,7 @@ fn a_partial_range_is_recorded_and_never_rewrites_the_layer_count() {
 /// The guards that fire before anything is written, each on its own mutation of the fixture.
 #[test]
 fn convert_v4_refuses_before_it_writes() {
-    let root = common::scratch("v4-convert-refuse");
-    let (src, out) = (root.join("src"), root.join("out"));
+    let (root, src, out) = common::scratch_src_out("v4-convert-refuse");
     write_fixture(&src);
 
     // `out_dir == src_dir` is refused by path identity — `src/.` canonicalizes to the same
@@ -585,8 +582,7 @@ fn convert_v4_refuses_before_it_writes() {
 /// and an injection is the only thing that has ever made it speak.
 #[test]
 fn an_e8m0_nan_scale_byte_is_refused() {
-    let root = common::scratch("v4-convert-nan");
-    let (src, out) = (root.join("src"), root.join("out"));
+    let (root, src, out) = common::scratch_src_out("v4-convert-nan");
     write_fixture(&src);
 
     let mut poisoned = all_tensors();

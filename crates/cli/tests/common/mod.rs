@@ -275,8 +275,9 @@ impl ConvertRun<'_> {
 }
 
 /// A scratch root plus the `src`/`out` pair every converter arm starts from — factored
-/// because the three-line spelling recurred at every `#[test]` head in two gate files, and
-/// the runs between the differing tag literals were themselves over jscpd's floor.
+/// because the three-line spelling recurred at every `#[test]` head of the converter gate
+/// files, and the runs between the differing tag literals were themselves over jscpd's
+/// floor.
 pub fn scratch_src_out(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let root = scratch(tag);
     let (src, out) = (root.join("src"), root.join("out"));

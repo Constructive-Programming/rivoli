@@ -52,6 +52,12 @@ const MLA_LAYERS: [usize; 3] = [3, 91, 92];
 /// (`k3:tests/k3_kernels.rs:325`).
 const MLA_SWEEP_WORST: f32 = 3.634e-7;
 
+/// The suite's one spelling of its operator row — four tests read it, and four independent
+/// `rel_tolerance("mla_attend")` calls were four chances to typo a different row.
+fn mla_tol() -> f32 {
+    tolerance::rel_tolerance("mla_attend")
+}
+
 /// The four widths an attend is shaped by. One type because they always travel together —
 /// the k3 tree's jscpd rejected them appearing once as fields and once as parameters
 /// (`k3:tests/k3_kernels.rs:739`).
@@ -121,7 +127,7 @@ fn attend(g: &GoldenSet, layer: usize) -> Attend {
     assert_eq!(os, &[1, 1, heads, dv], "out is [b, q_len, heads, dv]");
     assert_eq!(ps, &[1, heads, 1, kv], "probs is [b, heads, q_len, kv]");
 
-    let cfg = tiny(g);
+    let cfg = g.k3_tiny_config();
     let nope = cfg["qk_nope_head_dim"].as_u64().unwrap() as usize;
     let rope = cfg["qk_rope_head_dim"].as_u64().unwrap() as usize;
     assert_eq!(nope + rope, d, "the head width is qk_nope + qk_rope");
@@ -260,26 +266,22 @@ fn host_attn(a: &AttnIn, head: usize, width: usize) -> (Vec<f64>, Vec<f32>) {
 /// **The attention core reproduces the reference at every MLA layer, at both draws.**
 #[test]
 fn mha_attend_matches_the_anchor() {
-    let tol = tolerance::rel_tolerance("mla_attend");
+    let tol = mla_tol();
     for_each_mla(|salt, layer, a| {
         let got = device_attend(&a.inputs());
-        let r = rel(&got, &a.out);
-        // The operator tolerance is a whole-model floor carrying upstream drift, so against
-        // it alone a two-order degradation in this kernel passes in silence. Measured worst
-        // over both draws and all three MLA layers, then given 10x of room
-        // (`k3:tests/k3_kernels.rs:955`).
-        tripwire(
-            r,
+        // Through `score_all`, so the two bars land in the factored order (tolerance, then
+        // tripwire). The 2.0e-7 is the measured worst over both draws and all three MLA
+        // layers, given 10x of room (`k3:tests/k3_kernels.rs:955`).
+        score_all(
+            &format!(
+                "{salt} layer {layer} at {:?}",
+                (a.dims.heads, a.dims.kv, a.dims.d, a.dims.dv)
+            ),
             Bars {
                 tol,
                 observed: 2.0e-7,
             },
-            &format!("{salt} layer {layer}"),
-        );
-        assert!(
-            r <= tol,
-            "{salt} layer {layer}: {r:e} exceeds {tol:e} at {:?}",
-            (a.dims.heads, a.dims.kv, a.dims.d, a.dims.dv)
+            &[("out", &got, &a.out)],
         );
     });
 }
@@ -319,7 +321,7 @@ fn the_softmax_scale_is_over_the_full_head_width() {
 /// separable, and they were captured for exactly this (`k3:tests/k3_kernels.rs:995`).
 #[test]
 fn the_unrotated_rope_dims_are_still_scored() {
-    let tol = tolerance::rel_tolerance("mla_attend");
+    let tol = mla_tol();
     for_each_mla(|salt, layer, a| {
         let inp = a.inputs();
         // The oracle is checked against the reference's own probabilities BEFORE it is used
@@ -365,7 +367,7 @@ fn the_unrotated_rope_dims_are_still_scored() {
 /// and read back from the same buffer (`k3:tests/k3_kernels.rs:1043`).
 #[test]
 fn the_gate_ordering_is_the_one_mla_uses() {
-    let tol = tolerance::rel_tolerance("mla_attend");
+    let tol = mla_tol();
     for_each_mla(|salt, layer, a| {
         let s = stream();
         let mut xb = dev(&f32b(&a.out));
@@ -427,7 +429,7 @@ fn the_gate_ordering_is_the_one_mla_uses() {
 /// golden tests validate at the widths the reference produced (`k3:tests/k3_kernels.rs:1104`).
 #[test]
 fn mha_attend_at_real_widths_masks_and_magnitudes() {
-    let tol = tolerance::rel_tolerance("mla_attend");
+    let tol = mla_tol();
     let mut r = Lcg(0x11A5);
     // `(heads, kv, d, dv, masked, gain)`. 96/192/128 are the real model's. kv 1024 wraps the
     // per-position loop well past one block; kv 9 reproduces the goldens' shape. `gain`
@@ -469,26 +471,24 @@ fn mha_attend_at_real_widths_masks_and_magnitudes() {
 
         for h in 0..heads {
             let (_, want) = host_attn(&inp, h, d);
+            let head = &got[h * dv..(h + 1) * dv];
             assert!(
-                got[h * dv..(h + 1) * dv].iter().all(|x| x.is_finite()),
+                head.iter().all(|x| x.is_finite()),
                 "heads={heads} kv={kv} d={d} gain={gain} head {h}: non-finite output — the \
                  softmax lost its max-subtraction"
             );
-            let d_rel = rel(&got[h * dv..(h + 1) * dv], &want);
             // Same argument as the AttnRes sweep's tripwire: `tol` is a whole-model floor
             // and this cell is kernel-versus-f64-oracle, three orders tighter.
-            tripwire(
-                d_rel,
+            score_all(
+                &format!(
+                    "the mha_attend width sweep at heads={heads} kv={kv} d={d} dv={dv} \
+                     masked={masked} gain={gain} head {h}"
+                ),
                 Bars {
                     tol,
                     observed: MLA_SWEEP_WORST,
                 },
-                "the mha_attend width sweep",
-            );
-            assert!(
-                d_rel <= tol,
-                "heads={heads} kv={kv} d={d} dv={dv} masked={masked} gain={gain} head {h}: \
-                 {d_rel:e} exceeds {tol:e}"
+                &[("out", head, &want)],
             );
         }
     }

@@ -41,6 +41,10 @@ pub mod golden_read;
 pub mod tolerance;
 
 pub use golden_read::{GoldenSet, float};
+// Separate line for the allow: the decode gate re-lays states through this; the widths
+// gate is deviceless and never touches a state buffer (`k3/mod.rs` makes the same move).
+#[allow(unused_imports)]
+pub use golden_read::to_key_major;
 use serde_json::Value;
 use tolerance::{Policy, Tol};
 
@@ -102,8 +106,7 @@ pub fn anchors() -> Vec<Anchor> {
     for (name, bytes) in ANCHORS {
         let caps = GoldenSet::read_k3(&mut &bytes[..])
             .unwrap_or_else(|e| panic!("{name}: the vendored golden must load: {e:#}"));
-        let tiny = serde_json::from_str(caps.meta_get("tiny_config").expect("tiny_config"))
-            .expect("tiny_config is JSON");
+        let tiny = caps.k3_tiny_config();
         out.push(Anchor { name, caps, tiny });
     }
     out
@@ -130,23 +133,10 @@ pub const KDA_FIXTURE: [&str; 10] = [
     "out.state",
 ];
 
-/// fla's recurrent state is `[value][key]`; rivoli's is `[key][value]`
-/// (`launch_gated_delta_recurrent_f32`'s documented axis order, chosen for coalescing).
-/// The transpose lives in the FIXTURE, not the engine — `square tensors hide their axis
-/// order`, and the anchor's own `KdaStateLayout` defect run is what prices getting this
-/// backwards. `[heads][d][d]`, per head.
-pub fn to_key_major(v: &[f32], heads: usize, d: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; v.len()];
-    for h in 0..heads {
-        let base = h * d * d;
-        for a in 0..d {
-            for b in 0..d {
-                out[base + b * d + a] = v[base + a * d + b];
-            }
-        }
-    }
-    out
-}
+// `to_key_major` — fla's `[value][key]` re-laid into the kernel's `[key][value]` — is
+// re-exported from `golden_read.rs` above, one owner with the kernel suite; its doc
+// carries the measurement, and the anchor's own `KdaStateLayout` defect run is what
+// prices getting the direction backwards.
 
 /// The device gate's ONE anchor-derived tolerance: the table's `kda_op` row, looked up
 /// rather than transcribed, so the constant cannot drift from the measurement that owns it

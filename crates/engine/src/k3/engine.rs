@@ -38,7 +38,7 @@
 //! is a compacting append per step. Priced when a benchmark exists; `geometry::check_context`
 //! is where the same fact becomes a `--ctx` ceiling.
 
-use super::geometry::{Dims, MOE_ACC_ROWS, check_context};
+use super::geometry::{Dims, check_context};
 use super::pin::{Attn, K3Pin};
 use crate::device::DeviceBuf;
 use crate::routed::ResolvedBatch;
@@ -54,6 +54,11 @@ pub(super) const NEG_INF_BITS: u32 = f32::NEG_INFINITY.to_bits();
 
 /// Device argmax result bytes: one i32 index then one f32 value.
 pub(super) const ARGMAX_BYTES: usize = 8;
+
+/// Rows of the fixed-point MoE accumulator — one per STREAM (residents on the compute
+/// stream, misses on the miss stream), same value and same no-cross-stream-join reason as
+/// `crate::v4::engine::MOE_ACC_ROWS`, and beside the engine like both siblings'.
+pub(super) const MOE_ACC_ROWS: usize = 2;
 
 /// One layer's persistent decode state — the enum mirrors `pin::Attn` so a KDA layer
 /// cannot be driven with an MLA cache or vice versa: the dispatch in `forward.rs` matches
@@ -195,7 +200,9 @@ impl<'a> K3Engine<'a> {
         // Checked a second time here (the seam checks at the door): a hand-built caller
         // never passed the door, and the mask/cache sizing below assumes the ceiling.
         check_context(max_ctx)?;
-        let d = Dims::from_config(cfg)?;
+        // The widths the PIN was placed under, not a re-derivation — `K3Pin::build` already
+        // ran `Dims::from_config` and its refusals.
+        let d = pin.d;
         let la = &cfg.linear_attn_config;
         // The `.f4` range must START at the dense prefix's end: the resident file of a
         // partial artifact only covers `0..first_dense ∪ range`, and a forward pass has no
@@ -284,7 +291,7 @@ impl<'a> K3Engine<'a> {
             wexpert_host: vec![0.0; ne],
             wexpert_launch: vec![0.0; ne],
             wexpert: f32s(ne)?,
-            descs_host: vec![null_desc(); ne],
+            descs_host: vec![ExpertDescF4::null(); ne],
             descs: DeviceBuf::new(ne * size_of::<ExpertDescF4>())?,
             resolved: ResolvedBatch::default(),
             launch_idx: Vec::with_capacity(cfg.top_k),
@@ -397,21 +404,5 @@ impl<'a> K3Engine<'a> {
         Ok(quads
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect())
-    }
-}
-
-/// A descriptor that faults if it is ever read — same defence, same argument as
-/// `crate::v4::engine::desc_never_read`: launch-order tables sized `n_experts` mostly hold
-/// entries no launch names, and a null there is a fault where a stale slot is plausible
-/// wrong weights.
-pub(super) fn null_desc() -> ExpertDescF4 {
-    use std::ptr::null;
-    ExpertDescF4 {
-        gate_packed: null(),
-        gate_scale: null(),
-        up_packed: null(),
-        up_scale: null(),
-        down_packed: null(),
-        down_scale: null(),
     }
 }

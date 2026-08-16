@@ -86,9 +86,13 @@ appears that enum dispatch cannot fill.
   against the table's own message fragments, the bench cell pinned to the recorded
   reference ids, a live serve round-trip (readiness, /v1/models, non-stream, SSE).
   On-demand (GPU, ~45 min), not CI. Red-proofed 2026-08-16 (wrong fragment reddens).
-- Landing later, each with the thing that makes it non-vacuous: INV-n registry (first
-  invariant, M1), feature matrix (first feature, M1), kernel census (first launcher, M3),
-  refactor gates (first capture).
+- **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
+  suite or a live deferral, checked both ends; 60/60/0 since M9. **INV-n registry** —
+  `crates/cli/tests/invariants.rs`, doc-and-test must move together. **feature matrix** —
+  `tests/feature-matrix.sh` + `crates/cli/tests/matrix.rs` (lists derived from the
+  manifests; the resolve cell proves `--no-default-features` is genuinely deviceless).
+  All landed with what made each non-vacuous (M1–M3); this line said "landing later"
+  until M9 closed.
 
 ## Build and test
 

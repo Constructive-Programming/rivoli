@@ -161,6 +161,10 @@ pub struct K3Pin {
     /// RAII owner of the resident slab; never read through.
     #[allow(dead_code)]
     tier: DeviceTier,
+    /// The composed widths this pin was placed under — derived ONCE in [`K3Pin::build`]
+    /// (geometry's own derive-once rule) and read by the engine rather than re-derived,
+    /// so the pin and the loop cannot disagree on a width.
+    pub(super) d: Dims,
     pub embed: Bf16Weight,
     pub head: Bf16Weight,
     pub final_norm: *const f32,
@@ -238,6 +242,7 @@ impl K3Pin {
         let layers = place_layers(&mut p, cfg, &d, moe_layers.end.min(cfg.n_layers))?;
         Ok(Self {
             tier,
+            d,
             embed,
             head,
             final_norm,
@@ -297,8 +302,8 @@ impl Placer<'_, '_> {
     /// A BF16 vector widened to the f32 the launchers declare, its extent asserted — a norm
     /// of the wrong length reads in-bounds garbage, and no launch has a length of its own.
     fn widen(&mut self, name: String, want: usize) -> Result<*const f32> {
-        let (v, len) = read_bf16_1d(self.st, &name)?;
-        ensure!(len == want, "{name}: [{len}], expected [{want}]");
+        let v = read_bf16_1d(self.st, &name)?;
+        ensure!(v.len() == want, "{name}: [{}], expected [{want}]", v.len());
         Ok(self.tier.place(as_le_bytes(&v))? as *const f32)
     }
 
@@ -309,11 +314,13 @@ impl Placer<'_, '_> {
     /// (`k3:docs/reference/k3-architecture.md` §3). The proj really is `[1][hidden]` — a
     /// single scoring vector, not a matrix — so both flatten and must agree elementwise.
     fn fold(&mut self, base: &str) -> Result<*const f32> {
-        let (norm, n_len) = read_bf16_1d(self.st, &format!("{base}_norm.weight"))?;
-        let (proj, p_len) = read_bf16_1d(self.st, &format!("{base}_proj.weight"))?;
+        let norm = read_bf16_1d(self.st, &format!("{base}_norm.weight"))?;
+        let proj = read_bf16_1d(self.st, &format!("{base}_proj.weight"))?;
         ensure!(
-            n_len == p_len,
-            "{base}: norm [{n_len}] against proj [{p_len}] — the fold is elementwise"
+            norm.len() == proj.len(),
+            "{base}: norm [{}] against proj [{}] — the fold is elementwise",
+            norm.len(),
+            proj.len()
         );
         let prod: Vec<f32> = norm.iter().zip(&proj).map(|(a, b)| a * b).collect();
         Ok(self.tier.place(as_le_bytes(&prod))? as *const f32)
@@ -331,10 +338,10 @@ impl Placer<'_, '_> {
     }
 }
 
-/// A BF16 tensor flattened to host f32, with its element count. Rank is NOT constrained
-/// here: the fold proj is `[1, hidden]` and the norms are `[hidden]`, and both flatten to
-/// the vector the caller length-checks.
-fn read_bf16_1d(st: &Safetensors, name: &str) -> Result<(Vec<f32>, usize)> {
+/// A BF16 tensor flattened to host f32. Rank is NOT constrained here: the fold proj is
+/// `[1, hidden]` and the norms are `[hidden]`, and both flatten to the vector the caller
+/// length-checks off `.len()`.
+fn read_bf16_1d(st: &Safetensors, name: &str) -> Result<Vec<f32>> {
     let (bytes, shape) = st.typed(name, Dtype::Bf16)?;
     let v: Vec<f32> = bytes
         .chunks_exact(2)
@@ -345,8 +352,7 @@ fn read_bf16_1d(st: &Safetensors, name: &str) -> Result<(Vec<f32>, usize)> {
         "{name}: {} elements against shape {shape:?}",
         v.len()
     );
-    let len = v.len();
-    Ok((v, len))
+    Ok(v)
 }
 
 /// One KDA layer's family weights, each site one line against the census.

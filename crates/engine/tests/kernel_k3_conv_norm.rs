@@ -234,13 +234,18 @@ fn device_conv(c: &Conv) -> (Vec<f32>, Vec<f32>) {
     )
 }
 
-fn for_each_conv(mut f: impl FnMut(&str, usize, &str, f32, Conv)) {
-    let tol = tolerance::rel_tolerance("kda_conv");
+/// The suite's one spelling of the conv operator row — three scoring tests read it, and
+/// the tolerance no longer rides through a loop whose iterations cannot change it.
+fn conv_tol() -> f32 {
+    tolerance::rel_tolerance("kda_conv")
+}
+
+fn for_each_conv(mut f: impl FnMut(&str, usize, &str, Conv)) {
     for (salt, bytes) in GOLDENS {
         let g = load(bytes);
         for layer in KDA_LAYERS {
             for which in CONVS {
-                f(salt, layer, which, tol, conv(&g, layer, which));
+                f(salt, layer, which, conv(&g, layer, which));
             }
         }
     }
@@ -268,7 +273,8 @@ fn score_gate_norm(at: &str, b: Bars, got: &[f32], c: &GateNorm) {
 /// window.**
 #[test]
 fn the_short_conv_matches_the_anchor_at_every_kda_layer() {
-    for_each_conv(|salt, layer, which, tol, c| {
+    let tol = conv_tol();
+    for_each_conv(|salt, layer, which, c| {
         let (y, win) = device_conv(&c);
         let at = format!("{salt} layer {layer} {which}_conv1d");
         let bars = Bars {
@@ -287,7 +293,8 @@ fn the_short_conv_matches_the_anchor_at_every_kda_layer() {
 /// and is priced here (`k3:tests/k3_kernels.rs:3313`).
 #[test]
 fn the_conv_tap_order_and_its_fused_silu_are_priced() {
-    for_each_conv(|salt, layer, which, tol, c| {
+    let tol = conv_tol();
+    for_each_conv(|salt, layer, which, c| {
         let at = format!("{salt} layer {layer} {which}");
         for (what, form) in [
             (
@@ -320,7 +327,7 @@ fn the_conv_tap_order_and_its_fused_silu_are_priced() {
 /// (`k3:tests/k3_kernels.rs:3337`).
 #[test]
 fn the_conv_window_discards_only_its_oldest_slot() {
-    for_each_conv(|salt, layer, which, _tol, c| {
+    for_each_conv(|salt, layer, which, c| {
         // A different sentinel in the same slot. The window is copied rather than the case
         // moved, so both launches see identical taps and identical `cur`.
         let mut other = c.win_in.clone();
@@ -550,7 +557,8 @@ fn the_gate_ordering_and_the_norm_convention_are_priced() {
 /// it is the same argument twice (`k3:tests/k3_kernels.rs:3561`).
 #[test]
 fn the_conv_and_gated_norm_host_oracles_agree_with_the_anchor() {
-    for_each_conv(|salt, layer, which, tol, c| {
+    let tol = conv_tol();
+    for_each_conv(|salt, layer, which, c| {
         let (y, win) = host_conv(&c, ConvForm::Reference);
         let oat = format!("oracle {salt} layer {layer} {which}_conv1d");
         score_conv(

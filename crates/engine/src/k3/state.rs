@@ -18,7 +18,7 @@ use anyhow::{Result, ensure};
 /// What the AttnRes machinery does at one layer: the two fold widths and whether a snapshot
 /// is pushed between them (`k3:docs/reference/k3-architecture.md` §3's layer loop, restated
 /// as data).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub struct Fold {
     /// Sources of the layer-entry fold (`self_attention_res`): the block stack plus the
     /// prefix sum. `None` at layer 0 only — the stack is empty and the reference GUARDS this

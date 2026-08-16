@@ -60,6 +60,29 @@ pub fn shape_of(g: &GoldenSet, name: &str) -> Vec<usize> {
 /// `rivoli_core::hash` now carries it and the published-vector test.
 pub use rivoli_core::hash::fnv1a;
 
+/// Re-lay each head's square state from the K3 reference's `[value][key]` into the
+/// kernel's `[key][value]` — `[heads][d][d]`, per head. Named for the POSTCONDITION, not
+/// the mechanism: "transpose" is direction-free, and this is the one place in the port
+/// where getting the direction backwards is invisible to every assertion.
+///
+/// **Measured, not chosen.** The state is square at both the tiny widths (32) and the real
+/// ones (128), so no shape assertion can see which axis the reference's BUFFER puts first.
+/// Scoring both interpretations of the anchor's own `initial_state` against its `out.o`
+/// settled it: with the transpose the recurrence agrees to 2.5e-7, without it to 2.2e-1 to
+/// 5.6e-1. rivoli's own state starts at zero and never leaves the device, and
+/// `[key][value]` is the coalescing order — so the transpose is a FIXTURE boundary, and
+/// the anchor's `KdaStateLayout` defect run prices getting it backwards
+/// (`k3:tests/k3_kernels.rs:2556`). One owner for the kernel suite and the anchor gate,
+/// on [`GoldenSet::k3_gate_lower_bound`]'s precedent — the anchor gate's own copy had
+/// silently lost the length assert.
+pub fn to_key_major(v: &[f32], heads: usize, dim: usize) -> Vec<f32> {
+    assert_eq!(v.len(), heads * dim * dim, "not a per-head square");
+    (0..heads)
+        .flat_map(|h| (0..dim).flat_map(move |i| (0..dim).map(move |j| (h, i, j))))
+        .map(|(h, i, j)| v[h * dim * dim + j * dim + i])
+        .collect()
+}
+
 /// One vendored golden, with the two facts that pin its bytes.
 ///
 /// Shared since 2026-08-11, when Muse Glimmer's anchor made this a second table and jscpd matched

@@ -219,7 +219,7 @@ fn confront(src: &Safetensors, name: &str, want: &[usize]) -> Result<()> {
 /// BF16 tensor read as f32 is not a length error, it is half the rows at wrong magnitudes.
 fn write_resident(
     src: &Safetensors,
-    k3: &K3TextConfig,
+    n_experts: usize,
     in_scope: &impl Fn(&str) -> bool,
     moe_layers: usize,
     out_dir: &str,
@@ -248,14 +248,14 @@ fn write_resident(
     // per layer of duplicated weights, an artifact that still loads. `>=` rather than `==`
     // because an opened shard may hold more than one layer's experts, and this run only
     // accounts for its own.
-    let want_skipped = moe_layers * k3.n_experts * 6;
+    let want_skipped = moe_layers * n_experts * 6;
     ensure!(
         skipped_routed >= want_skipped,
         "only {skipped_routed} routed tensors were skipped, expected at least \
          {want_skipped} ({moe_layers} layers x {} experts x 6) — `is_routed` is no longer \
          matching the checkpoint's expert names, and those weights are about to be \
          duplicated into the resident set",
-        k3.n_experts
+        n_experts
     );
     ensure!(kept > 0, "the resident set is empty — nothing was in scope");
     let rpath = format!("{out_dir}/resident.safetensors");
@@ -393,7 +393,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    write_resident(&src, k3, &in_scope, layers.len(), &out_dir)?;
+    write_resident(&src, k3.n_experts, &in_scope, layers.len(), &out_dir)?;
     write_manifest(&src_dir, &out_dir, range)?;
     eprintln!("convert_k3: done — {src_dir} → {out_dir}");
     Ok(())

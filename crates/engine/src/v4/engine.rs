@@ -424,7 +424,7 @@ impl<'a> V4Engine<'a> {
             wexpert_host: vec![0.0; n_desc],
             wexpert_launch: vec![0.0; n_desc],
             wexpert: f32s(n_desc)?,
-            descs_host: vec![desc_never_read(); n_desc],
+            descs_host: vec![ExpertDescF4::null(); n_desc],
             descs: DeviceBuf::new(n_desc * size_of::<ExpertDescF4>())?,
             resolved: ResolvedBatch::default(),
             // `MOE_ACC_ROWS` rows of ONE token's hidden width: the routed experts are launched
@@ -597,23 +597,5 @@ pub(super) fn desc_of_f4(s: &ExpertSlot) -> ExpertDescF4 {
         up_scale: s.up.scale,
         down_packed: s.down.packed,
         down_scale: s.down.scale,
-    }
-}
-
-/// A descriptor that faults if it is ever read.
-///
-/// The descriptor table is written in LAUNCH order and sized `n_experts`, so most of its
-/// entries sit past any one token's selection and no launch names them. Filling those with
-/// nulls rather than with a copy of some resolved expert is the difference between a fault and
-/// a plausible wrong weight the day a range is computed wrongly.
-pub(super) fn desc_never_read() -> ExpertDescF4 {
-    let n = std::ptr::null();
-    ExpertDescF4 {
-        gate_packed: n,
-        gate_scale: n,
-        up_packed: n,
-        up_scale: n,
-        down_packed: n,
-        down_scale: n,
     }
 }

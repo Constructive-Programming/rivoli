@@ -108,39 +108,18 @@ struct Kda {
     want_state: Vec<f32>,
 }
 
-/// Re-lay each head's state from the reference's `[value][key]` into the kernel's
-/// `[key][value]`. Named for the POSTCONDITION, not the mechanism: "transpose" is
-/// direction-free, and this is the one place in the port where getting the direction
-/// backwards is invisible to every assertion.
-///
-/// **Measured, not chosen.** §4 writes the recurrence as `S[i][j]` with `i` the key channel,
-/// and the state is square at both the tiny widths (32) and the real ones (128), so no shape
-/// assertion can see which axis the reference's BUFFER puts first. Scoring both
-/// interpretations of the anchor's own `initial_state` against its `out.o` settled it: with
-/// the transpose the recurrence agrees to 2.5e-7, without it to 2.2e-1 to 5.6e-1 — three
-/// sites' worth of separation, at both draws. **The port does not inherit that layout, and
-/// does not pay a transpose either**: rivoli's state starts at zero and never leaves the
-/// device, and `[key][value]` is the order that makes `S[i*d + t]` consecutive across the
-/// threads of a wave — the whole reason `kernels/recurrent.hip` is a two-pass kernel rather
-/// than four. So the transpose is a FIXTURE boundary, applied once here to compare two
-/// conventions, and the `StateValueMajor` variant is the red-proof that this fixture can
-/// tell them apart (`k3:tests/k3_kernels.rs:2556`).
-fn to_key_major(v: &[f32], heads: usize, dim: usize) -> Vec<f32> {
-    assert_eq!(v.len(), heads * dim * dim, "not a per-head square");
-    (0..heads)
-        .flat_map(|h| (0..dim).flat_map(move |i| (0..dim).map(move |j| (h, i, j))))
-        .map(|(h, i, j)| v[h * dim * dim + j * dim + i])
-        .collect()
-}
+// `to_key_major` — the `[value][key]` → `[key][value]` fixture transpose — lives in the
+// shared `golden_read.rs` with its measurement, since the anchor gate applies the same
+// re-lay to the same captures. The `StateValueMajor` variant below is the red-proof that
+// this fixture can tell the two conventions apart.
 
 /// Every (draw, KDA layer) pair with its boundary assembled — the loader lives inside its
 /// one caller, and the widths come from the capture rather than from the config so that a
 /// fixture cannot disagree with the tensor it is scoring.
 fn for_each_kda(mut f: impl FnMut(&Site, Kda)) {
-    let tol = tolerance::rel_tolerance("kda_op");
     for (salt, bytes) in GOLDENS {
         let g = load(bytes);
-        let lb = lower_bound(&g);
+        let lb = GoldenSet::k3_gate_lower_bound(&g.k3_tiny_config());
         for layer in KDA_LAYERS {
             let m = format!("model.layers.{layer}.kda.fused_recurrent_kda");
             let get = |n: &str| {
@@ -174,7 +153,7 @@ fn for_each_kda(mut f: impl FnMut(&Site, Kda)) {
                 want_o,
                 want_state: to_key_major(&get("out.state").1, heads, head_dim),
             };
-            let site = Site { salt, layer, tol };
+            let site = Site { salt, layer };
             f(&site, c);
         }
     }
@@ -394,15 +373,19 @@ fn device_kda(c: &Kda) -> (Vec<f32>, Vec<f32>) {
     ok(kda_launch(c), "gated_delta_recurrent_f32")
 }
 
-/// One golden-backed scoring site: which draw, which layer, and the two numbers every
-/// score there is held to. A type because the four always travel together from
-/// [`for_each_kda`] into every test — spelled as four bare parameters they were this file's
-/// own Primitive Obsession finding, and the k3 tree's `Fold` made the same move for the
-/// same reason (`k3:tests/k3_kernels.rs:428`).
+/// One golden-backed scoring site: which draw, which layer. A type because the pair
+/// travels together from [`for_each_kda`] into every test — spelled as bare parameters
+/// they were this file's own Primitive Obsession finding, and the k3 tree's `Fold` made
+/// the same move for the same reason (`k3:tests/k3_kernels.rs:428`).
 struct Site<'a> {
     salt: &'a str,
     layer: usize,
-    tol: f32,
+}
+
+/// The suite's one spelling of its operator row — the tolerance is loop-invariant, so it
+/// no longer rides through [`Site`].
+fn kda_op_tol() -> f32 {
+    tolerance::rel_tolerance("kda_op")
 }
 
 /// Score the recurrence's two outputs — both, because a kernel that produces the right `o`
@@ -411,7 +394,7 @@ fn score_kda(s: &Site, observed: f32, got: (&[f32], &[f32]), c: &Kda) {
     score_all(
         &format!("{} layer {}", s.salt, s.layer),
         Bars {
-            tol: s.tol,
+            tol: kda_op_tol(),
             observed,
         },
         &[("o", got.0, &c.want_o), ("state", got.1, &c.want_state)],
@@ -545,7 +528,7 @@ fn the_recurrence_arithmetic_inside_flas_kernel_is_all_priced() {
                 what,
                 moved,
                 Bars {
-                    tol: site.tol,
+                    tol: kda_op_tol(),
                     observed: KDA_OBSERVED_WORST,
                 },
             );

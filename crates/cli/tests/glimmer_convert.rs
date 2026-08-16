@@ -246,8 +246,7 @@ fn refuses(src: &Path, out: &Path, want: &str) {
 
 #[test]
 fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
-    let root = common::scratch("glimmer-convert-rt");
-    let (src, out) = (root.join("src"), root.join("out"));
+    let (root, src, out) = common::scratch_src_out("glimmer-convert-rt");
     let tensors = write_fixture(&src);
 
     let log = common::expect_success(&run(&src, &out), "convert_glimmer");
@@ -309,8 +308,7 @@ fn convert_glimmer_writes_a_bf16_artifact_that_reopens_as_the_same_model() {
 /// assertion is about its own mutation rather than about the wreckage of the previous one.
 #[test]
 fn convert_glimmer_refuses_before_it_writes() {
-    let root = common::scratch("glimmer-convert-refuse");
-    let (src, out) = (root.join("src"), root.join("out"));
+    let (root, src, out) = common::scratch_src_out("glimmer-convert-refuse");
     write_fixture(&src);
 
     // Writing into the source directory is a SIGBUS risk, not an error — the writer maps the
@@ -357,8 +355,7 @@ fn convert_glimmer_refuses_before_it_writes() {
 /// reached the artifact" is satisfied by any converter that copies a file.
 #[test]
 fn both_eos_ids_reach_the_artifact_and_an_unusable_generation_config_is_refused() {
-    let root = common::scratch("glimmer-convert-eos");
-    let (src, out) = (root.join("src"), root.join("out"));
+    let (root, src, out) = common::scratch_src_out("glimmer-convert-eos");
     write_fixture(&src);
 
     // **A DISTINCT pair, written here rather than left at the fixture's default**, so the

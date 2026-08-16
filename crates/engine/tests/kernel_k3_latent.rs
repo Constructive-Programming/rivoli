@@ -158,22 +158,18 @@ fn device_gemv(x: &[f32], w: &[u16], n: usize) -> Vec<f32> {
 fn the_latent_norm_matches_the_anchor_at_every_moe_layer() {
     let tol = tolerance::rel_tolerance("moe_latent");
     for_each_latent_norm(|salt, layer, eps, ln| {
-        let r = rel(&device_rmsnorm_single(&ln.x, &ln.w, eps), &ln.want);
-        assert!(
-            r <= tol,
-            "{salt} layer {layer}: the latent norm differs by {r:e}, over {tol:e}"
-        );
-        // `tol` is 6.3e-4 and this kernel lands at 1.3e-7 — against `tol` alone a
-        // THREE-order degradation would pass in silence. Measured worst over both draws and
-        // all five layers, then 10x; three of the ten cells are BIT-EXACT
-        // (`k3:tests/k3_kernels.rs:1315`).
-        tripwire(
-            r,
+        let got = device_rmsnorm_single(&ln.x, &ln.w, eps);
+        // Through `score_all`, so the two bars land in the factored order. `tol` is 6.3e-4
+        // and this kernel lands at 1.3e-7 — against `tol` alone a THREE-order degradation
+        // would pass in silence. Measured worst over both draws and all five layers, then
+        // 10x; three of the ten cells are BIT-EXACT (`k3:tests/k3_kernels.rs:1315`).
+        score_all(
+            &format!("{salt} layer {layer} latent norm"),
             Bars {
                 tol,
                 observed: 1.307e-7,
             },
-            &format!("{salt} layer {layer} latent norm"),
+            &[("out", &got, &ln.want)],
         );
     });
 }
