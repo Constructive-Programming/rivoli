@@ -61,8 +61,24 @@ impl FormatMeta {
     /// nothing needed. `fp8_block` is inert the same way on a bf16 Glimmer artifact — and
     /// LOAD-BEARING on an `--fp8` one, where `add_quantized_fp8` writes grids at exactly this
     /// block and the Glimmer pin reads the stamp back as the block it dequantizes with (M11).
-    /// Stamped from the same constant the quantizer is handed, so the two cannot disagree
-    /// here; the load-side check is for an artifact written by a DIFFERENT build.
+    /// Stamped from the same constant the quantizer is handed, so the two cannot disagree here.
+    ///
+    /// > **CORRECTED 2026-08-16, by review, before the sentence could be relied on.** This
+    /// > ended "the load-side check is for an artifact written by a DIFFERENT build", which
+    /// > reads as if [`Self::load`] compares `fp8_block` against this build's constant. **It
+    /// > does not** — it checks only that the stamped value is a positive power of two, because
+    /// > the block is a property of the ARTIFACT and a different one is a legitimate artifact,
+    /// > not a stale one. That reading matters: a pin that "knew" the block from the constant
+    /// > instead of the stamp is exactly the defect `gate-red-proofs.md` §5b plants and proves
+    /// > red, so a comment implying the two are cross-checked would license it.
+    ///
+    /// > **AND THE VQ CLAUSE IS NOT INERT ON A LOAD PATH, as of M11.** `Self::load` REFUSES on
+    /// > a VQ-parameter mismatch, and `glimmer::geometry::ProjFmt::sniff` now calls it on every
+    /// > fp8 Glimmer open. So a future change to `VQ_DIM`/`VQ_K`/`VQ_INDEX_BITS`/`VQ_GROUP`
+    /// > would refuse a perfectly good Glimmer artifact — which has no VQ tensors at all — for
+    /// > a reason that has nothing to do with Glimmer. Nothing to fix today (no such change is
+    /// > planned, and the failure is loud and named); recorded because "inert" was written
+    /// > when nothing but `bin/convert`'s own artifacts reached this function.
     pub fn manifest_from_config(src_dir: &str, fp8_block: usize) -> Result<serde_json::Value> {
         let path = format!("{src_dir}/config.json");
         let mut manifest: serde_json::Value =
