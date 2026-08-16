@@ -9,6 +9,10 @@
 //! judge a configuration lives in `rivoli_core::legality`, and everything that could build
 //! a device lives behind `rivoli_engine::Engine::open` — including the refusal a build with
 //! no compute backend gives, which is why there is not one `#[cfg]` in this file.
+//!
+//! A run is exactly one of two things — `--bench N` (decode N tokens, print, exit) or
+//! `--port P` (serve until killed) — and clap enforces the exclusivity, so neither branch
+//! below has to defend against the other having been asked for too.
 
 use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::format::RoutedFmt;
@@ -20,6 +24,16 @@ use rivoli_core::legality::{ATTNS, Arch, AttnKind, Flag, MODES, Mode, Outcome, d
 use rivoli_engine::{Engine, GenSpec, OpenSpec};
 use std::collections::HashSet;
 use std::io::Write as _;
+
+// Private to the binary rather than `pub` in `lib.rs`: `serve` has exactly one consumer,
+// the `rivoli` process, and publishing it would invent a crate API nobody imports. Its
+// tests still run under `cargo test --workspace`, which builds and tests bin targets.
+//
+// BELOW the imports, not above: `mod serve;` sitting directly on top of this file's
+// `use anyhow::{Context, Result, bail, ensure}; use rivoli_artifact::format::RoutedFmt;`
+// reproduced `routed.rs`'s preamble token for token, and the jscpd gate reported it (46
+// tokens, 2026-08-16). rustfmt sorts the `use` list, so the only movable item is this one.
+mod serve;
 
 // NOTE: doc comments on this struct and its fields are USER-FACING — clap renders them as
 // `--help`. Rationale for the code goes in `//` comments like this one, which clap ignores.
@@ -43,17 +57,44 @@ struct Args {
     /// + per-layer expert files + tokenizer). The artifact IS the model.
     model: String,
 
-    /// Decode this many tokens, print the text and the DECODE line, exit.
+    /// Decode this many tokens, print the text and the DECODE line, exit. Omit for the
+    /// server path (`--port`); exactly one of the two is required.
     ///
     /// Spelled `-bench` in every recorded command line of the reference engine; `main`
     /// rewrites that single-dash form to `--bench` before clap sees it, since clap has no
     /// single-dash-long concept. Both work.
-    // REQUIRED for now, rather than `Option` with a runtime bail: with the server path not
-    // yet landed there is no other thing a run could be, and clap's own usage line says so
-    // better than a message would. It widens back to `Option` in one word when `--port`
-    // arrives.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(usize))]
-    bench: usize,
+    // The exclusivity is clap's, not a runtime bail: `conflicts_with` + `required_unless_
+    // present` make "neither" and "both" usage errors, rendered by clap's own error path
+    // with the usage line attached. A hand-written message would say the same thing worse
+    // and would not appear in `--help`.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(usize),
+          conflicts_with = "port", required_unless_present = "port")]
+    bench: Option<usize>,
+
+    /// Serve an OpenAI-compatible HTTP API on 127.0.0.1:PORT until killed — this is how
+    /// llama-swap (and any OpenAI client) calls the engine. `POST /v1/chat/completions`
+    /// with or without `stream`, plus `GET /health` and `GET /v1/models`.
+    ///
+    /// The port opens only once the model is loaded, so it doubles as the readiness
+    /// signal. Sampling is NOT implemented — `temperature`/`top_p` are accepted and
+    /// ignored, because the engine decodes greedy argmax.
+    #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    port: Option<u16>,
+
+    /// `--port`: reason before answering, unless the request says otherwise.
+    ///
+    /// The checkpoint is a thinking model — its template ends the prompt at an OPEN
+    /// `<think>` by default, and the model fills it before answering. rivoli defaults the
+    /// other way: at ~2.7 tok/s a reasoning block is tens of seconds of silence, and most
+    /// OpenAI clients have no way to turn it off once it is on. A request's
+    /// `enable_thinking` (or `reasoning_effort`) overrides this in either direction, and
+    /// the reasoning comes back in `reasoning_content`, never mixed into `content`.
+    // `conflicts_with` and not `requires = "port"`: the `requires` form was tried and is
+    // INERT here — `rivoli DIR --bench 4 --think` sailed past clap and loaded a model
+    // (probed 2026-08-16, clap 4.6.6). An attribute that cannot refuse anything is
+    // decoration, so the exclusivity is spelled the way this file has already proved works.
+    #[arg(long, conflicts_with = "bench")]
+    think: bool,
 
     /// Routed-expert format: int3-vq | int4 | hybrid. int4 scores best and is slowest;
     /// hybrid is refused at startup with the reason.
@@ -80,14 +121,21 @@ struct Args {
     max_mem: Option<u64>,
 
     /// The context window, in tokens. The KV cache is allocated ONCE at startup (there is
-    /// no paging here), so this is a hard ceiling on prompt + generated: a run that does
-    /// not fit is refused before any weight is placed. Costs ~51 KB of device memory per
-    /// token, on top of `--max-mem`'s expert pool.
+    /// no paging here), so this is a hard ceiling on prompt + generated: a `--bench` run
+    /// that does not fit is refused before any weight is placed, and under `--port` a
+    /// conversation that does not fit is refused with a 400 rather than silently
+    /// truncated. Costs ~51 KB of device memory per token, on top of `--max-mem`'s expert
+    /// pool.
     #[arg(long, value_name = "N", default_value_t = 4096, value_parser = clap::value_parser!(usize))]
     ctx: usize,
 
     /// Override the fixed bench prompt, for capturing traces of diverse inputs.
-    #[arg(long, value_name = "TEXT")]
+    // Refused under `--port` for the same reason the legality table refuses rather than
+    // ignores: there every request brings its own prompt, so this flag would be silently
+    // dropped, and a recorded command line carrying a knob that did nothing is exactly the
+    // lie the table exists to stop. Spelled `conflicts_with` — see `--think` for why the
+    // `requires` form is not used.
+    #[arg(long, value_name = "TEXT", conflicts_with = "port")]
     prompt: Option<String>,
 
     /// Dump the routed-expert access trace (v2: demand keys plus the ranked candidate
@@ -108,7 +156,9 @@ struct Args {
     /// Comparing decoded TEXT is not a substitute: different id sequences can decode to
     /// identical text, so a text diff reports only a lower bound on divergence. Any
     /// two-arm comparison across a refactor wants this rather than an eyeball.
-    #[arg(long, value_name = "PATH")]
+    // Refused under `--port`: it dumps ONE run's ids under a header naming the arm, and a
+    // server answers many. See `--prompt` for why this is a refusal and not a silent drop.
+    #[arg(long, value_name = "PATH", conflicts_with = "port")]
     dump_ids: Option<String>,
 }
 
@@ -280,18 +330,14 @@ fn main() -> Result<()> {
     )?;
 
     let tok = Tokenizer::load(&a.model)?;
-    let prompt_text = a.prompt.as_deref().unwrap_or(BENCH_PROMPT);
-    let prompt = tok.encode_chat(prompt_text)?;
-    // At startup, before any weight is placed: the KV slab is sized once from `--ctx`, and
-    // a run that outgrows it fails somewhere in the token loop, minutes in.
-    ensure!(
-        prompt.len() + a.bench <= a.ctx,
-        "{} prompt + {} generated tokens exceed --ctx {} — raise it (~51 KB of device \
-         memory per token) or shorten the run",
-        prompt.len(),
-        a.bench,
-        a.ctx
-    );
+    // `--bench` resolves its input BEFORE the engine opens, so a run that outgrows the KV
+    // slab is refused before any weight is placed rather than failing in the token loop,
+    // minutes in. `--port` has no prompt to check here: every request brings its own, and
+    // `serve` checks each against `Engine::max_ctx` and answers 400.
+    let bench = a
+        .bench
+        .map(|ngen| bench_input(&tok, &a, ngen))
+        .transpose()?;
 
     let mut eng = Engine::open(
         &a.model,
@@ -305,10 +351,59 @@ fn main() -> Result<()> {
             max_ctx: a.ctx,
         },
     )?;
+    match (&bench, a.port) {
+        (Some(b), _) => run_bench(&mut eng, &tok, &a, b),
+        (None, Some(port)) => serve::serve(
+            &mut eng,
+            &tok,
+            &serve::Opts {
+                port,
+                // The artifact directory's own name, so `/v1/models` and the echoed
+                // `model` field say which checkpoint answered.
+                model_id: std::path::Path::new(&a.model)
+                    .file_name()
+                    .map_or_else(|| "rivoli".into(), |n| n.to_string_lossy().into_owned()),
+                think: a.think,
+            },
+        ),
+        // Unreachable through clap (`--bench` is `required_unless_present = "port"`), and a
+        // `bail!` rather than a `debug_assert!`: this is the one place the two-flag contract
+        // is read, and under `--release` a debug assert would enforce nothing at all.
+        (None, None) => bail!(
+            "neither --bench nor --port was given, which clap should have refused — the \
+             exclusivity attributes on `Args::bench` have come undone"
+        ),
+    }
+}
+
+/// The `--bench` arm's fixed input, resolved before any weight is placed.
+struct Bench<'a> {
+    /// Printed back on stdout ahead of the completion, so the two read together.
+    text: &'a str,
+    ids: Vec<u32>,
+    ngen: usize,
+}
+
+fn bench_input<'a>(tok: &Tokenizer, a: &'a Args, ngen: usize) -> Result<Bench<'a>> {
+    let text = a.prompt.as_deref().unwrap_or(BENCH_PROMPT);
+    let ids = tok.encode_chat(text)?;
+    // The KV slab is sized once from `--ctx`; a run that outgrows it fails somewhere in the
+    // token loop, minutes in, so it is refused here instead.
+    ensure!(
+        ids.len() + ngen <= a.ctx,
+        "{} prompt + {ngen} generated tokens exceed --ctx {} — raise it (~51 KB of device \
+         memory per token) or shorten the run",
+        ids.len(),
+        a.ctx
+    );
+    Ok(Bench { text, ids, ngen })
+}
+
+fn run_bench(eng: &mut Engine<'_>, tok: &Tokenizer, a: &Args, b: &Bench<'_>) -> Result<()> {
     let out = eng.generate(
         GenSpec {
-            prompt: &prompt,
-            ngen: a.bench,
+            prompt: &b.ids,
+            ngen: b.ngen,
             eos: &tok.eos,
         },
         &mut |_| true,
@@ -316,7 +411,7 @@ fn main() -> Result<()> {
 
     // stdout: the prompt and its completion, the way the reference engine reports a bench —
     // reading them together is what tells you whether the run answered the question.
-    println!("{prompt_text}{}", tok.decode_all(&out.ids)?);
+    println!("{}{}", b.text, tok.decode_all(&out.ids)?);
     // stderr, and NOT through `tracing`: the engine logs its own DECODE line at `info`, but
     // a benchmark number that disappears under `RUST_LOG=warn` is a number someone will one
     // day fail to find. The prompt length is here and not there, which is the other half of
@@ -325,14 +420,14 @@ fn main() -> Result<()> {
         "BENCH {:.2} tok/s | {} prompt + {} generated tokens in {:.1} s | {} expert hits, \
          {} misses",
         out.stats.tok_s,
-        prompt.len(),
+        b.ids.len(),
         out.ids.len(),
         out.stats.decode_s,
         out.stats.hits,
         out.stats.misses
     );
     match &a.dump_ids {
-        Some(path) => write_ids(path, &a, &out.ids),
+        Some(path) => write_ids(path, a, &out.ids),
         None => Ok(()),
     }
 }
@@ -341,6 +436,41 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// The invocation contract, PARSED rather than trusted to an attribute.
+    ///
+    /// This exists because the first spelling was `requires = "port"` / `requires =
+    /// "bench"`, and it is INERT in clap 4.6.6: `rivoli DIR --bench 4 --think` parsed clean
+    /// and went on to load a model. Nothing but a parse test tells two attribute spellings
+    /// apart, and an exclusivity nobody can see fail is decoration. The accepted rows are
+    /// here so this cannot pass by refusing everything.
+    #[test]
+    fn exactly_one_of_bench_and_port_and_the_bench_only_flags_say_so() {
+        let refused: [&[&str]; 5] = [
+            &["rivoli", "DIR"],                                       // neither
+            &["rivoli", "DIR", "--bench", "4", "--port", "8080"],     // both
+            &["rivoli", "DIR", "--bench", "4", "--think"],            // --think is server-only
+            &["rivoli", "DIR", "--port", "8080", "--prompt", "x"],    // requests bring prompts
+            &["rivoli", "DIR", "--port", "8080", "--dump-ids", "/x"], // one run, many replies
+        ];
+        for argv in refused {
+            assert!(
+                Args::command().try_get_matches_from(argv).is_err(),
+                "clap accepted {argv:?}, which is not a legal invocation"
+            );
+        }
+        let accepted: [&[&str]; 3] = [
+            &["rivoli", "DIR", "--bench", "4"],
+            &["rivoli", "DIR", "--port", "8080"],
+            &["rivoli", "DIR", "--port", "8080", "--think"],
+        ];
+        for argv in accepted {
+            assert!(
+                Args::command().try_get_matches_from(argv).is_ok(),
+                "clap refused {argv:?}, which is a legal invocation"
+            );
+        }
+    }
 
     /// Every id in [`PRESENCE`] must name a real argument. Without this the strings are
     /// unchecked: renaming a field would leave its flag permanently unrequested, and the

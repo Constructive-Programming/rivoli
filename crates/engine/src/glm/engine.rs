@@ -251,6 +251,13 @@ impl<'a> GlmEngine<'a> {
         })
     }
 
+    /// The KV ceiling this engine allocated for, in tokens — see `Engine::max_ctx`, whose
+    /// only job is to hand this number to a caller that must refuse an over-long request
+    /// before decoding it.
+    pub fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
     pub fn hits(&self) -> u64 {
         self.pin.routed.hits()
     }

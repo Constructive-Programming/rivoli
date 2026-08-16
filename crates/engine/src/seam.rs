@@ -145,6 +145,23 @@ impl<'a> Engine<'a> {
         )
     }
 
+    /// The KV ceiling this engine was BUILT with, in tokens.
+    ///
+    /// Exists so a long-lived caller can refuse a request before decoding it. `serve`
+    /// answers "does this conversation fit?" on every request, and the honest source of
+    /// that number is the engine that allocated the slabs: [`OpenSpec::max_ctx`] passed a
+    /// SECOND time alongside the engine would be a copy free to drift the moment `open`
+    /// ever clamps or rounds it, and the drift would surface as a `forward` refusal minutes
+    /// into a decode instead of as a 400 at the door.
+    pub fn max_ctx(&self) -> usize {
+        match self {
+            #[cfg(feature = "rocm")]
+            Engine::Glm(e) => e.max_ctx(),
+            #[cfg(not(feature = "rocm"))]
+            Engine::Never(never, _) => match *never {},
+        }
+    }
+
     /// Greedy-decode `req`, streaming each token to `sink` the moment it lands; return
     /// false from it to stop early. The delegating match is the whole seam — everything
     /// architecture-shaped is on the other side of it.

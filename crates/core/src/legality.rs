@@ -182,14 +182,25 @@ pub fn name_in<T: Copy + PartialEq>(table: &[(&'static str, T)], v: T) -> &'stat
         .map_or("?", |(name, _)| *name)
 }
 
-/// One thing a run can ask for. Closed on purpose: the domain is exactly the optional
-/// flags `rivoli` exposes, so there is no second, informal list of "flags nobody checks".
-/// The positional artifact path and `--bench` are not here — they are the invocation
-/// itself, not knobs on it.
+/// One thing a run can ask for, **whose answer can differ by architecture**. Closed on
+/// purpose: the domain is exactly the flags whose legality is an architectural question, so
+/// there is no second, informal list of "flags nobody checks".
 ///
-/// Note the asymmetry: `Mode` and `Attn` carry their value because the answer differs per
-/// value (int4 decodes, hybrid does not), while `CachePolicy` does not because all three
-/// of its values stand or fall together on any given architecture.
+/// Two kinds of flag are deliberately absent, and the distinction is the table's scope:
+/// - `--bench` and `--port`, plus the positional artifact path, are the INVOCATION — which
+///   of the two things this process is — not knobs on it. Their exclusivity is clap's.
+/// - `--think` is a knob, but an architecture-independent one: it selects a framing the
+///   tokenizer either renders or does not, and no architecture here answers it differently.
+///   A row that reads `Support` for every arch is a row that can only ever be noise, and
+///   the cost of adding it is real — [`Flag::ALL`], the ordinal permutation and the product
+///   test all widen. **The rule: a flag earns a row when some architecture would answer it
+///   differently, and not before.** A flag that later grows per-arch variance gets its row
+///   then, which is also when there is something true to write in the cell.
+///
+/// Note the asymmetry among the rows that do exist: `Mode` and `Attn` carry their value
+/// because the answer differs per value (int4 decodes, hybrid does not), while
+/// `CachePolicy` does not because all three of its values stand or fall together on any
+/// given architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flag {
     Mode(Mode),
