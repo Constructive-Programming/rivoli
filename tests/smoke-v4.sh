@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # M15 exit gate: the V4 arm end to end, thin on purpose — smoke-glm.sh owns the server
 # path and the clap-exclusivity cells (arch-independent), so this suite pins only what is
-# V4's own: the --mtp refusal quotes V4's kernel-shaped reason; the sparse --attn values
-# PROCEED loudly (the M15 legality flip) and provably toggle nothing (ids identical to the
-# recorded dense run); and a --ctx past the old 2052 ceiling loads, prefills ACROSS the
-# boundary, and decodes finite tokens through the scored selection.
+# V4's own: the --mtp refusal quotes V4's kernel-shaped reason; a --ctx past the old 2052
+# ceiling loads, prefills ACROSS the boundary, and decodes finite tokens through the scored
+# selection; and the sparse --attn values PROCEED loudly (the M15 legality flip) and
+# provably toggle nothing (ids identical to the recorded dense run).
+#
+# **The ceiling cell runs BEFORE the ids cell, and the order is load-bearing.** The ids
+# cell reds on a missing reference file, and `red` exits — so with the ids capture still
+# owed, the original order meant the one cell that actually reaches the scored path never
+# ran. The ids cell decodes at --ctx 2048, BELOW the boundary, where no indexer state is
+# built at all; it pins the legality flip and the below-cap identity, not the selection.
 #
 #   tests/smoke-v4.sh <artifact-dir> [max-mem-GiB]
 #
@@ -45,23 +51,6 @@ grep -q "missing KERNEL" "$SCRATCH/mtp.err" ||
     red mtp "refused (rc=$rc) but without V4's kernel-shaped reason"
 ok "refused with the table's message"
 
-# --- bench cell: below the cap, ids pinned, and the M15 legality flip in one run ------
-# --attn dsa on purpose: pre-M15 this refused at the door; now it must WARN with the
-# rewritten const and then decode ids IDENTICAL to the recorded dense run — the
-# strongest form of "the flag toggles nothing".
-cell "bench 32 @ ctx 2048, --attn dsa falls back loudly"
-[ -f "$IDS_REF" ] || red bench "recorded reference ids missing: $IDS_REF — capture per the file's header note"
-flock "$LOCK" "$BIN" "$ARTIFACT" --attn dsa --max-mem "$MEM" --ctx 2048 \
-    --bench 32 --dump-ids "$SCRATCH/bench.ids" \
-    >"$SCRATCH/bench.out" 2>"$SCRATCH/bench.err" ||
-    red bench "decode failed rc=$? — see bench.err"
-grep -q "toggles nothing" "$SCRATCH/bench.err" ||
-    red bench "--attn dsa proceeded without the fallback warning"
-WANT=$(grep -vE '^#' "$IDS_REF" | tr '\n' ' ')
-GOT=$(grep -vE '^#' "$SCRATCH/bench.ids" | tr '\n' ' ')
-[ "$GOT" = "$WANT" ] || red bench "ids [$GOT] != recorded [$WANT]"
-ok "warned, then decoded 32/32 ids identical to the recorded run"
-
 # --- ceiling cell: the 2052 refusal is GONE and the scored selection decodes ----------
 # The prompt is ~2.6k tokens of deterministic prose, so the PREFILL itself crosses the
 # old boundary: past position 2052 every indexed layer's block set is decided by the
@@ -83,18 +72,47 @@ for i in range(95):
 print(" ".join(words))
 EOF
 )
-flock "$LOCK" "$BIN" "$ARTIFACT" --max-mem "$MEM" \
+# `--ctx 4096` is TYPED and not left to the CLI default, because both bounds below are
+# derived from it — 4083 is `max_ctx - 1` minus the 12 decode steps.
+flock "$LOCK" "$BIN" "$ARTIFACT" --max-mem "$MEM" --ctx 4096 \
     --prompt "$PROMPT" --bench 12 --dump-ids "$SCRATCH/ceiling.ids" \
     >"$SCRATCH/ceiling.out" 2>"$SCRATCH/ceiling.err" ||
     red ceiling "decode failed rc=$? — see ceiling.err (pre-M15 this refused at the door)"
 # The boundary must actually have been CROSSED, or this cell is the vacuous-boundary
 # trap: the engine's own PREFILL line carries the token count, so assert from it.
-NTOK=$(grep -oE 'PREFILL: [0-9]+ tokens' "$SCRATCH/ceiling.err" | grep -oE '[0-9]+' | head -1)
+#
+# **`|| true` inside every substitution, and it is the opposite of sloppiness.** Under
+# `set -euo pipefail` a grep that matches NOTHING fails the pipeline, which fails the
+# ASSIGNMENT, which exits the script — before the very `[ -n "$NTOK" ]` line whose job is
+# to say the boundary could not be proven. The two anti-vacuity checks in this cell were
+# unreachable in exactly the case they exist for; verified by running the shape standalone
+# (exit 1, no message). Let the substitution come back empty and let the check speak.
+NTOK=$(grep -oE 'PREFILL: [0-9]+ tokens' "$SCRATCH/ceiling.err" | grep -oE '[0-9]+' | head -1 || true)
 [ -n "$NTOK" ] || red ceiling "no PREFILL line in stderr — cannot prove the boundary was crossed"
 [ "$NTOK" -ge 2053 ] || red ceiling "prompt tokenized to $NTOK < 2053 — grow the prompt, the cell is vacuous"
 [ "$NTOK" -le 4083 ] || red ceiling "prompt tokenized to $NTOK, too close to the 4095-row bound"
-NIDS=$(grep -cvE '^#' "$SCRATCH/ceiling.ids")
-[ "$NIDS" -eq 12 ] || red ceiling "expected 12 decoded ids, got $NIDS"
+NIDS=$(grep -cvE '^#' "$SCRATCH/ceiling.ids" || true)
+[ "${NIDS:-0}" -eq 12 ] || red ceiling "expected 12 decoded ids, got ${NIDS:-0}"
 ok "prefilled $NTOK tokens across the old ceiling and decoded 12/12 finite tokens"
+
+# --- bench cell: below the cap, ids pinned, and the M15 legality flip in one run ------
+# --attn dsa on purpose: pre-M15 this refused at the door; now it must WARN with the
+# rewritten const and then decode ids IDENTICAL to the recorded dense run — the
+# strongest form of "the flag toggles nothing".
+cell "bench 32 @ ctx 2048, --attn dsa falls back loudly"
+[ -f "$IDS_REF" ] || red bench "recorded reference ids missing: $IDS_REF — capture per the file's header note"
+flock "$LOCK" "$BIN" "$ARTIFACT" --attn dsa --max-mem "$MEM" --ctx 2048 \
+    --bench 32 --dump-ids "$SCRATCH/bench.ids" \
+    >"$SCRATCH/bench.out" 2>"$SCRATCH/bench.err" ||
+    red bench "decode failed rc=$? — see bench.err"
+grep -q "toggles nothing" "$SCRATCH/bench.err" ||
+    red bench "--attn dsa proceeded without the fallback warning"
+# `|| true` for the reason the ceiling cell's does: an all-comment (i.e. EMPTY) id dump
+# would otherwise kill the script silently instead of failing this comparison by name.
+WANT=$(grep -vE '^#' "$IDS_REF" | tr '\n' ' ' || true)
+GOT=$(grep -vE '^#' "$SCRATCH/bench.ids" | tr '\n' ' ' || true)
+[ -n "$WANT" ] || red bench "recorded ids file has no id lines: $IDS_REF"
+[ "$GOT" = "$WANT" ] || red bench "ids [$GOT] != recorded [$WANT]"
+ok "warned, then decoded 32/32 ids identical to the recorded run"
 
 echo "SMOKE GREEN: $pass cells | evidence: $SCRATCH"

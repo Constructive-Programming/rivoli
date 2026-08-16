@@ -24,10 +24,16 @@
 //!    also claim 1 restated as an executable).
 //!
 //! Runs on the toy (`index_topk = 2`, so the cap is 12 tokens and truncation is REACHED),
-//! deviceless, on every `cargo test`. Reaching it is COUNTED here rather than trusted: the
-//! rows whose legal set outgrows the top-k are tallied while they are checked, and the run
-//! refuses to be green under five of them — the anti-vacuity half, since every claim below
-//! is satisfied by the causal mask alone on a row that never truncates.
+//! deviceless, on every `cargo test`.
+//!
+//! **Both sides of the cap are COUNTED rather than trusted, because claims 1 and 2 live on
+//! opposite sides of it and either side's row count can reach zero while the other's floor
+//! is still met.** Rows above the cap come from every step; rows below it come only from
+//! the prefill capture (every decode step here sits above). `steps()` extends from an
+//! `Option` and a `filter_map`, neither of which asserts, so a renamed export would leave
+//! the truncated floor satisfied by decode rows alone while claim 1 — the premise the
+//! whole below-cap byte-identity argument rests on — examined nothing. Red-proved by
+//! dropping the prefill capture: `only 0 non-empty below-cap rows`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli_oracles::v4oracle::forward::{Capture, Defect};
@@ -124,7 +130,7 @@ fn set_of(row: &[i64]) -> std::collections::BTreeSet<i64> {
 /// (prompt 16), plus every decode step, all of which sit above it.
 #[test]
 fn the_exported_scores_determine_the_exported_selection_and_below_the_cap_keep_everything() {
-    let mut truncated_rows = 0usize;
+    let (mut truncated_rows, mut below_cap_rows) = (0usize, 0usize);
     for prompt in [12usize, 16] {
         let all = steps(prompt);
         assert!(all.len() > 1, "prompt {prompt}: prefill plus decode steps");
@@ -137,6 +143,9 @@ fn the_exported_scores_determine_the_exported_selection_and_below_the_cap_keep_e
                 let got = set_of(row);
                 if limit <= TOPK {
                     // Claim 1: below the cap, the selection IS every causally-legal block.
+                    // Counted only when there IS one — a `limit == 0` row compares two
+                    // empty sets and would let the floor below be met vacuously.
+                    below_cap_rows += usize::from(limit >= 1);
                     let want: std::collections::BTreeSet<i64> =
                         (0..limit as i64).map(|c| c + s.offset).collect();
                     assert_eq!(got, want, "prompt {prompt} row {t}: below-cap set");
@@ -152,11 +161,25 @@ fn the_exported_scores_determine_the_exported_selection_and_below_the_cap_keep_e
             }
         }
     }
-    // Anti-vacuity: the boundary was CROSSED, or every assertion above ran on the vacuous
-    // side and this test is the "dsa A/B under 2048 tokens" trap wearing a new name.
+    // Anti-vacuity, BOTH sides, because the two claims live on opposite sides of the cap
+    // and each one's rows can reach zero while the other's floor is still met.
+    //
+    // Above: the boundary was CROSSED, or claim 2 ran only where the causal mask decides
+    // everything — the "dsa A/B under 2048 tokens" trap wearing a new name.
     assert!(
         truncated_rows >= 5,
         "only {truncated_rows} truncated rows — the fixture no longer crosses the cap"
+    );
+    // Below: claim 1 is reachable ONLY from the prefill capture (every decode row here
+    // sits above the cap — `n_comp` is 3, 3, 3, 4 at prompt 12 and 4, 4, 4, 5 at 16, all
+    // past `TOPK = 2`). So a `steps()` that silently lost `L2.pre.*` — it extends from an
+    // `Option` and a `filter_map`, neither of which asserts — would leave the truncated
+    // floor met by the four decode steps alone while the claim the whole below-cap
+    // byte-identity argument rests on executed zero times.
+    assert!(
+        below_cap_rows >= 8,
+        "only {below_cap_rows} non-empty below-cap rows — the prefill capture is gone and \
+         claim 1 examined nothing"
     );
 }
 

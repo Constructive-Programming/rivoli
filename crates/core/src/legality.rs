@@ -362,10 +362,11 @@ const V4_SPARSE_ATTN_IS_NOT_A_CHOICE: &str = "--attn names how attention SELECTS
      it reads, and this architecture does not offer the choice: streaming sinks, the DSA \
      token indexer and MISA are all row selections over a DENSE cache, and this cache is a \
      sliding-window ring plus pooled blocks. Its own trained-in indexer ranks COMPRESSED \
-     BLOCKS — a different object from GLM's — and since the scored selection landed it runs \
-     natively, always, on the 21 indexed layers: top index_topk blocks by score, no context \
-     ceiling, not a mode. The flag toggles nothing; the run proceeds with the checkpoint's \
-     own selection";
+     BLOCKS — a different object from GLM's — and since the scored selection landed it \
+     decides the set natively, on every indexed layer, wherever the causally-legal set \
+     outgrows index_topk. Below that the set already fits and both rules name it, so there \
+     is no context ceiling and nothing here to pick. The flag toggles nothing; the run \
+     proceeds with the checkpoint's own selection";
 
 const V4_MTP_NEEDS_A_KERNEL: &str = "speculative decode on this architecture is blocked by a \
      missing KERNEL, not a missing head, and that is which of the two would have to arrive \

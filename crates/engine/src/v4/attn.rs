@@ -18,8 +18,16 @@
 //! is what the reference did and what its own header recorded as an owed rebase. The device
 //! copies are the part that is easy to miss: `memcpy_dtod` is a BLOCKING `hipMemcpy`, so
 //! host-blocking hides the hazard while everything sits on stream 0 — the moment the launchers
-//! move, it becomes a read racing a stream-ordered write. The set to convert is seven, not
-//! six: the six launcher FUNCTIONS plus the async copy.
+//! move, it becomes a read racing a stream-ordered write. The set to convert is seven here,
+//! not six: the six launcher FUNCTIONS plus the async copy.
+//!
+//! **M15 widened the set past this file.** The same attention block now also runs
+//! `super::blocksel::scored_selection` on the null stream — the indexer's nested compressor
+//! (through `kvcompress`'s launches), its `wq_b` GEMV, rope, the Hadamard-fp4 spread,
+//! `weights_proj`, the scorer, and one async D2D copy — plus two BLOCKING D2H round-trips
+//! that would each need a stream sync. The census already spanned modules (it counts the
+//! compressor, which lives in `kvcompress.rs`), so this is a number that has grown rather
+//! than a scope this file never had. Whoever does the rebase counts all three files.
 //!
 //! # Three obligations no plausible caller satisfies by accident
 //!
@@ -79,10 +87,19 @@ struct Weights {
 /// All `Copy` raw pointers — holding them across `&mut self` calls borrows nothing, which is
 /// the same shape [`crate::glm::attn`]'s `AttnCall` takes and for the same reason.
 ///
-/// `qr` and `qrq` are separate buffers holding the same values, and that is not waste: `qr` is
-/// `q_norm(wq_a(x))` and a ratio-4 layer's indexer consumes it AFTER the q path is done with
-/// it, so quantizing in place would destroy an input. `xq` is separate for the same reason on
-/// `x`, which the compressor and the router both read UNQUANTIZED. Neither pair costs a copy:
+/// `xq` is separate from `x` because `x` — the pre-attention norm's output — is read
+/// UNQUANTIZED by the compressor, the router, and (since M15) the indexer's `weights_proj`
+/// and its own nested compressor, all AFTER `qkv_project` has quantized it.
+///
+/// **`qr` and `qrq` are separate for a weaker reason than this comment used to give.** It
+/// said a ratio-4 layer's indexer consumes `qr` after the q path is done with it, so
+/// quantizing in place would destroy an input. When M15 wired the indexer it turned out to
+/// consume `qrq` — the checkpoint's `indexer.wq_b` is fp8, like the attention's, so it
+/// wants the same quantized rows. Nothing reads `a_qr` after
+/// `launch_act_quant_f8_prefix`, and the fused decode path does not use it at all. So the
+/// pair is now a `max_m * q_lora_rank` f32 buffer (16.8 MB at ctx 4096) that in-place
+/// quantization would retire — measured against nothing yet, which is why it is recorded
+/// here rather than changed inside a milestone about selection. Neither pair costs a copy:
 /// the activation quantizer reads its source and writes the quantized copy in one launch,
 /// which preserves exactly the property the separation exists for.
 #[derive(Clone, Copy)]

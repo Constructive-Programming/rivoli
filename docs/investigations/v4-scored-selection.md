@@ -101,15 +101,78 @@ real depth. The attended ORDER is ascending-by-position where the reference's is
 score-descending: a summation-order difference inside the online softmax over the same
 set, the same class of difference every tolerance-gated kernel already carries.
 
+## Raised in review, deliberately NOT done here
+
+Three review rounds ran before the commit; most findings were taken. These four were
+declined with the reason, rather than silently:
+
+- **`scored_rows` should be a `Sel` method.** It takes `kind`, `index_topk`, `at` and
+  `offset` as loose parameters, and `blocksel` derives all four from the same engine fields
+  `attn::upload_selection` independently builds its `Sel` from — which is precisely the
+  re-derivation `select.rs`'s own header was written about. The fix (`Sel::scored_rows`,
+  one `Sel` built in `attention_block` and passed to both) is right and should happen.
+  Declined for THIS commit because it re-plumbs the device path, and the device path's only
+  gate is owed to a GPU session: making the change now means the first silicon run of M15
+  tests a refactor rather than the milestone.
+- **`tests/smoke-lib.sh`.** ~16 lines of `smoke-v4.sh` are verbatim `smoke-glm.sh` — the
+  `BIN` resolution (which has already been fixed once, in one place), `LOCK` (which has
+  already moved once), and the four cell helpers. Nothing can see it: `build.rs` scans
+  `crates` only and `.jscpd.json` is `format: ["rust"]`, and both line-cap walkers start at
+  `crates/` too, so root `tests/*.sh` is in a permanent blind spot. Declined because the
+  extraction edits `smoke-glm.sh`, a GPU gate this session cannot run. Worth doing with the
+  walkers extended to `tests/` in the same change.
+- **`v4_scored_selection.rs` rebuilds the toy** instead of using `common::v4::toy_fixture()`
+  (cached; three builds here). jscpd cannot see a 3-line clone under its `minLines: 5`.
+  Declined as test-only, and because the fixture is what three of this milestone's red
+  proofs were executed against.
+- **CodeScene was not run.** `cs` is installed but `CS_ACCESS_TOKEN` is unset on this box,
+  so the 10/10 hard gate is the one merge gate M15 leaves unverified. The two plausible
+  triggers are `blocksel::scored_selection` (~113 code lines, four phases — its own
+  comments already mark the split seams) and `scored_rows`'s six parameters. **Score
+  `crates/engine/src/v4/blocksel.rs` before merge.**
+
 ## Cost, stated
 
 Below the boundary: zero — no allocation, no launch, no byte moved. Above it, per step:
 the nested compressor (two `[m,4096]×[256,4096]` bf16 GEMMs + pooling) on every
 indexed-layer call, plus — only past 2052 — wq_b GEMV, rope+spread over `[m·64, 128]`, the
 score kernel (`m·n_comp` threads × 8192 MACs), one 256 B and one `4·n_comp` B D2H, and a
-host top-k over `n_comp ≤ max_ctx/4` candidates. Device memory when armed:
-`iq [max_m, 8192]` f32 (134 MB at ctx 4096) + score `[max_m, max_ctx/4]` (16 MB) + 21
-caches `[max_ctx/4, 128]` (11 MB) + narrowed weights (~98 MB) ≈ **260 MB of scratch**,
-same accounting class as the existing `max_m`-sized activation scratch (charged to free
-memory, not the partition — `weights_only_floor` carries what that means). tok/s deltas
-above/below the boundary are the GPU session's to measure.
+host top-k **per query row** over `n_comp ≤ max_ctx/4` candidates. That last one is the
+term to watch: `scored_rows` runs one full sort per row, so a boundary-crossing PREFILL
+does `m` sorts × 21 layers rather than the one a decode step does. Decode is unaffected;
+prefill above the boundary is unmeasured, and `select_nth_unstable_by` under the identical
+comparator yields the identical set in O(n) if it measures badly.
+
+**Device memory when armed, corrected 2026-08-16** — the first table said ≈260 MB and
+omitted the nested compressor's two `[max_m, cd]` projection scratches, which are its
+largest allocation. Recomputed from `LayerCompressor::build` and `IndexerBank::new` at
+ctx 4096 (`max_m` 4095, `cd` 256 read off the artifact's own
+`attn.indexer.compressor.wkv` `[256, 4096]`, `d` 128, 21 indexed layers):
+
+| buffer | each | ×21 |
+|---|---|---|
+| `iq [max_m, 64·128]` f32 | — | 134.2 MB |
+| `score_dev [max_m, max_ctx/4]` f32 | — | 16.8 MB |
+| `w_dev [max_m, 64]` f32 | — | 1.0 MB |
+| `proj_kv` + `proj_score` `[max_m, cd]` f32 | 8.39 MB | **176.1 MB** |
+| `w_kv` + `w_gate` narrowed bf16 | 4.19 MB | 88.1 MB |
+| `blocks [max_ctx/4, d]` f32 | 0.52 MB | **11.0 MB** |
+| `cache [max_ctx/4, d]` f32 | 0.52 MB | 11.0 MB |
+| `wproj` narrowed bf16 | 0.52 MB | 11.0 MB |
+| pooling states | ~8 KB | 0.2 MB |
+
+**≈ 449 MB of scratch**, not 260 — same accounting class as the existing `max_m`-sized
+activation scratch (charged to free memory, not the partition — `weights_only_floor`
+carries what that means). tok/s deltas above/below the boundary are the GPU session's to
+measure.
+
+**A residual the deleted door used to hide.** `--ctx` is now bounded by memory alone, and
+this scratch is QUADRATIC in it: `score_dev` is `(max_ctx-1)·⌈max_ctx/4⌉·4` bytes — 16.8 MB
+at 4096, 268 MB at 16384, 4.3 GB at 65536 (the checkpoint's own
+`original_max_position_embeddings`) — with `iq` linear at 2.1 GB there. It fails loudly at
+`DeviceBuf::new`, but AFTER `V4Pin::build` has read nine gigabytes, where `check_context`
+used to refuse at the door. `main.rs`'s `--ctx` help still quotes a linear "~51 KB of
+device memory per token". Not fixed here: the honest bound is a footprint estimate, which
+is the same unbudgeted-activation-scratch question `V4Engine::max_m`'s doc already names
+and defers, and inventing a second ceiling inside the milestone that removed the first one
+would be the wrong shape.

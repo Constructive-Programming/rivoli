@@ -1,9 +1,12 @@
 //! Shared drivers for the `v4_oracle*` test binaries — the V4-checkpoint-free slice of the
 //! old tests/common tail (its Checkpoint/LayerKind-coupled half stays deferred to M8).
 //!
-//! Six sibling binaries `#[path]`-include this file: `v4_oracle` (the defect matrix),
-//! `v4_oracle_codecs`, `v4_oracle_gate`, `v4_oracle_head_tail`, `v4_oracle_reduction` and
-//! `v4_oracle_targeted`. They ask different questions of the same instrument, and every one
+//! Seven sibling binaries `#[path]`-include this file: `v4_oracle` (the defect matrix),
+//! `v4_oracle_codecs`, `v4_oracle_gate`, `v4_oracle_head_tail`, `v4_oracle_reduction`,
+//! `v4_oracle_targeted` and `v4_indexer_goldens` (M15's oracle-side selection gate — the
+//! one that does not carry the `v4_oracle_` prefix, because it asks about the indexer
+//! rather than about the oracle's defect matrix). They ask different questions of the same
+//! instrument, and every one
 //! of them drives the SAME toy through the SAME grid — a second copy of [`model`] or [`run`]
 //! would be a second fixture, and two fixtures that drift are two different claims wearing
 //! one name. So the driver lives here and the questions live there.

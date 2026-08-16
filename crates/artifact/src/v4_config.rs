@@ -189,8 +189,20 @@ pub struct V4Config {
     quantization_config: QuantConfig,
 
     // --- lightning indexer, on the `compress_ratio == 4` layers. `indexer.wq_b` is
-    // `[index_n_heads · index_head_dim, q_lora_rank]`, confronted with the tensor by
-    // `convert_v4::write_layer_resident`. ---
+    // `[index_n_heads · index_head_dim, q_lora_rank]`.
+    //
+    // **CORRECTED 2026-08-16 (M15).** This said the shape was "confronted with the tensor by
+    // `convert_v4::write_layer_resident`". It is not: that function's table names
+    // `attn.{wq_a, wq_b, wkv, wo_a, wo_b}` and no `attn.indexer.*` entry, and `convert_v4`
+    // does not mention `index_n_heads` at all. Harmless while nothing read those tensors;
+    // load-bearing since M15, because `v4::blocksel` hands `gemv_fp8` the CONFIG-derived
+    // `(index_n_heads · index_head_dim, q_lora_rank)` and ignores the `Fp8Weight`'s own
+    // dims, and `narrow_to_bf16` reads config-derived byte counts out of `place_f32`
+    // placements, which do no shape check. So a checkpoint whose `attn.indexer.*` shapes
+    // disagree with these two fields gets out-of-bounds device reads instead of a
+    // load-time refusal. Bounded, not closed, by `place_fp8`, which does confront `wq_b`'s
+    // scale grid against the weight's own shape. `attn.compressor.*` has the identical
+    // gap and predates M15; both want one confront table, which is its own change. ---
     pub index_n_heads: usize,
     pub index_head_dim: usize,
     /// How many compressed blocks the lightning indexer keeps:

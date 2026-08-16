@@ -49,7 +49,7 @@ use rivoli_backend::abi::ScoreDims;
 use rivoli_backend::hip::ScoreBufs;
 use rivoli_backend::{
     NULL_STREAM, launch_act_quant_f4_rotated, launch_gemm_bf16, launch_index_score_blocks,
-    launch_rope_adjacent, memcpy_dtod,
+    launch_rope_adjacent, memcpy_dtod_async,
 };
 use rivoli_core::num::{bf16_to_f32, f32_to_bf16};
 
@@ -84,7 +84,11 @@ pub(super) struct IndexerBank {
     w_dev: DeviceBuf,
     /// `[max_m, max_blocks]` f32 — the full pre-top-k score matrix.
     score_dev: DeviceBuf,
-    /// D2H staging, reused across steps so the decode loop allocates nothing.
+    /// D2H staging BYTES, reused across steps. Narrower than the arm's "a decode
+    /// allocates nothing on the hot path" rule and deliberately stated so: `read_f32`
+    /// hands back a fresh `Vec<f32>` view of each of these, the scaled weights collect
+    /// into another, and `scored_rows` allocates a row per query. Only the two byte
+    /// buffers below are actually reused; the rest is per-step and unpriced.
     w_host: Vec<u8>,
     score_host: Vec<u8>,
     /// `index_head_dim^-1/2 * index_n_heads^-1/2` — the reference's
@@ -228,30 +232,49 @@ impl V4Engine<'_> {
         // shape; the null stream is what this whole arm runs on.
         let blocks = unsafe { ix.comp.run(w, at, NULL_STREAM) }
             .with_context(|| format!("layer {layer} indexer compressor at {at:?}"))?;
-        if blocks > 0 {
-            let (row, want) = compress_dst(kind, 0, at)
-                .context("the compressor emitted where compress_dst names no destination")?;
-            ensure!(
-                blocks == want,
-                "layer {layer}: indexer emitted {blocks} block(s) where compress_dst \
-                 reserved {want}"
-            );
-            ensure!(
-                row + blocks <= ix.cache_rows,
-                "layer {layer}: {blocks} indexer block(s) at row {row} overrun the \
-                 {}-row cache",
-                ix.cache_rows
-            );
-            let rowb = hd * size_of::<f32>();
-            // SAFETY: `emitted()` holds `blocks * hd` f32 by the compressor's sizing; the
-            // destination range was bounded above; distinct allocations.
-            unsafe {
-                memcpy_dtod(
-                    ix.cache.ptr_mut().cast::<f32>().add(row * hd).cast(),
-                    ix.comp.emitted(),
-                    blocks * rowb,
-                )
-                .context("persisting the indexer's compressed cache")?;
+        // The drift tripwire, BOTH ways, which is `kvcompress::compress_and_place`'s shape
+        // and for its reason: the run and `compress_dst` decide from the same `(kind, at)`
+        // and today cannot disagree, so what this catches is a future edit to one of them.
+        // The `Some(_) && blocks == 0` corner is not cosmetic here — it would leave
+        // `ix.cache[row]` at its reset zeros, and a zero row scores EXACTLY 0.0 through the
+        // scorer's `relu` while a real block can score negative (`weights_proj` is a bare
+        // Linear), so the empty row would outrank real ones. Silent, plausible, permanent.
+        match compress_dst(kind, 0, at) {
+            None => ensure!(
+                blocks == 0,
+                "layer {layer}: the indexer's compressor emitted {blocks} block(s) where \
+                 compress_dst names no destination — the two have drifted"
+            ),
+            Some((row, want)) => {
+                ensure!(
+                    blocks == want,
+                    "layer {layer}: indexer emitted {blocks} block(s) at {at:?} where \
+                     compress_dst reserved {want}"
+                );
+                ensure!(
+                    row + blocks <= ix.cache_rows,
+                    "layer {layer}: {blocks} indexer block(s) at row {row} overrun the \
+                     {}-row cache",
+                    ix.cache_rows
+                );
+                // The block WIDTH off the emitting geometry, not off the config a second
+                // time — which is what `LayerCompressor::d`'s doc promised and this is the
+                // caller it named.
+                let d = ix.comp.d();
+                // SAFETY: `emitted()` holds `blocks * d` f32 by the compressor's sizing;
+                // the destination range was bounded above; distinct allocations. Async and
+                // stream-ordered like `attn::write_ring`'s copies — the blocking
+                // `memcpy_dtod` is the arena-relocation entry point, and forcing a host
+                // sync per indexed layer per step is not what this path wants.
+                unsafe {
+                    memcpy_dtod_async(
+                        ix.cache.ptr_mut().cast::<f32>().add(row * d).cast(),
+                        ix.comp.emitted(),
+                        blocks * d * size_of::<f32>(),
+                        NULL_STREAM,
+                    )
+                    .context("persisting the indexer's compressed cache")?;
+                }
             }
         }
 
@@ -266,8 +289,11 @@ impl V4Engine<'_> {
         let wp = bank.w_dev.ptr_mut().cast::<f32>();
         // SAFETY: `qrq` holds this step's `m * q_lora` quantized rows (qkv_project ran),
         // `iq` is `max_m * h * hd`, `wp` is `max_m * h`, the score slab is
-        // `max_m * max_blocks >= m * n_comp`, and `ix.cache` holds `n_comp` finished rows
-        // by step 1 — all on the null stream, so ordering holds.
+        // `max_m * max_blocks >= m * n_comp`, and `ix.cache` holds `n_comp` finished rows —
+        // written by step 1 at prefill, but at DECODE step 1 contributes at most the ONE
+        // row that just closed and the rest came from earlier steps, so the invariant is
+        // that the decode loop visits every position from 0, not anything step 1 does. All
+        // on the null stream, so ordering holds.
         unsafe {
             gemv_fp8(qrq, wq_b, m, (h * hd, q_lora), iq, NULL_STREAM)?;
             launch_rope_adjacent(
