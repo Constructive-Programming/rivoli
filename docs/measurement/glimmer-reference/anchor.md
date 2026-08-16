@@ -393,6 +393,24 @@ conversion that is off by an ulp; it witnesses structure. (Recorded because this
 registered a red-proof whose perturbation was below the detection floor and read the resulting
 green as a passing gate.)
 
+The whole battery, each plant applied to the tree, run, and reverted (2026-08-16):
+
+| plant | gate | result |
+|---|---|---|
+| one capture forced to all-NaN, got-side guard PRESENT | clean forward | red at the finite guard |
+| the same, guard REMOVED | clean forward | **GREEN — all 39 tolerances passed** |
+| a well-formed extra row in `DRAFT_ORACLE` | `table_covers_exactly` | red |
+| attention scale `1/√head_dim` → `1/√(head_dim+1)` | clean forward | red |
+| `+1 ulp` on one f32 element of `encoder.fc` | clean forward | green (2.980126e−7 vs 2.980119e−7) |
+| one recorded L0 signal raised 2.146e−1 → 2.60e−1 | defect matrix | red at the signal bar |
+| `mask()` reading `block` instead of `window` | whole binary | red at **exactly one** test — the window gate — and green at the other nine |
+| a draft golden renamed out of the prefix filter | whole binary | red (salt pairing, 7 of 10) |
+
+The `block`-for-`window` row is the one worth keeping: nine value gates stayed green under a
+substitution that is a 128× error in the real model, and only the gate written for that collapse
+caught it. That is what "every value comparison scores green with either read for the other"
+means measured rather than argued.
+
 **A false green was found and closed the same day.** The scoring helper folded
 `(got − want).abs()` with `f64::max`, which RETURNS THE OTHER ARGUMENT ON NaN — so a capture
 that computed only NaN scored 0.0, a perfect match. Proven both ways rather than argued: with
