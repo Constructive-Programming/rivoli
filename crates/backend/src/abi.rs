@@ -16,8 +16,13 @@
 /// What actually guards the layout is the compile-time assert below plus the kernel's
 /// run-time `compress_guard`; what guards DERIVATION is the M8 rule that the engine's
 /// `Geom` is the sole producer.
+/// `PartialEq` and not `Eq`, because `eps` is a float — and it is derived at all for one
+/// reason: it is what makes the M8 rule above CHECKABLE. The engine builds two of these on an
+/// indexed layer, for the attention compressor and for the indexer's nested one, and the
+/// claim that they differ only in a finish the kernel never sees is a claim about these
+/// seven fields being equal. Without this derive that claim is a comment.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CompGeom {
     pub ratio: i32,
     pub coff: i32,

@@ -19,6 +19,10 @@ pub mod indexer;
 pub mod routed;
 pub mod seam;
 pub mod telemetry;
+// Ungated at the module and gated inside it, unlike `glm`: this arm's layer classes, rotary
+// tables and row selection are arithmetic over a config that touches no device, and they are
+// the half where a wrong answer is silent. `v4.rs` carries the argument.
+pub mod v4;
 
 // The seam's vocabulary, hoisted to the crate root: `rivoli_engine::Engine` is what a
 // consumer programs against, and making it name the module the enum happens to live in is
