@@ -194,9 +194,34 @@ Three runs, each a source mutation, `--expect-red`, then `git checkout` and a gr
 
 | cell | mutation | must redden with |
 |---|---|---|
-| `profile` | delete `self.prof.lap(Phase::Ffn, t)` after the compute-stream await (`glm/mlp.rs`) | `--expect-red='ffn bucket is'` — and this is the run that proves the stamps are wired, which 5a cannot |
-| `p4` | none — `tests/ppl-gates.sh --red-proof-corpus` scores arm B on a one-word-different corpus, no rebuild | the NLL bodies differ, with the first differing position named |
-| `tf` | off-by-one the forced position in `score::walk` (`tally.push(&row, own, ids[i])` → `ids[i-1]`) | the CI lands entirely outside ±0.00995 |
+| `profile` | `telemetry.rs`: `Phase::Ffn => self.ffn_ns += ns,` → `Phase::Ffn => {}` — the whole ffn accumulation, gone | `--expect-red='ffn bucket is'`. This is the run that proves the stamps are WIRED, which 5a cannot |
+| `p4` | none — `--red-proof-corpus` scores arm B on a one-word-different corpus, no rebuild | the NLL bodies differ, with the first differing position named |
+| `tf` | `glm/decode.rs`: `tally.push(&row, own, target)?` → `tally.push(&row, own, ids[i - 1])?` — position i's row scored against position i-1's token | the CI lands entirely outside ±0.00995 |
+
+The `tf` mutation is in `glm/decode.rs` and not in `score::walk` because **GLM does not
+come through `walk`** — its whole score runs inside one `block_on`, so it keeps a bespoke
+loop over the same `Tally`, and the `tf` cell scores GLM. Mutating `walk` would redden
+nothing here. (`walk`'s own alignment is covered deviceless by
+`walk_scores_every_position_and_forces_all_but_the_last`, which asserts the exact
+`advanced == [(1,1),(2,2)]` sequence this mutation breaks.)
+
+**Both mutations were pre-verified to COMPILE, 2026-08-16, and reverted.** That is not
+ceremony: §4 above records two operator false-greens where the mutation orphaned a
+variable, `warnings = deny` failed the rebuild, the exit code was eaten by a pipeline, and
+the "red-proof" ran against a stale binary — a proof that refused to go red, and a red with
+the wrong failure. Each of these keeps its variables used (`target` is still read by
+`forward`; `ns` is still read by the other three arms), so neither can produce that
+failure. Run:
+
+```
+cd .claude/worktrees/wave-m10
+sed -i 's/Phase::Ffn => self.ffn_ns += ns,/Phase::Ffn => {}/' crates/engine/src/telemetry.rs
+CARGO_TARGET_DIR=... cargo build --release --features teacher-forcing   # OUTSIDE the flock, exit UNPIPED
+PPL_BIN=.../release/rivoli tests/ppl-gates.sh --expect-red='ffn bucket is' <artifact> profile
+git checkout -- crates/engine/src/telemetry.rs        # never sed a file back
+CARGO_TARGET_DIR=... cargo build --release --features teacher-forcing
+PPL_BIN=.../release/rivoli tests/ppl-gates.sh <artifact> profile        # green again
+```
 
 `p4`'s red-proof scope, stated because it is narrower than it looks: it proves the byte
 comparison and the anti-vacuity hit_pct check are live. It does **not** simulate a
