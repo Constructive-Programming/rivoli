@@ -88,6 +88,56 @@ impl Lcg {
     }
 }
 
+/// `n` draws advancing `r` — the fixture draw for a case whose operands come from ONE stream
+/// in a fixed order.
+///
+/// **HOISTED 2026-08-16 with M8's V4 oracles**, which is what the three `kernel_glimmer_*.rs`
+/// files' debt notes asked for: each spelled its own body, none could share one, and
+/// `build.rs`'s duplication gate was all that kept them apart. Their notes each named this
+/// file, beside [`Lcg`] and [`block_scales`], as where the shared spelling belongs, and each
+/// said to hoist it "the next time `common/` is open". M8 opened it.
+///
+/// Takes the STREAM rather than a salt because the three operands of one attend case must come
+/// from one cursor: a seed means the same data at two call sites only while the draw ORDER is
+/// shared, and three independently salted draws would let two of them silently coincide.
+/// [`fill`] is the other half — same draw, salted, for the callers that reuse one operand
+/// across cases and so cannot share a cursor.
+pub fn draws(r: &mut Lcg, n: usize) -> Vec<f32> {
+    std::iter::repeat_with(|| r.f()).take(n).collect()
+}
+
+/// `n` draws uniform in `[-scale, scale)` from a SALTED stream.
+///
+/// [`draws`] over a fresh [`Lcg`], scaled. Salted rather than sequential because the callers
+/// that reach for this reuse one operand across several cases, and a shared cursor makes that
+/// unspellable — which is exactly the property the stream form is chosen for elsewhere. The
+/// scaling is applied after the draw rather than inside it, so the two spellings produce the
+/// same stream and `fill(n, s, 1.0)` IS `draws(&mut Lcg(s), n)`.
+///
+/// Hoisted with [`draws`]; see its note for why all three copies existed and what they cost.
+pub fn fill(n: usize, salt: u64, scale: f32) -> Vec<f32> {
+    draws(&mut Lcg(salt), n)
+        .into_iter()
+        .map(|v| v * scale)
+        .collect()
+}
+
+/// How many DISTINCT byte values appear at dword byte position `p` of a packed weight — the
+/// coverage a byte-pattern sweep COUNTS rather than trusting from its construction.
+///
+/// Both V4 sweeps (the fp4 expert's and the fp8 GEMV's) build a weight whose bytes are meant to
+/// walk every value at every position of the four-byte load, and both assert this against 256 or
+/// 254. A second body of it is what `build.rs`'s duplication gate reported on 2026-08-16, and it
+/// is right about the substance too: the two sweeps make the same claim, and a claim measured two
+/// ways is two claims.
+pub fn byte_position_coverage(w: &[u8], p: usize) -> usize {
+    let mut seen = [false; 256];
+    for b in w.iter().skip(p).step_by(4) {
+        seen[*b as usize] = true;
+    }
+    seen.iter().filter(|&&s| s).count()
+}
+
 /// `n` positive per-block scales, `|f·0.1| + 0.01`. Every fp8 oracle draws them this way,
 /// and the 0.01 floor is load-bearing rather than tidy: a tile whose
 /// scale rounds to zero makes the comparison for that tile vacuous, and `assert_close`'s

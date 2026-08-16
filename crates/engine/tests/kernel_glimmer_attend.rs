@@ -54,7 +54,8 @@ use rivoli_backend::hip::{
 
 mod common;
 use common::{
-    Got, Lcg, Want, assert_bits, assert_guard, back, dev, f32b, f32v, ok, window_lo, worst_rel,
+    Got, Lcg, Want, assert_bits, assert_guard, back, dev, draws, f32b, f32v, ok, window_lo,
+    worst_rel,
 };
 
 /// `tolerance::GLIMMER`'s `attend` row — `Rel(1.64e-4)` over a floor of 1.639e-5, measured at
@@ -284,28 +285,20 @@ fn worst(got: &[f32], want: &[f32]) -> f32 {
     worst_rel(Got(got), Want(want))
 }
 
-/// `n` draws uniform in `[-1, 1)`, advancing `r`.
-///
-/// Takes the stream rather than a salt because the three operands of one attend case come from
-/// ONE stream in a fixed order: a seed means the same data at two call sites only while the DRAW
-/// ORDER is shared, and three independently salted draws would let two of them silently coincide.
-///
-/// > Each of the three `kernel_glimmer_*.rs` files spells its own fixture draw and none of them
-/// > can share a body, because the shared spelling would belong in `common/reference.rs` beside
-/// > `Lcg` and `block_scales` and `common/` is outside this port's file scope. **That is a debt,
-/// > not a design** — when a fourth consumer appears, hoist it there and delete all three.
-fn draw(r: &mut Lcg, n: usize) -> Vec<f32> {
-    std::iter::repeat_with(|| r.f()).take(n).collect()
-}
+// The stream-form fixture draw this file spelled as `draw(r, n)` is now `common::draws`,
+// HOISTED 2026-08-16 with M8's V4 oracles — the "fourth consumer" the debt note here made the
+// condition for hoisting. Its argument travelled with the body and is stated at `common::draws`:
+// the three operands of one attend case come from ONE cursor in a fixed order, because a seed
+// means the same data at two call sites only while the draw ORDER is shared.
 
 /// q, k and v for `rows` cached positions at `tq` query rows — everything one attend case needs,
 /// in draw order, so two cases of the same shape are two cases over the same data.
 fn operands(tq: usize, rows: usize, d: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let mut r = Lcg(0x91a5_0a55);
     (
-        draw(&mut r, tq * HQ * d),
-        draw(&mut r, rows * HKV * d),
-        draw(&mut r, rows * HKV * d),
+        draws(&mut r, tq * HQ * d),
+        draws(&mut r, rows * HKV * d),
+        draws(&mut r, rows * HKV * d),
     )
 }
 
@@ -648,7 +641,7 @@ fn rope_on_device(data: &[f32], g: Rope, conv: Conv) -> Vec<f32> {
 /// One rotary fixture: `count * stride` floats under `salt`. Its own function because three tests
 /// below want the same segment layout and two of them want the same bytes as each other.
 fn rope_base(g: Rope, salt: u64) -> Vec<f32> {
-    draw(&mut Lcg(salt), g.count * g.stride)
+    draws(&mut Lcg(salt), g.count * g.stride)
 }
 
 /// Split-half RoPE on the host: pair `(x[j], x[j+half])` rotates by `pos·theta^(-2j/seg)` and

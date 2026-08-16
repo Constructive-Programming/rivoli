@@ -65,6 +65,7 @@ mod geometry;
 mod reference;
 mod scoring;
 mod upload;
+mod v4;
 
 // `#[allow(unused_imports)]` for the reason the header gives `dead_code`, one lint further on:
 // this compiles into EVERY test binary and none of them names an item from every submodule —
@@ -78,7 +79,7 @@ mod upload;
 // would propagate down the module tree into all six files and suppress exactly that — the
 // same argument the `DeviceBuf` re-export in `upload.rs` makes about attributing ONE item.
 #[allow(unused_imports)]
-pub use {asserts::*, geometry::*, reference::*, scoring::*, upload::*};
+pub use {asserts::*, geometry::*, reference::*, scoring::*, upload::*, v4::*};
 
 #[cfg(feature = "rocm")]
 pub mod moe;
@@ -87,17 +88,17 @@ pub mod moe;
 // copy; the kernel-oracle scaffolding here never walks the tree.)
 
 // ---------------------------------------------------------------------------------------
-// V4-Flash checkpoint scaffolding, shared by `kvcompress_probe.rs` and
-// `kvcompress_kernel.rs`
+// V4-Flash checkpoint scaffolding — `v4.rs`, ARRIVED 2026-08-16 with M8's four oracle suites
 // ---------------------------------------------------------------------------------------
 //
-// These moved here from `kvcompress_probe.rs` when the kernel test needed the same loader:
-// both drive the SAME two compressors (layer 2 at ratio 4, layer 3 at ratio 128), one
-// against the oracle alone and one against the GPU, and a second copy of `compressor_w`
-// would be a second set of shape assertions that could drift apart while both stayed green.
-// `build.rs`'s duplication gate watches `tests/`, so it would also be a build error.
+// The old tree kept this in `common/mod.rs` because two suites drove the SAME two compressors
+// (layer 2 at ratio 4, layer 3 at ratio 128), one against the oracle alone and one against the
+// GPU, and a second copy of `compressor_w` would be a second set of shape assertions that could
+// drift apart while both stayed green. Three suites need it here.
 //
-// jscpd:ignore-free by construction: the loader is spelled once and both suites call it.
-//
-// **Split note 2026-08-15**: when that loader arrives it lands in its own submodule beside the
-// six above, not in this file — the umbrella holds module declarations and re-exports only.
+// **The split note this replaces predicted exactly this**: "when that loader arrives it lands
+// in its own submodule beside the six above, not in this file — the umbrella holds module
+// declarations and re-exports only." It did, and `v4.rs` carries one thing the old copy could
+// not: the CONFIG PAIR, `Configs`, which holds the checkpoint's parsed `config.json` against
+// the oracle's hard-coded transliteration of it. Every dimension a launcher is handed comes
+// from the former; the latter builds the `Oracle` and nothing else.

@@ -52,7 +52,7 @@ use rivoli_backend::hip::{
 
 mod common;
 use common::{
-    DeviceBuf, Got, Lcg, Want, Weightless, assert_bits, assert_guard, back, dev, f32b, f32v, ok,
+    DeviceBuf, Got, Want, Weightless, assert_bits, assert_guard, back, dev, f32b, f32v, fill, ok,
     worst_rel, zeros,
 };
 
@@ -106,19 +106,13 @@ const W_SCALE: f32 = 0.2;
 /// plus an 8-level ladder at 2^-24), and a bar under that rejects correct code.
 const BAR: f32 = 2.0e-6;
 
-/// `n` draws uniform in `[-scale, scale)` from a salted stream — the fixture draw the ported file
-/// spells `fill(n, salt, scale)`. Salted rather than sequential because `x` and `w` must be
-/// INDEPENDENT: drawn from one stream in order they would still be independent, but the tests
-/// below reuse one of the pair across cases and a shared cursor makes that unspellable.
-///
-/// > Each of the three `kernel_glimmer_*.rs` files spells its own draw and none of them can share
-/// > a body: the shared spelling belongs in `common/reference.rs` beside `Lcg` and `block_scales`,
-/// > and `common/` is outside this port's file scope. That is a debt, not a design — hoist it and
-/// > delete all three the next time `common/` is open.
-fn fill(n: usize, salt: u64, scale: f32) -> Vec<f32> {
-    let mut r = Lcg(salt);
-    (0..n).map(|_| r.f() * scale).collect()
-}
+// The fixture draw this file spelled as its own `fill(n, salt, scale)` is now
+// `common::fill`, HOISTED 2026-08-16 with M8's V4 oracles — which is what the debt note here
+// asked for by name ("hoist it and delete all three the next time `common/` is open"). The
+// salted form's argument travelled with the body and is at `common::fill`: `x` and `w` must be
+// INDEPENDENT, and the tests below reuse one of the pair across cases, which a shared cursor
+// makes unspellable. Nothing about the stream changed — `Lcg(salt)` then `n` draws, scaled — so
+// every measurement in this file is against the same bytes.
 
 /// The weightless norm's four values for a QK-norm of `rows` heads at Glimmer's `head_dim`.
 ///

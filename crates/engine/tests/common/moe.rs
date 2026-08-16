@@ -117,8 +117,19 @@ pub fn drain(d: Drain<'_>, row: usize, hidden: usize, stream: &HipStream) {
 }
 
 /// The descriptor ARRAY on device — the addresses themselves, uploaded verbatim.
-pub fn desc_buf(descs: &[ExpertDesc]) -> DeviceBuf {
-    // SAFETY: `ExpertDesc` is plain pointers, and the span is exactly the slice's own bytes.
+///
+/// **Generic over the descriptor since 2026-08-16**, when M8's `kernel_v4_moe.rs` needed the
+/// same upload for `ExpertDescF4` — six `*const u8` where [`ExpertDesc`] is four wider
+/// pointers. A second body would have been a second `size_of_val`/`from_raw_parts` pair, which
+/// is what `build.rs`'s duplication gate is for, and the arithmetic reads no field: it is the
+/// slice's own byte span either way.
+///
+/// It does NOT weaken the type separation `ExpertDescF4`'s doc argues for. That separation
+/// lives at the CONSTRUCTION sites, which stay type-checked; this is already downstream of the
+/// `buf.ptr() as *const _` cast that doc records as compiling either way.
+pub fn desc_buf<T: Copy>(descs: &[T]) -> DeviceBuf {
+    // SAFETY: both descriptor types are plain pointers, and the span is exactly the slice's
+    // own bytes.
     dev(unsafe {
         std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs))
     })

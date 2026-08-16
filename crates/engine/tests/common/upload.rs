@@ -126,6 +126,23 @@ pub fn dev(b: &[u8]) -> rivoli_engine::device::DeviceBuf {
     d
 }
 
+/// A fresh non-blocking stream, for the oracles that launch onto one rather than onto null.
+///
+/// **A real stream and not `null_mut()` is a deliberate choice each caller inherits**: the
+/// launchers took a stream parameter before any oracle passed one, and a suite that only ever
+/// passed null would score the arithmetic without exercising the argument. It says nothing about
+/// WHICH stream an operation landed on — a launch on the null stream produces identical bytes —
+/// only that the parameter is threaded.
+///
+/// Here rather than per file since M8: five V4 suites opened one with the same line, which is five
+/// places for the failure message to drift and one clone `build.rs`'s gate reported. Guard tests
+/// that reject before any launch keep passing `null_mut()` at the call, for the reason they each
+/// state: there is no launch for a stream to order.
+#[cfg(feature = "rocm")]
+pub fn stream() -> rivoli_backend::gpustream::HipStream {
+    rivoli_backend::gpustream::HipStream::new().expect("hip stream")
+}
+
 /// The device buffer type every helper here returns and every oracle file names.
 ///
 /// Re-exported rather than imported per file: `use rivoli_engine::device::DeviceBuf;` sat

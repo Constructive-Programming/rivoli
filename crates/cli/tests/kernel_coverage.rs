@@ -26,25 +26,19 @@ mod common;
 /// milestone and the old-tree oracle file that covers it there, so the port task is
 /// written down where the gap is enforced.
 const DEFERRED: &[(&str, &str)] = &[
-    // (Muse Glimmer's six rows retired 2026-08-16 with M7's oracles — `kernel_glimmer_norm.rs`,
-    // `kernel_glimmer_attend.rs` and `kernel_glimmer_pointwise.rs` under `crates/engine/tests`.
-    // The table can only shrink, and this is what that looks like.)
-    // DeepSeek-V4-Flash (M8) — old:tests/{f4_kernel,f4_attn,kvcompress_kernel,blockindex_kernel}.rs
-    ("act_quant_f4_rotated", "M8: old:tests/kvcompress_kernel.rs"),
-    ("act_quant_f8", "M8: old:tests/f4_kernel.rs"),
-    ("act_quant_f8_prefix", "M8: old:tests/kvcompress_kernel.rs"),
-    ("gather_attn_shared_kv", "M8: old:tests/f4_attn.rs"),
-    ("gemv_fp8_bf16", "M8: old:tests/f4_kernel.rs"),
-    ("hc_post", "M8: old:tests/f4_kernel.rs"),
-    ("hc_pre", "M8: old:tests/f4_kernel.rs"),
-    ("index_score_blocks", "M8: old:tests/blockindex_kernel.rs"),
-    ("kv_compress_decode", "M8: old:tests/kvcompress_kernel.rs"),
-    ("kv_compress_deposit", "M8: old:tests/kvcompress_kernel.rs"),
-    ("kv_compress_prefill", "M8: old:tests/kvcompress_kernel.rs"),
-    ("moe_expert_range_f4", "M8: old:tests/f4_kernel.rs"),
-    ("rmsnorm_single", "M8: old:tests/f4_kernel.rs"),
-    ("rope_adjacent", "M8: old:tests/f4_attn.rs"),
-    ("swiglu_clamped_bf16", "M8: old:tests/f4_kernel.rs"),
+    // **EMPTY, 2026-08-16.** Muse Glimmer's six rows retired that day with M7's oracles
+    // (`kernel_glimmer_{norm,attend,pointwise}.rs`); DeepSeek-V4-Flash's fifteen retired the same
+    // day with M8's (`kernel_v4_{moe,quant,shared_expert,hc,compress,compress_defects,indexer,
+    // attend}.rs`, ported from `old:tests/{f4_kernel,f4_attn,kvcompress_kernel,
+    // blockindex_kernel}.rs`). The table can only shrink, and this is what the bottom of that
+    // looks like.
+    //
+    // **It stays declared, and not because a row is expected.** Its two both-ends checks are what
+    // make it a port-transient rather than an exemption list, and deleting the table would delete
+    // them along with the census's own statement of the difference. An empty table also makes the
+    // `missing` assertion below the sole authority again, which is the state the header describes
+    // as the goal — every launcher covered, none deferred. The next architecture's port adds rows
+    // here and then removes them; that cycle is the design.
 ];
 
 /// Launcher names in `text`, under both declaration forms (hand-written `pub unsafe fn

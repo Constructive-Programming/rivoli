@@ -46,7 +46,7 @@
 use rivoli_backend::hip::{device_sync, launch_logit_softcap, launch_sigmoid_gate};
 
 mod common;
-use common::{Got, Lcg, Want, assert_guard, back, dev, f32b, f32v, ok, worst_rel};
+use common::{Got, Want, assert_guard, back, dev, f32b, f32v, fill, ok, worst_rel};
 
 /// Glimmer's text vocabulary — the dim `logit_softcap` is about, and one nothing else in this
 /// tree runs a pointwise kernel over. Pinned against the shipped `config.json` in
@@ -106,20 +106,11 @@ const SOFTCAP_TOL: f32 = 1.0e-6;
 /// with nothing behind it here.
 const GATE_TOL: f32 = 1.0e-5;
 
-/// `n` draws uniform in `[-scale, scale)`.
-///
-/// > Written as a fill over a preallocated vector rather than as the `(0..n).map(…)` its sibling
-/// > `kernel_glimmer_norm.rs` uses, and `kernel_glimmer_attend.rs` has a third spelling. **They
-/// > cannot share a body**: the shared one belongs in `common/reference.rs` beside `Lcg` and
-/// > `block_scales`, and `common/` is outside this port's file scope, so `build.rs`'s duplication
-/// > gate is what keeps the three apart. That is a debt this port owes — hoist it and delete all
-/// > three the next time `common/` is open.
-fn fill(n: usize, salt: u64, scale: f32) -> Vec<f32> {
-    let mut r = Lcg(salt);
-    let mut v = vec![0.0f32; n];
-    v.iter_mut().for_each(|x| *x = r.f() * scale);
-    v
-}
+// The `fill(n, salt, scale)` this file spelled over a preallocated vector — a third spelling of
+// its two siblings' draw, kept distinct only by `build.rs`'s duplication gate — is now
+// `common::fill`, HOISTED 2026-08-16 with M8's V4 oracles. That is what this file's debt note
+// asked for by name ("hoist it and delete all three the next time `common/` is open"); the
+// third spelling was the whole of the debt, and the shared body draws the identical stream.
 
 /// `logit_softcap` over a copy of `x`, returning what the device produced.
 fn softcap(x: &[f32], s: Softcap) -> Vec<f32> {

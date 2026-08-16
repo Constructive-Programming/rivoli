@@ -114,6 +114,45 @@ pub fn assert_rel(want: &[f32], got: &[f32], label: &str, ratio: f32) {
     );
 }
 
+/// A whole table of [`assert_guard`] rows: `(expected code, what, the launcher's result)`.
+///
+/// The loop is here because the four V4 guard tests each ended in the identical three lines and
+/// `build.rs`'s duplication gate reported it (2026-08-16) — correctly, since a second copy is a
+/// second place for a table to stop being iterated. Taking the table by `IntoIterator` rather than
+/// `Vec` lets a caller pass an array literal, which is what every one of them has.
+pub fn assert_guards<T: std::fmt::Debug>(
+    cases: impl IntoIterator<Item = (u32, &'static str, anyhow::Result<T>)>,
+) {
+    for (code, what, r) in cases {
+        assert_guard(r, Some(code), what);
+    }
+}
+
+/// The NEGATIVE of [`assert_rel`] at the SAME ratio: the two must not agree.
+///
+/// **Every deliberate-break arm goes through here rather than through a bare `assert_ne!`, and
+/// the shared threshold is what makes the pair meaningful**: a break that moved the result by
+/// less than the positive gate's tolerance is a break that gate would NOT have caught, so it
+/// must fail here rather than pass. A bare inequality would accept a one-ulp move as proof that
+/// a `w1`/`w3` swap is visible.
+///
+/// Added 2026-08-16 with M8's V4 oracles, whose fp4 and fp8 expert suites each carry a set of
+/// them; a second body of this is what `build.rs`'s duplication gate is for, and the ratio has
+/// to be the caller's for the reason [`assert_rel`] gives.
+pub fn assert_separates(want: &[f32], got: &[f32], label: &str, ratio: f32) {
+    let (err, tol) = report_rel(
+        Want(want),
+        Got(got),
+        &format!("{label} (must differ)"),
+        ratio,
+    );
+    assert!(
+        err > tol,
+        "{label}: err={err:.3e} <= tol={tol:.3e} — the break is INVISIBLE at the tolerance the \
+         POSITIVE gate passes at, so that gate proves nothing about it"
+    );
+}
+
 /// Report the max error AND the threshold it was compared against. Printing BOTH is the
 /// point: a green oracle that passed on 100x of headroom looks exactly like one that passed
 /// on 2x, and only one of them is evidence of anything.
