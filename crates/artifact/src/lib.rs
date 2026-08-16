@@ -7,6 +7,7 @@
 //! tokenizer, and the converters' sealed writer. Host-only and featureless:
 //! every test here runs in the featureless CI job.
 pub mod arch;
+pub mod drafter_config;
 pub mod format;
 pub mod glimmer;
 pub mod glimmer_config;
