@@ -48,7 +48,7 @@ use rivoli_artifact::format::{
 use rivoli_artifact::quant::V4_PROJ;
 use rivoli_artifact::quant::f4::f4_expert_stride;
 use rivoli_artifact::v4_config::V4Config;
-use rivoli_core::residency::{Partition, Unit};
+use rivoli_core::residency::Unit;
 
 /// One hyper-connection block's three f32 tables: `<base>_base`, `<base>_fn`, `<base>_scale`.
 ///
@@ -161,9 +161,6 @@ pub struct V4Pin {
     /// fds these `File`s own, so dropping this closes them under a live pool.
     #[allow(dead_code)]
     f4: ExpertSet,
-    /// The partition that placed this run. Kept so the startup log and tests can cite the
-    /// decision rather than re-deriving it.
-    pub placement: Partition,
     /// The routed FP4 streaming pool. **Not optional, and that is the size argument**: the
     /// shipped 43-layer `.f4` set is 137 GiB against a ~115 GiB budget, so unlike GLM's
     /// (~41% residency) V4's routed experts cannot all be resident on any configuration this
@@ -443,7 +440,6 @@ impl V4Pin {
             // Opened LAST, after every resident byte is placed: the tier's allocation is the
             // one that must not fail, and the pool's reservation is ~100x its size.
             routed: RoutedPool::new(pool, geom)?,
-            placement,
         })
     }
 

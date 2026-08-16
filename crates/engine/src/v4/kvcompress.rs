@@ -341,7 +341,10 @@ impl V4Engine<'_> {
     /// decode's selection space IS the persistent buffer. The `if` below tests the two BASES,
     /// not the phase.
     pub(super) fn compress_and_place(&mut self, layer: usize, at: Extent) -> Result<()> {
-        let (win, hd) = (self.cfg.sliding_window, self.cfg.head_dim);
+        // Off `Dims`, not `cfg`, for `attn::write_ring`'s reason: the placement bases below
+        // and the ring writes deposit into the SAME cache buffer, so they must share one
+        // authority for its width — "equal by construction" is two authors one edit apart.
+        let (win, hd) = (self.dims.window, self.dims.head_dim);
         let li = layer - self.range.start;
         let kind = self.layers[li].kind;
         if self.layers[li].comp.is_none() {
@@ -436,7 +439,7 @@ impl V4Engine<'_> {
         let (sel_base, _) =
             sel.context("compress_dst named a persistent destination and no selection one")?;
         if sel_base != persist_base {
-            let rows = self.max_m + self.max_m.div_ceil(self.tightest_ratio());
+            let rows = self.a_kv_rows;
             ensure!(
                 sel_base + blocks <= rows,
                 "layer {layer}: {blocks} block(s) at kv row {sel_base} overrun the {rows}-row \
@@ -444,13 +447,6 @@ impl V4Engine<'_> {
             );
         }
         Ok(())
-    }
-
-    /// The ratio `a_kv`'s compressed tail was sized at — the tightest any layer class uses, so
-    /// one buffer serves every layer. Read through [`LayerKind`] rather than spelled, so a
-    /// change to which ratio carries an indexer lands here too.
-    pub(super) fn tightest_ratio(&self) -> usize {
-        LayerKind::Overlap.compressor_ratio().unwrap_or(1)
     }
 
     /// Assemble the compressor's inputs, make the call, and hand back `(blocks emitted, the

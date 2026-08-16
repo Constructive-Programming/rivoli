@@ -3,9 +3,11 @@
 //!
 //! Ported from `old:tests/blockindex_kernel.rs`. The two halves are gated against DIFFERENT
 //! references and the difference matters: the spread against the frozen oracle's own primitives,
-//! the score against a host transliteration of `model.py:425-427` that **the oracle currently
-//! contradicts** (see [`host_score`]). A green run of the score half is not a correctness verdict
-//! until the oracle's fix lands.
+//! the score against a host transliteration of `model.py:425-427` that the oracle AGREES with —
+//! `Oracle::bf16_sum`'s default arm accumulates in f32 and rounds once, corrected 2026-08-05,
+//! with the running fold surviving only as `Defect::IndexerBf16RunningSum`. (This header said
+//! "the oracle currently contradicts [`host_score`]; a green run is not a correctness verdict"
+//! long after that correction landed — stale as of the port, caught by review 2026-08-16.)
 //!
 //! # Why the SCORE matrix and not the selected sets
 //!
@@ -20,14 +22,13 @@
 //!
 //! # What this file provably cannot detect — read before trusting it
 //!
-//! * **Anything the oracle is also wrong about**, though the one instance found is CONFIRMED and
-//!   fixed on this side. `Oracle::indexer` sums the per-head products as a bf16 RUNNING fold,
-//!   while `torch.sum` over bf16 accumulates through `acc_type` — f32 — and rounds ONCE. That is
-//!   a property of the reduction, measured off-repo against CPU torch, with no reproducer in this
-//!   tree. The kernel and [`host_score`] both do what torch does and
-//!   [`host_score_accumulates_in_f32_not_bf16`] is the in-tree guard; **the oracle's fix is owned
-//!   elsewhere**, so do not read a comparison against the current indexer goldens as evidence in
-//!   either direction.
+//! * **Anything the oracle is also wrong about.** The one instance ever found — the per-head
+//!   score sum as a bf16 RUNNING fold where `torch.sum` accumulates f32 and rounds ONCE — was
+//!   corrected in the oracle on 2026-08-05 (`Oracle::bf16_sum`, which carries the measurement);
+//!   the kernel, [`host_score`] and the oracle now all do what torch does, and
+//!   [`host_score_accumulates_in_f32_not_bf16`] is the in-tree guard that the transliteration
+//!   stays that way. The class of failure remains: a defect shared by oracle and kernel is
+//!   invisible here by construction.
 //! * **The summation ORDER.** The bf16 fold pinned it as a side effect and an f32 accumulator does
 //!   not; torch's own reduction is vectorized and tree-shaped. The kernel and [`host_score`] agree
 //!   with each other exactly, and neither is pinned to torch's order.
@@ -420,11 +421,11 @@ fn device_score(c: ScoreCase<'_>) -> Vec<f32> {
 
 /// `model.py:425-427` on the host — the value `index_score_blocks` must reproduce.
 ///
-/// **Transcribed from `model.py`, not from `Oracle::indexer`** — and that stopped being only a
-/// limitation and became the reason this file is right where the oracle is wrong: `Oracle::indexer`
-/// folds the head sum in bf16 per term, where `torch.sum` accumulates in f32 and rounds once. The
-/// oracle's fix is owned elsewhere; this reference already matches the measured behaviour, so
-/// **the two will disagree until it lands.**
+/// **Transcribed from `model.py`, not from `Oracle::indexer`** — deliberately, so a defect in the
+/// oracle's own transliteration would surface as a disagreement here rather than being shared.
+/// It caught exactly one: the head sum as a bf16 running fold where `torch.sum` accumulates f32
+/// and rounds once — corrected in the oracle 2026-08-05 (`Oracle::bf16_sum`), so the two now
+/// agree; the fold survives only as `Defect::IndexerBf16RunningSum`.
 ///
 /// The rest of the distinction is the honest limit of this comparison. The oracle computes this
 /// chain inside `indexer` but exposes neither the roped-and-spread `q` nor the scaled `weights`,

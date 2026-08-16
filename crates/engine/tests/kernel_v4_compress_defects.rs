@@ -158,11 +158,19 @@ fn in_compressor_scope(d: Defect) -> bool {
         | Defect::KvActQuantWholeTensor
         | Defect::KvActQuantBlock128
         | Defect::KvActQuantNoRoundScale
+        // In scope BECAUSE of the `if compressed` guard on its `Oracle::freqs` arm: base-theta
+        // YaRN swaps the table on exactly the layers this sweep drives. Its twin
+        // `RopeYarnEverywhere` guards `if !compressed` and is the excluded one below — the
+        // first classification lumped the two as a pair and excluded both, with a stated
+        // reason ("keys off a ratio-0 layer") that is true only of the twin (review
+        // 2026-08-16). An excluded defect is simply never run, so the sweep itself could not
+        // catch the misclassification.
+        | Defect::RopeBaseThetaEverywhere
         | Defect::NoBf16Rounding => true,
-        // `None` is the baseline, not a breakage. `RopeYarnEverywhere` and
-        // `RopeBaseThetaEverywhere` key off a ratio-0 layer, which by construction has no
-        // compressor at all. Everything below belongs to the attention core, the router and MoE,
-        // the indexer, or the head tail.
+        // `None` is the baseline, not a breakage. `RopeYarnEverywhere` keys off a ratio-0
+        // layer (`if !compressed`), which by construction has no compressor at all.
+        // Everything below belongs to the attention core, the router and MoE, the indexer,
+        // or the head tail.
         //
         // `IndexerBf16RunningSum` is the indexer's per-head score reduction, and the indexer has
         // its OWN compressor — distinct instance, distinct algorithm (fp4 + Hadamard, not partial
@@ -170,7 +178,6 @@ fn in_compressor_scope(d: Defect) -> bool {
         // after the last block, downstream of everything here.
         Defect::None
         | Defect::RopeYarnEverywhere
-        | Defect::RopeBaseThetaEverywhere
         | Defect::SkipQkNorm
         | Defect::QkNormUsesQNormWeight
         | Defect::QkNormAfterRope

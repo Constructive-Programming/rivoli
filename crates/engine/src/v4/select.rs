@@ -19,7 +19,7 @@
 //! The two coincide at decode and disagree at prefill, and passing one where the other is due
 //! aims every selected index at the wrong buffer — in bounds, finite, and wrong.
 
-use super::geometry::LayerKind;
+use super::geometry::{LayerKind, tightest_ratio};
 use anyhow::{Result, bail, ensure};
 
 /// The rows one call covers: how many query rows, and where the first one sits.
@@ -94,11 +94,7 @@ impl Extent {
 /// context at or above this at startup; [`Sel::shape`] refuses it again at the call, which is
 /// not redundant — a hand-built `Sel` never passed the startup check.
 pub fn positional_context_limit(index_topk: usize) -> usize {
-    // The indexed ratio, from the only layer class that has an indexer. Read through
-    // `LayerKind` rather than spelled, so a future change to which ratio carries one lands
-    // here too.
-    let ratio = LayerKind::Overlap.compressor_ratio().unwrap_or(1);
-    ratio * (index_topk + 1)
+    tightest_ratio() * (index_topk + 1)
 }
 
 /// Which sliding-window ring slots each query row may read, `-1` for "nothing there yet".

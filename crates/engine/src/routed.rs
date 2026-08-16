@@ -31,7 +31,6 @@ mod geom;
 mod trace;
 
 pub use geom::{ExpertSlot, ProjSlot, RoutedGeom, expert_key, slot_at};
-pub use trace::TRACE_WINDOW;
 
 use crate::device::VmmBuf;
 use crate::fetch::asyncfetch::{AsyncFetch, ReadSpec, Ticket};
@@ -140,14 +139,14 @@ pub struct RoutedPool {
     fetch: AsyncFetch,
     hits: u64,
     misses: u64,
-    /// The ranked top-[`TRACE_WINDOW`] candidates for the layer in flight — trace state, and
+    /// The ranked top-[`trace::TRACE_WINDOW`] candidates for the layer in flight — trace state, and
     /// EMPTY on every run that is not capturing. It lives here rather than on each arm's
     /// engine because nothing but [`RoutedPool::write_trace`] reads it, and a buffer two
     /// callers fill for one reader is two places to fill it wrongly.
     window: Vec<usize>,
     /// Optional access-trace sink (`--trace`), format v2: a `#` header line, then one
     /// line per resolved MoE layer — the `(layer,expert)` keys looked up in access
-    /// order, then `|`, then the top-[`TRACE_WINDOW`] router candidates as
+    /// order, then `|`, then the top-[`trace::TRACE_WINDOW`] router candidates as
     /// `key:choice` in rank order. Feeds the offline `replay` simulator.
     trace: Option<std::io::BufWriter<std::fs::File>>,
 }

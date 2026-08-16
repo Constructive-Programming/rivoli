@@ -29,7 +29,7 @@ use rivoli_artifact::format::{
 };
 use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_artifact::quant::vq::{VQ_DIM, VQ_K};
-use rivoli_core::residency::{Partition, Unit};
+use rivoli_core::residency::Unit;
 
 /// `Fp8Weight` and `Fp8Mlp` moved to [`crate::resident`] when the V4 arm needed the same
 /// two (M8) — same types, same bodies, one home. Re-exported so every
@@ -94,10 +94,6 @@ pub struct GlmPin<'a> {
     /// run, not read through after `build`.
     #[allow(dead_code)]
     src: ExpertSet,
-    /// The partition that placed this run: how many routed experts fit resident
-    /// beyond the batch slots. Kept so the startup log and tests can cite the
-    /// decision rather than re-deriving it.
-    pub placement: Partition,
     pub routed: RoutedPool,
 }
 
@@ -212,7 +208,7 @@ impl<'a> GlmPin<'a> {
         // `top_k * MAXROW + n_shared` and not one row's picks. `Batch::union` is where that
         // bound is checked, at startup, with the friendly message.
         let batch = Batch::union(cfg.top_k, super::MAXROW, cfg.n_shared, unit)?;
-        let (placement, pool) = PoolPlan::new("GLM", &units, tier_cap, batch).decide(pin)?;
+        let (_, pool) = PoolPlan::new("GLM", &units, tier_cap, batch).decide(pin)?;
         let mut tier = DeviceTier::new(tier_cap)?;
 
         // Codebooks resident (gate/up/down), narrowed f32 → fp16 at load. VQ only —
@@ -247,7 +243,6 @@ impl<'a> GlmPin<'a> {
             moe_bias,
             codebooks,
             src,
-            placement,
             routed,
         })
     }

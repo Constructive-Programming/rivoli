@@ -13,7 +13,7 @@
 //! **Every device buffer is allocated once, here.** A decode allocates nothing on the hot
 //! path, which is `crate::glm::engine`'s rule and the reason both engines' `new` are long.
 
-use super::geometry::{Dims, LayerKind};
+use super::geometry::{Dims, LayerKind, tightest_ratio};
 use super::kvcompress::LayerCompressor;
 use super::rope::{self, Params};
 use super::select::positional_context_limit;
@@ -253,6 +253,11 @@ pub struct V4Engine<'a> {
     /// happens to cover the spill for `max_m >= 2` but not at `max_m == 1`, so the slack is
     /// explicit rather than counted out of rows.
     pub(super) a_kv: DeviceBuf,
+    /// How many `head_dim` rows [`Self::a_kv`] was ALLOCATED with — carried for the reason
+    /// `DeviceLayer` carries `cache_rows`: `DeviceBuf` has no length, and the selection-space
+    /// bound in `kvcompress::check_block_room` must compare against what was actually
+    /// allocated, not against a second copy of the sizing arithmetic (review 2026-08-16).
+    pub(super) a_kv_rows: usize,
     pub(super) a_o: DeviceBuf,
     pub(super) a_y: DeviceBuf,
     pub(super) idx_host: Vec<i32>,
@@ -370,8 +375,9 @@ impl<'a> V4Engine<'a> {
         // `min(m, win) + m/ratio`, decode is one row of `win + max_ctx/ratio`. Taken as the
         // bound of BOTH rather than assumed to be one of them, and at the tightest ratio
         // because one buffer serves every layer class.
-        let tightest = LayerKind::Overlap.compressor_ratio().unwrap_or(1);
+        let tightest = tightest_ratio();
         let idx_cols = cfg.sliding_window + max_ctx.div_ceil(tightest);
+        let a_kv_rows = max_m + max_m.div_ceil(tightest);
         let mut layers = Vec::with_capacity(range.len());
         for l in range.clone() {
             let kind =
@@ -403,7 +409,8 @@ impl<'a> V4Engine<'a> {
             a_qr: f32s(max_m * cfg.q_lora_rank)?,
             a_qrq: f32s(max_m * cfg.q_lora_rank)?,
             a_q: f32s(max_m * nhd)?,
-            a_kv: f32s((max_m + max_m.div_ceil(tightest)) * hd + cfg.q_lora_rank)?,
+            a_kv: f32s(a_kv_rows * hd + cfg.q_lora_rank)?,
+            a_kv_rows,
             a_o: f32s(max_m * nhd)?,
             a_y: f32s(max_m * cfg.o_groups * cfg.o_lora_rank)?,
             idx_host: Vec::with_capacity(max_m * idx_cols),

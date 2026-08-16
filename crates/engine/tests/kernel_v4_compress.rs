@@ -153,6 +153,12 @@ fn the_four_cells_reproduce_the_oracle() {
         println!("{}", dv.one_line(name));
         over.extend(assert_clean(name, &dv));
     }
+    no_cell_over(&over);
+}
+
+/// The deferred verdict both oracle-comparison tests end on: report-then-assert, so a
+/// multi-cell run prints every cell's diagnostic before any one of them aborts the binary.
+fn no_cell_over(over: &[String]) {
     assert!(
         over.is_empty(),
         "clean comparison failed:\n  {}",
@@ -160,12 +166,17 @@ fn the_four_cells_reproduce_the_oracle() {
     );
 }
 
-/// The ratio-128 prefill at 256 reads NO compressor state — re-proved against the GPU.
+/// The ratio-128 prefill at 256 reads NO initial compressor state — proved by NaN poison —
+/// and its output reproduces the oracle, which no other test compares at a whole multiple.
 ///
 /// A previous session of this port asserted a block-to-block state carry here that does not
-/// exist, and two reviewers disproved it by substituting zero-length state buffers and getting
-/// bit-identical output. The technique is what is worth keeping, so it is applied to the kernel:
-/// `Cell::run` allocates fresh state per call, so two identical runs must agree bit-for-bit.
+/// exist, and two reviewers disproved it on the HOST by substituting zero-length state
+/// buffers. The device equivalent is `Run::state_poison`: NaN in every initial state word, so
+/// a kernel that reads any of it propagates NaN into its output and the bit-compare goes red.
+/// (The first port of this test ran the kernel twice on FRESH state and compared — which
+/// proves harness determinism only, since a state-reading kernel reads the same neutral fills
+/// both times; review 2026-08-16.) The clean run is asserted finite first, because NaN breaks
+/// `==` the other way too — a poison compare against a NaN-carrying baseline proves nothing.
 ///
 /// Scoped to a whole multiple of the ratio on purpose — at 300 tokens the remainder path DOES
 /// write state, which is why the cell list uses 300 for the ratio-128 prefill cell.
@@ -179,12 +190,26 @@ fn state_is_not_read_by_the_ratio_128_prefill_at_a_whole_multiple() {
     );
     let script = vec![(PROBE_LEN, 0)];
     let mut cell = Cell::load(&ck, &c, 3);
-    let (_, base) = cell.run(Run::clean(&script));
-    let (_, again) = cell.run(Run::clean(&script));
+    let (want, base) = cell.run(Run::clean(&script));
     assert!(!base.is_empty(), "256 tokens pools two ratio-128 blocks");
+    assert!(
+        base.iter().all(|v| v.is_finite()),
+        "the clean run is not finite — the poison compare below would be vacuous"
+    );
+    // The whole-multiple path against the oracle. The four-cell sweep uses 300 tokens for
+    // ratio-128 prefill, so without this the 256-token path is value-compared nowhere.
+    let dv = diff(&want, &base, Widths::of(&c.engine));
+    println!("{}", dv.one_line("ratio128/prefill-256"));
+    no_cell_over(&assert_clean("ratio128/prefill-256", &dv));
+
+    let (_, poisoned) = cell.run(Run {
+        state_poison: true,
+        ..Run::clean(&script)
+    });
     assert_eq!(
-        base, again,
-        "the harness is not deterministic — nothing else here is evidence"
+        base, poisoned,
+        "output moved when only the INITIAL state changed — the whole-multiple prefill read \
+         compressor state it is documented not to touch"
     );
 }
 

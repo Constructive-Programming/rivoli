@@ -233,9 +233,11 @@ impl Cell {
         let clean_table = self.table(Defect::None);
         let freqs = Dev::f32(r.freqs_over.unwrap_or(&clean_table));
         let ape_over = r.ape_over.map(Dev::f32);
+        let init =
+            |neutral: f32| Dev::filled(ents * cd, if r.state_poison { f32::NAN } else { neutral });
         let mut bufs = Scratch {
-            kv_state: Dev::filled(ents * cd, 0.0),
-            score_state: Dev::filled(ents * cd, f32::NEG_INFINITY),
+            kv_state: init(0.0),
+            score_state: init(f32::NEG_INFINITY),
             kv: Dev::filled(max_rows * cd, 0.0),
             score: Dev::filled(max_rows * cd, 0.0),
             out: Dev::filled(max_rows.div_ceil(self.ratio()).max(1) * d, 0.0),
@@ -447,6 +449,13 @@ pub struct Run<'a> {
     pub steps: &'a [(usize, usize)],
     pub ape_over: Option<&'a [f32]>,
     pub freqs_over: Option<&'a [f32]>,
+    /// Fill the DEVICE's initial `kv_state`/`score_state` with NaN instead of the neutral
+    /// fills. The oracle side is untouched — the point is one-sided: a kernel that reads any
+    /// initial state propagates NaN into its output (NaN survives every arithmetic path), so
+    /// output bit-identical to a clean run proves the initial state was never read. A fresh
+    /// zero/−inf state cannot prove that: it is exactly what a state-reading kernel would
+    /// read anyway (review 2026-08-16).
+    pub state_poison: bool,
 }
 
 impl<'a> Run<'a> {
@@ -457,6 +466,7 @@ impl<'a> Run<'a> {
             steps,
             ape_over: None,
             freqs_over: None,
+            state_poison: false,
         }
     }
 }

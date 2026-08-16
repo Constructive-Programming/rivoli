@@ -130,6 +130,16 @@ impl LayerKind {
     }
 }
 
+/// The tightest compressor ratio any layer class uses — what sizes shared selection-space
+/// buffers and bounds the indexer's positional reach, since one buffer serves every class.
+///
+/// Read through [`LayerKind`] rather than spelled, so a change to which ratio carries an
+/// indexer lands here — and only here: three call sites each spelling this read carried
+/// the same comment making that promise, which three copies cannot keep (review 2026-08-16).
+pub fn tightest_ratio() -> usize {
+    LayerKind::Overlap.compressor_ratio().unwrap_or(1)
+}
+
 /// Which quantization a compressor finishes with — the reference's `rotate` flag, which is
 /// the ONLY thing that differs between the attention compressor and the indexer's nested one.
 ///
@@ -358,7 +368,7 @@ impl Dims {
     /// One output group's width — the reduction extent the grouped projection is launched
     /// with. `o_groups` is non-zero by [`Dims::no_extent_is_zero`], which runs first.
     pub fn group_width(&self) -> usize {
-        self.n_heads * self.head_dim / self.o_groups.max(1)
+        self.n_heads * self.head_dim / self.o_groups
     }
 
     /// EVERY extent, not just the three that read as counts.
