@@ -257,7 +257,12 @@ impl<'a> GlmEngine<'a> {
     /// folds into it and every pass drains it.
     #[cfg(feature = "corruption-probe")]
     pub fn arm_divergence_log(&mut self, folds: crate::probe::Folds) -> Result<()> {
-        self.probe = Some(crate::probe::Probe::new(self.cfg.n_layers, folds)?);
+        let slot_bytes = self.pin.routed.slot_bytes();
+        self.probe = Some(crate::probe::Probe::new(
+            self.cfg.n_layers,
+            folds,
+            slot_bytes,
+        )?);
         Ok(())
     }
 

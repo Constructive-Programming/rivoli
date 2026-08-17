@@ -418,6 +418,13 @@ impl Streamer {
         #[cfg(feature = "corruption-probe")]
         if self.fold[ud].bh_armed() {
             let n = self.nbytes[ud] as usize / 4;
+            // `i_base = ud * n`, NOT 0. Every cold read of a layer folds into ONE accumulator, so
+            // at `i_base = 0` the fold would be invariant under two reads' payloads being SWAPPED
+            // between their destinations — a crossed destination is precisely the "wrong bytes in a
+            // slot" class under investigation, and it would leave the fold agreeing and be misread.
+            // The staging slot `ud` is deterministic given the miss sequence (INV-9), so it is
+            // comparable across runs. `se` got this fix a commit earlier; `bh`/`sc` were left at 0.
+            //
             // LOGGED, NOT `?`. A `?` here returns from `reap` after the CQE is consumed and
             // BEFORE `copy_to_slot`, so the reaper poisons, the ticket is released from the host,
             // and the miss kernel launches over a slot this layer never wrote. That is the
@@ -427,7 +434,14 @@ impl Streamer {
             // SAFETY: `src` owns `nbytes` readable bytes; `bh` is one live device u64; `stream` is
             // live.
             let r = unsafe {
-                rivoli_backend::launch_hash_rows(src as *const f32, n, 0, self.fold[ud].bh, stream)
+                rivoli_backend::launch_hash_rows(
+                    src as *const f32,
+                    n,
+                    1,
+                    (ud as u64) * n as u64,
+                    self.fold[ud].bh,
+                    stream,
+                )
             };
             if let Err(e) = r {
                 tracing::error!("divergence probe: bh fold failed on slot {ud} ({e:#})");
@@ -456,35 +470,38 @@ impl Streamer {
             // Logged rather than `?` for the reason given at `bh` above: a `?` here would abort a
             // copy the engine needs, i.e. the instrument changing what is computed.
             let n = self.nbytes[ud] as usize / 4;
-            let r = match self.fold[ud].sc_mode {
-                crate::fetch::asyncfetch::ScProbe::Off => Ok(()),
-                // SAFETY: no memory is read; `sc` is one live device u64 and `stream` is live.
-                crate::fetch::asyncfetch::ScProbe::Spin => unsafe {
-                    rivoli_backend::launch_spin_rows(n, self.fold[ud].sc, stream)
-                },
-                // `Full` and `Line` are the SAME call at different widths, and saying so in one
-                // arm is the honest factoring: the pair's entire experiment is that they differ in
-                // how much they read and in nothing else.
-                // SAFETY: `dst[ud]` is a live pool slot of `nbytes`; both widths are within it;
-                // `sc` is one live device u64; `stream` is live and the copy is already enqueued
-                // on it, so the read happens after.
-                mode => {
-                    let words = match mode {
-                        crate::fetch::asyncfetch::ScProbe::Line => {
-                            crate::fetch::asyncfetch::LINE_F32.min(n)
-                        }
-                        _ => n,
-                    };
-                    unsafe {
-                        rivoli_backend::launch_hash_rows(
-                            self.dst[ud] as *const f32,
-                            words,
-                            0,
-                            self.fold[ud].sc,
-                            stream,
-                        )
-                    }
+            // ONE call serves every arm; they differ only in WHICH buffer, HOW MUCH of it, and
+            // therefore how long they take. See `ScProbe` for the ladder and what each rung means.
+            let slot = self.dst[ud] as *const f32;
+            let (buf, count, stride) = match self.fold[ud].sc_mode {
+                crate::fetch::asyncfetch::ScProbe::Off => (slot, 0, 1),
+                crate::fetch::asyncfetch::ScProbe::Full => (slot, n, 1),
+                // Every cache line of the slot, ~1/32 of its bytes — a sweep that COVERS the slot,
+                // so unlike reading one line at the front it could actually be a fix.
+                crate::fetch::asyncfetch::ScProbe::Line => {
+                    (slot, n, crate::fetch::asyncfetch::LINE_F32)
                 }
+                // Same size, same bandwidth, same duration — a buffer that is NOT the slot.
+                crate::fetch::asyncfetch::ScProbe::Decoy => (self.fold[ud].decoy, n, 1),
+                // Same launch and the same stream-boundary cache maintenance, ~no work.
+                crate::fetch::asyncfetch::ScProbe::Nop => (self.fold[ud].decoy, 1, 1),
+            };
+            let r = match count {
+                0 => Ok(()),
+                // SAFETY: `buf` owns `count` readable f32 — the pool slot (`nbytes` bytes, live
+                // until this read's signal) or the decoy (allocated slot-sized). `sc` is one live
+                // device u64; `stream` is live and the copy is already enqueued on it, so any arm
+                // that reads the slot does so after it.
+                c => unsafe {
+                    rivoli_backend::launch_hash_rows(
+                        buf,
+                        c,
+                        stride,
+                        (ud as u64) * n as u64,
+                        self.fold[ud].sc,
+                        stream,
+                    )
+                },
             };
             if let Err(e) = r {
                 tracing::error!("divergence probe: sc fold failed on slot {ud} ({e:#})");

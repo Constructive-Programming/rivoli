@@ -1,7 +1,7 @@
 ---
 status: live
 scope: glm
-verdict: A WRONG-BYTES READ IN THE ROUTED-EXPERT POOL, and the working mechanism is now a DEVICE-SIDE VISIBILITY problem on the DMA. Localised on device 2026-08-17: at pos=164 layer=24 the `h` fold moved while `xn`, `gl`, `pk` and `sl` were IDENTICAL and relocs=0 — same experts, same slots, same input, different result. Then the decisive clue: the HEAVY probe SUPPRESSES it (2,048 instrumented tokens, zero events, P=0.11%/2.89%), and the distinguishing ingredient is a read of the pool slot immediately after the copy — so the consumer appears to read a slot whose `hipMemcpyAsync` was signalled but whose bytes are not yet coherently visible, and any extra read forces the ordering. `--mode int4` diverges too (body line 28, different stride and kernel), which retires "vq3-specific" and shows THE RATE IS PER READ, NOT PER TOKEN. Attention, routing, placement, relocation and MoE accumulation are all out of frame; no float atomic exists in any kernel, so identical bytes give identical results. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT. `--divergence-folds` now enables one fold at a time (default none, since all-on is the suppressor) and Phase 2's `sc-spin` / `sc-line` variants separate a pure-TIME hazard from a repair-by-TOUCHING one. The toolchain is NOT exonerated. The determinism gate exists, floor 512, and its GREEN IS OWED because the engine is red.
+verdict: A WRONG-BYTES READ IN THE ROUTED-EXPERT POOL; the working mechanism is a device-side VISIBILITY problem on the bounce->GTT copy. TWO coordinates with OPPOSITE signatures, one mechanism: at pos=164 layer=24 `h` differed (gate/up read wrong bytes); at pos=186 layer=35 `h` was IDENTICAL and only `x` moved, which — since `h` is a CONSUMER-OUTPUT fold and the accumulator and drain are refuted — means the DOWN projection read wrong bytes from the same slot at a different instant. Hence the reading rule now distinguishes CONSUMER-OUTPUT columns (xa/xn/h/ac/x, whose agreement does constrain what the kernel consumed) from BYTES-AT-AN-INSTANT columns (bh/sc/se, whose agreement exonerates NOTHING). Control is live: unprobed diverges at line 66, light probe at 169, so the light probe does not suppress and the suppressor is the hop folds specifically (all-on: 2,048 tokens, zero events). HOP 1 IS LARGELY EXONERATED by a check already running — the artifact is on btrfs with datasum ON and btrfs verifies checksums on direct-IO reads, so every one of ~70-95k reads per arm is a storage test and the kernel log is clean; the surviving suspects are the bounce->GTT copy and the consumer reading before it is coherently visible. `--mode int4` diverges too, retiring "vq3-specific". Relocation carries no signal (33.6% of ordinary rows have relocs>0). THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT. `--divergence-folds` enables one fold at a time (default light) and Phase 2's sc-nop/sc-decoy/sc-line ladder separates a launch-boundary, a timing and a touch-the-bytes hazard. The toolchain is NOT exonerated. The determinism gate exists, floor 512, and its GREEN IS OWED because the engine is red.
 ---
 
 # GLM does not reproduce itself: the bytes read out of the pool slots differ
@@ -467,6 +467,105 @@ Red-proofed by making `scan_free` ignore `landed`.
 So an instrumented pair gives ONE coordinate, and the hop table above should be read as "one sample
 decides which hop we are on", not as "one run settles the mechanism".
 
+## The control, and a SECOND coordinate with the opposite signature
+
+**Control, same box and day, same pinned prompt (md5 `18927a780b36b029d03450d2100e9242`), all
+binaries built before any arm:** the unprobed pair diverged at body line **66** of 512, and the
+**v2 light-probe pair diverged at body line 169**. So the unmodified engine still diverges today
+and **the light probe does not suppress** — which isolates the suppressor to the v3 *hop* folds
+specifically and gives every ablation below a live baseline.
+
+The light pair's first differing row:
+
+```
+row 11814   pos=186  nrow=1  layer=35   misses=3  relocs=1
+  A   xn bd7368d84ea4b46f   h b7d6b00bf231b134   x 568ecb4fe448726f
+  B   xn bd7368d84ea4b46f   h b7d6b00bf231b134   x 327c32c8d8c34960
+      gl b545f4899bbd9bde   pk c2d211a6885ec420   sl 27e82e49106795e3   (identical)
+```
+
+**Only `x` moved; `h` is IDENTICAL** — the opposite of the token-164 event, where `h` differed and
+`x` followed.
+
+### What that means, and it is sharper than "`h` matching proves nothing"
+
+The reading offered with this result was that `h` is folded at one instant while the kernel reads
+the slot at another, so a corruption landing in between leaves `h` identical — and therefore that
+"`h` differing proves wrong bytes; `h` matching proves nothing". **The first half is right and the
+second half is too weak, because `h` is not a fold of the bytes.**
+
+`h` is `moe_hidden` — the *output* of the gate/up pass, folded after both MoE lanes are awaited. It
+is a **consumer-output** quantity: a function of what the kernel actually consumed, computed by the
+consumer itself. The gate/up kernel is deterministic given `(xn, gate/up weights)`, and `xn` is
+identical here. So `h` identical **does** prove the gate and up weights were read identically. The
+"fold at a different instant" caveat applies to `bh`/`sc`/`se`, which fold BYTES at a chosen moment;
+it does not apply to `h`, `x`, `ac` or `xn`.
+
+That distinction is now in the log's own header, in `tests/divergence-columns.sh`'s key, and at the
+flag, because getting it wrong in either direction misleads:
+
+- a **bytes-at-an-instant** column agreeing (`bh`, `sc`, `se`) → proves only that the bytes matched
+  when it looked. **No null on those exonerates a hop.**
+- a **consumer-output** column agreeing (`xa`, `xn`, `h`, `ac`, `x`) → the kernel is deterministic,
+  so equal output over equal other-inputs means the bytes it consumed were equal.
+
+So at this coordinate: gate/up read the right bytes, and everything between `h` and `x` is
+suspect — the **down projection**, the fixed-point accumulator, or the drain. The accumulator is
+refuted at the kernel (per-term saturating fixed point, wrapping u64 `atomicAdd`, lane split exactly
+equivalent to one accumulator) and the drain is deterministic given `moe_acc`. **The surviving
+reading is that the DOWN projection read different bytes** — the same slot as gate/up, a different
+sub-region (`down_indices`/`down_scales`), a *separate kernel launch*, and therefore a different
+instant. One mechanism, two signatures, depending on which part of the slot was stale when it was
+read.
+
+**Two gaps this exposed, both now closed rather than argued about.**
+
+1. `xn` is a **norm** of the residual, and rmsnorm is scale-invariant — so `xn` agreeing does not
+   strictly rule out a rescaled residual, which would leave `xn` identical and `x` different. That
+   is the alternative explanation for this exact coordinate, and it is a real (if implausible) hole.
+   **`--divergence-folds xa`** folds the residual *before* the norm and closes it.
+2. `h` and `x` cannot separate "the down projection read wrong bytes" from "the drain".
+   **`--divergence-folds ac`** folds the fixed-point accumulator after both lanes are awaited and
+   *before* the drain — the consumer-output witness for pass 2, exactly as `h` is for pass 1. With
+   it, this coordinate resolves in one run.
+
+Both are cheap (6,144 and ~24,576 elements against `h`'s ~98,000) and both are **opt-in**, so the
+light probe stays byte-identical to the configuration just proven not to suppress.
+
+### Relocation carries no signal at all
+
+`relocs > 0` occurs in **14,338 of 42,666 rows (33.6%)** of an ordinary run. The token-164 event
+fired at `relocs = 0` and this one at `relocs = 1`. Neither value carries weight, and the column
+stays only so that a future coordinate can be checked against it rather than assumed clean.
+
+## Hop 1 is largely exonerated, by a check that was already running
+
+The owner ran the kernel-log audit: **no MCE, no KFD resets, no amdgpu/SDMA faults, no NVMe AERs,
+no btrfs checksum errors**, across every window. On its own a clean log is weak evidence. Here it is
+not, and the reason is the filesystem: the artifact sits on **plain btrfs with `datasum` ON** (no
+`C` attribute on the slabs or their directory), and btrfs verifies checksums on **direct-IO** reads
+after the data lands. The engine reads io_uring O_DIRECT into a `hipHostMalloc` pinned arena, so
+**every one of the ~70,000–95,000 expert reads per arm is already a storage-integrity test**, and it
+reports clean.
+
+Bad bytes on the drive, or corruption in the NVMe→host DMA, would have EIO'd and logged. **They did
+not.** What that does NOT cover is anything after the verification: the arena sitting in host memory,
+and the `hipMemcpyAsync` from it into GTT.
+
+Two consequences:
+
+- **Phase 4's userspace storage repro drops sharply in value** — btrfs is already running that
+  experiment continuously, at scale, and it is clean.
+- **`bh` is not thereby redundant.** btrfs verifies at read completion; `bh` folds on the fetch
+  stream some time later, so `bh` differing would mean the arena changed *after* btrfs blessed it.
+  That is a real and otherwise-unwatched window, and it is why F1 keeps its place — with the
+  asymmetry above attached, since `bh` agreeing still cannot acquit.
+
+The surviving suspects are the **bounce→GTT copy** and the **consumer reading before that copy is
+coherently visible** — neither of which produces a kernel log entry, so a clean audit is exactly what
+they predict. That promotes F2 and Phase 2 to the main line, and pulls Phase 3's copy-by-kernel and
+blocking-`hipMemcpy` ablations forward.
+
 ## THE HEAVY PROBE SUPPRESSES THE DEFECT — and that is itself the strongest clue yet
 
 Two instrumented pairs on a quiet box, all three fetch-path folds on, **2,048 tokens and ZERO
@@ -518,8 +617,11 @@ int4 took **95,351 misses** against int3-vq's 70,030 over the same 512 tokens (+
 token 28 rather than 320–452. That is **one sample per mode**, so it cannot establish a per-read
 rate on its own — an exponential with mean 320 produces a first event at 28 about 8% of the time, so
 the observation is unsurprising under a per-TOKEN model too. What it does do is remove the reason to
-prefer per-token: the two modes differ in reads per token and in nothing else that should matter,
-and the one with more reads failed sooner. **Per-read is now the working model, not a measured
+prefer per-token — the mode with more reads failed sooner. It cannot go further than that, and an
+earlier draft of this paragraph overreached by saying the modes "differ in reads per token and in
+nothing else that should matter" three sentences after listing three differences. They also differ
+in BYTES (95,351 × 19.125 MiB against 70,030 × 14.625 MiB is **1.78×**, not the 1.36× of the read
+count) and in the kernel. So this single pair cannot separate per-read from per-byte either. **Per-read is now the working model, not a measured
 result**, and it is what makes an instrumented run worth its throughput cost and what the storage
 repro exploits to turn a 20-minute-per-arm hunt into millions of iterations per hour. Two more int4
 pairs would settle it cheaply.
@@ -583,27 +685,74 @@ is exact — XOR is associative and commutative — and `fwd_kernel.rs` still sc
 
 **Measure it on the first instrumented run** rather than trusting the paragraph above:
 `AsyncFetch::io_wait_ns` already reports the reaper's slack, and the run's own tok/s says what the
-folds cost. The masking risk is bounded by the coordinate measurement: the event fired on a QUIET
-box, and the rate is per READ rather than per second, so a run ~27% slower issues the same number of
-reads and should fire at a similar TOKEN position. **If it does not fire, that is itself
-informative** — it would mean the instrument perturbs, and would have to be recorded as such rather
-than read as a green.
+folds cost.
 
-### Phase 2: does the post-copy read repair by DELAY or by TOUCHING the bytes?
+> **FALSIFIED 2026-08-17, the same day, and left here rather than deleted because being wrong in a
+> stated way is the point of stating it.** This paragraph continued: *"The masking risk is bounded
+> by the coordinate measurement: the event fired on a QUIET box, and the rate is per READ rather
+> than per second, so a run ~27% slower issues the same number of reads and should fire at a similar
+> TOKEN position. If it does not fire, that is itself informative — it would mean the instrument
+> perturbs."*
+>
+> **It did not fire.** 2,048 instrumented tokens, zero events — the section above. So the masking
+> risk was NOT bounded, the prediction was wrong, and the "if it does not fire" clause is the one
+> part that held: the instrument perturbs. Two further corrections travel with it — "the rate is per
+> READ" is now a working model rather than a fact (below), and a ~27% cost estimate cannot bound a
+> masking risk in the first place, because what suppresses is evidently the *shape* of the added
+> work and not its duration. That is exactly what Phase 2's ladder was built to separate.
 
-Three alternatives occupy the same pipeline position, so exactly one may be selected:
+### Phase 1's matrix, and the asymmetry it must be read under
 
-| `--divergence-folds` | what runs after the copy | suppression there means |
-|---|---|---|
-| `sc` | fold the whole slot — delays AND reads | either; this is the configuration already known to suppress |
-| `sc-spin` | the same launch geometry and trip count, touching NO memory | the hazard is **pure time** — a fixed-lag write-visibility problem |
-| `sc-line` | read ONE cacheline, ~0% cost | **touching** the bytes repairs them; this is then also the cheapest candidate fix |
+One fold at a time, 1536-token pairs, against the live control above:
 
-"Equal duration" for `sc-spin` is by construction — same grid, same block, same grid-stride trip
-count, same three multiply-shift-xor rounds, omitting exactly the global load. **Compare the two
-arms' measured tok/s before believing the result**: if they differ materially the construction
-failed and the comparison is confounded. `spin_rows`' oracle asserts the property the experiment
-depends on — that its output is *invariant under the payload*, i.e. it really does read nothing.
+| cell | `--divergence-folds` | fires ⇒ | goes clean ⇒ |
+|---|---|---|---|
+| F1 | `bh` | if `bh` DIFFERS, the arena changed after btrfs blessed it | **not an acquittal of storage** — see the asymmetry |
+| F2 | `sc` | the post-copy read is not the mask | `sc` is the mask; the hazard is at the copy/visibility boundary |
+| F3 | `se` | the control behaved like the unprobed engine, as expected | the hypothesis is wrong — `se` runs *after* the consumer and should not be able to suppress anything |
+
+**Whichever fold turns RED→GREEN is the mask, and its position names the mechanism.** But a cell
+that fires convicts nothing on its own either: `bh`/`sc`/`se` are bytes-at-an-instant folds, so
+their nulls are not acquittals, and only their DIFFERENCES carry a verdict.
+
+### Phase 2: WHAT about the post-copy read repairs the hazard?
+
+Four alternatives occupy the same pipeline position, so exactly one may be selected. Each rung
+removes one ingredient, read against `sc`, the known suppressor:
+
+| `--divergence-folds` | launch | duration & bandwidth | touches the slot |
+|---|---|---|---|
+| `sc-nop` | yes | ~0 | no |
+| `sc-decoy` | yes | same as `sc` | **no** |
+| `sc-line` | yes | ~1/32 of `sc` | yes, every cache line |
+| `sc` | yes | full | yes |
+
+**Run `sc-nop` FIRST.** If a bare kernel launch at that position suppresses, the mechanism is the
+stream boundary's own cache maintenance and every other arm is confounded — the folds are enqueued
+*before* the timeline signal the consuming kernel waits on, so any launch there also delays that
+signal. Every outcome, including the two that are not a clean win:
+
+| result | reading |
+|---|---|
+| `sc-nop` suppresses | the LAUNCH BOUNDARY, not duration and not this slot. Go to Phase 3; the other arms add nothing |
+| `sc-nop` fires, `sc-decoy` suppresses | duration or bandwidth — a **timing** hazard. The fix is a delay or a stream-ordering change, not a read |
+| `sc-nop` and `sc-decoy` fire, `sc-line` suppresses | **touching the bytes** repairs them: a cache/visibility effect, and `sc-line` is then a candidate fix at ~1/32 of the reads |
+| everything below `sc` fires | what `sc` does that none of them do is the full-width read of *this* slot. Nothing cheaper serves as a fix; go to Phase 3 |
+| nothing fires, `sc` included | the suppression did not reproduce. The rate's interval permits it (23% at the pessimistic end) — re-run the control before reading anything into the ladder |
+
+**`sc-decoy` replaced an equal-duration spin kernel, and why is worth recording.** The first version
+burned the same trip count with no memory access, claiming equal duration "by construction". Review
+refuted it from this tree's own comment: `hash_rows` is *bandwidth-bound*, so removing 100% of the
+bandwidth and keeping the ALU makes the arm far SHORTER — and an arm that then failed to suppress
+would have been read as "the hazard is not time" when it never delivered the time. Folding a decoy
+buffer of the same size holds duration and bandwidth constant while still never touching the slot.
+The spin kernel is deleted; `sc-nop` is a one-element fold of that same decoy, so there is no second
+kernel to drift.
+
+**`sc-line` sweeps one element per 128 B cache line across the WHOLE slot**, not the first line —
+covering the slot is what lets it be a candidate fix at all. 128 B is measured in this tree
+(`kernels/linalg.hip`, `kernels/mla.hip`); an earlier constant said 64 B with no citation, which
+would have swept every other line. Its column renders `~<hash>` because it sees ~1/32 of the bytes.
 
 ### Still open, and cheap
 

@@ -189,24 +189,42 @@ struct Args {
     #[arg(long, value_name = "PATH", conflicts_with = "port")]
     divergence_log: Option<String>,
 
-    /// DIAGNOSTIC: which FETCH-PATH folds `--divergence-log` enables, comma-separated —
-    /// `bh`, `sc`, `sc-spin`, `sc-line`, `se`. Default: none (the light probe).
+    /// DIAGNOSTIC: which OPTIONAL folds `--divergence-log` enables, comma-separated —
+    /// `xa`, `ac`, `bh`, `sc`, `sc-nop`, `sc-decoy`, `sc-line`, `se`. Default: none (the light
+    /// probe).
     ///
-    /// The default is none because the all-three configuration was measured to SUPPRESS the
-    /// divergence it exists to localise: 2,048 instrumented tokens produced zero events against a
-    /// rate predicting several (P = 0.11% matched / 2.89% conservative), while the light probe is
-    /// what produced the token-164 coordinate. So the folds are enabled ONE AT A TIME, and
-    /// whichever one turns a red pair green is the mask — its position in the pipeline names where
-    /// the mechanism lives.
+    /// The default is none because the all-on fetch-path configuration was measured to SUPPRESS
+    /// the divergence it exists to localise (2,048 instrumented tokens, zero events), while the
+    /// light probe diverges normally — so the suppressor is the hop folds specifically. Enable ONE
+    /// at a time; whichever turns a red pair green is the mask, and its position names where the
+    /// mechanism lives.
     ///
-    /// The three `sc` forms are alternatives at the same pipeline position, not additions:
-    /// `sc` both delays and reads; `sc-spin` delays the same amount and reads nothing; `sc-line`
-    /// reads one cacheline for ~0% cost. Which of those suppresses separates a timing hazard from
-    /// a visibility one.
-    // Requires `--divergence-log`: folds with nowhere to be recorded are a knob nothing spends.
+    /// Two kinds, and they are not read the same way. `xa`/`ac` are CONSUMER-OUTPUT folds (the
+    /// residual before the norm; the MoE accumulator before the drain) — cheap, and a null on them
+    /// genuinely constrains what the kernel consumed. `bh`/`sc`/`se` are BYTES-AT-AN-INSTANT folds
+    /// on the fetch path; a null on those cannot exonerate a hop, because a corruption landing
+    /// between the fold and the consumer's read is invisible to them.
+    ///
+    /// The `sc` forms are alternatives at one pipeline position, not additions, and each removes
+    /// one ingredient of the known suppressor: `sc` reads the whole slot; `sc-nop` is the same
+    /// launch with ~no work; `sc-decoy` moves the same bytes from a buffer that is NOT the slot;
+    /// `sc-line` touches every cache line of the slot for ~1/32 of the reads. Run `sc-nop` first —
+    /// if a bare launch suppresses, every other arm is confounded.
+    // Parsed by clap, not in `run_bench`: a typo used to be refused only AFTER the artifact had
+    // loaded, which on this model is minutes of a sole-tenant GPU to learn that `sc-lien` is not a
+    // fold. The refusals are the point of this flag — a misparse would make a cell green for the
+    // wrong reason — so they happen at the door.
     #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
-    #[arg(long, value_name = "LIST", requires = "divergence_log")]
-    divergence_folds: Option<String>,
+    #[arg(long, value_name = "LIST", requires = "divergence_log", value_parser = parse_folds)]
+    divergence_folds: Option<rivoli_engine::probe::Folds>,
+}
+
+/// `--divergence-folds`' parser, so clap refuses a bad spec before the artifact loads.
+///
+/// The engine owns the grammar (`Folds::parse`); this only adapts its error to clap's `String`.
+#[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+fn parse_folds(s: &str) -> Result<rivoli_engine::probe::Folds, String> {
+    rivoli_engine::probe::Folds::parse(s).map_err(|e| format!("{e:#}"))
 }
 
 /// The default bench prompt.
@@ -563,10 +581,7 @@ fn run_bench(eng: &mut Engine<'_>, tok: &Tokenizer, a: &Args, b: &Bench<'_>) -> 
     // the measurement is not perturbed by its own instrument.
     #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
     if a.divergence_log.is_some() {
-        let folds = match &a.divergence_folds {
-            Some(spec) => rivoli_engine::probe::Folds::parse(spec)?,
-            None => rivoli_engine::probe::Folds::default(),
-        };
+        let folds = a.divergence_folds.unwrap_or_default();
         tracing::info!("divergence probe: folds = {}", folds.label());
         eng.arm_divergence_log(folds)?;
     }

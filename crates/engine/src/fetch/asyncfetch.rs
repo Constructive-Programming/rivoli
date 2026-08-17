@@ -62,22 +62,46 @@ pub struct ReadSpec {
 
 /// What runs immediately after the bounce→slot copy — the position measured to suppress.
 ///
-/// Phase 2's discriminator lives here: [`ScProbe::Full`] both delays and reads, so on its own it
-/// cannot say which repaired the hazard. [`ScProbe::Spin`] delays for the same duration and reads
-/// NOTHING; [`ScProbe::Line`] reads one cacheline and costs ~0% of the time. Suppression under `Spin`
-/// means the hazard is pure TIME; suppression only under `Line` means touching the bytes repairs
-/// them, and `Line` is then also the cheapest candidate fix.
+/// **A ladder, and each rung removes exactly one ingredient.** [`ScProbe::Full`] both takes time,
+/// moves bandwidth, launches a kernel and reads the slot, so on its own it cannot say which of
+/// those repaired the hazard. The other three hold all but one constant:
+///
+/// | arm | launch | duration & bandwidth | touches the slot | suppression means |
+/// |---|---|---|---|---|
+/// | [`ScProbe::Nop`] | yes | ~0 | no | the LAUNCH BOUNDARY itself — its cache maintenance, not its work |
+/// | [`ScProbe::Decoy`] | yes | same as `Full` | **no** | time/bandwidth, not this slot |
+/// | [`ScProbe::Line`] | yes | ~1/32 of `Full` | yes, every cache line | touching the bytes, and this is also a ~0.8% candidate FIX |
+/// | [`ScProbe::Full`] | yes | full | yes | the known suppressor; the baseline the others are read against |
+///
+/// **`Decoy` replaced an equal-duration spin kernel that read nothing** (deleted 2026-08-17).
+/// Review killed it on this tree's own evidence: `hash_rows` is *bandwidth-bound* by its own
+/// comment, so a variant that removes 100% of the bandwidth and keeps only the ALU is not
+/// equal-duration by construction — it is guaranteed to be far SHORTER, and an arm that then
+/// failed to suppress would have been read as "the hazard is not time" when it delivered perhaps a
+/// tenth of the delay. Folding a decoy buffer of the same size holds duration and bandwidth
+/// constant while still never touching the slot, which is the comparison that was wanted.
+///
+/// `Nop` is a one-element fold of that same decoy, so it needs no second kernel: same launch, same
+/// cache maintenance at the stream boundary, negligible work. It should run FIRST — if a bare
+/// launch suppresses, every other arm is confounded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ScProbe {
     #[default]
     Off,
     Full,
-    Spin,
+    Nop,
+    Decoy,
     Line,
 }
 
-/// One cacheline of f32 — the width [`ScProbe::Line`] reads. 64 B on gfx1151.
-pub const LINE_F32: usize = 16;
+/// Elements per cache line: **128 B on gfx1151**, so 32 f32.
+///
+/// Measured in this tree, not assumed — `kernels/linalg.hip` prices a 32 B/wave access as "a
+/// quarter line at a time against a 128 B cache line" (117 of 256 GB/s) and `kernels/mla.hip`
+/// records a 128 B wave load as "exactly one cache line". An earlier version of this constant said
+/// 64 B / 16 f32 with no citation, which would have made the sweep touch every OTHER line and the
+/// arm test a quantity nobody named.
+pub const LINE_F32: usize = 32;
 
 /// The two device u64 a cold read XOR-folds into: the bounce arena before the copy, the pool slot
 /// after it. `--divergence-log` only.
@@ -95,6 +119,9 @@ pub const LINE_F32: usize = 16;
 pub struct FetchFolds {
     pub bh: *mut u64,
     pub sc: *mut u64,
+    /// A slot-sized scratch buffer the no-touch arms fold instead of the pool slot. Null unless an
+    /// arm needs it; never the destination of any copy, so folding it cannot perturb the payload.
+    pub decoy: *const f32,
     /// WHAT runs at the post-copy position — a full fold, an equal-duration spin that reads
     /// nothing, or a one-cacheline read. See `rivoli_engine::probe::ScProbe`.
     pub sc_mode: ScProbe,
@@ -104,15 +131,18 @@ impl FetchFolds {
     /// Folds disabled — the shipping configuration and every non-probe build.
     ///
     /// **This type is NOT feature-gated, and the cost is stated rather than claimed away.** A build
-    /// without `corruption-probe` still carries two null pointers per [`ReadSpec`] (~130 per token),
-    /// one `Vec<FetchFolds>` of `entries` per `Streamer`, and one 16-byte store per queued read —
-    /// call it ~2 KB of stores per token against a 388 ms budget, and NO new branch on any hot path
-    /// (the fold sites are `#[cfg]`-gated out entirely). An earlier commit message claimed "no new
-    /// field cost", which was simply false; gating four fields to recover this would add eight
-    /// `#[cfg]` attributes and cfg'd initialisers in three arms, which is the worse trade.
+    /// without `corruption-probe` still carries three null pointers and a discriminant per
+    /// [`ReadSpec`] (~130 per token), one `Vec<FetchFolds>` of `entries` per `Streamer`, and one
+    /// 32-byte store per queued read — call it ~4 KB of stores per token against a 388 ms budget,
+    /// and NO new branch on any hot path (the fold sites are `#[cfg]`-gated out entirely). An
+    /// earlier commit message claimed "no new field cost", which was simply false; gating five
+    /// fields to recover this would add ten `#[cfg]` attributes and cfg'd initialisers in three
+    /// arms, which is the worse trade. (The numbers were 16 B / four fields before `Decoy` and
+    /// `Nop` arrived — kept current because a stale cost claim is how the false one started.)
     pub const OFF: Self = Self {
         bh: std::ptr::null_mut(),
         sc: std::ptr::null_mut(),
+        decoy: std::ptr::null(),
         sc_mode: ScProbe::Off,
     };
 
@@ -129,7 +159,12 @@ impl FetchFolds {
     /// post-copy read, which is the position under suspicion.
     #[inline]
     pub fn sc_armed(&self) -> bool {
-        !self.sc.is_null() && self.sc_mode != ScProbe::Off
+        if self.sc.is_null() || self.sc_mode == ScProbe::Off {
+            return false;
+        }
+        // The no-touch arms are inert without their decoy, and silently degrading to "no launch"
+        // would make the cell green for a reason the log does not record.
+        !matches!(self.sc_mode, ScProbe::Nop | ScProbe::Decoy) || !self.decoy.is_null()
     }
 }
 // SAFETY: `dst` and `fold`'s two pointers are only handed to io_uring / hipMemcpyAsync / a fold

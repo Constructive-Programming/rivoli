@@ -32,7 +32,7 @@
 
 use rivoli_backend::hip::{
     launch_append_kv, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
-    launch_hash_rows, launch_spin_rows,
+    launch_hash_rows,
 };
 use rivoli_core::num::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3};
 
@@ -322,7 +322,7 @@ fn hash_rows_matches_the_host_fold() {
     let launch = |x: *const f32, n: usize, out: *mut u64| {
         // SAFETY: the callers pass a live device f32 span of `n` and one live device u64.
         ok(
-            unsafe { launch_hash_rows(x, n, 0, out, rivoli_backend::NULL_STREAM) },
+            unsafe { launch_hash_rows(x, n, 1, 0, out, rivoli_backend::NULL_STREAM) },
             "hash_rows",
         );
     };
@@ -376,58 +376,6 @@ fn hash_rows_matches_the_host_fold() {
         "XOR is self-inverse: two folds of one array must cancel, which is why an \
          un-zeroed slot silently corrupts the next token's hash"
     );
-}
-
-/// `spin_rows` — the equal-duration, NO-MEMORY variant of `hash_rows`.
-///
-/// **The property under test is what it does NOT do.** Phase 2 of the divergence investigation puts
-/// `spin_rows` and `hash_rows` at the same point in the fetch stream and asks which of them
-/// suppresses the defect: if the delay alone suppresses, the hazard is pure time; if only the
-/// reading variant does, touching the bytes repairs them. That experiment is worthless if
-/// `spin_rows` secretly depends on the buffer, so the assertion is that its output is INVARIANT
-/// under changing the payload — which is exactly the claim `hash_rows_matches_the_host_fold`
-/// asserts the opposite of for its neighbour.
-///
-/// Its value is also asserted non-zero and length-dependent: a kernel optimised down to a store of
-/// 0, or one whose loop was elided, would satisfy "invariant under the payload" perfectly.
-#[test]
-fn spin_rows_burns_time_without_reading_anything() {
-    let n = 1000;
-    let mut r = Lcg(0x51D3);
-    let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
-    let spin = |v: &[f32]| -> u64 {
-        // The buffer is uploaded and its pointer is NOT passed: `spin_rows` takes only a length.
-        // Uploading it anyway keeps the two arms' device state comparable.
-        let _xb = dev(&f32b(v));
-        let mut out = zeros(8);
-        // SAFETY: one live device u64, zeroed by `zeros`.
-        ok(
-            unsafe {
-                launch_spin_rows(
-                    v.len(),
-                    out.ptr_mut() as *mut u64,
-                    rivoli_backend::NULL_STREAM,
-                )
-            },
-            "spin_rows",
-        );
-        u64le(&back(&out))
-    };
-    let base = spin(&x);
-    assert_ne!(base, 0, "the spin must not collapse to a store of zero");
-
-    let mut other: Vec<f32> = x.clone();
-    for v in other.iter_mut() {
-        *v = -*v - 1.0;
-    }
-    assert_eq!(
-        spin(&other),
-        base,
-        "spin_rows must be INVARIANT under the payload — if it reads anything, Phase 2's \
-         delay-vs-read comparison measures nothing"
-    );
-    // ...and it is a function of the LENGTH, which is what makes "equal duration" meaningful.
-    assert_ne!(spin(&x[..500]), base, "a different trip count must differ");
 }
 
 /// First 8 bytes of `b` as a little-endian u64.

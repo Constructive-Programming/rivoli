@@ -95,9 +95,23 @@ pub fn xor_fold(x: &[f32]) -> u64 {
 /// swapping two buffers' contents — which for `rivoli_engine::probe`'s pool-slot fold would make it
 /// blind to a crossed destination, the exact defect class it is aimed at.
 pub fn xor_fold_from(x: &[f32], i_base: u64) -> u64 {
-    x.iter().enumerate().fold(0u64, |h, (i, v)| {
-        h ^ xor_fold_step((i_base + i as u64) as usize, v.to_bits())
-    })
+    xor_fold_strided(x, i_base, 1)
+}
+
+/// The XOR fold over every `stride`-th element, with the index space offset by `i_base`.
+///
+/// The index mixed in is the ELEMENT index, never the sample number, so a fold at `stride > 1`
+/// still says WHERE a difference is and two folds at different strides are not confusable. Its
+/// consumer is the divergence probe's cache-line sweep: one element per 128 B line touches the
+/// whole buffer while reading ~1/32 of it.
+pub fn xor_fold_strided(x: &[f32], i_base: u64, stride: usize) -> u64 {
+    assert!(stride > 0, "xor_fold_strided needs a positive stride");
+    x.iter()
+        .enumerate()
+        .step_by(stride)
+        .fold(0u64, |h, (i, v)| {
+            h ^ xor_fold_step((i_base + i as u64) as usize, v.to_bits())
+        })
 }
 
 #[cfg(test)]
@@ -179,6 +193,29 @@ mod tests {
         assert_eq!(base ^ base, 0);
         // ...and the fold is not trivially zero, which the line above would also satisfy.
         assert_ne!(base, 0);
+
+        // A STRIDED fold visits every `stride`-th element and mixes the ELEMENT index, so it is
+        // not confusable with a contiguous fold of the samples — which is what lets the probe's
+        // cache-line sweep say WHERE a difference is while reading 1/32 of the bytes.
+        let sweep = super::xor_fold_strided(&x, 0, 32);
+        assert_ne!(sweep, base, "a strided fold is not the full fold");
+        assert_eq!(
+            sweep,
+            x.iter()
+                .enumerate()
+                .filter(|(i, _)| i % 32 == 0)
+                .fold(0u64, |h, (i, v)| h ^ super::xor_fold_strided(
+                    std::slice::from_ref(v),
+                    i as u64,
+                    1
+                )),
+            "the strided fold is exactly the fold of the sampled elements at their own indices"
+        );
+        assert_eq!(
+            super::xor_fold_strided(&x, 0, 1),
+            base,
+            "stride 1 is the full fold"
+        );
 
         // The index OFFSET must matter, or several buffers folding into one accumulator would be
         // invariant under swapping their contents — which is what it exists to prevent.

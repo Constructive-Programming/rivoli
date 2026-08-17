@@ -223,6 +223,20 @@ impl GlmEngine<'_> {
         // nothing was measured. That is a false EXCLUSION, the one failure mode an instrument
         // must not have. `xn` is written by the post-attention rmsnorm above on the null
         // stream, which this fold also uses, so it reads settled bytes with no barrier added.
+        // `xa`: the residual AFTER attention and BEFORE the norm. `xn` below is a NORM of it, and
+        // rmsnorm is scale-invariant, so `xn` agreeing does not rule out a rescaled residual —
+        // which would leave `xn` identical and the layer's exit `x` different, the exact signature
+        // of the second recorded coordinate. Opt-in (`--divergence-folds xa`) so the light probe
+        // stays byte-identical to the configuration proven not to suppress.
+        #[cfg(feature = "corruption-probe")]
+        {
+            let (n, xa) = (rows.nrow * self.cfg.hidden, xp.0 as *const f32);
+            if let Some(p) = self.probe.as_mut().filter(|p| p.folds().xa) {
+                // SAFETY: `xp` is this pass's residual rows, live f32, written on the null stream
+                // by `attention` above, which orders against this launch.
+                unsafe { p.fold(crate::probe::Q::Xa, l, xa, n)? };
+            }
+        }
         #[cfg(feature = "corruption-probe")]
         {
             let (n, xn) = (rows.nrow * self.cfg.hidden, self.xn.ptr() as *const f32);

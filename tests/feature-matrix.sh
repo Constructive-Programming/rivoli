@@ -125,6 +125,16 @@ UNION="${BACKENDS[0]},$(IFS=,; echo "${OPTIONAL[*]}")"
 run "test   --features $UNION ${CHEAP_TESTS[*]}" \
   cargo test --release --quiet -p rivoli --no-default-features --features "$UNION" "${CHEAP_TESTS[@]}"
 
+# The divergence probe's two PURE surfaces — the `--divergence-folds` parser and the log-row
+# formatter — live in `rivoli-engine`'s own deviceless test target, which the `-p rivoli` line above
+# cannot reach. Named here because that is the difference between a red proof and a one-shot manual
+# run: `mod probe` is gated on `corruption-probe`, `cargo test --workspace` does not set it, and CI
+# has no rocm arm, so without this line nothing executes them (review, 2026-08-17 — the same trap
+# `NQ`'s `const` assertion was written to escape).
+run "test   -p rivoli-engine --features $UNION --test probe_format" \
+  cargo test --release --quiet -p rivoli-engine --no-default-features --features "$UNION" \
+    --test probe_format
+
 echo
 echo "----- $PASS passed, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

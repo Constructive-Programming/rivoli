@@ -91,6 +91,23 @@ impl GlmEngine<'_> {
         self.moe_layer(l, rows).await?;
         #[cfg(feature = "corruption-probe")]
         self.probe_moe(l, rows, before)?;
+        // `ac`: the fixed-point accumulator BEFORE the drain resets it — the consumer-output
+        // witness for pass 2, exactly as `h` is for pass 1. Both MoE lanes were awaited inside
+        // `moe_layer`, so every writer has retired; the drain below is the next reader.
+        //
+        // It has to be here and not in `probe_moe`, because `probe_moe` runs before this point in
+        // the call order and the drain runs immediately after — this is the only instant at which
+        // the accumulator holds the layer's complete result.
+        #[cfg(feature = "corruption-probe")]
+        {
+            let n = MOE_ACC_ROWS * rows.nrow * self.cfg.hidden * 2; // u64 slots as f32 words
+            let acc = self.moe_acc.ptr() as *const f32;
+            if let Some(p) = self.probe.as_mut().filter(|p| p.folds().ac) {
+                // SAFETY: `moe_acc` holds MOE_ACC_ROWS*MAXROW*hidden u64 and `nrow <= MAXROW`, so
+                // `n` f32 words are in bounds; both lanes' atomics retired at `launch_moe`'s awaits.
+                unsafe { p.fold(crate::probe::Q::Ac, l, acc, n)? };
+            }
+        }
         // SAFETY: xp nrow rows live; moe_acc's writers completed.
         unsafe {
             launch_moe_acc_drain(
@@ -311,6 +328,7 @@ impl GlmEngine<'_> {
                         crate::fetch::asyncfetch::ScProbe::Off => std::ptr::null_mut(),
                         _ => p.fold_slot(l, crate::probe::Q::Sc)?,
                     },
+                    decoy: p.decoy(),
                     sc_mode: f.sc,
                 }
             }

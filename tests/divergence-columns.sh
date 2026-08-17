@@ -12,44 +12,57 @@
 #
 # ## What it does, and why the FIRST DIFFERING COLUMN is the answer
 #
-# `--divergence-log` writes one row per (pass, layer) with fourteen fields. Six are device XOR
-# folds; three are host-side FNV folds of what the router saw, picked and where the pool put it, and
-# `misses`/`relocs` are plain counts rather than folds. The
-# first row where the two runs disagree is the coordinate, and *which field disagrees there* names
-# the subsystem:
+# `--divergence-log` writes one row per (pass, layer). The first row where the two runs disagree is
+# the coordinate, and *which field disagrees there* names the subsystem — but the columns come in
+# two kinds and they do NOT carry the same weight.
 #
-#   xn      differs -> attention or its KV cache; the MLP has not run yet
-#   h       differs, xn equal -> the gate/up expert BYTES, or that kernel
-#   x       differs, xn and h equal -> the down projection, the accumulator, or the drain
-#   gl      differs -> the router's INPUT moved, so the fault is upstream of routing
-#   pk      differs, gl equal -> routing consulted something outside its inputs (INV-1)
-#   sl      differs, pk equal -> the pool placed the same experts in different slots
-#   misses  differs -> the two runs made different residency DECISIONS
-#   relocs  differs -> the arena compacted in one run and not the other
+# CONSUMER-OUTPUT columns (xa, xn, h, ac, x) are what a kernel PRODUCED. The kernels are
+# deterministic given their inputs, so equal output over equal other-inputs means the bytes the
+# kernel actually consumed were equal. Walk them in pipeline order; the first that differs names
+# the stage:
 #
-# and the three fetch-path folds, which exist to split a `h`-differs verdict into WHICH HOP:
+#   xa   the residual after attention   -> attention or its KV cache
+#   xn   after the norm                 -> the norm (xa equal => attention is clear)
+#   h    the SwiGLU intermediate        -> gate/up read WRONG BYTES
+#   ac   the accumulator before drain   -> the DOWN projection read WRONG BYTES
+#   x    the residual at layer exit     -> the drain or the residual add
 #
-#   bh      the bounce arena, right after the NVMe read      differs -> the DRIVE delivered
-#                                                                       different bytes
-#   sc      the pool slot, right after the bounce->slot copy  bh equal, sc differs -> the COPY
-#   se      the same slot again at end of layer               sc == se but h differs -> the bytes
-#                                                            AT REST are right, so the kernel read
-#                                                            them too early: a ticket/timeline
-#                                                            ordering failure, not a bad payload
-#                                                            sc != se -> something wrote the slot
-#                                                            after the copy landed
+# and the host columns, which say what the router saw and did:
 #
-# `se` covers only the experts the layer MISSED (folding the whole batch would be ~5x the cost), so
-# it is silent about a RESIDENT expert corrupted on an earlier token. State that with any result.
+#   gl differs -> the router's INPUT moved, upstream of routing
+#   pk differs, gl equal -> routing consulted something outside its inputs (INV-1)
+#   sl differs, pk equal -> the pool placed the same experts in different slots
+#   misses / relocs differ -> the two runs made different residency DECISIONS
 #
-# A `-` is NOT MEASURED, never zero: a dense layer has no `h` and no router. Rows are compared
-# field-wise as TEXT, and a `-` on one side with a hash on the other is reported as a real
-# difference, because it means the two runs disagree about whether a layer had a MoE at all.
+# BYTES-AT-AN-INSTANT columns (bh, sc, se) say what the payload looked like WHEN THE FOLD LOOKED,
+# and they split a wrong-bytes verdict into WHICH HOP. Read them CROSS-RUN -- A's column against
+# B's -- never against each other: sc folds the one slot just copied, se folds all ~9 the layer
+# used.
 #
-# The two logs generally have DIFFERENT LENGTHS — after diverging, the arms generate different
-# numbers of tokens — so this walks them in parallel and stops at the first disagreement rather
-# than requiring equal lengths. That is also why it reports the row NUMBER: past the first
-# difference nothing is comparable.
+#   bh   the bounce arena after the NVMe read    differs -> the DRIVE delivered different bytes
+#   sc   the pool slot right after the copy      bh equal, sc differs -> the COPY
+#   se   ALL the layer's slots, end of layer     bh+sc equal, se differs -> wrong AT REST and not
+#                                                the slot just copied
+#
+# **THE ASYMMETRY, and it differs by kind.** A bytes-at-an-instant column AGREEING proves only that
+# the bytes matched when it looked; a corruption landing between the fold and the consumer's read is
+# invisible to it. **So no null on bh/sc/se exonerates a hop.** A consumer-output column agreeing is
+# the stronger statement and does constrain what was consumed. Two recorded coordinates show why it
+# matters: one where `h` differed (gate/up read wrong bytes) and one where `h` was IDENTICAL and
+# only `x` moved -- the same mechanism reaching a different part of the slot, which is what `ac` was
+# added to separate.
+#
+# A `-` is NOT MEASURED, never zero: the run did not enable that fold, or the layer had nothing for
+# it (a dense layer has no h/ac/router; a layer with no miss has no bh/sc). A `~<hash>` is a PARTIAL
+# fold -- sc-line covers every cache line but ~1/32 of the bytes, so its agreement is weaker. Both
+# compare as real differences against a hash on the other side, because that means the two runs
+# disagree about whether a quantity was measured at all.
+#
+# `se` folds every expert the layer used, each at its own index offset, so it is NOT blind to a
+# resident expert nor to two payloads swapped between slots. (This block said the opposite --
+# "covers only the experts the layer MISSED ... State that with any result" -- for one commit after
+# `se` was widened to the union, i.e. it told every operator to attach a false caveat to every
+# result. Corrected 2026-08-17.)
 #
 # THIS IS A READER, NEVER A GATE. It exits 0 whether or not it found a divergence — only its three
 # refusals (unreadable input, missing header, headers that disagree) exit 2. A caller must not key
@@ -97,14 +110,18 @@ hdr() { grep -m1 -E '^# rivoli-divergence ' "$1" | sed -E 's/^# rivoli-divergenc
 # the single most important thing to label. Deriving it keeps the historical logs (including the
 # pair that produced the token-164 coordinate) readable while still refusing to compare across
 # configurations.
+# Returns ONLY the config, never its provenance: the note used to be inside the returned string, so
+# a v3 log (derived "bh,sc,se (derived: …)") and a genuine v4 `--divergence-folds bh,sc,se` log —
+# the SAME configuration — compared unequal and were refused. That defeated the derivation's own
+# purpose, which is to keep the historical logs comparable. The provenance is printed separately.
 folds() {
     local v line
     line=$(grep -m1 -E '^# rivoli-divergence-folds ' "$1" | sed -E 's/^# rivoli-divergence-folds //')
     if [ -n "$line" ]; then printf '%s' "$line"; return 0; fi
     v=$(grep -m1 -E '^# rivoli-divergence v[0-9]+ ' "$1" | sed -E 's/^# rivoli-divergence v([0-9]+) .*/\1/')
     case "$v" in
-        2) printf 'light (derived: v2 predates the fetch-path folds)' ;;
-        3) printf 'bh,sc,se (derived: v3 could not disable them)' ;;
+        2) printf 'light' ;;
+        3) printf 'bh,sc,se' ;;
         *) printf '' ;;
     esac
 }
@@ -139,7 +156,11 @@ done
     echo "  B: $FB" >&2
     exit 2
 }
-echo "   folds: $FA"
+prov() { # where did the config come from?
+    grep -qE '^# rivoli-divergence-folds ' "$1" && { printf 'declared'; return; }
+    printf 'derived from the format version'
+}
+echo "   folds: $FA ($(prov "$A") / $(prov "$B"))"
 
 # TRUNCATED TO THE COMMON PREFIX FIRST, and that is a fix rather than tidiness.
 #

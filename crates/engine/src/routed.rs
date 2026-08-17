@@ -403,6 +403,13 @@ impl RoutedPool {
         self.fetch.wait(t, stream_raw)
     }
 
+    /// The pool's slot stride — what the divergence probe's decoy buffer must match so a
+    /// no-touch arm moves exactly as many bytes as the arm that reads a slot.
+    #[cfg(feature = "corruption-probe")]
+    pub fn slot_bytes(&self) -> usize {
+        self.geom.stride
+    }
+
     /// Device bytes this pool may hold. Read by the startup log and by pool tests,
     /// which need it to ASSERT that their eviction case is one — a test whose premise
     /// ("the working set exceeds the budget") is assumed rather than checked passes
@@ -464,6 +471,7 @@ impl RoutedPool {
                 rivoli_backend::launch_hash_rows(
                     p,
                     n,
+                    1,
                     (j * n) as u64,
                     out,
                     rivoli_backend::NULL_STREAM,

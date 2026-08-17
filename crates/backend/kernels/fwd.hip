@@ -355,7 +355,7 @@ extern "C" int rivoli_flag_nonfinite(const float* x, int n, unsigned tag, unsign
 // without the probe produced a clean run with it (see `flag_nonfinite` above). An
 // instrument that perturbs its own subject is not an instrument. The caller drains every
 // slot in ONE D2H per token, at a point the end-of-layer sync has already idled.
-extern "C" __global__ void hash_rows(const float* __restrict__ x, int n,
+extern "C" __global__ void hash_rows(const float* __restrict__ x, int n, int stride,
                                     unsigned long long i_base,
                                     unsigned long long* __restrict__ out) {
     // ONE ATOMIC PER BLOCK, not one per element, and this is a correctness-of-the-instrument fix
@@ -380,10 +380,19 @@ extern "C" __global__ void hash_rows(const float* __restrict__ x, int n,
     // is invariant under SWAPPING two experts' payloads between their slots — and a crossed
     // destination is exactly the "wrong bytes in a slot" class under investigation, which would
     // then leave every fold agreeing and be misread as something else (review, 2026-08-17).
+    // `stride` SAMPLES the buffer: element 0, `stride`, `2*stride`, … < `n`. At `stride == 1`
+    // this is the whole buffer and every earlier caller is unchanged. It exists so one arm can
+    // touch every CACHE LINE of a slot while reading ~1/32 of its bytes — a sweep that covers the
+    // slot can be a candidate FIX, where reading one line at the front can only ever repair one
+    // line. The mixed-in index is the ELEMENT index, not the sample number, so folds at different
+    // strides remain sensitive to where a difference is.
     __shared__ unsigned long long red[256];
     unsigned long long acc = 0;
-    // Grid-stride, so the launch geometry is bounded and independent of `n`.
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+    long long samples = stride > 0 ? (n + stride - 1) / stride : 0;
+    // Grid-stride over SAMPLES, so the launch geometry is bounded and independent of `n`.
+    for (long long s_i = blockIdx.x * blockDim.x + threadIdx.x; s_i < samples;
+         s_i += (long long)blockDim.x * gridDim.x) {
+        long long i = s_i * stride;
         unsigned int bits;
         __builtin_memcpy(&bits, &x[i], sizeof(bits));
         unsigned long long z = ((i_base + (unsigned long long)i) << 32) ^ (unsigned long long)bits;
@@ -400,68 +409,19 @@ extern "C" __global__ void hash_rows(const float* __restrict__ x, int n,
     if (threadIdx.x == 0) atomicXor(out, red[0]);
 }
 
-// EQUAL-DURATION SPIN, NO MEMORY ACCESS — Phase 2's delay-vs-read discriminator.
-//
-// `hash_rows` at the post-copy position was measured to SUPPRESS the divergence it exists to
-// localise (2,048 instrumented tokens, zero events, against a rate that predicts ~1 per 300-578).
-// Two things could do that: the fold takes TIME, or the fold READS the bytes. This kernel is the
-// first arm — the same launch geometry and the same trip count as `hash_rows`, doing arithmetic of
-// the same shape, and touching NO memory at all except its single output word.
-//
-// If this suppresses too, the hazard is pure TIME: a fixed-lag write-visibility problem, and the
-// fix is a delay or a stream-ordering change. If only the reading variant suppresses, something
-// about TOUCHING the bytes repairs them — a cache/visibility effect — and a one-cacheline read is
-// then both the diagnosis and a ~0%-cost candidate fix.
-//
-// "Equal duration" is BY CONSTRUCTION, not by measurement: same grid, same block, same grid-stride
-// trip count, same three multiply-shift-xor rounds per iteration. It omits exactly the global load,
-// which is the variable under test. The arms' measured tok/s must be compared before the result is
-// believed — if they differ materially the construction failed and the comparison is confounded.
-//
-// The accumulator is written out so the loop cannot be optimised away. That word is a pure function
-// of the geometry, NOT of any payload, so it carries no information about the bytes — which is why
-// `probe.rs` renders this column as `-` rather than as a hash a reader might compare.
-extern "C" __global__ void spin_rows(int n, unsigned long long* __restrict__ out) {
-    unsigned long long acc = 0;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
-        unsigned long long z = (unsigned long long)i;
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-        acc ^= z ^ (z >> 31);
-    }
-    __shared__ unsigned long long red[256];
-    red[threadIdx.x] = acc;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] ^= red[threadIdx.x + s];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) atomicXor(out, red[0]);
-}
-
-extern "C" int rivoli_spin_rows(int n, unsigned long long* out, void* stream) {
-    if (n <= 0) return 1001;
-    hipGetLastError();
-    // The SAME grid rule as `rivoli_hash_rows`, so the two are the same launch with and without
-    // the loads. Duplicated deliberately: a shared helper would let one drift.
-    int blocks = (n + 255) / 256;
-    if (blocks > 1024) blocks = 1024;
-    hipLaunchKernelGGL(spin_rows, dim3(blocks), dim3(256), 0, (hipStream_t)stream, n, out);
-    hipError_t e = hipGetLastError();
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
-extern "C" int rivoli_hash_rows(const float* x, int n, unsigned long long i_base,
+extern "C" int rivoli_hash_rows(const float* x, int n, int stride, unsigned long long i_base,
                                 unsigned long long* out, void* stream) {
-    if (n <= 0) return 1001;
+    if (n <= 0 || stride <= 0) return 1001;
     hipGetLastError();
     // Grid CAPPED at 1024 blocks: the kernel is grid-stride, so a bounded grid bounds the number
     // of atomics (one per block) independently of `n`. 1024 is ~25x the 40 CUs, enough to saturate
-    // and few enough that the atomics are noise. Small folds still get one block per 256 elements.
-    int blocks = (n + 255) / 256;
+    // and few enough that the atomics are noise. Sized on SAMPLES, so a strided sweep launches the
+    // blocks its sample count needs rather than the buffer's length.
+    int samples = (n + stride - 1) / stride;
+    int blocks = (samples + 255) / 256;
     if (blocks > 1024) blocks = 1024;
-    hipLaunchKernelGGL(hash_rows, dim3(blocks), dim3(256), 0, (hipStream_t)stream, x, n, i_base,
-                       out);
+    hipLaunchKernelGGL(hash_rows, dim3(blocks), dim3(256), 0, (hipStream_t)stream, x, n, stride,
+                       i_base, out);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

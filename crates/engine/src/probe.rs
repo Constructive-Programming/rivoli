@@ -67,6 +67,22 @@ use rivoli_backend::{fill_u32, launch_hash_rows};
 pub enum Q {
     /// `xn`: the MoE's input, after the post-attention rmsnorm.
     Xn = 0,
+    /// **`xa`** — the residual AFTER attention and BEFORE the norm.
+    ///
+    /// `xn` is a NORM of this, and rmsnorm is scale-invariant, so `xn` agreeing cannot rule out a
+    /// pure rescaling of the residual — which would leave `xn` identical and the layer's EXIT
+    /// residual different. That gap is narrow and implausible as a corruption, and it is exactly
+    /// the shape of the second recorded coordinate (only `x` moved), so it is closed rather than
+    /// argued about.
+    Xa = 6,
+    /// **`ac`** — the fixed-point MoE accumulator, folded after both lanes are awaited and BEFORE
+    /// the drain.
+    ///
+    /// The consumer-output witness for pass 2, exactly as `h` is for pass 1. `h` identical with
+    /// `ac` differing means the DOWN projection read different bytes; `h` and `ac` identical with
+    /// `x` differing means the drain or the residual add. Without it those two collapse into one
+    /// column and the second coordinate cannot be resolved.
+    Ac = 7,
     /// `moe_hidden`: the SwiGLU intermediate, after gate/up and before down.
     H = 1,
     /// The residual stream at layer exit.
@@ -107,8 +123,13 @@ pub enum Q {
 /// Which fold turns RED→GREEN names the mask, and its position in the pipeline names where the
 /// mechanism lives. `se` is the control: it runs AFTER the consumer has read the slot, so it
 /// should not be able to suppress anything — if it does, the hypothesis is wrong.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Folds {
+    /// Fold the residual after attention, before the norm — closes `xn`'s scale blindness.
+    pub xa: bool,
+    /// Fold the fixed-point accumulator before the drain — the consumer-output witness for the
+    /// DOWN projection, which `h` (pass 1) and `x` (post-drain) cannot separate.
+    pub ac: bool,
     /// Fold the bounce arena after the NVMe read, before the copy.
     pub bh: bool,
     /// What, if anything, runs at the post-copy position.
@@ -119,12 +140,19 @@ pub struct Folds {
 
 impl Folds {
     /// Parse `--divergence-folds`: a comma-separated subset of
-    /// `bh,sc,se,sc-spin,sc-line`. Empty or absent = the light probe.
+    /// `xa,ac,bh,sc,sc-nop,sc-decoy,sc-line,se`. Absent = the light probe.
     ///
     /// Unknown names are REFUSED rather than ignored, and the three `sc` forms are mutually
     /// exclusive: a typo that silently disabled the one fold a cell exists to test would make the
     /// cell's green mean the opposite of what it appears to.
     pub fn parse(spec: &str) -> Result<Self> {
+        // An explicitly EMPTY spec is refused, though an absent flag is fine and means `light`.
+        // `--divergence-folds ""` reads as "I chose a configuration" and would silently deliver the
+        // light probe — the same inversion the per-`sc` refusal below exists to stop.
+        ensure!(
+            !spec.trim().is_empty(),
+            "--divergence-folds was given an empty list; omit the flag for the light probe"
+        );
         let mut f = Self::default();
         for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let sc = |f: &Folds| -> Result<()> {
@@ -136,22 +164,43 @@ impl Folds {
                 Ok(())
             };
             match name {
-                "bh" => f.bh = true,
-                "se" => f.se = true,
+                // Repeats refuse for the same reason the `sc` variants do: a spec the operator
+                // did not mean is a cell whose green means something else.
+                "xa" => {
+                    ensure!(!f.xa, "--divergence-folds names `xa` twice");
+                    f.xa = true;
+                }
+                "ac" => {
+                    ensure!(!f.ac, "--divergence-folds names `ac` twice");
+                    f.ac = true;
+                }
+                "bh" => {
+                    ensure!(!f.bh, "--divergence-folds names `bh` twice");
+                    f.bh = true;
+                }
+                "se" => {
+                    ensure!(!f.se, "--divergence-folds names `se` twice");
+                    f.se = true;
+                }
                 "sc" => {
                     sc(&f)?;
                     f.sc = ScProbe::Full;
                 }
-                "sc-spin" => {
+                "sc-nop" => {
                     sc(&f)?;
-                    f.sc = ScProbe::Spin;
+                    f.sc = ScProbe::Nop;
+                }
+                "sc-decoy" => {
+                    sc(&f)?;
+                    f.sc = ScProbe::Decoy;
                 }
                 "sc-line" => {
                     sc(&f)?;
                     f.sc = ScProbe::Line;
                 }
                 other => anyhow::bail!(
-                    "unknown --divergence-folds entry {other:?} (bh, sc, sc-spin, sc-line, se)"
+                    "unknown --divergence-folds entry {other:?} \
+                     (xa, ac, bh, sc, sc-nop, sc-decoy, sc-line, se)"
                 ),
             }
         }
@@ -163,13 +212,20 @@ impl Folds {
     /// different configurations must never be compared.
     pub fn label(&self) -> String {
         let mut v: Vec<&str> = Vec::new();
+        if self.xa {
+            v.push("xa");
+        }
+        if self.ac {
+            v.push("ac");
+        }
         if self.bh {
             v.push("bh");
         }
         match self.sc {
             ScProbe::Off => {}
             ScProbe::Full => v.push("sc"),
-            ScProbe::Spin => v.push("sc-spin"),
+            ScProbe::Nop => v.push("sc-nop"),
+            ScProbe::Decoy => v.push("sc-decoy"),
             ScProbe::Line => v.push("sc-line"),
         }
         if self.se {
@@ -184,13 +240,19 @@ impl Folds {
 
 /// One log row, as a pure function of the drained fold words and the layer's host columns.
 ///
+/// `pub` so `crates/engine/tests/probe_format.rs` can reach it: the tests below used to live in
+/// this file, where NO PRESCRIBED COMMAND compiled them — `mod probe` is gated on
+/// `corruption-probe`, `cargo test --workspace` does not set it, the feature matrix only `cargo
+/// check`s those cells, and CI has no rocm arm. That is the exact trap `NQ`'s `const` assertion
+/// 40 lines below was written to escape, and it had been walked into again (review, 2026-08-17).
+///
 /// **Extracted so the `-`-versus-`0` rule can be tested WITHOUT A DEVICE**, which
 /// `docs/measurement/gate-red-proofs.md` §5g recorded as owed. `Probe` needs a `DeviceBuf`, so as
 /// long as this logic lived inside `drain` the one rule that has already produced a false
 /// conclusion on this bug was checked by reading the code.
 ///
 /// `w` is the layer's [`NQ`] fold words in [`Q`] order.
-fn format_row(
+pub fn format_row(
     pos: usize,
     nrow: usize,
     layer: usize,
@@ -216,15 +278,26 @@ fn format_row(
     };
     let xn = hex(true, Q::Xn);
     let x = hex(true, Q::X);
+    let xa = hex(folds.xa, Q::Xa);
+    let ac = hex(cols.is_some() && folds.ac, Q::Ac);
     let h = hex(cols.is_some(), Q::H);
     let miss = cols.is_some_and(|c| c.miss > 0);
     let trio = format!(
         "{} {} {}",
         hex(folds.bh && miss, Q::Bh),
-        hex(
-            matches!(folds.sc, ScProbe::Full | ScProbe::Line) && miss,
-            Q::Sc
-        ),
+        // `~` prefixes a PARTIAL fold. Under `sc-line` the column covers every cache line but only
+        // ~1/32 of the bytes, so `sc` AGREEING exonerates far less than it does under `sc`/`sc-full`
+        // — and the reading key says "sc differs -> the COPY", which would be over-read in the
+        // other direction. The no-touch arms (`sc-nop`, `sc-decoy`) print `-`: their word is a hash
+        // of a DECOY, and rendering it as a payload hash would be a false exclusion outright.
+        match folds.sc {
+            ScProbe::Full => hex(miss, Q::Sc),
+            ScProbe::Line => match miss {
+                true => format!("~{}", hex(true, Q::Sc)),
+                false => "-".to_string(),
+            },
+            _ => "-".to_string(),
+        },
         hex(cols.is_some() && folds.se, Q::Se),
     );
     let host = match cols {
@@ -234,61 +307,11 @@ fn format_row(
             c.gl, c.pk, c.sl, c.miss, c.reloc
         ),
     };
-    format!("{pos} {nrow} {layer} {xn} {h} {x} {host} {trio}")
-}
-
-#[cfg(test)]
-mod fold_tests {
-    // A panic in a test is loud and correct, which is the workspace's stated reason for opting back
-    // in per file; a panic on the decode path would be a crash in a server, which is why it is
-    // deny-level everywhere else.
-    #![allow(clippy::expect_used)]
-    use super::Folds;
-    use crate::fetch::asyncfetch::ScProbe;
-
-    /// `--divergence-folds` parsing, with the two refusals that matter.
-    ///
-    /// A silently-misparsed fold set is the worst outcome this flag has: every Phase 1 cell is
-    /// "enable exactly one fold and see whether the pair still diverges", so a typo that quietly
-    /// enabled NOTHING would make the cell green and be read as "this fold is the mask" — the
-    /// precise inversion of the truth. Hence unknown names are refused rather than ignored, and the
-    /// three `sc` forms refuse each other rather than the last one winning.
-    #[test]
-    fn folds_parse_refuses_what_it_cannot_honour() {
-        // The default is the LIGHT probe — the configuration that produced the coordinate.
-        assert_eq!(Folds::parse("").expect("empty").label(), "light");
-        assert_eq!(Folds::default().label(), "light");
-
-        let f = Folds::parse("bh").expect("bh");
-        assert!(f.bh && !f.se && f.sc == ScProbe::Off, "bh must not arm sc");
-        assert_eq!(f.label(), "bh");
-
-        let f = Folds::parse("sc-spin").expect("sc-spin");
-        assert_eq!(f.sc, ScProbe::Spin);
-        assert!(!f.bh && !f.se, "an sc variant must not arm the others");
-        assert_eq!(f.label(), "sc-spin");
-
-        // Order-independent, and the label is canonical so two logs of the same config compare
-        // equal however the operator typed it.
-        assert_eq!(
-            Folds::parse("se, bh ,sc-line").expect("spaced").label(),
-            Folds::parse("bh,sc-line,se").expect("plain").label()
-        );
-
-        assert!(
-            Folds::parse("bh,nope").is_err(),
-            "unknown names are refused"
-        );
-        assert!(
-            Folds::parse("sc,sc-line").is_err(),
-            "two sc variants occupy one pipeline position and must refuse"
-        );
-        assert!(Folds::parse("sc-spin,sc").is_err(), "in either order");
-    }
+    format!("{pos} {nrow} {layer} {xa} {xn} {h} {ac} {x} {host} {trio}")
 }
 
 /// Device u64 fold slots per layer — one per [`Q`].
-const NQ: usize = 6;
+pub const NQ: usize = 8;
 
 /// `NQ` must cover every [`Q`], checked AT COMPILE TIME.
 ///
@@ -297,7 +320,7 @@ const NQ: usize = 6;
 /// CI has no rocm arm, and `tests/feature-matrix.sh` runs `cargo check` plus two integration
 /// targets — so nothing executed it (review, 2026-08-17). A `const` assertion is checked by every
 /// build of every feature cell, which is the coverage the claim needs.
-const _: () = assert!(Q::Se as usize + 1 == NQ, "NQ must cover every Q variant");
+const _: () = assert!(Q::Ac as usize + 1 == NQ, "NQ must cover every Q variant");
 
 /// One MoE layer's host-side columns. Every field is a fold of data the decode thread already
 /// holds, so recording them costs no device traffic and no I/O.
@@ -359,6 +382,17 @@ pub struct Probe {
     cols: Vec<Option<Cols>>,
     /// Which fetch-path folds this run enables; see [`Folds`].
     folds: Folds,
+    /// Slot-sized scratch the no-touch arms (`sc-nop`, `sc-decoy`) fold INSTEAD of the pool slot,
+    /// allocated only when one of them is selected.
+    ///
+    /// It is never a copy destination, so folding it cannot perturb any payload — which is the
+    /// entire point: it holds the arm's duration and bandwidth equal to `sc`'s while removing the
+    /// one variable under test, whether the slot itself is touched.
+    ///
+    /// **Its contents are never read for meaning**, only for bandwidth. It is left as `hipMalloc`
+    /// returned it — uninitialised — deliberately: zeroing it would cost a slot-sized fill at
+    /// startup for a buffer whose hash the log renders as `-`.
+    decoy: Option<DeviceBuf>,
     /// The whole log, appended a line at a time. Held in memory: see the header for why the
     /// write cannot happen during the run. ONE `String` rather than a `Vec<String>` — at
     /// 512 tokens x 78 layers that would be 40k heap allocations on a path whose entire design
@@ -367,8 +401,22 @@ pub struct Probe {
 }
 
 impl Probe {
-    pub fn new(n_layers: usize, folds: Folds) -> Result<Self> {
+    /// `slot_bytes` sizes the decoy buffer — the pool's slot stride, so a no-touch arm moves
+    /// exactly as many bytes as the arm that reads the slot.
+    pub fn new(n_layers: usize, folds: Folds, slot_bytes: usize) -> Result<Self> {
         ensure!(n_layers > 0, "divergence probe over a 0-layer model");
+        // Allocated ONLY for the arms that need it: a slot is ~15 MiB, and a cell that does not
+        // use the decoy should not pay for it or have it resident to confuse a memory reading.
+        let decoy = match matches!(folds.sc, ScProbe::Nop | ScProbe::Decoy) {
+            true => {
+                ensure!(
+                    slot_bytes >= 4,
+                    "divergence probe: decoy needs a slot stride, got {slot_bytes} bytes"
+                );
+                Some(DeviceBuf::new(slot_bytes)?)
+            }
+            false => None,
+        };
         let bytes = n_layers * NQ * 8;
         let mut dev = DeviceBuf::new(bytes)?;
         // SAFETY: `dev` owns `bytes`, just allocated, and `bytes` is a multiple of 4.
@@ -378,6 +426,7 @@ impl Probe {
             host: vec![0u8; bytes],
             cols: vec![None; n_layers],
             folds,
+            decoy,
             recs: String::new(),
         })
     }
@@ -414,6 +463,14 @@ impl Probe {
         self.folds
     }
 
+    /// The decoy buffer's device address, or null when no arm needs one.
+    pub fn decoy(&self) -> *const f32 {
+        match &self.decoy {
+            Some(b) => b.ptr() as *const f32,
+            None => std::ptr::null(),
+        }
+    }
+
     /// The device address of `(layer, q)`'s fold slot — for a caller that folds into it itself
     /// (the reaper thread, via [`crate::fetch::asyncfetch::FetchFolds`]) rather than through
     /// [`Self::fold`].
@@ -434,7 +491,7 @@ impl Probe {
         let out = self.slot_ptr(layer, q)?;
         // SAFETY: `out` is one live device u64 inside the slab; `x`/`n` are the caller's
         // contract, forwarded.
-        unsafe { launch_hash_rows(x, n, 0, out, rivoli_backend::NULL_STREAM) }
+        unsafe { launch_hash_rows(x, n, 1, 0, out, rivoli_backend::NULL_STREAM) }
     }
 
     /// Record a MoE layer's host columns for the pass in flight.
@@ -523,20 +580,34 @@ impl Probe {
         // heavy config is now known to SUPPRESS the defect, so a log that does not say which folds
         // produced it cannot be attributed at all.
         out.push_str(
-            "# rivoli-divergence v4 pos nrow layer xn h x gl pk sl misses relocs bh sc se\n\
+            "# rivoli-divergence v5 pos nrow layer xa xn h ac x gl pk sl misses relocs bh sc se\n\
              # pos is the PASS's FIRST ROW and nrow is how many it carried: (pos=k, nrow=1) is \
-             token k in decode, (pos=k, nrow=2) is a layer-major prefill row-block. v2 added \
-             nrow because pos alone made those two indistinguishable\n\
-             # `-` means NOT MEASURED, never zero: a dense layer has no h and no router, and a \
-             layer with no miss has no bh/sc (se is folded on every MoE layer)\n\
-             # bh = bounce arena after the NVMe read; sc = the pool slot just copied; se = ALL \
-             the slots this layer used, at end of layer\n\
-             # DECISION RULE, CROSS-RUN and never within-run (sc folds 1 slot, se folds ~9, so \
-             they are different quantities): h_A!=h_B is the trigger; then bh differs -> the \
-             DRIVE; bh equal and sc differs -> the COPY; bh and sc equal and se differs -> a slot \
-             was wrong AT REST and not the one just copied (a resident expert, or a write after \
-             the copy); all three equal -> the kernel read a slot BEFORE it landed, a \
-             ticket/timeline ordering failure\n\
+             token k in decode, (pos=k, nrow=2) is a layer-major prefill row-block\n\
+             # `-` = NOT MEASURED, never zero: the run did not enable that fold, or the layer had \
+             nothing for it (a dense layer has no h/ac/router; a layer with no miss has no bh/sc). \
+             `~<hash>` = a PARTIAL fold (sc-line sees every cache line but ~1/32 of the bytes)\n\
+             # WHEN each fold is taken, because a null means different things at different \
+             instants:\n\
+             #   xa  after attention, before the norm        | CONSUMER OUTPUT\n\
+             #   xn  after the norm, before the gate GEMV    | CONSUMER OUTPUT\n\
+             #   bh  fetch stream, after the NVMe read       | BYTES AT AN INSTANT\n\
+             #   sc  fetch stream, right after the copy      | BYTES AT AN INSTANT\n\
+             #   h   after both MoE lanes are awaited        | CONSUMER OUTPUT (pass 1: gate/up)\n\
+             #   ac  after the lanes, before the drain       | CONSUMER OUTPUT (pass 2: down)\n\
+             #   se  end of layer, after the consumer read   | BYTES AT AN INSTANT\n\
+             #   x   end of layer, after the drain           | CONSUMER OUTPUT\n\
+             # THE ASYMMETRY, and it is not the same for both kinds. A BYTES-AT-AN-INSTANT fold \
+             agreeing proves only that the bytes matched WHEN IT LOOKED — it cannot exonerate a \
+             hop, because a corruption landing between the fold and the consumer's read is \
+             invisible to it. A CONSUMER-OUTPUT fold agreeing is stronger: the kernel is \
+             deterministic given its inputs, so equal output over equal other-inputs means the \
+             bytes it actually consumed were equal. Never read a null on bh/sc/se as an \
+             acquittal; h/ac/x/xa/xn nulls do carry that weight\n\
+             # DECISION RULE, CROSS-RUN and never within-run (sc folds 1 slot, se folds ~9). Walk \
+             the consumer-output columns in order — xa, xn, h, ac, x — and the FIRST that differs \
+             names the stage: xa attention; xn the norm; h gate/up read wrong bytes; ac the DOWN \
+             projection read wrong bytes; x the drain or the residual add. Then bh/sc/se say \
+             which HOP delivered them, subject to the asymmetry above\n\
              # diff two runs: first differing LINE is the coordinate, first differing \
              COLUMN names the mechanism\n",
         );
@@ -547,102 +618,5 @@ impl Probe {
             self.recs.lines().count()
         );
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod row_tests {
-    #![allow(clippy::expect_used)] // a panic in a test is loud and correct; see `fold_tests`
-    use super::{Cols, Folds, NQ, format_row};
-    use crate::fetch::asyncfetch::ScProbe;
-
-    /// **A DISABLED OR ABSENT FOLD PRINTS `-`, NEVER `0`.** The red proof
-    /// `docs/measurement/gate-red-proofs.md` §5g recorded as OWED, now paid.
-    ///
-    /// This is the instrument's one unacceptable failure mode and it has already happened once:
-    /// `xn` was folded on MoE layers only, so GLM's three dense layers carried `0` in both runs of
-    /// a pair, and a diff reads two equal zeros as "attention agreed" when nothing was measured.
-    /// A false EXCLUSION is worse than a missing column, because it is indistinguishable from
-    /// evidence. Every combination that can produce an unmeasured column is enumerated here.
-    ///
-    /// Note the fold words are deliberately all-nonzero, so a `-` in the output can only come from
-    /// the rule and never from the data happening to be zero.
-    #[test]
-    fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
-        let w: Vec<u64> = (1..=NQ as u64).collect();
-        let cols = |miss: u64| {
-            Some(Cols {
-                gl: 0xA,
-                pk: 0xB,
-                sl: 0xC,
-                miss,
-                reloc: 0,
-            })
-        };
-        let all = Folds {
-            bh: true,
-            sc: ScProbe::Full,
-            se: true,
-        };
-        let field = |row: &str, i: usize| row.split_whitespace().nth(i).expect("field").to_string();
-        // One helper for "every fetch-path column is unmeasured", because the two sites that assert
-        // it differ only in WHY — and rustfmt made them identical text, which the duplication gate
-        // then reported.
-        let fetch_all_dash = |row: &str, why: &str| {
-            for c in [11, 12, 13] {
-                assert_eq!(field(row, c), "-", "{why}");
-            }
-        };
-        // Columns: 0 pos, 1 nrow, 2 layer, 3 xn, 4 h, 5 x, 6..10 host, 11 bh, 12 sc, 13 se.
-        let (bh, sc, se, h) = (11, 12, 13, 4);
-
-        // A DENSE layer: no router, no pool, no moe_hidden. `xn`/`x` are still measured.
-        let r = format_row(7, 1, 3, &w, None, all);
-        assert_eq!(field(&r, h), "-", "a dense layer has no h");
-        fetch_all_dash(&r, "a dense layer folds nothing on the fetch path");
-        assert_ne!(
-            field(&r, 3),
-            "-",
-            "xn is folded on EVERY layer — that was the bug"
-        );
-        assert_ne!(field(&r, 5), "-", "and so is x");
-
-        // A MoE layer with NO MISS: nothing was copied, so bh/sc cannot exist; se still can.
-        let r = format_row(7, 1, 4, &w, cols(0), all);
-        assert_eq!(field(&r, bh), "-");
-        assert_eq!(field(&r, sc), "-");
-        assert_ne!(
-            field(&r, se),
-            "-",
-            "se is folded on every MoE layer, misses or not"
-        );
-
-        // Folds DISABLED by the flag, with a miss present: still `-`, for a different reason.
-        let r = format_row(7, 1, 4, &w, cols(1), Folds::default());
-        fetch_all_dash(&r, "a fold the run did not enable is not measured");
-
-        // `sc-spin` writes a word so its loop survives, but that word is a function of the launch
-        // geometry — it must NOT be printed as if it were a payload hash.
-        let spin = Folds {
-            bh: false,
-            sc: ScProbe::Spin,
-            se: false,
-        };
-        assert_eq!(
-            field(&format_row(7, 1, 4, &w, cols(1), spin), sc),
-            "-",
-            "sc-spin's output is not a payload hash and must not look like one"
-        );
-
-        // ...and when everything IS measured, every column is a hash. Without this the assertions
-        // above are satisfied by a formatter that prints `-` unconditionally.
-        let r = format_row(7, 1, 4, &w, cols(1), all);
-        for c in [h, bh, sc, se] {
-            assert_ne!(
-                field(&r, c),
-                "-",
-                "an enabled, applicable fold must print its hash"
-            );
-        }
     }
 }
