@@ -23,6 +23,38 @@ and fixed"**, because someone auditing numerics reads that file and someone tuni
 reads this one. Two known-broken twins are recorded there too. Perf items cross-reference
 the bug; they do not host it.
 
+## Before any quality comparison: measure the noise floor
+
+**Added 2026-08-17 (M10), and it is a precondition, not an aside.** A paired-dNLL number
+means nothing until you know what the same run compared against ITSELF produces.
+
+| arm | two runs, identical flags | floor |
+|---|---|---|
+| GLM int3-vq, `--max-mem 115`, 761 scored positions | 555 positions moved, PPL 5.200080 vs 5.209284 | **0.0018 nats** of mean dNLL |
+| Muse Glimmer bf16, 52/52 layers pinned, 0 streamed | **byte-identical**, PPL 7.008490 both | **0** |
+
+So the floor is **per arm, and it is a property of streaming, not of the engine as a
+whole** — see `docs/investigations/glm-nondeterminism.md`, which is scoped `glm` for
+exactly that reason. Do not carry GLM's number to another arm, and do not assume a new
+arm has one until its control has been run.
+
+Three rules follow, and each has already been paid for once:
+
+1. **Run the control.** An A/B without an A-vs-A arm cannot tell "the knob moved the
+   output" from "the engine does not repeat itself". `tests/ppl-gates.sh`'s `p4` cell was
+   specified without one, reddened on a real device run, and was measuring nondeterminism
+   the whole time.
+2. **Never rank on a difference below the floor.** On GLM that is ~0.002 nats. The gaps
+   the ladder chases are 0.07–0.09 PPL = 0.0134–0.0172 nats, ~8x the floor, so the
+   instrument is sound — but state the floor alongside the number.
+3. **Do not quote the floor from here; re-measure it.** A floor carried in prose is an
+   inherited number. `p4` measures its own on every invocation, which is why that cell
+   runs three arms instead of two.
+
+**Counting differing POSITIONS is not a measurement of this.** GLM moved 553 positions
+across a 16-point hit-rate swing and 555 across no change at all. The count saturates;
+the mean and its interval do not.
+
 ## How to read — and write — this document
 
 **A phase profile localises cost; it does not explain it.** Any mechanism attributed to a

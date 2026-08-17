@@ -84,8 +84,11 @@ appears that enum dispatch cannot fill.
   rungs (1-ulp: erased by fp16 narrowing; one sign flip: under argmax margins).
 - **ppl gates** — `tests/ppl-gates.sh`: three cells over the M10 instruments — `profile`
   (the stamped phase buckets account for the decode wall, per-bucket census + a re-derived
-  remainder), `p4` (P4 at NLL: two `--max-mem` values must not move one NLL bit in
-  int3-vq, with differing `hit_pct` as the anti-vacuity check), `tf` (paired dNLL against
+  remainder), `p4` (P4 at NLL, THREE arms — A, a same-budget control A', and B — whose
+  strictness CALIBRATES ITSELF: byte-identity is demanded of an arm whose control repeats
+  byte-for-byte, and elsewhere the floor is measured and the budget's interval must contain
+  zero where the control's does. Re-specified 2026-08-17 after the byte-identity form
+  reddened on GLM's own nondeterminism, not on the budget), `tf` (paired dNLL against
   the pinned reference inside a pre-registered ±ln(1.01) equivalence band; INCONCLUSIVE is
   never a pass). `--expect-red[=FRAGMENT]` inverts the classification so a red proof is
   judged by the gate's own code. On-demand (GPU, ~30 min + ~6 min per red-proof), not CI.
@@ -136,7 +139,12 @@ a check that must hold in a shipped binary is an `assert!` and pays its cost.
   ms/miss 1.36 → 5.14 once).
 - **Rank quality on paired dNLL from `bin/ppl`, never the PPL column.** An interval
   straddling zero is *inconclusive*, not a pass. `distinct`/longest-repeated-block measure
-  nothing — read the text.
+  nothing — read the text. **And run the A-vs-A control**: GLM int3-vq does not repeat
+  itself (0.0018 nats of mean dNLL between two runs at identical flags, 2026-08-17), while
+  Glimmer fully pinned is byte-identical — so the floor is per arm, it is a property of
+  streaming, and a comparison below it is not a measurement.
+  `docs/investigations/glm-nondeterminism.md` bounds it;
+  `docs/measurement/how-to-measure.md` opens with the three rules.
 - **Instruments go behind a feature AND a flag, never an env var** (invisible to `--help`,
   absent from recorded command lines, silently active in a stock-looking build). Scripts
   that are not cargo runs may use env vars with the argument written down in place.

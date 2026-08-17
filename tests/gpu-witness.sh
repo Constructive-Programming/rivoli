@@ -70,6 +70,23 @@ gtt_used() { # KFD is blind to Vulkan tenants (llama-swap once held 1.6 GB with 
     [ "$n" -gt 0 ] && echo "$s"
 }
 
+host_load() { # 1-minute loadavg, the HOST-tenant witness.
+    # **The KFD witness is blind to everything that is not on the GPU, and this box's
+    # decode is heavily host-bound** — routing, pool submit and staging run on the decode
+    # thread and the fetch reaper is its own thread on io_uring, so a CPU/NFS tenant steals
+    # from the critical path without ever appearing in /sys/class/kfd. Measured 2026-08-17:
+    # a `convert_k3` repack held two processes at ~240% CPU each (loadavg 7.31 on 32 cores)
+    # while an arm of this gate reported 1.84 tok/s against a 2.58 baseline. Nothing in the
+    # GPU witness saw it, and the arm passed its (ratio-based) gate while producing an
+    # absolute number that cannot be compared to anything.
+    #
+    # Recorded, never DISCARDED: on a shared box a long repack is legitimate work that must
+    # not veto every measurement, and the honest response is to make the number carry the
+    # conditions it was taken under. Linux loadavg counts uninterruptible-sleep tasks, so
+    # I/O contention shows here too, which is the kind this actually catches.
+    awk '{print $1}' /proc/loadavg 2>/dev/null || echo "?"
+}
+
 run_arm() { # $1 = arm name, $2 = stdout file, $3 = stderr file, rest = command.
     # The arm's streams are redirected HERE, on the flock'd command only, so DISCARD
     # diagnostics reach the terminal instead of being buried in the arm's log.
@@ -92,6 +109,7 @@ run_arm() { # $1 = arm name, $2 = stdout file, $3 = stderr file, rest = command.
         exit 3
     fi
     : >"$wfile"
+    ARM_LOAD_BEFORE=$(host_load)
     flock "$LOCK" "${@:4}" >"$2" 2>"$3" &
     apid=$!
     witness "$wfile" "$apid" &
@@ -99,6 +117,8 @@ run_arm() { # $1 = arm name, $2 = stdout file, $3 = stderr file, rest = command.
     wait "$apid" || rc=$?
     kill "$wpid" 2>/dev/null || true
     wait "$wpid" 2>/dev/null || true
+    ARM_LOAD_AFTER=$(host_load)
+    echo "   arm '$1': host loadavg ${ARM_LOAD_BEFORE} -> ${ARM_LOAD_AFTER} (32 cores), GTT $((gtt >> 20)) MiB pre-arm"
     if [ -s "$wfile" ]; then
         echo "DISCARD arm '$1': foreign GPU tenant witnessed:" >&2
         sort -u "$wfile" >&2

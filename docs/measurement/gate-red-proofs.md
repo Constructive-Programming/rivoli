@@ -188,6 +188,49 @@ pre-registered `±ln(1.01) = ±0.00995` nats band:
 | `[-0.05000, -0.02000]` | RED (entirely BETTER — two-sided on purpose; a rewrite that reliably beats the reference is a misaligned position, not a free lunch) |
 | `[-0.00200, +0.01100]`, `[-0.90000, +0.90000]` | INCONCLUSIVE, exit 1 — never a pass |
 
+### 5a-2. The `p4` discriminator, re-specified and re-proved (2026-08-17)
+
+The first device battery reddened `p4`, and **the red was a specification error**: the cell
+demanded byte-identical NLLs across `--max-mem` 115 and 70 on an arm that does not repeat
+itself. The control (same budget twice) moved 555 positions against the budget's 553.
+`docs/investigations/glm-nondeterminism.md` holds the measurement; what belongs here is
+that the replacement was proved before it was believed.
+
+The cell now runs A, A' (control) and B, and reads two intervals out of `bin/ppl`. Proved
+deviceless against synthetic `.nll` files carrying the observed jitter shape (761
+positions, ~72% of them moving, calibrated so the control's mean lands at the measured
+0.0018 nats), driving **the script's own verdict code**, not a copy:
+
+| control CI | budget CI | verdict |
+|---|---|---|
+| `[-0.00214, +0.00635]` | `[-0.00665, +0.00157]` (null effect) | GREEN |
+| `[-0.00214, +0.00635]` | `[+0.01017, +0.01887]` (+0.015 nats) | RED |
+| `[-0.00214, +0.00635]` | `[-0.04569, -0.03405]` (budget BETTER) | RED — two-sided |
+| `[+0.00300, +0.00900]` (excludes 0) | any | UNCALIBRATED, exit 1, never a pass |
+
+Resolution bought: a ~0.0043-nat half-width, against the 0.0134–0.0172-nat quality gaps
+the ladder must resolve — ~3x headroom.
+
+**Two design errors were found and fixed while proving it**, both of the kind that produce
+a confident wrong number rather than a failure:
+
+- **The first replacement was also wrong.** It demanded the two intervals be DISJOINT. But
+  A' and B are both paired against A, so both intervals carry A's noise and non-overlap
+  double-counts it — the test came out ~2x less sensitive than the data supports, and a
+  +0.004-nat effect passed. Writing the model out (`d(A→B)ᵢ = δ + εᵢᴮ − εᵢᴬ`) shows the
+  interval already estimates δ at the right SE, so the question is whether it clears zero,
+  and the control's job is to prove zero is where a null lands.
+- **`bin/ppl` prints intervals in its VERDICT block too**, so grepping its whole output for
+  a CI can return a verdict's interval as if it were a table row. Found when `p4` needed
+  two rows; `tf` had been taking `head -1` off an untruncated grep since it was written and
+  is now fixed too. Both parses assert their expected row COUNT.
+
+And one gate-shape bug the battery exposed directly: **`p4` reddening meant `tf` never
+ran** — the one cell that validates scoring against the pinned reference was lost to an
+unrelated failure two cells earlier. Cells now run in subshells and the battery continues;
+setup (2) and discard (3) still abort, because those say the measurement could not be
+taken at all.
+
 ### 5b. Engine half — OWED, needs the device
 
 Three runs, each a source mutation, `--expect-red`, then `git checkout` and a green:
@@ -195,7 +238,7 @@ Three runs, each a source mutation, `--expect-red`, then `git checkout` and a gr
 | cell | mutation | must redden with |
 |---|---|---|
 | `profile` | `telemetry.rs`: `Phase::Ffn => self.ffn_ns += ns,` → `Phase::Ffn => {}` — the whole ffn accumulation, gone | `--expect-red='ffn bucket is'`. This is the run that proves the stamps are WIRED, which 5a cannot |
-| `p4` | none — `--red-proof-corpus` scores arm B on a one-word-different corpus, no rebuild | the NLL bodies differ, with the first differing position named |
+| `p4` | none — `--red-proof-corpus` scores arm B on a one-word-different corpus, no rebuild | the budget interval EXCLUDES zero against a control that contains it. Note this is now a stronger proof than it was: the perturbation has to clear a MEASURED noise floor, not merely be non-zero |
 | `tf` | `glm/decode.rs`: `tally.push(&row, own, target)?` → `tally.push(&row, own, ids[i - 1])?` — position i's row scored against position i-1's token | the CI lands entirely outside ±0.00995 |
 
 The `tf` mutation is in `glm/decode.rs` and not in `score::walk` because **GLM does not
@@ -223,12 +266,40 @@ CARGO_TARGET_DIR=... cargo build --release --features teacher-forcing
 PPL_BIN=.../release/rivoli tests/ppl-gates.sh <artifact> profile        # green again
 ```
 
-`p4`'s red-proof scope, stated because it is narrower than it looks: it proves the byte
-comparison and the anti-vacuity hit_pct check are live. It does **not** simulate a
-residency-dependent format defect — the only real one on record is `--mode hybrid`, whose
+`p4`'s red-proof scope, stated because it is narrower than it looks: it proves the paired
+discriminator and the control-relative anti-vacuity check are live. It does **not** simulate
+a residency-dependent format defect — the only real one on record is `--mode hybrid`, whose
 cache picks each expert's format, and hybrid does not decode in this tree (it refuses at
 `FormatPlan`). When it lands, IT is this cell's red-proof, and this paragraph is the
 instruction to make it so.
+
+**What is already known about `tf` before it runs, and it matters because three branches
+depend on `--ppl` (2026-08-17, zero GPU):** the old tree recorded GLM int3-vq at
+**PPL 5.222720** over `tests/ppl-corpus.txt` — the same 762-token corpus this tree vendored
+byte-identically (`old:docs/investigations/int4-scales.md`, re-measured 2026-07-31 on the
+current artifact, `--cache-policy lru --max-mem 100`). This tree's two runs give
+**5.200080 / 5.209284**, mean 5.204682:
+
+```
+dPPL  -0.018038  (-0.345%)      dNLL  -0.00346 nats
+      = 2.0x the measured noise floor,  0.35x the 1% quality bar
+```
+
+So the scorer's ABSOLUTE SCALE is independently corroborated. That is a weaker statement
+than the `tf` cell's paired equivalence and does not replace it — the arms differ in cache
+policy and budget (both output-neutral in int3-vq per INV-1, though only up to the noise
+floor now that one is measured), and the old figure is a single run whose own floor is
+unknown, so the residual 2x-floor gap is not attributable. But it does bound the failure it
+rules out: an off-by-one target on real prose would land near the corpus entropy, order
+**5 nats**, and a broken softmax would produce a non-finite NLL that `nll_of` refuses. A
+0.003-nat agreement is not what either looks like.
+
+**`profile` has since run GREEN on the device** (2026-08-17: `other` 0.265% of wall,
+census 3/3, remainder re-derived to 0.001 ms on the real line — see
+`docs/measurement/baseline-2026-08-16.md` for the numbers and for why that run's absolute
+wall is not citeable). A green is not a red proof; the mutation below is still owed. What
+the green does establish is that the stamps produce a coherent profile at all, so a
+subsequent red can be attributed to the mutation rather than to the instrument.
 
 **A rebuild sits between the green and the red-proof of `profile` and `tf`,** which evicts
 page cache (ms/miss 1.36 → 5.14, measured). It does not invalidate either proof: both
