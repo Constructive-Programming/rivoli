@@ -139,6 +139,12 @@ pub struct RoutedPool {
     fetch: AsyncFetch,
     hits: u64,
     misses: u64,
+    /// Compaction relocations executed. Counted because arena relocation was the standing
+    /// suspect for the run-to-run divergence and nothing was measuring how often it fires:
+    /// `--divergence-log` records the per-layer DELTA, so a divergence coordinate can be
+    /// checked against what the arena did at that coordinate. A total is useless for that
+    /// question and a total is all anyone had.
+    relocs: u64,
     /// The ranked top-[`trace::TRACE_WINDOW`] candidates for the layer in flight — trace state, and
     /// EMPTY on every run that is not capturing. It lives here rather than on each arm's
     /// engine because nothing but [`RoutedPool::write_trace`] reads it, and a buffer two
@@ -244,6 +250,7 @@ impl RoutedPool {
             fetch,
             hits: 0,
             misses: 0,
+            relocs: 0,
             trace: cfg.trace.map(|p| open_trace(p, cfg.top_k)).transpose()?,
         })
     }
@@ -372,6 +379,7 @@ impl RoutedPool {
         self.key_at.insert((r.hot, r.to), moved);
         // The relocation copies the bytes with the key, so `moved` stays loaded.
         // Nothing else changes state: the source slot is now free and holds no key.
+        self.relocs += 1;
         Ok(())
     }
 
@@ -396,6 +404,30 @@ impl RoutedPool {
 
     pub fn misses(&self) -> u64 {
         self.misses
+    }
+
+    /// Compaction relocations executed so far. Read as a per-layer DELTA — the question
+    /// `--divergence-log` asks is whether a divergence coordinate coincides with the arena
+    /// moving bytes, not how many it moved overall.
+    pub fn relocs(&self) -> u64 {
+        self.relocs
+    }
+
+    /// A fold of WHERE the pool put each of `experts` — the arena BYTE OFFSET of each key's
+    /// slot, `u64::MAX` for a key with no slot.
+    ///
+    /// **Offsets, never addresses**, and that is the whole reason this lives here rather
+    /// than being computed from an [`ExpertSlot`]'s pointers at the call site: the pool's VMM
+    /// base differs between runs, so a fold over addresses would report a difference on
+    /// every line and localise nothing. An offset is comparable across processes.
+    ///
+    /// Call it AFTER `submit`, which is when a key has its final slot.
+    #[cfg(feature = "corruption-probe")]
+    pub fn slot_fold(&self, layer: usize, experts: &[usize]) -> u64 {
+        rivoli_core::hash::fnv1a_u64s(experts.iter().map(|&e| {
+            self.slot(expert_key(layer, e))
+                .map_or(u64::MAX, |(hot, idx)| self.arena.offset(hot, idx) as u64)
+        }))
     }
 
     /// Accumulated reaper fetch wall (ns) — the off-main-thread load cost the expert

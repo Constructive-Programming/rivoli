@@ -167,6 +167,27 @@ struct Args {
     // server answers many. See `--prompt` for why this is a refusal and not a silent drop.
     #[arg(long, value_name = "PATH", conflicts_with = "port")]
     dump_ids: Option<String>,
+
+    /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
+    /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
+    /// saw, picked and where the pool put it.
+    ///
+    /// `--dump-ids` says THAT two runs diverged; this says WHERE and in WHICH quantity.
+    /// Diff two logs: the first differing line is the (position, layer) coordinate, the
+    /// first differing column names the mechanism. GLM only, and refused elsewhere.
+    ///
+    /// Costs no device traffic and no I/O during the run, deliberately: the predecessor
+    /// copied the residual to the host every layer and MASKED the fault it was built to
+    /// find. For the same reason, do not combine it with `--trace`, which adds a
+    /// `device_sync` per layer-with-misses.
+    // Refused under `--port` for the reason `--dump-ids` and `--trace` already are: one
+    // run, many replies, and no request delimiter in the file.
+    // Gated on `rocm` too: the probe is part of the device path, and a flag a deviceless
+    // build accepted and could not spend is the "knob nothing spends" `rivoli_core::legality`
+    // exists to stop.
+    #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+    #[arg(long, value_name = "PATH", conflicts_with = "port")]
+    divergence_log: Option<String>,
 }
 
 /// The default bench prompt.
@@ -519,6 +540,12 @@ fn bench_input<'a>(tok: &Tokenizer, arch: Arch, a: &'a Args, ngen: usize) -> Res
 }
 
 fn run_bench(eng: &mut Engine<'_>, tok: &Tokenizer, a: &Args, b: &Bench<'_>) -> Result<()> {
+    // Armed BEFORE the decode and written after it — the log is held in memory precisely so
+    // the measurement is not perturbed by its own instrument.
+    #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+    if a.divergence_log.is_some() {
+        eng.arm_divergence_log()?;
+    }
     let out = eng.generate(
         GenSpec {
             prompt: &b.ids,
@@ -545,6 +572,11 @@ fn run_bench(eng: &mut Engine<'_>, tok: &Tokenizer, a: &Args, b: &Bench<'_>) -> 
         out.stats.hits,
         out.stats.misses
     );
+    // After the run, never during it (see `arm_divergence_log` above).
+    #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+    if let Some(path) = &a.divergence_log {
+        eng.write_divergence_log(path)?;
+    }
     match &a.dump_ids {
         Some(path) => write_ids(path, a, &out.ids),
         None => Ok(()),

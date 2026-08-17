@@ -296,6 +296,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn rivoli_fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> i32;
+    fn rivoli_hash_rows(x: *const f32, n: i32, out: *mut u64) -> i32;
 
     fn rivoli_mla_attend_scratch_floats(h: i32, kvl: i32) -> usize;
 
@@ -390,6 +391,32 @@ pub unsafe fn memcpy_dtod_async(
 /// `dst` must be a device pointer owning at least `bytes`.
 pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
     ensure_hip_status(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
+}
+
+/// XOR-fold the exact bits of `x[0..n]` into `*out` — the `--divergence-log` probe.
+///
+/// The fold is order-independent (XOR is commutative and associative), which is what makes
+/// it quieter than the run-to-run divergence it localises; a float sum would report a
+/// difference from scheduling jitter alone. It adds no sync, for the same measured reason
+/// [`launch_flag_nonfinite`](crate::hip_linalg::launch_flag_nonfinite) does not: the
+/// host-copying predecessor perturbed timing enough to MASK the fault it was built to find.
+///
+/// Hand-written here rather than a `launchers!` row in `hip_linalg.rs`, and the reason is the
+/// 800-line soft cap: that file sits at 797 and the row would have carried it over. It also
+/// belongs with `fill_u32` and `memcpy_dtod` on cohesion — the three are utilities over raw
+/// device bytes rather than operators the model graph names.
+///
+/// The host twin is `rivoli_engine::probe::fold_host`, and
+/// `crates/engine/tests/fwd_kernel.rs::hash_rows_matches_the_host_fold` scores the two
+/// against each other. That gate is not decoration: every conclusion the GLM-nondeterminism
+/// investigation draws is read off a pair of these hashes.
+///
+/// # Safety
+/// `x` must be `n` device f32; `out` one device u64, ZEROED before the first fold into it —
+/// XOR against uninitialised memory is silently wrong, and `hipMalloc` does not zero.
+pub unsafe fn launch_hash_rows(x: *const f32, n: usize, out: *mut u64) -> Result<()> {
+    // SAFETY: caller's pointer contract.
+    ensure_hip_status(unsafe { rivoli_hash_rows(x, n as i32, out) }, "hash_rows")
 }
 
 //

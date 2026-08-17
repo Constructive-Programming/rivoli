@@ -12,7 +12,7 @@
 #
 # WHY THIS IS `cargo check` AND NOT `cargo test`, and why the two matrices are not nested:
 # the mode x policy x attn matrix (tests/mode-matrix.sh) needs a GPU and ~145 s per cell.
-# Running it under all 33 feature combinations would be 1188 GPU-bound cells, roughly two
+# Running it under all 65 feature combinations would be 2340 GPU-bound cells, roughly four
 # days of sole-tenant machine, to re-prove decode behaviour that features do not change —
 # they gate instruments, not arithmetic. So: features are checked for COMPILATION here
 # (plus the non-GPU tests, which is where feature-gated logic actually has assertions), and
@@ -25,8 +25,11 @@
 # Usage: tests/feature-matrix.sh [quick|full]        # default: full
 #   quick — backends x {none, each single feature, all}: catches a module that stopped
 #           compiling. ~7 combos per backend.
-#   full  — the whole powerset of the optional features per backend. ~33 combos, and the
-#           only tier that can catch a PAIR of features interacting.
+#   full  — the whole powerset of the optional features per backend. 2^|OPTIONAL| + 1 combos,
+#           and the only tier that can catch a PAIR of features interacting. **The count
+#           DOUBLES with every feature added**: it went 33 -> 65 when `corruption-probe`
+#           landed on 2026-08-17, which is the real price of a new feature in this repo and is
+#           stated here rather than discovered by whoever next times this script.
 #   RIVOLI_BACKENDS="rocm" narrows the backends. There is only `rocm` since 2026-08-06, so
 #           the knob is vestigial today; it is kept because BACKENDS is what tests/matrix.rs
 #           asserts against Cargo.toml, and a second backend would want it back.
@@ -37,7 +40,7 @@ MODE="${1:-full}"
 # Mutually exclusive — one backend per build, no runtime selection. Never both in one cell.
 BACKENDS=(rocm)
 # The optional, non-backend features. `default` is empty and is not a cell.
-OPTIONAL=(otlp teacher-forcing pred-probe trace stale-sel)
+OPTIONAL=(otlp teacher-forcing pred-probe corruption-probe trace stale-sel)
 
 read -r -a BACKENDS <<<"${RIVOLI_BACKENDS:-${BACKENDS[*]}}"
 

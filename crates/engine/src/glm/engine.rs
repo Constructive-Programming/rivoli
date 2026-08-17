@@ -122,6 +122,10 @@ pub struct GlmEngine<'a> {
     /// the residents finish, putting the GPU's wake latency on the critical path
     /// (measured +382 µs per layer-with-misses in the old tree).
     pub(super) miss_stream: HipStream,
+    /// `--divergence-log` state, `None` unless the flag is on — so a probe build that does
+    /// not pass it allocates nothing and folds nothing.
+    #[cfg(feature = "corruption-probe")]
+    pub(super) probe: Option<crate::probe::Probe>,
 }
 
 impl<'a> GlmEngine<'a> {
@@ -243,8 +247,28 @@ impl<'a> GlmEngine<'a> {
             argmax_host: Vec::with_capacity(ARGMAX_BYTES),
             compute_stream: HipStream::compute()?,
             miss_stream: HipStream::miss()?,
+            #[cfg(feature = "corruption-probe")]
+            probe: None,
             pin,
         })
+    }
+
+    /// Arm `--divergence-log`. Allocates the fold slab; every later layer folds into it and
+    /// every pass drains it.
+    #[cfg(feature = "corruption-probe")]
+    pub fn arm_divergence_log(&mut self) -> Result<()> {
+        self.probe = Some(crate::probe::Probe::new(self.cfg.n_layers)?);
+        Ok(())
+    }
+
+    /// Write the `--divergence-log`. AFTER the run, never during it — the records are held
+    /// in memory precisely so the measurement is not perturbed by its own instrument.
+    #[cfg(feature = "corruption-probe")]
+    pub fn write_divergence_log(&self, path: &str) -> Result<()> {
+        match &self.probe {
+            Some(p) => p.write(path),
+            None => Ok(()),
+        }
     }
 
     /// The KV ceiling this engine allocated for, in tokens — see `Engine::max_ctx`, whose

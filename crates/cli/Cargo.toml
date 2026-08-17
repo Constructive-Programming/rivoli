@@ -13,6 +13,7 @@ rocm = ["rivoli-engine/rocm"]
 otlp = ["rivoli-engine/otlp"]
 teacher-forcing = ["rivoli-engine/teacher-forcing"]
 pred-probe = ["rivoli-engine/pred-probe"]
+corruption-probe = ["rivoli-engine/corruption-probe"]
 trace = ["rivoli-engine/trace"]
 stale-sel = ["rivoli-engine/stale-sel"]
 

@@ -78,8 +78,15 @@ impl GlmEngine<'_> {
         rows: Rows,
         xp: ResidualBase,
     ) -> Result<()> {
+        // Sampled BEFORE the layer runs: what `--divergence-log` records is the per-layer
+        // DELTA, because the question is whether a divergence coordinate coincides with this
+        // layer's misses and relocations, not with the run's totals.
+        #[cfg(feature = "corruption-probe")]
+        let before = (self.pin.routed.misses(), self.pin.routed.relocs());
         self.route_layer(l, rows)?;
         self.moe_layer(l, rows).await?;
+        #[cfg(feature = "corruption-probe")]
+        self.probe_moe(l, rows, before)?;
         // SAFETY: xp nrow rows live; moe_acc's writers completed.
         unsafe {
             launch_moe_acc_drain(
@@ -91,6 +98,71 @@ impl GlmEngine<'_> {
                 NULL_STREAM,
             )
         }
+    }
+
+    /// `--divergence-log`'s MoE-layer record: the two device folds that CUT the layer at the
+    /// seams the two standing hypotheses sit either side of, plus the six host columns.
+    ///
+    /// The cut is the whole point of the instrument. `xn` is the MoE's input, so a difference
+    /// there is attention's; `h` is the SwiGLU intermediate, so a difference there with `xn`
+    /// equal is the gate/up expert BYTES or that kernel — the routed-pool hypothesis; and the
+    /// exit residual (folded in `forward.rs::run_layer`) differing with both equal is the
+    /// down projection, the fixed-point accumulator or the drain — the accumulation
+    /// hypothesis. Two runs' logs diff to a coordinate AND a mechanism.
+    ///
+    /// Runs AFTER `moe_layer`, which is what makes it legal: that call host-awaits both MoE
+    /// streams, so `h`'s writers have retired and a fold on the null stream reads settled
+    /// bytes. It also means the record can carry `wexpert` and the slot placement, which do
+    /// not exist until `stage_batch` and `submit` have run.
+    #[cfg(feature = "corruption-probe")]
+    fn probe_moe(&mut self, l: usize, rows: Rows, before: (u64, u64)) -> Result<()> {
+        if self.probe.is_none() {
+            return Ok(());
+        }
+        // Row 0's gate logits ONLY. `gate_logits_host` is the whole `MAXROW`-wide D2H, so at
+        // `nrow == 1` its second half is uninitialised device memory — folding it would make
+        // every line differ between runs and the instrument would report itself.
+        let ne = self.cfg.n_experts * 4;
+        let cols = crate::probe::Cols {
+            gl: rivoli_core::hash::fnv1a(
+                self.gate_logits_host
+                    .get(..ne)
+                    .unwrap_or(&self.gate_logits_host),
+            ),
+            pk: rivoli_core::hash::fnv1a_u64s(self.sel_row[0].iter().map(|&e| e as u64)),
+            // Exact BITS, not values: a one-ulp move in a routing weight is exactly the size
+            // of perturbation this is hunting. `as_le_bytes` is the same widening the H2D of
+            // this buffer already does, so the hash covers what the kernel will read.
+            wx: rivoli_core::hash::fnv1a(as_le_bytes(&self.wexpert)),
+            sl: self.pin.routed.slot_fold(l, &self.union),
+            miss: self.pin.routed.misses() - before.0,
+            reloc: self.pin.routed.relocs() - before.1,
+        };
+        let (hidden, inter) = (self.cfg.hidden, self.cfg.moe_inter);
+        let xn = (self.xn.ptr() as *const f32, rows.nrow * hidden);
+        // EXACTLY the written extent, and the bound is load-bearing: the kernel writes
+        // `h[(e·R + t)·inter + j]` for `e < descs.len()` and `R == nrow`, so anything past
+        // `descs.len() · nrow · inter` is untouched `hipMalloc` memory whose bits differ per
+        // run. Folding one word of it would manufacture a divergence on every line.
+        let h = (
+            self.moe_hidden.ptr() as *const f32,
+            self.descs.len() * rows.nrow * inter,
+        );
+        // Re-taken rather than held across the reads above: `cols` needs `&self.pin` and
+        // `&self.cfg`, which a live `&mut self.probe` borrow would forbid. The `is_none`
+        // guard at the top is what keeps the folds free when the flag is off; this `else` is
+        // the borrow checker's copy of it and cannot be reached.
+        let Some(p) = self.probe.as_mut() else {
+            return Ok(());
+        };
+        // SAFETY: both extents are live device f32 written by launches this layer already
+        // host-awaited (see the doc above), and both are bounded to the written region.
+        unsafe {
+            p.fold(crate::probe::Q::Xn, l, xn.0, xn.1)?;
+            p.fold(crate::probe::Q::H, l, h.0, h.1)?;
+        }
+        p.set_cols(l, cols);
+        Ok(())
     }
 
     /// Host routing for a MoE layer: gate GEMV, the blocking logits D2H, per-row

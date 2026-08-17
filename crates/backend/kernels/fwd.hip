@@ -331,3 +331,46 @@ extern "C" int rivoli_flag_nonfinite(const float* x, int n, unsigned tag, unsign
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// XOR-fold the EXACT BITS of `x[0..n]` into `*out` — the divergence-localisation probe
+// (`--divergence-log`). Two runs of one input must agree slot for slot; the first slot that
+// differs names the (position, layer, quantity) where a run diverged, which is the question
+// GLM's run-to-run divergence cannot answer from output text alone (a single changed token
+// rewrites the whole tail, so the output says only "somewhere before here").
+//
+// XOR because it is commutative AND associative, so the fold is bit-identical whatever order
+// the atomics land in. A float sum would be neither and would report divergence from
+// scheduling jitter alone — the probe has to be quieter than the bug it hunts. This is the
+// load-bearing property of the whole instrument, and it is the reason a `+` here would be a
+// defect rather than a style choice.
+//
+// The INDEX is mixed in before the finalizer for two reasons: a permutation of the same
+// values is then a different hash, and — because XOR is self-inverse — two elements that
+// happen to hold the same bit pattern no longer cancel each other out of the fold.
+// splitmix64's finalizer spreads a one-bit input change across the whole word, so two
+// nearby single-ulp differences cannot cancel either.
+//
+// Stays on the DEVICE and adds NO sync, for a measured reason: the old tree's `--checksum-x`
+// copied the residual to the host every layer, and a config that reproduced its fault
+// without the probe produced a clean run with it (see `flag_nonfinite` above). An
+// instrument that perturbs its own subject is not an instrument. The caller drains every
+// slot in ONE D2H per token, at a point the end-of-layer sync has already idled.
+extern "C" __global__ void hash_rows(const float* __restrict__ x, int n,
+                                     unsigned long long* __restrict__ out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    unsigned int bits;
+    __builtin_memcpy(&bits, &x[i], sizeof(bits));
+    unsigned long long z = ((unsigned long long)i << 32) ^ (unsigned long long)bits;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    atomicXor(out, z ^ (z >> 31));
+}
+
+extern "C" int rivoli_hash_rows(const float* x, int n, unsigned long long* out) {
+    if (n <= 0) return 1001;
+    hipGetLastError();
+    hipLaunchKernelGGL(hash_rows, dim3((n + 255) / 256), dim3(256), 0, 0, x, n, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}

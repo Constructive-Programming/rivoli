@@ -32,6 +32,7 @@
 
 use rivoli_backend::hip::{
     launch_append_kv, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
+    launch_hash_rows,
 };
 use rivoli_core::num::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3};
 
@@ -280,4 +281,108 @@ fn flag_nonfinite_records_the_first_fault_only() {
         "-inf must flag on its own — without this the line above proves only that the \
          kernel cannot see it"
     );
+}
+
+/// `hash_rows` — the `--divergence-log` fold, scored against its host twin.
+///
+/// **The instrument gets a gate of its own, and P7 is the whole argument.** Every conclusion
+/// the GLM-nondeterminism investigation reaches is read off a pair of these hashes; a fold
+/// that were subtly wrong would produce confident coordinates pointing at nothing, and no
+/// other test in the tree would notice. `rivoli_engine::probe::fold_host` is the reference,
+/// and it is a REFERENCE rather than a second copy: `probe::Probe` never computes a hash on
+/// the host, so there is one implementation of the fold on each side of the ABI and this test
+/// is the only thing that makes them agree.
+///
+/// Four assertions, each pinning a property the instrument's usefulness depends on:
+///
+/// 1. **Bit-exact against the host fold**, over a length that is NOT a multiple of the 256
+///    block so the `i >= n` guard is exercised. This is the correctness assertion.
+/// 2. **A one-ULP change in ONE element moves the hash.** Without this, assertion 1 is
+///    satisfied by a fold that ignores its input entirely (e.g. an XOR of indices), and the
+///    probe would report "identical" for every divergence there is. This is the
+///    anti-vacuity assertion, and one ulp is the resolution the investigation needs: a
+///    fixed-point accumulator differing by one count is exactly the perturbation being
+///    hunted.
+/// 3. **A PERMUTATION of the same values moves the hash.** This is what the index mix-in
+///    buys, and it matters because XOR is self-inverse: without the index, two elements
+///    holding the same bit pattern would cancel out of the fold and a reordering would be
+///    invisible.
+/// 4. **Folding the same array twice returns to the starting value.** The fold's
+///    self-inverse property IS why `Probe::drain` must re-zero the slab, so the property is
+///    pinned here rather than left as a comment there.
+#[test]
+fn hash_rows_matches_the_host_fold() {
+    // 1000, deliberately: 3 full 256-blocks plus 232, so the last block's `i >= n` guard
+    // decides the result. A multiple of 256 would leave that branch untested.
+    let n = 1000;
+    let mut r = Lcg(0x8AD5);
+    let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
+    let fold = |v: &[f32]| -> u64 {
+        let xb = dev(&f32b(v));
+        let mut out = zeros(8);
+        // SAFETY: `v.len()` live device f32 and one live device u64, zeroed by `zeros`.
+        ok(
+            unsafe { launch_hash_rows(xb.ptr() as *const f32, v.len(), out.ptr_mut() as *mut u64) },
+            "hash_rows",
+        );
+        u64le(&back(&out))
+    };
+
+    let want = rivoli_engine::probe::fold_host(&x);
+    assert_eq!(
+        fold(&x),
+        want,
+        "hash_rows must equal the host fold bit for bit"
+    );
+
+    let mut ulp = x.clone();
+    ulp[617] = f32::from_bits(x[617].to_bits() ^ 1);
+    assert_ne!(
+        rivoli_engine::probe::fold_host(&ulp),
+        want,
+        "a ONE-ULP change in one element must move the fold — a probe blind to that is \
+         blind to the divergence it exists to localise"
+    );
+    assert_eq!(
+        fold(&ulp),
+        rivoli_engine::probe::fold_host(&ulp),
+        "and the kernel must agree with the host on the perturbed array too"
+    );
+
+    let mut swapped = x.clone();
+    swapped.swap(4, 900);
+    assert_ne!(
+        fold(&swapped),
+        want,
+        "a permutation of the same values must move the fold (this is what mixing the \
+         INDEX in buys — XOR is self-inverse)"
+    );
+
+    // Folding twice into the same slot cancels. This is the property `Probe::drain`'s
+    // re-zero exists for, so it is asserted rather than asserted-in-prose.
+    let xb = dev(&f32b(&x));
+    let mut twice = zeros(8);
+    for _ in 0..2 {
+        // SAFETY: as above.
+        ok(
+            unsafe { launch_hash_rows(xb.ptr() as *const f32, n, twice.ptr_mut() as *mut u64) },
+            "hash_rows",
+        );
+    }
+    assert_eq!(
+        u64le(&back(&twice)),
+        0,
+        "XOR is self-inverse: two folds of one array must cancel, which is why an \
+         un-zeroed slot silently corrupts the next token's hash"
+    );
+}
+
+/// First 8 bytes of `b` as a little-endian u64. Local to this file: `common::upload` has
+/// `u32v`/`u16v`/`f32v` because their callers want whole vectors; the only u64 in this suite
+/// is a single fold slot, and a `u64v` nobody else calls would be a helper written for one
+/// site.
+fn u64le(b: &[u8]) -> u64 {
+    let mut w = [0u8; 8];
+    w.copy_from_slice(&b[..8]);
+    u64::from_le_bytes(w)
 }

@@ -21,6 +21,19 @@ rocm = ["rivoli-backend/rocm", "dep:io-uring"]
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 teacher-forcing = []
 pred-probe = []
+# `--divergence-log`: the (position, layer, quantity) localiser for GLM's run-to-run
+# divergence. SPLIT FROM `trace`, and the split is the whole design: `trace`'s arena
+# poison-fill carries its own `device_sync` per layer-with-misses (`routed.rs::admit_misses`),
+# and this probe hunts a fault that added syncs are recorded to MASK. See
+# `crates/engine/src/probe.rs`'s header for the measurement.
+#
+# **`trace` deliberately does NOT imply it.** The archived predecessor did (`trace =
+# ["corruption-probe"]`, archive 544fea7) because its `--checksum-x` had always lived under
+# `trace` and a trace build had a flag to keep. `--divergence-log` was born in the same commit
+# as this feature, so there is no such flag — and implying it would arm the probe in exactly
+# the build whose extra barrier its own doc says invalidates the measurement (review finding,
+# 2026-08-17).
+corruption-probe = []
 trace = []
 stale-sel = []
 

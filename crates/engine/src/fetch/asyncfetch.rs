@@ -499,6 +499,87 @@ mod tests {
         );
     }
 
+    /// **INV-9: nothing on the host path can make two runs of one input a different
+    /// program.** The one host-side decision on the routed path that reads DEVICE PROGRESS
+    /// rather than its own inputs is this staging-slot hand-out — `landed(s)` is a timeline
+    /// value, i.e. wall-clock — so if it varies between two runs of one input, the two runs
+    /// stop being the same program there and every later comparison is of two different
+    /// things.
+    ///
+    /// It does not vary, and the reason is a barrier somewhere else: `glm::forward::run_layer`
+    /// ends every layer with an unconditional `device_sync`, so at the next `submit` EVERY
+    /// prior bounce copy has retired and `landed` is uniformly true. Under that precondition
+    /// `scan_free` is pure round-robin over the miss sequence, and two runs with an identical
+    /// miss sequence assign identical staging slots. `AsyncFetch::slot_stalls()` is the
+    /// observable that falsifies the precondition: non-zero means it did not hold, and a
+    /// determinism comparison over that run is unsound.
+    ///
+    /// **What each assertion can actually catch**, stated because two of the three are much
+    /// stronger than the first and a reader should not credit them equally:
+    ///
+    /// 1. *Two walks agree.* A purity check. It can only redden if `scan_free` grows a hidden
+    ///    input — a clock, a `static`, an address. It is a regression guard, and the red proof
+    ///    below records that it CANNOT be reddened by any change to the current body, which is
+    ///    exactly what a purity assertion over a pure function should be.
+    /// 2. *The hand-out is `[0,1,…,7,0,1]`.* Round-robin rather than first-fit, and this one
+    ///    reddens on a real mutation (drop the cursor advance → all-zeros). Without it, 1 is
+    ///    satisfied by a hand-out that always returns slot 0 and breaks slot reuse outright.
+    /// 3. *An un-landed slot changes the result and is never handed out.* This is what makes
+    ///    the barrier load-bearing rather than decorative: `scan_free` advances past every
+    ///    candidate it TESTS, so a single skip permanently offsets the cursor and the two runs
+    ///    never re-converge.
+    ///
+    /// **What this does NOT claim.** Two runs are the same PROGRAM, not that they produce the
+    /// same OUTPUT. The output property is a device property; its gate is
+    /// `tests/determinism-glm.sh` (GPU, real artifact, ≥256 tokens — it is green at 32 on an
+    /// engine that fails at 512). See `docs/investigations/glm-nondeterminism.md`.
+    #[test]
+    fn inv_9_slot_handout_is_deterministic_under_the_layer_barrier() {
+        const N: usize = 8;
+        // A miss sequence shaped like real layers: batches of 3, 1, 4, 2 cold experts.
+        let batches = [3usize, 1, 4, 2];
+        let walk = |landed: &dyn Fn(usize) -> bool| -> Vec<usize> {
+            let mut cursor = 0;
+            let mut got = Vec::new();
+            for b in batches {
+                for _ in 0..b {
+                    match scan_free(N, &mut cursor, landed) {
+                        Some(s) => got.push(s),
+                        None => break,
+                    }
+                }
+            }
+            got
+        };
+        let all_landed = |_: usize| true;
+        assert_eq!(
+            walk(&all_landed),
+            walk(&all_landed),
+            "under the per-layer device barrier the hand-out must be a pure function of the \
+             miss sequence — two runs of one input assign identical staging slots"
+        );
+        assert_eq!(
+            walk(&all_landed),
+            [0, 1, 2, 3, 4, 5, 6, 7, 0, 1],
+            "round-robin, not first-fit: an always-slot-0 hand-out satisfies the purity \
+             assertion above and breaks reuse"
+        );
+
+        // Slot 3 stands in for a copy still in flight — the case `slot_stalls` counts.
+        let stalled = |s: usize| s != 3;
+        let a = walk(&stalled);
+        assert_ne!(
+            a,
+            walk(&all_landed),
+            "an un-landed slot must change the hand-out; if it did not, the barrier this \
+             invariant rests on would be unnecessary and the purity assertion vacuous"
+        );
+        assert!(
+            !a.contains(&3),
+            "an un-landed slot must never be handed out — its bytes are still being copied"
+        );
+    }
+
     /// Round-robin, not first-fit: a slot just handed back is the LAST candidate, so slots
     /// age evenly instead of hammering the one whose copy was enqueued most recently.
     #[test]

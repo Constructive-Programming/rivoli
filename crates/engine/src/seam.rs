@@ -365,6 +365,51 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The GLM arm, or the refusal `--divergence-log` gives everywhere else.
+    ///
+    /// **A refusal, not a silent no-op.** GLM is the arm that does not reproduce itself, so
+    /// it is the only arm the folds are placed for; an arm that accepted the flag and wrote
+    /// an empty log would be a recorded command line carrying a knob nothing spent, which is
+    /// what [`rivoli_core::legality`] exists to stop. Delegated here rather than plumbed
+    /// through [`OpenSpec`] for the same reason — a shared startup struct would gain a field
+    /// three arms fill and never read.
+    ///
+    /// One accessor rather than the same `#[cfg]`-split match in both callers below, because
+    /// that is exactly the pair `build.rs`'s duplication gate reported when they were two
+    /// (2026-08-17). It also removes the fudge the split version needed: the writer used to
+    /// return `Ok(())` on a non-GLM arm on the grounds that the door had already refused,
+    /// which is a second, weaker copy of the same decision.
+    /// Gated on `rocm` as well as its own feature, unlike every other method here: the probe
+    /// IS part of the device path, so a deviceless build has no arm to point it at and
+    /// [`Engine::open`] has already refused to decode. That also keeps the two callers below
+    /// single-bodied — a `#[cfg]`-split body in each is the shape the duplication gate
+    /// rejected in the first place.
+    #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+    fn glm_for_probe(&mut self) -> Result<&mut crate::glm::engine::GlmEngine<'a>> {
+        match self {
+            Engine::Glm(e) => Ok(e),
+            _ => anyhow::bail!(
+                "--divergence-log is implemented for GLM only: it folds the routed-MoE \
+                 quantities that split GLM's own run-to-run divergence, and no other arm has \
+                 been shown not to reproduce itself"
+            ),
+        }
+    }
+
+    /// Arm `--divergence-log`: fold three per-layer quantities on the device so two runs of
+    /// one input can be diffed to a (position, layer, quantity) coordinate.
+    #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+    pub fn arm_divergence_log(&mut self) -> Result<()> {
+        self.glm_for_probe()?.arm_divergence_log()
+    }
+
+    /// Write the `--divergence-log`. After the run, never during it — the records are held in
+    /// memory precisely so the measurement is not perturbed by its own instrument.
+    #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+    pub fn write_divergence_log(&mut self, path: &str) -> Result<()> {
+        self.glm_for_probe()?.write_divergence_log(path)
+    }
+
     /// Greedy-decode `req`, streaming each token to `sink` the moment it lands; return
     /// false from it to stop early. The delegating match is the whole seam — everything
     /// architecture-shaped is on the other side of it.

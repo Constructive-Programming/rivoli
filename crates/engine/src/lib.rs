@@ -15,6 +15,13 @@ pub mod glimmer;
 #[cfg(feature = "rocm")]
 pub mod glm;
 pub mod indexer;
+/// `--divergence-log`: the (position, layer, quantity) localiser for a run-to-run
+/// divergence, behind its own feature rather than `trace`'s because `trace` adds the class
+/// of `device_sync` that is recorded to MASK this fault. Gated INSIDE on that feature, not
+/// here: the host folds are pure arithmetic and are the ORACLE the kernel is scored against,
+/// so they must compile in any build that runs the device suite.
+#[cfg(feature = "rocm")]
+pub mod probe;
 // Ungated at the module and gated inside it, like `v4`: the fold schedule, the router
 // weighting and the composed widths are arithmetic over a config that touches no device,
 // and they are the half where a wrong answer is silent. `k3.rs` carries the arm's table.

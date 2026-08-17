@@ -141,6 +141,18 @@ impl GlmEngine<'_> {
         for l in span.layers.clone() {
             self.run_layer(l, rows, xp).await?;
         }
+        // `--divergence-log`: drain every fold slot this pass touched in ONE D2H and re-zero.
+        // Once per token in decode, once per (layer, rows) pass under layer-major prefill —
+        // and at a point the end-of-layer `device_sync` has already idled the device, so it
+        // adds no barrier. The per-LAYER host copy this replaced is what masked the fault in
+        // the old tree.
+        #[cfg(feature = "corruption-probe")]
+        {
+            let layers = span.layers.clone();
+            if let Some(p) = self.probe.as_mut() {
+                p.drain(rows.pos, layers)?;
+            }
+        }
         if span.tail > 0 {
             self.tail(rows, span.tail, xp)?;
         }
@@ -222,6 +234,20 @@ impl GlmEngine<'_> {
                 1 + (rows.pos as u32) * 256 + l as u32,
                 self.argmax_dev.ptr_mut().add(MAXROW * 8) as *mut u32,
             )?;
+        }
+        // `--divergence-log`: fold the layer's EXIT residual, on the device, into its own
+        // slot. This is the localiser — the first slot that differs between two runs of one
+        // input names the (pos, layer) a run diverged at, which the output text cannot say
+        // because one changed token rewrites the whole tail. Folded here rather than beside
+        // the flag above only because the sync must have retired every writer first.
+        #[cfg(feature = "corruption-probe")]
+        {
+            let (n, x) = (rows.nrow * self.cfg.hidden, xp.0 as *const f32);
+            if let Some(p) = self.probe.as_mut() {
+                // SAFETY: `xp` is this pass's residual rows, `n` live f32 inside `x`, and
+                // the `device_sync` above retired every writer.
+                unsafe { p.fold(crate::probe::Q::X, l, x, n)? };
+            }
         }
         Ok(())
     }

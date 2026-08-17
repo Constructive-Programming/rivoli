@@ -123,14 +123,71 @@ impl RoutedGeom {
                 table.push(src.read_spec(l, e)?);
             }
         }
-        Ok(Self {
+        let me = Self {
             off: src.slot_offsets(),
             fmt: src.fmt(),
             stride: src.expert_slot(),
             table,
             first_layer,
             n_experts,
-        })
+        };
+        me.check_reads_fit_their_slots()?;
+        Ok(me)
+    }
+
+    /// **Every read must start block-aligned and its aligned superset must fit ONE slot.**
+    /// Checked here, once, over the whole table.
+    ///
+    /// This replaces a `debug_assert_eq!(sub, 0, "VQ expert read must be block-aligned")` on
+    /// the per-read path in `asyncfetch.rs`, and the replacement is the point rather than a
+    /// tidy-up. That assert claimed to enforce two properties the fetch path genuinely depends
+    /// on, and under `--release` — which is what every benchmark and every long divergence run
+    /// is built with — it enforced neither. This repo's most common review finding is a
+    /// `debug_assert!` whose comment claims it *enforces* something; this one was in the fetch
+    /// path of an open non-determinism defect.
+    ///
+    /// The two properties, and what breaks without each:
+    ///
+    /// 1. **`begin` is `ALIGN`-aligned**, so the useful bytes start at sub-offset 0 in the
+    ///    bounce slot. `Streamer::reap` copies the aligned superset to the pool slot's BASE, so
+    ///    a non-zero sub-offset shifts every one of the six projection pointers by that many
+    ///    bytes — a silent, deterministic wrong-weights read with no downstream check that
+    ///    could see it.
+    /// 2. **The superset fits `stride`**, so the copy cannot spill past the slot. A spill
+    ///    overwrites the NEIGHBOURING slot, i.e. some other resident expert's weights, at a
+    ///    moment that depends on when the reaper reaps — a timing-dependent cross-expert
+    ///    corruption, which is precisely the shape of defect under investigation.
+    ///
+    /// Both currently hold by arithmetic rather than by check: an expert block sits at
+    /// `VQ_ALIGN + e·stride` with `VQ_ALIGN == ALIGN == 4096` and `stride` a multiple of it. So
+    /// this is expected to be silent forever — and it is worth its startup cost anyway,
+    /// because "holds by arithmetic in a different crate" is exactly the kind of coupling a
+    /// repack or a new format changes without anyone noticing. It costs one pass over
+    /// `layers × n_experts` entries at `open()` and nothing per read.
+    fn check_reads_fit_their_slots(&self) -> Result<()> {
+        const A: usize = crate::fetch::stream::ALIGN;
+        for (i, &(_, begin, len)) in self.table.iter().enumerate() {
+            let (layer, expert) = (self.first_layer + i / self.n_experts, i % self.n_experts);
+            ensure!(
+                begin.is_multiple_of(A),
+                "routed .{} read for (layer {layer}, expert {expert}) starts at {begin}, \
+                 which is not a multiple of the {A}-byte O_DIRECT block. The bounce->slot \
+                 copy lands the aligned superset at the slot BASE, so every projection \
+                 pointer would be off by {} bytes.",
+                self.fmt.ext(),
+                begin % A,
+            );
+            let superset = (begin + len).next_multiple_of(A) - begin;
+            ensure!(
+                superset <= self.stride,
+                "routed .{} read for (layer {layer}, expert {expert}) needs {superset} bytes \
+                 ({len} rounded up to the {A}-byte block) but a pool slot is {}. The copy \
+                 would spill into the neighbouring slot and corrupt another resident expert.",
+                self.fmt.ext(),
+                self.stride,
+            );
+        }
+        Ok(())
     }
 
     /// The cold-read spec for `(layer, expert)`, by ABSOLUTE layer id.

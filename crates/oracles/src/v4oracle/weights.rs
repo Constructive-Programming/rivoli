@@ -681,14 +681,13 @@ impl NamedRng {
         Self(h | 1)
     }
     fn next_u64(&mut self) -> u64 {
-        // splitmix64. Chosen over xorshift64* only because `src/artifact/format.rs` already
-        // has that one and the duplication gate is not budgeted; statistically either is
-        // more than adequate for synthetic weights.
+        // splitmix64: the state step here, the avalanche in `rivoli_core::hash`. Chosen over
+        // xorshift64* only because `artifact/format.rs` already has that one and the
+        // duplication gate is not budgeted; statistically either is more than adequate for
+        // synthetic weights. The finalizer MOVED to core on 2026-08-17, when jscpd reported
+        // it against the divergence probe's copy — see that function for the argument.
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        rivoli_core::hash::splitmix_finalize(self.0)
     }
     /// Uniform in [-1, 1).
     pub fn unit(&mut self) -> f32 {
