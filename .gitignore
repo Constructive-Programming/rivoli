@@ -1,1 +1,6 @@
 /target
+# Python bytecode from the anchor/golden DRIVER scripts under crates/*/tests. Importing one
+# (as the K3 tokenizer verification did) leaves a .pyc that is build output, not source — it
+# was staged once on 2026-08-17 before this line existed.
+__pycache__/
+*.pyc

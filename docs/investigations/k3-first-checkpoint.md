@@ -1,7 +1,7 @@
 ---
 status: live
 scope: k3
-verdict: The real Kimi-K3 checkpoint arrived 2026-08-16 and the schema survived it — every field K3TextConfig requires is present at the level it expects, num_nextn_predict_layers IS 0 (no MTP head, the assertion holds), the quantization block is MXFP4 e2m1 + e8m0 group_size 32 as assumed, and the vendored config.json is BYTE-IDENTICAL to the shipped one (md5 e0b7be1d…, index sha256 a1c52106… matching its pinned revision). Two things the synthetic gates could not see: the checkpoint ships NO tokenizer.json — it is tiktoken (163,584 ranks + 16 special ids in tokenizer_config.json) — so convert_k3's aux list refused the real source at the LAST step of a 1.42 TiB run, and Tokenizer::load reads tokenizer.json unconditionally for every arch, which blocks the first K3 decode on a tiktoken loader that does not exist rather than on the GPU. Conversion census: 497,220 tensors = 494,592 routed (1,446,456,066,048 B) + 2,460 resident (113,509,540,864 B) + 168 vision (894,717,952 B); one .f4 layer is exactly 4096 + 896 × 17,547,264 = 15,722,352,640 B, verified against the source at 0 differing bytes.
+verdict: The real Kimi-K3 checkpoint arrived 2026-08-16 and the schema survived it — every field K3TextConfig requires is present at the level it expects, num_nextn_predict_layers IS 0 (no MTP head, the assertion holds), the quantization block is MXFP4 e2m1 + e8m0 group_size 32 as assumed, and the vendored config.json is BYTE-IDENTICAL to the shipped one (md5 e0b7be1d…, index sha256 a1c52106… matching its pinned revision). Two things the synthetic gates could not see: the checkpoint ships NO tokenizer.json — it is tiktoken (163,584 ranks + 16 special ids in tokenizer_config.json) — so convert_k3's aux list refused the real source at the LAST step of a 1.42 TiB run, and Tokenizer::load read tokenizer.json unconditionally for every arch, so no K3 artifact could be opened at all -- FIXED 2026-08-17 by a first-party-gated tiktoken loader (95 id-pinned cases; 8 gates, all deviceless -- but only ONE asserts in CI, since 7 need the checkpoint and skip without it; 5 red proofs), which measured two corrections to its own plan: round-trip stays GREEN under a broken pre-tokenizer, and the pat_str Han intersections are invisible to id equality because no token in the vocabulary mixes Han with non-Han. Conversion census: 497,220 tensors = 494,592 routed (1,446,456,066,048 B) + 2,460 resident (113,509,540,864 B) + 168 vision (894,717,952 B); one .f4 layer is exactly 4096 + 896 × 17,547,264 = 15,722,352,640 B, verified against the source at 0 differing bytes.
 ---
 
 # Kimi-K3: the first real checkpoint
@@ -310,10 +310,14 @@ superset of the names the test spells — it could not see `tokenizer.json` comi
 sidecar's bytes are also compared against the source's, since presence under a right name says
 nothing about content.
 
-## 7. Scoping the tiktoken loader (the critical path; not started)
+## 7. The tiktoken loader — SHIPPED 2026-08-17
 
-The artifact will exist hours before anything can open it (§4), and closing that needs no
-GPU. Scope and gate design only — nothing here is implemented.
+> **This section was written as a SCOPE and is kept as one**, with the outcome folded in
+> beneath: the plan below is what was built, and the two places reality contradicted it are
+> called out where they occur rather than quietly edited away. The conversion finished (92
+> layers, §5), the loader landed, and **a K3 artifact now opens** —
+> `crates/artifact/src/tiktoken.rs`, gated by `crates/artifact/tests/k3_tokenizer.rs`,
+> **deviceless, so unlike everything else on this arm it runs in CI**.
 
 **Separate the two questions first, because conflating them is the trap.** K3 ships *two*
 first-party Python files and they are not the same milestone:
@@ -377,11 +381,86 @@ it:
 The eos discrepancy in §3 is a live hazard for step 3: `tokenizer_config.json` says `[EOS]`
 163585 and the two generation-side files say 163586. Pin 163586 and pin the disagreement.
 
+### What shipped, and the measured red-proof matrix
+
+Eight gates, all deviceless — **but be precise about what that buys in CI: exactly one of them
+asserts there.** `pat_str` equality needs no checkpoint and never skips; the other seven read
+`tiktoken.model` out of the **artifact** (not the source, so they also gate what `convert_k3`
+shipped) and announce a skip without it, which in CI is all seven. On a box with the artifact all
+eight assert. Each skipping gate also asserts a census, so a partial run cannot report green —
+that is what makes the skip safe rather than what makes it coverage.
+
+Every perturbation was applied, run, and reverted:
+
+| perturbation | `pat_str` | id equality | special block | chunking | round-trip | Han census |
+|---|---|---|---|---|---|---|
+| drop `\s+(?!\S)` | **RED** | **RED** | ok | **RED** | ok | ok |
+| drop one `&&[^\p{Han}]]` | **RED** | ok | ok | ok | ok | ok |
+| special base `+1` | ok | **RED** | **RED** | ok | **RED** | ok |
+| `SPECIAL_SLOTS` 256→255 | ok | **RED** | **RED** | **RED** | **RED** | **RED** |
+| invert the Han-census predicate | ok | ok | ok | ok | ok | **RED** |
+
+**The merge itself was fuzzed rather than argued.** "Merge the globally lowest-rank adjacent
+pair, repeatedly" is the same function as tiktoken's threaded loop only if merge order cannot
+change the outcome — an argument about ties that is easy to get wrong on paper. Differential
+against the first-party encoder: **13,400 texts, 473,049 ids, zero mismatches**, over twelve
+alphabets plus a second corpus weighted toward deep merges (whitespace-free pieces of 8..200
+characters) and 600 lossily-decoded random byte strings; `decode` round-tripped every row. Not
+vendored — the 95 curated cases stay the standing gate because each names a `pat_str` clause,
+where a megabyte of random strings says nothing about which clause broke.
+
+**Two rows overturn claims this section originally made, and both are the useful part.**
+
+**1. Round-trip is not merely weak — it is measurably blind.** Row 1 breaks the lookahead,
+which changes ids on real text, and `decode_round_trips_every_case` stays **green**. The
+prediction that "a consistently wrong encoder round-trips perfectly" is no longer an argument
+for preferring id equality; it is an observation with a run behind it.
+
+**2. Trap 2 cannot be caught by id equality at all, and the plan above was wrong to require
+it.** The red proof *refused to redden* the id gate, which per P7 is evidence about the tree
+rather than a pass — so it was chased. Removing an intersection does change the pre-tokenizer
+(`"hello你好"` becomes one piece instead of two), but the ids are **identical**, confirmed at
+the reference level in python: 0 of 12 Han-boundary texts differ. The reason is structural —
+**no token in the 163,584-entry vocabulary mixes Han with non-Han**, so no byte-pair merge can
+cross the boundary and BPE *reconstructs* exactly the split the intersection would have made.
+
+So `pat_str` string equality is not belt-and-braces for that trap, it is the **only** guard —
+and a claim resting on one assertion needs its premise checked, which is why
+`no_vocabulary_token_mixes_han_with_non_han` exists. If a future vocabulary ships a Han-mixing
+token, it reddens and tells the reader that id equality has *started* covering the
+intersections. Same shape as Glimmer's `qk_scale_on_k` exclusion: invisible by algebra, not by
+resolution.
+
+> The driver had the same disease it was built to detect. Its first draft *spelled* the
+> reserved-slot expectations itself and put 163839 among them — which is named `[PAD]`, so the
+> golden asserted a spelling the reference does not have. The Rust gate caught it on its first
+> run. Both sides now derive from the reference's own special map, and a negative case
+> (`<|reserved_token_163839|>` must NOT be one id) keeps the distinction live.
+
+### The seam, which is where the bug actually was
+
+`Tokenizer::load` sniffs by FILE — `tokenizer.json` first (what the other three checkpoints
+ship, and what every recorded benchmark id was produced with), then `tiktoken.model`, and it
+names both when neither is present. `Vocabulary` is a two-arm enum rather than a trait object
+**because the arms are not interchangeable**: every chat-framing method is built on
+`token_to_id`, which only the HuggingFace arm has. A trait would force the tiktoken arm to
+answer `None`, and `encode_chat_turns` already responds to missing chat tokens by encoding RAW
+with a warning — so the abstraction would have converted "this model has no chat framing" into
+a silently unframed prompt. It refuses instead, and a gate asserts the refusal names both the
+format and why.
+
 ## Open, in order
 
-1. **Tiktoken tokenizer loader** — deviceless, blocks every K3 decode (§4).
-2. **First K3 decode**, correctness-only, once (1) lands: ids finite, `--ctx` at or under the
-   `ATTEND_MAX_KV` 8192 ceiling, small token count.
-3. **Chat encoding** (after 1) — `encoding_k3.py` is a legitimate first-party source, and a port needs
-   an id-pinned golden against it rather than a hand-read. Not started; `--port` still
-   refuses, on a message corrected the same day to stop claiming K3 ships no encoder.
+1. ~~Tiktoken tokenizer loader~~ — **done 2026-08-17**, §7. A K3 artifact opens.
+2. **First K3 decode**, correctness-only: ids finite, sane text, no crash, `--ctx` at or under
+   the `ATTEND_MAX_KV` 8192 ceiling, small token count. **Not a reproducibility claim** — GLM
+   decode is on record as failing to reproduce itself over long runs (496 of 512 ids differing
+   after one event; 61/512 on a quiet box), the cause sits in the routed expert pool, and K3
+   streams ~92% of a 1.3 TiB routed set against GLM's 22%. So instability is the expected
+   default here, and any byte-identity gate for K3 needs a token count and an A-vs-A control
+   arm before it means anything. Perf is disclaimed: the artifact is NFS-resident by the
+   owner's Q1 decision, so no tok/s from it is citeable.
+3. **Chat encoding** (independent of 2) — `encoding_k3.py` is the first-party source and a port
+   needs an id-pinned golden against it rather than a hand-read. Not started; `--port` still
+   refuses. Note the loader does **not** unblock this: it turns strings into ids, and the
+   framing that produces the string is the separate milestone §7 opens by distinguishing.

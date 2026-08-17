@@ -22,3 +22,12 @@ safetensors = { version = "0.8.0", default-features = false, features = ["alloc"
 # dependency) and `http` (a network fetcher this engine must never grow), leaving the
 # pure-Rust pattern engine the GLM pre-tokenizer's lookarounds need.
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# Kimi-K3's vocabulary is tiktoken, not HuggingFace JSON, so `tokenizers` cannot read it
+# (`src/tiktoken.rs` carries why). Both of these are ALREADY in the dependency graph as
+# transitive deps of `tokenizers` at these exact versions, so naming them directly adds zero
+# compilation and zero supply-chain surface — which is the whole argument for reusing them
+# instead of hand-rolling. `fancy-regex` is the only engine here that can express K3's
+# `\s+(?!\S)`: the `regex` crate has no lookaround at all, and dropping that alternative
+# changes whitespace tokenization silently.
+fancy-regex = "0.14"
+base64 = "0.22"

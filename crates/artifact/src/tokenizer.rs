@@ -57,7 +57,7 @@
 //! > this function's own doc was written against. The prediction that two ports would otherwise
 //! > get Python's truth table right independently is now a fact with three witnesses.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::io::{self, Write};
 
@@ -74,9 +74,31 @@ fn warn(msg: &str) {
 }
 
 pub struct Tokenizer {
-    inner: tokenizers::Tokenizer,
+    vocab: Vocabulary,
     /// End-of-sequence ids from generation_config (any one stops decode).
     pub eos: Vec<u32>,
+}
+
+/// Which vocabulary format this artifact carries.
+///
+/// **An enum rather than a trait object**, because the two arms are not interchangeable and
+/// pretending otherwise is the bug: only the HuggingFace arm can answer `token_to_id`, which is
+/// what every chat-framing method here is built on. A trait would have to include those methods
+/// and the tiktoken arm would implement them by returning `None`, turning "this model has no
+/// chat framing" into "this model's framing tokens are all missing" — which `encode_chat_turns`
+/// already handles by silently encoding RAW. Refusing loudly is the whole point, so the
+/// distinction stays visible in the type.
+///
+/// **Both arms are boxed, not just the larger one.** `tokenizers::Tokenizer` is ~1480 bytes and
+/// `tiktoken::Vocab` ~368, so boxing only the first merely inverts which variant clippy's
+/// `large_enum_variant` complains about (measured, in that order, 2026-08-17). One `Tokenizer`
+/// exists per process and lives for its whole life, so two indirections cost two allocations at
+/// startup and keep this enum at a pointer.
+enum Vocabulary {
+    /// GLM, DeepSeek-V4 and Muse Glimmer: `tokenizer.json` through the `tokenizers` crate.
+    Hf(Box<tokenizers::Tokenizer>),
+    /// Kimi-K3: `tiktoken.model` plus a positional special block — see [`crate::tiktoken`].
+    Tiktoken(Box<crate::tiktoken::Vocab>),
 }
 
 /// The snapshot's stop tokens, as the engine reads them: `generation_config.json`'s
@@ -335,10 +357,35 @@ impl ChatTokens {
 }
 
 impl Tokenizer {
+    /// Load whichever vocabulary the artifact carries.
+    ///
+    /// **Sniffed by FILE, not by architecture**, so this stays the one door every arm enters
+    /// through and `main` needs no per-arch branch before it. `tokenizer.json` wins when both
+    /// exist, which is the conservative order: it is what the other three checkpoints ship and
+    /// what every recorded benchmark id was produced with.
+    ///
+    /// > **Kimi-K3 could not be opened AT ALL before this landed** (2026-08-17). This function
+    /// > ran unconditionally before the architecture match, took `tokenizer.json` as the only
+    /// > possibility, and K3 ships none — so `--bench` failed on a 1.42 TiB artifact that was
+    /// > otherwise complete and verified. `docs/investigations/k3-first-checkpoint.md` §4.
     pub fn load(snapshot_dir: &str) -> Result<Self> {
-        let path = format!("{snapshot_dir}/tokenizer.json");
-        let inner =
-            tokenizers::Tokenizer::from_file(&path).map_err(|e| anyhow!("load {path}: {e}"))?;
+        let hf = format!("{snapshot_dir}/tokenizer.json");
+        let tk = format!("{snapshot_dir}/tiktoken.model");
+        let vocab = if std::fs::metadata(&hf).is_ok() {
+            Vocabulary::Hf(Box::new(
+                tokenizers::Tokenizer::from_file(&hf).map_err(|e| anyhow!("load {hf}: {e}"))?,
+            ))
+        } else if std::fs::metadata(&tk).is_ok() {
+            Vocabulary::Tiktoken(Box::new(crate::tiktoken::Vocab::load(snapshot_dir)?))
+        } else {
+            // Both names, because which one is missing depends on the model and a reader
+            // holding the artifact needs to know which they should have.
+            bail!(
+                "{snapshot_dir} has neither tokenizer.json (HuggingFace: GLM, DeepSeek-V4, \
+                 Muse Glimmer) nor tiktoken.model (Kimi-K3) — an artifact carries its own \
+                 tokenizer, so one of the two must be there"
+            );
+        };
         // An empty eos means decode can never stop on an end token (runaway
         // generation) — surface a broken generation_config loudly, don't swallow.
         let eos = match eos_token_ids(snapshot_dir) {
@@ -354,7 +401,33 @@ impl Tokenizer {
                 Vec::new()
             }
         };
-        Ok(Self { inner, eos })
+        Ok(Self { vocab, eos })
+    }
+
+    /// The HuggingFace vocabulary, or a refusal naming why the caller cannot have it.
+    ///
+    /// Every chat-framing method below is written against `token_to_id`, which only this arm
+    /// has. Returning an error rather than falling back is deliberate: `encode_chat_turns`'s
+    /// existing fallback for a vocabulary *missing* the GLM chat tokens is to encode RAW with a
+    /// warning, and routing K3 into that path would silently produce an unframed prompt where
+    /// the honest answer is that this build has no K3 chat encoding at all.
+    /// The HuggingFace arm if this is one, for the call sites that cannot return `Result`.
+    fn hf_opt(&self) -> Option<&tokenizers::Tokenizer> {
+        match &self.vocab {
+            Vocabulary::Hf(t) => Some(t),
+            Vocabulary::Tiktoken(_) => None,
+        }
+    }
+
+    fn hf(&self, what: &str) -> Result<&tokenizers::Tokenizer> {
+        match &self.vocab {
+            Vocabulary::Hf(t) => Ok(t),
+            Vocabulary::Tiktoken(_) => bail!(
+                "{what} needs a HuggingFace tokenizer's token_to_id, and this artifact carries \
+                 a tiktoken vocabulary (Kimi-K3). K3's chat framing is its first-party XTML \
+                 encoder and is not ported; --bench encodes RAW on that architecture"
+            ),
+        }
     }
 
     /// GLM turn framing: `[gMASK] <sop> <|user|> {text} <|assistant|> <think> </think>`.
@@ -401,7 +474,7 @@ impl Tokenizer {
     /// and both turns are opt-in), so it is also the part whose conditions do not belong
     /// tangled with the per-turn loop.
     fn preamble(&self, opts: &ChatOpts) -> Result<Vec<u32>> {
-        let Some(system) = self.inner.token_to_id("<|system|>") else {
+        let Some(system) = self.hf("chat preamble")?.token_to_id("<|system|>") else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
@@ -438,7 +511,14 @@ impl Tokenizer {
             "assistant" => sp.assistant,
             // Only looked up when actually used: an artifact can carry the tokens above
             // without these, and a `system` message is optional.
-            other => match self.inner.token_to_id(&format!("<|{other}|>")) {
+            // `hf_opt`, not `hf`: this returns `u32` and is only reachable from
+            // `encode_chat_turns`, which already refused the tiktoken arm. A `None` here is
+            // therefore unreachable rather than a case, and it lands on the same
+            // frame-it-as-user fallback the missing-token case already uses.
+            other => match self
+                .hf_opt()
+                .and_then(|h| h.token_to_id(&format!("<|{other}|>")))
+            {
                 Some(id) => id,
                 None => {
                     warn(&format!(
@@ -477,7 +557,7 @@ impl Tokenizer {
         // Missing any of the six means an artifact whose tokenizer predates the chat tokens;
         // fall back rather than fail, but say so — silent raw encoding is the bug this
         // function exists to fix.
-        let Some(sp) = ChatTokens::resolve(&self.inner) else {
+        let Some(sp) = ChatTokens::resolve(self.hf("chat framing")?) else {
             warn(
                 "tokenizer lacks the GLM chat tokens ([gMASK]/<sop>/<|user|>/<|assistant|>/\
                  <think>) — encoding the prompt RAW. Decode will not stop on EOS.",
@@ -538,11 +618,13 @@ impl Tokenizer {
     /// served `--raw-prompt`, a flag deleted 2026-08-01 for reproducing pre-templating
     /// benchmark numbers that no recorded command line ever asked for.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let enc = self
-            .inner
-            .encode(text, false)
-            .map_err(|e| anyhow!("encode: {e}"))?;
-        Ok(enc.get_ids().to_vec())
+        match &self.vocab {
+            Vocabulary::Hf(t) => {
+                let enc = t.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?;
+                Ok(enc.get_ids().to_vec())
+            }
+            Vocabulary::Tiktoken(v) => v.encode(text),
+        }
     }
 
     /// Decode a whole id sequence to text at once. Byte-level BPE splits one
@@ -551,9 +633,10 @@ impl Tokenizer {
     /// there is no incremental-flush footgun. Streaming detok belongs to server
     /// mode; it can be added there when it exists.
     pub fn decode_all(&self, ids: &[u32]) -> Result<String> {
-        self.inner
-            .decode(ids, false)
-            .map_err(|e| anyhow!("decode: {e}"))
+        match &self.vocab {
+            Vocabulary::Hf(t) => t.decode(ids, false).map_err(|e| anyhow!("decode: {e}")),
+            Vocabulary::Tiktoken(v) => v.decode(ids),
+        }
     }
 }
 
