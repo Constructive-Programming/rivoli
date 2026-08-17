@@ -296,6 +296,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn rivoli_fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> i32;
+    fn rivoli_spin_rows(n: i32, out: *mut u64, stream: *mut c_void) -> i32;
     fn rivoli_hash_rows(
         x: *const f32,
         n: i32,
@@ -529,6 +530,27 @@ pub unsafe fn launch_index_score_blocks(
 // (The marker is named rather than spelled, because `crates/cli/tests/docs.rs` refuses a
 // mid-sentence mention of it: jscpd treats one as a real marker, so a comment that quoted it
 // would silently move where the exemption ends. That check caught this very comment.)
+
+/// Burn the same time `launch_hash_rows` would over `n` elements, touching NO memory — Phase 2's
+/// delay-vs-read discriminator for the divergence probe. See `kernels/fwd.hip::spin_rows`.
+///
+/// The written word is a function of the launch geometry only and carries NOTHING about any
+/// payload; it exists so the loop is not optimised away, and `rivoli_engine::probe` renders the
+/// column as `-` rather than as a hash a reader could mistake for evidence.
+///
+/// # Safety
+/// `out` must be one live device u64; `stream` a live `hipStream_t` or null.
+pub unsafe fn launch_spin_rows(n: usize, out: *mut u64, stream: *mut c_void) -> Result<()> {
+    ensure!(
+        n <= i32::MAX as usize,
+        "spin_rows: {n} elements exceeds the i32 ABI"
+    );
+    // SAFETY: caller's pointer contract.
+    ensure_hip_status(
+        unsafe { rivoli_spin_rows(n as i32, out, stream) },
+        "spin_rows",
+    )
+}
 
 /// XOR-fold the exact bits of `x[0..n]` into `*out` — the `--divergence-log` probe.
 ///

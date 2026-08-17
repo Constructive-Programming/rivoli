@@ -60,6 +60,25 @@ pub struct ReadSpec {
     pub fold: FetchFolds,
 }
 
+/// What runs immediately after the bounce→slot copy — the position measured to suppress.
+///
+/// Phase 2's discriminator lives here: [`ScProbe::Full`] both delays and reads, so on its own it
+/// cannot say which repaired the hazard. [`ScProbe::Spin`] delays for the same duration and reads
+/// NOTHING; [`ScProbe::Line`] reads one cacheline and costs ~0% of the time. Suppression under `Spin`
+/// means the hazard is pure TIME; suppression only under `Line` means touching the bytes repairs
+/// them, and `Line` is then also the cheapest candidate fix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScProbe {
+    #[default]
+    Off,
+    Full,
+    Spin,
+    Line,
+}
+
+/// One cacheline of f32 — the width [`ScProbe::Line`] reads. 64 B on gfx1151.
+pub const LINE_F32: usize = 16;
+
 /// The two device u64 a cold read XOR-folds into: the bounce arena before the copy, the pool slot
 /// after it. `--divergence-log` only.
 ///
@@ -76,6 +95,9 @@ pub struct ReadSpec {
 pub struct FetchFolds {
     pub bh: *mut u64,
     pub sc: *mut u64,
+    /// WHAT runs at the post-copy position — a full fold, an equal-duration spin that reads
+    /// nothing, or a one-cacheline read. See `rivoli_engine::probe::ScProbe`.
+    pub sc_mode: ScProbe,
 }
 
 impl FetchFolds {
@@ -91,13 +113,23 @@ impl FetchFolds {
     pub const OFF: Self = Self {
         bh: std::ptr::null_mut(),
         sc: std::ptr::null_mut(),
+        sc_mode: ScProbe::Off,
     };
 
-    /// Are the folds armed? One check, so the two call sites in `reap` cannot disagree about
-    /// which pointer decides.
+    /// Is the pre-copy (bounce arena) fold armed?
     #[inline]
-    pub fn armed(&self) -> bool {
+    pub fn bh_armed(&self) -> bool {
         !self.bh.is_null()
+    }
+
+    /// Is anything armed at the post-copy position?
+    ///
+    /// Two independent checks rather than one `armed()`, because the whole point of Phase 1 is to
+    /// run the positions SEPARATELY: a single flag would have made `bh`-only silently enable the
+    /// post-copy read, which is the position under suspicion.
+    #[inline]
+    pub fn sc_armed(&self) -> bool {
+        !self.sc.is_null() && self.sc_mode != ScProbe::Off
     }
 }
 // SAFETY: `dst` and `fold`'s two pointers are only handed to io_uring / hipMemcpyAsync / a fold

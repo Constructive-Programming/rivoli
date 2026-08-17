@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). ADDED 2026-08-17: the GLM determinism gates (§5) — the id comparator, a prompt pinned by length+md5 that fired unplanted, INV-9 under a scan_free mutation, the probe's fold-slot layout under an inserted enum variant, and the column comparator's three refusals; the determinism gate's own 512-token GREEN is OWED and standing, because the engine is red. Also recorded there: a false EXCLUSION found in this round's own instrument — a fold omitted on dense layers made two runs 'agree' about a quantity neither measured, which no gate in this repo could see.
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). ADDED 2026-08-17: the GLM determinism gates (§5) — the id comparator, a prompt pinned by length+md5 that fired unplanted, INV-9 under a scan_free mutation, the probe's fold-slot layout under an inserted enum variant, and the column comparator's three refusals; the determinism gate's own 512-token GREEN is OWED and standing, because the engine is red. Also recorded there: a false EXCLUSION found in this round's own instrument — a fold omitted on dense layers made two runs 'agree' about a quantity neither measured, which no gate in this repo could see. ADDED 2026-08-17 (Phase 1): the per-fold probe flags — parse refusals, spin_rows reading nothing, and the column comparator refusing two logs from different fold configurations; the -for-disabled rendering is OWED a red proof and says so.
 ---
 
 # M0 gate red proofs
@@ -226,3 +226,33 @@ of the probe folded the MoE's input `xn` on MoE layers only. GLM has three dense
 nothing was measured. A false EXCLUSION is the one failure mode an instrument may not have, and it
 is invisible to every gate in this repo because the instrument was producing well-formed output the
 whole time. Every column that cannot exist for a row now prints `-`, never 0.
+
+**5g. The per-fold probe flags (added 2026-08-17, Phase 1).** Four checkable surfaces landed with
+`--divergence-folds`; three have proofs, one is asserted and says so.
+
+- **`Folds::parse` refusals** (`probe.rs::folds_parse_refuses_what_it_cannot_honour`). The
+  assertions ARE the proof — `is_err()` on an unknown name and on two `sc` variants — because the
+  failure being guarded is a silent success. Why it matters: every Phase 1 cell is "enable exactly
+  one fold and see whether the pair still diverges", so a typo that quietly enabled NOTHING would
+  make the cell green and be read as *"this fold is the mask"* — the precise inversion of the truth.
+- **`spin_rows` reads nothing** (`fwd_kernel.rs::spin_rows_burns_time_without_reading_anything`).
+  The property is invariance under the payload, plus non-zero and length-dependent so an elided
+  loop or a store of 0 cannot pass. **Partly vacuous by construction and labelled so**: the kernel
+  never receives the buffer pointer, so it *cannot* read it — the test guards a future signature
+  change rather than today's code.
+- **`tests/divergence-columns.sh`'s fold guard**, all three paths observed:
+
+  ```
+  two logs, different fold configs      → FAIL: ... DIFFERENT fold configurations   exit 2
+  a log whose version implies no config → FAIL: ... declares no fold configuration  exit 2
+  v2 logs (the token-164 pair)          → "folds: light (derived: v2 predates …)"   exit 0
+  ```
+
+  The derivation is what keeps the historical pair readable: v2 predates the fetch-path folds, v3
+  could not disable them. Refusing them outright — the first version — would have made the one pair
+  that produced a coordinate uncomparable.
+- **OWED: the `-`-for-disabled rendering has no red proof.** `Probe::drain` must print `-` and never
+  `0` for a fold the run did not enable, because a `0` lets two runs "agree" about bytes neither
+  hashed. That is the same false-EXCLUSION class already recorded above, and it is currently
+  asserted only by reading the code. It needs a deviceless test over `drain`'s formatting, which
+  needs `Probe` constructible without a device; recorded as owed rather than claimed.

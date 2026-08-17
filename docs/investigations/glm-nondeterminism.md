@@ -1,7 +1,7 @@
 ---
 status: live
 scope: glm
-verdict: THE MECHANISM IS A WRONG-BYTES READ IN THE ROUTED-EXPERT POOL, localised on device 2026-08-17: at pos=164 layer=24 the `h` fold moved while `xn`, `gl`, `pk` and `sl` were IDENTICAL and relocs=0 — the same experts, in the same slots, fed the same input, produced different results. Attention, routing, placement and relocation are all out of frame, and both previously named candidates stay refuted by construction (no float atomic exists in any kernel, so identical bytes give identical results). The rate is measured — 1 event per ~300-578 token-forwards, so a pair of 512-token runs detects it 83-97% of the time and a 32-token pair 10-19%, which is why every byte-identity claim on GLM must state its token count. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT. WHAT REMAINS is which hop delivers the wrong bytes — the NVMe read, the bounce arena, or the DMA — and three cross-run folds now split them at an ESTIMATED ~27% throughput cost that must be measured on the first instrumented run. The toolchain is NOT exonerated: both binaries were built under it. The determinism gate exists, is length-aware with a 512-token floor, and its GREEN IS OWED because the engine is red.
+verdict: A WRONG-BYTES READ IN THE ROUTED-EXPERT POOL, and the working mechanism is now a DEVICE-SIDE VISIBILITY problem on the DMA. Localised on device 2026-08-17: at pos=164 layer=24 the `h` fold moved while `xn`, `gl`, `pk` and `sl` were IDENTICAL and relocs=0 — same experts, same slots, same input, different result. Then the decisive clue: the HEAVY probe SUPPRESSES it (2,048 instrumented tokens, zero events, P=0.11%/2.89%), and the distinguishing ingredient is a read of the pool slot immediately after the copy — so the consumer appears to read a slot whose `hipMemcpyAsync` was signalled but whose bytes are not yet coherently visible, and any extra read forces the ordering. `--mode int4` diverges too (body line 28, different stride and kernel), which retires "vq3-specific" and shows THE RATE IS PER READ, NOT PER TOKEN. Attention, routing, placement, relocation and MoE accumulation are all out of frame; no float atomic exists in any kernel, so identical bytes give identical results. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT. `--divergence-folds` now enables one fold at a time (default none, since all-on is the suppressor) and Phase 2's `sc-spin` / `sc-line` variants separate a pure-TIME hazard from a repair-by-TOUCHING one. The toolchain is NOT exonerated. The determinism gate exists, floor 512, and its GREEN IS OWED because the engine is red.
 ---
 
 # GLM does not reproduce itself: the bytes read out of the pool slots differ
@@ -348,6 +348,8 @@ appears:
 | 70.6% MTP acceptance, `p0.8+` at 89% | `wave/m12-glm-chain`'s measurement | another branch |
 | 7.7 GB/s at QD1, ~35% ring idle | the old tree's fetch probes | no probe in this tree |
 | 9 corrupted reads in 8452 at `--max-mem 30` | the old tree's relocation finding | archive only |
+| 236,570/70,030 and 714,436/206,564 hit/miss; 42,666 and 122,538 log rows | the two heavy-probe pairs | the logs were not retained here; the ZERO-EVENTS result is the load-bearing part and the counts are corroborating detail |
+| int4: body line 28, 95,351 misses | the int4 pair | same — the ids were not retained here |
 | ~148 misses/token, ~20 MB/expert | the old tree's poison-fill comment | **superseded by derivation** — see the note below |
 
 **The two numbers that were inherited and are now derived**, because the cost figures above rest on
@@ -465,10 +467,68 @@ Red-proofed by making `scan_free` ignore `landed`.
 So an instrumented pair gives ONE coordinate, and the hop table above should be read as "one sample
 decides which hop we are on", not as "one run settles the mechanism".
 
+## THE HEAVY PROBE SUPPRESSES THE DEFECT — and that is itself the strongest clue yet
+
+Two instrumented pairs on a quiet box, all three fetch-path folds on, **2,048 tokens and ZERO
+events**: 512 tokens (identical ids, identical hit/miss 236,570/70,030, all 42,666 log rows equal)
+and 1,536 tokens (identical ids, hit/miss 714,436/206,564, all 122,538 rows equal).
+
+**The probability, re-derived here rather than quoted.** A pair diverges if EITHER arm has an event,
+so the exposure is 2 × 2,048 = 4,096 arm-tokens, and P(zero) = exp(−rate × exposure):
+
+| rate | P(zero), exposure counted once per pair | P(zero), per ARM — the correct reading |
+|---|---:|---:|
+| matched, 1 per 299 | 0.106% | **0.00011%** |
+| conservative, 1 per 578 | 2.89% | **0.084%** |
+
+The figures first reported for this result — 0.11% / 2.89% — are the middle column, i.e. the
+single-arm reading, which is conservative in the right direction; the correct per-arm numbers are
+smaller still and the conclusion is stronger than it was stated.
+
+**But it is not airtight, and this is the honest bound.** The rate itself has a wide interval
+(exact 95% Poisson, 1 per [206, 2804] on the conservative reading). At its **pessimistic end**,
+P(zero over 4,096 arm-tokens) is **23%** — so a clean 2,048-token result is suggestive rather than
+conclusive on its own. Each Phase 1 cell adds another sample against the same rate, which is the
+cheapest way to close that gap; a single further clean heavy pair takes it well under 5%.
+
+The variable is the probe's **weight**, not its presence: the light probe — the per-layer columns
+with no fetch-path folds — is what produced the token-164 coordinate above. The heavy probe's
+distinguishing ingredient is **a read of the pool slot immediately after the copy**.
+
+**Working hypothesis: a device-side VISIBILITY problem on the DMA.** The consumer occasionally reads
+a slot whose `hipMemcpyAsync` has been signalled but whose bytes are not yet coherently visible to
+it, and any extra read at that point forces the ordering that makes them visible. Every other
+observation fits: host bookkeeping is correct, `READ-BEFORE-WRITE` never fires, the tickets are in
+place, `relocs=0`, and routing and slot identity are identical while only the payload differs.
+
+**This also indicts the instrument I built.** The all-folds-on configuration is the `--checksum-x`
+failure reproduced in new code — a probe that dilates its subject until the subject stops
+misbehaving. It is why `--divergence-folds` now defaults to NONE and enables one fold at a time, and
+why the log records which folds produced it and `tests/divergence-columns.sh` refuses to compare two
+configurations.
+
+## `--mode int4` diverges too: not a vq3 problem, and the rate is per READ
+
+An unprobed 512-token pair in `--mode int4` diverged at body line **28**. Different stride
+(19.125 MiB against 14.625), different kernel (`launch_moe_expert_range_i4`), no codebooks — the
+same defect. Every arm before this compared int3-vq against itself, so **"vq3-specific" is retired**.
+
+It also bears on the rate model, and the claim has to be made at the strength the evidence supports.
+int4 took **95,351 misses** against int3-vq's 70,030 over the same 512 tokens (+36%) and diverged at
+token 28 rather than 320–452. That is **one sample per mode**, so it cannot establish a per-read
+rate on its own — an exponential with mean 320 produces a first event at 28 about 8% of the time, so
+the observation is unsurprising under a per-TOKEN model too. What it does do is remove the reason to
+prefer per-token: the two modes differ in reads per token and in nothing else that should matter,
+and the one with more reads failed sooner. **Per-read is now the working model, not a measured
+result**, and it is what makes an instrumented run worth its throughput cost and what the storage
+repro exploits to turn a 20-minute-per-arm hunt into millions of iterations per hour. Two more int4
+pairs would settle it cheaply.
+
 ## What the instrument now measures, and the one question left
 
-Three fetch-path folds were added after the coordinate came in, to split the one remaining
-question — **which hop delivers the wrong bytes**:
+Three fetch-path folds split the one remaining question — **which hop delivers the wrong bytes** —
+and each is now enabled INDEPENDENTLY by `--divergence-folds`, because all three at once suppress
+the defect (above). The default is none.
 
 | column | folded where | a difference means |
 |---|---|---|
@@ -528,6 +588,22 @@ box, and the rate is per READ rather than per second, so a run ~27% slower issue
 reads and should fire at a similar TOKEN position. **If it does not fire, that is itself
 informative** — it would mean the instrument perturbs, and would have to be recorded as such rather
 than read as a green.
+
+### Phase 2: does the post-copy read repair by DELAY or by TOUCHING the bytes?
+
+Three alternatives occupy the same pipeline position, so exactly one may be selected:
+
+| `--divergence-folds` | what runs after the copy | suppression there means |
+|---|---|---|
+| `sc` | fold the whole slot — delays AND reads | either; this is the configuration already known to suppress |
+| `sc-spin` | the same launch geometry and trip count, touching NO memory | the hazard is **pure time** — a fixed-lag write-visibility problem |
+| `sc-line` | read ONE cacheline, ~0% cost | **touching** the bytes repairs them; this is then also the cheapest candidate fix |
+
+"Equal duration" for `sc-spin` is by construction — same grid, same block, same grid-stride trip
+count, same three multiply-shift-xor rounds, omitting exactly the global load. **Compare the two
+arms' measured tok/s before believing the result**: if they differ materially the construction
+failed and the comparison is confounded. `spin_rows`' oracle asserts the property the experiment
+depends on — that its output is *invariant under the payload*, i.e. it really does read nothing.
 
 ### Still open, and cheap
 

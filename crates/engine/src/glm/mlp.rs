@@ -160,7 +160,7 @@ impl GlmEngine<'_> {
         //
         // The `se` pointer is taken in its own scope so the `&mut self.probe` borrow ends before
         // `fold_slots` needs `&self.pin`, and before the `p` binding below takes the probe again.
-        {
+        if self.probe.as_ref().is_some_and(|p| p.folds().se) {
             // Its own scope: the `&mut self.probe` borrow ends before `fold_slots` needs
             // `&self.pin`, and before the `p` binding below takes the probe again.
             let se = {
@@ -297,10 +297,23 @@ impl GlmEngine<'_> {
         // the probe is in hand rather than pushed into the pool as state beforehand.
         #[cfg(feature = "corruption-probe")]
         let fold = match self.probe.as_mut() {
-            Some(p) => crate::fetch::asyncfetch::FetchFolds {
-                bh: p.fold_slot(l, crate::probe::Q::Bh)?,
-                sc: p.fold_slot(l, crate::probe::Q::Sc)?,
-            },
+            // Each position is armed ONLY if `--divergence-folds` asked for it. The all-three
+            // configuration is what suppressed the defect over 2,048 tokens, so a cell enables one
+            // at a time and the others must be genuinely absent, not merely unread.
+            Some(p) => {
+                let f = p.folds();
+                crate::fetch::asyncfetch::FetchFolds {
+                    bh: match f.bh {
+                        true => p.fold_slot(l, crate::probe::Q::Bh)?,
+                        false => std::ptr::null_mut(),
+                    },
+                    sc: match f.sc {
+                        crate::fetch::asyncfetch::ScProbe::Off => std::ptr::null_mut(),
+                        _ => p.fold_slot(l, crate::probe::Q::Sc)?,
+                    },
+                    sc_mode: f.sc,
+                }
+            }
             None => crate::fetch::asyncfetch::FetchFolds::OFF,
         };
         #[cfg(not(feature = "corruption-probe"))]

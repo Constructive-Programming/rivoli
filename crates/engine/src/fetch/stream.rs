@@ -416,7 +416,7 @@ impl Streamer {
         // every layer of a pass and syncs again after its own clear. So no fold for pass N+1 can
         // be enqueued before pass N's clear has executed.
         #[cfg(feature = "corruption-probe")]
-        if self.fold[ud].armed() {
+        if self.fold[ud].bh_armed() {
             let n = self.nbytes[ud] as usize / 4;
             // LOGGED, NOT `?`. A `?` here returns from `reap` after the CQE is consumed and
             // BEFORE `copy_to_slot`, so the reaper poisons, the ticket is released from the host,
@@ -442,21 +442,49 @@ impl Streamer {
             anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
         }
         #[cfg(feature = "corruption-probe")]
-        if self.fold[ud].armed() {
+        if self.fold[ud].sc_armed() {
+            // THE POST-COPY POSITION — the one measured to suppress the divergence. Three
+            // alternatives at the same point in the stream, which is Phase 2's whole experiment:
+            //
+            //   Full  fold the entire slot: both DELAYS and READS, so on its own it cannot say
+            //         which of the two repaired the hazard.
+            //   Spin  the same launch geometry and trip count, touching NO memory. Suppression
+            //         here means the hazard is pure TIME — a fixed-lag write-visibility problem.
+            //   Line  read ONE cacheline. Suppression only here means TOUCHING the bytes repairs
+            //         them, and at ~0% cost this is also the cheapest candidate fix.
+            //
+            // Logged rather than `?` for the reason given at `bh` above: a `?` here would abort a
+            // copy the engine needs, i.e. the instrument changing what is computed.
             let n = self.nbytes[ud] as usize / 4;
-            // Logged rather than `?` for the same reason as `bh` above, though this one is after
-            // the copy and so could safely abort; keeping both the same means neither can be
-            // changed to `?` by someone reading only one of them.
-            // SAFETY: as above, and the copy is already enqueued on `stream`, so this fold reads
-            // the slot AFTER it.
-            let r = unsafe {
-                rivoli_backend::launch_hash_rows(
-                    self.dst[ud] as *const f32,
-                    n,
-                    0,
-                    self.fold[ud].sc,
-                    stream,
-                )
+            let r = match self.fold[ud].sc_mode {
+                crate::fetch::asyncfetch::ScProbe::Off => Ok(()),
+                // SAFETY: no memory is read; `sc` is one live device u64 and `stream` is live.
+                crate::fetch::asyncfetch::ScProbe::Spin => unsafe {
+                    rivoli_backend::launch_spin_rows(n, self.fold[ud].sc, stream)
+                },
+                // `Full` and `Line` are the SAME call at different widths, and saying so in one
+                // arm is the honest factoring: the pair's entire experiment is that they differ in
+                // how much they read and in nothing else.
+                // SAFETY: `dst[ud]` is a live pool slot of `nbytes`; both widths are within it;
+                // `sc` is one live device u64; `stream` is live and the copy is already enqueued
+                // on it, so the read happens after.
+                mode => {
+                    let words = match mode {
+                        crate::fetch::asyncfetch::ScProbe::Line => {
+                            crate::fetch::asyncfetch::LINE_F32.min(n)
+                        }
+                        _ => n,
+                    };
+                    unsafe {
+                        rivoli_backend::launch_hash_rows(
+                            self.dst[ud] as *const f32,
+                            words,
+                            0,
+                            self.fold[ud].sc,
+                            stream,
+                        )
+                    }
+                }
             };
             if let Err(e) = r {
                 tracing::error!("divergence probe: sc fold failed on slot {ud} ({e:#})");

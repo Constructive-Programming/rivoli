@@ -83,6 +83,32 @@ echo "== $(basename "$A") ($(body "$A" | wc -l) rows)  vs  $(basename "$B") ($(b
 # would have mislabelled every column while still "working". Both headers must agree, or the two
 # runs were produced by different builds and are not comparable.
 hdr() { grep -m1 -E '^# rivoli-divergence ' "$1" | sed -E 's/^# rivoli-divergence v[0-9]+ //'; }
+# THE FOLD CONFIGURATION IS PART OF THE COMPARISON'S VALIDITY, not metadata.
+#
+# The heavy probe (all three fetch-path folds) was measured to SUPPRESS the defect over 2,048
+# tokens, so two logs taken under different `--divergence-folds` are not two samples of one
+# experiment — they are two different experiments, and a `-` on one side against a hash on the other
+# would read as a divergence in the payload. Refused.
+# The fold config, DERIVED for older formats rather than refused.
+#
+# v4 states it on its own line. v2 and v3 do not need to: v2 predates the fetch-path folds
+# entirely, so it is unambiguously `light`, and v3 had no way to disable them, so it is
+# unambiguously all-on — which is the configuration measured to SUPPRESS the defect, and therefore
+# the single most important thing to label. Deriving it keeps the historical logs (including the
+# pair that produced the token-164 coordinate) readable while still refusing to compare across
+# configurations.
+folds() {
+    local v line
+    line=$(grep -m1 -E '^# rivoli-divergence-folds ' "$1" | sed -E 's/^# rivoli-divergence-folds //')
+    if [ -n "$line" ]; then printf '%s' "$line"; return 0; fi
+    v=$(grep -m1 -E '^# rivoli-divergence v[0-9]+ ' "$1" | sed -E 's/^# rivoli-divergence v([0-9]+) .*/\1/')
+    case "$v" in
+        2) printf 'light (derived: v2 predates the fetch-path folds)' ;;
+        3) printf 'bh,sc,se (derived: v3 could not disable them)' ;;
+        *) printf '' ;;
+    esac
+}
+
 HA=$(hdr "$A"); HB=$(hdr "$B")
 # BOTH, separately. Checking only A blamed a missing B header on "different columns — different
 # builds", which names the wrong cause (review 2026-08-17).
@@ -95,6 +121,25 @@ done
     echo "  B: $HB" >&2
     exit 2
 }
+FA=$(folds "$A"); FB=$(folds "$B")
+# A v3-or-earlier log has no fold line at all. Refuse rather than assume: those were written by a
+# build whose folds were ALL-ON, which is the suppressing configuration, and treating them as
+# equal to a light log would compare an experiment against its own suppressor.
+for f in "$A:$FA" "$B:$FB"; do
+    [ -n "${f#*:}" ] || {
+        echo "FAIL: ${f%%:*} declares no fold configuration and its version is not one this \
+script can derive one from. Which folds were on decides what a difference MEANS — the all-on \
+configuration suppresses the defect — so an unlabelled log cannot be compared." >&2
+        exit 2
+    }
+done
+[ "$FA" = "$FB" ] || {
+    echo "FAIL: the two logs were taken under DIFFERENT fold configurations — two experiments, not two samples:" >&2
+    echo "  A: $FA" >&2
+    echo "  B: $FB" >&2
+    exit 2
+}
+echo "   folds: $FA"
 
 # TRUNCATED TO THE COMMON PREFIX FIRST, and that is a fix rather than tidiness.
 #

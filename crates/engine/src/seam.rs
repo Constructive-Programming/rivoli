@@ -406,8 +406,8 @@ impl<'a> Engine<'a> {
     /// Arm `--divergence-log`: fold three per-layer quantities on the device so two runs of
     /// one input can be diffed to a (position, layer, quantity) coordinate.
     #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
-    pub fn arm_divergence_log(&mut self) -> Result<()> {
-        self.glm_for_probe()?.arm_divergence_log()
+    pub fn arm_divergence_log(&mut self, folds: crate::probe::Folds) -> Result<()> {
+        self.glm_for_probe()?.arm_divergence_log(folds)
     }
 
     /// Write the `--divergence-log`. After the run, never during it — the records are held in

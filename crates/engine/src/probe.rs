@@ -55,6 +55,7 @@
 //! and never accept a green obtained with tracing enabled.**
 
 use crate::device::DeviceBuf;
+use crate::fetch::asyncfetch::ScProbe;
 use anyhow::{Context, Result, ensure};
 use rivoli_backend::{fill_u32, launch_hash_rows};
 
@@ -92,6 +93,143 @@ pub enum Q {
     /// every row, sending an operator after an innocent hop. **Compare A's `se` against B's `se`.**
     /// The full rule is in the log's own header, where it travels with the data.
     Se = 5,
+}
+
+/// Which of the three FETCH-PATH folds a run enables. `xn`/`h`/`x` are always folded.
+///
+/// **The default is NONE, and that is the whole point of this type.** The light probe — the
+/// per-layer columns with no fetch-path folds — is the configuration that PRODUCED the token-164
+/// coordinate. Adding all three at once produced 2,048 instrumented tokens with ZERO events
+/// against a rate predicting ~4-7 (P = 0.11% matched / 2.89% conservative): **the heavy probe
+/// suppresses the defect it was built to localise.** So the folds are now opt-in one at a time,
+/// and the suppressing configuration cannot be reached by accident.
+///
+/// Which fold turns RED→GREEN names the mask, and its position in the pipeline names where the
+/// mechanism lives. `se` is the control: it runs AFTER the consumer has read the slot, so it
+/// should not be able to suppress anything — if it does, the hypothesis is wrong.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct Folds {
+    /// Fold the bounce arena after the NVMe read, before the copy.
+    pub bh: bool,
+    /// What, if anything, runs at the post-copy position.
+    pub sc: crate::fetch::asyncfetch::ScProbe,
+    /// Fold every slot the layer used, at end of layer.
+    pub se: bool,
+}
+
+impl Folds {
+    /// Parse `--divergence-folds`: a comma-separated subset of
+    /// `bh,sc,se,sc-spin,sc-line`. Empty or absent = the light probe.
+    ///
+    /// Unknown names are REFUSED rather than ignored, and the three `sc` forms are mutually
+    /// exclusive: a typo that silently disabled the one fold a cell exists to test would make the
+    /// cell's green mean the opposite of what it appears to.
+    pub fn parse(spec: &str) -> Result<Self> {
+        let mut f = Self::default();
+        for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let sc = |f: &Folds| -> Result<()> {
+                ensure!(
+                    f.sc == ScProbe::Off,
+                    "--divergence-folds names more than one `sc` variant; they occupy the same \
+                     pipeline position and are alternatives, not additions"
+                );
+                Ok(())
+            };
+            match name {
+                "bh" => f.bh = true,
+                "se" => f.se = true,
+                "sc" => {
+                    sc(&f)?;
+                    f.sc = ScProbe::Full;
+                }
+                "sc-spin" => {
+                    sc(&f)?;
+                    f.sc = ScProbe::Spin;
+                }
+                "sc-line" => {
+                    sc(&f)?;
+                    f.sc = ScProbe::Line;
+                }
+                other => anyhow::bail!(
+                    "unknown --divergence-folds entry {other:?} (bh, sc, sc-spin, sc-line, se)"
+                ),
+            }
+        }
+        Ok(f)
+    }
+
+    /// The config as it appears in the log header — every log states what produced it, because a
+    /// divergence log without its probe configuration cannot be attributed, and two logs from
+    /// different configurations must never be compared.
+    pub fn label(&self) -> String {
+        let mut v: Vec<&str> = Vec::new();
+        if self.bh {
+            v.push("bh");
+        }
+        match self.sc {
+            ScProbe::Off => {}
+            ScProbe::Full => v.push("sc"),
+            ScProbe::Spin => v.push("sc-spin"),
+            ScProbe::Line => v.push("sc-line"),
+        }
+        if self.se {
+            v.push("se");
+        }
+        match v.is_empty() {
+            true => "light".to_string(),
+            false => v.join(","),
+        }
+    }
+}
+
+#[cfg(test)]
+mod fold_tests {
+    // A panic in a test is loud and correct, which is the workspace's stated reason for opting back
+    // in per file; a panic on the decode path would be a crash in a server, which is why it is
+    // deny-level everywhere else.
+    #![allow(clippy::expect_used)]
+    use super::Folds;
+    use crate::fetch::asyncfetch::ScProbe;
+
+    /// `--divergence-folds` parsing, with the two refusals that matter.
+    ///
+    /// A silently-misparsed fold set is the worst outcome this flag has: every Phase 1 cell is
+    /// "enable exactly one fold and see whether the pair still diverges", so a typo that quietly
+    /// enabled NOTHING would make the cell green and be read as "this fold is the mask" — the
+    /// precise inversion of the truth. Hence unknown names are refused rather than ignored, and the
+    /// three `sc` forms refuse each other rather than the last one winning.
+    #[test]
+    fn folds_parse_refuses_what_it_cannot_honour() {
+        // The default is the LIGHT probe — the configuration that produced the coordinate.
+        assert_eq!(Folds::parse("").expect("empty").label(), "light");
+        assert_eq!(Folds::default().label(), "light");
+
+        let f = Folds::parse("bh").expect("bh");
+        assert!(f.bh && !f.se && f.sc == ScProbe::Off, "bh must not arm sc");
+        assert_eq!(f.label(), "bh");
+
+        let f = Folds::parse("sc-spin").expect("sc-spin");
+        assert_eq!(f.sc, ScProbe::Spin);
+        assert!(!f.bh && !f.se, "an sc variant must not arm the others");
+        assert_eq!(f.label(), "sc-spin");
+
+        // Order-independent, and the label is canonical so two logs of the same config compare
+        // equal however the operator typed it.
+        assert_eq!(
+            Folds::parse("se, bh ,sc-line").expect("spaced").label(),
+            Folds::parse("bh,sc-line,se").expect("plain").label()
+        );
+
+        assert!(
+            Folds::parse("bh,nope").is_err(),
+            "unknown names are refused"
+        );
+        assert!(
+            Folds::parse("sc,sc-line").is_err(),
+            "two sc variants occupy one pipeline position and must refuse"
+        );
+        assert!(Folds::parse("sc-spin,sc").is_err(), "in either order");
+    }
 }
 
 /// Device u64 fold slots per layer — one per [`Q`].
@@ -164,6 +302,8 @@ pub struct Probe {
     /// Per-layer host columns for the pass in flight; `None` on a dense layer, which has no
     /// router and no pool.
     cols: Vec<Option<Cols>>,
+    /// Which fetch-path folds this run enables; see [`Folds`].
+    folds: Folds,
     /// The whole log, appended a line at a time. Held in memory: see the header for why the
     /// write cannot happen during the run. ONE `String` rather than a `Vec<String>` — at
     /// 512 tokens x 78 layers that would be 40k heap allocations on a path whose entire design
@@ -172,7 +312,7 @@ pub struct Probe {
 }
 
 impl Probe {
-    pub fn new(n_layers: usize) -> Result<Self> {
+    pub fn new(n_layers: usize, folds: Folds) -> Result<Self> {
         ensure!(n_layers > 0, "divergence probe over a 0-layer model");
         let bytes = n_layers * NQ * 8;
         let mut dev = DeviceBuf::new(bytes)?;
@@ -182,6 +322,7 @@ impl Probe {
             dev,
             host: vec![0u8; bytes],
             cols: vec![None; n_layers],
+            folds,
             recs: String::new(),
         })
     }
@@ -211,6 +352,11 @@ impl Probe {
         // SAFETY: `layer * NQ + (q as usize) < cols.len() * NQ` by the check above and `q < NQ`,
         // so the offset is inside the slab this `DeviceBuf` owns.
         Ok(unsafe { (self.dev.ptr_mut() as *mut u64).add(layer * NQ + q as usize) })
+    }
+
+    /// Which fetch-path folds are enabled.
+    pub fn folds(&self) -> Folds {
+        self.folds
     }
 
     /// The device address of `(layer, q)`'s fold slot — for a caller that folds into it itself
@@ -309,23 +455,33 @@ impl Probe {
                 Some(_) => format!("{:016x}", at(Q::H as usize)?),
                 None => "-".to_string(),
             };
-            // `bh` and `sc` exist only where a COLD READ landed — they bracket a copy, and with no
-            // miss there was no copy. `se` is folded on EVERY MoE layer, hits included, because a
-            // resident expert's bytes can be wrong from an earlier token. Printing 0 for an
-            // unfolded slot would let two runs "agree" about bytes neither hashed, which is the
-            // false-exclusion trap this instrument already fell into once (`xn` on dense layers).
-            let trio = match moe {
-                None => "- - -".to_string(),
-                Some(c) => {
-                    let bh_sc = match c.miss > 0 {
-                        true => {
-                            format!("{:016x} {:016x}", at(Q::Bh as usize)?, at(Q::Sc as usize)?)
-                        }
-                        false => "- -".to_string(),
-                    };
-                    format!("{bh_sc} {:016x}", at(Q::Se as usize)?)
+            // `-` MEANS NOT MEASURED and is never 0, for two reasons that compound. A fold is
+            // absent when the run did not ENABLE it (`--divergence-folds`) and when the layer gave
+            // it nothing to do — `bh`/`sc` bracket a copy, so with no miss there was no copy; `se`
+            // runs on every MoE layer. Printing 0 for either would let two runs "agree" about bytes
+            // neither hashed, which is the false-exclusion trap this instrument already fell into
+            // once. `sc-spin` also prints `-`: it writes a word so the loop is not optimised away,
+            // but that word is a function of the launch geometry and carries nothing about any
+            // payload, so it must not look like a hash somebody can compare.
+            let hex = |on: bool, q: Q| -> Result<String> {
+                match on {
+                    true => Ok(format!("{:016x}", at(q as usize)?)),
+                    false => Ok("-".to_string()),
                 }
             };
+            let trio = match moe {
+                None => "- - -".to_string(),
+                Some(c) => format!(
+                    "{} {} {}",
+                    hex(self.folds.bh && c.miss > 0, Q::Bh)?,
+                    hex(
+                        matches!(self.folds.sc, ScProbe::Full | ScProbe::Line) && c.miss > 0,
+                        Q::Sc
+                    )?,
+                    hex(self.folds.se, Q::Se)?,
+                ),
+            };
+            // A dense layer has no router and no pool, so its five host columns are `-` too.
             let host = match moe {
                 None => "- - - - -".to_string(),
                 Some(c) => format!(
@@ -351,8 +507,13 @@ impl Probe {
     /// Write the log. Built whole and written once — the run is over by the time this is
     /// called, which is the point (see the header).
     pub fn write(&self, path: &str) -> Result<()> {
-        let mut out = String::from(
-            "# rivoli-divergence v3 pos nrow layer xn h x gl pk sl misses relocs bh sc se\n\
+        let mut out = format!("# rivoli-divergence-folds {}\n", self.folds.label());
+        // The fold config goes FIRST and on its own line, because two logs from different configs
+        // must never be compared — `tests/divergence-columns.sh` refuses on it — and because the
+        // heavy config is now known to SUPPRESS the defect, so a log that does not say which folds
+        // produced it cannot be attributed at all.
+        out.push_str(
+            "# rivoli-divergence v4 pos nrow layer xn h x gl pk sl misses relocs bh sc se\n\
              # pos is the PASS's FIRST ROW and nrow is how many it carried: (pos=k, nrow=1) is \
              token k in decode, (pos=k, nrow=2) is a layer-major prefill row-block. v2 added \
              nrow because pos alone made those two indistinguishable\n\

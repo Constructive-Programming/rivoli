@@ -253,11 +253,11 @@ impl<'a> GlmEngine<'a> {
         })
     }
 
-    /// Arm `--divergence-log`. Allocates the fold slab; every later layer folds into it and
-    /// every pass drains it.
+    /// Arm `--divergence-log` with `folds` enabled. Allocates the fold slab; every later layer
+    /// folds into it and every pass drains it.
     #[cfg(feature = "corruption-probe")]
-    pub fn arm_divergence_log(&mut self) -> Result<()> {
-        self.probe = Some(crate::probe::Probe::new(self.cfg.n_layers)?);
+    pub fn arm_divergence_log(&mut self, folds: crate::probe::Folds) -> Result<()> {
+        self.probe = Some(crate::probe::Probe::new(self.cfg.n_layers, folds)?);
         Ok(())
     }
 

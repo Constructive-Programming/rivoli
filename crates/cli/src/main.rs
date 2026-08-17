@@ -188,6 +188,25 @@ struct Args {
     #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
     #[arg(long, value_name = "PATH", conflicts_with = "port")]
     divergence_log: Option<String>,
+
+    /// DIAGNOSTIC: which FETCH-PATH folds `--divergence-log` enables, comma-separated —
+    /// `bh`, `sc`, `sc-spin`, `sc-line`, `se`. Default: none (the light probe).
+    ///
+    /// The default is none because the all-three configuration was measured to SUPPRESS the
+    /// divergence it exists to localise: 2,048 instrumented tokens produced zero events against a
+    /// rate predicting several (P = 0.11% matched / 2.89% conservative), while the light probe is
+    /// what produced the token-164 coordinate. So the folds are enabled ONE AT A TIME, and
+    /// whichever one turns a red pair green is the mask — its position in the pipeline names where
+    /// the mechanism lives.
+    ///
+    /// The three `sc` forms are alternatives at the same pipeline position, not additions:
+    /// `sc` both delays and reads; `sc-spin` delays the same amount and reads nothing; `sc-line`
+    /// reads one cacheline for ~0% cost. Which of those suppresses separates a timing hazard from
+    /// a visibility one.
+    // Requires `--divergence-log`: folds with nowhere to be recorded are a knob nothing spends.
+    #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
+    #[arg(long, value_name = "LIST", requires = "divergence_log")]
+    divergence_folds: Option<String>,
 }
 
 /// The default bench prompt.
@@ -544,7 +563,12 @@ fn run_bench(eng: &mut Engine<'_>, tok: &Tokenizer, a: &Args, b: &Bench<'_>) -> 
     // the measurement is not perturbed by its own instrument.
     #[cfg(all(feature = "rocm", feature = "corruption-probe"))]
     if a.divergence_log.is_some() {
-        eng.arm_divergence_log()?;
+        let folds = match &a.divergence_folds {
+            Some(spec) => rivoli_engine::probe::Folds::parse(spec)?,
+            None => rivoli_engine::probe::Folds::default(),
+        };
+        tracing::info!("divergence probe: folds = {}", folds.label());
+        eng.arm_divergence_log(folds)?;
     }
     let out = eng.generate(
         GenSpec {
