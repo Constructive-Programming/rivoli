@@ -86,15 +86,15 @@ const WEIGHT_SETS: [(&str, &[u8]); 2] = [
 /// tolerance is a property of, and the same merge `anchor.md`'s floor table makes.
 const DRAFT_ORACLE: &[Tol] = &[
     row("encoder.out", 2.3281e-6, 9.832e-1, 2.33e-5),
-    row("input_layernorm.out", 2.0248e-6, 2.457e-1, 2.02e-5),
-    row("attend.q", 3.5134e-6, 5.156e-1, 3.51e-5),
-    row("attend.k", 3.3121e-6, 4.632e-1, 3.31e-5),
-    row("attend.v", 2.3172e-6, 1.325e0, 2.32e-5),
-    row("attend.out", 3.4292e-6, 1.496e0, 3.43e-5),
-    row("post_attention_layernorm.out", 2.4606e-6, 2.212e-1, 2.46e-5),
-    row("mlp.out", 3.5313e-6, 3.936e-1, 3.53e-5),
-    row("final_norm.out", 2.4320e-6, 2.850e-1, 2.43e-5),
-    row("logits", 2.6476e-6, 2.213e-1, 2.65e-5),
+    row("input_layernorm.out", 2.4993e-6, 2.457e-1, 2.50e-5),
+    row("attend.q", 4.7961e-6, 5.031e-1, 4.80e-5),
+    row("attend.k", 2.9202e-6, 4.632e-1, 2.92e-5),
+    row("attend.v", 2.3172e-6, 1.307e0, 2.32e-5),
+    row("attend.out", 4.6989e-6, 1.015e0, 4.70e-5),
+    row("post_attention_layernorm.out", 2.7168e-6, 2.212e-1, 2.72e-5),
+    row("mlp.out", 3.7631e-6, 3.936e-1, 3.76e-5),
+    row("final_norm.out", 3.2815e-6, 2.850e-1, 3.28e-5),
+    row("logits", 2.9504e-6, 4.015e-1, 2.95e-5),
 ];
 
 /// The `Rel` threshold for one operator, with the two failures kept distinct for the reason
@@ -457,26 +457,37 @@ fn the_oracle_reproduces_every_captured_value_of_both_goldens() {
     }
 }
 
-/// **THE FIXTURE NEVER ATTENDS THE BLOCK, and this gate is where that is written down.**
+/// **THE BLOCK ATTENDS ITSELF, and both classes of pair are present.** This is the property the
+/// whole fixture exists to make scorable, and it is asserted rather than assumed.
 ///
-/// Measured 2026-08-16 and asserted below: the tiny config is `sliding_window 4`,
-/// `block_size 4`, and the captured context is 12 rows, so `kv_len` is 16, the block's own K/V
-/// rows sit at 12..16, and the mask `|q_row - kv| <= 4` lets the furthest query (row 3) reach
-/// kv 7 — four columns short. **Every scored value in this binary is attention over CONTEXT
-/// rows only**: the block's four K rows and four V rows carry probability exactly zero in every
-/// head of every layer on both salts.
+/// Until 2026-08-16 it was FALSE. At `sliding_window 4`, `block_size 4`, ctx 12 the mask
+/// `|q_row - kv| <= w` let the furthest query reach kv 7 of 16, and the block-vs-block submatrix
+/// summed to exactly **0.0** on both salts — no query ever attended the block, so §11 step 5
+/// (attention is bidirectional ACROSS THE BLOCK) was pinned by the mask pattern and by no value,
+/// and `DraftDefect::CausalMask`'s red was the re-selection of CONTEXT rows rather than the
+/// property under test. The goldens were re-vendored at `sliding_window 13` — the value that
+/// exercises both classes — and every floor and every defect signal in this file was re-measured
+/// under it — the defect matrix's own table below records what moved, next to the constants
+/// that assert it. **Four of the ten `weakest_defect` values were re-derived** (`attend.q`,
+/// `attend.v`, `attend.out`, `logits`); the other six were NOT re-measured and are carried from
+/// the old geometry. Five of those six have floors that DID move, so their captures changed and
+/// their signals are stale by an unmeasured amount. Left standing because every one sits ~4
+/// decades above its tolerance and `tolerances_leave_room`'s verdict cannot turn on it — but
+/// they are inherited numbers until swept, and this sentence is the record that they are.
 ///
-/// What that costs, stated rather than rediscovered: §11 step 5 — attention is BIDIRECTIONAL
-/// across the block — is pinned here **by the mask pattern alone**, and by no number.
-/// [`DraftDefect::CausalMask`]'s 1.471e0 red at `attend.out` is real but it is the
-/// re-selection of CONTEXT rows; a port that is block-causal and context-correct is
-/// indistinguishable from a correct one on every value this file scores. Closing that needs a
-/// re-vendor at `sliding_window >= ctx + block`, which is anchor-kit work, not oracle work.
-/// Half the K/V tensor being inert also means `attend.out`'s floor and every defect signal in
-/// the matrix were measured on a pattern the real model (window 2048, block 16, every block row
-/// attending every other) does not produce.
+/// 13 of the 16 block-vs-block pairs attend and 3 are masked, so the window still BINDS inside
+/// the block: an all-ones mask (w >= 15) would score green against a port that had no mask.
+///
+/// **What it costs, so nobody has to rediscover it.** At w >= 12 the CONTEXT half of the mask is
+/// all ones, so this fixture no longer exercises window-masking of the context — asserted below
+/// so the blind spot is declared rather than latent. The trade is FORCED: swept at ctx 12 /
+/// block 4, context columns are masked only for w <= 10 and a strictly-bidirectional pair
+/// appears only at w >= 13, and the two ranges never meet. That follows from the reference's own
+/// mask form (`q_offset = 0` indexes queries by ROW while K/V spans `ctx + block`), so no
+/// geometry with this mask has both at any ctx. §11 step 5 is the property under test, so the
+/// block wins.
 #[test]
-fn the_fixture_attends_no_block_row_and_the_bidirectional_half_is_unscored() {
+fn the_block_attends_itself_and_the_window_still_binds() {
     for case in cases() {
         let d = &case.dims;
         let m = case.want("draft.L0.attend.mask");
@@ -484,29 +495,45 @@ fn the_fixture_attends_no_block_row_and_the_bidirectional_half_is_unscored() {
         let ctx = kv_len - d.block;
         assert_eq!(
             (d.block, d.window, ctx),
-            (4, 4, 12),
-            "{}: fixture widths",
+            (4, 13, 12),
+            "{}: fixture widths — the geometry moved, so every floor and signal here is stale",
             case.name
         );
-        let block_cols: f32 = (0..d.block)
+        let attended: usize = (0..d.block)
             .flat_map(|q| (ctx..kv_len).map(move |kv| (q, kv)))
-            .map(|(q, kv)| m[q * kv_len + kv])
-            .sum();
+            .filter(|(q, kv)| m[q * kv_len + kv] > 0.5)
+            .count();
         assert_eq!(
-            block_cols, 0.0,
-            "{}: a query DOES reach the block — the note above and \
-             the tolerances measured under it are stale, not the assert",
+            (attended, d.block * d.block - attended),
+            (13, 3),
+            "{}: block-vs-block attended/masked split",
+            case.name
+        );
+        // The half a causal mask forbids: row 0 attending row 1 is bidirectionality itself, and
+        // no count of attended pairs alone would distinguish it from a causal block.
+        assert!(
+            m[ctx + 1] > 0.5,
+            "{}: block row 0 does not attend block row 1 — the mask is not bidirectional",
+            case.name
+        );
+        // The declared blind spot, asserted so it stays declared: every context column is
+        // attended by every query, so a defect in how the window masks CONTEXT is invisible
+        // here. If this ever fails, the fixture gained context masking and the doc above —
+        // which says that is impossible with this mask form — is what needs re-deriving.
+        assert!(
+            (0..d.block).all(|q| (0..ctx).all(|kv| m[q * kv_len + kv] > 0.5)),
+            "{}: a context column is masked — re-derive the sweep in the doc above",
             case.name
         );
     }
 }
 
-/// **The mask reads `window`, not `block`.** The two are BOTH 4 in this fixture (2048 and 16 in
-/// the real model) and sit one field apart in [`DraftDims`], so — verified by substitution,
-/// 2026-08-16 — every value comparison in this file scores green with either read for the
-/// other. That is the `[D][D]` axis-order trap in a new place, and this is the one gate that
-/// separates them: widening the window by one must move the mask, which it cannot do if the
-/// mask is reading `block`.
+/// **The mask reads `window`, not `block`.** Until the 2026-08-16 re-vendor the two were BOTH 4
+/// — one field apart in [`DraftDims`] — and substituting either for the other scored green on
+/// every value in this file; only this gate reddened, which is how the collapse was found. They
+/// are now 13 and 4, so it is gone from the fixture, and the gate stays because it is what
+/// proves that: widening the window by one must move the mask, which it cannot do if the mask is
+/// reading `block`.
 #[test]
 fn the_mask_reads_the_window_and_not_the_block_size() {
     for case in cases() {
@@ -520,13 +547,6 @@ fn the_mask_reads_the_window_and_not_the_block_size() {
         assert_ne!(
             bad.mask, clean.mask,
             "{}: the mask ignored `window`",
-            case.name
-        );
-        // ...and the two fields are still the collapse this gate exists for.
-        assert_eq!(
-            case.dims.window, case.dims.block,
-            "{}: no longer collapsed — reword the \
-             doc above rather than deleting this",
             case.name
         );
     }
@@ -571,7 +591,7 @@ struct Reach {
     logits: f32,
 }
 
-/// ~280x the widest tolerance (3.53e-5) and 21x under the smallest measured L0 red-set signal
+/// ~208x the widest tolerance (4.80e-5, `attend.q`) and 21x under the smallest measured L0 signal
 /// (2.146e-1, `attend.k` under the encoder-norm plant, salt 2); a defect that moves a capture
 /// less than this is not the defect it claims to be.
 const REDDEN: f32 = 1e-2;
@@ -655,13 +675,21 @@ fn assert_reach(case: &Case, params: &DraftParams, clean: &DraftTrace, r: &Reach
 ///
 /// | defect | reds at L0 (rel) | holds at L0 |
 /// |---|---|---|
-/// | CausalMask | attend.out 1.471e0, logits 6.231e-1, mask ≠ | encoder, ln_in, q, k, v |
-/// | RopeUntailed | attend.q 5.032e-1, attend.out 2.212e-1, logits 2.213e-1 | encoder, ln_in, k, v, mask |
-/// | EncoderNormSkipped | encoder 9.832e-1, k 2.146e-1, v 1.308e0, out 1.106e0, logits 3.237e-1 | ln_in, q, mask |
+/// | CausalMask | attend.out 2.018e0, logits 1.075e0, mask ≠ | encoder, ln_in, q, k, v |
+/// | RopeUntailed | attend.q 5.031e-1, attend.out 2.173e-1, logits 4.015e-1 | encoder, ln_in, k, v, mask |
+/// | EncoderNormSkipped | encoder 9.832e-1, k 2.146e-1, v 1.307e0, out 1.201e0, logits 7.023e-1 | ln_in, q, mask |
+///
+/// **Re-measured 2026-08-16 at the re-vendored geometry** (`sliding_window` 4 → 13), and the
+/// movement is the point: `CausalMask` went 1.471e0 → 2.018e0 at `attend.out` and 6.231e-1 →
+/// 1.075e0 at the logits, because at the old window no query reached the block and making the
+/// block causal could only re-select CONTEXT rows. The trap now costs what it is supposed to
+/// cost. `RopeUntailed`'s logits nearly doubled (2.213e-1 → 4.015e-1) for the same reason.
 ///
 /// **These are L0 figures, and `DRAFT_ORACLE`'s `weakest_defect` column is not.** That column
 /// is the worst LAYER — the same bucket-level aggregation `--by-operator` makes for the text
-/// tables — so the two differ on purpose (`attend.q` 5.032e-1 here against 5.156e-1 there).
+/// tables — so the two differ on purpose (`attend.k` 2.146e-1 here against 4.632e-1 there; on a
+/// row whose worst layer IS L0 the two coincide, e.g. `attend.q` at 5.031e-1 — coincidence, not
+/// transcription).
 /// Neither is a transcription of the other. Since 2026-08-16 the numbers in THIS table are
 /// data, asserted per salt by [`assert_reach`]; the `weakest_defect` column is still prose,
 /// because six of its rows are L1+ minima that no test in this file sweeps.
@@ -671,14 +699,14 @@ fn each_planted_defect_reddens_its_reach_and_holds_the_rest() {
         Reach {
             defect: DraftDefect::CausalMask,
             holds: PRE_ATTEND,
-            reds: &[("attend.out", 1.471e0)],
-            logits: 6.231e-1,
+            reds: &[("attend.out", 2.018e0)],
+            logits: 1.075e0,
         },
         Reach {
             defect: DraftDefect::RopeUntailed,
             holds: &["encoder.out", "input_layernorm.out", "attend.k", "attend.v"],
-            reds: &[("attend.q", 5.032e-1), ("attend.out", 2.212e-1)],
-            logits: 2.213e-1,
+            reds: &[("attend.q", 5.031e-1), ("attend.out", 2.173e-1)],
+            logits: 4.015e-1,
         },
         Reach {
             defect: DraftDefect::EncoderNormSkipped,
@@ -686,10 +714,10 @@ fn each_planted_defect_reddens_its_reach_and_holds_the_rest() {
             reds: &[
                 ("encoder.out", 9.832e-1),
                 ("attend.k", 2.146e-1),
-                ("attend.v", 1.308e0),
-                ("attend.out", 1.106e0),
+                ("attend.v", 1.307e0),
+                ("attend.out", 1.201e0),
             ],
-            logits: 3.237e-1,
+            logits: 7.023e-1,
         },
     ];
     for case in cases() {
@@ -732,8 +760,8 @@ fn reusing_the_targets_grouping_moves_exactly_the_reassigned_heads() {
             &Reach {
                 defect: DraftDefect::TargetGrouping { group: wrong },
                 holds: PRE_ATTEND,
-                reds: &[("attend.out", 1.217e0)],
-                logits: 1.022e0,
+                reds: &[("attend.out", 1.015e0)],
+                logits: 1.180e0,
             },
         );
         let (hd, block) = (d.head_dim, d.block);

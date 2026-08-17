@@ -1,6 +1,10 @@
 //! **The DFlash block drafter's CPU forward — a value-scoring transliteration of
-//! `modeling_muse_glimmer_assistant.py` at transformers `fe747d88`, the commit the vendored
-//! draft goldens pin.**
+//! `models/muse_glimmer_assistant/modeling_muse_glimmer_assistant.py` as pinned by the vendored
+//! draft goldens' `assistant_modeling_sha256` = `c31755fb…d709ed` (transformers 5.15.0).**
+//!
+//! That digest replaced a `fe747d88` commit pin at the 2026-08-16 re-vendor: the venv holding
+//! that revision is gone, and the two stacks' assistant modeling files were proven identical by
+//! reproducing every capture of every vendored file bit-identically before the substitution.
 //!
 //! DFlash is the block-diffusion drafting SCHEME (one bidirectional forward denoises a
 //! `block_size` window against a projected target context); the model that uses it here is
@@ -311,9 +315,16 @@ impl Rope {
 /// The mask the reference builds for this CACHELESS call, and the quirk that makes it worth a
 /// paragraph: `create_bidirectional_sliding_window_mask` indexes queries by their row in the
 /// query tensor (`q_offset = 0` with no cache), while RoPE places the same rows at positions
-/// `ctx..ctx+block`. So the vendored pattern is `|q_row - kv_idx| <= window` — q0 of the tiny
-/// fixture attends kv 0..=4 and none of the block, both salts, all five layers (read off the
-/// captures 2026-08-16). The oracle transliterates the reference AS PINNED; whether that
+/// `ctx..ctx+block`. So the vendored pattern is `|q_row - kv_idx| <= window`: at the re-vendored
+/// window 13, q0 attends kv 0..=13 — INCLUDING block rows 12 and 13 — and 13 of the 16
+/// block-vs-block pairs attend, both salts, all five layers, asserted by
+/// `glimmer_draft_oracle.rs::the_block_attends_itself_and_the_window_still_binds`. Until
+/// 2026-08-16 the window was 4, q0 reached only kv 0..=4, and NO query attended the block at
+/// all — which is what the re-vendor was for.
+///
+/// The window's LOWER edge (`kv >= q - w`) has never bound in this fixture: q < block = 4 and
+/// w >= 4, so `q - w <= 0` always. `DraftDefect::CausalMask` is therefore a plain causal plant
+/// here, not the sliding-causal pair its own doc names; a second declared blind spot. The oracle transliterates the reference AS PINNED; whether that
 /// off-window indexing is desirable at real context lengths is a serving-path question the
 /// cache answers, not this fixture.
 fn mask(dims: &DraftDims, ctx: usize, defect: DraftDefect) -> Vec<f32> {

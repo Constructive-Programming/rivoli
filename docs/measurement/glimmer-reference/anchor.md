@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: data
-verdict: The S1b anchor exists and runs — Muse Glimmer's own first-party stack (transformers 5.16.0.dev0 at commit fe747d88, torch 2.13.0+cpu, python 3.14.6) executed at tiny widths but the REAL structure, and it needs NO GPU because this reference is plain PyTorch with a CPU path for every operator. SIX files are vendored (tests/glimmer-anchor-{text,draft,weights}-{1,2}.bin; text 643,957 B, draft 72,145 B, weights 113,035 B), two weight draws x two modes plus a WEIGHT SET per draw, each reproduced byte-for-byte on a later run, and read by tests/glimmer_anchor.rs with no python, no venv, no network and no device. THE WEIGHT SETS WERE ADDED 2026-08-13 for S3 item 3 (--dump-weights): gate_proj is 72->48 and a layer captures only 18 rows, so 18 equations against 72 unknowns per output element is underdetermined by 4x and EVERY candidate operand admits a weight that fits the captures exactly -- the recover-and-predict shape the sandwich norms use is not weaker here but VACUOUS, because a norm is elementwise and a projection is not. They go in their own files, not into the goldens, so the four pinned FNVs above did not move; verified by regenerating both goldens with the flag on and finding them byte-identical. They were first vendored with no length, no FNV, no census and no regeneration path, which review caught the same day -- glimmer-anchor.sh now regenerates and cmps them and glimmer_anchor.rs pins their bytes. FOURTEEN defect runs are scored at both draws, 28 runs in all, and each is GATED on the captures it must leave bit-identical rather than merely on having changed something. THE FINDING THAT ONLY THIS CAN SEE - softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so the argmax-invariant logit path is not an argument but a measurement, and every greedy gate in this repo is provably blind to it. Two reference behaviours were discovered by running it: the DFlash drafter's default mask is block-wide against context+block K/V and RAISES, and passing the correct 2D mask only works with use_cache=False because a fresh DFlashCache reports kv_length 0. The green sets are scoped to step 0 because a defect that shifts the argmax contaminates every later step through the token it feeds back - localisation is only possible on the prefill. Five deviations are declared in the metadata and pinned by the test - eager attention, fp32 against a bf16 checkpoint, the ForConditionalGeneration wrapper (the softcap lives only there), shrunk special-token ids, and output_multiplier kept at the released value rather than recomputed. TOLERANCES ADDED 2026-08-11 for S2 item 1: per-operator fp32 floors for all thirteen buckets, from --dtype float64 (the whole model in double, no island needed) against each fp32 golden, measured at BOTH draws because attend's floor is 2.1x apart between them - 7.819e-6 and 1.639e-5 - so a one-draw floor would have set the threshold at half what a correct kernel needs. SIX rows are tabled as of 2026-08-12 -- attend, rope, o_proj, logits, norm and qk_norm; attend's is floor 1.639e-5, weakest targeting defect 2.086e0 (kv_broadcast_blocked), Rel(1.64e-4). (This said "ONE row is tabled" through five more landing; the count is stated once here and was gated by old:glimmer_tolerance.rs, nowhere else -- CORRECTED 2026-08-16: that file does not exist in the rewrite and no table_covers_exactly caller covers GLIMMER here, so the six-row set is gated in neither direction in this tree.) qk_scale_on_k is EXCLUDED from that set at 6.232e-4 (38x the floor, which would have forced ExactOnly) because (s*q).k and q.(s*k) are the same product - the defect is invisible to this kernel by algebra, not by resolution. CORRECTED 2026-08-12: this said it "is caught in qk_norm/proj instead" at 2.16e0, and measuring it for S3 item 2's row showed all of that false -- qk_norm moves 4.324e-4/2.825e-4 and proj 4.185e-4/2.449e-4, the 2.16e0 was qk_norm_off's attend figure off the wrong row, and and it does not implement trap 3 at all. CORRECTED AGAIN 2026-08-13: the replacement claim -- that it is caught NOWHERE at Rel strength because an RMS norm is scale-invariant -- is ALSO false. The norm cancels a scalar only up to the eps term, a residue of sqrt(1+(s^2-1)*eps/(s^2*m+eps))-1 which reproduces the measured 2.825e-4 and 6.232e-4 figures and is 3.7x-7.9x the qk_norm row's own Rel(7.85e-5). So the defect IS caught there; the exclusion now rests on MARGIN (36x the floor against the 297x a Rel policy needs) and on every m here coming from toy widths with no real weights, the residue falling as 1/m to 0.06x tol at m~1. S4 re-derives it. The other twelve buckets have floors and no row: a floor is half a row, and S2 compares them exactly until the other half is reasoned through. DRAFT-MODE FLOORS MEASURED 2026-08-16 for M17a: the same fp64 protocol at --mode draft, both salts -- 11 compute captures floored at 2.0248e-6..3.5313e-6 while mask/noise_embeds/candidates came back exactly 0.0 (copies and picks, compared bit-exactly, no tolerance) -- and the CPU drafter oracle scores every capture at 10x these (3 s.f.), with a five-defect matrix in crates/oracles/tests/glimmer_draft_oracle.rs proving the comparison reddens. THE GATE'S OWN LADDER was then measured and both halves recorded: a +1 ulp f32 flip on one encoder.fc element moves encoder.out by 7e-13 relative (2.980119e-7 -> 2.980126e-7) and is CORRECTLY invisible at a 2.33e-5 threshold, so this gate witnesses structure and never a one-ulp conversion error, while an attention-scale slip to 1/sqrt(head_dim+1) reddens it. AND A FALSE GREEN WAS FOUND AND CLOSED: the scoring helper folded (got-want).abs() with f64::max, which returns the OTHER argument on NaN, so an all-NaN capture scored 0.0 -- a perfect match -- proven by running the clean gate GREEN on a capture forced to all-NaN with the guard removed, and red with it. Third recorded reintroduction of that trap in this tree, and the first where the reference side was already guarded and the got side was not. THREE FIXTURE LIMITS were then found by review and are now standing assertions rather than surprises: (1) NO QUERY EVER ATTENDS THE BLOCK -- window 4, block 4, ctx 12, so the furthest query reaches kv 7 of 16 and the block-vs-block submatrix sums to exactly 0.0 on both salts, which means glimmer-architecture.md section 11 step 5 (attention is BIDIRECTIONAL across the block) is pinned by the mask PATTERN alone and by no value, and every draft floor and defect signal was measured on a pattern the real model does not produce; (2) sliding_window and block_size are BOTH 4, so every value comparison scores green with either read for the other -- closed by a gate that widens the window and requires the mask to move; (3) the reference pins its rotary tables to FLOAT32 even under --dtype float64 (inv_freq via torch.arange dtype=torch.float, re-cast inside maybe_autocast(enabled=False)), so the floors have zero contribution from the rope table and could never price one computed otherwise -- the oracle now builds that table in f32 in the reference's own order. Limits 1 and 2 need a re-vendor at sliding_window >= ctx + block to close.
+verdict: The S1b anchor exists and runs — Muse Glimmer's own first-party stack (transformers 5.15.0 from PyPI -- no commit, pinned instead by assistant_modeling_sha256 c31755fb..d709ed -- torch 2.13.0+cpu, python 3.14.6; RE-VENDORED 2026-08-16 from transformers 5.16.0.dev0 at commit fe747d88) executed at tiny widths but the REAL structure, and it needs NO GPU because this reference is plain PyTorch with a CPU path for every operator. SIX files are vendored (tests/glimmer-anchor-{text,draft,weights}-{1,2}.bin; text 644,019 B, draft 72,208 B, weights 2,065,247 B, all re-vendored 2026-08-16), two weight draws x two modes plus a WEIGHT SET per draw, each reproduced byte-for-byte on a later run, and read by tests/glimmer_anchor.rs with no python, no venv, no network and no device. THE WEIGHT SETS WERE ADDED 2026-08-13 for S3 item 3 (--dump-weights): gate_proj is 72->48 and a layer captures only 18 rows, so 18 equations against 72 unknowns per output element is underdetermined by 4x and EVERY candidate operand admits a weight that fits the captures exactly -- the recover-and-predict shape the sandwich norms use is not weaker here but VACUOUS, because a norm is elementwise and a projection is not. They go in their own files, not into the goldens, so the four pinned FNVs above did not move; verified by regenerating both goldens with the flag on and finding them byte-identical. They were first vendored with no length, no FNV, no census and no regeneration path, which review caught the same day -- glimmer-anchor.sh now regenerates and cmps them and glimmer_anchor.rs pins their bytes. FOURTEEN defect runs are scored at both draws, 28 runs in all, and each is GATED on the captures it must leave bit-identical rather than merely on having changed something. THE FINDING THAT ONLY THIS CAN SEE - softcap_off moves 7 of 1103 captures and leaves emitted.ids identical, so the argmax-invariant logit path is not an argument but a measurement, and every greedy gate in this repo is provably blind to it. Two reference behaviours were discovered by running it: the DFlash drafter's default mask is block-wide against context+block K/V and RAISES, and passing the correct 2D mask only works with use_cache=False because a fresh DFlashCache reports kv_length 0. The green sets are scoped to step 0 because a defect that shifts the argmax contaminates every later step through the token it feeds back - localisation is only possible on the prefill. Five deviations are declared in the metadata and pinned by the test - eager attention, fp32 against a bf16 checkpoint, the ForConditionalGeneration wrapper (the softcap lives only there), shrunk special-token ids, and output_multiplier kept at the released value rather than recomputed. TOLERANCES ADDED 2026-08-11 for S2 item 1: per-operator fp32 floors for all thirteen buckets, from --dtype float64 (the whole model in double, no island needed) against each fp32 golden, measured at BOTH draws because attend's floor is 2.1x apart between them - 7.819e-6 and 1.639e-5 - so a one-draw floor would have set the threshold at half what a correct kernel needs. SIX rows are tabled as of 2026-08-12 -- attend, rope, o_proj, logits, norm and qk_norm; attend's is floor 1.639e-5, weakest targeting defect 2.086e0 (kv_broadcast_blocked), Rel(1.64e-4). (This said "ONE row is tabled" through five more landing; the count is stated once here and was gated by old:glimmer_tolerance.rs, nowhere else -- CORRECTED 2026-08-16: that file does not exist in the rewrite and no table_covers_exactly caller covers GLIMMER here, so the six-row set is gated in neither direction in this tree.) qk_scale_on_k is EXCLUDED from that set at 6.232e-4 (38x the floor, which would have forced ExactOnly) because (s*q).k and q.(s*k) are the same product - the defect is invisible to this kernel by algebra, not by resolution. CORRECTED 2026-08-12: this said it "is caught in qk_norm/proj instead" at 2.16e0, and measuring it for S3 item 2's row showed all of that false -- qk_norm moves 4.324e-4/2.825e-4 and proj 4.185e-4/2.449e-4, the 2.16e0 was qk_norm_off's attend figure off the wrong row, and and it does not implement trap 3 at all. CORRECTED AGAIN 2026-08-13: the replacement claim -- that it is caught NOWHERE at Rel strength because an RMS norm is scale-invariant -- is ALSO false. The norm cancels a scalar only up to the eps term, a residue of sqrt(1+(s^2-1)*eps/(s^2*m+eps))-1 which reproduces the measured 2.825e-4 and 6.232e-4 figures and is 3.7x-7.9x the qk_norm row's own Rel(7.85e-5). So the defect IS caught there; the exclusion now rests on MARGIN (36x the floor against the 297x a Rel policy needs) and on every m here coming from toy widths with no real weights, the residue falling as 1/m to 0.06x tol at m~1. S4 re-derives it. The other twelve buckets have floors and no row: a floor is half a row, and S2 compares them exactly until the other half is reasoned through. DRAFT-MODE FLOORS MEASURED 2026-08-16 for M17a: the same fp64 protocol at --mode draft, both salts -- 11 compute captures floored at 2.0248e-6..3.5313e-6 while mask/noise_embeds/candidates came back exactly 0.0 (copies and picks, compared bit-exactly, no tolerance) -- and the CPU drafter oracle scores every capture at 10x these (3 s.f.), with a five-defect matrix in crates/oracles/tests/glimmer_draft_oracle.rs proving the comparison reddens. THE GATE'S OWN LADDER was then measured and both halves recorded: a +1 ulp f32 flip on one encoder.fc element moves encoder.out by 7e-13 relative (2.980119e-7 -> 2.980126e-7) and is CORRECTLY invisible at a 2.33e-5 threshold, so this gate witnesses structure and never a one-ulp conversion error, while an attention-scale slip to 1/sqrt(head_dim+1) reddens it. AND A FALSE GREEN WAS FOUND AND CLOSED: the scoring helper folded (got-want).abs() with f64::max, which returns the OTHER argument on NaN, so an all-NaN capture scored 0.0 -- a perfect match -- proven by running the clean gate GREEN on a capture forced to all-NaN with the guard removed, and red with it. Third recorded reintroduction of that trap in this tree, and the first where the reference side was already guarded and the got side was not. THREE FIXTURE LIMITS were then found by review and are now standing assertions rather than surprises: (1) NO QUERY EVER ATTENDS THE BLOCK -- window 4, block 4, ctx 12, so the furthest query reaches kv 7 of 16 and the block-vs-block submatrix sums to exactly 0.0 on both salts, which means glimmer-architecture.md section 11 step 5 (attention is BIDIRECTIONAL across the block) is pinned by the mask PATTERN alone and by no value, and every draft floor and defect signal was measured on a pattern the real model does not produce; (2) sliding_window and block_size are BOTH 4, so every value comparison scores green with either read for the other -- closed by a gate that widens the window and requires the mask to move; (3) the reference pins its rotary tables to FLOAT32 even under --dtype float64 (inv_freq via torch.arange dtype=torch.float, re-cast inside maybe_autocast(enabled=False)), so the floors have zero contribution from the rope table and could never price one computed otherwise -- the oracle now builds that table in f32 in the reference's own order. LIMITS 1 AND 2 ARE NOW CLOSED BY A RE-VENDOR (2026-08-16): sliding_window 4 -> 13 in the drafter's tiny config, so 13 of the 16 block-vs-block pairs attend and 3 stay masked -- the block genuinely attends itself (row 0 attends row 1, which a causal mask forbids) AND the window still binds, where w>=15 would have made the mask all ones and unable to fail. EVERY draft floor was re-measured under it (attend.q, attend.out and final_norm.out rose 1.35x-1.37x while encoder.out and attend.v did not move at all, because the encoder never sees the mask and V is projected before attention) and every defect signal re-measured: CausalMask went 1.471e0 -> 2.018e0 at attend.out and 6.231e-1 -> 1.075e0 at the logits, measuring for the first time the property it is named for. THE RED PROOF THAT MATTERS: substituting block for window used to redden 1 of 10 tests and now reddens 3, so the blind spot was closed by changing the fixture rather than by adding an assertion. The stack moved too -- the fe747d88 venv is gone and the only one left is transformers 5.15.0 from PyPI, which has no commit -- so the provenance gate now pins assistant_modeling_sha256 (the digest of the four muse_glimmer_assistant/*.py that actually run) by VALUE for every file -- a dual sha-or-digest form was written and killed by review the same day, because the sha branch was unreachable and a 40-hex shape check is strictly weaker than a value check, and the substitution was bridged by regenerating at the OLD geometry and reproducing (1103 text + 50 draft + 107 weights) x 2 salts = 2,520 of 2,520 captures across all six vendored files bit-identically -- CORRECTED 2026-08-16 from "2,420", which was a sum this verdict stated rather than added up. All six were re-vendored together because the one-environment invariant spans them; new pins are text 644,019 B, draft 72,208 B, weights 2,065,247 B. Limit 3 (the f32 rope table) stands and the oracle matches it.
 ---
 
 # The Muse Glimmer S1b anchor
@@ -338,10 +338,44 @@ tensor in this bucket can see it. It is visible one capture later, in `q.pre_rop
 bucket), which the driver takes on entry to `apply_rotary_pos_emb` — after norm and after scale. A
 port that omits the scale, or folds it into the softmax scale instead, reddens there and not here.
 
-### Draft-mode floors, measured 2026-08-16 for M17a
+### Draft-mode floors — RE-MEASURED 2026-08-16 at the re-vendored geometry
 
-The same fp64-against-fp32 protocol, `--mode draft`, both salts — the CPU drafter oracle
-(`crates/oracles/src/dflash.rs`) computes in f64 and is scored per capture at 10× these:
+> **The first set of these floors is superseded, not merely refined.** They were measured at
+> `sliding_window 4`, where no query ever reached the block (below), so every one of them priced
+> an attention pattern the real model does not produce. Do not carry a number out of the
+> superseded table; it is kept only in git history.
+
+**The re-vendor.** `sliding_window` 4 → **13** in the drafter's tiny config
+(`glimmer_anchor_lib.py`). ctx is `PROMPT_LEN` 12 and `block_size` is 4, so `kv_len` is 16 and
+the block's own K/V rows sit at 12..16. The reference indexes queries by ROW (`q_offset = 0`,
+no cache) while RoPE places them at `ctx..`, so the mask is `|q_row − kv| ≤ w`:
+
+| w | block-vs-block pairs attending | window binds? |
+|---|---|---|
+| 4 (old) | **0 of 16** | yes, but the block is out of reach |
+| 13 (new) | **13 of 16** | yes — 3 pairs masked |
+| ≥ 15 | 16 of 16 | **no** — the mask is all ones and cannot fail |
+
+13 is the **minimum** value producing a strictly-bidirectional pair — a query attending a LATER
+block row, exactly what a causal mask forbids — and minimal on purpose: 3 of the 16 block pairs
+stay masked, so the window still binds inside the block where w ≥ 15 would be all ones and unable
+to fail.
+
+**The cost, and why it is forced rather than chosen.** At w ≥ 12 the CONTEXT half of the mask is
+all ones, so this fixture no longer exercises window-masking of the context. Swept over w at
+ctx 12 / block 4:
+
+| w | 2–8 | 9 | 10 | 11 | 12 | **13** | 14 | 15+ |
+|---|---|---|---|---|---|---|---|---|
+| context columns masked | 31–6 | 3 | 1 | 0 | 0 | **0** | 0 | 0 |
+| strictly-bidirectional pairs | 0 | 0 | 0 | 0 | 0 | **3** | 5 | 6 |
+
+The two ranges never meet: context masking needs w ≤ 10, bidirectionality needs w ≥ 13. That
+follows from the reference's own mask form — `q_offset = 0` indexes queries by ROW (0..block)
+while K/V spans `ctx + block`, so any w letting q0 reach kv = ctx also lets it reach every
+kv < ctx. **No geometry with this mask has both, at any ctx.** §11 step 5 is the property under
+test, so the block wins, and the context-window blind spot is now asserted explicitly in
+`glimmer_draft_oracle.rs` rather than left latent.
 
 ```bash
 $VENV/bin/python glimmer_anchor_driver.py --mode draft --salt glimmer-anchor-$n \
@@ -349,104 +383,86 @@ $VENV/bin/python glimmer_anchor_driver.py --mode draft --salt glimmer-anchor-$n 
 # then per-capture max|f32−f64| / max|f64|, worst over both salts and all five layers
 ```
 
-| capture | floor | | capture | floor |
-|---|---|---|---|---|
-| `encoder.out` | 2.3281e−6 | | `attend.out` | 3.4292e−6 |
-| `input_layernorm.out` | 2.0248e−6 | | `post_attention_layernorm.out` | 2.4606e−6 |
-| `attend.q` | 3.5134e−6 | | `mlp.out` | 3.5313e−6 |
-| `attend.k` | 3.3121e−6 | | `final_norm.out` / `last_hidden` | 2.4320e−6 |
-| `attend.v` | 2.3172e−6 | | `logits` | 2.6476e−6 |
-
-`attend.mask`, `noise_embeds`, `block_ids` and `candidates` came back at exactly 0.0 — they
-are copies, thresholds or integer picks, not arithmetic, and the oracle compares them
-bit-exactly with no tolerance at all. The thresholds (10×, written to 3 s.f. because FOUR of
-these floors round outside `FLOOR_MULT`'s (9.9, 10.2) band at 2 s.f. — `encoder.out` 9.879×,
-`input_layernorm.out` 9.878×, `final_norm.out` 9.868× and, worst, `logits` at 9.820×; at 3 s.f.
-every ratio lands in 9.976×–10.012×. **CORRECTED 2026-08-16, same day:** this said "two of these
-floors", a count restated rather than recomputed, and review recomputing it found four — the
-worst of them not one of the two that had been named), the oracle-side defect signals they
-must catch, and the five-defect matrix that proves the comparison can redden all live in
-`crates/oracles/tests/glimmer_draft_oracle.rs`; the fp64 runs were made under
-`/home/rhansen/glm-anchor/venv` (transformers 5.15.0 — the 5.16.0.dev0 venv named above no
-longer exists on this machine) after verifying that env regenerates both vendored draft
-goldens with all 50 captures bit-identical (only the metadata version strings differ — the
-assistant modeling files are byte-identical between 5.15.0 and the pinned `fe747d88`).
-
-### What the draft oracle's gate can and cannot see — the ladder, measured 2026-08-16
-
-Each rung was planted in the tree, run, and reverted. The instrument is the clean gate
-(`the_oracle_reproduces_every_captured_value_of_both_goldens`); where a number is quoted it was
-read off the assert's own message with that row's tolerance driven to zero, which is how a
-green gate is made to state what it actually measured.
-
-| rung | perturbation | `encoder.out` rel | gate |
+| capture | floor | 10× tol | vs old |
 |---|---|---|---|
-| 0 | none (the shipped oracle) | 2.980119e−7 | green — 78× inside its 2.33e−5 tolerance |
-| 1 | +1 ulp on one f32 element of `encoder.fc` | 2.980126e−7 | **green, and correctly so** |
-| 2 | attention scale `1/√head_dim` → `1/√(head_dim+1)` | — | red |
+| `encoder.out` | 2.3281e−6 | 2.33e−5 | 1.00× |
+| `input_layernorm.out` | 2.4993e−6 | 2.50e−5 | 1.23× |
+| `attend.q` | 4.7961e−6 | 4.80e−5 | **1.37×** |
+| `attend.k` | 2.9202e−6 | 2.92e−5 | 0.88× |
+| `attend.v` | 2.3172e−6 | 2.32e−5 | 1.00× |
+| `attend.out` | 4.6989e−6 | 4.70e−5 | **1.37×** |
+| `post_attention_layernorm.out` | 2.7168e−6 | 2.72e−5 | 1.10× |
+| `mlp.out` | 3.7631e−6 | 3.76e−5 | 1.07× |
+| `final_norm.out` / `last_hidden` | 3.2815e−6 | 3.28e−5 | **1.35×** |
+| `logits` | 2.9504e−6 | 2.95e−5 | 1.11× |
 
-**Rung 1 is the floor and it is the useful number**: a one-ulp weight flip moves the worst
-relative difference by 7e−13, five orders of magnitude below the threshold. That is not a hole
-— a single-ulp f32 perturbation is far inside the reference's OWN fp32 noise, which is what the
-floor measures — but it does bound what this gate is evidence for. It cannot witness a
-conversion that is off by an ulp; it witnesses structure. (Recorded because this repo has twice
-registered a red-proof whose perturbation was below the detection floor and read the resulting
-green as a passing gate.)
+The movement is itself evidence the measurement is real: `encoder.out` and `attend.v` did not
+move at all (the encoder does not see the mask, and V is projected before attention), while the
+three captures downstream of the widened attention rose 1.35–1.37×. At 3 s.f. every ratio lands
+in 9.99×–10.01×, inside `FLOOR_MULT`'s (9.9, 10.2). `attend.mask`, `noise_embeds`, `block_ids`,
+`prompt.ids`, `target_layer_ids` and `candidates` came back at exactly 0.0 — copies and integer
+picks, compared bit-exactly with no tolerance.
 
-The whole battery, each plant applied to the tree, run, and reverted (2026-08-16):
+**The defect signals moved with the geometry, which is the whole reason the re-vendor mattered.**
+Min over both salts, at L0, now asserted as data by `glimmer_draft_oracle.rs`:
 
-| plant | gate | result |
+| defect | attend.out | logits | was (old geometry) |
+|---|---|---|---|
+| `CausalMask` | **2.018e0** | **1.075e0** | 1.471e0 / 6.231e-1 |
+| `RopeUntailed` | 2.173e-1 | **4.015e-1** | 2.212e-1 / 2.213e-1 |
+| `EncoderNormSkipped` | 1.201e0 | 7.023e-1 | 1.106e0 / 3.237e-1 |
+| `TargetGrouping` | 1.015e0 | 1.180e0 | 1.217e0 / 1.022e0 |
+
+`CausalMask` is the one to read: at the old window it could only re-select CONTEXT rows, because
+the block was unreachable. It now costs 1.37× more at `attend.out` and 1.73× more at the logits,
+and for the first time it is measuring the property it is named for.
+
+### Provenance: the stack changed under the re-vendor, and 2,420 captures say it did not matter
+
+The venv holding transformers at `fe747d88` no longer exists on this machine. Everything above
+was produced under `/home/rhansen/glm-anchor/venv` — **torch 2.13.0+cpu, transformers 5.15.0
+from PyPI, python 3.14.6** — which has no `direct_url.json` and therefore no commit at all.
+
+Rather than weaken the gate that required a 40-hex sha, the driver now also records
+**`assistant_modeling_sha256`**: the digest of the four
+`models/muse_glimmer_assistant/*.py` that actually run, name-then-bytes, sorted —
+`c31755fb…d709ed`, pinned by value in `glimmer_anchor.rs`. Every vendored file must match that digest — one
+assertion, not a choice: the dual form this briefly had was killed by review the same day,
+because every file carries `transformers_commit` = `"unknown"` so the sha branch was unreachable,
+the driver emits the digest unconditionally so it is not a fallback, and a 40-hex *shape* check is
+strictly weaker than a *value* check anyway. `transformers_commit` is still required to agree
+across all four goldens. A content hash is the stronger pin of the two: a
+repository revision does not tell you which four files were installed.
+
+The bridge was measured before anything was re-vendored under the new stack. Regenerating under
+5.15.0 at the OLD geometry reproduced **every capture of every vendored file bit-identically** —
+**(1103 text + 50 draft + 107 weights) × 2 salts = 2,520 in all** — with only the
+metadata version strings differing. So the only numbers that moved in this re-vendor are the ones
+the geometry change was for. All six files were re-vendored together, because
+`the_anchor_goldens_record_what_produced_them` requires one environment across all of them and
+two files pinned to different stacks cannot be compared to each other.
+
+New byte pins: text 644,019 B, draft 72,208 B, weights 2,065,247 B.
+
+### The red-proof battery, RE-RUN at the re-vendored geometry (2026-08-16)
+
+Every plant above was re-applied after the re-vendor. All still redden — and two rows changed
+meaning, which is the measurement that justifies the whole re-vendor:
+
+| plant | old geometry | new geometry |
 |---|---|---|
-| one capture forced to all-NaN, got-side guard PRESENT | clean forward | red at the finite guard |
-| the same, guard REMOVED | clean forward | **GREEN — all 39 tolerances passed** |
-| a well-formed extra row in `DRAFT_ORACLE` | `table_covers_exactly` | red |
-| attention scale `1/√head_dim` → `1/√(head_dim+1)` | clean forward | red |
-| `+1 ulp` on one f32 element of `encoder.fc` | clean forward | green (2.980126e−7 vs 2.980119e−7) |
-| one recorded L0 signal raised 2.146e−1 → 2.60e−1 | defect matrix | red at the signal bar |
-| `mask()` reading `block` instead of `window` | whole binary | red at **exactly one** test — the window gate — and green at the other nine |
-| a draft golden renamed out of the prefix filter | whole binary | red (salt pairing, 7 of 10) |
+| all-NaN capture, guard PRESENT | red | red |
+| all-NaN capture, guard REMOVED | **green (the hole)** | **green (the hole)** |
+| extra unconsulted tolerance row | red | red |
+| attention scale `1/√(hd+1)` | red | red |
+| a recorded L0 signal raised | red | red |
+| **`mask()` reading `block` instead of `window`** | red at **1** of 10 tests | **red at 3 of 10** |
+| **a mask cell flipped INSIDE the block** | *(inexpressible — the block was never attended)* | **red at 3 of 10** |
 
-The `block`-for-`window` row is the one worth keeping: nine value gates stayed green under a
-substitution that is a 128× error in the real model, and only the gate written for that collapse
-caught it. That is what "every value comparison scores green with either read for the other"
-means measured rather than argued.
-
-**A false green was found and closed the same day.** The scoring helper folded
-`(got − want).abs()` with `f64::max`, which RETURNS THE OTHER ARGUMENT ON NaN — so a capture
-that computed only NaN scored 0.0, a perfect match. Proven both ways rather than argued: with
-one capture forced to all-NaN and the guard removed, the clean gate **passed** (all 39 captures
-green); with the guard in place it fails on that capture before any tolerance is consulted.
-This is the third recorded reintroduction of the same trap in this tree
-(`crates/engine/tests/common/scoring.rs` carries the first two), and the first where the
-reference side was already guarded and the got side was not.
-
-### What the draft goldens cannot see, found by review 2026-08-16
-
-Three limits of the FIXTURE, not of the oracle. Each is now a standing assertion in
-`crates/oracles/tests/glimmer_draft_oracle.rs` or a stated exception in `dflash.rs`, so none
-can be rediscovered as a surprise:
-
-- **No query ever attends the block.** `sliding_window 4`, `block_size 4`, captured context 12
-  → `kv_len` 16, the block's own K/V rows at 12..16, and the mask `|q_row − kv| ≤ 4` lets the
-  furthest query (row 3) reach kv **7**. Measured: the block-vs-block submatrix sums to exactly
-  0.0 on both salts. **§11 step 5 — attention is bidirectional across the block — is therefore
-  pinned by the mask PATTERN alone and by no value in this golden.** `defect_causal_mask`'s red
-  is the re-selection of CONTEXT rows; a port that is block-causal and context-correct is
-  indistinguishable here. Every draft-mode floor and every defect signal was measured on an
-  attention pattern the real model (window 2048, block 16) does not produce. Closing it needs a
-  re-vendor at `sliding_window ≥ ctx + block`.
-- **`sliding_window` and `block_size` are both 4**, one field apart in the config, so every
-  value comparison scores green with either substituted for the other — the `[D][D]` axis-order
-  trap in a new place. Verified by substitution. Closed by a gate that widens the window by one
-  and requires the mask to move; the collapse itself needs a re-vendor.
-- **The reference's rotary tables are float32 even under `--dtype float64`**
-  (`modeling_muse_glimmer_assistant.py:352` pins `inv_freq` to `torch.arange(..., dtype=
-  torch.float)`, and `:358-363` re-casts inside `maybe_autocast(enabled=False)  # Force
-  float32`). So the fp64 run that measured these floors used the SAME f32 table as the fp32
-  run, and **the floors have zero contribution from the rope table** — they cannot price one
-  computed any other way. The oracle originally built it in f64, ~2e−7 relative from the
-  reference (inside `attend.q`'s 3.51e−5, but on an argument the floor never made, and growing
-  linearly with position). It now builds the table in f32 in the reference's own order.
+The `block`-for-`window` row is the direct evidence. At the old geometry a 128×-in-the-real-model
+substitution was visible only to the one gate written for it, and nine value gates scored it
+green. At the new geometry the value gates see it too. The blind spot is closed, and it was
+closed by changing the FIXTURE, not by adding an assertion.
 
 ## What this does NOT establish
 

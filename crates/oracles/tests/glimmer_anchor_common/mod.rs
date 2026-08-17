@@ -46,26 +46,26 @@ pub const GOLDENS: &[Vendored] = &[
     Vendored {
         name: "text-1",
         bytes: include_bytes!("../glimmer-anchor-text-1.bin"),
-        len: 643_957,
-        fnv: 0xc765_6dea_dd50_3c51,
+        len: 644_019,
+        fnv: 0x1d38_1eb7_e15c_fdee,
     },
     Vendored {
         name: "text-2",
         bytes: include_bytes!("../glimmer-anchor-text-2.bin"),
-        len: 643_957,
-        fnv: 0xe778_0679_924e_cd5f,
+        len: 644_019,
+        fnv: 0x7d9d_ab84_8f72_fc14,
     },
     Vendored {
         name: "draft-1",
         bytes: include_bytes!("../glimmer-anchor-draft-1.bin"),
-        len: 72_145,
-        fnv: 0x3dcf_a1ed_6536_a6f0,
+        len: 72_208,
+        fnv: 0x0d18_5f12_9070_d85d,
     },
     Vendored {
         name: "draft-2",
         bytes: include_bytes!("../glimmer-anchor-draft-2.bin"),
-        len: 72_145,
-        fnv: 0xd15d_109a_9a72_f7ab,
+        len: 72_208,
+        fnv: 0x0f1a_81ad_1595_8e07,
     },
 ];
 
