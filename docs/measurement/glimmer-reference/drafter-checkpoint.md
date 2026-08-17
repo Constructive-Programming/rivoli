@@ -1,7 +1,7 @@
 ---
 scope: glimmer
 status: data
-verdict: The DFlash drafter checkpoint is on this box and was CONVERTED end to end, so M17b's numbers are measured rather than derived from the spec. It carries 58 tensors, NOT the spec's 59 -- eleven per layer x 5 plus encoder.fc, encoder.output_norm_enc and norm -- every one BF16, 2,555,985,152 parameters, 5,111,970,304 tensor bytes under a 6,296-byte header for a 5,111,976,608-byte file. The 59th tensor does not exist: DrafterConfig::census's header had predicted the discrepancy and named an `fc` bias as the candidate, and there is no bias, so the spec's PROSE is wrong and its own per-layer enumeration (which derives 58) is right. encoder.fc is [6656, 33280] = [hidden, 5 x hidden], the only place the length of target_layer_ids is visible in a SHAPE rather than in the config. convert_glimmer_drafter ran against the real checkpoint 2026-08-17 in 174 s on CPU/NFS, writing 36 tensors bf16 verbatim and 22 norms widened to f32, and the output artifact's tensor half is 5,112,132,608 B -- EXACTLY the pin this gate derives from the census, confirming the rank rule (1-D is a norm and is held f32) adds 162,304 B and nothing else. So the resident pin is 4.761 GiB, not the plan's 5.1 GiB, which was the file's size in GB read as GiB and overstated a P6 budget by 7.1% (5,476,083,302 B claimed against 5,112,132,608 B actual -- CORRECTED 2026-08-17 from 7.6%, a figure that followed from none of these numbers and was invented inside the paragraph correcting a different unit slip). Three M17c budgets are now derived from the shipped config rather than inherited: drafter KV is 2 x 8 kv_heads x 128 head_dim x 5 layers x 2 B = 20,480 B = 20.0 KiB/token exactly; the target-side hidden-state export is 5 x 6656 x 2 B = 66,560 B/token; and a ctx-4096 ring is 272,629,760 B = 260.0 MiB. The checkpoint itself is NOT vendored -- only its 6,304-byte safetensors header, which carries every name, shape, dtype and offset and so is the whole census and none of the weights, pinned by length and FNV-1a and RECOMPUTED from the live file whenever the mount is present. All THIRTEEN gates in crates/cli/tests/drafter_convert.rs are proven red by nine plants (gate-red-proofs.md section 6; twelve gates and six plants as first landed, grown the same day under review), including the two that matter most: a one-byte header edit reddens the live-file comparison, which is the proof that conditional half is armed on this box rather than silently skipping, and a wrong drafter hidden_size reddens the POSITIVE pairing arm, which is what makes "the shipped drafter pairs with the shipped target" evidence instead of a run that failed early for its own reasons. What this does NOT establish: no VALUE was scored -- the conversion is a byte copy plus a widen, the drafter's arithmetic is scored by the CPU oracle on the tiny anchor fixtures, and nothing here has run a drafter forward pass. The TARGET's own name census still has no real-index gate. WHY THIS ARM'S GATES MEAN WHAT THEY SAY, recorded because M17c/d set their gates here: Glimmer decode reproduces itself byte-for-byte, both fully pinned and while streaming, so a lossless-drafting gate ("greedy ids identical with and without drafting") is EXPRESSIBLE on this arm and an acceptance histogram here is a measurement rather than a sample -- neither of which currently holds on GLM, whose decode does not reproduce itself and which has a blocking defect with its own owner. And DFlash economics must be priced against BOTH target dtypes, because a dense verify pass reads every weight once regardless of row count, so a cheaper fp8 target makes the drafter's FIXED cost a larger fraction of the step and break-even N is a function of the target's dtype. The supporting GLM-determinism and fp8 throughput FIGURES are other tracks' measurements, cited in the body and NOT owned here: this doc is scope glimmer and must not become the tree's only home for a scope-glm defect.
+verdict: The DFlash drafter checkpoint is on this box and was CONVERTED end to end, so M17b's numbers are measured rather than derived from the spec. It carries 58 tensors, NOT the spec's 59 -- eleven per layer x 5 plus encoder.fc, encoder.output_norm_enc and norm -- every one BF16, 2,555,985,152 parameters, 5,111,970,304 tensor bytes under a 6,296-byte header for a 5,111,976,608-byte file. The 59th tensor does not exist: DrafterConfig::census's header had predicted the discrepancy and named an `fc` bias as the candidate, and there is no bias, so the spec's PROSE is wrong and its own per-layer enumeration (which derives 58) is right. encoder.fc is [6656, 33280] = [hidden, 5 x hidden], the only place the length of target_layer_ids is visible in a SHAPE rather than in the config. convert_glimmer_drafter ran against the real checkpoint 2026-08-17 in 174 s on CPU/NFS, writing 36 tensors bf16 verbatim and 22 norms widened to f32, and the output artifact's tensor half is 5,112,132,608 B -- EXACTLY the pin this gate derives from the census, confirming the rank rule (1-D is a norm and is held f32) adds 162,304 B and nothing else. So the resident pin is 4.761 GiB, not the plan's 5.1 GiB, which was the file's size in GB read as GiB and overstated a P6 budget by 7.1% (5,476,083,302 B claimed against 5,112,132,608 B actual -- CORRECTED 2026-08-17 from 7.6%, a figure that followed from none of these numbers and was invented inside the paragraph correcting a different unit slip). Three M17c budgets are now derived from the shipped config rather than inherited: drafter KV is 2 x 8 kv_heads x 128 head_dim x 5 layers x 2 B = 20,480 B = 20.0 KiB/token exactly; the target-side hidden-state export is 5 x 6656 x 2 B = 66,560 B/token; and a ctx-4096 ring is 272,629,760 B = 260.0 MiB. The checkpoint itself is NOT vendored -- only its 6,304-byte safetensors header, which carries every name, shape, dtype and offset and so is the whole census and none of the weights, pinned by length and FNV-1a and RECOMPUTED from the live file whenever the mount is present. All THIRTEEN gates in crates/cli/tests/drafter_convert.rs are proven red by nine plants (gate-red-proofs.md section 6; twelve gates and six plants as first landed, grown the same day under review), including the two that matter most: a one-byte header edit reddens the live-file comparison, which is the proof that conditional half is armed on this box rather than silently skipping, and a wrong drafter hidden_size reddens the POSITIVE pairing arm, which is what makes "the shipped drafter pairs with the shipped target" evidence instead of a run that failed early for its own reasons. What this does NOT establish: no VALUE was scored -- the conversion is a byte copy plus a widen, the drafter's arithmetic is scored by the CPU oracle on the tiny anchor fixtures, and nothing here has run a drafter forward pass. The TARGET's own name census still has no real-index gate. WHY THIS ARM'S GATES MEAN WHAT THEY SAY, recorded because M17c/d set their gates here: Glimmer decode reproduces itself byte-for-byte, both fully pinned and while streaming, so a lossless-drafting gate ("greedy ids identical with and without drafting") is EXPRESSIBLE on this arm and an acceptance histogram here is a measurement rather than a sample -- neither of which currently holds on GLM, whose decode does not reproduce itself and which has a blocking defect with its own owner. And DFlash economics must be priced against BOTH target dtypes, because a dense verify pass reads every weight once regardless of row count, so a cheaper fp8 target makes the drafter's FIXED cost a larger fraction of the step and break-even N is a function of the target's dtype. The supporting GLM-determinism and fp8 throughput FIGURES are other tracks' measurements, cited in the body and NOT owned here: this doc is scope glimmer and must not become the tree's only home for a scope-glm defect. THE LARGEST THING THE REAL CONFIG CONTRADICTS IN THE PLAN, measured before the kernel exists: the mask M17c must build is NOT the one the anchor pins. The reference's overlay is abs(q_idx - kv_idx) <= sliding_window with q_idx = row + q_offset, and q_offset is the cache's query offset when a cache is present and ZERO when it is not -- the anchor ran use_cache=False (a fresh DFlashCache reports kv_length 0), so every vendored golden pins the q_offset=0 branch. At the fixture's ctx 12 / block 4 / window 13 that is 13 of 16 block-vs-block pairs, which is what M17a re-vendored to obtain; at the SHIPPED ctx 4096 / block 16 / window 2048 the same expression gives ZERO of 256, because q_idx <= 15 cannot reach kv >= ctx once ctx > window -- the block does not attend itself at all and the drafter degenerates to a context-reader that still produces finite logits and passes every shape check. The cache branch (q_offset = ctx) gives 256 of 256 with 120 strictly bidirectional. The anchor CANNOT arbitrate because the two indexings differ even at the tiny geometry (13 of 16 vs 16 of 16, 0 masked context columns vs 3), so the goldens pin one by value and it is the one that does not survive scaling -- M17a's re-vendor was necessary and correct and still leaves the property pinned in a regime that inverts at production widths. M17c therefore carries q_offset as an EXPLICIT kernel argument, 0 for anchor parity and ctx in decode, never a default.
 ---
 
 # The DFlash drafter checkpoint, measured
@@ -181,6 +181,63 @@ pass reads every weight once regardless of how many rows it verifies, so making 
 2.16× cheaper makes the drafter's **fixed** cost a correspondingly larger fraction of the step.
 The break-even N is therefore a function of the target's dtype, and quoting one number for it
 without saying which dtype it was measured at is the mistake to avoid at M17e.
+
+## The mask M17c must build is NOT the mask the anchor pins
+
+**Measured 2026-08-17, before the kernel exists — which is the only order in which it can prevent
+anything.** This is the largest thing the real config contradicts in the plan.
+
+The reference's overlay is one line, `masking_utils.py::sliding_window_bidirectional_overlay`: "a
+token can attend to any other token if their absolute distance is within the (inclusive) sliding
+window size", i.e. `abs(q_idx - kv_idx) <= sliding_window`.
+
+`q_idx` is `row + q_offset`, and `_preprocess_mask_arguments` sets
+`q_offset = past_key_values.get_query_offset(layer_idx)` **when a cache is present and `0` when it
+is not**. Both branches reach the same overlay, so the mask's entire meaning turns on which branch
+built it — and nothing in the shapes, the byte counts or the census says which.
+
+**The S1b anchor is the no-cache branch.** Its own recorded reference behaviour is that a fresh
+`DFlashCache` reports `kv_length` 0 and the correct 2D mask only works with `use_cache=False`, so
+every vendored draft golden pins **`q_offset = 0`**.
+
+Both branches, counted over block-vs-block pairs (`kv >= ctx`), strictly-bidirectional pairs among
+them (a query attending a **later** row of its own block — the only positive evidence of
+bidirectionality, since a causal mask permits none), and masked context columns:
+
+| geometry | `q_offset` | block pairs attending | strictly bidirectional | ctx cols masked |
+|---|---|---|---|---|
+| fixture: ctx 12, block 4, window 13 | **0** (the anchor) | **13 of 16** | 3 | 0 |
+| fixture: ctx 12, block 4, window 13 | 12 (cache) | 16 of 16 | 6 | 3 |
+| **shipped: ctx 4096, block 16, window 2048** | **0** (anchor form) | **0 of 256** | **0** | 32,632 |
+| **shipped: ctx 4096, block 16, window 2048** | 4096 (cache) | **256 of 256** | 120 | 32,888 |
+
+**Read the third row.** With `q_offset = 0`, `q_idx` is at most `block − 1` = 15, so no query can
+reach a key at `kv >= ctx` once `ctx > window`. **The block does not attend itself at all.** A
+kernel that transliterates the anchor's mask is not a block drafter — it is a context-reader that
+would still produce finite logits, still pass every shape check in this file, and still decode. The
+cache branch restores the property in full.
+
+**And the anchor cannot arbitrate**, which is why this needed measuring rather than reading. The two
+indexings differ *even at the fixture's geometry* — 13 of 16 against 16 of 16, and 0 masked context
+columns against 3 — so the goldens pin one of them **by value**, and it is the one that does not
+survive scaling. `dflash.rs`'s `mask` docstring had anticipated the shape of the question ("whether
+that off-window indexing is desirable at real context lengths is a serving-path question the cache
+answers, not this fixture"); this is that question answered, in the direction that costs something.
+
+**There is an irony worth stating, because it bounds what M17a bought.** M17a's headline finding was
+that the old fixtures pinned bidirectionality by *no value at all* — the block-vs-block submatrix
+summed to exactly 0.0 — and the re-vendor to `sliding_window` 13 fixed that, correctly and
+necessarily. But the property it now pins by value is pinned **in the `q_offset = 0` regime**, where
+it holds for a reason that inverts at production widths. The fixture is strictly better than it was
+and still cannot answer this.
+
+**So M17c carries `q_offset` as an explicit kernel argument**: `0` when scoring against the vendored
+goldens, so anchor parity stays exact, and `ctx` in the decode path. Not a default and not an
+inferred value — the two regimes differ by 256 attending pairs at ctx 4096, and a wrong default is
+invisible to every other gate here.
+`drafter_convert.rs::the_serving_mask_indexes_queries_by_position_and_the_anchor_pins_the_other_branch`
+holds both arms, red-proofed by passing `0` at the serving call site (which is the mistake, and it
+reddens with `left: 0, right: 256`).
 
 ## What is vendored, and why only the header
 

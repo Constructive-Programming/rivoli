@@ -568,3 +568,113 @@ fn the_per_token_budgets_follow_from_the_shipped_config() {
         "the export is supposed to dominate the drafter's own KV"
     );
 }
+
+// ------------------------------------------------------------------------------------------
+// The mask the SERVING path must build, which is not the one the anchor pins.
+// ------------------------------------------------------------------------------------------
+
+/// Block-vs-block pairs that attend, strictly-bidirectional pairs among them, and masked context
+/// columns, for the reference's own overlay `|q_idx - kv_idx| <= sliding_window`.
+///
+/// `q_offset` is the whole point of the function existing. The reference derives it in
+/// `masking_utils.py::_preprocess_mask_arguments`: `q_offset = past_key_values.get_query_offset(..)`
+/// when a cache is present, and **`q_offset = 0` when it is not**. Both branches reach the same
+/// overlay, so the mask's meaning turns entirely on which branch built it.
+fn mask_shape(ctx: usize, block: usize, window: usize, q_offset: usize) -> (usize, usize, usize) {
+    let (mut attending, mut strict, mut ctx_masked) = (0usize, 0usize, 0usize);
+    for row in 0..block {
+        let q = (row + q_offset) as i64;
+        for kv in 0..ctx + block {
+            let ok = (q - kv as i64).abs() <= window as i64;
+            if kv >= ctx {
+                attending += usize::from(ok);
+                // A query attending a LATER row of its own block — precisely what a causal mask
+                // forbids, and therefore the only positive evidence of bidirectionality.
+                strict += usize::from(ok && kv - ctx > row);
+            } else {
+                ctx_masked += usize::from(!ok);
+            }
+        }
+    }
+    (attending, strict, ctx_masked)
+}
+
+/// **THE ANCHOR'S MASK IS THE NO-CACHE MASK, AND TRANSLITERATING IT INTO THE ENGINE WOULD DELETE
+/// THE DRAFTER'S DEFINING PROPERTY AT EVERY REAL CONTEXT.** Measured 2026-08-17, before the
+/// kernel exists, which is the only order in which it can prevent anything.
+///
+/// The reference's overlay is `abs(q_idx - kv_idx) <= sliding_window`
+/// (`masking_utils.py::sliding_window_bidirectional_overlay`), and `q_idx` is `row + q_offset`.
+/// The S1b anchor ran with no cache — its own recorded reference behaviour is that a fresh
+/// `DFlashCache` reports `kv_length` 0 and the correct 2D mask only works with `use_cache=False` —
+/// so every vendored draft golden pins the **`q_offset = 0`** branch. At the fixture's ctx 12 /
+/// block 4 / window 13 that yields 13 of 16 block-vs-block pairs, which is exactly what M17a
+/// re-vendored the fixtures to obtain and what `glimmer_draft_oracle.rs` asserts.
+///
+/// **At the shipped widths the same expression yields ZERO.** With `window` 2048 and `block` 16,
+/// `q_idx = row` is at most 15, so no query can reach a key at `kv >= ctx` once `ctx > window`:
+/// the block does not attend itself at all, the drafter degenerates to a context-reader, and
+/// nothing about the shapes or the byte counts would say so. The cache branch — `q_offset = ctx`,
+/// which is what the serving path has and the anchor did not — restores it.
+///
+/// So the anchor **cannot arbitrate this**, and it is not a defect in the anchor: the two
+/// indexings disagree even at the tiny geometry (13 of 16 against 16 of 16, and 0 masked context
+/// columns against 3), so the fixture pins one of them by value and it is the wrong one for
+/// serving. `dflash.rs`'s `mask` docstring anticipated the shape of this — "whether that
+/// off-window indexing is desirable at real context lengths is a serving-path question the cache
+/// answers, not this fixture" — and this test is that question answered.
+///
+/// **What M17c must therefore do:** carry `q_offset` as an explicit kernel argument, pass 0 when
+/// scoring against the vendored goldens (so anchor parity stays exact) and `ctx` in the decode
+/// path. Not a default, not an inferred value — the two regimes differ by 256 attending pairs at
+/// ctx 4096 and a wrong default is invisible in every shape check in this file.
+#[test]
+fn the_serving_mask_indexes_queries_by_position_and_the_anchor_pins_the_other_branch() {
+    let cfg = real("drafter-cfg-mask");
+    let (block, window) = (cfg.block_size, cfg.sliding_window);
+    assert_eq!((block, window), (16, 2048), "the shipped block and window");
+
+    // The shipped widths, at a context past the window — the regime every real decode is in.
+    let ctx = 4096;
+    assert!(ctx > window, "the trap needs ctx past the window to bite");
+    let (row_attending, row_strict, _) = mask_shape(ctx, block, window, 0);
+    assert_eq!(
+        (row_attending, row_strict),
+        (0, 0),
+        "row-indexed queries at ctx {ctx}: the block attends ITSELF zero times, so a kernel that \
+         transliterates the anchor's mask is not a block drafter at all"
+    );
+    let (pos_attending, pos_strict, _) = mask_shape(ctx, block, window, ctx);
+    assert_eq!(
+        pos_attending,
+        block * block,
+        "position-indexed queries: every block pair attends"
+    );
+    assert_eq!(
+        pos_strict,
+        block * (block - 1) / 2,
+        "and {} of them are strictly bidirectional — a causal mask allows none",
+        block * (block - 1) / 2
+    );
+
+    // And the anchor's own geometry, where the two branches ALSO differ — which is why the
+    // goldens cannot be read as evidence for either choice at real widths.
+    let (a_row, a_row_strict, a_row_ctx) = mask_shape(12, 4, 13, 0);
+    let (a_pos, _, a_pos_ctx) = mask_shape(12, 4, 13, 12);
+    assert_eq!(
+        (a_row, a_row_strict, a_row_ctx),
+        (13, 3, 0),
+        "the vendored fixture's pinned mask — 13 of 16, 3 strictly bidirectional, no context \
+         column masked; `glimmer_draft_oracle.rs` asserts the same numbers from the golden BYTES"
+    );
+    assert_eq!(
+        (a_pos, a_pos_ctx),
+        (16, 3),
+        "the cache branch at the same widths is a different mask, so the fixture distinguishes \
+         them and pins the no-cache one"
+    );
+    assert_ne!(
+        a_row, a_pos,
+        "if these agreed, the anchor would arbitrate and this test would be unnecessary"
+    );
+}
