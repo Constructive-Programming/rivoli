@@ -198,3 +198,49 @@ that work starts from a bounded statement rather than from a rediscovery.
 What it hands off: a magnitude (0.0018 nats), a proven-clean half of the system (kernels,
 toolchain, scoring), two unseparated candidates, and a ranked list of one-session
 experiments that separates them.
+
+## ADDED 2026-08-17 by the coordinator: it reaches generated TEXT, and it is not new
+
+The sections above measured NLL floats through the scoring path. Four further runs, all
+`--bench 512 --mode int3-vq --attn dense --max-mem 115`, same artifact, same prompt,
+`--dump-ids` compared body-only, move the finding from "floats wobble" to something
+stronger and narrower.
+
+**1. Greedy decode diverges in the generated text.** Three 512-token runs gave three
+different outputs. no-MTP run 1 vs no-MTP run 2: **496 of 512 ids differ, first at
+position 13**. no-MTP run 2 vs the `--mtp` run: **220 of 512, first at position 292**. A
+divergence cascades — one changed token at 13 rewrites essentially the whole tail.
+
+**2. MTP is NOT the cause, and the control says so precisely.** The `--mtp` run and
+no-MTP run 2 both match the 32-token control at **0 of 32** differing; no-MTP run 1
+disagrees with it at **20 of 32**. The outlier is a run with speculation switched OFF.
+Any losslessness gate of the form "ids identical with and without `--mtp`" is therefore
+**unprovable on this arm at this length** — not failed, unprovable, because the baseline
+does not reproduce itself. Short runs are a different story: at 32 tokens, two no-MTP
+runs and the `--mtp` run were byte-identical.
+
+**3. Contention amplifies it; quiet does not cure it.** The runs above shared the machine
+with a 1.4 TiB `convert_k3` job. Repeated on a quiet box (114 GiB free, conversion
+finished): **61 of 512 differ, first at position 452** — the same defect, arriving far
+later. So memory/page-cache pressure changes fetch timing and brings the event forward;
+it does not create it.
+
+**4. It is NOT a rewrite regression.** The pinned OLD-tree reference binary
+(`ref-pin` @ 6b7f496), same artifact, same prompt, `--mode int3-vq --attn dense
+--no-mtp --max-mem 115`, run twice on the same quiet box: **247 of 512 differ, first at
+position 265** — worse than the rewrite's 61/452 in this sample. Both trees carry it.
+That retires the hypothesis that the recent ROCm/HIP upgrade (7.14 / clang 23.1)
+introduced it, and equally the hypothesis that the upgrade retired the old defect.
+
+**What this costs the record.** The old tree's own claims of byte-identical output —
+gated MTP at `--mtp-min-conf 0.8`, the parity gates, the quality ladder's A/Bs — were
+measured on an engine that does not reproduce itself over long runs. They are not
+thereby wrong; they are unproven at any length where a divergence event is likely. Any
+future byte-identity claim on GLM must state its token count, because the property holds
+at 32 and fails by 512.
+
+**Scope, unchanged and now firmer.** Glimmer is byte-identical fully pinned AND while
+streaming 21 of 52 layers; V4 was byte-identical over 32 ids. The wobble stays confined
+to the routed expert pool — per-expert admission, the two-ended arena's relocations and
+ticket lifetime, MoE accumulation — which GLM has and the other arms do not. Those
+candidates are still not separated from one another.
