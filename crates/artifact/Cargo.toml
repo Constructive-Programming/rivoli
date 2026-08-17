@@ -31,3 +31,12 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 # changes whitespace tokenization silently.
 fancy-regex = "0.14"
 base64 = "0.22"
+# **`tiktoken-rs` was considered and DECLINED**, recorded because it is the first thing a reader
+# will ask about. It would replace the ~80 lines of `encode`/`find_special`/`bpe` in
+# `src/tiktoken.rs` and none of the rest (the dense-rank check, the positional 256-slot block,
+# the same-class run cap), so it buys under half the module while adding a package that vendors
+# OpenAI's own vocabularies. The deciding argument is in the checkpoint's own comments: BOTH caps
+# `tokenization_kimi.py` carries exist to dodge panics inside that very Rust core
+# (`pyo3_runtime.PanicException` at line 157, `openai/tiktoken` issue 195 at line 160), so
+# adopting it would turn `MAX_SAME_CLASS_RUN` from a parity detail into a hard requirement and
+# make an unported outer cap a crash rather than a declared deviation.

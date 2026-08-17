@@ -9,15 +9,17 @@
 //! arm, this runs in CI, on the featureless default `cargo test`.
 //!
 //! **`pat_str` equality needs no checkpoint at all** and therefore never skips: it compares this
-//! tree's constant against the reference's copy in the vendored JSON. That is **one** of the
-//! eight gates; the other seven need `tiktoken.model` and skip without it.
+//! tree's constant against the reference's copy in the vendored JSON. That is **one** of the nine
+//! gates here; the other eight need `tiktoken.model` and skip without it. Four more gates live in
+//! `src/tiktoken.rs`'s own `mod tests` and need no checkpoint either, so **five of thirteen assert
+//! in CI** — the count that matters, and it is not nine.
 //!
 //! > **CORRECTED 2026-08-17, before this ever ran anywhere but here.** This said "every id gate
 //! > also asserts a CENSUS. A run that examined nothing cannot report success." **False, and
 //! > the second sentence was the dangerous half:** `load_or_skip` returning `None` leads to a
 //! > bare `return`, which libtest scores as a PASS. The censuses defend a *partial* run after a
 //! > successful load; they say nothing about a run that loaded nothing. On a machine with no
-//! > checkpoint this suite reports 8/8 having checked one string constant.
+//! > checkpoint this suite reports 9/9 having checked one string constant.
 //! >
 //! > **Absent-checkpoint policy, copied from `crates/cli/tests/codescene.rs`:** warn-and-skip by
 //! > default so a missing artifact cannot brick `cargo test` on a box that has no K3, and
@@ -54,13 +56,6 @@ fn art() -> String {
 }
 
 /// The reference's own output, vendored beside this file.
-/// The reference's `n_vocab`. A helper because two gates want it and neither should restate it.
-fn g_n_vocab() -> u64 {
-    golden()["n_vocab"]
-        .as_u64()
-        .expect("golden carries n_vocab")
-}
-
 fn golden() -> Value {
     let raw = include_str!("k3-tokenizer-cases.json");
     serde_json::from_str(raw).expect("the vendored golden is JSON")
@@ -189,13 +184,12 @@ fn the_pat_str_is_the_references_character_for_character() {
 /// no byte-pair merge can cross the boundary and BPE reconstructs the very split the
 /// intersection would have made.
 ///
-/// That makes `the_pat_str_is_the_references_character_for_character` the sole guard for that
-/// trap, which is a fragile place to leave a claim. So the claim is checked here: if a future
-/// vocabulary ever ships a Han-mixing token, this reddens and tells the reader that id equality
-/// has *started* covering the intersections — the opposite of a gate that silently stops
-/// meaning anything.
-///
-/// Same shape as Glimmer's `qk_scale_on_k` exclusion: invisible by algebra, not by resolution.
+/// **This is a TRIPWIRE, not the guard** — a correction to an earlier draft that called it the
+/// load-bearing one. Trap 2 is already caught twice, by `pat_str` string equality and (better) by
+/// `the_pat_str_compiles_under_fancy_regex`, which observes the split itself. What this adds is
+/// the *premise*: if a future vocabulary ships a Han-mixing token, it reddens and tells the reader
+/// that id equality has **started** covering the intersections — so the reasoning above stops
+/// being quietly false rather than silently outliving its evidence.
 #[test]
 fn no_vocabulary_token_mixes_han_with_non_han() {
     let Some(v) = load_or_skip("k3 han-mixing census") else {
@@ -302,13 +296,16 @@ fn the_special_block_is_positional_and_matches_the_reference() {
     // (python's `len(mergeable)` against Rust's `parse_ranks`, asserted just above), the 240
     // reserved spellings (two independent positional constructions), and the 16 `special_named`
     // CASE rows, whose ids come through python's encoder.
-    let named = g["named_specials"].as_object().unwrap();
-    assert_eq!(named.len(), 16, "K3 names 16 of the 256 slots");
-    for (id, content) in named {
-        let id: u32 = id.parse().unwrap();
-        let name = content.as_str().unwrap();
-        assert_eq!(v.special(name), Some(id), "special {name:?} is not id {id}");
-    }
+    // The COUNT only. The per-name loop that stood here is deleted (review, 2026-08-17): the
+    // golden's `named_specials` IS `added_tokens_decoder`'s id→content, the same file
+    // `named_specials()` parses, so `special(name) == id` followed from the positional rule plus
+    // that config and asserted nothing the loader could get wrong. The same 16 ids ARE checked
+    // independently — as `special_named` CASE rows, whose ids come through python's encoder.
+    assert_eq!(
+        g["named_specials"].as_object().unwrap().len(),
+        16,
+        "K3 names 16 of the 256 slots"
+    );
     // ALL 240 UNNAMED slots — the rows a port trusting `added_tokens_decoder` alone fails.
     // Read out of the reference's own special map rather than spelled here: the driver used to
     // spell them and got 163839 wrong (it is `[PAD]`), this gate caught it, and deriving both
@@ -343,7 +340,9 @@ fn the_vocabulary_boundary_and_the_eos_disagreement_are_pinned() {
     // From the golden, not a literal: the reference states `n_vocab` and this must equal it.
     assert_eq!(
         v.n_vocab() as u64,
-        g_n_vocab(),
+        golden()["n_vocab"]
+            .as_u64()
+            .expect("golden carries n_vocab"),
         "n_vocab differs from the reference's"
     );
     assert_eq!(v.num_base() + SPECIAL_SLOTS, v.n_vocab());
@@ -411,7 +410,7 @@ fn chunking_matches_the_reference_at_a_small_cap() {
         );
         n += 1;
     }
-    assert_eq!(n, 8, "expected 8 chunked cases");
+    assert_eq!(n, 7, "expected 7 chunked cases");
     // **Anti-vacuity: chunking must actually CHANGE something.** Without this the rows above
     // would pass for a loader that ignored the cap entirely, since most texts are shorter than
     // any cap. `MAX_SAME_CLASS_RUN` is the shipped value and a 40-character run is far below
@@ -433,8 +432,12 @@ fn chunking_matches_the_reference_at_a_small_cap() {
 #[test]
 fn the_shared_tokenizer_door_opens_a_k3_artifact() {
     let dir = art();
+    // `absent`, not a bare `eprintln!` + return. This test had its own inline skip and so was
+    // the ONE gate that stayed green under `RIVOLI_K3_REQUIRED=1` against a bogus artifact path
+    // — found by red-proofing the flag itself (2026-08-17), which is the whole reason to prove a
+    // gate can fail rather than to reason that it can.
     if std::fs::metadata(format!("{dir}/tiktoken.model")).is_err() {
-        eprintln!("skip k3 tokenizer door: {dir}/tiktoken.model absent");
+        absent("k3 tokenizer door", &format!("{dir}/tiktoken.model absent"));
         return;
     }
     let tok = rivoli_artifact::tokenizer::Tokenizer::load(&dir)

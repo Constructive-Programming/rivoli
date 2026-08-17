@@ -60,18 +60,13 @@ pub const MAX_SAME_CLASS_RUN: usize = 25_000;
 /// * `[…&&[^\p{Han}]]` is **character-class intersection**. `regex-syntax` does support `&&`,
 ///   which makes it look safe under a change of engine; it is pinned rather than trusted.
 ///
-/// > **MEASURED 2026-08-17, and it corrects this file's first draft.** The intersection clauses
-/// > were expected to be catchable by id equality at a script boundary. They are **not**, and
-/// > not because the case set is thin: **no token in this vocabulary mixes Han with non-Han**
-/// > (checked, 0 of 163,584 — `tests/k3_tokenizer.rs` asserts it), so no byte-pair merge can
-/// > cross the boundary and BPE *reconstructs* exactly the split the intersection would have
-/// > produced. Removing one clause changes the pre-tokenizer (`"hello你好"` becomes one piece
-/// > instead of two) and leaves the ids **identical** — confirmed at the reference level in
-/// > python, 0 of 12 Han-boundary texts differing.
-/// >
-/// > So the string equality above is not belt-and-braces for this trap, it is the ONLY guard,
-/// > and the mixed-token assertion is what will tell a future reader when that stops being
-/// > true. Same shape as Glimmer's `qk_scale_on_k`: invisible by algebra, not by resolution.
+/// > **MEASURED 2026-08-17.** The intersections are invisible to *id* equality — not for want of
+/// > cases, but because **no token in this vocabulary mixes Han with non-Han**, so no merge can
+/// > cross the boundary and BPE reconstructs the split the clauses would have made. Removing one
+/// > changes the pre-tokenizer (`"hello你好"` becomes one piece) and leaves ids identical,
+/// > confirmed in python. Two gates still catch it: the string equality above, and
+/// > `the_pat_str_compiles_under_fancy_regex` below, which observes the *split* and is the
+/// > stronger of the pair. `docs/investigations/k3-first-checkpoint.md` §7 carries the record.
 pub const PAT_STR: &str = concat!(
     r"[\p{Han}]+",
     "|",
@@ -221,6 +216,22 @@ impl Vocab {
 
     /// Encode, with special spellings recognised — the reference's `encode` default
     /// (`allow_special_tokens=True` → `allowed_special="all"`).
+    ///
+    /// **Two declared deviations from `_encode_text_piece`, both stated because the driver's
+    /// golden pins the constants and something has to say what happens to them here:**
+    ///
+    /// * `TIKTOKEN_MAX_ENCODE_CHARS = 400_000`, the reference's OUTER chunk, is **not ported**.
+    ///   It exists to dodge a `pyo3_runtime.PanicException` in tiktoken's Rust core, which this
+    ///   implementation is not, and 400,000 characters is ~50x the whole `ATTEND_MAX_KV` 8192
+    ///   context this engine can decode — so no reachable prompt crosses it. If a caller ever
+    ///   encodes text that long for some non-decode purpose, the ids would diverge from the
+    ///   reference at that boundary and this is the note that says so.
+    /// * `allow_special_tokens=False` is **not ported** either. The reference offers it for
+    ///   *user* text, where `<|end_of_msg|>` in a prompt must become ordinary bytes rather than
+    ///   a control token; this arm only ever encodes raw bench prompts, where the distinction
+    ///   cannot arise because nothing frames turns. **A chat port must add it before the first
+    ///   user-supplied string reaches here** — otherwise a prompt containing that spelling
+    ///   injects the model's stop token and the decode ends early on the user's own text.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         self.encode_capped(text, MAX_SAME_CLASS_RUN)
     }
@@ -500,10 +511,16 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
-    /// The pattern must COMPILE under the engine that has to run it. A separate test from the
-    /// id gate because a pattern that fails to compile makes every other case fail for the
-    /// same uninformative reason, and because this is the assertion that `fancy-regex` — not
-    /// `regex` — is the right dependency.
+    /// The pattern must COMPILE under the engine that has to run it, and SPLIT as the reference
+    /// does. Separate from the id gate because a pattern that fails to compile makes every other
+    /// case fail for the same uninformative reason, and because this is the assertion that
+    /// `fancy-regex` — not `regex` — is the right dependency.
+    ///
+    /// **Load-bearing for the Han intersections, which id equality cannot see** (see `PAT_STR`).
+    /// The `"hello你好"` row observes the split BEHAVIOURALLY rather than comparing pattern text,
+    /// so it reddens on a broken intersection even though every id stays identical — measured
+    /// 2026-08-17. Checkpoint-free, so this is one of the few gates on this arm that asserts in
+    /// CI rather than skipping.
     #[test]
     fn the_pat_str_compiles_under_fancy_regex() {
         let re = fancy_regex::Regex::new(PAT_STR).unwrap();

@@ -407,18 +407,14 @@ impl Tokenizer {
     /// The HuggingFace vocabulary, or a refusal naming why the caller cannot have it.
     ///
     /// Every chat-framing method below is written against `token_to_id`, which only this arm
-    /// has. Returning an error rather than falling back is deliberate: `encode_chat_turns`'s
-    /// existing fallback for a vocabulary *missing* the GLM chat tokens is to encode RAW with a
-    /// warning, and routing K3 into that path would silently produce an unframed prompt where
-    /// the honest answer is that this build has no K3 chat encoding at all.
-    /// The HuggingFace arm if this is one, for the call sites that cannot return `Result`.
-    fn hf_opt(&self) -> Option<&tokenizers::Tokenizer> {
-        match &self.vocab {
-            Vocabulary::Hf(t) => Some(t),
-            Vocabulary::Tiktoken(_) => None,
-        }
-    }
-
+    /// has. Refusing rather than falling back is deliberate — [`Vocabulary`]'s doc carries why.
+    ///
+    /// > **A second accessor `hf_opt() -> Option<..>` stood here and is deleted** (review,
+    /// > 2026-08-17). It existed only because `turn_header` returns `u32` and cannot use `?`;
+    /// > the doc block above had landed on IT rather than on this function, leaving `hf` with no
+    /// > doc at all. Threading the already-resolved `&Tokenizer` into `turn_header` removes the
+    /// > second accessor, the `Option` that could never be `None` there, and the paragraph
+    /// > explaining which of two near-identical accessors to reach for.
     fn hf(&self, what: &str) -> Result<&tokenizers::Tokenizer> {
         match &self.vocab {
             Vocabulary::Hf(t) => Ok(t),
@@ -505,20 +501,17 @@ impl Tokenizer {
     /// The turn token a role is framed with. Roles map to GLM's own turn tokens
     /// (`system`/`user`/`assistant`/`observation`); an unknown role is framed as `user`,
     /// since the alternative — dropping the turn — loses content silently.
-    fn turn_header(&self, role: &str, sp: &ChatTokens) -> u32 {
+    /// `hf` is passed in rather than re-fetched: this returns `u32` and cannot use `?`, and its
+    /// only caller has already resolved the HuggingFace arm — so the tiktoken case is
+    /// unreachable here by construction instead of by a second accessor that has to invent an
+    /// answer for it.
+    fn turn_header(&self, hf: &tokenizers::Tokenizer, role: &str, sp: &ChatTokens) -> u32 {
         match role {
             "user" => sp.user,
             "assistant" => sp.assistant,
             // Only looked up when actually used: an artifact can carry the tokens above
             // without these, and a `system` message is optional.
-            // `hf_opt`, not `hf`: this returns `u32` and is only reachable from
-            // `encode_chat_turns`, which already refused the tiktoken arm. A `None` here is
-            // therefore unreachable rather than a case, and it lands on the same
-            // frame-it-as-user fallback the missing-token case already uses.
-            other => match self
-                .hf_opt()
-                .and_then(|h| h.token_to_id(&format!("<|{other}|>")))
-            {
+            other => match hf.token_to_id(&format!("<|{other}|>")) {
                 Some(id) => id,
                 None => {
                     warn(&format!(
@@ -557,7 +550,8 @@ impl Tokenizer {
         // Missing any of the six means an artifact whose tokenizer predates the chat tokens;
         // fall back rather than fail, but say so — silent raw encoding is the bug this
         // function exists to fix.
-        let Some(sp) = ChatTokens::resolve(self.hf("chat framing")?) else {
+        let hf = self.hf("chat framing")?;
+        let Some(sp) = ChatTokens::resolve(hf) else {
             warn(
                 "tokenizer lacks the GLM chat tokens ([gMASK]/<sop>/<|user|>/<|assistant|>/\
                  <think>) — encoding the prompt RAW. Decode will not stop on EOS.",
@@ -568,7 +562,7 @@ impl Tokenizer {
         out.extend_from_slice(&self.preamble(opts)?);
 
         for (role, text) in turns {
-            out.push(self.turn_header(role, &sp));
+            out.push(self.turn_header(hf, role, &sp));
             if *role == "assistant" {
                 // History carries NO reasoning. The template keeps it only for assistant
                 // turns after the last user message (a continuation), so for a request that

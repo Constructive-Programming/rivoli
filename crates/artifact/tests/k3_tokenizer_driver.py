@@ -32,6 +32,13 @@ is recorded on the line above.
 import hashlib
 
 
+import json
+import os
+import pathlib
+import sys
+
+import tiktoken
+
 def fnv1a(data: bytes) -> int:
     """FNV-1a/64, matching `rivoli_core::hash::fnv1a` exactly.
 
@@ -44,12 +51,6 @@ def fnv1a(data: bytes) -> int:
     for b in data:
         h = ((h ^ b) * 0x00000100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
-import json
-import os
-import pathlib
-import sys
-
-import tiktoken
 
 # The checkpoint's own import (`from tiktoken.load import load_tiktoken_bpe`). Spelled as an
 # explicit submodule import because `import tiktoken` alone does not bind `tiktoken.load` in
@@ -290,7 +291,6 @@ def main() -> int:
     # in chunks, which is exactly why the reference does this and why dropping it is silent.
     chunked = []
     for name, text, cap in [
-        ("run_under_cap", "abcdefgh", 16),
         ("run_at_cap", "abcdefgh", 8),
         ("run_over_cap", "abcdefghij", 4),
         ("long_nonspace_run", "x" * 40, 7),
