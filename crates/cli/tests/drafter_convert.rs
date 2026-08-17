@@ -539,32 +539,55 @@ fn attaching_to_something_that_is_not_an_artifact_is_refused() {
 fn the_per_token_budgets_follow_from_the_shipped_config() {
     let cfg = real("drafter-cfg-budgets");
     let (kv_heads, hd, layers) = (cfg.num_key_value_heads, cfg.head_dim, cfg.num_hidden_layers);
+    // The two dtypes, named once. BF16 is the checkpoint's and the plan's; F32 is what
+    // `glimmer::pin::scratch` and `geometry::kv_bytes` actually allocate.
+    const BF16: usize = 2;
+    const F32: usize = 4;
 
-    // Drafter KV cache. TWO tensors per layer (K and V), bf16, and the drafter's OWN kv_heads --
-    // not the target's, which is the `TargetGrouping` defect the oracle plants.
-    let kv_per_token = 2 * kv_heads * hd * layers * 2;
-    assert_eq!(kv_per_token, 20_480, "drafter KV bytes/token");
+    // Drafter KV cache. TWO tensors per layer (K and V), and the drafter's OWN kv_heads -- not
+    // the target's, which is the `TargetGrouping` defect the oracle plants.
+    let kv_elems = 2 * kv_heads * hd * layers;
     assert_eq!(
-        kv_per_token,
+        kv_elems * BF16,
         20 * 1024,
-        "and that is 20.0 KiB exactly, not approximately"
+        "drafter KV at checkpoint dtype: 20,480 B = 20.0 KiB/token exactly -- the plan's figure"
+    );
+    assert_eq!(
+        kv_elems * F32,
+        40 * 1024,
+        "drafter KV as THIS ENGINE would allocate it: 40,960 B = 40.0 KiB/token, twice the plan"
     );
 
-    // The target-side hidden-state export: one hidden row per target layer, bf16. This is the
-    // cost the TARGET pays to feed the drafter, and it is charged per ACCEPTED token.
-    let export_per_token = cfg.target_layer_ids().len() * cfg.hidden_size * 2;
-    assert_eq!(export_per_token, 66_560, "hidden-state export bytes/token");
+    // The target-side hidden-state export: one hidden row per target layer. This is the cost the
+    // TARGET pays to feed the drafter, charged per ACCEPTED token.
+    let export_elems = cfg.target_layer_ids().len() * cfg.hidden_size;
+    assert_eq!(
+        export_elems * BF16,
+        66_560,
+        "export bytes/token at bf16 -- the plan's figure"
+    );
+    assert_eq!(
+        export_elems * F32,
+        133_120,
+        "export bytes/token straight out of the f32 residual stream, with no narrowing"
+    );
 
-    // The ring at the context this wave sizes for.
-    let ring = export_per_token * 4096;
-    assert_eq!(ring, 272_629_760, "export ring bytes at ctx 4096");
-    assert_eq!(ring, 260 * 1024 * 1024, "and that is 260.0 MiB exactly");
+    // The ring at the context this wave sizes for -- what the dtype decision actually costs.
+    assert_eq!(
+        export_elems * BF16 * 4096,
+        260 * 1024 * 1024,
+        "260.0 MiB ring at ctx 4096 IF the export narrows to bf16"
+    );
+    assert_eq!(
+        export_elems * F32 * 4096,
+        520 * 1024 * 1024,
+        "520.0 MiB if it does not -- the same ring, one dtype decision apart"
+    );
 
-    // The drafter's KV is ~3.25x cheaper per token than the export it consumes, which is the
-    // asymmetry M17c's ring sizing turns on: the export dominates, and it is the one that scales
-    // with context rather than with the drafted block.
+    // The export dominates the drafter's own KV at either dtype, which is the asymmetry M17c's
+    // ring sizing turns on: the export scales with CONTEXT, the KV with the drafted block.
     assert!(
-        export_per_token > 3 * kv_per_token,
+        export_elems > 3 * kv_elems,
         "the export is supposed to dominate the drafter's own KV"
     );
 }
