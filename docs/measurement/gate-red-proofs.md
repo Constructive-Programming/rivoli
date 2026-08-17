@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record).
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M17a's DFlash drafter oracle is registered here and recorded in glimmer-reference/anchor.md: nine deviceless plants, all re-run after the 2026-08-16 fixture re-vendor because a re-measured floor invalidates its old red proof, with the block-for-window substitution going from 1 of 10 tests red to 3; two rows the rewrite had DELETED rather than corrected -- the prefix-filter proof and the +1-ulp detection floor -- were restored and independently re-run 2026-08-17, both reproducing their pre-re-vendor results exactly, with their observed values kept in anchor.md alone. The restored prefix-filter row also carried a wrong MECHANISM (labelled salt pairing, when the planted rename cannot reach the salt assert -- dropping the LAST draft golden leaves the first correctly paired and the CENSUS assert is what reddens), and running the mirror plant to find what does exercise the pairing guard added a tenth plant: two independent guards, one plant each, both 7 of 10 red.
 ---
 
 # M0 gate red proofs
@@ -115,3 +115,39 @@ deny` failed the rebuild, and the build's exit code had been eaten by `| tail` /
 with the WRONG failure (row 1 reddened the partition test, not the logits). Debug the
 harness before the tree: check the build's exit UNPIPED, and read WHICH test failed, not
 just that one did.
+
+## 5. The DFlash drafter oracle (added 2026-08-16, M17a; re-run 2026-08-17)
+
+`crates/oracles/tests/glimmer_draft_oracle.rs`. **Deviceless, and the battery itself lives in
+`docs/measurement/glimmer-reference/anchor.md`** §The red-proof battery — kept there rather than
+copied here because every row is stated next to the floor it is measured against, and a second
+frozen copy of eight numbers agreeing with the first is not a check. This section is the registry
+entry; that section is the record.
+
+**Ten** plants, each applied, run, and reverted (nine as of 2026-08-16; the tenth is the mirror
+prefix-filter plant below). All were re-run after the 2026-08-16 fixture
+re-vendor (`sliding_window` 4 → 13), because **a re-measured floor invalidates its old red
+proof.** Two rows changed meaning under the re-vendor and that change IS the finding:
+`mask()` reading `block` instead of `window` went from reddening 1 of 10 tests to 3, and a mask
+cell flipped inside the block went from inexpressible to reddening 3.
+
+Two rows were deleted from the doc rather than corrected when that section was rewritten — the
+prefix-filter proof and the `+1 ulp` detection floor — and were **restored and independently
+re-run 2026-08-17**, both reproducing their pre-re-vendor results exactly. Their observed values
+are in anchor.md §the red-proof battery and §the ladder, and are deliberately **not** repeated
+here: by this section's own rule, a second frozen copy would be a number to drift rather than a
+check.
+
+**The restored prefix-filter row also carried a wrong MECHANISM, and finding that added the tenth
+plant.** It was labelled "salt pairing"; review traced the positional zip and showed the planted
+rename cannot reach the salt assert at all, because dropping the last draft golden leaves the
+first paired with the first — correctly — and the census assert is what reddens. The mirror plant
+(rename the FIRST golden out) was then run to find what does exercise the pairing guard, and it
+does. Two independent guards, one plant each, both recorded against the line they fire on in
+anchor.md. **The count was right and the mechanism was not**, which is the failure mode a battery
+of counts cannot catch on its own.
+
+The ulp row is a **detection-floor** record, not a passing gate: it bounds what the oracle's green
+is evidence for. This repo has twice registered a red-proof whose perturbation was below the
+detection floor and read the resulting green as coverage (the parity 1-ulp and single-sign-flip
+rungs, `CLAUDE.md` §Gates → parity), which is why the floor is measured and written down.

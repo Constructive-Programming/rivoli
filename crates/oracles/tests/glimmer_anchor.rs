@@ -23,8 +23,9 @@
 //! nested test bodies or long unbroken runs of assertions, and a run of asserts with no name on it
 //! is exactly the shape that makes a failure read as "something in this file broke".
 //!
-//! **FOUR binaries over one fixture set, split 2026-08-15 for the 800-line gate.** The split is by
-//! what a group asserts about, which is how the file already grouped itself:
+//! **FIVE binaries over one fixture set**, four split 2026-08-15 for the 800-line gate and the
+//! fifth added 2026-08-16 by M17a. The split is by what a group asserts about, which is how the
+//! file already grouped itself:
 //!
 //! | binary | holds |
 //! |---|---|
@@ -32,8 +33,14 @@
 //! | `glimmer_anchor_text.rs` | the text goldens' structure: the tiny config, the widths, the layer pattern, the capture census |
 //! | `glimmer_anchor_draft.rs` | the shapes that make the DFlash drafter a drafter rather than a small target |
 //! | `glimmer_anchor_arithmetic.rs` | the two properties read off the VALUES: the QK-norm's axis, and Q's scale against K's |
+//! | `glimmer_draft_oracle.rs` | the drafter oracle's VALUES scored against the draft goldens at measured tolerances |
 //!
-//! The tables and the accessors all four read through are `glimmer_anchor_common/mod.rs`.
+//! The tables and the accessors all five read through are `glimmer_anchor_common/mod.rs`.
+//!
+//! **CORRECTED 2026-08-17.** This said "FOUR binaries" and listed four, while five files include
+//! `glimmer_anchor_common/mod.rs` — `glimmer_draft_oracle.rs` landed the day before and was added
+//! to that module's own header count and not to this table. Exactly the rot `mod.rs`'s header
+//! warns about, one file over: a count in prose, stated in two places.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #[path = "glimmer_anchor_common/mod.rs"]

@@ -32,9 +32,10 @@ use serde_json::Value;
 use tolerance::{Policy, Tol, rel_row as row};
 
 /// The two vendored weight sets, by the same bytes `glimmer_anchor.rs` pins. Provenance is NOT
-/// re-checked here — that file gates length and FNV of all six anchor binaries, and a second
-/// frozen copy of those numbers agreeing with the first is not a check
-/// (`crates/engine/tests/glimmer_anchor/mod.rs` states the same rule).
+/// re-checked here — that file gates length and FNV of all six vendored FILES (four goldens plus
+/// these two weight sets; read "six anchor binaries" until 2026-08-17, conflating them with the
+/// five test binaries), and a second frozen copy of those numbers agreeing with the first is not
+/// a check (`crates/engine/tests/glimmer_anchor/mod.rs` states the same rule).
 const WEIGHT_SETS: [(&str, &[u8]); 2] = [
     ("weights-1", include_bytes!("glimmer-anchor-weights-1.bin")),
     ("weights-2", include_bytes!("glimmer-anchor-weights-2.bin")),
@@ -119,8 +120,7 @@ fn the_draft_tolerances_leave_room() {
 // Reading one draft case out of the goldens.
 // ------------------------------------------------------------------------------------------
 
-/// One salt's full scoring input: the draft golden, its paired weight set, and the dims both
-/// agree on.
+/// One salt's full scoring input: the golden, its paired weight set, and the dims both agree on.
 struct Case {
     name: &'static str,
     golden: GoldenSet,
@@ -221,8 +221,7 @@ impl Case {
         dflash::embed_block(ids, &etable, &self.dims, defect)
     }
 
-    /// The forward under one defect, from the golden's own captured inputs and the paired
-    /// weight set's borrowed lm_head.
+    /// The forward under one defect, from the golden's captured inputs and the borrowed lm_head.
     fn run(&self, params: &DraftParams, defect: DraftDefect) -> DraftTrace {
         self.run_dims(&self.dims, params, defect)
     }
