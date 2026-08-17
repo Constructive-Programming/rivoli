@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record).
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). ADDED 2026-08-17: the GLM determinism gates (§5) — the id comparator, a prompt pinned by length+md5 that fired unplanted, INV-9 under a scan_free mutation, the probe's fold-slot layout under an inserted enum variant, and the column comparator's three refusals; the determinism gate's own 512-token GREEN is OWED and standing, because the engine is red. Also recorded there: a false EXCLUSION found in this round's own instrument — a fold omitted on dense layers made two runs 'agree' about a quantity neither measured, which no gate in this repo could see.
 ---
 
 # M0 gate red proofs
@@ -115,3 +115,78 @@ deny` failed the rebuild, and the build's exit code had been eaten by `| tail` /
 with the WRONG failure (row 1 reddened the partition test, not the logits). Debug the
 harness before the tree: check the build's exit UNPIPED, and read WHICH test failed, not
 just that one did.
+
+## 5. The GLM determinism gates (added 2026-08-17, `wave/fix-glm-determinism`)
+
+Five checks landed with the divergence investigation. Each was planted, observed red, reverted,
+observed green again — and one of them reddened *by itself*, which is recorded because a proof that
+fires unbidden is worth more than one you had to arrange.
+
+**5a. `tests/determinism-glm.sh --self-test` (the id comparator).** Two id streams differing by one
+token, and a truncated stream. Both must compare unequal. The truncated case is the one that
+matters: a naive `diff <(sort)`-style comparator passes it, and that substitution has been made
+before.
+
+```
+FAIL: the comparator did NOT redden on differing id streams  → exit 2   (red, on a planted no-op comparator)
+FAIL: the comparator did NOT redden on a TRUNCATED stream    → exit 2   (red)
+SELF-TEST ok ...                                                        (green)
+```
+
+**5b. The gate's recorded prompt, pinned by length + md5.** This one **fired on its own**: the pin
+was written with a placeholder hash before the real one was computed, and the self-test refused.
+
+```
+FAIL: the recorded prompt changed — 317 bytes, md5 18927a780b36b029d03450d2100e9242
+      expected 317 bytes, md5 c26cb59ea0b3d5c3b83fa1a1e2fa3ee5                (red, unplanted)
+→ real hash inserted → SELF-TEST ok, prompt is 317 bytes                     (green)
+```
+
+**5c. INV-9 (`inv_9_a_slot_is_not_reissued_until_its_copy_lands`).** Planted: `scan_free` ignores
+its `landed` predicate, i.e. the invariant's own violation.
+
+```
+assertion `left == right` failed
+  left: Some(0)   right: None      FAILED   (red — an un-landed slot was issued)
+revert → 1 passed                          (green again)
+```
+
+An earlier draft added a SECOND test for this invariant, whose declared red proof reddened the
+existing one as well. That is what the duplication was: the two asserted the same three things.
+The existing test was renamed to carry the number instead — the registry check does not care which
+test carries it, only that exactly one does.
+
+**5d. The divergence probe's fold-slot layout
+(`the_fold_slot_layout_matches_what_pointer_arithmetic_assumes`).** `Probe::fetch_fold_slot` hands
+out `Q::Bh`'s address and its callers reach `Sc`/`Se` with `.add(1)`/`.add(2)`. Planted: a variant
+inserted between `Bh` and `Sc`, with `NQ` bumped so it compiles — exactly the change that would
+silently make one layer's folds land in another layer's slot.
+
+```
+assertion `left == right` failed: Sc must follow Bh    FAILED   (red)
+revert → 1 passed                                              (green again)
+```
+
+**5e. `tests/divergence-columns.sh`'s three refusals.** All observed on real inputs:
+
+```
+mismatched headers (v2 log vs v3 log)  → FAIL: the two logs declare different columns   exit 2
+no header line                         → FAIL: ... has no 'rivoli-divergence' header    exit 2
+header names more columns than rows    → FAIL: row 1 has 22 fields but the header ... 14 exit 2
+```
+
+It also reproduced the coordinator's hand-written comparison exactly on the first real pair — row
+12427, `pos=164 layer=24`, column `h` — which is the closest thing to a green with independent
+provenance this round has.
+
+**Owed, and standing.** The gate's own 512-token GREEN has never been observed, because the engine
+is red: the first device pair diverged. That is the live red proof for the gate as a whole (§5a's
+comparator is only the mechanism), and the green is owed once the defect is fixed. Recorded as owed
+rather than claimed — this section exists so that distinction survives.
+
+**One false-green caught in this round's own instrument, and it is the lesson.** The first version
+of the probe folded the MoE's input `xn` on MoE layers only. GLM has three dense layers, so their
+`xn` column stayed 0 in both runs — and a diff reads two equal zeros as "attention agreed" when
+nothing was measured. A false EXCLUSION is the one failure mode an instrument may not have, and it
+is invisible to every gate in this repo because the instrument was producing well-formed output the
+whole time. Every column that cannot exist for a row now prints `-`, never 0.

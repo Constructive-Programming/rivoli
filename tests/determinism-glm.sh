@@ -85,8 +85,30 @@ set -uo pipefail
 # sibling gate rather than `RIVOLI_*`, which is the engine's own flat env namespace.
 BIN=${DETERMINISM_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/release/rivoli}
 LOCK=/var/run/sys-gpu.lock
+
+
 # The floor, argued in the header. A caller may raise `ngen`, never lower it past this.
 MIN_NGEN=512
+
+# THE PROMPT, RECORDED VERBATIM AND NOT REFERENCED.
+#
+# `docs/measurement/baseline-2026-08-16.md` records its command as `--prompt '<P>'` — a literal
+# placeholder — and the text appears nowhere in that doc, its commit, or the tree, so that
+# baseline's rows cannot be reproduced from their own record. A gate meant to outlive its authors
+# must not repeat that, and a path into someone's scratchpad is the same mistake with extra steps.
+#
+# WHY THIS PROMPT AND NOT THE ENGINE'S DEFAULT: `--bench` with no `--prompt` uses "The sky is blue
+# because", which hits EOS at 276 tokens, so a 512-token floor is UNREACHABLE and the gate refuses
+# its own precondition (observed 2026-08-17). This is the essay prompt the wave standardised on;
+# it is long-form enough that the model keeps generating.
+#
+# Heredoc rather than a quoted literal so the text is byte-for-byte readable in the diff, and
+# `read -r -d ''` so no shell expansion touches it. The trailing newline is dropped, which is a
+# CHOICE: tokenization differs with and without it, so the recorded form is the 317-byte text.
+IFS= read -r -d '' PROMPT <<'PROMPT_EOF'
+Explain in depth how modern computer systems manage memory, from DRAM and the cache hierarchy through virtual memory, TLBs, cache coherence, NUMA, allocators, and garbage collection. For each mechanism, describe why it exists, the trade-offs it makes, and a concrete failure mode an engineer would meet in production.
+PROMPT_EOF
+PROMPT=${PROMPT%$'\n'}
 
 # --- the comparator, and its red proof ----------------------------------------------------
 #
@@ -130,7 +152,20 @@ if [ "${1:-}" = "--self-test" ]; then
         echo "FAIL: the comparator did NOT redden on a TRUNCATED stream (a crashed arm)" >&2
         exit 2
     fi
-    echo "SELF-TEST ok: the comparator reddens on a changed id and on a truncated stream"
+    # THE PROMPT IS PINNED BY ITS OWN HASH, so a stray edit to the heredoc cannot silently change
+    # what every recorded green was measured on. This is the `corpus=<fnv>` discipline the .nll
+    # header already uses, applied to the one input this gate carries in-line.
+    plen=$(printf '%s' "$PROMPT" | wc -c)
+    pmd5=$(printf '%s' "$PROMPT" | md5sum | cut -d' ' -f1)
+    if [ "$plen" != 317 ] || [ "$pmd5" != 18927a780b36b029d03450d2100e9242 ]; then
+        echo "FAIL: the recorded prompt changed — $plen bytes, md5 $pmd5" >&2
+        echo "      expected 317 bytes, md5 18927a780b36b029d03450d2100e9242" >&2
+        echo "      Every green recorded by this gate was measured on the old text. If the change" >&2
+        echo "      is intended, update BOTH numbers here in the same commit that edits it." >&2
+        exit 2
+    fi
+    echo "SELF-TEST ok: the comparator reddens on a changed id and on a truncated stream;"
+    echo "             the recorded prompt is 317 bytes, md5 $pmd5"
     exit 0
 fi
 
@@ -192,7 +227,7 @@ run_arm() { # $1 = arm name, $2 = ids out path
     # reads — would make this a comparison of two configurations instead of a repeatability
     # test.
     flock "$LOCK" "$BIN" "$ARTIFACT" --bench "$NGEN" --mode int3-vq --attn dense \
-        --max-mem "$MEM" --dump-ids "$2" >"$SCRATCH/$1.out" 2>"$SCRATCH/$1.log" &
+        --max-mem "$MEM" --prompt "$PROMPT" --dump-ids "$2" >"$SCRATCH/$1.out" 2>"$SCRATCH/$1.log" &
     apid=$!
     witness "$wfile" "$apid" &
     wpid=$!
@@ -208,16 +243,39 @@ run_arm() { # $1 = arm name, $2 = ids out path
     # The header line `--dump-ids` writes is stripped, so the comparison is ids only: a header
     # naming the arm would differ between arms for reasons that are not the measurement.
     grep -E '^[0-9]+$' "$2" >"$2.ids"
-    local n
-    n=$(wc -l <"$2.ids")
-    [ "$n" -eq "$NGEN" ] || {
-        echo "FAIL: arm '$1' produced $n ids, expected $NGEN. A SHORT arm is not a pass — it means the run stopped early (EOS or an error), and comparing two short arms of the same length would be a green over a decode that never happened." >&2
-        exit 1
-    }
 }
 
 run_arm a "$SCRATCH/a"
 run_arm b "$SCRATCH/b"
+
+NA=$(wc -l <"$SCRATCH/a.ids")
+NB=$(wc -l <"$SCRATCH/b.ids")
+
+# LENGTH IS CLASSIFIED BEFORE CONTENT, and the order is load-bearing.
+#
+# An earlier version checked each arm against $NGEN inside run_arm and exited 2. That mis-files
+# the most interesting outcome there is: two arms that stop at DIFFERENT lengths have stopped at
+# different EOS tokens, which IS the divergence — it was observed for real on 2026-08-17 (25,272
+# vs 22,386 divergence-log rows from one pair) and would have been reported as a setup error.
+if [ "$NA" -ne "$NB" ]; then
+    echo "RED: the two arms generated DIFFERENT LENGTHS ($NA vs $NB ids)." >&2
+    echo "     A length difference is a divergence, not a setup problem: the arms reached EOS at" >&2
+    echo "     different points, so they had already stopped agreeing before then." >&2
+    compare_ids "$SCRATCH/a.ids" "$SCRATCH/b.ids" || true
+    echo "  arm A ids: $SCRATCH/a.ids ($NA)" >&2
+    echo "  arm B ids: $SCRATCH/b.ids ($NB)" >&2
+    exit 1
+fi
+if [ "$NA" -lt "$NGEN" ]; then
+    cat >&2 <<EOF
+FAIL (setup, not a verdict): both arms generated $NA ids of the $NGEN requested, and the SAME
+number — so they agree, and the run simply hit EOS early. That is a prompt problem, not a
+determinism result: comparing two short arms of equal length would be a green over a decode that
+never happened, and $NA is below the floor's power calculation anyway.
+Lengthen the recorded PROMPT at the top of this script until $NGEN tokens generate without EOS.
+EOF
+    exit 2
+fi
 
 if compare_ids "$SCRATCH/a.ids" "$SCRATCH/b.ids"; then
     echo "GREEN: two runs at identical flags produced identical ids over $NGEN tokens (mem=${MEM}GiB)."

@@ -164,11 +164,20 @@ pub struct ReadSpan {
     pub len: usize,
 }
 
-/// One read's destination: the aligned pointer and the slot whose ticket gates reuse.
+/// One read's destination: the aligned pointer, the slot whose ticket gates reuse, and the
+/// optional divergence-fold target.
 #[derive(Clone, Copy)]
 pub struct ReadDst {
     pub ptr: *mut u8,
     pub slot: u32,
+    /// `--divergence-log` only: three contiguous device u64 this read XOR-folds into — the bounce
+    /// arena before the copy, the pool slot after it, and (written elsewhere) the same slot at end
+    /// of layer. NULL disables the folds entirely, which is the shipping configuration.
+    ///
+    /// A raw pointer rather than a handle because [`reap`](Streamer::reap) runs on the reaper
+    /// thread and the probe lives on the decode thread; it is device memory and is never
+    /// dereferenced on the CPU, exactly like `ptr`.
+    pub fold: *mut u64,
 }
 
 pub struct Streamer {
@@ -192,6 +201,8 @@ pub struct Streamer {
     /// [`Ticket`](crate::fetch::asyncfetch::Ticket) now, not by the batch that happened to use it.
     dst: Vec<*mut u8>,
     nbytes: Vec<u32>,
+    /// Per-SLOT divergence-fold target, parallel to `dst`. Null = folds off.
+    fold: Vec<*mut u64>,
     /// Per-SLOT minimum completion length (sub-block offset + useful len). `reap` compares
     /// the completion `res` against it so a real mid-file short read is caught while
     /// EOF-padding truncation is tolerated.
@@ -241,6 +252,7 @@ impl Streamer {
             arena,
             dst: vec![std::ptr::null_mut(); entries as usize],
             nbytes: vec![0; entries as usize],
+            fold: vec![std::ptr::null_mut(); entries as usize],
             min_res: vec![0; entries as usize],
         })
     }
@@ -261,7 +273,11 @@ impl Streamer {
     /// read whose bounce copy has not yet retired (the caller's ticket gate).
     pub unsafe fn queue(&mut self, fd: RawFd, span: ReadSpan, dst: ReadDst) -> Result<usize> {
         let ReadSpan { begin, len } = span;
-        let ReadDst { ptr: dst, slot } = dst;
+        let ReadDst {
+            ptr: dst,
+            slot,
+            fold,
+        } = dst;
         debug_assert_eq!(
             dst as usize % ALIGN,
             0,
@@ -305,6 +321,7 @@ impl Streamer {
         );
         self.dst[ud as usize] = dst;
         self.nbytes[ud as usize] = nbytes as u32;
+        self.fold[ud as usize] = fold;
         // The completion must deliver at least the useful window `[begin,begin+len)`
         // from the aligned start; a shorter read is mid-file truncation (checked in
         // `reap` against `min_res`). Trailing EOF padding beyond this is fine.
@@ -379,20 +396,51 @@ impl Streamer {
             "short read on expert slot {ud}: {res} < {} useful bytes",
             self.min_res[ud]
         );
+        // SAFETY: `ud < entries`, and every read's `nbytes <= span`, so this slot's arena window
+        // is owned and in bounds.
+        let src = unsafe { self.arena.add(ud * self.span) };
+        // `--divergence-log`: BRACKET THE COPY. `bh` hashes what the drive delivered into the
+        // pinned arena; `sc` hashes what arrived in the pool slot. Both are enqueued on the FETCH
+        // stream around the copy, so the three are stream-ordered with no host sync and no
+        // barrier — which is the whole reason this instrument can be pointed at a timing defect.
+        //
+        // A difference in `bh` across two runs means the READ delivered different bytes; `bh`
+        // equal with `sc` differing isolates the copy itself. Both are folded at FULL WIDTH
+        // (`nbytes`), so neither can miss a corruption by sampling.
+        //
+        // The fold reads the arena as f32 purely to reuse `hash_rows`; it folds raw bits and the
+        // payload is packed indices plus bf16 scales, so the interpretation is irrelevant.
+        // `nbytes` is a multiple of the O_DIRECT block and therefore of 4.
+        #[cfg(feature = "corruption-probe")]
+        if !self.fold[ud].is_null() {
+            let n = self.nbytes[ud] as usize / 4;
+            // SAFETY: `src` owns `nbytes` readable bytes; `fold[ud]` is the base of three live
+            // device u64; `stream` is live. Slot 0 is `Q::Bh`.
+            unsafe {
+                rivoli_backend::launch_hash_rows(src as *const f32, n, self.fold[ud], stream)?
+            };
+        }
         // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
         // read's signal fires; the arena slot holds the just-read bytes; `stream` is
         // live. Copies the full aligned `nbytes` (a trailing-EOF short read leaves
         // stale bytes only past the useful window, never read).
-        let r = unsafe {
-            stage::copy_to_slot(
-                self.dst[ud],
-                self.arena.add(ud * self.span),
-                self.nbytes[ud] as usize,
-                stream,
-            )
-        };
+        let r = unsafe { stage::copy_to_slot(self.dst[ud], src, self.nbytes[ud] as usize, stream) };
         if let Err(e) = r {
             anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
+        }
+        #[cfg(feature = "corruption-probe")]
+        if !self.fold[ud].is_null() {
+            let n = self.nbytes[ud] as usize / 4;
+            // SAFETY: as above, and the copy is already enqueued on `stream`, so this fold reads
+            // the slot AFTER it. Slot 1 is `Q::Sc`.
+            unsafe {
+                rivoli_backend::launch_hash_rows(
+                    self.dst[ud] as *const f32,
+                    n,
+                    self.fold[ud].add(1),
+                    stream,
+                )?
+            };
         }
         Ok(ud)
     }

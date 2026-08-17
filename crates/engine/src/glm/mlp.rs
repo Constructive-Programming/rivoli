@@ -87,6 +87,18 @@ impl GlmEngine<'_> {
         // layer's misses and relocations, not with the run's totals.
         #[cfg(feature = "corruption-probe")]
         let before = (self.pin.routed.misses(), self.pin.routed.relocs());
+        // Arm this layer's fetch-path folds BEFORE routing, so they are in place by the time
+        // `moe_layer` submits its cold reads. The pool clears the pointer as it consumes it, so a
+        // layer that submits nothing cannot leave it armed for the next one.
+        #[cfg(feature = "corruption-probe")]
+        if self.probe.is_some() {
+            let fold = self
+                .probe
+                .as_mut()
+                .context("unreachable: probe checked present")?
+                .fetch_fold_slot(l)?;
+            self.pin.routed.probe_next_layer(fold);
+        }
         self.route_layer(l, rows)?;
         self.moe_layer(l, rows).await?;
         #[cfg(feature = "corruption-probe")]
@@ -149,6 +161,26 @@ impl GlmEngine<'_> {
             miss: self.pin.routed.misses() - before.0,
             reloc: self.pin.routed.relocs() - before.1,
         };
+        // `se`: the SAME pool slots, folded again now that the layer's compute has been awaited.
+        // Only the experts this layer MISSED — `fold_slots` carries the cost argument and the
+        // coverage limit. Nothing to fold when the layer was all hits, which is why the record
+        // prints `-` for the trio at `misses == 0`.
+        //
+        // The `se` pointer is taken in its own scope so the `&mut self.probe` borrow ends before
+        // `fold_slots` needs `&self.pin`, and before the `p` binding below takes the probe again.
+        if cols.miss > 0 {
+            let se = {
+                let p = self
+                    .probe
+                    .as_mut()
+                    .context("unreachable: probe checked present above")?;
+                p.fetch_fold_slot(l)?
+            };
+            // SAFETY: `se.add(2)` is `Q::Se`, one live device u64 in the slab (Bh, Sc, Se are
+            // contiguous by `Q`'s ordering); every writer of these slots retired at
+            // `launch_moe`'s awaits.
+            unsafe { self.pin.routed.fold_slots(l, &self.union, se.add(2))? };
+        }
         let inter = self.cfg.moe_inter;
         // EXACTLY the written extent, and the bound is load-bearing: the kernel writes
         // `h[(e·R + t)·inter + j]` for `e < descs.len()` and `R == nrow`, so anything past

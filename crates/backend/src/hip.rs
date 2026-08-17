@@ -296,7 +296,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
     fn rivoli_fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> i32;
-    fn rivoli_hash_rows(x: *const f32, n: i32, out: *mut u64) -> i32;
+    fn rivoli_hash_rows(x: *const f32, n: i32, out: *mut u64, stream: *mut c_void) -> i32;
 
     fn rivoli_mla_attend_scratch_floats(h: i32, kvl: i32) -> usize;
 
@@ -535,10 +535,21 @@ pub unsafe fn launch_index_score_blocks(
 /// belongs with `fill_u32` and `memcpy_dtod` on cohesion — the three are utilities over raw
 /// device bytes rather than operators the model graph names.
 ///
+/// `stream` is trailing and null is the null stream. On the fetch path it MUST be the fetch
+/// stream: the folds bracket the bounce->slot copy, and rivoli's streams are
+/// `hipStreamNonBlocking`, so a null-stream launch would race the copy it is meant to bracket.
+///
 /// # Safety
 /// `x` must be `n` device f32; `out` one device u64, ZEROED before the first fold into it —
-/// XOR against uninitialised memory is silently wrong, and `hipMalloc` does not zero.
-pub unsafe fn launch_hash_rows(x: *const f32, n: usize, out: *mut u64) -> Result<()> {
+/// XOR against uninitialised memory is silently wrong, and `hipMalloc` does not zero. `stream`
+/// must be a live `hipStream_t`, or null.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // `stream` is a handle, never dereferenced here
+pub unsafe fn launch_hash_rows(
+    x: *const f32,
+    n: usize,
+    out: *mut u64,
+    stream: *mut c_void,
+) -> Result<()> {
     // The ABI takes an i32. Every current call site is a few times 10^4 elements, so this is
     // defensive — but a silent wrap would fold a NEGATIVE length, which the kernel's `n <= 0`
     // guard turns into a no-op and the probe would report two runs agreeing about a quantity it
@@ -548,5 +559,8 @@ pub unsafe fn launch_hash_rows(x: *const f32, n: usize, out: *mut u64) -> Result
         "hash_rows: {n} elements exceeds the i32 ABI"
     );
     // SAFETY: caller's pointer contract.
-    ensure_hip_status(unsafe { rivoli_hash_rows(x, n as i32, out) }, "hash_rows")
+    ensure_hip_status(
+        unsafe { rivoli_hash_rows(x, n as i32, out, stream) },
+        "hash_rows",
+    )
 }

@@ -139,6 +139,15 @@ pub struct RoutedPool {
     fetch: AsyncFetch,
     hits: u64,
     misses: u64,
+    /// `--divergence-log`: the base of the fold slots the NEXT `submit`'s cold reads write into.
+    ///
+    /// **Single-use: `submit` takes it and clears it.** A sticky pointer would let layer L+1's
+    /// reads fold into layer L's slots if the caller forgot to set it, which reads in the log as
+    /// two runs agreeing about a layer whose bytes were never hashed. Set per layer via
+    /// [`RoutedPool::probe_next_layer`]; `None` means the folds are off, which is every run
+    /// without the flag.
+    #[cfg(feature = "corruption-probe")]
+    fetch_fold: Option<*mut u64>,
     /// Compaction relocations executed. Counted because arena relocation was the standing
     /// suspect for the run-to-run divergence and nothing was measuring how often it fires:
     /// `--divergence-log` records the per-layer DELTA, so a divergence coordinate can be
@@ -251,6 +260,8 @@ impl RoutedPool {
             hits: 0,
             misses: 0,
             relocs: 0,
+            #[cfg(feature = "corruption-probe")]
+            fetch_fold: None,
             trace: cfg.trace.map(|p| open_trace(p, cfg.top_k)).transpose()?,
         })
     }
@@ -404,6 +415,45 @@ impl RoutedPool {
 
     pub fn misses(&self) -> u64 {
         self.misses
+    }
+
+    /// Arm the fetch-path divergence folds for the NEXT `submit` only. See
+    /// [`RoutedPool::fetch_fold`] for why it is single-use.
+    #[cfg(feature = "corruption-probe")]
+    pub fn probe_next_layer(&mut self, fold: *mut u64) {
+        self.fetch_fold = Some(fold);
+    }
+
+    /// XOR-fold the pool slots of `experts` into `out` — the `se` column, taken at END OF LAYER on
+    /// the null stream once both MoE lanes have been awaited.
+    ///
+    /// **What this answers that `bh`/`sc` cannot.** Those two are taken inside the fetch stream,
+    /// around the copy. This one is taken after the layer's compute has finished. So `sc == se`
+    /// while `h` differs says the bytes AT REST are right and the kernel read them before they
+    /// landed — a ticket/timeline ordering failure rather than a corrupt payload — and `sc != se`
+    /// says something wrote the slot after the copy.
+    ///
+    /// **Folds only the experts the caller passes, and the caller passes the MISSES.** Folding the
+    /// whole batch would be ~9 experts x 14.6 MiB x 78 layers = ~10 GB/token of extra device
+    /// reads, against ~2 GB for the misses alone. The coverage limit is real and must be stated
+    /// with any result: if the corrupted expert was a RESIDENT one, loaded on an earlier token,
+    /// this column is silent about it.
+    ///
+    /// # Safety
+    /// `out` is one live device u64; every writer of the named slots has retired.
+    #[cfg(feature = "corruption-probe")]
+    pub unsafe fn fold_slots(&self, layer: usize, experts: &[usize], out: *mut u64) -> Result<()> {
+        let n = self.geom.stride / 4;
+        for &e in experts {
+            let Some((hot, idx)) = self.slot(expert_key(layer, e)) else {
+                continue;
+            };
+            let p = self.ptr(hot, idx) as *const f32;
+            // SAFETY: `p` owns `stride` bytes in the pool VMM and `stride` is a multiple of the
+            // O_DIRECT block, hence of 4; `out` is the caller's live device u64.
+            unsafe { rivoli_backend::launch_hash_rows(p, n, out, rivoli_backend::NULL_STREAM)? };
+        }
+        Ok(())
     }
 
     /// Compaction relocations executed so far. Read as a per-layer DELTA — the question
@@ -620,6 +670,10 @@ impl RoutedPool {
                     begin,
                     len,
                     dst: self.host_ptr(hot, idx),
+                    #[cfg(feature = "corruption-probe")]
+                    fold: self.fetch_fold.unwrap_or(std::ptr::null_mut()),
+                    #[cfg(not(feature = "corruption-probe"))]
+                    fold: std::ptr::null_mut(),
                 });
                 miss_sel.push(i);
             }
@@ -628,6 +682,12 @@ impl RoutedPool {
         for &i in &miss_sel {
             self.pending_loaded
                 .push(expert_key(sel.layer, sel.experts[i]));
+        }
+        // Consumed: see `fetch_fold`'s doc. Cleared before the submit so an early return from it
+        // cannot leave the pointer armed for the next layer.
+        #[cfg(feature = "corruption-probe")]
+        {
+            self.fetch_fold = None;
         }
         let miss_tickets = self.fetch.submit(reads)?;
         // A resident expert's data is already there, so it carries the RESIDENT ticket

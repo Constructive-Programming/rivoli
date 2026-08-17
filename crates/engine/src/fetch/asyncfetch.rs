@@ -55,9 +55,12 @@ pub struct ReadSpec {
     pub begin: usize,
     pub len: usize,
     pub dst: *mut u8,
+    /// `--divergence-log` only; see [`crate::fetch::stream::ReadDst::fold`]. Null = off, which is
+    /// every build without the feature and every run without the flag.
+    pub fold: *mut u64,
 }
-// SAFETY: `dst` is only handed to io_uring / hipMemcpyAsync on the reaper thread,
-// never dereferenced on the CPU; `fd` is a plain descriptor.
+// SAFETY: `dst` and `fold` are only handed to io_uring / hipMemcpyAsync / a fold launch on the
+// reaper thread, never dereferenced on the CPU; `fd` is a plain descriptor.
 unsafe impl Send for ReadSpec {}
 
 /// A layer's demand batch: the reads plus the ticket each one redeems.
@@ -404,6 +407,7 @@ impl Reaper {
                     crate::fetch::stream::ReadDst {
                         ptr: r.dst,
                         slot: u32::from(t.slot),
+                        fold: r.fold,
                     },
                 )?
             };

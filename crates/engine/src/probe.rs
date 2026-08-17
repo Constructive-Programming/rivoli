@@ -70,10 +70,48 @@ pub enum Q {
     H = 1,
     /// The residual stream at layer exit.
     X = 2,
+    /// **`bh`** — the BOUNCE ARENA slot, folded on the fetch stream the moment the NVMe read
+    /// completes and BEFORE the bounce->slot copy. "What the drive delivered."
+    Bh = 3,
+    /// **`sc`** — the POOL slot, folded on the fetch stream immediately AFTER the copy.
+    /// "What arrived in the pool." `bh != sc` isolates the copy.
+    Sc = 4,
+    /// **`se`** — the same POOL slot, folded again at END OF LAYER on the null stream, after
+    /// both MoE lanes have been awaited. "What the slot holds once the layer is over."
+    ///
+    /// `sc == se` with `h` differing is the interesting one: the bytes at rest are RIGHT, so the
+    /// kernel read them before they landed — a ticket/timeline ordering failure, not a corrupt
+    /// payload. That question is why this slot exists and it is not answerable from `bh`/`sc`.
+    Se = 5,
 }
 
 /// Device u64 fold slots per layer — one per [`Q`].
-const NQ: usize = 3;
+const NQ: usize = 6;
+
+#[cfg(test)]
+mod tests {
+    use super::{NQ, Q};
+
+    /// `NQ` and [`Q`] must agree, and `Bh`/`Sc`/`Se` must be CONTIGUOUS.
+    ///
+    /// Both are relied on by pointer arithmetic outside this module:
+    /// [`Probe::fetch_fold_slot`](super::Probe::fetch_fold_slot) hands out `Bh`'s address and its
+    /// callers reach `Sc`/`Se` with `.add(1)`/`.add(2)`. Today that is true because of the order
+    /// the variants happen to be DECLARED in, which is not a guarantee — inserting a variant
+    /// between them would silently make one layer's folds land in another's slot, and every
+    /// resulting log would be wrong in a way that reads as evidence. Asserted here so the
+    /// insertion is a failing test instead.
+    #[test]
+    fn the_fold_slot_layout_matches_what_pointer_arithmetic_assumes() {
+        assert_eq!(
+            Q::Se as usize + 1,
+            NQ,
+            "NQ must be exactly the number of Q variants"
+        );
+        assert_eq!(Q::Sc as usize, Q::Bh as usize + 1, "Sc must follow Bh");
+        assert_eq!(Q::Se as usize, Q::Bh as usize + 2, "Se must follow Sc");
+    }
+}
 
 /// One MoE layer's host-side columns. Every field is a fold of data the decode thread already
 /// holds, so recording them costs no device traffic and no I/O.
@@ -155,23 +193,42 @@ impl Probe {
         })
     }
 
-    /// XOR-fold `n` device f32 at `x` into `(layer, q)`'s slot. No sync, no D2H.
+    /// The device address of `(layer, q)`'s fold slot, bounds-checked.
     ///
-    /// # Safety
-    /// `x` must be `n` live device f32 whose writers have retired.
-    pub unsafe fn fold(&mut self, q: Q, layer: usize, x: *const f32, n: usize) -> Result<()> {
-        // A layer outside the slab would fold into another layer's slot and report a
-        // difference that never happened — the worst failure mode an instrument has. Refused
-        // with both numbers rather than clamped.
+    /// One place, because a layer outside the slab would fold into ANOTHER LAYER's slot and report
+    /// a difference that never happened — the worst failure mode an instrument has — and two
+    /// copies of that check are one edit away from disagreeing. (jscpd said so on the day the
+    /// second caller landed.) Refused with both numbers rather than clamped.
+    fn slot_ptr(&mut self, layer: usize, q: Q) -> Result<*mut u64> {
         ensure!(
             layer < self.cols.len(),
             "divergence probe: layer {layer} outside a {}-layer slab",
             self.cols.len()
         );
-        let slot = layer * NQ + q as usize;
-        // SAFETY: `slot < n_layers * NQ` by the check above, so the offset is inside the slab;
-        // `x`/`n` are the caller's contract, forwarded.
-        unsafe { launch_hash_rows(x, n, (self.dev.ptr_mut() as *mut u64).add(slot)) }
+        // SAFETY: `layer * NQ + (q as usize) < cols.len() * NQ` by the check above and `q < NQ`,
+        // so the offset is inside the slab this `DeviceBuf` owns.
+        Ok(unsafe { (self.dev.ptr_mut() as *mut u64).add(layer * NQ + q as usize) })
+    }
+
+    /// The base of this layer's THREE fetch-path fold slots (`Bh`, `Sc`, `Se`), contiguous by the
+    /// ordering of [`Q`].
+    ///
+    /// Handed to the pool so the reaper thread can fold into it from the fetch stream without this
+    /// type crossing a thread boundary. Device memory, never dereferenced on the CPU.
+    pub fn fetch_fold_slot(&mut self, layer: usize) -> Result<*mut u64> {
+        self.slot_ptr(layer, Q::Bh)
+    }
+
+    /// XOR-fold `n` device f32 at `x` into `(layer, q)`'s slot, on the null stream. No sync, no
+    /// D2H.
+    ///
+    /// # Safety
+    /// `x` must be `n` live device f32 whose writers have retired.
+    pub unsafe fn fold(&mut self, q: Q, layer: usize, x: *const f32, n: usize) -> Result<()> {
+        let out = self.slot_ptr(layer, q)?;
+        // SAFETY: `out` is one live device u64 inside the slab; `x`/`n` are the caller's
+        // contract, forwarded.
+        unsafe { launch_hash_rows(x, n, out, rivoli_backend::NULL_STREAM) }
     }
 
     /// Record a MoE layer's host columns for the pass in flight.
@@ -203,10 +260,28 @@ impl Probe {
     pub fn drain(&mut self, pos: usize, nrow: usize, layers: std::ops::Range<usize>) -> Result<()> {
         self.dev.copy_out_into(&mut self.host)?;
         let bytes = self.host.len();
-        // SAFETY: `dev` owns `bytes` (allocated with exactly this length) and it is a multiple
-        // of 4. Enqueued on the null stream, which every later fold also uses, so the clear is
-        // ordered before the next token's folds.
+        // SAFETY: `dev` owns `bytes` (allocated with exactly this length) and it is a multiple of 4.
         unsafe { fill_u32(self.dev.ptr_mut(), 0, bytes)? };
+        // THE SYNC IS LOAD-BEARING AND WAS A REAL BUG WITHOUT IT.
+        //
+        // `fill_u32` is an ASYNC launch on the null stream. The three fetch-path folds (`Bh`,
+        // `Sc`, `Se`) are launched by the REAPER THREAD on the FETCH stream, which is
+        // `hipStreamNonBlocking` — so the null stream carries no implicit ordering against them.
+        // Without this, the next pass's arena fold could land BEFORE this clear executed and then
+        // be wiped: two runs would read 0 and "agree" about bytes neither hashed (a false
+        // exclusion), or one would read 0 and the other a hash (a false positive naming the wrong
+        // hop). Either is the instrument lying, which is the one thing it may not do.
+        //
+        // It is closed today by accident as well — `route_layer`'s gate-logits D2H is a blocking
+        // null-stream sync and sits between this clear and any later fold — but an instrument must
+        // not rest on a barrier that belongs to someone else's code and could go async.
+        //
+        // The cost is nil where it stands: `drain` runs at the end of a pass, immediately after
+        // its own blocking D2H, at a point `run_layer`'s per-layer `device_sync` has already
+        // idled the device. It adds no barrier that was not already there — which is the test any
+        // sync in this file has to pass, because added syncs are what MASKED this defect's
+        // predecessor.
+        rivoli_backend::device_sync()?;
         let words: Vec<u64> = self
             .host
             .chunks_exact(8)
@@ -229,6 +304,19 @@ impl Probe {
                 Some(_) => format!("{:016x}", at(Q::H as usize)?),
                 None => "-".to_string(),
             };
+            // The three fetch-path folds exist only where a COLD READ landed. With no miss
+            // nothing was folded, and printing 0 would let two runs "agree" about bytes neither
+            // of them hashed — the same false-exclusion trap as `h` on a dense layer.
+            let fetched = moe.is_some_and(|c| c.miss > 0);
+            let trio = match fetched {
+                true => format!(
+                    "{:016x} {:016x} {:016x}",
+                    at(Q::Bh as usize)?,
+                    at(Q::Sc as usize)?,
+                    at(Q::Se as usize)?
+                ),
+                false => "- - -".to_string(),
+            };
             let host = match moe {
                 None => "- - - - -".to_string(),
                 Some(c) => format!(
@@ -239,7 +327,7 @@ impl Probe {
             use std::fmt::Write as _;
             writeln!(
                 self.recs,
-                "{pos} {nrow} {l} {:016x} {h} {:016x} {host}",
+                "{pos} {nrow} {l} {:016x} {h} {:016x} {host} {trio}",
                 at(Q::Xn as usize)?,
                 at(Q::X as usize)?,
             )
@@ -255,11 +343,15 @@ impl Probe {
     /// called, which is the point (see the header).
     pub fn write(&self, path: &str) -> Result<()> {
         let mut out = String::from(
-            "# rivoli-divergence v2 pos nrow layer xn h x gl pk sl misses relocs\n\
+            "# rivoli-divergence v3 pos nrow layer xn h x gl pk sl misses relocs bh sc se\n\
              # pos is the PASS's FIRST ROW and nrow is how many it carried: (pos=k, nrow=1) is \
              token k in decode, (pos=k, nrow=2) is a layer-major prefill row-block. v2 added \
              nrow because pos alone made those two indistinguishable\n\
-             # `-` means NOT MEASURED, never zero: a dense layer has no h and no router\n\
+             # `-` means NOT MEASURED, never zero: a dense layer has no h and no router, and a \
+             layer with no miss has no bh/sc/se\n\
+             # bh = bounce arena after the NVMe read; sc = pool slot after the copy; se = the \
+             same slot at end of layer. bh!=sc isolates the copy; sc==se with h differing means \
+             the bytes at rest are RIGHT and the kernel read them too early\n\
              # diff two runs: first differing LINE is the coordinate, first differing \
              COLUMN names the mechanism\n",
         );

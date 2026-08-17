@@ -317,14 +317,19 @@ fn hash_rows_matches_the_host_fold() {
     let n = 1000;
     let mut r = Lcg(0x8AD5);
     let x: Vec<f32> = (0..n).map(|_| r.f()).collect();
+    // ONE launch site. Spelling the four-argument call twice made the two bodies identical text,
+    // which the duplication gate reported the moment the `stream` parameter widened them.
+    let launch = |x: *const f32, n: usize, out: *mut u64| {
+        // SAFETY: the callers pass a live device f32 span of `n` and one live device u64.
+        ok(
+            unsafe { launch_hash_rows(x, n, out, rivoli_backend::NULL_STREAM) },
+            "hash_rows",
+        );
+    };
     let fold = |v: &[f32]| -> u64 {
         let xb = dev(&f32b(v));
         let mut out = zeros(8);
-        // SAFETY: `v.len()` live device f32 and one live device u64, zeroed by `zeros`.
-        ok(
-            unsafe { launch_hash_rows(xb.ptr() as *const f32, v.len(), out.ptr_mut() as *mut u64) },
-            "hash_rows",
-        );
+        launch(xb.ptr() as *const f32, v.len(), out.ptr_mut() as *mut u64);
         u64le(&back(&out))
     };
 
@@ -363,11 +368,7 @@ fn hash_rows_matches_the_host_fold() {
     let xb = dev(&f32b(&x));
     let mut twice = zeros(8);
     for _ in 0..2 {
-        // SAFETY: as above.
-        ok(
-            unsafe { launch_hash_rows(xb.ptr() as *const f32, n, twice.ptr_mut() as *mut u64) },
-            "hash_rows",
-        );
+        launch(xb.ptr() as *const f32, n, twice.ptr_mut() as *mut u64);
     }
     assert_eq!(
         u64le(&back(&twice)),

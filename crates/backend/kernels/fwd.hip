@@ -367,10 +367,16 @@ extern "C" __global__ void hash_rows(const float* __restrict__ x, int n,
     atomicXor(out, z ^ (z >> 31));
 }
 
-extern "C" int rivoli_hash_rows(const float* x, int n, unsigned long long* out) {
+// `stream` is trailing and null is the null stream, per the mla.hip launcher convention. It is
+// not optional decoration: the fetch-path folds must be ORDERED against the bounce->slot copy on
+// the fetch stream (fold the arena, then copy, then fold the slot), and rivoli's streams are
+// `hipStreamNonBlocking`, so a null-stream launch between two fetch-stream operations would race
+// both of them and hash whichever bytes happened to be there.
+extern "C" int rivoli_hash_rows(const float* x, int n, unsigned long long* out, void* stream) {
     if (n <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(hash_rows, dim3((n + 255) / 256), dim3(256), 0, 0, x, n, out);
+    hipLaunchKernelGGL(hash_rows, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream, x, n,
+                       out);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
