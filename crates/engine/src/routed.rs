@@ -69,6 +69,10 @@ pub struct PoolCfg<'a> {
     pub two_q: cache::TwoQSplit,
     /// `--trace` sink path, v2 format.
     pub trace: Option<&'a str>,
+    /// Allocate the bounce arena FINE-GRAINED (`hipHostMallocCoherent`) — the candidate fix for
+    /// the ordering gap argued at `kernels/async.hip::rivoli_pinned_alloc`. Off is the historical
+    /// behaviour, and the two are meant to be A/B-ed.
+    pub pinned_coherent: bool,
 }
 
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
@@ -247,7 +251,11 @@ impl RoutedPool {
         // Ring sized for one layer's worst case: one demand read per expert, one
         // aligned block each.
         let ring = (cfg.top_k + 4).next_power_of_two();
-        let fetch = AsyncFetch::new(Streamer::new(ring as u32, slot_span(stride))?)?;
+        let fetch = AsyncFetch::new(Streamer::new(
+            ring as u32,
+            slot_span(stride),
+            cfg.pinned_coherent,
+        )?)?;
         Ok(Self {
             buf,
             base,

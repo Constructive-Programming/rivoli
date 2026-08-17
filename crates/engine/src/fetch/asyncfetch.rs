@@ -60,18 +60,20 @@ pub struct ReadSpec {
     pub fold: FetchFolds,
 }
 
-/// What runs immediately after the bounce→slot copy — the position measured to suppress.
+/// What runs at ONE of the two fetch-path fold positions — before the copy (`bh`) or after it
+/// (`sc`). One enum for both, because the ladder is the same question asked at two points and a
+/// second copy of it would drift.
 ///
-/// **A ladder, and each rung removes exactly one ingredient.** [`ScProbe::Full`] both takes time,
+/// **A ladder, and each rung removes exactly one ingredient.** [`FoldProbe::Full`] both takes time,
 /// moves bandwidth, launches a kernel and reads the slot, so on its own it cannot say which of
 /// those repaired the hazard. The other three hold all but one constant:
 ///
 /// | arm | launch | duration & bandwidth | touches the slot | suppression means |
 /// |---|---|---|---|---|
-/// | [`ScProbe::Nop`] | yes | ~0 | no | the LAUNCH BOUNDARY itself — its cache maintenance, not its work |
-/// | [`ScProbe::Decoy`] | yes | same as `Full` | **no** | time/bandwidth, not this slot |
-/// | [`ScProbe::Line`] | yes | ~1/32 of `Full` | yes, every cache line | touching the bytes, and this is also a ~0.8% candidate FIX |
-/// | [`ScProbe::Full`] | yes | full | yes | the known suppressor; the baseline the others are read against |
+/// | [`FoldProbe::Nop`] | yes | ~0 | no | the LAUNCH BOUNDARY itself — its cache maintenance, not its work |
+/// | [`FoldProbe::Decoy`] | yes | same as `Full` | **no** | time/bandwidth, not this slot |
+/// | [`FoldProbe::Line`] | yes | ~1/32 of `Full` | yes, every cache line | touching the bytes, and this is also a ~0.8% candidate FIX |
+/// | [`FoldProbe::Full`] | yes | full | yes | the known suppressor; the baseline the others are read against |
 ///
 /// **`Decoy` replaced an equal-duration spin kernel that read nothing** (deleted 2026-08-17).
 /// Review killed it on this tree's own evidence: `hash_rows` is *bandwidth-bound* by its own
@@ -85,7 +87,7 @@ pub struct ReadSpec {
 /// cache maintenance at the stream boundary, negligible work. It should run FIRST — if a bare
 /// launch suppresses, every other arm is confounded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ScProbe {
+pub enum FoldProbe {
     #[default]
     Off,
     Full,
@@ -118,13 +120,19 @@ pub const LINE_F32: usize = 32;
 #[derive(Clone, Copy)]
 pub struct FetchFolds {
     pub bh: *mut u64,
+    /// WHAT runs at the PRE-copy position. `bh` is the measured suppressor, so this ladder is how
+    /// the fix is chosen: `Full` reads the whole arena slot, `Nop` is the same launch with ~no work,
+    /// `Line` reads one cache line. If `Nop` suppresses, the repair is the LAUNCH's acquire and no
+    /// read is needed — which makes a coherent allocation or an explicit cache op the fix, and a
+    /// read merely an accident that works.
+    pub bh_mode: FoldProbe,
     pub sc: *mut u64,
     /// A slot-sized scratch buffer the no-touch arms fold instead of the pool slot. Null unless an
     /// arm needs it; never the destination of any copy, so folding it cannot perturb the payload.
     pub decoy: *const f32,
     /// WHAT runs at the post-copy position — a full fold, an equal-duration spin that reads
-    /// nothing, or a one-cacheline read. See `rivoli_engine::probe::ScProbe`.
-    pub sc_mode: ScProbe,
+    /// nothing, or a one-cacheline read. See `rivoli_engine::probe::FoldProbe`.
+    pub sc_mode: FoldProbe,
 }
 
 impl FetchFolds {
@@ -141,15 +149,19 @@ impl FetchFolds {
     /// `Nop` arrived — kept current because a stale cost claim is how the false one started.)
     pub const OFF: Self = Self {
         bh: std::ptr::null_mut(),
+        bh_mode: FoldProbe::Off,
         sc: std::ptr::null_mut(),
         decoy: std::ptr::null(),
-        sc_mode: ScProbe::Off,
+        sc_mode: FoldProbe::Off,
     };
 
     /// Is the pre-copy (bounce arena) fold armed?
     #[inline]
     pub fn bh_armed(&self) -> bool {
-        !self.bh.is_null()
+        if self.bh.is_null() || self.bh_mode == FoldProbe::Off {
+            return false;
+        }
+        !matches!(self.bh_mode, FoldProbe::Nop | FoldProbe::Decoy) || !self.decoy.is_null()
     }
 
     /// Is anything armed at the post-copy position?
@@ -159,12 +171,12 @@ impl FetchFolds {
     /// post-copy read, which is the position under suspicion.
     #[inline]
     pub fn sc_armed(&self) -> bool {
-        if self.sc.is_null() || self.sc_mode == ScProbe::Off {
+        if self.sc.is_null() || self.sc_mode == FoldProbe::Off {
             return false;
         }
         // The no-touch arms are inert without their decoy, and silently degrading to "no launch"
         // would make the cell green for a reason the log does not record.
-        !matches!(self.sc_mode, ScProbe::Nop | ScProbe::Decoy) || !self.decoy.is_null()
+        !matches!(self.sc_mode, FoldProbe::Nop | FoldProbe::Decoy) || !self.decoy.is_null()
     }
 }
 // SAFETY: `dst` and `fold`'s two pointers are only handed to io_uring / hipMemcpyAsync / a fold

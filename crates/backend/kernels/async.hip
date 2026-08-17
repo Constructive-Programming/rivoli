@@ -62,9 +62,30 @@ extern "C" void rivoli_event_destroy(void* ev) {
 //     two HIP ops stay here, next to the other rivoli_* HIP wrappers). O_DIRECT reads
 //     land in this PINNED host arena (get_user_pages OK on pinned host — the amdgpu
 //     kernel-bug workaround from stream.rs), then an async H2D copy fills the VMM slot.
-extern "C" void* rivoli_pinned_alloc(unsigned long long bytes) {
+// `coherent != 0` requests FINE-GRAINED (system-coherent) host memory instead of whatever
+// `hipHostMallocDefault` yields on this runtime. It is a CANDIDATE FIX under evaluation, not a
+// knob, and the argument is an ordering gap the rest of this file never addresses:
+//
+//   1. io_uring O_DIRECT has the NVMe DMA write this arena. The CQE establishes that those writes
+//      are visible TO THE CPU — the kernel's completion path carries the barriers for that.
+//   2. `rivoli_memcpy_h2d_async` below then reads the arena from the GPU side (copy engine or
+//      blit), with NOTHING in between (`fetch/stream.rs::reap` consumes the CQE and enqueues the
+//      copy back to back).
+//   3. **Nothing establishes that the agent performing (2) observes the writes from (1).** The CPU
+//      is neither the producer nor the consumer, so the CQE's guarantee is about the wrong agent.
+//
+// For fine-grained host memory the platform provides that guarantee by snooping. For coarse-grained
+// it does not, and an acquire is required at a synchronisation point — and a stale line is exactly
+// what the reuse pattern arranges, because a staging slot's previous contents were themselves read
+// through the GPU on an earlier fetch.
+//
+// `hipHostMallocDefault` does not SAY which it gets: on ROCm that has been runtime- and
+// environment-dependent. So this is not asserted, it is A/B-ed — which is why the flag exists and
+// why the allocation logs what it asked for.
+extern "C" void* rivoli_pinned_alloc(unsigned long long bytes, int coherent) {
     void* p = nullptr;
-    if (hipHostMalloc(&p, (size_t)bytes, hipHostMallocDefault) != hipSuccess) return nullptr;
+    unsigned flags = coherent ? hipHostMallocCoherent : hipHostMallocDefault;
+    if (hipHostMalloc(&p, (size_t)bytes, flags) != hipSuccess) return nullptr;
     return p;
 }
 

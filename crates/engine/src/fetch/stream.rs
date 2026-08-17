@@ -79,7 +79,7 @@ mod stage {
         use std::ffi::c_void;
         unsafe extern "C" {
             /// Pinned host arena for the bounce path (kernels/async.hip). Null on failure.
-            pub fn rivoli_pinned_alloc(bytes: u64) -> *mut c_void;
+            pub fn rivoli_pinned_alloc(bytes: u64, coherent: i32) -> *mut c_void;
             pub fn rivoli_pinned_free(p: *mut c_void);
             /// Async H2D copy on `stream` (bounce slot → VMM slot). 0 ok, else negative.
             pub fn rivoli_memcpy_h2d_async(
@@ -93,9 +93,13 @@ mod stage {
 
     /// A HIP-PINNED host arena, which is what makes the copy below a DMA rather than a
     /// staged CPU memcpy. Null on failure.
-    pub fn alloc(bytes: usize) -> *mut u8 {
+    ///
+    /// `coherent` requests FINE-GRAINED host memory — a candidate fix for the ordering gap argued
+    /// at `kernels/async.hip::rivoli_pinned_alloc`, where nothing establishes that the GPU-side
+    /// copy observes the NVMe DMA's writes to this arena.
+    pub fn alloc(bytes: usize, coherent: bool) -> *mut u8 {
         // SAFETY: no pointer args; null on failure.
-        unsafe { ffi::rivoli_pinned_alloc(bytes as u64) as *mut u8 }
+        unsafe { ffi::rivoli_pinned_alloc(bytes as u64, i32::from(coherent)) as *mut u8 }
     }
 
     /// HIP tracks the pinned registration's size itself, so this takes only the pointer.
@@ -213,10 +217,11 @@ unsafe impl Send for Streamer {}
 
 impl Streamer {
     /// `entries` = max in-flight reads; `span` = the largest aligned superset a
-    /// single read may deliver (`slot_span` of the biggest projection tensor).
+    /// single read may deliver (`slot_span` of the biggest projection tensor); `coherent` requests
+    /// a fine-grained arena (see [`stage::alloc`]).
     /// Always allocates the `entries * span` host staging arena — it is the only
     /// destination path (see this module's header).
-    pub fn new(entries: u32, span: usize) -> Result<Self> {
+    pub fn new(entries: u32, span: usize, coherent: bool) -> Result<Self> {
         // The bounce arena has exactly `entries` slots and `queue` indexes it by the
         // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
         // be a power of two for the arena to match the SQ capacity — otherwise a push
@@ -234,7 +239,17 @@ impl Streamer {
             .or_else(|_| IoUring::new(entries))?;
 
         let arena_bytes = entries as usize * span;
-        let arena = stage::alloc(arena_bytes);
+        let arena = stage::alloc(arena_bytes, coherent);
+        // Logged because it is the one allocation whose MEMORY TYPE is under investigation: a run's
+        // record has to say which it made, or its result cannot be attributed.
+        tracing::info!(
+            "bounce arena: {:.0} MiB, {}",
+            arena_bytes as f64 / (1u64 << 20) as f64,
+            match coherent {
+                true => "hipHostMallocCoherent (fine-grained — candidate fix under evaluation)",
+                false => "hipHostMallocDefault",
+            }
+        );
         ensure!(
             !arena.is_null(),
             "bounce arena alloc failed (entries={entries}, {:.0} MiB)",
@@ -417,34 +432,47 @@ impl Streamer {
         // be enqueued before pass N's clear has executed.
         #[cfg(feature = "corruption-probe")]
         if self.fold[ud].bh_armed() {
-            let n = self.nbytes[ud] as usize / 4;
-            // `i_base = ud * n`, NOT 0. Every cold read of a layer folds into ONE accumulator, so
-            // at `i_base = 0` the fold would be invariant under two reads' payloads being SWAPPED
-            // between their destinations — a crossed destination is precisely the "wrong bytes in a
-            // slot" class under investigation, and it would leave the fold agreeing and be misread.
-            // The staging slot `ud` is deterministic given the miss sequence (INV-9), so it is
-            // comparable across runs. `se` got this fix a commit earlier; `bh`/`sc` were left at 0.
+            // THE PRE-COPY POSITION — the one measured to SUPPRESS. Same ladder as post-copy, and
+            // here it decides the FIX rather than the diagnosis: if `Nop` suppresses, what repairs
+            // the hazard is the kernel dispatch's acquire and not the bytes read, so the fix is a
+            // coherent arena (or an explicit cache operation) and any read is incidental.
             //
-            // LOGGED, NOT `?`. A `?` here returns from `reap` after the CQE is consumed and
-            // BEFORE `copy_to_slot`, so the reaper poisons, the ticket is released from the host,
-            // and the miss kernel launches over a slot this layer never wrote. That is the
-            // INSTRUMENT changing what the engine computes, which it may never do — the engine's
-            // own guards above (`res < 0`, short read) legitimately abort because they are engine
-            // faults. A dropped fold costs one hole in the log and says so.
-            // SAFETY: `src` owns `nbytes` readable bytes; `bh` is one live device u64; `stream` is
-            // live.
-            let r = unsafe {
-                rivoli_backend::launch_hash_rows(
-                    src as *const f32,
-                    n,
-                    1,
-                    (ud as u64) * n as u64,
-                    self.fold[ud].bh,
-                    stream,
-                )
+            // `i_base = ud * n`, NOT 0: every cold read of a layer folds into ONE accumulator, so at
+            // 0 the fold would be invariant under two reads' payloads being SWAPPED between their
+            // destinations — a crossed destination is precisely the class under investigation. `ud`
+            // is deterministic given the miss sequence (INV-9), so it is comparable across runs.
+            //
+            // LOGGED, NOT `?`. A `?` here returns from `reap` after the CQE is consumed and BEFORE
+            // `copy_to_slot`, so the reaper poisons, the ticket is released from the host, and the
+            // miss kernel launches over a slot this layer never wrote — the INSTRUMENT changing what
+            // the engine computes, which it may never do.
+            let n = self.nbytes[ud] as usize / 4;
+            let (buf, count, stride) = match self.fold[ud].bh_mode {
+                crate::fetch::asyncfetch::FoldProbe::Off => (src as *const f32, 0, 1),
+                crate::fetch::asyncfetch::FoldProbe::Full => (src as *const f32, n, 1),
+                crate::fetch::asyncfetch::FoldProbe::Line => {
+                    (src as *const f32, n, crate::fetch::asyncfetch::LINE_F32)
+                }
+                crate::fetch::asyncfetch::FoldProbe::Decoy => (self.fold[ud].decoy, n, 1),
+                crate::fetch::asyncfetch::FoldProbe::Nop => (self.fold[ud].decoy, 1, 1),
             };
-            if let Err(e) = r {
-                tracing::error!("divergence probe: bh fold failed on slot {ud} ({e:#})");
+            if count > 0 {
+                // SAFETY: `buf` owns `count` readable f32 — the arena slot (`nbytes` bytes, just
+                // written by the completed read) or the decoy; `bh` is one live device u64;
+                // `stream` is live.
+                let r = unsafe {
+                    rivoli_backend::launch_hash_rows(
+                        buf,
+                        count,
+                        stride,
+                        (ud as u64) * n as u64,
+                        self.fold[ud].bh,
+                        stream,
+                    )
+                };
+                if let Err(e) = r {
+                    tracing::error!("divergence probe: bh fold failed on slot {ud} ({e:#})");
+                }
             }
         }
         // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
@@ -471,20 +499,20 @@ impl Streamer {
             // copy the engine needs, i.e. the instrument changing what is computed.
             let n = self.nbytes[ud] as usize / 4;
             // ONE call serves every arm; they differ only in WHICH buffer, HOW MUCH of it, and
-            // therefore how long they take. See `ScProbe` for the ladder and what each rung means.
+            // therefore how long they take. See `FoldProbe` for the ladder and what each rung means.
             let slot = self.dst[ud] as *const f32;
             let (buf, count, stride) = match self.fold[ud].sc_mode {
-                crate::fetch::asyncfetch::ScProbe::Off => (slot, 0, 1),
-                crate::fetch::asyncfetch::ScProbe::Full => (slot, n, 1),
+                crate::fetch::asyncfetch::FoldProbe::Off => (slot, 0, 1),
+                crate::fetch::asyncfetch::FoldProbe::Full => (slot, n, 1),
                 // Every cache line of the slot, ~1/32 of its bytes — a sweep that COVERS the slot,
                 // so unlike reading one line at the front it could actually be a fix.
-                crate::fetch::asyncfetch::ScProbe::Line => {
+                crate::fetch::asyncfetch::FoldProbe::Line => {
                     (slot, n, crate::fetch::asyncfetch::LINE_F32)
                 }
                 // Same size, same bandwidth, same duration — a buffer that is NOT the slot.
-                crate::fetch::asyncfetch::ScProbe::Decoy => (self.fold[ud].decoy, n, 1),
+                crate::fetch::asyncfetch::FoldProbe::Decoy => (self.fold[ud].decoy, n, 1),
                 // Same launch and the same stream-boundary cache maintenance, ~no work.
-                crate::fetch::asyncfetch::ScProbe::Nop => (self.fold[ud].decoy, 1, 1),
+                crate::fetch::asyncfetch::FoldProbe::Nop => (self.fold[ud].decoy, 1, 1),
             };
             let r = match count {
                 0 => Ok(()),

@@ -55,7 +55,7 @@
 //! and never accept a green obtained with tracing enabled.**
 
 use crate::device::DeviceBuf;
-use crate::fetch::asyncfetch::ScProbe;
+use crate::fetch::asyncfetch::FoldProbe;
 use anyhow::{Context, Result, ensure};
 use rivoli_backend::{fill_u32, launch_hash_rows};
 
@@ -130,17 +130,18 @@ pub struct Folds {
     /// Fold the fixed-point accumulator before the drain — the consumer-output witness for the
     /// DOWN projection, which `h` (pass 1) and `x` (post-drain) cannot separate.
     pub ac: bool,
-    /// Fold the bounce arena after the NVMe read, before the copy.
-    pub bh: bool,
+    /// What runs at the PRE-copy position — the measured suppressor, so this is the ladder that
+    /// chooses the fix. See [`crate::fetch::asyncfetch::FoldProbe`].
+    pub bh: FoldProbe,
     /// What, if anything, runs at the post-copy position.
-    pub sc: crate::fetch::asyncfetch::ScProbe,
+    pub sc: crate::fetch::asyncfetch::FoldProbe,
     /// Fold every slot the layer used, at end of layer.
     pub se: bool,
 }
 
 impl Folds {
     /// Parse `--divergence-folds`: a comma-separated subset of
-    /// `xa,ac,bh,sc,sc-nop,sc-decoy,sc-line,se`. Absent = the light probe.
+    /// `xa,ac,{bh,sc}[-nop|-decoy|-line],se`. Absent = the light probe.
     ///
     /// Unknown names are REFUSED rather than ignored, and the three `sc` forms are mutually
     /// exclusive: a typo that silently disabled the one fold a cell exists to test would make the
@@ -157,7 +158,7 @@ impl Folds {
         for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let sc = |f: &Folds| -> Result<()> {
                 ensure!(
-                    f.sc == ScProbe::Off,
+                    f.sc == FoldProbe::Off,
                     "--divergence-folds names more than one `sc` variant; they occupy the same \
                      pipeline position and are alternatives, not additions"
                 );
@@ -174,9 +175,18 @@ impl Folds {
                     ensure!(!f.ac, "--divergence-folds names `ac` twice");
                     f.ac = true;
                 }
-                "bh" => {
-                    ensure!(!f.bh, "--divergence-folds names `bh` twice");
-                    f.bh = true;
+                "bh" | "bh-nop" | "bh-decoy" | "bh-line" => {
+                    ensure!(
+                        f.bh == FoldProbe::Off,
+                        "--divergence-folds names more than one `bh` variant; they occupy the \
+                         same pipeline position and are alternatives, not additions"
+                    );
+                    f.bh = match name {
+                        "bh-nop" => FoldProbe::Nop,
+                        "bh-decoy" => FoldProbe::Decoy,
+                        "bh-line" => FoldProbe::Line,
+                        _ => FoldProbe::Full,
+                    };
                 }
                 "se" => {
                     ensure!(!f.se, "--divergence-folds names `se` twice");
@@ -184,23 +194,23 @@ impl Folds {
                 }
                 "sc" => {
                     sc(&f)?;
-                    f.sc = ScProbe::Full;
+                    f.sc = FoldProbe::Full;
                 }
                 "sc-nop" => {
                     sc(&f)?;
-                    f.sc = ScProbe::Nop;
+                    f.sc = FoldProbe::Nop;
                 }
                 "sc-decoy" => {
                     sc(&f)?;
-                    f.sc = ScProbe::Decoy;
+                    f.sc = FoldProbe::Decoy;
                 }
                 "sc-line" => {
                     sc(&f)?;
-                    f.sc = ScProbe::Line;
+                    f.sc = FoldProbe::Line;
                 }
                 other => anyhow::bail!(
                     "unknown --divergence-folds entry {other:?} \
-                     (xa, ac, bh, sc, sc-nop, sc-decoy, sc-line, se)"
+                     (xa, ac, bh, bh-nop, bh-decoy, bh-line, sc, sc-nop, sc-decoy, sc-line, se)"
                 ),
             }
         }
@@ -218,15 +228,19 @@ impl Folds {
         if self.ac {
             v.push("ac");
         }
-        if self.bh {
-            v.push("bh");
+        match self.bh {
+            FoldProbe::Off => {}
+            FoldProbe::Full => v.push("bh"),
+            FoldProbe::Nop => v.push("bh-nop"),
+            FoldProbe::Decoy => v.push("bh-decoy"),
+            FoldProbe::Line => v.push("bh-line"),
         }
         match self.sc {
-            ScProbe::Off => {}
-            ScProbe::Full => v.push("sc"),
-            ScProbe::Nop => v.push("sc-nop"),
-            ScProbe::Decoy => v.push("sc-decoy"),
-            ScProbe::Line => v.push("sc-line"),
+            FoldProbe::Off => {}
+            FoldProbe::Full => v.push("sc"),
+            FoldProbe::Nop => v.push("sc-nop"),
+            FoldProbe::Decoy => v.push("sc-decoy"),
+            FoldProbe::Line => v.push("sc-line"),
         }
         if self.se {
             v.push("se");
@@ -276,28 +290,31 @@ pub fn format_row(
             _ => "-".to_string(),
         }
     };
+    let miss = cols.is_some_and(|c| c.miss > 0);
+    // ONE rendering rule for both ladder positions, because they are the same ladder asked at two
+    // points and two copies of the rule would drift (jscpd said so the moment `bh` gained variants).
+    //
+    // `~` prefixes a PARTIAL fold: `-line` covers every cache line but ~1/32 of the bytes, so its
+    // AGREEMENT exonerates far less than a full fold's and the reading key would otherwise be
+    // over-read. The NO-TOUCH arms (`-nop`, `-decoy`) print `-`: their word is a hash of a decoy
+    // buffer and carries nothing about any payload, so rendering it as a payload hash would be a
+    // false exclusion outright.
+    let ladder = |mode: FoldProbe, q: Q| -> String {
+        match (mode, miss) {
+            (FoldProbe::Full, true) => hex(true, q),
+            (FoldProbe::Line, true) => format!("~{}", hex(true, q)),
+            _ => "-".to_string(),
+        }
+    };
     let xn = hex(true, Q::Xn);
     let x = hex(true, Q::X);
     let xa = hex(folds.xa, Q::Xa);
     let ac = hex(cols.is_some() && folds.ac, Q::Ac);
     let h = hex(cols.is_some(), Q::H);
-    let miss = cols.is_some_and(|c| c.miss > 0);
     let trio = format!(
         "{} {} {}",
-        hex(folds.bh && miss, Q::Bh),
-        // `~` prefixes a PARTIAL fold. Under `sc-line` the column covers every cache line but only
-        // ~1/32 of the bytes, so `sc` AGREEING exonerates far less than it does under `sc`/`sc-full`
-        // — and the reading key says "sc differs -> the COPY", which would be over-read in the
-        // other direction. The no-touch arms (`sc-nop`, `sc-decoy`) print `-`: their word is a hash
-        // of a DECOY, and rendering it as a payload hash would be a false exclusion outright.
-        match folds.sc {
-            ScProbe::Full => hex(miss, Q::Sc),
-            ScProbe::Line => match miss {
-                true => format!("~{}", hex(true, Q::Sc)),
-                false => "-".to_string(),
-            },
-            _ => "-".to_string(),
-        },
+        ladder(folds.bh, Q::Bh),
+        ladder(folds.sc, Q::Sc),
         hex(cols.is_some() && folds.se, Q::Se),
     );
     let host = match cols {
@@ -407,7 +424,7 @@ impl Probe {
         ensure!(n_layers > 0, "divergence probe over a 0-layer model");
         // Allocated ONLY for the arms that need it: a slot is ~15 MiB, and a cell that does not
         // use the decoy should not pay for it or have it resident to confuse a memory reading.
-        let decoy = match matches!(folds.sc, ScProbe::Nop | ScProbe::Decoy) {
+        let decoy = match matches!(folds.sc, FoldProbe::Nop | FoldProbe::Decoy) {
             true => {
                 ensure!(
                     slot_bytes >= 4,

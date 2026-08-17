@@ -168,6 +168,24 @@ struct Args {
     #[arg(long, value_name = "PATH", conflicts_with = "port")]
     dump_ids: Option<String>,
 
+    /// CANDIDATE FIX UNDER EVALUATION: allocate the io_uring bounce arena FINE-GRAINED
+    /// (`hipHostMallocCoherent`) instead of `hipHostMallocDefault`.
+    ///
+    /// GLM's nondeterminism was localised to the bounce arena: a fold of the arena between the
+    /// io_uring completion and the `hipMemcpyAsync` enqueue SUPPRESSES the defect, while every
+    /// probe that does not read the arena leaves it intact. The gap that predicts this is that the
+    /// CQE establishes visibility of the NVMe DMA's writes TO THE CPU, while the agent that
+    /// actually reads the arena is the GPU's copy path — and nothing establishes visibility for
+    /// it. On fine-grained host memory the platform provides that guarantee; on coarse-grained it
+    /// does not. `hipHostMallocDefault` does not say which it yields, so this is A/B-ed rather
+    /// than asserted.
+    ///
+    /// NOT behind a feature, unlike the instruments: the acceptance protocol compares two release
+    /// binaries differing in exactly this flag, and a fix reachable only in a probe build cannot be
+    /// measured against a stock one. Expect a bandwidth cost on the bounce->GTT copy — measure it.
+    #[arg(long)]
+    pinned_coherent: bool,
+
     /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
     /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
     /// saw, picked and where the pool put it.
@@ -473,6 +491,7 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
         cache_policy: &a.cache_policy,
         two_q: TwoQSplit::default(),
         trace_path: a.trace.as_deref(),
+        pinned_coherent: a.pinned_coherent,
     }
 }
 

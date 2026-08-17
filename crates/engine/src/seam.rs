@@ -180,6 +180,14 @@ pub struct PoolKnobs<'a> {
     pub cache_policy: &'a str,
     pub two_q: TwoQSplit,
     pub trace_path: Option<&'a str>,
+    /// `--pinned-coherent`: allocate the io_uring bounce arena FINE-GRAINED.
+    ///
+    /// **A candidate FIX under evaluation, not an instrument**, which is why it is here rather
+    /// than behind a feature: the acceptance protocol compares two release binaries differing in
+    /// exactly this flag, and a fix that can only be reached in a probe build cannot be measured
+    /// against a stock one. It applies to every routed arm because every routed arm has the same
+    /// arena and the same ordering gap (`kernels/async.hip::rivoli_pinned_alloc`).
+    pub pinned_coherent: bool,
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -470,6 +478,7 @@ impl<'a> Engine<'a> {
 #[cfg(feature = "rocm")]
 fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_> {
     crate::resident::PinCfg {
+        pinned_coherent: knobs.pinned_coherent,
         capacity,
         cache_policy: knobs.cache_policy,
         two_q: knobs.two_q,

@@ -240,6 +240,10 @@ pub struct PinCfg<'a> {
     pub cache_policy: &'a str,
     pub two_q: rivoli_core::cache::TwoQSplit,
     pub trace_path: Option<&'a str>,
+    /// Allocate the io_uring bounce arena FINE-GRAINED — `--pinned-coherent`, the candidate fix
+    /// for the ordering gap argued at `kernels/async.hip::rivoli_pinned_alloc`. Every arm gets it
+    /// because every routed arm has the same arena and the same gap.
+    pub pinned_coherent: bool,
 }
 
 /// How many experts one `submit` carries, and what one costs — the shape an arm's MoE
@@ -361,6 +365,7 @@ impl<'a> PoolPlan<'a> {
             budget as f64 / (1u64 << 30) as f64,
         );
         let cfg = PoolCfg {
+            pinned_coherent: pin.pinned_coherent,
             budget,
             top_k: b.top_k,
             max_batch: b.max_batch,

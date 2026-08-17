@@ -511,6 +511,8 @@ fn open_engine<'c>(
     let unit = f4_expert_stride(cfg.text.expert_in, cfg.text.moe_inter);
     let floor = ok(safetensors_bytes(dir, None), "file bytes") + (64 << 20) + 2 * unit;
     let pin = PinCfg {
+        // Stock allocation: a fixture must not silently test the candidate fix.
+        pinned_coherent: false,
         capacity: floor + extra_units * unit + 512,
         cache_policy: "2q",
         two_q: rivoli_core::cache::TwoQSplit::default(),

@@ -321,11 +321,12 @@ impl GlmEngine<'_> {
                 let f = p.folds();
                 crate::fetch::asyncfetch::FetchFolds {
                     bh: match f.bh {
-                        true => p.fold_slot(l, crate::probe::Q::Bh)?,
-                        false => std::ptr::null_mut(),
+                        crate::fetch::asyncfetch::FoldProbe::Off => std::ptr::null_mut(),
+                        _ => p.fold_slot(l, crate::probe::Q::Bh)?,
                     },
+                    bh_mode: f.bh,
                     sc: match f.sc {
-                        crate::fetch::asyncfetch::ScProbe::Off => std::ptr::null_mut(),
+                        crate::fetch::asyncfetch::FoldProbe::Off => std::ptr::null_mut(),
                         _ => p.fold_slot(l, crate::probe::Q::Sc)?,
                     },
                     decoy: p.decoy(),

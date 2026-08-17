@@ -1,7 +1,7 @@
 ---
 status: live
 scope: glm
-verdict: A WRONG-BYTES READ IN THE ROUTED-EXPERT POOL; the working mechanism is a device-side VISIBILITY problem on the bounce->GTT copy. TWO coordinates with OPPOSITE signatures, one mechanism: at pos=164 layer=24 `h` differed (gate/up read wrong bytes); at pos=186 layer=35 `h` was IDENTICAL and only `x` moved, which — since `h` is a CONSUMER-OUTPUT fold and the accumulator and drain are refuted — means the DOWN projection read wrong bytes from the same slot at a different instant. Hence the reading rule now distinguishes CONSUMER-OUTPUT columns (xa/xn/h/ac/x, whose agreement does constrain what the kernel consumed) from BYTES-AT-AN-INSTANT columns (bh/sc/se, whose agreement exonerates NOTHING). Control is live: unprobed diverges at line 66, light probe at 169, so the light probe does not suppress and the suppressor is the hop folds specifically (all-on: 2,048 tokens, zero events). HOP 1 IS LARGELY EXONERATED by a check already running — the artifact is on btrfs with datasum ON and btrfs verifies checksums on direct-IO reads, so every one of ~70-95k reads per arm is a storage test and the kernel log is clean; the surviving suspects are the bounce->GTT copy and the consumer reading before it is coherently visible. `--mode int4` diverges too, retiring "vq3-specific". Relocation carries no signal (33.6% of ordinary rows have relocs>0). THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT. `--divergence-folds` enables one fold at a time (default light) and Phase 2's sc-nop/sc-decoy/sc-line ladder separates a launch-boundary, a timing and a touch-the-bytes hazard. The toolchain is NOT exonerated. The determinism gate exists, floor 512, and its GREEN IS OWED because the engine is red.
+verdict: THE DEFECT IS IN THE BOUNCE ARENA, and Phase 1 named it by ablation: every probe cell that does NOT read the pinned arena diverges (light @169, se @301, sc @236, sc-nop @292, xa+ac @292) and both cells that DO read it are clean over 1536 tokens. Not a slowdown artifact — `bh` suppresses at 2.19-2.39 tok/s while the light probe diverges at 1.61-1.84. The post-copy slot read (`sc`) does NOT suppress, refuting the visibility-at-the-copy story. THE MISSING GUARANTEE, named: the arena is `hipHostMalloc(hipHostMallocDefault)`, io_uring's CQE establishes the NVMe DMA's writes are visible TO THE CPU (which is why btrfs verifies clean), and `Streamer::reap` then enqueues `hipMemcpyAsync` back to back — but that copy's reader is the GPU's copy path, so the only ordering present is about the wrong agent. Fine-grained host memory provides it by snooping; coarse-grained does not. A CPU-side fence is NOT a fix (it orders the CPU, which is neither producer nor consumer, and whose view was already correct). Candidates, A/B-able: `--pinned-coherent` (architectural — changes the memory type; measure the bandwidth cost) and `--divergence-folds bh-nop` (a bare launch's dispatch acquire, the decisive next cell — if it suppresses, no read is needed and any read-based fix is incidental). TWO coordinates with opposite signatures, one mechanism: gate/up read stale at one, DOWN at another, so it is whichever part of the slot is read while stale, not sub-region-specific. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT; the rate scales per READ. Storage and the toolchain: storage largely exonerated by btrfs datasum on direct-IO reads plus a clean kernel log; the toolchain is NOT exonerated. NO FIX IS CLAIMED — the acceptance protocol (same-day RED control, GREEN at 512 x2 plus 4x1536, rate bound, throughput cost) is unmet.
 ---
 
 # GLM does not reproduce itself: the bytes read out of the pool slots differ
@@ -466,6 +466,84 @@ Red-proofed by making `scan_free` ignore `landed`.
 
 So an instrumented pair gives ONE coordinate, and the hop table above should be read as "one sample
 decides which hop we are on", not as "one run settles the mechanism".
+
+## PHASE 1 RESULT: `bh` is the suppressor — the defect is in the BOUNCE ARENA
+
+All 1536-token pairs, quiet box, binaries built before any arm:
+
+| folds | tok/s | reads the arena? | outcome |
+|---|---|---|---|
+| v2 light | 1.61 / 1.84 | no | DIVERGED @169 |
+| `se` | 2.16 / 2.04 | no | DIVERGED @301 |
+| `sc` | 2.46 / 2.58 | no | DIVERGED @236 |
+| `sc-nop` | 2.57 / 2.59 | no | DIVERGED @292 |
+| `xa,ac` | 2.32 / 2.41 | no | DIVERGED @292 |
+| **`bh`** | **2.19 / 2.39** | **YES** | **CLEAN over 1536** |
+| `bh,sc,se` | 1.25 / 1.70 | YES | CLEAN (512 and 1536) |
+
+**Every cell that does not touch the bounce arena diverges; both cells that do are clean.** And it
+is not a slowdown artifact — `bh` runs at 2.19–2.39 tok/s and suppresses while the light probe runs
+*slower* at 1.61–1.84 and diverges, so duration is ruled out by the data rather than by argument.
+`sc` — the post-copy slot read that the visibility-at-the-copy story predicted would be the
+suppressor — **does not suppress**. That prediction was wrong.
+
+`ac` also resolved coordinate 2, in the opposite direction from the guess attached to it: at pos 287
+L18 `xa` was identical (closing the rescaled-residual alternative `xa` was added for) with `h`, `ac`
+and `x` all differing. So gate/up read wrong there, versus down at coordinate 2 — **not
+sub-region-specific: whichever part of the slot is read while stale.**
+
+## The missing ordering guarantee, named
+
+The chain, with the code that assumes each step:
+
+1. **`rivoli_pinned_alloc`** (`kernels/async.hip`) allocates the arena
+   `hipHostMalloc(..., hipHostMallocDefault)` — **no coherence property requested**.
+2. io_uring O_DIRECT has the **NVMe device DMA** into that arena. The CQE establishes that those
+   writes are visible **to the CPU**: the kernel's completion path carries the barriers for that,
+   and btrfs's own `datasum` verification then reads them successfully on the CPU, which is why
+   storage is clean.
+3. **`Streamer::reap`** (`fetch/stream.rs`) consumes the CQE and enqueues
+   `hipMemcpyAsync(H2D)` **back to back, with nothing between them.**
+4. That copy's reader is the **GPU's copy path**, not the CPU.
+
+**Nothing in that chain establishes that the agent in (4) observes the writes from (2).** The CPU is
+neither the producer nor the consumer, so the CQE's guarantee — the only one present — is about the
+wrong agent. For **fine-grained** host memory the platform provides the missing guarantee by
+snooping; for **coarse-grained** it does not, and an acquire is required at a synchronisation point.
+`hipHostMallocDefault` does not state which it yields, and on ROCm that has been runtime- and
+environment-dependent, so **this is not asserted here — it is A/B-ed** (`--pinned-coherent`).
+
+A stale line is exactly what the reuse pattern arranges: a staging slot's *previous* contents were
+themselves read through the GPU on an earlier fetch, so the GPU may hold a cached copy of that host
+range when the NVMe DMA overwrites it. The corrupted payload would then be a **previous expert's
+weights** — finite, plausible, silently wrong, which is the recorded symptom class exactly.
+
+### Why a CPU-side fence is NOT the fix
+
+It was proposed as candidate (a) and as potentially shippable. **It cannot work**, and the reason is
+the same one that makes the gap real: an acquire/`sfence` on the reaper thread orders the *CPU's own*
+accesses. The producer is a third-party device's DMA and the consumer is the GPU's copy engine —
+**neither is the CPU**, and the CPU's view was already correct (btrfs verified it). A CPU fence adds
+no ordering between those two agents. If it appeared to help it would be by perturbing timing, which
+is the class of accidental fix this investigation exists to reject.
+
+### The candidates, and which are architectural
+
+| candidate | flag | architectural? |
+|---|---|---|
+| **fine-grained arena** — `hipHostMallocCoherent` | `--pinned-coherent` | **YES.** Changes the memory TYPE, so the platform provides the guarantee. Expect a bandwidth cost on the bounce→GTT copy: fine-grained host memory is not GPU-cached. **Measure it.** |
+| **a bare kernel launch before the copy** | `--divergence-folds bh-nop` | **Probably** — an HSA dispatch performs a system-scope acquire, which is a documented dispatch property rather than a side effect of reading. But relying on the *scope* of that acquire is a weaker contract than owning the memory type |
+| one cache line of the arena | `--divergence-folds bh-line` | **NO — mitigation.** Works, if it works, by touching memory. Label it as such |
+| a CPU fence | — | **NO — not a fix at all**, see above |
+
+**`bh-nop` is the decisive cheap cell and it should run next.** It has the launch and its acquire and
+reads nothing of the arena. If it suppresses, what repairs the hazard is the *dispatch*, not the
+bytes — which makes the coherent allocation (or an explicit cache operation) the fix and any read
+incidental. If `bh-nop` fires while `bh` suppresses, it really is about reading those bytes, and the
+memory-type story needs revisiting.
+
+Note the ladder now exists at **both** positions (`bh`/`bh-nop`/`bh-decoy`/`bh-line` and the `sc`
+set) from one enum, because it is the same question asked at two points.
 
 ## The control, and a SECOND coordinate with the opposite signature
 

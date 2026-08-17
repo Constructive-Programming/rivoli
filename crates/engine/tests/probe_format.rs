@@ -12,7 +12,7 @@
 #![cfg(all(feature = "rocm", feature = "corruption-probe"))]
 #![allow(clippy::expect_used)] // a panic in a test is loud and correct; the workspace opts back in
 
-use rivoli_engine::fetch::asyncfetch::ScProbe;
+use rivoli_engine::fetch::asyncfetch::FoldProbe;
 use rivoli_engine::probe::{Cols, Folds, NQ, format_row};
 
 // A panic in a test is loud and correct, which is the workspace's stated reason for opting back
@@ -32,12 +32,29 @@ fn folds_parse_refuses_what_it_cannot_honour() {
     assert_eq!(Folds::default().label(), "light");
 
     let f = Folds::parse("bh").expect("bh");
-    assert!(f.bh && !f.se && f.sc == ScProbe::Off, "bh must not arm sc");
+    assert!(
+        f.bh == FoldProbe::Full && !f.se && f.sc == FoldProbe::Off,
+        "bh must not arm sc"
+    );
     assert_eq!(f.label(), "bh");
+    // The pre-copy position is a ladder too, and its variants refuse each other.
+    assert_eq!(
+        Folds::parse("bh-nop").expect("bh-nop").bh,
+        FoldProbe::Nop,
+        "bh-nop is the launch-only arm at the SUPPRESSING position — the cell that decides \
+         whether the fix needs a read at all"
+    );
+    assert!(
+        Folds::parse("bh,bh-line").is_err() && Folds::parse("bh-nop,bh-decoy").is_err(),
+        "the bh variants occupy one position and are alternatives"
+    );
 
     let f = Folds::parse("sc-decoy").expect("sc-decoy");
-    assert_eq!(f.sc, ScProbe::Decoy);
-    assert!(!f.bh && !f.se, "an sc variant must not arm the others");
+    assert_eq!(f.sc, FoldProbe::Decoy);
+    assert!(
+        f.bh == FoldProbe::Off && !f.se,
+        "an sc variant must not arm the others"
+    );
     assert_eq!(f.label(), "sc-decoy");
 
     // Order-independent, and the label is canonical so two logs of the same config compare
@@ -60,6 +77,9 @@ fn folds_parse_refuses_what_it_cannot_honour() {
         Folds::parse("bh,bh").is_err(),
         "a repeat is a spec the operator did not mean"
     );
+    // The two positions are independent: one may be armed without the other.
+    let both = Folds::parse("bh-nop,sc-line").expect("one arm at each position");
+    assert_eq!((both.bh, both.sc), (FoldProbe::Nop, FoldProbe::Line));
     assert!(
         Folds::parse("").is_err() && Folds::parse("  ").is_err(),
         "an explicitly EMPTY list must refuse — omit the flag to ask for the light probe"
@@ -92,8 +112,8 @@ fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
     let all = Folds {
         xa: true,
         ac: true,
-        bh: true,
-        sc: ScProbe::Full,
+        bh: FoldProbe::Full,
+        sc: FoldProbe::Full,
         se: true,
     };
     let field = |row: &str, i: usize| row.split_whitespace().nth(i).expect("field").to_string();
@@ -136,11 +156,11 @@ fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
     fetch_all_dash(&r, "a fold the run did not enable is not measured");
 
     // The NO-TOUCH arms hash a DECOY buffer, so their column must not look like a payload hash.
-    for arm in [ScProbe::Nop, ScProbe::Decoy] {
+    for arm in [FoldProbe::Nop, FoldProbe::Decoy] {
         let f = Folds {
             xa: false,
             ac: false,
-            bh: false,
+            bh: FoldProbe::Off,
             sc: arm,
             se: false,
         };
@@ -155,8 +175,8 @@ fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
     let line = Folds {
         xa: false,
         ac: false,
-        bh: false,
-        sc: ScProbe::Line,
+        bh: FoldProbe::Off,
+        sc: FoldProbe::Line,
         se: false,
     };
     let lr = field(&format_row(7, 1, 4, &w, cols(1), line), sc);
