@@ -83,6 +83,17 @@ set -uo pipefail
 # because this gate must be able to test a binary it did not build and must never build one
 # itself (a cargo run between arms evicts page cache); it is spelled like `PARITY_*` in the
 # sibling gate rather than `RIVOLI_*`, which is the engine's own flat env namespace.
+# EXTRA FLAGS APPENDED TO BOTH ARMS — how a candidate fix is gated without a second script.
+#
+# The acceptance protocol compares an unpatched RED control against a patched GREEN, so the two runs
+# must differ in exactly the flag under test and in nothing else. `DETERMINISM_FIX_FLAGS='--pinned-
+# coherent'` is the whole difference, and it is PRINTED with the verdict: a recorded green that does
+# not say what it was measured on is the `--prompt '<P>'` failure again, one level up.
+#
+# An env var rather than a flag because this script is not a cargo run and the house rule allows one
+# with the argument written down. A positional would have to thread past the optional ngen and mem.
+FIX_FLAGS=${DETERMINISM_FIX_FLAGS:-}
+
 BIN=${DETERMINISM_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/release/rivoli}
 LOCK=/var/run/sys-gpu.lock
 # The floor, argued in the header. A caller may raise `ngen`, never lower it past this.
@@ -244,7 +255,7 @@ EOF
 # it ever needs enforcing, `--version` should print its feature set.
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/determinism-glm.XXXXXX")
-echo "== determinism-glm | ngen=$NGEN mem=${MEM}GiB scratch=$SCRATCH"
+echo "== determinism-glm | ngen=$NGEN mem=${MEM}GiB${FIX_FLAGS:+ fix-flags='$FIX_FLAGS'} scratch=$SCRATCH"
 echo "   bin: $(stat -c '%y' "$BIN") $BIN"
 
 # --- contention witness, per arm ----------------------------------------------------
@@ -270,7 +281,8 @@ run_arm() { # $1 = arm name, $2 = ids out path
     # reads — would make this a comparison of two configurations instead of a repeatability
     # test.
     flock "$LOCK" "$BIN" "$ARTIFACT" --bench "$NGEN" --mode int3-vq --attn dense \
-        --max-mem "$MEM" --prompt "$PROMPT" --dump-ids "$2" >"$SCRATCH/$1.out" 2>"$SCRATCH/$1.log" &
+        --max-mem "$MEM" --prompt "$PROMPT" $FIX_FLAGS --dump-ids "$2" \
+        >"$SCRATCH/$1.out" 2>"$SCRATCH/$1.log" &
     apid=$!
     witness "$wfile" "$apid" &
     wpid=$!
@@ -308,6 +320,8 @@ fi
 if compare_ids "$SCRATCH/a.ids" "$SCRATCH/b.ids"; then
     echo "GREEN: two runs at identical flags produced identical ids over $NGEN tokens (mem=${MEM}GiB)."
     echo "       binary: $BIN"
+    echo "       flags:  --mode int3-vq --attn dense --max-mem $MEM ${FIX_FLAGS:-<none>}"
+    echo "       prompt: $PLEN bytes, md5 $PMD5"
     echo "       This BOUNDS the divergence rate at this length; it does not prove determinism."
     exit 0
 fi
