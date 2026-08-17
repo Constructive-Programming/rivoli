@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). ADDED 2026-08-17: the GLM determinism gates (§5) — the id comparator, a prompt pinned by length+md5 that fired unplanted, INV-9 under a scan_free mutation, the probe's fold-slot layout under an inserted enum variant, and the column comparator's three refusals; the determinism gate's own 512-token GREEN is OWED and standing, because the engine is red. Also recorded there: a false EXCLUSION found in this round's own instrument — a fold omitted on dense layers made two runs 'agree' about a quantity neither measured, which no gate in this repo could see. ADDED 2026-08-17 (Phase 1): the per-fold probe flags — parse refusals, spin_rows reading nothing, and the column comparator refusing two logs from different fold configurations; the -for-disabled rendering is OWED a red proof and says so.
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). ADDED 2026-08-17: the GLM determinism gates (§5) — the id comparator, a prompt pinned by length+md5 that fired unplanted, INV-9 under a scan_free mutation, the probe's fold-slot layout under an inserted enum variant, and the column comparator's three refusals; the determinism gate's own 512-token GREEN is OWED and standing, because the engine is red. Also recorded there: a false EXCLUSION found in this round's own instrument — a fold omitted on dense layers made two runs 'agree' about a quantity neither measured, which no gate in this repo could see. ADDED 2026-08-17 (Phase 1): the per-fold probe flags — parse refusals, spin_rows reading nothing, and the column comparator refusing two logs from different fold configurations; the dash-for-disabled rendering was recorded OWED and PAID the same day, red-proofed by printing 0 instead.
 ---
 
 # M0 gate red proofs
@@ -251,8 +251,19 @@ whole time. Every column that cannot exist for a row now prints `-`, never 0.
   The derivation is what keeps the historical pair readable: v2 predates the fetch-path folds, v3
   could not disable them. Refusing them outright — the first version — would have made the one pair
   that produced a coordinate uncomparable.
-- **OWED: the `-`-for-disabled rendering has no red proof.** `Probe::drain` must print `-` and never
-  `0` for a fold the run did not enable, because a `0` lets two runs "agree" about bytes neither
-  hashed. That is the same false-EXCLUSION class already recorded above, and it is currently
-  asserted only by reading the code. It needs a deviceless test over `drain`'s formatting, which
-  needs `Probe` constructible without a device; recorded as owed rather than claimed.
+- **The `-`-for-disabled rendering** (`probe.rs::an_unmeasured_column_prints_a_dash_and_never_a_zero`).
+  **Recorded as OWED earlier the same day and paid before the round closed.** The obstacle was that
+  `Probe` needs a `DeviceBuf`, so the rule lived inside `drain` where nothing deviceless could reach
+  it; the fix was to extract `format_row` as a pure function of the drained words. Planted: print
+  `0` instead of `-` for an unmeasured column — the exact shape of the bug that already occurred
+  here, where `xn` was folded on MoE layers only and the dense rows' zeros read as
+  "attention agreed".
+
+  ```
+  assertion `left == right` failed: a dense layer has no h   FAILED   (red)
+  revert → 1 passed                                                  (green again)
+  ```
+
+  The fold words in the fixture are all NON-zero, so a `-` in the output can only come from the
+  rule and never from the data; and the test closes by asserting that a fully-enabled row prints a
+  hash in every column, without which a formatter that emitted `-` unconditionally would pass.

@@ -182,6 +182,61 @@ impl Folds {
     }
 }
 
+/// One log row, as a pure function of the drained fold words and the layer's host columns.
+///
+/// **Extracted so the `-`-versus-`0` rule can be tested WITHOUT A DEVICE**, which
+/// `docs/measurement/gate-red-proofs.md` §5g recorded as owed. `Probe` needs a `DeviceBuf`, so as
+/// long as this logic lived inside `drain` the one rule that has already produced a false
+/// conclusion on this bug was checked by reading the code.
+///
+/// `w` is the layer's [`NQ`] fold words in [`Q`] order.
+fn format_row(
+    pos: usize,
+    nrow: usize,
+    layer: usize,
+    w: &[u64],
+    cols: Option<Cols>,
+    folds: Folds,
+) -> String {
+    // `-` MEANS NOT MEASURED and is never 0. A fold is absent when the run did not ENABLE it
+    // (`--divergence-folds`) and when the layer gave it nothing to do — `bh`/`sc` bracket a copy,
+    // so with no miss there was no copy; `se` runs on every MoE layer. Printing 0 for either would
+    // let two runs "agree" about bytes neither hashed: a false EXCLUSION, which is the one failure
+    // mode an instrument may not have, and which this instrument has already had once (`xn` was
+    // folded on MoE layers only, so the dense rows' zeros read as "attention agreed").
+    //
+    // `sc-spin` also prints `-`: it writes a word so its loop is not optimised away, but that word
+    // is a function of the launch geometry and carries nothing about any payload, so it must not
+    // look like a hash somebody can compare.
+    let hex = |on: bool, q: Q| -> String {
+        match (on, w.get(q as usize)) {
+            (true, Some(v)) => format!("{v:016x}"),
+            _ => "-".to_string(),
+        }
+    };
+    let xn = hex(true, Q::Xn);
+    let x = hex(true, Q::X);
+    let h = hex(cols.is_some(), Q::H);
+    let miss = cols.is_some_and(|c| c.miss > 0);
+    let trio = format!(
+        "{} {} {}",
+        hex(folds.bh && miss, Q::Bh),
+        hex(
+            matches!(folds.sc, ScProbe::Full | ScProbe::Line) && miss,
+            Q::Sc
+        ),
+        hex(cols.is_some() && folds.se, Q::Se),
+    );
+    let host = match cols {
+        None => "- - - - -".to_string(),
+        Some(c) => format!(
+            "{:016x} {:016x} {:016x} {} {}",
+            c.gl, c.pk, c.sl, c.miss, c.reloc
+        ),
+    };
+    format!("{pos} {nrow} {layer} {xn} {h} {x} {host} {trio}")
+}
+
 #[cfg(test)]
 mod fold_tests {
     // A panic in a test is loud and correct, which is the workspace's stated reason for opting back
@@ -439,64 +494,19 @@ impl Probe {
             .map(|c| c.try_into().map(u64::from_le_bytes).unwrap_or(0))
             .collect();
         for l in layers {
-            let at = |q: usize| -> Result<u64> {
+            let row = format_row(
+                pos,
+                nrow,
+                l,
                 words
-                    .get(l * NQ + q)
-                    .copied()
-                    .context("divergence probe: fold slot outside the drained slab")
-            };
-            // A dense layer has no router, no pool and no `moe_hidden`, so those columns print
-            // `-` rather than 0. NOT cosmetic: a 0 would read as a measured hash that happened
-            // to be zero, so two runs would "agree" about a quantity neither of them measured
-            // — a false EXCLUSION, which is the one failure mode an instrument must not have.
-            // `xn` and `x` ARE folded on every layer, so they are always numbers.
-            let moe = self.cols.get(l).copied().flatten();
-            let h = match moe {
-                Some(_) => format!("{:016x}", at(Q::H as usize)?),
-                None => "-".to_string(),
-            };
-            // `-` MEANS NOT MEASURED and is never 0, for two reasons that compound. A fold is
-            // absent when the run did not ENABLE it (`--divergence-folds`) and when the layer gave
-            // it nothing to do — `bh`/`sc` bracket a copy, so with no miss there was no copy; `se`
-            // runs on every MoE layer. Printing 0 for either would let two runs "agree" about bytes
-            // neither hashed, which is the false-exclusion trap this instrument already fell into
-            // once. `sc-spin` also prints `-`: it writes a word so the loop is not optimised away,
-            // but that word is a function of the launch geometry and carries nothing about any
-            // payload, so it must not look like a hash somebody can compare.
-            let hex = |on: bool, q: Q| -> Result<String> {
-                match on {
-                    true => Ok(format!("{:016x}", at(q as usize)?)),
-                    false => Ok("-".to_string()),
-                }
-            };
-            let trio = match moe {
-                None => "- - -".to_string(),
-                Some(c) => format!(
-                    "{} {} {}",
-                    hex(self.folds.bh && c.miss > 0, Q::Bh)?,
-                    hex(
-                        matches!(self.folds.sc, ScProbe::Full | ScProbe::Line) && c.miss > 0,
-                        Q::Sc
-                    )?,
-                    hex(self.folds.se, Q::Se)?,
-                ),
-            };
-            // A dense layer has no router and no pool, so its five host columns are `-` too.
-            let host = match moe {
-                None => "- - - - -".to_string(),
-                Some(c) => format!(
-                    "{:016x} {:016x} {:016x} {} {}",
-                    c.gl, c.pk, c.sl, c.miss, c.reloc
-                ),
-            };
+                    .get(l * NQ..l * NQ + NQ)
+                    .context("divergence probe: fold slots outside the drained slab")?,
+                self.cols.get(l).copied().flatten(),
+                self.folds,
+            );
             use std::fmt::Write as _;
-            writeln!(
-                self.recs,
-                "{pos} {nrow} {l} {:016x} {h} {:016x} {host} {trio}",
-                at(Q::Xn as usize)?,
-                at(Q::X as usize)?,
-            )
-            .context("divergence probe: formatting a record into the in-memory log")?;
+            writeln!(self.recs, "{row}")
+                .context("divergence probe: formatting a record into the in-memory log")?;
             if let Some(slot) = self.cols.get_mut(l) {
                 *slot = None;
             }
@@ -537,5 +547,102 @@ impl Probe {
             self.recs.lines().count()
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    #![allow(clippy::expect_used)] // a panic in a test is loud and correct; see `fold_tests`
+    use super::{Cols, Folds, NQ, format_row};
+    use crate::fetch::asyncfetch::ScProbe;
+
+    /// **A DISABLED OR ABSENT FOLD PRINTS `-`, NEVER `0`.** The red proof
+    /// `docs/measurement/gate-red-proofs.md` §5g recorded as OWED, now paid.
+    ///
+    /// This is the instrument's one unacceptable failure mode and it has already happened once:
+    /// `xn` was folded on MoE layers only, so GLM's three dense layers carried `0` in both runs of
+    /// a pair, and a diff reads two equal zeros as "attention agreed" when nothing was measured.
+    /// A false EXCLUSION is worse than a missing column, because it is indistinguishable from
+    /// evidence. Every combination that can produce an unmeasured column is enumerated here.
+    ///
+    /// Note the fold words are deliberately all-nonzero, so a `-` in the output can only come from
+    /// the rule and never from the data happening to be zero.
+    #[test]
+    fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
+        let w: Vec<u64> = (1..=NQ as u64).collect();
+        let cols = |miss: u64| {
+            Some(Cols {
+                gl: 0xA,
+                pk: 0xB,
+                sl: 0xC,
+                miss,
+                reloc: 0,
+            })
+        };
+        let all = Folds {
+            bh: true,
+            sc: ScProbe::Full,
+            se: true,
+        };
+        let field = |row: &str, i: usize| row.split_whitespace().nth(i).expect("field").to_string();
+        // One helper for "every fetch-path column is unmeasured", because the two sites that assert
+        // it differ only in WHY — and rustfmt made them identical text, which the duplication gate
+        // then reported.
+        let fetch_all_dash = |row: &str, why: &str| {
+            for c in [11, 12, 13] {
+                assert_eq!(field(row, c), "-", "{why}");
+            }
+        };
+        // Columns: 0 pos, 1 nrow, 2 layer, 3 xn, 4 h, 5 x, 6..10 host, 11 bh, 12 sc, 13 se.
+        let (bh, sc, se, h) = (11, 12, 13, 4);
+
+        // A DENSE layer: no router, no pool, no moe_hidden. `xn`/`x` are still measured.
+        let r = format_row(7, 1, 3, &w, None, all);
+        assert_eq!(field(&r, h), "-", "a dense layer has no h");
+        fetch_all_dash(&r, "a dense layer folds nothing on the fetch path");
+        assert_ne!(
+            field(&r, 3),
+            "-",
+            "xn is folded on EVERY layer — that was the bug"
+        );
+        assert_ne!(field(&r, 5), "-", "and so is x");
+
+        // A MoE layer with NO MISS: nothing was copied, so bh/sc cannot exist; se still can.
+        let r = format_row(7, 1, 4, &w, cols(0), all);
+        assert_eq!(field(&r, bh), "-");
+        assert_eq!(field(&r, sc), "-");
+        assert_ne!(
+            field(&r, se),
+            "-",
+            "se is folded on every MoE layer, misses or not"
+        );
+
+        // Folds DISABLED by the flag, with a miss present: still `-`, for a different reason.
+        let r = format_row(7, 1, 4, &w, cols(1), Folds::default());
+        fetch_all_dash(&r, "a fold the run did not enable is not measured");
+
+        // `sc-spin` writes a word so its loop survives, but that word is a function of the launch
+        // geometry — it must NOT be printed as if it were a payload hash.
+        let spin = Folds {
+            bh: false,
+            sc: ScProbe::Spin,
+            se: false,
+        };
+        assert_eq!(
+            field(&format_row(7, 1, 4, &w, cols(1), spin), sc),
+            "-",
+            "sc-spin's output is not a payload hash and must not look like one"
+        );
+
+        // ...and when everything IS measured, every column is a hash. Without this the assertions
+        // above are satisfied by a formatter that prints `-` unconditionally.
+        let r = format_row(7, 1, 4, &w, cols(1), all);
+        for c in [h, bh, sc, se] {
+            assert_ne!(
+                field(&r, c),
+                "-",
+                "an enabled, applicable fold must print its hash"
+            );
+        }
     }
 }
