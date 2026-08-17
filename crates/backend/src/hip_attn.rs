@@ -230,6 +230,55 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// **Bidirectional block attention: the DFlash drafter's attend** (M17c). The same GQA
+    /// operator as [`launch_gqa_attend`] with one difference that is the whole point — the
+    /// drafter denoises a 16-row block at once, so a query attends LATER rows of its own block,
+    /// which a causal bound forbids.
+    ///
+    /// `q`/`out` are `[tq][hq][d]`, `k`/`v` are `[kv_len][hkv][d]` LINEAR — no ring, because the
+    /// drafter rebuilds `ctx + block` rows for every drafted block rather than rolling a cache.
+    /// That absence is why there is no `ring_cap`: `launch_gqa_attend`'s
+    /// `ring_cap >= win + tq - 1` guard exists for a multi-row batch reading a slot it
+    /// overwrote, and with no ring the failure mode is unspellable.
+    ///
+    /// **`q_offset` is the CONTEXT LENGTH, not a decode position, and it is not optional.** The
+    /// reference's overlay is `abs(q_idx - kv_idx) <= win` with `q_idx = row + q_offset`, and
+    /// `masking_utils.py` takes `q_offset` from the cache when one is present and **0 when it is
+    /// not**. Pass `ctx` in decode; pass `0` only to reproduce a vendored S1b golden, which was
+    /// captured with `use_cache=False`. At the shipped ctx 4096 / block 16 / win 2048, passing 0
+    /// gives **0 of 256** block-vs-block pairs — the block never attends itself, the drafter is
+    /// a context-reader, and every shape and byte count still checks out.
+    ///
+    /// **`kv_len` is taken, not derived**, because this bound runs PAST `pos` and the buffer's
+    /// extent is the only thing that stops it.
+    ///
+    /// # Safety
+    /// Async device pointers live until the next [`device_sync`]: `q` (`tq·hq·d` f32), `k` and
+    /// `v` (`kv_len·hkv·d` f32 each), `out` (`tq·hq·d` f32). `k`/`v` must hold **`kv_len` rows**,
+    /// not `q_offset + tq` — the bidirectional upper bound reads up to `q_offset + tq - 1 + win`,
+    /// clamped to `kv_len - 1` by the kernel, so a `kv_len` larger than the allocation is an
+    /// out-of-bounds read that no argument guard can see.
+    ///
+    /// Three defects here are invisible to the vendored goldens — the `q_offset` branch, the
+    /// inclusive-vs-strict lower edge, and the target's `qk_scale_factor` leaking in. They are
+    /// gated deviceless from the shipped config by `crates/cli/tests/drafter_convert.rs`;
+    /// `glimmer-reference/drafter-checkpoint.md` carries the measurements.
+    launch_gqa_block_attend -> rivoli_gqa_block_attend, "gqa_block_attend" (
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        hq: usize as i32,
+        hkv: usize as i32,
+        d: usize as i32,
+        tq: usize as i32,
+        q_offset: usize as i32,
+        win: usize as i32,
+        kv_len: usize as i32,
+        scale: f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// Dense multi-head attention over explicit per-head K and V: Kimi-K3's gated MLA core.
     /// Ported from `k3:src/backend/hip.rs` (M9).
     ///

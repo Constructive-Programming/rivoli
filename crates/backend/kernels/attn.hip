@@ -662,6 +662,171 @@ extern "C" int rivoli_gqa_attend(const float* q, const float* k, const float* v,
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════
+// Bidirectional block attention — the DFlash drafter's attend
+// ═══════════════════════════════════════════════════════════════════════════════════
+//
+// Used by Muse Glimmer's DFlash block drafter (M17c): 5 layers, 32 Q / 8 KV heads, head_dim
+// 128, `block_size` 16, `sliding_window` 2048 on all five layers. The drafter denoises a
+// whole 16-row block at once, so its queries attend BIDIRECTIONALLY to each other — a query
+// sees LATER rows of its own block — while `gqa_attend` above is causal. That one property is
+// the whole reason this kernel exists; everything else about it is the same operator.
+//
+//     out[i][h] = Σ_j softmax_j( q[i][h] · k[j][h/group] · scale ) · v[j][h/group]
+//                 over  j ∈ [pos - win, pos + win] ∩ [0, kv_len)
+//
+// THREE THINGS ARE LOAD-BEARING AND EACH IS A DEFECT THE VENDORED S1b GOLDENS SCORE GREEN ON.
+// They are gated instead by `crates/cli/tests/drafter_convert.rs`, deviceless, from the
+// shipped config; `glimmer-reference/drafter-checkpoint.md` carries the measurements.
+//
+//  1. **`q_offset` IS THE CONTEXT LENGTH, NOT A DECODE POSITION.** The reference's overlay is
+//     `abs(q_idx - kv_idx) <= win` with `q_idx = row + q_offset`, and
+//     `masking_utils.py::_preprocess_mask_arguments` takes `q_offset` from the cache when one
+//     is present and **0 when it is not**. The anchor ran `use_cache=False` (a fresh
+//     `DFlashCache` reports `kv_length` 0), so every vendored golden pins the `q_offset = 0`
+//     branch. At the fixture's ctx 12 / block 4 / win 13 that is 13 of 16 block-vs-block pairs;
+//     at the shipped ctx 4096 / block 16 / win 2048 the SAME expression gives **0 of 256** —
+//     `q_idx <= 15` cannot reach `kv >= ctx` once `ctx > win`, so the block would not attend
+//     itself at all and the drafter degenerates to a context-reader that still returns finite
+//     logits. The caller passes `ctx` in decode and `0` only to reproduce a golden.
+//  2. **THE LOWER EDGE IS INCLUSIVE: `pos - win`, NOT `pos - win + 1`.** `gqa_attend`'s is
+//     `pos - win + 1` because the reference's CAUSAL overlay is `kv_idx > q_idx - win`, strict,
+//     and its own comment calls that off-by-one "trap 14". The BIDIRECTIONAL overlay is
+//     `abs(q_idx - kv_idx) <= win`, inclusive on both sides. Copying `gqa_attend`'s `lo` drops
+//     exactly one KV row per query row — 16 at the shipped geometry — and **the fixture cannot
+//     see it at all**: at ctx 12 with win 13 the lower edge is negative for every row and
+//     clamps to 0 either way. Of the three, this is the one no golden can ever catch.
+//  3. **No ring, deliberately.** The drafter's K/V is `ctx + block` linear rows rebuilt for
+//     each drafted block, never a rolling cache, so `ring_cap` is absent rather than passed as
+//     0. `gqa_attend` needs a `ring_cap >= win + tq - 1` guard because its multi-row batch can
+//     read a slot its own batch overwrote; with no ring that failure mode is unspellable here.
+//
+// `kv_len` is taken rather than derived. `gqa_attend` derives its upper bound (`hi = pos`, the
+// causal one) and needs no length; this bound runs PAST `pos`, so the buffer's extent is the
+// only thing that stops it and a kernel that guessed it would read off the end.
+//
+// Q arrives POST-`q_norm` and POST-rope, K POST-`k_norm` and POST-rope; this kernel applies
+// only `scale`, which is `head_dim**-0.5`. Unlike the target, the drafter has no
+// `qk_scale_factor` — §11's drafter is a plain GQA block, and passing the target's 3.87 here is
+// a defect the oracle plants as `TargetGrouping`'s sibling. Layout is the engine's
+// `[row][head][dim]`.
+//
+// ponytail: one subgroup per (block row, Q head) — grid (hq, tq) is 32x16 = 512 blocks against
+// 40 CUs, which unlike `gqa_attend`'s 32-block decode launch actually fills the device, so the
+// per-block KV sweep being serialised matters less here. Not tuned; `GQA_TILE` is still unswept
+// (see its definition) and this kernel adds no new constant to guess at.
+#pragma clang fp contract(off)
+extern "C" __global__ void gqa_block_attend(
+    const float* __restrict__ q,   // [tq*hq*d]     post-norm, post-rope
+    const float* __restrict__ k,   // [kv_len*hkv*d] linear: context rows then the block's own
+    const float* __restrict__ v,   // [kv_len*hkv*d]
+    int hq, int hkv, int d, int q_offset, int win, int kv_len, float scale,
+    float* __restrict__ out) {     // [tq*hq*d]
+    extern __shared__ float smem[];
+    float* Kt = smem;                     // [GQA_TILE*d] staged key tile
+    float* Vt = Kt + GQA_TILE * d;        // [GQA_TILE*d] staged value tile
+
+    const int lane = (int)threadIdx.x;
+    const int head = (int)blockIdx.x, row = (int)blockIdx.y;
+    const int kvh = head / (hq / hkv);    // block repeat, not an interleave — `gqa_attend` item 1
+    const int pos = q_offset + row;       // item 1: q_offset is ctx in decode, 0 for a golden
+    // Item 2: INCLUSIVE both sides. `pos - win`, never `pos - win + 1`.
+    const int lo = max(0, pos - win);
+    const int hi = min(kv_len - 1, pos + win);
+    const int nacc = (d + GQA_THREADS - 1) / GQA_THREADS;
+
+    const float* qrow = q + ((size_t)row * hq + head) * d;
+    float qv[GQA_ACC];
+#pragma unroll
+    for (int c = 0; c < GQA_ACC; ++c) {
+        const int i = lane + c * GQA_THREADS;
+        qv[c] = (c < nacc && i < d) ? qrow[i] : 0.0f;
+    }
+
+    float acc[GQA_ACC] = {0};
+    float m = -INFINITY, l = 0.0f;
+
+    for (int j0 = lo; j0 <= hi; j0 += GQA_TILE) {
+        const int cnt = min(GQA_TILE, hi - j0 + 1);
+        // Item 3: linear, no slot mapping. K and V share the index.
+        for (int idx = lane; idx < cnt * d; idx += GQA_THREADS) {
+            const int tt = idx / d, c = idx - tt * d;
+            const size_t at = ((size_t)(j0 + tt) * (size_t)hkv + (size_t)kvh) * (size_t)d + (size_t)c;
+            Kt[idx] = k[at];
+            Vt[idx] = v[at];
+        }
+        __syncthreads();
+
+        for (int tt = 0; tt < cnt; ++tt) {
+            float part = 0.0f;
+#pragma unroll
+            for (int c = 0; c < GQA_ACC; ++c) {
+                const int i = lane + c * GQA_THREADS;
+                if (c < nacc && i < d) part += qv[c] * Kt[tt * d + i];
+            }
+            for (int off = GQA_THREADS / 2; off > 0; off >>= 1)
+                part += __shfl_down(part, off, GQA_THREADS);
+            const float s = __shfl(part, 0, GQA_THREADS) * scale;
+
+            const float mx = fmaxf(m, s);
+            const float rescale = expf(m - mx), w = expf(s - mx);
+#pragma unroll
+            for (int c = 0; c < GQA_ACC; ++c) {
+                const int i = lane + c * GQA_THREADS;
+                if (c < nacc && i < d) acc[c] = acc[c] * rescale + w * Vt[tt * d + i];
+            }
+            l = l * rescale + w;
+            m = mx;
+        }
+        __syncthreads();  // tile consumed before the next load overwrites it
+    }
+
+    // Unguarded, for `gqa_attend`'s reason: a query that attended to nothing must poison its
+    // output rather than return a plausible 0. Here `lo > hi` is reachable ONLY by a caller
+    // that placed the block outside its own K/V buffer (`q_offset - win > kv_len - 1`), which
+    // the launcher rejects — so an inf reaching a tensor means the launcher's guard was
+    // bypassed, and that is worth more than a zero.
+    const float inv = 1.0f / l;
+    float* orow = out + ((size_t)row * hq + head) * d;
+#pragma unroll
+    for (int c = 0; c < GQA_ACC; ++c) {
+        const int i = lane + c * GQA_THREADS;
+        if (c < nacc && i < d) orow[i] = acc[c] * inv;
+    }
+}
+
+// Takes a STREAM. Return codes: 0 = success, POSITIVE = arg guard, NEGATIVE = -(hipError_t).
+// The codes are `gqa_attend`'s, deliberately: 1001 arg range, 1002 size bound, 1003 grouping,
+// 1005 geometry — a caller switching between the two attends reads one table.
+extern "C" int rivoli_gqa_block_attend(const float* q, const float* k, const float* v, int hq,
+                                      int hkv, int d, int tq, int q_offset, int win, int kv_len,
+                                      float scale, float* out, void* stream) {
+    if (hq <= 0 || hkv <= 0 || d <= 0 || tq <= 0 || q_offset < 0 || kv_len <= 0) return 1001;
+    // **`win > 0`, unlike `gqa_attend` where 0 means a global layer.** All five drafter layers
+    // are `sliding_attention` (`DrafterConfig::validate` refuses any other `layer_types`), and
+    // a bidirectional bound with win 0 is the identity mask on the diagonal — every query
+    // attending only its own index, which is not an operator this model has.
+    if (win <= 0) return 1001;
+    if (hq % hkv) return 1003;
+    if (d > GQA_THREADS * GQA_ACC) return 1002;
+    // The block must fit in its own K/V buffer, and the FIRST row must be able to see
+    // something: `lo > hi` for row 0 means the block was placed past the buffer entirely. Rows
+    // above 0 only push `lo` further right, so row 0 is not the binding case — row `tq-1` is,
+    // and its `lo` is `q_offset + tq - 1 - win`.
+    if (kv_len < tq) return 1005;
+    if (q_offset + tq - 1 - win > kv_len - 1) return 1005;
+    static_assert(2 * GQA_TILE * (GQA_THREADS * GQA_ACC) * sizeof(float) <= 65536,
+                  "GQA_TILE/GQA_ACC now allow an LDS request past gfx1151's 64 KB");
+    const size_t lds = 2 * (size_t)GQA_TILE * (size_t)d * sizeof(float);
+    hipGetLastError();
+    hipLaunchKernelGGL(gqa_block_attend, dim3((unsigned)hq, (unsigned)tq), dim3(GQA_THREADS),
+                       (unsigned)lds, (hipStream_t)stream, q, k, v, hq, hkv, d, q_offset, win,
+                       kv_len, scale, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+
 // **Dense multi-head attention over an EXPLICIT per-head K and V.** One block per head.
 // Ported verbatim from `k3:kernels/attn.hip` (M9); only the pointer to `mla_latent_attend`'s
 // position moved, because this file keeps the absorbed operator ABOVE rather than below.

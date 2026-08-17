@@ -39,6 +39,13 @@ const DEFERRED: &[(&str, &str)] = &[
     // out-of-place gate fixture took the one-buffer adaptation in `kernel_k3_attend.rs`. The
     // table can only shrink — within one architecture's port; the next port adds rows and
     // then removes them, and that cycle is the design.)
+    //
+    // **THIRD TURN, opened 2026-08-17 by M17c with exactly one row.** The cycle above predicted
+    // it: "the next port adds rows and then removes them".
+    (
+        "gqa_block_attend",
+        "M17c — the DFlash drafter's bidirectional block attend. The kernel and launcher landed          2026-08-17 with three defects the vendored S1b goldens provably CANNOT catch (the          q_offset branch, the inclusive-vs-strict lower edge, the target's qk_scale_factor          leaking in), so its oracle is not just absent, it is the piece that has to be designed          rather than ported: scoring at q_offset=0 against the re-vendored draft goldens covers          the arithmetic and NONE of those three. The deviceless half is already gated from the          shipped config in crates/cli/tests/drafter_convert.rs. Arrives with the on-device          oracle, which needs a GPU this agent does not hold.",
+    ),
 ];
 
 /// Launcher names in `text`, under both declaration forms (hand-written `pub unsafe fn

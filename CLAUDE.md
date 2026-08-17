@@ -87,7 +87,11 @@ appears that enum dispatch cannot fill.
   reference ids, a live serve round-trip (readiness, /v1/models, non-stream, SSE).
   On-demand (GPU, ~45 min), not CI. Red-proofed 2026-08-16 (wrong fragment reddens).
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
-  suite or a live deferral, checked both ends; 60/60/0 since M9. **INV-n registry** —
+  suite or a live deferral, checked both ends; 60/60/0 from M9 until **2026-08-17, now
+  61/60/1** — M17c's `gqa_block_attend` (the DFlash drafter's bidirectional block attend)
+  landed with its launcher and a DEFERRED row, opening the table's **third** turn after
+  two full empty-to-empty cycles. Its oracle needs a GPU and is the row's stated arrival;
+  the deviceless half is already gated in `crates/cli/tests/drafter_convert.rs`. **INV-n registry** —
   `crates/cli/tests/invariants.rs`, doc-and-test must move together. **feature matrix** —
   `tests/feature-matrix.sh` + `crates/cli/tests/matrix.rs` (lists derived from the
   manifests; the resolve cell proves `--no-default-features` is genuinely deviceless).
