@@ -44,6 +44,22 @@ pub const SPECIAL_SLOTS: usize = 256;
 /// base64 blob pasted into a prompt does.
 pub const MAX_SAME_CLASS_RUN: usize = 25_000;
 
+/// The reference's OUTER cap, `TIKTOKEN_MAX_ENCODE_CHARS` — characters per encode call.
+///
+/// > **PORTED 2026-08-17, after first being declared unreachable and left out. That was wrong,
+/// > and review produced the counterexample.** The claim was that `ATTEND_MAX_KV` 8192 tokens is
+/// > ~32 KB of text, so 400,000 characters cannot be reached — which divides characters by
+/// > TOKENS. The longest token in this vocabulary is **256 bytes**, so 8192 tokens can carry
+/// > ~2.1 M characters and the cap sits *below* the reachable budget rather than far above it.
+/// > Measured: `" " + "*".repeat(420_000)` is **1,664 ids** — comfortably inside `--ctx 8192` —
+/// > and the reference returns **1,666** for it.
+/// >
+/// > The mechanism is that the reference restarts the inner run counter at each outer boundary
+/// > and the unported version did not, so the two diverge whenever character 400,000 falls
+/// > mid-run and off the inner grid. `"*".repeat(400_001)` is NOT a counterexample
+/// > (400,000 = 16 x 25,000 lands on the grid), which is how spot-checking missed it.
+pub const MAX_ENCODE_CHARS: usize = 400_000;
+
 /// The pre-tokenizer pattern, character for character from `tokenization_kimi.py`'s `pat_str`.
 ///
 /// Pinned by string equality against the driver's copy (`tests/k3-tokenizer-cases.json` carries
@@ -159,6 +175,18 @@ impl Vocab {
             special_id.insert(name.clone(), id);
             special_name.insert(id, name);
         }
+        // **Distinct, and last-write-wins would hide it.** `special_id` is a name→id map, so a
+        // config whose `added_tokens_decoder` content collides with another entry — or with a
+        // `<|reserved_token_N|>` spelling — silently yields fewer than 256 entries: one id becomes
+        // unencodable while `special_name` still decodes to a spelling that re-encodes to a
+        // DIFFERENT id. 256/256 distinct on the shipped config (2026-08-17); asserted because the
+        // failure is a silent id substitution, not an error.
+        ensure!(
+            special_id.len() == SPECIAL_SLOTS,
+            "the special block has {} distinct spellings for {SPECIAL_SLOTS} ids — two entries \
+             collide, so one id cannot be encoded and decode/encode are no longer inverse",
+            special_id.len()
+        );
         let named_outside: Vec<&u32> = named
             .keys()
             .filter(|id| (**id as usize) < num_base || (**id as usize) >= num_base + SPECIAL_SLOTS)
@@ -200,6 +228,48 @@ impl Vocab {
         self.bytes_of.len()
     }
 
+    /// The first base token mixing Han with non-Han, as `(rank, text)`.
+    ///
+    /// **A tripwire on a PREMISE, not a correctness check.** The `PAT_STR` Han intersections are
+    /// invisible to id equality precisely because no such token exists (see `PAT_STR`), so BPE
+    /// reconstructs the split the clauses would have made. If a future vocabulary ships one, the
+    /// reasoning changes — id equality starts covering the intersections — and the gate that
+    /// calls this reddens to say so rather than letting a stale argument outlive its evidence.
+    ///
+    /// A method rather than a loop inside the test, so the same definition serves the real
+    /// vocabulary and the synthetic one a unit test can build (which is what proves the tripwire
+    /// fires at all, and lands that proof in CI where no checkpoint exists).
+    pub fn mixed_script_token(&self) -> Option<(u32, String)> {
+        // `[^\p{Han}]` in the pattern's OWN terms, not a hand-rolled codepoint range.
+        let han = fancy_regex::Regex::new(r"\p{Han}").ok()?;
+        let other = fancy_regex::Regex::new(r"[^\p{Han}]").ok()?;
+        (0..self.bytes_of.len() as u32).find_map(|rank| {
+            // A partial UTF-8 sequence cannot mix scripts as text; byte-level BPE guarantees
+            // nothing else, so those are skipped rather than counted.
+            let s = std::str::from_utf8(self.token_bytes(rank)?).ok()?;
+            let mixed = han.is_match(s).unwrap_or(false) && other.is_match(s).unwrap_or(false);
+            mixed.then(|| (rank, s.to_string()))
+        })
+    }
+
+    /// A special spelling that is a strict prefix of another, as `(shorter, longer)`.
+    ///
+    /// **[`Self::find_special`] takes the LONGEST match at the earliest position; tiktoken matches
+    /// by regex alternation, which is leftmost-FIRST-alternative.** Those two rules agree only
+    /// while no spelling is a prefix of another — verified over all 256 of K3's (zero prefix
+    /// pairs, 2026-08-17), and asserted rather than assumed because a checkpoint that added, say,
+    /// `<|sep|>` beside `<|sep|>2` would make the two encoders disagree with nothing to notice.
+    pub fn prefixed_special(&self) -> Option<(String, String)> {
+        let mut names: Vec<&String> = self.special_id.keys().collect();
+        names.sort();
+        names.iter().enumerate().find_map(|(i, a)| {
+            names[i + 1..]
+                .iter()
+                .find(|b| b.starts_with(a.as_str()) && b.len() > a.len())
+                .map(|b| ((*a).clone(), (*b).clone()))
+        })
+    }
+
     /// One base token's bytes, by rank. `None` above [`Self::num_base`].
     ///
     /// Exists for the gate that checks WHY `PAT_STR`'s Han intersections are invisible to id
@@ -233,20 +303,25 @@ impl Vocab {
     ///   user-supplied string reaches here** — otherwise a prompt containing that spelling
     ///   injects the model's stop token and the decode ends early on the user's own text.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        self.encode_capped(text, MAX_SAME_CLASS_RUN)
+        self.encode_capped(text, MAX_ENCODE_CHARS, MAX_SAME_CLASS_RUN)
     }
 
-    /// [`Self::encode`] with the same-class run cap as a parameter.
+    /// [`Self::encode`] with both caps as parameters.
     ///
-    /// A parameter rather than a constant read from inside, for the reason
-    /// `format::layer::write_expert_layer`'s `window` is one: it lets the gate reach the
-    /// chunking BOUNDARY without a 25,000-character fixture. Nothing but a test should pass
-    /// anything other than [`MAX_SAME_CLASS_RUN`].
-    pub fn encode_capped(&self, text: &str, max_run: usize) -> Result<Vec<u32>> {
-        ensure!(max_run > 0, "max_run must be positive");
+    /// Parameters rather than constants read from inside, for the reason
+    /// `format::layer::write_expert_layer`'s `window` is one: it lets a gate reach either
+    /// BOUNDARY without a 400,000-character fixture. Nothing but a test should pass anything
+    /// other than [`MAX_ENCODE_CHARS`] and [`MAX_SAME_CLASS_RUN`].
+    pub fn encode_capped(&self, text: &str, max_chars: usize, max_run: usize) -> Result<Vec<u32>> {
+        ensure!(max_chars > 0 && max_run > 0, "both caps must be positive");
         let mut out = Vec::new();
-        for chunk in split_same_class_runs(text, max_run) {
-            self.encode_chunk(chunk, &mut out)?;
+        // BOTH caps, nested as `_encode_text_piece` nests them: the outer one slices characters
+        // and the inner run counter RESTARTS inside each slice. That restart is the entire
+        // observable difference — see [`MAX_ENCODE_CHARS`].
+        for outer in char_chunks(text, max_chars) {
+            for chunk in split_same_class_runs(outer, max_run) {
+                self.encode_chunk(chunk, &mut out)?;
+            }
         }
         Ok(out)
     }
@@ -302,44 +377,63 @@ impl Vocab {
 
     /// Byte-pair encode one pre-tokenized piece, appending its ids.
     ///
-    /// Merges the lowest-rank adjacent pair until none is in the vocabulary — the standard
-    /// tiktoken merge, written straightforwardly rather than with the reference's
-    /// index-threading optimisation. Pieces are single words (the pre-tokenizer guarantees it),
-    /// so the quadratic scan is over a handful of bytes; the vocabulary lookup dominates.
+    /// Merges the **leftmost lowest-rank** adjacent pair until none is in the vocabulary — exactly
+    /// tiktoken's `_byte_pair_merge` rule, tie-break included: both scan for the minimum with a
+    /// strict `<` left to right, so equal ranks resolve to the earlier position and merge order
+    /// cannot diverge.
     ///
-    /// **The equivalence to the reference is MEASURED, not reasoned.** "Repeatedly merge the
-    /// globally lowest-rank adjacent pair" is the same function as tiktoken's threaded loop only
-    /// if merge order cannot change the outcome, which is an argument about ties that is easy to
-    /// get wrong on paper. So it was fuzzed differentially against the first-party encoder
-    /// (2026-08-17): **13,400 texts, 473,049 ids, zero mismatches.** Two corpora — 5,000 random
-    /// strings over twelve alphabets (Latin both cases, digits, whitespace, punctuation, Han,
-    /// accented Latin, Cyrillic, Arabic, emoji with ZWJ, special-token spellings, control bytes)
-    /// plus 1,000 targeted whitespace/script-boundary storms; then 8,400 more weighted toward
-    /// DEEP merges — single pieces of 8..200 characters with no whitespace, so the loop runs to
-    /// its full depth — plus long prose and 600 lossily-decoded random byte strings. `decode`
-    /// round-tripped every row.
+    /// **The equivalence is MEASURED, not reasoned.** Differentially fuzzed against the
+    /// first-party encoder (2026-08-17): **8,372 texts, 3,523,794 ids, zero mismatches**, twelve
+    /// alphabets plus deep-merge pieces, 800 lossily-decoded random byte strings, and 57 rows
+    /// that straddle BOTH caps (24,999 / 25,000 / 25,001 / 26,000 / 399,999 / 400,000 / 400,001 /
+    /// 420,000 characters over six repeated characters). `decode` round-tripped every row. Review
+    /// reproduced the earlier round independently at 13,000 / 490,925 / 0.
     ///
-    /// That corpus is not vendored: the 95 curated cases in `tests/k3-tokenizer-cases.json` are
-    /// the standing gate because each targets a named `pat_str` clause, and a megabyte of random
-    /// strings would gate the same algorithm with far less to say about which clause broke. The
-    /// numbers above are the one-time evidence that the merge itself is right; regenerate with
-    /// the driver's constants against the shipped vocabulary if `bpe` is ever rewritten.
+    /// > **The reference in that harness has to be `_encode_text_piece`, not `Encoding.encode`.**
+    /// > An earlier corpus called tiktoken directly and so applied NEITHER cap; it reported three
+    /// > mismatches on 26,000-character runs, and the ids it called correct were the unchunked
+    /// > ones. The loader was right and the harness was wrong — which would have "fixed" working
+    /// > code had the three failures been taken at face value instead of localised. Any future
+    /// > re-fuzz must go through both caps.
+    ///
+    /// **Threaded rather than rescanned, and the old justification for rescanning was false.**
+    /// The first version re-probed every adjacent pair in the `HashMap` each merge round — O(n²)
+    /// hashed byte-slice lookups — on the argument that "pieces are single words". `PAT_STR` does
+    /// not guarantee that: `\s+`, ` ?[^\s\p{L}\p{N}]+` and `[\p{Han}]+` are unbounded, so a pasted
+    /// separator line or an unbroken CJK run arrives as ONE piece at the inner cap — 25,000
+    /// characters, which for Han is **75,000 bytes**, about 2.8x10⁹ hashed probes and tens of
+    /// seconds. That contradicted this file's own [`MAX_SAME_CLASS_RUN`] doc, which says such runs
+    /// are reachable. Each merge now updates only the two neighbouring pair ranks: probes are
+    /// O(n) and the remaining O(n²) is an integer scan, the same shape tiktoken has.
+    ///
+    /// `u32::MAX` is the "not a token" sentinel, safe because [`parse_ranks`] proves the ranks are
+    /// dense `0..num_base` and no vocabulary approaches 2³²−1.
     fn bpe(&self, piece: &[u8], out: &mut Vec<u32>) -> Result<()> {
         if piece.is_empty() {
             return Ok(());
         }
-        // The whole piece is usually a token already — the common case for any word the
-        // vocabulary carries, and it skips the merge loop entirely.
+        // The whole piece is usually a token already. Also required: the merge below assumes at
+        // least two bytes, exactly as tiktoken's `byte_pair_encode` asserts `len > 1`.
         if let Some(&rank) = self.ranks.get(piece) {
             out.push(rank);
             return Ok(());
         }
-        let mut cuts: Vec<usize> = (0..=piece.len()).collect();
-        while let Some(at) = self.lowest_pair(piece, &cuts) {
-            cuts.remove(at + 1);
+        // `parts[i] = (start offset, rank of the pair starting there)`, plus two sentinels so the
+        // final window walk and the neighbour update need no bounds special-casing.
+        let mut parts: Vec<(usize, u32)> = (0..piece.len() - 1)
+            .map(|i| (i, self.rank_of(&piece[i..i + 2])))
+            .collect();
+        parts.push((piece.len() - 1, u32::MAX));
+        parts.push((piece.len(), u32::MAX));
+        while let Some(at) = lowest(&parts) {
+            if at > 0 {
+                parts[at - 1].1 = self.pair_rank(piece, &parts, at - 1);
+            }
+            parts[at].1 = self.pair_rank(piece, &parts, at);
+            parts.remove(at + 1);
         }
-        for w in cuts.windows(2) {
-            let part = &piece[w[0]..w[1]];
+        for w in parts.windows(2) {
+            let part = &piece[w[0].0..w[1].0];
             let &rank = self.ranks.get(part).with_context(|| {
                 format!(
                     "no rank for {part:?} — every part is a merged pair or a lone byte, and all \
@@ -351,22 +445,16 @@ impl Vocab {
         Ok(())
     }
 
-    /// Index in `cuts` of the adjacent pair with the lowest rank, if any pair is a token.
-    ///
-    /// Split out from [`Self::bpe`] so the merge loop reads as one statement; `bpe` was a
-    /// single function with three nested blocks and the cohesion gate prefers this shape.
-    fn lowest_pair(&self, piece: &[u8], cuts: &[usize]) -> Option<usize> {
-        let mut best: Option<(u32, usize)> = None;
-        for at in 0..cuts.len().saturating_sub(2) {
-            let pair = &piece[cuts[at]..cuts[at + 2]];
-            let Some(&rank) = self.ranks.get(pair) else {
-                continue;
-            };
-            if best.is_none_or(|(seen, _)| rank < seen) {
-                best = Some((rank, at));
-            }
-        }
-        best.map(|(_, at)| at)
+    /// The rank of the pair that would result from merging at `at`, or `u32::MAX`.
+    fn pair_rank(&self, piece: &[u8], parts: &[(usize, u32)], at: usize) -> u32 {
+        parts
+            .get(at + 3)
+            .map_or(u32::MAX, |&(end, _)| self.rank_of(&piece[parts[at].0..end]))
+    }
+
+    /// A pair's rank, or `u32::MAX` when it is not a token.
+    fn rank_of(&self, pair: &[u8]) -> u32 {
+        self.ranks.get(pair).copied().unwrap_or(u32::MAX)
     }
 
     /// Decode a whole id sequence, special spellings included.
@@ -392,6 +480,21 @@ impl Vocab {
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+/// Index of the leftmost lowest-rank mergeable pair, or `None` when none is a token.
+///
+/// Free rather than a method because it reads only the threaded rank column. The final entry is a
+/// sentinel and never a pair, hence the `len() - 1`.
+fn lowest(parts: &[(usize, u32)]) -> Option<usize> {
+    let mut best: Option<(u32, usize)> = None;
+    for (at, &(_, rank)) in parts[..parts.len() - 1].iter().enumerate() {
+        // Strict `<` keeps the LEFTMOST of equal ranks — tiktoken's tie-break.
+        if rank != u32::MAX && best.is_none_or(|(seen, _)| rank < seen) {
+            best = Some((rank, at));
+        }
+    }
+    best.map(|(_, at)| at)
 }
 
 /// Parse `<base64> <rank>` lines into the dense `rank -> bytes` table.
@@ -474,6 +577,27 @@ fn named_specials(dir: &str) -> Result<HashMap<u32, String>> {
     Ok(out)
 }
 
+/// Slice `s` into runs of at most `max_chars` CHARACTERS — the reference's outer chunk.
+///
+/// Characters, not bytes: the reference indexes a Python `str`, so its boundary falls on
+/// codepoints. A byte slice would both land elsewhere and risk splitting one.
+fn char_chunks(s: &str, max_chars: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut n) = (0usize, 0usize);
+    for (at, _) in s.char_indices() {
+        if n == max_chars {
+            out.push(&s[start..at]);
+            start = at;
+            n = 0;
+        }
+        n += 1;
+    }
+    // Always pushes a final slice, so `""` yields `[""]` — `split_same_class_runs` is written for
+    // that and the empty case must still reach it.
+    out.push(&s[start..]);
+    out
+}
+
 /// Split so no chunk holds more than `max_run` consecutive whitespace or non-whitespace
 /// characters — `tokenization_kimi.py`'s `_split_whitespaces_or_nonwhitespaces`.
 ///
@@ -508,7 +632,9 @@ fn split_same_class_runs(s: &str, max_run: usize) -> Vec<&str> {
 mod tests {
     // Crate-wide `unwrap`/`expect` are deny; a firing one in a unit test IS the report, and
     // these cases carry no checkpoint to be missing.
-    #![allow(clippy::unwrap_used)]
+    // Crate-wide `unwrap`/`expect` are deny; in a unit test a firing one IS the report, and
+    // these fixtures carry no checkpoint that could be legitimately missing.
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
     use super::*;
 
     /// The pattern must COMPILE under the engine that has to run it, and SPLIT as the reference
@@ -517,7 +643,7 @@ mod tests {
     /// `fancy-regex` — not `regex` — is the right dependency.
     ///
     /// **Load-bearing for the Han intersections, which id equality cannot see** (see `PAT_STR`).
-    /// The `"hello你好"` row observes the split BEHAVIOURALLY rather than comparing pattern text,
+    /// The `"AB你好c"` row observes the split BEHAVIOURALLY rather than comparing pattern text,
     /// so it reddens on a broken intersection even though every id stays identical — measured
     /// 2026-08-17. Checkpoint-free, so this is one of the few gates on this arm that asserts in
     /// CI rather than skipping.
@@ -536,11 +662,18 @@ mod tests {
             ["a", "   ", " b"],
             "the lookahead is not in effect"
         );
-        // And the class intersection keeps Han out of the Latin run.
+        // And the class intersections keep Han out of the Latin runs. **`AB你好c` rather than
+        // `hello你好`, because there are FOUR intersection clauses and one probe does not see
+        // them all** (measured 2026-08-17, after review pointed out the gap): `hello你好`
+        // detects only alt-2's LOWERCASE clause, and `A你好` — the probe review itself proposed
+        // — detects three of four, missing alt-2's UPPERCASE one. `AB你好c` exercises an
+        // uppercase run, a Han run and a trailing lowercase run in one string, and removing ANY
+        // of the four changes its split. Without it, two of the four clauses had no behavioural
+        // gate at all and rested on string equality alone.
         assert_eq!(
-            split("hello你好"),
-            ["hello", "你好"],
-            "Han was absorbed into a Latin run"
+            split("AB你好c"),
+            ["AB", "你好", "c"],
+            "Han was absorbed into a Latin run — one of the four &&[^Han] clauses is broken"
         );
     }
 
@@ -572,6 +705,80 @@ mod tests {
             err.to_string().contains("of 256 single-byte tokens"),
             "unexpected: {err}"
         );
+    }
+
+    /// A vocabulary with all 256 bytes, plus whatever extra tokens the caller wants. The
+    /// smallest thing `assemble` accepts, so a unit test can exercise a `Vocab` property with no
+    /// checkpoint on disk.
+    fn synthetic(extra: &[&[u8]]) -> Vocab {
+        try_synthetic(extra, HashMap::new()).expect("synthetic vocab")
+    }
+
+    /// The fallible form, and the one that takes NAMED specials. One builder, because three
+    /// fixtures wanted a `Vocab` with no checkpoint and jscpd reported the copies.
+    fn try_synthetic(extra: &[&[u8]], named: HashMap<u32, String>) -> Result<Vocab> {
+        let mut bytes_of: Vec<Vec<u8>> = (0..=u8::MAX).map(|b| vec![b]).collect();
+        bytes_of.extend(extra.iter().map(|b| b.to_vec()));
+        let ranks = ranks_from(&bytes_of);
+        Vocab::assemble(ranks, bytes_of, named)
+    }
+
+    /// **The Han tripwire fires**, proven on a vocabulary that has a mixing token.
+    ///
+    /// Without this the tripwire is a check that has only ever been green, which is the shape the
+    /// house rules refuse. It also lands the proof in CI: the real-vocabulary census needs a 2.7 MB
+    /// `tiktoken.model` and skips without it, while this needs nothing.
+    #[test]
+    fn the_han_mixing_tripwire_fires_on_a_token_that_mixes() {
+        // Clean: single bytes only. A lone byte of a multi-byte codepoint is not valid UTF-8 and
+        // is skipped, so no single-byte vocabulary can mix scripts.
+        assert_eq!(synthetic(&[]).mixed_script_token(), None);
+        // `a` + 你 in ONE token — exactly what would let a byte-pair merge cross the boundary.
+        let v = synthetic(&["a你".as_bytes()]);
+        let (rank, text) = v
+            .mixed_script_token()
+            .expect("the mixing token must be found");
+        assert_eq!((rank, text.as_str()), (256, "a你"));
+        // And Han alone is NOT mixing — otherwise the tripwire would fire on every CJK vocabulary.
+        assert_eq!(synthetic(&["你好".as_bytes()]).mixed_script_token(), None);
+    }
+
+    /// **The prefix tripwire fires.** `find_special` is longest-match; tiktoken is
+    /// leftmost-first-alternative, and the two agree only while no spelling prefixes another.
+    #[test]
+    fn the_special_prefix_tripwire_fires_on_a_prefixed_spelling() {
+        // K3's own 256 positional spellings differ only in an id, so none prefixes another.
+        assert_eq!(synthetic(&[]).prefixed_special(), None);
+        // Name two slots so that one spelling IS a strict prefix of the other.
+        let mut bytes_of: Vec<Vec<u8>> = (0..=u8::MAX).map(|b| vec![b]).collect();
+        bytes_of.push(b"zz".to_vec());
+        let ranks = ranks_from(&bytes_of);
+        let named = HashMap::from([
+            (257u32, "<|s|>".to_string()),
+            (258u32, "<|s|>x".to_string()),
+        ]);
+        let v = Vocab::assemble(ranks, bytes_of, named).expect("synthetic vocab");
+        assert_eq!(
+            v.prefixed_special(),
+            Some(("<|s|>".to_string(), "<|s|>x".to_string()))
+        );
+    }
+
+    /// **The distinctness invariant fires.** Two named slots given the SAME spelling.
+    ///
+    /// Cannot be red-proofed by perturbing the real artifact — no shipped config collides — so the
+    /// proof has to be a synthetic one, and it lands in CI where the artifact never is.
+    #[test]
+    fn colliding_special_spellings_are_refused() {
+        let named = HashMap::from([
+            (257u32, "<|dup|>".to_string()),
+            (258u32, "<|dup|>".to_string()),
+        ]);
+        let err = match try_synthetic(&[b"zz"], named) {
+            Ok(_) => panic!("two ids sharing one spelling was accepted: one is unencodable"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("distinct spellings"), "unexpected: {err}");
     }
 
     #[test]

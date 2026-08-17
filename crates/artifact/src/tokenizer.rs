@@ -604,6 +604,13 @@ impl Tokenizer {
         messages: Vec<crate::v4_encoding::Message>,
         opts: &crate::v4_encoding::EncodeOpts,
     ) -> Result<Vec<u32>> {
+        // The one arm check that is about REACHABILITY rather than today's behaviour.
+        // Unreachable now — `main.rs::frame_prompt` calls this only under `Arch::DeepseekV4`,
+        // and a V4 artifact carries `tokenizer.json` — but it was the only `pub` method whose
+        // tiktoken behaviour was "silently BPE V4's framing through K3's vocabulary" rather
+        // than "refuse loudly", which is the hazard `Vocabulary`'s enum-not-trait argument
+        // exists to prevent. Found by review 2026-08-17.
+        self.hf("DeepSeek-V4 chat framing")?;
         self.encode(&crate::v4_encoding::encode_messages(messages, opts)?)
     }
 

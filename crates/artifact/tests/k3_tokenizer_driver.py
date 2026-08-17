@@ -110,6 +110,65 @@ def split_whitespaces_or_nonwhitespaces(s: str, max_consecutive_slice_len: int):
     yield s[slice_start:]
 
 
+def verify_copies_against_the_checkpoint(src: pathlib.Path) -> dict:
+    """Assert every constant copied below appears VERBATIM in `tokenization_kimi.py`.
+
+    **This closes the one hole in the reference chain.** `PAT_STR`, the two caps and
+    `split_whitespaces_or_nonwhitespaces` are hand copies — deliberately, since importing the real
+    module would drag in `transformers` and let a future refactor there silently redefine "the
+    reference". But the Rust side pins itself against these copies, and the goldens' ids are
+    produced USING them, so a transcription slip would make all thirteen gates agree with the
+    wrong reference and nothing would notice. CLAUDE.md's rule is "never a transliteration"; this
+    is the check that makes the copies verifiable rather than trusted.
+
+    Cheap, because the checkpoint is already required to read `tiktoken.model`.
+    """
+    path = src / "tokenization_kimi.py"
+    text = path.read_text()
+    raw = text.encode()
+    checks = {
+        "pat_str alternatives": [a for a in PAT_STR.split("|") if a],
+        "num_reserved_special_tokens": [f"num_reserved_special_tokens = {NUM_RESERVED_SPECIAL_TOKENS}"],
+        "MAX_NO_WHITESPACES_CHARS": [f"MAX_NO_WHITESPACES_CHARS = {MAX_NO_WHITESPACES_CHARS:_}"],
+        "TIKTOKEN_MAX_ENCODE_CHARS": [f"TIKTOKEN_MAX_ENCODE_CHARS = {TIKTOKEN_MAX_ENCODE_CHARS:_}"],
+    }
+    for what, needles in checks.items():
+        # **A MOVING cursor, so ORDER is checked too.** Alternation order is semantically
+        # load-bearing — `\s+(?!\S)` must precede the bare `\s+` or a whitespace run is taken
+        # whole — and a plain `in` test passes a reordered pattern. Verified: reordering the
+        # alternatives passes a presence-only check while changing `"a    b"` from
+        # ['a','   ',' b'] to ['a','    ','b']. (A monotonic position check would NOT do:
+        # `(?i:'s|'t|...)` legitimately appears twice, so the cursor must advance past each hit.)
+        cursor = 0
+        for needle in needles:
+            at = text.find(needle, cursor)
+            if at < 0:
+                raise SystemExit(
+                    f"{path}: this driver's copy of {what} is not in the checkpoint verbatim, in "
+                    f"order.\n"
+                    f"  missing at or after offset {cursor}: {needle!r}\n"
+                    "  Either the checkpoint changed, the copy has a transcription error, or the "
+                    "alternatives were REORDERED; do NOT regenerate goldens until they agree."
+                )
+            cursor = at + len(needle)
+    # The split helper, compared as a body rather than a substring: whitespace differs by
+    # indentation level, so the distinctive statements are what is checked.
+    for line in (
+        "current_slice_is_space = s[0].isspace() if len(s) > 0 else False",
+        "if current_slice_is_space ^ is_now_space:",
+        "if current_slice_len > max_consecutive_slice_len:",
+        "yield s[slice_start:i]",
+        "yield s[slice_start:]",
+    ):
+        if line not in text:
+            raise SystemExit(f"{path}: split helper line missing verbatim: {line!r}")
+    return {
+        "tokenization_kimi_sha256": hashlib.sha256(raw).hexdigest(),
+        "tokenization_kimi_fnv1a": fnv1a(raw),
+        "tokenization_kimi_bytes": len(raw),
+    }
+
+
 def build_encoding(src: pathlib.Path):
     """`TikTokenTokenizer.__init__`'s model, with its special block named from the config."""
     vocab_file = src / "tiktoken.model"
@@ -271,6 +330,7 @@ def main() -> int:
         print(f"K3_SRC={src} has no tiktoken.model", file=sys.stderr)
         return 1
 
+    copied = verify_copies_against_the_checkpoint(src)
     enc, mergeable, named, special = build_encoding(src)
     vocab_bytes = (src / "tiktoken.model").read_bytes()
 
@@ -289,6 +349,26 @@ def main() -> int:
     # boundary without allocating a gigabyte. What is being gated is that chunking happens at
     # all and at the right place: encoding a long run whole gives DIFFERENT ids from encoding it
     # in chunks, which is exactly why the reference does this and why dropping it is silent.
+    # The OUTER cap (`TIKTOKEN_MAX_ENCODE_CHARS`), driven small for the same reason the inner one
+    # is: reaching the real 400,000-character boundary would mean a 400 KB fixture. These rows are
+    # what gate the port of that cap — it was left out at first on a false reachability argument,
+    # and the divergence only appears when a boundary falls mid-run and off the inner grid.
+    outer = []
+    for name, text, ocap, icap in [
+        ("outer_under", "aaaaaaaa", 16, 4),
+        ("outer_at", "aaaaaaaa", 8, 4),
+        ("outer_over_on_inner_grid", "a" * 16, 8, 4),
+        ("outer_over_off_inner_grid", "a" * 17, 6, 4),
+        ("outer_splits_a_space_run", " " * 20, 7, 5),
+        ("outer_and_inner_interact", "aa   aa   aa", 5, 3),
+        ("outer_over_han", "你好世界" * 4, 6, 5),
+    ]:
+        ids = []
+        for i in range(0, len(text), ocap):
+            for piece in split_whitespaces_or_nonwhitespaces(text[i:i + ocap], icap):
+                ids.extend(enc.encode(piece, allowed_special="all"))
+        outer.append({"name": name, "text": text, "max_chars": ocap, "max_run": icap, "ids": ids})
+
     chunked = []
     for name, text, cap in [
         ("run_at_cap", "abcdefgh", 8),
@@ -318,6 +398,9 @@ def main() -> int:
             "tiktoken_model_sha256": hashlib.sha256(vocab_bytes).hexdigest(),
             "tiktoken_model_fnv1a": fnv1a(vocab_bytes),
             "tiktoken_model_bytes": len(vocab_bytes),
+            # The module the constants above were copied from, pinned so a reader can tell WHICH
+            # revision of it this driver was verified against.
+            **copied,
         },
         # Pinned so the Rust side asserts its OWN pattern equals the reference's. This is the
         # check that catches a transcription typo directly, rather than as a puzzling id
@@ -346,6 +429,7 @@ def main() -> int:
         },
         "cases": rows,
         "chunked": chunked,
+        "outer": outer,
     }
     out = pathlib.Path(__file__).with_name("k3-tokenizer-cases.json")
     out.write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n")

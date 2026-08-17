@@ -32,7 +32,9 @@
 // tests: panic-on-failure is the idiom, and a broken gate should be loud.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rivoli_artifact::tiktoken::{MAX_SAME_CLASS_RUN, PAT_STR, SPECIAL_SLOTS, Vocab};
+use rivoli_artifact::tiktoken::{
+    MAX_ENCODE_CHARS, MAX_SAME_CLASS_RUN, PAT_STR, SPECIAL_SLOTS, Vocab,
+};
 use serde_json::Value;
 
 /// The converted K3 artifact — deliberately the ARTIFACT and not the 1.42 TiB source.
@@ -76,8 +78,22 @@ fn ids_of(row: &Value) -> Vec<u32> {
 
 /// Load the vocabulary out of the artifact, or announce the skip.
 fn load_or_skip(what: &str) -> Option<Vocab> {
+    load_or_skip_needing(what, &[])
+}
+
+/// [`load_or_skip`] plus any EXTRA artifact files the caller will read directly.
+///
+/// **The precondition has to cover what the test touches, not just what `Vocab::load` touches**
+/// (review, 2026-08-17). Two gates read `manifest.json` and `generation_config.json` with
+/// `unwrap`, so against a half-written artifact — a convert still running, a partial copy — they
+/// panicked where the absent-policy intends a skip. CI is unaffected either way (it has no
+/// artifact at all and stops at the first name), which is exactly why this could sit unnoticed.
+fn load_or_skip_needing(what: &str, extra: &[&str]) -> Option<Vocab> {
     let dir = art();
-    for need in ["tiktoken.model", "tokenizer_config.json"] {
+    for need in ["tiktoken.model", "tokenizer_config.json"]
+        .iter()
+        .chain(extra)
+    {
         if std::fs::metadata(format!("{dir}/{need}")).is_err() {
             absent(what, &format!("{dir}/{need} absent"));
             return None;
@@ -195,41 +211,30 @@ fn no_vocabulary_token_mixes_han_with_non_han() {
     let Some(v) = load_or_skip("k3 han-mixing census") else {
         return;
     };
-    // `\p{Han}` and its complement from the same engine the pre-tokenizer uses, so this asks
-    // the question in the pattern's OWN terms — `[^\p{Han}]`, exactly as the four clauses spell
-    // it — rather than in a hand-rolled codepoint range or a variant that also excludes `\s`.
-    let han = fancy_regex::Regex::new(r"\p{Han}").unwrap();
-    let other = fancy_regex::Regex::new(r"[^\p{Han}]").unwrap();
-    let (mut examined, mut first_mixed) = (0usize, None);
-    for rank in 0..v.num_base() as u32 {
-        let bytes = v.token_bytes(rank).expect("rank below num_base");
-        // A token may be a partial UTF-8 sequence — byte-level BPE guarantees nothing else — and
-        // a fragment cannot mix scripts as text, so it is skipped rather than counted as
-        // examined.
-        let Ok(s) = std::str::from_utf8(bytes) else {
-            continue;
-        };
-        examined += 1;
-        if han.is_match(s).unwrap() && other.is_match(s).unwrap() {
-            first_mixed = first_mixed.or(Some((rank, s.to_string())));
-        }
-    }
+    // `Vocab::mixed_script_token` — the SAME definition the unit test drives over a synthetic
+    // vocabulary carrying `a你`, which is what proves this can fire at all (a census that has only
+    // ever been green is not evidence). Here it is asked of the real 163,584-token vocabulary.
     assert_eq!(
-        first_mixed, None,
+        v.mixed_script_token(),
+        None,
         "a token mixes Han with non-Han: byte-pair merges can now cross the script boundary, so \
-         the PAT_STR intersections have become visible to id equality. Add Han-boundary cases \
-         to the driver and update this test's argument."
+         the PAT_STR intersections have become visible to id equality. Add Han-boundary cases to \
+         the driver and update this test's argument."
     );
-    // Non-vacuity, and the ONLY form of it that can fire here. An earlier draft also asserted
-    // `examined + undecodable == num_base`, which review pointed out is a tautology: the loop
-    // increments exactly one counter per rank over exactly `num_base` ranks, so no defect makes
-    // it false. This one can — a `from_utf8` that rejected everything, or a `token_bytes` that
-    // returned fragments, drops `examined` and reddens.
-    assert!(
-        examined > v.num_base() / 2,
-        "only {examined} of {} tokens decoded as text — this census is not looking at the \
-         vocabulary it claims to",
-        v.num_base()
+    // And `find_special`'s longest-match rule still agrees with tiktoken's leftmost-first
+    // alternation, which it does only while no spelling prefixes another.
+    assert_eq!(
+        v.prefixed_special(),
+        None,
+        "a special spelling is a strict prefix of another: `find_special` takes the longest match \
+         and tiktoken takes the first alternative, so the two encoders would now disagree"
+    );
+    // Non-vacuity: the scan must have SEEN the vocabulary. `mixed_script_token` returning None on
+    // an empty or unreadable table is indistinguishable from None on a clean one.
+    assert_eq!(
+        v.num_base(),
+        163_584,
+        "the base vocabulary is not the one being scanned"
     );
 }
 
@@ -333,7 +338,10 @@ fn the_special_block_is_positional_and_matches_the_reference() {
 /// output that never stops, which no id-equality case over ordinary prose would catch.
 #[test]
 fn the_vocabulary_boundary_and_the_eos_disagreement_are_pinned() {
-    let Some(v) = load_or_skip("k3 vocabulary boundary") else {
+    let Some(v) = load_or_skip_needing(
+        "k3 vocabulary boundary",
+        &["manifest.json", "generation_config.json"],
+    ) else {
         return;
     };
     let dir = art();
@@ -390,36 +398,60 @@ fn the_vocabulary_boundary_and_the_eos_disagreement_are_pinned() {
     );
 }
 
-/// The same-class run chunking, at a small cap so no 25,000-character fixture is needed.
+/// **Both caps, driven small.** The reference nests an outer character cap inside which the
+/// inner whitespace-run counter RESTARTS, and reaching either real boundary would need a
+/// 400 KB fixture — so the caps are parameters and these rows drive them low.
+///
+/// The outer rows are what gate the port of `MAX_ENCODE_CHARS`, which was first left out on the
+/// false argument that 400,000 characters is unreachable at `--ctx 8192`. It is not: the longest
+/// token is 256 bytes, so 8192 tokens can carry ~2.1 M characters.
 #[test]
-fn chunking_matches_the_reference_at_a_small_cap() {
+fn both_caps_match_the_reference_at_small_values() {
     let Some(v) = load_or_skip("k3 run chunking") else {
         return;
     };
     let g = golden();
-    let rows = g["chunked"].as_array().expect("chunked rows");
     let mut n = 0;
-    for c in rows {
+    // Inner cap only, at the shipped outer cap.
+    for c in g["chunked"].as_array().expect("chunked rows") {
         let (name, text) = (c["name"].as_str().unwrap(), c["text"].as_str().unwrap());
         let cap = c["max_run"].as_u64().unwrap() as usize;
-        let want = ids_of(c);
         assert_eq!(
-            v.encode_capped(text, cap).unwrap(),
-            want,
-            "chunked case {name} at cap {cap}"
+            v.encode_capped(text, MAX_ENCODE_CHARS, cap).unwrap(),
+            ids_of(c),
+            "inner-cap case {name} at cap {cap}"
         );
         n += 1;
     }
-    assert_eq!(n, 7, "expected 7 chunked cases");
-    // **Anti-vacuity: chunking must actually CHANGE something.** Without this the rows above
-    // would pass for a loader that ignored the cap entirely, since most texts are shorter than
-    // any cap. `MAX_SAME_CLASS_RUN` is the shipped value and a 40-character run is far below
-    // it, so the two calls must differ.
+    // Both caps small, so the outer boundary and the inner restart interact.
+    for c in g["outer"].as_array().expect("outer rows") {
+        let (name, text) = (c["name"].as_str().unwrap(), c["text"].as_str().unwrap());
+        let (oc, ic) = (
+            c["max_chars"].as_u64().unwrap() as usize,
+            c["max_run"].as_u64().unwrap() as usize,
+        );
+        assert_eq!(
+            v.encode_capped(text, oc, ic).unwrap(),
+            ids_of(c),
+            "outer-cap case {name} at max_chars {oc}, max_run {ic}"
+        );
+        n += 1;
+    }
+    assert_eq!(n, 14, "expected 7 inner-cap and 7 outer-cap rows");
+    // **Anti-vacuity for BOTH caps**: a low value must actually change the ids, or every row
+    // above would pass for an implementation that ignored the parameter entirely.
     let long = "x".repeat(40);
     assert_ne!(
-        v.encode_capped(&long, 7).unwrap(),
-        v.encode_capped(&long, MAX_SAME_CLASS_RUN).unwrap(),
-        "a low cap produced the same ids as the shipped cap — the cap is being ignored"
+        v.encode_capped(&long, MAX_ENCODE_CHARS, 7).unwrap(),
+        v.encode_capped(&long, MAX_ENCODE_CHARS, MAX_SAME_CLASS_RUN)
+            .unwrap(),
+        "a low INNER cap produced the same ids as the shipped one — it is being ignored"
+    );
+    assert_ne!(
+        v.encode_capped(&long, 7, MAX_SAME_CLASS_RUN).unwrap(),
+        v.encode_capped(&long, MAX_ENCODE_CHARS, MAX_SAME_CLASS_RUN)
+            .unwrap(),
+        "a low OUTER cap produced the same ids as the shipped one — it is being ignored"
     );
 }
 
@@ -436,9 +468,17 @@ fn the_shared_tokenizer_door_opens_a_k3_artifact() {
     // the ONE gate that stayed green under `RIVOLI_K3_REQUIRED=1` against a bogus artifact path
     // — found by red-proofing the flag itself (2026-08-17), which is the whole reason to prove a
     // gate can fail rather than to reason that it can.
-    if std::fs::metadata(format!("{dir}/tiktoken.model")).is_err() {
-        absent("k3 tokenizer door", &format!("{dir}/tiktoken.model absent"));
-        return;
+    // Every file `Tokenizer::load` reads, not just the one that selects the tiktoken arm:
+    // `tokenizer_config.json` carries the special block and `generation_config.json` the eos ids.
+    for need in [
+        "tiktoken.model",
+        "tokenizer_config.json",
+        "generation_config.json",
+    ] {
+        if std::fs::metadata(format!("{dir}/{need}")).is_err() {
+            absent("k3 tokenizer door", &format!("{dir}/{need} absent"));
+            return;
+        }
     }
     let tok = rivoli_artifact::tokenizer::Tokenizer::load(&dir)
         .expect("Tokenizer::load must open a K3 artifact");

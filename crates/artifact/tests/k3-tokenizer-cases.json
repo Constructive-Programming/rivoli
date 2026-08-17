@@ -6,7 +6,10 @@
   "checkpoint_revision": "9f62e4e9fffbd0a83ddd60e1c209d828994b3569",
   "tiktoken_model_sha256": "b6c497a7469b33ced9c38afb1ad6e47f03f5e5dc05f15930799210ec050c5103",
   "tiktoken_model_fnv1a": 13981957285401409552,
-  "tiktoken_model_bytes": 2795286
+  "tiktoken_model_bytes": 2795286,
+  "tokenization_kimi_sha256": "f28ea66e2d862a2a5814970b2ce40c2f7d8296ff09aed90a7e7def689b906944",
+  "tokenization_kimi_fnv1a": 15421385684772560735,
+  "tokenization_kimi_bytes": 16145
  },
  "pat_str": "[\\p{Han}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}&&[^\\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
  "num_reserved_special_tokens": 256,
@@ -1334,6 +1337,99 @@
     2243,
     33845,
     2243,
+    33845,
+    2243
+   ]
+  }
+ ],
+ "outer": [
+  {
+   "name": "outer_under",
+   "text": "aaaaaaaa",
+   "max_chars": 16,
+   "max_run": 4,
+   "ids": [
+    36324,
+    36324
+   ]
+  },
+  {
+   "name": "outer_at",
+   "text": "aaaaaaaa",
+   "max_chars": 8,
+   "max_run": 4,
+   "ids": [
+    36324,
+    36324
+   ]
+  },
+  {
+   "name": "outer_over_on_inner_grid",
+   "text": "aaaaaaaaaaaaaaaa",
+   "max_chars": 8,
+   "max_run": 4,
+   "ids": [
+    36324,
+    36324,
+    36324,
+    36324
+   ]
+  },
+  {
+   "name": "outer_over_off_inner_grid",
+   "text": "aaaaaaaaaaaaaaaaa",
+   "max_chars": 6,
+   "max_run": 4,
+   "ids": [
+    36324,
+    7028,
+    36324,
+    7028,
+    36324,
+    64
+   ]
+  },
+  {
+   "name": "outer_splits_a_space_run",
+   "text": "                    ",
+   "max_chars": 7,
+   "max_run": 5,
+   "ids": [
+    535,
+    256,
+    535,
+    256,
+    535,
+    220
+   ]
+  },
+  {
+   "name": "outer_and_inner_interact",
+   "text": "aa   aa   aa",
+   "max_chars": 5,
+   "max_run": 3,
+   "ids": [
+    7028,
+    274,
+    7028,
+    274,
+    7028
+   ]
+  },
+  {
+   "name": "outer_over_han",
+   "text": "你好世界你好世界你好世界你好世界",
+   "max_chars": 6,
+   "max_run": 5,
+   "ids": [
+    33845,
+    2243,
+    633,
+    628,
+    2243,
+    33845,
+    1395,
+    1620,
     33845,
     2243
    ]

@@ -1,7 +1,7 @@
 ---
 status: live
 scope: k3
-verdict: The real Kimi-K3 checkpoint arrived 2026-08-16 and the schema survived it — every field K3TextConfig requires is present at the level it expects, num_nextn_predict_layers IS 0 (no MTP head, the assertion holds), the quantization block is MXFP4 e2m1 + e8m0 group_size 32 as assumed, and the vendored config.json is BYTE-IDENTICAL to the shipped one (md5 e0b7be1d…, index sha256 a1c52106… matching its pinned revision). Two things the synthetic gates could not see: the checkpoint ships NO tokenizer.json — it is tiktoken (163,584 ranks + 16 special ids in tokenizer_config.json) — so convert_k3's aux list refused the real source at the LAST step of a 1.42 TiB run, and Tokenizer::load read tokenizer.json unconditionally for every arch, so no K3 artifact could be opened at all -- FIXED 2026-08-17 by a first-party-gated tiktoken loader (95 id-pinned cases; 13 gates, all deviceless -- 5 assert in CI and 8 skip without the checkpoint; 8 red proofs, three of which corrected the plan), which measured two corrections to its own plan: round-trip stays GREEN under a broken pre-tokenizer, and the pat_str Han intersections are invisible to id equality because no token in the vocabulary mixes Han with non-Han. Conversion census: 497,220 tensors = 494,592 routed (1,446,456,066,048 B) + 2,460 resident (113,509,540,864 B) + 168 vision (894,717,952 B); one .f4 layer is exactly 4096 + 896 × 17,547,264 = 15,722,352,640 B, verified against the source at 0 differing bytes.
+verdict: The real Kimi-K3 checkpoint arrived 2026-08-16 and the schema survived it — every field K3TextConfig requires is present at the level it expects, num_nextn_predict_layers IS 0 (no MTP head, the assertion holds), the quantization block is MXFP4 e2m1 + e8m0 group_size 32 as assumed, and the vendored config.json is BYTE-IDENTICAL to the shipped one (md5 e0b7be1d…, index sha256 a1c52106… matching its pinned revision). Two things the synthetic gates could not see: the checkpoint ships NO tokenizer.json — it is tiktoken (163,584 ranks + 16 special ids in tokenizer_config.json) — so convert_k3's aux list refused the real source at the LAST step of a 1.42 TiB run, and Tokenizer::load read tokenizer.json unconditionally for every arch, so no K3 artifact could be opened at all -- FIXED 2026-08-17 by a first-party-gated tiktoken loader (95 id-pinned cases; 16 gates, all deviceless -- 8 assert in CI and 8 skip without the checkpoint; 17 red proofs, five of which corrected the plan; both encode caps ported and fuzzed against the first-party encoder at 8,372 texts / 3,523,794 ids / zero mismatches), which measured two corrections to its own plan: round-trip stays GREEN under a broken pre-tokenizer, and the pat_str Han intersections are invisible to id equality because no token in the vocabulary mixes Han with non-Han. Conversion census: 497,220 tensors = 494,592 routed (1,446,456,066,048 B) + 2,460 resident (113,509,540,864 B) + 168 vision (894,717,952 B); one .f4 layer is exactly 4096 + 896 × 17,547,264 = 15,722,352,640 B, verified against the source at 0 differing bytes.
 ---
 
 # Kimi-K3: the first real checkpoint
@@ -24,16 +24,21 @@ things a fixture cannot tell you.
   the real thing.
 - **The converter could not finish**, for one reason, now fixed: it copied `tokenizer.json`,
   and Kimi-K3 has none.
-- **The first K3 decode is not blocked on the GPU.** It is blocked on a tiktoken tokenizer
-  loader — deviceless work, and now the critical path, since the artifact will exist long
-  before anything can open it. §4 for the diagnosis, §7 for the scope and its gate design.
-- **The tiktoken loader SHIPPED** — 13 deviceless gates, 5 of which assert in CI, 8 red proofs
-  (§7). Three of those proofs refused to redden where predicted and each correction is recorded.
+- **The first K3 decode was not blocked on the GPU** — it was blocked on a tiktoken tokenizer
+  loader, because `Tokenizer::load` reads `tokenizer.json` unconditionally and K3 ships none.
+  §4 is the diagnosis. **CLOSED 2026-08-17** by the loader in §7; the sentence is kept in the
+  past tense rather than deleted, because "the artifact existed before anything could read it"
+  is the shape of the finding and the next arm can repeat it.
+- **The tiktoken loader SHIPPED** — 16 deviceless gates, 8 of which assert in CI, 17 red proofs
+  (§7). Both encode caps are ported and differentially fuzzed against the first-party encoder at
+  **8,372 texts / 3,523,794 ids / zero mismatches**. Five proofs refused to redden where
+  predicted and two of my own harnesses produced false greens; every correction is recorded.
 - **A concurrent GPU pin starves this job, and starvation reads as death.** GTT is system RAM
   here, so a ~115 GiB pin and a large streaming CPU job cannot share the machine — and the
   flock does not express it, because this job never touches the device. Two observers called
   a live process dead off an empty `ps | grep`. §5.
-- Conversion is running; §5 carries the census to assert it against.
+- Conversion FINISHED: 92 layers, every one verified at 0 differing bytes, artifact 1.4188 TiB.
+  §5 carries the census it was asserted against.
 
 ## 1. Config, field by field
 
@@ -385,40 +390,64 @@ The eos discrepancy in §3 is a live hazard for step 3: `tokenizer_config.json` 
 
 ### What shipped, and the measured red-proof matrix
 
-**Thirteen gates, all deviceless — and exactly FIVE assert in CI.** Nine live in
-`crates/artifact/tests/k3_tokenizer.rs`; four more are unit tests inside
-`crates/artifact/src/tiktoken.rs`. The four units plus one integration gate
+**Sixteen gates, all deviceless — and exactly EIGHT assert in CI.** Nine live in
+`crates/artifact/tests/k3_tokenizer.rs`; seven more are unit tests inside
+`crates/artifact/src/tiktoken.rs`. The seven units plus one integration gate
 (`pat_str`/constant equality) need no checkpoint and never skip. The other eight read
 `tiktoken.model` out of the **artifact** — not the source, so they also gate what `convert_k3`
 shipped — and skip without it, which in CI is all eight.
 
-> An earlier draft of this section said "nine gates … the other seven", then "all eight assert",
-> and separately claimed the censuses make a skipped run safe. All three were wrong, and the last
-> one is retracted below in the same breath it was written — the count is now stated once, here.
+> This count has been wrong three times (8, then 9, then 13) as gates were added and as a whole
+> test binary turned out to be missing from the tally. It is now **derived by script rather than
+> written** — `#[test]` counted in both files, minus those that reach `load_or_skip`/`absent` — and
+> that is the only reason to trust it. An earlier draft also claimed the censuses make a *skipped*
+> run safe, which is retracted below.
 
-Every perturbation was applied, run, and reverted. **LIB** = the four `src/tiktoken.rs` unit
-tests (checkpoint-free); the rest are the integration gates — **pat** = constant equality ·
+Every perturbation was applied, run, and reverted. **LIB** = the seven `src/tiktoken.rs` unit
+tests (checkpoint-free); the rest are the nine integration gates — **pat** = constant equality ·
 **prov** = vocabulary provenance · **ids** = id equality · **spec** = special block · **bnd** =
-boundary+eos · **chk** = chunking · **rt** = round-trip · **han** = Han tripwire · **door** =
-`Tokenizer::load` seam.
+boundary+eos · **cap** = both encode caps · **rt** = round-trip · **trip** = vocabulary tripwires ·
+**door** = `Tokenizer::load` seam.
 
-| perturbation | LIB | pat | prov | ids | spec | bnd | chk | rt | han | door |
+| perturbation | LIB | pat | prov | ids | spec | bnd | cap | rt | trip | door |
 |---|---|---|---|---|---|---|---|---|---|---|
 | RP1 drop `\s+(?!\S)` | **R** | **R** | ok | **R** | ok | ok | **R** | *ok* | ok | ok |
-| RP2 drop one `&&[^\p{Han}]]` | **R** | **R** | ok | *ok* | ok | ok | ok | ok | ok | ok |
-| RP3 special base `+1` | ok | ok | ok | **R** | **R** | *ok* | ok | **R** | ok | ok |
-| RP4 `SPECIAL_SLOTS` 256→255 | ok | **R** | ok | **R** | **R** | **R** | **R** | **R** | **R** | **R** |
+| RP2a–d drop ANY ONE of the four `&&[^\p{Han}]]` | **R** | **R** | ok | *ok* | ok | ok | ok | ok | ok | ok |
+| RP3 special base `+1` | ok | ok | ok | **R** | *ok* | ok | ok | **R** | ok | ok |
+| RP4 `SPECIAL_SLOTS` 256→255 | ok | **R** | ok | † | † | † | † | † | † | † |
 | RP5 `MAX_SAME_CLASS_RUN` −1 | ok | **R** | ok | ok | ok | ok | ok | ok | ok | ok |
 | RP6 `RIVOLI_K3_REQUIRED=1`, bogus path | ok | ok | **R** | **R** | **R** | **R** | **R** | **R** | **R** | **R** |
 | RP7 golden's vocabulary FNV-1a flipped 1 bit | ok | ok | **R** | ok | ok | ok | ok | ok | ok | ok |
-| RP8 chunking `>` → `>=` (off-by-one at the cap) | **R** | ok | ok | ok | ok | ok | **R** | ok | ok | ok |
+| RP8 inner cap `>` → `>=` | **R** | ok | ok | ok | ok | ok | **R** | ok | ok | ok |
+| RP9 `n_vocab` −1 | ok | ok | ok | ok | ok | **R** | ok | ok | ok | ok |
+| RP10′ sniff a filename K3 does not ship | ok | ok | ok | ok | ok | ok | ok | ok | ok | **R** |
+| RP11 drop "XTML" from `hf()`'s refusal | ok | ok | ok | ok | ok | ok | ok | ok | ok | **R** |
+| RP14 a special spelling prefixes another | **R** | ok | ok | ok | ok | ok | ok | ok | ok | ok |
+| RP15 reserved-name format `<\|reserved_{id}\|>` | ok | ok | ok | **R** | **R** | ok | ok | ok | ok | ok |
+| RP16′ outer cap disabled | ok | ok | ok | ok | ok | ok | **R** | ok | ok | ok |
+| RP17 two ids share one spelling | **R** | ok | ok | ok | ok | ok | ok | ok | ok | ok |
+| RP12/13 typo in a driver constant copy | — | — | — | — | — | — | — | — | — | — |
 
-> **The LIB column is a correction, found by review.** The first matrix omitted the unit tests
-> entirely and concluded from RP2 that `pat_str` string equality was trap 2's *only* guard. It is
-> not: `the_pat_str_compiles_under_fancy_regex` asserts the *split* (`"hello你好"` → two pieces)
-> and reddens under RP2 too — behaviourally, which is the stronger form. Omitting a whole test
-> binary from a red-proof matrix is the same defect class as an empty `ps | grep`: the absence of
-> a signal was read as the absence of a gate.
+Every gate now has at least one perturbation aimed at **its own** claim: `bnd` gets RP9 (not RP4,
+see †), `spec` gets RP15, `cap` gets RP8 and RP16′, `door` gets RP10′/RP11, `trip` gets RP14/RP17
+as unit tests, `prov` gets RP7. RP12/13 sit outside the matrix — they redden the *driver*, which
+exits 1 and refuses to write goldens at all.
+
+**† is not a red.** With `SPECIAL_SLOTS = 255`, `assemble`'s `named_outside` guard fires (`[PAD]`
+163839 falls outside `163584..163839`), `Vocab::load` returns `Err`, and every
+`load_or_skip(..).expect(..)` panics on the SAME refusal. Those cells are one load failure, not
+eight gates seeing their own claims. I had credited RP4 as the boundary gate's proof; **RP9** is.
+
+> **My own red-proof harness produced two false greens, and both were build failures read as
+> "nothing reddened".** A shell helper that counts `FAILED` lines cannot tell a clean run from a
+> tree that did not compile, and `-D warnings` makes that likely: deleting `Tokenizer::load`'s
+> tiktoken arm leaves the enum variant unconstructed (`dead-code`), and disabling the outer cap
+> orphans `char_chunks`. Both perturbations were replaced with ones that compile (RP10′, RP16′).
+> The lesson is the day's other one restated: **check that the thing ran before believing what it
+> reports.** A perturbation the compiler refuses is itself a result — `-D warnings` is a stronger
+> guard there than any test — but it must be recorded as that, not as a silent green.
+
+*Italics mark a proof that refused to redden where predicted; each was chased, not accepted.*
 
 **Three cells in italics are the findings.** Each is a red proof that *refused* to redden where
 it was predicted to, which P7 treats as evidence about the tree rather than a pass — so each was
@@ -451,7 +480,16 @@ cross the boundary and BPE *reconstructs* exactly the split the intersection wou
 So id equality is not what protects that trap — **two pattern-level gates are**: the string
 equality, and the behavioural split assertion in `src/tiktoken.rs`'s unit tests, which is the
 stronger because it observes the effect rather than the text. Both are checkpoint-free and assert
-in CI. `no_vocabulary_token_mixes_han_with_non_han` is then a *tripwire* on the premise, not the
+in CI.
+
+> **The behavioural probe was itself wrong twice, and this is the third statement of it.** There
+> are FOUR intersection clauses and one probe does not see them all. `"hello你好"` — the original —
+> detects only alt-2's LOWERCASE clause; `"A你好"`, which review proposed as the fix, detects three
+> of four and misses alt-2's UPPERCASE one; removing that clause changes **nothing** across six
+> Han-boundary probes. Measured over all four clauses × ten probes, the covering probe is
+> **`"AB你好c"` → `["AB", "你好", "c"]`**, which reddens on any one of the four. Until it landed,
+> two of the four clauses had no behavioural gate at all — which is exactly the "only guard" claim
+> this section had just finished retracting, true again for half the clauses. `no_vocabulary_token_mixes_han_with_non_han` is then a *tripwire* on the premise, not the
 guard an earlier draft called it. If a future vocabulary ships a Han-mixing
 token, it reddens and tells the reader that id equality has *started* covering the
 intersections. Same shape as Glimmer's `qk_scale_on_k` exclusion: invisible by algebra, not by
@@ -470,8 +508,9 @@ vocabulary sitting at the same path. RP6 is the one that matters most for readin
 > 9/9 having checked one string constant. The censuses defend a *partial* run after a successful
 > load; they say nothing about a run that loaded nothing. `RIVOLI_K3_REQUIRED=1` turns every skip
 > into a panic (`crates/cli/tests/codescene.rs`'s `RIVOLI_CS_REQUIRED` is the precedent and the
-> carve-out argument), and RP6 is that flag against a bogus artifact path: 8 gates red, only the
-> checkpoint-free one green. Red-proofing the flag is also what found the last gate still
+> carve-out argument), and RP6 is that flag against a bogus artifact path: **within the
+> integration binary**, 8 red and only its checkpoint-free gate green. The six unit tests are
+> unaffected — they need no artifact — so five of thirteen stay green by design. Red-proofing the flag is also what found the last gate still
 > carrying its own inline skip — it was the single test that stayed green, which is precisely
 > what a proof is for. **Nothing arms the flag today**: there is no K3 smoke script, so that is
 > owed, and it is the difference between "runs in CI" and "asserts in CI".
