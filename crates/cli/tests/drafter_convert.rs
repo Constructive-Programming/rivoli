@@ -705,3 +705,84 @@ fn the_serving_mask_indexes_queries_by_position_and_the_anchor_pins_the_other_br
         "if these agreed, the anchor would arbitrate and this test would be unnecessary"
     );
 }
+
+/// The set of KV rows one query attends, under a named lower/upper edge pair.
+///
+/// Separate from [`mask_shape`] because that function counts pairs and this one needs the ROWS: the
+/// defect below is one row per query, which every count in this file rounds away.
+fn attended(q: i64, kv_len: usize, window: i64, lower_is_strict: bool) -> Vec<i64> {
+    let lo = if lower_is_strict {
+        q - window + 1
+    } else {
+        q - window
+    };
+    (0..kv_len as i64)
+        .filter(|kv| *kv >= lo && *kv <= q + window)
+        .collect()
+}
+
+/// **THE BIDIRECTIONAL LOWER EDGE IS INCLUSIVE AND THE CAUSAL ONE IS STRICT, AND THE ANCHOR
+/// FIXTURE CANNOT SEE THE DIFFERENCE.** Measured 2026-08-17.
+///
+/// The tree already has a Glimmer GQA attend kernel — `attn.hip::gqa_attend` — with the right head
+/// grouping, the right layout, a multi-row `tq`, and a `start_pos` that is exactly the `q_offset`
+/// the sibling test above says the drafter needs. So the natural way to build the block-attend
+/// kernel is to copy it and widen the bound. **That produces a defect this anchor scores green.**
+///
+/// The reference's two overlays are not the same shape (`masking_utils.py`):
+///
+/// | overlay | expression | lower edge |
+/// |---|---|---|
+/// | `sliding_window_overlay` (causal) | `kv_idx > q_idx - window`, and-ed with `kv_idx <= q_idx` | **strict**: `q - w + 1` |
+/// | `sliding_window_bidirectional_overlay` | `abs(q_idx - kv_idx) <= window` | **inclusive**: `q - w` |
+///
+/// `gqa_attend` implements the first and its own comment calls the off-by-one "trap 14", which is
+/// why it computes `lo = pos - win + 1` rather than `pos - win`. **Carrying that `lo` into a
+/// bidirectional kernel drops exactly one KV row per query row** — 16 rows at the shipped geometry,
+/// every query affected.
+///
+/// **And the fixture is blind to it: 0 of its 4 query rows change.** At ctx 12 with window 13 the
+/// lower edge is negative for every row, so it clamps to 0 either way and the two expressions agree
+/// on every cell. Scoring a kernel against the vendored goldens therefore cannot distinguish
+/// `pos - win` from `pos - win + 1`, and this is a SECOND blindness independent of the `q_offset`
+/// one — that one the fixture answers wrongly, this one it cannot answer at all.
+#[test]
+fn the_bidirectional_lower_edge_is_inclusive_and_the_fixture_cannot_see_it() {
+    let cfg = real("drafter-cfg-loweredge");
+    let (block, window) = (cfg.block_size as i64, cfg.sliding_window as i64);
+
+    // The shipped geometry, serving indexing: one row lost per query, every query.
+    let (ctx, off) = (4096i64, 4096i64);
+    let kv_len = (ctx + block) as usize;
+    let mut affected = 0;
+    for row in 0..block {
+        let q = row + off;
+        let right = attended(q, kv_len, window, false);
+        let wrong = attended(q, kv_len, window, true);
+        assert_eq!(
+            right.len(),
+            wrong.len() + 1,
+            "row {row}: the inclusive edge must admit exactly one more KV row than the strict one"
+        );
+        assert_eq!(right[0], q - window, "row {row}: inclusive lower edge");
+        assert_eq!(wrong[0], q - window + 1, "row {row}: strict lower edge");
+        affected += 1;
+    }
+    assert_eq!(
+        affected, block,
+        "every query row is affected at the shipped widths"
+    );
+
+    // The fixture, at the geometry the goldens were vendored at: NO row changes.
+    let (f_ctx, f_block, f_win) = (12i64, 4usize, 13i64);
+    let f_kv = (f_ctx + f_block as i64) as usize;
+    for row in 0..f_block as i64 {
+        assert_eq!(
+            attended(row, f_kv, f_win, false),
+            attended(row, f_kv, f_win, true),
+            "fixture row {row}: the two edges must AGREE here — that is the blindness being \
+             recorded, so if this ever differs the fixture gained the power and this test is the \
+             thing to delete"
+        );
+    }
+}
