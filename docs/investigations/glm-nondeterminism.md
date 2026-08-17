@@ -1,7 +1,7 @@
 ---
 status: live
 scope: glm
-verdict: THE MECHANISM IS A WRONG-BYTES READ IN THE ROUTED POOL, and the discriminator that says so has run on device. Coordinate: two arms at identical flags, quiet box, witness clean, ids diverged at body position 157; the divergence logs' first differing row is pos=164 nrow=1 layer=24, where `h` and `x` differ while `xn`, `gl`, `pk` and `sl` are IDENTICAL and relocs=0, misses=1. Attention output, router logits, picks and slot placement all agree — the same experts were selected and placed in the same slots, and the bytes read out of those slots hashed differently. So attention is out of frame, routing is out of frame (INV-1 holds), placement is out of frame, and relocation is not merely refuted by the barrier argument but ABSENT from the event row. BOTH previously named candidates stay refuted by construction: MoE accumulation cannot do it (per-term saturating fixed point, wrapping u64 atomicAdd, drain summing lanes at a fixed stride, so the resident/miss lane split is exactly equivalent to one accumulator) and relocation-vs-in-flight-read cannot (unconditional per-layer device_sync, ticketed miss kernels, host-awaited lanes, submit relocating only before it resolves any read). No float atomic exists in any kernel, so given identical bytes the arithmetic is bit-reproducible. THE RATE IS MEASURED AND THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT: per-run first divergences 236, 362, 375 with a fourth arm clean to 762 give 1 event per 299 (matched pair) or 1 per 578 (conservative, keeping the censored arm), exact 95% Poisson interval 1 per [206, 2804]; P(detect) = 1-exp(-2n/rate) predicts the greedy observations it was not fitted on, 0-of-3 pairs at 32 tokens and 3-of-3 at 512. Contention is NOT required — this pair ran on a quiet box. Positions 0..235 are bit-identical across two budgets and two source trees, so the engine reproduces until an event fires, and the wake then GROWS rather than decays. WHAT REMAINS is which HOP delivers the wrong bytes: the NVMe read, the bounce arena, or the DMA into the slot. Three fetch-path folds now split them (`bh` the arena after the read, `sc` the slot after the copy, `se` the same slot at end of layer) at ~10-15% throughput cost, and the rate being per-read rather than per-second is why a slower instrumented run should still fire. NOT ESTABLISHED: the ROCm 7.14/clang 23.1 toolchain is NOT exonerated — both binaries were built under it, so that experiment varied source and held toolchain fixed.
+verdict: THE MECHANISM IS A WRONG-BYTES READ IN THE ROUTED-EXPERT POOL, localised on device 2026-08-17: at pos=164 layer=24 the `h` fold moved while `xn`, `gl`, `pk` and `sl` were IDENTICAL and relocs=0 — the same experts, in the same slots, fed the same input, produced different results. Attention, routing, placement and relocation are all out of frame, and both previously named candidates stay refuted by construction (no float atomic exists in any kernel, so identical bytes give identical results). The rate is measured — 1 event per ~300-578 token-forwards, so a pair of 512-token runs detects it 83-97% of the time and a 32-token pair 10-19%, which is why every byte-identity claim on GLM must state its token count. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT. WHAT REMAINS is which hop delivers the wrong bytes — the NVMe read, the bounce arena, or the DMA — and three cross-run folds now split them at an ESTIMATED ~27% throughput cost that must be measured on the first instrumented run. The toolchain is NOT exonerated: both binaries were built under it. The determinism gate exists, is length-aware with a 512-token floor, and its GREEN IS OWED because the engine is red.
 ---
 
 # GLM does not reproduce itself: the rate, and why both suspects are innocent
@@ -23,6 +23,9 @@ FIRST DIVERGENCE at row 12427:  pos=164 nrow=1 layer=24
   -> column 5 (h) moved first
 
   column   A                    B
+  pos      164                  164
+  nrow     1                    1
+  layer    24                   24
   xn       7e4e946650f24190     7e4e946650f24190
   h        9c7e5614ddb784fc     bb1a15e399e82fbf       <-- DIFFERS
   x        5f7ac21d78086fba     c4d30b6a9ae85370       <-- DIFFERS
@@ -56,7 +59,9 @@ Two notes on the run itself, both worth keeping:
   it is not — a length difference IS a divergence. Fixed: lengths are now compared to each other
   before either is compared to `ngen`.
 - **The gate refused this configuration**, correctly, on its own precondition: with no `--prompt`
-  the engine's default hits EOS at 276 tokens, so a 512-token floor is unreachable. Fixed by
+  the engine's default ("The sky is blue because", 11 prompt tokens) hits EOS well before 512 — 276,
+  281 and 318 generated ids observed across retained runs, and *that spread is itself the defect*,
+  since diverged arms stop at different points. So a 512-token floor is unreachable there. Fixed by
   recording a long-form prompt VERBATIM in the gate, pinned by length and md5 in its `--self-test`
   so it cannot drift — the placeholder-prompt failure that makes
   `docs/measurement/baseline-2026-08-16.md` unreproducible from its own record.
@@ -169,9 +174,9 @@ P(detect) = 1 − exp(−2n/rate):
 | 256 | 82% | 59% | 17% |
 | 512 | 97% | 83% | 31% |
 
-80% power needs ngen 241 at the optimistic reading and **465 at the conservative one**, which is
-why the gate's floor is 512 rather than 256 — an earlier draft set it at 256 off the matched
-reading alone. **And the interval is the point: at its pessimistic end even 512 tokens is 31%
+80% power needs ngen 241 at the optimistic reading and **465 at the conservative one**, which is why
+`tests/determinism-glm.sh`'s floor is **512** — an earlier draft set it at 256 off the matched
+reading alone, and 256 is now nowhere in the gate. **And the interval is the point: at its pessimistic end even 512 tokens is 31%
 power.** A green bounds the rate; it does not prove determinism.
 
 **That curve was fitted on teacher-forced NLLs and predicts the greedy id observations it was
@@ -339,7 +344,18 @@ appears:
 | 70.6% MTP acceptance, `p0.8+` at 89% | `wave/m12-glm-chain`'s measurement | another branch |
 | 7.7 GB/s at QD1, ~35% ring idle | the old tree's fetch probes | no probe in this tree |
 | 9 corrupted reads in 8452 at `--max-mem 30` | the old tree's relocation finding | archive only |
-| ~148 misses/token, ~20 MB/expert | the old tree's poison-fill comment | superseded below by a DERIVED 130.4 and 14.625 MiB |
+| ~148 misses/token, ~20 MB/expert | the old tree's poison-fill comment | **superseded by derivation** — see the note below |
+
+**The two numbers that were inherited and are now derived**, because the cost figures above rest on
+them and an earlier draft quoted the old tree's: **misses/token = 130.4** (75 MoE layers × `top_k` 8
+= 600 routed lookups, at the 78.2591% hit rate in these `.nll` headers) and **expert stride =
+15,335,424 B = 14.625 MiB** (`L03.vq3` is 3,941,208,064 B, the layout is `hbytes + blocks · stride`,
+and `blocks` is **257** — 256 routed plus the shared expert, as `artifact/src/format/layer.rs` states
+outright; 4096 + 257 × 15,335,424 reproduces the file size exactly). The old tree's "~20 MB per
+expert" is the **`.i4`** stride, and assuming 256 blocks instead of 257 gives 15,395,328 B, which is
+not a multiple of 4096 — under which `RoutedGeom::check_reads_fit_their_slots` would refuse the real
+artifact at startup. Both mistakes were made and caught here; this is the inherited-number failure
+this repo keeps writing down.
 
 The greedy numbers are load-bearing for one claim only — that the defect reaches generated text
 and is length-dependent — and the rate derived here independently predicts their 32-vs-512
@@ -427,12 +443,12 @@ same-PROGRAM half — that no host decision on the routed path can make two runs
 diverge — and scopes itself explicitly away from the same-OUTPUT half, which is false today.
 Red-proofed by making `scan_free` ignore `landed`.
 
-## One capability gap that shapes experiment 2
+## One capability gap that shapes the next run
 
 **`--divergence-log` can only be pointed at GREEDY decode on this branch.** It is wired into
 `run_bench`, and there is no `--ppl` / teacher-forcing decode path in this tree at all — the
 `teacher-forcing` feature is declared empty here and the `.nll` evidence above came from
-`wave/m10-spine`'s `score.rs`. That matters for how experiment 2 is read:
+`wave/m10-spine`'s `score.rs`. That matters for how the next instrumented run is read:
 
 - **Greedy is still interpretable**, and this is the important half: the first differing LINE is a
   divergence that happened *during that forward, on identical inputs*, so its (layer, column) is a
@@ -442,8 +458,8 @@ Red-proofed by making `scan_free` ignore `landed`.
   first one's wake — a run would yield several coordinates rather than one. That needs the probe
   wired into a TF walk, i.e. it lands when this branch and `wave/m10-spine`'s scorer meet.
 
-So experiment 2 gives ONE coordinate per pair, and the ladder below should be read as
-"one sample decides which arm we are on", not as "one run settles the mechanism".
+So an instrumented pair gives ONE coordinate, and the hop table above should be read as "one sample
+decides which hop we are on", not as "one run settles the mechanism".
 
 ## What the instrument now measures, and the one question left
 
@@ -454,27 +470,60 @@ question — **which hop delivers the wrong bytes**:
 |---|---|---|
 | `bh` | the pinned bounce arena, on the fetch stream, the moment the NVMe read completes and **before** the copy | the DRIVE delivered different bytes |
 | `sc` | the pool slot, on the fetch stream, immediately **after** the copy | with `bh` equal: the COPY |
-| `se` | the same pool slot again at end of layer, after both MoE lanes are awaited | with `sc == se` and `h` differing: the bytes AT REST are RIGHT, so the kernel read them **too early** — a ticket/timeline ordering failure, not a bad payload. With `sc != se`: something wrote the slot after the copy landed |
+| `se` | ALL the layer's slots, at end of layer, each at its own index offset | with `bh` and `sc` equal: a slot was wrong AT REST and not the one just copied — a resident expert, or a write after the copy landed |
 
-All three are XOR folds at **full width**, so none can miss a corruption by sampling, and all three
-are stream-ordered around the copy with **no host sync and no barrier** — which is the only reason
-an instrument may be pointed at this defect at all.
+**Read them CROSS-RUN — A's column against B's — and never against each other.** `sc` folds the one
+slot just copied; `se` folds all ~9 the layer used. They are different quantities and would differ
+on every row, so a within-run `sc == se` test (which an earlier draft of this section invited) sends
+an operator after an innocent hop. With all three equal across runs and `h` differing, the reading
+is: every byte the batch used was identical at rest in BOTH runs, so the kernel read one of them
+before it landed — a ticket/timeline ordering failure.
 
-`se` is deliberately narrower than the others: it folds only the experts the layer MISSED. Folding
-the whole batch would be ~9 experts × 14.6 MiB × 78 layers ≈ 10 GB/token of extra device reads
-against ~2 GB for the misses. **So `se` is silent about a RESIDENT expert corrupted on an earlier
-token, and that limit must be stated with any result it produces.** If `h` differs while all three
-of `bh`, `sc`, `se` agree, that is the surviving reading and it points at a resident expert.
+All three are XOR folds at **full width**, so none can miss a corruption by sampling. `bh` and `sc`
+are stream-ordered around the copy on the fetch stream; `se` is on the null stream at end of layer,
+after both MoE lanes have been awaited. **No fold adds a host sync of its own** — but `Probe::drain`
+does add one `device_sync` per pass, and that is deliberate and argued at the code: without it the
+async null-stream clear of the fold slab could race the reaper's fetch-stream folds. It lands where
+`run_layer`'s per-layer sync has already idled the device, so it adds no barrier that was not
+already there.
 
-**Cost, and why it is worth paying.** Three full-width folds add ~6 GB/token of device reads on top
-of the ~2 GB the fetch path already moves. Those reads come from system RAM at LPDDR5 bandwidth
-rather than from NVMe, so the arithmetic is ~40–60 ms/token against the 388 ms the committed
-baseline records — **roughly 10–15%**, not the 2× a naive reading of the byte volume suggests.
-And the masking risk is bounded by the measurement above: the event fired on a QUIET box, and the
-rate is per READ rather than per second, so a run 15% slower issues the same number of reads and
-should fire at a similar TOKEN position. **If it does not fire, that is itself informative** — it
-would mean the instrument perturbs, which is the `--checksum-x` failure and would have to be
-recorded as such rather than read as a green.
+`se` folds every expert the layer used, each at a distinct index offset (`i_base = j·n`), which
+matters twice. It is **not** blind to a resident expert corrupted on an earlier token — `bh`/`sc`
+see only the ~1.7 of 9 slots that were read, and that gap is the whole reason `se` exists. And it is
+not invariant under two payloads being **swapped between slots**: without the offset the fold mixes
+only the within-slot index, so a crossed destination — exactly the "wrong bytes in a slot" class
+under investigation — would leave every fold agreeing and be misread as something else. That was a
+real hole, found by review 2026-08-17.
+
+**Cost, re-derived — and the first version of this paragraph was wrong twice.**
+
+The byte volume is **~14.4 GB/token**: `bh` and `sc` fold one 14.625 MiB expert per cold read at
+130.4 reads/token (2.0 GB each), and `se` folds all 9 of the batch's slots on each of the 75 MoE
+layers (10.4 GB). An earlier draft said ~6 GB, which was all three at misses-only — `se` had been
+widened to the union without the number moving with it, and `--divergence-log`'s cost then appeared
+in the INDEX verdict, the place CLAUDE.md tells readers to trust *instead of* the doc.
+
+Against the only effective-bandwidth figure this repo has measured — **~135 GB/s** on this box
+(`docs/measurement/baseline-2026-08-16.md`, Glimmer bf16 fully resident) — that is ~106 ms/token, or
+**~27%** of the 388 ms/token the same baseline records for GLM int3-vq.
+
+**That estimate is arithmetic, not a measurement, and it only became credible after a bug was
+fixed.** The fold kernel originally did one `atomicXor` per element against a SINGLE global u64.
+At ~936 folds/token × 3.8 M elements that is 3.6e9 same-address atomics — which serialise, so no
+bandwidth figure bounds them at all, and at any plausible rate the instrument would have run ~1–4 s
+per token: several times slower than the thing it measures, which is the `--checksum-x` failure with
+a different mechanism. `hash_rows` now reduces in shared memory and issues one atomic per block
+(3744× fewer), which is what makes it bandwidth-bound and the number above meaningful. The reduction
+is exact — XOR is associative and commutative — and `fwd_kernel.rs` still scores the kernel against
+`rivoli_core::hash::xor_fold_from` bit for bit.
+
+**Measure it on the first instrumented run** rather than trusting the paragraph above:
+`AsyncFetch::io_wait_ns` already reports the reaper's slack, and the run's own tok/s says what the
+folds cost. The masking risk is bounded by the coordinate measurement: the event fired on a QUIET
+box, and the rate is per READ rather than per second, so a run ~27% slower issues the same number of
+reads and should fire at a similar TOKEN position. **If it does not fire, that is itself
+informative** — it would mean the instrument perturbs, and would have to be recorded as such rather
+than read as a green.
 
 ### Still open, and cheap
 

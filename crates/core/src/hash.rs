@@ -84,9 +84,20 @@ fn xor_fold_step(i: usize, bits: u32) -> u64 {
 /// land in. A float sum would be neither and would report a difference from scheduling jitter
 /// alone — an instrument noisier than its subject measures nothing.
 pub fn xor_fold(x: &[f32]) -> u64 {
-    x.iter()
-        .enumerate()
-        .fold(0u64, |h, (i, v)| h ^ xor_fold_step(i, v.to_bits()))
+    xor_fold_from(x, 0)
+}
+
+/// The XOR fold with the index space OFFSET by `i_base` — how several disjoint buffers fold into
+/// one accumulator while staying sensitive to which buffer each element came from.
+///
+/// Folding N buffers at `i_base = j * n` treats them as one virtual array of length `N*n`. Without
+/// the offset the fold mixes only the within-buffer index, so the result is invariant under
+/// swapping two buffers' contents — which for `rivoli_engine::probe`'s pool-slot fold would make it
+/// blind to a crossed destination, the exact defect class it is aimed at.
+pub fn xor_fold_from(x: &[f32], i_base: u64) -> u64 {
+    x.iter().enumerate().fold(0u64, |h, (i, v)| {
+        h ^ xor_fold_step((i_base + i as u64) as usize, v.to_bits())
+    })
 }
 
 #[cfg(test)]
@@ -168,6 +179,23 @@ mod tests {
         assert_eq!(base ^ base, 0);
         // ...and the fold is not trivially zero, which the line above would also satisfy.
         assert_ne!(base, 0);
+
+        // The index OFFSET must matter, or several buffers folding into one accumulator would be
+        // invariant under swapping their contents — which is what it exists to prevent.
+        assert_ne!(
+            super::xor_fold_from(&x, 1),
+            base,
+            "i_base must change the fold"
+        );
+        // ...and offsetting is the same as prepending that many elements: folding buffer B at
+        // `i_base = n` equals folding `A ++ B` and then XOR-ing out A's own fold. This is the
+        // property `probe`'s multi-slot fold relies on, so it is asserted rather than assumed.
+        let (a, b) = (&x[..400], &x[400..]);
+        assert_eq!(
+            super::xor_fold(a) ^ super::xor_fold_from(b, 400),
+            base,
+            "folding the halves at their true offsets must reconstruct the whole"
+        );
     }
 
     #[test]

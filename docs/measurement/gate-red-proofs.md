@@ -134,7 +134,13 @@ SELF-TEST ok ...                                                        (green)
 ```
 
 **5b. The gate's recorded prompt, pinned by length + md5.** This one **fired on its own**: the pin
-was written with a placeholder hash before the real one was computed, and the self-test refused.
+was written with a placeholder hash before the real one was computed, and the check refused.
+
+> **CORRECTED 2026-08-17, same day.** As first written the pin ran only under `--self-test`, i.e.
+> never on the path it claimed to protect — review named it. It now runs on EVERY invocation, and
+> was re-proved there: a planted wrong hash makes `determinism-glm.sh <artifact> 512` exit 2 before
+> it reaches the artifact check, with the exit code read UNPIPED (`| head` eats it — that is a
+> recorded trap in this very file).
 
 ```
 FAIL: the recorded prompt changed — 317 bytes, md5 18927a780b36b029d03450d2100e9242
@@ -156,16 +162,38 @@ existing one as well. That is what the duplication was: the two asserted the sam
 The existing test was renamed to carry the number instead — the registry check does not care which
 test carries it, only that exactly one does.
 
-**5d. The divergence probe's fold-slot layout
-(`the_fold_slot_layout_matches_what_pointer_arithmetic_assumes`).** `Probe::fetch_fold_slot` hands
-out `Q::Bh`'s address and its callers reach `Sc`/`Se` with `.add(1)`/`.add(2)`. Planted: a variant
-inserted between `Bh` and `Sc`, with `NQ` bumped so it compiles — exactly the change that would
-silently make one layer's folds land in another layer's slot.
+**5d. The divergence probe's fold-slot layout — RED-PROVED, THEN THE TEST WAS DELETED, and the
+sequence is the point.** `Probe::fetch_fold_slot` handed out `Q::Bh`'s address and its callers
+reached `Sc`/`Se` with `.add(1)`/`.add(2)`. A test asserted the contiguity, and was planted against:
+a variant inserted between `Bh` and `Sc` with `NQ` bumped so it compiles — exactly the change that
+would silently make one layer's folds land in another layer's slot.
 
 ```
 assertion `left == right` failed: Sc must follow Bh    FAILED   (red)
 revert → 1 passed                                              (green again)
 ```
+
+> **SUPERSEDED 2026-08-17, same day.** Review pointed out that a test guarding an offset assumption
+> is the weaker half of the choice: make the layout unrepresentable instead. `FetchFolds { bh, sc }`
+> now names both pointers, `Q::Se` is fetched by name, no `.add()` remains, and the test is gone
+> along with the three SAFETY paragraphs that existed only to restate the offset. **The red proof is
+> kept rather than deleted** because it is the evidence that the hazard was real — the reason the
+> refactor happened at all — and because a reader finding the deleted test in history should find
+> why it went. This is the one row in this file whose gate no longer exists, and it is the right
+> outcome: a hazard removed beats a hazard tested.
+
+**5f. The length classifier (`classify_lengths`).** Added because review pointed out the branch was
+reachable only after two real 512-token GPU arms and so could never be shown red — and because it is
+the code that had just been found WRONG (it filed a divergence as a setup error). Factored out and
+driven from `--self-test`; planted: the unequal-length branch returns 2 (setup) instead of 1 (RED).
+
+```
+FAIL: unequal lengths must be RED (1), not a setup error   exit 2   (red)
+revert → SELF-TEST ok                                      exit 0   (green again)
+```
+
+Exit codes read UNPIPED both times. Piped through `| tail` the mutated run reports 0, which is the
+trap this file already records twice.
 
 **5e. `tests/divergence-columns.sh`'s three refusals.** All observed on real inputs:
 
@@ -178,6 +206,14 @@ header names more columns than rows    → FAIL: row 1 has 22 fields but the hea
 It also reproduced the coordinator's hand-written comparison exactly on the first real pair — row
 12427, `pos=164 layer=24`, column `h` — which is the closest thing to a green with independent
 provenance this round has.
+
+> **CORRECTED 2026-08-17, same day.** A fourth refusal was firing on the documented-NORMAL case:
+> `paste` pads the exhausted side, so once the shorter log ran out a row carried `n` fields instead
+> of `2n` and the guard reported "row 12001 has 11 fields but the header names 11 columns" — a
+> self-contradictory setup error on two logs of different length, which is what diverged arms always
+> produce. It also made the honest "no differing row in the common prefix" message unreachable
+> whenever the lengths differed. Both bodies are now truncated to the common prefix first, and the
+> prefix case was verified to print its own message with exit 0.
 
 **Owed, and standing.** The gate's own 512-token GREEN has never been observed, because the engine
 is red: the first device pair diverged. That is the live red proof for the gate as a whole (§5a's

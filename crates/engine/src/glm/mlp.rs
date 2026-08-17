@@ -87,18 +87,6 @@ impl GlmEngine<'_> {
         // layer's misses and relocations, not with the run's totals.
         #[cfg(feature = "corruption-probe")]
         let before = (self.pin.routed.misses(), self.pin.routed.relocs());
-        // Arm this layer's fetch-path folds BEFORE routing, so they are in place by the time
-        // `moe_layer` submits its cold reads. The pool clears the pointer as it consumes it, so a
-        // layer that submits nothing cannot leave it armed for the next one.
-        #[cfg(feature = "corruption-probe")]
-        if self.probe.is_some() {
-            let fold = self
-                .probe
-                .as_mut()
-                .context("unreachable: probe checked present")?
-                .fetch_fold_slot(l)?;
-            self.pin.routed.probe_next_layer(fold);
-        }
         self.route_layer(l, rows)?;
         self.moe_layer(l, rows).await?;
         #[cfg(feature = "corruption-probe")]
@@ -161,25 +149,30 @@ impl GlmEngine<'_> {
             miss: self.pin.routed.misses() - before.0,
             reloc: self.pin.routed.relocs() - before.1,
         };
-        // `se`: the SAME pool slots, folded again now that the layer's compute has been awaited.
-        // Only the experts this layer MISSED — `fold_slots` carries the cost argument and the
-        // coverage limit. Nothing to fold when the layer was all hits, which is why the record
-        // prints `-` for the trio at `misses == 0`.
+        // `se`: the WHOLE union's pool slots, folded now that the layer's compute has been
+        // awaited — see `fold_slots` for why the union and not just the misses, and what it costs.
+        //
+        // UNCONDITIONAL on a MoE layer, including one that missed nothing. A layer of pure hits
+        // can still read corrupt bytes: the corruption would have arrived on whatever earlier
+        // token loaded them. Guarding this on `misses > 0` (as an earlier draft did) would have
+        // made the instrument blind to exactly the case `bh`/`sc` cannot see, which is the reason
+        // this column exists.
         //
         // The `se` pointer is taken in its own scope so the `&mut self.probe` borrow ends before
         // `fold_slots` needs `&self.pin`, and before the `p` binding below takes the probe again.
-        if cols.miss > 0 {
+        {
+            // Its own scope: the `&mut self.probe` borrow ends before `fold_slots` needs
+            // `&self.pin`, and before the `p` binding below takes the probe again.
             let se = {
                 let p = self
                     .probe
                     .as_mut()
                     .context("unreachable: probe checked present above")?;
-                p.fetch_fold_slot(l)?
+                p.fold_slot(l, crate::probe::Q::Se)?
             };
-            // SAFETY: `se.add(2)` is `Q::Se`, one live device u64 in the slab (Bh, Sc, Se are
-            // contiguous by `Q`'s ordering); every writer of these slots retired at
-            // `launch_moe`'s awaits.
-            unsafe { self.pin.routed.fold_slots(l, &self.union, se.add(2))? };
+            // SAFETY: `se` is one live device u64 in the slab; every writer of these slots retired
+            // at `launch_moe`'s awaits.
+            unsafe { self.pin.routed.fold_slots(l, &self.union, se)? };
         }
         let inter = self.cfg.moe_inter;
         // EXACTLY the written extent, and the bound is load-bearing: the kernel writes
@@ -300,11 +293,24 @@ impl GlmEngine<'_> {
     /// the batch, launch. The UNION, not one row's picks: every expert any row routed
     /// to must be resident before the batch launches.
     async fn moe_layer(&mut self, l: usize, rows: Rows) -> Result<()> {
+        // The fetch-path fold targets travel WITH the selection, so they are resolved here where
+        // the probe is in hand rather than pushed into the pool as state beforehand.
+        #[cfg(feature = "corruption-probe")]
+        let fold = match self.probe.as_mut() {
+            Some(p) => crate::fetch::asyncfetch::FetchFolds {
+                bh: p.fold_slot(l, crate::probe::Q::Bh)?,
+                sc: p.fold_slot(l, crate::probe::Q::Sc)?,
+            },
+            None => crate::fetch::asyncfetch::FetchFolds::OFF,
+        };
+        #[cfg(not(feature = "corruption-probe"))]
+        let fold = crate::fetch::asyncfetch::FetchFolds::OFF;
         let (out, choice, union) = (&mut self.resolved, &self.choice, &self.union);
         self.pin.routed.submit(
             Selection {
                 layer: l,
                 experts: union,
+                fold,
             },
             choice,
             out,

@@ -13,7 +13,8 @@
 # ## What it does, and why the FIRST DIFFERING COLUMN is the answer
 #
 # `--divergence-log` writes one row per (pass, layer) with fourteen fields. Six are device XOR
-# folds; five are host-side folds of what the router saw, picked and where the pool put it. The
+# folds; three are host-side FNV folds of what the router saw, picked and where the pool put it, and
+# `misses`/`relocs` are plain counts rather than folds. The
 # first row where the two runs disagree is the coordinate, and *which field disagrees there* names
 # the subsystem:
 #
@@ -50,6 +51,13 @@
 # than requiring equal lengths. That is also why it reports the row NUMBER: past the first
 # difference nothing is comparable.
 #
+# THIS IS A READER, NEVER A GATE. It exits 0 whether or not it found a divergence — only its three
+# refusals (unreadable input, missing header, headers that disagree) exit 2. A caller must not key
+# on the exit code to decide whether the runs diverged; read the output. Making it exit 1 on "found"
+# would turn a diagnostic into a gate, and the gate for this property is
+# `tests/determinism-glm.sh`, which compares ids rather than instrumented folds and does not
+# perturb the run.
+#
 # Deviceless. No GPU, no artifact, no lock.
 set -uo pipefail
 
@@ -76,7 +84,11 @@ echo "== $(basename "$A") ($(body "$A" | wc -l) rows)  vs  $(basename "$B") ($(b
 # runs were produced by different builds and are not comparable.
 hdr() { grep -m1 -E '^# rivoli-divergence ' "$1" | sed -E 's/^# rivoli-divergence v[0-9]+ //'; }
 HA=$(hdr "$A"); HB=$(hdr "$B")
-[ -n "$HA" ] || { echo "FAIL: $A has no 'rivoli-divergence' header line" >&2; exit 2; }
+# BOTH, separately. Checking only A blamed a missing B header on "different columns — different
+# builds", which names the wrong cause (review 2026-08-17).
+for f in "$A:$HA" "$B:$HB"; do
+    [ -n "${f#*:}" ] || { echo "FAIL: ${f%%:*} has no 'rivoli-divergence' header line" >&2; exit 2; }
+done
 [ "$HA" = "$HB" ] || {
     echo "FAIL: the two logs declare different columns — different builds, not comparable:" >&2
     echo "  A: $HA" >&2
@@ -84,9 +96,23 @@ HA=$(hdr "$A"); HB=$(hdr "$B")
     exit 2
 }
 
-# `paste` over the two bodies; NF/2 splits the row because both sides have the same field count.
-# An unequal field count would make the halving wrong, so it is checked rather than assumed.
-paste <(body "$A") <(body "$B") | awk -v cols="$HA" '
+# TRUNCATED TO THE COMMON PREFIX FIRST, and that is a fix rather than tidiness.
+#
+# `paste` pads the exhausted side with an EMPTY field, so once the shorter log runs out a row has
+# `n` fields instead of `2n` — and the field-count guard below then reported
+# "row 12001 has 11 fields but the header names 11 columns", a self-contradictory setup error, on
+# the case this script's own header calls NORMAL (the arms generate different lengths by
+# construction once diverged). It also made the "no differing row in the common prefix" message
+# unreachable whenever the lengths differed, which is the honest verdict for an identical prefix.
+# Reproduced deviceless by review 2026-08-17.
+#
+# Past the shorter log's end nothing is comparable anyway — there is no second run to compare
+# against — so the common prefix IS the comparison, and cutting to it makes `NF == 2n` an invariant
+# the guard can genuinely check.
+NA=$(body "$A" | wc -l)
+NB=$(body "$B" | wc -l)
+NROWS=$((NA < NB ? NA : NB))
+paste <(body "$A" | head -n "$NROWS") <(body "$B" | head -n "$NROWS") | awk -v cols="$HA" '
 BEGIN { n = split(cols, F, " ") }
 {
     # NO EARLY `exit`, deliberately. awk exiting on the first difference closes the pipe under

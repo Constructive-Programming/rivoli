@@ -322,7 +322,7 @@ fn hash_rows_matches_the_host_fold() {
     let launch = |x: *const f32, n: usize, out: *mut u64| {
         // SAFETY: the callers pass a live device f32 span of `n` and one live device u64.
         ok(
-            unsafe { launch_hash_rows(x, n, out, rivoli_backend::NULL_STREAM) },
+            unsafe { launch_hash_rows(x, n, 0, out, rivoli_backend::NULL_STREAM) },
             "hash_rows",
         );
     };

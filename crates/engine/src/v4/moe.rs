@@ -205,6 +205,9 @@ impl V4Engine<'_> {
                 Selection {
                     layer,
                     experts: sel,
+                    // `--divergence-log` is a GLM-only instrument (the arm that does not reproduce itself), so
+                    // this arm has no fold targets to point at.
+                    fold: crate::fetch::asyncfetch::FetchFolds::OFF,
                 },
                 choice,
                 out,

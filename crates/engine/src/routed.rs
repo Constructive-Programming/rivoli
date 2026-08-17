@@ -77,6 +77,19 @@ pub struct PoolCfg<'a> {
 pub struct Selection<'a> {
     pub layer: usize,
     pub experts: &'a [usize],
+    /// `--divergence-log`'s per-layer fetch-path fold targets, or [`FetchFolds::OFF`].
+    ///
+    /// **On the selection rather than in the pool**, and unconditional rather than
+    /// feature-gated. The first version kept a single-use `Option<*mut u64>` on `RoutedPool`, set
+    /// by a `probe_next_layer` call before `submit` and cleared as `submit` consumed it — hidden
+    /// mutable state with a two-call protocol, eight lines of comment arguing that no path could
+    /// leave it armed for the next layer, and a real hazard if one ever did. Carrying it here
+    /// makes that hazard unrepresentable: the folds belong to the layer being submitted, so they
+    /// travel with it (review, 2026-08-17).
+    ///
+    /// Unconditional because a `#[cfg]` field would force cfg'd initializers on the two arms that
+    /// never use it; `OFF` costs two null pointers in a `Copy` struct built once per layer.
+    pub fold: crate::fetch::asyncfetch::FetchFolds,
 }
 
 /// [`RoutedPool::submit`]'s result buffers, caller-owned so the per-layer hot path
@@ -139,15 +152,6 @@ pub struct RoutedPool {
     fetch: AsyncFetch,
     hits: u64,
     misses: u64,
-    /// `--divergence-log`: the base of the fold slots the NEXT `submit`'s cold reads write into.
-    ///
-    /// **Single-use: `submit` takes it and clears it.** A sticky pointer would let layer L+1's
-    /// reads fold into layer L's slots if the caller forgot to set it, which reads in the log as
-    /// two runs agreeing about a layer whose bytes were never hashed. Set per layer via
-    /// [`RoutedPool::probe_next_layer`]; `None` means the folds are off, which is every run
-    /// without the flag.
-    #[cfg(feature = "corruption-probe")]
-    fetch_fold: Option<*mut u64>,
     /// Compaction relocations executed. Counted because arena relocation was the standing
     /// suspect for the run-to-run divergence and nothing was measuring how often it fires:
     /// `--divergence-log` records the per-layer DELTA, so a divergence coordinate can be
@@ -260,8 +264,6 @@ impl RoutedPool {
             hits: 0,
             misses: 0,
             relocs: 0,
-            #[cfg(feature = "corruption-probe")]
-            fetch_fold: None,
             trace: cfg.trace.map(|p| open_trace(p, cfg.top_k)).transpose()?,
         })
     }
@@ -417,13 +419,6 @@ impl RoutedPool {
         self.misses
     }
 
-    /// Arm the fetch-path divergence folds for the NEXT `submit` only. See
-    /// [`RoutedPool::fetch_fold`] for why it is single-use.
-    #[cfg(feature = "corruption-probe")]
-    pub fn probe_next_layer(&mut self, fold: *mut u64) {
-        self.fetch_fold = Some(fold);
-    }
-
     /// XOR-fold the pool slots of `experts` into `out` — the `se` column, taken at END OF LAYER on
     /// the null stream once both MoE lanes have been awaited.
     ///
@@ -433,25 +428,47 @@ impl RoutedPool {
     /// landed — a ticket/timeline ordering failure rather than a corrupt payload — and `sc != se`
     /// says something wrote the slot after the copy.
     ///
-    /// **Folds only the experts the caller passes, and the caller passes the MISSES.** Folding the
-    /// whole batch would be ~9 experts x 14.6 MiB x 78 layers = ~10 GB/token of extra device
-    /// reads, against ~2 GB for the misses alone. The coverage limit is real and must be stated
-    /// with any result: if the corrupted expert was a RESIDENT one, loaded on an earlier token,
-    /// this column is silent about it.
+    /// **Folds every expert the caller passes, and the caller passes the WHOLE UNION** — not just
+    /// the misses. That is deliberate and it is the expensive choice: ~9 experts x 14.6 MiB x 75
+    /// MoE layers is ~9.8 GB/token of extra device reads, against ~1.9 GB if it followed the one
+    /// or two misses. It buys the elimination of an entire branch of the diagnosis. `bh` and `sc`
+    /// can only see the expert that was READ this layer, so with them alone a divergence in a
+    /// RESIDENT expert's bytes — loaded on some earlier token and corrupted since — is
+    /// indistinguishable from the kernel reading a fresh slot too early. Folding the union
+    /// separates those two outright, and they are the two most likely survivors.
+    ///
+    /// If that cost ever masks the defect, narrowing this to the misses is a one-line change at
+    /// the call site — and it costs exactly the resident-expert branch, which is what to say when
+    /// making it.
     ///
     /// # Safety
     /// `out` is one live device u64; every writer of the named slots has retired.
     #[cfg(feature = "corruption-probe")]
     pub unsafe fn fold_slots(&self, layer: usize, experts: &[usize], out: *mut u64) -> Result<()> {
         let n = self.geom.stride / 4;
-        for &e in experts {
-            let Some((hot, idx)) = self.slot(expert_key(layer, e)) else {
-                continue;
-            };
+        for (j, &e) in experts.iter().enumerate() {
+            // NOT a silent `continue`. An expert with no slot would leave its bytes out of the
+            // fold, and two runs would then "agree" about a payload neither hashed — the one
+            // failure mode this instrument may not have. Unreachable today (`resolve` already
+            // `?`-ed on every union member's slot and nothing evicts before this point), which is
+            // exactly why a skip here would never be noticed.
+            let (hot, idx) = self
+                .slot(expert_key(layer, e))
+                .with_context(|| format!("fold_slots: (layer {layer}, expert {e}) has no slot"))?;
             let p = self.ptr(hot, idx) as *const f32;
-            // SAFETY: `p` owns `stride` bytes in the pool VMM and `stride` is a multiple of the
-            // O_DIRECT block, hence of 4; `out` is the caller's live device u64.
-            unsafe { rivoli_backend::launch_hash_rows(p, n, out, rivoli_backend::NULL_STREAM)? };
+            // `j * n` offsets each slot into its own window of one virtual array, so the combined
+            // fold is NOT invariant under two experts' payloads being swapped between slots — see
+            // `launch_hash_rows`. `experts` is the union in a fixed order, so `j` is comparable
+            // across runs (and `sl` folds the same order, which is what makes the pair meaningful).
+            unsafe {
+                rivoli_backend::launch_hash_rows(
+                    p,
+                    n,
+                    (j * n) as u64,
+                    out,
+                    rivoli_backend::NULL_STREAM,
+                )?
+            };
         }
         Ok(())
     }
@@ -670,10 +687,7 @@ impl RoutedPool {
                     begin,
                     len,
                     dst: self.host_ptr(hot, idx),
-                    #[cfg(feature = "corruption-probe")]
-                    fold: self.fetch_fold.unwrap_or(std::ptr::null_mut()),
-                    #[cfg(not(feature = "corruption-probe"))]
-                    fold: std::ptr::null_mut(),
+                    fold: sel.fold,
                 });
                 miss_sel.push(i);
             }
@@ -682,12 +696,6 @@ impl RoutedPool {
         for &i in &miss_sel {
             self.pending_loaded
                 .push(expert_key(sel.layer, sel.experts[i]));
-        }
-        // Consumed: see `fetch_fold`'s doc. Cleared before the submit so an early return from it
-        // cannot leave the pointer armed for the next layer.
-        #[cfg(feature = "corruption-probe")]
-        {
-            self.fetch_fold = None;
         }
         let miss_tickets = self.fetch.submit(reads)?;
         // A resident expert's data is already there, so it carries the RESIDENT ticket

@@ -356,26 +356,60 @@ extern "C" int rivoli_flag_nonfinite(const float* x, int n, unsigned tag, unsign
 // instrument that perturbs its own subject is not an instrument. The caller drains every
 // slot in ONE D2H per token, at a point the end-of-layer sync has already idled.
 extern "C" __global__ void hash_rows(const float* __restrict__ x, int n,
-                                     unsigned long long* __restrict__ out) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    unsigned int bits;
-    __builtin_memcpy(&bits, &x[i], sizeof(bits));
-    unsigned long long z = ((unsigned long long)i << 32) ^ (unsigned long long)bits;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    atomicXor(out, z ^ (z >> 31));
+                                    unsigned long long i_base,
+                                    unsigned long long* __restrict__ out) {
+    // ONE ATOMIC PER BLOCK, not one per element, and this is a correctness-of-the-instrument fix
+    // rather than a tuning choice.
+    //
+    // The first version did `atomicXor(out, …)` per element against a SINGLE global u64. That is
+    // fine for the residual folds (6144 elements) but the fetch-path folds are 3.8 M elements each
+    // and there are ~936 of them per token: 3.6e9 same-address atomics, which serialise. At any
+    // plausible same-address atomic rate that is ~1-4 s/token against a 388 ms budget — the
+    // instrument would be several times slower than what it measures, which is the `--checksum-x`
+    // failure with a different mechanism. Reducing in-block first (3744x fewer atomics) makes it
+    // bandwidth-bound instead.
+    //
+    // The reduction is EXACT and needs no tolerance argument: XOR is associative and commutative,
+    // so a tree in shared memory yields the identical word a serial fold does. That is the property
+    // the whole instrument rests on, used one level deeper. `rivoli_core::hash::xor_fold_from`
+    // remains the reference and `fwd_kernel.rs` scores this against it bit for bit.
+    //
+    // `i_base` OFFSETS THE INDEX SPACE, which is how several slots fold into one accumulator while
+    // staying sensitive to WHICH slot each payload came from. Folding N slots at `i_base = j*n`
+    // treats them as one virtual array. Without it the fold mixes only the within-slot index, so it
+    // is invariant under SWAPPING two experts' payloads between their slots — and a crossed
+    // destination is exactly the "wrong bytes in a slot" class under investigation, which would
+    // then leave every fold agreeing and be misread as something else (review, 2026-08-17).
+    __shared__ unsigned long long red[256];
+    unsigned long long acc = 0;
+    // Grid-stride, so the launch geometry is bounded and independent of `n`.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        unsigned int bits;
+        __builtin_memcpy(&bits, &x[i], sizeof(bits));
+        unsigned long long z = ((i_base + (unsigned long long)i) << 32) ^ (unsigned long long)bits;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        acc ^= z ^ (z >> 31);
+    }
+    red[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] ^= red[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicXor(out, red[0]);
 }
 
-// `stream` is trailing and null is the null stream, per the mla.hip launcher convention. It is
-// not optional decoration: the fetch-path folds must be ORDERED against the bounce->slot copy on
-// the fetch stream (fold the arena, then copy, then fold the slot), and rivoli's streams are
-// `hipStreamNonBlocking`, so a null-stream launch between two fetch-stream operations would race
-// both of them and hash whichever bytes happened to be there.
-extern "C" int rivoli_hash_rows(const float* x, int n, unsigned long long* out, void* stream) {
+extern "C" int rivoli_hash_rows(const float* x, int n, unsigned long long i_base,
+                                unsigned long long* out, void* stream) {
     if (n <= 0) return 1001;
     hipGetLastError();
-    hipLaunchKernelGGL(hash_rows, dim3((n + 255) / 256), dim3(256), 0, (hipStream_t)stream, x, n,
+    // Grid CAPPED at 1024 blocks: the kernel is grid-stride, so a bounded grid bounds the number
+    // of atomics (one per block) independently of `n`. 1024 is ~25x the 40 CUs, enough to saturate
+    // and few enough that the atomics are noise. Small folds still get one block per 256 elements.
+    int blocks = (n + 255) / 256;
+    if (blocks > 1024) blocks = 1024;
+    hipLaunchKernelGGL(hash_rows, dim3(blocks), dim3(256), 0, (hipStream_t)stream, x, n, i_base,
                        out);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;

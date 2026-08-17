@@ -54,6 +54,7 @@
 //! whole of [`stage`] below.
 #![cfg(feature = "rocm")]
 
+use crate::fetch::asyncfetch::FetchFolds;
 use anyhow::{Result, ensure};
 use io_uring::{IoUring, opcode, types};
 use std::ffi::c_void;
@@ -170,14 +171,9 @@ pub struct ReadSpan {
 pub struct ReadDst {
     pub ptr: *mut u8,
     pub slot: u32,
-    /// `--divergence-log` only: three contiguous device u64 this read XOR-folds into — the bounce
-    /// arena before the copy, the pool slot after it, and (written elsewhere) the same slot at end
-    /// of layer. NULL disables the folds entirely, which is the shipping configuration.
-    ///
-    /// A raw pointer rather than a handle because [`reap`](Streamer::reap) runs on the reaper
-    /// thread and the probe lives on the decode thread; it is device memory and is never
-    /// dereferenced on the CPU, exactly like `ptr`.
-    pub fold: *mut u64,
+    /// `--divergence-log` only; see [`FetchFolds`] for why it is a named pair rather than a base
+    /// pointer plus an offset.
+    pub fold: FetchFolds,
 }
 
 pub struct Streamer {
@@ -201,8 +197,8 @@ pub struct Streamer {
     /// [`Ticket`](crate::fetch::asyncfetch::Ticket) now, not by the batch that happened to use it.
     dst: Vec<*mut u8>,
     nbytes: Vec<u32>,
-    /// Per-SLOT divergence-fold target, parallel to `dst`. Null = folds off.
-    fold: Vec<*mut u64>,
+    /// Per-SLOT divergence-fold targets, parallel to `dst`. [`FetchFolds::OFF`] = folds off.
+    fold: Vec<FetchFolds>,
     /// Per-SLOT minimum completion length (sub-block offset + useful len). `reap` compares
     /// the completion `res` against it so a real mid-file short read is caught while
     /// EOF-padding truncation is tolerated.
@@ -252,7 +248,7 @@ impl Streamer {
             arena,
             dst: vec![std::ptr::null_mut(); entries as usize],
             nbytes: vec![0; entries as usize],
-            fold: vec![std::ptr::null_mut(); entries as usize],
+            fold: vec![FetchFolds::OFF; entries as usize],
             min_res: vec![0; entries as usize],
         })
     }
@@ -411,14 +407,31 @@ impl Streamer {
         // The fold reads the arena as f32 purely to reuse `hash_rows`; it folds raw bits and the
         // payload is packed indices plus bf16 scales, so the interpretation is irrelevant.
         // `nbytes` is a multiple of the O_DIRECT block and therefore of 4.
+        //
+        // WHY THESE FOLDS CANNOT RACE THE PROBE'S PER-PASS CLEAR, recorded here because the
+        // argument spans three files and a reader of this one deserves it: each read's `bh`/copy/
+        // `sc` are enqueued before THAT read's timeline signal (`asyncfetch.rs::run_job`), the miss
+        // kernel waits on that value, `launch_moe` host-awaits the miss stream, and `run_layer`
+        // ends every layer with an unconditional `device_sync`. `Probe::drain` runs only after
+        // every layer of a pass and syncs again after its own clear. So no fold for pass N+1 can
+        // be enqueued before pass N's clear has executed.
         #[cfg(feature = "corruption-probe")]
-        if !self.fold[ud].is_null() {
+        if self.fold[ud].armed() {
             let n = self.nbytes[ud] as usize / 4;
-            // SAFETY: `src` owns `nbytes` readable bytes; `fold[ud]` is the base of three live
-            // device u64; `stream` is live. Slot 0 is `Q::Bh`.
-            unsafe {
-                rivoli_backend::launch_hash_rows(src as *const f32, n, self.fold[ud], stream)?
+            // LOGGED, NOT `?`. A `?` here returns from `reap` after the CQE is consumed and
+            // BEFORE `copy_to_slot`, so the reaper poisons, the ticket is released from the host,
+            // and the miss kernel launches over a slot this layer never wrote. That is the
+            // INSTRUMENT changing what the engine computes, which it may never do — the engine's
+            // own guards above (`res < 0`, short read) legitimately abort because they are engine
+            // faults. A dropped fold costs one hole in the log and says so.
+            // SAFETY: `src` owns `nbytes` readable bytes; `bh` is one live device u64; `stream` is
+            // live.
+            let r = unsafe {
+                rivoli_backend::launch_hash_rows(src as *const f32, n, 0, self.fold[ud].bh, stream)
             };
+            if let Err(e) = r {
+                tracing::error!("divergence probe: bh fold failed on slot {ud} ({e:#})");
+            }
         }
         // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
         // read's signal fires; the arena slot holds the just-read bytes; `stream` is
@@ -429,18 +442,25 @@ impl Streamer {
             anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
         }
         #[cfg(feature = "corruption-probe")]
-        if !self.fold[ud].is_null() {
+        if self.fold[ud].armed() {
             let n = self.nbytes[ud] as usize / 4;
+            // Logged rather than `?` for the same reason as `bh` above, though this one is after
+            // the copy and so could safely abort; keeping both the same means neither can be
+            // changed to `?` by someone reading only one of them.
             // SAFETY: as above, and the copy is already enqueued on `stream`, so this fold reads
-            // the slot AFTER it. Slot 1 is `Q::Sc`.
-            unsafe {
+            // the slot AFTER it.
+            let r = unsafe {
                 rivoli_backend::launch_hash_rows(
                     self.dst[ud] as *const f32,
                     n,
-                    self.fold[ud].add(1),
+                    0,
+                    self.fold[ud].sc,
                     stream,
-                )?
+                )
             };
+            if let Err(e) = r {
+                tracing::error!("divergence probe: sc fold failed on slot {ud} ({e:#})");
+            }
         }
         Ok(ud)
     }

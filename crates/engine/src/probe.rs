@@ -76,42 +76,35 @@ pub enum Q {
     /// **`sc`** — the POOL slot, folded on the fetch stream immediately AFTER the copy.
     /// "What arrived in the pool." `bh != sc` isolates the copy.
     Sc = 4,
-    /// **`se`** — the same POOL slot, folded again at END OF LAYER on the null stream, after
-    /// both MoE lanes have been awaited. "What the slot holds once the layer is over."
+    /// **`se`** — the POOL slots of the WHOLE BATCH, folded at END OF LAYER on the null stream
+    /// after both MoE lanes have been awaited, each at its own `i_base`. "What every expert this
+    /// layer used holds, at rest."
     ///
-    /// `sc == se` with `h` differing is the interesting one: the bytes at rest are RIGHT, so the
-    /// kernel read them before they landed — a ticket/timeline ordering failure, not a corrupt
-    /// payload. That question is why this slot exists and it is not answerable from `bh`/`sc`.
+    /// **Its value is COVERAGE, and the rule for reading it is CROSS-RUN.** Two earlier versions of
+    /// this comment got that wrong, and both errors are worth recording. The first claimed the
+    /// point was detecting a write to the slot after the copy — review answered that `bh` equal
+    /// *and* `sc` equal with `h` differing already implies the kernel read something else, which is
+    /// true for the expert that was READ. `bh`/`sc` bracket ONE copy, so they see ~1.7 of the
+    /// batch's 9 slots at the measured 78% hit rate; `se` sees all 9, and that is what separates "a
+    /// RESIDENT expert's bytes went wrong on an earlier token" from "the kernel read a fresh slot
+    /// too early". The second version then invited `sc == se` as a WITHIN-RUN test, which cannot
+    /// hold: a fold over one slot and a fold over nine are different quantities and would differ on
+    /// every row, sending an operator after an innocent hop. **Compare A's `se` against B's `se`.**
+    /// The full rule is in the log's own header, where it travels with the data.
     Se = 5,
 }
 
 /// Device u64 fold slots per layer — one per [`Q`].
 const NQ: usize = 6;
 
-#[cfg(test)]
-mod tests {
-    use super::{NQ, Q};
-
-    /// `NQ` and [`Q`] must agree, and `Bh`/`Sc`/`Se` must be CONTIGUOUS.
-    ///
-    /// Both are relied on by pointer arithmetic outside this module:
-    /// [`Probe::fetch_fold_slot`](super::Probe::fetch_fold_slot) hands out `Bh`'s address and its
-    /// callers reach `Sc`/`Se` with `.add(1)`/`.add(2)`. Today that is true because of the order
-    /// the variants happen to be DECLARED in, which is not a guarantee — inserting a variant
-    /// between them would silently make one layer's folds land in another's slot, and every
-    /// resulting log would be wrong in a way that reads as evidence. Asserted here so the
-    /// insertion is a failing test instead.
-    #[test]
-    fn the_fold_slot_layout_matches_what_pointer_arithmetic_assumes() {
-        assert_eq!(
-            Q::Se as usize + 1,
-            NQ,
-            "NQ must be exactly the number of Q variants"
-        );
-        assert_eq!(Q::Sc as usize, Q::Bh as usize + 1, "Sc must follow Bh");
-        assert_eq!(Q::Se as usize, Q::Bh as usize + 2, "Se must follow Sc");
-    }
-}
+/// `NQ` must cover every [`Q`], checked AT COMPILE TIME.
+///
+/// A `#[test]` was the first form and was the wrong one: `mod probe` is gated on
+/// `corruption-probe`, the prescribed battery is `cargo test --workspace` (which does not set it),
+/// CI has no rocm arm, and `tests/feature-matrix.sh` runs `cargo check` plus two integration
+/// targets — so nothing executed it (review, 2026-08-17). A `const` assertion is checked by every
+/// build of every feature cell, which is the coverage the claim needs.
+const _: () = assert!(Q::Se as usize + 1 == NQ, "NQ must cover every Q variant");
 
 /// One MoE layer's host-side columns. Every field is a fold of data the decode thread already
 /// holds, so recording them costs no device traffic and no I/O.
@@ -205,18 +198,30 @@ impl Probe {
             "divergence probe: layer {layer} outside a {}-layer slab",
             self.cols.len()
         );
+        // `q` is bounded too, and not for symmetry: `layer * NQ + q` with `q >= NQ` lands in the
+        // NEXT layer's block on every layer but the last, and past the `DeviceBuf` on the last —
+        // a silent device OOB write, and on the earlier layers a fold that corrupts another
+        // layer's slot while looking like it worked. Adding a `Q` variant without bumping `NQ`
+        // is all it takes, so this is total rather than trusting the enum (review, 2026-08-17).
+        ensure!(
+            (q as usize) < NQ,
+            "divergence probe: Q index {} >= NQ {NQ} — a variant was added without bumping NQ",
+            q as usize
+        );
         // SAFETY: `layer * NQ + (q as usize) < cols.len() * NQ` by the check above and `q < NQ`,
         // so the offset is inside the slab this `DeviceBuf` owns.
         Ok(unsafe { (self.dev.ptr_mut() as *mut u64).add(layer * NQ + q as usize) })
     }
 
-    /// The base of this layer's THREE fetch-path fold slots (`Bh`, `Sc`, `Se`), contiguous by the
-    /// ordering of [`Q`].
+    /// The device address of `(layer, q)`'s fold slot — for a caller that folds into it itself
+    /// (the reaper thread, via [`crate::fetch::asyncfetch::FetchFolds`]) rather than through
+    /// [`Self::fold`].
     ///
-    /// Handed to the pool so the reaper thread can fold into it from the fetch stream without this
-    /// type crossing a thread boundary. Device memory, never dereferenced on the CPU.
-    pub fn fetch_fold_slot(&mut self, layer: usize) -> Result<*mut u64> {
-        self.slot_ptr(layer, Q::Bh)
+    /// Each slot is named by its [`Q`], never reached by offset from another. An earlier version
+    /// handed out `Q::Bh`'s address and let callers `.add(1)`/`.add(2)`, which was correct only
+    /// because of the order the variants are declared in and needed a test to catch a reordering.
+    pub fn fold_slot(&mut self, layer: usize, q: Q) -> Result<*mut u64> {
+        self.slot_ptr(layer, q)
     }
 
     /// XOR-fold `n` device f32 at `x` into `(layer, q)`'s slot, on the null stream. No sync, no
@@ -228,7 +233,7 @@ impl Probe {
         let out = self.slot_ptr(layer, q)?;
         // SAFETY: `out` is one live device u64 inside the slab; `x`/`n` are the caller's
         // contract, forwarded.
-        unsafe { launch_hash_rows(x, n, out, rivoli_backend::NULL_STREAM) }
+        unsafe { launch_hash_rows(x, n, 0, out, rivoli_backend::NULL_STREAM) }
     }
 
     /// Record a MoE layer's host columns for the pass in flight.
@@ -304,18 +309,22 @@ impl Probe {
                 Some(_) => format!("{:016x}", at(Q::H as usize)?),
                 None => "-".to_string(),
             };
-            // The three fetch-path folds exist only where a COLD READ landed. With no miss
-            // nothing was folded, and printing 0 would let two runs "agree" about bytes neither
-            // of them hashed — the same false-exclusion trap as `h` on a dense layer.
-            let fetched = moe.is_some_and(|c| c.miss > 0);
-            let trio = match fetched {
-                true => format!(
-                    "{:016x} {:016x} {:016x}",
-                    at(Q::Bh as usize)?,
-                    at(Q::Sc as usize)?,
-                    at(Q::Se as usize)?
-                ),
-                false => "- - -".to_string(),
+            // `bh` and `sc` exist only where a COLD READ landed — they bracket a copy, and with no
+            // miss there was no copy. `se` is folded on EVERY MoE layer, hits included, because a
+            // resident expert's bytes can be wrong from an earlier token. Printing 0 for an
+            // unfolded slot would let two runs "agree" about bytes neither hashed, which is the
+            // false-exclusion trap this instrument already fell into once (`xn` on dense layers).
+            let trio = match moe {
+                None => "- - -".to_string(),
+                Some(c) => {
+                    let bh_sc = match c.miss > 0 {
+                        true => {
+                            format!("{:016x} {:016x}", at(Q::Bh as usize)?, at(Q::Sc as usize)?)
+                        }
+                        false => "- -".to_string(),
+                    };
+                    format!("{bh_sc} {:016x}", at(Q::Se as usize)?)
+                }
             };
             let host = match moe {
                 None => "- - - - -".to_string(),
@@ -348,10 +357,15 @@ impl Probe {
              token k in decode, (pos=k, nrow=2) is a layer-major prefill row-block. v2 added \
              nrow because pos alone made those two indistinguishable\n\
              # `-` means NOT MEASURED, never zero: a dense layer has no h and no router, and a \
-             layer with no miss has no bh/sc/se\n\
-             # bh = bounce arena after the NVMe read; sc = pool slot after the copy; se = the \
-             same slot at end of layer. bh!=sc isolates the copy; sc==se with h differing means \
-             the bytes at rest are RIGHT and the kernel read them too early\n\
+             layer with no miss has no bh/sc (se is folded on every MoE layer)\n\
+             # bh = bounce arena after the NVMe read; sc = the pool slot just copied; se = ALL \
+             the slots this layer used, at end of layer\n\
+             # DECISION RULE, CROSS-RUN and never within-run (sc folds 1 slot, se folds ~9, so \
+             they are different quantities): h_A!=h_B is the trigger; then bh differs -> the \
+             DRIVE; bh equal and sc differs -> the COPY; bh and sc equal and se differs -> a slot \
+             was wrong AT REST and not the one just copied (a resident expert, or a write after \
+             the copy); all three equal -> the kernel read a slot BEFORE it landed, a \
+             ticket/timeline ordering failure\n\
              # diff two runs: first differing LINE is the coordinate, first differing \
              COLUMN names the mechanism\n",
         );

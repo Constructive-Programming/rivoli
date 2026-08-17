@@ -583,6 +583,9 @@ impl K3Engine<'_> {
         let picks = Selection {
             layer,
             experts: &self.sel,
+            // `--divergence-log` is a GLM-only instrument (the arm that does not reproduce itself), so
+            // this arm has no fold targets to point at.
+            fold: crate::fetch::asyncfetch::FetchFolds::OFF,
         };
         self.pin
             .routed

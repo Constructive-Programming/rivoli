@@ -55,12 +55,53 @@ pub struct ReadSpec {
     pub begin: usize,
     pub len: usize,
     pub dst: *mut u8,
-    /// `--divergence-log` only; see [`crate::fetch::stream::ReadDst::fold`]. Null = off, which is
-    /// every build without the feature and every run without the flag.
-    pub fold: *mut u64,
+    /// `--divergence-log` only; see [`FetchFolds`]. `FetchFolds::OFF` in every build without the
+    /// feature and every run without the flag.
+    pub fold: FetchFolds,
 }
-// SAFETY: `dst` and `fold` are only handed to io_uring / hipMemcpyAsync / a fold launch on the
-// reaper thread, never dereferenced on the CPU; `fd` is a plain descriptor.
+
+/// The two device u64 a cold read XOR-folds into: the bounce arena before the copy, the pool slot
+/// after it. `--divergence-log` only.
+///
+/// **A PAIR OF NAMED POINTERS, not a base plus `.add(1)`.** The first version handed the fetch path
+/// one pointer and reached the second slot by offset, which is correct only because of the order
+/// two enum variants happen to be declared in — so it needed a test to catch a future reordering,
+/// and three SAFETY paragraphs restating the offset. Naming both makes the reorder unrepresentable
+/// instead of test-detected, which is this workspace's rule (review, 2026-08-17).
+///
+/// Raw pointers because [`crate::fetch::stream::Streamer::reap`] runs on the reaper thread while
+/// the probe lives on the decode thread. They are device memory and are never dereferenced on the
+/// CPU, exactly like `ReadSpec::dst`.
+#[derive(Clone, Copy)]
+pub struct FetchFolds {
+    pub bh: *mut u64,
+    pub sc: *mut u64,
+}
+
+impl FetchFolds {
+    /// Folds disabled — the shipping configuration and every non-probe build.
+    ///
+    /// **This type is NOT feature-gated, and the cost is stated rather than claimed away.** A build
+    /// without `corruption-probe` still carries two null pointers per [`ReadSpec`] (~130 per token),
+    /// one `Vec<FetchFolds>` of `entries` per `Streamer`, and one 16-byte store per queued read —
+    /// call it ~2 KB of stores per token against a 388 ms budget, and NO new branch on any hot path
+    /// (the fold sites are `#[cfg]`-gated out entirely). An earlier commit message claimed "no new
+    /// field cost", which was simply false; gating four fields to recover this would add eight
+    /// `#[cfg]` attributes and cfg'd initialisers in three arms, which is the worse trade.
+    pub const OFF: Self = Self {
+        bh: std::ptr::null_mut(),
+        sc: std::ptr::null_mut(),
+    };
+
+    /// Are the folds armed? One check, so the two call sites in `reap` cannot disagree about
+    /// which pointer decides.
+    #[inline]
+    pub fn armed(&self) -> bool {
+        !self.bh.is_null()
+    }
+}
+// SAFETY: `dst` and `fold`'s two pointers are only handed to io_uring / hipMemcpyAsync / a fold
+// launch on the reaper thread, never dereferenced on the CPU; `fd` is a plain descriptor.
 unsafe impl Send for ReadSpec {}
 
 /// A layer's demand batch: the reads plus the ticket each one redeems.

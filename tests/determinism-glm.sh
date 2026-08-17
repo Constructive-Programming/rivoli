@@ -85,8 +85,6 @@ set -uo pipefail
 # sibling gate rather than `RIVOLI_*`, which is the engine's own flat env namespace.
 BIN=${DETERMINISM_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/release/rivoli}
 LOCK=/var/run/sys-gpu.lock
-
-
 # The floor, argued in the header. A caller may raise `ngen`, never lower it past this.
 MIN_NGEN=512
 
@@ -99,16 +97,27 @@ MIN_NGEN=512
 #
 # WHY THIS PROMPT AND NOT THE ENGINE'S DEFAULT: `--bench` with no `--prompt` uses "The sky is blue
 # because", which hits EOS at 276 tokens, so a 512-token floor is UNREACHABLE and the gate refuses
-# its own precondition (observed 2026-08-17). This is the essay prompt the wave standardised on;
-# it is long-form enough that the model keeps generating.
+# its own precondition (observed on device 2026-08-17). This is the essay prompt the wave
+# standardised on; it is long-form enough that the model keeps generating.
+PROMPT='Explain in depth how modern computer systems manage memory, from DRAM and the cache hierarchy through virtual memory, TLBs, cache coherence, NUMA, allocators, and garbage collection. For each mechanism, describe why it exists, the trade-offs it makes, and a concrete failure mode an engineer would meet in production.'
+
+# PINNED, AND CHECKED ON EVERY RUN — not only under --self-test, which was the first version and
+# never executed on the path it claimed to protect (review, 2026-08-17).
 #
-# Heredoc rather than a quoted literal so the text is byte-for-byte readable in the diff, and
-# `read -r -d ''` so no shell expansion touches it. The trailing newline is dropped, which is a
-# CHOICE: tokenization differs with and without it, so the recorded form is the 317-byte text.
-IFS= read -r -d '' PROMPT <<'PROMPT_EOF'
-Explain in depth how modern computer systems manage memory, from DRAM and the cache hierarchy through virtual memory, TLBs, cache coherence, NUMA, allocators, and garbage collection. For each mechanism, describe why it exists, the trade-offs it makes, and a concrete failure mode an engineer would meet in production.
-PROMPT_EOF
-PROMPT=${PROMPT%$'\n'}
+# The pin is not there to stop a silent edit: `git diff` already shows one. It is there so a
+# RECORDED GREEN means something. Every green this gate prints cites the prompt's md5, and a green
+# in a doc is only comparable to a later green if both ran the same text — the `corpus=<fnv>`
+# discipline the .nll header already uses, applied to the one input this gate carries in-line.
+# Costs one md5 of 317 bytes per run.
+PLEN=$(printf '%s' "$PROMPT" | wc -c)
+PMD5=$(printf '%s' "$PROMPT" | md5sum | cut -d' ' -f1)
+if [ "$PLEN" != 317 ] || [ "$PMD5" != 18927a780b36b029d03450d2100e9242 ]; then
+    echo "FAIL: the recorded prompt changed — $PLEN bytes, md5 $PMD5" >&2
+    echo "      expected 317 bytes, md5 18927a780b36b029d03450d2100e9242" >&2
+    echo "      Every green recorded by this gate was measured on the old text. If the change" >&2
+    echo "      is intended, update BOTH numbers here in the same commit that edits it." >&2
+    exit 2
+fi
 
 # --- the comparator, and its red proof ----------------------------------------------------
 #
@@ -118,15 +127,50 @@ PROMPT=${PROMPT%$'\n'}
 compare_ids() { # $1 = arm A ids, $2 = arm B ids; 0 identical, 1 differ
     if cmp -s "$1" "$2"; then return 0; fi
     local n first
-    n=$(paste "$1" "$2" | awk '$1 != $2' | wc -l)
+    # `-F'\t'` in BOTH awk calls, not the default FS. `paste` pads the exhausted side with an EMPTY
+    # field, and under the default FS an empty leading field collapses — so when arm A is the
+    # shorter one, awk reads B's id as `$1` and the excerpt prints it under the `A=` label with A's
+    # count as the denominator. Reproduced by review 2026-08-17 (A=3, B=5: "2 of 3 differ, pos 3:
+    # A=4 B=" when the truth is A had nothing there). Reporting a length divergence honestly is the
+    # entire purpose of the branch that reaches this.
+    n=$(paste "$1" "$2" | awk -F'\t' '$1 != $2' | wc -l)
     # 0-BASED, matching how every recorded measurement of this defect states its onset
     # ("first at position 13", "first at 452"): position 0 is the first generated token.
-    first=$(paste "$1" "$2" | awk '$1 != $2 {print NR - 1; exit}')
+    first=$(paste "$1" "$2" | awk -F'\t' '$1 != $2 {print NR - 1; exit}')
     echo "RED: $n of $(wc -l <"$1") ids differ, first at position ${first:-?} (0-based)" >&2
     # `F` is 0-based and `NR` is 1-based, so the differing row is NR == F+1. Without the +1 the
     # first line printed is an IDENTICAL one, in the excerpt that is the gate's whole payload.
-    paste "$1" "$2" | awk -v F="${first:-0}" 'NR >= F + 1 && NR <= F + 5 {printf "  pos %d: A=%s B=%s\n", NR - 1, $1, $2}' >&2
+    paste "$1" "$2" | awk -F'\t' -v F="${first:-0}" 'NR >= F + 1 && NR <= F + 5 {printf "  pos %d: A=%s B=%s\n", NR - 1, $1, $2}' >&2
     return 1
+}
+
+# LENGTH IS CLASSIFIED BEFORE CONTENT, and the order is load-bearing.
+#
+# An earlier version checked each arm against $NGEN inside run_arm and exited 2. That mis-files the
+# most interesting outcome there is: two arms that stop at DIFFERENT lengths have stopped at
+# different EOS tokens, which IS the divergence — observed for real on 2026-08-17 (25,272 vs 22,386
+# divergence-log rows from one pair) and reported as a setup error.
+#
+# In its own function so `--self-test` can exercise it. Reachable in the main flow only after two
+# real 512-token GPU arms, so left inline it could never be shown red.
+classify_lengths() { # $1 = A's ids, $2 = B's ids, $3 = ngen; echoes a verdict, returns its code
+    local na nb
+    na=$(wc -l <"$1"); nb=$(wc -l <"$2")
+    if [ "$na" -ne "$nb" ]; then
+        echo "RED: the two arms generated DIFFERENT LENGTHS ($na vs $nb ids)."
+        echo "     A length difference is a divergence, not a setup problem: the arms reached EOS at"
+        echo "     different points, so they had already stopped agreeing before then."
+        return 1
+    fi
+    if [ "$na" -lt "$3" ]; then
+        echo "FAIL (setup, not a verdict): both arms generated $na ids of the $3 requested, and the"
+        echo "SAME number — so they agree, and the run simply hit EOS early. That is a prompt"
+        echo "problem, not a determinism result: comparing two short arms of equal length would be a"
+        echo "green over a decode that never happened, and $na is below the floor's power"
+        echo "calculation anyway. Lengthen the recorded PROMPT at the top of this script."
+        return 2
+    fi
+    return 0
 }
 
 if [ "${1:-}" = "--self-test" ]; then
@@ -152,20 +196,19 @@ if [ "${1:-}" = "--self-test" ]; then
         echo "FAIL: the comparator did NOT redden on a TRUNCATED stream (a crashed arm)" >&2
         exit 2
     fi
-    # THE PROMPT IS PINNED BY ITS OWN HASH, so a stray edit to the heredoc cannot silently change
-    # what every recorded green was measured on. This is the `corpus=<fnv>` discipline the .nll
-    # header already uses, applied to the one input this gate carries in-line.
-    plen=$(printf '%s' "$PROMPT" | wc -c)
-    pmd5=$(printf '%s' "$PROMPT" | md5sum | cut -d' ' -f1)
-    if [ "$plen" != 317 ] || [ "$pmd5" != 18927a780b36b029d03450d2100e9242 ]; then
-        echo "FAIL: the recorded prompt changed — $plen bytes, md5 $pmd5" >&2
-        echo "      expected 317 bytes, md5 18927a780b36b029d03450d2100e9242" >&2
-        echo "      Every green recorded by this gate was measured on the old text. If the change" >&2
-        echo "      is intended, update BOTH numbers here in the same commit that edits it." >&2
-        exit 2
-    fi
+    # THE LENGTH CLASSIFIER, exercised here because the main flow reaches it only after two real
+    # 512-token GPU arms. All three branches, including the one that was WRONG (unequal lengths
+    # were filed as a setup error when they are the divergence itself).
+    printf '1\n2\n3\n' >"$d/l3"
+    printf '1\n2\n3\n4\n' >"$d/l4"
+    classify_lengths "$d/l3" "$d/l4" 4 >/dev/null && { echo "FAIL: unequal lengths must NOT pass" >&2; exit 2; }
+    [ $? -eq 1 ] || { echo "FAIL: unequal lengths must be RED (1), not a setup error" >&2; exit 2; }
+    classify_lengths "$d/l3" "$d/l3" 4 >/dev/null; [ $? -eq 2 ] || { echo "FAIL: equal-but-short must be a setup error (2)" >&2; exit 2; }
+    classify_lengths "$d/l4" "$d/l4" 4 >/dev/null || { echo "FAIL: equal-and-full must pass (0)" >&2; exit 2; }
+
     echo "SELF-TEST ok: the comparator reddens on a changed id and on a truncated stream;"
-    echo "             the recorded prompt is 317 bytes, md5 $pmd5"
+    echo "             the length classifier separates RED (unequal) from setup (equal but short);"
+    echo "             the recorded prompt is $PLEN bytes, md5 $PMD5 (checked above, every run)"
     exit 0
 fi
 
@@ -251,30 +294,15 @@ run_arm b "$SCRATCH/b"
 NA=$(wc -l <"$SCRATCH/a.ids")
 NB=$(wc -l <"$SCRATCH/b.ids")
 
-# LENGTH IS CLASSIFIED BEFORE CONTENT, and the order is load-bearing.
-#
-# An earlier version checked each arm against $NGEN inside run_arm and exited 2. That mis-files
-# the most interesting outcome there is: two arms that stop at DIFFERENT lengths have stopped at
-# different EOS tokens, which IS the divergence — it was observed for real on 2026-08-17 (25,272
-# vs 22,386 divergence-log rows from one pair) and would have been reported as a setup error.
-if [ "$NA" -ne "$NB" ]; then
-    echo "RED: the two arms generated DIFFERENT LENGTHS ($NA vs $NB ids)." >&2
-    echo "     A length difference is a divergence, not a setup problem: the arms reached EOS at" >&2
-    echo "     different points, so they had already stopped agreeing before then." >&2
-    compare_ids "$SCRATCH/a.ids" "$SCRATCH/b.ids" || true
-    echo "  arm A ids: $SCRATCH/a.ids ($NA)" >&2
-    echo "  arm B ids: $SCRATCH/b.ids ($NB)" >&2
-    exit 1
-fi
-if [ "$NA" -lt "$NGEN" ]; then
-    cat >&2 <<EOF
-FAIL (setup, not a verdict): both arms generated $NA ids of the $NGEN requested, and the SAME
-number — so they agree, and the run simply hit EOS early. That is a prompt problem, not a
-determinism result: comparing two short arms of equal length would be a green over a decode that
-never happened, and $NA is below the floor's power calculation anyway.
-Lengthen the recorded PROMPT at the top of this script until $NGEN tokens generate without EOS.
-EOF
-    exit 2
+if ! classify_lengths "$SCRATCH/a.ids" "$SCRATCH/b.ids" "$NGEN" >"$SCRATCH/verdict"; then
+    rc=$?
+    cat "$SCRATCH/verdict" >&2
+    if [ "$rc" -eq 1 ]; then
+        compare_ids "$SCRATCH/a.ids" "$SCRATCH/b.ids" || true
+        echo "  arm A ids: $SCRATCH/a.ids" >&2
+        echo "  arm B ids: $SCRATCH/b.ids" >&2
+    fi
+    exit "$rc"
 fi
 
 if compare_ids "$SCRATCH/a.ids" "$SCRATCH/b.ids"; then
