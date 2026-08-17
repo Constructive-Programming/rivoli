@@ -213,6 +213,12 @@ impl DrafterConfig {
     /// equality, so whichever tensor accounts for the difference (an `fc` bias is the
     /// candidate) is NAMED by the gate on first contact instead of silently copied or
     /// silently dropped.
+    ///
+    /// > **RESOLVED 2026-08-17 against the real file: it is 58, and there is no `fc` bias.** The
+    /// > enumeration was right and the prose was wrong. The prediction is kept because the
+    /// > *reason* it was made is the reusable part — a set-equality census names the
+    /// > disagreement instead of choosing a side — and because it is the record of what this
+    /// > schema knew before it had a checkpoint to read.
     pub fn census(&self) -> Vec<(String, Vec<usize>)> {
         let (h, hd) = (self.hidden_size, self.head_dim);
         let (nq, nkv, inter) = (
@@ -261,6 +267,17 @@ impl DrafterConfig {
 #[cfg(test)]
 mod tests {
     //! **The census against the SPEC, because the checkpoint is not on this machine.**
+    //!
+    //! > **CORRECTED 2026-08-17: the checkpoint IS on this machine now**, at
+    //! > `/swarm/storage/ai/rivoli/muse-glimmer-30b-assistant` — the directory search recorded
+    //! > below was right on 2026-08-16 and wrong the next day. The end-to-end gate this note
+    //! > says "cannot exist yet" exists: `crates/cli/tests/drafter_convert.rs`, which gates the
+    //! > REAL checkpoint's census against the checkpoint's own vendored safetensors header, and
+    //! > `convert_glimmer_drafter` has run against the real file (174 s, exit 0). The tests
+    //! > below keep their value unchanged and are not superseded: they pin the SCHEMA's
+    //! > defaults, while that gate pins the vendored config — two independent literals about one
+    //! > shipped model, and the pair is the cross-check. **The 58-vs-59 question these tests
+    //! > were written unable to settle is settled: 58, and there is no `fc` bias.**
     //!
     //! `meta-models/Muse-Glimmer-30B-assistant` is absent from `/swarm/storage/ai/` (checked
     //! 2026-08-16: `glimmer-30b-bf16`, `glimmer-30b-fp8` and `muse-glimmer-30b` are all the

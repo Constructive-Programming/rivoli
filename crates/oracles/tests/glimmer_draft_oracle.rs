@@ -53,15 +53,19 @@ const WEIGHT_SETS: [(&str, &[u8]); 2] = [
 /// oracle computes in f64, so a correct oracle sits at ~the floor and a tolerance of 10x
 /// admits it; the commands are in `glimmer-reference/anchor.md` §draft-tolerances.
 ///
-/// **`weakest_defect`** is the smallest signal among this binary's planted defects, measured
-/// 2026-08-16 as the worst-layer rel-vs-golden, **min over both salts** (the binding case: the
-/// tolerance must catch the defect on every draw, so the smallest draw is the one recorded).
-/// For the five attend-side operators the recording is the defect that TARGETS them (RoPE for
-/// `attend.q`, the encoder norm for `attend.k`/`v` — the context enters as K/V rows — and the
-/// mask/grouping pair for `attend.out`). For the rest it is the min over all four forward
-/// defects, worst layer — a deviation from the K3/GLIMMER "targeting defects only" reading,
-/// stated rather than hidden, because a drafter port defective at any of the four points DOES
-/// present exactly that signal at these captures.
+/// **`weakest_defect`** is a measured LOWER BOUND on the smallest signal among this binary's
+/// planted defects, **min over both salts** (the binding case: a tolerance must catch the defect
+/// on every draw).
+///
+/// > **SWEPT AND CORRECTED 2026-08-17**, all four defects x ten operators x both salts; the 4x10
+/// > matrix and the owed standing-sweep are `anchor.md` §`weakest_defect` SWEPT. Every row is at
+/// > or under its measured weakest signal (8,132x-56,336x above tolerance), so no
+/// > `tolerances_leave_room` verdict was wrong — but the rule stated here (targeting-defect for
+/// > the five attend-side rows, min-over-all-four for the rest) does NOT describe them: it cannot
+/// > hold for `encoder.out`, where three defects leave the capture at the clean 2.980e-7 floor
+/// > (§11 step 4, Q never sees the context) and would put its bound under its own tolerance; and
+/// > seven of ten declared values are this file's L0 figures, not worst-layer ones (`attend.q`
+/// > 5.031e-1 declared against a 6.170e-1 worst-layer minimum). A bound is all this column is.
 ///
 /// **CORRECTED 2026-08-16, same day.** This said the six non-attend operators "are upstream of
 /// every trap at L0 BY DESIGN (they are the defect matrix's hold half), so their reach is
@@ -689,9 +693,9 @@ fn assert_reach(case: &Case, params: &DraftParams, clean: &DraftTrace, r: &Reach
 /// tables — so the two differ on purpose (`attend.k` 2.146e-1 here against 4.632e-1 there; on a
 /// row whose worst layer IS L0 the two coincide, e.g. `attend.q` at 5.031e-1 — coincidence, not
 /// transcription).
-/// Neither is a transcription of the other. Since 2026-08-16 the numbers in THIS table are
-/// data, asserted per salt by [`assert_reach`]; the `weakest_defect` column is still prose,
-/// because six of its rows are L1+ minima that no test in this file sweeps.
+/// Since 2026-08-16 the numbers in THIS table are data, asserted per salt by [`assert_reach`].
+/// ("Neither is a transcription of the other" stood here until 2026-08-17, when the sweep showed
+/// seven of `DRAFT_ORACLE`'s ten rows ARE these L0 figures — see that table's own note.)
 #[test]
 fn each_planted_defect_reddens_its_reach_and_holds_the_rest() {
     let reaches = [

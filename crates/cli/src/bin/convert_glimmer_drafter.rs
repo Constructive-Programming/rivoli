@@ -11,7 +11,27 @@
 //! alone decodes nothing — it owns neither the embedding nor the lm_head it needs
 //! (`glimmer-architecture.md` §11, `drafter_config.rs`'s header).
 //!
-//! **THIS BINARY HAS NO END-TO-END GATE. Not one line below `main` has ever executed.**
+//! > **CORRECTED 2026-08-17. BOTH HALVES OF THIS ARE NOW FALSE, and this note is here rather
+//! > than a deletion because what it ruled out is the record.** It read: "THIS BINARY HAS NO
+//! > END-TO-END GATE. Not one line below `main` has ever executed." Since M17b:
+//! >
+//! > 1. **`main` has executed, against the real checkpoint.** The assistant checkpoint arrived at
+//! >    `/swarm/storage/ai/rivoli/muse-glimmer-30b-assistant`, and this binary converted it in
+//! >    **174 s** on CPU and NFS — 36 tensors bf16 verbatim, 22 norms widened, 58 total,
+//! >    5,112,138,812 B out, exit 0. The target side was a scratch directory holding only the
+//! >    production artifact's `manifest.json`, so nothing was written into the shared artifact.
+//! >    `glimmer-reference/drafter-checkpoint.md` is the record.
+//! > 2. **It has a gate**: `crates/cli/tests/drafter_convert.rs`, 13 tests, deviceless, all
+//! >    proven red (`gate-red-proofs.md` §6). It gates the real checkpoint's census from the
+//! >    checkpoint's own vendored safetensors header, and fires the three pairing refusals
+//! >    against the real pair of shipped configs.
+//! >
+//! > **What the paragraph below still gets right, and it is the part worth keeping:** the reason
+//! > the gate was missing was never the absent checkpoint. The gate that landed builds its
+//! > refusal arms from vendored configs and needs no weights at all, exactly as the paragraph
+//! > argued — so the diagnosis outlived the claim.
+//!
+//! **The original note, kept for its argument:**
 //!
 //! The absent checkpoint is NOT the reason, and saying it was is a finding review returned
 //! here: `crates/cli/tests/glimmer_convert.rs` opens with the same sentence about the TARGET
@@ -28,6 +48,15 @@
 //! split, the manifest round-trip, and the three pairing refusals that need a target artifact.
 //! `glimmer_convert.rs` is the shape that gate takes, on a fixture built from
 //! `DrafterConfig::census()` at tiny widths with `head_dim * heads != hidden`.
+//!
+//! > **UPDATED 2026-08-17.** Of that "what is NOT" list, `drafter_convert.rs` now closes the
+//! > three pairing refusals (against the real configs, not tiny ones) and the widen/verbatim
+//! > split (36/22, derived from the census AND from the real header independently).
+//! > `ensure_census` is covered in the direction that matters — the real checkpoint's tensor set
+//! > IS the census, both ways, by name — though the gate asserts that against the vendored
+//! > header rather than by calling `ensure_census` itself. **Still open: the manifest
+//! > round-trip**, which needs a target artifact, and the shape the note predicted for it
+//! > (a tiny fixture with `head_dim * heads != hidden`) is still the right one.
 //!
 //! Like the target's converter this quantizes nothing: the checkpoint is BF16 and the first
 //! artifact is bf16 verbatim, norms widened to f32 per the house rank rule. **No aux files

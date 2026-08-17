@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M17a's DFlash drafter oracle is registered here and recorded in glimmer-reference/anchor.md: nine deviceless plants, all re-run after the 2026-08-16 fixture re-vendor because a re-measured floor invalidates its old red proof, with the block-for-window substitution going from 1 of 10 tests red to 3; two rows the rewrite had DELETED rather than corrected -- the prefix-filter proof and the +1-ulp detection floor -- were restored and independently re-run 2026-08-17, both reproducing their pre-re-vendor results exactly, with their observed values kept in anchor.md alone. The restored prefix-filter row also carried a wrong MECHANISM (labelled salt pairing, when the planted rename cannot reach the salt assert -- dropping the LAST draft golden leaves the first correctly paired and the CENSUS assert is what reddens), and running the mirror plant to find what does exercise the pairing guard added a tenth plant: two independent guards, one plant each, both 7 of 10 red.
+verdict: Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M17a's DFlash drafter oracle is registered here and recorded in glimmer-reference/anchor.md: nine deviceless plants, all re-run after the 2026-08-16 fixture re-vendor because a re-measured floor invalidates its old red proof, with the block-for-window substitution going from 1 of 10 tests red to 3; two rows the rewrite had DELETED rather than corrected -- the prefix-filter proof and the +1-ulp detection floor -- were restored and independently re-run 2026-08-17, both reproducing their pre-re-vendor results exactly, with their observed values kept in anchor.md alone. The restored prefix-filter row also carried a wrong MECHANISM (labelled salt pairing, when the planted rename cannot reach the salt assert -- dropping the LAST draft golden leaves the first correctly paired and the CENSUS assert is what reddens), and running the mirror plant to find what does exercise the pairing guard added a tenth plant: two independent guards, one plant each, both 7 of 10 red. M17b's drafter converter gate is proven red in all twelve of its tests AS FIRST LANDED by six plants, with two rows carrying the argument: a one-byte edit to the vendored checkpoint header reddens the LIVE-file comparison, which is what proves that conditional half is armed on this box rather than silently skipping, and a wrong drafter hidden_size reddens the POSITIVE pairing arm, which is what makes "the shipped drafter pairs with the shipped target" evidence rather than a run that failed early for an unrelated reason; the two refusal-only plants show each refusal arm reddening both when its guard is deleted and when its wording drifts, which a status-code-only refusal test cannot see. GREW the same day under review to 13 tests and NINE plants: the per-token budgets (drafter KV 20,480 B/token, hidden-state export 66,560 B/token, a 260.0 MiB ring at ctx 4096) were prose in a doc and gated nowhere and are now derived from the shipped config; the pin test was strengthened to derive its 36/22 verbatim-widened split from the real HEADER as well as from the census, red-proofed by a rank change that preserves every byte total; and RIVOLI_DRAFTER_CKPT_REQUIRED was added on RIVOLI_CS_REQUIRED's precedent because stating that the live comparison degrades when the mount vanishes is not the same as enforcing it -- proven in all THREE states, including the one people skip, the real path WITH the variable set, since a required mode never run in its required state is a mechanism rather than a gate.
 ---
 
 # M0 gate red proofs
@@ -151,3 +151,66 @@ The ulp row is a **detection-floor** record, not a passing gate: it bounds what 
 is evidence for. This repo has twice registered a red-proof whose perturbation was below the
 detection floor and read the resulting green as coverage (the parity 1-ulp and single-sign-flip
 rungs, `CLAUDE.md` §Gates → parity), which is why the floor is measured and written down.
+
+## 6. The DFlash drafter converter gate (added 2026-08-17, M17b)
+
+`crates/cli/tests/drafter_convert.rs`, **13** tests, deviceless. **All thirteen are proven red by
+nine plants**, each applied, run, and reverted; the suite is 13/13 green before and after. The
+measurements they gate are in `glimmer-reference/drafter-checkpoint.md`.
+
+> **GREW 2026-08-17, same day, from 12 tests and six plants** — review added the thirteenth test
+> (the per-token budgets, which were prose in the doc and gated nowhere) and three plants: one for
+> an assertion strengthened in review, and two for the new test and the new required mode.
+
+| # | plant | reddens |
+|---|---|---|
+| P1 | `norm.weight` → `nprm.weight` inside the vendored header (same length, still valid JSON) | **3** — the header FNV pin, the census set equality, and the **live-file comparison** |
+| P2 | `TENSOR_BYTES` 5,111,970,304 → ...306 | **3** — the offsets-tile-the-file check, the resident pin, and the params×2 identity |
+| P3 | `target_layer_ids` 5 entries → 4 in the vendored config | **3** — the `encoder.fc` 5×hidden concat, the census, the shipped-config facts |
+| P4 | `hidden_size` 6656 → 6144 in the vendored config | **7** — including the POSITIVE pairing arm |
+| P5 | the converter's `hidden_size` cross-check disabled | **1** — the hidden-width refusal, and only it |
+| P6 | the not-an-artifact refusal reworded | **1** — the attach refusal, and only it |
+| P7 | `norm.weight` retyped `[6656]` → `[6656, 1]` in the vendored header — same element count, same byte span | **5** — including the pin test's new file-derived rank check |
+| P8 | `num_key_value_heads` 8 → 4 in the vendored config | **3** — the per-token budgets, the census, the shipped-config facts |
+| P9 | `CKPT_DIR` pointed at an absent path, run in **both** modes | the required mode, in all three states |
+
+Every one of the thirteen is reddened by at least one plant. **Two of these rows carry the argument:**
+
+**P1 reddens `the_vendored_header_is_the_live_checkpoints_own_bytes`.** That test is this suite's
+one conditional half — with the checkpoint unmounted it has nothing to compare and degrades to the
+vendored-only checks. P1 is therefore not just a proof that the comparison works; it is the proof
+that the comparison **is armed on this box right now** rather than silently skipping. A suite whose
+conditional half had quietly gone inert would show exactly the same all-green result.
+
+**P4 reddens `the_shipped_drafter_pairs_with_the_shipped_target`.** That arm asserts a refusal
+naming the ABSENT WEIGHTS, which the run can only reach by passing all three of the converter's
+pairing cross-checks — so the refusal it dies on is the evidence that the shipped drafter and the
+shipped target pair. Without P4 that arm could be passing because the run failed early for its own
+unrelated reason. P4 makes the positive arm evidence rather than a coincidence.
+
+**P7 is the plant that had to preserve the byte totals to be worth running.** The pin test was
+strengthened in review 2026-08-17: it derived the 36-verbatim/22-widened split from the config
+only, in a file whose whole premise is "against the real checkpoint", so it never touched a
+checkpoint byte. It now computes the same split from the real header's own ranks and compares.
+Proving that live needed a plant that changes a RANK without changing anything else — retyping
+`norm.weight` from `[6656]` to `[6656, 1]` keeps the element count, keeps `elems * 2` bytes, and
+keeps every offset — and the new assertion is the one that catches it.
+
+**P9 is the required-mode proof, and it needs all three states to mean anything.**
+`RIVOLI_DRAFTER_CKPT_REQUIRED` exists because P7 above only proves the live-header comparison was
+armed *at the instant it was planted*; P7's honesty about the mount does not enforce it, and P7
+says so. Following `RIVOLI_CS_REQUIRED`'s precedent exactly:
+
+| `CKPT_DIR` | variable | result |
+|---|---|---|
+| absent path | unset | **passes** — the honest optional case, and the suite's other twelve still examine the vendored bytes |
+| absent path | set | **panics**: `RIVOLI_DRAFTER_CKPT_REQUIRED is set but /…/no-such-drafter/model.safetensors is absent — the live-header comparison examined nothing` |
+| the real path | set | **13/13 green** — which is the state that proves the required mode is satisfiable here rather than aspirational |
+
+The third row is the one people skip. A required mode nobody has run in its required state is a
+mechanism, not a gate.
+
+**P5 and P6 are the pair that keeps the refusal arms honest.** Each refusal test asserts a MESSAGE,
+not merely a non-zero exit, so it reddens both when the guard is **deleted** (P5) and when its
+wording **drifts** (P6). The second failure mode is the one a status-code-only refusal test cannot
+see, and this repo's harness (`common::expect_refusal`) exists because of it.

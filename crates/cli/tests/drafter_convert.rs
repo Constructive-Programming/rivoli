@@ -10,6 +10,14 @@
 //! candidate for the 59th. There is no bias. The spec's prose is wrong and its own per-layer
 //! enumeration — which derives 58 — is right.
 //!
+//! **Vendored as BYTES rather than as text**, which review 2026-08-17 challenged: only the first
+//! 8 of the 6,304 are genuinely binary (a little-endian `u64` length), the rest is JSON, and a
+//! text fixture would diff readably. Measured before deciding — the header JSON contains **zero
+//! newlines**; it is one 6,296-character line. So a text fixture would diff as one changed line
+//! exactly as the blob does, and the legibility the change buys is nil. Declined on that
+//! measurement rather than on preference; if safetensors ever emits pretty-printed headers the
+//! trade flips.
+//!
 //! **The checkpoint's HEADER is vendored, the checkpoint is not.** 6,304 bytes of a
 //! 5,111,976,608-byte file: the 8-byte length plus the safetensors JSON, which carries every
 //! name, shape, dtype and byte offset. That is the whole census and none of the weights, so
@@ -164,8 +172,7 @@ fn the_real_checkpoint_is_exactly_the_census_the_schema_derives() {
 
     for (name, shape) in &census {
         assert_eq!(
-            &have[name].shape,
-            shape,
+            &have[name].shape, shape,
             "{name}: checkpoint shape != census shape"
         );
     }
@@ -197,19 +204,12 @@ fn the_encoder_projection_proves_the_five_hidden_concat() {
          checked against"
     );
 
-    // And the two absences that are the other half of the same claim: the drafter owns neither
-    // the embedding nor the lm_head. It borrows the target's, which is why there is no
-    // standalone drafter artifact and why the converter treats their PRESENCE as an error.
-    for absent in [
-        "model.language_model.embed_tokens.weight",
-        "embed_tokens.weight",
-        "lm_head.weight",
-    ] {
-        assert!(
-            !have.contains_key(absent),
-            "{absent} is in the checkpoint — the drafter is supposed to BORROW it"
-        );
-    }
+    // The other half of the same claim -- that the drafter owns NEITHER the embedding nor the
+    // lm_head, and borrows the target's -- is deliberately NOT re-asserted here. Review
+    // 2026-08-17 traced it: `the_real_checkpoint_is_exactly_the_census_the_schema_derives` is
+    // bidirectional SET equality, and `census()` emits no `embed_tokens` and no `lm_head`, so
+    // either one appearing in the checkpoint lands in that test's `extra` and reddens it. An
+    // explicit absence loop here was three assertions restating a stronger one next door.
 }
 
 #[test]
@@ -238,7 +238,10 @@ fn every_tensor_is_bf16_and_the_offsets_tile_the_file() {
     // bytes; only the offsets say it does.
     let mut cursor = 0u64;
     for (begin, end, name) in &spans {
-        assert_eq!(*begin, cursor, "{name}: a gap or overlap before this tensor");
+        assert_eq!(
+            *begin, cursor,
+            "{name}: a gap or overlap before this tensor"
+        );
         cursor = *end;
     }
     assert_eq!(cursor, TENSOR_BYTES, "total tensor bytes");
@@ -274,6 +277,31 @@ fn the_resident_pin_is_the_checkpoint_plus_the_widened_norms() {
         (36, 22),
         "the verbatim/widened split the converter prints"
     );
+
+    // The same split, taken from the real HEADER rather than from the config. Added 2026-08-17
+    // after review pointed out that this test -- in a file whose premise is "against the real
+    // checkpoint" -- read only `cfg.census()` and never touched a checkpoint byte, so a reader
+    // would reasonably assume it did. Now both sides are computed and compared: the config says
+    // which names are rank-1, the file says which tensors carry a 1-D shape, and 36/22 has to
+    // fall out of each independently. Red-proofed by retyping `norm.weight` as `[6656, 1]` in
+    // the vendored header -- same element count, same byte span, and this assert is the one that
+    // notices (gate-red-proofs.md section 6, plant P7).
+    let (have, _, _) = header(VENDORED);
+    let (mut f_verbatim, mut f_widened, mut f_norm_elems) = (0usize, 0usize, 0usize);
+    for entry in have.values() {
+        let elems: usize = entry.shape.iter().product();
+        if entry.shape.len() == 1 {
+            f_widened += 1;
+            f_norm_elems += elems;
+        } else {
+            f_verbatim += 1;
+        }
+    }
+    assert_eq!(
+        (f_verbatim, f_widened, f_norm_elems),
+        (verbatim, widened, norm_elems),
+        "the real header and the derived census disagree about which tensors are norms"
+    );
     assert_eq!(
         widened,
         4 * cfg.num_hidden_layers + 2,
@@ -283,8 +311,10 @@ fn the_resident_pin_is_the_checkpoint_plus_the_widened_norms() {
 
     let pin = TENSOR_BYTES + (norm_elems * 2) as u64;
     assert_eq!(pin, 5_112_132_608, "the resident pin, in bytes");
-    // 4.761 GiB. The plan said "5.1 GiB", which is the file's size in GB read as GiB — a
-    // 7.6% overstatement of a pin that P6 spends against free memory.
+    // 4.761 GiB. The plan said "5.1 GiB", which is the file's size in GB read as GiB: 5.1 GiB is
+    // 5,476,083,302 B against this 5,112,132,608, so the overstatement is 363,950,694 B = 7.1% of
+    // a pin that P6 spends against free memory. (Said "7.6%" until 2026-08-17, when review
+    // recomputed it — a percentage with no visible numerator is one nobody can check.)
     let gib = pin as f64 / f64::from(1u32 << 30);
     assert!(
         (4.760..4.762).contains(&gib),
@@ -299,9 +329,24 @@ fn the_vendored_header_is_the_live_checkpoints_own_bytes() {
     assert_eq!(have.len(), 58, "the vendored header's own tensor count");
 
     let path = std::path::Path::new(CKPT_DIR).join("model.safetensors");
-    let Ok(meta) = std::fs::metadata(&path) else {
-        // The mount is absent. Recorded in the module header as this gate's one conditional
-        // half; the census above stands on the vendored bytes alone.
+    let missing = std::fs::metadata(&path);
+    // **The required mode, on the RIVOLI_CS_REQUIRED precedent** (`CLAUDE.md` §Gates → CodeScene):
+    // P7 says a check whose examined-count can silently reach zero is not a check, and a mount
+    // that vanishes takes this comparison to zero examinations while the suite still reports
+    // all-green. Stating that honestly is not the same as enforcing it, which review 2026-08-17
+    // pointed out — this repo had already built the mechanism for exactly this failure mode and
+    // this gate was not using it. Set the variable wherever the checkpoint is supposed to be
+    // present and absence becomes a panic naming the path, rather than a silent pass.
+    let required = std::env::var_os("RIVOLI_DRAFTER_CKPT_REQUIRED").is_some();
+    let Ok(meta) = missing else {
+        assert!(
+            !required,
+            "RIVOLI_DRAFTER_CKPT_REQUIRED is set but {} is absent — the live-header comparison \
+             examined nothing",
+            path.display()
+        );
+        // Unset: the mount is genuinely optional here, and the census stands on the vendored
+        // bytes alone. Recorded in the module header as this gate's one conditional half.
         return;
     };
     assert_eq!(meta.len(), FILE_BYTES, "the live checkpoint's size moved");
@@ -324,13 +369,23 @@ fn the_vendored_header_is_the_live_checkpoints_own_bytes() {
 
 #[test]
 fn the_shipped_config_is_the_drafter_the_spec_describes() {
+    // **This overlaps `drafter_config.rs::the_defaults_are_the_shipped_drafters` on purpose**, and
+    // review 2026-08-17 asked why. The two read DIFFERENT literals: that test pins the schema's
+    // own `#[serde(default)]` values, this one pins the vendored `assistant-config.json`. Nothing
+    // in the tree forces those two to agree, and both are claims about the same shipped model --
+    // so the pair is a cross-check, and collapsing it to one would delete the only thing that
+    // notices when a default drifts away from the file it was copied from. `DrafterConfig` has no
+    // `PartialEq`, so it cannot be spelled as a single equality between the two.
     let cfg = real("drafter-cfg-spec");
     // The seven §11 facts that make this a block-diffusion drafter rather than a small dense
     // model, read off the shipped config so a re-download that changed one reddens here.
     assert_eq!(cfg.model_type, "muse_glimmer_assistant");
     assert_eq!(cfg.num_hidden_layers, 5);
     assert_eq!(cfg.block_size, 16, "the drafted block width");
-    assert_eq!(cfg.mask_token_id, 201_818, "the noise token the block starts as");
+    assert_eq!(
+        cfg.mask_token_id, 201_818,
+        "the noise token the block starts as"
+    );
     assert_eq!((cfg.num_attention_heads, cfg.num_key_value_heads), (32, 8));
     assert_eq!((cfg.hidden_size, cfg.head_dim), (6656, 128));
     assert_eq!(cfg.intermediate_size, 19968);
@@ -428,8 +483,10 @@ fn a_target_layer_id_past_the_targets_depth_is_refused() {
     // fits and 52 is the first that does not — the off-by-one, not an arbitrary large number.
     cfg["target_layer_ids"] = serde_json::json!([1, 13, 25, 37, 52]);
     let (src, out) = pair("drafter-pair-layer", &cfg);
-    BIN.at(&src, &out)
-        .refuses(&[], "target_layer_ids entry 52 is past the target's 52 layers");
+    BIN.at(&src, &out).refuses(
+        &[],
+        "target_layer_ids entry 52 is past the target's 52 layers",
+    );
 }
 
 #[test]
@@ -437,14 +494,17 @@ fn a_mask_token_past_the_targets_vocabulary_is_refused() {
     let mut cfg = shipped();
     // The drafter embeds its noise rows through the TARGET's embedding table, so this id is an
     // index into a matrix this checkpoint does not own. Set it one past the last legal row.
-    let vocab = serde_json::from_str::<Value>(TARGET_CONFIG).expect("target config is JSON")
-        ["text_config"]["vocab_size"]
-        .as_u64()
-        .expect("the target declares a vocab_size");
+    let vocab =
+        serde_json::from_str::<Value>(TARGET_CONFIG).expect("target config is JSON")["text_config"]
+            ["vocab_size"]
+            .as_u64()
+            .expect("the target declares a vocab_size");
     cfg["mask_token_id"] = Value::from(vocab);
     let (src, out) = pair("drafter-pair-mask", &cfg);
-    BIN.at(&src, &out)
-        .refuses(&[], &format!("mask_token_id {vocab} is past the target's vocabulary"));
+    BIN.at(&src, &out).refuses(
+        &[],
+        &format!("mask_token_id {vocab} is past the target's vocabulary"),
+    );
 }
 
 #[test]
@@ -453,11 +513,58 @@ fn attaching_to_something_that_is_not_an_artifact_is_refused() {
     // The drafter attaches to an ARTIFACT, never to a bare checkpoint directory — otherwise it
     // writes a `drafter/` layout somewhere the engine never looks.
     std::fs::remove_file(out.join("manifest.json")).expect("remove the target manifest");
-    BIN.at(&src, &out)
-        .refuses(&[], "is not a Muse Glimmer artifact — run convert_glimmer first");
+    BIN.at(&src, &out).refuses(
+        &[],
+        "is not a Muse Glimmer artifact — run convert_glimmer first",
+    );
 }
 
 // `SafeWriter::refuse_writing_into_source` is deliberately NOT gated here. With `src == out`
 // the drafter loader prefers `manifest.json`, so it reads the TARGET's document as the drafter's
 // and the run refuses one check earlier — a test naming the self-write guard would pass on the
 // wrong refusal. The guard is shared and gated by the other converter suites.
+
+/// **The three per-token budgets M17c is sized by, derived rather than quoted.**
+///
+/// They were prose in `glimmer-reference/drafter-checkpoint.md` and in nothing else, which review
+/// 2026-08-17 called correctly: under P5 bytes/token is the currency, and under P7 a currency
+/// figure with no gate is a number waiting to rot. Every one below is computed from the shipped
+/// config, so a checkpoint whose `head_dim`, `num_key_value_heads` or `hidden_size` moved would
+/// redden here instead of leaving the doc quietly wrong.
+///
+/// **KiB and MiB, not kB and MB** — these are memory budgets against a GTT allocation, and the
+/// exactness is the point: 20,480 B *is* 20.0 KiB with no rounding, and the ring *is* 260.0 MiB.
+/// A "~20 KiB" would read like an estimate of a number that has none.
+#[test]
+fn the_per_token_budgets_follow_from_the_shipped_config() {
+    let cfg = real("drafter-cfg-budgets");
+    let (kv_heads, hd, layers) = (cfg.num_key_value_heads, cfg.head_dim, cfg.num_hidden_layers);
+
+    // Drafter KV cache. TWO tensors per layer (K and V), bf16, and the drafter's OWN kv_heads --
+    // not the target's, which is the `TargetGrouping` defect the oracle plants.
+    let kv_per_token = 2 * kv_heads * hd * layers * 2;
+    assert_eq!(kv_per_token, 20_480, "drafter KV bytes/token");
+    assert_eq!(
+        kv_per_token,
+        20 * 1024,
+        "and that is 20.0 KiB exactly, not approximately"
+    );
+
+    // The target-side hidden-state export: one hidden row per target layer, bf16. This is the
+    // cost the TARGET pays to feed the drafter, and it is charged per ACCEPTED token.
+    let export_per_token = cfg.target_layer_ids().len() * cfg.hidden_size * 2;
+    assert_eq!(export_per_token, 66_560, "hidden-state export bytes/token");
+
+    // The ring at the context this wave sizes for.
+    let ring = export_per_token * 4096;
+    assert_eq!(ring, 272_629_760, "export ring bytes at ctx 4096");
+    assert_eq!(ring, 260 * 1024 * 1024, "and that is 260.0 MiB exactly");
+
+    // The drafter's KV is ~3.25x cheaper per token than the export it consumes, which is the
+    // asymmetry M17c's ring sizing turns on: the export dominates, and it is the one that scales
+    // with context rather than with the drafted block.
+    assert!(
+        export_per_token > 3 * kv_per_token,
+        "the export is supposed to dominate the drafter's own KV"
+    );
+}

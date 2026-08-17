@@ -426,6 +426,73 @@ Min over both salts, at L0, now asserted as data by `glimmer_draft_oracle.rs`:
 the block was unreachable. It now costs 1.37× more at `attend.out` and 1.73× more at the logits,
 and for the first time it is measuring the property it is named for.
 
+### `weakest_defect` SWEPT 2026-08-17 — the column is a valid bound and its stated rule was wrong
+
+Six of the ten `weakest_defect` values in `DRAFT_ORACLE` had never been re-measured after the
+re-vendor, and five of those six had floors that moved, so their captures changed by an unmeasured
+amount. They were left standing on the argument that all ten sit ~4 decades above tolerance and
+`tolerances_leave_room`'s verdict cannot turn on them. **That argument holds — and it was the wrong
+thing to rely on, because it is not a measurement.** All four forward defects were therefore swept
+across all ten operators and both salts.
+
+The instrument: a temporary `#[test]` running `case.run(&params, defect)` for each of the four,
+scoring every capture with the same `worst_rel` the clean gate uses, taking **max over layers** per
+operator and then **min over the two salts** (the binding draw — a tolerance must catch the defect
+on every draw). Planted, run, reverted.
+
+**The measured matrix**, min over salts, worst layer, `rel`-vs-golden:
+
+| operator | `CausalMask` | `RopeUntailed` | `EncoderNormSkipped` | `TargetGrouping` |
+|---|---|---|---|---|
+| `encoder.out` | **2.980e−7** | **2.980e−7** | 9.832e−1 | **2.980e−7** |
+| `input_layernorm.out` | 1.064e0 | 3.359e−1 | 7.467e−1 | 9.943e−1 |
+| `attend.q` | 1.376e0 | 6.170e−1 | 7.352e−1 | 1.364e0 |
+| `attend.k` | 1.278e0 | 2.687e−1 | 7.848e−1 | 1.031e0 |
+| `attend.v` | 1.212e0 | 2.434e−1 | 1.308e0 | 8.678e−1 |
+| `attend.out` | 2.027e0 | 5.294e−1 | 1.425e0 | 1.673e0 |
+| `post_attention_layernorm.out` | 9.642e−1 | 3.488e−1 | 7.489e−1 | 1.050e0 |
+| `mlp.out` | 1.452e0 | 4.506e−1 | 1.133e0 | 1.544e0 |
+| `final_norm.out` | 1.036e0 | 3.298e−1 | 6.005e−1 | 1.013e0 |
+| `logits` | 1.075e0 | 4.016e−1 | 7.023e−1 | 1.180e0 |
+
+**The good news first: every declared value is at or below the measured weakest signal for the
+defects its row is answerable for, so no gate's verdict was ever wrong.** Declared-over-tolerance
+runs **8,132×** (`post_attention_layernorm.out`) to **56,336×** (`attend.v`) — 3.91 to 4.75
+decades, so "~4 decades above tolerance" was right — and the measured minima are all at or above
+declared, which only widens those margins.
+
+**Three findings the sweep produced, none of them visible from the declared column:**
+
+1. **`encoder.out` cannot take the stated rule at all.** Three of the four defects leave it at
+   **2.980e−7** — the CLEAN oracle's own floor, the identical number §the ladder records for rung
+   0 at salt 1. So a literal "min over all four forward defects" would set its `weakest_defect`
+   *below its own 2.33e−5 tolerance* and `tolerances_leave_room` would refuse the table. Its
+   declared 9.832e−1 is `EncoderNormSkipped`'s and could only ever have been: the encoder does not
+   see the mask, the grouping, or Q's RoPE. §11 step 4 — Q never sees the context — is why, and
+   the three floor readings are that structural claim measured rather than argued.
+2. **The docstring's "neither is a transcription of the other" is false for seven of ten rows.**
+   `DRAFT_ORACLE`'s column is supposed to be the worst LAYER while the defect matrix's table is
+   L0. For `attend.q` the docstring even offers itself an example — "on a row whose worst layer IS
+   L0 the two coincide, e.g. `attend.q` at 5.031e−1 — coincidence, not transcription". The sweep
+   says `attend.q`'s worst-layer minimum is **6.170e−1**, not 5.031e−1, so its worst layer is
+   **not** L0 and the declared number *is* the L0 figure transcribed. Same for
+   `input_layernorm.out`, `attend.k`, `attend.out`, `post_attention_layernorm.out`, `mlp.out` and
+   `final_norm.out`. Only `encoder.out`, `attend.v` (1.307e0 against a measured 1.308e0) and
+   `logits` (4.015e−1 against 4.016e−1) are the worst-layer numbers they claim to be.
+3. **So the column is a LOWER BOUND, not the quantity its name and docstring describe** — and a
+   lower bound is exactly what `tolerances_leave_room` needs, which is why nothing broke. It is
+   now written down as one.
+
+**What is owed, and why it was not done here.** The strong fix is to make this sweep a standing
+test, so the column can never drift again: a per-operator table of the defects each operator is
+**answerable for** (a real design statement — finding 1 shows it cannot be "all of them"), plus an
+assertion that the non-answerable defects leave the capture at the clean floor. That needs
+`Case`, `scored` and `worst_rel` moved into `glimmer_anchor_common/mod.rs` so a second binary can
+reach them without jscpd reporting the copy, and `glimmer_draft_oracle.rs` is already **822 lines
+against the 800 soft cap**, whose contract is that the next edit shrinks it. Adding ~60 lines
+there would break that rule to fix this one. Recorded as owed rather than done, with the matrix
+above standing in for it until then.
+
 ### Provenance: the stack changed under the re-vendor, and the bridge says it did not matter
 
 > **CORRECTED 2026-08-17.** This heading read "2,420 captures", the same restated-not-added sum
@@ -624,4 +691,9 @@ now — `Case::want` for the reference, `worst_rel` for the oracle.
   > this tree at all**, and `glimmer_convert.rs`'s own header says so, naming the real-index gate
   > as work that "arrives with the real-checkpoint work". A name or shape wrong in BOTH the
   > schema and the fixture is therefore still uncaught for the target.
+  >
+  > For the **DRAFTER** it is now caught: M17b vendors the shipped assistant checkpoint's own
+  > 6,304-byte safetensors header and gates `DrafterConfig::census()` against it
+  > (`crates/cli/tests/drafter_convert.rs`, `glimmer-reference/drafter-checkpoint.md`). That is
+  > the shape the target's gate should take when its checkpoint work lands.
 
