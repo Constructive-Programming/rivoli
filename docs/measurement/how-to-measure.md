@@ -50,6 +50,12 @@ Three rules follow, and each has already been paid for once:
 3. **Do not quote the floor from here; re-measure it.** A floor carried in prose is an
    inherited number. `p4` measures its own on every invocation, which is why that cell
    runs three arms instead of two.
+4. **Treat every such interval as a LOWER BOUND on its true width until the independence
+   assumption is checked.** `bin/ppl`'s `SE = sd/sqrt(n)` assumes per-position differences
+   are independent, and on a streaming arm they are not — one event propagates through KV
+   into every later position. The correction could be ~4x, which is the difference between
+   ~8x headroom and none. It is a deviceless check on two retained `.nll` files and it is
+   owed: `docs/investigations/glm-nondeterminism.md`, the caveat under the floor table.
 
 **Counting differing POSITIONS is not a measurement of this.** GLM moved 553 positions
 across a 16-point hit-rate swing and 555 across no change at all. The count saturates;

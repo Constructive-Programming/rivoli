@@ -10,11 +10,8 @@
 # | `p4`      | P4 at NLL: `--max-mem` moves speed, never text               | `--red-proof-corpus`, a one-word-different corpus in arm B |
 # | `tf`      | the rewrite scores the reference's text equivalently         | off-by-one the TF position (source, reverted) |
 #
-# **`--expect-red` inverts the classification, and exists so a red-proof is judged by the
-# SAME code the green is.** A proof scored by eye, or by a second parser written for the
-# occasion, proves nothing about the gate. Under it, a cell that comes out green is
-# reported as a FAILED PROOF (exit 1) — "a proof that refuses to go red is itself
-# evidence: debug the tree, not the proof."
+# `--expect-red[=FRAGMENT]` inverts the classification so a red-proof is judged by the SAME
+# code the green is; the argument is at the flag, below.
 #
 # **This gate NEVER builds.** Both binaries arrive prebuilt (a cargo run between arms
 # evicts page cache: ms/miss 1.36 -> 5.14, measured). The source-mutation red-proofs DO
@@ -23,7 +20,8 @@
 #
 # Cost, release profile, `tests/ppl-corpus.txt` (762 tokens) on GLM int3-vq at the
 # baseline's 2.58 tok/s: profile ~4 min (512 decoded tokens), p4 ~18 min (THREE scoring
-# arms since the re-spec — A, the control A', and B), tf ~6 min (one reference arm; it
+# arms since the re-spec — A, the control A', and B; plus a FOURTH, B'', only on the strict
+# branch's red path, so ~24 min in that case), tf ~6 min (one reference arm; it
 # reuses p4's arm A under `all`) — **~28 min for `all`**, plus ~6 min per red-proof re-run.
 # Measured 2026-08-17 at 1.84 tok/s under a foreign host tenant, so budget ~40 min when the
 # box is not idle. `PPL_CORPUS=tests/ppl-corpus-5000.txt PPL_CTX=8192` is the powered
@@ -57,30 +55,22 @@ CORPUS=${PPL_CORPUS:-$HERE/ppl-corpus.txt}
 # question nobody asked (caught while specifying the Glimmer experiment, 2026-08-17).
 MEM_A=${PPL_MEM_A:-115}
 MEM_B=${PPL_MEM_B:-70}
-NGEN=${PPL_NGEN:-512}
+# 512, not a knob: it is what makes this run comparable to the row in
+# `docs/measurement/baseline-2026-08-16.md`, and a knob with no caller that silently
+# decouples the two is worth less than the line it costs. Same argument as `PROMPT` below.
+NGEN=512
 # The KV slab, and the reason it is a knob rather than the CLI default: `--ctx` defaults to
 # 4096 and `tests/ppl-corpus-5000.txt` does not fit under it, so the powered re-run this
 # file tells you to take (`tf` INCONCLUSIVE) would refuse at the door instead of scoring.
 # ~51 KB of device memory per token, so raising it competes with --max-mem for the budget.
 CTX=${PPL_CTX:-4096}
-# The architecture-shaped flags, so `profile` and `p4` are not GLM-only.
-#
-# **Added 2026-08-17 because the cheapest remaining experiment needed it.** Glimmer was
-# shown deterministic and budget-neutral over 64 greedy IDS while actively streaming 21 of
-# 52 layers; making that exclusion airtight needs the same pair scored as NLL FLOATS, which
-# is exactly `p4` pointed at Glimmer — and `p4` could not be pointed anywhere, because it
-# hard-coded `--mode int3-vq`. On a dense arm that flag is `FallbackLoudly`: the run
-# proceeds with a warn, and the `.nll` label then records a routed format the run never
-# used, which is the "command line carrying a knob nothing spent" `rivoli_core::legality`
-# exists to stop. So a dense arm passes `PPL_MODE_FLAGS='--attn dense'`.
-#
-#   GLM:     (default)
-#   Glimmer: PPL_MODE_FLAGS='--attn dense' PPL_MEM_A=32 PPL_MEM_B=20
-#
-# Known residue, not fixed here: `nll.rs` builds the label from `Args::mode`, which carries
-# a clap default, so the header still prints `mode=int3-vq` on a dense run even when the
-# flag is not typed. The gate compares BODIES, so it does not care; a reader of the .nll
-# should.
+# The architecture-shaped flags, so `profile` and `p4` are not GLM-only. Caller today:
+# experiment 0 in `docs/investigations/glm-nondeterminism.md` (Glimmer at two budgets,
+# `PPL_MODE_FLAGS='--attn dense'`). A dense arm must NOT inherit `--mode`, which is
+# `FallbackLoudly` there — the run would proceed with a warn and the `.nll` label would
+# record a routed format nothing spent. (Residue, unfixed: `nll.rs` labels from
+# `Args::mode`'s clap default, so a dense run's header still says `mode=int3-vq`. This gate
+# compares bodies and does not care; a reader of the file should.)
 read -ra MODE_FLAGS <<<"${PPL_MODE_FLAGS:---mode int3-vq --attn dense}"
 # The `profile` cell's prompt. Pinned as a constant because
 # `docs/measurement/baseline-2026-08-16.md` recorded its own only as `<P>` plus a prose
@@ -99,10 +89,9 @@ SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/ppl-gates.XXXXXX")
 # pins the one it reads instead of inheriting it. (`crates/cli/src/bench.rs` makes the same
 # argument for putting BENCH on stderr outside tracing.)
 export RUST_LOG=info
-# gawk: the profile classifier uses three-argument `match(s, re, arr)`, a GNU extension.
-# Under a POSIX awk it is a syntax error, the verdict comes back empty, and the cell reds
-# with "did not parse" — an environment fault classified as an engine RED, and under
-# --expect-red a proof of nothing. Checked at the door rather than left to chance.
+# gawk: the profile classifier needs 3-argument `match(s, re, arr)`. Under a POSIX awk that
+# is a syntax error, the cell reds with "did not parse", and an environment fault reads as
+# an engine RED — so it is checked here rather than left to chance.
 awk 'BEGIN { if (match("a1", /([0-9])/, m) && m[1] == 1) exit 0; exit 1 }' </dev/null 2>/dev/null ||
     { echo "FAIL: awk here has no 3-argument match() — the profile classifier needs gawk. This would otherwise surface as a bogus 'PROFILE/tok line did not parse' RED." >&2; exit 2; }
 
@@ -178,6 +167,9 @@ if [ "$CELL" != profile ]; then
         echo "FAIL: the teacher-forcing probe reached neither door nor the corpus read — the startup order changed and this check now proves nothing. See $SCRATCH/probe.log" >&2
         exit 2
     fi
+    # `bin/ppl` is needed by both scoring cells and by neither profile — the same set this
+#    block already guards, so it is asserted once here instead of in each cell.
+    [ -x "$PPL_TOOL" ] || { echo "FAIL: bin/ppl missing: $PPL_TOOL (cargo build --release builds it alongside rivoli)" >&2; exit 2; }
     echo "== door: $BIN passes ensure_backend + ensure_scoring (probed, deviceless)"
 fi
 
@@ -209,19 +201,14 @@ red() {
     exit 1
 }
 
-# One cell, in a subshell, with its classification mapped. Setup (2) and discard (3) still
-# abort the whole run — they say the measurement could not be taken, which the next cell
-# would hit too — while a RED is recorded and the battery continues.
-run_cell() {
-    local rc=0
-    "cell_$1" || rc=$?
-    case $rc in
-    0) ;;
-    1) ;; # red() already recorded it
-    4) exit 1 ;; # a red-proof that fired on the wrong defect: hard stop, already explained
-    *) exit "$rc" ;;
-    esac
-}
+# `set -e` IS SUPPRESSED INSIDE EVERY CELL, and that is not a choice — it is bash. A
+# subshell that is the left operand of `||` runs with `-e` disabled *inside* it, and the
+# suppression cannot be lifted: `( set +e; set -e; ... )` and a bare `( ... ) || rc=$?` both
+# still run past a failing command (measured 2026-08-17; only a fresh `bash -c` re-entry
+# restores it, which is too heavy for a cell). **So every failure inside a cell is checked
+# explicitly** — `run_arm`/`score_arm` return their rc into a tested variable, the `cmp`s sit
+# in `if`, and the awk/grep parses are followed by an emptiness or row-count assertion. If
+# you add a step to a cell, check its status; nothing else will.
 
 # --- cell: profile — the stamped buckets account for the decode wall ------------------
 # PRE-REGISTERED BAND, written here before the first run (2026-08-16, no number observed
@@ -264,18 +251,19 @@ OTHER_EPS=0.02
 cell_profile() {
     say "profile: bucket sum vs decode wall (${MODE_FLAGS[*]}, --bench $NGEN)"
     local rc=0
-    # `PPL_REPLAY_LOG` re-classifies a SAVED arm log instead of decoding. An env var
-    # rather than a flag because this is not a cargo run and the house rule says so in
-    # that case — and the argument for it is that the CLASSIFIER and the ENGINE are two
-    # separable claims. Replay can show this cell's arithmetic goes red on a mutilated
-    # PROFILE line with no device at all; only a real run with an accumulation deleted
-    # from the source shows the engine's stamps are what that arithmetic reads. The
-    # red-proof record keeps them apart, and a replayed green is never evidence about the
-    # engine — it is evidence about the parser, which is all it claims.
+    # `PPL_REPLAY_LOG` re-classifies a SAVED arm log instead of decoding, so the
+    # CLASSIFIER half of this cell's red proof needs no device (that half is PAID —
+    # `docs/measurement/gate-red-proofs.md` §5a). A replayed result is evidence about the
+    # parser and never about the engine, and the summary line says so.
     if [ -n "${PPL_REPLAY_LOG:-}" ]; then
         [ -f "$PPL_REPLAY_LOG" ] || { echo "FAIL: PPL_REPLAY_LOG not readable: $PPL_REPLAY_LOG" >&2; exit 2; }
         cp "$PPL_REPLAY_LOG" "$SCRATCH/profile.log"
-        REPLAYED=" (REPLAY — classifier only, NOT evidence about the engine)"
+        # A marker FILE, not a variable: this runs inside the cell's subshell, so a variable
+        # would never reach the summary line — which is how the first version of this shipped,
+        # printing a plain `PPL-GATES GREEN` for a classifier-only run and making it
+        # indistinguishable from a real one. That is the false-green class this repo tracks,
+        # in the code meant to prevent it (review, 2026-08-17).
+        : >"$SCRATCH/replayed"
         echo "   REPLAY of $PPL_REPLAY_LOG — classifier only, no device, no claim about the engine"
     else
         run_arm profile "$SCRATCH/profile.out" "$SCRATCH/profile.log" \
@@ -295,12 +283,9 @@ cell_profile() {
         match($0, /wall ([0-9.]+)ms = attend ([0-9.]+) \+ ffn ([0-9.]+) \+ fetch-wait ([0-9.]+) \+ head ([0-9.]+) \+ other (-?[0-9.]+)/, m) {
             wall=m[1]+0; other=m[6]+0
             if (wall <= 0) { print "SETUP wall " wall " is not positive"; exit }
-            # The census is DATA, not three hand-written ifs, so the examined count is a
-            # real number rather than one the code makes true by construction. fetch-wait
-            # (m[4]) is deliberately absent: 0.0 is its SUCCESS value on every arm — fetch
-            # fully hidden behind resident compute is the design — so requiring it non-zero
-            # would gate on the engine performing badly. That is a stated blind spot: a
-            # dropped fetch-wait stamp is invisible to this cell.
+            # DATA, not three hand-written ifs, so the examined count is real rather than
+            # true by construction. fetch-wait (m[4]) is excluded on purpose — see the
+            # census note in the pre-registration block above.
             split("attend ffn head", name, " "); split("2 3 5", col, " ")
             n = 0
             for (k = 1; k in name; k++) {
@@ -309,10 +294,8 @@ cell_profile() {
                 named += v; n++
             }
             if (n != 3) { print "SETUP census examined " n " buckets, expected 3"; exit }
-            # `other` is the ONE derived number the engine reports. Re-derive it from the
-            # four buckets on this same line: without this, hard-coding `other_ms: 0.0`
-            # passes both the band and the census, and the gate audits arithmetic by
-            # asking the arithmetic (review, 2026-08-16).
+            # Re-derive the one DERIVED number from the four measured ones on the same
+            # line — item 3 of the pre-registration block above says why.
             derived = wall - (named + m[4])
             if ((derived - other) > eps || (other - derived) > eps) {
                 printf "RED the reported other %.3f ms disagrees with wall - buckets = %.3f ms (eps %.3f) — `other` is not the remainder it claims to be\n", other, derived, eps
@@ -333,13 +316,11 @@ cell_profile() {
     esac
     # Not a gate, the DELIVERABLE: the per-phase decomposition this milestone owes.
     grep -F 'DECODE' "$SCRATCH/profile.log" | tail -1 || true
-    # **The gate and the measurement are separable here and only this cell has to say so.**
-    # What the cell TESTS is a ratio — do the buckets account for the wall — and a ratio
-    # survives a loaded box. What the cell PRODUCES is an absolute wall and a per-phase
-    # decomposition, and those are comparable to a baseline only if the host was in a
-    # comparable state. 2.0 is the bound: this arm's own decode thread plus its fetch
-    # reaper contribute ~1-2 to loadavg on 32 cores, so anything materially above that is
-    # a foreign host tenant. Recorded rather than enforced, and green either way.
+    # The cell TESTS a ratio, which survives a loaded box; it PRODUCES an absolute wall,
+    # which is comparable only across comparable host states. 2.0 is the bound because this
+    # arm's own decode thread plus its fetch reaper contribute ~1-2 on 32 cores, so above
+    # that a foreign host tenant is running — see `gpu-witness.sh::host_load`. Recorded, not
+    # enforced: green either way.
     awk -v l="${ARM_LOAD_BEFORE:-0}" 'BEGIN { exit (l+0 > 2.0) ? 0 : 1 }' && cat <<CAVEAT
    ATTRIBUTION CAVEAT: host loadavg was ${ARM_LOAD_BEFORE} when this arm started, so a
    foreign CPU/NFS tenant was running. The GATE above stands (it is a ratio), but the
@@ -355,24 +336,13 @@ CAVEAT
 # select a format the way `--mode hybrid`'s cache does, and the budget must not move the
 # text.
 #
-# > **RE-SPECIFIED 2026-08-17, after the first device run. The original cell was a
-# > SPECIFICATION ERROR and could never have passed.** It demanded the per-token NLLs be
-# > byte-identical across `--max-mem` 115 and 70, and they were not: 553 of 762 positions
-# > moved. The coordinator then ran the control this cell did not have — **the same budget
-# > TWICE, identical flags** — and got **555 of 762 positions moved**, PPL 5.200080 vs
-# > 5.209284, hit% 78.2643 vs 78.2352. The baseline moves on its own. A gate demanding
-# > byte-identity of a run that does not repeat itself is not measuring `--max-mem`; it is
-# > measuring nondeterminism, and it reds whatever the budget does.
-# >
-# > Note what the differing-position COUNT does here: 553 (budget) against 555 (control).
-# > Nearly equal — so the count, which the original cell reported as its evidence, has no
-# > discriminating power at all and is now reported for context only.
-# >
-# > A second control settles that this is not the harness: **Glimmer**, teacher-forced
-# > twice at `52 of 52 layers pinned, 0 streamed`, is **byte-identical**, PPL 7.008490 both
-# > runs. Kernels, reduction order, toolchain and this scoring path are bit-reproducible.
-# > The wobble is confined to arms that STREAM. `docs/investigations/glm-nondeterminism.md`
-# > holds the measurement and its bounds; this cell only has to stop being fooled by it.
+# > **RE-SPECIFIED 2026-08-17: byte-identity across budgets was a SPECIFICATION ERROR and
+# > could never have passed** — the control (same budget twice) moves as much as the budget
+# > does, so the cell was measuring nondeterminism and reddening whatever `--max-mem` did.
+# > The differing-position COUNT, which it reported as evidence, turned out to have no
+# > discriminating power at all. Measurements and bounds:
+# > `docs/investigations/glm-nondeterminism.md`. Why the replacement has this shape and what
+# > proved it: `docs/measurement/gate-red-proofs.md` §5a-2. Neither is restated here.
 #
 # **The cell now calibrates its own strictness from a control arm it has to run anyway**,
 # rather than from a flag someone can set wrong or an arm name someone can forget to
@@ -382,10 +352,14 @@ CAVEAT
 #   A' @ MEM_A          the CONTROL — same budget, same flags, same corpus
 #   B  @ MEM_B          the test
 #
-#   if body(A) == body(A')   the arm repeats itself here, so demand byte-identity of B.
-#                            This is the STRICT gate the coordinator asked be kept rather
-#                            than deleted, and it is what Glimmer gets — automatically,
-#                            because Glimmer's control comes back identical.
+#   if body(A) == body(A')   the arm repeats itself AT THIS LENGTH, so demand byte-identity
+#                            of B. This is the STRICT gate, and it is what Glimmer gets —
+#                            automatically, because Glimmer's control comes back identical.
+#                            A differing B does NOT convict on the spot: it runs a fourth
+#                            arm, B'' at MEM_B, because a one-off divergence would not
+#                            repeat while a real budget effect would. See that branch for
+#                            the false-conviction arithmetic and for why repeating the
+#                            BUDGET beats repeating the control.
 #   else                     the arm does not repeat itself, so the floor is MEASURED:
 #                            `bin/ppl` pairs both A'→A and B→A, and the verdict reads the
 #                            two 95% intervals as CALIBRATION and TEST.
@@ -394,23 +368,25 @@ CAVEAT
 #                                  The jitter is not zero-mean, so an interval away from
 #                                  zero cannot be attributed to the budget rather than to
 #                                  whatever biases a repeat.
+#                                  **Expect this ~5% of the time even on a healthy arm**: two
+#                                  runs of one config differ by symmetry with mean zero, and
+#                                  a 95% interval on a zero-mean quantity excludes zero one
+#                                  time in twenty. So ONE UNCALIBRATED is a re-run, not a
+#                                  finding; TWO in a row says the jitter is biased, which is
+#                                  a real result and belongs in
+#                                  docs/investigations/glm-nondeterminism.md.
 #                              control contains 0, budget EXCLUDES 0  -> RED. A systematic
 #                                  shift the noise does not account for: a P4 violation.
 #                              both contain 0  -> GREEN, and the control's half-width is
 #                                  reported as the resolution the run actually had.
 #
-# **Why not "the two intervals must not overlap", which this cell used for one draft:** A'
-# and B are both paired against A, so both intervals inherit A's noise and non-overlap
-# double-counts it — the test comes out ~2x less sensitive than the data supports. Writing
-# the model out: d(A->B)_i = delta + eps_i^B - eps_i^A, so the estimate of delta has the
-# SE the interval already reports, and the question is simply whether it clears zero. The
-# control's job is not to widen the bar, it is to prove zero is where a null effect lands.
-# Checked deviceless on synthetic files carrying the observed jitter shape (2026-08-17):
-# a null budget gives [-0.00665, +0.00157] (green), +0.015 nats gives [+0.01017, +0.01887]
-# (red), +0.05 gives [+0.04569, +0.05405] (red), control [-0.00214, +0.00635] throughout.
+# A'''s and B'''s intervals are both paired against A, so a "must not overlap" rule (used for
+# one draft) double-counts A'''s noise and comes out ~2x less sensitive than the data
+# supports; the interval already estimates the effect at the right SE, so the question is
+# whether it clears zero, and the control'''s job is to prove zero is where a null lands.
+# Derivation, the synthetic red-proof intervals, and the resolution this buys against the
+# ladder'''s 0.0134-0.0172-nat gaps: `docs/measurement/gate-red-proofs.md` §5a-2.
 #
-# Resolution that buys: a half-width near 0.0043 nats, against the 0.07-0.09 PPL quality
-# gaps (0.0135-0.017 nats) the wave's ladder has to resolve — a factor of ~3 of headroom.
 # No magnitude floor is applied on purpose: P4 is an INVARIANT, not a budget, so a small
 # systematic effect is still a violation and must not be excused by being small.
 #
@@ -462,10 +438,28 @@ cell_p4() {
     score_arm "p4a" "$MEM_A" "$CORPUS" "$SCRATCH/a.nll"
     score_arm "p4a2" "$MEM_A" "$CORPUS" "$SCRATCH/a2.nll"
     score_arm "p4b" "$MEM_B" "$b_corpus" "$SCRATCH/b.nll"
+    # **LENGTH goes in every verdict this cell prints.** Divergence on a streaming arm is
+    # STOCHASTIC in the sequence position at which it first fires — GLM is byte-identical at
+    # 32 generated tokens and differs at 512, and on a quiet box its first divergence moved
+    # from position 13 to 452 (docs/investigations/glm-nondeterminism.md). So "byte-identical"
+    # and "the control spread is X" are meaningless without the count they were measured
+    # over, and a reader comparing two runs of this gate at two corpus lengths must be able
+    # to see that they are not the same experiment.
+    local npos
+    npos=$(nll_body "$SCRATCH/a.nll" | wc -l)
+    # A floor, because "a check whose examined count can silently reach zero is not a check"
+    # and this one can get close: `nll.rs` admits any corpus of >=2 tokens, so a 2-token file
+    # yields npos=1 and the strict branch would print a perfectly cheerful
+    # `1 per-token NLLs byte-identical`. 32 is not arbitrary — it is the length at which GLM
+    # IS byte-identical (docs/investigations/glm-nondeterminism.md), i.e. the shortest run
+    # anyone has a reason to cite, and the paired branch needs far more than that for its
+    # interval to mean anything.
+    [ "$npos" -ge 32 ] || { echo "FAIL: only $npos scored positions — too few for either branch to mean anything (byte-identity is trivial and the interval is not estimable). Use a corpus of at least 33 tokens." >&2; exit 2; }
+    echo "   length: $npos scored positions (from $(basename "$CORPUS")) — every verdict below is scoped to it"
     local ha ha2 hb
     ha=$(hit_of "$SCRATCH/a.nll"); ha2=$(hit_of "$SCRATCH/a2.nll"); hb=$(hit_of "$SCRATCH/b.nll")
     echo "   hit_pct: A=${ha} A'=${ha2} (control) B=${hb}"
-    echo "   positions moved: A vs A' = $(moved "$SCRATCH/a.nll" "$SCRATCH/a2.nll") (noise), A vs B = $(moved "$SCRATCH/a.nll" "$SCRATCH/b.nll") (noise + budget), of $(nll_body "$SCRATCH/a.nll" | wc -l)"
+    echo "   positions moved: A vs A' = $(moved "$SCRATCH/a.nll" "$SCRATCH/a2.nll") (noise), A vs B = $(moved "$SCRATCH/a.nll" "$SCRATCH/b.nll") (noise + budget), of $npos"
     # Anti-vacuity, and it too is now control-relative. `ha != hb` was the original check
     # and it is worthless once the baseline wobbles: A and A' differ in hit% (78.2643 vs
     # 78.2352 measured) with no budget change at all, so "the hit rates differ" is true of
@@ -482,16 +476,27 @@ cell_p4() {
     fi
     # --- strictness, chosen by the control ------------------------------------------
     if nll_body "$SCRATCH/a.nll" | cmp -s - <(nll_body "$SCRATCH/a2.nll"); then
-        echo "   control is BYTE-IDENTICAL — this arm repeats itself here, so P4 is gated strictly"
+        echo "   control is BYTE-IDENTICAL over $npos positions — this arm repeats itself at THIS LENGTH, so P4 is gated strictly"
         if nll_body "$SCRATCH/a.nll" | cmp -s - <(nll_body "$SCRATCH/b.nll"); then
-            ok "strict: $(nll_body "$SCRATCH/a.nll" | wc -l) per-token NLLs byte-identical across budgets, on an arm whose control proved it byte-reproducible"
-        else
-            red p4 "STRICT: the control repeated byte-for-byte but --max-mem did not — $(moved "$SCRATCH/a.nll" "$SCRATCH/b.nll") positions moved; first: $(nll_body "$SCRATCH/a.nll" | paste - <(nll_body "$SCRATCH/b.nll") | awk '$1!=$2{print NR": "$1" vs "$2; exit}')"
+            ok "strict: $npos per-token NLLs byte-identical across budgets, on an arm whose control proved it byte-reproducible at that length"
+            return 0
         fi
-        return 0
+        # **CONFIRM BEFORE CONVICTING — a fourth arm, on the red path only, repeating the
+        # BUDGET and not the control.** A one-off divergence does not recur, so `B == B''`
+        # cannot happen by chance, while a REAL budget effect is a different but STABLE
+        # output and still convicts. Repeating the CONTROL instead — the first draft of this
+        # fix — leaves the likelihood ratio unchanged and so carries no information about the
+        # budget at all. Arithmetic, and the exception if the divergence turns out to be a
+        # two-attractor race rather than diffuse: `docs/measurement/gate-red-proofs.md` §5a-2.
+        echo "   B differs. A one-off divergence would not REPEAT, so a second budget arm decides whether this is the budget or the wobble"
+        score_arm "p4b2" "$MEM_B" "$b_corpus" "$SCRATCH/b2.nll"
+        if nll_body "$SCRATCH/b.nll" | cmp -s - <(nll_body "$SCRATCH/b2.nll"); then
+            red p4 "STRICT: the control repeated byte-for-byte over $npos positions AND both budget-$MEM_B arms agreed with each other while differing from it — a STABLE, reproducible budget effect, which is a P4 violation. $(moved "$SCRATCH/a.nll" "$SCRATCH/b.nll") positions moved; first: $(nll_body "$SCRATCH/a.nll" | paste - <(nll_body "$SCRATCH/b.nll") | awk '$1!=$2{print NR": "$1" vs "$2; exit}')"
+        fi
+        echo "PPL-GATE UNCALIBRATED: the control repeated over $npos positions but the two budget-$MEM_B arms disagree with EACH OTHER ($(moved "$SCRATCH/b.nll" "$SCRATCH/b2.nll") positions), so this experiment CANNOT SEPARATE a budget effect from the wobble — a real effect plus wobble at B looks the same. Not attributable either way. Not a pass and not a P4 verdict — a finding for docs/investigations/glm-nondeterminism.md. Re-run at a shorter corpus for a verdict, or wait for wave/fix-glm-determinism." >&2
+        exit 1
     fi
-    echo "   control is NOT byte-identical — this arm does not repeat itself, so the floor is MEASURED (see docs/investigations/glm-nondeterminism.md)"
-    [ -x "$PPL_TOOL" ] || { echo "FAIL: bin/ppl missing: $PPL_TOOL" >&2; exit 2; }
+    echo "   control moved $(moved "$SCRATCH/a.nll" "$SCRATCH/a2.nll") of $npos positions — this arm does not repeat itself at this length, so the floor is MEASURED (see docs/investigations/glm-nondeterminism.md)"
     "$PPL_TOOL" "$SCRATCH/a.nll" "$SCRATCH/a2.nll" "$SCRATCH/b.nll" | tee "$SCRATCH/p4-paired.txt"
     local cis n
     cis=$(table_cis "$SCRATCH/p4-paired.txt")
@@ -500,16 +505,16 @@ cell_p4() {
     # mean bin/ppl refused a cell and the comparison silently became control-vs-nothing.
     [ "$n" -eq 2 ] || { echo "FAIL: expected 2 table rows from bin/ppl (control, test), parsed $n — its table format changed, or a cell was refused. See $SCRATCH/p4-paired.txt" >&2; exit 2; }
     local verdict
-    verdict=$(printf '%s\n' "$cis" | awk '
+    verdict=$(printf '%s\n' "$cis" | awk -v npos="$npos" '
         { gsub(/[][,]/, " "); if (NR == 1) { clo = $1 + 0; chi = $2 + 0 } else { tlo = $1 + 0; thi = $2 + 0 } }
         END {
             half = (chi - clo) / 2
             if (clo > 0 || chi < 0) {
-                printf "UNCALIBRATED the CONTROL interval [%+.5f, %+.5f] excludes zero — two identical runs differ systematically, so nondeterminism here is not zero-mean and no interval can be attributed to the budget. Not a pass and not a P4 verdict; this is a finding about the engine, for docs/investigations/glm-nondeterminism.md\n", clo, chi
+                printf "UNCALIBRATED over %d scored positions the CONTROL interval [%+.5f, %+.5f] excludes zero — two identical runs differ systematically, so nondeterminism here is not zero-mean and no interval can be attributed to the budget. Not a pass and not a P4 verdict. Expect this ~1 run in 20 even on a healthy arm, so ONE is a re-run and TWO in a row is a finding for docs/investigations/glm-nondeterminism.md\n", npos, clo, chi
             } else if (tlo > 0 || thi < 0) {
-                printf "RED budget CI [%+.5f, %+.5f] EXCLUDES zero against a control of [%+.5f, %+.5f] that contains it — --max-mem moved the text systematically, beyond what a repeat accounts for. P4 violation\n", tlo, thi, clo, chi
+                printf "RED over %d scored positions the budget CI [%+.5f, %+.5f] EXCLUDES zero against a control of [%+.5f, %+.5f] that contains it — --max-mem moved the text systematically, beyond what a repeat accounts for. P4 violation\n", npos, tlo, thi, clo, chi
             } else {
-                printf "GREEN budget CI [%+.5f, %+.5f] contains zero, control [%+.5f, %+.5f] contains zero — no systematic budget effect at this run resolution (noise half-width %.5f nats)\n", tlo, thi, clo, chi, half
+                printf "GREEN budget CI [%+.5f, %+.5f] contains zero, control [%+.5f, %+.5f] contains zero — no systematic budget effect over %d scored positions (noise half-width %.5f nats, which IS the resolution this length bought)\n", tlo, thi, clo, chi, npos, half
             }
         }')
     case $verdict in
@@ -555,7 +560,6 @@ cell_tf() {
         exit 2
     }
     [ -x "$REF_BIN" ] || { echo "FAIL: reference scoring binary missing: $REF_BIN (see the build line at the top of this file)" >&2; exit 2; }
-    [ -x "$PPL_TOOL" ] || { echo "FAIL: bin/ppl missing: $PPL_TOOL" >&2; exit 2; }
     echo "   ref: $(stat -c '%y' "$REF_BIN") $REF_BIN"
     echo "   new: $(stat -c '%y' "$BIN") $BIN"
     local rc=0
@@ -589,10 +593,13 @@ cell_tf() {
     # untruncated `head -1` can return a VERDICT's interval when the table row is missing —
     # reading a number off the wrong line and calling it a measurement. Found while giving
     # `p4` a two-row parse (2026-08-17).
-    ci=$(table_cis "$SCRATCH/paired.txt" | head -1 || true)
-    [ "$(table_cis "$SCRATCH/paired.txt" | grep -c . || true)" -eq 1 ] ||
-        { echo "FAIL: expected exactly 1 table row from bin/ppl, got $(table_cis "$SCRATCH/paired.txt" | grep -c . || true) — its table format changed; see $SCRATCH/paired.txt" >&2; exit 2; }
-    [ -n "$ci" ] || { echo "FAIL: no 95% CI in bin/ppl's output — its table format changed; see $SCRATCH/paired.txt" >&2; exit 2; }
+    local cis n
+    cis=$(table_cis "$SCRATCH/paired.txt")
+    n=$(printf '%s\n' "$cis" | grep -c . || true)
+    # One cell in, one table row out. This subsumes an emptiness check on `ci` — a count of
+    # exactly 1 cannot leave it empty — so there is no second assertion.
+    [ "$n" -eq 1 ] || { echo "FAIL: expected exactly 1 table row from bin/ppl, parsed $n — its table format changed, or the cell was refused. See $SCRATCH/paired.txt" >&2; exit 2; }
+    ci=$(printf '%s\n' "$cis" | head -1)
     local verdict
     verdict=$(awk -v bar="$TF_BAR" -v ci="$ci" 'BEGIN {
         gsub(/[][,]/, " ", ci); split(ci, v, " ")
@@ -614,16 +621,37 @@ cell_tf() {
     esac
 }
 
+# **A RED in one cell must not cost the others their run**, and the first attempt at this
+# did exactly that: `(run_cell "$c") || exit $?` put the subshell in a `||` list whose
+# right-hand side re-raised the cell's exit code, so `p4` reddening still killed `tf` — the
+# very failure it was written to fix. Reproduced and fixed 2026-08-17; the mapping now lives
+# HERE, at the one place the codes are read, with no `exit` on a red.
+#
+#   0  green            1  RED (already recorded by `red()` in a marker file)
+#   4  a red-proof that fired on the WRONG defect — hard stop, already explained
+#   2  setup     3  arm discarded     both abort: the measurement could not be taken at all,
+#                                     and the next cell would hit the same wall.
+#
+# Ordered cheapest-first so a battery cut short by a setup failure spends the least device
+# time discovering it — and `tf` reuses `p4`'s arm A, so `p4` runs before it.
 case $CELL in
-profile | p4 | tf) (run_cell "$CELL") || exit $? ;;
-# Ordered cheapest-first so a battery that is going to be cut short by a setup failure
-# spends the least device time discovering it — and `tf` reuses `p4`'s arm A, so p4 runs
-# before it.
-all) for c in profile p4 tf; do (run_cell "$c") || exit $?; done ;;
+profile | p4 | tf) CELLS=$CELL ;;
+all) CELLS="profile p4 tf" ;;
 *) echo "FAIL: unknown cell '$CELL' (profile|p4|tf|all)" >&2; exit 2 ;;
 esac
+for c in $CELLS; do
+    rc=0
+    ("cell_$c") || rc=$?
+    case $rc in
+    0 | 1) ;;
+    4) exit 1 ;;
+    *) exit "$rc" ;;
+    esac
+done
 
 count() { find "$SCRATCH" -maxdepth 1 -name "$1" 2>/dev/null | wc -l; }
+REPLAYED=""
+[ -f "$SCRATCH/replayed" ] && REPLAYED=" (REPLAY — classifier only, NOT evidence about the engine)"
 reds=$(count 'red.*')
 proofs=$(count 'proof.*')
 passes=0

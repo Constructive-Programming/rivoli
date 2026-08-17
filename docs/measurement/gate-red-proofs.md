@@ -211,6 +211,60 @@ positions, ~72% of them moving, calibrated so the control's mean lands at the me
 Resolution bought: a ~0.0043-nat half-width, against the 0.0134–0.0172-nat quality gaps
 the ladder must resolve — ~3x headroom.
 
+**LENGTH-AWARE, added 2026-08-17 after the text-level result.** Divergence on this arm is
+stochastic in the position at which it first fires — GLM is byte-identical at 32 generated
+tokens and differs at 512, and the same command's first divergence moved from position 13
+(loaded box) to 452 (quiet box). Two consequences are now built in rather than assumed:
+
+- **Every verdict this cell prints carries its scored-position count**, because
+  "byte-identical" and "the control spread is X" are different experiments at different
+  lengths and a reader comparing two runs must be able to see that.
+- **The strict branch CONFIRMS BEFORE CONVICTING, by repeating the BUDGET arm.** A
+  matching control pair plus a differing B could be the budget, or it could be arm B
+  catching a one-off — and convicting the budget of the engine's wobble is exactly what
+  the first version of this cell did on a real device run. So a strict-branch difference
+  triggers a fourth arm, on the red path only.
+  **Which side to repeat is not a matter of taste, and the first attempt at this fix got it
+  wrong** (it re-ran the CONTROL). Model a run as modal with probability `q`, else divergent
+  in a one-off way that does not recur — which is what this looks like, being stochastic in
+  the position it first fires. Under no budget effect every arm is an independent draw:
+
+  | rule | false-conviction rate | q=0.90 | q=0.70 |
+  |---|---|---:|---:|
+  | `A==A'` and `A!=B` | `q²(1−q)` | 0.0810 | 0.1470 |
+  | `A==A'==A''` and `A!=B` | `q³(1−q)` | 0.0729 | 0.1029 |
+  | `A==A'`, `A!=B`, **`B==B''`** | ~0 | ~0 | ~0 |
+
+  A second CONTROL only sharpens the estimate of `q`; the false conviction comes entirely
+  from the B side, and it does nothing about that. Sharper still: the second control
+  multiplies the true and false rates by the SAME `q`, so the likelihood ratio
+  `q²/[q²(1−q)] = q³/[q³(1−q)] = 1/(1−q)` is UNCHANGED — it carries no information about the
+  budget whatsoever, and only makes REDs rarer in both directions, by exactly a factor of
+  `(1−q)`. A second BUDGET arm kills the confound instead, because a one-off does not repeat
+  — while a REAL budget effect is a different but STABLE output, so `B==B''` still holds and
+  the rule convicts. Same cost, one arm.
+
+  Two things the rule pays for, both stated rather than discovered later:
+
+  - **Power.** Convicting needs `q⁴` instead of `q²`, so at `q=0.90` a genuine P4 violation
+    is reported UNCALIBRATED rather than RED about 34% of the time (19% before). The
+    direction is safe — no path turns a real violation into GREEN, because a strict GREEN
+    still requires byte-identity of A and B — and `MEM_B` streams ~1.7x the misses of
+    `MEM_A`, so it is a priori the arm likelier to wobble. **Expect UNCALIBRATED, not RED,
+    to be the strict branch's usual answer on a GLM-like arm.** That is the correct
+    diagnosis, not a gate failure.
+  - **The `≈0` rests entirely on one-offs being UNIQUE.** If the divergence turns out to be
+    a race with two STABLE attractors rather than a diffuse one-off — second mode reached
+    with probability `r` at `MEM_B` — then `B==B''` happens with probability `r²` and the
+    false-conviction rate is `q²r²`, which at `q=0.9, r=0.3` is 0.073: no better than the
+    rule it replaced. The evidence (first-divergence position moving 13→452 with host load)
+    favours diffuseness but does not establish it. If `wave/fix-glm-determinism` finds a
+    two-attractor race, this rule needs revisiting.
+
+So the cell's failure mode under a non-reproducing arm is now **UNCALIBRATED (exit 1, never
+a pass), not a false conviction** — which is the property that matters for the three
+branches inheriting it.
+
 **Two design errors were found and fixed while proving it**, both of the kind that produce
 a confident wrong number rather than a failure:
 
@@ -230,6 +284,20 @@ ran** — the one cell that validates scoring against the pinned reference was l
 unrelated failure two cells earlier. Cells now run in subshells and the battery continues;
 setup (2) and discard (3) still abort, because those say the measurement could not be
 taken at all.
+
+> **CORRECTED 2026-08-17, same day: the FIRST fix for that did not work, and this paragraph
+> asserted it did.** The driver was `(run_cell "$c") || exit $?` — a subshell in a `||` list
+> whose right-hand side re-raised the cell's own exit code, so a red still killed the
+> battery. Reproduced with a 15-line mirror, then fixed by moving the code mapping to the
+> loop and removing the `exit` on a red.
+>
+> The same bash rule has a second consequence worth writing down, because it cannot be
+> worked around: **`set -e` is disabled INSIDE a subshell that is an operand of `||`, and it
+> cannot be re-armed** — `( set +e; set -e; … )` still runs past a failing command (measured;
+> only a fresh `bash -c` restores it). So every failure inside a cell must be checked
+> explicitly, which is what `run_arm`/`score_arm` returning into a tested variable, the
+> `cmp`s inside `if`, and the row-count assertions after each parse are for. A step added to
+> a cell without an explicit status check is silently ignored.
 
 ### 5b. Engine half — OWED, needs the device
 

@@ -87,11 +87,16 @@ appears that enum dispatch cannot fill.
   remainder), `p4` (P4 at NLL, THREE arms — A, a same-budget control A', and B — whose
   strictness CALIBRATES ITSELF: byte-identity is demanded of an arm whose control repeats
   byte-for-byte, and elsewhere the floor is measured and the budget's interval must contain
-  zero where the control's does. Re-specified 2026-08-17 after the byte-identity form
-  reddened on GLM's own nondeterminism, not on the budget), `tf` (paired dNLL against
+  zero where the control's does; every verdict carries its scored-position count and a
+  strict-branch difference runs a second BUDGET arm before convicting — not a second control
+  pair, which was the rejected first attempt and carries no information about the budget —
+  because a one-off divergence does not recur while a real budget effect is stable. Re-specified 2026-08-17 after the byte-identity form
+  reddened on GLM's own nondeterminism, not on the budget. **On a non-reproducing arm it
+  reports UNCALIBRATED (exit 1), so it is a diagnostic there, not a merge gate**), `tf`
+  (paired dNLL against
   the pinned reference inside a pre-registered ±ln(1.01) equivalence band; INCONCLUSIVE is
   never a pass). `--expect-red[=FRAGMENT]` inverts the classification so a red proof is
-  judged by the gate's own code. On-demand (GPU, ~30 min + ~6 min per red-proof), not CI.
+  judged by the gate's own code. On-demand (GPU, ~28 min, or ~34 min if the strict branch takes its fourth arm; + ~6 min per red-proof), not CI.
   Shares `tests/gpu-witness.sh` with the parity gate. Classifier half red-proofed
   2026-08-16 deviceless; the engine half is OWED (`docs/measurement/gate-red-proofs.md` §5).
 - **smoke** — `tests/smoke-glm.sh`: the CLI end to end — every legality refusal asserted

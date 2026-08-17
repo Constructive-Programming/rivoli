@@ -1,7 +1,7 @@
 ---
 status: live
 scope: glm
-verdict: GLM int3-vq does not reproduce itself run to run — two teacher-forced runs at IDENTICAL flags moved 555 of ~761 scored positions and 0.0018 nats of mean NLL (PPL 5.200080 vs 5.209284). THREE controls bound it, and the third narrowed the scope: Muse Glimmer scored twice fully pinned is byte-identical, which excludes the kernels, reduction order, toolchain and this milestone's scoring harness; Glimmer at --max-mem 32 vs 20 is byte-identical in its ids while ACTIVELY STREAMING 21 of 52 layers through one slot, which excludes layer streaming as a generic cause; and V4 at 97% hit was byte-identical over 32 ids. So the wobble is confined to the ROUTED EXPERT POOL — per-expert admission, the two-ended arena's relocations and ticket lifetime, and the MoE accumulation — which GLM has and Glimmer does not; those two candidates are NOT separated. The exclusion is strong evidence rather than proof, because Glimmer's probe is greedy ids (argmax-robust) and GLM's is NLL floats; one Glimmer --ppl pair at the same budgets makes it airtight and is experiment 0. The usable result is the magnitude: a 0.0018-nat noise floor against the 0.0134-0.0172-nat gaps the wave's ladder must resolve, ~8x headroom, so paired dNLL stays valid provided every comparison runs its own A-vs-A control. Root cause deliberately NOT chased; named, bounded, handed off.
+verdict: GLM int3-vq does not reproduce itself, and it reaches the GENERATED TEXT: 512-token greedy runs at identical flags give different outputs (496 of 512 ids differing, first at position 13; 61 of 512 first at 452 on a quieter box), and the PINNED OLD TREE diverges from itself too (247 of 512, first at 265) — so this is NOT a rewrite regression. It is NOT thereby exonerating the ROCm 7.14/clang 23.1 upgrade: both reference binaries were built here under that same toolchain, so the experiment varied source and held toolchain FIXED; it shows the upgrade did not RETIRE the defect and says nothing about whether it introduced it. Byte-identity HOLDS at 32 tokens and FAILS by 512, so every byte-identity claim on this arm needs a token count attached, and the old tree's gated-MTP and parity claims are unproven at long lengths rather than wrong. CORRECTED 2026-08-17: this verdict previously framed the finding as NLL-float wobble with ~8x headroom, true but far too weak. The two magnitudes coexist structurally — teacher forcing re-anchors every position to the committed corpus so a perturbation cannot change the INPUT sequence, while a greedy decode feeds its output back and one flipped argmax rewrites the tail; so 496-of-512 is AT LEAST ONE event plus a cascade, later events are unmeasurable once the sequences part, and the ranking quantity is the FIRST DIVERGING POSITION, never the count. Paired dNLL over a fixed corpus therefore REMAINS VALID at a measured 0.0018-nat floor (PPL 5.200080 vs 5.209284) against the 0.0134-0.0172-nat gaps the ladder must resolve — the number every downstream --ppl gate must cite and re-measure — but that interval assumes per-position independence which this same defect violates, so it is a LOWER BOUND on its true width and a deviceless autocorrelation check on two retained .nll files is OWED before the headroom is leaned on. Greedy byte-identity on GLM is not a usable gate at 512. Scope: Glimmer is byte-identical fully pinned AND streaming 21 of 52 layers, V4 byte-identical over 32 ids, so the wobble is confined to the ROUTED EXPERT POOL — per-expert admission, arena relocation and ticket lifetime, MoE accumulation — and those candidates are NOT separated. Owner has made determinism a hard blocking requirement; root cause is owned by wave/fix-glm-determinism, not here.
 ---
 
 # GLM int3-vq does not repeat itself, and by how much
@@ -54,8 +54,24 @@ Against it, the quality gaps this wave's ladder has to resolve:
 | 0.07 PPL | 0.01337 | 7.6x |
 | 0.09 PPL | 0.01716 | 9.7x |
 
+
+> **CAVEAT on the multiples above, and it is OWED as a check (review 2026-08-17).** `bin/ppl`
+> computes `SE = sd/sqrt(n)`, which assumes the per-position differences are INDEPENDENT.
+> The section below argues the opposite: a perturbation propagates through one position's KV
+> entry into every later position's logits, and 555 of 761 positions moving from a small
+> number of events is what positive autocorrelation looks like. If the effective sample size
+> were ~50 rather than 761, the true half-width is `sqrt(761/50)` ~ **3.9x** the reported
+> +/-0.0043 — about +/-0.017, which would SWALLOW the 0.0134-0.0172-nat gaps in this table.
+>
+> **Unmeasured, and it needs NO GPU**: a lag-1 autocorrelation or a block-bootstrap SE over
+> any control pair's two `.nll` files settles it. Those files were not retained from the runs
+> above; `tests/ppl-gates.sh` leaves them in the evidence directory it prints, so **preserve
+> that directory from the next `p4` run and do this check before any downstream branch leans
+> on the multiples.** Until then the floor's POINT ESTIMATE stands and every INTERVAL derived
+> from it — here and in the `p4` cell — is a LOWER BOUND on the true width.
+
 So paired dNLL **remains the right instrument and remains usable** — the effects being
-chased are an order of magnitude above the wobble. What changes is that a comparison of
+chased are an order of magnitude above the wobble, subject to the caveat above. What changes is that a comparison of
 two GLM runs may no longer be reported without its floor, and **a difference under ~0.002
 nats on this arm is not a measurement**. `tests/ppl-gates.sh`'s `p4` cell now measures the
 floor on every invocation rather than citing this page, because a floor that is quoted
@@ -63,6 +79,35 @@ rather than re-measured is an inherited number.
 
 This applies to every downstream paired-dNLL gate in the wave — M11's fp8 ladder, M15's
 boundary work, M17's quality comparisons. It does **not** apply to Glimmer (below).
+
+## Why the two magnitudes coexist: teacher forcing cannot cascade, greedy decode must
+
+**Added 2026-08-17 to reconcile the sections above with the section below**, because at
+first reading they look contradictory: 0.0018 nats of mean NLL wobble against 496 of 512
+generated ids differing. Both are correct, and the difference is structural rather than a
+matter of degree.
+
+In a **teacher-forced** walk the input at every position is `ids[i]` from the committed
+corpus, whatever the model predicted. A perturbation at position *i* therefore propagates
+only NUMERICALLY — through that position's KV entry into later positions' logits — and
+every position is re-anchored to the same text. The walk cannot leave the corpus.
+
+In a **greedy decode** the emitted token IS the next input. A single perturbation that
+flips one argmax replaces the rest of the sequence: after position 13 the two runs are
+scoring different text, which is why 496 of 512 ids differ from ONE event. The 496 is not
+496 events; it is one event plus a cascade.
+
+Three consequences, and they are the reason this page's framing needed correcting rather
+than replacing:
+
+- **Paired dNLL over a fixed corpus stays a valid instrument** at the 0.0018-nat floor —
+  that number governs `--ppl` and every downstream quality gate, and it is not softened by
+  the text result.
+- **Greedy byte-identity on this arm is not a valid gate at 512 tokens** and every claim of
+  it must carry a token count. It holds at 32.
+- **A cascade count is not a magnitude.** "496 of 512" measures how far along the sequence
+  the first event landed, not how badly the engine is wrong. Rank on the FIRST DIVERGING
+  POSITION, which is what the runs below report and why they report it.
 
 ## What is EXCLUDED
 
@@ -153,10 +198,6 @@ Each is one device session, none needs new code:
    substitute bf16 Glimmer with budgets chosen to straddle its own partition — the argument
    is about layer streaming, not about the weight format.
 
-## The cheap next discriminators, in order
-
-Each is one device session, none needs new code:
-
 1. **GLM at two budgets, control-paired at each.** If the wobble is the routed pool,
    its magnitude should SCALE WITH STREAMED VOLUME: the control pair at `--max-mem 70`
    (62.1% hit, so ~1.7x the misses) should move further than the control pair at 115
@@ -207,9 +248,22 @@ The sections above measured NLL floats through the scoring path. Four further ru
 stronger and narrower.
 
 **1. Greedy decode diverges in the generated text.** Three 512-token runs gave three
-different outputs. no-MTP run 1 vs no-MTP run 2: **496 of 512 ids differ, first at
+different outputs — two of them at IDENTICAL flags (the third carried `--mtp`, see point 2;
+the quiet-box repeat below is a second same-flags pair, so the finding does not rest on the
+`--mtp` run). no-MTP run 1 vs no-MTP run 2: **496 of 512 ids differ, first at
 position 13**. no-MTP run 2 vs the `--mtp` run: **220 of 512, first at position 292**. A
 divergence cascades — one changed token at 13 rewrites essentially the whole tail.
+
+> **Refined 2026-08-17 (review): "AT LEAST one event, after which the comparison carries no
+> further information."** The four (first-position, count) pairs are near-exactly
+> complementary under 1-INDEXED positions — 13 leaves 500 available and 496 differ, 292
+> leaves 221 and 220 differ, 452 leaves 61 and 61 differ, 265 leaves 248 and 247 differ:
+> 0-4 coincidental matches out of hundreds, which a 154,880-token vocabulary makes
+> plausible. (The indexing is worth stating, because 512-452 = 60 < 61 makes the third row
+> impossible 0-indexed and a reader checking the arithmetic will hit it.) So "one event then
+> total divergence" fits tightly — but past the first divergence the two runs are scoring
+> DIFFERENT text, so any later event is invisible and the number of events is not
+> measurable. Rank on the first diverging position, which is why these runs report it.
 
 **2. MTP is NOT the cause, and the control says so precisely.** The `--mtp` run and
 no-MTP run 2 both match the 32-token control at **0 of 32** differing; no-MTP run 1
@@ -231,6 +285,16 @@ it does not create it.
 position 265** — worse than the rewrite's 61/452 in this sample. Both trees carry it.
 That retires the hypothesis that the recent ROCm/HIP upgrade (7.14 / clang 23.1)
 introduced it, and equally the hypothesis that the upgrade retired the old defect.
+
+> **CORRECTED 2026-08-17 (review): only the SECOND half of that sentence follows.** Both
+> reference binaries were built ON THIS BOX on 2026-08-15/16
+> (`/var/cache/users/rhansen/ref-pin-target`, `m10-ref-tf-target`) and the only installed
+> toolchain is HIP 7.14.60850 / clang 23.1.0 — so the experiment varied the SOURCE and held
+> the TOOLCHAIN fixed. What it establishes: this is **not a rewrite regression** (old source
+> diverges too), and the upgrade did **not retire** a pre-existing defect (old source under
+> 7.14 still diverges). What it cannot establish is that the upgrade did not INTRODUCE it —
+> that needs the old source under the OLD toolchain, which is not installed here. Treat the
+> upgrade as **untested in that direction**, not exonerated.
 
 **What this costs the record.** The old tree's own claims of byte-identical output —
 gated MTP at `--mtp-min-conf 0.8`, the parity gates, the quality ladder's A/Bs — were
