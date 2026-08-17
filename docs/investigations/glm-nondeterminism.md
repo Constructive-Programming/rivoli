@@ -4,13 +4,17 @@ scope: glm
 verdict: THE MECHANISM IS A WRONG-BYTES READ IN THE ROUTED-EXPERT POOL, localised on device 2026-08-17: at pos=164 layer=24 the `h` fold moved while `xn`, `gl`, `pk` and `sl` were IDENTICAL and relocs=0 — the same experts, in the same slots, fed the same input, produced different results. Attention, routing, placement and relocation are all out of frame, and both previously named candidates stay refuted by construction (no float atomic exists in any kernel, so identical bytes give identical results). The rate is measured — 1 event per ~300-578 token-forwards, so a pair of 512-token runs detects it 83-97% of the time and a 32-token pair 10-19%, which is why every byte-identity claim on GLM must state its token count. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT. WHAT REMAINS is which hop delivers the wrong bytes — the NVMe read, the bounce arena, or the DMA — and three cross-run folds now split them at an ESTIMATED ~27% throughput cost that must be measured on the first instrumented run. The toolchain is NOT exonerated: both binaries were built under it. The determinism gate exists, is length-aware with a 512-token floor, and its GREEN IS OWED because the engine is red.
 ---
 
-# GLM does not reproduce itself: the rate, and why both suspects are innocent
+# GLM does not reproduce itself: the bytes read out of the pool slots differ
 
-**Supersedes the page of this name on `wave/m10-spine`**, which measured the defect and
-bounded its magnitude. Every measurement there stands. What changes here is (a) the rate and
-the ranking quantity, (b) the attribution: that page's scope statement — "the wobble is
-confined to the routed expert pool … those two candidates are NOT separated" — names two
-candidates that **cannot be the mechanism in this tree**.
+**Supersedes the page of this name on `wave/m10-spine`**, which measured the defect and bounded its
+magnitude. Every measurement there stands — including the independence check it recorded as OWED,
+which this page pays rather than inherits (see below). What changes here is three things: the rate
+and the ranking quantity; the attribution, since that page's two named candidates **cannot be the
+mechanism in this tree**; and the mechanism itself, now localised on device to a wrong-bytes read in
+the routed-expert pool.
+
+The one question left is which HOP delivers them — the NVMe read, the bounce arena, or the DMA —
+and the instrument that splits those is built but has not run.
 
 ## The coordinate, measured on device 2026-08-17
 
