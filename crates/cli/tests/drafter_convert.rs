@@ -683,7 +683,11 @@ fn the_serving_mask_indexes_queries_by_position_and_the_anchor_pins_the_other_br
     // And the anchor's own geometry, where the two branches ALSO differ — which is why the
     // goldens cannot be read as evidence for either choice at real widths.
     let (a_row, a_row_strict, a_row_ctx) = mask_shape(12, 4, 13, 0);
-    let (a_pos, _, a_pos_ctx) = mask_shape(12, 4, 13, 12);
+    // The cache branch's strict count is asserted rather than discarded. It was `_` until
+    // 2026-08-17, when review pointed out that the commit message cited 6 for this row and no test
+    // held it -- so an edit to `strict` that broke exactly this case would have passed here while
+    // the doc went on claiming the number.
+    let (a_pos, a_pos_strict, a_pos_ctx) = mask_shape(12, 4, 13, 12);
     assert_eq!(
         (a_row, a_row_strict, a_row_ctx),
         (13, 3, 0),
@@ -691,8 +695,8 @@ fn the_serving_mask_indexes_queries_by_position_and_the_anchor_pins_the_other_br
          column masked; `glimmer_draft_oracle.rs` asserts the same numbers from the golden BYTES"
     );
     assert_eq!(
-        (a_pos, a_pos_ctx),
-        (16, 3),
+        (a_pos, a_pos_strict, a_pos_ctx),
+        (16, 6, 3),
         "the cache branch at the same widths is a different mask, so the fixture distinguishes \
          them and pins the no-cache one"
     );
