@@ -521,6 +521,24 @@ vocabulary sitting at the same path. RP6 is the one that matters most for readin
 > run. Both sides now derive from the reference's own special map, and a negative case
 > (`<|reserved_token_163839|>` must NOT be one id) keeps the distinction live.
 
+### Two gate results that are not about ids
+
+**CodeScene could not be discharged and is owed.** `cs` is installed but unlicensed here, so the
+gate warn-and-skips by design (`RIVOLI_CS_REQUIRED=1` correctly turns that into a failure — I ran
+it). It therefore did NOT score this module, matching CLAUDE.md's standing note that the
+score-below-10 half waits on `CS_ACCESS_TOKEN`. Self-assessed against the band the tree records
+instead: 12 primitive arguments across the methods, against a threshold of 11 — inside it. The
+biggest contributor was `encode_capped`'s two bare `usize` caps, now one [`EncodeCaps`] value,
+which drops it to 10. That refactor stands on its own argument regardless of the gate: the caps are
+a pair the reference nests, both are `usize`, and swapping them **compiles and passes every short
+fixture** — at `chars = 25_000, run = 400_000` the inner cap simply never trips. Same hazard
+`ArtifactDirs` exists for.
+
+**The 800-line soft cap fired at 821 lines** and its instruction is that the next edit shrink the
+file, so the unit tests moved to `src/tiktoken/tests.rs` (666 + 164), following `v4_encoding`'s
+`mod tests;` precedent. They are the part that moves without splitting an argument across files —
+and they are also the only K3 gates that assert in CI, which is worth having in one obvious place.
+
 ### The seam, which is where the bug actually was
 
 `Tokenizer::load` sniffs by FILE — `tokenizer.json` first (what the other three checkpoints

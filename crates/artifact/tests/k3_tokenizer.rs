@@ -32,9 +32,7 @@
 // tests: panic-on-failure is the idiom, and a broken gate should be loud.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rivoli_artifact::tiktoken::{
-    MAX_ENCODE_CHARS, MAX_SAME_CLASS_RUN, PAT_STR, SPECIAL_SLOTS, Vocab,
-};
+use rivoli_artifact::tiktoken::{EncodeCaps, MAX_SAME_CLASS_RUN, PAT_STR, SPECIAL_SLOTS, Vocab};
 use serde_json::Value;
 
 /// The converted K3 artifact — deliberately the ARTIFACT and not the 1.42 TiB source.
@@ -55,6 +53,24 @@ const ART_DEFAULT: &str = "/swarm/storage/ai/rivoli/kimi-k3-f4";
 
 fn art() -> String {
     std::env::var("RIVOLI_K3_ARTIFACT").unwrap_or_else(|_| ART_DEFAULT.to_string())
+}
+
+/// Only the INNER cap lowered; the outer stays at the shipped value.
+fn inner(run: usize) -> EncodeCaps {
+    EncodeCaps {
+        run,
+        ..Default::default()
+    }
+}
+
+/// Only the OUTER cap lowered. Named rather than spelled inline at four sites: jscpd reported the
+/// repeated struct literals, and `inner(7)` / `outer(7)` says which boundary a row is aiming at
+/// where `EncodeCaps { chars: 7, .. }` makes the reader check.
+fn outer(chars: usize) -> EncodeCaps {
+    EncodeCaps {
+        chars,
+        ..Default::default()
+    }
 }
 
 /// The reference's own output, vendored beside this file.
@@ -417,7 +433,7 @@ fn both_caps_match_the_reference_at_small_values() {
         let (name, text) = (c["name"].as_str().unwrap(), c["text"].as_str().unwrap());
         let cap = c["max_run"].as_u64().unwrap() as usize;
         assert_eq!(
-            v.encode_capped(text, MAX_ENCODE_CHARS, cap).unwrap(),
+            v.encode_capped(text, inner(cap)).unwrap(),
             ids_of(c),
             "inner-cap case {name} at cap {cap}"
         );
@@ -431,7 +447,8 @@ fn both_caps_match_the_reference_at_small_values() {
             c["max_run"].as_u64().unwrap() as usize,
         );
         assert_eq!(
-            v.encode_capped(text, oc, ic).unwrap(),
+            v.encode_capped(text, EncodeCaps { chars: oc, run: ic })
+                .unwrap(),
             ids_of(c),
             "outer-cap case {name} at max_chars {oc}, max_run {ic}"
         );
@@ -442,15 +459,13 @@ fn both_caps_match_the_reference_at_small_values() {
     // above would pass for an implementation that ignored the parameter entirely.
     let long = "x".repeat(40);
     assert_ne!(
-        v.encode_capped(&long, MAX_ENCODE_CHARS, 7).unwrap(),
-        v.encode_capped(&long, MAX_ENCODE_CHARS, MAX_SAME_CLASS_RUN)
-            .unwrap(),
+        v.encode_capped(&long, inner(7)).unwrap(),
+        v.encode_capped(&long, EncodeCaps::default()).unwrap(),
         "a low INNER cap produced the same ids as the shipped one — it is being ignored"
     );
     assert_ne!(
-        v.encode_capped(&long, 7, MAX_SAME_CLASS_RUN).unwrap(),
-        v.encode_capped(&long, MAX_ENCODE_CHARS, MAX_SAME_CLASS_RUN)
-            .unwrap(),
+        v.encode_capped(&long, outer(7)).unwrap(),
+        v.encode_capped(&long, EncodeCaps::default()).unwrap(),
         "a low OUTER cap produced the same ids as the shipped one — it is being ignored"
     );
 }
