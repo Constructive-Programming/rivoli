@@ -28,7 +28,7 @@
 #![cfg(feature = "rocm")]
 
 use crate::abi::ScoreDims;
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use std::ffi::c_void;
 
 // Glob, not a curated list: a curated one is a third place a launcher has to be spelled, and
@@ -393,32 +393,6 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
     ensure_hip_status(unsafe { rivoli_fill_u32(dst, pat, bytes) }, "fill_u32")
 }
 
-/// XOR-fold the exact bits of `x[0..n]` into `*out` — the `--divergence-log` probe.
-///
-/// The fold is order-independent (XOR is commutative and associative), which is what makes
-/// it quieter than the run-to-run divergence it localises; a float sum would report a
-/// difference from scheduling jitter alone. It adds no sync, for the same measured reason
-/// [`launch_flag_nonfinite`](crate::hip_linalg::launch_flag_nonfinite) does not: the
-/// host-copying predecessor perturbed timing enough to MASK the fault it was built to find.
-///
-/// Hand-written here rather than a `launchers!` row in `hip_linalg.rs`, and the reason is the
-/// 800-line soft cap: that file sits at 797 and the row would have carried it over. It also
-/// belongs with `fill_u32` and `memcpy_dtod` on cohesion — the three are utilities over raw
-/// device bytes rather than operators the model graph names.
-///
-/// The host twin is `rivoli_engine::probe::fold_host`, and
-/// `crates/engine/tests/fwd_kernel.rs::hash_rows_matches_the_host_fold` scores the two
-/// against each other. That gate is not decoration: every conclusion the GLM-nondeterminism
-/// investigation draws is read off a pair of these hashes.
-///
-/// # Safety
-/// `x` must be `n` device f32; `out` one device u64, ZEROED before the first fold into it —
-/// XOR against uninitialised memory is silently wrong, and `hipMalloc` does not zero.
-pub unsafe fn launch_hash_rows(x: *const f32, n: usize, out: *mut u64) -> Result<()> {
-    // SAFETY: caller's pointer contract.
-    ensure_hip_status(unsafe { rivoli_hash_rows(x, n as i32, out) }, "hash_rows")
-}
-
 //
 // THE LAUNCHER WALL — same exemption, and for the same reason, as the `extern "C"` block
 // above: from here to the end of the file every item is a signature mirroring a
@@ -539,3 +513,40 @@ pub unsafe fn launch_index_score_blocks(
     ensure_hip_status(r, "index_score_blocks")
 }
 // jscpd:ignore-end
+
+// Deliberately BELOW the duplication-gate exemption that closes just above — the placement is
+// the point. This first landed INSIDE that region, which would have put brand-new code under a
+// build-error gate that had been told not to look at it. The region's argument is about the ABI
+// wall's same-shaped parameter lists; this is an ordinary wrapper and has no business borrowing
+// the exemption (review, 2026-08-17). An over-broad exemption is a hole in the gate.
+//
+// (The marker is named rather than spelled, because `crates/cli/tests/docs.rs` refuses a
+// mid-sentence mention of it: jscpd treats one as a real marker, so a comment that quoted it
+// would silently move where the exemption ends. That check caught this very comment.)
+
+/// XOR-fold the exact bits of `x[0..n]` into `*out` — the `--divergence-log` probe.
+///
+/// The device twin of `rivoli_core::hash::xor_fold`, which carries the argument for why the
+/// fold is an XOR and adds no sync; `crates/engine/tests/fwd_kernel.rs::
+/// hash_rows_matches_the_host_fold` scores the two against each other.
+///
+/// Hand-written here rather than a `launchers!` row in `hip_linalg.rs`, and the reason is the
+/// 800-line soft cap: that file sits at 797 and the row would have carried it over. It also
+/// belongs with `fill_u32` and `memcpy_dtod` on cohesion — the three are utilities over raw
+/// device bytes rather than operators the model graph names.
+///
+/// # Safety
+/// `x` must be `n` device f32; `out` one device u64, ZEROED before the first fold into it —
+/// XOR against uninitialised memory is silently wrong, and `hipMalloc` does not zero.
+pub unsafe fn launch_hash_rows(x: *const f32, n: usize, out: *mut u64) -> Result<()> {
+    // The ABI takes an i32. Every current call site is a few times 10^4 elements, so this is
+    // defensive — but a silent wrap would fold a NEGATIVE length, which the kernel's `n <= 0`
+    // guard turns into a no-op and the probe would report two runs agreeing about a quantity it
+    // never hashed. That is the instrument's one unacceptable failure, so it is a check.
+    ensure!(
+        n <= i32::MAX as usize,
+        "hash_rows: {n} elements exceeds the i32 ABI"
+    );
+    // SAFETY: caller's pointer contract.
+    ensure_hip_status(unsafe { rivoli_hash_rows(x, n as i32, out) }, "hash_rows")
+}

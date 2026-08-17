@@ -136,15 +136,21 @@ impl RoutedGeom {
     }
 
     /// **Every read must start block-aligned and its aligned superset must fit ONE slot.**
-    /// Checked here, once, over the whole table.
+    ///
+    /// Three `ensure!`s and no loop, because the read specs are AFFINE:
+    /// `ExpertSet::read_spec` returns `begin = hbytes + expert · stride` with `len` constant,
+    /// and `stride`/`len` do not vary by layer either (a set has one layout; only the `fd`
+    /// changes). So `hbytes ≡ 0` and `stride ≡ 0 (mod ALIGN)` give an aligned start for every
+    /// one of the 19,200 entries, and `align_up(len) ≤ stride` bounds every copy — checked
+    /// once instead of 19,200 times. The first draft did loop, which review named
+    /// (2026-08-17) as evaluating two predicates with at most two distinct outcomes.
     ///
     /// This replaces a `debug_assert_eq!(sub, 0, "VQ expert read must be block-aligned")` on
     /// the per-read path in `asyncfetch.rs`, and the replacement is the point rather than a
     /// tidy-up. That assert claimed to enforce two properties the fetch path genuinely depends
-    /// on, and under `--release` — which is what every benchmark and every long divergence run
-    /// is built with — it enforced neither. This repo's most common review finding is a
-    /// `debug_assert!` whose comment claims it *enforces* something; this one was in the fetch
-    /// path of an open non-determinism defect.
+    /// on, and under `--release` — what every benchmark and every long divergence run is built
+    /// with — it enforced neither. It is DELETED there, not left alongside this: two checks for
+    /// one property, one of them inert, is the finding rather than the fix.
     ///
     /// The two properties, and what breaks without each:
     ///
@@ -153,40 +159,56 @@ impl RoutedGeom {
     ///    a non-zero sub-offset shifts every one of the six projection pointers by that many
     ///    bytes — a silent, deterministic wrong-weights read with no downstream check that
     ///    could see it.
-    /// 2. **The superset fits `stride`**, so the copy cannot spill past the slot. A spill
-    ///    overwrites the NEIGHBOURING slot, i.e. some other resident expert's weights, at a
-    ///    moment that depends on when the reaper reaps — a timing-dependent cross-expert
-    ///    corruption, which is precisely the shape of defect under investigation.
+    /// 2. **The superset fits `stride`.** A spill overwrites the NEIGHBOURING slot, i.e. another
+    ///    resident expert's weights, at a moment that depends on when the reaper reaps — a
+    ///    timing-dependent cross-expert corruption, which is the shape of the defect in
+    ///    `docs/investigations/glm-nondeterminism.md`.
     ///
-    /// Both currently hold by arithmetic rather than by check: an expert block sits at
-    /// `VQ_ALIGN + e·stride` with `VQ_ALIGN == ALIGN == 4096` and `stride` a multiple of it. So
-    /// this is expected to be silent forever — and it is worth its startup cost anyway,
-    /// because "holds by arithmetic in a different crate" is exactly the kind of coupling a
-    /// repack or a new format changes without anyone noticing. It costs one pass over
-    /// `layers × n_experts` entries at `open()` and nothing per read.
+    /// **Why this is not the guard [`RoutedGeom::new`] deleted**, thirty lines above — the two
+    /// are easy to confuse and the reconciliation matters. That one compared the six projection
+    /// OFFSETS against the stride, and could not fire: every routed block is padded up to
+    /// `VQ_ALIGN`, so every format's offsets sit inside every format's stride. This one compares
+    /// numbers that arrive from the artifact MANIFEST (`hbytes`, `stride`, `expert_bytes`), not
+    /// from padding arithmetic in this crate, so a repack or a new format can break it and it
+    /// would say so at `open()`.
+    ///
+    /// **Verified against the real artifact before shipping**, because a startup check that
+    /// refuses a valid model is worse than the inert assert it replaces:
+    /// `glm52-vq3-full/L03.vq3` is 3,941,208,064 B = `4096 + 257 · 15,335,424`, and
+    /// 15,335,424 = 3744 · 4096. The **257** matters — 256 routed experts plus the shared one in
+    /// the same file (`ExpertSet`'s own size formula is
+    /// `hbytes + (n_experts + has_shared) · stride`). At 256 the implied stride would be
+    /// 15,395,328 B, which is NOT a multiple of 4096, and this check would reject the artifact
+    /// on its first run.
     fn check_reads_fit_their_slots(&self) -> Result<()> {
         const A: usize = crate::fetch::stream::ALIGN;
-        for (i, &(_, begin, len)) in self.table.iter().enumerate() {
-            let (layer, expert) = (self.first_layer + i / self.n_experts, i % self.n_experts);
-            ensure!(
-                begin.is_multiple_of(A),
-                "routed .{} read for (layer {layer}, expert {expert}) starts at {begin}, \
-                 which is not a multiple of the {A}-byte O_DIRECT block. The bounce->slot \
-                 copy lands the aligned superset at the slot BASE, so every projection \
-                 pointer would be off by {} bytes.",
-                self.fmt.ext(),
-                begin % A,
-            );
-            let superset = (begin + len).next_multiple_of(A) - begin;
-            ensure!(
-                superset <= self.stride,
-                "routed .{} read for (layer {layer}, expert {expert}) needs {superset} bytes \
-                 ({len} rounded up to the {A}-byte block) but a pool slot is {}. The copy \
-                 would spill into the neighbouring slot and corrupt another resident expert.",
-                self.fmt.ext(),
-                self.stride,
-            );
-        }
+        // Expert 0 of the first layer gives `hbytes` and `len`; `stride` is the set's own.
+        let (_, hbytes, len) = self.spec(self.first_layer, 0)?;
+        ensure!(
+            hbytes.is_multiple_of(A),
+            "routed .{} expert blocks start at {hbytes}, not a multiple of the {A}-byte \
+             O_DIRECT block. The bounce->slot copy lands the aligned superset at the slot BASE, \
+             so every projection pointer would be off by {} bytes.",
+            self.fmt.ext(),
+            hbytes % A,
+        );
+        ensure!(
+            self.stride.is_multiple_of(A),
+            "routed .{} slot stride {} is not a multiple of the {A}-byte O_DIRECT block, so \
+             expert e starts {} bytes off it",
+            self.fmt.ext(),
+            self.stride,
+            self.stride % A,
+        );
+        let superset = len.next_multiple_of(A);
+        ensure!(
+            superset <= self.stride,
+            "a routed .{} read needs {superset} bytes ({len} rounded up to the {A}-byte block) \
+             but a pool slot is {}. The copy would spill into the neighbouring slot and corrupt \
+             another resident expert.",
+            self.fmt.ext(),
+            self.stride,
+        );
         Ok(())
     }
 

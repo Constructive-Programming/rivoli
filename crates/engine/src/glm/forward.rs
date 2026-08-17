@@ -150,7 +150,7 @@ impl GlmEngine<'_> {
         {
             let layers = span.layers.clone();
             if let Some(p) = self.probe.as_mut() {
-                p.drain(rows.pos, layers)?;
+                p.drain(rows.pos, rows.nrow, layers)?;
             }
         }
         if span.tail > 0 {
@@ -215,6 +215,23 @@ impl GlmEngine<'_> {
     /// before the next layer overwrites them, and surfaces faults.
     async fn run_layer(&mut self, l: usize, rows: Rows, xp: ResidualBase) -> Result<()> {
         self.attention(l, rows, xp)?;
+        // `--divergence-log`: fold the MLP's INPUT for EVERY layer, dense included.
+        //
+        // Here and not in `mlp.rs::probe_moe`, and the difference is not cosmetic: GLM has 3
+        // dense layers, and folding `xn` only on the 75 MoE ones left the dense rows' `xn`
+        // column at 0 in both runs — which a diff reads as "attention agreed" when in fact
+        // nothing was measured. That is a false EXCLUSION, the one failure mode an instrument
+        // must not have. `xn` is written by the post-attention rmsnorm above on the null
+        // stream, which this fold also uses, so it reads settled bytes with no barrier added.
+        #[cfg(feature = "corruption-probe")]
+        {
+            let (n, xn) = (rows.nrow * self.cfg.hidden, self.xn.ptr() as *const f32);
+            if let Some(p) = self.probe.as_mut() {
+                // SAFETY: `xn` is nrow*hidden live device f32, written on the null stream by
+                // the rmsnorm inside `attention` above, which orders against this launch.
+                unsafe { p.fold(crate::probe::Q::Xn, l, xn, n)? };
+            }
+        }
         match &self.pin.layers[l].mlp {
             LayerMlp::Dense(m) => {
                 let m = *m; // Copy — ends the &pin borrow

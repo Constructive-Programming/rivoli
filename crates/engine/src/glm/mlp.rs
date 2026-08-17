@@ -10,6 +10,10 @@ use crate::fetch::asyncfetch::Ticket;
 use crate::glm::pin::{Fp8Mlp, Fp8Weight, LayerMlp};
 use crate::routed::{ExpertSlot, Selection};
 use anyhow::Result;
+// Only the divergence probe's two `.context()` calls need this, and an unconditional import is
+// an `unused_imports` error under this workspace's deny-level warnings.
+#[cfg(feature = "corruption-probe")]
+use anyhow::Context;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_backend::{
     ExpertDesc, NULL_STREAM, launch_gemv_f32, launch_gemv_fp8, launch_moe_acc_drain,
@@ -100,46 +104,52 @@ impl GlmEngine<'_> {
         }
     }
 
-    /// `--divergence-log`'s MoE-layer record: the two device folds that CUT the layer at the
-    /// seams the two standing hypotheses sit either side of, plus the six host columns.
+    /// `--divergence-log`'s MoE-layer record: the `h` fold plus the host columns.
     ///
-    /// The cut is the whole point of the instrument. `xn` is the MoE's input, so a difference
-    /// there is attention's; `h` is the SwiGLU intermediate, so a difference there with `xn`
-    /// equal is the gate/up expert BYTES or that kernel — the routed-pool hypothesis; and the
-    /// exit residual (folded in `forward.rs::run_layer`) differing with both equal is the
-    /// down projection, the fixed-point accumulator or the drain — the accumulation
-    /// hypothesis. Two runs' logs diff to a coordinate AND a mechanism.
+    /// **This is the middle of a three-way cut and the other two ends are in `forward.rs`.**
+    /// `xn` (the MLP's input, folded there for every layer including the dense ones) differing
+    /// means attention; `h` — the SwiGLU intermediate, folded here — differing with `xn` equal
+    /// means the gate/up expert BYTES or that kernel, the routed-pool hypothesis; and the exit
+    /// residual differing with both equal means the down projection, the fixed-point
+    /// accumulator or the drain, the accumulation hypothesis. Two runs' logs diff to a
+    /// coordinate AND a mechanism.
     ///
     /// Runs AFTER `moe_layer`, which is what makes it legal: that call host-awaits both MoE
     /// streams, so `h`'s writers have retired and a fold on the null stream reads settled
-    /// bytes. It also means the record can carry `wexpert` and the slot placement, which do
-    /// not exist until `stage_batch` and `submit` have run.
+    /// bytes. It also means the record can carry the slot placement, which does
+    /// not exist until `submit` has run.
     #[cfg(feature = "corruption-probe")]
     fn probe_moe(&mut self, l: usize, rows: Rows, before: (u64, u64)) -> Result<()> {
         if self.probe.is_none() {
             return Ok(());
         }
-        // Row 0's gate logits ONLY. `gate_logits_host` is the whole `MAXROW`-wide D2H, so at
-        // `nrow == 1` its second half is uninitialised device memory — folding it would make
-        // every line differ between runs and the instrument would report itself.
+        // EVERY ROW OF THE PASS, not just row 0 — `nrow * ne` bytes.
+        //
+        // Row 0 alone was the first version, on the argument that `gate_logits_host` is the whole
+        // `MAXROW`-wide D2H and its tail is uninitialised at `nrow == 1`. True, but the bound
+        // that fixes it is `nrow * ne`, not `ne`: MAXROW is 2, so EVERY layer-major prefill pass
+        // runs nrow=2, and a row-0 fold left a divergence entering row 1's logits invisible in
+        // `gl` and `pk` while `xn` and `sl` moved — which is `pk`'s documented reading
+        // ("equal `gl` and unequal `pk` means routing consulted something outside its inputs")
+        // silently narrowed to a claim about one row. Found by review, 2026-08-17.
         let ne = self.cfg.n_experts * 4;
+        let glen = rows.nrow * ne;
         let cols = crate::probe::Cols {
             gl: rivoli_core::hash::fnv1a(
                 self.gate_logits_host
-                    .get(..ne)
-                    .unwrap_or(&self.gate_logits_host),
+                    .get(..glen)
+                    .context("divergence probe: gate-logits staging shorter than the pass")?,
             ),
-            pk: rivoli_core::hash::fnv1a_u64s(self.sel_row[0].iter().map(|&e| e as u64)),
-            // Exact BITS, not values: a one-ulp move in a routing weight is exactly the size
-            // of perturbation this is hunting. `as_le_bytes` is the same widening the H2D of
-            // this buffer already does, so the hash covers what the kernel will read.
-            wx: rivoli_core::hash::fnv1a(as_le_bytes(&self.wexpert)),
+            pk: rivoli_core::hash::fnv1a_u64s(
+                self.sel_row[..rows.nrow]
+                    .iter()
+                    .flat_map(|r| r.iter().map(|&e| e as u64)),
+            ),
             sl: self.pin.routed.slot_fold(l, &self.union),
             miss: self.pin.routed.misses() - before.0,
             reloc: self.pin.routed.relocs() - before.1,
         };
-        let (hidden, inter) = (self.cfg.hidden, self.cfg.moe_inter);
-        let xn = (self.xn.ptr() as *const f32, rows.nrow * hidden);
+        let inter = self.cfg.moe_inter;
         // EXACTLY the written extent, and the bound is load-bearing: the kernel writes
         // `h[(e·R + t)·inter + j]` for `e < descs.len()` and `R == nrow`, so anything past
         // `descs.len() · nrow · inter` is untouched `hipMalloc` memory whose bits differ per
@@ -155,14 +165,14 @@ impl GlmEngine<'_> {
         let Some(p) = self.probe.as_mut() else {
             return Ok(());
         };
-        // SAFETY: both extents are live device f32 written by launches this layer already
-        // host-awaited (see the doc above), and both are bounded to the written region.
-        unsafe {
-            p.fold(crate::probe::Q::Xn, l, xn.0, xn.1)?;
-            p.fold(crate::probe::Q::H, l, h.0, h.1)?;
-        }
-        p.set_cols(l, cols);
-        Ok(())
+        // SAFETY: `h` is live device f32 written by launches this layer already host-awaited
+        // (`launch_moe` awaits both lanes), bounded to exactly the written region. What keeps it
+        // readable on the NULL stream is that `run_layer`'s trailing `device_sync` is what stands
+        // between this and the NEXT layer's overwrite of the same buffer — the two MoE lanes are
+        // `hipStreamNonBlocking`, so the host await orders the WRITE and the device_sync orders
+        // the reuse.
+        unsafe { p.fold(crate::probe::Q::H, l, h.0, h.1)? };
+        p.set_cols(l, cols)
     }
 
     /// Host routing for a MoE layer: gate GEMV, the blocking logits D2H, per-row

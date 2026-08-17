@@ -55,39 +55,11 @@ echo "   ref: $(stat -c '%y' "$REF_BIN") $REF_BIN"
 echo "   new: $(stat -c '%y' "$NEW_BIN") $NEW_BIN"
 
 # --- contention witness -------------------------------------------------------------
-# The flock is advisory and other tenants skip it, so every arm carries a witness:
-# KFD tenants sampled every 5 s while the arm runs. Ours is identified by DESCENT from
-# the arm's own pid — never by binary path, because on this shared machine a peer
-# agent may run the identical pinned reference binary, and a path whitelist would wave
-# it through (the exact false-green the witness exists to prevent). Each entry is
-# resolved against /proc before being believed (the empty-dir/phantom trap).
-descends_from() { # $1 = candidate pid, $2 = ancestor pid
-    local p=$1
-    while [ "$p" -gt 1 ] 2>/dev/null; do
-        [ "$p" = "$2" ] && return 0
-        p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null) || return 1
-        [ -n "$p" ] || return 1
-    done
-    return 1
-}
-
-witness() { # $1 = out-file, $2 = arm pid; runs until killed
-    while :; do
-        find /sys/class/kfd/kfd/proc/ -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null |
-            while read -r p; do
-                [ -d "/proc/$p" ] || continue
-                descends_from "$p" "$2" && continue
-                cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || true
-                echo "pid=$p cmd=${cmd:-?}" >>"$1"
-            done
-        sleep 5
-    done
-}
-
-gtt_used() { # KFD is blind to Vulkan tenants (llama-swap once held 1.6 GB with zero KFD
-    # entries), so the pre-arm baseline reads the allocator itself.
-    cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | awk '{s+=$1} END {print s+0}'
-}
+# The contention witness lives in ONE file, sourced: the flock is advisory, peers skip it,
+# and the failure mode of a two-copy false-green guard is that one copy stops guarding. See
+# tests/gpu-witness.sh for the two traps each function encodes.
+# shellcheck source=tests/gpu-witness.sh
+. "$(dirname "$0")/gpu-witness.sh"
 
 run_arm() { # $1 = arm name, $2 = stdout file, $3 = stderr file, rest = command.
     # The arm's streams are redirected HERE, on the flock'd command only, so DISCARD

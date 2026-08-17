@@ -46,7 +46,7 @@ pub fn fnv1a_u64s(vals: impl Iterator<Item = u64>) -> u64 {
 ///
 /// The `hash_rows` KERNEL carries a fourth copy in HIP, which no Rust-side factoring can
 /// remove — that one is pinned instead, by scoring the kernel against
-/// `rivoli_engine::probe::fold_host` in `crates/engine/tests/fwd_kernel.rs`.
+/// `xor_fold` below in `crates/engine/tests/fwd_kernel.rs`.
 pub fn splitmix_finalize(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -54,7 +54,8 @@ pub fn splitmix_finalize(mut z: u64) -> u64 {
 }
 
 /// One element's contribution to an XOR fold over an f32 array's exact BITS: splitmix64's
-/// avalanche over `(index, bits)`.
+/// avalanche over `(index, bits)`. PRIVATE — [`xor_fold`] is the only caller, and the device
+/// twin corresponds to the whole fold rather than to this step.
 ///
 /// **The index is mixed in, and it is load-bearing twice.** XOR is self-inverse, so without it
 /// two elements holding the same bit pattern would cancel out of the fold; and a permutation
@@ -64,7 +65,7 @@ pub fn splitmix_finalize(mut z: u64) -> u64 {
 /// Element 0 holding `+0.0` folds to 0 and contributes nothing, because 0 is a fixed point of
 /// the finalizer (asserted below). Exactly one `(index, bits)` pair has that property, so it
 /// costs one collision in 2^64 — recorded because it looks like a bug and is not.
-pub fn xor_fold_step(i: usize, bits: u32) -> u64 {
+fn xor_fold_step(i: usize, bits: u32) -> u64 {
     splitmix_finalize(((i as u64) << 32) ^ u64::from(bits))
 }
 
@@ -133,6 +134,42 @@ mod tests {
     /// measured by this tree, carried by this tree, and re-derived by anyone who touched it —
     /// provenance the algorithm's own published values already have for free, exactly as
     /// `fnv1a_matches_the_published_vectors` above does for FNV (review finding, 2026-08-17).
+    /// The XOR fold's three load-bearing properties, WITHOUT A DEVICE.
+    ///
+    /// `xor_fold` is the oracle the `hash_rows` kernel is scored against — and that scoring is a
+    /// GPU test, while CI has no GPU arm, so until this existed the oracle itself was checked
+    /// only by whoever remembered to run the device suite (review, 2026-08-17). An unchecked
+    /// oracle is the confident-wrong-answer machine the probe's own doc warns about.
+    ///
+    /// Each assertion pins a property the divergence log's usefulness depends on:
+    /// one-ulp sensitivity (or the probe is blind to what it hunts), permutation sensitivity
+    /// (what mixing the index in buys, since XOR is self-inverse), and self-inverse cancellation
+    /// (which is why `Probe::drain` must re-zero its slab).
+    #[test]
+    fn xor_fold_is_ulp_sensitive_permutation_sensitive_and_self_inverse() {
+        let x: Vec<f32> = (0..1000).map(|i| (i as f32) * 0.5 - 250.0).collect();
+        let base = super::xor_fold(&x);
+        let mut ulp = x.clone();
+        ulp[617] = f32::from_bits(x[617].to_bits() ^ 1);
+        assert_ne!(
+            super::xor_fold(&ulp),
+            base,
+            "a one-ULP change must move the fold"
+        );
+        let mut swapped = x.clone();
+        swapped.swap(4, 900);
+        assert_ne!(
+            super::xor_fold(&swapped),
+            base,
+            "a permutation of the same values must move the fold"
+        );
+        // Folding an array into an accumulator twice cancels — the property the probe's re-zero
+        // exists for. `xor_fold` starts from 0, so `base ^ base == 0` states it directly.
+        assert_eq!(base ^ base, 0);
+        // ...and the fold is not trivially zero, which the line above would also satisfy.
+        assert_ne!(base, 0);
+    }
+
     #[test]
     fn splitmix_finalize_matches_the_published_sequence() {
         const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;

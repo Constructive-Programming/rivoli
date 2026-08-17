@@ -9,22 +9,48 @@
 #   green:      tests/determinism-glm.sh <artifact-dir> [ngen] [max-mem-GiB]
 #   red-proof:  tests/determinism-glm.sh --self-test      (deviceless, no artifact, no GPU)
 #
-# ## LENGTH IS THE WHOLE POINT, and a short run is not a weaker gate but a USELESS one
+# ## LENGTH IS THE WHOLE POINT, and the floor is a POWER calculation
 #
-# The defect passes at 32 tokens. Two no-MTP runs and an --mtp run were all byte-identical
-# over 32 ids on the same tree, same artifact, same box, that produced 61/512 at 512. A
-# 32-token determinism gate is therefore green on a broken engine — it is not conservative,
-# it is vacuous. So `ngen` has a HARD FLOOR (see MIN_NGEN) and the gate refuses below it with
-# the reason rather than reporting a green nobody should believe.
+# The defect passes at 32 tokens. Two no-MTP runs and an --mtp run were all byte-identical over
+# 32 ids on the same tree, same artifact, same box that produced 61/512 at 512 (inherited from
+# `docs/investigations/glm-nondeterminism.md`, not re-derived here). A 32-token determinism gate
+# is not a conservative gate, it is a GREEN ON A BROKEN ENGINE.
 #
-# The floor is 256, and it is the honest number rather than a round one: the earliest quiet-box
-# onset actually observed is position 452, and the earliest onset observed at all is 13, so
-# there is no length at which a single pair is guaranteed to catch it. 512 is the default
-# because it is the length every recorded measurement of this defect used; 256 is the floor
-# because below the earliest observed quiet onset a green says nothing at all, and a gate that
-# can be dialled down to a length where it always passes is a gate someone will dial down.
-# **A green at 512 bounds the rate; it does not prove determinism.** State the length with
-# every green.
+# That is not a threshold, it is a rate, and the rate is measured — from the four vendored
+# teacher-forced arms, whose per-run first-divergence positions are 236, 362 and 375 with a
+# fourth arm clean to 762. Two readings, and the gate is sized against the CONSERVATIVE one:
+#
+#   matched pair only (both arms at --max-mem 115)   2 events / 598   -> 1 per 299
+#   all four arms, the clean one contributing its
+#   full length as exposure                          3 events / 1735  -> 1 per 578
+#
+# A pair diverges if EITHER arm has an event, so P(detect) = 1 - exp(-2 * ngen / rate):
+#
+#            1/299        1/578
+#     32       19%          10%
+#    256       82%          59%
+#    512       97%          83%     <- MIN_NGEN and the default
+#
+# 80% power needs ngen 241 at 1/299 and **465 at 1/578**, so the floor is 512 — the conservative
+# reading rounded to the length every recorded measurement of this defect used. There is no knob
+# below it, deliberately: a gate that can be dialled down to a length where it always passes is
+# a gate someone will dial down.
+#
+# Re-derive all of it, and note that BOTH readings are printed so neither is buried:
+#
+#     tests/nll-divergence.sh docs/measurement/glm-divergence-evidence/{a,a2,b,ref}.nll
+#     tests/nll-divergence.sh --power 2 598     # matched
+#     tests/nll-divergence.sh --power 3 1735    # conservative
+#
+# **AND THE RATE ITSELF HAS A WIDE INTERVAL.** At k=3 the exact 95% Poisson bounds are 1 per
+# [206, 2804], so 512 tokens gives between 31% and 99% power. A GREEN AT 512 BOUNDS THE RATE; IT
+# DOES NOT PROVE DETERMINISM. State the length with every green. The rate also rose roughly
+# thirtyfold under CPU/NFS load (452 vs 13, two n=1 runs — a ratio, not an interval), so a green
+# on a loaded box bounds more than a green on a quiet one.
+#
+# That last point is about CPU and page-cache load, NOT about GPU tenancy: the witness below
+# still DISCARDS any arm that shared the device, because a foreign GPU tenant changes what was
+# computed and not merely when.
 #
 # ## What it does NOT do
 #
@@ -43,12 +69,24 @@
 #       2 setup error (usage, missing binary/artifact, non-id output)
 #       3 arm discarded (foreign GPU tenant witnessed) — rerun
 #       66 GPU lock file missing (house convention: /run is tmpfs, dies on reboot)
+#
+# `set -uo pipefail` WITHOUT `-e`, which DIFFERS from tests/parity-glm.sh's `set -euo` — an
+# earlier comment here claimed it matched, and it does not (review 2026-08-17). The reason to
+# differ: the id-census and the arm-rc checks below must REPORT a failed arm with its log and
+# exit with this script's own code, and under `-e` an arm's non-zero rc, or a `grep` that matched
+# nothing, would exit before reaching them.
 set -uo pipefail
 
-BIN=${DETERMINISM_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/debug/rivoli}
+# RELEASE, not debug, and the default matters: every recorded measurement of this defect is a
+# release run, the defect is timing-dependent (its rate rose ~30x under load), and a dev-profile
+# green therefore does not bound the release binary at the same length. `DETERMINISM_BIN` exists
+# because this gate must be able to test a binary it did not build and must never build one
+# itself (a cargo run between arms evicts page cache); it is spelled like `PARITY_*` in the
+# sibling gate rather than `RIVOLI_*`, which is the engine's own flat env namespace.
+BIN=${DETERMINISM_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/release/rivoli}
 LOCK=/var/run/sys-gpu.lock
 # The floor, argued in the header. A caller may raise `ngen`, never lower it past this.
-MIN_NGEN=256
+MIN_NGEN=512
 
 # --- the comparator, and its red proof ----------------------------------------------------
 #
@@ -63,7 +101,9 @@ compare_ids() { # $1 = arm A ids, $2 = arm B ids; 0 identical, 1 differ
     # ("first at position 13", "first at 452"): position 0 is the first generated token.
     first=$(paste "$1" "$2" | awk '$1 != $2 {print NR - 1; exit}')
     echo "RED: $n of $(wc -l <"$1") ids differ, first at position ${first:-?} (0-based)" >&2
-    paste "$1" "$2" | awk -v F="${first:-0}" 'NR >= F && NR <= F + 4 {printf "  pos %d: A=%s B=%s\n", NR - 1, $1, $2}' >&2
+    # `F` is 0-based and `NR` is 1-based, so the differing row is NR == F+1. Without the +1 the
+    # first line printed is an IDENTICAL one, in the excerpt that is the gate's whole payload.
+    paste "$1" "$2" | awk -v F="${first:-0}" 'NR >= F + 1 && NR <= F + 5 {printf "  pos %d: A=%s B=%s\n", NR - 1, $1, $2}' >&2
     return 1
 }
 
@@ -94,77 +134,55 @@ if [ "${1:-}" = "--self-test" ]; then
     exit 0
 fi
 
-ARTIFACT=${1:?usage: determinism-glm.sh <artifact-dir> [ngen] [max-mem-GiB] | --self-test}
+# `${1:?}` would exit 1, which this script's own table reserves for "gate RED" — a wrapper
+# keying on the code would report nondeterminism for a missing argument (review 2026-08-17).
+if [ $# -lt 1 ]; then
+    echo "usage: determinism-glm.sh <artifact-dir> [ngen] [max-mem-GiB] | --self-test" >&2
+    exit 2
+fi
+ARTIFACT=$1
 NGEN=${2:-512}
 MEM=${3:-115}
 
 [ "$NGEN" -ge "$MIN_NGEN" ] 2>/dev/null || {
     cat >&2 <<EOF
 FAIL: ngen=$NGEN is below the $MIN_NGEN floor.
-This defect is byte-identical at 32 tokens and reproduces by 512 (measured 2026-08-17,
-both on the same tree and artifact). A short determinism gate is not a conservative gate,
-it is a green on a broken engine. Raise ngen or do not run this.
+Two arms of N tokens detect a rate r with probability 1-exp(-2rN). Against the conservative
+measured rate of 1 per 578 token-forwards that is 10% at 32, 59% at 256, 83% at $MIN_NGEN — and
+80% power needs 465. Below the floor a green rules out nothing, and this defect IS byte-identical
+at 32 tokens on the very tree that fails at 512.
+  re-derive: tests/nll-divergence.sh --power 3 1735
 EOF
     exit 2
 }
 [ -x "$BIN" ] || { echo "FAIL: binary missing: $BIN (build it BEFORE the gate — this gate never builds)" >&2; exit 2; }
 [ -e "$LOCK" ] || { echo "FAIL: GPU lock file missing: $LOCK" >&2; exit 66; }
 [ -d "$ARTIFACT" ] || { echo "FAIL: artifact dir missing: $ARTIFACT" >&2; exit 2; }
-# NO TRACE-BUILD PROBE, and its absence is deliberate rather than an omission.
-#
-# A `--features trace` binary has an extra `device_sync` per layer-with-misses and is recorded
-# to MASK this defect, so a green from one is worse than no measurement. The obvious guard is
-# to grep `--help` for `--trace` — and it is a check that CANNOT FAIL: `--trace` is declared
-# unconditionally in `crates/cli/src/main.rs`, so it appears in every build's help and the
-# probe warns on every run. A guard that always fires is noise that teaches its reader to
-# ignore it, which is worse than no guard, and this repo bans the shape.
-#
-# There is no signal in the binary that distinguishes the feature set, so the rule stays where
-# a rule with no enforcement belongs: written down, here and in the header, for the operator.
-# **Do not run this gate on a binary built with `--features trace`.** If that ever needs
-# enforcing, the honest fix is for `--version` to print its feature set, not a grep that
-# guesses.
+# NO TRACE-BUILD PROBE, and its absence is deliberate. The obvious guard — grep `--help` for
+# `--trace` — CANNOT FAIL: that flag is declared unconditionally in `crates/cli/src/main.rs`, so
+# it is in every build's help and the probe would warn on every run. A guard that always fires
+# teaches its reader to ignore it. Nothing in the binary distinguishes the feature set, so the
+# rule stays written down instead: **do not run this gate on a `--features trace` binary.** If
+# it ever needs enforcing, `--version` should print its feature set.
 
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/determinism-glm.XXXXXX")
 echo "== determinism-glm | ngen=$NGEN mem=${MEM}GiB scratch=$SCRATCH"
 echo "   bin: $(stat -c '%y' "$BIN") $BIN"
 
-# --- contention witness, per arm ----------------------------------------------------------
-# Lifted wholesale in SHAPE from tests/parity-glm.sh, whose header carries the full argument:
-# the flock is advisory, peers skip it, ours is identified by DESCENT from the arm's own pid
-# (never by binary path — a peer may be running the same binary), and every KFD entry is
-# resolved against /proc before it is believed.
-descends_from() { # $1 = candidate pid, $2 = ancestor pid
-    local p=$1
-    while [ "$p" -gt 1 ] 2>/dev/null; do
-        [ "$p" = "$2" ] && return 0
-        p=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null) || return 1
-        [ -n "$p" ] || return 1
-    done
-    return 1
-}
-
-witness() { # $1 = out-file, $2 = arm pid; runs until killed
-    while :; do
-        find /sys/class/kfd/kfd/proc/ -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null |
-            while read -r p; do
-                [ -d "/proc/$p" ] || continue
-                descends_from "$p" "$2" && continue
-                cmd=$(tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null) || true
-                echo "pid=$p cmd=${cmd:-?}" >>"$1"
-            done
-        sleep 5
-    done
-}
-
-gtt_used() { # KFD is blind to Vulkan tenants, so the pre-arm baseline reads the allocator.
-    cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | awk '{s+=$1} END {print s+0}'
-}
+# --- contention witness, per arm ----------------------------------------------------
+# The contention witness lives in ONE file, sourced: the flock is advisory, peers skip it,
+# and the failure mode of a two-copy false-green guard is that one copy stops guarding. See
+# tests/gpu-witness.sh for the two traps each function encodes.
+# shellcheck source=tests/gpu-witness.sh
+. "$(dirname "$0")/gpu-witness.sh"
 
 run_arm() { # $1 = arm name, $2 = ids out path
     local wfile="$SCRATCH/witness-$1" wpid apid gtt rc=0
     gtt=$(gtt_used)
-    if [ "$gtt" -gt $((2 << 30)) ]; then
+    # 1 GiB, not 2: the one recorded ghost tenant held 1.6 GB (llama-swap, zero KFD entries —
+    # see tests/gpu-witness.sh), so a 2 GiB threshold would have waved through the exact tenant
+    # the guard was written for. 1 GiB sits below it and above this box's idle ~18 MiB.
+    if [ "$gtt" -gt $((1 << 30)) ]; then
         echo "DISCARD arm '$1': $((gtt >> 20)) MiB GTT already held before the arm started — a ghost tenant KFD cannot see" >&2
         exit 3
     fi
@@ -203,6 +221,7 @@ run_arm b "$SCRATCH/b"
 
 if compare_ids "$SCRATCH/a.ids" "$SCRATCH/b.ids"; then
     echo "GREEN: two runs at identical flags produced identical ids over $NGEN tokens (mem=${MEM}GiB)."
+    echo "       binary: $BIN"
     echo "       This BOUNDS the divergence rate at this length; it does not prove determinism."
     exit 0
 fi

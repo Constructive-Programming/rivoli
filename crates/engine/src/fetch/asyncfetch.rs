@@ -386,7 +386,15 @@ impl Reaper {
             // this read's signal resolves; the VQ blocks are VQ_ALIGN-aligned so the
             // returned sub-offset is 0 (the slot start IS the block). `t.slot` came from
             // `take_slot`, so its previous copy has retired.
-            let sub = unsafe {
+            // The returned sub-offset is DISCARDED, and that is now safe to do rather than
+            // merely customary. It used to feed a `debug_assert_eq!(sub, 0, "VQ expert read
+            // must be block-aligned")` — a check that is compiled out under `--release`, which
+            // is the profile every benchmark and every divergence run uses, so it enforced
+            // nothing exactly where it mattered. `RoutedGeom::check_reads_fit_their_slots`
+            // makes the property an `ensure!` at `open()` instead: block-aligned starts and
+            // supersets that fit one slot, refused before the run rather than during it.
+            // Keeping both would be two checks for one property, one of them inert.
+            let _sub = unsafe {
                 streamer.queue(
                     r.fd,
                     crate::fetch::stream::ReadSpan {
@@ -399,10 +407,6 @@ impl Reaper {
                     },
                 )?
             };
-            debug_assert_eq!(
-                sub, 0,
-                "VQ expert read must be block-aligned (sub-offset 0)"
-            );
         }
         streamer.submit()?;
         // Everything above is CPU (building and submitting SQEs); everything in the loop
@@ -469,10 +473,34 @@ mod tests {
     use super::*;
 
     /// The hand-out rule, without a device: a slot is free iff its timeline has reached the
-    /// last value issued for it, and bumping that value at hand-out is what stops the same
-    /// slot being handed out twice — the property the old per-batch integer reset lacked.
+    /// last value issued for it, and bumping that value at hand-out is what stops the same slot
+    /// being handed out twice — the property the old per-batch integer reset lacked.
+    ///
+    /// **INV-9: nothing on the host path can make two runs of one input a different program.**
+    /// This test predates the invariant and is what carries it, which is why it was RENAMED
+    /// rather than joined by a second one (review, 2026-08-17 — the second one asserted the same
+    /// three things and its declared red proof reddened this one too).
+    ///
+    /// The connection: the one host decision on the routed path that reads DEVICE PROGRESS
+    /// rather than its own inputs is this hand-out, since `landed(s)` is a timeline value, i.e.
+    /// wall-clock. If it could vary between two runs of one input the runs would stop being the
+    /// same program there. It cannot, because of a barrier somewhere else —
+    /// `glm::forward::run_layer` ends every layer with an unconditional `device_sync`, so at the
+    /// next `submit` every prior bounce copy has retired, `landed` is uniformly true, and
+    /// `scan_free` is pure round-robin over the miss sequence. `AsyncFetch::slot_stalls()` is
+    /// the observable that falsifies that precondition: non-zero means it did not hold and a
+    /// determinism comparison over that run is unsound.
+    ///
+    /// What the assertions below have teeth against is the contrapositive — that an un-landed
+    /// slot is never issued and does change the hand-out. Red-proofed 2026-08-17 by making
+    /// `scan_free` ignore `landed`: the `None` assertion becomes `Some`.
+    ///
+    /// **Scope.** Two runs are the same PROGRAM, not the same OUTPUT. The output property is a
+    /// device property; its gate is `tests/determinism-glm.sh` (GPU, real artifact, >=256 tokens
+    /// for 82% power against the measured rate). See
+    /// `docs/investigations/glm-nondeterminism.md`.
     #[test]
-    fn a_slot_is_not_reissued_until_its_copy_lands() {
+    fn inv_9_a_slot_is_not_reissued_until_its_copy_lands() {
         const N: usize = 4;
         let completed = [0u64; N]; // nothing has landed yet
         let mut next = [0u64; N]; // ...and nothing has been issued yet either
@@ -490,93 +518,17 @@ mod tests {
         // All four copies are still in flight: the ring is exhausted, and the caller must
         // park rather than reuse a slot whose bytes are still being read out.
         assert_eq!(scan_free(N, &mut cursor, |s| completed[s] >= next[s]), None);
+        // ...and the hand-out above was a real sweep, not an early `None`. Without this, a
+        // `scan_free` that always returned `None` would satisfy every assertion in this test
+        // (review, 2026-08-17): `got` would be empty, `[]` sorts to `[]`, and the exhaustion
+        // assertion would pass for the wrong reason.
+        assert_eq!(next, [1u64; N], "every slot was issued exactly once");
         // One copy retires → exactly that slot comes back.
         let landed = [1u64, 0, 0, 0];
         assert_eq!(
             scan_free(N, &mut cursor, |s| landed[s] >= next[s]),
             Some(0),
             "the slot whose timeline advanced is the one reissued"
-        );
-    }
-
-    /// **INV-9: nothing on the host path can make two runs of one input a different
-    /// program.** The one host-side decision on the routed path that reads DEVICE PROGRESS
-    /// rather than its own inputs is this staging-slot hand-out — `landed(s)` is a timeline
-    /// value, i.e. wall-clock — so if it varies between two runs of one input, the two runs
-    /// stop being the same program there and every later comparison is of two different
-    /// things.
-    ///
-    /// It does not vary, and the reason is a barrier somewhere else: `glm::forward::run_layer`
-    /// ends every layer with an unconditional `device_sync`, so at the next `submit` EVERY
-    /// prior bounce copy has retired and `landed` is uniformly true. Under that precondition
-    /// `scan_free` is pure round-robin over the miss sequence, and two runs with an identical
-    /// miss sequence assign identical staging slots. `AsyncFetch::slot_stalls()` is the
-    /// observable that falsifies the precondition: non-zero means it did not hold, and a
-    /// determinism comparison over that run is unsound.
-    ///
-    /// **What each assertion can actually catch**, stated because two of the three are much
-    /// stronger than the first and a reader should not credit them equally:
-    ///
-    /// 1. *Two walks agree.* A purity check. It can only redden if `scan_free` grows a hidden
-    ///    input — a clock, a `static`, an address. It is a regression guard, and the red proof
-    ///    below records that it CANNOT be reddened by any change to the current body, which is
-    ///    exactly what a purity assertion over a pure function should be.
-    /// 2. *The hand-out is `[0,1,…,7,0,1]`.* Round-robin rather than first-fit, and this one
-    ///    reddens on a real mutation (drop the cursor advance → all-zeros). Without it, 1 is
-    ///    satisfied by a hand-out that always returns slot 0 and breaks slot reuse outright.
-    /// 3. *An un-landed slot changes the result and is never handed out.* This is what makes
-    ///    the barrier load-bearing rather than decorative: `scan_free` advances past every
-    ///    candidate it TESTS, so a single skip permanently offsets the cursor and the two runs
-    ///    never re-converge.
-    ///
-    /// **What this does NOT claim.** Two runs are the same PROGRAM, not that they produce the
-    /// same OUTPUT. The output property is a device property; its gate is
-    /// `tests/determinism-glm.sh` (GPU, real artifact, ≥256 tokens — it is green at 32 on an
-    /// engine that fails at 512). See `docs/investigations/glm-nondeterminism.md`.
-    #[test]
-    fn inv_9_slot_handout_is_deterministic_under_the_layer_barrier() {
-        const N: usize = 8;
-        // A miss sequence shaped like real layers: batches of 3, 1, 4, 2 cold experts.
-        let batches = [3usize, 1, 4, 2];
-        let walk = |landed: &dyn Fn(usize) -> bool| -> Vec<usize> {
-            let mut cursor = 0;
-            let mut got = Vec::new();
-            for b in batches {
-                for _ in 0..b {
-                    match scan_free(N, &mut cursor, landed) {
-                        Some(s) => got.push(s),
-                        None => break,
-                    }
-                }
-            }
-            got
-        };
-        let all_landed = |_: usize| true;
-        assert_eq!(
-            walk(&all_landed),
-            walk(&all_landed),
-            "under the per-layer device barrier the hand-out must be a pure function of the \
-             miss sequence — two runs of one input assign identical staging slots"
-        );
-        assert_eq!(
-            walk(&all_landed),
-            [0, 1, 2, 3, 4, 5, 6, 7, 0, 1],
-            "round-robin, not first-fit: an always-slot-0 hand-out satisfies the purity \
-             assertion above and breaks reuse"
-        );
-
-        // Slot 3 stands in for a copy still in flight — the case `slot_stalls` counts.
-        let stalled = |s: usize| s != 3;
-        let a = walk(&stalled);
-        assert_ne!(
-            a,
-            walk(&all_landed),
-            "an un-landed slot must change the hand-out; if it did not, the barrier this \
-             invariant rests on would be unnecessary and the purity assertion vacuous"
-        );
-        assert!(
-            !a.contains(&3),
-            "an un-landed slot must never be handed out — its bytes are still being copied"
         );
     }
 

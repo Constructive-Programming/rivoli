@@ -288,7 +288,7 @@ fn flag_nonfinite_records_the_first_fault_only() {
 /// **The instrument gets a gate of its own, and P7 is the whole argument.** Every conclusion
 /// the GLM-nondeterminism investigation reaches is read off a pair of these hashes; a fold
 /// that were subtly wrong would produce confident coordinates pointing at nothing, and no
-/// other test in the tree would notice. `rivoli_engine::probe::fold_host` is the reference,
+/// other test in the tree would notice. `rivoli_core::hash::xor_fold` is the reference,
 /// and it is a REFERENCE rather than a second copy: `probe::Probe` never computes a hash on
 /// the host, so there is one implementation of the fold on each side of the ABI and this test
 /// is the only thing that makes them agree.
@@ -328,7 +328,7 @@ fn hash_rows_matches_the_host_fold() {
         u64le(&back(&out))
     };
 
-    let want = rivoli_engine::probe::fold_host(&x);
+    let want = rivoli_core::hash::xor_fold(&x);
     assert_eq!(
         fold(&x),
         want,
@@ -338,14 +338,14 @@ fn hash_rows_matches_the_host_fold() {
     let mut ulp = x.clone();
     ulp[617] = f32::from_bits(x[617].to_bits() ^ 1);
     assert_ne!(
-        rivoli_engine::probe::fold_host(&ulp),
+        rivoli_core::hash::xor_fold(&ulp),
         want,
         "a ONE-ULP change in one element must move the fold — a probe blind to that is \
          blind to the divergence it exists to localise"
     );
     assert_eq!(
         fold(&ulp),
-        rivoli_engine::probe::fold_host(&ulp),
+        rivoli_core::hash::xor_fold(&ulp),
         "and the kernel must agree with the host on the perturbed array too"
     );
 
@@ -377,10 +377,12 @@ fn hash_rows_matches_the_host_fold() {
     );
 }
 
-/// First 8 bytes of `b` as a little-endian u64. Local to this file: `common::upload` has
-/// `u32v`/`u16v`/`f32v` because their callers want whole vectors; the only u64 in this suite
-/// is a single fold slot, and a `u64v` nobody else calls would be a helper written for one
-/// site.
+/// First 8 bytes of `b` as a little-endian u64.
+///
+/// Review asked for this to be inlined as `u64::from_le_bytes(b[..8].try_into().expect(..))`
+/// (2026-08-17). It cannot be: `expect_used` is deny-level workspace-wide and this file carries no
+/// `#![allow]` for it, so the inline form does not compile. `copy_from_slice` panics on a length
+/// mismatch without going through `Result`, which is the same loudness with no lint to opt out of.
 fn u64le(b: &[u8]) -> u64 {
     let mut w = [0u8; 8];
     w.copy_from_slice(&b[..8]);

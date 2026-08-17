@@ -388,6 +388,13 @@ impl<'a> Engine<'a> {
     fn glm_for_probe(&mut self) -> Result<&mut crate::glm::engine::GlmEngine<'a>> {
         match self {
             Engine::Glm(e) => Ok(e),
+            // A bare `bail!` rather than a `rivoli_core::legality` row, unlike `--trace`'s
+            // `DENSE_HAS_NO_EXPERT_TRACE`, and the reason is the DAG: the legality table lives in
+            // `rivoli-core`, which cannot name a feature this crate declares — a row for a flag
+            // that does not exist in most builds would have to be unconditional, and then the
+            // table would advertise a flag `--help` does not show. If `corruption-probe` ever
+            // becomes unconditional, this belongs in the table, where the smoke gate would
+            // assert its message (nothing asserts this one).
             _ => anyhow::bail!(
                 "--divergence-log is implemented for GLM only: it folds the routed-MoE \
                  quantities that split GLM's own run-to-run divergence, and no other arm has \

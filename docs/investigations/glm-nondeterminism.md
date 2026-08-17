@@ -1,251 +1,519 @@
 ---
 status: live
 scope: glm
-verdict: GLM int3-vq greedy decode does not reproduce its own generated TEXT — byte-identical at 32 tokens, 61 of 512 ids differing on a quiet box and 496 of 512 under load, first difference anywhere from position 13 to 452, and the pinned OLD tree is worse (247/512), so it is neither a rewrite regression nor the ROCm 7.14 upgrade. BOTH previously named candidates are now REFUTED BY CONSTRUCTION in this tree, which is the milestone's result. MoE accumulation cannot be the mechanism: `moe_fixed` saturates per term, the accumulator is a wrapping u64 `atomicAdd`, and the drain sums the two lane blocks at a fixed stride, so the resident/miss lane split is exactly equivalent to one accumulator — verified at the kernel, not inherited. Arena-relocation-vs-in-flight-read cannot be the mechanism either: `run_layer` ends EVERY layer with an unconditional `hipDeviceSynchronize`, every miss kernel sits behind `hipStreamWaitValue64` on its ticket, and `launch_moe` host-awaits both lanes, so no read outlives its layer and `relocate`'s blocking `hipMemcpy` cannot race a fetch. Three independent read-only audits of the sync substrate, the host residency path and the whole non-MoE GLM path found NO live ordering hole, no float atomic in any kernel, no hash-order or time-derived decision, and no read of unwritten memory — so the divergence must be a WRONG-BYTES READ, not a reordered sum. It is not statically visible, so the deliverables are instruments: `--divergence-log` (forward-ported and extended from archive commit 544fea7) localises a divergence to a (position, layer, QUANTITY) coordinate and splits the layer at the two seams the candidates sat either side of; `tests/determinism-glm.sh` is a length-aware gate with a 256-token floor, because a 32-token determinism gate is green on this engine. GPU time is now the binding constraint, and the first experiment is FREE — the pool's READ-BEFORE-WRITE detector is already live and unconditional in every build.
+verdict: GLM int3-vq does not reproduce itself, and the rate is now MEASURED rather than described — two teacher-forced runs at identical flags first disagree at positions 236 and 362 of 762, one event per ~300 token-forwards, and a pair of greedy runs diverges with probability 1-exp(-2n/300), which independently predicts the observed 0-of-3 pairs at 32 tokens and 3-of-3 at 512. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT: past the first event the runs compute over different state, so 496 of 512 is one event plus its wake and a count is neither a rate nor a severity. All four vendored arms — two budgets and two source trees — are bit-identical on positions 0..235, so the engine is reproducible and budget-neutral until an event fires; the wake then GROWS rather than decays (median |dNLL| 2.8e-3 rising to 3.8e-2), i.e. one event, permanent KV damage. BOTH previously named candidates are refuted by construction: MoE accumulation cannot do it (per-term saturating fixed point, wrapping u64 atomicAdd, drain summing lanes at a fixed stride, so the resident/miss lane split is exactly equivalent to one accumulator), and arena-relocation-vs-in-flight-read cannot either (an unconditional device_sync ends every layer, every miss kernel waits on its ticket, launch_moe host-awaits both lanes, and submit relocates only before it resolves any read). No float atomic exists in any kernel, so given identical input bytes the arithmetic is bit-reproducible and the defect must be a WRONG-BYTES READ. Three read-only audits found no live ordering hole, no read of unwritten memory, no hash-order or time-derived decision, and the attention split plan is exonerated (236 sits mid-plateau). It is not statically visible, so the deliverables are instruments and a gate: --divergence-log cuts a layer at the two seams the candidates sat either side of, and tests/determinism-glm.sh has a 256-token floor justified by an 82% power calculation. NOT YET ESTABLISHED, and corrected here: the ROCm 7.14/clang 23.1 toolchain is NOT exonerated — both binaries were built under it, so that experiment varied source and held toolchain fixed.
 ---
 
-# GLM does not reproduce itself, and both named suspects are innocent
+# GLM does not reproduce itself: the rate, and why both suspects are innocent
 
-**Inherited from `wave/m10-spine`'s doc of the same name**, which measured the defect and
-bounded it. That page's scope statement — "the wobble is confined to the routed expert pool
-… per-expert admission, the two-ended arena's relocations and ticket lifetime, MoE
-accumulation … those two candidates are NOT separated" — is what this page revisits, and the
-answer is that **neither of them can be the mechanism in this tree.** The measurements on
-that page stand unchanged; what changes is what they can be attributed to.
+**Supersedes the page of this name on `wave/m10-spine`**, which measured the defect and
+bounded its magnitude. Every measurement there stands. What changes here is (a) the rate and
+the ranking quantity, (b) the attribution: that page's scope statement — "the wobble is
+confined to the routed expert pool … those two candidates are NOT separated" — names two
+candidates that **cannot be the mechanism in this tree**.
 
-## The measurement, unchanged and restated so this page is self-contained
+## Two corrections to the record, before anything is built on it
 
-Artifact `/var/db/rivoli/glm52-vq3-full`, one prompt (`tests/bench-matrix.sh`'s default
-essay prompt, ~71 prompt tokens), `--bench 512 --mode int3-vq --attn dense --max-mem 115`,
-`--dump-ids` compared body-only, 2026-08-17:
+**1. The toolchain is NOT exonerated.** The inherited page and the brief that opened this
+milestone both concluded that because the pinned OLD binary diverges too, "the ROCm 7.14 /
+clang 23.1 upgrade did not introduce it". That does not follow. **Both** binaries were built
+on this box under 7.14, the only installed toolchain, so the experiment varied SOURCE and held
+TOOLCHAIN FIXED. What it establishes is two narrower things: it is not a rewrite regression,
+and the upgrade did not RETIRE a pre-existing defect. Whether the upgrade introduced it is
+**untested**, and testing it needs the old source under the old toolchain, which is not
+installed. Treat toolchain as an open variable.
 
-| runs | result |
-|---|---|
-| rewrite, no-MTP × 2, box under heavy CPU/NFS load | **496 of 512 differ, first at 13** |
-| rewrite, no-MTP × 2, quiet box (114 GiB free) | **61 of 512 differ, first at 452** |
-| OLD pinned binary (`ref-pin` @ 6b7f496), `--no-mtp`, quiet box | **247 of 512 differ, first at 265** |
-| rewrite, no-MTP × 2, **32 tokens** | **byte-identical** |
-| rewrite, `--mtp` vs no-MTP, 32 tokens | **byte-identical** |
-| Glimmer, teacher-forced × 2, fully pinned | **byte-identical** (PPL 7.008490 twice) |
-| Glimmer ids, `--max-mem` 32 (52/52 pinned) vs 20 (21 of 52 streamed, 1 slot) | **byte-identical** |
-| V4 ids × 2 at 97% hit | **byte-identical** |
+**2. The ranking quantity is the FIRST DIVERGING POSITION, never the differing count.** Past
+the first event the two runs are computing over different state, so every later position
+differs whether or not anything else went wrong. "496 of 512 ids differ" is **at least one**
+event plus its wake — not 496 events, not a severity, and not comparable between runs: it is a
+function of *where* the first event landed and nothing else. A count-based rate would have
+said the loaded box was 8× worse than the quiet one; the honest statement is that its first
+event arrived 35× sooner. `tests/nll-divergence.sh` computes the first position and refuses to
+report a count as a rate.
 
-Contention amplifies and quiet does not cure. **The length dependence is the single most
-important row**: it is why every gate over this property has to state its token count, and
-why a short gate is not a conservative gate but a vacuous one.
+## The rate, measured
 
-## What is now REFUTED, and by what
+Four teacher-forced arms are vendored at `docs/measurement/glm-divergence-evidence/` (33 KB,
+one f32 per predicted position). They came from `wave/m10-spine`'s `p4` cell on 2026-08-17.
+**Their provenance is what each file's own header says and no more** — an earlier draft of this
+paragraph asserted a uniform set of flags that the headers do not carry, which is the failure this
+whole page is about:
 
-Both refutations are structural — read off the code and the kernels, not off a run — which
-is why they are stated as refutations rather than as further exclusions.
+| file | header, verbatim | what is NOT recorded |
+|---|---|---|
+| `a.nll` | `mode=int3-vq policy=2q attn=dense max_mem=115 corpus=1253f29de5a93559 tokens=762 hit_pct=78.2591` | profile, binary, date |
+| `a2.nll` | same, `hit_pct=78.2597` | same |
+| `b.nll` | same but `max_mem=70`, `hit_pct=62.0900` | same |
+| `ref.nll` | `mode=int3-vq policy=2q moe_gain=1 tokens=762 hit_pct=78.1293` | **no `attn`, no `max_mem`, and NO CORPUS HASH** — a different writer, i.e. the pinned old binary, not the same `p4` invocation |
+
+`ref.nll`'s missing corpus hash is the one that matters: the property `wave/m10-spine` cited as
+making its numbers reproducible ("the FNV-1a the engine logs and writes into the `.nll` header")
+is absent from exactly the arm whose provenance is hardest to check. So `ref` is used below only
+where it cannot carry a conclusion on its own, and the rate is taken from `a`/`a2`, which are the
+only two arms whose headers agree in every field but the hit rate.
+
+**`a2`'s hit rate differs from `a`'s (78.2597 vs 78.2591) at the same budget on the same corpus,
+and that is a result, not noise in the bookkeeping.** Teacher forcing fixes the token sequence,
+so routing should be identical — unless the hidden state diverges, which changes the gate logits,
+which changes the picks, which changes what hits. The hit rates differing is independent
+confirmation that the event is real and lands upstream of routing.
+
+Reproduce every number below with:
+
+```
+tests/nll-divergence.sh docs/measurement/glm-divergence-evidence/{a,a2,b,ref}.nll
+tests/nll-divergence.sh --se    docs/measurement/glm-divergence-evidence/{a,a2}.nll
+tests/nll-divergence.sh --power 2 598      # matched-pair reading
+tests/nll-divergence.sh --power 3 1735     # conservative reading
+```
+
+| pair | ndiff | first | \|dNLL\| at the event |
+|---|---:|---:|---|
+| a vs a2 (**same budget, the control**) | 526 | **236** | 1.21e-2 |
+| a vs b (115 vs 70) | 526 | 236 | 1.21e-2 |
+| a vs ref (old binary) | 526 | 236 | 1.21e-2 |
+| a2 vs b | 400 | **362** | 3.20e-2 |
+| a2 vs ref | 400 | 362 | 3.20e-2 |
+| b vs ref | 387 | **375** | 2.04e-3 |
+
+Four readings, in order of how load-bearing they are:
+
+**Positions 0..235 are bit-identical in all four arms.** Two budgets (78.26% and 62.09% hit —
+1.7× the misses) and two source trees agree exactly for 236 positions. So the engine *is*
+reproducible and *is* budget-neutral (P4, INV-1) right up until an event fires. Whatever this
+is, it is rare, not pervasive.
+
+**The events are per-RUN, not per-position.** Every pair involving `a` breaks at 236 because
+`a` is the arm that broke there; among the others the earliest disagreement is 362, then 375.
+Reading first-disagreements as minima: `a` at 236, `a2` at 362, one of `{b, ref}` at 375, the
+last censored past 762. **236 is not a structural boundary** — which is worth saying because
+it looked like one for an hour, and the attention split plan was the obvious suspect. It is
+not: `mla_plan_splits` at GLM's `H=64, HB=16` changes cut at `nr` = 193 and 241, so 236 sits
+mid-plateau with `(n_splits=3, tps=5)` on both sides. **Split-KV is exonerated as the trigger.**
+
+**The rate, and the inference behind it.** The events are per-run, and only `a`'s is read
+directly: `a` vs everything breaks at 236, so `event(a) = 236`. `a2` vs `b` and `a2` vs `ref` both
+break at **362**, which is `min(event(a2), event(b))` and `min(event(a2), event(ref))`; if
+`event(a2)` were later, then `event(b)` and `event(ref)` would both have to be exactly 362, so
+`event(a2) = 362`. `b` vs `ref` then breaks at 375, giving `min(event(b), event(ref)) = 375` with
+the other censored past 762. **That chain is the whole basis for the numbers below and was
+implicit in an earlier draft** — a reviewer read "the matched pair gives two events" as
+self-contradictory, correctly, because a pair yields one first-divergence unless the other arm's
+event is inferred this way.
+
+Two readings, and neither is buried:
+
+| reading | events / exposure | rate | exact 95% Poisson interval |
+|---|---|---|---|
+| matched pair only (`a`, `a2`, both at `--max-mem 115`) | 2 / 598 | 1 per **299** | 1 per [83, 2469] |
+| all four arms, the clean one contributing its full 762 | 3 / 1735 | 1 per **578** | 1 per [206, 2804] |
+
+The second mixes configurations (`b` at a different budget, `ref` a different binary) but keeps
+the censored arm's exposure, so it is the **conservative** one and it is what
+`tests/determinism-glm.sh` is sized against. A pair diverges if either arm has an event, so
+P(detect) = 1 − exp(−2n/rate):
+
+| ngen | at 1/299 | at 1/578 | at the conservative interval's pessimistic end |
+|---:|---:|---:|---:|
+| 32 | 19% | 10% | 2% |
+| 256 | 82% | 59% | 17% |
+| 512 | 97% | 83% | 31% |
+
+80% power needs ngen 241 at the optimistic reading and **465 at the conservative one**, which is
+why the gate's floor is 512 rather than 256 — an earlier draft set it at 256 off the matched
+reading alone. **And the interval is the point: at its pessimistic end even 512 tokens is 31%
+power.** A green bounds the rate; it does not prove determinism.
+
+**That curve was fitted on teacher-forced NLLs and predicts the greedy id observations it was
+not fitted on.** It also disposes of the "32 tokens is safe" reading: there is no safe length,
+only a probability, and the 32-vs-512 contrast needs no extra mechanism to explain.
+
+**The wake GROWS, it does not decay.** `a` vs `a2`, median |dNLL| by 60-position window from
+the event: 2.8e-3, 2.6e-3, 1.7e-2, 3.6e-2, 3.3e-2, 2.0e-2, 3.5e-2, 3.5e-2, 3.8e-2. One event,
+then two KV caches drifting further apart forever. And the magnitude AT the event — 1.2e-2 to
+3.2e-2 nats — is far too large for a rounding difference and is the size of one expert's
+contribution to one position going wrong.
+
+### Why teacher forcing and greedy decode disagree about the magnitude, and which to use
+
+Teacher forcing re-anchors every position to the committed corpus, so a perturbation propagates
+only *numerically*, through the KV cache. Greedy decode feeds its own output back, so one flipped
+argmax rewrites the tail. Same defect, two magnitudes. **A teacher-forced probe measures
+perturbation MAGNITUDE; a greedy probe measures divergence TIMING.** Pick per question; do not
+compare their numbers.
+
+**The magnitude, derived from the vendored pair rather than quoted.** `a` vs `a2`: mean |dNLL|
+**0.035252**, mean signed dNLL **−0.004249** (`--se`). An earlier draft of this section put the
+teacher-forced wobble at "0.0018 nats", which is `wave/m10-spine`'s figure — and it is neither
+of these, because it was computed as `ln(5.209284/5.200080)` over a **different** `p4` invocation
+(hit 78.2643/78.2352, against these files' 78.2591/78.2597). Quoting it beside CIs derived from
+*these* files presented two runs as one body of evidence. It is dropped rather than corrected a
+second time.
+
+### The independence check `wave/m10-spine` owed, now paid — and what it changes
+
+That page carried a boxed caveat: `bin/ppl` reports `SE = sd/sqrt(n)`, which assumes the
+per-position dNLLs are independent; this defect makes one event contaminate every later position,
+so the assumption is exactly the one it violates; the true half-width could be ~3.9× wider; and
+*"a lag-1 autocorrelation or a block-bootstrap SE over any control pair's two `.nll` files settles
+it… those files were not retained… preserve that directory and do this check before any downstream
+branch leans on the multiples."*
+
+**This branch vendored those exact files, so the check is done** (`--se`, 2026-08-17). Two
+deterministic diagnostics, no RNG:
+
+| pair | mean dNLL | naive SE | lag-1 ρ | block SE (L=50) |
+|---|---:|---:|---:|---:|
+| `a2 − a` (control, same budget) | −0.004249 | 0.00302 | **−0.0797** | 0.00165 = 0.55× naive |
+| `b − a` (70 vs 115) | −0.003367 | 0.00232 | **−0.0093** | 0.00214 = 0.92× naive |
+
+**ρ is NEGATIVE, so the feared inflation does not occur: the naive SE is conservative here, not
+optimistic.** That retires the caveat, and it is retired by measurement rather than by
+supersession — which matters, because this page's first draft said "every measurement there
+stands" and silently dropped the obligation. `wave/m10-spine`'s ~3.9× worry is **refuted for these
+two pairs**; it remains untested for a pair whose event lands early enough to leave a long
+correlated tail, and `--se` is one command on any future pair.
+
+**One conclusion has to be corrected, and it is one of mine.** Under the naive SE both CIs contain
+zero, which the first draft read as "the wobble is symmetric noise, not a bias". Under the tighter
+block SE the control pair's CI is [−0.00748, −0.00101] — it **excludes** zero. So a pair's mean
+dNLL is genuinely non-zero: one run's event shifts its whole tail in one direction. What that does
+*not* mean is a bias, because the sign is a property of which arm had the event and where, and n=1
+constrains it not at all.
+
+**The `--max-mem` conclusion survives, and on better evidence than "both contain zero".** The
+control pair (same budget) and the budget pair move by the same amount in the same direction
+(−0.0042 vs −0.0034, ratio 1.3). Comparing them to *each other* is what says there is no budget
+effect — a comparison that does not depend on either interval, and the one the re-specified `p4`
+cell exists to make.
+
+## What is REFUTED, and by what
+
+Both refutations are structural — read off the code and the kernels — which is why they are
+stated as refutations and not as further exclusions. Both are also *reasoning*, not
+measurement, which is why `--divergence-log` carries the columns that let a device run check
+them (see `Cols::reloc`).
 
 ### MoE accumulation order cannot do it
 
-`docs/reference/architecture.md`'s standing claim is that fixed-point accumulation makes the
-MoE order-independent. That claim was **checked in this tree rather than trusted**, because
-the brief asked for exactly that:
+Checked in this tree rather than trusted, because the standing claim in
+`docs/reference/architecture.md` is exactly the kind of inherited assurance this repo distrusts:
 
 - `common.hpp::moe_fixed` clamps **each term independently** (`llrintf(fmin(fmax(v, ±MAX)) ·
-  2^44)`), so saturation cannot depend on the order terms arrive in.
-- `moe.hip:124`/`:371` accumulate with `atomicAdd` on `unsigned long long`. Integer addition
-  is associative and commutative, and the width argument in `common.hpp` bounds `Σ` over
-  ≤16 clamped terms at `2^62` — a full binade of slack, so no wrap occurs either.
-- `moe_acc_drain_impl` sums the `MOE_ACC_ROWS` lane blocks into a `long long` at a fixed
-  stride and converts **once**, in `double`.
+  2^44)`), so saturation cannot depend on arrival order.
+- `moe.hip:124`/`:371` accumulate with `atomicAdd` on `unsigned long long`. Integer addition is
+  associative and commutative, and `common.hpp`'s width argument bounds Σ over ≤16 clamped
+  terms at 2^62 — a full binade of slack, so no wrap occurs either.
+- `moe_acc_drain_impl` sums the `MOE_ACC_ROWS` lane blocks into a `long long` at a fixed stride
+  and converts **once**, in `double`.
 
-Therefore the resident-lane / miss-lane split (`glm/mlp.rs:281-290`, two streams, two
-accumulator blocks) is *exactly equivalent* to one accumulator: which lane a contribution
-lands in is a residency-dependent decision that **provably cannot** change the sum. The
-launch batching of maximal resident runs is the same argument. Nothing in the MoE's
-accumulation is schedule-sensitive.
+So the resident-lane / miss-lane split (`glm/mlp.rs`, two streams, two accumulator blocks) is
+*exactly equivalent* to one accumulator: which lane a contribution lands in is a
+residency-dependent decision that provably cannot change the sum. Batching maximal resident
+runs into one launch is the same argument.
 
-Stronger, and this is the load-bearing generalisation: **there is no float atomic in any
-kernel in the tree.** `grep atomic kernels/*.hip *.hpp` yields the u64 MoE `atomicAdd`, the
-`atomicCAS` on the non-finite diagnostic flag, and a u32 histogram in the DSA indexer that
-`--attn dense` never launches. The split-KV attend's cut is a pure function of `(H, nr)` and
-both its kernels are on stream 0, so the combine cannot race the partials. **Given identical
-input bytes, this engine's arithmetic is bit-reproducible.** A divergence therefore has to be
-a wrong-bytes read.
+Stronger, and the load-bearing generalisation: **there is no float atomic in any kernel in the
+tree.** `grep atomic kernels/*.hip *.hpp` yields the u64 MoE `atomicAdd`, the `atomicCAS` on
+the non-finite flag, and a u32 histogram in the DSA indexer that `--attn dense` never launches.
+**Given identical input bytes, this engine's arithmetic is bit-reproducible** — so the defect
+has to be a wrong-bytes read.
 
 ### Arena relocation vs an in-flight read cannot do it *in this tree*
 
-The prior hypothesis — a read outliving its layer and having its slot `memcpy`'d out from
-under it, with pins not stopping compaction, seen as 9 corrupted reads in 8452 at
-`--max-mem 30` — describes the OLD tree. In this one three barriers close it, and they
-compose:
+The prior hypothesis — a read outliving its layer and having its slot `memcpy`'d out from under
+it, pins not stopping compaction, seen as 9 corrupted reads in 8452 at `--max-mem 30` —
+describes the OLD tree. Here three barriers close it, and they compose:
 
-1. `glm/forward.rs::run_layer` ends **every** layer with `device_sync()`, which is
-   `hipDeviceSynchronize` (`linalg.hip:404`) — the whole device, all streams.
-2. Every miss kernel is enqueued behind `hipStreamWaitValue64` on its ticket
-   (`asyncfetch.rs::wait`), and the reaper signals that timeline on the fetch stream only
-   *after* enqueueing the bounce→slot copy. So a miss's bytes have landed before its kernel
-   runs.
-3. `launch_moe` host-awaits BOTH lanes with `hipLaunchHostFunc`-backed signals before
-   returning, so all of layer L's copies have executed before layer L+1 submits anything.
+1. `glm/forward.rs::run_layer` ends **every** layer with `device_sync()` =
+   `hipDeviceSynchronize` — the whole device, all streams.
+2. Every miss kernel is enqueued behind `hipStreamWaitValue64` on its ticket, and the reaper
+   signals that timeline on the fetch stream only *after* enqueueing the bounce→slot copy.
+3. `launch_moe` host-awaits both lanes (`hipLaunchHostFunc`-backed) before returning, so all of
+   layer L's copies have executed before layer L+1 submits anything.
 
-Consequently, when `admit_misses` evicts, frees and relocates, **the device is idle**. And
-`submit`'s phase order already forbids the remaining shape: every relocation happens in
-`admit_misses`, and `resolve` computes final slots and issues reads only afterwards, so a
-read never targets a slot that later moves. `relocate`'s `memcpy_dtod` is a blocking
-`hipMemcpy` (`hip.rs:343`), which is enough precisely *because* nothing else is in flight —
-note that it would NOT be enough otherwise, since rivoli's streams are `hipStreamNonBlocking`
-and the null stream carries no implicit ordering against them.
+So when `admit_misses` evicts, frees and relocates, **the device is idle**. And `submit`'s
+phase order forbids the remaining shape independently: all relocation happens in
+`admit_misses`, and `resolve` computes final slots and issues reads only afterwards, so a read
+never targets a slot that later moves. `relocate`'s `memcpy_dtod` is a blocking `hipMemcpy`,
+which suffices *because* nothing else is in flight — note it would NOT suffice otherwise, since
+rivoli's streams are `hipStreamNonBlocking` and the null stream carries no implicit ordering
+against them.
 
-## What three independent audits found, so the next reader does not repeat them
+## What three read-only audits found, so nobody repeats them
 
-Three read-only audits ran on 2026-08-17 over (a) the sync and memory-visibility substrate,
-(b) the host residency path, (c) the whole non-MoE GLM path. Their negative results are the
-useful part:
+Audits of (a) the sync and memory-visibility substrate, (b) the host residency path, (c) the
+whole non-MoE GLM path, 2026-08-17. The negative results are the useful part:
 
 - **No hash-order, time-derived, address-derived or unstable-sort decision** reaches an
-  eviction, a tier, a relocation order or a read order. The one `retain` over a
-  `HashMap` (`hybrid.rs:252`, the LFU halving) is order-INVARIANT: its closure reads and
-  writes only the entry's own value. Recency ordering is a `BTreeMap` on a monotonic tick.
-  `route_into`'s comparator carries an index tiebreak, so top-k ties resolve to lowest index.
-- **The `Arena`'s relocation sequence is a pure function of its `(alloc, free)` sequence.**
-  Its free lists are `Vec` with `pop`/`swap_remove`: history-dependent, fully determined.
-- **Argmax is a single-block reduction** (`dim3(1), dim3(256)`) whose combine resolves an
-  exact tie to `min(index)` explicitly, with `__syncthreads` between rounds and no atomics.
-  A tie cannot resolve differently across runs. Do not revisit this.
-- **No buffer in the GLM path is read before it is written**, padding included: every
-  producer and consumer is parameterised on `nrow` (the row count is a *template* parameter,
-  never a grid dimension), `moe_acc` and `argmax_dev` are explicitly zeroed at construction,
-  and `moe_hidden`'s two lanes index by the ABSOLUTE descriptor index so they are disjoint.
-  The one full-buffer D2H of a half-uninitialised staging buffer (`gate_logits_host` at
-  `nrow == 1`) is consumed only in its written half.
+  eviction, a tier, a relocation order or a read order. The one `retain` over a `HashMap` (the
+  LFU halving) is order-INVARIANT — its closure reads and writes only the entry's own value.
+  Recency is a `BTreeMap` on a monotonic tick. `route_into`'s comparator carries an index
+  tiebreak, so top-k ties resolve to lowest index.
+- **The `Arena`'s relocation sequence is a pure function of its `(alloc, free)` sequence.** Its
+  free lists are `Vec` with `pop`/`swap_remove`: history-dependent, fully determined.
+- **Argmax is a single-block reduction** whose combine resolves an exact tie to `min(index)`
+  explicitly, with `__syncthreads` between rounds and no atomics. A tie cannot resolve
+  differently across runs. Do not revisit this.
+- **No buffer in the GLM path is read before it is written**, padding included: every producer
+  and consumer is parameterised on `nrow` (the row count is a *template* parameter, never a
+  grid dimension), `moe_acc` and `argmax_dev` are explicitly zeroed at construction, and
+  `moe_hidden`'s two lanes index by the ABSOLUTE descriptor index so they are disjoint. The one
+  full-buffer D2H of a half-uninitialised staging buffer (`gate_logits_host` at `nrow == 1`) is
+  consumed only in its written half.
 - **The KV cache reads exactly `pos + r + 1` rows**, no padding, and the split plan is a pure
   function of `(H, nr)`.
 
-So there is no live ordering hole and no unwritten read. **The defect is not statically
-visible**, and that is why this milestone's deliverable is instruments rather than a fix.
+There is no live ordering hole and no unwritten read. **The defect is not statically visible**,
+which is why this milestone's deliverable is instruments and a gate rather than a fix.
 
 ## The instruments
 
+### `tests/nll-divergence.sh` — deviceless, and what it does and does not re-derive
+
+First-divergence position, magnitude at the event, the wake profile, the SE diagnostics, and the
+rate/power curve — all from the vendored files, with no device. It compares the recorded value
+TEXT, with no tolerance: the question is bit-reproducibility, and a per-position tolerance would
+hide exactly the small early perturbation whose position is the measurement.
+
+**It does not make every number on this page derived, and the first draft claimed it did.** What
+it re-derives is the divergence table, the wake profile, the SE diagnostics, and the rate and
+power from `(events, exposure)` — which it now takes explicitly, so a censored arm cannot be
+dropped silently. Everything below is INHERITED from `wave/m10-spine`'s prose or from the brief
+that opened this milestone, is not checkable in this tree, and is marked as such wherever it
+appears:
+
+| inherited number | what it is | why it is not checkable here |
+|---|---|---|
+| 61/512, 496/512, 247/512; first divergence 13, 265, 452 | the greedy-decode observations | the id dumps were not retained |
+| 0-of-3 pairs at 32 tokens, 3-of-3 at 512 | the greedy pair outcomes | same |
+| 70.6% MTP acceptance, `p0.8+` at 89% | `wave/m12-glm-chain`'s measurement | another branch |
+| 7.7 GB/s at QD1, ~35% ring idle | the old tree's fetch probes | no probe in this tree |
+| 9 corrupted reads in 8452 at `--max-mem 30` | the old tree's relocation finding | archive only |
+| ~148 misses/token, ~20 MB/expert | the old tree's poison-fill comment | superseded below by a DERIVED 130.4 and 14.625 MiB |
+
+The greedy numbers are load-bearing for one claim only — that the defect reaches generated text
+and is length-dependent — and the rate derived here independently predicts their 32-vs-512
+pattern, which is the strongest check available without re-running them.
+
 ### `--divergence-log` — a coordinate AND a mechanism
 
-Forward-ported from archive commit `544fea7` (reachable from
-`archive/belady-residency-bound`), not cherry-picked: that commit's `--checksum-x` and
-`--checksum-route` were written against a single-file `gpu.rs`, and both are folded here into
-one flag and one file format. Its two load-bearing design decisions are inherited verbatim
-and are the reason it can be pointed at this bug at all:
+Forward-ported from archive `544fea7` (reachable from `archive/belady-residency-bound`), not
+cherry-picked: that commit's `--checksum-x` and `--checksum-route` were written against a
+single-file `gpu.rs`, and they are folded here into one flag and one file format. Two of its
+design decisions are inherited verbatim and are why it can be pointed at this bug at all:
 
-- **The fold is XOR** (`kernels/fwd.hip::hash_rows`, splitmix64-finalized over
-  `(index, exact bits)`), because XOR is commutative *and* associative and so is bit-identical
-  whatever order the atomics land in. A float sum would report a difference from scheduling
-  jitter alone.
-- **Nothing touches the host or the disk mid-run.** The predecessor copied the residual to
-  the host every layer and produced a CLEAN run on a configuration that reproduced without
-  it — the tool built for the bug could not be used on it. Here the folds stay on the device,
-  all slots drain in ONE D2H per pass at a point the end-of-layer sync has already idled, and
-  the records are written after the last token.
+- **The fold is XOR** (`rivoli_core::hash::xor_fold` and its device twin
+  `kernels/fwd.hip::hash_rows`), because XOR is commutative *and* associative and so is
+  bit-identical whatever order the atomics land in. A float sum would report a difference from
+  scheduling jitter alone.
+- **Nothing touches the host or the disk mid-run.** The predecessor copied the residual to the
+  host every layer and produced a CLEAN run on a configuration that reproduced without it — the
+  tool built for the bug could not be used on it.
 
-What is **new** is that it is a discriminator rather than a localiser. Three quantities per
-layer cut the layer at the two seams the refuted candidates sat either side of:
+What is new is that it discriminates rather than only localising. Three device-folded quantities
+per layer cut the layer at the two seams the refuted candidates sat either side of:
 
-| column | quantity | a difference here, with the earlier columns equal, means |
-|---|---|---|
-| `xn` | the MoE's input (post-attention rmsnorm) | attention or its KV cache; the MLP has not run |
-| `h` | `moe_hidden`, the SwiGLU intermediate | the gate/up expert BYTES, or that kernel |
-| `x` | the residual at layer exit | the down projection, the accumulator or the drain |
+| column | quantity | folded for | a difference here, with the earlier columns equal, means |
+|---|---|---|---|
+| `xn` | the MLP's input (post-attention rmsnorm) | every layer | attention or its KV cache; the MLP has not run |
+| `h` | `moe_hidden`, the SwiGLU intermediate | MoE layers | the gate/up expert BYTES, or that kernel |
+| `x` | the residual at layer exit | every layer | the down projection, the accumulator or the drain |
 
-plus six host columns that cost nothing because routing is already a host function of
-host-resident data: `gl` (what the router saw, FNV-1a over exact bytes), `pk` (what it
-picked), `wx` (the routing-weight matrix), `sl` (WHERE the pool put each expert — arena
-**offsets**, never addresses, since the VMM base differs per run), and the layer's `misses`
-and `relocs` deltas.
+`xn` is folded on GLM's 3 dense layers too, which is not an incidental detail: folding it only
+on the 75 MoE layers left the dense rows' `xn` at 0 in both runs, and a diff reads two equal
+zeros as "attention agreed" when nothing was measured. Every column that cannot exist for a
+layer prints `-`, never 0 — a false EXCLUSION is the one failure mode an instrument must not
+have, and this one had it until it was caught here.
 
-Diff two logs: the first differing LINE is the coordinate, the first differing COLUMN names
-the mechanism. `crates/engine/tests/fwd_kernel.rs::hash_rows_matches_the_host_fold` scores
-the kernel against `probe::fold_host` and asserts the three properties the instrument's
-usefulness depends on — bit-exactness, one-ULP sensitivity, and permutation sensitivity —
-because every conclusion below will be read off a pair of these hashes.
+plus five host columns that cost nothing because routing is already a host function of
+host-resident data: `gl` (what the router saw, over exact bytes), `pk` (what it picked), `sl`
+(WHERE the pool put each expert — arena **offsets**, never addresses, since the VMM base
+differs per run), and the layer's `misses` and `relocs` deltas. Diff two logs: first differing
+LINE is the coordinate, first differing COLUMN names the mechanism.
+`fwd_kernel.rs::hash_rows_matches_the_host_fold` scores the kernel against the host fold and
+pins bit-exactness, one-ULP sensitivity and permutation sensitivity — every conclusion here
+will be read off a pair of these hashes, and an instrument nobody checked is a source of
+confident wrong answers.
 
-**Do not run it under `--trace`, and do not accept a green obtained with tracing enabled.**
-`trace` adds a poison fill and a `device_sync` per layer-with-misses, which is the class of
-perturbation that masked this fault before. `--divergence-log` is its own feature
-(`corruption-probe`, which `trace` implies) for exactly that reason.
+**`trace` deliberately does not imply the probe's feature.** The archived predecessor did,
+because its flag had always lived under `trace`; `--divergence-log` is new, so there is no flag
+to keep, and implying it would arm the probe in exactly the build whose extra per-layer
+`device_sync` invalidates the measurement. **Never debug this under `--trace`.**
 
-### `tests/determinism-glm.sh` — length-aware, with a floor
+## The gate
 
-Two runs, one binary, byte-identical arguments, ids compared. **`ngen` has a hard floor of
-256** and the gate refuses below it with the reason: the defect is byte-identical at 32
-tokens on the very tree that fails at 512, so a short determinism gate is green on a broken
-engine. The default is 512, the length every recorded measurement of this defect used. A
-green **bounds the rate at that length; it does not prove determinism**, and the gate says so
-in its own output.
+`tests/determinism-glm.sh`: two runs, one binary, byte-identical arguments, ids compared.
+`ngen` has a hard floor of **256**, and the floor is the power calculation above rather than a
+round number — the gate prints the curve when it refuses. Default 512. A green **bounds the
+rate at that length; it does not prove determinism**, and the gate says so in its own output.
+It carries a per-arm contention witness (now shared with `tests/parity-glm.sh` via
+`tests/gpu-witness.sh` — a two-copy false-green guard is one copy away from not guarding),
+never builds, and refuses a short arm, since two short arms of equal length would otherwise be
+a green over a decode that never happened.
 
-It carries a contention witness per arm (KFD holders resolved by descent from the arm's pid,
-GTT baseline for tenants KFD cannot see), never builds, and refuses a short arm — two short
-arms of equal length would otherwise be a green over a decode that never happened.
+Red proof, both halves, run 2026-08-17:
 
-Red proof, both halves:
+- **Mechanical, deviceless:** `--self-test` feeds the gate's own comparator two id streams
+  differing by one token, and a truncated stream, and fails if either compares equal. Reddens
+  on both. A proof about the comparator, labelled as such.
+- **Live:** the defect is present, so a 512-token arm on this tree IS the red proof, and the
+  table above is its record.
 
-- **Mechanical, deviceless:** `tests/determinism-glm.sh --self-test` feeds the gate's own
-  comparator two id streams that differ by one token, and a truncated stream, and fails if
-  either compares equal. Run 2026-08-17: reddens on both. This is a proof about the
-  comparator, not about the engine, and is labelled as such.
-- **Live:** the defect is present, so the 512-token arm on this tree IS the red proof, and
-  the table at the top of this page is its record. The gate's green after a fix is believable
-  because the same command was red on the same tree.
+**INV-9** (`docs/reference/architecture.md` §8b, paired with
+`asyncfetch.rs::inv_9_slot_handout_is_deterministic_under_the_layer_barrier`) covers the
+same-PROGRAM half — that no host decision on the routed path can make two runs of one input
+diverge — and scopes itself explicitly away from the same-OUTPUT half, which is false today.
+Red-proofed by making `scan_free` ignore `landed`.
 
-## The next experiments, in order, and the first one is free
+## One capability gap that shapes experiment 2
 
-1. **Grep the diverging runs' stderr for `READ-BEFORE-WRITE`.** `routed.rs::touch_hits`
-   carries a live, **unconditional** detector for "the policy counted this expert a HIT but
-   its bytes never landed since admission" — it is not feature-gated and it was active in
-   every run in the table above. If it fired, the coordinate is already recorded. If it was
-   silent, the premature-read half of wrong-bytes is excluded at zero cost. **Its blind spot
-   must be stated with the result:** it detects bytes that never arrived, never bytes that
-   arrived and were then clobbered.
-2. **`--divergence-log` on both arms at 512 tokens**, on a `--features corruption-probe`
-   build, quiet box, flock + witness. Diff the two logs. The first differing column decides
-   between "the expert bytes were wrong" (`h` moves with `xn` equal) and "the arithmetic
-   after them was" (`x` moves with both equal) — and if `xn` moves first, the whole
-   routed-pool scope statement inherited from `wave/m10-spine` is wrong and attention is in
-   frame.
-3. **Log `slot_stalls()` per token on both arms.** It should be identically 0: the per-layer
-   `device_sync` makes every staging slot landed at `submit`, which is what INV-9 rests on. A
-   non-zero count means the two runs stopped being the same program, and it is the only
+**`--divergence-log` can only be pointed at GREEDY decode on this branch.** It is wired into
+`run_bench`, and there is no `--ppl` / teacher-forcing decode path in this tree at all — the
+`teacher-forcing` feature is declared empty here and the `.nll` evidence above came from
+`wave/m10-spine`'s `score.rs`. That matters for how experiment 2 is read:
+
+- **Greedy is still interpretable**, and this is the important half: the first differing LINE is a
+  divergence that happened *during that forward, on identical inputs*, so its (layer, column) is a
+  real coordinate. Every line after it is trivially different and carries nothing.
+- **What is not reachable is the better measurement.** Teacher-forced, both arms stay re-anchored
+  to the corpus, so a second and third event remain visible instead of being buried under the
+  first one's wake — a run would yield several coordinates rather than one. That needs the probe
+  wired into a TF walk, i.e. it lands when this branch and `wave/m10-spine`'s scorer meet.
+
+So experiment 2 gives ONE coordinate per pair, and the ladder below should be read as
+"one sample decides which arm we are on", not as "one run settles the mechanism".
+
+## The next experiments, in order, and the first is free
+
+1. **Grep the diverging runs' stderr for `READ-BEFORE-WRITE`.** `routed.rs::touch_hits` carries
+   a live, **unconditional** detector for "the policy counted this expert a HIT but its bytes
+   never landed since admission" — not feature-gated, and active in every run in the table
+   above. If it fired, the coordinate is already recorded; if it was silent, the premature-read
+   half is excluded at zero cost. **Its blind spot must be stated with the result:** it detects
+   bytes that never arrived, never bytes that arrived and were then clobbered.
+2. **`--divergence-log` on both arms at 512 tokens**, `--features corruption-probe`, quiet box,
+   flock + witness. The first differing column decides between "the expert bytes were wrong"
+   (`h` moves with `xn` equal) and "the arithmetic after them was" (`x` moves with both equal) —
+   and if `xn` moves first, the routed-pool scope inherited from `wave/m10-spine` is wrong and
+   attention is back in frame.
+3. **Log `slot_stalls()` per token on both arms.** It should be identically 0; INV-9 rests on
+   that. Non-zero means the two runs stopped being the same program, and it is the only
    host-side amplifier on the path — `scan_free` advances its cursor past every candidate it
-   tests, so ONE skip offsets the hand-out for the rest of the run and the two arms never
-   re-converge.
-4. **`--max-mem` high enough that the routed pool never evicts**, if such a budget exists on
-   this box. Its control pair going byte-identical would put the fault in the fetch path;
-   still diverging would take the pool out of frame entirely. P1 says the routed experts do
-   not fit, so this may need a shrunk shadow artifact.
+   tests, so ONE skip offsets the hand-out for the rest of the run.
+4. **A per-read content hash, if step 2 says the bytes were wrong.** Not built, because
+   building it before step 2 asks for it would be speculative — but specified so it is ready:
+   hash each cold read's bytes on the reaper thread and keep `HashMap<key, u64>`. A key that is
+   evicted and re-fetched must produce identical bytes; a mismatch on re-read is *proof* of a
+   bad read and separates "the bytes arrived wrong" from "the bytes were clobbered after
+   landing", which the `h` column alone cannot do. Cost is an FNV over ~2 MB per miss, inside
+   the reaper's own io-wait and off the decode thread.
+5. **A budget high enough that the routed pool never evicts**, if one exists on this box. Its
+   control pair going byte-identical would put the fault in the fetch path; still diverging
+   would take the pool out of frame. P1 says the routed experts do not fit, so this may need a
+   shrunk shadow artifact. Note the weak counter-evidence already in hand: `b` at `--max-mem 70`
+   (1.7× the misses) had its event LATER than `a` at 115, which does not support a rate that
+   scales with miss count — n=1 per budget, so no power, but it is the direction that matters.
 
-## Two defects found on the way, neither able to explain a rare divergence
+## The fix ladder, priced — and why no fix is proposed as chosen yet
 
-Recorded here rather than dropped, and both are latent-not-live:
+**There is no fix in this milestone, and proposing one would be pricing a mechanism that has
+not been identified.** What the evidence establishes is where the mechanism ISN'T: not the
+arithmetic (no float atomic anywhere, so identical bytes give identical results), not the
+accumulation order, not the residency decisions, not relocation-vs-in-flight-read, not the
+attention split plan, and not any host decision (INV-9). What remains is a **wrong-bytes read**
+somewhere in NVMe → pinned bounce arena → `hipMemcpyAsync` → GTT pool slot, which is below the
+engine's own logic. Experiment 2 decides which arm of the ladder applies; each arm's price is
+different by an order of magnitude, so choosing now would be choosing blind.
 
-- **`asyncfetch.rs`'s `debug_assert_eq!(sub, 0, "VQ expert read must be block-aligned")` is
-  compiled out under `--release`, and it is the only thing "checking" a claim the fetch path
-  depends on.** If a read's file offset were not `ALIGN`-aligned, `reap` would copy the
-  aligned superset to the slot BASE and every projection pointer would be off by `sub` bytes.
-  It is currently guaranteed by arithmetic rather than by the assert: expert offsets are
-  `VQ_ALIGN + e·stride` with `VQ_ALIGN == ALIGN == 4096` and `stride` a multiple of it, so
-  `sub == 0` and `nbytes == stride` exactly — the copy neither underruns nor spills into the
-  neighbouring slot. A spill there would be precisely a timing-independent cross-expert
-  corruption, so this is worth an `ensure!` at pool construction rather than a
-  `debug_assert!` at every read. **This is the repo's most common review finding wearing a
-  new hat** and it is in the fetch path of the defect under investigation.
-- **Nothing asserts `lm_head.o_dim == cfg.vocab`.** `tail()` writes `logits` at width
-  `o_dim`; `argmax_rows` reduces over `cfg.vocab`; `logits` is allocated `MAXROW · vocab`. A
-  smaller `o_dim` makes argmax reduce over uninitialised device memory; a larger one writes
-  past `logits` into the buffer `hipMalloc` handed out next, which is `argmax_dev`. Inert for
-  the real artifact in either direction, and one `ensure!` to close.
+| if experiment 2 shows | mechanism | fix | price |
+|---|---|---|---|
+| `h` differs, `xn` equal | the gate/up expert BYTES were wrong | verify-on-read, below | 0.5% – 34% of throughput, depending on the corruption's GRANULARITY |
+| `x` differs, `xn` and `h` equal | down projection, accumulator or drain | a fourth fold on `moe_acc` before the drain narrows it further first | ~0 |
+| `xn` differs first | attention or the KV cache | the routed-pool scope inherited from `wave/m10-spine` is wrong and the hunt restarts at MLA | — |
 
-Also corrected while reading: `glm/engine.rs`'s comment describes `moe_acc` as
-`[MOE_ACC_ROWS][MAXROW][hidden]`, but the live lane stride is `nrow · hidden`
-(`mlp.rs:279`, matching the drain's own `n`). Writer and reader agree and every drain zeroes
-exactly what it reads, so it is correct — but a third consumer trusting the comment would
-alias.
+**Verify-on-read**, the fix for the first arm: hash each cold read's bytes on the reaper thread
+and keep `HashMap<key, u64>`; an expert that is evicted and re-fetched must produce identical
+bytes, and a mismatch is both a detection and a repair point (re-read). It runs off the decode
+thread, inside the reaper's own io-wait, so it costs throughput only where it exceeds that slack.
 
-## What this costs the record, unchanged from the inherited page
+The price is set by how many bytes have to be hashed, and **the byte volume is large enough that
+the choice of HASH dominates every other design decision here**. Both inputs are derived, not
+quoted:
 
-The old tree's own byte-identity claims — gated MTP at `--mtp-min-conf 0.8`, the parity
-gates, the quality ladder's A/Bs — were measured on an engine that does not reproduce itself
-over long runs. They are not thereby wrong; they are **unproven at any length where a
-divergence event is likely**. Any future byte-identity claim on GLM must state its token
-count. `wave/m12-glm-chain`'s MTP losslessness gate is the immediate casualty: at 70.6%
-acceptance it is well past break-even and cannot be closed until the baseline reproduces.
+- **misses/token = 130.4.** 75 MoE layers × `top_k` 8 = 600 routed lookups, at the 78.2591% hit
+  rate recorded in these very `.nll` headers.
+- **expert stride = 15,335,424 B (14.625 MiB).** From the artifact itself:
+  `L03.vq3` is 3,941,208,064 B, the layout is `VQ_ALIGN + blocks · stride`, and `blocks` is
+  **257** — 256 routed plus the shared expert, as `artifact/src/format/layer.rs` states outright
+  ("3.94 GB for GLM (257 — its shared expert…)"). 4096 + 257 × 15,335,424 reproduces the file
+  size exactly.
+
+  *This was worth deriving for a second reason.* Assuming 256 blocks gives 15,395,328 B, which is
+  **not** a multiple of 4096 — and under that layout `RoutedGeom::check_reads_fit_their_slots`
+  (added below) would refuse the real artifact at startup. At 257 it is 3744 × 4096 and every
+  expert offset is block-aligned, so the new check passes. An earlier draft of this section
+  quoted "~20 MB per expert" from a comment in the old tree; that is the **`.i4`** stride
+  (`L03.i4` / 257 ≈ 19.1 MiB), and it is exactly the inherited-number failure this repo keeps
+  writing down.
+
+So **2.0 GB/token** of expert bytes — which at the committed 2.58 tok/s is 5.2 GB/s, 67% of the
+7.7 GB/s the drive delivers at QD1, consistent with the recorded ~35% ring idle.
+
+| rung | bytes/token | with scalar FNV (~1 GB/s) | with a SIMD hash (~15 GB/s) | blind to |
+|---|---:|---|---|---|
+| every byte of every cold read | 2.00 GB | ~2.0 s/token — **impossible** (516% of a 388 ms budget) | ~133 ms/token, **34%** | nothing |
+| the per-group SCALE rows only | ~0.08 GB | ~80 ms, ~21% | ~5 ms, **1.4%** | a corruption confined to the packed indices |
+| a strided sample, 1 cache line in 64 | 31 MB | ~31 ms, ~8% | ~2 ms, **0.5%** | ~98% of single-cache-line corruptions |
+
+The scale rows are the interesting rung: they are a few percent of an expert's bytes and they are
+what a shifted or stale read corrupts most visibly, since every decoded weight in a group is
+multiplied by one.
+
+**Every percentage in that table is arithmetic, not a measurement**, and is labelled so
+deliberately. What it actually costs depends on how much io-wait slack there is for the reaper to
+hide the hash in — and `AsyncFetch::io_wait_ns` already measures that, and nobody has ever read
+it against this question. **That is one flag-less device run and it should precede any
+commitment**, because if the slack is large the cheap rungs are free and if it is small even the
+strided rung is a real number.
+
+**A global lock or a barrier is not on this ladder.** Serialising the fetch against compute
+would cost the overlap the whole engine exists for (P1, P5) and would not even be a fix — the
+evidence says the two are already ordered by an unconditional per-layer `device_sync`, so there
+is no race left for a barrier to close. A slower engine is a legitimate outcome to propose; a
+slower engine that does not fix the defect is not.
+
+## Defects found on the way
+
+**Fixed here.** `asyncfetch.rs`'s `debug_assert_eq!(sub, 0, "VQ expert read must be
+block-aligned")` was the only thing "checking" two properties the fetch path depends on, and
+under `--release` — which is what every benchmark and every divergence run is built with — it
+checked neither. It is replaced by `RoutedGeom::check_reads_fit_their_slots`, one pass over the
+read table at `open()`: every read must start `ALIGN`-aligned (or the bounce→slot copy lands the
+aligned superset at the slot BASE and shifts all six projection pointers) and its superset must
+fit one `stride` (or the copy spills into the neighbouring slot and corrupts another resident
+expert — precisely the shape of defect under investigation). Both hold today by arithmetic in
+another crate (`VQ_ALIGN == ALIGN == 4096`, blocks at `VQ_ALIGN + e·stride`), so the check is
+expected to stay silent; "holds by arithmetic elsewhere" is exactly the coupling a repack or a
+new format breaks quietly. This is the repo's most common review finding wearing a new hat, in
+the fetch path of an open defect.
+
+**Open, one `ensure!` each, both inert for the real artifact.** Nothing asserts
+`lm_head.o_dim == cfg.vocab`: `tail()` writes `logits` at width `o_dim` while `argmax_rows`
+reduces over `cfg.vocab`, so a smaller `o_dim` reduces over uninitialised memory and a larger
+one writes past `logits` into whatever `hipMalloc` handed out next (which is `argmax_dev`).
+
+**Corrected, not a defect.** `glm/engine.rs`'s comment describes `moe_acc` as
+`[MOE_ACC_ROWS][MAXROW][hidden]`, but the live lane stride is `nrow · hidden`, matching the
+drain's own `n`. Writer and reader agree and every drain zeroes exactly what it reads, so it is
+correct — but a third consumer trusting the comment would alias.
+
+## What this costs the record
+
+The old tree's byte-identity claims — gated MTP at `--mtp-min-conf 0.8`, the parity gates, the
+quality ladder's A/Bs — were measured on an engine that does not reproduce itself over long
+runs. They are not thereby wrong; they are **unproven at any length where an event is likely**,
+and the power table says what that means for a given length. Any future byte-identity claim on
+GLM must state its token count. `wave/m12-glm-chain`'s MTP losslessness gate is the immediate
+casualty: at 70.6% acceptance it is well past break-even and cannot close until the baseline
+reproduces.
