@@ -779,6 +779,40 @@ folds cost.
 > masking risk in the first place, because what suppresses is evidently the *shape* of the added
 > work and not its duration. That is exactly what Phase 2's ladder was built to separate.
 
+### `crates/engine/examples/arena_repro.rs` — the hop at rate, and the AMD exhibit
+
+```
+flock /var/run/sys-gpu.lock -c \
+  '<target>/release/examples/arena_repro /var/db/rivoli/glm52-vq3-full/L03.vq3 1000000'
+# ...and the same with --coherent, which is the fix arm
+```
+
+The engine reproduces the defect at roughly one event per 40,000–80,000 reads — a 20-minute arm per
+sample. This drives **the engine's own `Streamer`** (same ring, same pinned arena, same
+`hipMemcpyAsync`, not a re-implementation) in a hot loop and verifies every read, turning the same
+statistics into minutes. If it fires it is the minimal driver-level exhibit: no model, no MoE, no
+scheduling.
+
+Three properties make it faithful, and each is a way it could have been useless:
+
+1. **Staging slots are reused round-robin** — the condition the hypothesis needs, since a slot's
+   previous contents were themselves read through the GPU.
+2. **Consecutive uses of a slot carry DIFFERENT payloads** (17 block offsets against 16 slots,
+   coprime). Refill a slot with the same bytes and a stale line returns the right answer for the
+   wrong reason.
+3. **It never reads the arena.** Verification folds the DESTINATION after the copy — the `sc`
+   position, measured not to suppress. A repro that verified at the arena would be a repro of
+   nothing, because reading the arena is precisely what makes the defect vanish.
+
+The reference folds come from **buffered** reads of the same ranges, so a mismatch means the
+O_DIRECT + copy path delivered something the ordinary read path does not. A clean run prints its own
+rule-of-three bound, so a null is a number rather than a shrug.
+
+**It is NOT deviceless**, contrary to the plan that called for it: `hipHostMalloc` initialises the
+HIP runtime and both the copy and the verifying fold are device work, so it holds a KFD entry and
+appears to every witness. **Take the flock.** What it avoids is the 281 GB load and the decode, so it
+is cheap to run *between* GPU cells — not free of them.
+
 ### Phase 1's matrix, and the asymmetry it must be read under
 
 One fold at a time, 1536-token pairs, against the live control above:

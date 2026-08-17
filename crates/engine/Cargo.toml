@@ -67,3 +67,9 @@ opentelemetry-otlp = { version = "0.30", optional = true }
 [[example]]
 name = "glm_smoke"
 required-features = ["rocm"]
+
+# Same rule, same reason: the arena repro drives the io_uring ring, the pinned arena and a HIP
+# stream, none of which exist without the backend.
+[[example]]
+name = "arena_repro"
+required-features = ["rocm"]
