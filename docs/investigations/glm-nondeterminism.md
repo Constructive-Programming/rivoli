@@ -393,10 +393,24 @@ So experiment 2 gives ONE coordinate per pair, and the ladder below should be re
    half is excluded at zero cost. **Its blind spot must be stated with the result:** it detects
    bytes that never arrived, never bytes that arrived and were then clobbered.
 2. **`--divergence-log` on both arms at 512 tokens**, `--features corruption-probe`, quiet box,
-   flock + witness. The first differing column decides between "the expert bytes were wrong"
-   (`h` moves with `xn` equal) and "the arithmetic after them was" (`x` moves with both equal) —
-   and if `xn` moves first, the routed-pool scope inherited from `wave/m10-spine` is wrong and
-   attention is back in frame.
+   flock + witness. Read the pair MECHANICALLY rather than by eye — the first differing line has
+   eleven columns and which one moved first is the whole answer:
+
+   ```
+   diff <(grep -v '^#' A.log) <(grep -v '^#' B.log) | head -2      # the coordinate
+   paste <(grep -v '^#' A.log) <(grep -v '^#' B.log) | awk '
+     { half = NF / 2
+       for (i = 1; i <= half; i++) if ($i != $(i + half)) {
+         print "first divergence at pos=" $1 " nrow=" $2 " layer=" $3 \
+               "  -> column " i " (" NAMES[i] ") moved first"; exit } }
+     BEGIN { split("pos nrow layer xn h x gl pk sl misses relocs", NAMES, " ") }'
+   ```
+
+   The first differing column decides between "the expert bytes were wrong" (`h` moves with `xn`
+   equal) and "the arithmetic after them was" (`x` moves with both equal) — and if `xn` moves
+   first, the routed-pool scope inherited from `wave/m10-spine` is wrong and attention is back in
+   frame. `gl`/`pk`/`sl` moving before any device column would mean routing or placement, which
+   the barriers argument says cannot happen and this is how that gets checked.
 3. **Log `slot_stalls()` per token on both arms.** It should be identically 0; INV-9 rests on
    that. Non-zero means the two runs stopped being the same program, and it is the only
    host-side amplifier on the path — `scan_free` advances its cursor past every candidate it
