@@ -54,8 +54,8 @@ use rivoli_backend::hip::{
 
 mod common;
 use common::{
-    Got, Lcg, Want, assert_bits, assert_guard, back, dev, draws, f32b, f32v, ok, window_lo,
-    worst_rel,
+    AttendCase, AttendIo, AttendSpan, Got, Lcg, Want, assert_bits, assert_guard, attend_head,
+    attend_launch, attn_scale, back, dev, draws, f32b, f32v, ok, window_lo, worst_rel,
 };
 
 /// `tolerance::GLIMMER`'s `attend` row — `Rel(1.64e-4)` over a floor of 1.639e-5, measured at
@@ -121,59 +121,12 @@ impl<'a> Case<'a> {
     }
 }
 
-/// Everything one `gqa_attend` launch takes that is not a shape: the three read operands and the
-/// destination.
-///
-/// Bundled and spelled ONCE, on `kernel_attend.rs`'s `AttIo` argument: the launcher takes thirteen
-/// arguments, four of them interchangeable raw addresses, and the oracle and the guard table both
-/// spell the list — two copies that a transposed pair would move together while both stayed green.
-#[derive(Clone, Copy)]
-struct GqaIo {
-    q: *const f32,
-    k: *const f32,
-    v: *const f32,
-    out: *mut f32,
-}
+// `GqaIo` MOVED to `common::AttendIo` on 2026-08-17, when M17c's block attend became its second
+// consumer and jscpd reported the pair as a cross-file clone. Its argument travelled with it.
 
-/// One `gqa_attend` launch, `dims` being `[hq, hkv, d, tq, start_pos, win, ring_cap]` in launcher
-/// order.
-///
-/// **One array rather than seven parameters, and the order is spelled HERE and nowhere else.**
-/// Seven bare `usize` in a row is `common::Mla::new`'s excess-argument defect at full size, and
-/// the fix is that type's: keep them together, name the order once, and leave the call sites a
-/// literal a reader can check against this line.
-///
-/// Returns the launcher's own `Result` so the guard table can read a CODE while the oracles demand
-/// success.
-///
-/// # Safety
-/// `io.q` is `tq * hq * d` live f32, `io.k` and `io.v` are each `hkv * d` f32 per slot — at least
-/// `ring_cap` slots with a ring and `start_pos + tq` without — and `io.out` is `tq * hq * d`
-/// writable f32, none aliasing another (every kernel parameter is `__restrict__`). All live until
-/// the next [`device_sync`]. A REJECTED call returns before `hipLaunchKernelGGL` and dereferences
-/// nothing, which is what lets the guard table pass aliased addresses.
-unsafe fn gqa_launch(io: GqaIo, dims: [usize; 7], scale: f32) -> anyhow::Result<()> {
-    let [hq, hkv, d, tq, start_pos, win, ring_cap] = dims;
-    // SAFETY: the caller's contract above. Null stream: every call site here launches once and
-    // then joins, so there is nothing to order against.
-    unsafe {
-        launch_gqa_attend(
-            io.q,
-            io.k,
-            io.v,
-            hq,
-            hkv,
-            d,
-            tq,
-            start_pos,
-            win,
-            ring_cap,
-            scale,
-            io.out,
-            std::ptr::null_mut(),
-        )
-    }
-}
+// `gqa_launch` MOVED to `common::attend_launch` on 2026-08-17, when M17c's block attend became
+// its second consumer: the two launchers share an ABI exactly, and jscpd refused the second
+// wrapper. Its dims-array argument travelled with it.
 
 /// Launch and read back. `ring_cap` 0 is a cache indexed by position; anything else is a ring
 /// whose slot is `position % ring_cap`.
@@ -182,16 +135,14 @@ fn run(c: &Case<'_>, ring_cap: usize) -> Vec<f32> {
     let (tq, start_pos, win) = c.geom;
     let (qb, kb, vb) = (dev(&f32b(c.q)), dev(&f32b(c.k)), dev(&f32b(c.v)));
     let mut ob = dev(&vec![0u8; tq * hq * d * 4]);
-    let io = GqaIo {
-        q: qb.ptr() as *const f32,
-        k: kb.ptr() as *const f32,
-        v: vb.ptr() as *const f32,
-        out: ob.ptr_mut() as *mut f32,
-    };
-    // SAFETY: the three inputs are live device buffers of exactly the sizes `gqa_launch` requires,
-    // `ob` is writable and distinct from all three, and all four outlive the join inside `back`.
+
+    // SAFETY: the three inputs are live device buffers of exactly the sizes `attend_launch`
+    // requires, `ob` is writable and distinct from all three (held by `AttendIo::new`'s `&mut`),
+    // and all four outlive the join inside `back`.
     let r = unsafe {
-        gqa_launch(
+        let io = AttendIo::new(&qb, &kb, &vb, &mut ob);
+        attend_launch(
+            launch_gqa_attend,
             io,
             [hq, hkv, d, tq, start_pos, win, ring_cap],
             attn_scale(d),
@@ -199,13 +150,6 @@ fn run(c: &Case<'_>, ring_cap: usize) -> Vec<f32> {
     };
     ok(r, "gqa_attend");
     f32v(&back(&ob))
-}
-
-/// `1/sqrt(head_dim)`, and the argument it takes is the trap: reading `hidden` here instead —
-/// 6656 for 128 — scales every logit by 0.14x and stays fluent. Spelled once so the oracle and
-/// the launch cannot be handed different scales.
-fn attn_scale(d: usize) -> f32 {
-    1.0 / (d as f32).sqrt()
 }
 
 /// The reference attention on the host, with the KV broadcast selectable.
@@ -226,52 +170,30 @@ fn attend_host(c: &Case<'_>, block: bool) -> Vec<f32> {
         let (row, h) = (n / hq, n % hq);
         let pos = start_pos + row;
         let kvh = if block { h / group } else { h % hkv };
-        let slot = Slot {
+        let span = AttendSpan {
             n,
             kvh,
+            // The CAUSAL span: `window_lo`'s strict lower edge, and `pos` as the upper bound.
+            // The drafter's block attend passes a different pair at both ends.
             span: (window_lo(pos, win), pos),
         };
-        out[n * d..][..d].copy_from_slice(&attend_head(c, slot));
+        let ac = AttendCase {
+            q: c.q,
+            k: c.k,
+            v: c.v,
+            hkv,
+            d,
+        };
+        out[n * d..][..d].copy_from_slice(&attend_head(&ac, span));
     }
     out
 }
 
-/// Which output row `attend_head` is computing, which KV head it reads, and the inclusive span
-/// its softmax runs over.
-///
-/// `n` indexes Q and the destination identically — both are `[row][head][d]` — so it is one value
-/// rather than a `(row, h)` pair that a caller could split two ways.
-struct Slot {
-    n: usize,
-    kvh: usize,
-    /// `[lo, pos]`, INCLUSIVE at both ends: the derived causal bound for this row, `pos` included.
-    span: (usize, usize),
-}
-
-/// One (query row, Q head)'s attention output: the softmax over `s.span` applied to V.
-fn attend_head(c: &Case<'_>, s: Slot) -> Vec<f32> {
-    let (_, hkv, d) = c.dims;
-    let scale = attn_scale(d);
-    let (lo, pos) = s.span;
-    let qrow = &c.q[s.n * d..][..d];
-    let logits: Vec<f32> = (lo..=pos)
-        .map(|j| {
-            let kr = &c.k[(j * hkv + s.kvh) * d..][..d];
-            scale * (0..d).map(|i| qrow[i] * kr[i]).sum::<f32>()
-        })
-        .collect();
-    let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let w: Vec<f32> = logits.iter().map(|x| (x - mx).exp()).collect();
-    let denom: f32 = w.iter().sum();
-    let mut dst = vec![0.0f32; d];
-    for (j, wj) in (lo..=pos).zip(&w) {
-        let vr = &c.v[(j * hkv + s.kvh) * d..][..d];
-        for (i, o) in dst.iter_mut().enumerate() {
-            *o += wj / denom * vr[i];
-        }
-    }
-    dst
-}
+// `attn_scale`, `Slot`/`AttendSpan` and `attend_head` MOVED to `common/reference.rs` on
+// 2026-08-17, when M17c's block attend became their second consumer. They were always general
+// enough to share — the span here was already documented as inclusive at both ends — and
+// `build.rs`'s duplication gate is what would have refused the copy. One owner now, and the
+// bidirectional-versus-causal edge distinction is stated where the span type is defined.
 
 /// `max|Δ| / max|reference|` — the metric every Glimmer tolerance is stated in.
 ///
@@ -524,12 +446,23 @@ fn the_gqa_launcher_refuses_what_it_cannot_compute() {
     // launch, at 6 heads x at most 2 rows x head_dim 8 — 96 f32 in and 96 out, well inside the
     // 4096-byte buffer every argument points into. It is nonsense arithmetic over aliased inputs,
     // which is fine: this test reads the return code and nothing else.
-    let io = GqaIo {
+    // The LITERAL form, not `AttendIo::new`: this row set points all four addresses at ONE buffer
+    // on purpose, and `new` takes `&mut` for the destination precisely so the ordinary call sites
+    // cannot do that by accident. A guard table that never launches is the one place aliasing is
+    // the point, so it constructs the fields directly and says so.
+    let io = AttendIo {
         q: operand,
         k: operand,
         v: operand,
         out,
     };
+    // One-argument closure over the fixed launcher and `io`, so the assert below fits a line.
+    // Not cosmetic: at the inline spelling the call exceeded rustfmt's `fn_call_width`, rustfmt
+    // broke it across five lines, and jscpd then reported the resulting loop tail as a 27-token
+    // clone of `kernel_glimmer_pointwise.rs`'s guard table. rustfmt did not create that
+    // duplication — it made visible that two guard tables end in the same four lines — and the
+    // closure is the factoring rather than a reformat reverted.
+    let fire = |dims: [usize; 7]| unsafe { attend_launch(launch_gqa_attend, io, dims, 1.0) };
     for (dims, want, what) in [
         ([0usize, 2, 8, 1, 0, 1, 0], Some(1001), "zero Q heads"),
         (
@@ -568,7 +501,7 @@ fn the_gqa_launcher_refuses_what_it_cannot_compute() {
             "a ring of win + tq - 1, the smallest legal",
         ),
     ] {
-        assert_guard(unsafe { gqa_launch(io, dims, 1.0) }, want, what);
+        assert_guard(fire(dims), want, what);
     }
     device_sync().expect("sync the two accepted gqa dispatches");
 }

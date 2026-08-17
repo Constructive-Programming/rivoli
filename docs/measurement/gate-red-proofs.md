@@ -346,6 +346,47 @@ compiler and, by measurement, invisible to the vendored goldens too (§`drafter_
 `glimmer-reference/drafter-checkpoint.md`). The oracle scoring is the GPU work; the deviceless
 geometry gates are what stand in for it until then.
 
+## 7b. The oracle, and a FALSE GREEN in the census itself (2026-08-17)
+
+`crates/engine/tests/kernel_glimmer_block_attend.rs` landed the same day and **retired §7's
+DEFERRED row within one commit** — the census refused the stale row rather than letting it stand.
+Getting there produced two findings about the gates themselves, both worth more than the arms they
+came from.
+
+**FINDING 1: a legitimate refactor made real coverage invisible, and the census said so.** jscpd
+refused a second per-file launch wrapper (`gqa_attend` and `gqa_block_attend` take the same
+thirteen arguments in the same order, so the two wrappers were a genuine clone), and the factoring
+into `common::attend_launch(launch_x, io, dims, scale)` changed every call site from `launch_x(` to
+`launch_x,`. The census matches `launch_x(`. So **`gqa_attend` — covered since M7 — read as
+UNCOVERED**, and the suite failed. It was right to fail: its claim is about the pattern it can see,
+and the pattern had moved. Two gates pulling in opposite directions is the useful signal, not a
+conflict.
+
+**FINDING 2: the first fix passed the census WITH A STALE ROW, which is a false green in a
+meta-gate.** Widening `covered` to also accept `(launch_x,` looked correct and the suite went
+green — while `gqa_block_attend`'s DEFERRED row was still in place and should have been refused.
+Cause: rustfmt puts `attend_launch(` and its first argument on separate lines whenever the call
+exceeds `fn_call_width`, so `(launch_x,` never appears literally. The pattern was whitespace-
+sensitive and the formatter decided whether the gate could see anything. Fixed by matching against
+a **whitespace-stripped** copy of the corpus. **A green that arrived from a pattern nothing
+guaranteed the formatter would preserve is exactly the class this file's opening rule is about.**
+
+The `(` before the name is load-bearing anti-vacuity, not punctuation: a bare `launch_x,` is
+matched by the `use` list at the top of every oracle file, so importing a launcher would read as
+testing it.
+
+| # | plant | result |
+|---|---|---|
+| P21 | both call sites neutralised, the `use` import kept | *(half-applied — the two sites differ in indentation and only one was replaced; `grep -c` showed 2 references left, and the run's `exit=0` was NOT a proof)* |
+| P21b | the same, verified to have left exactly one reference | red — `1 kernel(s) have a launcher … : gqa_block_attend` |
+
+**P21 is the fourth failed plant in this file and the second of its exact kind.** The plant reported
+`exit=0` with the suite green, which is indistinguishable from "the import DOES count and the gate
+is vacuous" — the opposite of the truth. What caught it was counting references after the edit and
+reading 2 where 1 was required. That is the opening rule's first clause, applied: **observe that the
+plant changed the tree, and changed the part that matters.** P21b prints the before/after count for
+that reason.
+
 **One duplication note, since no gate will raise it.** `gqa_block_attend` shares its tile loop and
 online-softmax body with `gqa_attend` and differs in the bound, the absent ring, and `kv_len`.
 jscpd cannot see it (`.hip` is unscanned) and `hip_attn.rs`'s macro region is exempt by an ignore
