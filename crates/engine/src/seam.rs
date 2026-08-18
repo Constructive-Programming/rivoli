@@ -193,6 +193,10 @@ pub struct PoolKnobs<'a> {
     pub copy_by_kernel: bool,
     /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
     pub arena_refresh: bool,
+    /// `--direct-vmm-dma`: no bounce arena, no H2D copy — the read DMAs into the pool slot.
+    /// The diagnostic arm for whether the arena is the LOCUS of the nondeterminism defect
+    /// or only where its repair landed. Measurably slower; see `Streamer::bounce`.
+    pub direct_vmm_dma: bool,
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -486,6 +490,7 @@ fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_>
         pinned_coherent: knobs.pinned_coherent,
         copy_by_kernel: knobs.copy_by_kernel,
         arena_refresh: knobs.arena_refresh,
+        direct_vmm_dma: knobs.direct_vmm_dma,
         capacity,
         cache_policy: knobs.cache_policy,
         two_q: knobs.two_q,

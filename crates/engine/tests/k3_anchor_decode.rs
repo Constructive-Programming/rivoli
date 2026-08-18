@@ -511,9 +511,14 @@ fn open_engine<'c>(
     let unit = f4_expert_stride(cfg.text.expert_in, cfg.text.moe_inter);
     let floor = ok(safetensors_bytes(dir, None), "file bytes") + (64 << 20) + 2 * unit;
     let pin = PinCfg {
-        // Stock allocation: a fixture must not silently test the candidate fix.
+        // Stock allocation AND the stock destination: a fixture must not silently test a
+        // candidate fix. All four are the shipped defaults — `arena_refresh` has been a
+        // `PinCfg` field since 41f6f3d and this initializer was never updated, so
+        // `clippy --all-targets` was red on this branch before `direct_vmm_dma` arrived.
         pinned_coherent: false,
         copy_by_kernel: false,
+        arena_refresh: false,
+        direct_vmm_dma: false,
         capacity: floor + extra_units * unit + 512,
         cache_policy: "2q",
         two_q: rivoli_core::cache::TwoQSplit::default(),

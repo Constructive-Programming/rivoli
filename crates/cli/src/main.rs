@@ -215,10 +215,33 @@ struct Args {
     /// the staging hand-out (`slot_stalls` measured 0 on diverging pairs).
     ///
     /// Not behind a feature, for the same reason as `--copy-by-kernel`: the acceptance protocol
-    /// compares two release binaries differing in exactly this flag. Costs ~10% of decode
-    /// throughput — measure it on the arm, do not quote this number.
+    /// compares two release binaries differing in exactly this flag. Costs **1-3%** of decode
+    /// throughput (2.65 tok/s against 2.70-2.73 at 1536 tokens, measured 2026-08-18 — the ~10%
+    /// this said before the protocol ran was the PROBE fold, which also hashed and wrote a 19 MB
+    /// log per run). Measure it on the arm rather than quoting either number.
     #[arg(long)]
     arena_refresh: bool,
+
+    /// DIAGNOSTIC: DMA each O_DIRECT read straight into its pool slot — no staging arena, no
+    /// H2D copy. Restores the `--direct-vmm-dma` mechanism deleted 2026-08-01.
+    ///
+    /// **Not a shipping mode, and not a candidate.** Re-measured 2026-08-18 on kernel 6.18.39 /
+    /// ROCm 7.14 with `docs/measurement/probes/fetch_dest.hip`: DMA into the VMM pool runs
+    /// **6.4 GB/s** against the pinned arena's **13.3** at the engine's queue depth with the GPU
+    /// busy, reproducing the 2.19x gap (5.66 vs 12.4) that deleted the flag. The pre-registered
+    /// bar for recovering it as a real mode was 11.4 GB/s and it missed by 44%.
+    ///
+    /// What it is FOR: it is the only arm with NO ARENA, so it answers by removal what
+    /// `--arena-refresh` only answers by repair — whether the arena is the LOCUS of the GLM
+    /// nondeterminism defect (`glm-bug.md`) or merely where a working mitigation happened to
+    /// land. Divergence under this flag would mean the missing guarantee is downstream of the
+    /// arena entirely, and would retire `--arena-refresh`'s explanation along with it.
+    ///
+    /// Refuses to combine with `--arena-refresh`, `--copy-by-kernel` and `--pinned-coherent`:
+    /// all three act on an arena this mode does not allocate, and a silently-ignored knob is how
+    /// an arm gets attributed to the wrong cause.
+    #[arg(long)]
+    direct_vmm_dma: bool,
 
     /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
     /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
@@ -528,6 +551,7 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
         pinned_coherent: a.pinned_coherent,
         copy_by_kernel: a.copy_by_kernel,
         arena_refresh: a.arena_refresh,
+        direct_vmm_dma: a.direct_vmm_dma,
     }
 }
 

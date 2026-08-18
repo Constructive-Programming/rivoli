@@ -78,6 +78,10 @@ pub struct PoolCfg<'a> {
     pub copy_by_kernel: bool,
     /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
     pub arena_refresh: bool,
+    /// `--direct-vmm-dma`: no bounce arena and no H2D copy — the O_DIRECT read DMAs straight
+    /// into the pool slot. The diagnostic arm for the GLM nondeterminism defect; measurably
+    /// the slower mechanism. See `crate::fetch::stream::Streamer::bounce`.
+    pub direct_vmm_dma: bool,
 }
 
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
@@ -262,6 +266,7 @@ impl RoutedPool {
             cfg.pinned_coherent,
             cfg.copy_by_kernel,
             cfg.arena_refresh,
+            !cfg.direct_vmm_dma,
         )?)?;
         Ok(Self {
             buf,

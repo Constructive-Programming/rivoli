@@ -259,9 +259,26 @@ pub struct Streamer {
     /// Per-read pinned-bounce stride: the largest aligned superset any single read
     /// may deliver. A `queue` whose superset exceeds this can't fit its bounce slot.
     span: usize,
+    /// BOUNCE (the default): reads land in [`Streamer::arena`] and are async-copied into
+    /// the pool slot. `false` is DIRECT — `--direct-vmm-dma`, recovered 2026-08-18 as a
+    /// DIAGNOSTIC and not as a shipping mode.
+    ///
+    /// **It is measurably the worse mechanism and is not a candidate.** Re-derived on
+    /// kernel 6.18.39 / ROCm 7.14 with `docs/measurement/probes/fetch_dest.hip`: O_DIRECT
+    /// DMA into the VMM pool runs **6.4 GB/s** against **13.3** into the pinned arena at the
+    /// engine's queue depth with the GPU busy — a 2.08x gap that reproduces the 2026-07-30
+    /// measurement (5.66 vs 12.4, 2.19x) which deleted the flag in the first place. The
+    /// pre-registered bar for recovering it as a real mode was 11.4 GB/s.
+    ///
+    /// What it is FOR: direct mode has no arena, so it is the only arm that can say whether
+    /// the arena is the LOCUS of the GLM nondeterminism defect or merely where the repair
+    /// happened to land. `--arena-refresh` mitigates that defect without explaining it
+    /// (`glm-bug.md` §14); this arm answers the question by REMOVAL instead of by repair.
+    /// Divergence here would mean the missing guarantee is downstream of the arena entirely.
+    bounce: bool,
     /// Staging arena, `entries * span` bytes: read slot `user_data` is
-    /// `arena + user_data * span`. HIP-pinned under `rocm`, a host-visible `vk::Buf`
-    /// under `vulkan` — see [`stage`]. Never null: every read stages through it.
+    /// `arena + user_data * span`. HIP-pinned under `rocm` — see [`stage`].
+    /// Null in DIRECT mode, where nothing stages; never null in bounce mode.
     arena: *mut u8,
     /// Per-SLOT VMM destination + aligned read length. `reap` copies
     /// `nbytes` from the arena slot into `dst`. Indexed by staging slot — which is the
@@ -313,6 +330,7 @@ impl Streamer {
         coherent: bool,
         by_kernel: bool,
         arena_refresh: bool,
+        bounce: bool,
     ) -> Result<Self> {
         // The bounce arena has exactly `entries` slots and `queue` indexes it by the
         // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
@@ -330,43 +348,71 @@ impl Streamer {
             .build(entries)
             .or_else(|_| IoUring::new(entries))?;
 
-        let arena_bytes = entries as usize * span;
-        let arena = stage::alloc(arena_bytes, coherent);
-        // Logged because it is the one allocation whose MEMORY TYPE is under investigation: a run's
-        // record has to say which it made, or its result cannot be attributed.
-        // REQUESTED *and* RETURNED. Every arm of the coherence experiment is read off this line,
-        // so it reports the observation and not the intent; a `?` means the runtime refused to say.
-        let got = stage::flags(arena);
-        tracing::info!(
-            "bounce arena: {:.0} MiB | requested {} | returned flags {} coherent-bit {}",
-            arena_bytes as f64 / (1u64 << 20) as f64,
-            match coherent {
-                true => "hipHostMallocCoherent",
-                false => "hipHostMallocDefault",
-            },
-            got.map_or("?".into(), |(f, _)| format!("0x{f:x}")),
-            got.map_or("?".into(), |(_, c)| c.to_string()),
-        );
-        // The one case that invalidates an arm outright: the flag was asked for and did not stick.
-        // Loud, because it reads in a log exactly like a fix that did not work.
-        if let Some((_, c)) = got
-            && c != coherent
-        {
-            tracing::error!(
-                "bounce arena: asked coherent={coherent} but the runtime returned coherent={c} — \
-                 this arm did NOT apply the intervention it claims to test"
-            );
-        }
-        ensure!(
-            !arena.is_null(),
-            "bounce arena alloc failed (entries={entries}, {:.0} MiB)",
-            arena_bytes as f64 / (1u64 << 20) as f64
-        );
+        // The arena is the ONE thing DIRECT mode changes: it allocates none, and that
+        // absence is the intervention. Everything below is shared, so there is exactly one
+        // `Self` — a second one is a jscpd clone and, worse, a place for the two modes to
+        // drift apart.
+        let arena = match bounce {
+            false => {
+                // The three staging knobs act on an arena this mode does not have. The CLI
+                // refuses the combination; refused here too, because a silently-ignored
+                // knob is how an arm gets attributed to the wrong cause.
+                ensure!(
+                    !arena_refresh && !by_kernel && !coherent,
+                    "--direct-vmm-dma has no bounce arena, so --arena-refresh / \
+                     --copy-by-kernel / --pinned-coherent cannot apply — pass none of them"
+                );
+                tracing::info!(
+                    "DIRECT mode (--direct-vmm-dma): NO bounce arena, no H2D copy — every \
+                     read DMAs straight into its pool slot. Diagnostic arm; measured 2.08x \
+                     slower than bounce (probes/fetch_dest.hip, 2026-08-18)"
+                );
+                std::ptr::null_mut()
+            }
+            true => {
+                let arena_bytes = entries as usize * span;
+                let arena = stage::alloc(arena_bytes, coherent);
+                // Logged because it is the one allocation whose MEMORY TYPE is under
+                // investigation: a run's record has to say which it made, or its result
+                // cannot be attributed. REQUESTED *and* RETURNED — every arm of the
+                // coherence experiment is read off this line, so it reports the observation
+                // and not the intent; a `?` means the runtime refused to say.
+                let got = stage::flags(arena);
+                tracing::info!(
+                    "bounce arena: {:.0} MiB | requested {} | returned flags {} coherent-bit {}",
+                    arena_bytes as f64 / (1u64 << 20) as f64,
+                    match coherent {
+                        true => "hipHostMallocCoherent",
+                        false => "hipHostMallocDefault",
+                    },
+                    got.map_or("?".into(), |(f, _)| format!("0x{f:x}")),
+                    got.map_or("?".into(), |(_, c)| c.to_string()),
+                );
+                // The one case that invalidates an arm outright: the flag was asked for and
+                // did not stick. Loud, because it reads in a log exactly like a fix that
+                // did not work.
+                if let Some((_, c)) = got
+                    && c != coherent
+                {
+                    tracing::error!(
+                        "bounce arena: asked coherent={coherent} but the runtime returned \
+                         coherent={c} — this arm did NOT apply the intervention it claims to test"
+                    );
+                }
+                ensure!(
+                    !arena.is_null(),
+                    "bounce arena alloc failed (entries={entries}, {:.0} MiB)",
+                    arena_bytes as f64 / (1u64 << 20) as f64
+                );
+                arena
+            }
+        };
 
         Ok(Self {
             ring: ManuallyDrop::new(ring),
             entries,
             span,
+            bounce,
             arena,
             dst: vec![std::ptr::null_mut(); entries as usize],
             nbytes: vec![0; entries as usize],
@@ -376,6 +422,7 @@ impl Streamer {
             // The sink is a pinned-arena word, not a device allocation: the kernel's store is
             // never taken, so the address only has to be writable and mapped. Reusing the arena
             // avoids an allocation whose lifetime would have to be argued against teardown order.
+            // Null in DIRECT mode, where `arena_refresh` is refused above and nothing reads it.
             refresh_sink: arena.cast::<u64>(),
             issued: [0; 2],
             min_res: vec![0; entries as usize],
@@ -423,11 +470,18 @@ impl Streamer {
             "staging slot {ud} out of range (entries {})",
             self.entries
         );
-        // The read lands in this slot's arena window; `reap` copies it on to `dst`.
+        // BOUNCE: the read lands in this slot's arena window and `reap` copies it on to
+        // `dst`. DIRECT: the read lands in `dst` — the pool slot — and there is nothing to
+        // copy. `dst`'s ALIGN-alignment (asserted above) is what makes the direct case a
+        // legal O_DIRECT destination; the pool maintains it via `routed::pool_budget`.
+        //
         // SAFETY: `ud < entries` (checked above), and the arena is `entries*span` with
         // every read's `nbytes <= span` (checked above), so this slot's window is owned
         // and in bounds.
-        let into = unsafe { self.arena.add(ud as usize * self.span) };
+        let into = match self.bounce {
+            true => unsafe { self.arena.add(ud as usize * self.span) },
+            false => dst,
+        };
         let read = opcode::Read::new(types::Fd(fd), into, nbytes as u32)
             .offset(ab as u64)
             .build()
@@ -521,6 +575,13 @@ impl Streamer {
             "short read on expert slot {ud}: {res} < {} useful bytes",
             self.min_res[ud]
         );
+        // DIRECT: the drive wrote the pool slot itself. No refresh, no copy, and no folds —
+        // the `bh` fold hashes the arena, which does not exist here, and `sc` hashes a slot
+        // no copy ever wrote. The divergence probe is a bounce-mode instrument by
+        // construction, so this arm is measured with the determinism gate instead.
+        if !self.bounce {
+            return Ok(ud);
+        }
         // SAFETY: `ud < entries`, and every read's `nbytes <= span`, so this slot's arena window
         // is owned and in bounds.
         let src = unsafe { self.arena.add(ud * self.span) };
@@ -706,10 +767,12 @@ impl Drop for Streamer {
         // SAFETY: `ring` is never touched again; `ManuallyDrop::drop` runs exactly once
         // (single owner, no Clone).
         unsafe { ManuallyDrop::drop(&mut self.ring) };
-        // SAFETY: `arena` came from `stage::alloc` and `new` refuses to
+        // SAFETY: in bounce mode `arena` came from `stage::alloc` and `new` refuses to
         // build a `Streamer` around a null one, so this is a live allocation; single
-        // owner, no Clone, so it is freed exactly once.
-        unsafe { stage::free(self.arena) };
+        // owner, no Clone, so it is freed exactly once. DIRECT mode allocated none.
+        if self.bounce {
+            unsafe { stage::free(self.arena) };
+        }
     }
 }
 

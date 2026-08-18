@@ -123,7 +123,9 @@ fn main() -> Result<()> {
         stride as f64 / (1u64 << 20) as f64
     );
 
-    let mut streamer = Streamer::new(SLOTS, slot_span(stride), coherent, by_kernel, refresh)?;
+    // `true` = bounce. The repro exists to exercise the arena hop, so the arena-less
+    // `--direct-vmm-dma` destination is not one of its arms by construction.
+    let mut streamer = Streamer::new(SLOTS, slot_span(stride), coherent, by_kernel, refresh, true)?;
     let fetch = rivoli_backend::Stream::fetch()?;
     // One destination per staging slot, so a batch's copies never share a destination — the engine
     // has the same property (a slot's ticket gates its reuse).

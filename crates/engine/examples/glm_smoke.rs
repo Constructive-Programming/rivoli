@@ -39,6 +39,9 @@ fn main() -> Result<()> {
             cache_policy: "2q",
             two_q: rivoli_core::cache::TwoQSplit::default(),
             trace_path: None,
+            // Bounce, i.e. the shipped destination. `--direct-vmm-dma` is a diagnostic arm
+            // driven from the CLI; the parity gate must stay on the historical path.
+            direct_vmm_dma: false,
             // The historical allocation. This example is the parity gate's arm and must stay the
             // stock configuration; `--pinned-coherent` is evaluated through the CLI.
             pinned_coherent: false,

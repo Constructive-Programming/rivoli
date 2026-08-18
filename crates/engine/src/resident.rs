@@ -248,6 +248,11 @@ pub struct PinCfg<'a> {
     pub copy_by_kernel: bool,
     /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
     pub arena_refresh: bool,
+    /// `--direct-vmm-dma`: DMA the O_DIRECT read straight into the pool slot, with no
+    /// staging arena and no H2D copy. A DIAGNOSTIC for the GLM nondeterminism defect (it
+    /// deletes the arena rather than repairing it) — not a shipping mode: re-measured
+    /// 2026-08-18 at 6.4 GB/s against bounce's 13.3. See `Streamer::bounce`.
+    pub direct_vmm_dma: bool,
 }
 
 /// How many experts one `submit` carries, and what one costs — the shape an arm's MoE
@@ -372,6 +377,7 @@ impl<'a> PoolPlan<'a> {
             pinned_coherent: pin.pinned_coherent,
             copy_by_kernel: pin.copy_by_kernel,
             arena_refresh: pin.arena_refresh,
+            direct_vmm_dma: pin.direct_vmm_dma,
             budget,
             top_k: b.top_k,
             max_batch: b.max_batch,
