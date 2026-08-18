@@ -80,6 +80,43 @@ fn folds_parse_refuses_what_it_cannot_honour() {
     // The two positions are independent: one may be armed without the other.
     let both = Folds::parse("bh-nop,sc-line").expect("one arm at each position");
     assert_eq!((both.bh, both.sc), (FoldProbe::Nop, FoldProbe::Line));
+
+    // THE STRIDE SWEEP, which is the next experiment: `-line:N` reads one f32 every N elements.
+    //
+    // The default is one 128 B line, and it is a DEFAULT rather than a constant because the
+    // granularity of the effect is unknown — `bh-line` at 32 touched every 128 B line and still
+    // diverged while `bh` at stride 1 is clean, so "every line" is not the sufficient condition and
+    // a sweep is what names it. The label carries the stride, because two strides are two
+    // experiments and the comparator must refuse to mix them.
+    assert_eq!(
+        Folds::default().line_stride,
+        32,
+        "the default sampling stride is one 128 B line (measured in-tree), NOT the 0 a derived \
+         Default would give — a 0 stride reads nothing and its clean result would be a false green"
+    );
+    let sweep = Folds::parse("bh-line:16").expect("bh-line:16");
+    assert_eq!((sweep.bh, sweep.line_stride), (FoldProbe::Line, 16));
+    assert_eq!(
+        sweep.label(),
+        "bh-line:16",
+        "the stride is part of the config"
+    );
+    assert_eq!(
+        Folds::parse("bh-line").expect("default stride").label(),
+        "bh-line:32"
+    );
+    assert!(
+        Folds::parse("bh-line:0").is_err(),
+        "stride 0 reads nothing and must refuse, not silently no-op"
+    );
+    assert!(
+        Folds::parse("bh-line:x").is_err(),
+        "a non-numeric stride refuses"
+    );
+    assert!(
+        Folds::parse("bh-nop:16").is_err(),
+        "a stride on a non-sampling arm is a spec that cannot do what it says"
+    );
     assert!(
         Folds::parse("").is_err() && Folds::parse("  ").is_err(),
         "an explicitly EMPTY list must refuse — omit the flag to ask for the light probe"
@@ -115,6 +152,7 @@ fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
         bh: FoldProbe::Full,
         sc: FoldProbe::Full,
         se: true,
+        ..Default::default()
     };
     let field = |row: &str, i: usize| row.split_whitespace().nth(i).expect("field").to_string();
     // One helper for "every fetch-path column is unmeasured", because the two sites that assert
@@ -163,6 +201,7 @@ fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
             bh: FoldProbe::Off,
             sc: arm,
             se: false,
+            ..Default::default()
         };
         assert_eq!(
             field(&format_row(7, 1, 4, &w, cols(1), f), sc),
@@ -178,6 +217,7 @@ fn an_unmeasured_column_prints_a_dash_and_never_a_zero() {
         bh: FoldProbe::Off,
         sc: FoldProbe::Line,
         se: false,
+        ..Default::default()
     };
     let lr = field(&format_row(7, 1, 4, &w, cols(1), line), sc);
     assert!(

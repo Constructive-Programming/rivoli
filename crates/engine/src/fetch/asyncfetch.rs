@@ -127,6 +127,8 @@ pub struct FetchFolds {
     /// read merely an accident that works.
     pub bh_mode: FoldProbe,
     pub sc: *mut u64,
+    /// Element stride for the `-line` arms, carried per read so `reap` needs no probe handle.
+    pub line_stride: usize,
     /// A slot-sized scratch buffer the no-touch arms fold instead of the pool slot. Null unless an
     /// arm needs it; never the destination of any copy, so folding it cannot perturb the payload.
     pub decoy: *const f32,
@@ -152,6 +154,8 @@ impl FetchFolds {
         bh_mode: FoldProbe::Off,
         sc: std::ptr::null_mut(),
         decoy: std::ptr::null(),
+        // 1, not 0: `OFF` must never describe a fold that reads nothing while claiming to sample.
+        line_stride: 1,
         sc_mode: FoldProbe::Off,
     };
 

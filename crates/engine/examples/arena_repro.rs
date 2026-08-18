@@ -1,6 +1,6 @@
 //! **The minimal exhibit for the bounce-arena hop, at rate.**
 //!
-//! Usage: `arena_repro <layer-file> <iters> [stride-bytes] [--coherent]`
+//! Usage: `arena_repro <layer-file> <iters> [stride-bytes] [--coherent] [--copy-by-kernel]`
 //! Run under `flock /var/run/sys-gpu.lock` — see "GPU tenancy" below.
 //!
 //! Phase 1 localised GLM's nondeterminism to the pinned bounce arena: every probe cell that does
@@ -78,6 +78,9 @@ fn main() -> Result<()> {
     let args = common::start();
     // jscpd:ignore-end
     let coherent = args.iter().any(|a| a == "--coherent");
+    // Phase 3B in the repro too: the same candidate fix, so a firing repro can be re-run against it
+    // without touching the engine.
+    let by_kernel = args.iter().any(|a| a == "--copy-by-kernel");
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [file, iters, rest @ ..] = pos.as_slice() else {
         bail!("usage: arena_repro <layer-file> <iters> [stride-bytes] [--coherent]");
@@ -117,7 +120,7 @@ fn main() -> Result<()> {
         stride as f64 / (1u64 << 20) as f64
     );
 
-    let mut streamer = Streamer::new(SLOTS, slot_span(stride), coherent)?;
+    let mut streamer = Streamer::new(SLOTS, slot_span(stride), coherent, by_kernel)?;
     let fetch = rivoli_backend::Stream::fetch()?;
     // One destination per staging slot, so a batch's copies never share a destination — the engine
     // has the same property (a slot's ticket gates its reuse).
@@ -205,13 +208,16 @@ fn main() -> Result<()> {
     // The bound is the point of a clean run, so it is printed rather than left to the reader: at 0
     // events over N reads the 95% upper bound on the per-read rate is 3/N (the rule-of-three).
     println!(
-        "arena_repro: {reads} reads, {bad} MISMATCHES, {:.0} reads/s, {:.1} s, arena={}",
+        "arena_repro: {reads} reads, {bad} MISMATCHES, {:.0} reads/s, {:.1} s, arena={}, \
+         copies=[memcpy {} / kernel {}]",
         reads as f64 / secs,
         secs,
         match coherent {
             true => "hipHostMallocCoherent",
             false => "hipHostMallocDefault",
-        }
+        },
+        streamer.copies_issued()[0],
+        streamer.copies_issued()[1],
     );
     if bad == 0 {
         println!(

@@ -114,10 +114,48 @@ extern "C" void rivoli_pinned_free(void* p) {
 // Async host->device copy on `stream`: bounce slot -> VMM expert slot. The caller arms
 // a signal on the same stream, so the load future resolves when the COPY lands (not
 // merely the NVMe read). Returns 0 or HIP_ERR_BASE - hipError.
+// COPY BY KERNEL instead of by the copy engine — Phase 3B, a candidate FIX.
+//
+// `hipMemcpyAsync` above dispatches to whatever path the runtime picks, typically an SDMA/blit
+// engine. This does the same move as an ordinary shader read+write, so it goes through the normal
+// vector-memory path with a kernel's own acquire at dispatch. The distinction is the whole
+// experiment: the ablation matrix says suppression needs a device-side READ of the arena's own
+// bytes, in bulk, and nothing weaker — which is what a kernel copy does and what a copy engine may
+// not.
+//
+// `uint4` (16 B) per lane: the arena and every pool slot are `VQ_ALIGN`-aligned and the byte count
+// is a multiple of the O_DIRECT block, so the vector width always divides the extent and no tail
+// case exists. Grid-stride with a bounded grid, like the folds.
+extern "C" __global__ void copy_h2d_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src,
+                                          unsigned long long n4) {
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// ONE entry point with the path as an argument, not two entry points. The two are one operation
+// with a knob — the acceptance protocol switches between them by flag — and splitting them gave the
+// Rust side two identical 4-parameter externs and two identical call arms, which the duplication
+// gate reported twice. The branch belongs here, where both HIP calls already live.
 extern "C" int rivoli_memcpy_h2d_async(void* dst, const void* src, unsigned long long n,
-                                       void* stream) {
-    hipError_t e = hipMemcpyAsync(dst, src, (size_t)n, hipMemcpyHostToDevice,
-                                  (hipStream_t)stream);
+                                       void* stream, int by_kernel) {
+    hipError_t e;
+    if (by_kernel) {
+        // 16 B granularity is a hard requirement, not a fast path: a remainder would be silently
+        // dropped and the slot would hold a short expert. Refused loudly instead. Every caller
+        // passes an O_DIRECT-block multiple, so this cannot fire in the engine.
+        if (n == 0 || (n % sizeof(uint4)) != 0) return 1001;
+        unsigned long long n4 = n / sizeof(uint4);
+        unsigned long long blocks = (n4 + 255) / 256;
+        if (blocks > 1024) blocks = 1024;
+        hipGetLastError();
+        hipLaunchKernelGGL(copy_h2d_kernel, dim3((unsigned)blocks), dim3(256), 0,
+                           (hipStream_t)stream, (uint4*)dst, (const uint4*)src, n4);
+        e = hipGetLastError();
+    } else {
+        e = hipMemcpyAsync(dst, src, (size_t)n, hipMemcpyHostToDevice, (hipStream_t)stream);
+    }
     return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
 }
 

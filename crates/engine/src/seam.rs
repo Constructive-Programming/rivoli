@@ -188,6 +188,9 @@ pub struct PoolKnobs<'a> {
     /// against a stock one. It applies to every routed arm because every routed arm has the same
     /// arena and the same ordering gap (`kernels/async.hip::rivoli_pinned_alloc`).
     pub pinned_coherent: bool,
+    /// `--copy-by-kernel`: Phase 3B's candidate fix, on the same footing as `pinned_coherent` —
+    /// a flag rather than a feature, so the protocol can compare two release binaries.
+    pub copy_by_kernel: bool,
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -479,6 +482,7 @@ impl<'a> Engine<'a> {
 fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_> {
     crate::resident::PinCfg {
         pinned_coherent: knobs.pinned_coherent,
+        copy_by_kernel: knobs.copy_by_kernel,
         capacity,
         cache_policy: knobs.cache_policy,
         two_q: knobs.two_q,

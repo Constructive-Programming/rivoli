@@ -86,11 +86,14 @@ mod stage {
             pub fn rivoli_pinned_coherent_bit() -> u32;
             pub fn rivoli_pinned_free(p: *mut c_void);
             /// Async H2D copy on `stream` (bounce slot → VMM slot). 0 ok, else negative.
+            /// `by_kernel != 0` moves the bytes with an ordinary shader copy instead of the copy
+            /// engine — Phase 3B. One entry point, because the two are one operation with a knob.
             pub fn rivoli_memcpy_h2d_async(
                 dst: *mut c_void,
                 src: *const c_void,
                 n: u64,
                 stream: *mut c_void,
+                by_kernel: i32,
             ) -> i32;
         }
     }
@@ -136,7 +139,10 @@ mod stage {
         unsafe { ffi::rivoli_pinned_free(p as *mut c_void) };
     }
 
-    /// ASYNC `hipMemcpyAsync` on the fetch stream: it returns before the bytes land, and
+    /// ASYNC bounce->slot copy on the fetch stream — `hipMemcpyAsync` by default, or an ordinary
+    /// shader copy when `by_kernel` (Phase 3B, a candidate fix; see `kernels/async.hip`).
+    ///
+    /// ORIGINALLY: `hipMemcpyAsync` on the fetch stream: it returns before the bytes land, and
     /// the read's `Signal` (armed on the same stream) is what says they have. This is the
     /// op the load↔compute overlap is built on.
     ///
@@ -148,10 +154,17 @@ mod stage {
         src: *const u8,
         n: usize,
         stream: *mut c_void,
+        by_kernel: bool,
     ) -> Result<(), String> {
         // SAFETY: the caller's contract, forwarded.
         let rc = unsafe {
-            ffi::rivoli_memcpy_h2d_async(dst as *mut c_void, src as *const c_void, n as u64, stream)
+            ffi::rivoli_memcpy_h2d_async(
+                dst as *mut c_void,
+                src as *const c_void,
+                n as u64,
+                stream,
+                i32::from(by_kernel),
+            )
         };
         if rc == 0 {
             Ok(())
@@ -223,6 +236,16 @@ pub struct Streamer {
     nbytes: Vec<u32>,
     /// Per-SLOT divergence-fold targets, parallel to `dst`. [`FetchFolds::OFF`] = folds off.
     fold: Vec<FetchFolds>,
+    /// Phase 3B: move the bytes with a shader copy instead of `hipMemcpyAsync`.
+    by_kernel: bool,
+    /// Copies actually issued, per path — `[memcpy, kernel]`.
+    ///
+    /// **A COUNT, not the flag.** Two rounds of this investigation were spent on an arm that could
+    /// not be believed because nothing observed whether the intervention applied: the log recorded
+    /// the intent and the runtime was free to do something else. An intervention that never applied
+    /// and one that does not work produce the same red, so every candidate fix now reports what it
+    /// DID.
+    issued: [u64; 2],
     /// Per-SLOT minimum completion length (sub-block offset + useful len). `reap` compares
     /// the completion `res` against it so a real mid-file short read is caught while
     /// EOF-padding truncation is tolerated.
@@ -241,7 +264,7 @@ impl Streamer {
     /// a fine-grained arena (see [`stage::alloc`]).
     /// Always allocates the `entries * span` host staging arena — it is the only
     /// destination path (see this module's header).
-    pub fn new(entries: u32, span: usize, coherent: bool) -> Result<Self> {
+    pub fn new(entries: u32, span: usize, coherent: bool, by_kernel: bool) -> Result<Self> {
         // The bounce arena has exactly `entries` slots and `queue` indexes it by the
         // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
         // be a power of two for the arena to match the SQ capacity — otherwise a push
@@ -299,6 +322,8 @@ impl Streamer {
             dst: vec![std::ptr::null_mut(); entries as usize],
             nbytes: vec![0; entries as usize],
             fold: vec![FetchFolds::OFF; entries as usize],
+            by_kernel,
+            issued: [0; 2],
             min_res: vec![0; entries as usize],
         })
     }
@@ -486,7 +511,7 @@ impl Streamer {
                 crate::fetch::asyncfetch::FoldProbe::Off => (src as *const f32, 0, 1),
                 crate::fetch::asyncfetch::FoldProbe::Full => (src as *const f32, n, 1),
                 crate::fetch::asyncfetch::FoldProbe::Line => {
-                    (src as *const f32, n, crate::fetch::asyncfetch::LINE_F32)
+                    (src as *const f32, n, self.fold[ud].line_stride)
                 }
                 crate::fetch::asyncfetch::FoldProbe::Decoy => (self.fold[ud].decoy, n, 1),
                 crate::fetch::asyncfetch::FoldProbe::Nop => (self.fold[ud].decoy, 1, 1),
@@ -514,10 +539,19 @@ impl Streamer {
         // read's signal fires; the arena slot holds the just-read bytes; `stream` is
         // live. Copies the full aligned `nbytes` (a trailing-EOF short read leaves
         // stale bytes only past the useful window, never read).
-        let r = unsafe { stage::copy_to_slot(self.dst[ud], src, self.nbytes[ud] as usize, stream) };
+        let r = unsafe {
+            stage::copy_to_slot(
+                self.dst[ud],
+                src,
+                self.nbytes[ud] as usize,
+                stream,
+                self.by_kernel,
+            )
+        };
         if let Err(e) = r {
             anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
         }
+        self.issued[usize::from(self.by_kernel)] += 1;
         #[cfg(feature = "corruption-probe")]
         if self.fold[ud].sc_armed() {
             // THE POST-COPY POSITION — the one measured to suppress the divergence. Three
@@ -541,9 +575,7 @@ impl Streamer {
                 crate::fetch::asyncfetch::FoldProbe::Full => (slot, n, 1),
                 // Every cache line of the slot, ~1/32 of its bytes — a sweep that COVERS the slot,
                 // so unlike reading one line at the front it could actually be a fix.
-                crate::fetch::asyncfetch::FoldProbe::Line => {
-                    (slot, n, crate::fetch::asyncfetch::LINE_F32)
-                }
+                crate::fetch::asyncfetch::FoldProbe::Line => (slot, n, self.fold[ud].line_stride),
                 // Same size, same bandwidth, same duration — a buffer that is NOT the slot.
                 crate::fetch::asyncfetch::FoldProbe::Decoy => (self.fold[ud].decoy, n, 1),
                 // Same launch and the same stream-boundary cache maintenance, ~no work.
@@ -580,6 +612,12 @@ impl Streamer {
         let mut cq = self.ring.completion();
         cq.sync();
         cq.next().map(|c| (c.result(), c.user_data()))
+    }
+
+    /// Copies issued per path, `[hipMemcpyAsync, shader kernel]` — the OBSERVATION a candidate-fix
+    /// arm is read off, as against the flag it was asked for.
+    pub fn copies_issued(&self) -> [u64; 2] {
+        self.issued
     }
 
     /// Staging-slot count — the ring's capacity, and the number of per-slot timelines the

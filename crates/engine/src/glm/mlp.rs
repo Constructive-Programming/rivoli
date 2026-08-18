@@ -330,6 +330,7 @@ impl GlmEngine<'_> {
                         _ => p.fold_slot(l, crate::probe::Q::Sc)?,
                     },
                     decoy: p.decoy(),
+                    line_stride: f.line_stride,
                     sc_mode: f.sc,
                 }
             }

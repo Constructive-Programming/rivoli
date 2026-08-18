@@ -1,7 +1,7 @@
 ---
 status: live
 scope: glm
-verdict: THE DEFECT IS IN THE BOUNCE ARENA, and Phase 1 named it by ablation: every probe cell that does NOT read the pinned arena diverges (light @169, se @301, sc @236, sc-nop @292, xa+ac @292) and both cells that DO read it are clean over 1536 tokens. Not a slowdown artifact — `bh` suppresses at 2.19-2.39 tok/s while the light probe diverges at 1.61-1.84. The post-copy slot read (`sc`) does NOT suppress, refuting the visibility-at-the-copy story. THE MISSING GUARANTEE, named: the arena is `hipHostMalloc(hipHostMallocDefault)`, io_uring's CQE establishes the NVMe DMA's writes are visible TO THE CPU (which is why btrfs verifies clean), and `Streamer::reap` then enqueues `hipMemcpyAsync` back to back — but that copy's reader is the GPU's copy path, so the only ordering present is about the wrong agent. Fine-grained host memory provides it by snooping; coarse-grained does not. A CPU-side fence is NOT a fix (it orders the CPU, which is neither producer nor consumer, and whose view was already correct). Candidates, A/B-able: `--pinned-coherent` (architectural — changes the memory type; measure the bandwidth cost) and `--divergence-folds bh-nop` (a bare launch's dispatch acquire, the decisive next cell — if it suppresses, no read is needed and any read-based fix is incidental). TWO coordinates with opposite signatures, one mechanism: gate/up read stale at one, DOWN at another, so it is whichever part of the slot is read while stale, not sub-region-specific. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT; the rate scales per READ. Storage and the toolchain: storage largely exonerated by btrfs datasum on direct-IO reads plus a clean kernel log; the toolchain is NOT exonerated. NO FIX IS CLAIMED — the acceptance protocol (same-day RED control, GREEN at 512 x2 plus 4x1536, rate bound, throughput cost) is unmet.
+verdict: THE DEFECT IS IN THE BOUNCE ARENA and only a bulk device-side read of the arena's own just-written bytes suppresses it. The ablation matrix is complete: a dispatch acquire does not (`bh-nop` RED @292), equal bandwidth on another buffer does not (`bh-decoy` RED @12, earliest of all), reading the destination slot does not (`sc` RED @236), and FINE-GRAINED ALLOCATION DOES NOT — `--pinned-coherent` RED 225/512 @283 against a same-day control 220/512 @291 with `hipHostGetFlags` returning coherent-bit TRUE, so host->device visibility is refuted with the intervention OBSERVED TO APPLY. CORRECTION TO THE MATRIX: `bh-line` was read as "one cache line, bulk no", but it strides 128 B across the WHOLE region, so it touches EVERY line at ~1/32 of the bytes — both it and `bh` touch every line, the "per-LINE effect" reading is not established, and what is established is that stride-32 sampling is insufficient while stride-1 is sufficient, with `bh-line` the LATEST red (704 vs a ~292 median). That is a dose-response in BYTES and the granularity is unknown, so `--divergence-folds bh-line:N` makes it a sweep; one hypothesis is a 64 B sector, predicting stride 16 is clean at 1/16 the cost — which would be a FIX where `bh` is only a Heisenberg probe at ~10% of throughput. Phase 3B is built: `--copy-by-kernel` moves the bytes with a shader copy through the normal vector-memory path a copy engine may bypass, and it COUNTS which path ran, because an intervention that never applied and one that does not work produce the same red. The isolated path is exonerated: 1e6 repro reads, 0 mismatches, 4-8x cleaner than the engine, so the hazard needs the engine's concurrency. TWO coordinates with opposite signatures (gate/up stale at one, DOWN at the other) show it is whichever part of the slot is read while stale. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT; the rate scales per READ. Storage largely exonerated (btrfs datasum verifies direct-IO reads; kernel log clean); the toolchain NOT exonerated. NO FIX IS CLAIMED — the acceptance protocol, which now includes the path read-back, is unmet.
 ---
 
 # GLM does not reproduce itself: the bytes read out of the pool slots differ
@@ -466,6 +466,67 @@ Red-proofed by making `scan_free` ignore `landed`.
 
 So an instrumented pair gives ONE coordinate, and the hop table above should be read as "one sample
 decides which hop we are on", not as "one run settles the mechanism".
+
+## The completed ablation matrix — and a MISLABEL that inverts its inference
+
+| intervention | reads the arena? | outcome |
+|---|---|---|
+| v2 light · `sc` · `sc-nop` · `se` · `xa,ac` | no | RED (169 / 236 / 292 / 301 / 292) |
+| `bh-nop` — launch + dispatch acquire, no read | no | RED @292 |
+| `bh-decoy` — same bytes, same duration, NOT the arena | no | RED **@12** (earliest in the investigation) |
+| `bh-line` — **stride 32, one dword per 128 B line** | yes, ~1/32 of the bytes | RED **@704** (latest) |
+| **`bh` — every byte of the just-written region** | yes, all | **CLEAN 1536** |
+| `bh,sc,se` | yes, all | CLEAN (512 + 1536) |
+| `--pinned-coherent` (fine-grained arena, **flag observed to apply**) | — | RED 225/512 @283 vs control 220/512 @291 |
+
+Two conclusions are solid. **It is not a dispatch/ordering acquire** (`bh-nop` red) and **not
+bandwidth or delay on the fetch stream** (`bh-decoy` red, and earliest of all). And
+**host→device visibility of the arena is refuted with the intervention observed to apply** —
+`hipHostGetFlags` returned `0x40000000`, coherent-bit true, so `hipHostMallocCoherent` is not a
+no-op on ROCm 7.14 and the arena really was fine-grained. That branch is closed properly rather
+than by assumption, and the read-back is now automatic for any candidate fix.
+
+**`bh` is therefore a Heisenberg probe, not a fix candidate** — ~10% of throughput on a hash nobody
+reads.
+
+### The mislabel, and what it costs
+
+`bh-line` was recorded as "one cache line of the arena" and read as "bulk: no", giving
+*"one line insufficient, all lines sufficient ⇒ a per-LINE effect"*. **That is not what the arm
+does.** `LINE_F32 = 32` f32 = a **128 B stride**, so `bh-line` reads one dword every 128 B **across
+the whole region** — it touches *every* line, at ~1/32 of the bytes. Both it and `bh` touch every
+line.
+
+So the per-line reading is not established. What the matrix actually says is that **stride-32
+sampling is insufficient and stride-1 is sufficient**, and `bh-line` is the LATEST red in the
+investigation (704 against a ~292 median) — a **dose-response in bytes read**, not a threshold in
+lines touched.
+
+**The granularity is therefore unknown, and that is now the cheapest decisive question.** One
+hypothesis with a concrete prediction: a single dword touch pulls only the containing **64 B
+sector**, not both halves of a 128 B line, so stride 32 repairs half of each line and stride 16
+would repair all of it. If so, **stride 16 is clean at 1/16 of the bytes** — a fix, where `bh` is
+only a probe.
+
+`--divergence-folds bh-line:N` makes that a sweep. `N ∈ {1, 4, 8, 16, 32}` names the granularity;
+the stride is part of the fold label, so two strides are two experiments and
+`tests/divergence-columns.sh` refuses to mix them. The default is 32 and is a *default*, not a
+constant, for exactly this reason — and `Folds`'s `Default` is hand-written because a derived one
+would give stride 0, a `-line` arm that reads NOTHING whose clean result would read as
+"sampling suffices".
+
+### Phase 3B — copy by kernel — is built and is the other live branch
+
+`--copy-by-kernel` moves bounce→slot bytes with an ordinary shader copy instead of
+`hipMemcpyAsync`. The matrix demands a device-side read of the arena's own bytes in bulk, and a
+shader copy is exactly that — reading through the normal vector-memory path that a copy engine may
+bypass. **If it comes back clean it is both the conviction and a fix at roughly equal bandwidth.**
+
+On the same footing as `--pinned-coherent`: a flag and not a feature, so the protocol compares two
+release binaries differing in one argument. And it **counts what it actually did** —
+`copies=[memcpy N / kernel M]` — because an intervention that never applied and one that does not
+work produce the same red, which has already cost this investigation two rounds. That read-back is
+the standing lesson and applies to every candidate fix from here.
 
 ## PHASE 1 RESULT: `bh` is the suppressor — the defect is in the BOUNCE ARENA
 

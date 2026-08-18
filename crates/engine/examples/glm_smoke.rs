@@ -42,6 +42,7 @@ fn main() -> Result<()> {
             // The historical allocation. This example is the parity gate's arm and must stay the
             // stock configuration; `--pinned-coherent` is evaluated through the CLI.
             pinned_coherent: false,
+            copy_by_kernel: false,
         },
     )?;
     let mut eng = rivoli_engine::glm::engine::GlmEngine::new(pin, &cfg, 4096)?;

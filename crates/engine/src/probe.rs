@@ -123,10 +123,21 @@ pub enum Q {
 /// Which fold turns RED→GREEN names the mask, and its position in the pipeline names where the
 /// mechanism lives. `se` is the control: it runs AFTER the consumer has read the slot, so it
 /// should not be able to suppress anything — if it does, the hypothesis is wrong.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Folds {
     /// Fold the residual after attention, before the norm — closes `xn`'s scale blindness.
     pub xa: bool,
+    /// Element stride for the `-line` arms: they read one f32 every `line_stride` elements across
+    /// the WHOLE region. `--divergence-folds bh-line:16` sets it; the default is [`LINE_F32`].
+    ///
+    /// **It is a knob because the granularity of the effect is UNKNOWN and is the next thing to
+    /// measure.** `bh-line` at the default 32 (128 B) touched every 128 B line and still diverged —
+    /// at 704, the latest red in the investigation — while `bh` at stride 1 is clean. So "every line
+    /// touched" is NOT sufficient and the honest reading is a dose-response in BYTES. A single dword
+    /// per 128 B line plausibly pulls only the containing 64 B sector, which predicts stride 16 is
+    /// clean; sweeping 1, 4, 8, 16, 32 names the granularity, and any coarse stride that comes back
+    /// clean is a fix at that fraction of the cost rather than `bh`'s ~10%.
+    pub line_stride: usize,
     /// Fold the fixed-point accumulator before the drain — the consumer-output witness for the
     /// DOWN projection, which `h` (pass 1) and `x` (post-drain) cannot separate.
     pub ac: bool,
@@ -139,78 +150,101 @@ pub struct Folds {
     pub se: bool,
 }
 
+/// Refuse a second arm at a ladder position. One function for both positions, because the message
+/// and the reason are the same and two copies would drift.
+fn set_ladder(slot: &mut FoldProbe, pos: &str, arm: FoldProbe) -> Result<()> {
+    ensure!(
+        *slot == FoldProbe::Off,
+        "--divergence-folds names more than one `{pos}` variant; they occupy the same pipeline \
+         position and are alternatives, not additions"
+    );
+    *slot = arm;
+    Ok(())
+}
+
+/// Refuse a repeated boolean fold. A spec the operator did not mean is a cell whose green means
+/// something other than what it appears to.
+fn set_flag(b: &mut bool, name: &str) -> Result<()> {
+    ensure!(!*b, "--divergence-folds names `{name}` twice");
+    *b = true;
+    Ok(())
+}
+
+impl Default for Folds {
+    /// The LIGHT probe, with the sampling stride at one 128 B line.
+    ///
+    /// Hand-written because `#[derive(Default)]` would make `line_stride` 0 — a stride that reads
+    /// NOTHING, so a `-line` arm would silently become a no-op and its clean result would be read
+    /// as "sampling suffices" when nothing was sampled. That is the false-green shape this whole
+    /// investigation keeps meeting, and a derive is how it would have arrived.
+    fn default() -> Self {
+        Self {
+            xa: false,
+            ac: false,
+            line_stride: crate::fetch::asyncfetch::LINE_F32,
+            bh: FoldProbe::Off,
+            sc: FoldProbe::Off,
+            se: false,
+        }
+    }
+}
+
 impl Folds {
     /// Parse `--divergence-folds`: a comma-separated subset of
-    /// `xa,ac,{bh,sc}[-nop|-decoy|-line],se`. Absent = the light probe.
+    /// `xa,ac,{bh,sc}[-nop|-decoy|-line[:STRIDE]],se`. Absent = the light probe.
     ///
-    /// Unknown names are REFUSED rather than ignored, and the three `sc` forms are mutually
+    /// Unknown names are REFUSED rather than ignored, and the arms at one position are mutually
     /// exclusive: a typo that silently disabled the one fold a cell exists to test would make the
     /// cell's green mean the opposite of what it appears to.
+    ///
+    /// `-line:STRIDE` sets the element stride for the sampling arms — see [`Folds::line_stride`] for
+    /// why it is a knob rather than a constant.
     pub fn parse(spec: &str) -> Result<Self> {
         // An explicitly EMPTY spec is refused, though an absent flag is fine and means `light`.
         // `--divergence-folds ""` reads as "I chose a configuration" and would silently deliver the
-        // light probe — the same inversion the per-`sc` refusal below exists to stop.
+        // light probe — the same inversion the per-position refusal exists to stop.
         ensure!(
             !spec.trim().is_empty(),
             "--divergence-folds was given an empty list; omit the flag for the light probe"
         );
         let mut f = Self::default();
-        for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let sc = |f: &Folds| -> Result<()> {
-                ensure!(
-                    f.sc == FoldProbe::Off,
-                    "--divergence-folds names more than one `sc` variant; they occupy the same \
-                     pipeline position and are alternatives, not additions"
-                );
-                Ok(())
-            };
-            match name {
-                // Repeats refuse for the same reason the `sc` variants do: a spec the operator
-                // did not mean is a cell whose green means something else.
-                "xa" => {
-                    ensure!(!f.xa, "--divergence-folds names `xa` twice");
-                    f.xa = true;
-                }
-                "ac" => {
-                    ensure!(!f.ac, "--divergence-folds names `ac` twice");
-                    f.ac = true;
-                }
-                "bh" | "bh-nop" | "bh-decoy" | "bh-line" => {
+        for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (name, stride) = match entry.split_once(':') {
+                Some((n, v)) => {
+                    let v: usize = v.parse().with_context(|| {
+                        format!("--divergence-folds {entry}: stride must be a number")
+                    })?;
                     ensure!(
-                        f.bh == FoldProbe::Off,
-                        "--divergence-folds names more than one `bh` variant; they occupy the \
-                         same pipeline position and are alternatives, not additions"
+                        v > 0,
+                        "--divergence-folds {entry}: stride 0 would read nothing"
                     );
-                    f.bh = match name {
-                        "bh-nop" => FoldProbe::Nop,
-                        "bh-decoy" => FoldProbe::Decoy,
-                        "bh-line" => FoldProbe::Line,
-                        _ => FoldProbe::Full,
-                    };
+                    (n, Some(v))
                 }
-                "se" => {
-                    ensure!(!f.se, "--divergence-folds names `se` twice");
-                    f.se = true;
-                }
-                "sc" => {
-                    sc(&f)?;
-                    f.sc = FoldProbe::Full;
-                }
-                "sc-nop" => {
-                    sc(&f)?;
-                    f.sc = FoldProbe::Nop;
-                }
-                "sc-decoy" => {
-                    sc(&f)?;
-                    f.sc = FoldProbe::Decoy;
-                }
-                "sc-line" => {
-                    sc(&f)?;
-                    f.sc = FoldProbe::Line;
-                }
+                None => (entry, None),
+            };
+            // A stride on anything but a sampling arm is a spec that cannot do what it says.
+            ensure!(
+                stride.is_none() || name.ends_with("-line"),
+                "--divergence-folds {entry}: a stride applies only to a `-line` arm"
+            );
+            if let Some(v) = stride {
+                f.line_stride = v;
+            }
+            match name {
+                "xa" => set_flag(&mut f.xa, "xa")?,
+                "ac" => set_flag(&mut f.ac, "ac")?,
+                "se" => set_flag(&mut f.se, "se")?,
+                "bh" => set_ladder(&mut f.bh, "bh", FoldProbe::Full)?,
+                "bh-nop" => set_ladder(&mut f.bh, "bh", FoldProbe::Nop)?,
+                "bh-decoy" => set_ladder(&mut f.bh, "bh", FoldProbe::Decoy)?,
+                "bh-line" => set_ladder(&mut f.bh, "bh", FoldProbe::Line)?,
+                "sc" => set_ladder(&mut f.sc, "sc", FoldProbe::Full)?,
+                "sc-nop" => set_ladder(&mut f.sc, "sc", FoldProbe::Nop)?,
+                "sc-decoy" => set_ladder(&mut f.sc, "sc", FoldProbe::Decoy)?,
+                "sc-line" => set_ladder(&mut f.sc, "sc", FoldProbe::Line)?,
                 other => anyhow::bail!(
-                    "unknown --divergence-folds entry {other:?} \
-                     (xa, ac, bh, bh-nop, bh-decoy, bh-line, sc, sc-nop, sc-decoy, sc-line, se)"
+                    "unknown --divergence-folds entry {other:?} (xa, ac, se, and \
+                     {{bh,sc}}[-nop|-decoy|-line[:STRIDE]])"
                 ),
             }
         }
@@ -220,30 +254,31 @@ impl Folds {
     /// The config as it appears in the log header — every log states what produced it, because a
     /// divergence log without its probe configuration cannot be attributed, and two logs from
     /// different configurations must never be compared.
+    ///
+    /// A `-line` arm carries its STRIDE, because two `bh-line` runs at different strides are
+    /// different experiments and `tests/divergence-columns.sh` must refuse to mix them exactly as
+    /// it refuses two different fold sets.
     pub fn label(&self) -> String {
-        let mut v: Vec<&str> = Vec::new();
+        let mut v: Vec<String> = Vec::new();
         if self.xa {
-            v.push("xa");
+            v.push("xa".into());
         }
         if self.ac {
-            v.push("ac");
+            v.push("ac".into());
         }
-        match self.bh {
-            FoldProbe::Off => {}
-            FoldProbe::Full => v.push("bh"),
-            FoldProbe::Nop => v.push("bh-nop"),
-            FoldProbe::Decoy => v.push("bh-decoy"),
-            FoldProbe::Line => v.push("bh-line"),
-        }
-        match self.sc {
-            FoldProbe::Off => {}
-            FoldProbe::Full => v.push("sc"),
-            FoldProbe::Nop => v.push("sc-nop"),
-            FoldProbe::Decoy => v.push("sc-decoy"),
-            FoldProbe::Line => v.push("sc-line"),
-        }
+        let arm = |pos: &str, p: FoldProbe, stride: usize| -> Option<String> {
+            match p {
+                FoldProbe::Off => None,
+                FoldProbe::Full => Some(pos.to_string()),
+                FoldProbe::Nop => Some(format!("{pos}-nop")),
+                FoldProbe::Decoy => Some(format!("{pos}-decoy")),
+                FoldProbe::Line => Some(format!("{pos}-line:{stride}")),
+            }
+        };
+        v.extend(arm("bh", self.bh, self.line_stride));
+        v.extend(arm("sc", self.sc, self.line_stride));
         if self.se {
-            v.push("se");
+            v.push("se".into());
         }
         match v.is_empty() {
             true => "light".to_string(),

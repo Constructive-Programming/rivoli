@@ -186,6 +186,24 @@ struct Args {
     #[arg(long)]
     pinned_coherent: bool,
 
+    /// CANDIDATE FIX UNDER EVALUATION (Phase 3B): move bounce->slot bytes with an ordinary shader
+    /// copy instead of `hipMemcpyAsync`.
+    ///
+    /// The ablation matrix says suppression needs a device-side READ of the bounce arena's own
+    /// bytes, in bulk: a bare launch does not do it (`bh-nop` red), equal bandwidth on another
+    /// buffer does not (`bh-decoy` red), reading the destination slot does not (`sc` red), and
+    /// fine-grained allocation does not (`--pinned-coherent` red with the flag observed to apply).
+    /// A shader copy reads the arena through the normal vector-memory path, which a copy engine may
+    /// bypass — so if this comes back clean it is both the conviction and a fix at roughly equal
+    /// bandwidth.
+    ///
+    /// Like `--pinned-coherent`: a flag and not a feature, so the protocol compares two release
+    /// binaries differing in one argument. The run REPORTS how many copies each path actually
+    /// issued — an intervention that never applied and one that does not work produce the same red,
+    /// which has already cost this investigation two rounds.
+    #[arg(long)]
+    copy_by_kernel: bool,
+
     /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
     /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
     /// saw, picked and where the pool put it.
@@ -492,6 +510,7 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
         two_q: TwoQSplit::default(),
         trace_path: a.trace.as_deref(),
         pinned_coherent: a.pinned_coherent,
+        copy_by_kernel: a.copy_by_kernel,
     }
 }
 

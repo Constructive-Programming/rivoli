@@ -73,6 +73,9 @@ pub struct PoolCfg<'a> {
     /// the ordering gap argued at `kernels/async.hip::rivoli_pinned_alloc`. Off is the historical
     /// behaviour, and the two are meant to be A/B-ed.
     pub pinned_coherent: bool,
+    /// Move bounce->slot bytes with a shader copy instead of `hipMemcpyAsync` — `--copy-by-kernel`,
+    /// Phase 3B's candidate fix.
+    pub copy_by_kernel: bool,
 }
 
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
@@ -255,6 +258,7 @@ impl RoutedPool {
             ring as u32,
             slot_span(stride),
             cfg.pinned_coherent,
+            cfg.copy_by_kernel,
         )?)?;
         Ok(Self {
             buf,
