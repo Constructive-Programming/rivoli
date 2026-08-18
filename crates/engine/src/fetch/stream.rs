@@ -80,6 +80,10 @@ mod stage {
         unsafe extern "C" {
             /// Pinned host arena for the bounce path (kernels/async.hip). Null on failure.
             pub fn rivoli_pinned_alloc(bytes: u64, coherent: i32) -> *mut c_void;
+            /// What the runtime ACTUALLY gave: 0 and `*out` on success, negative on failure.
+            pub fn rivoli_pinned_flags(p: *mut c_void, out: *mut u32) -> i32;
+            /// The bit `hipHostMallocCoherent` sets, so Rust does not hardcode a HIP constant.
+            pub fn rivoli_pinned_coherent_bit() -> u32;
             pub fn rivoli_pinned_free(p: *mut c_void);
             /// Async H2D copy on `stream` (bounce slot → VMM slot). 0 ok, else negative.
             pub fn rivoli_memcpy_h2d_async(
@@ -100,6 +104,22 @@ mod stage {
     pub fn alloc(bytes: usize, coherent: bool) -> *mut u8 {
         // SAFETY: no pointer args; null on failure.
         unsafe { ffi::rivoli_pinned_alloc(bytes as u64, i32::from(coherent)) as *mut u8 }
+    }
+
+    /// What the runtime ACTUALLY returned for `p`: `(flags, coherent_bit_set)`, or `None` if the
+    /// query failed.
+    ///
+    /// **A run must state what it GOT, not what it asked for.** A `--pinned-coherent` arm was run
+    /// and reported no effect, and it could not be believed because nothing observed whether the
+    /// allocation had changed — an intervention that never applied and an intervention that does
+    /// not work produce the same red. This is that observation.
+    pub fn flags(p: *mut u8) -> Option<(u32, bool)> {
+        let mut f = 0u32;
+        // SAFETY: `p` came from `alloc` and is live; `f` is a live local.
+        let rc = unsafe { ffi::rivoli_pinned_flags(p as *mut c_void, &raw mut f) };
+        // SAFETY: no arguments.
+        let bit = unsafe { ffi::rivoli_pinned_coherent_bit() };
+        (rc == 0).then_some((f, f & bit != 0))
     }
 
     /// HIP tracks the pinned registration's size itself, so this takes only the pointer.
@@ -242,14 +262,29 @@ impl Streamer {
         let arena = stage::alloc(arena_bytes, coherent);
         // Logged because it is the one allocation whose MEMORY TYPE is under investigation: a run's
         // record has to say which it made, or its result cannot be attributed.
+        // REQUESTED *and* RETURNED. Every arm of the coherence experiment is read off this line,
+        // so it reports the observation and not the intent; a `?` means the runtime refused to say.
+        let got = stage::flags(arena);
         tracing::info!(
-            "bounce arena: {:.0} MiB, {}",
+            "bounce arena: {:.0} MiB | requested {} | returned flags {} coherent-bit {}",
             arena_bytes as f64 / (1u64 << 20) as f64,
             match coherent {
-                true => "hipHostMallocCoherent (fine-grained — candidate fix under evaluation)",
+                true => "hipHostMallocCoherent",
                 false => "hipHostMallocDefault",
-            }
+            },
+            got.map_or("?".into(), |(f, _)| format!("0x{f:x}")),
+            got.map_or("?".into(), |(_, c)| c.to_string()),
         );
+        // The one case that invalidates an arm outright: the flag was asked for and did not stick.
+        // Loud, because it reads in a log exactly like a fix that did not work.
+        if let Some((_, c)) = got
+            && c != coherent
+        {
+            tracing::error!(
+                "bounce arena: asked coherent={coherent} but the runtime returned coherent={c} — \
+                 this arm did NOT apply the intervention it claims to test"
+            );
+        }
         ensure!(
             !arena.is_null(),
             "bounce arena alloc failed (entries={entries}, {:.0} MiB)",

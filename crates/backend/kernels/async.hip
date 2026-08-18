@@ -89,6 +89,24 @@ extern "C" void* rivoli_pinned_alloc(unsigned long long bytes, int coherent) {
     return p;
 }
 
+// READ BACK what the runtime actually gave us. `rivoli_pinned_alloc` says what it ASKED for; this
+// says what it GOT, and the difference is the whole reason a `--pinned-coherent` arm could not be
+// believed: a flag that never applied and a fix that does not work produce the same red.
+//
+// Returns 0 and writes `*out` on success, negative on failure. `hipHostGetFlags` is the canonical
+// query — `hipPointerGetAttributes().allocationFlags` is the same information by a longer road.
+extern "C" int rivoli_pinned_flags(void* p, unsigned* out) {
+    unsigned f = 0;
+    hipError_t e = hipHostGetFlags(&f, p);
+    if (e != hipSuccess) return HIP_ERR_BASE - (int)e;
+    *out = f;
+    return 0;
+}
+
+// The bit `hipHostMallocCoherent` sets, exported so the Rust side does not hardcode a HIP constant
+// it cannot see. A run reports the requested and returned flags and whether this bit survived.
+extern "C" unsigned rivoli_pinned_coherent_bit(void) { return (unsigned)hipHostMallocCoherent; }
+
 extern "C" void rivoli_pinned_free(void* p) {
     hipHostFree(p);
 }
