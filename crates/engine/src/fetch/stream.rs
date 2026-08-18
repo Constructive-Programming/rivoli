@@ -95,6 +95,16 @@ mod stage {
                 stream: *mut c_void,
                 by_kernel: i32,
             ) -> i32;
+            /// Full-width device read of a pinned-arena window on `stream`, value discarded —
+            /// the ARENA REFRESH mitigation (`kernels/async.hip` carries the evidence and the
+            /// ceiling). Enqueued BEFORE the copy; `sink` is written only on an impossible
+            /// value and exists solely to stop the loads being optimised away.
+            pub fn rivoli_touch_arena_async(
+                src: *const c_void,
+                n: u64,
+                stream: *mut c_void,
+                sink: *mut u64,
+            ) -> i32;
         }
     }
 
@@ -166,11 +176,36 @@ mod stage {
                 i32::from(by_kernel),
             )
         };
+        check(rc)
+    }
+
+    /// `0` is HIP success at this boundary; anything else is the negative HIP code the C side
+    /// folded through `HIP_ERR_BASE`. Factored because both staging calls end this way and the
+    /// duplication gate is right that one tail should exist once.
+    fn check(rc: i32) -> Result<(), String> {
         if rc == 0 {
             Ok(())
         } else {
             Err(format!("hip rc {rc}"))
         }
+    }
+
+    /// ARENA REFRESH: read `n` bytes of the arena window at `src` on `stream`, discarding the
+    /// value. Enqueued BEFORE the copy, so it is stream-ordered ahead of it with no host sync.
+    ///
+    /// # Safety
+    /// `src` is a live arena window valid for `n` bytes, `stream` is a live handle, and `sink` is
+    /// a mapped writable `u64` the kernel stores to only on a value real payloads cannot produce.
+    pub unsafe fn touch_arena(
+        src: *const u8,
+        n: usize,
+        stream: *mut c_void,
+        sink: *mut u64,
+    ) -> Result<(), String> {
+        // SAFETY: the caller's contract, forwarded.
+        let rc =
+            unsafe { ffi::rivoli_touch_arena_async(src as *const c_void, n as u64, stream, sink) };
+        check(rc)
     }
 }
 
@@ -238,6 +273,14 @@ pub struct Streamer {
     fold: Vec<FetchFolds>,
     /// Phase 3B: move the bytes with a shader copy instead of `hipMemcpyAsync`.
     by_kernel: bool,
+    /// ARENA REFRESH: enqueue a full-width device read of the just-written arena window on the
+    /// fetch stream BEFORE the copy. The only intervention measured to make GLM decode
+    /// reproduce itself; a MITIGATION with an unexplained mechanism, not a root-cause fix.
+    /// Evidence, alternatives tried, and the ceiling: `kernels/async.hip`, `glm-bug.md` §7b.
+    arena_refresh: bool,
+    /// Device word the refresh kernel stores to only on an impossible value — it exists to stop
+    /// the loads being optimised away, is never read, and needs no synchronisation.
+    refresh_sink: *mut u64,
     /// Copies actually issued, per path — `[memcpy, kernel]`.
     ///
     /// **A COUNT, not the flag.** Two rounds of this investigation were spent on an arm that could
@@ -264,7 +307,13 @@ impl Streamer {
     /// a fine-grained arena (see [`stage::alloc`]).
     /// Always allocates the `entries * span` host staging arena — it is the only
     /// destination path (see this module's header).
-    pub fn new(entries: u32, span: usize, coherent: bool, by_kernel: bool) -> Result<Self> {
+    pub fn new(
+        entries: u32,
+        span: usize,
+        coherent: bool,
+        by_kernel: bool,
+        arena_refresh: bool,
+    ) -> Result<Self> {
         // The bounce arena has exactly `entries` slots and `queue` indexes it by the
         // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
         // be a power of two for the arena to match the SQ capacity — otherwise a push
@@ -323,6 +372,11 @@ impl Streamer {
             nbytes: vec![0; entries as usize],
             fold: vec![FetchFolds::OFF; entries as usize],
             by_kernel,
+            arena_refresh,
+            // The sink is a pinned-arena word, not a device allocation: the kernel's store is
+            // never taken, so the address only has to be writable and mapped. Reusing the arena
+            // avoids an allocation whose lifetime would have to be argued against teardown order.
+            refresh_sink: arena.cast::<u64>(),
             issued: [0; 2],
             min_res: vec![0; entries as usize],
         })
@@ -470,6 +524,17 @@ impl Streamer {
         // SAFETY: `ud < entries`, and every read's `nbytes <= span`, so this slot's arena window
         // is owned and in bounds.
         let src = unsafe { self.arena.add(ud * self.span) };
+        // ARENA REFRESH, enqueued BEFORE the copy on the fetch stream. See the struct field and
+        // `kernels/async.hip` for the evidence, the fifteen alternatives that did not work, and
+        // the ceiling. Stream-ordered ahead of the copy, so it needs no sync of its own.
+        if self.arena_refresh {
+            // SAFETY: `src` is this slot's arena window, valid for `nbytes[ud]` bytes; the stream
+            // is live; `refresh_sink` is a mapped, writable arena word the kernel never stores to.
+            // SAFETY: `src` is this slot's arena window, valid for `nbytes[ud]` bytes; the
+            // stream is live; `refresh_sink` is a mapped arena word the kernel never stores to.
+            unsafe { stage::touch_arena(src, self.nbytes[ud] as usize, stream, self.refresh_sink) }
+                .map_err(|e| anyhow::anyhow!("arena refresh launch failed: {e}"))?;
+        }
         // `--divergence-log`: BRACKET THE COPY. `bh` hashes what the drive delivered into the
         // pinned arena; `sc` hashes what arrived in the pool slot. Both are enqueued on the FETCH
         // stream around the copy, so the three are stream-ordered with no host sync and no

@@ -81,6 +81,9 @@ fn main() -> Result<()> {
     // Phase 3B in the repro too: the same candidate fix, so a firing repro can be re-run against it
     // without touching the engine.
     let by_kernel = args.iter().any(|a| a == "--copy-by-kernel");
+    // ARENA REFRESH: the engine-side mitigation, testable here too so a firing repro can be
+    // re-run against it without the engine.
+    let refresh = args.iter().any(|a| a == "--arena-refresh");
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [file, iters, rest @ ..] = pos.as_slice() else {
         bail!("usage: arena_repro <layer-file> <iters> [stride-bytes] [--coherent]");
@@ -120,7 +123,7 @@ fn main() -> Result<()> {
         stride as f64 / (1u64 << 20) as f64
     );
 
-    let mut streamer = Streamer::new(SLOTS, slot_span(stride), coherent, by_kernel)?;
+    let mut streamer = Streamer::new(SLOTS, slot_span(stride), coherent, by_kernel, refresh)?;
     let fetch = rivoli_backend::Stream::fetch()?;
     // One destination per staging slot, so a batch's copies never share a destination — the engine
     // has the same property (a slot's ticket gates its reuse).

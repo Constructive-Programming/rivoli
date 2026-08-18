@@ -76,6 +76,8 @@ pub struct PoolCfg<'a> {
     /// Move bounce->slot bytes with a shader copy instead of `hipMemcpyAsync` — `--copy-by-kernel`,
     /// Phase 3B's candidate fix.
     pub copy_by_kernel: bool,
+    /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
+    pub arena_refresh: bool,
 }
 
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
@@ -259,6 +261,7 @@ impl RoutedPool {
             slot_span(stride),
             cfg.pinned_coherent,
             cfg.copy_by_kernel,
+            cfg.arena_refresh,
         )?)?;
         Ok(Self {
             buf,

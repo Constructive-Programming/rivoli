@@ -291,6 +291,21 @@ impl<'a> GlmEngine<'a> {
         self.pin.routed.misses()
     }
 
+    /// The staging-slot hand-out's OWN falsifier, and until 2026-08-18 nothing ever read it.
+    ///
+    /// `AsyncFetch::take_slot` picks a slot with `scan_free`, which advances its cursor on every
+    /// PROBE, not every hand-out — so one skipped (un-landed) slot shifts the cursor and every
+    /// later hand-out with it. INV-9's argument (`fetch/asyncfetch.rs`) is that this cannot vary
+    /// between two runs of one input, BECAUSE `run_layer` ends every layer with an unconditional
+    /// `device_sync`, making `landed` uniformly true at the next `submit` and `scan_free` pure
+    /// round-robin over the miss sequence. That argument names its own precondition, and this
+    /// counter is the observable that falsifies it: **non-zero means the barrier did not hold,
+    /// the hand-out read device progress (wall-clock) rather than its own inputs, and a
+    /// determinism comparison over that run is unsound.**
+    pub fn slot_stalls(&self) -> u64 {
+        self.pin.routed.slot_stalls()
+    }
+
     /// Flush the `--trace` sink (per token — `Drop` discards flush errors, and a trace
     /// is ~30 minutes of sole-tenant GPU time).
     pub fn flush_trace(&mut self) -> Result<()> {

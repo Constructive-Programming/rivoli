@@ -147,6 +147,15 @@ impl GlmEngine<'_> {
             }
             Ok::<_, anyhow::Error>((hit0, miss0, decode_wall.elapsed()))
         })?;
+        // INV-9's precondition, MEASURED rather than assumed. See `GlmEngine::slot_stalls`:
+        // non-zero means the staging hand-out read device progress and this run is not
+        // comparable to another for determinism. Logged every run so a divergence pair can
+        // never again be argued over without it.
+        tracing::info!(
+            "STAGING: slot_stalls {} (INV-9 precondition: 0 = hand-out was pure round-robin \
+             over the miss sequence; non-zero = it read device progress, comparison unsound)",
+            self.slot_stalls()
+        );
         Ok(emit.finish(decode_wall, self.hits() - hit0, self.misses() - miss0))
     }
 }

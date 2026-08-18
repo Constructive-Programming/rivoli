@@ -134,6 +134,52 @@ extern "C" __global__ void copy_h2d_kernel(uint4* __restrict__ dst, const uint4*
     }
 }
 
+// ARENA REFRESH — the only intervention measured to eliminate the divergence, promoted out of the
+// probe and given its own kernel so it carries no hash nobody reads.
+//
+// WHAT IS KNOWN (2026-08-18, glm-bug.md §7b): a FULL-WIDTH device read of the just-written arena
+// window, enqueued on the fetch stream BEFORE the copy, makes GLM decode reproduce itself — four
+// clean pairs over 6144 tokens against a rate that predicts P(all clean) ~ 1e-9. Everything else
+// tried is RED: one cache line of the arena, stride-32 sampling, the same bulk from a decoy buffer,
+// the bare dispatch, a kernel copy instead of SDMA, a fine-grained arena, a write-combined arena
+// (each read back and confirmed to apply), and the staging hand-out (`slot_stalls` measured 0).
+//
+// WHAT IS NOT KNOWN: why. Fifteen mechanisms are eliminated and none of the survivors predicts
+// "bulk AND arena-specific". So this is a MITIGATION with a measured price, not a root-cause fix,
+// and it is labelled that way on purpose — the ceiling is that a future compiler, driver or cache
+// geometry could stop making the read sufficient, and nothing here would notice except the
+// determinism gate. Do not delete it without re-running `tests/determinism-glm.sh`.
+__global__ void touch_arena_kernel(const uint4* __restrict__ src, unsigned long long n4,
+                                   unsigned long long* sink) {
+    unsigned long long acc = 0;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        uint4 v = src[i];
+        acc += (unsigned long long)v.x ^ (unsigned long long)v.y ^ (unsigned long long)v.z ^
+               (unsigned long long)v.w;
+    }
+    // The store is what stops the compiler deleting the loads. The condition is never true for real
+    // payloads, so the sink is never written and needs no synchronisation with anything.
+    if (acc == 0xFFFFFFFFFFFFFFFFULL) {
+        *sink = acc;
+    }
+}
+
+// Read `n` bytes of `src` (a pinned-arena window) on `stream` at full width, discarding the value.
+// 16 B granularity like the copy: every caller passes an O_DIRECT-block multiple.
+extern "C" int rivoli_touch_arena_async(const void* src, unsigned long long n, void* stream,
+                                       unsigned long long* sink) {
+    if (n == 0 || (n % sizeof(uint4)) != 0) return 1002;
+    unsigned long long n4 = n / sizeof(uint4);
+    unsigned long long blocks = (n4 + 255) / 256;
+    if (blocks > 1024) blocks = 1024;
+    hipGetLastError();
+    hipLaunchKernelGGL(touch_arena_kernel, dim3((unsigned)blocks), dim3(256), 0,
+                       (hipStream_t)stream, (const uint4*)src, n4, sink);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
+}
+
 // ONE entry point with the path as an argument, not two entry points. The two are one operation
 // with a knob — the acceptance protocol switches between them by flag — and splitting them gave the
 // Rust side two identical 4-parameter externs and two identical call arms, which the duplication

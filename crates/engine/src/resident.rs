@@ -246,6 +246,8 @@ pub struct PinCfg<'a> {
     pub pinned_coherent: bool,
     /// `--copy-by-kernel`: move bounce->slot bytes with a shader copy. Phase 3B.
     pub copy_by_kernel: bool,
+    /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
+    pub arena_refresh: bool,
 }
 
 /// How many experts one `submit` carries, and what one costs — the shape an arm's MoE
@@ -369,6 +371,7 @@ impl<'a> PoolPlan<'a> {
         let cfg = PoolCfg {
             pinned_coherent: pin.pinned_coherent,
             copy_by_kernel: pin.copy_by_kernel,
+            arena_refresh: pin.arena_refresh,
             budget,
             top_k: b.top_k,
             max_batch: b.max_batch,

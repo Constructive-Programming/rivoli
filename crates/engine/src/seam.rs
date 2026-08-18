@@ -191,6 +191,8 @@ pub struct PoolKnobs<'a> {
     /// `--copy-by-kernel`: Phase 3B's candidate fix, on the same footing as `pinned_coherent` —
     /// a flag rather than a feature, so the protocol can compare two release binaries.
     pub copy_by_kernel: bool,
+    /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
+    pub arena_refresh: bool,
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -483,6 +485,7 @@ fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_>
     crate::resident::PinCfg {
         pinned_coherent: knobs.pinned_coherent,
         copy_by_kernel: knobs.copy_by_kernel,
+        arena_refresh: knobs.arena_refresh,
         capacity,
         cache_policy: knobs.cache_policy,
         two_q: knobs.two_q,

@@ -43,6 +43,7 @@ fn main() -> Result<()> {
             // stock configuration; `--pinned-coherent` is evaluated through the CLI.
             pinned_coherent: false,
             copy_by_kernel: false,
+            arena_refresh: false,
         },
     )?;
     let mut eng = rivoli_engine::glm::engine::GlmEngine::new(pin, &cfg, 4096)?;

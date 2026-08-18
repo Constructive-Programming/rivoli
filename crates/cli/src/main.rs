@@ -204,6 +204,22 @@ struct Args {
     #[arg(long)]
     copy_by_kernel: bool,
 
+    /// MITIGATION for the GLM decode nondeterminism (`glm-bug.md`): before each bounce->VMM copy,
+    /// read the just-written arena window at full width on the fetch stream and discard the value.
+    ///
+    /// This is the ONLY intervention measured to make GLM decode reproduce itself — four clean
+    /// pairs over 6144 tokens against a rate predicting P(all clean) ~ 1e-9 — and its mechanism is
+    /// NOT understood. Fifteen alternatives are RED, each read back and confirmed to have applied:
+    /// one cache line of the arena, stride-32 sampling, the same bulk from a decoy buffer, the bare
+    /// dispatch, a shader copy instead of SDMA, a fine-grained arena, a write-combined arena, and
+    /// the staging hand-out (`slot_stalls` measured 0 on diverging pairs).
+    ///
+    /// Not behind a feature, for the same reason as `--copy-by-kernel`: the acceptance protocol
+    /// compares two release binaries differing in exactly this flag. Costs ~10% of decode
+    /// throughput — measure it on the arm, do not quote this number.
+    #[arg(long)]
+    arena_refresh: bool,
+
     /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
     /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
     /// saw, picked and where the pool put it.
@@ -511,6 +527,7 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
         trace_path: a.trace.as_deref(),
         pinned_coherent: a.pinned_coherent,
         copy_by_kernel: a.copy_by_kernel,
+        arena_refresh: a.arena_refresh,
     }
 }
 
