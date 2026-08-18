@@ -253,6 +253,9 @@ pub struct PinCfg<'a> {
     /// deletes the arena rather than repairing it) — not a shipping mode: re-measured
     /// 2026-08-18 at 6.4 GB/s against bounce's 13.3. See `Streamer::bounce`.
     pub direct_vmm_dma: bool,
+    /// `--slot-refresh`: the DIRECT-mode analogue of `--arena-refresh` — same full-width read,
+    /// aimed at the region DIRECT actually DMA'd into. See `Streamer::slot_refresh`.
+    pub slot_refresh: bool,
 }
 
 /// How many experts one `submit` carries, and what one costs — the shape an arm's MoE
@@ -378,6 +381,7 @@ impl<'a> PoolPlan<'a> {
             copy_by_kernel: pin.copy_by_kernel,
             arena_refresh: pin.arena_refresh,
             direct_vmm_dma: pin.direct_vmm_dma,
+            slot_refresh: pin.slot_refresh,
             budget,
             top_k: b.top_k,
             max_batch: b.max_batch,

@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: THE ARENA IS NOT THE LOCUS AND NO LAYER IS NAMED. `--arena-refresh` (a full-width device read of the just-written bounce arena, enqueued before the copy) passes the acceptance protocol at 1-3% cost — 7,168 tokens, zero events, 95% residual bound 1 per 2,389 against a pre-fix 1 per 299-578 — but `--direct-vmm-dma`, which has NO arena and NO H2D copy, still diverges (91/512 @420, 2026-08-18), so any account that is purely "the copy read stale arena bytes" is REFUTED AS A COMPLETE ONE. Sixteen mechanisms are eliminated by measurement and five candidate layers remain, INCLUDING OUR OWN MISSING SYNCHRONISATION — "hardware bug" is a hypothesis, not a finding, and the micro-repro is clean at 1e6 reads, which points toward the engine's concurrency rather than away from it. The surviving rule that fits every cell is narrow: the repair must read THE REGION THE NVMe DMA'd INTO, at full density, BEFORE the next device agent consumes it — reading the destination afterwards is RED (`sc` @236, `se` @301), equal bulk from a decoy is RED (@12), the bare dispatch is RED (@292), a shader copy instead of SDMA is RED, and every arena memory type is RED with the allocation read back. That rule predicts the one untested cell, DIRECT + a full-width slot read, which unifies the evidence if clean and kills the theory if red. ONLY GLM IS ESTABLISHED AFFECTED — Glimmer is a genuine control (dense, byte-identical pinned AND at 21/52 streamed), while V4 (32 ids) and K3 (16 ids) are UNTESTED at any length where the defect is detectable, and since the rate is PER READ, K3 streaming ~92% of 1.3 TiB should be the worst arm of the four.
+verdict: THE ARENA IS NOT THE LOCUS AND NO LAYER IS NAMED. `--arena-refresh` (a full-width device read of the just-written bounce arena, enqueued before the copy) passes the acceptance protocol at 1-3% cost — 7,168 tokens, zero events, 95% residual bound 1 per 2,389 against a pre-fix 1 per 299-578 — but `--direct-vmm-dma`, which has NO arena and NO H2D copy, still diverges (91/512 @420, 2026-08-18), so any account that is purely "the copy read stale arena bytes" is REFUTED AS A COMPLETE ONE. Sixteen mechanisms are eliminated by measurement and five candidate layers remain, INCLUDING OUR OWN MISSING SYNCHRONISATION — "hardware bug" is a hypothesis, not a finding, and the micro-repro is clean at 1e6 reads, which points toward the engine's concurrency rather than away from it. The surviving rule that fits every cell is narrow: the repair must read THE REGION THE NVMe DMA'd INTO, at full density, BEFORE the next device agent consumes it — reading the destination afterwards is RED (`sc` @236, `se` @301), equal bulk from a decoy is RED (@12), the bare dispatch is RED (@292), a shader copy instead of SDMA is RED, and every arena memory type is RED with the allocation read back. THAT RULE WAS TESTED AND IS REFUTED: `--slot-refresh` performs exactly that read of the pool slot in direct mode, was observed to apply, and is RED (210/512 @300). So the investigation has exactly ONE clean cell and no rule — bounce mode, the pinned-host arena, read before the SDMA copy — and three properties separate it from today's red (host memory vs device-local, copy engine vs compute kernel, a copy existing at all), none of them isolated. The compaction confound on the direct arms is CLOSED on two grounds: relocation frequency is identical between the clean and diverging configurations (8755 vs 8763 over identical work) and by construction relocation runs only after the previous layer's reads have all landed, so it cannot race an in-flight DMA in either mode. ONLY GLM IS ESTABLISHED AFFECTED — Glimmer is a genuine control (dense, byte-identical pinned AND at 21/52 streamed), while V4 (32 ids) and K3 (16 ids) are UNTESTED at any length where the defect is detectable, and since the rate is PER READ, K3 streaming ~92% of 1.3 TiB should be the worst arm of the four.
 ---
 
 # GLM decode nondeterminism — closeout
@@ -58,21 +58,60 @@ Calling it hardware is the least falsifiable and least actionable of the five an
 until a **firing micro-repro** exists. That repro is the only exhibit AMD would act on, and it
 is the thing that would promote the hypothesis to a finding.
 
-### The rule that fits every cell — and the one experiment that tests it
+### The rule that fit every cell — proposed, tested, REFUTED
+
+One rule fit every cell of the matrix as it stood on 2026-08-18:
 
 > A device-side reader — the SDMA copy engine **or** a compute kernel — can read **stale** bytes
 > from a region the NVMe has just DMA'd into. A prior full-width read **by a compute kernel**
-> repairs that region for the next consumer. Reading the destination afterwards is too late:
-> the wrong bytes are already there.
+> repairs that region for the next consumer.
 
-In **bounce** mode the DMA target is the arena and the next consumer is the SDMA copy, so the
-pre-copy arena read (`--arena-refresh`) repairs it. In **direct** mode the DMA target is the pool
-slot and the next consumer is the MoE kernel — **and no such prior read exists**, which is
-exactly why direct diverged.
+It named its own experiment. In bounce mode the DMA target is the arena and the next consumer is
+the SDMA copy, so `--arena-refresh` is that read and it is clean; in direct mode the DMA target is
+the pool **slot** and the next consumer is the MoE kernel, and nothing reads it first. So: aim the
+same full-width read at the slot, enqueued after the completion and before the ticket signal.
 
-**The untested cell that decides this: DIRECT + a full-width read of the pool slot**, enqueued
-after the read completes and before the ticket signal. **Clean ⇒ the rule unifies every arm and
-names the defect's shape. Red ⇒ the rule is dead.** Either way it is decisive.
+**`--slot-refresh` was built and it is RED — 210 of 512 ids, first at position 300.** The arm was
+observed to apply, from inside `reap` after the launch returned (`SLOT REFRESH applied: full-width
+read of 15335424 B of pool slot 2`), so this is not a non-applying arm. **The rule is dead.**
+
+### What is left is one point, not a rule
+
+| region read | when | next consumer | result |
+|---|---|---|---|
+| **pinned host arena** | **before the copy** | **SDMA engine** | **CLEAN** |
+| pool slot | after the copy (`sc`) | MoE kernel | RED @236 |
+| every slot | end of layer (`se`) | MoE kernel | RED @301 |
+| pool slot | after the DMA, pre-signal (`--slot-refresh`) | MoE kernel | **RED @300** |
+| nothing (`--direct-vmm-dma`) | — | MoE kernel | RED @420 |
+
+**Exactly one configuration has ever been clean**, and **three** properties separate it from
+today's red arm — the region is *pinned host* memory rather than device-local VMM; the next
+consumer is the *copy engine* rather than a compute kernel; and a copy exists at all. **None of
+the three is isolated by any measurement.** Naming which one matters is the next question, and it
+is a smaller question than the one this investigation started with.
+
+### The compaction confound on the direct arms — closed
+
+Both direct arms are only evidence about the shared defect if their divergence is not
+`relocate`'s own hazard. It is not, on two independent grounds:
+
+1. **Frequency is matched.** Identical command, one flag different, identical work
+   (34,131 vs 34,118 misses over 318 tokens): **8763 relocations in direct, 8755 in bounce** — a
+   0.1% difference. Compaction fires at the same rate in the configuration that is *clean*.
+2. **By construction, relocation races nothing.** `admit_misses` (which evicts, places and
+   compacts) runs strictly before `resolve` hands the batch's reads to the reaper, and layer L's
+   per-expert awaits plus its unconditional end-of-layer `device_sync` complete before layer L+1
+   submits — so every byte of L has landed before L+1 relocates anything. This is the argument
+   §4 already accepted for bounce, and the barrier it rests on is mode-independent.
+
+> **RETRACTED 2026-08-18, same day, by the author who wrote it.** This section first claimed direct
+> "widens the slot-write window ~13x, from the copy's 0.18 ms to the whole read's 2.4 ms". **That is
+> backwards.** In direct the slot write is *complete* when `reap` returns — the CQE means the DMA
+> landed. In bounce, `reap` returning means the copy was only *enqueued*; the slot write executes
+> later on the stream. Which mode exposes a slot for longer is **not established**, and it was
+> asserted as though it were. The confound is closed by the two grounds above, neither of which
+> depends on the retracted claim.
 
 ---
 
@@ -101,11 +140,18 @@ work produce the same red).
 | 13 | **`--direct-vmm-dma`** — no arena, no copy at all | n/a | none | **RED 91/512 @420** |
 | 14 | CPU-side store fence | — | — | refuted by argument: the CPU is neither producer nor consumer on this path |
 | 15 | stride sweep 16 → 8 → 4 → 1 | yes | — | **started, never completed** |
-| 16 | **DIRECT + full-width slot read** | **yes** | **bulk** | **the open cell** |
+| 16 | **`--slot-refresh`** — DIRECT + full-width slot read, pre-signal | **yes** | **bulk** | **RED 210/512 @300** — the rule's own prediction, refuted |
 
 **What the shape demands of any theory**: bulk (stride-32 sampling insufficient),
 region-specific (equal bulk elsewhere insufficient), not a dispatch effect, not a copy-engine
-effect, and not curable by any arena memory type.
+effect, not curable by any arena memory type — **and not reproducible by performing the same read
+on the other region**, which is what row 16 added and what removes "read the bytes you just wrote"
+as a general account.
+
+**Counters that existed and were never read.** `slot_stalls` went unread for the first half of
+this investigation while being INV-9's own falsifier; `relocs` was read only by a feature build
+nobody runs. Both now print on the `STAGING` line every run. A counter nothing reads is not
+an instrument.
 
 ### Instruments built
 

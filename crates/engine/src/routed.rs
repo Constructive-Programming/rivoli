@@ -82,6 +82,9 @@ pub struct PoolCfg<'a> {
     /// into the pool slot. The diagnostic arm for the GLM nondeterminism defect; measurably
     /// the slower mechanism. See `crate::fetch::stream::Streamer::bounce`.
     pub direct_vmm_dma: bool,
+    /// `--slot-refresh`: full-width read of the pool slot the drive just DMA'd into, enqueued
+    /// before the ticket signal. DIRECT only. See `crate::fetch::stream::Streamer::slot_refresh`.
+    pub slot_refresh: bool,
 }
 
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
@@ -267,6 +270,7 @@ impl RoutedPool {
             cfg.copy_by_kernel,
             cfg.arena_refresh,
             !cfg.direct_vmm_dma,
+            cfg.slot_refresh,
         )?)?;
         Ok(Self {
             buf,

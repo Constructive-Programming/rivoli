@@ -149,7 +149,7 @@ extern "C" __global__ void copy_h2d_kernel(uint4* __restrict__ dst, const uint4*
 // and it is labelled that way on purpose — the ceiling is that a future compiler, driver or cache
 // geometry could stop making the read sufficient, and nothing here would notice except the
 // determinism gate. Do not delete it without re-running `tests/determinism-glm.sh`.
-__global__ void touch_arena_kernel(const uint4* __restrict__ src, unsigned long long n4,
+__global__ void touch_region_kernel(const uint4* __restrict__ src, unsigned long long n4,
                                    unsigned long long* sink) {
     unsigned long long acc = 0;
     for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
@@ -165,16 +165,20 @@ __global__ void touch_arena_kernel(const uint4* __restrict__ src, unsigned long 
     }
 }
 
-// Read `n` bytes of `src` (a pinned-arena window) on `stream` at full width, discarding the value.
+// Read `n` bytes of `src` at full width on `stream`, discarding the value. `src` is whichever
+// region the NVMe just DMA'd into: the pinned arena in BOUNCE mode (--arena-refresh) or the
+// pool slot itself in DIRECT mode (--slot-refresh). WHICH region is the variable under test —
+// reading the arena pre-copy suppresses the defect, reading the destination slot post-copy
+// (`sc`) does NOT, and direct mode with no refresh at all diverges. Hence the neutral name.
 // 16 B granularity like the copy: every caller passes an O_DIRECT-block multiple.
-extern "C" int rivoli_touch_arena_async(const void* src, unsigned long long n, void* stream,
+extern "C" int rivoli_touch_region_async(const void* src, unsigned long long n, void* stream,
                                        unsigned long long* sink) {
     if (n == 0 || (n % sizeof(uint4)) != 0) return 1002;
     unsigned long long n4 = n / sizeof(uint4);
     unsigned long long blocks = (n4 + 255) / 256;
     if (blocks > 1024) blocks = 1024;
     hipGetLastError();
-    hipLaunchKernelGGL(touch_arena_kernel, dim3((unsigned)blocks), dim3(256), 0,
+    hipLaunchKernelGGL(touch_region_kernel, dim3((unsigned)blocks), dim3(256), 0,
                        (hipStream_t)stream, (const uint4*)src, n4, sink);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;

@@ -302,6 +302,22 @@ impl<'a> GlmEngine<'a> {
     /// counter is the observable that falsifies it: **non-zero means the barrier did not hold,
     /// the hand-out read device progress (wall-clock) rather than its own inputs, and a
     /// determinism comparison over that run is unsound.**
+    /// Pool COMPACTION relocations, so a determinism arm can state whether any happened.
+    ///
+    /// `relocate` memcpys a slot's bytes to a new address; nothing in it argues that it waits
+    /// for an io_uring DMA still in flight into that slot. Under BOUNCE that window is the
+    /// copy's ~0.18 ms, but `--direct-vmm-dma` DMAs for the whole ~2.4 ms read — ~13x wider.
+    /// So a red direct arm has two possible causes and this number separates them: **0 relocs
+    /// means the divergence cannot be compaction**, and the arm is evidence about the shared
+    /// defect. Non-zero means it may be direct's own hazard and says nothing about the arena.
+    ///
+    /// The counter existed and was read only by the divergence log, i.e. by a feature build
+    /// nobody runs — the same shape as `slot_stalls`, which went unread for the whole first
+    /// half of this investigation.
+    pub fn relocs(&self) -> u64 {
+        self.pin.routed.relocs()
+    }
+
     pub fn slot_stalls(&self) -> u64 {
         self.pin.routed.slot_stalls()
     }

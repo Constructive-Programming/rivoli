@@ -152,9 +152,12 @@ impl GlmEngine<'_> {
         // comparable to another for determinism. Logged every run so a divergence pair can
         // never again be argued over without it.
         tracing::info!(
-            "STAGING: slot_stalls {} (INV-9 precondition: 0 = hand-out was pure round-robin \
-             over the miss sequence; non-zero = it read device progress, comparison unsound)",
-            self.slot_stalls()
+            "STAGING: slot_stalls {} relocs {} (INV-9 precondition: 0 = hand-out was pure \
+             round-robin over the miss sequence; non-zero = it read device progress, comparison \
+             unsound. relocs 0 = no slot was memcpy'd under a possibly-in-flight DMA, which is \
+             what separates a shared-defect divergence from compaction's own)",
+            self.slot_stalls(),
+            self.relocs()
         );
         Ok(emit.finish(decode_wall, self.hits() - hit0, self.misses() - miss0))
     }

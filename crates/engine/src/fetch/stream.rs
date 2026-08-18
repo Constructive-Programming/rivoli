@@ -99,7 +99,7 @@ mod stage {
             /// the ARENA REFRESH mitigation (`kernels/async.hip` carries the evidence and the
             /// ceiling). Enqueued BEFORE the copy; `sink` is written only on an impossible
             /// value and exists solely to stop the loads being optimised away.
-            pub fn rivoli_touch_arena_async(
+            pub fn rivoli_touch_region_async(
                 src: *const c_void,
                 n: u64,
                 stream: *mut c_void,
@@ -196,7 +196,7 @@ mod stage {
     /// # Safety
     /// `src` is a live arena window valid for `n` bytes, `stream` is a live handle, and `sink` is
     /// a mapped writable `u64` the kernel stores to only on a value real payloads cannot produce.
-    pub unsafe fn touch_arena(
+    pub unsafe fn touch_region(
         src: *const u8,
         n: usize,
         stream: *mut c_void,
@@ -204,7 +204,7 @@ mod stage {
     ) -> Result<(), String> {
         // SAFETY: the caller's contract, forwarded.
         let rc =
-            unsafe { ffi::rivoli_touch_arena_async(src as *const c_void, n as u64, stream, sink) };
+            unsafe { ffi::rivoli_touch_region_async(src as *const c_void, n as u64, stream, sink) };
         check(rc)
     }
 }
@@ -295,6 +295,27 @@ pub struct Streamer {
     /// reproduce itself; a MITIGATION with an unexplained mechanism, not a root-cause fix.
     /// Evidence, alternatives tried, and the ceiling: `kernels/async.hip`, `glm-bug.md` §7b.
     arena_refresh: bool,
+    /// SLOT REFRESH — the arm that tests the only rule fitting every cell of the matrix:
+    /// *a device-side reader can read STALE bytes from the region the NVMe just DMA'd into, and a
+    /// prior full-width read by a compute kernel repairs it for the next consumer.*
+    ///
+    /// In BOUNCE mode the DMA target is the arena and the next consumer is the SDMA copy, so
+    /// `--arena-refresh` is that read and it is CLEAN. In DIRECT mode the DMA target is the pool
+    /// slot and the next consumer is the MoE kernel — and nothing reads it first, which is why
+    /// direct diverges (91/512 @420, 2026-08-18). This enqueues the same full-width read of the
+    /// SLOT, after the completion and before the ticket signal the miss kernel waits on.
+    ///
+    /// **Clean ⇒ the rule unifies every arm. Red ⇒ the rule is dead.** Either outcome is decisive,
+    /// which is why it is built as its own flag rather than folded into `arena_refresh`.
+    ///
+    /// DIRECT only. In bounce mode this read is `sc`, already measured RED @236, so the CLI
+    /// refuses the combination rather than re-running a known-red arm under a new name.
+    slot_refresh: bool,
+    /// One-shot: has the first slot refresh been LOGGED yet. Positive evidence that the
+    /// intervention ran, not that it was asked for — two rounds of this investigation were lost
+    /// to arms that never applied, and an arm that did not apply reds exactly like one that
+    /// does not work.
+    logged_refresh: bool,
     /// Device word the refresh kernel stores to only on an impossible value — it exists to stop
     /// the loads being optimised away, is never read, and needs no synchronisation.
     refresh_sink: *mut u64,
@@ -331,6 +352,7 @@ impl Streamer {
         by_kernel: bool,
         arena_refresh: bool,
         bounce: bool,
+        slot_refresh: bool,
     ) -> Result<Self> {
         // The bounce arena has exactly `entries` slots and `queue` indexes it by the
         // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
@@ -348,6 +370,27 @@ impl Streamer {
             .build(entries)
             .or_else(|_| IoUring::new(entries))?;
 
+        // `--slot-refresh` in BOUNCE mode IS `sc`, already measured RED @236. Refused rather than
+        // re-run under a new name; the CLI says the same thing with the number attached.
+        ensure!(
+            bounce || !arena_refresh,
+            "--slot-refresh and --arena-refresh are the same read of different regions; pass one"
+        );
+        ensure!(
+            !bounce || !slot_refresh,
+            "--slot-refresh reads the destination slot, which in bounce mode is the `sc` arm — \
+             already measured RED at first-divergence 236. It applies only with --direct-vmm-dma"
+        );
+        // One page, only when DIRECT needs a sink and therefore cannot borrow the arena's.
+        // Allocated before the arena so a single `Self` below can take both unconditionally.
+        let refresh_sink = match (bounce, slot_refresh) {
+            (false, true) => {
+                let p = stage::alloc(ALIGN, false);
+                ensure!(!p.is_null(), "slot-refresh sink alloc failed");
+                p
+            }
+            _ => std::ptr::null_mut(),
+        };
         // The arena is the ONE thing DIRECT mode changes: it allocates none, and that
         // absence is the intervention. Everything below is shared, so there is exactly one
         // `Self` — a second one is a jscpd clone and, worse, a place for the two modes to
@@ -407,23 +450,31 @@ impl Streamer {
                 arena
             }
         };
+        // BOUNCE borrows the arena's first word rather than holding a second allocation.
+        let refresh_sink = match bounce {
+            true => arena,
+            false => refresh_sink,
+        };
 
         Ok(Self {
             ring: ManuallyDrop::new(ring),
             entries,
             span,
             bounce,
+            slot_refresh,
+            logged_refresh: false,
             arena,
             dst: vec![std::ptr::null_mut(); entries as usize],
             nbytes: vec![0; entries as usize],
             fold: vec![FetchFolds::OFF; entries as usize],
             by_kernel,
             arena_refresh,
-            // The sink is a pinned-arena word, not a device allocation: the kernel's store is
-            // never taken, so the address only has to be writable and mapped. Reusing the arena
-            // avoids an allocation whose lifetime would have to be argued against teardown order.
-            // Null in DIRECT mode, where `arena_refresh` is refused above and nothing reads it.
-            refresh_sink: arena.cast::<u64>(),
+            // The sink is a pinned word, not a device allocation: the kernel's store is never
+            // taken, so the address only has to be writable and mapped. In BOUNCE mode it reuses
+            // the arena's first word, which avoids an allocation whose lifetime would have to be
+            // argued against teardown order. DIRECT has no arena, so `--slot-refresh` gets one
+            // page of its own — freed in `Drop`, and null when the flag is off.
+            refresh_sink: refresh_sink.cast::<u64>(),
             issued: [0; 2],
             min_res: vec![0; entries as usize],
         })
@@ -580,6 +631,33 @@ impl Streamer {
         // no copy ever wrote. The divergence probe is a bounce-mode instrument by
         // construction, so this arm is measured with the determinism gate instead.
         if !self.bounce {
+            // SLOT REFRESH: the same full-width read `--arena-refresh` performs, aimed at the
+            // region DIRECT mode actually DMA'd into. Enqueued on the fetch stream here, which is
+            // before `asyncfetch::run_job` signals this slot's timeline — so it is stream-ordered
+            // ahead of the miss kernel that waits on that value, exactly as the arena read is
+            // ordered ahead of the copy.
+            if self.slot_refresh {
+                // SAFETY: `dst[ud]` is a live pool slot holding the `nbytes[ud]` bytes the drive
+                // just wrote and valid until this read's signal fires; `stream` is live;
+                // `refresh_sink` is a mapped, writable page the kernel never stores to.
+                unsafe {
+                    stage::touch_region(
+                        self.dst[ud],
+                        self.nbytes[ud] as usize,
+                        stream,
+                        self.refresh_sink,
+                    )
+                }
+                .map_err(|e| anyhow::anyhow!("slot refresh launch failed: {e}"))?;
+                if !self.logged_refresh {
+                    self.logged_refresh = true;
+                    tracing::info!(
+                        "SLOT REFRESH applied: full-width read of {} B of pool slot {ud}, \
+                         enqueued on the fetch stream ahead of this slot's ticket signal",
+                        self.nbytes[ud]
+                    );
+                }
+            }
             return Ok(ud);
         }
         // SAFETY: `ud < entries`, and every read's `nbytes <= span`, so this slot's arena window
@@ -593,8 +671,10 @@ impl Streamer {
             // is live; `refresh_sink` is a mapped, writable arena word the kernel never stores to.
             // SAFETY: `src` is this slot's arena window, valid for `nbytes[ud]` bytes; the
             // stream is live; `refresh_sink` is a mapped arena word the kernel never stores to.
-            unsafe { stage::touch_arena(src, self.nbytes[ud] as usize, stream, self.refresh_sink) }
-                .map_err(|e| anyhow::anyhow!("arena refresh launch failed: {e}"))?;
+            unsafe {
+                stage::touch_region(src, self.nbytes[ud] as usize, stream, self.refresh_sink)
+            }
+            .map_err(|e| anyhow::anyhow!("arena refresh launch failed: {e}"))?;
         }
         // `--divergence-log`: BRACKET THE COPY. `bh` hashes what the drive delivered into the
         // pinned arena; `sc` hashes what arrived in the pool slot. Both are enqueued on the FETCH
@@ -770,8 +850,14 @@ impl Drop for Streamer {
         // SAFETY: in bounce mode `arena` came from `stage::alloc` and `new` refuses to
         // build a `Streamer` around a null one, so this is a live allocation; single
         // owner, no Clone, so it is freed exactly once. DIRECT mode allocated none.
-        if self.bounce {
-            unsafe { stage::free(self.arena) };
+        match self.bounce {
+            true => unsafe { stage::free(self.arena) },
+            // DIRECT allocated no arena; its only allocation is the `--slot-refresh` sink page,
+            // null when that flag is off.
+            false if !self.refresh_sink.is_null() => unsafe {
+                stage::free(self.refresh_sink.cast::<u8>())
+            },
+            false => {}
         }
     }
 }

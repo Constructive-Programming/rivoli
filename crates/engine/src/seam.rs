@@ -197,6 +197,9 @@ pub struct PoolKnobs<'a> {
     /// The diagnostic arm for whether the arena is the LOCUS of the nondeterminism defect
     /// or only where its repair landed. Measurably slower; see `Streamer::bounce`.
     pub direct_vmm_dma: bool,
+    /// `--slot-refresh`: DIRECT-mode full-width read of the just-DMA'd pool slot. The arm that
+    /// tests whether the repair follows THE REGION rather than the arena.
+    pub slot_refresh: bool,
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -491,6 +494,7 @@ fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_>
         copy_by_kernel: knobs.copy_by_kernel,
         arena_refresh: knobs.arena_refresh,
         direct_vmm_dma: knobs.direct_vmm_dma,
+        slot_refresh: knobs.slot_refresh,
         capacity,
         cache_policy: knobs.cache_policy,
         two_q: knobs.two_q,

@@ -243,6 +243,28 @@ struct Args {
     #[arg(long)]
     direct_vmm_dma: bool,
 
+    /// THE DECIDING ARM for the GLM nondeterminism defect: with `--direct-vmm-dma`, read the pool
+    /// slot the drive just DMA'd into at full width on the fetch stream, before the ticket signal
+    /// the MoE kernel waits on. Value discarded.
+    ///
+    /// One rule fits every cell of the ablation matrix: *a device-side reader can read STALE bytes
+    /// from the region the NVMe just DMA'd into, and a prior full-width read by a compute kernel
+    /// repairs it for the next consumer.* In bounce mode the DMA target is the arena and the next
+    /// consumer is the SDMA copy, so `--arena-refresh` is that read and it is CLEAN. In direct mode
+    /// the DMA target is the SLOT and the next consumer is the MoE kernel, and nothing reads it
+    /// first — which is why direct diverges (91/512 at 420, 2026-08-18).
+    ///
+    /// This is the same read aimed at the region direct mode actually writes. **Clean means the
+    /// rule unifies every arm and names the defect's shape; red means the rule is dead.** Both
+    /// outcomes are worth the run, which is the only reason a mode measured 29% slower carries a
+    /// fix flag at all.
+    ///
+    /// Requires `--direct-vmm-dma`: in bounce mode this same read of the destination slot is the
+    /// `sc` arm, already measured RED at first-divergence 236, and re-running a known-red arm under
+    /// a new name is how a matrix grows a row that decides nothing.
+    #[arg(long)]
+    slot_refresh: bool,
+
     /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
     /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
     /// saw, picked and where the pool put it.
@@ -552,6 +574,7 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
         copy_by_kernel: a.copy_by_kernel,
         arena_refresh: a.arena_refresh,
         direct_vmm_dma: a.direct_vmm_dma,
+        slot_refresh: a.slot_refresh,
     }
 }
 

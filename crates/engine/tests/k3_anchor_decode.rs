@@ -519,6 +519,7 @@ fn open_engine<'c>(
         copy_by_kernel: false,
         arena_refresh: false,
         direct_vmm_dma: false,
+        slot_refresh: false,
         capacity: floor + extra_units * unit + 512,
         cache_policy: "2q",
         two_q: rivoli_core::cache::TwoQSplit::default(),
