@@ -84,6 +84,9 @@ fn main() -> Result<()> {
     // ARENA REFRESH: the engine-side mitigation, testable here too so a firing repro can be
     // re-run against it without the engine.
     let refresh = args.iter().any(|a| a == "--arena-refresh");
+    // COPY VIA CPU: the candidate fix. The verifying fold then reads a destination the CPU
+    // wrote, on the same stream with no sync — exactly the coherence property the fix spends.
+    let by_cpu = args.iter().any(|a| a == "--copy-via-cpu");
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [file, iters, rest @ ..] = pos.as_slice() else {
         bail!("usage: arena_repro <layer-file> <iters> [stride-bytes] [--coherent]");
@@ -123,22 +126,47 @@ fn main() -> Result<()> {
         stride as f64 / (1u64 << 20) as f64
     );
 
-    // `true` = bounce. The repro exists to exercise the arena hop, so the arena-less
+    // `bounce: true` — the repro exists to exercise the arena hop, so the arena-less
     // `--direct-vmm-dma` destination is not one of its arms by construction.
     let mut streamer = Streamer::new(
         SLOTS,
         slot_span(stride),
-        coherent,
-        by_kernel,
-        refresh,
-        true,
-        false,
+        rivoli_engine::fetch::stream::FetchKnobs {
+            coherent,
+            by_kernel,
+            arena_refresh: refresh,
+            cpu_copy: by_cpu,
+            ..Default::default()
+        },
     )?;
     let fetch = rivoli_backend::Stream::fetch()?;
     // One destination per staging slot, so a batch's copies never share a destination — the engine
     // has the same property (a slot's ticket gates its reuse).
-    let mut dst: Vec<rivoli_engine::device::DeviceBuf> = (0..SLOTS)
-        .map(|_| rivoli_engine::device::DeviceBuf::new(stride))
+    //
+    // `--copy-via-cpu` needs HOST-WRITABLE destinations, which `hipMalloc` memory is not on this
+    // APU — that is why `VmmBuf` exists (device-local, host-fillable; exactly what the engine's
+    // pool is). The other arms keep `DeviceBuf`, so the repro's clean record stays on the memory
+    // type it was measured on. The two differ only in allocation; both hand out one pointer.
+    enum Dst {
+        Dev(rivoli_engine::device::DeviceBuf),
+        Vmm(rivoli_engine::device::VmmBuf),
+    }
+    impl Dst {
+        fn ptr(&mut self) -> *mut u8 {
+            match self {
+                Dst::Dev(b) => b.ptr_mut(),
+                Dst::Vmm(b) => b.ptr_mut(),
+            }
+        }
+    }
+    let mut dst: Vec<Dst> = (0..SLOTS)
+        .map(|_| {
+            if by_cpu {
+                rivoli_engine::device::VmmBuf::new(stride).map(Dst::Vmm)
+            } else {
+                rivoli_engine::device::DeviceBuf::new(stride).map(Dst::Dev)
+            }
+        })
         .collect::<Result<_>>()?;
     let mut folds = rivoli_engine::device::DeviceBuf::new(SLOTS as usize * 8)?;
     let mut got = vec![0u8; SLOTS as usize * 8];
@@ -166,7 +194,7 @@ fn main() -> Result<()> {
                         len: stride,
                     },
                     ReadDst {
-                        ptr: d.ptr_mut(),
+                        ptr: d.ptr(),
                         slot: slot as u32,
                         fold: rivoli_engine::fetch::asyncfetch::FetchFolds::OFF,
                     },
@@ -222,7 +250,7 @@ fn main() -> Result<()> {
     // events over N reads the 95% upper bound on the per-read rate is 3/N (the rule-of-three).
     println!(
         "arena_repro: {reads} reads, {bad} MISMATCHES, {:.0} reads/s, {:.1} s, arena={}, \
-         copies=[memcpy {} / kernel {}]",
+         copies=[memcpy {} / kernel {} / cpu {}]",
         reads as f64 / secs,
         secs,
         match coherent {
@@ -231,6 +259,7 @@ fn main() -> Result<()> {
         },
         streamer.copies_issued()[0],
         streamer.copies_issued()[1],
+        streamer.copies_issued()[2],
     );
     if bad == 0 {
         println!(

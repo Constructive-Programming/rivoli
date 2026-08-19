@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: THE ARENA IS NOT THE LOCUS AND NO LAYER IS NAMED. `--arena-refresh` (a full-width device read of the just-written bounce arena, enqueued before the copy) passes the acceptance protocol at 1-3% cost — 7,168 tokens, zero events, 95% residual bound 1 per 2,389 against a pre-fix 1 per 299-578 — but `--direct-vmm-dma`, which has NO arena and NO H2D copy, still diverges (91/512 @420, 2026-08-18), so any account that is purely "the copy read stale arena bytes" is REFUTED AS A COMPLETE ONE. Sixteen mechanisms are eliminated by measurement and five candidate layers remain, INCLUDING OUR OWN MISSING SYNCHRONISATION — "hardware bug" is a hypothesis, not a finding, and the micro-repro is clean at 1e6 reads, which points toward the engine's concurrency rather than away from it. The surviving rule that fits every cell is narrow: the repair must read THE REGION THE NVMe DMA'd INTO, at full density, BEFORE the next device agent consumes it — reading the destination afterwards is RED (`sc` @236, `se` @301), equal bulk from a decoy is RED (@12), the bare dispatch is RED (@292), a shader copy instead of SDMA is RED, and every arena memory type is RED with the allocation read back. THAT RULE WAS TESTED AND IS REFUTED: `--slot-refresh` performs exactly that read of the pool slot in direct mode, was observed to apply, and is RED (210/512 @300). So the investigation has exactly ONE clean cell and no rule — bounce mode, the pinned-host arena, read before the SDMA copy — and three properties separate it from today's red (host memory vs device-local, copy engine vs compute kernel, a copy existing at all), none of them isolated. The compaction confound on the direct arms is CLOSED on two grounds: relocation frequency is identical between the clean and diverging configurations (8755 vs 8763 over identical work) and by construction relocation runs only after the previous layer's reads have all landed, so it cannot race an in-flight DMA in either mode. ONLY GLM IS ESTABLISHED AFFECTED — Glimmer is a genuine control (dense, byte-identical pinned AND at 21/52 streamed), while V4 (32 ids) and K3 (16 ids) are UNTESTED at any length where the defect is detectable, and since the rate is PER READ, K3 streaming ~92% of 1.3 TiB should be the worst arm of the four.
+verdict: UPDATED 2026-08-19: STILL OPEN — but the matrix's one refutation of the delay class was unmeasured, and there is now a validated FIX CANDIDATE with the mechanism narrowed to an operational rule. The `bh-decoy` arm ("not bandwidth or delay", RED @12) read a DEVICE buffer at ~10x the pinned arena's bandwidth, so duration was never held constant and the visibility class was live the whole time. Under the condition that keeps the defect firing (int4 + steady CPU/NFS/NVMe load; control RED @311 and @38): a pure 1.5 ms settle is RED @227 (time alone does not repair), a full-width touch of a never-DMA'd decoy arena is GREEN (the arena's addresses do not matter), the same touch AFTER the copy is GREEN (the repair need only precede the consumer). The surviving rule is operational: a GPU agent reading NVMe-DMA'd memory can read stale; GPU read traffic over the HOST-memory path — any addresses — repairs when it lands before the consumer; time, device-memory traffic, and the bare dispatch do not. THE FIX: `--copy-via-cpu` makes the bounce→slot hop a host memcpy on the reaper thread, so no GPU agent reads IO-written memory (the CPU's read of the arena is the CQE's own guarantee — the one btrfs's datasum check already spends; the CPU's write to the pool is the coherence the resident tier's 281 GB startup load already spends). In the live window it is GREEN and byte-identical to the control's CORRECT arm — it computes the true function, at ~11% cost quiet / ~4% loaded against `--arena-refresh`'s 1-3% unexplained mitigation. NOT CLOSED: the fix's clean exposure is one live-window pair against the §5 bar of several thousand controlled tokens (accumulation continues in int4+load); `--copy-by-kernel` flipped RED(2026-08-17)→GREEN(2026-08-19) unreconciled; one routing-churn anomaly with byte-identical ids awaits its reproducibility test; and no microarchitectural structure is named, which is what AMD and a final verdict both still need. Supersedes the 2026-08-18 verdict below, which stands in the body: the arena is not the locus, sixteen mechanisms were eliminated by measurement, and `--slot-refresh` killed the read-the-region rule.
 ---
 
 # GLM decode nondeterminism — closeout
@@ -288,3 +288,105 @@ The flag is **opt-in**. Correctness argues for on-by-default and the price to qu
 That is the owner's call and it is not made here. Whichever way it goes, the recorded command
 line in `docs/measurement/` must carry the flag's state, because every quality and throughput
 number in this repo is now conditional on it.
+
+---
+
+## 6. 2026-08-19 — the delay refutation was unmeasured; the mechanism is a path; a candidate fix removes it
+
+**Status: still OPEN.** A candidate fix is validated in the live window and output-identical
+to the correct control arm, but its clean exposure is one live-window pair plus quiet-window
+greens — short of the acceptance bar §5 sets. The mechanism is narrowed to an operational
+rule, not a named microarchitectural structure.
+
+### The `bh-decoy` confound — "not bandwidth or delay" was never established
+
+The matrix's one refutation of the whole delay/bandwidth class was `bh-decoy` ("same bytes,
+same duration, different buffer", RED @12). The decoy is `probe.rs`'s `DeviceBuf` — DEVICE
+memory, read at ~135–220 GB/s — while `bh` reads the pinned HOST arena at the ~13 GB/s the
+arena-refresh cost implies. That is roughly a 10× difference in the duration the arm existed
+to hold constant. `glm-nondeterminism.md` carries the dated correction; the sc-ladder decoys
+are unaffected (slot and decoy are both device memory there).
+
+### The condition that keeps the defect firing
+
+The box went quiet after 2026-08-17: int3-vq stock controls came back green all day on
+2026-08-18 and -19 (one exception: RED @473 on 08-19), at ~1 red per 10 pairs — no arm is
+interpretable against that. The recorded amplifier was reproduced and it works: steady
+**CPU spinners + NFS reads + O_DIRECT NVMe reads** (the box's `/home` is NFS), and
+**`--mode int4`** (+36% reads and 1.78× the bytes of int3-vq — the exposure model's own
+prediction). Under int4+load the control reddened twice in two pairs (@311, @38). All arms
+below ran under that condition, on one binary differing only in the named flag, with every
+arm's application line read back out of its log.
+
+### The arms the matrix never had, and what they settled
+
+| arm | what it varies | int4+load result | settles |
+|---|---|---|---|
+| `--fetch-settle-us 1500` — pure host sleep between CQE and copy | TIME, nothing else | **RED @227** | the repair is not time |
+| `--arena-refresh-decoy` — the full-width touch aimed at a second pinned arena the NVMe never writes | ADDRESSES, holding kernel/bytes/memory-type/duration | GREEN (n=1) | the repair is not the arena's addresses |
+| `--arena-refresh-late` — the same touch AFTER the copy, before the signal | POSITION | GREEN (n=1) | the repair need only precede the CONSUMER |
+| `--copy-by-kernel` (re-run under today's condition) | — | GREEN (n=1) | its 08-17 RED is now suspect; see below |
+| **`--copy-via-cpu`** — the bounce→slot hop as a HOST memcpy on the reaper thread | removes the GPU's read of IO-written memory | **GREEN, and byte-identical to the correct control arm** | the candidate fix |
+
+With the legacy cells, the surviving rule is narrow and operational: **a GPU agent that reads
+memory the NVMe's DMA just wrote can get stale bytes; the repair is GPU read traffic over the
+HOST-memory path (any addresses — a flush-like effect), before the consumer; time alone does
+not repair, device-memory traffic does not repair, and the dispatch alone does not repair.**
+Whether the pending state lives in a fabric queue, an IOMMU staging buffer, or a GPU host-path
+cache is below what these cells can name, and the doc does not pretend otherwise. The
+`--copy-by-kernel` conflict (RED on 08-17, GREEN today) is unresolved: under this rule its own
+arena reads ARE host-path traffic, which flushes while it copies — a pair at 512 may simply
+hide behind that. It is recorded as suspect, not reconciled.
+
+### The candidate fix: `--copy-via-cpu`
+
+The bounce→slot hop becomes a host `memcpy` on the reaper thread. After it, **no GPU agent
+anywhere reads memory the NVMe wrote**: the arena is read only by the CPU (the visibility the
+io_uring CQE actually guarantees — the one btrfs's datasum verification already spends on
+every read) and the slot is written only by the CPU (the CPU→GPU coherence `kernels/vmm.hip`
+was verified to have and the resident tier's 281 GB startup load already spends). The ticket
+still signals on the fetch stream; the consumer side is byte-identical.
+
+**Validation.** Micro-repro with the exact memory pattern (CPU-written destination, verifying
+fold on the same stream, no sync): 20,000/20,000 content-correct against the buffered
+reference. Gate: in the live int4+load window, the fix pair is GREEN *and its 512 ids are
+byte-identical to the control's correct arm* — the control's other arm hit the event at 311
+and went corrupt, so the fix is measured computing the true function, not a frozen wrong one.
+Its int3-vq ids are byte-identical to every green control pair as well (output-preserving).
+
+**Cost.** int3-vq quiet box, 512-token arms: 2.78–2.85 tok/s against 3.16–3.17 control —
+**~11%**, worse than `--arena-refresh`'s 1–3% (the memcpy's CPU time is exposed against the
+disk-bound baseline; under load the gap compresses to ~4%). The memcpy is not yet tuned (no
+non-temporal stores, it copies the O_DIRECT pad too). Whether the principled path is worth the
+delta over the unexplained mitigation is the owner's call, now with both prices measured.
+
+### One anomaly, and the memory-state reading of it
+
+One fix arm (int3-vq quiet) ended with a different hit/miss split (72,170 vs 70,030 misses)
+and +529 relocations while its 512 ids stayed byte-identical to the other three arms'. Budget
+(98.4 GiB) and pin (6,872 of 19,200) are byte-identical across all four runs and `slot_stalls`
+is 0, so a changed partition cannot explain it within this series. Two readings remain open:
+a sub-argmax event (routing churn without an output flip), or a residency difference of the
+class the owner named on review — **"total used and available memory changed"**: any run whose
+pin derives from free memory (no literal `--max-mem`, or a mid-run tenant in the old tree)
+gets a different resident set, hence different miss counts, at *identical* output (P4 — the
+memory knob trades speed, never text). That reading is correct in principle and it has a
+teeth-cutting consequence here: `glm-nondeterminism.md`'s "`a2`'s hit rate differs from `a`'s
+… is a result, not noise" — recorded as the defect's upstream signature — is **confounded**
+by exactly this class whenever the two runs' memory state differed, and the a-series' memory
+state was never recorded. The id divergences stand; one supporting signature does not. **The
+reproducibility test then ran: two further fix arms came back at the common counts (70,030
+misses, 20,490 relocs) with ids byte-identical to the controls — the anomaly did not recur.**
+It is recorded as a singular observation, class-explained, not chased further.
+
+### What closure still needs
+
+1. **Exposure to the §5 bar.** The fix's clean record must reach the same several-thousand
+   controlled tokens `--arena-refresh` earned (accumulation continues in int4+load; today's
+   tally is one live-window pair plus quiet-window greens).
+2. **The default-on decision**, repriced with the two costs now measured (fix ~11% quiet /
+   ~4% loaded, vs mitigation 1–3%).
+3. **The `--copy-by-kernel` reconciliation** (the q4 anomaly ran its reproducibility test and
+   did not recur — see above).
+4. **A named microarchitectural structure** — the one thing AMD would need, and the only
+   thing that promotes the operational rule to a finding.

@@ -265,6 +265,71 @@ struct Args {
     #[arg(long)]
     slot_refresh: bool,
 
+    /// CANDIDATE FIX: the bounce→slot hop as a HOST memcpy on the reaper thread instead of an
+    /// async copy on the fetch stream.
+    ///
+    /// The defect the matrix localised is that a GPU-side reader (the SDMA copy engine, or a
+    /// shader) can read bytes the NVMe's DMA wrote and get stale ones, and that the ONE clean
+    /// cell repairs it with a full-width device read of the DMA'd region. This flag removes the
+    /// hop rather than repairing it: the arena is read only by the CPU (the visibility the
+    /// io_uring CQE actually guarantees — the same one btrfs's datasum verification spends on
+    /// every read) and the pool slot is written only by the CPU (the CPU→GPU coherence
+    /// `kernels/vmm.hip` was verified to have, which the resident tier's 281 GB startup load
+    /// already relies on). The ticket still signals on the fetch stream, so the consumer side
+    /// is unchanged. A flag and not a feature, like every fix arm here: the protocol compares
+    /// two release binaries differing in exactly this argument.
+    #[arg(long)]
+    copy_via_cpu: bool,
+
+    /// DIAGNOSTIC: sleep this many microseconds on the reaper thread between each io_uring
+    /// completion and the copy it kicks — pure TIME, no device work, no memory traffic.
+    ///
+    /// The arm the ablation matrix never had: `bh-nop` has ~no delay, and `bh-decoy` was
+    /// recorded as the equal-duration control but reads a DEVICE buffer (~10x the bandwidth of
+    /// the host arena `--arena-refresh` reads), so "not bandwidth or delay" was never actually
+    /// established. CLEAN here and the refresh repairs by TIME; RED and the repair is specific
+    /// to the arena's addresses. Pair with `--arena-refresh-decoy` to separate the two.
+    #[arg(long, value_name = "US", default_value_t = 0)]
+    fetch_settle_us: u64,
+
+    /// DIAGNOSTIC: the `--arena-refresh` full-width read, aimed at a SECOND pinned host arena
+    /// (same size, same per-slot indexing, same memory type) that the NVMe never writes.
+    ///
+    /// Same kernel, same stream position, same byte count, same duration as the one clean cell
+    /// — different addresses. CLEAN means the repair is the time or the host-read traffic, not
+    /// the region; RED means the repair is specific to the region the NVMe DMA'd into, which
+    /// is the address-cache class of mechanism. With `--fetch-settle-us` this completes the
+    /// time-vs-address separation the decoy-on-device-memory arm could not.
+    #[arg(long)]
+    arena_refresh_decoy: bool,
+
+    /// DIAGNOSTIC: the `--arena-refresh` read at one 16 B unit per N — the dose-response sweep
+    /// the investigation left unfinished (`--divergence-folds bh-line:N` needed a probe build;
+    /// this needs none). N=1 is the clean cell; N=4 is the 64 B sector hypothesis's prediction;
+    /// N=8 reproduces the `bh-line` cell (RED at first-divergence 704). Conflicts with
+    /// `--arena-refresh`, which IS N=1.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    arena_refresh_stride: u64,
+
+    /// DIAGNOSTIC: the SAME full-width arena read as `--arena-refresh`, enqueued AFTER the
+    /// copy instead of before it. The fetch stream's FIFO order means it cannot delay the
+    /// copy, only the signal the consumer waits on — so it separates "the repair must precede
+    /// the COPY" from "must precede the CONSUMER". CLEAN re-locates the defect to the slot's
+    /// consumer; RED keeps it producer-side. Conflicts with `--arena-refresh` and
+    /// `--arena-refresh-decoy`.
+    #[arg(long)]
+    arena_refresh_late: bool,
+
+    /// DIAGNOSTIC, with `--direct-vmm-dma`: after each completion the reaper CPU-reads the
+    /// just-DMA'd pool slot into a scratch buffer and writes it straight back. The payload is
+    /// unchanged — only the last WRITER changes, from the NVMe's DMA engine to the CPU. This is
+    /// the `--copy-via-cpu` premise (CPU writes to the pool are GPU-visible — the property the
+    /// resident tier's startup load already spends) tested against direct mode, the one
+    /// condition measured to still fire. CLEAN supports the premise in the live condition; RED
+    /// kills it — and with it `--copy-via-cpu` — without needing bounce mode to cooperate.
+    #[arg(long)]
+    cpu_retouch: bool,
+
     /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
     /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
     /// saw, picked and where the pool put it.
@@ -575,6 +640,12 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
         arena_refresh: a.arena_refresh,
         direct_vmm_dma: a.direct_vmm_dma,
         slot_refresh: a.slot_refresh,
+        copy_via_cpu: a.copy_via_cpu,
+        fetch_settle_us: a.fetch_settle_us,
+        arena_refresh_decoy: a.arena_refresh_decoy,
+        arena_refresh_stride: a.arena_refresh_stride,
+        arena_refresh_late: a.arena_refresh_late,
+        cpu_retouch: a.cpu_retouch,
     }
 }
 

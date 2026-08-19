@@ -510,21 +510,11 @@ fn open_engine<'c>(
 ) -> K3Engine<'c> {
     let unit = f4_expert_stride(cfg.text.expert_in, cfg.text.moe_inter);
     let floor = ok(safetensors_bytes(dir, None), "file bytes") + (64 << 20) + 2 * unit;
-    let pin = PinCfg {
-        // Stock allocation AND the stock destination: a fixture must not silently test a
-        // candidate fix. All four are the shipped defaults — `arena_refresh` has been a
-        // `PinCfg` field since 41f6f3d and this initializer was never updated, so
-        // `clippy --all-targets` was red on this branch before `direct_vmm_dma` arrived.
-        pinned_coherent: false,
-        copy_by_kernel: false,
-        arena_refresh: false,
-        direct_vmm_dma: false,
-        slot_refresh: false,
-        capacity: floor + extra_units * unit + 512,
-        cache_policy: "2q",
-        two_q: rivoli_core::cache::TwoQSplit::default(),
-        trace_path: None,
-    };
+    // Stock allocation AND the stock destination, spelled once at `PinCfg::stock`: a fixture
+    // must not silently test a candidate fix. (This initializer was hand-maintained until
+    // 2026-08-19, and twice missed fields added upstream — `arena_refresh`, then
+    // `direct_vmm_dma` — which is why the stock spelling now exists.)
+    let pin = PinCfg::stock(floor + extra_units * unit + 512);
     let pin = ok(K3Pin::build(dir, &cfg.text, pin), "build the tiny pin");
     ok(K3Engine::new(pin, &cfg.text, max_ctx), "build the engine")
 }

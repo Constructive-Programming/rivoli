@@ -85,6 +85,23 @@ pub struct PoolCfg<'a> {
     /// `--slot-refresh`: full-width read of the pool slot the drive just DMA'd into, enqueued
     /// before the ticket signal. DIRECT only. See `crate::fetch::stream::Streamer::slot_refresh`.
     pub slot_refresh: bool,
+    /// `--copy-via-cpu`: the bounce→slot hop as a host memcpy on the reaper thread — the
+    /// candidate fix; no GPU agent then reads IO-written memory. See
+    /// `crate::fetch::stream::FetchKnobs::cpu_copy`.
+    pub copy_via_cpu: bool,
+    /// `--fetch-settle-us`: pure host time between each CQE and its copy — the
+    /// time-vs-address discriminator. See `crate::fetch::stream::FetchKnobs::settle_us`.
+    pub fetch_settle_us: u64,
+    /// `--arena-refresh-decoy`: the refresh read aimed at a pinned arena the NVMe never
+    /// writes. See `crate::fetch::stream::FetchKnobs::arena_refresh_decoy`.
+    pub arena_refresh_decoy: bool,
+    /// `--arena-refresh-stride`: the refresh at reduced density. See `FetchKnobs::arena_refresh_stride`.
+    pub arena_refresh_stride: u64,
+    /// `--arena-refresh-late`: the refresh AFTER the copy. See `FetchKnobs::arena_refresh_late`.
+    pub arena_refresh_late: bool,
+    /// `--cpu-retouch` (direct only): CPU read+write-back of the just-DMA'd slot. See
+    /// `crate::fetch::stream::FetchKnobs::cpu_retouch`.
+    pub cpu_retouch: bool,
 }
 
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
@@ -266,11 +283,19 @@ impl RoutedPool {
         let fetch = AsyncFetch::new(Streamer::new(
             ring as u32,
             slot_span(stride),
-            cfg.pinned_coherent,
-            cfg.copy_by_kernel,
-            cfg.arena_refresh,
-            !cfg.direct_vmm_dma,
-            cfg.slot_refresh,
+            crate::fetch::stream::FetchKnobs {
+                coherent: cfg.pinned_coherent,
+                by_kernel: cfg.copy_by_kernel,
+                arena_refresh: cfg.arena_refresh,
+                bounce: !cfg.direct_vmm_dma,
+                slot_refresh: cfg.slot_refresh,
+                cpu_copy: cfg.copy_via_cpu,
+                settle_us: cfg.fetch_settle_us,
+                arena_refresh_decoy: cfg.arena_refresh_decoy,
+                arena_refresh_stride: cfg.arena_refresh_stride,
+                arena_refresh_late: cfg.arena_refresh_late,
+                cpu_retouch: cfg.cpu_retouch,
+            },
         )?)?;
         Ok(Self {
             buf,

@@ -6,4 +6,5 @@
 #![cfg(feature = "rocm")]
 
 pub mod asyncfetch;
+mod stage;
 pub mod stream;

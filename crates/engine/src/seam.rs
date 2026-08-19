@@ -200,6 +200,30 @@ pub struct PoolKnobs<'a> {
     /// `--slot-refresh`: DIRECT-mode full-width read of the just-DMA'd pool slot. The arm that
     /// tests whether the repair follows THE REGION rather than the arena.
     pub slot_refresh: bool,
+    /// `--copy-via-cpu`: the bounce→slot hop as a host memcpy on the reaper thread — the
+    /// candidate FIX. After it, no GPU agent reads memory the NVMe wrote: the CPU reads the
+    /// arena (the CQE's own guarantee) and writes the slot (the CPU→GPU coherence the resident
+    /// tier's startup load already spends). See `fetch::stream::FetchKnobs::cpu_copy`.
+    pub copy_via_cpu: bool,
+    /// `--fetch-settle-us`: pure host time between each CQE and its copy — the diagnostic the
+    /// ablation matrix never had, since its equal-duration control (`bh-decoy`) read a DEVICE
+    /// buffer and never held duration. Clean ⇒ the repair is time. `FetchKnobs::settle_us`.
+    pub fetch_settle_us: u64,
+    /// `--arena-refresh-decoy`: the `--arena-refresh` read aimed at a pinned host arena the
+    /// NVMe never writes — same kernel, bytes, memory type and duration, different addresses.
+    /// Clean ⇒ time/traffic; red ⇒ address-specific. `FetchKnobs::arena_refresh_decoy`.
+    pub arena_refresh_decoy: bool,
+    /// `--arena-refresh-stride N`: the refresh at one 16 B unit per N — the dose-response
+    /// sweep. N=4 is the 64 B sector hypothesis's prediction. `FetchKnobs::arena_refresh_stride`.
+    pub arena_refresh_stride: u64,
+    /// `--arena-refresh-late`: the refresh AFTER the copy — separates "repair precedes the
+    /// COPY" from "precedes the CONSUMER". `FetchKnobs::arena_refresh_late`.
+    pub arena_refresh_late: bool,
+    /// `--cpu-retouch` (with `--direct-vmm-dma`): the reaper CPU-reads the just-DMA'd slot and
+    /// writes it back — the payload unchanged, the last WRITER changed from the NVMe's DMA to
+    /// the CPU. The `--copy-via-cpu` premise tested against the one condition that still
+    /// fires. `FetchKnobs::cpu_retouch`.
+    pub cpu_retouch: bool,
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -495,6 +519,12 @@ fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_>
         arena_refresh: knobs.arena_refresh,
         direct_vmm_dma: knobs.direct_vmm_dma,
         slot_refresh: knobs.slot_refresh,
+        copy_via_cpu: knobs.copy_via_cpu,
+        fetch_settle_us: knobs.fetch_settle_us,
+        arena_refresh_decoy: knobs.arena_refresh_decoy,
+        arena_refresh_stride: knobs.arena_refresh_stride,
+        arena_refresh_late: knobs.arena_refresh_late,
+        cpu_retouch: knobs.cpu_retouch,
         capacity,
         cache_policy: knobs.cache_policy,
         two_q: knobs.two_q,

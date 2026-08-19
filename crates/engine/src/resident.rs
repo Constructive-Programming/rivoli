@@ -256,6 +256,47 @@ pub struct PinCfg<'a> {
     /// `--slot-refresh`: the DIRECT-mode analogue of `--arena-refresh` — same full-width read,
     /// aimed at the region DIRECT actually DMA'd into. See `Streamer::slot_refresh`.
     pub slot_refresh: bool,
+    /// `--copy-via-cpu`: the bounce→slot hop as a host memcpy — the candidate fix. See
+    /// `fetch::stream::FetchKnobs::cpu_copy`.
+    pub copy_via_cpu: bool,
+    /// `--fetch-settle-us`: pure time between CQE and copy. See `FetchKnobs::settle_us`.
+    pub fetch_settle_us: u64,
+    /// `--arena-refresh-decoy`: the refresh read aimed at a never-written pinned arena. See
+    /// `FetchKnobs::arena_refresh_decoy`.
+    pub arena_refresh_decoy: bool,
+    /// `--arena-refresh-stride`: the refresh at one 16 B unit per N. See `FetchKnobs`.
+    pub arena_refresh_stride: u64,
+    /// `--arena-refresh-late`: the refresh AFTER the copy, pre-signal. See `FetchKnobs`.
+    pub arena_refresh_late: bool,
+    /// `--cpu-retouch` (direct only): CPU read+write-back of the DMA'd slot. See `FetchKnobs`.
+    pub cpu_retouch: bool,
+}
+
+impl PinCfg<'static> {
+    /// The STOCK configuration over `capacity` device bytes: 2q policy, no trace, every
+    /// investigation arm off. Spelled ONCE — the fixtures that must not silently test a
+    /// candidate fix (`glm_smoke`, the anchor decodes) all want exactly this, and two
+    /// hand-written copies of it is how a field gets updated in one and not the other (the
+    /// `arena_refresh`/`direct_vmm_dma` fields did exactly that to `k3_anchor_decode`).
+    pub fn stock(capacity: usize) -> PinCfg<'static> {
+        PinCfg {
+            capacity,
+            cache_policy: "2q",
+            two_q: rivoli_core::cache::TwoQSplit::default(),
+            trace_path: None,
+            pinned_coherent: false,
+            copy_by_kernel: false,
+            arena_refresh: false,
+            direct_vmm_dma: false,
+            slot_refresh: false,
+            copy_via_cpu: false,
+            fetch_settle_us: 0,
+            arena_refresh_decoy: false,
+            arena_refresh_stride: 0,
+            arena_refresh_late: false,
+            cpu_retouch: false,
+        }
+    }
 }
 
 /// How many experts one `submit` carries, and what one costs — the shape an arm's MoE
@@ -382,6 +423,12 @@ impl<'a> PoolPlan<'a> {
             arena_refresh: pin.arena_refresh,
             direct_vmm_dma: pin.direct_vmm_dma,
             slot_refresh: pin.slot_refresh,
+            copy_via_cpu: pin.copy_via_cpu,
+            fetch_settle_us: pin.fetch_settle_us,
+            arena_refresh_decoy: pin.arena_refresh_decoy,
+            arena_refresh_stride: pin.arena_refresh_stride,
+            arena_refresh_late: pin.arena_refresh_late,
+            cpu_retouch: pin.cpu_retouch,
             budget,
             top_k: b.top_k,
             max_batch: b.max_batch,

@@ -34,21 +34,10 @@ fn main() -> Result<()> {
         dir,
         &cfg,
         rivoli_artifact::format::RoutedFmt::Vq3,
-        rivoli_engine::resident::PinCfg {
-            capacity,
-            cache_policy: "2q",
-            two_q: rivoli_core::cache::TwoQSplit::default(),
-            trace_path: None,
-            // Bounce, i.e. the shipped destination. `--direct-vmm-dma` is a diagnostic arm
-            // driven from the CLI; the parity gate must stay on the historical path.
-            direct_vmm_dma: false,
-            slot_refresh: false,
-            // The historical allocation. This example is the parity gate's arm and must stay the
-            // stock configuration; `--pinned-coherent` is evaluated through the CLI.
-            pinned_coherent: false,
-            copy_by_kernel: false,
-            arena_refresh: false,
-        },
+        // The STOCK configuration, spelled once at `PinCfg::stock`: this example is the
+        // parity gate's arm and must stay the historical path — every candidate-fix and
+        // diagnostic arm is evaluated through the CLI, never here.
+        rivoli_engine::resident::PinCfg::stock(capacity),
     )?;
     let mut eng = rivoli_engine::glm::engine::GlmEngine::new(pin, &cfg, 4096)?;
     let (out, stats) = eng.generate(

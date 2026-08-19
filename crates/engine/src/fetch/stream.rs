@@ -55,6 +55,7 @@
 #![cfg(feature = "rocm")]
 
 use crate::fetch::asyncfetch::FetchFolds;
+use crate::fetch::stage; // the HIP FFI half — the ONLY backend-specific block here
 use anyhow::{Result, ensure};
 use io_uring::{IoUring, opcode, types};
 use std::ffi::c_void;
@@ -66,148 +67,6 @@ use std::os::fd::RawFd;
 /// (512/4096) and matches the page/VMM granularity — offset, length, and buffer
 /// must all be multiples of it.
 pub const ALIGN: usize = 4096;
-
-/// The two staging operations, per backend: allocate/free the staging arena, and move one
-/// staged read into its pool slot.
-///
-/// Nothing else in this file is backend-specific.
-#[cfg(feature = "rocm")]
-mod stage {
-    use std::ffi::c_void;
-
-    mod ffi {
-        use std::ffi::c_void;
-        unsafe extern "C" {
-            /// Pinned host arena for the bounce path (kernels/async.hip). Null on failure.
-            pub fn rivoli_pinned_alloc(bytes: u64, coherent: i32) -> *mut c_void;
-            /// What the runtime ACTUALLY gave: 0 and `*out` on success, negative on failure.
-            pub fn rivoli_pinned_flags(p: *mut c_void, out: *mut u32) -> i32;
-            /// The bit `hipHostMallocCoherent` sets, so Rust does not hardcode a HIP constant.
-            pub fn rivoli_pinned_coherent_bit() -> u32;
-            pub fn rivoli_pinned_free(p: *mut c_void);
-            /// Async H2D copy on `stream` (bounce slot → VMM slot). 0 ok, else negative.
-            /// `by_kernel != 0` moves the bytes with an ordinary shader copy instead of the copy
-            /// engine — Phase 3B. One entry point, because the two are one operation with a knob.
-            pub fn rivoli_memcpy_h2d_async(
-                dst: *mut c_void,
-                src: *const c_void,
-                n: u64,
-                stream: *mut c_void,
-                by_kernel: i32,
-            ) -> i32;
-            /// Full-width device read of a pinned-arena window on `stream`, value discarded —
-            /// the ARENA REFRESH mitigation (`kernels/async.hip` carries the evidence and the
-            /// ceiling). Enqueued BEFORE the copy; `sink` is written only on an impossible
-            /// value and exists solely to stop the loads being optimised away.
-            pub fn rivoli_touch_region_async(
-                src: *const c_void,
-                n: u64,
-                stream: *mut c_void,
-                sink: *mut u64,
-            ) -> i32;
-        }
-    }
-
-    /// A HIP-PINNED host arena, which is what makes the copy below a DMA rather than a
-    /// staged CPU memcpy. Null on failure.
-    ///
-    /// `coherent` requests FINE-GRAINED host memory — a candidate fix for the ordering gap argued
-    /// at `kernels/async.hip::rivoli_pinned_alloc`, where nothing establishes that the GPU-side
-    /// copy observes the NVMe DMA's writes to this arena.
-    pub fn alloc(bytes: usize, coherent: bool) -> *mut u8 {
-        // SAFETY: no pointer args; null on failure.
-        unsafe { ffi::rivoli_pinned_alloc(bytes as u64, i32::from(coherent)) as *mut u8 }
-    }
-
-    /// What the runtime ACTUALLY returned for `p`: `(flags, coherent_bit_set)`, or `None` if the
-    /// query failed.
-    ///
-    /// **A run must state what it GOT, not what it asked for.** A `--pinned-coherent` arm was run
-    /// and reported no effect, and it could not be believed because nothing observed whether the
-    /// allocation had changed — an intervention that never applied and an intervention that does
-    /// not work produce the same red. This is that observation.
-    pub fn flags(p: *mut u8) -> Option<(u32, bool)> {
-        let mut f = 0u32;
-        // SAFETY: `p` came from `alloc` and is live; `f` is a live local.
-        let rc = unsafe { ffi::rivoli_pinned_flags(p as *mut c_void, &raw mut f) };
-        // SAFETY: no arguments.
-        let bit = unsafe { ffi::rivoli_pinned_coherent_bit() };
-        (rc == 0).then_some((f, f & bit != 0))
-    }
-
-    /// HIP tracks the pinned registration's size itself, so this takes only the pointer.
-    ///
-    /// It took an unused `_bytes` until 2026-08-06 so both backends' `free` were called
-    /// identically — the Vulkan one needed it because `std::alloc::dealloc` demands the
-    /// original `Layout`. With one backend that threaded a value through `Streamer`
-    /// construction and `Drop` purely to be discarded, so it is gone, on the same reasoning
-    /// as `device.rs::bump`'s `pad`. A backend whose deallocator needs the size needs it back.
-    ///
-    /// # Safety
-    /// `p` came from [`alloc`] and is freed exactly once.
-    pub unsafe fn free(p: *mut u8) {
-        unsafe { ffi::rivoli_pinned_free(p as *mut c_void) };
-    }
-
-    /// ASYNC bounce->slot copy on the fetch stream — `hipMemcpyAsync` by default, or an ordinary
-    /// shader copy when `by_kernel` (Phase 3B, a candidate fix; see `kernels/async.hip`).
-    ///
-    /// ORIGINALLY: `hipMemcpyAsync` on the fetch stream: it returns before the bytes land, and
-    /// the read's `Signal` (armed on the same stream) is what says they have. This is the
-    /// op the load↔compute overlap is built on.
-    ///
-    /// # Safety
-    /// `dst` owns `n` device bytes and stays valid until `stream`'s completion signal
-    /// fires; `src` is a live arena slot holding `n` bytes; `stream` is a live handle.
-    pub unsafe fn copy_to_slot(
-        dst: *mut u8,
-        src: *const u8,
-        n: usize,
-        stream: *mut c_void,
-        by_kernel: bool,
-    ) -> Result<(), String> {
-        // SAFETY: the caller's contract, forwarded.
-        let rc = unsafe {
-            ffi::rivoli_memcpy_h2d_async(
-                dst as *mut c_void,
-                src as *const c_void,
-                n as u64,
-                stream,
-                i32::from(by_kernel),
-            )
-        };
-        check(rc)
-    }
-
-    /// `0` is HIP success at this boundary; anything else is the negative HIP code the C side
-    /// folded through `HIP_ERR_BASE`. Factored because both staging calls end this way and the
-    /// duplication gate is right that one tail should exist once.
-    fn check(rc: i32) -> Result<(), String> {
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(format!("hip rc {rc}"))
-        }
-    }
-
-    /// ARENA REFRESH: read `n` bytes of the arena window at `src` on `stream`, discarding the
-    /// value. Enqueued BEFORE the copy, so it is stream-ordered ahead of it with no host sync.
-    ///
-    /// # Safety
-    /// `src` is a live arena window valid for `n` bytes, `stream` is a live handle, and `sink` is
-    /// a mapped writable `u64` the kernel stores to only on a value real payloads cannot produce.
-    pub unsafe fn touch_region(
-        src: *const u8,
-        n: usize,
-        stream: *mut c_void,
-        sink: *mut u64,
-    ) -> Result<(), String> {
-        // SAFETY: the caller's contract, forwarded.
-        let rc =
-            unsafe { ffi::rivoli_touch_region_async(src as *const c_void, n as u64, stream, sink) };
-        check(rc)
-    }
-}
 
 /// Destination bytes needed to O_DIRECT-read `len` bytes starting at an arbitrary
 /// file offset: the aligned superset, upper-bounded independent of the offset so a
@@ -235,6 +94,87 @@ fn min_completion(begin: usize, len: usize) -> u64 {
 pub struct ReadSpan {
     pub begin: usize,
     pub len: usize,
+}
+
+/// The fetch path's knobs — the whole intervention matrix the GLM nondeterminism
+/// investigation (`docs/investigations/glm-nondeterminism-closeout.md`) built, bundled
+/// because [`Streamer::new`] was already seven parameters of which four were `bool` —
+/// exactly the transposition hazard this workspace refuses everywhere else.
+///
+/// [`FetchKnobs::default`] is the STOCK configuration (bounce, no arms); every field
+/// that is not it is one named arm of that investigation.
+#[derive(Clone, Copy)]
+pub struct FetchKnobs {
+    /// `--pinned-coherent`: allocate the bounce arena FINE-GRAINED. RED 2026-08-18.
+    pub coherent: bool,
+    /// `--copy-by-kernel`: bounce→slot by shader copy instead of the copy engine. RED.
+    pub by_kernel: bool,
+    /// `--arena-refresh`: full-width device read of the just-written arena window,
+    /// pre-copy. The ONE clean cell of the matrix — a mitigation, not a fix.
+    pub arena_refresh: bool,
+    /// `--arena-refresh-stride N`: the refresh at one 16 B unit per N — the dose-response
+    /// sweep the investigation left unfinished. N=4 is the 64 B sector hypothesis's
+    /// prediction; N=8 is the `bh-line` cell (RED @704). 0 = off. Conflicts with
+    /// `arena_refresh` (two spellings of one arm).
+    pub arena_refresh_stride: u64,
+    /// `--arena-refresh-late`: the SAME full-width arena read enqueued AFTER the copy instead
+    /// of before it — it cannot delay the copy, only the signal, so it separates "the repair
+    /// must precede the COPY" from "...the CONSUMER". Clean = the copy reads the arena
+    /// correctly without help and the defect is consumer-side; red = producer-side.
+    pub arena_refresh_late: bool,
+    /// `false` is DIRECT mode (`--direct-vmm-dma`): no arena, no copy. Diagnostic.
+    pub bounce: bool,
+    /// `--slot-refresh`: DIRECT-only full-width read of the just-DMA'd slot. RED.
+    pub slot_refresh: bool,
+    /// `--copy-via-cpu`: the bounce→slot hop as a HOST memcpy on the reaper thread —
+    /// the candidate FIX. No GPU agent then ever reads memory the NVMe wrote: the
+    /// arena is read only by the CPU (the CQE's own guarantee, the one btrfs's datasum
+    /// verification already relies on) and the slot is written only by the CPU (the
+    /// CPU→GPU coherence `kernels/vmm.hip` was verified to have and the resident
+    /// tier's 281 GB startup load already spends). The ticket is signalled on the
+    /// fetch stream exactly as after an SDMA copy, so the consumer side is unchanged.
+    pub cpu_copy: bool,
+    /// `--fetch-settle-us`: pure TIME between the CQE and the copy — a host sleep on
+    /// the reaper thread, no device work, no memory traffic. The arm the ablation
+    /// matrix never had: `bh-nop` has ~no delay and `bh-decoy` reads a DEVICE buffer
+    /// (~10x faster than the host-memory `bh` it was meant to hold duration for), so
+    /// "not a delay effect" was never established. CLEAN here and the repair was time.
+    pub settle_us: u64,
+    /// `--arena-refresh-decoy`: the `--arena-refresh` read aimed at a SECOND pinned
+    /// host arena that the NVMe never writes — same kernel, same stream position,
+    /// same bytes, same memory type, same per-slot cycling; different addresses.
+    /// With `settle` it separates TIME from ADDRESS: both clean ⇒ the repair is the
+    /// delay; both red ⇒ the repair is specific to the DMA'd region.
+    pub arena_refresh_decoy: bool,
+    /// `--cpu-retouch` (DIRECT mode only): after the CQE, the reaper CPU-reads the
+    /// just-DMA'd pool slot into a scratch buffer and CPU-writes it back. The payload
+    /// is unchanged, so nothing about the DATA differs — only the last WRITER changes,
+    /// from the NVMe's DMA engine to the CPU. This is the `--copy-via-cpu` premise
+    /// tested against the one condition that still fires: if CPU writes repair GPU
+    /// visibility of the device pages, direct+retouch is CLEAN; if it is RED, CPU→GPU
+    /// coherence into the pool is not reliable at this rate and the fix is dead.
+    pub cpu_retouch: bool,
+}
+
+impl Default for FetchKnobs {
+    /// The stock configuration: bounce mode, every arm off. Hand-written because a
+    /// derived default would give `bounce: false` — DIRECT, a diagnostic mode, as the
+    /// DEFAULT — the `Folds`-stride trap (`glm-nondeterminism.md`) wearing a new hat.
+    fn default() -> Self {
+        Self {
+            coherent: false,
+            by_kernel: false,
+            arena_refresh: false,
+            arena_refresh_stride: 0,
+            arena_refresh_late: false,
+            bounce: true,
+            slot_refresh: false,
+            cpu_copy: false,
+            settle_us: 0,
+            arena_refresh_decoy: false,
+            cpu_retouch: false,
+        }
+    }
 }
 
 /// One read's destination: the aligned pointer, the slot whose ticket gates reuse, and the
@@ -295,6 +235,10 @@ pub struct Streamer {
     /// reproduce itself; a MITIGATION with an unexplained mechanism, not a root-cause fix.
     /// Evidence, alternatives tried, and the ceiling: `kernels/async.hip`, `glm-bug.md` §7b.
     arena_refresh: bool,
+    /// `--arena-refresh-stride`: the refresh at reduced density (16 B units), 0 = off.
+    arena_refresh_stride: u64,
+    /// `--arena-refresh-late`: the refresh enqueued AFTER the copy instead of before it.
+    arena_refresh_late: bool,
     /// SLOT REFRESH — the arm that tests the only rule fitting every cell of the matrix:
     /// *a device-side reader can read STALE bytes from the region the NVMe just DMA'd into, and a
     /// prior full-width read by a compute kernel repairs it for the next consumer.*
@@ -311,6 +255,19 @@ pub struct Streamer {
     /// DIRECT only. In bounce mode this read is `sc`, already measured RED @236, so the CLI
     /// refuses the combination rather than re-running a known-red arm under a new name.
     slot_refresh: bool,
+    /// `--copy-via-cpu`: the bounce→slot hop as a host memcpy on the reaper thread — see
+    /// [`FetchKnobs::cpu_copy`]. Bounce mode only.
+    cpu_copy: bool,
+    /// `--cpu-retouch` (direct only) — see [`FetchKnobs::cpu_retouch`]. The scratch is `span`
+    /// bytes of pinned host memory, allocated only when the arm is on; null otherwise.
+    cpu_retouch: *mut u8,
+    /// `--fetch-settle-us` as a Duration — see [`FetchKnobs::settle_us`].
+    settle: std::time::Duration,
+    /// `--arena-refresh-decoy` — see [`FetchKnobs::arena_refresh_decoy`]. The buffer is
+    /// `entries * span` bytes like the arena itself and is indexed by the same `ud * span`, so
+    /// the read's size, stride pattern, memory type and duration all match the real refresh —
+    /// only the addresses (never DMA'd) differ. Null when the arm is off.
+    arena_refresh_decoy: *mut u8,
     /// One-shot: has the first slot refresh been LOGGED yet. Positive evidence that the
     /// intervention ran, not that it was asked for — two rounds of this investigation were lost
     /// to arms that never applied, and an arm that did not apply reds exactly like one that
@@ -319,14 +276,14 @@ pub struct Streamer {
     /// Device word the refresh kernel stores to only on an impossible value — it exists to stop
     /// the loads being optimised away, is never read, and needs no synchronisation.
     refresh_sink: *mut u64,
-    /// Copies actually issued, per path — `[memcpy, kernel]`.
+    /// Copies actually issued, per path — `[sdma-memcpy, shader-kernel, host-cpu]`.
     ///
     /// **A COUNT, not the flag.** Two rounds of this investigation were spent on an arm that could
     /// not be believed because nothing observed whether the intervention applied: the log recorded
     /// the intent and the runtime was free to do something else. An intervention that never applied
     /// and one that does not work produce the same red, so every candidate fix now reports what it
     /// DID.
-    issued: [u64; 2],
+    issued: [u64; 3],
     /// Per-SLOT minimum completion length (sub-block offset + useful len). `reap` compares
     /// the completion `res` against it so a real mid-file short read is caught while
     /// EOF-padding truncation is tolerated.
@@ -341,19 +298,24 @@ unsafe impl Send for Streamer {}
 
 impl Streamer {
     /// `entries` = max in-flight reads; `span` = the largest aligned superset a
-    /// single read may deliver (`slot_span` of the biggest projection tensor); `coherent` requests
-    /// a fine-grained arena (see [`stage::alloc`]).
+    /// single read may deliver (`slot_span` of the biggest projection tensor); `knobs`
+    /// selects the mode and any investigation arm (see [`FetchKnobs`]).
     /// Always allocates the `entries * span` host staging arena — it is the only
     /// destination path (see this module's header).
-    pub fn new(
-        entries: u32,
-        span: usize,
-        coherent: bool,
-        by_kernel: bool,
-        arena_refresh: bool,
-        bounce: bool,
-        slot_refresh: bool,
-    ) -> Result<Self> {
+    pub fn new(entries: u32, span: usize, knobs: FetchKnobs) -> Result<Self> {
+        let FetchKnobs {
+            coherent,
+            by_kernel,
+            arena_refresh,
+            arena_refresh_stride,
+            arena_refresh_late,
+            bounce,
+            slot_refresh,
+            cpu_copy,
+            settle_us,
+            arena_refresh_decoy,
+            cpu_retouch,
+        } = knobs;
         // The bounce arena has exactly `entries` slots and `queue` indexes it by the
         // SQE's user_data. io_uring rounds the SQ up to a power of two, so `entries` MUST
         // be a power of two for the arena to match the SQ capacity — otherwise a push
@@ -381,6 +343,86 @@ impl Streamer {
             "--slot-refresh reads the destination slot, which in bounce mode is the `sc` arm — \
              already measured RED at first-divergence 236. It applies only with --direct-vmm-dma"
         );
+        // The `--copy-via-cpu` refusal set: it IS the copy path, so every other copy-path knob
+        // conflicts, and it leaves no GPU-side reader of the arena, so both refresh arms lose
+        // their subject. A silently-ignored knob is how an arm gets attributed to the wrong cause.
+        ensure!(
+            bounce || !cpu_copy,
+            "--direct-vmm-dma has no bounce arena and no copy; --copy-via-cpu has no subject"
+        );
+        ensure!(
+            !(cpu_copy && by_kernel),
+            "--copy-via-cpu and --copy-by-kernel are two answers to one question; pass one"
+        );
+        ensure!(
+            !(cpu_copy && arena_refresh),
+            "--copy-via-cpu leaves no GPU-side reader of the arena; --arena-refresh has no subject"
+        );
+        ensure!(
+            !(cpu_copy && arena_refresh_decoy),
+            "--copy-via-cpu leaves no GPU-side reader of the arena; --arena-refresh-decoy has no subject"
+        );
+        ensure!(
+            !(arena_refresh && arena_refresh_decoy),
+            "--arena-refresh and --arena-refresh-decoy are the same read of different regions; pass one"
+        );
+        ensure!(
+            bounce || !arena_refresh_decoy,
+            "--arena-refresh-decoy reads a pinned HOST buffer; direct mode's question is about \
+             the slot. Refused rather than run an arm that decides nothing"
+        );
+        // The stride and late arms are the SAME refresh at a different density or position —
+        // each combination that would make a cell ambiguous is refused rather than run.
+        ensure!(
+            !(arena_refresh && arena_refresh_stride > 0),
+            "--arena-refresh IS --arena-refresh-stride 1; pass one spelling"
+        );
+        ensure!(
+            !arena_refresh_late || !(arena_refresh || arena_refresh_decoy),
+            "two refresh arms at once answer nothing — pass one"
+        );
+        ensure!(
+            !(arena_refresh_stride > 0 && arena_refresh_late),
+            "--arena-refresh-stride is the PRE-copy position; --arena-refresh-late the post-copy — pass one"
+        );
+        ensure!(
+            bounce || (arena_refresh_stride == 0 && !arena_refresh_late),
+            "--arena-refresh-stride/--arena-refresh-late read the arena; direct mode has none"
+        );
+        ensure!(
+            !(cpu_copy && (arena_refresh_stride > 0 || arena_refresh_late)),
+            "--copy-via-cpu leaves no GPU-side reader of the arena; the refresh arms lose their subject"
+        );
+        // `--cpu-retouch` is a DIRECT-mode arm: in bounce mode the slot's last writer is the
+        // copy, and retouching the arena would test a property the copy then re-crosses.
+        ensure!(
+            !bounce || !cpu_retouch,
+            "--cpu-retouch rewrites the slot the drive wrote; bounce mode's writer is the copy \
+             — it applies only with --direct-vmm-dma"
+        );
+        ensure!(
+            !(cpu_retouch && slot_refresh),
+            "--cpu-retouch and --slot-refresh are two direct-mode arms; one question per arm"
+        );
+        // The retouch scratch: `span` bytes of pinned host memory, allocated only for the arm.
+        let cpu_retouch = match cpu_retouch {
+            false => std::ptr::null_mut(),
+            true => {
+                let s = stage::alloc(span, false);
+                ensure!(!s.is_null(), "cpu-retouch scratch alloc failed");
+                s
+            }
+        };
+        // The decoy arena: same size and indexing as the real one (`entries * span`), so the
+        // refresh read's footprint and cycling match exactly. Allocated ONLY when its arm is on.
+        let arena_refresh_decoy = match arena_refresh_decoy {
+            false => std::ptr::null_mut(),
+            true => {
+                let d = stage::alloc(entries as usize * span, coherent);
+                ensure!(!d.is_null(), "arena-refresh decoy alloc failed");
+                d
+            }
+        };
         // One page, only when DIRECT needs a sink and therefore cannot borrow the arena's.
         // Allocated before the arena so a single `Self` below can take both unconditionally.
         let refresh_sink = match (bounce, slot_refresh) {
@@ -456,12 +498,39 @@ impl Streamer {
             false => refresh_sink,
         };
 
+        if settle_us > 0 {
+            // Logged at CONSTRUCTION: the arm is a host sleep, so there is no device-side
+            // application to witness later — this line is the whole read-back.
+            tracing::info!(
+                "FETCH SETTLE (--fetch-settle-us): {settle_us} us of pure host time between \
+                 every CQE and its copy/signal — the TIME-vs-ADDRESS discriminator"
+            );
+        }
+        if cpu_copy {
+            tracing::info!(
+                "COPY VIA CPU (--copy-via-cpu): the bounce->slot hop is a host memcpy on the \
+                 reaper thread; no GPU agent reads IO-written memory anywhere on the path"
+            );
+        }
+        if !arena_refresh_decoy.is_null() {
+            tracing::info!(
+                "ARENA REFRESH DECOY (--arena-refresh-decoy): the refresh read is aimed at a \
+                 second pinned arena the NVMe NEVER writes — the ADDRESS discriminator"
+            );
+        }
+
         Ok(Self {
             ring: ManuallyDrop::new(ring),
             entries,
             span,
             bounce,
             slot_refresh,
+            cpu_copy,
+            cpu_retouch,
+            settle: std::time::Duration::from_micros(settle_us),
+            arena_refresh_decoy,
+            arena_refresh_stride,
+            arena_refresh_late,
             logged_refresh: false,
             arena,
             dst: vec![std::ptr::null_mut(); entries as usize],
@@ -475,9 +544,19 @@ impl Streamer {
             // argued against teardown order. DIRECT has no arena, so `--slot-refresh` gets one
             // page of its own — freed in `Drop`, and null when the flag is off.
             refresh_sink: refresh_sink.cast::<u64>(),
-            issued: [0; 2],
+            issued: [0; 3],
             min_res: vec![0; entries as usize],
         })
+    }
+
+    /// Log an arm's first APPLICATION, once — positive evidence the intervention ran, as
+    /// against the flag that asked for it. Two rounds of the nondeterminism investigation
+    /// were lost to arms that never applied; every arm's acceptance line comes through here.
+    fn log_applied_once(&mut self, text: String) {
+        if !self.logged_refresh {
+            self.logged_refresh = true;
+            tracing::info!("{text}");
+        }
     }
 
     /// Queue an O_DIRECT read of `len` bytes at file offset `begin` (from `fd`)
@@ -590,10 +669,10 @@ impl Streamer {
     }
 
     /// Per-read async reap: block for the NEXT read to complete, kick its bounce→slot
-    /// copy on `stream`, and return the completed read's `user_data` (the index into
-    /// the batch). The caller reaps exactly once per read it queued. Reads run
-    /// concurrently on the NVMe; completions arrive in device order, each resolving its
-    /// own expert.
+    /// copy on `stream` (or, under `--copy-via-cpu`, perform it on the spot as a host
+    /// memcpy), and return the completed read's `user_data` (the index into the batch).
+    /// The caller reaps exactly once per read it queued. Reads run concurrently on the
+    /// NVMe; completions arrive in device order, each resolving its own expert.
     ///
     /// # Safety
     /// `stream` is a live HipStream handle; the copied read's `dst` slot must stay
@@ -626,11 +705,49 @@ impl Streamer {
             "short read on expert slot {ud}: {res} < {} useful bytes",
             self.min_res[ud]
         );
+        // FETCH SETTLE: pure TIME between the CQE and whatever consumes the read next. A host
+        // sleep on the reaper thread, NOT a device delay kernel: a kernel would occupy the
+        // fetch stream and carry a dispatch (bh-nop's confound), a sleep is only time. This is
+        // the arm the ablation matrix never had — `bh-decoy` was recorded as the equal-duration
+        // control but reads a DEVICE buffer (~10x the bandwidth of the host arena), so the
+        // matrix's "not bandwidth or delay" cell never held duration constant. CLEAN here and
+        // the repair is time; RED and the repair is specific to the arena's addresses.
+        if !self.settle.is_zero() {
+            std::thread::sleep(self.settle);
+        }
         // DIRECT: the drive wrote the pool slot itself. No refresh, no copy, and no folds —
         // the `bh` fold hashes the arena, which does not exist here, and `sc` hashes a slot
         // no copy ever wrote. The divergence probe is a bounce-mode instrument by
         // construction, so this arm is measured with the determinism gate instead.
         if !self.bounce {
+            // CPU RETOUCH: read the just-DMA'd slot into the scratch and write it straight
+            // back. The bytes are unchanged; the last WRITER changes from the NVMe's DMA
+            // engine to the CPU — the `--copy-via-cpu` premise (CPU writes to the pool are
+            // GPU-visible, the property the resident tier's startup load spends) tested
+            // against the one condition that still fires.
+            if !self.cpu_retouch.is_null() {
+                // SAFETY: `dst[ud]` is a live pool slot holding the `nbytes[ud]` bytes the
+                // drive just wrote, host-mapped for read+write (what `host_ptr` is FOR); the
+                // scratch is `span >= nbytes[ud]` bytes of pinned host memory. The two
+                // copies never overlap (different allocations).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.dst[ud],
+                        self.cpu_retouch,
+                        self.nbytes[ud] as usize,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        self.cpu_retouch,
+                        self.dst[ud],
+                        self.nbytes[ud] as usize,
+                    );
+                }
+                self.log_applied_once(format!(
+                    "CPU RETOUCH applied: host read+write-back of {} B of pool slot {ud}, \
+                     between the CQE and this slot's ticket signal",
+                    self.nbytes[ud]
+                ));
+            }
             // SLOT REFRESH: the same full-width read `--arena-refresh` performs, aimed at the
             // region DIRECT mode actually DMA'd into. Enqueued on the fetch stream here, which is
             // before `asyncfetch::run_job` signals this slot's timeline — so it is stream-ordered
@@ -646,17 +763,15 @@ impl Streamer {
                         self.nbytes[ud] as usize,
                         stream,
                         self.refresh_sink,
+                        1,
                     )
                 }
                 .map_err(|e| anyhow::anyhow!("slot refresh launch failed: {e}"))?;
-                if !self.logged_refresh {
-                    self.logged_refresh = true;
-                    tracing::info!(
-                        "SLOT REFRESH applied: full-width read of {} B of pool slot {ud}, \
-                         enqueued on the fetch stream ahead of this slot's ticket signal",
-                        self.nbytes[ud]
-                    );
-                }
+                self.log_applied_once(format!(
+                    "SLOT REFRESH applied: full-width read of {} B of pool slot {ud}, \
+                     enqueued on the fetch stream ahead of this slot's ticket signal",
+                    self.nbytes[ud]
+                ));
             }
             return Ok(ud);
         }
@@ -666,13 +781,32 @@ impl Streamer {
         // ARENA REFRESH, enqueued BEFORE the copy on the fetch stream. See the struct field and
         // `kernels/async.hip` for the evidence, the fifteen alternatives that did not work, and
         // the ceiling. Stream-ordered ahead of the copy, so it needs no sync of its own.
-        if self.arena_refresh {
-            // SAFETY: `src` is this slot's arena window, valid for `nbytes[ud]` bytes; the stream
-            // is live; `refresh_sink` is a mapped, writable arena word the kernel never stores to.
-            // SAFETY: `src` is this slot's arena window, valid for `nbytes[ud]` bytes; the
-            // stream is live; `refresh_sink` is a mapped arena word the kernel never stores to.
+        // Three arms select (region, density): `--arena-refresh` is (the arena, full width),
+        // `--arena-refresh-decoy` is (the never-DMA'd second arena, full width) and
+        // `--arena-refresh-stride` is (the arena, one 16 B unit per N).
+        // SAFETY: `src` is this slot's arena window, valid for `nbytes[ud]` bytes; the decoy
+        // branch substitutes its own `entries * span` arena at the same `ud` offset, so that
+        // window is owned and in bounds too; the stream is live; `refresh_sink` is a mapped,
+        // writable word the kernel never stores to.
+        let refresh = if self.arena_refresh {
+            Some((src, 1))
+        } else if !self.arena_refresh_decoy.is_null() {
+            // SAFETY: the decoy is `entries * span` and `ud < entries` — in-bounds window.
+            Some((unsafe { self.arena_refresh_decoy.add(ud * self.span) }, 1))
+        } else if self.arena_refresh_stride > 0 {
+            Some((src, self.arena_refresh_stride))
+        } else {
+            None
+        };
+        if let Some((rsrc, stride4)) = refresh {
             unsafe {
-                stage::touch_region(src, self.nbytes[ud] as usize, stream, self.refresh_sink)
+                stage::touch_region(
+                    rsrc,
+                    self.nbytes[ud] as usize,
+                    stream,
+                    self.refresh_sink,
+                    stride4,
+                )
             }
             .map_err(|e| anyhow::anyhow!("arena refresh launch failed: {e}"))?;
         }
@@ -741,23 +875,59 @@ impl Streamer {
                 }
             }
         }
-        // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
-        // read's signal fires; the arena slot holds the just-read bytes; `stream` is
-        // live. Copies the full aligned `nbytes` (a trailing-EOF short read leaves
-        // stale bytes only past the useful window, never read).
-        let r = unsafe {
-            stage::copy_to_slot(
-                self.dst[ud],
-                src,
-                self.nbytes[ud] as usize,
-                stream,
-                self.by_kernel,
-            )
-        };
-        if let Err(e) = r {
-            anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
+        // THE COPY — three paths, one destination:
+        //  - default: `hipMemcpyAsync` (SDMA) on the fetch stream, async;
+        //  - `--copy-by-kernel`: a shader copy on the fetch stream, async;
+        //  - `--copy-via-cpu`: a HOST memcpy, right here on the reaper thread.
+        //
+        // The CPU path is the candidate FIX and its argument is a subtraction: after it, NO
+        // GPU agent anywhere reads memory the NVMe's DMA wrote. The arena is read only by the
+        // CPU — the visibility the io_uring CQE actually guarantees (and the one btrfs's
+        // datasum check already spends) — and the slot is written only by the CPU, whose
+        // writes to this VMM are verified GPU-coherent (`kernels/vmm.hip`; the resident
+        // tier's startup load spends the same property at 281 GB). The ticket still signals
+        // on the fetch stream after this returns, so the consumer side is byte-identical.
+        //
+        // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this read's
+        // signal fires, and its HOST mapping is writable (that is what `host_ptr` is FOR);
+        // the arena slot holds the just-read `nbytes[ud]` bytes; arena and pool never alias.
+        if self.cpu_copy {
+            unsafe { std::ptr::copy_nonoverlapping(src, self.dst[ud], self.nbytes[ud] as usize) };
+            self.issued[2] += 1;
+            self.log_applied_once(format!(
+                "COPY VIA CPU applied: host memcpy of {} B, arena slot {ud} -> pool slot",
+                self.nbytes[ud]
+            ));
+        } else {
+            // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this
+            // read's signal fires; the arena slot holds the just-read bytes; `stream` is
+            // live. Copies the full aligned `nbytes` (a trailing-EOF short read leaves
+            // stale bytes only past the useful window, never read).
+            let r = unsafe {
+                stage::copy_to_slot(
+                    self.dst[ud],
+                    src,
+                    self.nbytes[ud] as usize,
+                    stream,
+                    self.by_kernel,
+                )
+            };
+            if let Err(e) = r {
+                anyhow::bail!("bounce staging copy failed on slot {ud} ({e})");
+            }
+            self.issued[usize::from(self.by_kernel)] += 1;
         }
-        self.issued[usize::from(self.by_kernel)] += 1;
+        // ARENA REFRESH LATE: the same read as `--arena-refresh`, enqueued AFTER the copy — the
+        // stream's FIFO order means it cannot hasten or delay the copy itself, only the signal
+        // that follows, so it tests whether the repair must precede the COPY or only the
+        // CONSUMER. Clean here re-locates the defect to the slot's consumer entirely.
+        if self.arena_refresh_late {
+            // SAFETY: as the pre-copy refresh above — same window, same sink, live stream.
+            unsafe {
+                stage::touch_region(src, self.nbytes[ud] as usize, stream, self.refresh_sink, 1)
+            }
+            .map_err(|e| anyhow::anyhow!("arena refresh (late) launch failed: {e}"))?;
+        }
         #[cfg(feature = "corruption-probe")]
         if self.fold[ud].sc_armed() {
             // THE POST-COPY POSITION — the one measured to suppress the divergence. Three
@@ -820,9 +990,9 @@ impl Streamer {
         cq.next().map(|c| (c.result(), c.user_data()))
     }
 
-    /// Copies issued per path, `[hipMemcpyAsync, shader kernel]` — the OBSERVATION a candidate-fix
-    /// arm is read off, as against the flag it was asked for.
-    pub fn copies_issued(&self) -> [u64; 2] {
+    /// Copies issued per path, `[hipMemcpyAsync, shader kernel, host memcpy]` — the
+    /// OBSERVATION a candidate-fix arm is read off, as against the flag it was asked for.
+    pub fn copies_issued(&self) -> [u64; 3] {
         self.issued
     }
 
@@ -858,6 +1028,15 @@ impl Drop for Streamer {
                 stage::free(self.refresh_sink.cast::<u8>())
             },
             false => {}
+        }
+        // The `--arena-refresh-decoy` arena and the `--cpu-retouch` scratch, each allocated
+        // only when its arm is on (null otherwise).
+        // SAFETY: as the arena above — live, single owner, freed once.
+        if !self.arena_refresh_decoy.is_null() {
+            unsafe { stage::free(self.arena_refresh_decoy) };
+        }
+        if !self.cpu_retouch.is_null() {
+            unsafe { stage::free(self.cpu_retouch) };
         }
     }
 }

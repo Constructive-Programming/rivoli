@@ -150,11 +150,14 @@ extern "C" __global__ void copy_h2d_kernel(uint4* __restrict__ dst, const uint4*
 // geometry could stop making the read sufficient, and nothing here would notice except the
 // determinism gate. Do not delete it without re-running `tests/determinism-glm.sh`.
 __global__ void touch_region_kernel(const uint4* __restrict__ src, unsigned long long n4,
-                                   unsigned long long* sink) {
+                                   unsigned long long* sink, unsigned long long stride) {
     unsigned long long acc = 0;
-    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
-         i += (unsigned long long)blockDim.x * gridDim.x) {
-        uint4 v = src[i];
+    // Grid-stride over the REGION at `stride` uint4 per step: stride 1 is the full-width read;
+    // stride 4 touches one 16 B unit per 64 B sector, stride 8 one per 128 B line. The ablation
+    // matrix's dose-response runs on this knob, so it is a parameter rather than a second kernel.
+    for (unsigned long long j = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         j * stride < n4; j += (unsigned long long)blockDim.x * gridDim.x) {
+        uint4 v = src[j * stride];
         acc += (unsigned long long)v.x ^ (unsigned long long)v.y ^ (unsigned long long)v.z ^
                (unsigned long long)v.w;
     }
@@ -165,21 +168,24 @@ __global__ void touch_region_kernel(const uint4* __restrict__ src, unsigned long
     }
 }
 
-// Read `n` bytes of `src` at full width on `stream`, discarding the value. `src` is whichever
-// region the NVMe just DMA'd into: the pinned arena in BOUNCE mode (--arena-refresh) or the
-// pool slot itself in DIRECT mode (--slot-refresh). WHICH region is the variable under test —
-// reading the arena pre-copy suppresses the defect, reading the destination slot post-copy
-// (`sc`) does NOT, and direct mode with no refresh at all diverges. Hence the neutral name.
-// 16 B granularity like the copy: every caller passes an O_DIRECT-block multiple.
+// Read `n` bytes of `src` at `stride4`-uint4 density on `stream`, discarding the value. `src`
+// is whichever region the NVMe just DMA'd into: the pinned arena in BOUNCE mode
+// (--arena-refresh) or the pool slot itself in DIRECT mode (--slot-refresh). WHICH region is
+// the variable under test — reading the arena pre-copy suppresses the defect, reading the
+// destination slot post-copy (`sc`) does NOT, and direct mode with no refresh at all diverges.
+// Hence the neutral name. `stride4` is in 16 B units: 1 = full width (the one clean cell),
+// 4 = one unit per 64 B sector, 8 = one per 128 B line (~`bh-line`, RED @704). 16 B
+// granularity like the copy: every caller passes an O_DIRECT-block multiple.
 extern "C" int rivoli_touch_region_async(const void* src, unsigned long long n, void* stream,
-                                       unsigned long long* sink) {
-    if (n == 0 || (n % sizeof(uint4)) != 0) return 1002;
+                                       unsigned long long* sink, unsigned long long stride4) {
+    if (n == 0 || (n % sizeof(uint4)) != 0 || stride4 == 0) return 1002;
     unsigned long long n4 = n / sizeof(uint4);
-    unsigned long long blocks = (n4 + 255) / 256;
+    unsigned long long blocks = (n4 / stride4 + 255) / 256;
     if (blocks > 1024) blocks = 1024;
+    if (blocks == 0) blocks = 1;
     hipGetLastError();
     hipLaunchKernelGGL(touch_region_kernel, dim3((unsigned)blocks), dim3(256), 0,
-                       (hipStream_t)stream, (const uint4*)src, n4, sink);
+                       (hipStream_t)stream, (const uint4*)src, n4, sink, stride4);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
 }

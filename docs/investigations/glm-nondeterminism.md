@@ -1,7 +1,7 @@
 ---
 status: live
 scope: glm
-verdict: SUPERSEDED 2026-08-18 by glm-nondeterminism-closeout.md, and this doc's LEADING CLAIM IS REFUTED: the defect is NOT in the bounce arena — `--direct-vmm-dma` has no arena and no H2D copy and still diverges (91/512 @420), so "the copy read stale arena bytes" cannot be the complete account. What survives is narrower and still true: only a BULK device-side read of the just-written region, before the next device agent consumes it, suppresses it. The ablation matrix is complete: a dispatch acquire does not (`bh-nop` RED @292), equal bandwidth on another buffer does not (`bh-decoy` RED @12, earliest of all), reading the destination slot does not (`sc` RED @236), and FINE-GRAINED ALLOCATION DOES NOT — `--pinned-coherent` RED 225/512 @283 against a same-day control 220/512 @291 with `hipHostGetFlags` returning coherent-bit TRUE, so host->device visibility is refuted with the intervention OBSERVED TO APPLY. CORRECTION TO THE MATRIX: `bh-line` was read as "one cache line, bulk no", but it strides 128 B across the WHOLE region, so it touches EVERY line at ~1/32 of the bytes — both it and `bh` touch every line, the "per-LINE effect" reading is not established, and what is established is that stride-32 sampling is insufficient while stride-1 is sufficient, with `bh-line` the LATEST red (704 vs a ~292 median). That is a dose-response in BYTES and the granularity is unknown, so `--divergence-folds bh-line:N` makes it a sweep; one hypothesis is a 64 B sector, predicting stride 16 is clean at 1/16 the cost — which would be a FIX where `bh` is only a Heisenberg probe at ~10% of throughput. Phase 3B is built: `--copy-by-kernel` moves the bytes with a shader copy through the normal vector-memory path a copy engine may bypass, and it COUNTS which path ran, because an intervention that never applied and one that does not work produce the same red. The isolated path is exonerated: 1e6 repro reads, 0 mismatches, 4-8x cleaner than the engine, so the hazard needs the engine's concurrency. TWO coordinates with opposite signatures (gate/up stale at one, DOWN at the other) show it is whichever part of the slot is read while stale. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT; the rate scales per READ. Storage largely exonerated (btrfs datasum verifies direct-IO reads; kernel log clean); the toolchain NOT exonerated. NO FIX IS CLAIMED — the acceptance protocol, which now includes the path read-back, is unmet.
+verdict: SUPERSEDED 2026-08-18 by glm-nondeterminism-closeout.md, and this doc's LEADING CLAIM IS REFUTED: the defect is NOT in the bounce arena — `--direct-vmm-dma` has no arena and no H2D copy and still diverges (91/512 @420), so "the copy read stale arena bytes" cannot be the complete account. What survives is narrower and still true: only a BULK device-side read of the just-written region, before the next device agent consumes it, suppresses it. The ablation matrix is complete: a dispatch acquire does not (`bh-nop` RED @292), equal bandwidth on another buffer does not (`bh-decoy` RED @12, earliest of all) — BUT that decoy read DEVICE memory at ~10x the host arena's bandwidth, so duration was never held constant and the delay class stayed live until the 2026-08-19 arms (see glm-nondeterminism-closeout.md §6), reading the destination slot does not (`sc` RED @236), and FINE-GRAINED ALLOCATION DOES NOT — `--pinned-coherent` RED 225/512 @283 against a same-day control 220/512 @291 with `hipHostGetFlags` returning coherent-bit TRUE, so host->device visibility is refuted with the intervention OBSERVED TO APPLY. CORRECTION TO THE MATRIX: `bh-line` was read as "one cache line, bulk no", but it strides 128 B across the WHOLE region, so it touches EVERY line at ~1/32 of the bytes — both it and `bh` touch every line, the "per-LINE effect" reading is not established, and what is established is that stride-32 sampling is insufficient while stride-1 is sufficient, with `bh-line` the LATEST red (704 vs a ~292 median). That is a dose-response in BYTES and the granularity is unknown, so `--divergence-folds bh-line:N` makes it a sweep; one hypothesis is a 64 B sector, predicting stride 16 is clean at 1/16 the cost — which would be a FIX where `bh` is only a Heisenberg probe at ~10% of throughput. Phase 3B is built: `--copy-by-kernel` moves the bytes with a shader copy through the normal vector-memory path a copy engine may bypass, and it COUNTS which path ran, because an intervention that never applied and one that does not work produce the same red. The isolated path is exonerated: 1e6 repro reads, 0 mismatches, 4-8x cleaner than the engine, so the hazard needs the engine's concurrency. TWO coordinates with opposite signatures (gate/up stale at one, DOWN at the other) show it is whichever part of the slot is read while stale. THE RANKING QUANTITY IS THE FIRST DIVERGING POSITION, NEVER THE COUNT; the rate scales per READ. Storage largely exonerated (btrfs datasum verifies direct-IO reads; kernel log clean); the toolchain NOT exonerated. NO FIX IS CLAIMED — the acceptance protocol, which now includes the path read-back, is unmet.
 ---
 
 # GLM does not reproduce itself: the bytes read out of the pool slots differ
@@ -473,18 +473,27 @@ decides which hop we are on", not as "one run settles the mechanism".
 |---|---|---|
 | v2 light · `sc` · `sc-nop` · `se` · `xa,ac` | no | RED (169 / 236 / 292 / 301 / 292) |
 | `bh-nop` — launch + dispatch acquire, no read | no | RED @292 |
-| `bh-decoy` — same bytes, same duration, NOT the arena | no | RED **@12** (earliest in the investigation) |
+| `bh-decoy` — same bytes, NOT the arena. **NOT same duration — see the correction below** | no | RED **@12** (earliest in the investigation) |
 | `bh-line` — **stride 32, one dword per 128 B line** | yes, ~1/32 of the bytes | RED **@704** (latest) |
 | **`bh` — every byte of the just-written region** | yes, all | **CLEAN 1536** |
 | `bh,sc,se` | yes, all | CLEAN (512 + 1536) |
 | `--pinned-coherent` (fine-grained arena, **flag observed to apply**) | — | RED 225/512 @283 vs control 220/512 @291 |
 
-Two conclusions are solid. **It is not a dispatch/ordering acquire** (`bh-nop` red) and **not
-bandwidth or delay on the fetch stream** (`bh-decoy` red, and earliest of all). And
+Two conclusions are solid. **It is not a dispatch/ordering acquire** (`bh-nop` red). And
 **host→device visibility of the arena is refuted with the intervention observed to apply** —
 `hipHostGetFlags` returned `0x40000000`, coherent-bit true, so `hipHostMallocCoherent` is not a
 no-op on ROCm 7.14 and the arena really was fine-grained. That branch is closed properly rather
 than by assumption, and the read-back is now automatic for any candidate fix.
+
+> **CORRECTION 2026-08-19 — the `bh-decoy` cell never held duration constant, so "not bandwidth
+> or delay" was never established.** The decoy is `probe.rs`'s `DeviceBuf` — DEVICE memory
+> (`hipMalloc`), read at ~135–220 GB/s — while `bh` reads the PINNED HOST arena at the ~13 GB/s
+> the arena-refresh cost implies (~1.15 ms per miss against ~0.1 ms for the decoy). The arm that
+> was recorded as the equal-duration control delivered roughly a TENTH of the delay. The
+> delay/bandwidth hypothesis was therefore open the whole time, and it is what the
+> `--fetch-settle-us` (pure host time, no device work) and `--arena-refresh-decoy` (the same
+> touch aimed at a second pinned-HOST arena the NVMe never writes) arms exist to close. The
+> `sc`-ladder decoys are unaffected: there both the slot and the decoy are device memory.
 
 **`bh` is therefore a Heisenberg probe, not a fix candidate** — ~10% of throughput on a hash nobody
 reads.
