@@ -537,6 +537,13 @@ impl Tokenizer {
     /// Used by `--ppl`, which scores a fixed corpus rather than a chat turn. It also
     /// served `--raw-prompt`, a flag deleted 2026-08-01 for reproducing pre-templating
     /// benchmark numbers that no recorded command line ever asked for.
+    /// **Two of the four callers depend on SPECIALS matching inside `text`** (added M11b):
+    /// `main::frame_prompt` and `serve::frame_prompt` both hand it
+    /// `glimmer_encoding::render`'s output, whose `<|start|>`/`<|message|>`/`<|eot|>` are
+    /// literal characters that must each become one id. That is the `tokenizers` crate reading
+    /// the checkpoint's added-token table, not anything this crate does — and it is gated, not
+    /// assumed, by `tests/glimmer_template.rs::rendered_prompts_tokenize_to_the_vendored_ids`.
+    /// The other two (`--ppl`, K3's raw bench prompt) want the plain continuation encoding.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let enc = self
             .inner

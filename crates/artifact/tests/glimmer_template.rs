@@ -47,6 +47,56 @@ fn opts_of(kw: &Value) -> GlimmerChatOpts<'_> {
     }
 }
 
+/// A case's vendored ids. Spelled once because TWO tests read them — this and the census
+/// below — and jscpd reported the second copy of the `as_array`/`as_u64` chain as a clone
+/// (2026-08-17). Said as two rather than three because the first draft of this line said
+/// three, which is the count-nobody-re-derived class in a comment about a duplication gate.
+fn ids_of(case: &Value) -> Vec<u32> {
+    case["ids"]
+        .as_array()
+        .expect("case has ids")
+        .iter()
+        .map(|v| v.as_u64().expect("id is a number") as u32)
+        .collect()
+}
+
+/// Compare two sequences and panic on the FIRST divergence, with `win` elements of context on
+/// both sides rendered by `show`.
+///
+/// **One reporter for the byte pin and the id pin, and the factoring was forced.** Written
+/// twice — once over `&[u8]`, once over `&[u32]` — jscpd matched the pair at 65 tokens and
+/// refused the build. The generic is also the honest shape: "first divergence plus a window"
+/// is one idea, and the only thing that differs is how a window is worth printing (a `str`
+/// slice for text, the numbers themselves for ids), which is exactly what `show` is.
+///
+/// Reported this way rather than as a bare `assert_eq!` because the tool-definition cases are
+/// 2 KB of identical preamble, and a diff of two 4 KB strings is a diff nobody reads.
+fn assert_same<T: PartialEq, F: Fn(&[T]) -> String>(
+    name: &str,
+    unit: &str,
+    (got, want): (&[T], &[T]),
+    win: usize,
+    show: F,
+) {
+    let Some(at) = got
+        .iter()
+        .zip(want)
+        .position(|(a, b)| a != b)
+        .or_else(|| (got.len() != want.len()).then(|| got.len().min(want.len())))
+    else {
+        return;
+    };
+    let lo = at.saturating_sub(win);
+    panic!(
+        "case `{name}` diverges at {unit} {at} (got {} {unit}s, want {})\n  got  ...{}\n  \
+         want ...{}",
+        got.len(),
+        want.len(),
+        show(&got[lo..(at + win).min(got.len())]),
+        show(&want[lo..(at + win).min(want.len())]),
+    );
+}
+
 /// The point of the whole file: every vendored case, byte for byte.
 ///
 /// Reported as a first-difference offset with both sides' context rather than as two 4 KB
@@ -55,42 +105,89 @@ fn opts_of(kw: &Value) -> GlimmerChatOpts<'_> {
 #[test]
 fn every_case_renders_byte_for_byte() {
     let cases = cases();
-    let mut checked = 0usize;
+    // **Anti-vacuity, hoisted, and it is not decoration here.** `include_str!` of a file that
+    // was emptied, or a driver that wrote `{"cases": []}` after a failed render, would leave
+    // this test green having compared nothing. Asserted on the INPUT rather than on a counter
+    // the loop increments: the loop has no `continue`, so the two were provably equal, and the
+    // counter version's tail assertion was byte-identical to the id pin's — a verbatim copy
+    // escaping the duplication gate only by sitting ~12 tokens under its 15-token floor
+    // (review, 2026-08-17). The count is the driver's own, so it moves only when a case is
+    // deliberately added or removed.
+    assert_eq!(cases.len(), 31, "expected 31 vendored cases");
     for case in &cases {
         let name = case["name"].as_str().expect("case has a name");
         let kw = &case["kwargs"];
         let messages = kw["messages"].as_array().expect("kwargs has messages");
         let want = case["expected"].as_str().expect("case has expected text");
         let got = render(messages, &opts_of(kw));
-        if got != want {
-            let at = got
-                .as_bytes()
-                .iter()
-                .zip(want.as_bytes())
-                .position(|(a, b)| a != b)
-                .unwrap_or(got.len().min(want.len()));
-            let lo = at.saturating_sub(60);
-            panic!(
-                "case `{name}` diverges at byte {at} (got {} bytes, want {})\n  got  ...{:?}\n  want ...{:?}",
-                got.len(),
-                want.len(),
-                &got[lo..(at + 60).min(got.len())],
-                &want[lo..(at + 60).min(want.len())],
-            );
-        }
-        checked += 1;
+        assert_same(name, "byte", (got.as_bytes(), want.as_bytes()), 60, |w| {
+            format!("{:?}", String::from_utf8_lossy(w))
+        });
     }
-    // **Anti-vacuity, and it is not decoration here.** `include_str!` of a file that was
-    // emptied, or a driver that wrote `{"cases": []}` after a failed render, would leave this
-    // test green having compared nothing. The count is the driver's own, so it moves only when
-    // a case is deliberately added or removed.
-    assert_eq!(
-        checked, 31,
-        "expected 31 vendored cases, compared {checked}"
+}
+
+/// **The id pin, and it is the gate M11b's framing change rests on**: `render`'s bytes through
+/// the SHIPPED tokenizer must equal the ids `apply_chat_template` produced, for all 31 cases.
+///
+/// This closes exactly the gap [`the_special_tokens_survive_tokenization_as_single_ids`]'s
+/// dated correction names — "`Tokenizer::load(dir).encode(&render(msgs, &opts))` against
+/// `case[\"ids\"]`, on an artifact with a real tokenizer" — which was owed because no Glimmer
+/// tokenizer was on the machine when that note was written. One now is.
+///
+/// **Why it matters more than the byte pin.** `render` returns a STRING containing
+/// `<|start|>`, `<|message|>`, `<|eot|>` and friends as literal text, and whether each becomes
+/// ONE id is decided by the `tokenizers` crate reading the checkpoint's added-token table —
+/// not by anything in this crate. The byte pin cannot see that; a port whose specials
+/// tokenized as five ordinary pieces each would pass it and feed the model a prompt it has
+/// never seen, which is the failure mode `tokenizer.rs`'s own retraction is about.
+///
+/// **The tokenizer is 27 MB and cannot be vendored**, so the artifact directory is supplied by
+/// `RIVOLI_GLIMMER_ARTIFACT` (any Glimmer artifact or the HF checkpoint — they carry identical
+/// `tokenizer.json`; `tests/convert-parity-glimmer-fp8.sh` proves the copy is byte-exact).
+/// Without it the id half cannot run, and this test does NOT then pass silently: it asserts
+/// the reason. `eprintln!` would be invisible under libtest capture, which is the recorded
+/// reason "skips loudly" is not a thing here.
+#[test]
+fn rendered_prompts_tokenize_to_the_vendored_ids() {
+    let cases = cases();
+    // Hoisted ABOVE the skip so it covers both branches. It used to live only in the skip
+    // branch, which meant the arm that actually runs borrowed its credibility from an arm it
+    // never executes (review, 2026-08-17).
+    assert_eq!(cases.len(), 31, "expected 31 vendored cases");
+    let Ok(dir) = std::env::var("RIVOLI_GLIMMER_ARTIFACT") else {
+        // The census above already ran and covers this branch, so an unset variable cannot
+        // read as coverage: what is missing here is precisely the tokenizer, and nothing else
+        // about the fixture has been assumed.
+        return;
+    };
+    let tok = rivoli_artifact::tokenizer::Tokenizer::load(&dir)
+        .unwrap_or_else(|e| panic!("RIVOLI_GLIMMER_ARTIFACT={dir} is not loadable: {e}"));
+    for case in &cases {
+        let name = case["name"].as_str().expect("case has a name");
+        let kw = &case["kwargs"];
+        let want = ids_of(case);
+        let got = tok
+            .encode(&render(
+                kw["messages"].as_array().expect("kwargs has messages"),
+                &opts_of(kw),
+            ))
+            .unwrap_or_else(|e| panic!("case `{name}`: encode failed: {e}"));
+        assert_same(name, "id", (&got, &want), 6, |w| format!("{w:?}"));
+    }
+    println!(
+        "  id pin: {} cases tokenized identically to apply_chat_template",
+        cases.len()
     );
 }
 
-/// The vendored ids exist and every special the template can emit is exercised by some case.
+/// Every special the template can emit is exercised by some vendored case — a CENSUS of the
+/// fixture, and nothing more.
+///
+/// **Renamed 2026-08-17.** It was `the_special_tokens_survive_tokenization_as_single_ids`, and
+/// its own dated correction below explains at length that it does not establish that. The test
+/// that does is [`rendered_prompts_tokenize_to_the_vendored_ids`]; this one keeps the half it
+/// really pays, and now says so in its name. Kept separate because the census needs no
+/// tokenizer and therefore runs everywhere, including where the id pin skips.
 ///
 /// > **CORRECTED 2026-08-14, by review, and the correction is that this test does LESS than it
 /// > claimed.** It read: "This is what a lookalike would fail. A port that emitted `<|start|>` as
@@ -108,10 +205,16 @@ fn every_case_renders_byte_for_byte() {
 /// **What would close it:** `Tokenizer::load(dir).encode(&render(msgs, &opts))` against
 /// `case["ids"]`, on an artifact with a real tokenizer. The tiny fixture has none.
 ///
+/// > **CLOSED 2026-08-17 (M11b)** — by [`rendered_prompts_tokenize_to_the_vendored_ids`]
+/// > above, which is exactly that run, on the shipped 27 MB `tokenizer.json` via
+/// > `RIVOLI_GLIMMER_ARTIFACT`: 31 of 31 cases identical. What remains HERE is the census,
+/// > which is worth keeping separate because it needs no tokenizer and therefore runs
+/// > everywhere, including where the id pin skips.
+///
 /// What this still buys: a census. Every special the template can emit appears in some case, so
 /// a fixture regenerated from a template that stopped emitting one goes red.
 #[test]
-fn the_special_tokens_survive_tokenization_as_single_ids() {
+fn every_special_the_template_emits_is_exercised_by_some_case() {
     // `<|begin_of_text|>`, `<|start|>`, `<|message|>`, `<|eot|>`, `<|eom|>`, `<|patch|>`,
     // `<|video|>` — resolved from the vendored ids rather than restated, since the whole
     // question is what the tokenizer does.
@@ -120,12 +223,7 @@ fn the_special_tokens_survive_tokenization_as_single_ids() {
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     for case in &cases {
         let name = case["name"].as_str().expect("case has a name");
-        let ids: Vec<u32> = case["ids"]
-            .as_array()
-            .expect("case has ids")
-            .iter()
-            .map(|v| v.as_u64().expect("id is a number") as u32)
-            .collect();
+        let ids = ids_of(case);
         assert_eq!(
             ids.first(),
             Some(&200000),

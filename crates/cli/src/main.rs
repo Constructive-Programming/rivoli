@@ -555,8 +555,14 @@ fn invocation<'a>(
 ///
 /// **The shared tail.** Everything below the seam is architecture-shaped and everything here
 /// is not, so this function names no architecture — which is what makes "a third arm is two
-/// lines in `main`" true rather than aspirational.
+/// lines in `main`" true rather than aspirational. M11b needed the architecture in
+/// `serve::Opts` — chat framing is a property of the CHECKPOINT and sits outside the engine
+/// seam — and it comes from `cfg.arch()` rather than a fifth parameter, because the config
+/// already knows which architecture it is.
 fn open_and_run(a: &Args, tok: &Tokenizer, inv: Invocation<'_>, cfg: ArchCfg<'_>) -> Result<()> {
+    // Read BEFORE the config moves into `Engine::open`. `ArchCfg` is not `Copy`, so this
+    // ordering is the borrow checker's, not a preference.
+    let arch = cfg.arch();
     let mut eng = Engine::open(
         &a.model,
         cfg,
@@ -579,6 +585,10 @@ fn open_and_run(a: &Args, tok: &Tokenizer, inv: Invocation<'_>, cfg: ArchCfg<'_>
                     .file_name()
                     .map_or_else(|| "rivoli".into(), |n| n.to_string_lossy().into_owned()),
                 think: a.think,
+                // Which chat template frames a request, and reads the reply back — see
+                // `serve::Opts::arch`. Read off the config rather than matched here, which is
+                // what keeps this function's "names no architecture" claim true.
+                arch,
             },
         ),
     }

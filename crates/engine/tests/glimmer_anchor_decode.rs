@@ -117,103 +117,18 @@ mod glimmer_anchor;
 
 use common::{Got, Want, Weightless, worst_rel};
 use glimmer_anchor::{
-    Anchor, BRANCH_CAP, TOL, TOL_BRANCH, TOL_NLL, TOL_TV, anchors, float, ints, is_alias, stored,
+    Anchor, BRANCH_CAP, TOL, TOL_BRANCH, TOL_NLL, TOL_TV, anchors, assert_split_entered, budgets,
+    float, ints, write_artifact,
 };
-use rivoli_artifact::format::SafeWriter;
-use rivoli_artifact::glimmer::GLIMMER_LAYER_TENSORS;
-use rivoli_artifact::glimmer_config::{GlimmerConfig, GlimmerTextConfig};
+use rivoli_artifact::glimmer_config::GlimmerTextConfig;
 use rivoli_engine::glimmer::engine::GlimmerEngine;
-use rivoli_engine::glimmer::geometry;
+use rivoli_engine::glimmer::geometry::ProjFmt;
 use rivoli_engine::seam::GenSpec;
-use std::path::PathBuf;
 
-/// An artifact directory that removes itself on drop.
-///
-/// **Panic-safe, which a `remove_dir_all` at the end of a test is not** — a failing
-/// assertion skips it and leaves the fixture behind, and the next run with the same pid
-/// reuses it. `tag` carries the salt so the two arms cannot collide.
-struct Artifact(PathBuf);
-
-impl Artifact {
-    fn path(&self) -> &str {
-        self.0.to_str().expect("the artifact path is utf-8")
-    }
-}
-
-impl Drop for Artifact {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Write the reference's own parameters as a Muse Glimmer artifact.
-///
-/// The config is the shipped wrapper with `text_config` replaced by the golden's own
-/// `tiny_config`, so every scalar the loop reads — both epsilons, `qk_scale_factor`,
-/// `output_multiplier`, `final_logit_softcapping`, `sliding_window`, `layer_types`,
-/// `layer_rope_theta` — comes from the run that produced the logits rather than from this
-/// file.
-///
-/// **The projections go out as bf16, which is where this gate's floor comes from.** That
-/// is not a choice: bf16 is what the artifact stores, so rounding here is the same
-/// rounding the shipped converter would do, applied where it can be seen.
-fn write_artifact(a: &Anchor) -> Artifact {
-    let root = std::env::temp_dir().join(format!(
-        "rivoli-glimmer-anchor-{}-{}",
-        a.name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).expect("create the artifact directory");
-
-    let mut w = SafeWriter::new();
-    let mut placed = 0usize;
-    for (name, shape, vals) in a.weights.floats.iter().filter(|(n, _, _)| !is_alias(n)) {
-        let (dt, bytes) = stored(shape, vals);
-        w.add(name.clone(), dt, shape.clone(), bytes);
-        placed += 1;
-    }
-    w.write(&format!("{}/resident.safetensors", root.display()))
-        .expect("write the artifact weights");
-
-    std::fs::write(root.join("config.json"), a.config_json().to_string())
-        .expect("write the config");
-    let art = Artifact(root);
-    // The engine's own loader, on the bytes just written: a config this fixture got wrong
-    // fails HERE, with the schema's own message, rather than as a wrong number later.
-    let back = GlimmerConfig::load(art.path()).expect("the artifact re-opens as a Glimmer one");
-    assert_eq!(
-        placed,
-        3 + back.text.n_layers * GLIMMER_LAYER_TENSORS.len(),
-        "{}: the artifact is not the whole parameter set",
-        a.name
-    );
-    art
-}
-
-/// The budget that pins every layer, and the one that forces a streaming split — both
-/// derived from the engine's own footprint arithmetic rather than picked.
-///
-/// `floor_of` states everything a run pays before one weight is resident; adding `k` layers'
-/// worth of bytes to it is a budget that admits about `k` of them. Returns
-/// `(all_resident, about_three_layers)`.
-///
-/// **`n_ctx` here is the anchor's FULL run** (prompt plus every emitted token) while a given
-/// forward is opened at `prompt.len() + 1`, so the floor charged is a slight over-estimate and
-/// the split arm may pin one more layer than three. That is deliberate and the callers do not
-/// predict the split: the roomy arm asserts nothing streams, the tight arm asserts that
-/// something is pinned AND something streams AND a slot was filled. A test that asserted "3
-/// and 5" would be asserting `partition`'s answer, which is `rivoli-core`'s own gate to keep —
-/// what THIS file needs is that both residency paths were entered.
-fn budgets(t: &GlimmerTextConfig, n_ctx: usize) -> (usize, usize) {
-    let layer = geometry::layer_bytes(t).expect("a layer's bytes");
-    let roomy = geometry::floor_of(t, n_ctx, 0).expect("the slotless floor");
-    let tight = geometry::floor_of(t, n_ctx, geometry::STREAM_SLOTS).expect("the slotted floor");
-    (
-        roomy.total().0 as usize + t.n_layers * layer,
-        tight.total().0 as usize + 3 * layer,
-    )
-}
+// `Artifact`, `write_artifact` and `budgets` lived here until M11, when the fp8 decode gate
+// (`glimmer_fp8_decode.rs`) became their second consumer; they moved to `glimmer_anchor/`
+// with their docs. `budgets` gained the artifact's `ProjFmt` — this file's arms are the bf16
+// reference, so every call here passes `ProjFmt::Bf16`.
 
 /// One forward over `prompt`, with the engine handed back for a readback.
 ///
@@ -391,7 +306,7 @@ fn the_engine_reproduces_muse_glimmers_own_logits() {
             .map(|v| *v as u32)
             .collect();
         let prompt = effective_prompt(a, &cfg.text);
-        let (capacity, _) = budgets(&cfg.text, a.positions());
+        let (capacity, _) = budgets(&cfg.text, a.positions(), ProjFmt::Bf16);
         let mut worst = (0.0f32, 0usize);
         for step in 0..emitted.len() {
             let mut fed = prompt.clone();
@@ -490,7 +405,7 @@ fn every_layers_branch_matches_the_reference() {
         let cfg = a.config();
         let prompt = effective_prompt(a, &cfg.text);
         let (hid, layers) = (cfg.text.hidden, cfg.text.n_layers);
-        let (capacity, _) = budgets(&cfg.text, a.positions());
+        let (capacity, _) = budgets(&cfg.text, a.positions(), ProjFmt::Bf16);
         for l in 0..layers {
             let mut t = cfg.text.clone();
             t.n_layers = l + 1;
@@ -553,7 +468,7 @@ fn the_partition_moves_bytes_and_never_text() {
         let art = write_artifact(a);
         let cfg = a.config();
         let prompt = effective_prompt(a, &cfg.text);
-        let (roomy, tight) = budgets(&cfg.text, a.positions());
+        let (roomy, tight) = budgets(&cfg.text, a.positions(), ProjFmt::Bf16);
         let (all, _) = one_forward(art.path(), &cfg.text, &prompt, roomy);
         let (pinned, streamed) = all.residency();
         assert_eq!(
@@ -567,18 +482,7 @@ fn the_partition_moves_bytes_and_never_text() {
         drop(all);
 
         let (split, _) = one_forward(art.path(), &cfg.text, &prompt, tight);
-        let (p2, s2) = split.residency();
-        let (hits, fills) = split.slot_stats();
-        println!(
-            "  {}: {p2} pinned / {s2} streamed, {fills} slot fills, {hits} hits",
-            a.name
-        );
-        assert!(
-            p2 > 0 && s2 > 0 && fills > 0,
-            "{}: the tight budget pinned {p2} and streamed {s2} with {fills} fills — this \
-             arm must exercise BOTH the resident and the streaming path",
-            a.name
-        );
+        assert_split_entered(a.name, split.residency(), split.slot_stats());
         assert_eq!(
             split.logits().expect("the streamed logits"),
             want,

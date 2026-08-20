@@ -1,6 +1,14 @@
 //! Muse Glimmer's shapes and footprints: the per-layer attention window, the QK scale pair,
-//! and every byte count the pin's [`Floor`] is built from. **Arithmetic over a config,
-//! touching no device.**
+//! every byte count the pin's [`Floor`] is built from, and the artifact's storage format.
+//! **Touching no device.**
+//!
+//! > **AMENDED 2026-08-16 (M11).** This line read "Arithmetic over a config, touching no
+//! > device", and [`ProjFmt::sniff`] is not arithmetic over a config — it opens the artifact
+//! > and reads `manifest.json`. It lives here anyway, for the module's OWN reason below:
+//! > `pin.rs` is `#[cfg(feature = "rocm")]` and no CI job compiles that, so a refusal table
+//! > placed there is a refusal table nothing tests. Written down because "tidy the artifact
+//! > I/O out of the geometry module" is an obvious-looking cleanup that would silently drop
+//! > `sniff`'s three refusals out of every build CI runs.
 //!
 //! # Why this is a module of its own and not the top of `pin.rs`
 //!
@@ -16,10 +24,72 @@
 //! rule and [`qk_scales`]' pairing are the two things a loop is most likely to get fluently
 //! wrong, and a rule whose test needs 55 GB of weights to run is a rule nothing runs.
 
-use anyhow::{Context, Result, ensure};
-use rivoli_artifact::glimmer::GLIMMER_LAYER_TENSORS;
+use anyhow::{Context, Result, bail, ensure};
+use rivoli_artifact::format::{Dtype, FormatMeta, Safetensors};
+use rivoli_artifact::glimmer::{GLIMMER_LAYER_PREFIX, GLIMMER_LAYER_TENSORS};
 use rivoli_artifact::glimmer_config::{GlimmerTextConfig, LayerKind};
 use rivoli_core::residency::{Bytes, Floor};
+
+/// The storage format of the eight per-layer projections — the ONE fact that separates a bf16
+/// Glimmer artifact from an fp8 one.
+///
+/// **There is no flag and no legality flip: the artifact IS the model, sniffed by dtype**
+/// ([`ProjFmt::sniff`]). Everything else about the two artifacts is identical — same tensor
+/// names, same shapes, same norms widened to f32, same bf16 `embed`/`lm_head` — so the format
+/// is a per-run FACT the pin discovers, not a knob an operator can spend (which would be the
+/// "knob nothing spends" class `rivoli_core::legality` exists to refuse).
+///
+/// P6 note: the pin stays a function of free memory — this enum changes the BYTE SIZE of a
+/// layer (and so where the partition lands for a given budget), never the partition's shape
+/// or policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjFmt {
+    /// The checkpoint's own bf16, verbatim — the reference rung, 2 bytes per weight.
+    Bf16,
+    /// fp8-e4m3 with one f32 scale per `block × block` tile — `convert_glimmer --fp8`'s
+    /// output, 1 byte per weight plus the grid.
+    Fp8 { block: usize },
+}
+
+impl ProjFmt {
+    /// Sniff the artifact's projection format from layer 0's `q_proj` dtype.
+    ///
+    /// **The manifest is consulted ONLY on the fp8 arm.** A bf16 artifact needs no
+    /// `manifest.json` at all — the anchor gates build config-plus-weights fixtures without
+    /// one — while an fp8 artifact always has one, because `convert_glimmer --fp8` stamps the
+    /// block it quantized at and the pin must dequantize at the SAME block: a wrong block
+    /// mis-tiles every scale lookup silently, which is why this is read from the stamp rather
+    /// than assumed from the compiled-in constant.
+    ///
+    /// One tensor's header decides for all 416 because the converter asserts the pass was
+    /// all-or-nothing (`quantized == n_layers * 8`); a mixed artifact fails at the first
+    /// tensor whose dtype disagrees with the sniff, at load, with the header's own message.
+    ///
+    /// **The block needs no guard here and deliberately has none.** Every use downstream
+    /// divides by it — `layer_bytes`, `resident::place_fp8`, `check_layer_headers`, and the
+    /// kernel's own `blk_shift` — so a zero would divide by zero; but [`FormatMeta::load`],
+    /// which this arm goes through, already refuses anything that is not a positive power of
+    /// two, and one door is better than two doors that can disagree. (A guard WAS added here
+    /// 2026-08-16 on review's suggestion and removed the same day on reading that function:
+    /// a redundant check whose comment calls itself "the door" is how a reader stops looking
+    /// for the real one.) `layer_bytes` keeps its own because it is `pub` and `ProjFmt::Fp8`
+    /// is constructible without passing through here at all.
+    pub fn sniff(dir: &str, st: &Safetensors) -> Result<Self> {
+        let name = format!("{GLIMMER_LAYER_PREFIX}.0.self_attn.q_proj.weight");
+        let (_, dtype, _) = st.raw(&name)?;
+        match dtype {
+            Dtype::Bf16 => Ok(ProjFmt::Bf16),
+            Dtype::F8E4M3 => Ok(ProjFmt::Fp8 {
+                block: FormatMeta::load(dir)?.fp8_block,
+            }),
+            other => bail!(
+                "{name} is {other:?}, but a Glimmer artifact stores its projections as BF16 \
+                 (verbatim) or F8_E4M3 (--fp8) — this directory is not one this engine's \
+                 converter produced"
+            ),
+        }
+    }
+}
 
 /// How many layer-sized streaming slots the tier reserves. Raising it pins one layer fewer,
 /// and a streamed layer is **967.942 MB of host memcpy per visit**.
@@ -33,8 +103,15 @@ pub const STREAM_SLOTS: usize = 1;
 
 /// Alignment slack in the tier request. `DeviceTier::place` starts every reservation at a
 /// 256-byte boundary and the pin makes at most `3 + 12·n_layers` = 627 placements on the
-/// shipped model, so the padding is under 160 KB; 1 MiB is ~6x that bound and 0.002% of the
-/// 55.712 GB it can sit beside.
+/// shipped bf16 model — `3 + 20·n_layers` = 1043 on the fp8 one, whose eight projections each
+/// place a scale grid too — so the worst-case padding is under **157 KiB** bf16 (627 × 255 B =
+/// 159,885) and under **260 KiB** fp8 (1043 × 255 = 265,965); 1 MiB is 3.94× the larger bound
+/// and 0.002% of the 55.712 GB it can sit beside.
+///
+/// > **UNITS CORRECTED 2026-08-16, by review.** This said "under 160 KB bf16 and under 261 KB
+/// > fp8". Both hold only if KB means KiB for the second one and either for the first —
+/// > 265,965 B is 265.97 **KB** and 259.73 **KiB** — so the sentence needed two different
+/// > units to be true. Restated in KiB throughout, with the products shown.
 pub const PIN_SLACK: usize = 1 << 20;
 
 /// How many prompt positions a layer-major prefill batch carries.
@@ -158,7 +235,8 @@ pub fn slots_of(k: LayerKind, win: usize, n_ctx: usize) -> Result<usize> {
     })
 }
 
-/// Bytes ONE layer's twelve tensors occupy — **967.942 MB** for the shipped model.
+/// Bytes ONE layer's tensors occupy — **967.942 MB** bf16, roughly half that fp8, for the
+/// shipped model.
 ///
 /// Sized from [`GlimmerTextConfig::layer_tensor_shape`] rather than restating the shapes, so
 /// this number and the checks the placers make cannot drift apart. Every layer is identical —
@@ -166,15 +244,28 @@ pub fn slots_of(k: LayerKind, win: usize, n_ctx: usize) -> Result<usize> {
 /// makes a static prefix partition expressible at all.
 ///
 /// **The norms are f32 here and bf16 in the checkpoint** — `convert_glimmer` widens them, the
-/// house convention every architecture follows — so a layer here is 53,248 bytes larger than
-/// the checkpoint's. (`old:` carried 967.889 MB, the checkpoint figure, in a file whose own
-/// 55.712 GB total only reconciles with the f32 one; corrected there 2026-08-12.)
-pub fn layer_bytes(cfg: &GlimmerTextConfig) -> Result<usize> {
+/// house convention every architecture follows — so a bf16 layer here is 53,248 bytes larger
+/// than the checkpoint's. (`old:` carried 967.889 MB, the checkpoint figure, in a file whose
+/// own 55.712 GB total only reconciles with the f32 one; corrected there 2026-08-12.)
+///
+/// The fp8 arm charges the packed byte per weight PLUS the f32 scale grid per projection —
+/// the grid is ~0.006% of the weight at block 128, but a size that quietly omitted it would
+/// under-reserve the tier by exactly the amount `DeviceTier::place` then bails on.
+pub fn layer_bytes(cfg: &GlimmerTextConfig, fmt: ProjFmt) -> Result<usize> {
+    if let ProjFmt::Fp8 { block } = fmt {
+        ensure!(block > 0, "fp8 block size is 0");
+    }
     let mut per_layer = 0usize;
     for t in GLIMMER_LAYER_TENSORS {
         let shape = cfg.layer_tensor_shape(t)?;
         let n: usize = shape.iter().product();
-        per_layer += n * if shape.len() == 1 { 4 } else { 2 };
+        per_layer += match (shape.len(), fmt) {
+            (1, _) => n * 4,
+            (_, ProjFmt::Bf16) => n * 2,
+            (_, ProjFmt::Fp8 { block }) => {
+                n + shape[0].div_ceil(block) * shape[1].div_ceil(block) * 4
+            }
+        };
     }
     Ok(per_layer)
 }
@@ -272,13 +363,18 @@ pub fn check_footprint_inputs(cfg: &GlimmerTextConfig, n_ctx: usize) -> Result<(
 /// 52 and stream the last, which is **967.942 MB of host memcpy per token** bought for
 /// nothing. `old:` avoided it with an early return before its partition ran; here it is the
 /// same fact expressed as an argument to the one placement author.
-pub fn floor_of(cfg: &GlimmerTextConfig, n_ctx: usize, slots: usize) -> Result<Floor> {
+pub fn floor_of(
+    cfg: &GlimmerTextConfig,
+    n_ctx: usize,
+    slots: usize,
+    fmt: ProjFmt,
+) -> Result<Floor> {
     check_footprint_inputs(cfg, n_ctx)?;
     Ok(Floor {
         always_resident: Bytes((global_bytes(cfg) + PIN_SLACK) as u64),
         kv_at_max_ctx: Bytes(kv_bytes(cfg, n_ctx)? as u64),
         scratch: Bytes(scratch_bytes(cfg, n_ctx)? as u64),
-        slot_bytes: Bytes((slots * layer_bytes(cfg)?) as u64),
+        slot_bytes: Bytes((slots * layer_bytes(cfg, fmt)?) as u64),
     })
 }
 
@@ -289,7 +385,8 @@ mod geometry_tests {
     // refusal message these functions were written to produce, where `.unwrap()` shows only
     // "called `Result::unwrap()` on an `Err` value" and throws the argument away.
     use super::{
-        LayerKind, PIN_SLACK, STREAM_SLOTS, floor_of, global_bytes, qk_scales, slots_of, window_of,
+        LayerKind, PIN_SLACK, ProjFmt, STREAM_SLOTS, floor_of, global_bytes, layer_bytes,
+        qk_scales, slots_of, window_of,
     };
     use anyhow::Result;
 
@@ -369,7 +466,7 @@ mod geometry_tests {
     #[test]
     fn the_floor_charges_for_the_kv_cache_and_the_scratch_and_not_only_the_weights() -> Result<()> {
         let cfg = tiny_config();
-        let f = floor_of(&cfg, 64, STREAM_SLOTS)?;
+        let f = floor_of(&cfg, 64, STREAM_SLOTS, ProjFmt::Bf16)?;
         assert_eq!(
             f.always_resident.0,
             (global_bytes(&cfg) + PIN_SLACK) as u64,
@@ -385,7 +482,7 @@ mod geometry_tests {
             "{STREAM_SLOTS} slot(s) must be charged for"
         );
         // A longer context charges strictly more KV and never less of anything else.
-        let g = floor_of(&cfg, 128, STREAM_SLOTS)?;
+        let g = floor_of(&cfg, 128, STREAM_SLOTS, ProjFmt::Bf16)?;
         assert!(
             g.kv_at_max_ctx.0 > f.kv_at_max_ctx.0,
             "KV must grow with n_ctx"
@@ -399,8 +496,104 @@ mod geometry_tests {
     #[test]
     fn a_context_past_the_trained_positions_is_refused_before_the_arithmetic() {
         let cfg = tiny_config();
-        assert!(floor_of(&cfg, cfg.max_position_embeddings + 1, STREAM_SLOTS).is_err());
-        assert!(floor_of(&cfg, 0, STREAM_SLOTS).is_err());
+        let too_far = cfg.max_position_embeddings + 1;
+        assert!(floor_of(&cfg, too_far, STREAM_SLOTS, ProjFmt::Bf16).is_err());
+        assert!(floor_of(&cfg, 0, STREAM_SLOTS, ProjFmt::Bf16).is_err());
+    }
+
+    /// `layer_bytes` under each [`ProjFmt`], against arithmetic done by hand on the tiny
+    /// config's literal shapes — an independent restatement, so a formula that drifted (a
+    /// dropped grid, a wrong element size, a `2` where the fp8 arm needs `1`) reddens against
+    /// a number this module did not produce.
+    ///
+    /// Tiny config: hidden 64, q/attn_gate `[32, 64]`, k/v `[16, 64]`, o `[64, 32]`,
+    /// mlp gate/up `[128, 64]`, mlp down `[64, 128]`, four `[64]` norms.
+    /// - norms: 4 · 64 · 4 = 1,024 (f32 both arms)
+    /// - projection elements: 2·(32·64) + 2·(16·64) + (64·32) + 2·(128·64) + (64·128) = 32,768
+    /// - bf16: 1,024 + 2·32,768 = 66,560
+    /// - fp8 at block 128: every dim ≤ 128, so eight `[1, 1]` grids — 1,024 + 32,768 + 8·4
+    /// - fp8 at block 32: grids 2·(1·2) + 2·(1·2) + (2·1) + 2·(4·2) + (2·4) = 34 tiles
+    #[test]
+    fn layer_bytes_charges_each_format_its_own_size() -> Result<()> {
+        let cfg = tiny_config();
+        let bf16 = layer_bytes(&cfg, ProjFmt::Bf16)?;
+        assert_eq!(bf16, 66_560);
+        let fp8 = layer_bytes(&cfg, ProjFmt::Fp8 { block: 128 })?;
+        assert_eq!(fp8, 1_024 + 32_768 + 8 * 4);
+        assert!(
+            fp8 < bf16,
+            "the fp8 layer must be smaller — it is the point"
+        );
+        // The grid term scales with the tile count, not just the projection count.
+        let fine = layer_bytes(&cfg, ProjFmt::Fp8 { block: 32 })?;
+        assert_eq!(fine, 1_024 + 32_768 + 34 * 4);
+        assert!(layer_bytes(&cfg, ProjFmt::Fp8 { block: 0 }).is_err());
+        Ok(())
+    }
+
+    /// [`ProjFmt::sniff`] reads the artifact, not a flag: bf16 projections sniff `Bf16` with
+    /// NO manifest present (the anchor fixtures ship none), fp8 ones read the block from the
+    /// manifest stamp, and any other dtype is refused by name.
+    #[test]
+    fn sniff_reads_the_dtype_and_consults_the_manifest_only_for_fp8() -> Result<()> {
+        use anyhow::Context;
+        use rivoli_artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors};
+
+        /// A one-tensor artifact directory: layer 0's `q_proj` at `dtype`, and optionally the
+        /// `manifest.json` format stamp. Returns `(dir-as-string, opened reader)`.
+        fn fixture(tag: &str, dtype: Dtype, manifest: bool) -> Result<(String, Safetensors)> {
+            let dir =
+                std::env::temp_dir().join(format!("rivoli-sniff-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            let elem = match dtype {
+                Dtype::F32 => 4,
+                Dtype::Bf16 => 2,
+                _ => 1,
+            };
+            let mut w = SafeWriter::new();
+            w.add(
+                format!(
+                    "{}.0.self_attn.q_proj.weight",
+                    rivoli_artifact::glimmer::GLIMMER_LAYER_PREFIX
+                ),
+                dtype,
+                vec![2, 2],
+                vec![0u8; 4 * elem],
+            );
+            let st_path = dir.join("resident.safetensors");
+            let st_path = st_path.to_str().context("utf-8 path")?;
+            w.write(st_path)?;
+            if manifest {
+                let m = serde_json::json!({
+                    "format": serde_json::to_value(FormatMeta::current(128))?
+                });
+                std::fs::write(dir.join("manifest.json"), m.to_string())?;
+            }
+            Ok((
+                dir.to_str().context("utf-8 path")?.to_string(),
+                Safetensors::open_file(st_path)?,
+            ))
+        }
+
+        let (dir, st) = fixture("bf16", Dtype::Bf16, false)?; // deliberately manifest-less
+        assert_eq!(ProjFmt::sniff(&dir, &st)?, ProjFmt::Bf16);
+        let bf16 = dir;
+        let (dir, st) = fixture("fp8", Dtype::F8E4M3, true)?;
+        assert_eq!(ProjFmt::sniff(&dir, &st)?, ProjFmt::Fp8 { block: 128 });
+        let fp8 = dir;
+        // An fp8 artifact WITHOUT the stamp is refused — the block is load-bearing and there
+        // is nothing safe to assume it from.
+        let (dir, st) = fixture("fp8-bare", Dtype::F8E4M3, false)?;
+        assert!(ProjFmt::sniff(&dir, &st).is_err());
+        let bare = dir;
+        // A dtype neither converter arm writes is refused by name, not defaulted.
+        let (dir, st) = fixture("f32", Dtype::F32, true)?;
+        assert!(ProjFmt::sniff(&dir, &st).is_err());
+        for d in [bf16, fp8, bare, dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        Ok(())
     }
 
     /// A Glimmer-shaped config small enough to reason about, built through serde so the
