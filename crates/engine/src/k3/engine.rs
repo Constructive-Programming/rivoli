@@ -42,7 +42,8 @@ use super::geometry::{Dims, check_context};
 use super::pin::{Attn, K3Pin};
 use crate::device::DeviceBuf;
 use crate::routed::ResolvedBatch;
-use anyhow::{Result, ensure};
+use crate::telemetry::Phases;
+use anyhow::{Context as _, Result, ensure};
 use rivoli_artifact::k3_config::K3TextConfig;
 use rivoli_backend::gpustream::HipStream;
 use rivoli_backend::{ExpertDescF4, fill_u32};
@@ -191,6 +192,10 @@ pub struct K3Engine<'a> {
     /// a garbage-but-plausible logit vector is exactly what a readback consumer exists to
     /// catch.
     pub(super) stepped: bool,
+    /// Decode-thread phase spans — `forward.rs`/`decode.rs` stamp them around this arm's
+    /// existing joins. Unexercised on a device until a K3 checkpoint lands; the stamps
+    /// stand so the first real decode profiles without a second edit.
+    pub(super) prof: Phases,
 }
 
 impl<'a> K3Engine<'a> {
@@ -312,6 +317,7 @@ impl<'a> K3Engine<'a> {
             argmax_out: DeviceBuf::new(ARGMAX_BYTES)?,
             argmax_bytes: Vec::new(),
             stepped: false,
+            prof: Phases::default(),
             pin,
             cfg,
         };
@@ -399,10 +405,6 @@ impl<'a> K3Engine<'a> {
              allocator memory"
         );
         let raw = self.logits.copy_out()?;
-        let quads = raw.chunks_exact(4);
-        ensure!(quads.remainder().is_empty(), "a logit buffer of whole f32s");
-        Ok(quads
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect())
+        rivoli_core::num::f32s_le(&raw).context("a logit buffer of whole f32s")
     }
 }

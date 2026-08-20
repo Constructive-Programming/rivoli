@@ -26,6 +26,8 @@ impl V4Engine<'_> {
     /// This port's record is that the join someone forgets is the failure mode, so it is
     /// written as owned rather than inferred from where the launchers happen to run.
     fn argmax(&mut self) -> Result<u32> {
+        // Head bucket: the sync below drains the head chain (`head_tail`'s launches).
+        let t = std::time::Instant::now();
         // SAFETY: `logits` holds `vocab` f32; `argmax_dev` holds an i32 then an f32, and the
         // second pointer is offset by exactly the first's width.
         unsafe {
@@ -38,6 +40,7 @@ impl V4Engine<'_> {
         }
         device_sync()?;
         self.argmax_dev.copy_out_into(&mut self.argmax_host)?;
+        self.prof.lap(crate::telemetry::Phase::Head, t);
         // `argmax_dev` was allocated at exactly `ARGMAX_BYTES` and `copy_out_into` yields that
         // or errors, so the two slices below are total — but the length is asserted rather
         // than assumed, because a short read would index a stale suffix of the reused host
@@ -94,8 +97,9 @@ impl V4Engine<'_> {
             (miss0 - self.misses0) as f64 / spec.prompt.len() as f64,
         );
         // Stats describe steady-state DECODE, not the cold prefill — which is why the counters
-        // are re-read here rather than at `reset`.
+        // (phases included) are re-read here rather than at `reset`.
         let decode_wall = std::time::Instant::now();
+        let prof0 = self.prof;
         // `cur` is the token AT `pos`, decided but not yet fed through the model.
         let mut pos = spec.prompt.len();
         let mut cur = self.argmax()?;
@@ -105,11 +109,41 @@ impl V4Engine<'_> {
             pos += 1;
             cur = self.argmax()?;
         }
-        let (ids, stats) = emit.finish(
+        let ph = self.prof.since(&prof0);
+        Ok(emit.finish(
             decode_wall.elapsed(),
             self.hits() - hit0,
             self.misses() - miss0,
-        );
-        Ok(Decoded { ids, stats })
+            &ph,
+        ))
+    }
+
+    /// Teacher-forced scoring on the V4 arm. Reuses `reset`/`forward`/`argmax` verbatim
+    /// (the fidelity argument lives on `score::walk`), plus one read-only D2H of the
+    /// `vocab`-f32 logit buffer per position. The positional-selection context ceiling
+    /// applies exactly as it does to a decode: a corpus longer than `check_context`'s
+    /// limit is refused at the CLI door like any other over-long run — which is why the
+    /// 5000-token corpus cannot be scored on this arm until M15 lands scored selection
+    /// (the 762-token one fits).
+    #[cfg(feature = "teacher-forcing")]
+    pub fn score(&mut self, ids: &[u32]) -> Result<crate::seam::Scored> {
+        use anyhow::Context as _;
+        crate::score::admit(ids, self.max_ctx())?;
+        self.reset()?;
+        self.forward(&ids[..1], 0)?;
+        let (hit0, miss0) = (self.hits(), self.misses());
+        let mut own = self.argmax()?;
+        let tally = crate::score::walk(ids, |next| {
+            let raw = self.logits.copy_out()?;
+            let row = rivoli_core::num::f32s_le(&raw).context("ragged V4 logit row")?;
+            let at = own;
+            if let Some((t, pos)) = next {
+                self.forward(&[t], pos)?;
+                self.pin.routed.flush_trace()?;
+                own = self.argmax()?;
+            }
+            Ok((row, at))
+        })?;
+        tally.into_scored(self.hits() - hit0, self.misses() - miss0)
     }
 }

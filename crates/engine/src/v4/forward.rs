@@ -88,6 +88,14 @@ impl V4Engine<'_> {
     fn layer(&mut self, layer: usize, at: Extent) -> Result<()> {
         let (dim, hc, m) = (self.cfg.hidden, self.cfg.hc_mult, at.query_rows());
         for ffn in [false, true] {
+            // Phase stamp per sublayer half — COARSE on this arm, deliberately: the
+            // gate D2H (this arm's one host join besides the layer sync) sits inside
+            // the ffn half and its span lands there, so `attend` is launch time only.
+            // `telemetry::ProfileSummary` carries the table; sharpening it the way GLM
+            // does is deferred until a V4 phase number is actually needed — V4 decodes
+            // at the old tree's speed (9.17 vs 9.10–9.17), so nothing is being
+            // attributed here yet.
+            let t = std::time::Instant::now();
             self.pre_norm(layer, ffn, m)?;
             match ffn {
                 true => self.moe_sublayer(layer, m)?,
@@ -112,10 +120,20 @@ impl V4Engine<'_> {
                 )?;
             }
             self.cur = dst;
+            self.prof.lap(
+                match ffn {
+                    true => crate::telemetry::Phase::Ffn,
+                    false => crate::telemetry::Phase::Attend,
+                },
+                t,
+            );
         }
         // ONE join per layer, so layer `L+1`'s first atomic into the accumulator cannot race
         // `L`'s drain. GLM pays the same one for the same reason.
-        device_sync()
+        let t = std::time::Instant::now();
+        device_sync()?;
+        self.prof.lap(crate::telemetry::Phase::Ffn, t);
+        Ok(())
     }
 
     /// Bind this step's token ids and bound its position; returns the row count.
@@ -194,6 +212,9 @@ impl V4Engine<'_> {
     /// statistic was taken over ALL tokens is a real defect and it is a defect precisely
     /// because the statistic is per row.
     fn head_tail(&mut self, m: usize) -> Result<()> {
+        // Launch time only; the head's execution drains inside `argmax`'s
+        // `device_sync`, which `decode.rs` stamps into the same Head bucket.
+        let t = std::time::Instant::now();
         let (dim, hc) = (self.cfg.hidden, self.cfg.hc_mult);
         let last = m - 1;
         let h_last = self.h[self.cur].ptr();
@@ -245,6 +266,7 @@ impl V4Engine<'_> {
                 NULL_STREAM,
             )?;
         }
+        self.prof.lap(crate::telemetry::Phase::Head, t);
         Ok(())
     }
 }

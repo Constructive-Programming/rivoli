@@ -86,6 +86,23 @@ appears that enum dispatch cannot fill.
   flock + descendant-pid witness per arm, never builds. On-demand (GPU, ~1 h), not CI.
   Red-proofed 2026-08-15 by a gate-codebook inversion, after two measured sub-threshold
   rungs (1-ulp: erased by fp16 narrowing; one sign flip: under argmax margins).
+- **ppl gates** — `tests/ppl-gates.sh`: three cells over the M10 instruments — `profile`
+  (the stamped phase buckets account for the decode wall, per-bucket census + a re-derived
+  remainder), `p4` (P4 at NLL, THREE arms — A, a same-budget control A', and B — whose
+  strictness CALIBRATES ITSELF: byte-identity is demanded of an arm whose control repeats
+  byte-for-byte, and elsewhere the floor is measured and the budget's interval must contain
+  zero where the control's does; every verdict carries its scored-position count and a
+  strict-branch difference runs a second BUDGET arm before convicting — not a second control
+  pair, which was the rejected first attempt and carries no information about the budget —
+  because a one-off divergence does not recur while a real budget effect is stable. Re-specified 2026-08-17 after the byte-identity form
+  reddened on GLM's own nondeterminism, not on the budget. **On a non-reproducing arm it
+  reports UNCALIBRATED (exit 1), so it is a diagnostic there, not a merge gate**), `tf`
+  (paired dNLL against
+  the pinned reference inside a pre-registered ±ln(1.01) equivalence band; INCONCLUSIVE is
+  never a pass). `--expect-red[=FRAGMENT]` inverts the classification so a red proof is
+  judged by the gate's own code. On-demand (GPU, ~28 min, or ~34 min if the strict branch takes its fourth arm; + ~6 min per red-proof), not CI.
+  Shares `tests/gpu-witness.sh` with the parity gate. Classifier half red-proofed
+  2026-08-16 deviceless; the engine half is OWED (`docs/measurement/gate-red-proofs.md` §5).
 - **smoke** — `tests/smoke-glm.sh`: the CLI end to end — every legality refusal asserted
   against the table's own message fragments, the bench cell pinned to the recorded
   reference ids, a live serve round-trip (readiness, /v1/models, non-stream, SSE).
@@ -131,7 +148,12 @@ a check that must hold in a shipped binary is an `assert!` and pays its cost.
   ms/miss 1.36 → 5.14 once).
 - **Rank quality on paired dNLL from `bin/ppl`, never the PPL column.** An interval
   straddling zero is *inconclusive*, not a pass. `distinct`/longest-repeated-block measure
-  nothing — read the text.
+  nothing — read the text. **And run the A-vs-A control**: GLM int3-vq does not repeat
+  itself (0.0018 nats of mean dNLL between two runs at identical flags, 2026-08-17), while
+  Glimmer fully pinned is byte-identical — so the floor is per arm, it is a property of
+  streaming, and a comparison below it is not a measurement.
+  `docs/investigations/glm-nondeterminism.md` bounds it;
+  `docs/measurement/how-to-measure.md` opens with the three rules.
 - **Instruments go behind a feature AND a flag, never an env var** (invisible to `--help`,
   absent from recorded command lines, silently active in a stock-looking build). Scripts
   that are not cargo runs may use env vars with the argument written down in place.

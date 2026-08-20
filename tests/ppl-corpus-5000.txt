@@ -1,0 +1,370 @@
+The transformer architecture processes a sentence by first converting each token into a
+dense vector, then repeatedly mixing those vectors with attention and reshaping them with
+feed-forward layers. Attention lets every position look at every other position and decide,
+per head, which ones matter. Because the mixing is a weighted sum rather than a recurrence,
+all positions are processed in parallel, which is the property that made these models
+practical to train at scale.
+
+A mixture-of-experts layer replaces the single feed-forward block with many smaller ones and
+a router that selects a handful per token. The parameter count grows without the per-token
+compute growing with it, since only the selected experts run. The router is a small linear
+layer whose logits are turned into scores; the highest-scoring experts are chosen and their
+outputs are combined using those same scores as weights. Load balancing is usually
+encouraged with a bias term that nudges the ranking away from collapsing onto a few popular
+experts.
+
+Quantization reduces the memory each expert occupies. Vector quantization replaces groups of
+weights with indices into a learned codebook, so a block of values costs a few bits each
+plus one scale. Integer quantization instead stores a small integer per weight together with
+a per-row or per-block scale factor. The first is smaller but its dot product becomes a
+random gather, which is limited by cache behaviour rather than arithmetic; the second is
+larger but decodes sequentially and runs faster per element.
+
+On a machine where the weights do not all fit in memory at once, the experts must be
+streamed from storage as they are selected. A cache holds the most useful subset. When a
+requested expert is absent the engine stalls on a read of many megabytes, and the cost of
+that stall dominates everything else the layer does. This is why the policy governing which
+experts stay resident matters as much as the arithmetic, and why a policy that changes which
+experts are selected in the first place is worth measuring carefully.
+
+Rivers carved the valley slowly, and the town at its mouth grew up around a single bridge.
+In winter the water ran high and brown; in late summer it fell until the gravel bars showed
+through, and children walked out to islands that had been invisible in June. The bridge was
+replaced twice, once after a flood and once because the road was widened, but the crossing
+itself stayed where it had always been, which is how such places usually persist.
+
+She had not expected the letter, and read it twice before setting it down. It said very
+little: that the house had sold, that the furniture would be kept in storage until spring,
+and that nobody needed her to decide anything yet. That last sentence was the one she
+returned to. It was meant kindly, she thought, and it was almost certainly untrue.
+
+The proof proceeds by induction on the structure of the term. In the base case the term is a
+variable and the property holds trivially. For the inductive step, assume the property holds
+for every proper subterm. Each formation rule then preserves it, since the rule's conclusion
+mentions only the subterms' types and the property is closed under substitution. The
+remaining case, application, requires the substitution lemma proved above, and with it the
+argument closes.
+
+Prices fell through the second quarter before recovering in September, though not to their
+previous level. Analysts disagreed about the cause. The simplest explanation was that
+inventories had been built up in anticipation of demand that did not arrive, and that the
+correction was therefore mechanical rather than a signal about consumption. The alternative
+view, that the earlier prices had been wrong, was harder to argue and harder to refute.
+
+Positional information has to be injected deliberately, because attention itself is
+permutation invariant: shuffle the tokens and the weighted sums come out the same. Early
+models added a fixed sinusoidal vector to each embedding. Later work rotates the query and
+key vectors by an angle proportional to position, so that the dot product between two
+positions depends only on their separation. That relative property is what lets a model
+trained on short sequences behave sensibly on longer ones, at least for a while.
+
+Multi-head attention runs several attention operations side by side on slices of the hidden
+vector, then concatenates the results. The usual explanation is that different heads
+specialise, one tracking syntax, another coreference. The honest version is that heads are
+mostly redundant and many can be pruned with little loss, but the redundancy is cheap and
+appears to help optimisation, so the design persists largely unchanged from the original.
+
+Normalisation layers keep activations in a workable range as depth grows. Placing them
+before each sublayer rather than after makes very deep stacks trainable without a careful
+learning-rate warmup, because the residual path stays clean from input to output. The
+variant most models now use dispenses with the mean subtraction entirely and rescales by the
+root mean square alone, which costs less and appears to lose nothing measurable.
+
+Routing decisions are made independently at every layer, so an expert that matters at layer
+ten has no particular claim on layer eleven. This is inconvenient for anything that wants to
+predict future demand, and it is why cross-layer prediction is harder than it first sounds.
+The correlation that does exist comes from the residual stream changing slowly, not from any
+structural link between one layer's router and the next one's.
+
+A cache that holds a fixed number of items must decide what to discard. Recency is the
+cheapest signal and works well when access patterns are bursty. Frequency survives scanning
+better but adapts slowly to genuine change. The schemes that perform best in practice keep
+a little of both, usually by maintaining a probationary segment for newcomers and promoting
+only on a second access, so that a one-off reference cannot displace something established.
+
+Measuring a cache policy honestly is harder than implementing one. The tempting number is
+end-to-end throughput, which moves for many reasons at once, several of them unrelated to
+the policy. A trace replay isolates the residency question by holding the access sequence
+fixed. It cannot tell you anything about compute, but what it does tell you, it tells you
+without the confounds that make throughput comparisons so easy to misread.
+
+Storage bandwidth has improved faster than latency for two decades, which shapes what a
+streaming engine should optimise. Issuing more requests in parallel raises throughput until
+the queue saturates; it does nothing at all for the time an individual request takes. A
+design that is waiting on one read cannot be rescued by adding readers, and the usual
+symptom of getting this wrong is a system that looks busy while making no progress.
+
+The orchard was planted by someone who never saw it bear. Rows ran east to west, close
+enough that in the third decade the branches met overhead and the middle of the block stayed
+cool through August. Yield fell as the canopy closed and nobody thinned it, so the fruit ran
+small and the crop was sold for pressing rather than for the table, which was not what had
+been intended but kept the ground in use.
+
+Snow came early that year and stayed. The road crew gave up on the upper section by
+December, and for eleven weeks the only way in was a track packed hard by snowmachines,
+which suited some of the residents and enraged the rest. Arguments that had been dormant
+since the last long winter resumed exactly where they had left off, as though the intervening
+summers had been a pause rather than a passage of time.
+
+He kept the receipts in a shoebox, not from thrift but because throwing them away felt like
+a decision, and he had stopped making those. The box filled and a second one started. When
+his daughter finally went through them she found nothing of consequence: fuel, groceries,
+a decade of small ordinary transactions, and one ticket stub from a concert she had no
+memory of him attending.
+
+They agreed to meet at the same cafe, which was a mistake neither of them acknowledged. The
+conversation went well enough until it turned, as it always had, to the question of whose
+account of the last year was accurate. Nothing was settled. Walking back afterwards she
+noticed she was not upset, and spent the rest of the evening deciding whether that was
+progress or simply distance.
+
+Suppose the sequence is bounded and monotone. Then it converges, and its limit is the
+supremum of its range. To see this, let s be that supremum; for any positive epsilon, s minus
+epsilon is not an upper bound, so some term exceeds it. Monotonicity then puts every later
+term in the same interval, and since epsilon was arbitrary the terms are eventually within
+any neighbourhood of s.
+
+The construction generalises to arbitrary index sets provided the ordering is directed. What
+fails without directedness is the ability to choose a single term dominating any two given
+ones, and that choice is used twice in the argument above, once for each of the bounds. A
+counterexample with an antichain of size two is easy to write down and shows the hypothesis
+cannot simply be dropped.
+
+Uniqueness requires a separate argument. Suppose two limits exist and are distinct; take
+epsilon to be a third of their separation. Each limit eventually confines the sequence to its
+own neighbourhood, and those neighbourhoods are disjoint by construction, so beyond the later
+of the two thresholds the sequence would have to lie in both. It does not, and the
+contradiction establishes the claim.
+
+Margins compressed across the sector, though unevenly. Firms with long-term supply contracts
+absorbed the input shock late and reported flat results for two further quarters before the
+effect appeared. Those buying on the spot market took the hit immediately, which made the
+early reporting season look far worse than the underlying picture justified, and produced a
+round of commentary that had to be walked back.
+
+Guidance was withdrawn rather than revised, which the market read correctly as an admission
+that the range had become too wide to be useful. The subsequent recovery in the share price
+owed more to a general rotation than to anything specific, a distinction that was lost in
+most of the coverage and that matters a great deal for anyone trying to infer what
+management actually believed at the time.
+
+Working capital tells a cleaner story than earnings in a quarter like this one. Inventory
+days rose by nine while payables were held roughly flat, which is the signature of a firm
+that expected demand and did not get it, rather than one managing a deliberate build. The
+cash statement makes this obvious; the income statement conceals it almost entirely, which is
+the usual reason to read them in that order.
+
+Speculative execution in a decoder amortises the fixed cost of a forward pass across several
+candidate tokens. A smaller model proposes a short continuation and the large model verifies
+all of it in one batched pass, accepting the longest prefix that matches what it would have
+produced anyway. The saving is real but bounded by the acceptance rate, and the machinery
+only pays for itself once the per-pass overhead is large relative to the per-token work.
+
+The kernel spends most of its time waiting on memory rather than computing. Arithmetic
+intensity, the ratio of operations to bytes moved, is the number that predicts this, and for
+a batch of one it is close to the worst case: every weight is read once and used once. Any
+optimisation that does not either reduce bytes or increase reuse is decoration, however
+clever it looks in the source.
+
+By the second week the routine had established itself without anyone proposing it. Coffee at
+six, the long walk while it was still cool, then work until the heat made it pointless. The
+afternoons were the difficulty. Nobody had planned for how much of the day would be left over
+once the useful part was finished, and the various attempts to fill it were the only source
+of friction the whole month produced.
+
+Consider the map that sends each element to its orbit under the group action. It is
+surjective by construction and its fibres are precisely the orbits, so it factors through the
+quotient. The induced map on the quotient is injective, and therefore a bijection onto its
+image, which gives the orbit-counting result once the stabiliser subgroups are accounted for
+by the usual argument.
+
+Gradient checkpointing trades recomputation for memory during training by discarding
+intermediate activations and regenerating them on the backward pass. The saving is roughly
+the square root of the depth if the checkpoints are placed evenly, and the cost is one extra
+forward pass through each segment. On hardware where memory is the binding constraint this
+is close to free; on hardware where it is not, it is a straightforward waste, and the choice
+should be made per configuration rather than adopted as a default.
+
+The attention mask determines what each position is permitted to see. Causal masking forbids
+looking forward, which is what makes a single forward pass equivalent to predicting every
+position at once. Variants relax this: some allow a fixed window into the past, some allow
+attention to a handful of designated sink positions regardless of distance, and some combine
+both. The choice interacts with how the cache is stored, since anything that can never be
+attended to again can be discarded.
+
+Key-value caching is what makes generation tractable. Without it each new token would
+recompute attention over the whole prefix from scratch, quadratic in the length of the
+output. With it, the per-token cost is linear in context and the cache grows by one entry
+per layer per step. The cache quickly becomes the dominant memory consumer at long context,
+which is why it is so often stored at lower precision than the weights that produced it.
+
+Grouped-query attention shares key and value projections across several query heads,
+shrinking the cache by the sharing factor at some cost in expressiveness. Multi-head latent
+attention goes further, projecting keys and values into a compressed latent space and
+reconstructing them on demand, so the cache stores the latent rather than the full vectors.
+The reconstruction can often be folded into the surrounding projections, which makes the
+saving nearly free at inference time.
+
+An expert that is never selected contributes nothing but still occupies memory. Over a long
+run the distribution of selections is far from uniform: a minority of experts account for a
+large share of the traffic, and a long tail is touched only a handful of times. This is what
+makes caching viable at all, and it is also what makes the tail so expensive, since each
+rare selection costs a full read for a single use.
+
+The router's bias term exists to counteract that concentration during training, pushing
+probability mass toward under-used experts so that capacity is not wasted. At inference the
+bias is frozen, so the balancing pressure it encodes reflects the training distribution
+rather than the current input. Any scheme that reorders selections is therefore intervening
+on top of an existing intervention, which is worth remembering when interpreting what a
+change to the ranking actually does.
+
+Auxiliary losses for load balancing have largely given way to bias-based schemes, partly
+because the loss term competes with the language modelling objective and partly because it
+is difficult to tune. The bias approach adjusts a per-expert offset based on recent
+utilisation, nudging the ranking without adding a term to the gradient. The effect on final
+quality appears to be similar and the training dynamics are less delicate.
+
+Calibration data matters more for quantization than the algorithm often does. A few hundred
+sequences drawn from the target distribution are usually enough to fit scales that hold up,
+while scales fit on mismatched text can be badly wrong in the tails. The failure mode is
+subtle: aggregate error looks acceptable while a small number of large-magnitude weights are
+clipped, and those are exactly the weights that carry the most signal.
+
+Per-tensor scaling is the crudest option and is rarely adequate below eight bits. Per-row
+scaling adapts to the fact that different output channels have different dynamic ranges.
+Group-wise scaling subdivides further, storing one scale per contiguous block of weights
+along the reduction axis, which costs a little more memory and captures most of the
+remaining error. The overhead is a fraction of a bit per weight once the group is reasonably
+sized.
+
+Outlier features complicate everything. In large models a handful of hidden dimensions carry
+values orders of magnitude larger than the rest, and quantizing them together with their
+neighbours destroys the smaller values entirely. Approaches split the difference: keep the
+outlier dimensions in higher precision, or rotate the representation so that the energy is
+spread more evenly before quantizing, which trades a matrix multiply for a much better
+conditioned distribution.
+
+Error accumulates differently depending on where in the network the quantization is applied.
+Attention projections tolerate more error than the feed-forward blocks, and the final output
+layer tolerates least of all, since its errors are not attenuated by anything downstream. A
+uniform bit-width across the whole model is therefore almost always the wrong allocation,
+even though it is the easiest to implement and the easiest to describe.
+
+Direct I/O bypasses the page cache, which is the right choice when the access pattern is
+larger than memory and has no reuse the kernel could exploit. It also removes a copy. The
+cost is that alignment becomes the caller's problem: offsets and lengths must be multiples
+of the device block size, and buffers must be aligned in memory, which usually means the
+on-disk layout has to be designed around it rather than adapted afterwards.
+
+Asynchronous submission decouples issuing a read from waiting on it. A ring buffer shared
+with the kernel lets many requests be queued with a single system call and completions
+harvested the same way. The benefit is not fewer syscalls in themselves but the ability to
+keep many reads in flight, which is what saturates a device whose individual latency is high
+relative to its throughput.
+
+Overlapping transfer with computation hides latency but creates no bandwidth. If the
+computation and the transfer contend for the same memory bus, as they do on a unified-memory
+part, then perfect overlap still leaves total time bounded below by total traffic divided by
+bus width. This is the distinction between hiding a cost and avoiding one, and conflating
+them is the most common error in reasoning about streaming systems.
+
+Eviction and admission are separate decisions that are often conflated. Eviction asks which
+resident item to remove; admission asks whether an incoming item deserves to displace
+anything at all. A policy that admits everything will thrash under a scanning workload no
+matter how good its eviction order is, which is why probationary segments and frequency
+filters tend to matter more than the choice between recency orderings.
+
+The road up the pass had been surveyed three times before anyone cut it, each survey
+rejecting the previous route for reasons that were recorded and then lost. What finally went
+in followed the second alignment almost exactly, at greater expense than the first would have
+required, and the engineer who signed it off spent the remainder of his career explaining
+the decision to people who had not read the file.
+
+Grass came back to the burn within two seasons, then the fireweed, then the aspen in a band
+that followed the old fire line so precisely that from the ridge it looked drawn. The spruce
+took longer and came in unevenly, thickest where the soil had been least damaged. Forty years
+on the boundary was still legible to anyone who knew to look for it, and invisible to
+everyone else.
+
+They built the seawall in stages, each one responding to the failure of the last. The first
+was too low, the second too rigid, the third heavy enough to sink into the mud it stood on.
+The fourth worked, though nobody was confident about why, and the town's relationship to the
+water settled into a truce that has held for longer than anyone involved expected.
+
+In the dry months the lake dropped far enough to expose the foundations of the mill, and
+people walked out to photograph them. The reservoir had been filled in the fifties over the
+objections of about forty families, whose descendants still referred to the water by the name
+of the valley rather than the name on the map, which is the kind of grudge that outlasts
+everyone who had a reason for it.
+
+He answered the question that had been asked rather than the one intended, and the meeting
+moved on before anyone noticed. It was not evasion exactly. He had spent long enough in rooms
+like that one to know which misunderstandings were worth correcting and which would resolve
+themselves, and he had been wrong about the category often enough to have stopped trusting
+the judgement without ever stopping making it.
+
+The apartment kept the shape of two people for a long time after there was only one. Both
+sides of the wardrobe stayed in use, the second chair stayed at the table, and the habit of
+buying for two persisted at the shop until the waste became embarrassing. None of it was
+grief exactly, or not only grief; it was the ordinary difficulty of revising a set of
+arrangements that had taken years to become invisible.
+
+What she remembered afterwards was not the argument but the walk to the station, which had
+been perfectly ordinary, and the fact that neither of them had said anything they would have
+had to take back. That was the part she returned to. It suggested the ending had not been a
+rupture at all, only the last of a long series of small accommodations, and she could not
+decide whether that was better.
+
+The letters were numbered but not dated, and the numbering restarted twice, which suggests
+either two correspondents or one who lost track. Internal evidence favours the second. The
+handwriting is consistent throughout and a reference to the flood appears in both sequences,
+in the second case with a familiarity that implies the reader already knew about it, which
+would be odd for an unrelated recipient.
+
+Let the function be continuous on a closed bounded interval. Then it is uniformly continuous
+there. Suppose otherwise: there is a positive epsilon and pairs of points arbitrarily close
+together whose images differ by at least epsilon. Extract a convergent subsequence from the
+first coordinates; the second coordinates converge to the same limit. Continuity at that
+limit contradicts the separation of the images, so no such epsilon exists.
+
+The compactness hypothesis is doing all the work and cannot be dropped. On an open interval
+the reciprocal function is continuous but not uniformly so: points near the excluded endpoint
+can be arbitrarily close while their images are arbitrarily far apart. The extraction step
+above fails precisely because the subsequence's limit is not in the domain, so there is no
+point at which to invoke continuity.
+
+An analogous statement holds for functions between metric spaces whenever the domain is
+compact, and the proof is unchanged except that convergence is stated in terms of the
+metrics. The result fails for merely complete domains, and the standard counterexample is
+again a function whose modulus of continuity degrades without bound along a sequence with no
+convergent subsequence.
+
+To extend to the several-variable case, note that the argument used only sequential
+compactness and the triangle inequality. Both are available in any finite product of closed
+bounded intervals, since a product of sequentially compact spaces is sequentially compact for
+finite products. The infinite-dimensional case requires more care, and the naive extension is
+false without additional hypotheses on the family of functions.
+
+Revenue recognition timing accounts for most of the discrepancy between the two segments,
+which is unhelpful for anyone trying to compare them. One recognises on shipment and the
+other on installation, a difference of six to nine weeks that matters enormously at a quarter
+boundary and not at all over a year. The reconciliation is disclosed but buried, and the
+summary tables that most readers use do not carry it.
+
+The buyback was announced at a price the board has not since defended in public, and the
+subsequent decline made the timing look worse than the reasoning probably was. Capital
+allocation decisions are judged almost entirely on outcome, which is a poor way to evaluate
+them but the only way available to outsiders. The internal case, insofar as it can be
+reconstructed from the disclosures, rested on assumptions that were conventional at the time.
+
+Covenant headroom tightened for three consecutive quarters before the amendment, and the
+market appears to have priced the amendment as a formality well before it was granted. That
+judgement was correct in the event but was not obviously correct in advance, and the spread
+during that period is a reasonable estimate of what the participants actually believed rather
+than what they said afterwards.
+
+Depreciation schedules were extended by two years across the fleet, which flatters current
+earnings and defers the recognition of an economic cost that has not changed. The disclosure
+is adequate and the change is defensible on the engineering evidence, but the effect on the
+comparison with prior periods is material and is not adjusted for in any of the summary
+figures the company itself publishes.

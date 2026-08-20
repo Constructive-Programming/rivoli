@@ -126,6 +126,11 @@ pub struct GlmEngine<'a> {
     /// not pass it allocates nothing and folds nothing.
     #[cfg(feature = "corruption-probe")]
     pub(super) probe: Option<crate::probe::Probe>,
+    /// Decode-thread phase spans, stamped by `forward.rs`/`mlp.rs`/`decode.rs` around
+    /// this arm's existing joins (the gate D2H, the two stream awaits, the layer sync,
+    /// the argmax D2H — no sync was added to measure). `generate` rebases with
+    /// `Phases::since` exactly as it rebases the hit counters.
+    pub(super) prof: crate::telemetry::Phases,
 }
 
 impl<'a> GlmEngine<'a> {
@@ -249,6 +254,7 @@ impl<'a> GlmEngine<'a> {
             miss_stream: HipStream::miss()?,
             #[cfg(feature = "corruption-probe")]
             probe: None,
+            prof: crate::telemetry::Phases::default(),
             pin,
         })
     }

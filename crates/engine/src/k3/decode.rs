@@ -18,6 +18,8 @@ impl K3Engine<'_> {
     /// Greedy argmax over the logit buffer, refusing a non-finite top logit — a NaN
     /// blow-up must become a message, not a plausible token.
     fn argmax(&mut self) -> Result<u32> {
+        // Head bucket: the sync below drains the head chain (`head_tail`'s launches).
+        let t = std::time::Instant::now();
         // SAFETY: `logits` holds `vocab` f32; `argmax_out` is an i32 then an f32, the
         // second pointer offset by exactly the first's width.
         unsafe {
@@ -33,6 +35,9 @@ impl K3Engine<'_> {
         // redundancy that stops being redundant when the tail moves onto one — the join
         // someone forgets is this port's recorded failure mode, so it is owned here.
         device_sync()?;
+        // The sync above is the drain; the 8-byte D2H below is µs and stays outside the
+        // span (it would also extend a borrow across the lap).
+        self.prof.lap(crate::telemetry::Phase::Head, t);
         let host = &mut self.argmax_bytes;
         self.argmax_out.copy_out_into(host)?;
         // Asserted rather than assumed: a short read would leave a stale suffix in the
@@ -76,9 +81,10 @@ impl K3Engine<'_> {
             wall.elapsed().as_secs_f64(),
             miss0 - self.misses0,
         );
-        // Stats describe steady-state DECODE, so the counters re-read here, after the cold
-        // prefill, not at `reset`.
+        // Stats describe steady-state DECODE, so the counters (phases included) re-read
+        // here, after the cold prefill, not at `reset`.
         let decode_wall = std::time::Instant::now();
+        let prof0 = self.prof;
         let mut pos = spec.prompt.len();
         let mut cur = self.argmax()?;
         while emit.offer(cur, sink) {
@@ -91,7 +97,35 @@ impl K3Engine<'_> {
             cur = self.argmax()?;
         }
         let (hit1, miss1) = self.pool_counters();
-        let (ids, stats) = emit.finish(decode_wall.elapsed(), hit1 - hit0, miss1 - miss0);
-        Ok(Decoded { ids, stats })
+        Ok(emit.finish(
+            decode_wall.elapsed(),
+            hit1 - hit0,
+            miss1 - miss0,
+            &self.prof.since(&prof0),
+        ))
+    }
+
+    /// Teacher-forced scoring on the K3 arm, keeping this loop's flush-BEFORE-forward
+    /// ordering (the trace-well-formedness argument above). The scored row comes from
+    /// [`K3Engine::logits`], the arm's one public readback, guard included.
+    /// Unexercised on a device until a K3 checkpoint lands, like the rest of this arm.
+    #[cfg(feature = "teacher-forcing")]
+    pub fn score(&mut self, ids: &[u32]) -> Result<crate::seam::Scored> {
+        crate::score::admit(ids, self.max_ctx)?;
+        self.reset()?;
+        self.forward(ids[0], 0)?;
+        let (hit0, miss0) = self.pool_counters();
+        let mut own = self.argmax()?;
+        let tally = crate::score::walk(ids, |next| {
+            let (row, scored_own) = (self.logits()?, own);
+            if let Some((t, pos)) = next {
+                self.pin.routed.flush_trace()?;
+                self.forward(t, pos)?;
+                own = self.argmax()?;
+            }
+            Ok((row, scored_own))
+        })?;
+        let (hit1, miss1) = self.pool_counters();
+        tally.into_scored(hit1 - hit0, miss1 - miss0)
     }
 }

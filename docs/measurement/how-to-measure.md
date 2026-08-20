@@ -23,6 +23,44 @@ and fixed"**, because someone auditing numerics reads that file and someone tuni
 reads this one. Two known-broken twins are recorded there too. Perf items cross-reference
 the bug; they do not host it.
 
+## Before any quality comparison: measure the noise floor
+
+**Added 2026-08-17 (M10), and it is a precondition, not an aside.** A paired-dNLL number
+means nothing until you know what the same run compared against ITSELF produces.
+
+| arm | two runs, identical flags | floor |
+|---|---|---|
+| GLM int3-vq, `--max-mem 115`, 761 scored positions | 555 positions moved, PPL 5.200080 vs 5.209284 | **0.0018 nats** of mean dNLL |
+| Muse Glimmer bf16, 52/52 layers pinned, 0 streamed | **byte-identical**, PPL 7.008490 both | **0** |
+
+So the floor is **per arm, and it is a property of streaming, not of the engine as a
+whole** — see `docs/investigations/glm-nondeterminism.md`, which is scoped `glm` for
+exactly that reason. Do not carry GLM's number to another arm, and do not assume a new
+arm has one until its control has been run.
+
+Three rules follow, and each has already been paid for once:
+
+1. **Run the control.** An A/B without an A-vs-A arm cannot tell "the knob moved the
+   output" from "the engine does not repeat itself". `tests/ppl-gates.sh`'s `p4` cell was
+   specified without one, reddened on a real device run, and was measuring nondeterminism
+   the whole time.
+2. **Never rank on a difference below the floor.** On GLM that is ~0.002 nats. The gaps
+   the ladder chases are 0.07–0.09 PPL = 0.0134–0.0172 nats, ~8x the floor, so the
+   instrument is sound — but state the floor alongside the number.
+3. **Do not quote the floor from here; re-measure it.** A floor carried in prose is an
+   inherited number. `p4` measures its own on every invocation, which is why that cell
+   runs three arms instead of two.
+4. **Treat every such interval as a LOWER BOUND on its true width until the independence
+   assumption is checked.** `bin/ppl`'s `SE = sd/sqrt(n)` assumes per-position differences
+   are independent, and on a streaming arm they are not — one event propagates through KV
+   into every later position. The correction could be ~4x, which is the difference between
+   ~8x headroom and none. It is a deviceless check on two retained `.nll` files and it is
+   owed: `docs/investigations/glm-nondeterminism.md`, the caveat under the floor table.
+
+**Counting differing POSITIONS is not a measurement of this.** GLM moved 553 positions
+across a 16-point hit-rate swing and 555 across no change at all. The count saturates;
+the mean and its interval do not.
+
 ## How to read — and write — this document
 
 **A phase profile localises cost; it does not explain it.** Any mechanism attributed to a
@@ -96,6 +134,35 @@ well be right — but treat them as un-ISA'd until someone checks, and expect th
 hit rate to apply.
 
 ## What the time IS — the CLASS axis (always on, `class/tok`)
+
+> **CORRECTED 2026-08-16 (M10): the `class/tok` line does not exist in this tree.** Every
+> field behind it — `gpu_wait_ms`, `io_wait_ms`, the `cpu` split, the `route`/`tail`
+> sub-splits, `moe_us_by_miss` — described instruments the OLD engine carried (reaper-ring
+> stamps, HIP-event brackets, the DSA indexer's own timeline) and the rewrite carries none
+> of them yet. They were removed from `ProfileSummary` rather than ported as zeroes,
+> because a bucket that reads 0 because nothing filled it is worse than an absent one.
+>
+> What is always on here instead is the **PHASE** line, four disjoint decode-thread
+> buckets plus a measured remainder:
+>
+> ```
+> PROFILE/tok: wall <W>ms = attend <A> + ffn <F> + fetch-wait <X> + head <H> + other <O>
+>              | named <P>% of wall
+> ```
+>
+> Unlike the class spans below these DISJOINTLY partition wall, so they may be stacked and
+> `other` is the honest unattributed remainder rather than a residual absorbing every
+> error. **What each bucket covers is per-arm** — set by where that arm's existing sync
+> points already sit, because no sync was added to sharpen them (a sync would change the
+> thing being measured) — and the per-arm table lives on `ProfileSummary`'s doc in
+> `crates/engine/src/telemetry.rs`, not here, so it cannot drift from the code that stamps
+> it. `tests/ppl-gates.sh`'s `profile` cell bounds `other` and censuses the buckets for
+> zero; its red proofs are in [gate-red-proofs.md](gate-red-proofs.md) §5.
+>
+> **The method below is still the method** — that a bracket mixing host compute with
+> blocking waits localises cost without explaining it, and that a mechanism attributed to a
+> hot kernel without reading its ISA is a hypothesis. Each removed split returns with the
+> instrument that measures it, and the paragraphs below say what each one was for.
 
 The phase buckets below (`route` / `moe-gpu` / `tail`) say **where** time goes. They are
 *regions*, and each mixes host compute with blocking waits — which is why `tail` spent this

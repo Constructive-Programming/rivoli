@@ -80,6 +80,11 @@ pub struct GlimmerEngine<'a> {
     /// Whether [`Self::sample`](super::forward) has ever run, so the logit accessor cannot
     /// hand back an uninitialised buffer.
     pub(super) sampled: bool,
+    /// Decode-thread phase spans — `forward.rs` stamps them around this arm's existing
+    /// sync points (`telemetry::ProfileSummary` documents what each bucket covers here:
+    /// the slot-fill memcpy is the real fetch-wait; `sample`'s `device_sync` drains the
+    /// whole layer stack into `head`).
+    pub(super) prof: crate::telemetry::Phases,
 }
 
 impl<'a> GlimmerEngine<'a> {
@@ -144,6 +149,7 @@ impl<'a> GlimmerEngine<'a> {
             vc,
             n_ctx,
             sampled: false,
+            prof: crate::telemetry::Phases::default(),
         })
     }
 

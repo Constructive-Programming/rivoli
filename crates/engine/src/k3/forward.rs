@@ -139,6 +139,12 @@ impl K3Engine<'_> {
 
     /// One layer of §3's loop. Returns the arena bookkeeping for the next layer.
     fn layer(&mut self, l: usize, pos: usize, p: Pref) -> Result<Pref> {
+        // Phase stamp for the attention half — entry fold through the post-attention
+        // prefix add. COARSE like V4's (the gate D2H sits in the ffn half and lands
+        // there; `telemetry::ProfileSummary` carries the table), and unexercised on a
+        // device until a K3 checkpoint exists — the stamps stand so the first real
+        // decode profiles without a second edit.
+        let t = std::time::Instant::now();
         let f = fold_at(l, self.cfg.attn_res_block_size);
         // Layer entry: `h = attn_res(blocks ‖ pref)` — GUARDED (an empty stack skips),
         // unlike the mlp fold below.
@@ -168,6 +174,7 @@ impl K3Engine<'_> {
             false => self.mla_attention(l, pos)?,
         }
         p = self.add_sub_to_pref(p)?;
+        let t = self.prof.lap(crate::telemetry::Phase::Attend, t);
         // The pre-FFN fold is UNCONDITIONAL — no empty guard, §3's one asymmetry between
         // the two calls.
         self.fold_into_h(self.pin.layer(l)?.mlp_fold, f.mlp_sources)?;
@@ -181,6 +188,7 @@ impl K3Engine<'_> {
         // layer's first accumulator atomic, and GLM/V4 pay the same sync for the same
         // reason.
         device_sync()?;
+        self.prof.lap(crate::telemetry::Phase::Ffn, t);
         Ok(p)
     }
 
@@ -694,6 +702,9 @@ impl K3Engine<'_> {
     /// §7's tail: the model-level fold (whose omission is silent), the final norm, and the
     /// head — no bias, no logit scaling, no tied embeddings.
     fn head_tail(&mut self, stack: usize) -> Result<()> {
+        // Launch time only; the head's execution drains inside `argmax`'s
+        // `device_sync`, which `decode.rs` stamps into the same Head bucket.
+        let t = std::time::Instant::now();
         let want = final_sources(self.pin.layers(), self.cfg.attn_res_block_size);
         ensure!(
             stack + 1 == want,
@@ -705,6 +716,7 @@ impl K3Engine<'_> {
         // SAFETY: `xn` holds the normed `hidden` row; `logits` is `vocab` writable.
         unsafe { bproj(self.xn.ptr(), self.pin.head, self.logits.ptr_mut())? };
         self.stepped = true;
+        self.prof.lap(crate::telemetry::Phase::Head, t);
         Ok(())
     }
 }

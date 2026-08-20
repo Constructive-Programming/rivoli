@@ -46,15 +46,18 @@ pub struct RunInfo {
     pub mtp_min_conf: Option<f32>,
     pub bench_tokens: Option<usize>,
     pub prompt: Option<String>,
-    pub moe_gain: f32,
-    pub sinks: usize,
-    pub window: usize,
-    pub misa_heads: usize,
     /// Set when the generation ended in a verbatim repetition loop. `None` is the
     /// measurement "it did not", which is why this is an Option and not a bool plus
     /// three zeroes.
     pub degenerate: Option<LoopReport>,
 }
+
+// `moe_gain`, `sinks`, `window` and `misa_heads` left this struct on 2026-08-16: no flag
+// in this tree fills them (`--moe-gain`, `--sinks`/`--window`, `--misa-heads` are all
+// old-tree knobs that have not been ported), so a value here would be a constant nothing
+// spent — exactly the "recorded command line carrying a knob that did nothing" lie
+// `rivoli_core::legality` exists to stop. Each returns with the flag that gives it a
+// value (M13 streaming knobs, M14 `--misa-heads`).
 
 impl RunInfo {
     /// **Which run this is**, as metric labels: `(key, value)` in wire order.
@@ -103,199 +106,177 @@ impl RunInfo {
     }
 }
 
-/// End-of-run per-token performance summary — the PROFILE line and the OTLP span
-/// fields. Built by the GPU engine from its always-on [`Profile`](crate::gpu) buckets.
+/// Which named phase a decode-thread span belongs to. The vocabulary is fixed across all
+/// four arms so their profiles are comparable; what each name COVERS on a given arm is a
+/// property of that arm's sync points and is written on [`ProfileSummary`]'s fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Attend,
+    /// MoE on the routed arms, the dense MLP on Glimmer — one name because it is one
+    /// slot in the comparison, not a claim that the work is the same.
+    Ffn,
+    FetchWait,
+    Head,
+}
+
+/// Decode-thread phase accumulators, in nanoseconds — the raw material of
+/// [`ProfileSummary`]. One per engine, stamped by that arm's own loop.
+///
+/// **Each bucket is an independent sum of directly-stamped spans; nothing here is
+/// derived.** That is what makes the bucket-sum gate able to go red: `other` (computed
+/// later as `wall − named`) is NOT a field, so a dropped or forgotten stamp cannot hide
+/// in it — it surfaces as `other` growing past the gate's bound. The mirror design (a
+/// clock that attributes every nanosecond to the current phase) was rejected because it
+/// sums to wall BY CONSTRUCTION, which makes the gate vacuous: an arm that never
+/// switched phases would still pass.
+///
+/// Cost: two `Instant::now()` per stamp, ~600 stamp pairs per GLM token (78 layers × ~4
+/// sections), ≈30 µs against a ~390 ms token (<0.01%) — cheap enough to be always on.
+///
+/// `pub` rather than `pub(crate)` even though only this crate's arm modules stamp it: in
+/// the deviceless build NO arm module compiles, so `pub(crate)` makes this and `Phase`
+/// unconstructed dead code, and `warnings = deny` turns that into a build error. One
+/// spelling that works in both arms beats a tighter one plus a cfg'd `allow` at four
+/// sites (tried, 2026-08-16).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Phases {
+    pub attend_ns: u64,
+    pub ffn_ns: u64,
+    pub fetch_wait_ns: u64,
+    pub head_ns: u64,
+}
+
+impl Phases {
+    /// Close a span opened at `since` into bucket `p`; returns the closing instant so
+    /// consecutive sections can chain (`t = lap(A, t)`) without a gap between them.
+    pub fn lap(&mut self, p: Phase, since: std::time::Instant) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        // u128→u64: a span would need 584 years to overflow.
+        let ns = now.duration_since(since).as_nanos() as u64;
+        match p {
+            Phase::Attend => self.attend_ns += ns,
+            Phase::Ffn => self.ffn_ns += ns,
+            Phase::FetchWait => self.fetch_wait_ns += ns,
+            Phase::Head => self.head_ns += ns,
+        }
+        now
+    }
+
+    /// The counters since `start` — how a decode loop rebases past the prefill, exactly
+    /// as every arm already rebases its hit/miss counters (stats describe steady-state
+    /// decode, and the prefill is warm-up).
+    #[must_use]
+    pub fn since(&self, start: &Phases) -> Phases {
+        Phases {
+            attend_ns: self.attend_ns - start.attend_ns,
+            ffn_ns: self.ffn_ns - start.ffn_ns,
+            fetch_wait_ns: self.fetch_wait_ns - start.fetch_wait_ns,
+            head_ns: self.head_ns - start.head_ns,
+        }
+    }
+
+    /// Sum of the four named buckets.
+    pub fn named_ns(&self) -> u64 {
+        self.attend_ns + self.ffn_ns + self.fetch_wait_ns + self.head_ns
+    }
+}
+
+/// End-of-run per-token phase summary — the always-on PROFILE line and the OTLP gauge
+/// fields. Built by [`ProfileSummary::from_decode`] from the [`Phases`] each arm's loop
+/// stamps (the one constructor, and until 2026-08-16 nothing outside `cfg(test)` built
+/// this type at all — a profile nothing fills is this repo's named telemetry trap).
+///
+/// **The old-tree field set (gpu/io/cpu classes, route/tail splits, moe-by-miss,
+/// indexer) did not survive the port, deliberately** — those fields described instruments
+/// the old engine had and this tree's arms measure none of them yet, so each would read a
+/// structural zero. `docs/measurement/how-to-measure.md` carries the dated correction and
+/// the list; each split returns WITH the instrument that measures it.
+///
+/// **Bucket semantics are per-arm, set by where each arm's existing sync points sit** —
+/// no device syncs were added to sharpen them (a sync would change the thing measured):
+///
+/// | | attend | ffn | fetch-wait | head |
+/// |---|---|---|---|---|
+/// | GLM | attn launches + the gate-logits D2H (the layer's one host join, which drains attention execution; it also contains the gate GEMV's own execution, a 6144×256 f32 GEMV priced small against MLA over a growing KV) | host routing + submit/stage + the compute-stream await + drain + the end-of-layer sync | the residual wait on the MISS stream after the compute stream's await returned — fetch cost NOT hidden by resident compute, the design's own number; 0.0 means fully hidden | tail launches + the argmax D2H that drains final-norm → lm_head → argmax |
+/// | Glimmer | attn-half launches (µs — no per-layer join exists on this arm) | MLP-half launches (same) | the synchronous slot-fill memcpy of each streamed layer (967.942 MB apiece — real, and the number P6 turns on) | `sample`, whose `device_sync` drains the WHOLE layer stack's execution on this arm |
+/// | V4 / K3 | attention-half launches only (µs) — the gate D2H that drains attention execution sits inside these arms' ffn half and its span lands THERE; splitting it out the way GLM does is deferred until a V4/K3 phase number is needed (V4 decodes at the old tree's speed, so nothing is being attributed there yet) | everything else in the layer incl. the gate D2H and the `device_sync`s (expert waits are device-side, so fetch exposure drains here undistinguished) | 0.0 — no host-visible fetch wait exists to stamp | head launches + the argmax join |
 #[derive(Debug, Clone, Copy)]
 pub struct ProfileSummary {
-    /// Mean MoE bracket (µs) and layer count, indexed by that layer's MISS count.
-    ///
-    /// `compute_gpu` is a bracket, so the aggregate cannot say whether it is large because
-    /// the shaders are slow or because the compute stream idles waiting for bytes. This
-    /// can: read the SHAPE. A flat profile across miss counts means the gaps are not fetch
-    /// waits; a rising one means they are, and the slope is the per-miss cost.
-    pub moe_us_by_miss: [Option<(f64, u32)>; 16],
     pub tok_per_s: f64,
     pub hit_pct: f64,
+    /// Mean decode wall per token, ms — same clock as `DecodeStats::decode_s`.
     pub wall_ms: f64,
-    pub route_ms: f64,
-    /// The DSA indexer's GPU-timeline span; see [`Profile::idx_gpu_ns`](crate::gpu).
-    pub idx_gpu_ms: f64,
-    /// Full layers per token that took the scoring path. Not `21` until context exceeds
-    /// `index_topk`, and 0 whenever the indexer never scored — which is what gates the
-    /// report line below.
-    pub idx_layers_per_tok: f64,
-    /// CPU wall of the overlapped MoE phase (the `block_on`).
-    pub moe_wall_ms: f64,
-    /// GPU-event span of the compute stream (partials + reduce).
-    pub compute_gpu_ms: f64,
-    /// Off-thread reaper fetch cost (queue→submit→reap all misses).
-    pub fetch_wall_ms: f64,
-    pub miss_per_tok: f64,
-    pub ms_per_miss: f64,
-    pub gb_per_tok: f64,
-
-    // ---- CLASS spans: what the machine was DOING. All directly measured ----
-    // These OVERLAP and may sum to MORE than `wall_ms`. `io_wait_ms` runs on the reaper
-    // thread concurrently with everything else, so it is not a share of wall. The
-    // deliberate consequence: **no residual is reported.** An earlier `cpu` was
-    // `wall − the waits`, which absorbed every error in the other terms and measured
-    // nothing; unattributed time is now simply not shown rather than dressed up as a
-    // number.
-    /// Decode thread blocked in a device join — stamped at every blocking call.
-    ///
-    /// **NOT "the GPU was busy."** Against `rocm-smi`'s independent busy counter this
-    /// reads ~95% of wall while the device reports ~84%: roughly 11 points is the host
-    /// blocked on a GPU that is not executing (launch gaps, driver/queue-drain).
-    pub gpu_wait_ms: f64,
-    /// Reaper thread blocked in `io_uring` completions — measured at the ring, in
-    /// `run_job`'s reap loop, excluding the queue/submit syscalls around it.
-    /// Off-thread, so it overlaps the decode wall and can exceed it.
-    pub io_wait_ms: f64,
-    /// Host compute: the sum of `cpu_launch_ms + cpu_route_ms + cpu_submit_ms`. Every term
-    /// stamped; none derived. (It also carried the expert stream's tokio poll time until
-    /// 2026-08-01; enqueueing the launches straight onto the compute stream left no such
-    /// work to attribute — see `gpu.rs`'s `cpu_ns`.)
-    pub cpu_ms: f64,
-    /// Host time issuing kernel launches (per-layer attention/MLP block + the tail).
-    pub cpu_launch_ms: f64,
-    /// Host time in `route_into` — sigmoid/bias/top-k over 256 experts per MoE layer.
-    pub cpu_route_ms: f64,
-    /// Host time in `RoutedPool::submit` — residency, policy bookkeeping, read specs.
-    pub cpu_submit_ms: f64,
-    /// The blocking half of `route_ms` (the gate-logits D2H).
-    pub route_wait_ms: f64,
-    /// The argmax D2H — the single call the entire tail phase hides behind.
-    pub tail_wait_ms: f64,
-    /// HIP-event BRACKET across final rmsnorm → lm_head → argmax. An upper bound on the
-    /// tail's GPU work: measured 5.50 ms against a 4.66 ms microbench sum, so ~15% is
-    /// inter-kernel gap.
-    pub tail_gpu_ms: f64,
+    pub attend_ms: f64,
+    pub ffn_ms: f64,
+    pub fetch_wait_ms: f64,
+    pub head_ms: f64,
+    /// `wall − (attend + ffn + fetch-wait + head)`: loop glue, `Emit`, the sink, embed
+    /// and flag launches — everything deliberately not stamped. DERIVED, and the only
+    /// derived number here; the bucket-sum gate bounds it (measured ~1% on GLM), so a
+    /// dropped stamp shows up as `other` exploding rather than as a silent hole.
+    /// Negative means a span was double-counted, which the gate's upper bound catches.
+    pub other_ms: f64,
 }
 
 impl ProfileSummary {
-    /// The always-on stdout PROFILE line. Under the async overlap, `moe_wall` is the real
-    /// per-token MoE cost and `fetch_wall` the reaper's work behind it.
+    /// The one constructor: per-token means over a decode of `ntok` tokens that took
+    /// `decode` wall time, with `ph` already rebased past the prefill.
+    pub fn from_decode(ph: &Phases, decode: std::time::Duration, ntok: usize, hp: f64) -> Self {
+        let n = ntok.max(1) as f64;
+        let ms = |ns: u64| ns as f64 / n / 1e6;
+        let wall_ms = decode.as_secs_f64() * 1e3 / n;
+        Self {
+            tok_per_s: ntok as f64 / decode.as_secs_f64().max(1e-9),
+            hit_pct: hp,
+            wall_ms,
+            attend_ms: ms(ph.attend_ns),
+            ffn_ms: ms(ph.ffn_ns),
+            fetch_wait_ms: ms(ph.fetch_wait_ns),
+            head_ms: ms(ph.head_ns),
+            other_ms: wall_ms - ms(ph.named_ns()),
+        }
+    }
+
+    /// `other` as a share of wall — **the bucket-sum gate's number, and the only one
+    /// it reads.** A dropped accumulation drives it up, a span stamped into two buckets
+    /// drives it NEGATIVE, and `tests/ppl-gates.sh`'s `profile` cell bounds it on both
+    /// sides; the host tests below judge the same quantity, so the deviceless and the
+    /// on-device halves of the gate cannot come to disagree about what they measure.
     ///
-    /// The `% hidden` and `ms exposed` terms were removed 2026-08-01 with the two fields
-    /// behind them. Both derived from `moe_wall − compute_gpu`, and `compute_gpu` is a
-    /// BRACKET that CONTAINS the compute stream's stall — so every millisecond spent
-    /// waiting on NVMe was counted as compute, and therefore as fetch successfully hidden.
-    /// It reported 96% where the arithmetic caps the true figure at 57%: layers with 0
-    /// misses run the MoE bracket in 1563 us, so 75 layers of pure kernel work is 117
-    /// ms/token (`examples/moe_bench.rs` independently floors at 113), against a measured
-    /// `moe_wall` of 266 — 117 compute + 149 stall, and fetch can only hide behind the 117.
-    /// Read `io_wait_ms` in the class line below, which is measured at the io_uring ring,
-    /// and the `moe/layer by miss count` line, which measures the stall rather than
-    /// inferring its absence.
+    /// This was `named_pct` (= `100 − this`) until 2026-08-16, printed alongside `other`
+    /// and documented as what the gate greps. It was not: the gate's regex stops at
+    /// `other` and re-derives the share itself. Two spellings of one quantity, one of
+    /// them consumed and the other only claimed to be — so the claimed one went.
+    pub fn other_pct(&self) -> f64 {
+        100.0 * self.other_ms / self.wall_ms.max(1e-9)
+    }
+
+    /// The always-on PROFILE line, one per run, on the log stream.
+    ///
+    /// **Microsecond precision, and it is load-bearing rather than tidy.** At `{:.1}` a
+    /// bucket that is genuinely microseconds prints `0.0`, and the gate's per-bucket
+    /// census — which reads "> 0" as "the accumulation was stamped" — would call that a
+    /// dropped stamp. `ProfileSummary`'s own table says Glimmer's and V4/K3's attend
+    /// buckets ARE launch-only microseconds, so a one-decimal line makes the census
+    /// false the day the cell is pointed at a second arm (both reviews, 2026-08-16).
+    ///
+    /// The trailing percentage is [`Self::other_pct`], printed because "other 4.0"
+    /// against "wall 390.0" is arithmetic a reader should not have to do — the SAME
+    /// number the gate computes from the same line, not a second one that could drift.
+    /// The four buckets are printed too, so the gate can re-derive `other` from them and
+    /// check this line against itself: `other_ms` is the only derived field here, and a
+    /// consumer that reads it without checking it trusts the arithmetic it is auditing.
     pub fn report(&self) {
-        self.report_phases();
-        self.report_moe_by_miss();
-        self.report_classes();
-        self.report_splits();
-        self.report_indexer();
-    }
-
-    /// WHERE the time went, by phase. One line, always printed.
-    fn report_phases(&self) {
         tracing::info!(
-            // wall/route at 0.1 ms: the DSA selection A/B (docs/investigations/npu-offload.md) turns on deltas of
-            // a few ms against a ~400 ms token, which 1 ms resolution rounds into noise.
-            "PROFILE/tok: {:.1}ms wall | route {:.1}ms | moe {:.0}ms (gpu {:.0}ms) | fetch {:.0}ms | {:.2} miss, {:.2}ms/miss, {:.2} GB",
+            "PROFILE/tok: wall {:.3}ms = attend {:.3} + ffn {:.3} + fetch-wait {:.3} + \
+             head {:.3} + other {:.3} ({:.2}% of wall)",
             self.wall_ms,
-            self.route_ms,
-            self.moe_wall_ms,
-            self.compute_gpu_ms,
-            self.fetch_wall_ms,
-            self.miss_per_tok,
-            self.ms_per_miss,
-            self.gb_per_tok,
-        );
-    }
-
-    /// The MoE bracket decomposed by miss count — printed only when there is more than
-    /// one populated bucket, since a single bucket has no shape to read.
-    fn report_moe_by_miss(&self) {
-        let pop: Vec<(usize, f64, u32)> = self
-            .moe_us_by_miss
-            .iter()
-            .enumerate()
-            .filter_map(|(m, v)| v.map(|(us, n)| (m, us, n)))
-            .collect();
-        if pop.len() <= 1 {
-            return;
-        }
-        let cells: Vec<String> = pop
-            .iter()
-            .map(|(m, us, n)| format!("{m}m:{us:.0}us(n={n})"))
-            .collect();
-        let lo = pop.first().map(|c| c.1).unwrap_or(0.0);
-        let hi = pop.last().map(|c| c.1).unwrap_or(0.0);
-        tracing::info!(
-            "  moe/layer by miss count: {} | span {:.0}->{:.0}us ({:+.0}%)",
-            cells.join(" "),
-            lo,
-            hi,
-            if lo > 0.0 {
-                100.0 * (hi - lo) / lo
-            } else {
-                0.0
-            },
-        );
-    }
-
-    /// The CLASS view: [`Self::report_phases`] says WHERE the time is (phases); this says
-    /// WHAT it is. Every term is measured — none is a residual — so they OVERLAP and
-    /// need not sum to wall. `io-wait` is on the reaper thread and routinely exceeds
-    /// it. The `%` is therefore "of wall", not "share of wall", and unattributed time
-    /// is deliberately not shown.
-    fn report_classes(&self) {
-        let pct = |ms: f64| 100.0 * ms / self.wall_ms.max(1e-9);
-        tracing::info!(
-            "  class/tok [spans overlap; no residual]: gpu-wait {:.1}ms ({:.0}% of wall) | \
-             io-wait {:.1}ms ({:.0}%) | cpu {:.1}ms ({:.0}%)",
-            self.gpu_wait_ms,
-            pct(self.gpu_wait_ms),
-            self.io_wait_ms,
-            pct(self.io_wait_ms),
-            self.cpu_ms,
-            pct(self.cpu_ms),
-        );
-        tracing::info!(
-            "    cpu = launch {:.1}ms + route {:.2}ms + submit {:.2}ms",
-            self.cpu_launch_ms,
-            self.cpu_route_ms,
-            self.cpu_submit_ms,
-        );
-    }
-
-    /// The two phase/class splits that motivated the class view: `route` was a region
-    /// mixing a blocking D2H with host routing, and the whole `tail` phase was one
-    /// opaque wait with ~59% attributable to no kernel.
-    fn report_splits(&self) {
-        tracing::info!(
-            "  split/tok: route = {:.1}ms gpu-wait + {:.1}ms host-routing | tail wait {:.1}ms, of which {:.1}ms is GPU ({:.0}% overhead)",
-            self.route_wait_ms,
-            (self.route_ms - self.route_wait_ms).max(0.0),
-            self.tail_wait_ms,
-            self.tail_gpu_ms,
-            100.0 * (self.tail_wait_ms - self.tail_gpu_ms).max(0.0) / self.tail_wait_ms.max(1e-9),
-        );
-    }
-
-    /// DSA indexer decomposition (docs/investigations/npu-offload.md M0). Silent when the indexer never
-    /// scored — dense/streaming, or a context that stayed under `index_topk`, where a
-    /// row of zeros would read as a measurement of something that did not happen.
-    fn report_indexer(&self) {
-        if self.idx_layers_per_tok <= 0.0 {
-            return;
-        }
-        tracing::info!(
-            "  indexer/tok: gpu {:.1}ms => {:.1}us per layer (selection on device) over \
-             {:.3} scoring layers",
-            self.idx_gpu_ms,
-            // Guarded non-zero by the `> 0.0` above, so this division is safe.
-            self.idx_gpu_ms * 1e3 / self.idx_layers_per_tok,
-            self.idx_layers_per_tok,
+            self.attend_ms,
+            self.ffn_ms,
+            self.fetch_wait_ms,
+            self.head_ms,
+            self.other_ms,
+            self.other_pct(),
         );
     }
 }
@@ -313,6 +294,89 @@ pub fn export_decode(summary: &ProfileSummary, tokens: usize, run: &RunInfo) {
     }
     #[cfg(not(feature = "otlp"))]
     let _ = (summary, tokens, run);
+}
+
+/// The phase arithmetic, host-only — every property the bucket-sum gate leans on that
+/// does not need a device. The gate's own red-proof (drop one arm's accumulation, watch
+/// `other` blow the band) needs a GPU and lives in `tests/ppl-gates.sh`; what is pinned
+/// HERE is that the arithmetic those runs are judged by cannot silently change shape.
+#[cfg(test)]
+mod phase_tests {
+    use super::{Phase, Phases, ProfileSummary};
+    use std::time::Duration;
+
+    /// A dropped bucket surfaces as `other`, never as a smaller wall — the structural
+    /// property the whole design was chosen for (see [`Phases`]'s doc for the rejected
+    /// alternative, a switching clock that summed to wall by construction).
+    #[test]
+    fn a_missing_bucket_lands_in_other_not_in_a_shrunken_wall() {
+        let full = Phases {
+            attend_ns: 40_000_000,
+            ffn_ns: 320_000_000,
+            fetch_wait_ns: 12_000_000,
+            head_ns: 6_000_000,
+        };
+        let wall = Duration::from_millis(384); // ≈ the named sum + 6 ms of glue
+        let s = ProfileSummary::from_decode(&full, wall, 1, 78.0);
+        assert!(
+            s.other_pct() < 3.0,
+            "healthy profile: other {:.1}%",
+            s.other_pct()
+        );
+        // The red-proof's arithmetic: same run, ffn stamps dropped.
+        let dropped = Phases { ffn_ns: 0, ..full };
+        let s = ProfileSummary::from_decode(&dropped, wall, 1, 78.0);
+        assert!(
+            s.other_pct() > 80.0,
+            "a dropped ffn bucket must surface as `other`, got {:.1}%",
+            s.other_pct()
+        );
+        assert!((s.other_ms - 326.0).abs() < 1.0, "other absorbs it visibly");
+    }
+
+    /// Double-counting (a span stamped into two buckets) drives the stamped sum PAST
+    /// wall and `other` NEGATIVE — the gate's lower bound exists for exactly this defect,
+    /// and it is tight (zero) rather than fitted, because disjoint spans on one thread
+    /// cannot sum past the wall they sit inside.
+    #[test]
+    fn double_counting_goes_past_wall_rather_than_hiding() {
+        let ph = Phases {
+            attend_ns: 300_000_000,
+            ffn_ns: 300_000_000,
+            fetch_wait_ns: 0,
+            head_ns: 0,
+        };
+        let s = ProfileSummary::from_decode(&ph, Duration::from_millis(400), 1, 0.0);
+        assert!(s.other_ms < 0.0, "overlap must show as negative other");
+        assert!(s.other_pct() < 0.0, "overlap drives the share negative");
+    }
+
+    /// `lap` chains without gaps and `since` rebases — the two mechanics every arm's
+    /// loop leans on (rebasing past prefill is the same move the hit counters make).
+    #[test]
+    fn lap_accumulates_and_since_rebases() {
+        let mut p = Phases::default();
+        let t = std::time::Instant::now();
+        let t = p.lap(Phase::Attend, t);
+        let _ = p.lap(Phase::Ffn, t);
+        assert!(p.attend_ns > 0 && p.ffn_ns > 0);
+        let base = p;
+        let t = std::time::Instant::now();
+        let _ = p.lap(Phase::Head, t);
+        let d = p.since(&base);
+        assert_eq!(d.attend_ns, 0, "rebased attend");
+        assert_eq!(d.ffn_ns, 0, "rebased ffn");
+        assert!(d.head_ns > 0, "only post-rebase work remains");
+        assert_eq!(d.named_ns(), d.head_ns);
+    }
+
+    /// Zero generated tokens must not divide by zero (a run whose first token was EOS
+    /// still builds a summary).
+    #[test]
+    fn zero_tokens_is_a_summary_not_a_panic() {
+        let s = ProfileSummary::from_decode(&Phases::default(), Duration::from_millis(5), 0, 0.0);
+        assert!(s.wall_ms.is_finite() && s.tok_per_s.is_finite());
+    }
 }
 
 /// The metric label set — the run-identity half of the OTLP export, tested **without** the
@@ -340,10 +404,6 @@ mod run_label_tests {
             mtp_min_conf: Some(0.8),
             bench_tokens: Some(256),
             prompt: Some("explain virtual memory".to_string()),
-            moe_gain: 1.0,
-            sinks: 4,
-            window: 2048,
-            misa_heads: 0,
             degenerate: None,
         }
     }
