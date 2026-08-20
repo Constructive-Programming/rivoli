@@ -20,7 +20,7 @@
 //! aims every selected index at the wrong buffer — in bounds, finite, and wrong.
 
 use super::geometry::{LayerKind, tightest_ratio};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 /// The rows one call covers: how many query rows, and where the first one sits.
 ///
@@ -52,7 +52,11 @@ impl Extent {
     }
 
     /// One past the last position this call touches.
-    fn end_pos(self) -> usize {
+    ///
+    /// `pub` since the scored selection: the engine's trigger for RUNNING the indexer is
+    /// `end_pos / ratio > index_topk`, and a caller re-deriving `start_pos + query_rows()`
+    /// would be a second copy of the phase discriminant this type exists to hold once.
+    pub fn end_pos(self) -> usize {
         self.start_pos + self.query_rows()
     }
 
@@ -90,11 +94,84 @@ impl Extent {
 /// position between the cap and the window goes unattended, on every indexed layer, for the
 /// rest of the sequence. Fluent, wrong, and permanent.
 ///
-/// Takes the number rather than a config so it is checkable without one. The engine refuses a
-/// context at or above this at startup; [`Sel::shape`] refuses it again at the call, which is
-/// not redundant — a hand-built `Sel` never passed the startup check.
+/// Takes the number rather than a config so it is checkable without one.
+///
+/// **This stopped being an engine-level refusal when the scored selection landed (M15).**
+/// It is now the boundary the engine PLANS around: an engine whose `max_ctx` is below it can
+/// never need a score (every legal set fits under the cap, and [`scored_rows`] over any
+/// scores reproduces the positional buffer byte for byte there), so it builds no indexer
+/// state at all and runs exactly the pre-M15 arm. At or above it the indexer runs, and
+/// [`Sel::gather`]'s positional path — which cannot rank — still refuses in [`Sel::shape`],
+/// because a positional selection past this point is as wrong as it ever was.
 pub fn positional_context_limit(index_topk: usize) -> usize {
     tightest_ratio() * (index_topk + 1)
+}
+
+/// The indexer's top-k block selection, one row per query, from a `[rows, n_comp]` score
+/// matrix — the HOST half of the scored selection, and deliberately deviceless: the gate
+/// that compares it against the frozen oracle's `Indexer.forward` runs on every
+/// `cargo test`, with no GPU and no checkpoint.
+///
+/// # What is reproduced from the reference, and what is deliberately not
+///
+/// * **The set.** Per query row: the causal mask (a prefill row may see only blocks that
+///   closed at or before it — `c < (t+1)/ratio`, exactly [`compressed_rows`]'s rule), then
+///   the top `min(index_topk, n_comp)` by score. Ties break toward the LOWER block index —
+///   the frozen oracle's own rule (`v4oracle::forward::topk_idx`: descending `total_cmp`,
+///   `.then(a.cmp(&b))`), restated here because the two top-ks must agree given equal
+///   scores or the set gate has a hole exactly at ties.
+/// * **Not the order.** The oracle emits score order; this emits the selected blocks
+///   ASCENDING, `-1`-padded at the tail. The attend kernel's online softmax makes list
+///   order a summation-order detail, and ascending buys the property the below-cap gates
+///   stand on: where `limit <= k` the row is `[offset+0 .. offset+limit-1, -1 ..]` — BYTE
+///   IDENTICAL to the positional fill, whatever the scores say. A run that never exceeds
+///   the cap is therefore unchanged bit for bit, which is what makes the M8 parity record
+///   still binding on the scored arm.
+///
+/// `scores` is row-major `[query_rows, n_comp]`, exactly what `launch_index_score_blocks`
+/// wrote and D2H handed back; masked entries need NOT be pre-masked to `-inf` — the mask
+/// here is by INDEX, not by value, so a stale score in a causally-illegal slot cannot leak
+/// into the selection.
+pub fn scored_rows(
+    scores: &[f32],
+    n_comp: usize,
+    kind: LayerKind,
+    index_topk: usize,
+    at: Extent,
+    offset: usize,
+) -> Result<Vec<Vec<i32>>> {
+    at.check_single_row_decode()?;
+    let ratio = kind
+        .compressor_ratio()
+        .context("scored selection on a layer with no compressor")?;
+    let rows = at.query_rows();
+    ensure!(
+        scores.len() == rows * n_comp,
+        "v4 scored selection: {} scores for [{rows}, {n_comp}]",
+        scores.len()
+    );
+    let k = index_topk.min(n_comp);
+    Ok((0..rows)
+        .map(|t| {
+            let row = &scores[t * n_comp..(t + 1) * n_comp];
+            // The causal mask, by index: at prefill query `t` may read a block only once it
+            // is COMPLETE. At decode every block in the matrix has closed.
+            let limit = if at.is_prefill() {
+                ((t + 1) / ratio).min(n_comp)
+            } else {
+                n_comp
+            };
+            let mut sel: Vec<usize> = (0..limit).collect();
+            sel.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+            sel.truncate(k);
+            // Ascending, then the `-1` tail out to the rectangle's width — see the header
+            // for why ascending is load-bearing and not a tidiness choice.
+            sel.sort_unstable();
+            let mut out: Vec<i32> = sel.into_iter().map(|c| (c + offset) as i32).collect();
+            out.resize(k, -1);
+            out
+        })
+        .collect())
 }
 
 /// Which sliding-window ring slots each query row may read, `-1` for "nothing there yet".
@@ -283,8 +360,9 @@ impl Sel {
             bail!(
                 "v4 selection: {live} compressed blocks at position {} exceeds index_topk {} \
                  on an indexed layer. Past {} positions the block set is decided by the \
-                 indexer's SCORES, which this arm does not run; a positional selection here \
-                 keeps the oldest blocks and silently stops attending everything newer",
+                 indexer's SCORES — the scored path (gather_scored) is how it is answered, \
+                 and a positional selection here keeps the oldest blocks and silently stops \
+                 attending everything newer",
                 self.at.end_pos(),
                 self.index_topk,
                 positional_context_limit(self.index_topk)
@@ -298,13 +376,11 @@ impl Sel {
     /// returns `(rows, cols)`; `-1` masks a slot.
     ///
     /// **This is the POSITIONAL compressed selection.** On a layer with no indexer that is the
-    /// whole story. On an indexed one it stands in for the trained-in ranking and agrees with
-    /// it only on the SET, only below [`positional_context_limit`], and never on the score
-    /// ORDER that the attend kernel's online softmax folds in.
+    /// whole story — and not a deviation: the reference's own `get_compress_topk_idxs` is this
+    /// same arithmetic there. On an indexed one it agrees with the trained-in ranking on the
+    /// SET exactly while `limit <= index_topk` — where [`scored_rows`] produces the identical
+    /// buffer — and refuses past that, where only [`Sel::gather_scored`] can answer.
     pub fn gather(&self, out: &mut Vec<i32>) -> Result<(usize, usize)> {
-        // `out` is APPENDED to, so the length check below is against this mark and not
-        // against `out.len()` outright.
-        let start = out.len();
         let (rows, cols) = self.shape()?;
         let win = window_rows(self.win, self.at);
         // The compressed columns are the rest of `cols`, derived from the fill rather than by
@@ -315,26 +391,76 @@ impl Sel {
             0 => Vec::new(),
             _ => compressed_rows(self.kind, self.at, compress_offset(self.win, self.at)),
         };
-        for (t, w) in win.iter().enumerate() {
-            out.extend_from_slice(w);
-            if let Some(c) = comp.get(t) {
-                out.extend_from_slice(c);
-            }
-        }
-        // ONE check, and it must be live in every build: a ragged selection buffer is a
-        // silent-wrong, because the kernel reads a row's worth of whatever follows as
-        // attention indices. Against `start` because this function appends — a `% cols == 0`
-        // test on the whole buffer fires on a legitimate non-empty append and passes on a
-        // short final row. It covers a short window row, a short compressed row and a missing
-        // compressed row together.
-        ensure!(
-            out.len() - start == rows * cols,
-            "v4 selection: wrote {} entries, {rows}x{cols} needs {}",
-            out.len() - start,
-            rows * cols
-        );
-        Ok((rows, cols))
+        assemble(&win, &comp, (rows, cols), out)
     }
+
+    /// The window rows concatenated with the INDEXER's rows — [`scored_rows`]'s output, or
+    /// any per-row block selection the caller ranked — into the same row-major buffer
+    /// [`Sel::gather`] fills, under the same rectangle check.
+    ///
+    /// This is the path with no cap and no refusal: the ranking is the caller's, so the
+    /// positional path's "keeps the oldest blocks" hazard does not exist here. What it keeps
+    /// is everything else — one window fill, one masking convention, one rectangle check —
+    /// because a second copy of that assembly was exactly how the reference's two selection
+    /// files diverged (this module's header).
+    pub fn gather_scored(&self, comp: &[Vec<i32>], out: &mut Vec<i32>) -> Result<(usize, usize)> {
+        self.at.check_single_row_decode()?;
+        let rows = self.at.query_rows();
+        ensure!(
+            comp.len() == rows,
+            "v4 scored selection: {} ranked rows for {rows} query rows",
+            comp.len()
+        );
+        // BEFORE `window_rows`, which is where a zero window becomes a `win - 1` underflow
+        // rather than this message — [`Sel::shape`] orders the same two the same way.
+        ensure!(self.win > 0, "v4 selection: sliding_window is zero");
+        let win = window_rows(self.win, self.at);
+        let cols = win.first().map_or(0, Vec::len) + comp.first().map_or(0, Vec::len);
+        assemble(&win, comp, (rows, cols), out)
+    }
+}
+
+/// Interleave one window fill with one compressed fill into the row-major rectangle the
+/// attend kernel indexes. Appends to `out` and returns the `(rows, cols)` it wrote.
+///
+/// The one home of the rectangle check, and it must be live in every build: a ragged
+/// selection buffer is a silent-wrong, because the kernel reads a row's worth of whatever
+/// follows as attention indices.
+///
+/// **Two checks and not one, because a total is blind to compensation.** The PER-ROW width
+/// is what catches raggedness: rows of 2 and 4 against `cols == 3` sum to exactly `2 * 3`,
+/// so a total-only test passes a buffer every row of which is the wrong length — and
+/// `gather_scored` takes its compressed rows from a CALLER, which is the one path that can
+/// produce them. The total then covers what a per-row check cannot see: too few or too many
+/// rows. Against a start mark because this function appends — a `% cols == 0` test on the
+/// whole buffer fires on a legitimate non-empty append and passes on a short final row.
+fn assemble(
+    win: &[Vec<i32>],
+    comp: &[Vec<i32>],
+    (rows, cols): (usize, usize),
+    out: &mut Vec<i32>,
+) -> Result<(usize, usize)> {
+    let start = out.len();
+    for (t, w) in win.iter().enumerate() {
+        let c = comp.get(t).map_or(&[][..], Vec::as_slice);
+        ensure!(
+            w.len() + c.len() == cols,
+            "v4 selection: row {t} is {} wide ({} window + {} compressed), the rectangle is \
+             {cols}",
+            w.len() + c.len(),
+            w.len(),
+            c.len()
+        );
+        out.extend_from_slice(w);
+        out.extend_from_slice(c);
+    }
+    ensure!(
+        out.len() - start == rows * cols,
+        "v4 selection: wrote {} entries, {rows}x{cols} needs {}",
+        out.len() - start,
+        rows * cols
+    );
+    Ok((rows, cols))
 }
 
 #[cfg(test)]
@@ -345,7 +471,7 @@ mod tests {
     // and a glob would let one of them be deleted without a single case going red.
     use super::{
         Extent, LayerKind, Sel, compress_dst, compress_offset, compressed_rows,
-        positional_context_limit, window_rows,
+        positional_context_limit, scored_rows, window_rows,
     };
 
     const PLAIN: LayerKind = LayerKind::Plain;
@@ -495,6 +621,144 @@ mod tests {
             .shape()
             .is_ok(),
             "an unindexed layer has no cap"
+        );
+    }
+
+    /// **The below-cap identity the whole M15 landing stands on:** wherever the causal
+    /// limit never exceeds `index_topk`, the scored fill over ARBITRARY scores is byte
+    /// identical to the positional fill — the top-k keeps everything it is offered, and
+    /// ascending order plus the `-1` tail is exactly the positional layout. This is what
+    /// makes a `--ctx` below [`positional_context_limit`] the pre-M15 arm bit for bit.
+    #[test]
+    fn below_the_cap_the_scored_fill_reproduces_the_positional_buffer_byte_for_byte() {
+        let k = LayerKind::from_ratio(4);
+        // Decode at position 19 (5 live blocks) and a 12-row prefill (3 blocks) — both
+        // under a topk of 512, and both phases, since the mask rule differs between them.
+        for at in [at(1, 19), at(12, 0)] {
+            let s = sel(k, at);
+            let (rows, cols) = s.shape().expect("legal below the cap");
+            let n_comp = cols - window_rows(s.win, at).first().map_or(0, Vec::len);
+            // Scores chosen ADVERSARIALLY: strictly increasing, so a top-k that leaked into
+            // the selection ORDER would put the newest block first and the comparison would
+            // catch it. Below the cap the scores must not matter at all.
+            let scores: Vec<f32> = (0..rows * n_comp).map(|i| i as f32).collect();
+            let comp = scored_rows(
+                &scores,
+                n_comp,
+                k,
+                s.index_topk,
+                at,
+                compress_offset(s.win, at),
+            )
+            .expect("legal scored rows");
+            let (mut pos, mut scr) = (Vec::new(), Vec::new());
+            assert_eq!(s.gather(&mut pos).expect("positional"), (rows, cols));
+            assert_eq!(
+                s.gather_scored(&comp, &mut scr).expect("scored"),
+                (rows, cols)
+            );
+            assert_eq!(
+                pos, scr,
+                "{at:?}: the two fills must be identical below the cap"
+            );
+        }
+    }
+
+    /// Above the cap the scores DECIDE the set: the top `index_topk` by score survive, ties
+    /// break toward the lower block index (the frozen oracle's `topk_idx` rule), and the
+    /// output is ascending. Every clause here is one the below-cap identity cannot see.
+    #[test]
+    fn above_the_cap_the_scores_decide_the_set_with_ties_toward_the_lower_index() {
+        let k = LayerKind::from_ratio(4);
+        // Decode with 5 live blocks and topk 3: block 2 scores highest, blocks 0 and 4 tie
+        // for the next two slots ALONG WITH block 1 — the three-way tie at 1.0 makes the
+        // tie rule observable: {0, 1} must win over 4.
+        let scores = [1.0f32, 1.0, 9.0, 0.5, 1.0];
+        let rows = scored_rows(&scores, 5, k, 3, at(1, 19), 100).expect("legal");
+        assert_eq!(
+            rows,
+            vec![vec![100, 101, 102]],
+            "ascending; ties kept 0 and 1"
+        );
+        // A score bump on block 4 must MOVE the set — the resolution the gate stands on.
+        let mut moved = scores;
+        moved[4] = 2.0;
+        let rows = scored_rows(&moved, 5, k, 3, at(1, 19), 100).expect("legal");
+        assert_eq!(
+            rows,
+            vec![vec![100, 102, 104]],
+            "the perturbed score changed the set"
+        );
+    }
+
+    /// At prefill the mask is BY INDEX, so a hostile score in a causally-illegal slot cannot
+    /// buy that block a place, and a row with fewer legal blocks than the rectangle pads
+    /// with `-1` at the tail.
+    #[test]
+    fn a_prefill_row_cannot_select_a_block_that_closed_after_it() {
+        let k = LayerKind::from_ratio(4);
+        // 8 rows, 2 blocks live over the whole prompt, topk 1 -> every row keeps its single
+        // best LEGAL block. Block 1 outscores block 0 everywhere, but only rows 7.. may
+        // read it (block 1 closes at position 7).
+        let scores: Vec<f32> = (0..8).flat_map(|_| [0.1f32, 9.0]).collect();
+        let rows = scored_rows(&scores, 2, k, 1, at(8, 0), 10).expect("legal");
+        let want: Vec<Vec<i32>> = vec![
+            vec![-1],
+            vec![-1],
+            vec![-1],
+            vec![10], // row 3 closes block 0; block 1 is still open
+            vec![10],
+            vec![10],
+            vec![10],
+            vec![11], // row 7 closes block 1, which then wins on score
+        ];
+        assert_eq!(rows, want);
+        // And a score matrix of the wrong extent is refused, not truncated.
+        let msg = format!(
+            "{}",
+            scored_rows(&scores[..15], 2, k, 1, at(8, 0), 10).expect_err("must refuse")
+        );
+        assert!(msg.contains("15 scores"), "wrong refusal: {msg}");
+    }
+
+    /// `gather_scored` enforces the same rectangle as `gather`: a ragged ranked row is a
+    /// refusal, not a short row the kernel reads past.
+    #[test]
+    fn a_ragged_scored_row_is_refused_by_the_rectangle_check() {
+        let s = sel(LayerKind::from_ratio(4), at(1, 19));
+        let mut out = Vec::new();
+        assert!(
+            s.gather_scored(&[vec![100, 101, -1]], &mut out).is_ok(),
+            "uniform passes"
+        );
+        let mut out = Vec::new();
+        // Two rows for a one-row decode: the row-count ensure fires first and by name.
+        let msg = format!(
+            "{}",
+            s.gather_scored(&[vec![100], vec![101]], &mut out)
+                .expect_err("must refuse")
+        );
+        assert!(msg.contains("2 ranked rows"), "wrong refusal: {msg}");
+        // **The case a TOTAL cannot see, which is why `assemble` checks per row.** Widths
+        // 2, 1, 3 over a 3-row prefill sum to 6 — exactly `3 * comp[0].len()` — so every
+        // entry count agrees while rows 1 and 2 are the wrong length, and the kernel would
+        // read row 1's fifth index out of row 2's window. One row of this is what a
+        // caller-ranked selection can hand over; the positional fill cannot produce it.
+        let p = sel(LayerKind::from_ratio(4), at(3, 0));
+        let ragged = [vec![10, 11], vec![10], vec![10, 11, 12]];
+        let mut out = Vec::new();
+        let msg = format!(
+            "{}",
+            p.gather_scored(&ragged, &mut out).expect_err("must refuse")
+        );
+        assert!(msg.contains("row 1 is 4 wide"), "wrong refusal: {msg}");
+        // And the same three rows made rectangular pass, so the check is not refusing the
+        // shape rather than the raggedness.
+        let square = [vec![10, 11], vec![10, -1], vec![10, 11]];
+        let mut out = Vec::new();
+        assert_eq!(
+            p.gather_scored(&square, &mut out).expect("uniform passes"),
+            (3, 5)
         );
     }
 

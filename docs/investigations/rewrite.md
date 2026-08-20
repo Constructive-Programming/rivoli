@@ -422,6 +422,12 @@ weights are counted but not placed), bsz > 1 (the `ensure!`), a rewrite-side
 `--logit-dump` (the drift A/B above used the reference's; the rewrite grows one when a
 refactor needs a same-engine A/B).
 
+> **LANDED 2026-08-16 (M15): the scored indexer selection.** The second item above is
+> retired — the pin places the indexer weights, `v4/blocksel.rs` wires the already-scored
+> kernels, and the 2052 `--ctx` refusal is deleted. The record, its gates and what the GPU
+> session still owes are `investigations/v4-scored-selection.md`; below the old ceiling the
+> arm is this M8 engine byte for byte, so the parity figures above remain binding.
+
 
 ## M9 — Kimi-K3, the final milestone (CLOSED 2026-08-16). THE PLAN IS COMPLETE.
 

@@ -129,8 +129,10 @@ struct Args {
     #[arg(long, default_value = "int3-vq", value_parser = parse_mode)]
     mode: Mode,
 
-    /// Attention row selection: dense | streaming | dsa | misa. Only dense decodes today;
-    /// the other three are refused at startup with the reason.
+    /// Attention row selection: dense | streaming | dsa | misa. What each architecture does
+    /// with it is its own row of the legality table, and the run says which at startup:
+    /// most refuse the other three with the reason; DeepSeek-V4, whose attention is
+    /// natively block-sparse, warns and proceeds on all four.
     // No `auto`: it resolved to `dsa` when the artifact carried indexer weights, and with
     // one path built it could only ever resolve to one thing. A value whose whole purpose
     // is to choose, that cannot choose, is a value that lies.

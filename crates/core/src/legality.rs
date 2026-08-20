@@ -358,11 +358,15 @@ const V4_ATTENTION_IS_WINDOW_PLUS_BLOCKS: &str = "--attn names how attention SEL
      neither the dense causal prefix nor any of the three sparse selections. `dense` is \
      ignored rather than honoured — there is no dense path here to fall back to";
 
-const V4_SPARSE_ATTN_IS_NOT_A_CHOICE: &str = "streaming sinks, the DSA lightning indexer and \
-     MISA are all row selections over a DENSE cache, and this architecture's cache is a ring \
-     plus pooled blocks. Its own indexer ranks COMPRESSED BLOCKS, is a different object from \
-     GLM's, and is not placed in the resident pin at all — this arm selects blocks \
-     positionally, which is why it refuses a context past 4*(index_topk+1)";
+const V4_SPARSE_ATTN_IS_NOT_A_CHOICE: &str = "--attn names how attention SELECTS the rows \
+     it reads, and this architecture does not offer the choice: streaming sinks, the DSA \
+     token indexer and MISA are all row selections over a DENSE cache, and this cache is a \
+     sliding-window ring plus pooled blocks. Its own trained-in indexer ranks COMPRESSED \
+     BLOCKS — a different object from GLM's — and since the scored selection landed it \
+     decides the set natively, on every indexed layer, wherever the causally-legal set \
+     outgrows index_topk. Below that the set already fits and both rules name it, so there \
+     is no context ceiling and nothing here to pick. The flag toggles nothing; the run \
+     proceeds with the checkpoint's own selection";
 
 const V4_MTP_NEEDS_A_KERNEL: &str = "speculative decode on this architecture is blocked by a \
      missing KERNEL, not a missing head, and that is which of the two would have to arrive \
@@ -533,21 +537,27 @@ fn muse_glimmer(flag: Flag) -> Outcome {
 /// DeepSeek-V4-Flash's row of the table — and most of it is one fact worked out flag by flag:
 /// **this architecture chooses neither its expert format nor its attention selection.**
 ///
-/// # Both value-carrying flags fall back loudly, and the choice is forced the same way
+/// # EVERY value-carrying flag falls back loudly, and the choice is forced the same way
 /// Glimmer's `--mode` was
 ///
-/// `--mode` because the checkpoint owns the format, and `--attn dense` because a run here
-/// attends a ring plus pooled blocks: `Support` would record knobs nothing spent, and
-/// `Refuse` would kill the no-flags invocation — [`muse_glimmer`]'s doc carries the
-/// argument in full. The cost is two warn lines per V4 run.
+/// `--mode` because the checkpoint owns the format, and every `--attn` value because the
+/// checkpoint owns the attention too: a run here attends a ring plus pooled blocks, with
+/// the trained-in block indexer ranking the blocks on the 21 indexed layers — natively and
+/// always, since M15 placed its weights and wired its kernels. `Support` on any of the four
+/// would record a knob nothing spent, and `Refuse` would kill runs on a flag that
+/// contradicts nothing the user can change — [`muse_glimmer`]'s doc carries the
+/// no-flags half of the argument. The sparse three were `Refuse` while the indexer was
+/// unplaced and the positional stand-in imposed a context ceiling; with the ceiling gone,
+/// refusing `--attn dsa` on the one arm whose attention IS natively block-sparse would
+/// kill exactly the runs the flag's intent describes.
 ///
 /// # The rest
 ///
 /// `--cache-policy` and `--max-mem` are real here and for a sharper reason than on GLM: the
 /// `.f4` set is 137 GiB against ~115 GiB of budget, so this arm CANNOT be fully resident on
-/// any configuration this machine has and the policy governs every token. `--ctx` is doubly
-/// real — it sizes the KV ring and the compressed region, and it is the number
-/// `V4Engine::new` checks against the positional-selection ceiling.
+/// any configuration this machine has and the policy governs every token. `--ctx` sizes the
+/// KV ring, the compressed regions and the indexer's score scratch — and nothing refuses it
+/// since M15: memory is its only bound.
 fn deepseek_v4(flag: Flag) -> Outcome {
     match flag {
         // Every value together: the checkpoint's format is the same whichever was typed.
@@ -555,8 +565,11 @@ fn deepseek_v4(flag: Flag) -> Outcome {
             Outcome::FallbackLoudly(V4_FORMAT_IS_THE_CHECKPOINTS)
         }
         Flag::Attn(AttnKind::Dense) => Outcome::FallbackLoudly(V4_ATTENTION_IS_WINDOW_PLUS_BLOCKS),
+        // Every sparse value together, like `--mode`: the checkpoint's attention is the
+        // same whichever was typed. Flipped from `Refuse` when M15 landed the scored
+        // selection — the row doc carries the argument.
         Flag::Attn(AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa) => {
-            Outcome::Refuse(V4_SPARSE_ATTN_IS_NOT_A_CHOICE)
+            Outcome::FallbackLoudly(V4_SPARSE_ATTN_IS_NOT_A_CHOICE)
         }
         // The three knobs that are MORE real here than on GLM: the `.f4` set cannot fit on
         // this machine, so residency governs every token rather than the tail of a working

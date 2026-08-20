@@ -389,11 +389,8 @@ impl<'a> Engine<'a> {
                 Ok(Engine::Glimmer(e))
             }
             ArchCfg::V4(cfg, knobs) => {
-                // BEFORE the pin, which reads nine gigabytes: this arm's positional block
-                // selection has a context ceiling, and a run that exceeds it should learn so
-                // at the door rather than after the load. `check_context` carries why the
-                // answer is a refusal and not a clamp.
-                crate::v4::engine::check_context(cfg, spec.max_ctx)?;
+                // No context door since M15: the scored selection lifted the positional
+                // ceiling, and what remains (`max_ctx >= 2`) is `V4Engine::new`'s to say.
                 let pin = crate::v4::pin::V4Pin::build(dir, cfg, pin_cfg(capacity, knobs))?;
                 let e = crate::v4::engine::V4Engine::new(pin, cfg, spec.max_ctx)?;
                 Ok(Engine::V4(e))

@@ -20,19 +20,21 @@
 //! [`crate::routed`]'s pool, `ExpertSet` itself — and this arm is where `RoutedFmt::F4` is
 //! OWNED rather than refused (`glm::pin::expert_bytes` bails on it by name).
 //!
-//! # What this pin does NOT place, and why each one is a decision
+//! # What this pin does NOT place, and why it is a decision
 //!
-//! * **The lightning indexer** (`attn.indexer.*` on the 21 ratio-4 layers). This arm selects
-//!   compressed blocks POSITIONALLY — `crate::v4`'s second declared deviation — so nothing
-//!   reads an indexer weight, and placing ~1 GB of them would take those bytes straight out
-//!   of the routed pool. They are still COUNTED, because [`safetensors_bytes`] is the file's
-//!   length and the file holds them; that over-counts the tier, which is the safe direction
-//!   ([`safetensors_bytes`] carries the bias argument). The reference placed them and had no
-//!   reader either. They join with the scored selection, beside the caller that needs them.
 //! * **An int8 embed or head.** V4 carries both as bf16 and the int8 launchers are GLM's;
 //!   widening them at load would double 2.1 GB of resident set to paper over a missing
 //!   kernel, and whether to requantize is a quality question with a paired-dNLL measurement
 //!   attached. [`Bf16Weight`] is the type that says so.
+//!
+//! The lightning indexer (`attn.indexer.*` on the 21 ratio-4 layers, ~374 MB) used to head
+//! this list — counted in [`safetensors_bytes`]'s total but never placed, because the
+//! positional selection read nothing. The scored selection (M15) is its reader, so it is
+//! placed like everything else now; the tier was ALREADY sized for it, so the pool loses
+//! nothing. Placement is unconditional even though an engine below
+//! [`super::select::positional_context_limit`] never launches against it: the pin cannot
+//! know `max_ctx` (it is the ENGINE's argument), and a conditional placement would make the
+//! resident layout a function of a decode parameter — the exact coupling P6 forbids.
 
 use super::geometry::FP8_BLOCK;
 use crate::device::DeviceTier;
@@ -77,6 +79,24 @@ pub struct CompressorWeights {
     pub norm: *const f32,
     pub wgate: *const f32,
     pub wkv: *const f32,
+}
+
+/// One layer's lightning indexer: the two projections and its nested compressor.
+///
+/// `wq_b` is the one fp8 tensor on this path (it ships a `.weight_scale_inv`, `[64, 8]` —
+/// the same 128-block grid as every attention projection); `weights_proj` and the
+/// compressor's four are f32 in the artifact, widened by the converter from bf16 exactly as
+/// the attention compressor's were, and the engine narrows the GEMM operands back at build
+/// ([`super::kvcompress`]'s `narrow_to_bf16` carries why that is exact). The nested
+/// compressor reuses [`CompressorWeights`] because it IS the same four tensors at a
+/// different width — `index_head_dim` (128) against the attention's `head_dim` (512) — and
+/// what separates the two at launch is the [`super::geometry::Quantize`] finish, not the
+/// field types.
+pub struct IndexerWeights {
+    pub wq_b: Fp8Weight,
+    /// `[index_n_heads, hidden]` f32.
+    pub weights_proj: *const f32,
+    pub compressor: CompressorWeights,
 }
 
 /// How a layer's gate SELECTS experts.
@@ -134,6 +154,11 @@ pub struct V4LayerPin {
     /// [`super::geometry::Geom::attention`] returns `Some` for, decided from the same config
     /// in a different file. `super::kvcompress` asserts the two agree rather than assuming.
     pub compressor: Option<CompressorWeights>,
+    /// Present iff `compress_ratio == 4` — [`super::geometry::LayerKind::has_indexer`]'s
+    /// condition, decided from the config like [`V4LayerPin::compressor`]'s and for the same
+    /// reason: an artifact whose tensors disagree with `compress_ratios` must fail at load,
+    /// not take whichever branch it happens to satisfy.
+    pub indexer: Option<IndexerWeights>,
 }
 
 /// The V4 resident weight set, plus the validated `.f4` routed-expert source and its pool.
@@ -178,9 +203,8 @@ fn place_hc(tier: &mut DeviceTier, st: &Safetensors, base: &str) -> Result<Hyper
     })
 }
 
-/// Place one `Compressor` — the attention's own, and (when this arm ever runs one) the
-/// indexer's nested one, which differ only in width and are therefore the same four names
-/// under different prefixes.
+/// Place one `Compressor` — the attention's own, and the indexer's nested one, which differ
+/// only in width and are therefore the same four names under different prefixes.
 fn place_compressor(
     tier: &mut DeviceTier,
     st: &Safetensors,
@@ -549,6 +573,26 @@ fn place_layers(
             compressor: cfg
                 .layer_has_compressor(l)?
                 .then(|| place_compressor(tier, st, &format!("{a}.compressor")))
+                .transpose()?,
+            // The lightning indexer, same rule: `wq_b` through the fp8 placer (scale-grid
+            // checked like every other quantized projection), `weights_proj` as f32, and
+            // the nested compressor through `place_compressor` — the same four names the
+            // attention one has, under the `attn.indexer.compressor` prefix. Inline
+            // rather than a fourth placer fn: it is three lines with one caller, and its
+            // signature would be `place_fp8_qkv`'s to the token.
+            indexer: cfg
+                .layer_has_indexer(l)?
+                .then(|| -> Result<IndexerWeights> {
+                    Ok(IndexerWeights {
+                        wq_b: place_fp8(tier, st, &format!("{a}.indexer.wq_b"), block)?,
+                        weights_proj: place_f32(
+                            tier,
+                            st,
+                            &format!("{a}.indexer.weights_proj.weight"),
+                        )?,
+                        compressor: place_compressor(tier, st, &format!("{a}.indexer.compressor"))?,
+                    })
+                })
                 .transpose()?,
         });
     }
