@@ -39,6 +39,13 @@ const DEFERRED: &[(&str, &str)] = &[
     // out-of-place gate fixture took the one-buffer adaptation in `kernel_k3_attend.rs`. The
     // table can only shrink — within one architecture's port; the next port adds rows and
     // then removes them, and that cycle is the design.)
+    //
+    // **THIRD TURN, opened AND CLOSED 2026-08-17 by M17c.** The cycle above predicted it — "the
+    // next port adds rows and then removes them" — and this turn lasted one commit: the row was
+    // added with `gqa_block_attend`'s launcher, and retired the moment
+    // `kernel_glimmer_block_attend.rs` landed. **The census refused the stale row rather than
+    // letting it stand**, which is the both-ends check doing the one thing an exemption list
+    // cannot. EMPTY again, for the third time.)
 ];
 
 /// Launcher names in `text`, under both declaration forms (hand-written `pub unsafe fn
@@ -104,7 +111,36 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
     // The oracle corpus: engine's device tests. No size floor — a truncated corpus only
     // makes launchers look UNCOVERED, which fails loudly by itself.
     let tests = corpus("crates/engine/tests", "");
-    let covered = |name: &str| tests.contains(&format!("{stem}{}", format_args!("{name}(")));
+    // **Two forms count as exercising a launcher, and the second was added 2026-08-17 because a
+    // legitimate refactor made real coverage invisible.**
+    //
+    //  * `launch_x(` — called directly. The original and still the common case.
+    //  * `(launch_x,` — handed to a shared launch helper as its FIRST argument. M17c's block
+    //    attend and the causal `gqa_attend` take the same thirteen arguments in the same order, so
+    //    `build.rs`'s duplication gate refused the second per-file wrapper and both now go through
+    //    `common::attend_launch(launch_x, io, dims, scale)`. Under the old pattern alone
+    //    `gqa_attend` — covered since M7 — read as UNCOVERED, and this test said so. It was right
+    //    to fail: its claim is about the pattern it can see, and the pattern had moved.
+    //
+    // **The `(` in the second form is load-bearing anti-vacuity, not punctuation.** A bare
+    // `launch_x,` would be matched by the `use` list at the top of every oracle file, so importing
+    // a launcher would read as testing it — the exact "silently matches everything" failure this
+    // file's header warns about, arriving from the opposite direction. An import is preceded by
+    // `, ` or `{`, never by `(`.
+    //
+    // The residual limit, stated rather than discovered later: a helper that took the launcher in
+    // any position but FIRST would not be seen. That is a constraint on how a launch helper is
+    // written, and it is cheap to honour — `attend_launch` does.
+    // Whitespace-stripped, because the value form is otherwise defeated by line breaking: rustfmt
+    // puts `attend_launch(` and its first argument on separate lines whenever the call exceeds
+    // `fn_call_width`, so `(launch_x,` never appears literally. Measured 2026-08-17 — the census
+    // passed with a stale DEFERRED row because of exactly this, which is a FALSE GREEN and the
+    // reason the stripping is here rather than a comment about being careful.
+    let dense: String = tests.chars().filter(|c| !c.is_whitespace()).collect();
+    let covered = |name: &str| {
+        let base = format!("{stem}{name}");
+        tests.contains(&format!("{base}(")) || dense.contains(&format!("({base},"))
+    };
 
     // Both ends of every deferral, before the census consults it.
     for (name, arrives) in DEFERRED {

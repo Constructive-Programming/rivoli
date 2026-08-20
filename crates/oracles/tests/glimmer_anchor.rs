@@ -23,8 +23,9 @@
 //! nested test bodies or long unbroken runs of assertions, and a run of asserts with no name on it
 //! is exactly the shape that makes a failure read as "something in this file broke".
 //!
-//! **FOUR binaries over one fixture set, split 2026-08-15 for the 800-line gate.** The split is by
-//! what a group asserts about, which is how the file already grouped itself:
+//! **FIVE binaries over one fixture set**, four split 2026-08-15 for the 800-line gate and the
+//! fifth added 2026-08-16 by M17a. The split is by what a group asserts about, which is how the
+//! file already grouped itself:
 //!
 //! | binary | holds |
 //! |---|---|
@@ -32,12 +33,18 @@
 //! | `glimmer_anchor_text.rs` | the text goldens' structure: the tiny config, the widths, the layer pattern, the capture census |
 //! | `glimmer_anchor_draft.rs` | the shapes that make the DFlash drafter a drafter rather than a small target |
 //! | `glimmer_anchor_arithmetic.rs` | the two properties read off the VALUES: the QK-norm's axis, and Q's scale against K's |
+//! | `glimmer_draft_oracle.rs` | the drafter oracle's VALUES scored against the draft goldens at measured tolerances |
 //!
-//! The tables and the accessors all four read through are `glimmer_anchor_common/mod.rs`.
+//! The tables and the accessors all five read through are `glimmer_anchor_common/mod.rs`.
+//!
+//! **CORRECTED 2026-08-17.** This said "FOUR binaries" and listed four, while five files include
+//! `glimmer_anchor_common/mod.rs` — `glimmer_draft_oracle.rs` landed the day before and was added
+//! to that module's own header count and not to this table. Exactly the rot `mod.rs`'s header
+//! warns about, one file over: a count in prose, stated in two places.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #[path = "glimmer_anchor_common/mod.rs"]
-mod anchor; // keep this preamble blank-line-free: spread out, the four are a jscpd clone
+mod anchor; // keep this preamble blank-line-free: spread out, these are a jscpd clone
 use anchor::golden_read;
 use anchor::{GOLDENS, GoldenSet, Vendored, cfg, is_mode, load, meta, num};
 
@@ -69,14 +76,14 @@ const WEIGHT_SETS: &[Vendored] = &[
     Vendored {
         name: "weights-1",
         bytes: include_bytes!("glimmer-anchor-weights-1.bin"),
-        len: 2_065_185,
-        fnv: 0x8328_514c_9e73_d150,
+        len: 2_065_247,
+        fnv: 0x42de_93cc_4d1b_e85b,
     },
     Vendored {
         name: "weights-2",
         bytes: include_bytes!("glimmer-anchor-weights-2.bin"),
-        len: 2_065_185,
-        fnv: 0x4b5d_75e6_0b80_1cc4,
+        len: 2_065_247,
+        fnv: 0xc7aa_854e_a1a3_70f3,
     },
 ];
 
@@ -121,28 +128,46 @@ fn check_the_declared_deviations(v: &Vendored, g: &GoldenSet) {
     assert_eq!(meta(g, "dtype"), "torch.float32", "{who}: dtype");
 }
 
-/// `transformers_commit` is checked to be a full hex sha rather than merely present, because the
-/// driver's own fallback for "not installed from git" is the string `"unknown"`, which is
-/// non-empty and would satisfy a presence check.
-fn check_transformers_commit_is_a_full_sha(v: &Vendored, g: &GoldenSet) {
-    let (who, commit) = (v.name, meta(g, "transformers_commit"));
+/// **The sha256 of the four `models/muse_glimmer_assistant/*.py` that produced these captures**,
+/// sorted by name, name-then-bytes into one digest. Pinned by VALUE, not merely required to be
+/// present: a hash nobody compares to a constant is a field, not a gate.
+///
+/// This is what replaced the `transformers_commit` sha at the 2026-08-16 re-vendor. The venv
+/// holding transformers at `fe747d88` no longer exists on this machine, and the stack that does
+/// — `transformers==5.15.0` from PyPI — has no `direct_url.json` and therefore no commit at all.
+/// A content hash is the STRONGER pin of the two in any case: a repository revision does not tell
+/// you what four files were installed, and it is those four that run.
+const ASSISTANT_MODELING_SHA256: &str =
+    "c31755fbbb88c190d5dc7768a3cfab3f6b0a7c85bfdbaf806be49c322dd709ed";
+
+/// The stack the golden was produced under, checked by VALUE.
+///
+/// **One assertion, not two.** This was briefly a dual gate — a full 40-hex `transformers_commit`
+/// OR the digest — and review killed the first branch the day it was written, on three counts:
+/// every vendored file carries `transformers_commit` = `"unknown"` so the branch was unreachable;
+/// `environment()` emits the digest UNCONDITIONALLY, so it is not a fallback and this assert is
+/// right in both worlds including a future re-vendor from a git install; and a 40-hex shape check
+/// pins a SHAPE, not a value — any hex string of the right length passes, including the sha of an
+/// unrelated revision. It was strictly the weaker branch, which is a reason to delete it.
+/// `transformers_commit` is still held by `env_of` below, which requires all four goldens to
+/// agree on it.
+fn check_the_stack_is_pinned_by_value(v: &Vendored, g: &GoldenSet) {
     assert_eq!(
-        commit.len(),
-        40,
-        "{who}: transformers_commit is not a full sha: {commit:?}"
-    );
-    assert!(
-        commit.bytes().all(|b| b.is_ascii_hexdigit()),
-        "{who}: transformers_commit is not hex: {commit:?}"
+        meta(g, "assistant_modeling_sha256"),
+        ASSISTANT_MODELING_SHA256,
+        "{}: the assistant modeling digest is not the pinned one",
+        v.name
     );
 }
 
-/// The five keys that name the environment a golden was produced under, as one comparable list.
+/// The keys that name the environment a golden was produced under, as one comparable list.
+/// The array is the census; a count in the prose would be a second copy with nothing checking it.
 fn env_of(g: &GoldenSet) -> Vec<String> {
     [
         "torch",
         "transformers",
         "transformers_commit",
+        "assistant_modeling_sha256",
         "numpy",
         "python",
     ]
@@ -154,8 +179,15 @@ fn env_of(g: &GoldenSet) -> Vec<String> {
 /// The provenance every consumer has to be able to read off the file, **by value**.
 ///
 /// A golden separated from the versions that produced it cannot be re-derived, and these were
-/// produced by a stack that is not in the repo — transformers at a git revision, in a venv that
-/// exists on one machine.
+/// produced by a stack that is not in the repo: since 2026-08-16 a PyPI transformers release
+/// with no revision at all, pinned instead by the sha256 of the four assistant modeling files
+/// that actually run ([`ASSISTANT_MODELING_SHA256`]); before that, a git revision in a venv on
+/// one machine.
+///
+/// **The WEIGHT SETS are held to the same stamp**, added 2026-08-16 when review found they were
+/// not: they carry the same metadata and `glimmer_draft_oracle.rs` draws every scored parameter
+/// from them, so a weight set from another stack was caught by nothing while this doc claimed
+/// otherwise.
 #[test]
 fn the_anchor_goldens_record_what_produced_them() {
     let mut env: Option<(&str, Vec<String>)> = None;
@@ -164,7 +196,7 @@ fn the_anchor_goldens_record_what_produced_them() {
         check_the_golden_is_an_unperturbed_glimmer_run(v, &g);
         check_the_file_agrees_with_its_name(v, &g);
         check_the_declared_deviations(v, &g);
-        check_transformers_commit_is_a_full_sha(v, &g);
+        check_the_stack_is_pinned_by_value(v, &g);
         // Every golden must come from ONE environment. Two files pinned to different transformers
         // revisions cannot be compared to each other, and a port that scored against both would be
         // scoring against two references.
@@ -179,6 +211,22 @@ fn the_anchor_goldens_record_what_produced_them() {
         }
     }
     assert_eq!(GOLDENS.len(), 4, "two modes x two salts");
+
+    // The weight sets, held to the SAME digest and the SAME environment. They are not in
+    // `GOLDENS` (different magic, different reader), and until 2026-08-16 that meant nothing
+    // checked their provenance at all — while `glimmer_draft_oracle.rs` drew every scored
+    // parameter from them.
+    for v in WEIGHT_SETS {
+        let w = load(v);
+        check_the_stack_is_pinned_by_value(v, &w);
+        let (first, want) = env.as_ref().expect("GOLDENS is non-empty");
+        assert_eq!(
+            &env_of(&w),
+            want,
+            "{} was produced under a different env than {first}",
+            v.name
+        );
+    }
 }
 
 // ------------------------------------------------------------------------------------------

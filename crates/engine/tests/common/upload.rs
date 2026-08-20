@@ -120,6 +120,116 @@ pub fn u32v(b: &[u8]) -> Vec<u32> {
 // consumer tests; its parameter type is not ported yet.)
 
 #[cfg(feature = "rocm")]
+/// The four device addresses a GQA-family attend launch takes that are not shapes: three read
+/// operands and one destination.
+///
+/// **HOISTED 2026-08-17.** `kernel_glimmer_attend.rs` spelled it as `GqaIo` and M17c's
+/// `kernel_glimmer_block_attend.rs` spelled the same four fields, which `build.rs`'s duplication
+/// gate reported as a 45-token cross-file clone the moment the second existed. The argument for
+/// bundling is the one `GqaIo` carried and it survives the move: the launchers take thirteen
+/// arguments, **four of them interchangeable raw addresses**, and every oracle spells the list
+/// twice — once for the value arms and once for the guard table — so a transposed pair would move
+/// both copies together while both stayed green.
+///
+/// `kernel_attend.rs::AttIo` is deliberately NOT this type: it carries five `&DeviceBuf` for MLA's
+/// latent operands, a different set with a different lifetime story.
+#[derive(Clone, Copy)]
+pub struct AttendIo {
+    pub q: *const f32,
+    pub k: *const f32,
+    pub v: *const f32,
+    pub out: *mut f32,
+}
+
+impl AttendIo {
+    /// The addresses of four live buffers.
+    ///
+    /// Taking the buffers rather than the pointers is what removes the SECOND clone: every call
+    /// site was spelling the same four `ptr() as *const f32` casts, and jscpd reported that too.
+    /// `out` is `&mut` so the non-aliasing the kernels' `__restrict__` assumes is checked by the
+    /// borrow checker at the construction site rather than argued in a comment. **A guard table
+    /// that deliberately aliases all four addresses at one buffer constructs the fields directly
+    /// instead** — it never reaches a launch, so aliasing there is unobservable and is the point;
+    /// `kernel_glimmer_attend.rs`'s refusal table is that case and names it.
+    pub fn new(
+        q: &rivoli_engine::device::DeviceBuf,
+        k: &rivoli_engine::device::DeviceBuf,
+        v: &rivoli_engine::device::DeviceBuf,
+        out: &mut rivoli_engine::device::DeviceBuf,
+    ) -> Self {
+        Self {
+            q: q.ptr() as *const f32,
+            k: k.ptr() as *const f32,
+            v: v.ptr() as *const f32,
+            out: out.ptr_mut() as *mut f32,
+        }
+    }
+}
+
+/// The ABI every GQA-family attend launcher in this tree shares.
+///
+/// `gqa_attend` and `gqa_block_attend` take the **same thirteen arguments in the same order** and
+/// differ only in what two of them MEAN — `start_pos`/`ring_cap` against `q_offset`/`kv_len`. That
+/// is worth a named type rather than two wrappers: jscpd reported the two wrappers as a clone
+/// (2026-08-17) and it was right, because a shared ABI spelled twice is one place for a transposed
+/// pair to hide.
+pub type AttendLauncher = unsafe fn(
+    *const f32,
+    *const f32,
+    *const f32,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    f32,
+    *mut f32,
+    *mut std::ffi::c_void,
+) -> anyhow::Result<()>;
+
+/// One attend launch: `dims` is `[hq, hkv, d, tq, a, win, b]` in launcher order, where `a` and `b`
+/// are the two position/extent arguments whose MEANING is the launcher's.
+///
+/// **The dims order is spelled here and nowhere else.** Seven bare `usize` in a row is the
+/// excess-argument defect at full size; the array keeps them together and leaves every call site a
+/// literal a reader can check against this line. Returns the launcher's own `Result` so a guard
+/// table can read a CODE while the value arms demand success.
+///
+/// # Safety
+/// `io.q` and `io.out` are `tq * hq * d` live f32; `io.k` and `io.v` are the launcher's documented
+/// extent (`ring_cap`/`start_pos + tq` slots for the causal attend, `kv_len` rows for the block
+/// one) of `hkv * d` f32 each; none alias another, and all live until the next device sync. A
+/// REJECTED call returns before any kernel launch and dereferences nothing, which is what lets a
+/// guard table pass aliased addresses.
+pub unsafe fn attend_launch(
+    f: AttendLauncher,
+    io: AttendIo,
+    dims: [usize; 7],
+    scale: f32,
+) -> anyhow::Result<()> {
+    let [hq, hkv, d, tq, a, win, b] = dims;
+    // SAFETY: the caller's contract above. Null stream: every call site launches once and joins.
+    unsafe {
+        f(
+            io.q,
+            io.k,
+            io.v,
+            hq,
+            hkv,
+            d,
+            tq,
+            a,
+            win,
+            b,
+            scale,
+            io.out,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
 pub fn dev(b: &[u8]) -> rivoli_engine::device::DeviceBuf {
     let mut d = rivoli_engine::device::DeviceBuf::new(b.len().max(1)).expect("alloc");
     d.copy_in_at(0, b).expect("fill");

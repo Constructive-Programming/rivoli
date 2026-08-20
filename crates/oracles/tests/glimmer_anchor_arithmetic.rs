@@ -1,7 +1,7 @@
 //! **The two properties read off the goldens' VALUES rather than their shapes: the QK-norm's axis,
 //! and Q's scale against K's.**
 //!
-//! One of the four binaries the Muse Glimmer S1b anchor gate is split across — `glimmer_anchor.rs`
+//! One of the binaries the Muse Glimmer S1b anchor gate is split across — `glimmer_anchor.rs`
 //! carries the framing and the byte pins, `glimmer_anchor_common/mod.rs` the tables and accessors,
 //! and `glimmer_anchor_text.rs` everything about the text goldens that is a shape or a count. What
 //! is here is different in kind: each of these two folds the captured floats and asserts a fact
@@ -13,7 +13,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 #[path = "glimmer_anchor_common/mod.rs"]
-mod anchor; // keep this preamble blank-line-free: spread out, the four are a jscpd clone
+mod anchor; // keep this preamble blank-line-free: spread out, these are a jscpd clone
 use anchor::{GoldenSet, Vendored, Widths, each_text, golden_read, ints, meta_usize, num, real};
 use serde_json::Value;
 

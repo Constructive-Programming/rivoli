@@ -6,5 +6,7 @@
 //! changes only when the reference does, and the engine must never call into it
 //! on a decode path. Host-only and featureless.
 
+pub mod dflash;
 pub mod golden;
+pub mod torchdraw;
 pub mod v4oracle;

@@ -1,15 +1,18 @@
-//! The tables and accessors the four Muse Glimmer S1b anchor binaries read the vendored goldens
-//! through.
+//! The tables and accessors the Muse Glimmer S1b anchor binaries read the vendored goldens
+//! through — four at first, five since M17a added `glimmer_draft_oracle.rs`.
 //!
 //! `glimmer_anchor.rs` carries the framing and holds what is true of a FILE; `glimmer_anchor_text.rs`,
-//! `glimmer_anchor_draft.rs` and `glimmer_anchor_arithmetic.rs` hold the three groups of property.
-//! All four open the same files and derive the same widths from them, so the tables and the readers
-//! live here once — written four times they are a `build.rs` jscpd failure at `--min-tokens 15`, and
-//! four copies of a byte pin is four places for a re-vendor to be recorded in three of.
+//! `glimmer_anchor_draft.rs` and `glimmer_anchor_arithmetic.rs` hold the three groups of property,
+//! and `glimmer_draft_oracle.rs` scores the drafter oracle's VALUES against the draft goldens.
+//! All five open the same files and derive the same widths from them, so the tables and the readers
+//! live here once — written five times they are a `build.rs` jscpd failure at `--min-tokens 15`, and
+//! five copies of a byte pin is five places for a re-vendor to be recorded in four of.
 //!
 //! **A directory module rather than a `tests/glimmer_anchor_common.rs` sibling**, because cargo
-//! turns every `tests/*.rs` into a test binary: flat, this would embed the goldens a fifth time and
-//! run zero tests. `tests/common/` next door is the same shape for the same reason.
+//! turns every `tests/*.rs` into a test binary: flat, this would embed the goldens once MORE than
+//! the five that include it, and run zero tests. (The count is stated in this one sentence and
+//! nowhere else: it was written "a fifth time" when there were four includers and had to move the
+//! day the fifth arrived, which is what a count in prose does.) `tests/common/` next door is the same shape for the same reason.
 //!
 //! Widths are **derived from each golden's own `tiny_config`**, never written as literals, and the
 //! fields that are supposed to be REAL are compared against the vendored `config.json` rather than
@@ -43,26 +46,26 @@ pub const GOLDENS: &[Vendored] = &[
     Vendored {
         name: "text-1",
         bytes: include_bytes!("../glimmer-anchor-text-1.bin"),
-        len: 643_957,
-        fnv: 0xc765_6dea_dd50_3c51,
+        len: 644_019,
+        fnv: 0x1d38_1eb7_e15c_fdee,
     },
     Vendored {
         name: "text-2",
         bytes: include_bytes!("../glimmer-anchor-text-2.bin"),
-        len: 643_957,
-        fnv: 0xe778_0679_924e_cd5f,
+        len: 644_019,
+        fnv: 0x7d9d_ab84_8f72_fc14,
     },
     Vendored {
         name: "draft-1",
         bytes: include_bytes!("../glimmer-anchor-draft-1.bin"),
-        len: 72_145,
-        fnv: 0x3dcf_a1ed_6536_a6f0,
+        len: 72_208,
+        fnv: 0x0d18_5f12_9070_d85d,
     },
     Vendored {
         name: "draft-2",
         bytes: include_bytes!("../glimmer-anchor-draft-2.bin"),
-        len: 72_145,
-        fnv: 0xd15d_109a_9a72_f7ab,
+        len: 72_208,
+        fnv: 0x0f1a_81ad_1595_8e07,
     },
 ];
 

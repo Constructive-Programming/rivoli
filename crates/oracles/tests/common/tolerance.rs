@@ -348,6 +348,20 @@ const FLOOR_MULT: (f32, f32) = (9.9, 10.2);
 /// And at least this far UNDER the weakest defect it has to catch.
 const DEFECT_MARGIN: f32 = 30.0;
 
+/// A `Rel` row as `(operator, floor, weakest_defect, tolerance)` — the column order the table
+/// docs state them in, so a table READS as its own documentation. Grown here 2026-08-16 when
+/// the DFlash draft-oracle table became the SECOND consumer to write this exact constructor
+/// (`k3/tolerance.rs` had it first, for the same jscpd-reported reason its doc records), and
+/// two copies of the apparatus in two files is the drift this shared file exists to prevent.
+pub const fn rel_row(operator: &'static str, floor: f32, weakest_defect: f32, tol: f32) -> Tol {
+    Tol {
+        operator,
+        floor,
+        weakest_defect,
+        policy: Policy::Rel(tol),
+    }
+}
+
 /// **Every row's policy has to follow from its two measurements.**
 ///
 /// `Rel(t)` is defensible only when `t` sits clear of the floor and far below the weakest defect:

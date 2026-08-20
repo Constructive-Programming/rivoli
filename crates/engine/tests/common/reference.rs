@@ -56,6 +56,79 @@ impl Weightless {
 /// oracle and mask comparison) and `glimmer_chain.rs` (the loop's reference) both need it, and
 /// jscpd caught the second copy the moment it was written. The kernel has its own, in HIP, which
 /// is the implementation those files exist to check — this is deliberately not that one.
+/// `1/sqrt(head_dim)` — the only scale a Glimmer attend kernel applies itself.
+///
+/// **The argument is the trap**: reading `hidden` here instead (6656 against head_dim 128) scales
+/// every logit by 0.14x and stays fluent, which is why §9 trap 15 records that head_dim is NOT
+/// `hidden / heads`. Spelled once so an oracle and the launch it scores cannot be handed different
+/// scales — and shared, so the causal and the bidirectional attend cannot be handed different ones
+/// either.
+pub fn attn_scale(d: usize) -> f32 {
+    1.0 / (d as f32).sqrt()
+}
+
+/// The operands of one attention case: Q laid out `[row][head][d]`, and a K/V cache laid out
+/// `[slot][kv_head][d]`.
+///
+/// A struct rather than five parameters, on [`super::Mla`]'s argument: `hkv` and `d` are
+/// interchangeable to the type checker, and CodeScene prices a five-`usize`-and-three-slice
+/// signature as excess arguments before a reader ever gets to it.
+pub struct AttendCase<'a> {
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub hkv: usize,
+    pub d: usize,
+}
+
+/// Which output row [`attend_head`] computes, which KV head it reads, and the INCLUSIVE span its
+/// softmax runs over.
+///
+/// `n` indexes Q and the destination identically — both are `[row][head][d]` — so it is one value
+/// rather than a `(row, h)` pair a caller could split two ways.
+pub struct AttendSpan {
+    pub n: usize,
+    pub kvh: usize,
+    /// `[lo, hi]`, **inclusive at both ends**, and deliberately not derived here. The causal
+    /// attend passes `(window_lo(pos, win), pos)`; the drafter's bidirectional attend passes
+    /// `(pos.saturating_sub(win), min(kv_len - 1, pos + win))`. Those two differ in BOTH edges —
+    /// the causal lower bound is strict (`kv > q - win`, hence [`window_lo`]'s `+ 1`) while the
+    /// bidirectional one is inclusive, and the causal upper bound is `pos` while the
+    /// bidirectional one runs past it. **Making the span the caller's is what keeps that
+    /// distinction visible at two call sites instead of hidden in one branch here.**
+    pub span: (usize, usize),
+}
+
+/// One (query row, Q head)'s attention output: softmax over `s.span`, applied to V.
+///
+/// **HOISTED 2026-08-17 for M17c's block attend**, which needs this exact softmax over a
+/// bidirectional span. `kernel_glimmer_attend.rs` spelled it locally and
+/// `build.rs`'s duplication gate is what would have caught the second copy — the same sequence
+/// [`window_lo`] above records, and the same resolution.
+pub fn attend_head(c: &AttendCase<'_>, s: AttendSpan) -> Vec<f32> {
+    let (hkv, d) = (c.hkv, c.d);
+    let scale = attn_scale(d);
+    let (lo, hi) = s.span;
+    let qrow = &c.q[s.n * d..][..d];
+    let logits: Vec<f32> = (lo..=hi)
+        .map(|j| {
+            let kr = &c.k[(j * hkv + s.kvh) * d..][..d];
+            scale * (0..d).map(|i| qrow[i] * kr[i]).sum::<f32>()
+        })
+        .collect();
+    let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let w: Vec<f32> = logits.iter().map(|x| (x - mx).exp()).collect();
+    let denom: f32 = w.iter().sum();
+    let mut dst = vec![0.0f32; d];
+    for (j, wj) in (lo..=hi).zip(&w) {
+        let vr = &c.v[(j * hkv + s.kvh) * d..][..d];
+        for (i, o) in dst.iter_mut().enumerate() {
+            *o += wj / denom * vr[i];
+        }
+    }
+    dst
+}
+
 pub fn window_lo(pos: usize, win: usize) -> usize {
     if win > 0 && pos >= win {
         pos - win + 1

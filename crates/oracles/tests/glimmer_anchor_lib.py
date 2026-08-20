@@ -107,7 +107,39 @@ def tiny_draft_config(cfg_mod, text_cfg):
         rms_norm_eps=1e-5,  # REAL
         rope_parameters={"rope_theta": 500000.0, "rope_type": "default"},  # REAL
         max_position_embeddings=256,  # width
-        sliding_window=4,  # width, matched to the target's tiny window
+        # width. **NOT the target's tiny 4, and the difference is the whole point.** ctx is
+        # PROMPT_LEN 12 and block_size 4, so kv_len is 16 and the block's own K/V rows sit at
+        # 12..16. The reference indexes queries by ROW (`q_offset = 0`, no cache) while RoPE
+        # places them at ctx.., so the mask is `|q_row - kv| <= w`: at w=4 the furthest query
+        # reached kv 7 and the block-vs-block submatrix summed to EXACTLY 0.0 — no query ever
+        # attended the block, so §11 step 5 (attention is bidirectional ACROSS THE BLOCK) was
+        # pinned by the mask pattern and by no value at all, and `defect_causal_mask`'s red was
+        # the re-selection of CONTEXT rows rather than the property under test. Measured and
+        # re-vendored 2026-08-16.
+        #
+        # 13 is the MINIMUM value that produces a strictly-bidirectional pair (a query attending
+        # a LATER block row -- exactly what a causal mask forbids), and minimal on purpose: 13 of
+        # the 16 block-vs-block pairs attend and 3 stay masked, so the window still binds inside
+        # the block, where w >= 15 would make the whole mask all ones and unable to fail. The
+        # binding constraint is bidirectionality, NOT reach: at w=11 six block pairs already
+        # attend (the block is wholly out of reach only at w <= 8), but a query attending a LATER
+        # block row needs 12 + r - q <= w with r > q, i.e. w >= 13.
+        #
+        # THE COST, derived rather than discovered later: at w >= 12 the CONTEXT half of the mask
+        # is all ones, so this fixture no longer exercises window-masking of the context. That
+        # trade is FORCED, not a tuning choice -- swept over w at ctx 12 / block 4:
+        #
+        #   w               :  2 .. 8   9   10   11   12   13   14   15+
+        #   ctx cols masked : 31 .. 6   3    1    0    0    0    0    0
+        #   bidir pairs     :  0 .. 0   0    0    0    0    3    5    6
+        #
+        # The two never overlap: context masking needs w <= 10, bidirectionality needs w >= 13.
+        # It follows from the reference's own mask form -- `q_offset = 0` indexes queries by ROW
+        # (0..block) while K/V spans ctx+block, so any w letting q0 see kv=ctx also lets it see
+        # every kv < ctx. No geometry with this mask has both, at any ctx. Section 11 step 5 is
+        # the property under test, so the block wins; a context-window defect is now this
+        # fixture's DECLARED blind spot, asserted in glimmer_draft_oracle.rs.
+        sliding_window=13,
         attention_dropout=0.0,  # REAL
         hidden_act="silu",  # REAL
         block_size=4,  # width (real 16) -- one anchor token plus 3 masks
@@ -348,9 +380,19 @@ def preflight_env():
 def environment():
     """The versions that produced a golden, read from the installed packages.
 
-    `transformers_commit` comes from pip's own `direct_url.json` rather than from a constant: the
-    package is installed from a git URL at a pinned revision, so the commit is a fact about the
+    `transformers_commit` comes from pip's own `direct_url.json` rather than from a constant: when
+    the package is installed from a git URL at a pinned revision, the commit is a fact about the
     environment and restating it here would be a second copy to drift.
+
+    `assistant_modeling_sha256` is emitted alongside it, unconditionally, and is for this
+    model the better pin. A PyPI
+    RELEASE has no `direct_url.json` and so no commit, and the sha of a transformers git revision
+    would not tell you the content of the four files that actually produce these captures anyway.
+    This hashes those four directly, sorted by name, so the provenance is the SOURCE rather than a
+    label on the repository it came from. Added 2026-08-16, when the venv holding the pinned
+    revision stopped existing and the only stack left on the machine was `transformers==5.15.0`
+    from PyPI — whose assistant modeling files were proven to reproduce all 50 captures of both
+    vendored draft goldens bit-identically before anything was re-vendored under it.
     """
     import numpy
     import transformers
@@ -360,10 +402,16 @@ def environment():
         p = d / "direct_url.json"
         if p.exists():
             commit = json.loads(p.read_text()).get("vcs_info", {}).get("commit_id", "unknown")
+    src = pathlib.Path(transformers.__file__).parent / "models" / "muse_glimmer_assistant"
+    h = hashlib.sha256()
+    for f in sorted(src.glob("*.py")):
+        h.update(f.name.encode())
+        h.update(f.read_bytes())
     return {
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "transformers_commit": commit,
+        "assistant_modeling_sha256": h.hexdigest(),
         "numpy": numpy.__version__,
         "python": sys.version.split()[0],
     }

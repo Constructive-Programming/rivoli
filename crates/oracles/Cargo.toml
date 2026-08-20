@@ -15,7 +15,13 @@ memmap2 = "0.9"
 # sequence); kept identical here so ported readers see identical JSON behaviour.
 serde_json = { version = "1", features = ["preserve_order"] }
 safetensors = { version = "0.8.0", default-features = false, features = ["alloc"] }
+# The anchor fixtures key every parameter draw by sha256(salt/name); the hash is the
+# REFERENCE'S choice, so `torchdraw` matches it rather than choosing one (the artifact side's
+# "FNV, not a sha256 dep" rule is about hashes this repo is free to pick).
+sha2 = "0.10"
 
 [dev-dependencies]
-serde_json = "1"
+# No `serde_json` line here: it was one, featureless, and cargo unified it with the
+# `preserve_order` entry above — so it bought nothing and would have QUIETLY handed the tests a
+# non-preserving parser the day that entry moved. Removed 2026-08-16.
 rivoli-artifact = { path = "../artifact" }

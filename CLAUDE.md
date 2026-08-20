@@ -108,7 +108,14 @@ appears that enum dispatch cannot fill.
   reference ids, a live serve round-trip (readiness, /v1/models, non-stream, SSE).
   On-demand (GPU, ~45 min), not CI. Red-proofed 2026-08-16 (wrong fragment reddens).
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
-  suite or a live deferral, checked both ends; 60/60/0 since M9. **INV-n registry** —
+  suite or a live deferral, checked both ends; **61/61/0** since 2026-08-17, when M17c's
+  `gqa_block_attend` landed with its launcher and `kernel_glimmer_block_attend.rs`. Its
+  DEFERRED row opened and closed the table's **third** turn within one commit — the census
+  REFUSED the stale row rather than letting it stand, which is the both-ends check doing what
+  an exemption list cannot. Its `covered` scanner also grew a second form that day: a launcher
+  handed to a shared launch helper as its first argument counts, matched against a
+  whitespace-stripped corpus. Both halves were forced — jscpd refused the second per-file
+  launch wrapper, and without the new form a kernel covered since M7 read as uncovered. **INV-n registry** —
   `crates/cli/tests/invariants.rs`, doc-and-test must move together. **feature matrix** —
   `tests/feature-matrix.sh` + `crates/cli/tests/matrix.rs` (lists derived from the
   manifests; the resolve cell proves `--no-default-features` is genuinely deviceless).
