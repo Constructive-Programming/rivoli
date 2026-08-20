@@ -175,5 +175,5 @@ a check that must hold in a shipped binary is an `assert!` and pays its cost.
   membership is data in a checked census table.
 - Docs: front matter on every file, corrections **in place with a dated note**, superseded
   docs move directory rather than being deleted, closed verdicts rule out only their scope.
-- Verify sync with `git rev-parse HEAD origin/rw/main`, not log counting.
+- Verify sync with `git rev-parse HEAD origin/main`, not log counting.
 - `rtk proxy <cmd>` shows unfiltered cargo/git output.
