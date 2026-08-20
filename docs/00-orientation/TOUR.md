@@ -9,7 +9,7 @@ verdict: Two pages of orientation for the rewrite tree — what rivoli is, where
 rivoli decodes LLMs bigger than memory on one box: AMD Strix Halo (gfx1151), unified
 LPDDR5 via GTT, weights streamed from NVMe **overlapped with compute**. The overlap is the
 whole design. This tree is the ground-up rewrite; the previous implementation lives on
-`main` / `wt/glimmer-s2` (pinned in CLAUDE.md) and stays running as the parity reference
+tag `v2` / `archive/glimmer-s2` (pinned in CLAUDE.md; was branch `wt/glimmer-s2`) and stays running as the parity reference
 until M5 retires the comparison.
 
 ## Why a rewrite

@@ -3,7 +3,7 @@
 Decode engine for LLMs bigger than memory: AMD Strix Halo gfx1151, unified LPDDR5 via GTT,
 weights streamed from NVMe **overlapped with compute** — the overlap is the whole design.
 Rust workspace + HIP/ROCm, one backend. This is the ground-up rewrite; the old tree stays
-live as the parity reference at **`wt/glimmer-s2` @ `6b7f496e`** — port from there, cite
+live as the parity reference at **tag `archive/glimmer-s2` @ `6b7f496e`** (was branch `wt/glimmer-s2`) — port from there, cite
 it as `old:<path>`, and treat its `docs/` as the archive of closed investigations.
 
 Start with `docs/00-orientation/TOUR.md` (two pages), then `INDEX.md` — decide what NOT to

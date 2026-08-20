@@ -8,7 +8,7 @@ verdict: THE PLAN IS COMPLETE, M0-M9 — gates armed and red-proofed before any 
 
 The approved plan (2026-08-15) rebuilds rivoli on this orphan branch: quality gates before
 code, anchors before the engine, the six-crate DAG as the layering, GLM-5.2 first, then
-serve → Glimmer → V4 → K3. The old tree at `wt/glimmer-s2` @ `6b7f496e` stays live as the
+serve → Glimmer → V4 → K3. The old tree at tag `archive/glimmer-s2` @ `6b7f496e` (was branch `wt/glimmer-s2`) stays live as the
 parity reference. This doc is the running record; each milestone gets a dated section
 stating what shipped, what its exit gate showed, and what was deliberately not done.
 

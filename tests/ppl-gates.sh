@@ -37,7 +37,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=${PPL_BIN:-${CARGO_TARGET_DIR:-$HERE/../target}/release/rivoli}
 PPL_TOOL=${PPL_TOOL:-${CARGO_TARGET_DIR:-$HERE/../target}/release/ppl}
-# The reference pin (`wt/glimmer-s2 @ 6b7f496e`) built WITH `--features teacher-forcing`
+# The reference pin (tag `archive/glimmer-s2`, commit 6b7f496e) built WITH `--features teacher-forcing`
 # — the parity gate's own PARITY_REF_BIN is not it: that binary has no `--ppl` at all
 # (checked 2026-08-16), because the pin was built for `--bench`. Build the scoring one
 # into its OWN target dir rather than over the parity gate's:
@@ -550,7 +550,7 @@ TF_BAR=0.00995
 cell_tf() {
     say "tf: rewrite vs pinned reference, paired dNLL over $(basename "$CORPUS")"
     # **GLM-only, structurally**: the other side of this comparison is the pinned GLM
-    # reference at `wt/glimmer-s2 @ 6b7f496e`, so pointing the rewrite arm at another
+    # reference at tag `archive/glimmer-s2`, commit 6b7f496e, so pointing the rewrite arm at another
     # architecture compares two different models. It would not fail quietly — the corpora
     # tokenize to different lengths and the position-count check below would fire — but it
     # would fire as a RED naming the tokenizer, which is a wrong diagnosis for an operator

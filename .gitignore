@@ -1,2 +1,7 @@
 /target
 __pycache__/
+
+# session/tooling artifacts that live in the working dir, never in the repo
+.claude/pruned-patches/
+.claude/settings.json
+.snapshot_path
