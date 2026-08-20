@@ -566,3 +566,37 @@ format and why.
    needs an id-pinned golden against it rather than a hand-read. Not started; `--port` still
    refuses. Note the loader does **not** unblock this: it turns strings into ids, and the
    framing that produces the string is the separate milestone §7 opens by distinguishing.
+
+## 8. Third-party field report: airllm's scars from this same checkpoint (added 2026-08-20)
+
+airllm (lyogavin/airllm, Apache-2.0, read 2026-08-20) streams this exact checkpoint
+per-expert through transformers hooks, and its code carries two defensive patches whose
+commit-comments name concrete checkpoint-vs-config disagreements. **These are LEADS, not
+facts** — a third party's observations of the same artifact, to be re-derived here before
+anything trusts them (an inherited number is unverified by house rule):
+
+1. **`A_log` shape.** airllm's `_adopt_checkpoint_shape` exists because "Kimi K3 sizes
+   `A_log` from `num_heads` while its checkpoint stores one entry per head channel, which
+   would abort the load." Our anchor gate asserts `A_log` at `vec![nh]`
+   (`crates/oracles/tests/k3_anchor.rs:391`) — which scores the *reference module's*
+   construction and may both be right and still disagree with the *shipped tensor*. Before
+   the resident pin loads the real `in.A_log`: read the shape straight out of the shard
+   header and record which side the checkpoint takes. If it is per-channel, the engine-side
+   constructor (not the anchor) is the thing that needs to follow the checkpoint.
+
+2. **The MXFP4 target list lies for two module classes.** airllm's
+   `_restore_plain_weight_modules` exists because "some checkpoints (Kimi K3) list
+   residual/router Linears under the MXFP4 target list but store them as bf16." A converter
+   or pin that formats by the quantization config's target list rather than by each shard's
+   actual dtype corrupts exactly the router and the attention-residual projections — the
+   two places a wrong format is quietest. §5's census verified one routed `.f4` layer at
+   0 differing bytes; it did not assert the RESIDENT tensors' dtypes against the target
+   list. One `safe_open`-header sweep over the resident set settles it.
+
+Corroboration airllm provides for free (consistent with §5's census): 896 experts / 16
+routed per layer; a layer's experts ~55 GB expanded with ~1 GB touched per token; the
+resident set outside the streamed sequence is `output_attn_res_norm`,
+`output_attn_res_proj`, `mm_projector`, `vision_tower`, together under 1 GB. Nothing else
+in airllm is news to this tree: its layer prefetch is depth-1 and measured at +10% in its
+own README, its expert loads are synchronous inside the forward hook, and it holds no
+residency cache at all — every token re-reads every selected expert.
