@@ -305,11 +305,11 @@ impl<'a> GlmEngine<'a> {
     /// Pool COMPACTION relocations, so a determinism arm can state whether any happened.
     ///
     /// `relocate` memcpys a slot's bytes to a new address; nothing in it argues that it waits
-    /// for an io_uring DMA still in flight into that slot. Under BOUNCE that window is the
-    /// copy's ~0.18 ms, but `--direct-vmm-dma` DMAs for the whole ~2.4 ms read — ~13x wider.
-    /// So a red direct arm has two possible causes and this number separates them: **0 relocs
-    /// means the divergence cannot be compaction**, and the arm is evidence about the shared
-    /// defect. Non-zero means it may be direct's own hazard and says nothing about the arena.
+    /// for an io_uring DMA still in flight into that slot. On the bounce path that window is
+    /// the copy's ~0.18 ms; under the since-deleted `--direct-vmm-dma` diagnostic it was the
+    /// whole ~2.4 ms read — ~13x wider — which is why its red arm needed this number to
+    /// separate compaction from the shared defect (**0 relocs means the divergence cannot be
+    /// compaction**). `docs/investigations/glm-nondeterminism-closeout.md` keeps that record.
     ///
     /// The counter existed and was read only by the divergence log, i.e. by a feature build
     /// nobody runs — the same shape as `slot_stalls`, which went unread for the whole first

@@ -168,102 +168,22 @@ struct Args {
     #[arg(long, value_name = "PATH", conflicts_with = "port")]
     dump_ids: Option<String>,
 
-    /// CANDIDATE FIX UNDER EVALUATION: allocate the io_uring bounce arena FINE-GRAINED
-    /// (`hipHostMallocCoherent`) instead of `hipHostMallocDefault`.
-    ///
-    /// GLM's nondeterminism was localised to the bounce arena: a fold of the arena between the
-    /// io_uring completion and the `hipMemcpyAsync` enqueue SUPPRESSES the defect, while every
-    /// probe that does not read the arena leaves it intact. The gap that predicts this is that the
-    /// CQE establishes visibility of the NVMe DMA's writes TO THE CPU, while the agent that
-    /// actually reads the arena is the GPU's copy path — and nothing establishes visibility for
-    /// it. On fine-grained host memory the platform provides that guarantee; on coarse-grained it
-    /// does not. `hipHostMallocDefault` does not say which it yields, so this is A/B-ed rather
-    /// than asserted.
-    ///
-    /// NOT behind a feature, unlike the instruments: the acceptance protocol compares two release
-    /// binaries differing in exactly this flag, and a fix reachable only in a probe build cannot be
-    /// measured against a stock one. Expect a bandwidth cost on the bounce->GTT copy — measure it.
-    #[arg(long)]
-    pinned_coherent: bool,
-
-    /// CANDIDATE FIX UNDER EVALUATION (Phase 3B): move bounce->slot bytes with an ordinary shader
-    /// copy instead of `hipMemcpyAsync`.
-    ///
-    /// The ablation matrix says suppression needs a device-side READ of the bounce arena's own
-    /// bytes, in bulk: a bare launch does not do it (`bh-nop` red), equal bandwidth on another
-    /// buffer does not (`bh-decoy` red), reading the destination slot does not (`sc` red), and
-    /// fine-grained allocation does not (`--pinned-coherent` red with the flag observed to apply).
-    /// A shader copy reads the arena through the normal vector-memory path, which a copy engine may
-    /// bypass — so if this comes back clean it is both the conviction and a fix at roughly equal
-    /// bandwidth.
-    ///
-    /// Like `--pinned-coherent`: a flag and not a feature, so the protocol compares two release
-    /// binaries differing in one argument. The run REPORTS how many copies each path actually
-    /// issued — an intervention that never applied and one that does not work produce the same red,
-    /// which has already cost this investigation two rounds.
-    #[arg(long)]
-    copy_by_kernel: bool,
-
-    /// MITIGATION for the GLM decode nondeterminism (`glm-bug.md`): before each bounce->VMM copy,
-    /// read the just-written arena window at full width on the fetch stream and discard the value.
+    /// MITIGATION for the GLM decode nondeterminism: before each bounce->VMM copy, read the
+    /// just-written arena window at full width on the fetch stream and discard the value.
     ///
     /// This is the ONLY intervention measured to make GLM decode reproduce itself — four clean
     /// pairs over 6144 tokens against a rate predicting P(all clean) ~ 1e-9 — and its mechanism is
-    /// NOT understood. Fifteen alternatives are RED, each read back and confirmed to have applied:
-    /// one cache line of the arena, stride-32 sampling, the same bulk from a decoy buffer, the bare
-    /// dispatch, a shader copy instead of SDMA, a fine-grained arena, a write-combined arena, and
-    /// the staging hand-out (`slot_stalls` measured 0 on diverging pairs).
+    /// NOT understood. Fifteen alternatives are RED, each read back and confirmed to have applied;
+    /// `docs/investigations/glm-nondeterminism-closeout.md` keeps that ablation matrix and
+    /// `docs/investigations/glm-nondeterminism-worklog.md` the arm log.
     ///
-    /// Not behind a feature, for the same reason as `--copy-by-kernel`: the acceptance protocol
+    /// Not behind a feature, like `--copy-via-cpu`: the acceptance protocol
     /// compares two release binaries differing in exactly this flag. Costs **1-3%** of decode
     /// throughput (2.65 tok/s against 2.70-2.73 at 1536 tokens, measured 2026-08-18 — the ~10%
     /// this said before the protocol ran was the PROBE fold, which also hashed and wrote a 19 MB
     /// log per run). Measure it on the arm rather than quoting either number.
     #[arg(long)]
     arena_refresh: bool,
-
-    /// DIAGNOSTIC: DMA each O_DIRECT read straight into its pool slot — no staging arena, no
-    /// H2D copy. Restores the `--direct-vmm-dma` mechanism deleted 2026-08-01.
-    ///
-    /// **Not a shipping mode, and not a candidate.** Re-measured 2026-08-18 on kernel 6.18.39 /
-    /// ROCm 7.14 with `docs/measurement/probes/fetch_dest.hip`: DMA into the VMM pool runs
-    /// **6.4 GB/s** against the pinned arena's **13.3** at the engine's queue depth with the GPU
-    /// busy, reproducing the 2.19x gap (5.66 vs 12.4) that deleted the flag. The pre-registered
-    /// bar for recovering it as a real mode was 11.4 GB/s and it missed by 44%.
-    ///
-    /// What it is FOR: it is the only arm with NO ARENA, so it answers by removal what
-    /// `--arena-refresh` only answers by repair — whether the arena is the LOCUS of the GLM
-    /// nondeterminism defect (`glm-bug.md`) or merely where a working mitigation happened to
-    /// land. Divergence under this flag would mean the missing guarantee is downstream of the
-    /// arena entirely, and would retire `--arena-refresh`'s explanation along with it.
-    ///
-    /// Refuses to combine with `--arena-refresh`, `--copy-by-kernel` and `--pinned-coherent`:
-    /// all three act on an arena this mode does not allocate, and a silently-ignored knob is how
-    /// an arm gets attributed to the wrong cause.
-    #[arg(long)]
-    direct_vmm_dma: bool,
-
-    /// THE DECIDING ARM for the GLM nondeterminism defect: with `--direct-vmm-dma`, read the pool
-    /// slot the drive just DMA'd into at full width on the fetch stream, before the ticket signal
-    /// the MoE kernel waits on. Value discarded.
-    ///
-    /// One rule fits every cell of the ablation matrix: *a device-side reader can read STALE bytes
-    /// from the region the NVMe just DMA'd into, and a prior full-width read by a compute kernel
-    /// repairs it for the next consumer.* In bounce mode the DMA target is the arena and the next
-    /// consumer is the SDMA copy, so `--arena-refresh` is that read and it is CLEAN. In direct mode
-    /// the DMA target is the SLOT and the next consumer is the MoE kernel, and nothing reads it
-    /// first — which is why direct diverges (91/512 at 420, 2026-08-18).
-    ///
-    /// This is the same read aimed at the region direct mode actually writes. **Clean means the
-    /// rule unifies every arm and names the defect's shape; red means the rule is dead.** Both
-    /// outcomes are worth the run, which is the only reason a mode measured 29% slower carries a
-    /// fix flag at all.
-    ///
-    /// Requires `--direct-vmm-dma`: in bounce mode this same read of the destination slot is the
-    /// `sc` arm, already measured RED at first-divergence 236, and re-running a known-red arm under
-    /// a new name is how a matrix grows a row that decides nothing.
-    #[arg(long)]
-    slot_refresh: bool,
 
     /// CANDIDATE FIX: the bounce→slot hop as a HOST memcpy on the reaper thread instead of an
     /// async copy on the fetch stream.
@@ -280,55 +200,6 @@ struct Args {
     /// two release binaries differing in exactly this argument.
     #[arg(long)]
     copy_via_cpu: bool,
-
-    /// DIAGNOSTIC: sleep this many microseconds on the reaper thread between each io_uring
-    /// completion and the copy it kicks — pure TIME, no device work, no memory traffic.
-    ///
-    /// The arm the ablation matrix never had: `bh-nop` has ~no delay, and `bh-decoy` was
-    /// recorded as the equal-duration control but reads a DEVICE buffer (~10x the bandwidth of
-    /// the host arena `--arena-refresh` reads), so "not bandwidth or delay" was never actually
-    /// established. CLEAN here and the refresh repairs by TIME; RED and the repair is specific
-    /// to the arena's addresses. Pair with `--arena-refresh-decoy` to separate the two.
-    #[arg(long, value_name = "US", default_value_t = 0)]
-    fetch_settle_us: u64,
-
-    /// DIAGNOSTIC: the `--arena-refresh` full-width read, aimed at a SECOND pinned host arena
-    /// (same size, same per-slot indexing, same memory type) that the NVMe never writes.
-    ///
-    /// Same kernel, same stream position, same byte count, same duration as the one clean cell
-    /// — different addresses. CLEAN means the repair is the time or the host-read traffic, not
-    /// the region; RED means the repair is specific to the region the NVMe DMA'd into, which
-    /// is the address-cache class of mechanism. With `--fetch-settle-us` this completes the
-    /// time-vs-address separation the decoy-on-device-memory arm could not.
-    #[arg(long)]
-    arena_refresh_decoy: bool,
-
-    /// DIAGNOSTIC: the `--arena-refresh` read at one 16 B unit per N — the dose-response sweep
-    /// the investigation left unfinished (`--divergence-folds bh-line:N` needed a probe build;
-    /// this needs none). N=1 is the clean cell; N=4 is the 64 B sector hypothesis's prediction;
-    /// N=8 reproduces the `bh-line` cell (RED at first-divergence 704). Conflicts with
-    /// `--arena-refresh`, which IS N=1.
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    arena_refresh_stride: u64,
-
-    /// DIAGNOSTIC: the SAME full-width arena read as `--arena-refresh`, enqueued AFTER the
-    /// copy instead of before it. The fetch stream's FIFO order means it cannot delay the
-    /// copy, only the signal the consumer waits on — so it separates "the repair must precede
-    /// the COPY" from "must precede the CONSUMER". CLEAN re-locates the defect to the slot's
-    /// consumer; RED keeps it producer-side. Conflicts with `--arena-refresh` and
-    /// `--arena-refresh-decoy`.
-    #[arg(long)]
-    arena_refresh_late: bool,
-
-    /// DIAGNOSTIC, with `--direct-vmm-dma`: after each completion the reaper CPU-reads the
-    /// just-DMA'd pool slot into a scratch buffer and writes it straight back. The payload is
-    /// unchanged — only the last WRITER changes, from the NVMe's DMA engine to the CPU. This is
-    /// the `--copy-via-cpu` premise (CPU writes to the pool are GPU-visible — the property the
-    /// resident tier's startup load already spends) tested against direct mode, the one
-    /// condition measured to still fire. CLEAN supports the premise in the live condition; RED
-    /// kills it — and with it `--copy-via-cpu` — without needing bounce mode to cooperate.
-    #[arg(long)]
-    cpu_retouch: bool,
 
     /// DIAGNOSTIC: write a per-layer divergence log here — three device-folded quantities
     /// (the MoE's input, its SwiGLU intermediate, the exit residual) plus what the router
@@ -625,7 +496,7 @@ fn glm_fmt(a: &Args) -> Result<RoutedFmt> {
         .context("--mode hybrid reached the format mapping — legality::decide must refuse it first")
 }
 
-/// The routed pool's three knobs, gathered in the one place they are legal.
+/// The routed pool's knobs, gathered in the one place they are legal.
 ///
 /// Shared by both routed arms because they describe a POOL and both have one — see
 /// [`PoolKnobs`]. Whether the flags that fill it are legal on this architecture is the
@@ -635,17 +506,8 @@ fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
         cache_policy: &a.cache_policy,
         two_q: TwoQSplit::default(),
         trace_path: a.trace.as_deref(),
-        pinned_coherent: a.pinned_coherent,
-        copy_by_kernel: a.copy_by_kernel,
         arena_refresh: a.arena_refresh,
-        direct_vmm_dma: a.direct_vmm_dma,
-        slot_refresh: a.slot_refresh,
         copy_via_cpu: a.copy_via_cpu,
-        fetch_settle_us: a.fetch_settle_us,
-        arena_refresh_decoy: a.arena_refresh_decoy,
-        arena_refresh_stride: a.arena_refresh_stride,
-        arena_refresh_late: a.arena_refresh_late,
-        cpu_retouch: a.cpu_retouch,
     }
 }
 

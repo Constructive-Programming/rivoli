@@ -512,8 +512,10 @@ fn open_engine<'c>(
     let floor = ok(safetensors_bytes(dir, None), "file bytes") + (64 << 20) + 2 * unit;
     // Stock allocation AND the stock destination, spelled once at `PinCfg::stock`: a fixture
     // must not silently test a candidate fix. (This initializer was hand-maintained until
-    // 2026-08-19, and twice missed fields added upstream — `arena_refresh`, then
-    // `direct_vmm_dma` — which is why the stock spelling now exists.)
+    // 2026-08-19, and twice missed fields added upstream — `arena_refresh`, then the
+    // since-deleted `direct_vmm_dma` diagnostic, whose record is
+    // `docs/investigations/glm-nondeterminism-closeout.md` — which is why the stock spelling
+    // now exists.)
     let pin = PinCfg::stock(floor + extra_units * unit + 512);
     let pin = ok(K3Pin::build(dir, &cfg.text, pin), "build the tiny pin");
     ok(K3Engine::new(pin, &cfg.text, max_ctx), "build the engine")

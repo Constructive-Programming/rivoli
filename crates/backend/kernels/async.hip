@@ -62,87 +62,35 @@ extern "C" void rivoli_event_destroy(void* ev) {
 //     two HIP ops stay here, next to the other rivoli_* HIP wrappers). O_DIRECT reads
 //     land in this PINNED host arena (get_user_pages OK on pinned host — the amdgpu
 //     kernel-bug workaround from stream.rs), then an async H2D copy fills the VMM slot.
-// `coherent != 0` requests FINE-GRAINED (system-coherent) host memory instead of whatever
-// `hipHostMallocDefault` yields on this runtime. It is a CANDIDATE FIX under evaluation, not a
-// knob, and the argument is an ordering gap the rest of this file never addresses:
 //
-//   1. io_uring O_DIRECT has the NVMe DMA write this arena. The CQE establishes that those writes
-//      are visible TO THE CPU — the kernel's completion path carries the barriers for that.
-//   2. `rivoli_memcpy_h2d_async` below then reads the arena from the GPU side (copy engine or
-//      blit), with NOTHING in between (`fetch/stream.rs::reap` consumes the CQE and enqueues the
-//      copy back to back).
-//   3. **Nothing establishes that the agent performing (2) observes the writes from (1).** The CPU
-//      is neither the producer nor the consumer, so the CQE's guarantee is about the wrong agent.
-//
-// For fine-grained host memory the platform provides that guarantee by snooping. For coarse-grained
-// it does not, and an acquire is required at a synchronisation point — and a stale line is exactly
-// what the reuse pattern arranges, because a staging slot's previous contents were themselves read
-// through the GPU on an earlier fetch.
-//
-// `hipHostMallocDefault` does not SAY which it gets: on ROCm that has been runtime- and
-// environment-dependent. So this is not asserted, it is A/B-ed — which is why the flag exists and
-// why the allocation logs what it asked for.
-extern "C" void* rivoli_pinned_alloc(unsigned long long bytes, int coherent) {
+// The suspected ordering gap on this path — the CQE guarantees the NVMe DMA's writes are
+// visible to the CPU, while the agent that actually reads the arena is the GPU's copy path,
+// and nothing orders those two — is what the GLM nondeterminism investigation localised and
+// mitigated. A fine-grained (`hipHostMallocCoherent`) arena was one of its candidate fixes
+// and measured RED with the flag observed to apply, so the allocation is plain
+// `hipHostMallocDefault`; `docs/investigations/glm-nondeterminism-closeout.md` keeps that
+// record, and `docs/investigations/glm-nondeterminism-worklog.md` the arm log.
+extern "C" void* rivoli_pinned_alloc(unsigned long long bytes) {
     void* p = nullptr;
-    unsigned flags = coherent ? hipHostMallocCoherent : hipHostMallocDefault;
-    if (hipHostMalloc(&p, (size_t)bytes, flags) != hipSuccess) return nullptr;
+    if (hipHostMalloc(&p, (size_t)bytes, hipHostMallocDefault) != hipSuccess) return nullptr;
     return p;
 }
-
-// READ BACK what the runtime actually gave us. `rivoli_pinned_alloc` says what it ASKED for; this
-// says what it GOT, and the difference is the whole reason a `--pinned-coherent` arm could not be
-// believed: a flag that never applied and a fix that does not work produce the same red.
-//
-// Returns 0 and writes `*out` on success, negative on failure. `hipHostGetFlags` is the canonical
-// query — `hipPointerGetAttributes().allocationFlags` is the same information by a longer road.
-extern "C" int rivoli_pinned_flags(void* p, unsigned* out) {
-    unsigned f = 0;
-    hipError_t e = hipHostGetFlags(&f, p);
-    if (e != hipSuccess) return HIP_ERR_BASE - (int)e;
-    *out = f;
-    return 0;
-}
-
-// The bit `hipHostMallocCoherent` sets, exported so the Rust side does not hardcode a HIP constant
-// it cannot see. A run reports the requested and returned flags and whether this bit survived.
-extern "C" unsigned rivoli_pinned_coherent_bit(void) { return (unsigned)hipHostMallocCoherent; }
 
 extern "C" void rivoli_pinned_free(void* p) {
     hipHostFree(p);
 }
 
-// Async host->device copy on `stream`: bounce slot -> VMM expert slot. The caller arms
-// a signal on the same stream, so the load future resolves when the COPY lands (not
-// merely the NVMe read). Returns 0 or HIP_ERR_BASE - hipError.
-// COPY BY KERNEL instead of by the copy engine — Phase 3B, a candidate FIX.
-//
-// `hipMemcpyAsync` above dispatches to whatever path the runtime picks, typically an SDMA/blit
-// engine. This does the same move as an ordinary shader read+write, so it goes through the normal
-// vector-memory path with a kernel's own acquire at dispatch. The distinction is the whole
-// experiment: the ablation matrix says suppression needs a device-side READ of the arena's own
-// bytes, in bulk, and nothing weaker — which is what a kernel copy does and what a copy engine may
-// not.
-//
-// `uint4` (16 B) per lane: the arena and every pool slot are `VQ_ALIGN`-aligned and the byte count
-// is a multiple of the O_DIRECT block, so the vector width always divides the extent and no tail
-// case exists. Grid-stride with a bounded grid, like the folds.
-extern "C" __global__ void copy_h2d_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src,
-                                          unsigned long long n4) {
-    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n4;
-         i += (unsigned long long)blockDim.x * gridDim.x) {
-        dst[i] = src[i];
-    }
-}
-
 // ARENA REFRESH — the only intervention measured to eliminate the divergence, promoted out of the
 // probe and given its own kernel so it carries no hash nobody reads.
 //
-// WHAT IS KNOWN (2026-08-18, glm-bug.md §7b): a FULL-WIDTH device read of the just-written arena
-// window, enqueued on the fetch stream BEFORE the copy, makes GLM decode reproduce itself — four
-// clean pairs over 6144 tokens against a rate that predicts P(all clean) ~ 1e-9. Everything else
-// tried is RED: one cache line of the arena, stride-32 sampling, the same bulk from a decoy buffer,
-// the bare dispatch, a kernel copy instead of SDMA, a fine-grained arena, a write-combined arena
-// (each read back and confirmed to apply), and the staging hand-out (`slot_stalls` measured 0).
+// WHAT IS KNOWN (2026-08-18; docs/investigations/glm-nondeterminism-worklog.md §7b): a FULL-WIDTH
+// device read of the just-written arena window, enqueued on the fetch stream BEFORE the copy,
+// makes GLM decode reproduce itself — four clean pairs over 6144 tokens against a rate that
+// predicts P(all clean) ~ 1e-9. Everything else tried is RED: one cache line of the arena,
+// stride-32 sampling, the same bulk from a decoy buffer, the bare dispatch, a kernel copy instead
+// of SDMA, a fine-grained arena, a write-combined arena (each read back and confirmed to apply),
+// and the staging hand-out (`slot_stalls` measured 0). The diagnostic flags that ran those arms
+// were deleted 2026-08-20; docs/investigations/glm-nondeterminism-closeout.md keeps the record.
 //
 // WHAT IS NOT KNOWN: why. Fifteen mechanisms are eliminated and none of the survivors predicts
 // "bulk AND arena-specific". So this is a MITIGATION with a measured price, not a root-cause fix,
@@ -150,14 +98,13 @@ extern "C" __global__ void copy_h2d_kernel(uint4* __restrict__ dst, const uint4*
 // geometry could stop making the read sufficient, and nothing here would notice except the
 // determinism gate. Do not delete it without re-running `tests/determinism-glm.sh`.
 __global__ void touch_region_kernel(const uint4* __restrict__ src, unsigned long long n4,
-                                   unsigned long long* sink, unsigned long long stride) {
+                                   unsigned long long* sink) {
     unsigned long long acc = 0;
-    // Grid-stride over the REGION at `stride` uint4 per step: stride 1 is the full-width read;
-    // stride 4 touches one 16 B unit per 64 B sector, stride 8 one per 128 B line. The ablation
-    // matrix's dose-response runs on this knob, so it is a parameter rather than a second kernel.
+    // Grid-stride over the whole region: FULL WIDTH is load-bearing — the investigation's
+    // reduced-density arms (one 16 B unit per 64 B sector; one per 128 B line) were RED.
     for (unsigned long long j = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-         j * stride < n4; j += (unsigned long long)blockDim.x * gridDim.x) {
-        uint4 v = src[j * stride];
+         j < n4; j += (unsigned long long)blockDim.x * gridDim.x) {
+        uint4 v = src[j];
         acc += (unsigned long long)v.x ^ (unsigned long long)v.y ^ (unsigned long long)v.z ^
                (unsigned long long)v.w;
     }
@@ -168,50 +115,33 @@ __global__ void touch_region_kernel(const uint4* __restrict__ src, unsigned long
     }
 }
 
-// Read `n` bytes of `src` at `stride4`-uint4 density on `stream`, discarding the value. `src`
-// is whichever region the NVMe just DMA'd into: the pinned arena in BOUNCE mode
-// (--arena-refresh) or the pool slot itself in DIRECT mode (--slot-refresh). WHICH region is
-// the variable under test — reading the arena pre-copy suppresses the defect, reading the
-// destination slot post-copy (`sc`) does NOT, and direct mode with no refresh at all diverges.
-// Hence the neutral name. `stride4` is in 16 B units: 1 = full width (the one clean cell),
-// 4 = one unit per 64 B sector, 8 = one per 128 B line (~`bh-line`, RED @704). 16 B
-// granularity like the copy: every caller passes an O_DIRECT-block multiple.
+// Read `n` bytes of `src` at full width on `stream`, discarding the value. `src` is the pinned
+// arena window the NVMe just DMA'd into (`--arena-refresh`). The name stays neutral because the
+// investigation aimed the same read at other regions before the arena won: reading the arena
+// pre-copy suppresses the defect, reading the destination slot post-copy (`sc`) does NOT —
+// docs/investigations/glm-nondeterminism-closeout.md keeps that matrix. 16 B granularity like
+// the copy: every caller passes an O_DIRECT-block multiple.
 extern "C" int rivoli_touch_region_async(const void* src, unsigned long long n, void* stream,
-                                       unsigned long long* sink, unsigned long long stride4) {
-    if (n == 0 || (n % sizeof(uint4)) != 0 || stride4 == 0) return 1002;
+                                       unsigned long long* sink) {
+    if (n == 0 || (n % sizeof(uint4)) != 0) return 1002;
     unsigned long long n4 = n / sizeof(uint4);
-    unsigned long long blocks = (n4 / stride4 + 255) / 256;
+    unsigned long long blocks = (n4 + 255) / 256;
     if (blocks > 1024) blocks = 1024;
-    if (blocks == 0) blocks = 1;
     hipGetLastError();
     hipLaunchKernelGGL(touch_region_kernel, dim3((unsigned)blocks), dim3(256), 0,
-                       (hipStream_t)stream, (const uint4*)src, n4, sink, stride4);
+                       (hipStream_t)stream, (const uint4*)src, n4, sink);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
 }
 
-// ONE entry point with the path as an argument, not two entry points. The two are one operation
-// with a knob — the acceptance protocol switches between them by flag — and splitting them gave the
-// Rust side two identical 4-parameter externs and two identical call arms, which the duplication
-// gate reported twice. The branch belongs here, where both HIP calls already live.
+// Async host->device copy on `stream`: bounce slot -> VMM expert slot, `hipMemcpyAsync` (SDMA).
+// The caller arms a signal on the same stream, so the load future resolves when the COPY lands
+// (not merely the NVMe read). Returns 0 or HIP_ERR_BASE - hipError. A shader-copy alternative
+// (`--copy-by-kernel`, Phase 3B) lived here as a candidate fix and was deleted 2026-08-20 with
+// the other refuted arms — docs/investigations/glm-nondeterminism-closeout.md is the record.
 extern "C" int rivoli_memcpy_h2d_async(void* dst, const void* src, unsigned long long n,
-                                       void* stream, int by_kernel) {
-    hipError_t e;
-    if (by_kernel) {
-        // 16 B granularity is a hard requirement, not a fast path: a remainder would be silently
-        // dropped and the slot would hold a short expert. Refused loudly instead. Every caller
-        // passes an O_DIRECT-block multiple, so this cannot fire in the engine.
-        if (n == 0 || (n % sizeof(uint4)) != 0) return 1001;
-        unsigned long long n4 = n / sizeof(uint4);
-        unsigned long long blocks = (n4 + 255) / 256;
-        if (blocks > 1024) blocks = 1024;
-        hipGetLastError();
-        hipLaunchKernelGGL(copy_h2d_kernel, dim3((unsigned)blocks), dim3(256), 0,
-                           (hipStream_t)stream, (uint4*)dst, (const uint4*)src, n4);
-        e = hipGetLastError();
-    } else {
-        e = hipMemcpyAsync(dst, src, (size_t)n, hipMemcpyHostToDevice, (hipStream_t)stream);
-    }
+                                       void* stream) {
+    hipError_t e = hipMemcpyAsync(dst, src, (size_t)n, hipMemcpyHostToDevice, (hipStream_t)stream);
     return e == hipSuccess ? 0 : HIP_ERR_BASE - (int)e;
 }
 

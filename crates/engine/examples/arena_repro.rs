@@ -1,6 +1,6 @@
 //! **The minimal exhibit for the bounce-arena hop, at rate.**
 //!
-//! Usage: `arena_repro <layer-file> <iters> [stride-bytes] [--coherent] [--copy-by-kernel]`
+//! Usage: `arena_repro <layer-file> <iters> [stride-bytes] [--arena-refresh] [--copy-via-cpu]`
 //! Run under `flock /var/run/sys-gpu.lock` — see "GPU tenancy" below.
 //!
 //! Phase 1 localised GLM's nondeterminism to the pinned bounce arena: every probe cell that does
@@ -77,10 +77,6 @@ mod common;
 fn main() -> Result<()> {
     let args = common::start();
     // jscpd:ignore-end
-    let coherent = args.iter().any(|a| a == "--coherent");
-    // Phase 3B in the repro too: the same candidate fix, so a firing repro can be re-run against it
-    // without touching the engine.
-    let by_kernel = args.iter().any(|a| a == "--copy-by-kernel");
     // ARENA REFRESH: the engine-side mitigation, testable here too so a firing repro can be
     // re-run against it without the engine.
     let refresh = args.iter().any(|a| a == "--arena-refresh");
@@ -89,7 +85,9 @@ fn main() -> Result<()> {
     let by_cpu = args.iter().any(|a| a == "--copy-via-cpu");
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let [file, iters, rest @ ..] = pos.as_slice() else {
-        bail!("usage: arena_repro <layer-file> <iters> [stride-bytes] [--coherent]");
+        bail!(
+            "usage: arena_repro <layer-file> <iters> [stride-bytes] [--arena-refresh] [--copy-via-cpu]"
+        );
     };
     let iters: usize = iters.parse().context("iters")?;
     // Default 15,335,424 B = the GLM `.vq3` expert stride (`4096 + 257 * stride` reproduces
@@ -126,17 +124,12 @@ fn main() -> Result<()> {
         stride as f64 / (1u64 << 20) as f64
     );
 
-    // `bounce: true` — the repro exists to exercise the arena hop, so the arena-less
-    // `--direct-vmm-dma` destination is not one of its arms by construction.
     let mut streamer = Streamer::new(
         SLOTS,
         slot_span(stride),
         rivoli_engine::fetch::stream::FetchKnobs {
-            coherent,
-            by_kernel,
             arena_refresh: refresh,
             cpu_copy: by_cpu,
-            ..Default::default()
         },
     )?;
     let fetch = rivoli_backend::Stream::fetch()?;
@@ -249,17 +242,12 @@ fn main() -> Result<()> {
     // The bound is the point of a clean run, so it is printed rather than left to the reader: at 0
     // events over N reads the 95% upper bound on the per-read rate is 3/N (the rule-of-three).
     println!(
-        "arena_repro: {reads} reads, {bad} MISMATCHES, {:.0} reads/s, {:.1} s, arena={}, \
-         copies=[memcpy {} / kernel {} / cpu {}]",
+        "arena_repro: {reads} reads, {bad} MISMATCHES, {:.0} reads/s, {:.1} s, \
+         copies=[memcpy {} / cpu {}]",
         reads as f64 / secs,
         secs,
-        match coherent {
-            true => "hipHostMallocCoherent",
-            false => "hipHostMallocDefault",
-        },
         streamer.copies_issued()[0],
         streamer.copies_issued()[1],
-        streamer.copies_issued()[2],
     );
     if bad == 0 {
         println!(

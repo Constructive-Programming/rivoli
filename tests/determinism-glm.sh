@@ -86,8 +86,8 @@ set -uo pipefail
 # EXTRA FLAGS APPENDED TO BOTH ARMS — how a candidate fix is gated without a second script.
 #
 # The acceptance protocol compares an unpatched RED control against a patched GREEN, so the two runs
-# must differ in exactly the flag under test and in nothing else. `DETERMINISM_FIX_FLAGS='--pinned-
-# coherent'` is the whole difference, and it is PRINTED with the verdict: a recorded green that does
+# must differ in exactly the flag under test and in nothing else. `DETERMINISM_FIX_FLAGS='--copy-via-
+# cpu'` is the whole difference, and it is PRINTED with the verdict: a recorded green that does
 # not say what it was measured on is the `--prompt '<P>'` failure again, one level up.
 #
 # An env var rather than a flag because this script is not a cargo run and the house rule allows one

@@ -69,39 +69,13 @@ pub struct PoolCfg<'a> {
     pub two_q: cache::TwoQSplit,
     /// `--trace` sink path, v2 format.
     pub trace: Option<&'a str>,
-    /// Allocate the bounce arena FINE-GRAINED (`hipHostMallocCoherent`) — the candidate fix for
-    /// the ordering gap argued at `kernels/async.hip::rivoli_pinned_alloc`. Off is the historical
-    /// behaviour, and the two are meant to be A/B-ed.
-    pub pinned_coherent: bool,
-    /// Move bounce->slot bytes with a shader copy instead of `hipMemcpyAsync` — `--copy-by-kernel`,
-    /// Phase 3B's candidate fix.
-    pub copy_by_kernel: bool,
-    /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
+    /// ARENA REFRESH mitigation — see `fetch::stream` and
+    /// `docs/investigations/glm-nondeterminism-worklog.md`.
     pub arena_refresh: bool,
-    /// `--direct-vmm-dma`: no bounce arena and no H2D copy — the O_DIRECT read DMAs straight
-    /// into the pool slot. The diagnostic arm for the GLM nondeterminism defect; measurably
-    /// the slower mechanism. See `crate::fetch::stream::Streamer::bounce`.
-    pub direct_vmm_dma: bool,
-    /// `--slot-refresh`: full-width read of the pool slot the drive just DMA'd into, enqueued
-    /// before the ticket signal. DIRECT only. See `crate::fetch::stream::Streamer::slot_refresh`.
-    pub slot_refresh: bool,
     /// `--copy-via-cpu`: the bounce→slot hop as a host memcpy on the reaper thread — the
     /// candidate fix; no GPU agent then reads IO-written memory. See
     /// `crate::fetch::stream::FetchKnobs::cpu_copy`.
     pub copy_via_cpu: bool,
-    /// `--fetch-settle-us`: pure host time between each CQE and its copy — the
-    /// time-vs-address discriminator. See `crate::fetch::stream::FetchKnobs::settle_us`.
-    pub fetch_settle_us: u64,
-    /// `--arena-refresh-decoy`: the refresh read aimed at a pinned arena the NVMe never
-    /// writes. See `crate::fetch::stream::FetchKnobs::arena_refresh_decoy`.
-    pub arena_refresh_decoy: bool,
-    /// `--arena-refresh-stride`: the refresh at reduced density. See `FetchKnobs::arena_refresh_stride`.
-    pub arena_refresh_stride: u64,
-    /// `--arena-refresh-late`: the refresh AFTER the copy. See `FetchKnobs::arena_refresh_late`.
-    pub arena_refresh_late: bool,
-    /// `--cpu-retouch` (direct only): CPU read+write-back of the just-DMA'd slot. See
-    /// `crate::fetch::stream::FetchKnobs::cpu_retouch`.
-    pub cpu_retouch: bool,
 }
 
 /// One layer's routed selection — the router's picks, in RANK order (load-bearing for
@@ -284,17 +258,8 @@ impl RoutedPool {
             ring as u32,
             slot_span(stride),
             crate::fetch::stream::FetchKnobs {
-                coherent: cfg.pinned_coherent,
-                by_kernel: cfg.copy_by_kernel,
                 arena_refresh: cfg.arena_refresh,
-                bounce: !cfg.direct_vmm_dma,
-                slot_refresh: cfg.slot_refresh,
                 cpu_copy: cfg.copy_via_cpu,
-                settle_us: cfg.fetch_settle_us,
-                arena_refresh_decoy: cfg.arena_refresh_decoy,
-                arena_refresh_stride: cfg.arena_refresh_stride,
-                arena_refresh_late: cfg.arena_refresh_late,
-                cpu_retouch: cfg.cpu_retouch,
             },
         )?)?;
         Ok(Self {

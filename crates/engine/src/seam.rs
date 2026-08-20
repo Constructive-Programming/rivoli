@@ -166,7 +166,7 @@ pub struct OpenSpec {
     pub max_ctx: usize,
 }
 
-/// The routed-expert pool's startup knobs — the three that describe a POOL, which both routed
+/// The routed-expert pool's startup knobs — the ones that describe a POOL, which both routed
 /// arms have and a dense architecture has none of.
 ///
 /// **The routed FORMAT is deliberately not here**, and its absence is what makes this one type
@@ -180,50 +180,22 @@ pub struct PoolKnobs<'a> {
     pub cache_policy: &'a str,
     pub two_q: TwoQSplit,
     pub trace_path: Option<&'a str>,
-    /// `--pinned-coherent`: allocate the io_uring bounce arena FINE-GRAINED.
+    /// ARENA REFRESH mitigation — see `fetch::stream` and
+    /// `docs/investigations/glm-nondeterminism-worklog.md`.
     ///
-    /// **A candidate FIX under evaluation, not an instrument**, which is why it is here rather
-    /// than behind a feature: the acceptance protocol compares two release binaries differing in
-    /// exactly this flag, and a fix that can only be reached in a probe build cannot be measured
-    /// against a stock one. It applies to every routed arm because every routed arm has the same
-    /// arena and the same ordering gap (`kernels/async.hip::rivoli_pinned_alloc`).
-    pub pinned_coherent: bool,
-    /// `--copy-by-kernel`: Phase 3B's candidate fix, on the same footing as `pinned_coherent` —
-    /// a flag rather than a feature, so the protocol can compare two release binaries.
-    pub copy_by_kernel: bool,
-    /// ARENA REFRESH mitigation — see `fetch::stream` and `glm-bug.md`.
+    /// **A mitigation and a candidate FIX ride here, not behind a feature**: the acceptance
+    /// protocol compares two release binaries differing in exactly one flag, and a fix that
+    /// can only be reached in a probe build cannot be measured against a stock one. They apply
+    /// to every routed arm because every routed arm has the same arena and the same suspected
+    /// ordering gap (`kernels/async.hip::rivoli_pinned_alloc`). The investigation's nine
+    /// diagnostic knobs rode here too until 2026-08-20 —
+    /// `docs/investigations/glm-nondeterminism-closeout.md` is the record.
     pub arena_refresh: bool,
-    /// `--direct-vmm-dma`: no bounce arena, no H2D copy — the read DMAs into the pool slot.
-    /// The diagnostic arm for whether the arena is the LOCUS of the nondeterminism defect
-    /// or only where its repair landed. Measurably slower; see `Streamer::bounce`.
-    pub direct_vmm_dma: bool,
-    /// `--slot-refresh`: DIRECT-mode full-width read of the just-DMA'd pool slot. The arm that
-    /// tests whether the repair follows THE REGION rather than the arena.
-    pub slot_refresh: bool,
     /// `--copy-via-cpu`: the bounce→slot hop as a host memcpy on the reaper thread — the
     /// candidate FIX. After it, no GPU agent reads memory the NVMe wrote: the CPU reads the
     /// arena (the CQE's own guarantee) and writes the slot (the CPU→GPU coherence the resident
     /// tier's startup load already spends). See `fetch::stream::FetchKnobs::cpu_copy`.
     pub copy_via_cpu: bool,
-    /// `--fetch-settle-us`: pure host time between each CQE and its copy — the diagnostic the
-    /// ablation matrix never had, since its equal-duration control (`bh-decoy`) read a DEVICE
-    /// buffer and never held duration. Clean ⇒ the repair is time. `FetchKnobs::settle_us`.
-    pub fetch_settle_us: u64,
-    /// `--arena-refresh-decoy`: the `--arena-refresh` read aimed at a pinned host arena the
-    /// NVMe never writes — same kernel, bytes, memory type and duration, different addresses.
-    /// Clean ⇒ time/traffic; red ⇒ address-specific. `FetchKnobs::arena_refresh_decoy`.
-    pub arena_refresh_decoy: bool,
-    /// `--arena-refresh-stride N`: the refresh at one 16 B unit per N — the dose-response
-    /// sweep. N=4 is the 64 B sector hypothesis's prediction. `FetchKnobs::arena_refresh_stride`.
-    pub arena_refresh_stride: u64,
-    /// `--arena-refresh-late`: the refresh AFTER the copy — separates "repair precedes the
-    /// COPY" from "precedes the CONSUMER". `FetchKnobs::arena_refresh_late`.
-    pub arena_refresh_late: bool,
-    /// `--cpu-retouch` (with `--direct-vmm-dma`): the reaper CPU-reads the just-DMA'd slot and
-    /// writes it back — the payload unchanged, the last WRITER changed from the NVMe's DMA to
-    /// the CPU. The `--copy-via-cpu` premise tested against the one condition that still
-    /// fires. `FetchKnobs::cpu_retouch`.
-    pub cpu_retouch: bool,
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -514,17 +486,8 @@ impl<'a> Engine<'a> {
 #[cfg(feature = "rocm")]
 fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_> {
     crate::resident::PinCfg {
-        pinned_coherent: knobs.pinned_coherent,
-        copy_by_kernel: knobs.copy_by_kernel,
         arena_refresh: knobs.arena_refresh,
-        direct_vmm_dma: knobs.direct_vmm_dma,
-        slot_refresh: knobs.slot_refresh,
         copy_via_cpu: knobs.copy_via_cpu,
-        fetch_settle_us: knobs.fetch_settle_us,
-        arena_refresh_decoy: knobs.arena_refresh_decoy,
-        arena_refresh_stride: knobs.arena_refresh_stride,
-        arena_refresh_late: knobs.arena_refresh_late,
-        cpu_retouch: knobs.cpu_retouch,
         capacity,
         cache_policy: knobs.cache_policy,
         two_q: knobs.two_q,
