@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: UPDATED 2026-08-19: STILL OPEN — but the matrix's one refutation of the delay class was unmeasured, and there is now a validated FIX CANDIDATE with the mechanism narrowed to an operational rule. The `bh-decoy` arm ("not bandwidth or delay", RED @12) read a DEVICE buffer at ~10x the pinned arena's bandwidth, so duration was never held constant and the visibility class was live the whole time. Under the condition that keeps the defect firing (int4 + steady CPU/NFS/NVMe load; control RED @311 and @38): a pure 1.5 ms settle is RED @227 (time alone does not repair), a full-width touch of a never-DMA'd decoy arena is GREEN (the arena's addresses do not matter), the same touch AFTER the copy is GREEN (the repair need only precede the consumer). The surviving rule is operational: a GPU agent reading NVMe-DMA'd memory can read stale; GPU read traffic over the HOST-memory path — any addresses — repairs when it lands before the consumer; time, device-memory traffic, and the bare dispatch do not. THE FIX: `--copy-via-cpu` makes the bounce→slot hop a host memcpy on the reaper thread, so no GPU agent reads IO-written memory (the CPU's read of the arena is the CQE's own guarantee — the one btrfs's datasum check already spends; the CPU's write to the pool is the coherence the resident tier's 281 GB startup load already spends). In the live window it is GREEN and byte-identical to the control's CORRECT arm — it computes the true function, at ~11% cost quiet / ~4% loaded against `--arena-refresh`'s 1-3% unexplained mitigation. NOT CLOSED: the fix's clean exposure is one live-window pair against the §5 bar of several thousand controlled tokens (accumulation continues in int4+load); `--copy-by-kernel` flipped RED(2026-08-17)→GREEN(2026-08-19) unreconciled; one routing-churn anomaly with byte-identical ids awaits its reproducibility test; and no microarchitectural structure is named, which is what AMD and a final verdict both still need. Supersedes the 2026-08-18 verdict below, which stands in the body: the arena is not the locus, sixteen mechanisms were eliminated by measurement, and `--slot-refresh` killed the read-the-region rule.
+verdict: UPDATED 2026-08-20: STILL OPEN, with a validated FIX CANDIDATE and the mechanism narrowed to an operational rule — a GPU agent reading memory the NVMe's DMA just wrote can read stale, and GPU read traffic over the HOST-memory path (any addresses) repairs it when it lands before the consumer; time, device-memory traffic, and the bare dispatch do not (§6). THE FIX: `--copy-via-cpu` makes the bounce→slot hop a host memcpy so no GPU agent reads IO-written memory — GREEN in the live int4+load window and byte-identical to the control's correct arm, at ~11% quiet / ~4% loaded against `--arena-refresh`'s 1-3% unexplained mitigation. Closure still needs — exposure to the §5 bar, the default-on decision, the `--copy-by-kernel` RED(08-17)→GREEN(08-19) reconciliation, and a named microarchitectural structure (the one exhibit AMD would act on). Supersedes the 2026-08-18 verdict, which stands in the body — the arena is not the locus, sixteen mechanisms eliminated by measurement, `--slot-refresh` killed the read-the-region rule. 2026-08-20 — the nine refuted/answered diagnostic flags were DELETED from the engine (kept: `--arena-refresh`, `--copy-via-cpu`, `--divergence-log`); §2's matrix is the record.
 ---
 
 # GLM decode nondeterminism — closeout
@@ -14,7 +14,8 @@ position 13.
 
 **Where it stands.** Mitigated and gated by `--arena-refresh`; **root cause unknown**; the
 structure everyone assumed was the locus has been eliminated. The working record with every
-intermediate arm is `glm-bug.md`; this document is the closeout.
+intermediate arm is `glm-nondeterminism-worklog.md` (was root-level `glm-bug.md`, vendored
+2026-08-20); this document is the closeout.
 
 ---
 
@@ -77,19 +78,15 @@ read of 15335424 B of pool slot 2`), so this is not a non-applying arm. **The ru
 
 ### What is left is one point, not a rule
 
-| region read | when | next consumer | result |
-|---|---|---|---|
-| **pinned host arena** | **before the copy** | **SDMA engine** | **CLEAN** |
-| pool slot | after the copy (`sc`) | MoE kernel | RED @236 |
-| every slot | end of layer (`se`) | MoE kernel | RED @301 |
-| pool slot | after the DMA, pre-signal (`--slot-refresh`) | MoE kernel | **RED @300** |
-| nothing (`--direct-vmm-dma`) | — | MoE kernel | RED @420 |
+> **SUPERSEDED 2026-08-19 by §6**, which isolated the question this section left open. The
+> cells this section tabulated are rows 1, 5, 7, 13 and 16 of §2's matrix; the reading —
+> exactly one clean configuration, three unseparated properties — was correct on 2026-08-18
+> and §6's decoy/late/settle arms then separated them.
 
-**Exactly one configuration has ever been clean**, and **three** properties separate it from
-today's red arm — the region is *pinned host* memory rather than device-local VMM; the next
-consumer is the *copy engine* rather than a compute kernel; and a copy exists at all. **None of
-the three is isolated by any measurement.** Naming which one matters is the next question, and it
-is a smaller question than the one this investigation started with.
+**Exactly one configuration had ever been clean** (the pinned host arena, read before the copy,
+next consumer the SDMA engine), and three properties separated it from the red arms — pinned
+host memory vs device VMM, copy engine vs compute kernel as next consumer, and the existence of
+a copy at all. Naming which one mattered was the next question, and §6 answered it.
 
 ### The compaction confound on the direct arms — closed
 
@@ -120,6 +117,12 @@ Both direct arms are only evidence about the shared defect if their divergence i
 Every arm below was **read back and confirmed to have applied**, after two rounds were lost to
 interventions that never took effect (an intervention that did not apply and one that does not
 work produce the same red).
+
+> **2026-08-20: the diagnostic flags below no longer exist in the engine.** Each answered its
+> question and was deleted (house precedent: LOOKA hints). What remains buildable is
+> `--arena-refresh` (the mitigation), `--copy-via-cpu` (the fix candidate) and
+> `--divergence-log` (the localiser, feature `corruption-probe`). This matrix is the record;
+> rebuild an arm from its row if the AMD hunt (§6, closure item 4) ever needs it re-run.
 
 ### Fix candidates
 
@@ -362,22 +365,17 @@ delta over the unexplained mitigation is the owner's call, now with both prices 
 
 ### One anomaly, and the memory-state reading of it
 
-One fix arm (int3-vq quiet) ended with a different hit/miss split (72,170 vs 70,030 misses)
-and +529 relocations while its 512 ids stayed byte-identical to the other three arms'. Budget
-(98.4 GiB) and pin (6,872 of 19,200) are byte-identical across all four runs and `slot_stalls`
-is 0, so a changed partition cannot explain it within this series. Two readings remain open:
-a sub-argmax event (routing churn without an output flip), or a residency difference of the
-class the owner named on review — **"total used and available memory changed"**: any run whose
-pin derives from free memory (no literal `--max-mem`, or a mid-run tenant in the old tree)
-gets a different resident set, hence different miss counts, at *identical* output (P4 — the
-memory knob trades speed, never text). That reading is correct in principle and it has a
-teeth-cutting consequence here: `glm-nondeterminism.md`'s "`a2`'s hit rate differs from `a`'s
+One fix arm (int3-vq quiet) ended with a different hit/miss split (72,170 vs 70,030 misses,
++529 relocations) while its 512 ids stayed byte-identical to the other three arms'. **The
+reproducibility test ran: two further fix arms came back at the common counts with ids
+byte-identical to the controls — the anomaly did not recur.** Class explanation (owner, on
+review): any run whose pin derives from free memory gets a different resident set, hence
+different miss counts, at identical output (P4 — the memory knob trades speed, never text).
+The teeth-cutting consequence: `glm-nondeterminism.md`'s "`a2`'s hit rate differs from `a`'s
 … is a result, not noise" — recorded as the defect's upstream signature — is **confounded**
-by exactly this class whenever the two runs' memory state differed, and the a-series' memory
-state was never recorded. The id divergences stand; one supporting signature does not. **The
-reproducibility test then ran: two further fix arms came back at the common counts (70,030
-misses, 20,490 relocs) with ids byte-identical to the controls — the anomaly did not recur.**
-It is recorded as a singular observation, class-explained, not chased further.
+by exactly this class, and the a-series' memory state was never recorded. The id divergences
+stand; that one supporting signature does not. Recorded as a singular observation,
+class-explained, not chased further.
 
 ### What closure still needs
 
