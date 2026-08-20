@@ -388,6 +388,21 @@ fn the_draw_gate_reds_on_a_wrong_seed() {
 // 2. The clean forward.
 // ------------------------------------------------------------------------------------------
 
+/// The float-table census: nothing in the golden goes unscored but the two forward INPUTS
+/// (`draft.context_concat`, `draft.noise_embeds`), and the masks number exactly one per layer.
+fn assert_float_census(case: &Case, pairs: &[(String, &'static str, Vec<f64>)]) {
+    let scored_names: Vec<&str> = pairs.iter().map(|(n, _, _)| n.as_str()).collect();
+    let mut masks = 0;
+    for (name, _, _) in &case.golden.floats {
+        if name.ends_with(".attend.mask") {
+            masks += 1;
+        } else if name != "draft.context_concat" && name != "draft.noise_embeds" {
+            assert!(scored_names.contains(&name.as_str()), "{name} is unscored");
+        }
+    }
+    assert_eq!(masks, case.dims.layers, "{}: mask census", case.name);
+}
+
 /// **The oracle reproduces every captured value of both draft goldens** inside the measured
 /// tolerances: 39 Rel-scored captures per salt, the 5 masks and the block embedding bit-exact,
 /// and the candidate ids identical. The census is an absolute against the golden's own float
@@ -415,17 +430,7 @@ fn the_oracle_reproduces_every_captured_value_of_both_goldens() {
                 tol_for(operator)
             );
         }
-        // The float-table census: nothing in the golden goes unscored but the two inputs.
-        let scored_names: Vec<&str> = pairs.iter().map(|(n, _, _)| n.as_str()).collect();
-        let mut masks = 0;
-        for (name, _, _) in &case.golden.floats {
-            if name.ends_with(".attend.mask") {
-                masks += 1;
-            } else if name != "draft.context_concat" && name != "draft.noise_embeds" {
-                assert!(scored_names.contains(&name.as_str()), "{name} is unscored");
-            }
-        }
-        assert_eq!(masks, case.dims.layers, "{}: mask census", case.name);
+        assert_float_census(&case, &pairs);
         // The INT table too, by NAME, or the headline claim above is about the float table
         // only. `block_ids` and `target_layer_ids` are read as inputs (here and in `dims_from`),
         // `candidates` is scored below, and `prompt.ids` is the driver's record of what it fed

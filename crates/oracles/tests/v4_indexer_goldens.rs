@@ -125,6 +125,34 @@ fn set_of(row: &[i64]) -> std::collections::BTreeSet<i64> {
     row.iter().copied().filter(|&v| v >= 0).collect()
 }
 
+/// One step's rows against both claims. Returns (truncated, non-empty below-cap) counts —
+/// counted here, ASSERTED by the caller, so the anti-vacuity floors stay in the test body
+/// beside the argument for their values.
+fn check_step_rows(prompt: usize, s: &Step) -> (usize, usize) {
+    let (mut truncated, mut below_cap) = (0usize, 0usize);
+    for (t, (row, &limit)) in s.sel.iter().zip(&s.limits).enumerate() {
+        let got = set_of(row);
+        if limit <= TOPK {
+            // Claim 1: below the cap, the selection IS every causally-legal block.
+            // Counted only when there IS one — a `limit == 0` row compares two
+            // empty sets and would let the caller's floor be met vacuously.
+            below_cap += usize::from(limit >= 1);
+            let want: std::collections::BTreeSet<i64> =
+                (0..limit as i64).map(|c| c + s.offset).collect();
+            assert_eq!(got, want, "prompt {prompt} row {t}: below-cap set");
+        } else {
+            truncated += 1;
+            assert_eq!(got.len(), TOPK, "prompt {prompt} row {t}: k survivors");
+            assert!(
+                got.iter()
+                    .all(|&v| v >= s.offset && v < s.offset + limit as i64),
+                "prompt {prompt} row {t}: a selected block is causally illegal"
+            );
+        }
+    }
+    (truncated, below_cap)
+}
+
 /// Claims 1 and 2, over every captured step of two runs — one whose prefill crosses the
 /// truncation boundary at its last row (prompt 12) and one that crosses it four rows deep
 /// (prompt 16), plus every decode step, all of which sit above it.
@@ -139,26 +167,9 @@ fn the_exported_scores_determine_the_exported_selection_and_below_the_cap_keep_e
             // list-equal, not merely set-equal, so the tie rule and the `-1` mapping are
             // both pinned.
             assert_eq!(recompute(s), s.sel, "prompt {prompt}: rule drifted");
-            for (t, (row, &limit)) in s.sel.iter().zip(&s.limits).enumerate() {
-                let got = set_of(row);
-                if limit <= TOPK {
-                    // Claim 1: below the cap, the selection IS every causally-legal block.
-                    // Counted only when there IS one — a `limit == 0` row compares two
-                    // empty sets and would let the floor below be met vacuously.
-                    below_cap_rows += usize::from(limit >= 1);
-                    let want: std::collections::BTreeSet<i64> =
-                        (0..limit as i64).map(|c| c + s.offset).collect();
-                    assert_eq!(got, want, "prompt {prompt} row {t}: below-cap set");
-                } else {
-                    truncated_rows += 1;
-                    assert_eq!(got.len(), TOPK, "prompt {prompt} row {t}: k survivors");
-                    assert!(
-                        got.iter()
-                            .all(|&v| v >= s.offset && v < s.offset + limit as i64),
-                        "prompt {prompt} row {t}: a selected block is causally illegal"
-                    );
-                }
-            }
+            let (truncated, below_cap) = check_step_rows(prompt, s);
+            truncated_rows += truncated;
+            below_cap_rows += below_cap;
         }
     }
     // Anti-vacuity, BOTH sides, because the two claims live on opposite sides of the cap
