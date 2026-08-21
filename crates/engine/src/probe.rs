@@ -287,6 +287,29 @@ impl Folds {
     }
 }
 
+/// The device buffer a fold reads: `n` live f32 at `ptr`. Grouped because a bare pointer
+/// and a bare length are a transposable pair every call site would carry, and a fold over
+/// the wrong extent hashes bytes nobody meant — which reads in a diff as evidence about a
+/// quantity that was never measured.
+#[derive(Clone, Copy)]
+pub struct FoldBuf {
+    pub ptr: *const f32,
+    pub n: usize,
+}
+
+/// The coordinate that names a record — the log's first three columns. Grouped because
+/// `pos`, `nrow` and `layer` are three bare `usize` any caller can transpose, every
+/// transposition still typechecks, and a transposed coordinate mislabels every row of the
+/// log a pair of runs is then diffed by. `pos` is the PASS's first row and `nrow` how many
+/// rows it carried: `(pos=k, nrow=1)` is token k in decode, `(pos=k, nrow=2)` a
+/// layer-major prefill row-block.
+#[derive(Clone, Copy)]
+pub struct RowCoord {
+    pub pos: usize,
+    pub nrow: usize,
+    pub layer: usize,
+}
+
 /// One log row, as a pure function of the drained fold words and the layer's host columns.
 ///
 /// `pub` so `crates/engine/tests/probe_format.rs` can reach it: the tests below used to live in
@@ -301,14 +324,8 @@ impl Folds {
 /// conclusion on this bug was checked by reading the code.
 ///
 /// `w` is the layer's [`NQ`] fold words in [`Q`] order.
-pub fn format_row(
-    pos: usize,
-    nrow: usize,
-    layer: usize,
-    w: &[u64],
-    cols: Option<Cols>,
-    folds: Folds,
-) -> String {
+pub fn format_row(at: RowCoord, w: &[u64], cols: Option<Cols>, folds: Folds) -> String {
+    let RowCoord { pos, nrow, layer } = at;
     // `-` MEANS NOT MEASURED and is never 0. A fold is absent when the run did not ENABLE it
     // (`--divergence-folds`) and when the layer gave it nothing to do — `bh`/`sc` bracket a copy,
     // so with no miss there was no copy; `se` runs on every MoE layer. Printing 0 for either would
@@ -534,16 +551,16 @@ impl Probe {
         self.slot_ptr(layer, q)
     }
 
-    /// XOR-fold `n` device f32 at `x` into `(layer, q)`'s slot, on the null stream. No sync, no
+    /// XOR-fold the device f32 in `x` into `(layer, q)`'s slot, on the null stream. No sync, no
     /// D2H.
     ///
     /// # Safety
-    /// `x` must be `n` live device f32 whose writers have retired.
-    pub unsafe fn fold(&mut self, q: Q, layer: usize, x: *const f32, n: usize) -> Result<()> {
+    /// `x.ptr` must be `x.n` live device f32 whose writers have retired.
+    pub unsafe fn fold(&mut self, q: Q, layer: usize, x: FoldBuf) -> Result<()> {
         let out = self.slot_ptr(layer, q)?;
-        // SAFETY: `out` is one live device u64 inside the slab; `x`/`n` are the caller's
+        // SAFETY: `out` is one live device u64 inside the slab; `x` is the caller's
         // contract, forwarded.
-        unsafe { launch_hash_rows(x, n, 1, 0, out, rivoli_backend::NULL_STREAM) }
+        unsafe { launch_hash_rows(x.ptr, x.n, 1, 0, out, rivoli_backend::NULL_STREAM) }
     }
 
     /// Record a MoE layer's host columns for the pass in flight.
@@ -604,9 +621,11 @@ impl Probe {
             .collect();
         for l in layers {
             let row = format_row(
-                pos,
-                nrow,
-                l,
+                RowCoord {
+                    pos,
+                    nrow,
+                    layer: l,
+                },
                 words
                     .get(l * NQ..l * NQ + NQ)
                     .context("divergence probe: fold slots outside the drained slab")?,

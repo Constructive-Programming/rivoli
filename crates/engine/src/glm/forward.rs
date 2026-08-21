@@ -248,7 +248,7 @@ impl GlmEngine<'_> {
             if let Some(p) = self.probe.as_mut().filter(|p| p.folds().xa) {
                 // SAFETY: `xp` is this pass's residual rows, live f32, written on the null stream
                 // by `attention` above, which orders against this launch.
-                unsafe { p.fold(crate::probe::Q::Xa, l, xa, n)? };
+                unsafe { p.fold(crate::probe::Q::Xa, l, crate::probe::FoldBuf { ptr: xa, n })? };
             }
         }
         #[cfg(feature = "corruption-probe")]
@@ -257,7 +257,7 @@ impl GlmEngine<'_> {
             if let Some(p) = self.probe.as_mut() {
                 // SAFETY: `xn` is nrow*hidden live device f32, written on the null stream by
                 // the rmsnorm inside `attention` above, which orders against this launch.
-                unsafe { p.fold(crate::probe::Q::Xn, l, xn, n)? };
+                unsafe { p.fold(crate::probe::Q::Xn, l, crate::probe::FoldBuf { ptr: xn, n })? };
             }
         }
         match &self.pin.layers[l].mlp {
@@ -298,7 +298,7 @@ impl GlmEngine<'_> {
             if let Some(p) = self.probe.as_mut() {
                 // SAFETY: `xp` is this pass's residual rows, `n` live f32 inside `x`, and
                 // the `device_sync` above retired every writer.
-                unsafe { p.fold(crate::probe::Q::X, l, x, n)? };
+                unsafe { p.fold(crate::probe::Q::X, l, crate::probe::FoldBuf { ptr: x, n })? };
             }
         }
         Ok(())
