@@ -612,9 +612,11 @@ impl Streamer {
         let r = unsafe {
             rivoli_backend::launch_hash_rows(
                 buf,
-                count,
-                stride,
-                (ud as u64) * n as u64,
+                rivoli_backend::HashSpan {
+                    n: count,
+                    stride,
+                    i_base: (ud as u64) * n as u64,
+                },
                 acc,
                 stream,
             )

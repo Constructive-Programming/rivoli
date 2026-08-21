@@ -560,7 +560,14 @@ impl Probe {
         let out = self.slot_ptr(layer, q)?;
         // SAFETY: `out` is one live device u64 inside the slab; `x` is the caller's
         // contract, forwarded.
-        unsafe { launch_hash_rows(x.ptr, x.n, 1, 0, out, rivoli_backend::NULL_STREAM) }
+        unsafe {
+            let span = rivoli_backend::HashSpan {
+                n: x.n,
+                stride: 1,
+                i_base: 0,
+            };
+            launch_hash_rows(x.ptr, span, out, rivoli_backend::NULL_STREAM)
+        }
     }
 
     /// Record a MoE layer's host columns for the pass in flight.

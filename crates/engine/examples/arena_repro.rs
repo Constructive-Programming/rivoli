@@ -296,9 +296,11 @@ impl Harness {
             unsafe {
                 rivoli_backend::launch_hash_rows(
                     self.dst[slot].ptr() as *const f32,
-                    n_f32,
-                    1,
-                    0,
+                    rivoli_backend::HashSpan {
+                        n: n_f32,
+                        stride: 1,
+                        i_base: 0,
+                    },
                     (self.folds.ptr_mut() as *mut u64).add(slot),
                     self.fetch.raw(),
                 )?
