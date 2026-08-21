@@ -22,3 +22,21 @@ safetensors = { version = "0.8.0", default-features = false, features = ["alloc"
 # dependency) and `http` (a network fetcher this engine must never grow), leaving the
 # pure-Rust pattern engine the GLM pre-tokenizer's lookarounds need.
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# Kimi-K3's vocabulary is tiktoken, not HuggingFace JSON, so `tokenizers` cannot read it
+# (`src/tiktoken.rs` carries why). Both of these are ALREADY in the dependency graph as
+# transitive deps of `tokenizers` at these exact versions, so naming them directly adds zero
+# compilation and zero supply-chain surface — which is the whole argument for reusing them
+# instead of hand-rolling. `fancy-regex` is the only engine here that can express K3's
+# `\s+(?!\S)`: the `regex` crate has no lookaround at all, and dropping that alternative
+# changes whitespace tokenization silently.
+fancy-regex = "0.14"
+base64 = "0.22"
+# **`tiktoken-rs` was considered and DECLINED**, recorded because it is the first thing a reader
+# will ask about. It would replace the ~80 lines of `encode`/`find_special`/`bpe` in
+# `src/tiktoken.rs` and none of the rest (the dense-rank check, the positional 256-slot block,
+# the same-class run cap), so it buys under half the module while adding a package that vendors
+# OpenAI's own vocabularies. The deciding argument is in the checkpoint's own comments: BOTH caps
+# `tokenization_kimi.py` carries exist to dodge panics inside that very Rust core
+# (`pyo3_runtime.PanicException` at line 157, `openai/tiktoken` issue 195 at line 160), so
+# adopting it would turn `MAX_SAME_CLASS_RUN` from a parity detail into a hard requirement and
+# make an unported outer cap a crash rather than a declared deviation.

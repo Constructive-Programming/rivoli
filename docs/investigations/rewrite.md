@@ -489,7 +489,16 @@ Deliberately OUT of M9, each named in place: a real-checkpoint decode (no K3 che
 on this box; the pin reads ~1.3 TiB when one arrives, `--ctx ≤ 8192`), the three
 declared performance costs (shared-MLP stream overlap, the strided attend that kills the
 masked-full-width waste, chunked-KDA prefill with the UT-transform inverse), a chat
-encoding (`--port` refuses; none exists in any tree), MTP.
+encoding (`--port` refuses), MTP.
+
+> **CORRECTED 2026-08-16.** The chat-encoding item read "(`--port` refuses; none exists in any
+> tree)". The checkpoint itself disproves the parenthetical: Kimi-K3 ships `encoding_k3.py`, a
+> 647-line first-party XTML renderer. What it does not ship is a `chat_template`, which is the
+> narrower true claim. `--port` still refuses and should — porting the encoder needs an
+> id-pinned golden against its own output, and the tokenizer it would encode through does not
+> exist here either (K3 is tiktoken; there is no `tokenizer.json`). Found on first contact with
+> the real checkpoint, which also corrected the same sentence in `main.rs` twice over —
+> `docs/investigations/k3-first-checkpoint.md` §3, §4.
 
 
 ## The quality mandate (DONE 2026-08-15, owner-driven, same day as M0-M3)

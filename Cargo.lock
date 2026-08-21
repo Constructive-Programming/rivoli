@@ -1207,6 +1207,8 @@ name = "rivoli-artifact"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "fancy-regex",
  "half",
  "libc",
  "memmap2",

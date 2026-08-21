@@ -343,6 +343,26 @@ pub fn write_config(src: &std::path::Path, config: &serde_json::Value) {
     .expect("write the fixture config");
 }
 
+/// Write the fixture's aux sidecars — the files a converter COPIES into the artifact rather
+/// than reads, as `(name, body)` pairs.
+///
+/// Shared for `write_config`'s reason: jscpd reported the identical `for (name, body) in [...]
+/// { fs::write }` loop the moment K3's list stopped being a different length from V4's
+/// (2026-08-16, when K3's was corrected against the real checkpoint). **THREE gates carried
+/// that loop and all three now call this** — the gate only ever reports a pair, so migrating
+/// the two it named would have left the third to re-create the clone against whichever
+/// converter gate is written next.
+///
+/// The LIST stays at each call site and the walk lives here, which is the split that matters:
+/// which sidecars a checkpoint ships is the fact each gate asserts, and a fixture that invents
+/// one the real source lacks is the defect this correction came from.
+#[track_caller]
+pub fn write_aux(src: &std::path::Path, files: &[(&str, &str)]) {
+    for (name, body) in files {
+        std::fs::write(src.join(name), body).expect("write the fixture aux file");
+    }
+}
+
 /// The artifact's bytes for `name`, with its shape already confronted with the source's.
 ///
 /// The shape check is here rather than at each caller because that is the half a comparison

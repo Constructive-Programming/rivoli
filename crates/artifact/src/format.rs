@@ -63,7 +63,7 @@ mod fixtures;
 pub use expert::{F4_NAMING_K3, F4_NAMING_V4, F4Expert, F4Naming};
 pub use header::{EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, LayerDims, RoutedFmt, VQ3_MAGIC};
 pub use layer::{LAYER_WINDOW, write_expert_layer};
-pub use meta::{ArtifactDirs, FormatMeta, I4Source, finish_artifact};
+pub use meta::{ArtifactDirs, FormatMeta, I4Source, finish_artifact, require_aux};
 pub use repack::RoutedRepack;
 pub use set::{ExpertSet, SetDims, f4_layer_range, f4_source, load_codebooks};
 pub use tensors::{SafeWriter, Safetensors};

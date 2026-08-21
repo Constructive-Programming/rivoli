@@ -20,6 +20,7 @@ pub mod glm_config;
 pub mod k3_config;
 pub mod quant;
 pub mod schema;
+pub mod tiktoken;
 pub mod tokenizer;
 pub mod v4_config;
 /// DeepSeek-V4's prompt encoding. A sibling of [`tokenizer`]'s GLM surface for the same reason

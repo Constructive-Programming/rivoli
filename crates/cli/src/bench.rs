@@ -92,11 +92,17 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
             ))
         }
         Arch::GlmMoeDsa => tok.encode_chat(text),
-        // RAW, deliberately: K3 ships no chat template in ANY tree (`convert_k3`'s header
-        // records it), so there is no "its own framing" to render — this line inherited
-        // GLM's `encode_chat` until M9, which would have fed a K3 checkpoint `[gMASK]
-        // <sop>` markers it never saw. A base-model bench prompt is document continuation,
-        // and raw encoding is the honest spelling of that.
+        // RAW, deliberately. This line inherited GLM's `encode_chat` until M9, which would
+        // have fed a K3 checkpoint `[gMASK] <sop>` markers it never saw; a bench prompt is
+        // document continuation, and raw encoding is the honest spelling of that.
+        //
+        // > **CORRECTED 2026-08-16.** This said "K3 ships no chat template in ANY tree
+        // > (`convert_k3`'s header records it), so there is no 'its own framing' to render".
+        // > Both halves were wrong. The checkpoint ships `encoding_k3.py`, a first-party XTML
+        // > renderer, so a framing to render DOES exist — it is a `chat_template` that does
+        // > not, which is the narrower true claim ([`crate::K3_PORT_HAS_NO_CHAT_ENCODING`]
+        // > carries it). And the cross-reference was dangling: `convert_k3`'s module header
+        // > records no such thing; the note lives beside its `AUX` list.
         Arch::KimiK3 => tok.encode(text),
     }
 }

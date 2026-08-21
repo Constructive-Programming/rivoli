@@ -122,13 +122,6 @@ impl FormatMeta {
     }
 }
 
-/// Write `<out_dir>/manifest.json` and copy `aux` (tokenizer and friends) beside it, so
-/// the artifact is self-contained. The last step of every converter.
-///
-/// A missing aux file is a WARNING rather than an error: the artifact is still loadable
-/// without `generation_config.json`, and failing a multi-hour convert on its absence at
-/// the very end would be the worse trade. A missing manifest is not survivable, so that
-/// one propagates.
 /// The two directories an artifact finish reads and writes — one value because the pair
 /// travels together and swapping them is a plausible, silent call-site error.
 pub struct ArtifactDirs<'a> {
@@ -136,6 +129,48 @@ pub struct ArtifactDirs<'a> {
     pub src: &'a str,
 }
 
+/// Refuse a converter's `aux` list against the SOURCE before any weight is read.
+///
+/// [`finish_artifact`] already refuses a missing aux file — this buys **when**. That function
+/// is the last step of a convert, so without this the refusal lands after the whole weight
+/// write, on a checkpoint that could have been rejected in milliseconds.
+///
+/// **That is not hypothetical, and it is why this moved out of `convert_glimmer`.** Kimi-K3's
+/// list named `tokenizer.json`, which that checkpoint does not ship (it is tiktoken —
+/// `docs/investigations/k3-first-checkpoint.md` §3). The bad name survived every gate because
+/// the fixture wrote the file it named, and the real 1.3 TiB run would have refused at its
+/// final step. `convert_glimmer` had carried this guard since 2026-08-16 and `convert_k3` had
+/// not; a guard that lives in one converter protects one converter.
+///
+/// **Pass the SAME slice you pass [`finish_artifact`]** — a pre-check over a hand-maintained
+/// subset is a second list to keep in step, and the drift it admits is precisely a name that
+/// is checked but not copied, or copied but not checked.
+pub fn require_aux(src_dir: &str, aux: &[&str]) -> Result<()> {
+    for name in aux {
+        anyhow::ensure!(
+            std::path::Path::new(src_dir).join(name).is_file(),
+            "{name} is missing from {src_dir}. The artifact is not self-contained without it, \
+             and finish_artifact would refuse it only at the END of the convert"
+        );
+    }
+    Ok(())
+}
+
+/// Write `<out_dir>/manifest.json` and copy `aux` (tokenizer and friends) beside it, so the
+/// artifact is self-contained. The last step of every converter.
+///
+/// > **CORRECTED 2026-08-16.** This doc block said "a missing aux file is a WARNING rather
+/// > than an error … failing a multi-hour convert on its absence at the very end would be the
+/// > worse trade", and it was wrong twice over. The code below `?`s the copy and `ensure!`s
+/// > the result — absence has been a hard error in this tree since the shared function was
+/// > fixed — and the block was attached to [`ArtifactDirs`] rather than to this function, so
+/// > the false claim was invisible from here. `convert_glimmer`'s `REQUIRED_AUX` note already
+/// > recorded the true behaviour, which is how the two came to disagree in writing.
+/// >
+/// > The trade it describes is real and is answered by [`require_aux`], not by a warning: run
+/// > the same list against the source FIRST, and the multi-hour convert never starts.
+///
+/// A missing manifest is not survivable either, so that one propagates too.
 pub fn finish_artifact(
     tool: &str,
     dirs: ArtifactDirs<'_>,

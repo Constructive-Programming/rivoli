@@ -32,11 +32,37 @@ use anyhow::{Result, ensure};
 use clap::Parser;
 use rivoli_artifact::format::{
     ArtifactDirs, F4_NAMING_K3, FormatMeta, RoutedRepack, SafeWriter, Safetensors, f4_source,
-    finish_artifact,
+    finish_artifact, require_aux,
 };
 use rivoli_artifact::k3_config::{K3Config, K3TextConfig};
 use rivoli_artifact::quant::{FP8_BLOCK, K3_TEXT_PREFIX, k3_expert_base};
 use std::ops::Range;
+
+/// The files copied beside the weights, checked against the source before the convert starts
+/// and copied when it ends — ONE list, so the check and the copy cannot drift.
+///
+/// > **CORRECTED 2026-08-16, on first contact with the real checkpoint.** This was
+/// > `["tokenizer.json", "tokenizer_config.json"]` and named a file **Kimi-K3 does not ship**,
+/// > so the converter could not finish against the real source at all. It survived every gate
+/// > because `k3_convert.rs`'s fixture wrote a `tokenizer.json` of its own — a fixture free to
+/// > invent its inputs proves the tool agrees with the fixture. Full account:
+/// > `docs/investigations/k3-first-checkpoint.md` §3.
+///
+/// Each entry carries something no other file in the artifact does:
+/// * `tiktoken.model` — the vocabulary. K3's tokenizer is tiktoken, not HuggingFace JSON.
+/// * `tokenizer_config.json` — the 16 `added_tokens_decoder` ids. `tiktoken.model` stops at
+///   163583, so K3's XTML framing tokens (`<|open|>`, `<|sep|>`, `<|close|>`,
+///   `<|end_of_msg|>`) exist ONLY here.
+/// * `generation_config.json` — `eos_token_id` 163586, read by `Tokenizer::load` from this
+///   exact filename. The old comment claimed K3 ships none; it does.
+///
+/// No `chat_template.jinja`: that one genuinely does not exist. The checkpoint ships
+/// `encoding_k3.py` instead, and `--port` refuses rather than hand-porting it.
+const AUX: &[&str] = &[
+    "tiktoken.model",
+    "tokenizer_config.json",
+    "generation_config.json",
+];
 
 // NOTE: doc comments on the FIELDS below are USER-FACING — clap renders them as `--help`.
 #[derive(Parser)]
@@ -238,6 +264,25 @@ fn write_resident(
         if !in_scope(name) {
             continue; // a tensor that rode along in an opened shard — see `resident_layers`
         }
+        // **The vision guard, and it is deliberately NOT `is_vision`.** `skipped_vision`
+        // cannot be one: on the real checkpoint the 168 vision tensors sit alone in shards 95
+        // and 96, which `in_scope` therefore never opens, so the counter is structurally 0 and
+        // the log line below says `0 vision skipped` however broken the filter is (measured
+        // 2026-08-16 — `docs/investigations/k3-first-checkpoint.md` §2). `is_vision` is the
+        // same function in `in_scope` and three lines up, so breaking it opens those two
+        // shards AND stops filtering them, and 0.83 GiB of vision tower lands here unnoticed.
+        //
+        // This asks a different question: every text-side tensor carries `language_model.`
+        // (`K3_TEXT_PREFIX`, or `lm_head` directly under it — `k3_names.rs` pins exactly that
+        // over all 60 families), while `vision_tower.` and `mm_projector.` are its SIBLINGS.
+        // A name without the prefix is what `is_vision` should have removed, caught without
+        // consulting it.
+        ensure!(
+            name.starts_with(K3_TEXT_PREFIX) || name == "language_model.lm_head.weight",
+            "{name} is in scope for the resident set but is not under `language_model.` — \
+             this converter builds the TEXT arm only, and the multimodal siblings \
+             (`vision_tower.`, `mm_projector.`) must never reach the artifact"
+        );
         let (bytes, dtype, shape) = src.raw(name)?;
         w.add(name, dtype, shape.to_vec(), bytes);
         kept += 1;
@@ -269,36 +314,27 @@ fn write_resident(
 
 /// Step 3: `manifest.json` = the source config VERBATIM (wrapper and all — see the module
 /// header) + the `format` section + `f4_source` provenance.
-fn write_manifest(src_dir: &str, out_dir: &str, layers: std::ops::Range<usize>) -> Result<()> {
+///
+/// Returns the manifest instead of writing it, and that shape is the duplication gate's doing
+/// rather than a preference. Ending this function with `finish_artifact(tool, dirs, &manifest,
+/// AUX)` made its tail — through the closing brace and into `fn main` — token-identical to
+/// `convert_v4::write_manifest`'s, and jscpd refused it (2026-08-16, 26 tokens). The long
+/// inline aux list had been breaking that run by accident; collapsing the list to [`AUX`]
+/// exposed a clone that was always there. Splitting "build the manifest" from "write the
+/// artifact" is the honest fix — the two converters genuinely share the second step, so only
+/// the first belongs in a per-model function.
+fn build_manifest(src_dir: &str, layers: std::ops::Range<usize>) -> Result<serde_json::Value> {
     // `manifest_from_config` re-reads the source `config.json` rather than re-serializing
     // the parsed `K3Config`, so the nested `text_config` — including every key the schema
     // deliberately does not bind — survives byte-for-byte in spirit and the artifact
     // re-parses exactly as the source did.
-    let manifest = {
-        let mut m = FormatMeta::manifest_from_config(src_dir, FP8_BLOCK)?;
-        // `layers` is the range this artifact HOLDS; `num_hidden_layers` is deliberately
-        // left alone — every per-layer structure in a K3 config (`linear_attn_config`'s
-        // two one-based arrays, `first_k_dense_replace`) is indexed by the REAL layer id,
-        // so renumbering a partial artifact as a small MODEL would mis-key all of them.
-        m["f4_source"] = f4_source("convert_k3", src_dir, layers);
-        m
-    };
-    // `ArtifactDirs` spelled inline and src-first, where `convert_v4` routes both call
-    // sites through an `artifact_dirs` helper: with only two sites and no `&Args` to
-    // shield against, the helper would be one more 45-token twin of that file's.
-    finish_artifact(
-        "convert_k3",
-        ArtifactDirs {
-            src: src_dir,
-            out: out_dir,
-        },
-        &manifest,
-        // No `chat_template.jinja` and no `generation_config.json`: K3's
-        // `tokenizer_config.json` has no `chat_template` at all — there is no chat
-        // encoding for this model in any tree, and the engine arm refuses `--port` rather
-        // than inventing one.
-        &["tokenizer.json", "tokenizer_config.json"],
-    )
+    let mut m = FormatMeta::manifest_from_config(src_dir, FP8_BLOCK)?;
+    // `layers` is the range this artifact HOLDS; `num_hidden_layers` is deliberately
+    // left alone — every per-layer structure in a K3 config (`linear_attn_config`'s
+    // two one-based arrays, `first_k_dense_replace`) is indexed by the REAL layer id,
+    // so renumbering a partial artifact as a small MODEL would mis-key all of them.
+    m["f4_source"] = f4_source("convert_k3", src_dir, layers);
+    Ok(m)
 }
 
 fn main() -> Result<()> {
@@ -318,6 +354,9 @@ fn main() -> Result<()> {
         src: &src_dir,
         out: &out_dir,
     })?;
+    // Before the config, before a single shard is opened: a missing aux file is otherwise
+    // reported by `finish_artifact` at the END, hours and 1.3 TiB later. See `AUX`.
+    require_aux(&src_dir, AUX)?;
     let cfg = K3Config::load(&src_dir)?;
     let k3 = &cfg.text;
     let range = bounded_range(k3, args.from, args.to)?;
@@ -394,7 +433,20 @@ fn main() -> Result<()> {
     }
 
     write_resident(&src, k3.n_experts, &in_scope, layers.len(), &out_dir)?;
-    write_manifest(&src_dir, &out_dir, range)?;
+    // `AUX` again, the same slice `require_aux` checked before any shard was opened — that
+    // pairing is the point, so it is spelled at one call site rather than in two functions.
+    // `ArtifactDirs` inline and src-first, where `convert_v4` routes its two sites through an
+    // `artifact_dirs` helper: with one site here the helper would be a 45-token twin of that
+    // file's.
+    finish_artifact(
+        "convert_k3",
+        ArtifactDirs {
+            src: &src_dir,
+            out: &out_dir,
+        },
+        &build_manifest(&src_dir, range)?,
+        AUX,
+    )?;
     eprintln!("convert_k3: done — {src_dir} → {out_dir}");
     Ok(())
 }
