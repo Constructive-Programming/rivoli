@@ -440,6 +440,17 @@ impl RoutedPool {
         self.misses
     }
 
+    /// Both counters as ONE value — the single construction site of the pair, so the arms
+    /// rebase deltas through `Fetched::since` instead of each restating two subtractions
+    /// nothing keeps in the same order (the duplication gate reported exactly that
+    /// restatement, 2026-08-21).
+    pub fn fetched(&self) -> crate::seam::Fetched {
+        crate::seam::Fetched {
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+
     /// XOR-fold the pool slots of `experts` into `out` — the `se` column, taken at END OF LAYER on
     /// the null stream once both MoE lanes have been awaited.
     ///
@@ -481,16 +492,12 @@ impl RoutedPool {
             // fold is NOT invariant under two experts' payloads being swapped between slots — see
             // `launch_hash_rows`. `experts` is the union in a fixed order, so `j` is comparable
             // across runs (and `sl` folds the same order, which is what makes the pair meaningful).
-            unsafe {
-                rivoli_backend::launch_hash_rows(
-                    p,
-                    n,
-                    1,
-                    (j * n) as u64,
-                    out,
-                    rivoli_backend::NULL_STREAM,
-                )?
+            let span = rivoli_backend::HashSpan {
+                n,
+                stride: 1,
+                i_base: (j * n) as u64,
             };
+            unsafe { rivoli_backend::launch_hash_rows(p, span, out, rivoli_backend::NULL_STREAM)? };
         }
         Ok(())
     }
