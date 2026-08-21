@@ -289,12 +289,10 @@ impl<'a> GlmEngine<'a> {
         self.max_ctx
     }
 
-    pub fn hits(&self) -> u64 {
-        self.pin.routed.hits()
-    }
-
-    pub fn misses(&self) -> u64 {
-        self.pin.routed.misses()
+    /// The pool's fetch counters as one pair — totals; the arms rebase with
+    /// `Fetched::since`.
+    pub fn fetched(&self) -> crate::seam::Fetched {
+        self.pin.routed.fetched()
     }
 
     /// The staging-slot hand-out's OWN falsifier, and until 2026-08-18 nothing ever read it.

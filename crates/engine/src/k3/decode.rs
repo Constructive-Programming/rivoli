@@ -73,13 +73,13 @@ impl K3Engine<'_> {
         for (p, &t) in spec.prompt.iter().enumerate() {
             self.forward(t, p)?;
         }
-        let (hit0, miss0) = self.pool_counters();
+        let f0 = self.fetched();
         tracing::info!(
             "PREFILL: {} tokens in {:.1} s (token-sequential — the recurrence's order) | \
              {} expert reads",
             spec.prompt.len(),
             wall.elapsed().as_secs_f64(),
-            miss0 - self.misses0,
+            f0.misses - self.misses0,
         );
         // Stats describe steady-state DECODE, so the counters (phases included) re-read
         // here, after the cold prefill, not at `reset`.
@@ -96,11 +96,9 @@ impl K3Engine<'_> {
             pos += 1;
             cur = self.argmax()?;
         }
-        let (hit1, miss1) = self.pool_counters();
         Ok(emit.finish(
             decode_wall.elapsed(),
-            hit1 - hit0,
-            miss1 - miss0,
+            self.fetched().since(f0),
             &self.prof.since(&prof0),
         ))
     }
@@ -114,7 +112,7 @@ impl K3Engine<'_> {
         crate::score::admit(ids, self.max_ctx)?;
         self.reset()?;
         self.forward(ids[0], 0)?;
-        let (hit0, miss0) = self.pool_counters();
+        let f0 = self.fetched();
         let mut own = self.argmax()?;
         let tally = crate::score::walk(ids, |next| {
             let (row, scored_own) = (self.logits()?, own);
@@ -125,7 +123,10 @@ impl K3Engine<'_> {
             }
             Ok((row, scored_own))
         })?;
-        let (hit1, miss1) = self.pool_counters();
-        tally.into_scored(hit1 - hit0, miss1 - miss0)
+        // Two-line close where Glimmer's is one, for the preamble's reason: the walk
+        // protocol is deliberately shared, so the closes are one rebase apart and the
+        // jscpd gate reported the pair the moment they were also spelled identically.
+        let spent = self.fetched().since(f0);
+        tally.into_scored(spent)
     }
 }

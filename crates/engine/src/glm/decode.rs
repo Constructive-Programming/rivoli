@@ -99,7 +99,7 @@ impl GlmEngine<'_> {
                 pos += 1;
             }
         }
-        let (h, m) = (self.hits(), self.misses());
+        let crate::seam::Fetched { hits: h, misses: m } = self.fetched();
         tracing::info!(
             "PREFILL: {} tokens in {:.1} s ({}) | {m} expert reads, {:.2}/token | {h} \
              hits, {:.1}%",
@@ -132,11 +132,11 @@ impl GlmEngine<'_> {
         // shape: one `block_on` around the whole flow, because `forward` awaits the expert
         // stream inline and a per-layer `block_on` is what that avoids.
         let mut emit = Emit::new(&spec);
-        let (hit0, miss0, prof0, decode_wall) = rivoli_backend::block_on(async {
+        let (f0, prof0, decode_wall) = rivoli_backend::block_on(async {
             let mut pos = self.prefill(spec.prompt).await?;
             // Stats describe steady-state DECODE, not the cold prefill — the phase
-            // counters rebase here for exactly the reason the hit counters do.
-            let (hit0, miss0, prof0) = (self.hits(), self.misses(), self.prof);
+            // counters rebase here for exactly the reason the fetch counters do.
+            let (f0, prof0) = (self.fetched(), self.prof);
             let decode_wall = std::time::Instant::now();
             // `cur` is the token AT `pos`, decided but not yet fed through the model.
             let mut cur = self.argmax()?;
@@ -146,7 +146,7 @@ impl GlmEngine<'_> {
                 pos += 1;
                 cur = self.argmax()?;
             }
-            Ok::<_, anyhow::Error>((hit0, miss0, prof0, decode_wall.elapsed()))
+            Ok::<_, anyhow::Error>((f0, prof0, decode_wall.elapsed()))
         })?;
         // INV-9's precondition, MEASURED rather than assumed. See `GlmEngine::slot_stalls`:
         // non-zero means the staging hand-out read device progress and this run is not
@@ -161,7 +161,7 @@ impl GlmEngine<'_> {
             self.relocs()
         );
         let ph = self.prof.since(&prof0);
-        Ok(emit.finish(decode_wall, self.hits() - hit0, self.misses() - miss0, &ph))
+        Ok(emit.finish(decode_wall, self.fetched().since(f0), &ph))
     }
 
     /// Teacher-forced scoring: walk `ids`, score each position's logits against the true
@@ -197,7 +197,7 @@ impl GlmEngine<'_> {
             self.forward(ids[0], 0).await?;
             self.flush_trace()?;
             let mut pos = 1;
-            let (hit0, miss0) = (self.hits(), self.misses());
+            let f0 = self.fetched();
             for (i, &target) in ids.iter().enumerate().skip(1) {
                 let own = self.argmax()?;
                 // Row 0 of the logits buffer — the row `argmax` just reduced.
@@ -210,7 +210,7 @@ impl GlmEngine<'_> {
                     pos += 1;
                 }
             }
-            tally.into_scored(self.hits() - hit0, self.misses() - miss0)
+            tally.into_scored(self.fetched().since(f0))
         })
     }
 }
