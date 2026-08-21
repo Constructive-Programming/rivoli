@@ -11,6 +11,8 @@
 //! The `f4_source` section is NOT here: it is an input to opening the expert set rather than
 //! a fact about the manifest, so it lives with its consumer in [`super::set`].
 
+use std::path::Path;
+
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -79,21 +81,25 @@ impl FormatMeta {
     /// > a reason that has nothing to do with Glimmer. Nothing to fix today (no such change is
     /// > planned, and the failure is loud and named); recorded because "inert" was written
     /// > when nothing but `bin/convert`'s own artifacts reached this function.
-    pub fn manifest_from_config(src_dir: &str, fp8_block: usize) -> Result<serde_json::Value> {
-        let path = format!("{src_dir}/config.json");
-        let mut manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)
-                .with_context(|| format!("parse {path}"))?;
+    pub fn manifest_from_config(
+        src_dir: impl AsRef<Path>,
+        fp8_block: usize,
+    ) -> Result<serde_json::Value> {
+        let path = src_dir.as_ref().join("config.json");
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))?;
         manifest["format"] = serde_json::to_value(Self::current(fp8_block))?;
         Ok(manifest)
     }
 
     /// Read `<dir>/manifest.json`'s `format` section and check it matches this build
     /// (VQ params are compiled into the kernels, so a mismatch is unrunnable).
-    pub fn load(dir: &str) -> Result<Self> {
-        let v: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(format!("{dir}/manifest.json"))?)
-                .with_context(|| format!("parse {dir}/manifest.json"))?;
+    pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
+        let path = dir.as_ref().join("manifest.json");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("parse {}", path.display()))?;
         let m: FormatMeta = serde_json::from_value(v["format"].clone())
             .context("manifest.json missing/invalid `format` section")?;
         ensure!(
@@ -145,12 +151,14 @@ pub struct ArtifactDirs<'a> {
 /// **Pass the SAME slice you pass [`finish_artifact`]** — a pre-check over a hand-maintained
 /// subset is a second list to keep in step, and the drift it admits is precisely a name that
 /// is checked but not copied, or copied but not checked.
-pub fn require_aux(src_dir: &str, aux: &[&str]) -> Result<()> {
+pub fn require_aux(src_dir: impl AsRef<Path>, aux: &[&str]) -> Result<()> {
+    let src_dir = src_dir.as_ref();
     for name in aux {
         anyhow::ensure!(
-            std::path::Path::new(src_dir).join(name).is_file(),
-            "{name} is missing from {src_dir}. The artifact is not self-contained without it, \
-             and finish_artifact would refuse it only at the END of the convert"
+            src_dir.join(name).is_file(),
+            "{name} is missing from {}. The artifact is not self-contained without it, \
+             and finish_artifact would refuse it only at the END of the convert",
+            src_dir.display()
         );
     }
     Ok(())
@@ -237,12 +245,13 @@ impl I4Source {
     /// manifest, or no such field" — an unstamped artifact, which is a reportable
     /// fact rather than an error. A field that is PRESENT but unparseable is an
     /// error: silently reporting it as "unstamped" would hide a real corruption.
-    pub fn load(dir: &str) -> Result<Option<Self>> {
-        let Ok(text) = std::fs::read(format!("{dir}/manifest.json")) else {
+    pub fn load(dir: impl AsRef<Path>) -> Result<Option<Self>> {
+        let path = dir.as_ref().join("manifest.json");
+        let Ok(text) = std::fs::read(&path) else {
             return Ok(None);
         };
         let v: serde_json::Value =
-            serde_json::from_slice(&text).with_context(|| format!("parse {dir}/manifest.json"))?;
+            serde_json::from_slice(&text).with_context(|| format!("parse {}", path.display()))?;
         let Some(f) = v.get("i4_source") else {
             return Ok(None);
         };
@@ -289,11 +298,13 @@ impl I4Source {
 
     /// Record this provenance in `<dir>/manifest.json`, merging with an existing stamp per
     /// [`Self::merged_with`] and publishing it per [`write_json_atomic`].
-    pub fn stamp(&self, dir: &str) -> Result<()> {
-        let path = format!("{dir}/manifest.json");
-        let mut m: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)
-                .with_context(|| format!("parse {path}"))?;
+    pub fn stamp(&self, dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        let path = dir.join("manifest.json");
+        let mut m: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("parse {}", path.display()))?;
         // An unreadable prior stamp is not an error HERE — we are replacing it. Only
         // the reader is strict, so a corrupt field can never be misreported as fact.
         m["i4_source"] = serde_json::to_value(self.merged_with(Self::load(dir).ok().flatten()))?;
@@ -306,14 +317,21 @@ impl I4Source {
 /// The fsync is what separates this from [`super::layer::write_expert_layer`], which deliberately does not
 /// pay one: a torn `manifest.json` bricks an artifact whose `.i4` set alone is ~365 GB, while
 /// a torn layer file is regenerable.
-fn write_json_atomic(path: &str, doc: &serde_json::Value) -> Result<()> {
+fn write_json_atomic(path: &Path, doc: &serde_json::Value) -> Result<()> {
     use std::io::Write;
-    let tmp = format!("{path}.tmp");
-    let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {tmp}"))?;
+    // `.tmp` is APPENDED, not swapped in as an extension: `with_extension` would turn
+    // `manifest.json` into `manifest.tmp`, and a crash would leave that stray file
+    // shadowing nothing while the rename below expects the full suffixed name.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
     f.write_all(&serde_json::to_vec_pretty(doc)?)?;
-    f.sync_all().with_context(|| format!("fsync {tmp}"))?;
+    f.sync_all()
+        .with_context(|| format!("fsync {}", tmp.display()))?;
     drop(f);
-    std::fs::rename(&tmp, path).with_context(|| format!("rename {tmp} -> {path}"))
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))
 }
 
 #[cfg(test)]

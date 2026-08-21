@@ -29,9 +29,8 @@ build). None of that applies to a driver script that is not a cargo run and whos
 is recorded on the line above.
 """
 
+import collections
 import hashlib
-
-
 import json
 import os
 import pathlib
@@ -86,10 +85,17 @@ PAT_STR = "|".join([
 
 
 def split_whitespaces_or_nonwhitespaces(s: str, max_consecutive_slice_len: int):
-    """`TikTokenTokenizer._split_whitespaces_or_nonwhitespaces`, copied verbatim.
+    """`TikTokenTokenizer._split_whitespaces_or_nonwhitespaces`, statement for statement.
 
-    Copied for `PAT_STR`'s reason — importing would pull `transformers` in. The body below is
-    diffable against the checkpoint's line for line.
+    Copied for `PAT_STR`'s reason — importing would pull `transformers` in. One deviation from
+    a byte-verbatim copy: the checkpoint's `else:` arm is flattened to a `continue` (the
+    CodeScene gate refuses the original's nesting shape, and an exemption is not available in
+    this tree). The flatten is control-flow-identical — with nothing after the `if`/`else` in
+    the loop body the two shapes are the same program, and the two were run side by side over
+    every string of {a, space, tab, newline} up to length 10 at caps {1,2,3,4,7} plus long
+    mixed samples: identical slices on all 6,990,549 (string, cap) pairs (2026-08-21). Every
+    other statement is byte-verbatim, and the distinctive ones are what
+    `verify_copies_against_the_checkpoint` pins against the checkpoint, in order.
     """
     current_slice_len = 0
     current_slice_is_space = s[0].isspace() if len(s) > 0 else False
@@ -101,13 +107,37 @@ def split_whitespaces_or_nonwhitespaces(s: str, max_consecutive_slice_len: int):
         if current_slice_is_space ^ is_now_space:
             current_slice_len = 1
             current_slice_is_space = is_now_space
-        else:
-            current_slice_len += 1
-            if current_slice_len > max_consecutive_slice_len:
-                yield s[slice_start:i]
-                slice_start = i
-                current_slice_len = 1
+            continue
+        current_slice_len += 1
+        if current_slice_len > max_consecutive_slice_len:
+            yield s[slice_start:i]
+            slice_start = i
+            current_slice_len = 1
     yield s[slice_start:]
+
+
+def require_verbatim_in_order(path: pathlib.Path, text: str, what: str, needles: list):
+    """Die unless every needle appears in `text`, each strictly after the previous one.
+
+    **A MOVING cursor, so ORDER is checked too.** Alternation order is semantically
+    load-bearing — `\\s+(?!\\S)` must precede the bare `\\s+` or a whitespace run is taken
+    whole — and a plain `in` test passes a reordered pattern. Verified: reordering the
+    alternatives passes a presence-only check while changing `"a    b"` from
+    ['a','   ',' b'] to ['a','    ','b']. (A monotonic position check would NOT do:
+    `(?i:'s|'t|...)` legitimately appears twice, so the cursor must advance past each hit.)
+    """
+    cursor = 0
+    for needle in needles:
+        at = text.find(needle, cursor)
+        if at < 0:
+            raise SystemExit(
+                f"{path}: this driver's copy of {what} is not in the checkpoint verbatim, in "
+                f"order.\n"
+                f"  missing at or after offset {cursor}: {needle!r}\n"
+                "  Either the checkpoint changed, the copy has a transcription error, or the "
+                "alternatives were REORDERED; do NOT regenerate goldens until they agree."
+            )
+        cursor = at + len(needle)
 
 
 def verify_copies_against_the_checkpoint(src: pathlib.Path) -> dict:
@@ -131,37 +161,20 @@ def verify_copies_against_the_checkpoint(src: pathlib.Path) -> dict:
         "num_reserved_special_tokens": [f"num_reserved_special_tokens = {NUM_RESERVED_SPECIAL_TOKENS}"],
         "MAX_NO_WHITESPACES_CHARS": [f"MAX_NO_WHITESPACES_CHARS = {MAX_NO_WHITESPACES_CHARS:_}"],
         "TIKTOKEN_MAX_ENCODE_CHARS": [f"TIKTOKEN_MAX_ENCODE_CHARS = {TIKTOKEN_MAX_ENCODE_CHARS:_}"],
+        # The split helper, compared by its distinctive statements rather than as one substring:
+        # indentation differs between the checkpoint's method and this file's function, so a
+        # whole-body needle would fail on whitespace alone. The statements are listed in the
+        # checkpoint's own source order, so the same moving cursor pins that order too.
+        "split_whitespaces_or_nonwhitespaces": [
+            "current_slice_is_space = s[0].isspace() if len(s) > 0 else False",
+            "if current_slice_is_space ^ is_now_space:",
+            "if current_slice_len > max_consecutive_slice_len:",
+            "yield s[slice_start:i]",
+            "yield s[slice_start:]",
+        ],
     }
     for what, needles in checks.items():
-        # **A MOVING cursor, so ORDER is checked too.** Alternation order is semantically
-        # load-bearing — `\s+(?!\S)` must precede the bare `\s+` or a whitespace run is taken
-        # whole — and a plain `in` test passes a reordered pattern. Verified: reordering the
-        # alternatives passes a presence-only check while changing `"a    b"` from
-        # ['a','   ',' b'] to ['a','    ','b']. (A monotonic position check would NOT do:
-        # `(?i:'s|'t|...)` legitimately appears twice, so the cursor must advance past each hit.)
-        cursor = 0
-        for needle in needles:
-            at = text.find(needle, cursor)
-            if at < 0:
-                raise SystemExit(
-                    f"{path}: this driver's copy of {what} is not in the checkpoint verbatim, in "
-                    f"order.\n"
-                    f"  missing at or after offset {cursor}: {needle!r}\n"
-                    "  Either the checkpoint changed, the copy has a transcription error, or the "
-                    "alternatives were REORDERED; do NOT regenerate goldens until they agree."
-                )
-            cursor = at + len(needle)
-    # The split helper, compared as a body rather than a substring: whitespace differs by
-    # indentation level, so the distinctive statements are what is checked.
-    for line in (
-        "current_slice_is_space = s[0].isspace() if len(s) > 0 else False",
-        "if current_slice_is_space ^ is_now_space:",
-        "if current_slice_len > max_consecutive_slice_len:",
-        "yield s[slice_start:i]",
-        "yield s[slice_start:]",
-    ):
-        if line not in text:
-            raise SystemExit(f"{path}: split helper line missing verbatim: {line!r}")
+        require_verbatim_in_order(path, text, what, needles)
     return {
         "tokenization_kimi_sha256": hashlib.sha256(raw).hexdigest(),
         "tokenization_kimi_fnv1a": fnv1a(raw),
@@ -196,18 +209,8 @@ def build_encoding(src: pathlib.Path):
     return enc, mergeable, named, special
 
 
-def cases(named: dict) -> list:
-    """Texts chosen to break the two `pat_str` traps, plus the special-token block.
-
-    Every group names the clause it targets. A case list that merely looks varied is the
-    failure mode here: the traps are single alternatives inside one long pattern, and prose
-    exercises maybe three of the eight.
-    """
-    out = []
-
-    def add(group, name, text):
-        out.append({"group": group, "name": name, "text": text})
-
+def whitespace_cases(add):
+    """TRAP 1 and the newline clause -- the alternatives where ORDER shows up."""
     # TRAP 1 -- `\s+(?!\S)`, the negative lookahead. A whitespace run FOLLOWED BY
     # non-whitespace is the discriminator: the lookahead makes the run give its last character
     # to the following piece, so `a    b` splits `a` / `   ` / ` b`. Without lookaround the run
@@ -237,6 +240,9 @@ def cases(named: dict) -> list:
     add("newlines", "spaces_then_lf", "text   \n   more")
     add("newlines", "many_lf", "a\n\n\n\nb")
 
+
+def script_and_digit_cases(add):
+    """TRAP 2 (Han class intersection) and the capped `\\p{N}{1,3}` clause."""
     # TRAP 2 -- `&&[^\p{Han}]]` class intersection. These clauses exist so that Han is taken by
     # alternative 1 and never absorbed into a Latin run, which only shows at the BOUNDARY
     # between the two scripts.
@@ -261,6 +267,9 @@ def cases(named: dict) -> list:
     add("digits", "year_in_prose", "in 2026 the model shipped")
     add("digits", "decimal", "3.14159")
 
+
+def word_shape_cases(add):
+    """The contraction tail and the case-sensitive halves of alternatives 2 and 3."""
     # The `(?i:'s|'t|'re|'ve|'m|'ll|'d)?` tail, in BOTH cases -- `(?i:` is the only
     # case-insensitive island in the pattern, and dropping the flag changes only uppercase text.
     for w in ["it's", "IT'S", "don't", "DON'T", "we're", "WE'RE",
@@ -278,6 +287,9 @@ def cases(named: dict) -> list:
     add("case", "upper_then_lower", "ABCdef")
     add("case", "shouty_sentence", "THIS IS FINE")
 
+
+def special_block_cases(add, named: dict):
+    """The special-token block: every named id, the positional reserved spellings, and framing."""
     # The SPECIAL BLOCK. Every named id, individually -- a loop over the 16 rather than a
     # sample, because the failure this catches is one entry misplaced, and a sample is exactly
     # what misses it. Then a RESERVED id, which is the half a config-driven port gets wrong:
@@ -305,6 +317,9 @@ def cases(named: dict) -> list:
     add("special_context", "special_like_but_not", "<|not_a_real_token|>")
     add("special_context", "bare_angle_pipe", "<| |>")
 
+
+def byte_boundary_cases(add):
+    """Multi-byte codepoints, empty input, and prose."""
     # Bytes and boundaries. Multi-byte codepoints split across BPE tokens are what
     # `decode_all` exists for, and an empty string is where an unchecked `s[0]` panics.
     add("edge", "empty", "")
@@ -321,6 +336,74 @@ def cases(named: dict) -> list:
         "The routed experts do not fit in memory, so they stream from NVMe while the "
         "resident ones compute -- that overlap is the whole design.")
 
+
+def cases(named: dict) -> list:
+    """Texts chosen to break the two `pat_str` traps, plus the special-token block.
+
+    Every group names the clause it targets. A case list that merely looks varied is the
+    failure mode here: the traps are single alternatives inside one long pattern, and prose
+    exercises maybe three of the eight. Builders run in this order and append in place, so the
+    vendored JSON's row order is a property of this list, not of the builders.
+    """
+    out = []
+
+    def add(group, name, text):
+        out.append({"group": group, "name": name, "text": text})
+
+    whitespace_cases(add)
+    script_and_digit_cases(add)
+    word_shape_cases(add)
+    special_block_cases(add, named)
+    byte_boundary_cases(add)
+    return out
+
+
+# The same-class run chunking (`MAX_NO_WHITESPACES_CHARS`), gated at a SMALL cap.
+#
+# The real cap is 25,000 characters, and a fixture that reached it would be a 25 KB string
+# in a vendored JSON to test one boundary. So the cap is a PARAMETER on the Rust side and
+# these rows drive it low — the same trick `write_expert_layer`'s `window` uses to reach its
+# boundary without allocating a gigabyte. What is being gated is that chunking happens at
+# all and at the right place: encoding a long run whole gives DIFFERENT ids from encoding it
+# in chunks, which is exactly why the reference does this and why dropping it is silent.
+def chunked_rows(enc) -> list:
+    out = []
+    for name, text, cap in [
+        ("run_at_cap", "abcdefgh", 8),
+        ("run_over_cap", "abcdefghij", 4),
+        ("long_nonspace_run", "x" * 40, 7),
+        ("digits_over_cap", "1234567890" * 3, 8),
+        ("space_run_over_cap", " " * 20, 6),
+        ("alternating_classes", ("ab   " * 8), 5),
+        ("han_run_over_cap", "你好世界" * 5, 6),
+    ]:
+        ids = []
+        for piece in split_whitespaces_or_nonwhitespaces(text, cap):
+            ids.extend(enc.encode(piece, allowed_special="all"))
+        out.append({"name": name, "text": text, "max_run": cap, "ids": ids})
+    return out
+
+
+# The OUTER cap (`TIKTOKEN_MAX_ENCODE_CHARS`), driven small for the same reason the inner one
+# is: reaching the real 400,000-character boundary would mean a 400 KB fixture. These rows are
+# what gate the port of that cap — it was left out at first on a false reachability argument,
+# and the divergence only appears when a boundary falls mid-run and off the inner grid.
+def outer_rows(enc) -> list:
+    out = []
+    for name, text, ocap, icap in [
+        ("outer_under", "aaaaaaaa", 16, 4),
+        ("outer_at", "aaaaaaaa", 8, 4),
+        ("outer_over_on_inner_grid", "a" * 16, 8, 4),
+        ("outer_over_off_inner_grid", "a" * 17, 6, 4),
+        ("outer_splits_a_space_run", " " * 20, 7, 5),
+        ("outer_and_inner_interact", "aa   aa   aa", 5, 3),
+        ("outer_over_han", "你好世界" * 4, 6, 5),
+    ]:
+        ids = []
+        for i in range(0, len(text), ocap):
+            for piece in split_whitespaces_or_nonwhitespaces(text[i:i + ocap], icap):
+                ids.extend(enc.encode(piece, allowed_special="all"))
+        out.append({"name": name, "text": text, "max_chars": ocap, "max_run": icap, "ids": ids})
     return out
 
 
@@ -340,49 +423,6 @@ def main() -> int:
         # (`allow_special_tokens=True` -> `_encode_text_piece`), so it is the behaviour the
         # Rust `encode` is scored against.
         c["ids"] = enc.encode(c["text"], allowed_special="all")
-
-    # The same-class run chunking (`MAX_NO_WHITESPACES_CHARS`), gated at a SMALL cap.
-    #
-    # The real cap is 25,000 characters, and a fixture that reached it would be a 25 KB string
-    # in a vendored JSON to test one boundary. So the cap is a PARAMETER on the Rust side and
-    # these rows drive it low — the same trick `write_expert_layer`'s `window` uses to reach its
-    # boundary without allocating a gigabyte. What is being gated is that chunking happens at
-    # all and at the right place: encoding a long run whole gives DIFFERENT ids from encoding it
-    # in chunks, which is exactly why the reference does this and why dropping it is silent.
-    # The OUTER cap (`TIKTOKEN_MAX_ENCODE_CHARS`), driven small for the same reason the inner one
-    # is: reaching the real 400,000-character boundary would mean a 400 KB fixture. These rows are
-    # what gate the port of that cap — it was left out at first on a false reachability argument,
-    # and the divergence only appears when a boundary falls mid-run and off the inner grid.
-    outer = []
-    for name, text, ocap, icap in [
-        ("outer_under", "aaaaaaaa", 16, 4),
-        ("outer_at", "aaaaaaaa", 8, 4),
-        ("outer_over_on_inner_grid", "a" * 16, 8, 4),
-        ("outer_over_off_inner_grid", "a" * 17, 6, 4),
-        ("outer_splits_a_space_run", " " * 20, 7, 5),
-        ("outer_and_inner_interact", "aa   aa   aa", 5, 3),
-        ("outer_over_han", "你好世界" * 4, 6, 5),
-    ]:
-        ids = []
-        for i in range(0, len(text), ocap):
-            for piece in split_whitespaces_or_nonwhitespaces(text[i:i + ocap], icap):
-                ids.extend(enc.encode(piece, allowed_special="all"))
-        outer.append({"name": name, "text": text, "max_chars": ocap, "max_run": icap, "ids": ids})
-
-    chunked = []
-    for name, text, cap in [
-        ("run_at_cap", "abcdefgh", 8),
-        ("run_over_cap", "abcdefghij", 4),
-        ("long_nonspace_run", "x" * 40, 7),
-        ("digits_over_cap", "1234567890" * 3, 8),
-        ("space_run_over_cap", " " * 20, 6),
-        ("alternating_classes", ("ab   " * 8), 5),
-        ("han_run_over_cap", "你好世界" * 5, 6),
-    ]:
-        ids = []
-        for piece in split_whitespaces_or_nonwhitespaces(text, cap):
-            ids.extend(enc.encode(piece, allowed_special="all"))
-        chunked.append({"name": name, "text": text, "max_run": cap, "ids": ids})
 
     doc = {
         "_comment": (
@@ -428,15 +468,13 @@ def main() -> int:
             if i not in named
         },
         "cases": rows,
-        "chunked": chunked,
-        "outer": outer,
+        "chunked": chunked_rows(enc),
+        "outer": outer_rows(enc),
     }
     out = pathlib.Path(__file__).with_name("k3-tokenizer-cases.json")
     out.write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n")
 
-    groups: dict = {}
-    for c in rows:
-        groups[c["group"]] = groups.get(c["group"], 0) + 1
+    groups = collections.Counter(c["group"] for c in rows)
     print(f"wrote {out} ({out.stat().st_size} B)")
     print(f"  tiktoken {tiktoken.__version__}  python {sys.version.split()[0]}")
     print(f"  num_base_tokens {len(mergeable)}  n_vocab {enc.n_vocab}")
