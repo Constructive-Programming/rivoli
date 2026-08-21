@@ -600,3 +600,21 @@ resident set outside the streamed sequence is `output_attn_res_norm`,
 in airllm is news to this tree: its layer prefetch is depth-1 and measured at +10% in its
 own README, its expert loads are synchronous inside the forward hook, and it holds no
 residency cache at all — every token re-reads every selected expert.
+
+## 9. The first real decode — and the pin floor's uncounted allocation (2026-08-21)
+
+**K3 decoded on this box**: 16 tokens at `--ctx 1024 --max-mem 107`, coherent text ("The
+sky is blue because of Rayleigh scattering…"), 0 hits / 22,080 misses, 3,525.9 s wall over
+the NFS-resident artifact — correctness-only by design, perf disclaimed per the owner's Q1
+decision. Trunk: 105.8 GiB resident, 19 min to load; profile/tok: ffn 220,310 ms of a
+220,370 ms wall (the fetch path IS the run, as the 0-hit pool predicts).
+
+**The finding: the pin floor undercounts a ctx-scaled device allocation.** At `--ctx 4096`
+the door accepts (`--max-mem 107` clears the stated 113,857,749,854-byte floor), the whole
+trunk loads, and then a **288 MiB `hipMalloc(301989888)` fails AFTER the pin** — twice, on
+a loaded and on a quiet box. At `--ctx 1024`, identical everything else, the run completes.
+So an allocation that scales with the context window is charged nowhere in the floor: the
+door promises a budget the box then cannot honour, 19 NFS-minutes late. Owed to the m19
+chain: name the allocation (KV is charged; suspect the attend staging or indexer scratch),
+add it to the floor arithmetic, and red-proof the door refusing at `--ctx 4096`/107 BEFORE
+the load starts.
