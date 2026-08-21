@@ -107,6 +107,24 @@ pub fn positional_context_limit(index_topk: usize) -> usize {
     tightest_ratio() * (index_topk + 1)
 }
 
+/// The rule [`scored_rows`] ranks under — everything about the selection question except the
+/// score matrix itself.
+///
+/// A struct for [`Sel`]'s own reason: `index_topk` and `offset` are both `usize`, and their
+/// transposition type-checks while aiming every selected index at the wrong buffer. It is
+/// also what keeps `scored_rows` under the arity gate (`crates/cli/tests/codescene.rs`),
+/// which refused the loose six-parameter spelling on 2026-08-21.
+#[derive(Clone, Copy, Debug)]
+pub struct SelRule {
+    /// The layer's class. See [`compressed_rows`] for why this is not a raw ratio.
+    pub kind: LayerKind,
+    /// The length past which the top-k truncates by score.
+    pub index_topk: usize,
+    pub at: Extent,
+    /// Where the compressed region starts in SELECTION space — [`compress_offset`]'s value.
+    pub offset: usize,
+}
+
 /// The indexer's top-k block selection, one row per query, from a `[rows, n_comp]` score
 /// matrix — the HOST half of the scored selection, and deliberately deviceless: the gate
 /// that compares it against the frozen oracle's `Indexer.forward` runs on every
@@ -132,31 +150,25 @@ pub fn positional_context_limit(index_topk: usize) -> usize {
 /// wrote and D2H handed back; masked entries need NOT be pre-masked to `-inf` — the mask
 /// here is by INDEX, not by value, so a stale score in a causally-illegal slot cannot leak
 /// into the selection.
-pub fn scored_rows(
-    scores: &[f32],
-    n_comp: usize,
-    kind: LayerKind,
-    index_topk: usize,
-    at: Extent,
-    offset: usize,
-) -> Result<Vec<Vec<i32>>> {
-    at.check_single_row_decode()?;
-    let ratio = kind
+pub fn scored_rows(scores: &[f32], n_comp: usize, rule: SelRule) -> Result<Vec<Vec<i32>>> {
+    rule.at.check_single_row_decode()?;
+    let ratio = rule
+        .kind
         .compressor_ratio()
         .context("scored selection on a layer with no compressor")?;
-    let rows = at.query_rows();
+    let rows = rule.at.query_rows();
     ensure!(
         scores.len() == rows * n_comp,
         "v4 scored selection: {} scores for [{rows}, {n_comp}]",
         scores.len()
     );
-    let k = index_topk.min(n_comp);
+    let k = rule.index_topk.min(n_comp);
     Ok((0..rows)
         .map(|t| {
             let row = &scores[t * n_comp..(t + 1) * n_comp];
             // The causal mask, by index: at prefill query `t` may read a block only once it
             // is COMPLETE. At decode every block in the matrix has closed.
-            let limit = if at.is_prefill() {
+            let limit = if rule.at.is_prefill() {
                 ((t + 1) / ratio).min(n_comp)
             } else {
                 n_comp
@@ -167,7 +179,7 @@ pub fn scored_rows(
             // Ascending, then the `-1` tail out to the rectangle's width — see the header
             // for why ascending is load-bearing and not a tidiness choice.
             sel.sort_unstable();
-            let mut out: Vec<i32> = sel.into_iter().map(|c| (c + offset) as i32).collect();
+            let mut out: Vec<i32> = sel.into_iter().map(|c| (c + rule.offset) as i32).collect();
             out.resize(k, -1);
             out
         })
@@ -470,7 +482,7 @@ mod tests {
     // Named rather than a glob, because the private fills are exactly what these cases drive
     // and a glob would let one of them be deleted without a single case going red.
     use super::{
-        Extent, LayerKind, Sel, compress_dst, compress_offset, compressed_rows,
+        Extent, LayerKind, Sel, SelRule, compress_dst, compress_offset, compressed_rows,
         positional_context_limit, scored_rows, window_rows,
     };
 
@@ -642,15 +654,13 @@ mod tests {
             // the selection ORDER would put the newest block first and the comparison would
             // catch it. Below the cap the scores must not matter at all.
             let scores: Vec<f32> = (0..rows * n_comp).map(|i| i as f32).collect();
-            let comp = scored_rows(
-                &scores,
-                n_comp,
-                k,
-                s.index_topk,
+            let rule = SelRule {
+                kind: k,
+                index_topk: s.index_topk,
                 at,
-                compress_offset(s.win, at),
-            )
-            .expect("legal scored rows");
+                offset: compress_offset(s.win, at),
+            };
+            let comp = scored_rows(&scores, n_comp, rule).expect("legal scored rows");
             let (mut pos, mut scr) = (Vec::new(), Vec::new());
             assert_eq!(s.gather(&mut pos).expect("positional"), (rows, cols));
             assert_eq!(
@@ -674,7 +684,13 @@ mod tests {
         // for the next two slots ALONG WITH block 1 — the three-way tie at 1.0 makes the
         // tie rule observable: {0, 1} must win over 4.
         let scores = [1.0f32, 1.0, 9.0, 0.5, 1.0];
-        let rows = scored_rows(&scores, 5, k, 3, at(1, 19), 100).expect("legal");
+        let rule = SelRule {
+            kind: k,
+            index_topk: 3,
+            at: at(1, 19),
+            offset: 100,
+        };
+        let rows = scored_rows(&scores, 5, rule).expect("legal");
         assert_eq!(
             rows,
             vec![vec![100, 101, 102]],
@@ -683,7 +699,7 @@ mod tests {
         // A score bump on block 4 must MOVE the set — the resolution the gate stands on.
         let mut moved = scores;
         moved[4] = 2.0;
-        let rows = scored_rows(&moved, 5, k, 3, at(1, 19), 100).expect("legal");
+        let rows = scored_rows(&moved, 5, rule).expect("legal");
         assert_eq!(
             rows,
             vec![vec![100, 102, 104]],
@@ -701,7 +717,13 @@ mod tests {
         // best LEGAL block. Block 1 outscores block 0 everywhere, but only rows 7.. may
         // read it (block 1 closes at position 7).
         let scores: Vec<f32> = (0..8).flat_map(|_| [0.1f32, 9.0]).collect();
-        let rows = scored_rows(&scores, 2, k, 1, at(8, 0), 10).expect("legal");
+        let rule = SelRule {
+            kind: k,
+            index_topk: 1,
+            at: at(8, 0),
+            offset: 10,
+        };
+        let rows = scored_rows(&scores, 2, rule).expect("legal");
         let want: Vec<Vec<i32>> = vec![
             vec![-1],
             vec![-1],
@@ -716,7 +738,7 @@ mod tests {
         // And a score matrix of the wrong extent is refused, not truncated.
         let msg = format!(
             "{}",
-            scored_rows(&scores[..15], 2, k, 1, at(8, 0), 10).expect_err("must refuse")
+            scored_rows(&scores[..15], 2, rule).expect_err("must refuse")
         );
         assert!(msg.contains("15 scores"), "wrong refusal: {msg}");
     }
