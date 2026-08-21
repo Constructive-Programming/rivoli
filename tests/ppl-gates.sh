@@ -423,14 +423,21 @@ cell_p4() {
     say "p4: does --max-mem $MEM_A -> $MEM_B move the text FURTHER than a repeat does?"
     local b_corpus=$CORPUS
     if [ -n "$RED_CORPUS" ]; then
-        # One word changed, first line — a perturbation the comparison must see. Bigger
-        # than a byte on purpose: sub-threshold perturbations are this repo's recorded
-        # red-proof trap (a 1-ulp flip was erased by fp16 narrowing; one sign flip sat
-        # under argmax margins). A different TOKEN cannot be erased by anything, and it
-        # must clear the measured noise floor rather than merely being non-zero — which is
-        # exactly the discrimination the re-specified cell exists to make.
+        # The corpus with its LINES REVERSED — every position's context changes while each
+        # line's own tokenization, and therefore the total count, is preserved (newlines are
+        # token boundaries; bin/ppl pairs by position and refuses different lengths).
+        # The perturbation is this large because the first two rungs of the ladder failed,
+        # both on this proof's own first runs (2026-08-21), and the ladder is recorded per
+        # the sub-threshold-red-proof rule:
+        #   1. 'transformer'->'convolutional' (as shipped, never run): tokenizes 762->763,
+        #      bin/ppl REFUSES TO PAIR — the proof could never fire.
+        #   2. one adjacent-word swap on line 1: pairs, but mean dNLL sits UNDER the
+        #      762-token noise floor (budget CI [-0.01799,+0.03300] contained zero) — a
+        #      2-token reorder is below this gate's own resolution, which the gate itself
+        #      reports as ~0.009 nats half-width.
+        # A whole-corpus scramble cannot sit under any floor the gate could honestly pass.
         b_corpus="$SCRATCH/red-corpus.txt"
-        sed '1s/transformer/convolutional/' "$CORPUS" >"$b_corpus"
+        tac "$CORPUS" >"$b_corpus"
         cmp -s "$CORPUS" "$b_corpus" &&
             { echo "FAIL: the red-proof corpus is identical to the corpus — the substitution missed, and the proof would pass vacuously" >&2; exit 2; }
         echo "   red-proof: arm B scores a one-word-different corpus"

@@ -197,7 +197,19 @@ enum Health {
 /// machinery: it fails if the file vanishes, if it sinks BELOW the accepted floor (real
 /// decay), and — via the healed check in the sweep — if it reaches 10.0 (an exemption
 /// suppressing nothing must go).
-const EXEMPT: &[(&str, f64)] = &[("crates/oracles/src/v4oracle/numerics.rs", 9.6)];
+/// `dflash.rs` joined 2026-08-21, on the SAME argument, the first day the gate ran armed:
+/// it is the sha256-pinned transliteration of the DFlash assistant's modeling file (its
+/// header carries the digest), and its findings — `attend`'s nesting, `layer_forward`'s
+/// size and arity — are the REFERENCE's shape. Extracting helpers or bundling arguments
+/// would bury the Python-to-Rust correspondence that the bit-identical golden reproduction
+/// rests on. Floor 8.4 against a measured 8.46, so real decay still reddens. The two
+/// rivoli-AUTHORED files the same first run caught (`glimmer_draft_oracle.rs` 9.84,
+/// `v4_indexer_goldens.rs` 9.38) were refactored to 10.0 instead — the exemption class is
+/// transliterations, never our own tests.
+const EXEMPT: &[(&str, f64)] = &[
+    ("crates/oracles/src/v4oracle/numerics.rs", 9.6),
+    ("crates/oracles/src/dflash.rs", 8.4),
+];
 
 /// The verdict for a scored file, exemption triple included: an exempt file is green in
 /// `[floor, 10)`, red below its floor (decay), and red AT 10.0 (a row suppressing
