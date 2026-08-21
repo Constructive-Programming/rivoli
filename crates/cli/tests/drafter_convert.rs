@@ -252,16 +252,16 @@ fn every_tensor_is_bf16_and_the_offsets_tile_the_file() {
     );
 }
 
-#[test]
-fn the_resident_pin_is_the_checkpoint_plus_the_widened_norms() {
-    let cfg = real("drafter-cfg-pin");
-    let census = cfg.census();
-
-    // The converter's own rank rule: 1-D is a norm and is stored f32, everything else stays
-    // bf16 verbatim. So the pin is NOT the checkpoint's size — it is the checkpoint plus two
-    // more bytes for every norm element, and that is the number P6 costs the drafter at.
+/// The converter's own rank rule, applied to a stream of shapes: 1-D is a norm and is stored
+/// f32, everything else stays bf16 verbatim. Returns `(verbatim, widened, norm_elems)`.
+///
+/// One function on purpose: the pin test below runs this split TWICE — once over the config's
+/// derived census and once over the vendored header's own entries — and the point of that pairing
+/// is that 36/22 falls out of two independent SOURCES, not two independent spellings of the rule.
+/// A second copy of the rank rule is exactly how the two would drift.
+fn rank_split<'a>(shapes: impl Iterator<Item = &'a [usize]>) -> (usize, usize, usize) {
     let (mut verbatim, mut widened, mut norm_elems) = (0usize, 0usize, 0usize);
-    for (_, shape) in &census {
+    for shape in shapes {
         let elems: usize = shape.iter().product();
         if shape.len() == 1 {
             widened += 1;
@@ -270,6 +270,18 @@ fn the_resident_pin_is_the_checkpoint_plus_the_widened_norms() {
             verbatim += 1;
         }
     }
+    (verbatim, widened, norm_elems)
+}
+
+#[test]
+fn the_resident_pin_is_the_checkpoint_plus_the_widened_norms() {
+    let cfg = real("drafter-cfg-pin");
+    let census = cfg.census();
+
+    // The rank rule over the CONFIG's census ([`rank_split`]): the pin is NOT the checkpoint's
+    // size — it is the checkpoint plus two more bytes for every norm element, and that is the
+    // number P6 costs the drafter at.
+    let (verbatim, widened, norm_elems) = rank_split(census.iter().map(|(_, s)| s.as_slice()));
     // 4 per layer (both layernorms plus q_norm/k_norm) plus the encoder's output norm and the
     // final norm; the rest are projections.
     assert_eq!(
@@ -287,16 +299,8 @@ fn the_resident_pin_is_the_checkpoint_plus_the_widened_norms() {
     // the vendored header -- same element count, same byte span, and this assert is the one that
     // notices (gate-red-proofs.md section 6, plant P7).
     let (have, _, _) = header(VENDORED);
-    let (mut f_verbatim, mut f_widened, mut f_norm_elems) = (0usize, 0usize, 0usize);
-    for entry in have.values() {
-        let elems: usize = entry.shape.iter().product();
-        if entry.shape.len() == 1 {
-            f_widened += 1;
-            f_norm_elems += elems;
-        } else {
-            f_verbatim += 1;
-        }
-    }
+    let (f_verbatim, f_widened, f_norm_elems) =
+        rank_split(have.values().map(|e| e.shape.as_slice()));
     assert_eq!(
         (f_verbatim, f_widened, f_norm_elems),
         (verbatim, widened, norm_elems),
