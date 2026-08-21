@@ -81,8 +81,8 @@ struct Weights {
     wqkv: Option<Fp8Weight>,
 }
 
-/// This call's device pointers and per-call extents, resolved once so the phases share a
-/// single derivation.
+/// This call's weights, device pointers and per-call extents, resolved once so the phases
+/// share a single derivation.
 ///
 /// All `Copy` raw pointers — holding them across `&mut self` calls borrows nothing, which is
 /// the same shape [`crate::glm::attn`]'s `AttnCall` takes and for the same reason.
@@ -104,6 +104,11 @@ struct Weights {
 /// which preserves exactly the property the separation exists for.
 #[derive(Clone, Copy)]
 struct AttnCall {
+    /// The layer's [`Weights`], resolved by the same call that resolved the pointers.
+    /// Carried here rather than as a parameter beside the struct because every phase reads
+    /// the two together — the split bought nothing but a fifth parameter on
+    /// [`V4Engine::attend_rows`].
+    w: Weights,
     /// `[m, dim]` — the pre-attention norm's output. Not modified.
     x: *const f32,
     /// `[m, dim]` — the activation-quantized copy of `x`.
@@ -137,14 +142,12 @@ impl V4Engine<'_> {
     pub(super) fn attention_block(&mut self, layer: usize, at: Extent) -> Result<()> {
         self.dims.validate()?;
         self.compress_and_place(layer, at)?;
-        let li = layer - self.range.start;
-        let c = self.attn_call(li)?;
-        let w = self.attn_weights(layer)?;
-        self.qkv_project(w, c, at)?;
+        let c = self.attn_call(layer)?;
+        self.qkv_project(c, at)?;
         let scored = self.scored_selection(layer, at)?;
         let (_, topk) = self.upload_selection(layer, at, scored)?;
-        self.attend_rows(w, c, at, topk)?;
-        self.output_project(w, c, at)
+        self.attend_rows(c, at, topk)?;
+        self.output_project(c, at)
     }
 
     /// Build this step's selection, upload it, and report the `(rows, cols)` it filled.
@@ -197,15 +200,17 @@ impl V4Engine<'_> {
         })
     }
 
-    /// Resolve the layer's scratch and cache pointers once.
+    /// Resolve the layer's scratch and cache pointers — and its [`Weights`] — once.
     ///
     /// The selection's column count is NOT here: since the selection moved behind the q
     /// chain it does not exist yet when the pointers are resolved, so it travels from
     /// `upload_selection`'s return straight into `attend_rows` — one producer, one hop,
     /// nothing to disagree with.
-    fn attn_call(&mut self, li: usize) -> Result<AttnCall> {
+    fn attn_call(&mut self, layer: usize) -> Result<AttnCall> {
+        let li = layer - self.range.start;
         let freqs = self.rope.for_layer(self.layers[li].kind)?;
         Ok(AttnCall {
+            w: self.attn_weights(layer)?,
             x: self.xw.ptr().cast(),
             xq: self.xq.ptr_mut().cast(),
             qr: self.a_qr.ptr_mut().cast(),
@@ -233,7 +238,8 @@ impl V4Engine<'_> {
     /// the fused output must be contiguous and the KV entry must stay at the base where its
     /// consumers already look). The one LOCAL fact: the kv rows compute BEFORE `q_norm` rather
     /// than after the query's rotary, and nothing between those points reads or writes them.
-    fn qkv_project(&mut self, w: Weights, p: AttnCall, at: Extent) -> Result<()> {
+    fn qkv_project(&mut self, p: AttnCall, at: Extent) -> Result<()> {
+        let w = p.w;
         let (d, m) = (self.dims, at.query_rows());
         let (nh, hd, rd, dim) = (d.n_heads, d.head_dim, d.rope_head_dim, d.dim);
         let (q_lora, eps, pos0) = (d.q_lora_rank, d.norm_eps, at.start_pos);
@@ -295,7 +301,7 @@ impl V4Engine<'_> {
     /// TAIL, so that buffer IS the concatenation; at decode the compressed region is the
     /// cache's tail behind the ring. Both are one contiguous buffer the kernel indexes
     /// straight into.
-    fn attend_rows(&mut self, w: Weights, p: AttnCall, at: Extent, topk: usize) -> Result<()> {
+    fn attend_rows(&mut self, p: AttnCall, at: Extent, topk: usize) -> Result<()> {
         let d = self.dims;
         let (nh, hd, m) = (d.n_heads, d.head_dim, at.query_rows());
         // SAFETY: every copy below stays inside `cache[0, window)` — the ring region — and the
@@ -309,7 +315,7 @@ impl V4Engine<'_> {
             launch_gather_attn_shared_kv(
                 p.q,
                 kv_src,
-                w.attn_sink,
+                p.w.attn_sink,
                 p.idxs,
                 m,
                 nh,
@@ -377,7 +383,8 @@ impl V4Engine<'_> {
     ///
     /// The de-rotation is IN PLACE, which is why no probe can read the attend core's own
     /// output: by the time this returns the pre-image is gone.
-    fn output_project(&mut self, w: Weights, p: AttnCall, at: Extent) -> Result<()> {
+    fn output_project(&mut self, p: AttnCall, at: Extent) -> Result<()> {
+        let w = p.w;
         let (d, m) = (self.dims, at.query_rows());
         let (nh, hd, rd) = (d.n_heads, d.head_dim, d.rope_head_dim);
         let gr = d.o_groups * d.o_lora_rank;
