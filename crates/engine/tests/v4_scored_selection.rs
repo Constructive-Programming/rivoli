@@ -23,7 +23,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rivoli_engine::v4::geometry::LayerKind;
-use rivoli_engine::v4::select::{Extent, Sel, scored_rows};
+use rivoli_engine::v4::select::{Extent, Sel, SelRule, scored_rows};
 use rivoli_oracles::v4oracle::forward::{Counters, Defect, LayerCtx, Oracle};
 use rivoli_oracles::v4oracle::toy;
 use rivoli_oracles::v4oracle::weights::{V4Config, fixed_bf16};
@@ -124,6 +124,17 @@ fn capture() -> (V4Config, Vec<Golden>) {
     capture_with(PROMPT, DECODE_STEPS)
 }
 
+/// One golden's engine-side [`SelRule`], under the fixture's own constants — spelled once
+/// so the three gate tests cannot rank under three slightly different rules.
+fn rule_for(g: &Golden) -> SelRule {
+    SelRule {
+        kind: LayerKind::from_ratio(4),
+        index_topk: TOPK,
+        at: g.at,
+        offset: g.offset,
+    }
+}
+
 fn set_of_i64(row: &[i64]) -> BTreeSet<i64> {
     row.iter().copied().filter(|&v| v >= 0).collect()
 }
@@ -143,11 +154,9 @@ fn set_of_i32(row: &[i32]) -> BTreeSet<i64> {
 #[test]
 fn the_engines_selection_over_the_oracles_scores_names_the_oracles_set() {
     let (_, goldens) = capture();
-    let kind = LayerKind::from_ratio(4);
     let mut truncated = 0usize;
     for g in &goldens {
-        let got = scored_rows(&g.scores, g.n_comp, kind, TOPK, g.at, g.offset)
-            .expect("legal scored rows");
+        let got = scored_rows(&g.scores, g.n_comp, rule_for(g)).expect("legal scored rows");
         assert_eq!(got.len(), g.sel.len(), "{:?}: row count", g.at);
         for (t, (ours, theirs)) in got.iter().zip(&g.sel).enumerate() {
             assert_eq!(
@@ -188,11 +197,10 @@ fn the_engines_selection_over_the_oracles_scores_names_the_oracles_set() {
 #[test]
 fn a_keep_oldest_selection_disagrees_with_the_scored_one_above_the_boundary() {
     let (_, goldens) = capture();
-    let kind = LayerKind::from_ratio(4);
     let mut disagreements = 0usize;
     let mut truncated = 0usize;
     for g in goldens.iter().filter(|g| g.n_comp > TOPK) {
-        let scored = scored_rows(&g.scores, g.n_comp, kind, TOPK, g.at, g.offset).expect("legal");
+        let scored = scored_rows(&g.scores, g.n_comp, rule_for(g)).expect("legal");
         for (t, ours) in scored.iter().enumerate() {
             let limit = g.limit_of(t);
             if limit <= TOPK {
@@ -229,7 +237,7 @@ fn below_the_cap_the_scored_gather_is_the_positional_gather_on_real_scores() {
         index_topk: TOPK,
         at: g.at,
     };
-    let comp = scored_rows(&g.scores, g.n_comp, kind, TOPK, g.at, g.offset).expect("legal");
+    let comp = scored_rows(&g.scores, g.n_comp, rule_for(g)).expect("legal");
     let (mut pos, mut scr) = (Vec::new(), Vec::new());
     let shape_pos = sel.gather(&mut pos).expect("positional path");
     let shape_scr = sel.gather_scored(&comp, &mut scr).expect("scored path");

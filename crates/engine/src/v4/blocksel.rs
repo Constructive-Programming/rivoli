@@ -39,8 +39,11 @@
 use super::engine::{V4Engine, gemv_fp8};
 use super::geometry::LayerKind;
 use super::kvcompress::{CompInput, LayerCompressor, narrow_to_bf16};
-use super::select::{Extent, compress_dst, compress_offset, positional_context_limit, scored_rows};
+use super::select::{
+    Extent, SelRule, compress_dst, compress_offset, positional_context_limit, scored_rows,
+};
 use crate::device::DeviceBuf;
+use crate::resident::Fp8Weight;
 use crate::v4::pin::V4Pin;
 use anyhow::{Context, Result, ensure};
 use rivoli_artifact::quant::read_f32;
@@ -55,6 +58,16 @@ use rivoli_core::num::{bf16_to_f32, f32_to_bf16};
 
 /// One indexed layer's persistent scored-selection state.
 struct IdxLayer {
+    /// The ABSOLUTE layer id, for error attribution: every refusal in [`IdxLayer::ingest`]
+    /// names its layer, and carrying the id here is what keeps `ingest` from taking it as a
+    /// parameter beside every call.
+    layer: usize,
+    /// The layer's class — [`IdxLayer::ingest`]'s destination arithmetic ([`compress_dst`])
+    /// derives from it. Copied from the same `kinds` entry [`IndexerBank::new`] ASSERTS
+    /// against the pin, and the bank is already "parallel to the engine's layer vector", so
+    /// it cannot disagree with the engine's own classification without that assertion — or
+    /// the parallelism everything here indexes by — being broken first.
+    kind: LayerKind,
     /// The indexer's nested compressor — [`Geom::indexer`](super::geometry::Geom::indexer)'s
     /// geometry, so its emit finishes with the Hadamard-fp4 spread the scorer's `kv` side
     /// requires.
@@ -135,6 +148,8 @@ impl IndexerBank {
                 continue;
             };
             let mut ix = IdxLayer {
+                layer: l,
+                kind,
                 comp: LayerCompressor::indexer(cfg, kind, max_m, &iw.compressor)
                     .with_context(|| format!("layer {l} indexer compressor"))?,
                 cache: f32s(max_blocks * hd)?,
@@ -163,9 +178,160 @@ impl IndexerBank {
         }
         Ok(())
     }
+
+    /// Step 2 of [`V4Engine::scored_selection`]: the q-side launches, the host scale fold,
+    /// and the scoring kernel — the raw `[m, n_comp]` score matrix, for
+    /// [`scored_rows`] to rank. The caller owns the trigger: this runs only once the causal
+    /// set has outgrown the top-k.
+    ///
+    /// Takes the layer by INDEX rather than as `&mut IdxLayer` because that reference would
+    /// borrow `self.layers` — the caller cannot hold it and hand the bank over too.
+    fn raw_scores(&mut self, li: usize, q: ScoreStep<'_>, at: Extent) -> Result<Vec<f32>> {
+        let (h, hd) = (q.cfg.index_n_heads, q.cfg.index_head_dim);
+        let (q_lora, rd) = (q.cfg.q_lora_rank, q.cfg.qk_rope_head_dim);
+        let (dim, m, n_comp) = (q.cfg.hidden, at.query_rows(), q.n_comp);
+        let ix = self.layers[li]
+            .as_ref()
+            .context("scored_selection resolved this layer's state before ingest")?;
+        let iq = self.iq.ptr_mut().cast::<f32>();
+        let wp = self.w_dev.ptr_mut().cast::<f32>();
+        // SAFETY: `qrq` holds this step's `m * q_lora` quantized rows (qkv_project ran),
+        // `iq` is `max_m * h * hd`, `wp` is `max_m * h`, the score slab is
+        // `max_m * max_blocks >= m * n_comp`, and `ix.cache` holds `n_comp` finished rows —
+        // written by ingest at prefill, but at DECODE ingest contributes at most the ONE
+        // row that just closed and the rest came from earlier steps, so the invariant is
+        // that the decode loop visits every position from 0, not anything ingest does. All
+        // on the null stream, so ordering holds.
+        unsafe {
+            gemv_fp8(q.qrq, q.wq_b, m, (h * hd, q_lora), iq, NULL_STREAM)?;
+            launch_rope_adjacent(
+                iq,
+                q.freqs,
+                m * h,
+                hd,
+                rd,
+                at.start_pos,
+                h,
+                false,
+                NULL_STREAM,
+            )?;
+            launch_act_quant_f4_rotated(iq, m * h, hd, NULL_STREAM)?;
+            launch_gemm_bf16(q.x, ix.wproj.ptr().cast(), wp, m, h, dim, NULL_STREAM)?;
+        }
+        // The scale, on host: `round_bf16(weights_proj(x))`, then `* wscale` landing in
+        // bf16 — the oracle's own two stores (`Oracle::indexer`, model.py:424). The GEMM
+        // writes raw f32 accumulations, so both rounds happen here; the traffic is
+        // `m * index_n_heads` floats each way, 256 bytes at decode.
+        self.w_dev
+            .copy_out_prefix(&mut self.w_host, m * h * size_of::<f32>())?;
+        let scaled: Vec<u8> = read_f32(&self.w_host)
+            .into_iter()
+            .flat_map(|v| {
+                let r = bf16_to_f32(f32_to_bf16(v));
+                bf16_to_f32(f32_to_bf16(r * self.wscale)).to_le_bytes()
+            })
+            .collect();
+        self.w_dev.copy_in_at(0, &scaled)?;
+        let bufs = ScoreBufs {
+            q: self.iq.ptr().cast(),
+            kv: ix.cache.ptr().cast(),
+            w: self.w_dev.ptr().cast(),
+            score: self.score_dev.ptr_mut().cast(),
+        };
+        let dims = ScoreDims {
+            s: m,
+            n_comp,
+            heads: h,
+            hd,
+        };
+        // SAFETY: sized in the launch's own terms two comments up; distinct allocations.
+        unsafe { launch_index_score_blocks(bufs, dims, NULL_STREAM)? };
+        self.score_dev
+            .copy_out_prefix(&mut self.score_host, m * n_comp * size_of::<f32>())?;
+        Ok(read_f32(&self.score_host))
+    }
+}
+
+/// One step's q-side inputs to [`IndexerBank::raw_scores`] — resolved by the caller because
+/// they live on [`V4Engine`], whose borrow the caller has already split to hand the bank out
+/// `&mut`.
+struct ScoreStep<'a> {
+    /// The engine's config — the indexer's dims are read from it here rather than copied
+    /// into the bank, so there is exactly one authority for them.
+    cfg: &'a V4Config,
+    /// This step's quantized `qr` rows — why the scoring must run after `qkv_project`.
+    qrq: *const f32,
+    /// The indexer's own `wq_b`, fp8 like the attention's.
+    wq_b: Fp8Weight,
+    /// The UNQUANTIZED pre-attention norm output `weights_proj` consumes.
+    x: *const f32,
+    /// This layer's rotary table, from the ONE selection site.
+    freqs: *const f32,
+    /// Causally-complete block count — the score matrix's width.
+    n_comp: usize,
 }
 
 impl IdxLayer {
+    /// Step 1 of [`V4Engine::scored_selection`]: run the nested compressor for this call and
+    /// persist what it emitted into this layer's compressed cache. Runs on EVERY indexed-layer
+    /// call, scoring or not — the module header carries why this cannot wait for the boundary.
+    ///
+    /// Same launch sequence, same contract, different geometry and destination from the
+    /// attention compressor's.
+    fn ingest(&mut self, w: CompInput, at: Extent) -> Result<()> {
+        let layer = self.layer;
+        // SAFETY: every pointer is a pin placement or a live DeviceBuf at its documented
+        // shape; the null stream is what this whole arm runs on.
+        let blocks = unsafe { self.comp.run(w, at, NULL_STREAM) }
+            .with_context(|| format!("layer {layer} indexer compressor at {at:?}"))?;
+        // The drift tripwire, BOTH ways, which is `kvcompress::compress_and_place`'s shape
+        // and for its reason: the run and `compress_dst` decide from the same `(kind, at)`
+        // and today cannot disagree, so what this catches is a future edit to one of them.
+        // The `Some(_) && blocks == 0` corner is not cosmetic here — it would leave
+        // `self.cache[row]` at its reset zeros, and a zero row scores EXACTLY 0.0 through the
+        // scorer's `relu` while a real block can score negative (`weights_proj` is a bare
+        // Linear), so the empty row would outrank real ones. Silent, plausible, permanent.
+        match compress_dst(self.kind, 0, at) {
+            None => ensure!(
+                blocks == 0,
+                "layer {layer}: the indexer's compressor emitted {blocks} block(s) where \
+                 compress_dst names no destination — the two have drifted"
+            ),
+            Some((row, want)) => {
+                ensure!(
+                    blocks == want,
+                    "layer {layer}: indexer emitted {blocks} block(s) at {at:?} where \
+                     compress_dst reserved {want}"
+                );
+                ensure!(
+                    row + blocks <= self.cache_rows,
+                    "layer {layer}: {blocks} indexer block(s) at row {row} overrun the \
+                     {}-row cache",
+                    self.cache_rows
+                );
+                // The block WIDTH off the emitting geometry, not off the config a second
+                // time — which is what `LayerCompressor::d`'s doc promised and this is the
+                // caller it named.
+                let d = self.comp.d();
+                // SAFETY: `emitted()` holds `blocks * d` f32 by the compressor's sizing;
+                // the destination range was bounded above; distinct allocations. Async and
+                // stream-ordered like `attn::write_ring`'s copies — the blocking
+                // `memcpy_dtod` is the arena-relocation entry point, and forcing a host
+                // sync per indexed layer per step is not what this path wants.
+                unsafe {
+                    memcpy_dtod_async(
+                        self.cache.ptr_mut().cast::<f32>().add(row * d).cast(),
+                        self.comp.emitted(),
+                        blocks * d * size_of::<f32>(),
+                        NULL_STREAM,
+                    )
+                    .context("persisting the indexer's compressed cache")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn reset(&mut self) -> Result<()> {
         self.comp.reset()?;
         // The cache needs no zero for correctness — every block index below `n_comp` is
@@ -206,9 +372,7 @@ impl V4Engine<'_> {
             return Ok(None);
         }
         let freqs = self.rope.for_layer(kind)?;
-        let (dim, topk) = (self.cfg.hidden, self.cfg.index_topk);
-        let (h, hd) = (self.cfg.index_n_heads, self.cfg.index_head_dim);
-        let (q_lora, rd) = (self.cfg.q_lora_rank, self.cfg.qk_rope_head_dim);
+        let (cfg, topk) = (self.cfg, self.cfg.index_topk);
         let win = self.dims.window;
         let iw = self
             .pin
@@ -224,59 +388,8 @@ impl V4Engine<'_> {
             .as_mut()
             .with_context(|| format!("layer {layer} is indexed but the bank has no state"))?;
 
-        // 1. The nested compressor, EVERY call — the module header carries why this cannot
-        // wait for the boundary. Same launch sequence, same contract, different geometry
-        // and destination from the attention compressor's.
-        let w = CompInput::of(x, dim, &cw, freqs);
-        // SAFETY: every pointer is a pin placement or a live DeviceBuf at its documented
-        // shape; the null stream is what this whole arm runs on.
-        let blocks = unsafe { ix.comp.run(w, at, NULL_STREAM) }
-            .with_context(|| format!("layer {layer} indexer compressor at {at:?}"))?;
-        // The drift tripwire, BOTH ways, which is `kvcompress::compress_and_place`'s shape
-        // and for its reason: the run and `compress_dst` decide from the same `(kind, at)`
-        // and today cannot disagree, so what this catches is a future edit to one of them.
-        // The `Some(_) && blocks == 0` corner is not cosmetic here — it would leave
-        // `ix.cache[row]` at its reset zeros, and a zero row scores EXACTLY 0.0 through the
-        // scorer's `relu` while a real block can score negative (`weights_proj` is a bare
-        // Linear), so the empty row would outrank real ones. Silent, plausible, permanent.
-        match compress_dst(kind, 0, at) {
-            None => ensure!(
-                blocks == 0,
-                "layer {layer}: the indexer's compressor emitted {blocks} block(s) where \
-                 compress_dst names no destination — the two have drifted"
-            ),
-            Some((row, want)) => {
-                ensure!(
-                    blocks == want,
-                    "layer {layer}: indexer emitted {blocks} block(s) at {at:?} where \
-                     compress_dst reserved {want}"
-                );
-                ensure!(
-                    row + blocks <= ix.cache_rows,
-                    "layer {layer}: {blocks} indexer block(s) at row {row} overrun the \
-                     {}-row cache",
-                    ix.cache_rows
-                );
-                // The block WIDTH off the emitting geometry, not off the config a second
-                // time — which is what `LayerCompressor::d`'s doc promised and this is the
-                // caller it named.
-                let d = ix.comp.d();
-                // SAFETY: `emitted()` holds `blocks * d` f32 by the compressor's sizing;
-                // the destination range was bounded above; distinct allocations. Async and
-                // stream-ordered like `attn::write_ring`'s copies — the blocking
-                // `memcpy_dtod` is the arena-relocation entry point, and forcing a host
-                // sync per indexed layer per step is not what this path wants.
-                unsafe {
-                    memcpy_dtod_async(
-                        ix.cache.ptr_mut().cast::<f32>().add(row * d).cast(),
-                        ix.comp.emitted(),
-                        blocks * d * size_of::<f32>(),
-                        NULL_STREAM,
-                    )
-                    .context("persisting the indexer's compressed cache")?;
-                }
-            }
-        }
+        // 1. The nested compressor, EVERY call.
+        ix.ingest(CompInput::of(x, cfg.hidden, &cw, freqs), at)?;
 
         // 2. Scores, only once they can DECIDE something. The ratio is the compressor's
         // own — the same geometry that sized the cache the scorer reads.
@@ -284,70 +397,21 @@ impl V4Engine<'_> {
         if n_comp <= topk {
             return Ok(None);
         }
-        let m = at.query_rows();
-        let iq = bank.iq.ptr_mut().cast::<f32>();
-        let wp = bank.w_dev.ptr_mut().cast::<f32>();
-        // SAFETY: `qrq` holds this step's `m * q_lora` quantized rows (qkv_project ran),
-        // `iq` is `max_m * h * hd`, `wp` is `max_m * h`, the score slab is
-        // `max_m * max_blocks >= m * n_comp`, and `ix.cache` holds `n_comp` finished rows —
-        // written by step 1 at prefill, but at DECODE step 1 contributes at most the ONE
-        // row that just closed and the rest came from earlier steps, so the invariant is
-        // that the decode loop visits every position from 0, not anything step 1 does. All
-        // on the null stream, so ordering holds.
-        unsafe {
-            gemv_fp8(qrq, wq_b, m, (h * hd, q_lora), iq, NULL_STREAM)?;
-            launch_rope_adjacent(
-                iq,
-                freqs,
-                m * h,
-                hd,
-                rd,
-                at.start_pos,
-                h,
-                false,
-                NULL_STREAM,
-            )?;
-            launch_act_quant_f4_rotated(iq, m * h, hd, NULL_STREAM)?;
-            launch_gemm_bf16(x, ix.wproj.ptr().cast(), wp, m, h, dim, NULL_STREAM)?;
-        }
-        // The scale, on host: `round_bf16(weights_proj(x))`, then `* wscale` landing in
-        // bf16 — the oracle's own two stores (`Oracle::indexer`, model.py:424). The GEMM
-        // writes raw f32 accumulations, so both rounds happen here; the traffic is
-        // `m * index_n_heads` floats each way, 256 bytes at decode.
-        bank.w_dev
-            .copy_out_prefix(&mut bank.w_host, m * h * size_of::<f32>())?;
-        let scaled: Vec<u8> = read_f32(&bank.w_host)
-            .into_iter()
-            .flat_map(|v| {
-                let r = bf16_to_f32(f32_to_bf16(v));
-                bf16_to_f32(f32_to_bf16(r * bank.wscale)).to_le_bytes()
-            })
-            .collect();
-        bank.w_dev.copy_in_at(0, &scaled)?;
-        let bufs = ScoreBufs {
-            q: bank.iq.ptr().cast(),
-            kv: ix.cache.ptr().cast(),
-            w: bank.w_dev.ptr().cast(),
-            score: bank.score_dev.ptr_mut().cast(),
-        };
-        let dims = ScoreDims {
-            s: m,
+        let step = ScoreStep {
+            cfg,
+            qrq,
+            wq_b,
+            x,
+            freqs,
             n_comp,
-            heads: h,
-            hd,
         };
-        // SAFETY: sized in the launch's own terms two comments up; distinct allocations.
-        unsafe { launch_index_score_blocks(bufs, dims, NULL_STREAM)? };
-        bank.score_dev
-            .copy_out_prefix(&mut bank.score_host, m * n_comp * size_of::<f32>())?;
-        let rows = scored_rows(
-            &read_f32(&bank.score_host),
-            n_comp,
+        let rule = SelRule {
             kind,
-            topk,
+            index_topk: topk,
             at,
-            compress_offset(win, at),
-        )?;
+            offset: compress_offset(win, at),
+        };
+        let rows = scored_rows(&bank.raw_scores(li, step, at)?, n_comp, rule)?;
         Ok(Some(rows))
     }
 }
