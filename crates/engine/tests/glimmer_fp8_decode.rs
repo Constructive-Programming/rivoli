@@ -172,30 +172,45 @@ struct Run {
     stats: (u64, u64),
 }
 
-fn decode(dir: &str, t: &GlimmerTextConfig, prompt: &[u32], ngen: usize, capacity: usize) -> Run {
-    let mut e =
-        GlimmerEngine::open(dir, t, capacity, prompt.len() + ngen).expect("build the engine");
-    let out = e
-        .decode(
-            GenSpec {
-                prompt,
-                ngen,
-                eos: &[],
-            },
-            &mut |_| true,
-        )
-        .expect("decode");
-    let logits = e
-        .logits()
-        .expect("the last sample's logits")
-        .iter()
-        .map(|v| v.to_bits())
-        .collect();
-    Run {
-        ids: out.ids,
-        logits,
-        residency: e.residency(),
-        stats: e.slot_stats(),
+/// The generation request this file holds FIXED while the artifact and the budget vary.
+///
+/// Every claim below is "same prompt, different bytes or budget", so the config, prompt and
+/// length live here ONCE — they cannot drift between arms — and [`Request::decode`]'s two
+/// parameters are exactly the two axes the assertions compare across. `eos` is empty on
+/// purpose: every arm must generate all `ngen` tokens, or the bit-identity claims would be
+/// comparing runs of different lengths.
+struct Request<'a> {
+    t: &'a GlimmerTextConfig,
+    prompt: &'a [u32],
+    ngen: usize,
+}
+
+impl Request<'_> {
+    fn decode(&self, dir: &str, capacity: usize) -> Run {
+        let mut e = GlimmerEngine::open(dir, self.t, capacity, self.prompt.len() + self.ngen)
+            .expect("build the engine");
+        let out = e
+            .decode(
+                GenSpec {
+                    prompt: self.prompt,
+                    ngen: self.ngen,
+                    eos: &[],
+                },
+                &mut |_| true,
+            )
+            .expect("decode");
+        let logits = e
+            .logits()
+            .expect("the last sample's logits")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        Run {
+            ids: out.ids,
+            logits,
+            residency: e.residency(),
+            stats: e.slot_stats(),
+        }
     }
 }
 
@@ -212,10 +227,15 @@ fn the_fp8_partition_moves_bytes_and_never_text_and_is_not_bf16() {
         "a prompt id is outside the anchor vocab"
     );
     let ngen = 4;
+    let req = Request {
+        t,
+        prompt: &prompt,
+        ngen,
+    };
 
     // P4: all-resident vs forced-streaming, bit for bit.
     let (roomy, tight) = budgets(t, prompt.len() + ngen, ProjFmt::Fp8 { block: FP8_BLOCK });
-    let all = decode(fp8.path(), t, &prompt, ngen, roomy);
+    let all = req.decode(fp8.path(), roomy);
     let (pinned, streamed) = all.residency;
     assert_eq!(
         streamed, 0,
@@ -225,7 +245,7 @@ fn the_fp8_partition_moves_bytes_and_never_text_and_is_not_bf16() {
         pinned, t.n_layers,
         "the roomy fp8 budget must pin every layer"
     );
-    let split = decode(fp8.path(), t, &prompt, ngen, tight);
+    let split = req.decode(fp8.path(), tight);
     assert_split_entered(a.name, split.residency, split.stats);
     assert_eq!(
         split.ids, all.ids,
@@ -254,7 +274,7 @@ fn the_fp8_partition_moves_bytes_and_never_text_and_is_not_bf16() {
     // Anti-fallback: fp8 must NOT reproduce bf16. Equality here is the named M11 failure
     // mode (a dispatch that silently launched the bf16 kernel) wearing a green test.
     let (roomy_bf16, _) = budgets(t, prompt.len() + ngen, ProjFmt::Bf16);
-    let base = decode(bf16.path(), t, &prompt, ngen, roomy_bf16);
+    let base = req.decode(bf16.path(), roomy_bf16);
     assert_eq!(base.logits.len(), all.logits.len());
     let differing = base
         .logits
