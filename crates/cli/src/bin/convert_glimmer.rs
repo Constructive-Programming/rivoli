@@ -139,7 +139,13 @@ fn eos_ids(dir: &str) -> Result<Vec<u32>> {
 /// function is exactly "what is checked before the 53 GB write".
 ///
 /// Returns the ids, because `main`'s last act is comparing the artifact's against them.
-fn refuse_before_writing(src_dir: &str, out_dir: &str) -> Result<(GlimmerConfig, Vec<u32>)> {
+///
+/// Takes the parsed [`Args`] whole rather than two bare directory strings: what this guards
+/// is the INVOCATION, and two adjacent `&str` parameters are exactly the pair a caller can
+/// swap without a type saying so — `refuse_writing_into_source` would then be checking the
+/// hazard backwards and reporting it as absent.
+fn refuse_before_writing(args: &Args) -> Result<(GlimmerConfig, Vec<u32>)> {
+    let (src_dir, out_dir) = (args.src_dir.as_str(), args.out_dir.as_str());
     // **Not into the source directory.** The argument — and the words — moved to
     // `SafeWriter::refuse_writing_into_source` on 2026-08-16, when `convert_v4` became the
     // second converter with the same guard and jscpd reported the pair. It is the WRITER's
@@ -238,9 +244,78 @@ fn ensure_complete(names: &[String], n_layers: usize) -> Result<()> {
     Ok(())
 }
 
+/// What the tensor pass counted — the numbers `main` prints and asserts, travelling as one
+/// value so the print and the check cannot drift onto different tallies.
+struct Counts {
+    verbatim: usize,
+    widened: usize,
+    quantized: usize,
+}
+
+/// **The all-or-nothing check, made BEFORE the pass rather than after it** (review,
+/// 2026-08-16). `is_layer_proj` is a pure predicate over `names`, and `names` is complete
+/// at the call site, so the same claim the post-pass `ensure!` makes is decidable now — for
+/// free, in milliseconds, instead of after ~34 GB of owned bytes and a multi-hour
+/// quantization pass. That ordering is this file's own discipline (`refuse_before_writing`);
+/// the post-pass check stays, because this one says the NAMES imply the count and that one
+/// says the loop actually took the branch.
+///
+/// Returns the expected count so the post-pass check judges the same number this one did.
+fn refuse_partial_quantization(names: &[String], cfg: &GlimmerConfig, fp8: bool) -> Result<usize> {
+    let want_quantized = expected_quantized(&cfg.text, fp8)?;
+    ensure!(
+        names.iter().filter(|n| is_layer_proj(n)).count() * usize::from(fp8) == want_quantized,
+        "this checkpoint has {} layer projections; its {} layers imply {want_quantized}",
+        names.iter().filter(|n| is_layer_proj(n)).count(),
+        cfg.text.n_layers
+    );
+    Ok(want_quantized)
+}
+
+/// The one pass over the sorted names: norms widened to f32, projections quantized under
+/// `--fp8`, everything else bf16 verbatim. Split out of `main` on the same argument as
+/// [`refuse_before_writing`] — this function is exactly "what the artifact's tensors are".
+fn write_tensors<'a>(
+    src: &'a Safetensors,
+    names: &[String],
+    fp8: bool,
+) -> Result<(SafeWriter<'a>, Counts)> {
+    let mut w = SafeWriter::new();
+    let (mut verbatim, mut widened, mut quantized) = (0usize, 0usize, 0usize);
+    for name in names {
+        if is_vision(name) {
+            continue; // counted from the index, not from whichever shards were opened
+        }
+        if is_norm(name) {
+            w.add_widened(src, name)?;
+            widened += 1;
+        } else if fp8 && is_layer_proj(name) {
+            let base = name
+                .strip_suffix(".weight")
+                .with_context(|| format!("{name} is a layer projection with no `.weight` tail"))?;
+            w.add_quantized_fp8(src, base, rivoli_artifact::quant::FP8_BLOCK)?;
+            quantized += 1;
+        } else {
+            // Verbatim, and asserted BF16 rather than "whatever it is": `copy_verbatim` refuses
+            // any other dtype, so an fp8 or 4-bit export of this model refuses here instead of
+            // being copied into an artifact that claims to be bf16.
+            w.copy_verbatim(src, name, Dtype::Bf16)?;
+            verbatim += 1;
+        }
+    }
+    Ok((
+        w,
+        Counts {
+            verbatim,
+            widened,
+            quantized,
+        },
+    ))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let (cfg, ids) = refuse_before_writing(&args.src_dir, &args.out_dir)?;
+    let (cfg, ids) = refuse_before_writing(&args)?;
     let skipped = vision_count(&args.src_dir)?;
     std::fs::create_dir_all(&args.out_dir)?;
 
@@ -251,66 +326,28 @@ fn main() -> Result<()> {
     let want = |n: &str| !is_vision(n);
     let src = Safetensors::open_indexed(&args.src_dir, want)?;
 
-    let mut w = SafeWriter::new();
-    let (mut verbatim, mut widened, mut quantized) = (0usize, 0usize, 0usize);
     let mut names: Vec<String> = src.names().iter().map(|s| s.to_string()).collect();
     names.sort();
-    // **The all-or-nothing check, made BEFORE the pass rather than after it** (review,
-    // 2026-08-16). `is_layer_proj` is a pure predicate over `names`, and `names` is complete
-    // here, so the same claim the post-loop `ensure!` makes is decidable now — for free, in
-    // milliseconds, instead of after ~34 GB of owned bytes and a multi-hour quantization pass.
-    // That ordering is this file's own discipline (`refuse_before_writing`); the post-loop
-    // check stays, because this one says the NAMES imply the count and that one says the loop
-    // actually took the branch.
-    let want_quantized = expected_quantized(&cfg.text, args.fp8)?;
-    ensure!(
-        names.iter().filter(|n| is_layer_proj(n)).count() * usize::from(args.fp8) == want_quantized,
-        "this checkpoint has {} layer projections; its {} layers imply {want_quantized}",
-        names.iter().filter(|n| is_layer_proj(n)).count(),
-        cfg.text.n_layers
-    );
-    for name in &names {
-        if is_vision(name) {
-            continue; // counted from the index above, not from whichever shards were opened
-        }
-        if is_norm(name) {
-            w.add_widened(&src, name)?;
-            widened += 1;
-        } else if args.fp8 && is_layer_proj(name) {
-            let base = name
-                .strip_suffix(".weight")
-                .with_context(|| format!("{name} is a layer projection with no `.weight` tail"))?;
-            w.add_quantized_fp8(&src, base, rivoli_artifact::quant::FP8_BLOCK)?;
-            quantized += 1;
-        } else {
-            // Verbatim, and asserted BF16 rather than "whatever it is": `copy_verbatim` refuses
-            // any other dtype, so an fp8 or 4-bit export of this model refuses here instead of
-            // being copied into an artifact that claims to be bf16.
-            w.copy_verbatim(&src, name, Dtype::Bf16)?;
-            verbatim += 1;
-        }
-    }
+    let want_quantized = refuse_partial_quantization(&names, &cfg, args.fp8)?;
+    let (w, counts) = write_tensors(&src, &names, args.fp8)?;
     // **The count is asserted, not printed and trusted.** `is_layer_proj` is two string
     // predicates over names this binary does not control; if either ever stopped matching, the
     // artifact would come out with some projections bf16 and some fp8, and the pin's header
     // loop would refuse it — correctly, but hours later and with a message about one tensor
     // rather than about the pass that skipped it.
     //
-    // **The expected count is DERIVED, not the literal `8`** (review, 2026-08-16). It is the
-    // rank-2 entries of `GLIMMER_LAYER_TENSORS` — the same discriminator `geometry::layer_bytes`,
-    // `pin::layer_tails`, `pin::check_layer_headers` and `glimmer_anchor::stored` all branch on
-    // — so this joins those four rather than becoming a fifth authority on "how many
-    // projections a layer has". Writing `8` here would have been the very spelling
-    // `is_layer_proj`'s own doc declines to add below.
+    // **The expected count is DERIVED, not the literal `8`** (review, 2026-08-16) — see
+    // [`expected_quantized`], which is the one spelling of that arithmetic both this check and
+    // [`refuse_partial_quantization`] judge against.
     //
     // Guarded on `args.fp8` rather than carrying an `else { 0 }` arm: `quantized` is only
-    // incremented inside the `args.fp8 &&` branch above, so that arm could never fail — and its
-    // failure message names a flag the run did not pass.
+    // incremented inside `write_tensors`' `fp8 &&` branch, so that arm could never fail — and
+    // its failure message names a flag the run did not pass.
     if args.fp8 {
         ensure!(
-            quantized == want_quantized,
-            "--fp8 quantized {quantized} tensors; this checkpoint's {} layers imply \
-             {want_quantized}",
+            counts.quantized == want_quantized,
+            "--fp8 quantized {} tensors; this checkpoint's {} layers imply {want_quantized}",
+            counts.quantized,
             cfg.text.n_layers
         );
     }
@@ -319,8 +356,9 @@ fn main() -> Result<()> {
     let out = format!("{}/resident.safetensors", args.out_dir);
     w.write(&out).with_context(|| format!("write {out}"))?;
     eprintln!(
-        "convert_glimmer: {verbatim} tensors bf16 verbatim, {quantized} projections quantized \
-         to fp8, {widened} norms widened to f32, {skipped} vision tensors skipped -> {out}"
+        "convert_glimmer: {} tensors bf16 verbatim, {} projections quantized to fp8, {} norms \
+         widened to f32, {skipped} vision tensors skipped -> {out}",
+        counts.verbatim, counts.quantized, counts.widened
     );
 
     // The manifest is the checkpoint's own `config.json` plus the `format` section, so
