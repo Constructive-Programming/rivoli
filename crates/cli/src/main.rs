@@ -601,86 +601,91 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// The rows clap must refuse, each with why beside it. The table is data and the test
+    /// below is the loop, so a new illegal combination is one row here, not a new test.
+    const REFUSED: [&[&str]; 10] = [
+        &["rivoli", "DIR"],                                       // no invocation
+        &["rivoli", "DIR", "--bench", "4", "--port", "8080"],     // two invocations
+        &["rivoli", "DIR", "--bench", "4", "--think"],            // --think is server-only
+        &["rivoli", "DIR", "--port", "8080", "--prompt", "x"],    // requests bring prompts
+        &["rivoli", "DIR", "--port", "8080", "--dump-ids", "/x"], // one run, many replies
+        // --ppl is its own invocation: exclusive with the other two, inseparable
+        // from --ppl-out (the .nll file IS the deliverable), and --ppl-out without
+        // --ppl has nothing to write.
+        &["rivoli", "DIR", "--ppl", "c.txt"],
+        &["rivoli", "DIR", "--ppl-out", "/x.nll"],
+        &[
+            "rivoli",
+            "DIR",
+            "--bench",
+            "4",
+            "--ppl",
+            "c.txt",
+            "--ppl-out",
+            "/x.nll",
+        ],
+        &[
+            "rivoli",
+            "DIR",
+            "--port",
+            "8080",
+            "--ppl",
+            "c.txt",
+            "--ppl-out",
+            "/x.nll",
+        ],
+        // A scoring run never decodes free-running text, so a trace of "the decode's
+        // expert selections" would be a file about a run that did not happen.
+        &[
+            "rivoli",
+            "DIR",
+            "--ppl",
+            "c",
+            "--ppl-out",
+            "/x",
+            "--trace",
+            "/t",
+        ],
+    ];
+
+    /// The rows that must PARSE, so the refusal table cannot pass by refusing everything.
+    const ACCEPTED: [&[&str]; 5] = [
+        &["rivoli", "DIR", "--bench", "4"],
+        &["rivoli", "DIR", "--port", "8080"],
+        &["rivoli", "DIR", "--port", "8080", "--think"],
+        &["rivoli", "DIR", "--ppl", "c.txt", "--ppl-out", "/x.nll"],
+        // The sweep knobs stay legal under --ppl — mode/policy/budget ARE the cells
+        // a paired comparison distinguishes.
+        &[
+            "rivoli",
+            "DIR",
+            "--ppl",
+            "c",
+            "--ppl-out",
+            "/x",
+            "--mode",
+            "int4",
+            "--max-mem",
+            "70",
+        ],
+    ];
+
     /// The invocation contract, PARSED rather than trusted to an attribute.
     ///
     /// This exists because the first spelling was `requires = "port"` / `requires =
     /// "bench"`, and it is INERT in clap 4.6.6: `rivoli DIR --bench 4 --think` parsed clean
     /// and went on to load a model. Nothing but a parse test tells two attribute spellings
-    /// apart, and an exclusivity nobody can see fail is decoration. The accepted rows are
-    /// here so this cannot pass by refusing everything.
+    /// apart, and an exclusivity nobody can see fail is decoration. [`ACCEPTED`] is judged
+    /// here too, so this cannot pass by refusing everything.
     #[test]
     fn exactly_one_of_bench_and_port_and_the_bench_only_flags_say_so() {
-        let refused: [&[&str]; 10] = [
-            &["rivoli", "DIR"],                                       // no invocation
-            &["rivoli", "DIR", "--bench", "4", "--port", "8080"],     // two invocations
-            &["rivoli", "DIR", "--bench", "4", "--think"],            // --think is server-only
-            &["rivoli", "DIR", "--port", "8080", "--prompt", "x"],    // requests bring prompts
-            &["rivoli", "DIR", "--port", "8080", "--dump-ids", "/x"], // one run, many replies
-            // --ppl is its own invocation: exclusive with the other two, inseparable
-            // from --ppl-out (the .nll file IS the deliverable), and --ppl-out without
-            // --ppl has nothing to write.
-            &["rivoli", "DIR", "--ppl", "c.txt"],
-            &["rivoli", "DIR", "--ppl-out", "/x.nll"],
-            &[
-                "rivoli",
-                "DIR",
-                "--bench",
-                "4",
-                "--ppl",
-                "c.txt",
-                "--ppl-out",
-                "/x.nll",
-            ],
-            &[
-                "rivoli",
-                "DIR",
-                "--port",
-                "8080",
-                "--ppl",
-                "c.txt",
-                "--ppl-out",
-                "/x.nll",
-            ],
-            // A scoring run never decodes free-running text, so a trace of "the decode's
-            // expert selections" would be a file about a run that did not happen.
-            &[
-                "rivoli",
-                "DIR",
-                "--ppl",
-                "c",
-                "--ppl-out",
-                "/x",
-                "--trace",
-                "/t",
-            ],
-        ];
-        for argv in refused {
+        for argv in REFUSED {
             assert!(
                 Args::command().try_get_matches_from(argv).is_err(),
                 "clap accepted {argv:?}, which is not a legal invocation"
             );
         }
-        let accepted: [&[&str]; 5] = [
-            &["rivoli", "DIR", "--bench", "4"],
-            &["rivoli", "DIR", "--port", "8080"],
-            &["rivoli", "DIR", "--port", "8080", "--think"],
-            &["rivoli", "DIR", "--ppl", "c.txt", "--ppl-out", "/x.nll"],
-            // The sweep knobs stay legal under --ppl — mode/policy/budget ARE the cells
-            // a paired comparison distinguishes.
-            &[
-                "rivoli",
-                "DIR",
-                "--ppl",
-                "c",
-                "--ppl-out",
-                "/x",
-                "--mode",
-                "int4",
-                "--max-mem",
-                "70",
-            ],
-        ];
-        for argv in accepted {
+        for argv in ACCEPTED {
             assert!(
                 Args::command().try_get_matches_from(argv).is_ok(),
                 "clap refused {argv:?}, which is a legal invocation"
