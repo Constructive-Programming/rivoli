@@ -77,10 +77,12 @@ pub enum ProjPin {
 /// One value because they are ONE claim about the artifact — "these names, these shapes, this
 /// storage" — and because it keeps every placer below at four parameters where threading `fmt`
 /// beside `cfg` would widen five of them to the same `(tier, st, cfg, fmt, …)` run that
-/// `v4/pin.rs`'s placers already open with — and would make [`place_proj`] a **six**-parameter
-/// function, which `crates/cli/tests/codescene.rs` fails on its own (the arity rule fires at
-/// 5) whatever jscpd thinks. Two gates, one of them checkable by counting; a reader who
+/// `v4/pin.rs`'s placers already open with — and would put [`place_layer`] at **five**
+/// parameters, which `crates/cli/tests/codescene.rs` fails on its own (the arity rule fires
+/// at 5) whatever jscpd thinks. Two gates, one of them checkable by counting; a reader who
 /// deletes this struct after satisfying themselves about the other still breaks the build.
+/// The same rule fired on [`place_proj`] itself 2026-08-21 — it sat AT five with `Schema` in
+/// place — which is what [`Source`] exists to absorb.
 ///
 /// > **TRIMMED 2026-08-16, by review.** This carried two more sentences and neither survives.
 /// > It said jscpd "promptly reported" that widened run as a clone: **that measurement was not
@@ -95,6 +97,18 @@ pub enum ProjPin {
 struct Schema<'a> {
     cfg: &'a GlimmerTextConfig,
     fmt: ProjFmt,
+}
+
+/// The opened artifact beside the [`Schema`] describing it — the pair a byte-reading placer
+/// consumes together, since every byte it reads is read under the shapes the schema implies.
+///
+/// Bundled for `Schema`'s own arity reason (see its doc): [`place_proj`] needs the tier, both
+/// artifact-side values and the tensor's two-part name, and the loose spelling of that is the
+/// five-parameter signature the arity gate refuses.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    st: &'a Safetensors,
+    s: Schema<'a>,
 }
 
 /// One Muse Glimmer decoder layer's weights, resolved — **whether the budget pinned it or a
@@ -251,22 +265,21 @@ fn place_norm(
 /// review found running zero times on exactly this path.
 fn place_proj(
     tier: &mut DeviceTier,
-    st: &Safetensors,
-    s: Schema<'_>,
+    src: Source<'_>,
     prefix: &str,
     tensor: &str,
 ) -> Result<ProjPin> {
-    let want = s.cfg.layer_tensor_shape(tensor)?;
+    let want = src.s.cfg.layer_tensor_shape(tensor)?;
     let name = format!("{prefix}.{tensor}.weight");
-    let (_, _, shape) = st.raw(&name)?;
+    let (_, _, shape) = src.st.raw(&name)?;
     ensure!(
         *shape == want[..],
         "{name} is {shape:?}, but this config implies {want:?} — the artifact and the config \
          describe different models"
     );
-    match s.fmt {
+    match src.s.fmt {
         ProjFmt::Bf16 => {
-            let (bytes, _) = st.typed(&name, Dtype::Bf16)?;
+            let (bytes, _) = src.st.typed(&name, Dtype::Bf16)?;
             Ok(ProjPin::Bf16(Bf16Weight {
                 packed: tier.place(bytes)? as *const u16,
                 o_dim: want[0],
@@ -275,7 +288,7 @@ fn place_proj(
         }
         ProjFmt::Fp8 { block } => Ok(ProjPin::Fp8(crate::resident::place_fp8(
             tier,
-            st,
+            src.st,
             &format!("{prefix}.{tensor}"),
             block,
         )?)),
@@ -328,7 +341,7 @@ fn place_layer(
     let norm = |tier: &mut DeviceTier, t: &str| {
         place_norm(tier, st, s.cfg.hidden, &format!("{p}.{t}.weight"))
     };
-    let proj = |tier: &mut DeviceTier, t: &str| place_proj(tier, st, s, &p, t);
+    let proj = |tier: &mut DeviceTier, t: &str| place_proj(tier, Source { st, s }, &p, t);
     Ok(GlimmerLayerPin {
         input_ln: norm(tier, "input_layernorm")?,
         post_attn_ln: norm(tier, "post_attention_layernorm")?,
