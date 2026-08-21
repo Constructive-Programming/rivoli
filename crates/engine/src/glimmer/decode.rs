@@ -73,12 +73,14 @@ impl GlimmerEngine<'_> {
         let wall = std::time::Instant::now();
         let mut cur = self.prefill_and_sample(spec.prompt)?;
         let (pinned, streamed) = self.residency();
-        let (h0, f0) = self.slot_stats();
+        let f0 = self.fetched();
         tracing::info!(
             "PREFILL: {} tokens in {:.1} s (layer-major) | {pinned} layers pinned, {streamed} \
-             streamed | {f0} slot fills, {h0} hits",
+             streamed | {} slot fills, {} hits",
             spec.prompt.len(),
             wall.elapsed().as_secs_f64(),
+            f0.misses,
+            f0.hits,
         );
 
         let decode_wall = std::time::Instant::now();
@@ -100,9 +102,8 @@ impl GlimmerEngine<'_> {
         // `hits`/`misses` because they answer that field's question at this arm's own
         // granularity — see `DecodeStats`, which is where the counts-are-not-comparable
         // warning belongs rather than in this one log line.
-        let (h, f) = self.slot_stats();
         let ph = self.prof.since(&prof0);
-        Ok(emit.finish(decode_wall.elapsed(), h - h0, f - f0, &ph))
+        Ok(emit.finish(decode_wall.elapsed(), self.fetched().since(f0), &ph))
     }
 
     /// Teacher-forced scoring on the Glimmer arm — `prefill_and_sample` then
@@ -135,7 +136,7 @@ impl GlimmerEngine<'_> {
         // it would put the whole warm-up into the `.nll` header's `hit_pct` while
         // `--bench`'s own hits/misses excluded it, and the two would disagree about the
         // same run (review, 2026-08-16).
-        let (h0, f0) = self.slot_stats();
+        let f0 = self.fetched();
         let tally = crate::score::walk(ids, |next| {
             let row = self.logits()?;
             let scored_own = own;
@@ -145,7 +146,6 @@ impl GlimmerEngine<'_> {
             }
             Ok((row, scored_own))
         })?;
-        let (h, f) = self.slot_stats();
-        tally.into_scored(h - h0, f - f0)
+        tally.into_scored(self.fetched().since(f0))
     }
 }

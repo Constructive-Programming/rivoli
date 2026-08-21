@@ -509,12 +509,10 @@ impl<'a> V4Engine<'a> {
         self.max_ctx
     }
 
-    pub(super) fn hits(&self) -> u64 {
-        self.pin.routed.hits()
-    }
-
-    pub(super) fn misses(&self) -> u64 {
-        self.pin.routed.misses()
+    /// The pool's fetch counters as one pair — totals; the arm rebases with
+    /// `Fetched::since`.
+    pub(super) fn fetched(&self) -> crate::seam::Fetched {
+        self.pin.routed.fetched()
     }
 }
 

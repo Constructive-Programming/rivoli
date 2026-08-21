@@ -88,13 +88,13 @@ impl V4Engine<'_> {
         let mut emit = Emit::new(&spec);
         let wall = std::time::Instant::now();
         self.forward(spec.prompt, 0)?;
-        let (hit0, miss0) = (self.hits(), self.misses());
+        let f0 = self.fetched();
         tracing::info!(
             "PREFILL: {} tokens in {:.1} s (one whole-prompt pass) | {} expert reads, {:.2}/token",
             spec.prompt.len(),
             wall.elapsed().as_secs_f64(),
-            miss0 - self.misses0,
-            (miss0 - self.misses0) as f64 / spec.prompt.len() as f64,
+            f0.misses - self.misses0,
+            (f0.misses - self.misses0) as f64 / spec.prompt.len() as f64,
         );
         // Stats describe steady-state DECODE, not the cold prefill — which is why the counters
         // (phases included) are re-read here rather than at `reset`.
@@ -110,12 +110,7 @@ impl V4Engine<'_> {
             cur = self.argmax()?;
         }
         let ph = self.prof.since(&prof0);
-        Ok(emit.finish(
-            decode_wall.elapsed(),
-            self.hits() - hit0,
-            self.misses() - miss0,
-            &ph,
-        ))
+        Ok(emit.finish(decode_wall.elapsed(), self.fetched().since(f0), &ph))
     }
 
     /// Teacher-forced scoring on the V4 arm. Reuses `reset`/`forward`/`argmax` verbatim
@@ -131,7 +126,7 @@ impl V4Engine<'_> {
         crate::score::admit(ids, self.max_ctx())?;
         self.reset()?;
         self.forward(&ids[..1], 0)?;
-        let (hit0, miss0) = (self.hits(), self.misses());
+        let f0 = self.fetched();
         let mut own = self.argmax()?;
         let tally = crate::score::walk(ids, |next| {
             let raw = self.logits.copy_out()?;
@@ -144,6 +139,6 @@ impl V4Engine<'_> {
             }
             Ok((row, at))
         })?;
-        tally.into_scored(self.hits() - hit0, self.misses() - miss0)
+        tally.into_scored(self.fetched().since(f0))
     }
 }

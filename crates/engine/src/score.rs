@@ -22,7 +22,7 @@
 //! row already on the host and turns "the TF path quietly diverged from the decode path"
 //! from a silent wrong number into a loud coordinate.
 
-use crate::seam::Scored;
+use crate::seam::{Fetched, Scored};
 use anyhow::{Result, ensure};
 
 /// The scoring door, called by every arm BEFORE its first forward: a corpus that cannot
@@ -174,7 +174,8 @@ impl Tally {
     /// `ensure!`, not `debug_assert!`: benchmarks and every `--ppl` run of consequence are
     /// `--release` builds, where a debug assert enforces nothing at all, and a silently
     /// short `.nll` is exactly the failure that survives to become a quality claim.
-    pub fn into_scored(self, hits: u64, misses: u64) -> Result<Scored> {
+    pub fn into_scored(self, fetched: Fetched) -> Result<Scored> {
+        let Fetched { hits, misses } = fetched;
         ensure!(
             self.nlls.len() == self.want,
             "scored {} positions of {} — the forced walk ended early, and a short .nll \
@@ -262,7 +263,7 @@ mod tests {
         let row = [0.0f32, 4.0, 1.0];
         t.push(&row, 1, 1).unwrap(); // own == target
         t.push(&row, 1, 2).unwrap(); // own != target
-        let s = t.into_scored(7, 3).unwrap();
+        let s = t.into_scored(Fetched { hits: 7, misses: 3 }).unwrap();
         assert_eq!(s.nlls.len(), 2);
         assert_eq!(s.agree, 1);
         assert_eq!((s.hits, s.misses), (7, 3));
@@ -293,7 +294,7 @@ mod tests {
             Ok((vec![0.0, 3.0, 1.0], 1))
         })
         .unwrap();
-        let out = t.into_scored(0, 0).unwrap();
+        let out = t.into_scored(Fetched { hits: 0, misses: 0 }).unwrap();
         assert_eq!(out.nlls.len(), 3, "one NLL per position with a target");
         assert_eq!(
             advanced,

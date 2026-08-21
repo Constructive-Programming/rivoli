@@ -321,8 +321,13 @@ fn hash_rows_matches_the_host_fold() {
     // which the duplication gate reported the moment the `stream` parameter widened them.
     let launch = |x: *const f32, n: usize, out: *mut u64| {
         // SAFETY: the callers pass a live device f32 span of `n` and one live device u64.
+        let span = rivoli_backend::HashSpan {
+            n,
+            stride: 1,
+            i_base: 0,
+        };
         ok(
-            unsafe { launch_hash_rows(x, n, 1, 0, out, rivoli_backend::NULL_STREAM) },
+            unsafe { launch_hash_rows(x, span, out, rivoli_backend::NULL_STREAM) },
             "hash_rows",
         );
     };

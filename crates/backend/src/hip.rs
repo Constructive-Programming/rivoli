@@ -531,6 +531,31 @@ pub unsafe fn launch_index_score_blocks(
 // mid-sentence mention of it: jscpd treats one as a real marker, so a comment that quoted it
 // would silently move where the exemption ends. That check caught this very comment.)
 
+/// The sampled index space one hash fold walks — the scalar half of [`launch_hash_rows`],
+/// grouped for [`ScoreBufs`]'s reason on the integer axis: `n` and `stride` are two bare
+/// counts side by side, so no type check tells one from the other, and a transposed pair
+/// still launches a fold that runs and reports — finite, plausible, wrong. Named fields
+/// move that mistake to the construction site, where it has a name.
+///
+/// Like [`ScoreBufs`], NOT an ABI type and deliberately not `repr(C)`: nothing here
+/// crosses the wall (see that struct's note for the destructure-before-the-call
+/// convention this follows). Defined BELOW the exemption markers, beside the launcher it
+/// belongs to, for the placement argument recorded above.
+#[derive(Clone, Copy)]
+pub struct HashSpan {
+    /// Element count — the fold visits indices `0, stride, 2*stride, … < n`.
+    pub n: usize,
+    /// SAMPLES the buffer; pass 1 for every element. It exists so one probe arm can touch
+    /// every CACHE LINE of a slot while reading a small fraction of its bytes; the mixed-in
+    /// index is the element index, so folds at different strides stay sensitive to WHERE a
+    /// difference is.
+    pub stride: usize,
+    /// Offsets the index space so several disjoint buffers can fold into ONE accumulator
+    /// and still be sensitive to which buffer each element came from; pass 0 for a single
+    /// buffer. The reference is `rivoli_core::hash::xor_fold_from`.
+    pub i_base: u64,
+}
+
 /// XOR-fold the exact bits of `x[0..n]` into `*out` — the `--divergence-log` probe.
 ///
 /// The device twin of `rivoli_core::hash::xor_fold`, which carries the argument for why the
@@ -542,14 +567,8 @@ pub unsafe fn launch_index_score_blocks(
 /// belongs with `fill_u32` and `memcpy_dtod` on cohesion — the three are utilities over raw
 /// device bytes rather than operators the model graph names.
 ///
-/// `stride` SAMPLES the buffer — element 0, `stride`, `2*stride`, … `< n`. Pass 1 for every
-/// element. It exists so one probe arm can touch every CACHE LINE of a slot while reading a small
-/// fraction of its bytes; the mixed-in index is the element index, so folds at different strides
-/// stay sensitive to WHERE a difference is.
-///
-/// `i_base` offsets the index space so several disjoint buffers can fold into ONE accumulator and
-/// still be sensitive to which buffer each element came from; pass 0 for a single buffer. The
-/// reference is `rivoli_core::hash::xor_fold_from`.
+/// The walk itself — count, stride, index offset — rides in [`HashSpan`], whose field docs
+/// carry what `stride` and `i_base` mean.
 ///
 /// `stream` is trailing and null is the null stream. On the fetch path it MUST be the fetch
 /// stream: the folds bracket the bounce->slot copy, and rivoli's streams are
@@ -561,12 +580,14 @@ pub unsafe fn launch_index_score_blocks(
 /// must be a live `hipStream_t`, or null.
 pub unsafe fn launch_hash_rows(
     x: *const f32,
-    n: usize,
-    stride: usize,
-    i_base: u64,
+    span: HashSpan,
     out: *mut u64,
     stream: *mut c_void,
 ) -> Result<()> {
+    // Destructured here rather than field-accessed at the call — the same move
+    // `launch_index_score_blocks` makes, and for its reason: the raw call below stays
+    // readable 1:1 against the C signature, which is the wall's point.
+    let HashSpan { n, stride, i_base } = span;
     // The ABI takes an i32. Every current call site is a few times 10^4 elements, so this is
     // defensive — but a silent wrap would fold a NEGATIVE length, which the kernel's `n <= 0`
     // guard turns into a no-op and the probe would report two runs agreeing about a quantity it

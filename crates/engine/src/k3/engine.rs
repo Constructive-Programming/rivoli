@@ -372,7 +372,8 @@ impl<'a> K3Engine<'a> {
                 MOE_ACC_ROWS * self.cfg.expert_in * size_of::<u64>(),
             )?;
         }
-        (self.hits0, self.misses0) = self.pool_counters();
+        let f = self.fetched();
+        (self.hits0, self.misses0) = (f.hits, f.misses);
         self.stepped = false;
         Ok(())
     }
@@ -382,10 +383,12 @@ impl<'a> K3Engine<'a> {
         self.max_ctx
     }
 
-    /// The pool's cumulative `(hits, misses)` — one accessor, because every consumer wants
-    /// the pair and two single-counter getters were a jscpd clone of V4's besides.
-    pub(super) fn pool_counters(&self) -> (u64, u64) {
-        (self.pin.routed.hits(), self.pin.routed.misses())
+    /// The pool's cumulative fetch counters — one accessor, because every consumer wants
+    /// the pair and two single-counter getters were a jscpd clone of V4's besides. Named
+    /// `Fetched` (was a bare `(u64, u64)`, which read the same with the counters swapped);
+    /// the arm rebases with `Fetched::since`.
+    pub(super) fn fetched(&self) -> crate::seam::Fetched {
+        self.pin.routed.fetched()
     }
 
     /// The routed pool's byte budget — the anchor gate's residency DISCRIMINATOR: two

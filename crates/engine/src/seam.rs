@@ -94,6 +94,36 @@ pub struct Scored {
     pub misses: u64,
 }
 
+/// One run's weight-fetch counters, rebased to the arm's own start — the pair that already
+/// rides together everywhere it lands ([`DecodeStats`], [`Scored`], the `.nll` header's
+/// `hit_pct`), bundled at the two protocol doors ([`Emit::finish`],
+/// `score::Tally::into_scored`) so no arm can hand one without the other or swap them
+/// silently: two bare `u64`s read the same whichever way round they are — the argument
+/// [`Decoded`] makes against the bare tuple, one level down. The granularity caveat on
+/// [`DecodeStats::hits`] applies verbatim.
+///
+/// Ungated for [`Scored`]'s reason: `into_scored` compiles in every build, and a signature
+/// needs its types.
+#[derive(Clone, Copy)]
+pub struct Fetched {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl Fetched {
+    /// The counters this run added on top of `start` — the arm's closing rebase, mirroring
+    /// [`crate::telemetry::Phases::since`]. Totals are read at the arm's own starting
+    /// instant and subtracted ONCE, here: four arms each writing the two subtractions out
+    /// longhand is exactly the five-line clone the duplication gate reported when they did
+    /// (2026-08-21, glm ↔ v4, 76 tokens).
+    pub fn since(self, start: Fetched) -> Fetched {
+        Fetched {
+            hits: self.hits - start.hits,
+            misses: self.misses - start.misses,
+        }
+    }
+}
+
 /// Why a build without the `teacher-forcing` feature refuses `--ppl`. One authority: the
 /// CLI door check and `Engine::score`'s own guard both cite this, so the two refusals
 /// cannot drift apart.
@@ -169,10 +199,10 @@ impl<'a> Emit<'a> {
     pub(crate) fn finish(
         self,
         decode: std::time::Duration,
-        hits: u64,
-        misses: u64,
+        fetched: Fetched,
         phases: &crate::telemetry::Phases,
     ) -> Decoded {
+        let Fetched { hits, misses } = fetched;
         let decode_s = decode.as_secs_f64();
         let stats = DecodeStats {
             decode_s,

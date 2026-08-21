@@ -193,9 +193,19 @@ impl<'a> GlimmerEngine<'a> {
         self.n_ctx
     }
 
-    /// Slot hits and fills — see [`GlimmerPin::slot_stats`].
+    /// Slot hits and fills — see [`GlimmerPin::slot_stats`]. The decode loops read the
+    /// same numbers through [`Self::fetched`]; this raw pair stays for the fp8 decode
+    /// test, which asserts on it directly.
     pub fn slot_stats(&self) -> (u64, u64) {
         self.pin.slot_stats()
+    }
+
+    /// [`Self::slot_stats`] as one named pair — this arm's answer to the seam's
+    /// `hits`/`misses` question, at its own whole-layer granularity; the arm rebases with
+    /// `Fetched::since`.
+    pub fn fetched(&self) -> crate::seam::Fetched {
+        let (hits, misses) = self.slot_stats();
+        crate::seam::Fetched { hits, misses }
     }
 
     /// How many layers the budget pinned, and how many stream.
