@@ -47,8 +47,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // a repro harness dies loudly
 
 use anyhow::{Context, Result, bail};
-use rivoli_engine::fetch::stream::{ALIGN, ReadDst, ReadSpan, Streamer, slot_span};
-use std::os::fd::AsRawFd;
+use rivoli_engine::fetch::stream::{ALIGN, FetchKnobs, ReadDst, ReadSpan, Streamer, slot_span};
+use std::os::fd::{AsRawFd, RawFd};
 
 /// Distinct block offsets cycled through, so a staging slot's payload changes every time it is
 /// reused. 17 is coprime to the 16 staging slots, which keeps the (slot, previous tenant) pairing
@@ -77,114 +77,196 @@ mod common;
 fn main() -> Result<()> {
     let args = common::start();
     // jscpd:ignore-end
-    // ARENA REFRESH: the engine-side mitigation, testable here too so a firing repro can be
-    // re-run against it without the engine.
-    let refresh = args.iter().any(|a| a == "--arena-refresh");
-    // COPY VIA CPU: the candidate fix. The verifying fold then reads a destination the CPU
-    // wrote, on the same stream with no sync — exactly the coherence property the fix spends.
-    let by_cpu = args.iter().any(|a| a == "--copy-via-cpu");
-    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let [file, iters, rest @ ..] = pos.as_slice() else {
-        bail!(
-            "usage: arena_repro <layer-file> <iters> [stride-bytes] [--arena-refresh] [--copy-via-cpu]"
-        );
-    };
-    let iters: usize = iters.parse().context("iters")?;
-    // Default 15,335,424 B = the GLM `.vq3` expert stride (`4096 + 257 * stride` reproduces
-    // `L03.vq3`'s size exactly). Overridable so the same harness can carry another format's width.
-    let stride: usize = match rest.first() {
-        Some(s) => s.parse().context("stride-bytes")?,
-        None => 15_335_424,
-    };
-    if !stride.is_multiple_of(ALIGN) {
-        bail!("stride {stride} must be a multiple of the {ALIGN}-byte O_DIRECT block");
-    }
+    let cfg = Config::parse(&args)?;
+    let (direct, buffered) = open_both_paths(&cfg.file)?;
+    let want = reference_folds(&buffered, cfg.stride)?;
+    let mut h = Harness::new(&cfg, direct.as_raw_fd(), want)?;
 
-    // Two handles on purpose: O_DIRECT for the path under test, buffered for the reference. The
-    // reference must come from a DIFFERENT path, or a corruption common to both would cancel.
-    // O_DIRECT is 0o40000 on Linux; spelled here rather than pulling in a libc dependency for one
-    // constant, and asserted by the open failing loudly if it is wrong for this platform.
+    let t0 = std::time::Instant::now();
+    let (mut reads, mut bad) = (0usize, 0usize);
+    // One BATCH per outer step: `SLOTS` reads queued together, then reaped, each reap enqueueing its
+    // copy and then its verifying fold on the same stream, then ONE join. That shape is the engine's
+    // — no host sync between a copy and the read that consumes it.
+    while reads < cfg.iters {
+        let batch = SLOTS as usize;
+        let expect = h.queue_batch()?;
+        h.reap_batch()?;
+        bad += h.verify_batch(&expect, reads)?;
+        reads += batch;
+        if reads % (batch * 256) == 0 {
+            tracing::info!(
+                "{reads} reads, {bad} mismatches, {:.0} reads/s",
+                reads as f64 / t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+    report(reads, bad, t0.elapsed().as_secs_f64(), &h.streamer);
+    Ok(())
+}
+
+/// The command line, parsed: the two positional arguments, the optional stride, and the two
+/// intervention flags.
+struct Config {
+    file: String,
+    iters: usize,
+    stride: usize,
+    /// ARENA REFRESH: the engine-side mitigation, testable here too so a firing repro can be
+    /// re-run against it without the engine.
+    refresh: bool,
+    /// COPY VIA CPU: the candidate fix. The verifying fold then reads a destination the CPU
+    /// wrote, on the same stream with no sync — exactly the coherence property the fix spends.
+    by_cpu: bool,
+}
+
+impl Config {
+    fn parse(args: &[String]) -> Result<Self> {
+        let refresh = args.iter().any(|a| a == "--arena-refresh");
+        let by_cpu = args.iter().any(|a| a == "--copy-via-cpu");
+        let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+        let [file, iters, rest @ ..] = pos.as_slice() else {
+            bail!(
+                "usage: arena_repro <layer-file> <iters> [stride-bytes] [--arena-refresh] [--copy-via-cpu]"
+            );
+        };
+        let iters: usize = iters.parse().context("iters")?;
+        // Default 15,335,424 B = the GLM `.vq3` expert stride (`4096 + 257 * stride` reproduces
+        // `L03.vq3`'s size exactly). Overridable so the same harness can carry another format's width.
+        let stride: usize = match rest.first() {
+            Some(s) => s.parse().context("stride-bytes")?,
+            None => 15_335_424,
+        };
+        if !stride.is_multiple_of(ALIGN) {
+            bail!("stride {stride} must be a multiple of the {ALIGN}-byte O_DIRECT block");
+        }
+        Ok(Self {
+            file: (*file).clone(),
+            iters,
+            stride,
+            refresh,
+            by_cpu,
+        })
+    }
+}
+
+/// Two handles on purpose: O_DIRECT for the path under test, buffered for the reference. The
+/// reference must come from a DIFFERENT path, or a corruption common to both would cancel.
+/// O_DIRECT is 0o40000 on Linux; spelled here rather than pulling in a libc dependency for one
+/// constant, and asserted by the open failing loudly if it is wrong for this platform.
+fn open_both_paths(file: &str) -> Result<(std::fs::File, std::fs::File)> {
     let direct = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(0o40000)
         .open(file)
         .with_context(|| format!("open O_DIRECT {file}"))?;
     let buffered = std::fs::File::open(file).with_context(|| format!("open {file}"))?;
+    Ok((direct, buffered))
+}
 
-    // Reference folds, one per cycled offset, from the buffered path.
+/// Reference folds, one per cycled offset, from the buffered path.
+fn reference_folds(buffered: &std::fs::File, stride: usize) -> Result<Vec<u64>> {
     let mut want = Vec::with_capacity(EXPERTS);
     let mut host = vec![0u8; stride];
     for e in 0..EXPERTS {
         let off = (ALIGN + e * stride) as u64;
-        read_exact_at(&buffered, &mut host, off)?;
+        read_exact_at(buffered, &mut host, off)?;
         want.push(rivoli_core::hash::xor_fold(as_f32(&host)));
     }
     tracing::info!(
         "reference: {EXPERTS} blocks of {:.2} MiB from the buffered path",
         stride as f64 / (1u64 << 20) as f64
     );
+    Ok(want)
+}
 
-    let mut streamer = Streamer::new(
-        SLOTS,
-        slot_span(stride),
-        rivoli_engine::fetch::stream::FetchKnobs {
-            arena_refresh: refresh,
-            cpu_copy: by_cpu,
-        },
-    )?;
-    let fetch = rivoli_backend::Stream::fetch()?;
-    // One destination per staging slot, so a batch's copies never share a destination — the engine
-    // has the same property (a slot's ticket gates its reuse).
-    //
-    // `--copy-via-cpu` needs HOST-WRITABLE destinations, which `hipMalloc` memory is not on this
-    // APU — that is why `VmmBuf` exists (device-local, host-fillable; exactly what the engine's
-    // pool is). The other arms keep `DeviceBuf`, so the repro's clean record stays on the memory
-    // type it was measured on. The two differ only in allocation; both hand out one pointer.
-    enum Dst {
-        Dev(rivoli_engine::device::DeviceBuf),
-        Vmm(rivoli_engine::device::VmmBuf),
-    }
-    impl Dst {
-        fn ptr(&mut self) -> *mut u8 {
-            match self {
-                Dst::Dev(b) => b.ptr_mut(),
-                Dst::Vmm(b) => b.ptr_mut(),
-            }
+/// One destination per staging slot, so a batch's copies never share a destination — the engine
+/// has the same property (a slot's ticket gates its reuse).
+///
+/// `--copy-via-cpu` needs HOST-WRITABLE destinations, which `hipMalloc` memory is not on this
+/// APU — that is why `VmmBuf` exists (device-local, host-fillable; exactly what the engine's
+/// pool is). The other arms keep `DeviceBuf`, so the repro's clean record stays on the memory
+/// type it was measured on. The two differ only in allocation; both hand out one pointer.
+enum Dst {
+    Dev(rivoli_engine::device::DeviceBuf),
+    Vmm(rivoli_engine::device::VmmBuf),
+}
+
+impl Dst {
+    fn ptr(&mut self) -> *mut u8 {
+        match self {
+            Dst::Dev(b) => b.ptr_mut(),
+            Dst::Vmm(b) => b.ptr_mut(),
         }
     }
-    let mut dst: Vec<Dst> = (0..SLOTS)
-        .map(|_| {
-            if by_cpu {
-                rivoli_engine::device::VmmBuf::new(stride).map(Dst::Vmm)
-            } else {
-                rivoli_engine::device::DeviceBuf::new(stride).map(Dst::Dev)
-            }
-        })
-        .collect::<Result<_>>()?;
-    let mut folds = rivoli_engine::device::DeviceBuf::new(SLOTS as usize * 8)?;
-    let mut got = vec![0u8; SLOTS as usize * 8];
+}
 
-    let n_f32 = stride / 4;
-    let t0 = std::time::Instant::now();
-    let (mut reads, mut bad) = (0usize, 0usize);
-    // One BATCH per outer step: `SLOTS` reads queued together, then reaped, each reap enqueueing its
-    // copy and then its verifying fold on the same stream, then ONE join. That shape is the engine's
-    // — no host sync between a copy and the read that consumes it.
-    let mut e = 0usize;
-    while reads < iters {
+/// The repro's moving parts, grouped so the per-batch stages read as the three sentences the
+/// module header promises (queue, reap-and-fold, verify) and none of them needs an argument
+/// list two same-typed buffers could be transposed in.
+struct Harness {
+    streamer: Streamer,
+    fetch: rivoli_backend::Stream,
+    dst: Vec<Dst>,
+    /// One device u64 per staging slot — the verifying folds, drained per batch.
+    folds: rivoli_engine::device::DeviceBuf,
+    got: Vec<u8>,
+    /// The O_DIRECT fd the reads come from. The `File` stays open in `main` for the run.
+    fd: RawFd,
+    /// The buffered-path reference folds, indexed by cycled offset.
+    want: Vec<u64>,
+    stride: usize,
+    /// The cycled block offset, advanced per queued read and coprime to the slot count.
+    e: usize,
+}
+
+impl Harness {
+    fn new(cfg: &Config, fd: RawFd, want: Vec<u64>) -> Result<Self> {
+        let streamer = Streamer::new(
+            SLOTS,
+            slot_span(cfg.stride),
+            FetchKnobs {
+                arena_refresh: cfg.refresh,
+                cpu_copy: cfg.by_cpu,
+            },
+        )?;
+        let fetch = rivoli_backend::Stream::fetch()?;
+        let dst: Vec<Dst> = (0..SLOTS)
+            .map(|_| {
+                if cfg.by_cpu {
+                    rivoli_engine::device::VmmBuf::new(cfg.stride).map(Dst::Vmm)
+                } else {
+                    rivoli_engine::device::DeviceBuf::new(cfg.stride).map(Dst::Dev)
+                }
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            streamer,
+            fetch,
+            dst,
+            folds: rivoli_engine::device::DeviceBuf::new(SLOTS as usize * 8)?,
+            got: vec![0u8; SLOTS as usize * 8],
+            fd,
+            want,
+            stride: cfg.stride,
+            e: 0,
+        })
+    }
+
+    /// Zero the fold slab, queue one read per staging slot at the next cycled offsets, and
+    /// submit the batch. Returns the reference fold each slot's read must reproduce.
+    fn queue_batch(&mut self) -> Result<Vec<u64>> {
         let batch = SLOTS as usize;
-        folds.copy_in_at(0, &vec![0u8; SLOTS as usize * 8])?;
+        self.folds.copy_in_at(0, &vec![0u8; SLOTS as usize * 8])?;
         let mut expect = Vec::with_capacity(batch);
-        for (slot, d) in dst.iter_mut().enumerate().take(batch) {
-            let off = ALIGN + e * stride;
+        for (slot, d) in self.dst.iter_mut().enumerate().take(batch) {
+            let off = ALIGN + self.e * self.stride;
             // SAFETY: `dst[slot]` owns `stride` >= the aligned superset of this read, is
             // ALIGN-aligned (device allocation), and stays live for the whole batch.
             unsafe {
-                streamer.queue(
-                    direct.as_raw_fd(),
+                self.streamer.queue(
+                    self.fd,
                     ReadSpan {
                         begin: off,
-                        len: stride,
+                        len: self.stride,
                     },
                     ReadDst {
                         ptr: d.ptr(),
@@ -193,33 +275,47 @@ fn main() -> Result<()> {
                     },
                 )?
             };
-            expect.push(want[e]);
-            e = (e + 1) % EXPERTS;
+            expect.push(self.want[self.e]);
+            self.e = (self.e + 1) % EXPERTS;
         }
-        streamer.submit()?;
-        for _ in 0..batch {
+        self.streamer.submit()?;
+        Ok(expect)
+    }
+
+    /// Reap every read of the batch; each reap enqueues its copy and then its verifying fold
+    /// on the same stream, with no host sync in between.
+    fn reap_batch(&mut self) -> Result<()> {
+        let n_f32 = self.stride / 4;
+        for _ in 0..SLOTS as usize {
             // SAFETY: `fetch` is a live stream; each destination outlives the batch.
-            let slot = unsafe { streamer.reap(fetch.raw())? };
+            let slot = unsafe { self.streamer.reap(self.fetch.raw())? };
             // The VERIFYING fold, at the `sc` position: after the copy, on the same stream, reading
             // the DESTINATION. Never the arena — that is the read which makes the defect vanish.
             // SAFETY: `dst[slot]` holds `stride` bytes the copy just targeted; `folds` owns
             // `SLOTS * 8` bytes and `slot < SLOTS`.
             unsafe {
                 rivoli_backend::launch_hash_rows(
-                    dst[slot].ptr() as *const f32,
+                    self.dst[slot].ptr() as *const f32,
                     n_f32,
                     1,
                     0,
-                    (folds.ptr_mut() as *mut u64).add(slot),
-                    fetch.raw(),
+                    (self.folds.ptr_mut() as *mut u64).add(slot),
+                    self.fetch.raw(),
                 )?
             };
         }
+        Ok(())
+    }
+
+    /// Join the batch (its ONE sync), drain the fold slab, and compare every slot against its
+    /// reference. Returns the batch's mismatch count; `reads` only names the read in the log.
+    fn verify_batch(&mut self, expect: &[u64], reads: usize) -> Result<usize> {
         rivoli_backend::device_sync()?;
-        folds.copy_out_into(&mut got)?;
+        self.folds.copy_out_into(&mut self.got)?;
+        let mut bad = 0;
         for (slot, w) in expect.iter().enumerate() {
             let mut b = [0u8; 8];
-            b.copy_from_slice(&got[slot * 8..slot * 8 + 8]);
+            b.copy_from_slice(&self.got[slot * 8..slot * 8 + 8]);
             let g = u64::from_le_bytes(b);
             if g != *w {
                 bad += 1;
@@ -230,17 +326,14 @@ fn main() -> Result<()> {
                 );
             }
         }
-        reads += batch;
-        if reads % (batch * 256) == 0 {
-            tracing::info!(
-                "{reads} reads, {bad} mismatches, {:.0} reads/s",
-                reads as f64 / t0.elapsed().as_secs_f64()
-            );
-        }
+        Ok(bad)
     }
-    let secs = t0.elapsed().as_secs_f64();
-    // The bound is the point of a clean run, so it is printed rather than left to the reader: at 0
-    // events over N reads the 95% upper bound on the per-read rate is 3/N (the rule-of-three).
+}
+
+/// The run's verdict. The bound is the point of a clean run, so it is printed rather than left
+/// to the reader: at 0 events over N reads the 95% upper bound on the per-read rate is 3/N (the
+/// rule-of-three).
+fn report(reads: usize, bad: usize, secs: f64, streamer: &Streamer) {
     println!(
         "arena_repro: {reads} reads, {bad} MISMATCHES, {:.0} reads/s, {:.1} s, \
          copies=[memcpy {} / cpu {}]",
@@ -256,7 +349,6 @@ fn main() -> Result<()> {
             3.0 / reads as f64
         );
     }
-    Ok(())
 }
 
 /// `f32` view of a byte buffer, for the host fold. The payload is packed indices and bf16 scales,

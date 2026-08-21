@@ -58,6 +58,8 @@
 #![cfg(feature = "rocm")]
 
 use crate::fetch::asyncfetch::FetchFolds;
+#[cfg(feature = "corruption-probe")]
+use crate::fetch::asyncfetch::FoldProbe;
 use crate::fetch::stage; // the HIP FFI half — the ONLY backend-specific block here
 use anyhow::{Result, ensure};
 use io_uring::{IoUring, opcode, types};
@@ -187,6 +189,20 @@ pub struct Streamer {
     /// the completion `res` against it so a real mid-file short read is caught while
     /// EOF-padding truncation is tolerated.
     min_res: Vec<u64>,
+}
+
+/// Which of the two bracket positions a divergence fold serves — see the BRACKET THE
+/// COPY comment in [`Streamer::reap`]. The position selects everything: the accumulator,
+/// the mode, the log label, and the subject buffer, because the buffer IS what the
+/// position means (pre-copy = the arena window the read landed in, post-copy = the pool
+/// slot the copy targeted).
+#[cfg(feature = "corruption-probe")]
+#[derive(Clone, Copy)]
+enum FoldSide {
+    /// Pre-copy: `bh` hashes what the drive delivered into the pinned arena.
+    Bounce,
+    /// Post-copy: `sc` hashes what arrived in the pool slot.
+    Slot,
 }
 
 // SAFETY: the ring + arena are exclusively owned by whoever holds the `Streamer`.
@@ -385,16 +401,10 @@ impl Streamer {
         }
     }
 
-    /// Per-read async reap: block for the NEXT read to complete, kick its bounce→slot
-    /// copy on `stream` (or, under `--copy-via-cpu`, perform it on the spot as a host
-    /// memcpy), and return the completed read's `user_data` (the index into the batch).
-    /// The caller reaps exactly once per read it queued. Reads run concurrently on the
-    /// NVMe; completions arrive in device order, each resolving its own expert.
-    ///
-    /// # Safety
-    /// `stream` is a live HipStream handle; the copied read's `dst` slot must stay
-    /// valid until that stream's completion signal fires.
-    pub unsafe fn reap(&mut self, stream: *mut c_void) -> Result<usize> {
+    /// Block for the NEXT completion and validate it: a nonnegative `res` that reaches
+    /// the slot's minimum useful length (`min_res`). Returns the completed read's
+    /// `user_data`, which is its staging slot.
+    fn next_completed_slot(&mut self) -> Result<usize> {
         // Block for the next completion. A ready CQE is taken immediately; otherwise
         // submit_and_wait(1) parks until at least one more lands (submits nothing new —
         // the batch was already submitted).
@@ -422,6 +432,20 @@ impl Streamer {
             "short read on expert slot {ud}: {res} < {} useful bytes",
             self.min_res[ud]
         );
+        Ok(ud)
+    }
+
+    /// Per-read async reap: block for the NEXT read to complete, kick its bounce→slot
+    /// copy on `stream` (or, under `--copy-via-cpu`, perform it on the spot as a host
+    /// memcpy), and return the completed read's `user_data` (the index into the batch).
+    /// The caller reaps exactly once per read it queued. Reads run concurrently on the
+    /// NVMe; completions arrive in device order, each resolving its own expert.
+    ///
+    /// # Safety
+    /// `stream` is a live HipStream handle; the copied read's `dst` slot must stay
+    /// valid until that stream's completion signal fires.
+    pub unsafe fn reap(&mut self, stream: *mut c_void) -> Result<usize> {
+        let ud = self.next_completed_slot()?;
         // SAFETY: `ud < entries`, and every read's `nbytes <= span`, so this slot's arena window
         // is owned and in bounds.
         let src = unsafe { self.arena.add(ud * self.span) };
@@ -463,60 +487,56 @@ impl Streamer {
             // the hazard is the kernel dispatch's acquire and not the bytes read, so the fix is a
             // coherent arena (or an explicit cache operation) and any read is incidental.
             //
-            // `i_base = ud * n`, NOT 0: every cold read of a layer folds into ONE accumulator, so at
-            // 0 the fold would be invariant under two reads' payloads being SWAPPED between their
-            // destinations — a crossed destination is precisely the class under investigation. `ud`
-            // is deterministic given the miss sequence (INV-9), so it is comparable across runs.
-            //
-            // LOGGED, NOT `?`. A `?` here returns from `reap` after the CQE is consumed and BEFORE
-            // `copy_to_slot`, so the reaper poisons, the ticket is released from the host, and the
-            // miss kernel launches over a slot this layer never wrote — the INSTRUMENT changing what
-            // the engine computes, which it may never do.
-            let n = self.nbytes[ud] as usize / 4;
-            let (buf, count, stride) = match self.fold[ud].bh_mode {
-                crate::fetch::asyncfetch::FoldProbe::Off => (src as *const f32, 0, 1),
-                crate::fetch::asyncfetch::FoldProbe::Full => (src as *const f32, n, 1),
-                crate::fetch::asyncfetch::FoldProbe::Line => {
-                    (src as *const f32, n, self.fold[ud].line_stride)
-                }
-                crate::fetch::asyncfetch::FoldProbe::Decoy => (self.fold[ud].decoy, n, 1),
-                crate::fetch::asyncfetch::FoldProbe::Nop => (self.fold[ud].decoy, 1, 1),
-            };
-            if count > 0 {
-                // SAFETY: `buf` owns `count` readable f32 — the arena slot (`nbytes` bytes, just
-                // written by the completed read) or the decoy; `bh` is one live device u64;
-                // `stream` is live.
-                let r = unsafe {
-                    rivoli_backend::launch_hash_rows(
-                        buf,
-                        count,
-                        stride,
-                        (ud as u64) * n as u64,
-                        self.fold[ud].bh,
-                        stream,
-                    )
-                };
-                if let Err(e) = r {
-                    tracing::error!("divergence probe: bh fold failed on slot {ud} ({e:#})");
-                }
-            }
+            // SAFETY: this slot's arena window holds the `nbytes[ud]` bytes just written by
+            // the completed read; `stream` is live.
+            unsafe { self.launch_fold(ud, FoldSide::Bounce, stream) };
         }
-        // THE COPY — two paths, one destination:
-        //  - default: `hipMemcpyAsync` (SDMA) on the fetch stream, async;
-        //  - `--copy-via-cpu`: a HOST memcpy, right here on the reaper thread.
-        //
-        // The CPU path is the candidate FIX and its argument is a subtraction: after it, NO
-        // GPU agent anywhere reads memory the NVMe's DMA wrote. The arena is read only by the
-        // CPU — the visibility the io_uring CQE actually guarantees (and the one btrfs's
-        // datasum check already spends) — and the slot is written only by the CPU, whose
-        // writes to this VMM are verified GPU-coherent (`kernels/vmm.hip`; the resident
-        // tier's startup load spends the same property at 281 GB). The ticket still signals
-        // on the fetch stream after this returns, so the consumer side is byte-identical.
-        //
-        // SAFETY: `dst[ud]` is a live pool slot the pipeline keeps valid until this read's
-        // signal fires, and its HOST mapping is writable (that is what `host_ptr` is FOR);
-        // the arena slot holds the just-read `nbytes[ud]` bytes; arena and pool never alias.
+        unsafe { self.copy_bounce_to_slot(ud, src, stream) }?;
+        #[cfg(feature = "corruption-probe")]
+        if self.fold[ud].sc_armed() {
+            // THE POST-COPY POSITION — the one measured to suppress the divergence. Three
+            // alternatives at the same point in the stream, which is Phase 2's whole experiment:
+            //
+            //   Full  fold the entire slot: both DELAYS and READS, so on its own it cannot say
+            //         which of the two repaired the hazard.
+            //   Spin  the same launch geometry and trip count, touching NO memory. Suppression
+            //         here means the hazard is pure TIME — a fixed-lag write-visibility problem.
+            //   Line  read ONE cacheline. Suppression only here means TOUCHING the bytes repairs
+            //         them, and at ~0% cost this is also the cheapest candidate fix.
+            //
+            // SAFETY: the pool slot holds `nbytes[ud]` bytes, live until this read's signal;
+            // `stream` is live and the copy is already enqueued on it, so any arm that reads
+            // the slot does so after it.
+            unsafe { self.launch_fold(ud, FoldSide::Slot, stream) };
+        }
+        Ok(ud)
+    }
+
+    /// THE COPY — two paths, one destination:
+    ///  - default: `hipMemcpyAsync` (SDMA) on the fetch stream, async;
+    ///  - `--copy-via-cpu`: a HOST memcpy, right here on the reaper thread.
+    ///
+    /// The CPU path is the candidate FIX and its argument is a subtraction: after it, NO
+    /// GPU agent anywhere reads memory the NVMe's DMA wrote. The arena is read only by the
+    /// CPU — the visibility the io_uring CQE actually guarantees (and the one btrfs's
+    /// datasum check already spends) — and the slot is written only by the CPU, whose
+    /// writes to this VMM are verified GPU-coherent (`kernels/vmm.hip`; the resident
+    /// tier's startup load spends the same property at 281 GB). The ticket still signals
+    /// on the fetch stream after this returns, so the consumer side is byte-identical.
+    ///
+    /// # Safety
+    /// `dst[ud]` is a live pool slot the pipeline keeps valid until this read's
+    /// signal fires, and its HOST mapping is writable (that is what `host_ptr` is FOR);
+    /// `src` is this slot's arena window holding the just-read `nbytes[ud]` bytes; arena
+    /// and pool never alias. `stream` is a live HipStream handle.
+    unsafe fn copy_bounce_to_slot(
+        &mut self,
+        ud: usize,
+        src: *mut u8,
+        stream: *mut c_void,
+    ) -> Result<()> {
         if self.cpu_copy {
+            // SAFETY: caller's contract — non-aliasing live src/dst of `nbytes[ud]` bytes.
             unsafe { std::ptr::copy_nonoverlapping(src, self.dst[ud], self.nbytes[ud] as usize) };
             self.issued[1] += 1;
             self.log_applied_once(format!(
@@ -535,57 +555,73 @@ impl Streamer {
             }
             self.issued[0] += 1;
         }
-        #[cfg(feature = "corruption-probe")]
-        if self.fold[ud].sc_armed() {
-            // THE POST-COPY POSITION — the one measured to suppress the divergence. Three
-            // alternatives at the same point in the stream, which is Phase 2's whole experiment:
-            //
-            //   Full  fold the entire slot: both DELAYS and READS, so on its own it cannot say
-            //         which of the two repaired the hazard.
-            //   Spin  the same launch geometry and trip count, touching NO memory. Suppression
-            //         here means the hazard is pure TIME — a fixed-lag write-visibility problem.
-            //   Line  read ONE cacheline. Suppression only here means TOUCHING the bytes repairs
-            //         them, and at ~0% cost this is also the cheapest candidate fix.
-            //
-            // Logged rather than `?` for the reason given at `bh` above: a `?` here would abort a
-            // copy the engine needs, i.e. the instrument changing what is computed.
-            let n = self.nbytes[ud] as usize / 4;
-            // ONE call serves every arm; they differ only in WHICH buffer, HOW MUCH of it, and
-            // therefore how long they take. See `FoldProbe` for the ladder and what each rung means.
-            let slot = self.dst[ud] as *const f32;
-            let (buf, count, stride) = match self.fold[ud].sc_mode {
-                crate::fetch::asyncfetch::FoldProbe::Off => (slot, 0, 1),
-                crate::fetch::asyncfetch::FoldProbe::Full => (slot, n, 1),
-                // Every cache line of the slot, ~1/32 of its bytes — a sweep that COVERS the slot,
-                // so unlike reading one line at the front it could actually be a fix.
-                crate::fetch::asyncfetch::FoldProbe::Line => (slot, n, self.fold[ud].line_stride),
-                // Same size, same bandwidth, same duration — a buffer that is NOT the slot.
-                crate::fetch::asyncfetch::FoldProbe::Decoy => (self.fold[ud].decoy, n, 1),
-                // Same launch and the same stream-boundary cache maintenance, ~no work.
-                crate::fetch::asyncfetch::FoldProbe::Nop => (self.fold[ud].decoy, 1, 1),
-            };
-            let r = match count {
-                0 => Ok(()),
-                // SAFETY: `buf` owns `count` readable f32 — the pool slot (`nbytes` bytes, live
-                // until this read's signal) or the decoy (allocated slot-sized). `sc` is one live
-                // device u64; `stream` is live and the copy is already enqueued on it, so any arm
-                // that reads the slot does so after it.
-                c => unsafe {
-                    rivoli_backend::launch_hash_rows(
-                        buf,
-                        c,
-                        stride,
-                        (ud as u64) * n as u64,
-                        self.fold[ud].sc,
-                        stream,
-                    )
-                },
-            };
-            if let Err(e) = r {
-                tracing::error!("divergence probe: sc fold failed on slot {ud} ({e:#})");
+        Ok(())
+    }
+
+    /// One divergence fold at either bracket position: pick the buffer extent the armed
+    /// mode calls for and enqueue ONE `hash_rows` on the fetch stream. One call serves
+    /// every arm; they differ only in WHICH buffer, HOW MUCH of it, and therefore how
+    /// long they take. See `FoldProbe` for the ladder and what each rung means.
+    ///
+    /// `i_base = ud * n`, NOT 0: every cold read of a layer folds into ONE accumulator, so at
+    /// 0 the fold would be invariant under two reads' payloads being SWAPPED between their
+    /// destinations — a crossed destination is precisely the class under investigation. `ud`
+    /// is deterministic given the miss sequence (INV-9), so it is comparable across runs.
+    ///
+    /// LOGGED, NOT `?`. A `?` here returns from `reap` after the CQE is consumed and (at the
+    /// pre-copy position) BEFORE `copy_to_slot`, so the reaper poisons, the ticket is
+    /// released from the host, and the miss kernel launches over a slot this layer never
+    /// wrote — the INSTRUMENT changing what the engine computes, which it may never do.
+    ///
+    /// # Safety
+    /// The side's subject buffer must own `nbytes[ud]` readable bytes — `Bounce`: this
+    /// slot's arena window, just written by the completed read; `Slot`: the pool slot,
+    /// live until this read's signal, with the copy already enqueued on `stream` so any
+    /// fold that reads it does so after it. The side's decoy, when its mode selects it,
+    /// is allocated slot-sized. The side's accumulator is one live device u64; `stream`
+    /// is live.
+    #[cfg(feature = "corruption-probe")]
+    unsafe fn launch_fold(&self, ud: usize, side: FoldSide, stream: *mut c_void) {
+        let f = &self.fold[ud];
+        // SAFETY: `ud < entries` and every read's `nbytes <= span` (both checked in
+        // `queue`), so this slot's arena window is owned and in bounds.
+        let (mode, acc, label, base) = match side {
+            FoldSide::Bounce => {
+                let src = unsafe { self.arena.add(ud * self.span) };
+                (f.bh_mode, f.bh, "bh", src as *const f32)
             }
+            FoldSide::Slot => (f.sc_mode, f.sc, "sc", self.dst[ud] as *const f32),
+        };
+        let n = self.nbytes[ud] as usize / 4;
+        let (buf, count, stride) = match mode {
+            FoldProbe::Off => (base, 0, 1),
+            FoldProbe::Full => (base, n, 1),
+            // Every cache line of the buffer, ~1/32 of its bytes — a sweep that COVERS it,
+            // so unlike reading one line at the front it could actually be a fix.
+            FoldProbe::Line => (base, n, f.line_stride),
+            // Same size, same bandwidth, same duration — a buffer that is NOT the subject.
+            FoldProbe::Decoy => (f.decoy, n, 1),
+            // Same launch and the same stream-boundary cache maintenance, ~no work.
+            FoldProbe::Nop => (f.decoy, 1, 1),
+        };
+        if count == 0 {
+            return;
         }
-        Ok(ud)
+        // SAFETY: caller's contract — `buf` owns `count` readable f32, `acc` is one live
+        // device u64, `stream` is live.
+        let r = unsafe {
+            rivoli_backend::launch_hash_rows(
+                buf,
+                count,
+                stride,
+                (ud as u64) * n as u64,
+                acc,
+                stream,
+            )
+        };
+        if let Err(e) = r {
+            tracing::error!("divergence probe: {label} fold failed on slot {ud} ({e:#})");
+        }
     }
 
     /// Take one ready completion (if any), advancing the CQ head. Returns

@@ -105,7 +105,13 @@ impl GlmEngine<'_> {
             if let Some(p) = self.probe.as_mut().filter(|p| p.folds().ac) {
                 // SAFETY: `moe_acc` holds MOE_ACC_ROWS*MAXROW*hidden u64 and `nrow <= MAXROW`, so
                 // `n` f32 words are in bounds; both lanes' atomics retired at `launch_moe`'s awaits.
-                unsafe { p.fold(crate::probe::Q::Ac, l, acc, n)? };
+                unsafe {
+                    p.fold(
+                        crate::probe::Q::Ac,
+                        l,
+                        crate::probe::FoldBuf { ptr: acc, n },
+                    )?
+                };
             }
         }
         // SAFETY: xp nrow rows live; moe_acc's writers completed.
@@ -213,7 +219,13 @@ impl GlmEngine<'_> {
         // between this and the NEXT layer's overwrite of the same buffer — the two MoE lanes are
         // `hipStreamNonBlocking`, so the host await orders the WRITE and the device_sync orders
         // the reuse.
-        unsafe { p.fold(crate::probe::Q::H, l, h.0, h.1)? };
+        unsafe {
+            p.fold(
+                crate::probe::Q::H,
+                l,
+                crate::probe::FoldBuf { ptr: h.0, n: h.1 },
+            )?
+        };
         p.set_cols(l, cols)
     }
 
