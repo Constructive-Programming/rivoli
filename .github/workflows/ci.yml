@@ -9,7 +9,7 @@
 name: ci
 on:
   push:
-    branches: [rw/main]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 concurrency:
