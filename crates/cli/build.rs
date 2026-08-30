@@ -30,6 +30,43 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // THE GATE'S FIRST CLAIM IS THAT IT IS RUNNING IN THIS CHECKOUT. `env!` bakes the path
+    // at the build script's OWN compile time; `var` is what cargo passes the binary it
+    // decided to reuse. They differ exactly when a sibling worktree compiled this script
+    // last and a shared target dir handed its binary to us — measured 2026-08-21: the
+    // reused binary scanned `wave-m19/crates`, panicked, and jscpd never scanned this tree
+    // at all, so a commit landed on a green nothing had established
+    // (docs/measurement/gate-red-proofs.md §7e-bis). `assert!`, not `debug_assert!`: this
+    // has to hold in the release build too.
+    //
+    // The two failure modes are kept apart because their remedies are unrelated. An ABSENT
+    // variable means this binary was not started by cargo at all, so there is no build to
+    // reason about; a DIFFERENT one is the 7e-bis defect. The remedy for the second is a
+    // per-invocation `CARGO_TARGET_DIR`, not a config file: this box sets a box-wide
+    // `CARGO_TARGET_DIR` in `/etc/security/pam_env.conf` for every login, and an env var
+    // outranks `build.target-dir`, so a worktree's `.cargo/config.toml` is inert wherever
+    // that variable is present (§12, where it was observed losing silently).
+    let baked = env!("CARGO_MANIFEST_DIR");
+    match std::env::var("CARGO_MANIFEST_DIR") {
+        Err(e) => panic!(
+            "CARGO_MANIFEST_DIR is unset or unreadable ({e}), so this build script was not \
+             run by cargo. It cannot tell which checkout it belongs to and will not \
+             pretend the duplication gate ran -- invoke it through cargo."
+        ),
+        Ok(live) => assert_eq!(
+            live, baked,
+            "stale build-script binary reused across worktrees through a shared target dir: \
+             this build.rs was compiled for one checkout and run for another, so the \
+             duplication gate did not scan the tree being built (gate-red-proofs.md 7e-bis). \
+             Give THIS invocation its own target dir -- \
+             `CARGO_TARGET_DIR=/var/cache/rivoli/target/<worktree> cargo ...`, or \
+             `env -u CARGO_TARGET_DIR cargo ...` so this checkout's .cargo/config.toml can \
+             bind. Writing the config alone does not move anything: the box-wide \
+             CARGO_TARGET_DIR from pam_env outranks it (gate-red-proofs.md 12). \
+             tests/new-worktree.sh writes that config and prints the prefix to use."
+        ),
+    }
+
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)

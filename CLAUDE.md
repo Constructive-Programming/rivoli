@@ -75,6 +75,14 @@ appears that enum dispatch cannot fill.
 - **line caps** — 1200 hard (`crates/cli/tests/line_limit.rs`, red-proofed), 800 soft
   (`cargo:warning` from the cli build script on every build: the next edit to a warned
   file should shrink it). CodeScene binds independently below both.
+- **stale build-script binary tripwire** — `crates/cli/build.rs` asserts its compile-time
+  `CARGO_MANIFEST_DIR` against the run-time one, so a build-script binary compiled for one
+  checkout and handed to another by a shared target dir stops the build instead of scanning
+  a sibling's tree; red-proofed 2026-08-30 (`docs/measurement/gate-red-proofs.md` §12, W2
+  stage 2). It catches only the EXECUTED-stale-binary half: when both cargo units are fresh
+  the script is never run and its cached output is replayed silently (W2 stage 1), and no
+  assert can speak from inside a binary that does not execute — that half is closed only by
+  real target-dir isolation, i.e. the explicit per-invocation `CARGO_TARGET_DIR`.
 - **warnings are errors, structurally** — `[workspace.lints.rust] warnings = deny` and
   `[workspace.lints.clippy] all = deny` in the manifest, so a local `cargo check`
   enforces what CI enforces (owner rule 2026-08-15; red-proofed with a planted unused
@@ -142,6 +150,86 @@ cargo build --release             # benchmarks and performance evaluation ONLY
 **A run that is not timing something is a dev-profile run.** `[profile.release]` compiles
 out every `debug_assert!`; that is what benchmarks are measured under, and it is also why
 a check that must hold in a shipped binary is an `assert!` and pays its cost.
+
+## Build cache and worktrees
+
+**Build output belongs on `/var/cache/rivoli`, not in the worktree — `/home` is NFS.** Every
+node on this box's network mounts the same tree, so every artefact cargo writes and every
+freshness `stat` it makes crosses the network. Measured 2026-08-13: `du -sh` on an
+in-worktree `target/` **timed out at 120 s**, while the same command on the cache dir
+returned in **0.006 s**. That per-stat cost is paid constantly, not once.
+
+`/var/cache/rivoli` is a **btrfs subvolume** on the local NVMe with **`chattr +C`**
+(nodatacow): no copy-on-write fragmentation and no checksum cost for output that is
+rewritten constantly, and nested subvolumes fall out of any snapshot of `/` for free. **The
+flag is inherited only by files created after it is set**, so it goes on the subvolume while
+it is empty — it cannot be applied retroactively to a tree that already has content.
+
+**Worktrees are created by `tests/new-worktree.sh <name> <branch> <base-sha>`, never by a
+raw `git worktree add`.** They live under `.claude/worktrees/<name>`. The script is the one
+place that gets all three of these right at once, and each is something that has already
+gone wrong here silently:
+
+- **the base sha is REQUIRED** — `worktree add -b` defaults it to the current checkout's
+  HEAD, which is how a worktree ends up based off the primary tree instead of the sibling
+  branch it was meant to continue;
+- **one target dir per worktree — and the MECHANISM is an explicit environment variable,
+  not the config file.** `/etc/security/pam_env.conf` line 6 has set
+  `CARGO_TARGET_DIR DEFAULT=/var/cache/users/@{PAM_USER}/cargo-target` on every node since
+  2026-08-13; it is deliberate machine config, so we adapt to it rather than remove it.
+  Cargo's precedence is `--target-dir` > `CARGO_TARGET_DIR` > `build.target-dir`, so that
+  login variable beats a `.cargo/config.toml` in every interactive and ssh shell — which is
+  every shell an agent runs in. **Therefore every cargo invocation in every rivoli checkout
+  carries its own target dir on the command line:**
+  `CARGO_TARGET_DIR=/var/cache/rivoli/target/<name> cargo …`, where `<name>` is the
+  worktree's name and is `rivoli` for the primary checkout. `env -u CARGO_TARGET_DIR cargo
+  …` is the other working form: it strips the variable so the config binds. The script
+  still writes `<wt>/.cargo/config.toml` holding
+  `[build] target-dir = "/var/cache/rivoli/target/<name>"` and still refuses (exit 66) if
+  another checkout's config already claims that directory, because that file is three
+  things — declared intent, the claim registry the refusal reads, and the binding mechanism
+  wherever the variable is absent (CI, `env -u`). It is not, on this box, what redirects a
+  build. `docs/measurement/gate-red-proofs.md` §12 is where the config was OBSERVED losing
+  to the variable silently — W3's first attempt returned two greens while certifying an
+  isolation that had never happened — and §7e-bis is the defect the isolation exists to
+  stop;
+- **`/.cargo/` must be ignored by the COMMON gitdir** (`git rev-parse --git-common-dir`) —
+  the per-worktree gitdir's `info/exclude` is NOT read, which costs a confused minute if you
+  put it there. The script *verifies* this with `git check-ignore`, and on failure removes
+  the worktree and branch it just made — via a cleanup trap armed the moment `worktree add`
+  succeeds, so no failure path between there and the final print can leave a half-made one.
+
+**A shared target dir is a correctness defect, not a slow build.** Cargo reuses the
+build-script BINARY it finds there; `crates/cli/build.rs` bakes `env!("CARGO_MANIFEST_DIR")`
+at its own compile time, so a sibling worktree's binary scans a `crates` directory this
+checkout does not have. **The duplication gate did not run at all for that invocation, and a
+commit landed on the false green** — `docs/measurement/gate-red-proofs.md` §7e-bis. The
+build script now compares its compile-time and run-time `CARGO_MANIFEST_DIR` and panics
+naming the defect class, so a stale binary is loud; a per-invocation
+`CARGO_TARGET_DIR=/var/cache/rivoli/target/<name>` is what stops it arising, and it only
+stops it while it is actually on the invocation.
+
+**The tooling exception to "worktrees only via `tests/new-worktree.sh`".** Plugin and agent
+tooling — `isolation: "worktree"`, the worktree skills — creates scratch worktrees under
+`.claude/worktrees/` with a raw `git worktree add` and no `.cargo/config.toml`, and the
+script cannot intercept that. Such a worktree must NEVER run cargo without an explicit
+`CARGO_TARGET_DIR` on the invocation; the harness guard added in a later commit is what
+enforces it.
+
+**Read exit codes UNPIPED.** The same false green was a `cargo check … | grep … | head`
+followed by an unconditional `echo "CHECK OK"`: the pipeline reported its last stage and the
+echo printed a green that nothing had established. Redirect to a file, capture `$?` from the
+command itself, then read the file.
+
+The worktree-local `.cargo/config.toml` sets **`build.target-dir` only** — no profile, no
+flags — and it is machine state in `info/exclude`, not a repo file, so CI never sees it. It
+cannot change what `--release` compiles out; **read what such a file contains rather than
+inferring from its presence or absence.**
+
+**Scratch files go to `/var/cache/rivoli/scratch`**, not `/tmp`. `/tmp` is a **63 GB tmpfs
+in RAM** that competes with the GPU's unified-memory budget, and it is session-scoped: a
+sweep script written there is gone next session, and reading a census from a *previous*
+session's scratch directory is how a stale result gets mistaken for a fresh one.
 
 ## Measurement discipline (all of these drew blood in the old tree)
 
