@@ -5,13 +5,6 @@
 //! @ 6b7f496); the conversions and `Scoring` went to `num.rs` earlier, the frozen
 //! `route_into_pre` photograph travels here with its argued exemption.
 
-// CI's clippy (1.98) grew `chunks_exact_to_as_chunks`; the box's clippy predates both
-// the lint and a universally-stable `as_chunks`, so the suggestion cannot be taken
-// without splitting the toolchains. `unknown_lints` rides along because the OLDER
-// clippy would otherwise deny the allow itself. Revisit when the box's rust catches up
-// (rocm10-migration window, 2026-08-31).
-#![allow(unknown_lints)]
-#![allow(clippy::chunks_exact_to_as_chunks)]
 use crate::num::Scoring;
 
 pub fn softmax(v: &mut [f32]) {

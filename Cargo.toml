@@ -37,11 +37,21 @@ license = "MIT"
 # local build into a red remote one. `priority = -1` keeps the named lints able to layer.
 [workspace.lints.rust]
 warnings = { level = "deny", priority = -1 }
+# `unknown_lints` allowed so the clippy allow below can name a lint the BOX's older
+# clippy has not heard of without that becoming its own denied warning. The cost — a
+# misspelled lint name is silent — is carried until the box and CI run one rust version.
+unknown_lints = "allow"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
+# CI's clippy (1.98, 2026-08-31, run 33382412241) grew `chunks_exact_to_as_chunks`; the
+# box's clippy predates it AND a universally-stable `as_chunks`, so the suggestion cannot
+# be taken without splitting the toolchains. Six hits across core and oracles at the time
+# of writing. Revisit (delete this allow, take the suggestion) when the box's rust
+# catches up — tracked in docs/measurement/rocm10-migration.md's window notes.
+chunks_exact_to_as_chunks = "allow"
 
 # `debug-assertions` is deliberately ABSENT from [profile.release] (the default: off).
 # Develop on the dev profile, where every `debug_assert!` is live; `--release` is for
