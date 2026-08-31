@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: ROCm 7.14 -> 10.0.0 migration IN FLIGHT — the old-toolchain baseline is complete and green on all five arms (battery 576/576, V4 decode byte-identical to the pinned reference, GLM A-vs-A 512/512 identical at a 100 GiB budget), the merge is delegated to hr-fleet with a proven binpkg rollback, and the ROCm 10 column is not yet measured; no number here transfers to the new toolchain until it is.
+verdict: ROCm 10.0.0 ATTEMPTED 2026-08-31 AND ROLLED BACK the same day, by the pre-registered rule and in 43 s off the binpkgs: the merge cleared its patch layer (AMD upstreamed the msad fix) and then hit three BUILD-layer blockers (rocr's uninstalled kfd_ioctl.h vs the use-system-hsakmt patch, comgr vs a dylib-only LLVM 23, hipcc's slotted-clang path injection — the last live-broken until rollback), so the box runs the verified 7.14 stack again — post-rollback pinned decode byte-identical to the baseline ids under a clean witness — and the old-toolchain baseline column (battery 576/576, V4 decode byte-identical, GLM A-vs-A 512/512 @100 GiB) stands ready for the re-book, which is gated on the three ebuild fixes building green offline, no GPU window needed.
 ---
 
 # ROCm 7.14 → 10.0.0 on rh-anine — the measured migration
@@ -26,11 +26,11 @@ Do not cite the matrix's version numbers; cite the binary.
 
 | | OLD (baseline) | NEW (after merge) |
 |---|---|---|
-| HIP | 7.14.60850-0000000 | RESULT-PENDING |
-| clang | 23.1.0 (`/usr/lib/llvm/23`) | RESULT-PENDING |
+| HIP | 7.14.60850-0000000 | not measured — attempt 1 rolled back (see Outcome) |
+| clang | 23.1.0 (`/usr/lib/llvm/23`) | not measured — same |
 | kernel | 6.18.41-gentoo (in-kernel amdgpu, no driver phase) | same (no reboot planned) |
-| `libamdhip64` SONAME | `.so.7` | RESULT-PENDING (expected `.so.7`) |
-| package set | dev-util/hip-7.14.0, hipcc-7.14.0, rocm-smi-7.14.0, rocminfo-7.14.0, dev-libs/rocm-{core,comgr,device-libs}-7.14.0, rocr-runtime-7.14.0, roct-thunk-interface-7.14.0, rocm-cmake-7.1.0 (+ rocprofiler-therock-bin) | RESULT-PENDING (ten 10.0.0 atoms; rocprofiler-register stays 0.6.0 — ROCm 10 ships the identical version, all consumers dep on it unversioned) |
+| `libamdhip64` SONAME | `.so.7` | not measured (expected `.so.7`, confirmed from the shipped tarball) |
+| package set | dev-util/hip-7.14.0, hipcc-7.14.0, rocm-smi-7.14.0, rocminfo-7.14.0, dev-libs/rocm-{core,comgr,device-libs}-7.14.0, rocr-runtime-7.14.0, roct-thunk-interface-7.14.0, rocm-cmake-7.1.0 (+ rocprofiler-therock-bin) | not merged — rolled back to the 7.14 set (ten 10.0.0 atoms planned; rocprofiler-register stays 0.6.0 — ROCm 10 ships the identical version, all consumers dep on it unversioned) |
 
 **Install and rollback are hr-fleet's** (owner decision 2026-08-30): the rhansen overlay's
 TheRock-based ebuild set, bumped via its single `ROCM_TAG` anchor to `therock-10.0`; plan at
@@ -82,9 +82,9 @@ Three caveats that travel with these numbers:
    re-taken this window. Absolute tok/s everywhere is conditioned on standing host CPU
    tenants (loadavg 2.4–4.7 during arms; recorded in `00-host-tenants.txt`).
 
-## ROCm 10 column — RESULT-PENDING
+## ROCm 10 column — not measured (attempt 1 rolled back); the protocol below is the re-book spec
 
-After hr-fleet reports the merge green: rebuild EVERYTHING in a second fresh dir
+When the re-booked merge reports green: rebuild EVERYTHING in a second fresh dir
 (`/var/cache/rivoli/target/rocm10-mig-new`); deviceless suite; flocked battery against the
 SAME vendored goldens at the SAME tolerances (a trip means codegen moved numerics past a
 measured floor — investigate, never widen); pinned decode ×2 (byte-identity is THE
@@ -95,3 +95,35 @@ bench A/B against the numbers above.
 **Decision rule** (pre-registered): any red that is not a measured-and-accepted improvement
 rolls back — one message to hr-fleet, `emerge --usepkgonly`, rivoli rebuilt under 7.14, and
 this doc's verdict records the rollback and why.
+
+## Outcome — attempt 1 (2026-08-31): ROLLED BACK, re-book gated on three offline fixes
+
+The merge ran in two attempts inside the window. Attempt 1 failed at 5/10 atoms on the
+msad-target-feature patch, which AMD had upstreamed into therock-10.0 (hunk 2 refused;
+the fix was deleting the patch line — note the ebuild spells it `${PN}-…`, so the first
+recorded sed pattern matched nothing). Attempt 2 cleared the patch layer in 78 s and
+exposed three build-layer blockers, all deviceless to fix:
+
+1. **rocr-runtime**: `hsakmt/linux/kfd_ioctl.h` not found — the header exists in both
+   source tarballs but `roct-thunk-interface` never installs it; therock-10.0's new
+   `amd_core_dump.cpp` includes it through the household `use-system-hsakmt` patch.
+2. **rocm-comgr**: `-lLLVMBinaryFormat` (+9 more) unresolvable — the installed LLVM 23 is
+   dylib-only (`libamd_comgr.so.3.3.0` NEEDs `libLLVM.so.23.1`), and the ebuild does not
+   pass the CMake link-mode for it.
+3. **hipcc-10.0.0**: invokes the unslotted `/usr/lib/llvm/bin/clang++`, which does not
+   exist on Gentoo — live breakage while installed (worked only under HIP_CLANG_PATH).
+
+Rollback: `emerge --usepkgonly` over the 11 binpkgs, **43 s, zero compilation**; the
+restored `libamdhip64.so.7.14.60850` carries its original Aug 14 mtime (the binpkg's
+bytes, not a rebuild); keyword file removed and `emerge -uDNp @world` re-verified showing
+zero ROCm lines; overlay auto-sync restored. Post-rollback verification on the rivoli
+side: the pinned decode cell (arm-3 form, run once via the flocked+witnessed `run_arm`)
+reproduced `431606e9…` — byte-identical to baseline `03-r1.ids` — witness 0 bytes.
+
+Also recorded from the window: the nightly `emerge --sync` had DELETED the ten
+uncommitted overlay ebuilds (`reset --hard` on untracked-adjacent state) — everything
+deliberately parked outside the overlay (binpkgs, tag, staged keyword file, seeded
+distfile) survived; the recreated ebuilds are committed and the branch pushed upstream.
+Re-book gate: all three fixes above build green via `ebuild … compile` in an offline
+session; the window shape then shrinks to merge + rivoli re-run, since this baseline
+column stays valid while the 7.14 stack is byte-identical.
