@@ -57,6 +57,20 @@ jobs:
       # The deviceless feature union — the E0609-rot class's only watcher: `mod otlp` sat
       # broken for weeks in the old tree because no prescribed command compiled it.
       - run: cargo clippy -p rivoli --release --locked --no-default-features --features otlp,teacher-forcing,pred-probe,trace,stale-sel --all-targets
+      - name: Install the CodeScene CLI (only when the gate is armed)
+        # The secret arms RIVOLI_CS_REQUIRED below, and an armed gate with no binary is
+        # the exact red run 33382615288 recorded — this step is the "owner action" the
+        # old error branch demanded. CodeScene's installer is fetch-and-execute by
+        # design (no versioned artifact URL is published); the trade is accepted for a
+        # CI-only runner, and `cs version` prints what actually arrived so a silent
+        # installer change is at least visible in the log.
+        if: ${{ secrets.CS_ACCESS_TOKEN != '' }}
+        env:
+          CS_ACCESS_TOKEN: ${{ secrets.CS_ACCESS_TOKEN }}
+        run: |
+          curl -sSf https://downloads.codescene.io/enterprise/cli/install-cs-tool.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/cs" version
       # DEV profile deliberately (this tree's own rule: a run that is not timing
       # something is a dev-profile run — release compiles out every debug_assert!, so a
       # release-only CI never executes them; review 2026-08-15). Clippy above keeps the
@@ -76,6 +90,5 @@ jobs:
           if [ -z "$CS_ACCESS_TOKEN" ]; then
             echo "::warning::CS_ACCESS_TOKEN secret not configured — CodeScene gate ran in warn-and-skip mode. Add the secret and a cs install step to arm it (owner action)."
           else
-            echo "::error::CS_ACCESS_TOKEN is configured but no cs install step exists yet — the test step above already ran REQUIRED and failed on absence; write the install step (owner action)."
-            exit 1
+            echo "CodeScene gate ran ARMED (RIVOLI_CS_REQUIRED=1, cs installed above) — a tool-absence or sub-ten score already failed the test step."
           fi
