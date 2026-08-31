@@ -35,7 +35,8 @@ const STATUSES: [&str; 5] = [
 // Whose evidence backs the verdict. A closed verdict rules its question out only for its
 // scope: in the old tree, npu-offload.md's closed-negative was measured on GLM-5.2 and
 // says nothing about the V4 port (2026-08-07, the correction that motivated this field).
-const SCOPES: [&str; 5] = ["glm", "v4", "k3", "engine", "glimmer"];
+// `qwen` joined 2026-08-31 for the Qwen3.8-Flash-Next port, family-short like glm/glimmer.
+const SCOPES: [&str; 6] = ["glm", "v4", "k3", "engine", "glimmer", "qwen"];
 
 /// A doc's front matter. Named fields rather than a tuple because all three travel together
 /// through both tests below, and position stopped being readable at the third one.
