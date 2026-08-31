@@ -64,10 +64,13 @@ jobs:
         # design (no versioned artifact URL is published); the trade is accepted for a
         # CI-only runner, and `cs version` prints what actually arrived so a silent
         # installer change is at least visible in the log.
-        if: ${{ secrets.CS_ACCESS_TOKEN != '' }}
         env:
           CS_ACCESS_TOKEN: ${{ secrets.CS_ACCESS_TOKEN }}
         run: |
+          if [ -z "$CS_ACCESS_TOKEN" ]; then
+            echo "gate unarmed (no CS_ACCESS_TOKEN) — cs not installed, test runs warn-and-skip"
+            exit 0
+          fi
           curl -sSf https://downloads.codescene.io/enterprise/cli/install-cs-tool.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/cs" version
