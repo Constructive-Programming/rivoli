@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: ROCm 10.0.0 ATTEMPTED 2026-08-31 AND ROLLED BACK the same day, by the pre-registered rule and in 43 s off the binpkgs: the merge cleared its patch layer (AMD upstreamed the msad fix) and then hit three BUILD-layer blockers (rocr's uninstalled kfd_ioctl.h vs the use-system-hsakmt patch, comgr vs a dylib-only LLVM 23, hipcc's slotted-clang path injection — the last live-broken until rollback), so the box runs the verified 7.14 stack again — post-rollback pinned decode byte-identical to the baseline ids under a clean witness — and the old-toolchain baseline column (battery 576/576, V4 decode byte-identical, GLM A-vs-A 512/512 @100 GiB) stands ready for the re-book, which is gated on the three ebuild fixes building green offline, no GPU window needed.
+verdict: ROCm 10 attempt 2 (owner-installed 2026-08-31): rivoli COMPILES clean (117 crates, 15/15 HIP TUs, links .so.7) and the deviceless suite is green, but the device runtime is BROKEN — a deterministic SIGSEGV five frames inside the overlay-built libamdhip64.so.7.15.0's hipStreamCreateWithFlags, reproduced 3x with clean witnesses; the SAME test binary passes in 0.37 s under AMD's prebuilt 7.15.26333 lib dir, so the defect is the overlay HIP build (which also lacks ROCm 10's new librocm_kpack that AMD's hip links), not ROCm 10 and not rivoli; every rivoli device arm is blocked until hip is rebuilt to TheRock parity or the prebuilt runtime is installed — the 7.14 binpkgs remain a 43 s rollback.
 ---
 
 # ROCm 7.14 → 10.0.0 on rh-anine — the measured migration
@@ -127,3 +127,45 @@ distfile) survived; the recreated ebuilds are committed and the branch pushed up
 Re-book gate: all three fixes above build green via `ebuild … compile` in an offline
 session; the window shape then shrinks to merge + rivoli re-run, since this baseline
 column stays valid while the 7.14 stack is byte-identical.
+
+## Attempt 2 (2026-08-31, owner-installed): compiles, deviceless green, DEVICE RUNTIME BROKEN
+
+Installed set verified: nine atoms at 10.0.0 (hip, hipcc, comgr, core, device-libs, rocr,
+roct, rocm-smi, rocminfo), `hipcc` reports HIP 7.15.0 / clang 23.1.0, SONAME `.so.7` as the
+tarball predicted. **Not installed:** `dev-util/rocprofiler-therock-bin` 10.0.0 (no rocprof*
+binaries — the gfx1151 roofline tooling was the bump's headline payload) and
+`rocprofiler-register` no longer lists in qlist (its 0.6.0 files remain on disk, orphaned).
+
+Measured, in order, all commands and per-arm logs under
+`/var/cache/rivoli/scratch/rocm10-migration/new/` on rh-anine:
+1. **Compile: GREEN.** Fresh `CARGO_TARGET_DIR=/var/cache/rivoli/target/rocm10-mig-new`,
+   `cargo build --workspace` exit 0, 117 crates, 15/15 HIP TUs to `*.gfx1151.o`, CLI links
+   `libamdhip64.so.7`.
+2. **Deviceless suite: GREEN** (91 suites, 0 failed).
+3. **Device battery: RED.** rc=101 at suite 33 — `rivoli-backend --lib`,
+   `gpustream::tests::signal_resolves_and_latency`, **SIGSEGV**. Witness clean, GTT 17 MiB
+   pre-arm. Reproduced 2 more times in isolation, instantly, deterministically.
+4. **Fault located.** `AMD_LOG_LEVEL=3`: runtime init completes (ROCr backend initialized,
+   GPU enumerated), then the FIRST HIP call — `hipStreamCreateWithFlags(&s,
+   hipStreamNonBlocking)` — never returns. Coredump backtrace: five frames inside
+   `libamdhip64.so.7`, entered from `hipStreamCreateWithFlags` ←
+   `rivoli_stream_create` ← `HipStream::new` (gpustream.rs:96) — the same call the 7.14
+   battery passed 592/592 with hours earlier on identical rivoli code.
+5. **The A/B that convicts the build, not the release:** the SAME test binary under
+   `LD_LIBRARY_PATH` = AMD's own prebuilt tarball `lib/` (hip 7.15.26333, hsa 1.21.0)
+   **passes, 0.37 s, exit 0**, flocked + witnessed. One-lib bisect: prebuilt hsa alone and
+   prebuilt rocprofiler-register alone still segfault (the defect is not theirs); prebuilt
+   hip cannot be swapped alone because it NEEDs **`librocm_kpack.so.0`** — a NEW ROCm 10
+   component the overlay does not package at all — and prebuilt comgr NEEDs the tarball's
+   own `libclang-cpp.so.23.0git`, so the hip/comgr/LLVM trio only runs as a set.
+6. **Verdict:** the overlay-built `dev-util/hip-10.0.0` (built against the dylib-only
+   system LLVM 23, without rocm_kpack — i.e. exactly where attempt 1's blockers B and C
+   were hand-fixed) is defective at stream creation. ROCm 10 itself is fine on this
+   kernel; rivoli is fine.
+
+**Paths from here (owner's call):** (a) rebuild `dev-util/hip` to TheRock's own
+configuration (package `rocm_kpack`, match AMD's LLVM link mode) — hr-fleet's lane;
+(b) install AMD's prebuilt dist as the runtime (the tarball already validates on this box);
+(c) roll back to the 7.14 binpkgs (43 s, proven) until (a) lands. Until one of these,
+EVERY rivoli device arm on this box faults at engine start — batteries, anchors' GPU
+sessions, S7 — while builds and deviceless suites keep working.
