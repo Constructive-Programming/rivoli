@@ -304,6 +304,90 @@ arrive first; the ~4B tensors stay excluded by name), YaRN beyond native 262k,
 
 ## Worklog
 
+**2026-08-31 — S5 (track D): the chat template is hand-ported and pinned, and the case count grew
+to 78.** `chat_template.jinja` is now VENDORED at
+`docs/measurement/qwen-reference/chat_template.jinja` — 8,952 B, sha256 `c3cf9e34…`, fnv1a64
+`8b6b0871c5db260b`, fetched at `resolve/236dfdf2…/` and byte-compared against the pin track A
+recorded in `tensor-families.tsv` before it was vendored. Deliverables:
+`crates/artifact/src/qwen_encoding.rs` (string renderer, no Jinja, UNWIRED — S6 owns the seam),
+`crates/artifact/tests/{qwen_template.rs,qwen-chat-cases.json,qwen_template_driver.py}`.
+
+*Census item 2's parenthesis is corrected by measurement*: the two homes of the template are
+**exactly byte-identical**, not "identical modulo the file's trailing newline" — the `.jinja` file
+carries NO trailing newline, so `tokenizer_config.json`'s `chat_template` key is the same 8,952
+bytes with no modulo. The gate asserts equality, and asserts the vendored copy ends at the outer
+`endif` rather than a newline.
+
+**Why 78 cases and not the exit-gate row's ~31.** The counts are **78 = 65 rendering + 13
+refusals**, and those three are the only case numbers stated anywhere, because they are the three
+`qwen_template.rs` asserts. That row was written before the template was read; three surfaces it
+does not name account for the difference, and none of them collapses: **(a) `reasoning_effort`** —
+three legal values (`xhigh`, `medium`, `low`), `xhigh` is the DEFAULT and `medium` is the only one
+that emits nothing, so a render with NO kwargs at all already carries a synthesised system turn;
+anything else refuses; and the whole block is inert when thinking is off, so a bogus value there
+does NOT refuse. **(b) `enable_thinking`/`preserve_thinking`** — Jinja's `is true` and `is false`
+are IDENTITY against the booleans (measured on jinja2 3.1.6), so `1`, `0`, `null` and `"true"` are
+a FOURTH state neither branch was written for: no reasoning instructions, but an OPEN `<think>`.
+**(c) the reject direction** — the template calls `raise_exception` in eight places and three are
+reachable from an ordinary OpenAI client (`developer` role, no real user turn, a system turn that
+is not first), which is why this port returns `Result` where its three siblings return `String`.
+The rest are the surfaces the row did name, plus the vision placeholders and the `|trim` rule
+(Jinja's `trim` is Python `str.strip()`, which strips U+001C–U+001F where Rust's `str::trim()`
+does not — measured on CPython 3.14.6 and pinned).
+
+> **A per-surface case table was written and DELETED, 2026-08-31.** Two attributions of the same
+> 78 cases disagreed — a count of kwargs occurrences (a case can set several) against an
+> exclusive one-surface-per-case partition — and neither is recomputed by anything. That is the
+> `inherited-numbers-are-unverified` class caught inside the round that would have introduced it,
+> so the only counts that survive are the three the gate asserts.
+
+**Red proofs — three, each observed to have CHANGED THE TREE (byte-compared against a saved
+copy), to redden the assertion ADDED (read off `left`/`right`, not the exit code), then reverted
+with the tree observed green again on a run that carried a `Compiling` line:**
+
+1. **The M11b plant — close a turn with a non-stop token.** `IM_END` `<|im_end|>` (248046, an
+   `eos_token_id`) → `<|vision_pad|>` (248055, not a stop). Tree changed at byte 6470. FOUR
+   assertions red, exit 101: the byte pin at `default_bare` byte 228, `got ...<|vision_pad|>\n`
+   vs `want ...<|im_end|>\n`; the id pin at id 40, `got 248055` vs `want 248046` **with the id
+   COUNT unchanged at 48/48**, so only the value catches it; the divergence pin; and the
+   template-literal check, `template lacks <|vision_pad|>`.
+2. **One case's ids perturbed by one.** `tool_call_arg_shapes`, index 140, `29` → `30` (of 281).
+   Reddened the id pin ALONE — `got 29` vs `want 30` at id 140 — with the byte pin green, which
+   is what shows the id half is independently load-bearing.
+3. **One byte of the vendored template.** `xhigh` → `xhigb` inside the effort sentence, byte 2503,
+   **same length** so the byte-count assert cannot see it. Reddened the pin recomputation alone:
+   `left: Some("5fc96b0e9ade2b71")` (recomputed from the live file) vs
+   `right: Some("8b6b0871c5db260b")` (the fixture's and the census's pin).
+
+The `RIVOLI_QWEN_REQUIRED` env gate is proven in all THREE states, including the one people skip:
+artifact unset + REQUIRED unset → skip; artifact unset + `REQUIRED=1` → **exit 101**, *"qwen id
+pin REQUIRED but did not run: RIVOLI_QWEN_ARTIFACT is unset"*; and the REAL path with the
+variable set — **65 of 65 cases tokenized identically to `apply_chat_template`** through the
+shipped 12.8 MB `tokenizer.json`.
+
+**jscpd reported SIX clones on the first compile and all six were fixed, none exempted** — the
+`v4_encoding/render.rs` import run whose own comment predicts the clone (fixed by a braceless
+`use crate::tokenizer;`), two same-signature functions in this module (merged, since all four
+template call sites trim), a `match` over `Value` tailing into `python_json` twice, and three
+`glimmer_template.rs` helpers (the `as_bool` chain, the `tools`-shape match, the specials census).
+
+**OWED, and none of it is track D's to close:** (i) `tensor-families.tsv` still lists
+`chat_template.jinja` under **NOT VENDORED HERE** — one line to move, track A's file; (ii)
+`qwen_names.rs` does not recompute the template's hash (the fixture and `qwen_template.rs` do) —
+track A's; (iii) `docs/measurement/gate-red-proofs.md` §14 is still OWED, so the three proofs
+above live here; (iv) `python_json`'s float divergence from `json.dumps` (`1e-5` → `0.00001`
+against `1e-05`) is reachable from a tool argument and is gated only by
+`v4_encoding::tests::boundary::numeric_rendering_diverges_from_python`, so this fixture pins the
+AGREEING rows only and the complete fix stays crate-wide; (v) `messages=[]` and a mapping `tools`
+are refused by transformers before the template is entered, so neither is scored by this fixture.
+
+**Hand-off to S6/E:** the framing is `serve::oai::split_think`-compatible as it stands — thinking
+on ends the prompt at an OPEN `<think>` and the model closes it; thinking off puts `</think>` in
+the PROMPT so the generation carries no tags — and `<think>`/`</think>` are added tokens with
+`special: false`, so `skip_special_tokens` does not eat them. `qwen_encoding.rs` is deliberately
+UNWIRED: nothing in `serve/mod.rs`, `main.rs` or `bench.rs` calls it, and both
+`QWEN_ARM_NOT_BUILT` doors still refuse.
+
 **2026-08-31 — S0+S1 review-fix round: five red proofs run, and the gates they belong to.**
 Recorded here rather than in `docs/measurement/gate-red-proofs.md`, whose §14 is **OWED** — that
 file's verdict is a single paragraph summarising every section, so adding one is a rewrite of a
