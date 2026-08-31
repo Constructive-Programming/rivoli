@@ -1,7 +1,7 @@
 ---
 status: data
 scope: engine
-verdict: THE RULE THIS FILE NOW OPENS WITH, extracted from the M17 battery and generalising past this repo: a plant must be observed to have CHANGED THE TREE, and to have reddened THE ASSERTION UNDER TEST, before its result is evidence -- three of seventeen M17 plants produced a result meaning something other than it looked like (one reddened the BUILD via warnings = deny with no test executed, one reddened an EARLIER assert in the same body, and one NEVER APPLIED because rustfmt had reflowed the target line, so the suite ran green on an unmodified tree and reported exit=0 with everything passing, which is indistinguishable from a plant that failed to redden). Failed plants are kept rather than deleted, because a proof that missed is evidence about the harness. Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M15's scored selection carries seven deviceless proofs on BOTH sides of its gate: a tie-rule flip reddening the oracle-side list-equality on a real tie (left [[9,8]] vs right [[8,9]]) — which the engine-side set gate provably could not have caught, since the set was unchanged — a reversed ranking comparator reddening that engine-vs-oracle gate (left {16,18} vs right {17,18}) while the below-cap identity stayed green, a dropped ascending emit reddening the below-cap byte-identity on both real and adversarial scores, a removed per-row rectangle check accepting a compensating-ragged buffer the aggregate total was blind to, and two standing fixtures pinning score-perturbation resolution above the boundary against provable inertness below it plus the keep-oldest sabotage's observability. M10's three gates split each proof into a CLASSIFIER half (paid 2026-08-16, deviceless: 6 planted defects red, --expect-red inverted both ways, the small-bucket row showing why the band alone is not the gate) and an ENGINE half (PAID 2026-08-21 on the device: profile and tf mutations confirmed red and restored; p4 confirmed via the STRICT branch under --arena-refresh after its shipped one-word red-proof corpus proved unpairable (762→763 tokens) and a 2-token swap sat under the measured noise floor — and the stock-defaults attempt surfaced an honest new outcome, UNCALIBRATED, the GLM wobble firing inside the gate) — plus one gate that reddened unplanted on its own author, the argmax fold that let a leading NaN win. M11's fp8 gates are PAID deviceless — layer_bytes stripped of its scale grid, sniff falling back to the compiled-in block, the converter at the wrong block and with one projection class skipped, and the parity script over six runs including both refusals and a green baseline — while its DEVICE half is OWED with recipes written down: the anti-fallback assert in glimmer_fp8_decode.rs. Slot::fill's third-zip-leg guard was RETIRED rather than proven - the parameter it checked was deleted, so the truncation has no shape. M11b's id pin is PAID on the real 27 MB tokenizer, 31 of 31 cases identical to apply_chat_template and red-proofed by closing a system turn with the non-stop token; its serve door ships BOTH halves (request framing and reply channel-splitting) after the request-half-only version was written and reverted as a regression, behind SIX red-proofed pure gates including the arch dispatch itself; a prefix-monotonicity property caught two streaming P0s that no non-streaming gate could see - a raw turn header streamed then the channel wedged forever, and a partial <|eot|> at the prefix boundary. Only the live SSE round-trip is OWED on the GPU. ADDED 2026-08-17: the GLM determinism gates (§6) — the id comparator, a prompt pinned by length+md5 that fired unplanted, INV-9 under a scan_free mutation, the probe's fold-slot layout under an inserted enum variant, and the column comparator's three refusals; the determinism gate's own 512-token GREEN was PAID 2026-08-21 on the MITIGATION arm — DETERMINISM_FIX_FLAGS='--arena-refresh' byte-identical over 512 against a same-day stock control that reddened exactly as the defect predicts (496 of 512 ids, first at position 11), so the green is interpretable and the engine's stock red stands unclosed. Also recorded there: a false EXCLUSION found in this round's own instrument — a fold omitted on dense layers made two runs 'agree' about a quantity neither measured, which no gate in this repo could see. ADDED 2026-08-17 (Phase 1): the per-fold probe flags — parse refusals, spin_rows reading nothing, and the column comparator refusing two logs from different fold configurations; the dash-for-disabled rendering was recorded OWED and PAID the same day, red-proofed by printing 0 instead. M17a's DFlash drafter oracle is registered here and recorded in glimmer-reference/anchor.md: nine deviceless plants, all re-run after the 2026-08-16 fixture re-vendor because a re-measured floor invalidates its old red proof, with the block-for-window substitution going from 1 of 10 tests red to 3; two rows the rewrite had DELETED rather than corrected -- the prefix-filter proof and the +1-ulp detection floor -- were restored and independently re-run 2026-08-17, both reproducing their pre-re-vendor results exactly, with their observed values kept in anchor.md alone. The restored prefix-filter row also carried a wrong MECHANISM (labelled salt pairing, when the planted rename cannot reach the salt assert -- dropping the LAST draft golden leaves the first correctly paired and the CENSUS assert is what reddens), and running the mirror plant to find what does exercise the pairing guard added a tenth plant: two independent guards, one plant each, both 7 of 10 red. M17b's drafter converter gate is proven red in all twelve of its tests AS FIRST LANDED by six plants, with two rows carrying the argument: a one-byte edit to the vendored checkpoint header reddens the LIVE-file comparison, which is what proves that conditional half is armed on this box rather than silently skipping, and a wrong drafter hidden_size reddens the POSITIVE pairing arm, which is what makes "the shipped drafter pairs with the shipped target" evidence rather than a run that failed early for an unrelated reason; the two refusal-only plants show each refusal arm reddening both when its guard is deleted and when its wording drifts, which a status-code-only refusal test cannot see. GREW the same day under review to 13 tests and NINE plants: the per-token budgets (drafter KV 20,480 B/token, hidden-state export 66,560 B/token, a 260.0 MiB ring at ctx 4096) were prose in a doc and gated nowhere and are now derived from the shipped config; the pin test was strengthened to derive its 36/22 verbatim-widened split from the real HEADER as well as from the census, red-proofed by a rank change that preserves every byte total; and RIVOLI_DRAFTER_CKPT_REQUIRED was added on RIVOLI_CS_REQUIRED's precedent because stating that the live comparison degrades when the mount vanishes is not the same as enforcing it -- proven in all THREE states, including the one people skip, the real path WITH the variable set, since a required mode never run in its required state is a mechanism rather than a gate. GREW AGAIN to 14 tests and ELEVEN plants with the mask-indexing gate, whose first plant is recorded as a FAILED proof: removing q_offset's use left the parameter unread, warnings = deny turned that into a compile error, and the run exited 101 without executing a single test -- an exit code alone would have read as "reddened". The replacement plant passes 0 at the CALL SITE, which is the mistake a kernel author actually makes, compiles, and reddens the gate with left: 0 right: 256. THREE MORE PLANTS (fifteen in all) close a discarded-count gap review found in the same gate -- the cache branch's strictly-bidirectional count was captured into `_` and thrown away while the commit message cited it, a guard that cannot fire -- and proving the new assertion red took all three attempts, because an assert earlier in the same test body hides every later one: two plants exited 101 with the test named while never touching the line under test, and only conditioning on q_offset separated the two fixture calls. A plant that reddens the TEST is not a plant that reddens the ASSERTION you added; read left/right, not the exit code. TWO MORE GATES AND TWO MORE PLANTS (15 tests, 17 plants) cover a SECOND fixture blindness: the reference's causal overlay has a STRICT lower edge and its bidirectional overlay an INCLUSIVE one, one row apart, and attn.hip::gqa_attend -- which already exists for Glimmer with the right grouping, layout and a start_pos that IS the q_offset -- implements the causal form with lo = pos - win + 1 (its own comment calls that off-by-one trap 14). Copying it and widening the bound drops exactly one KV row per query, 16 at the shipped geometry, and the vendored fixture changes on 0 of its 4 rows because at ctx 12 window 13 the lower edge clamps to 0 either way -- so the gate asserts the shipped arithmetic AND the blindness. A THIRD failed plant is recorded with them: rustfmt had reflowed the target line, the substitution matched nothing, and the suite ran green on an unmodified tree, reporting exit=0 15 passed -- indistinguishable from a plant that failed to redden. The invariant covering all three failures is that a plant must be observed to have CHANGED THE TREE before its result is evidence. SECTION 11 adds M17c's block-attend kernel: its census DEFERRED row is red-proofed on all three edges (row deleted while the gap exists; launcher renamed so the row names something absent; a test made to cover it, retiring the deferral), and a removed semicolon takes the BUILD to exit 101 -- which had to be run rather than assumed, because .jscpd.json is format:["rust"] so the duplication gate never scans .hip, and build.rs skips objects newer than their source so a fast rebuild proves nothing about whether hipcc ran. The kernel compiles for gfx1151 and has NEVER EXECUTED; the three defects its header names are invisible to a compiler and, by measurement, to the vendored goldens as well. Its duplication against gqa_attend is recorded as OWED rather than clean, because no gate can raise it and the factoring would refactor the GPU-parity-gated live attend path on a change this agent cannot verify. A TWELFTH plant guards the per-token budget gate's two dtype columns: the plan's three budgets are bf16 figures against an f32 engine (scratch is DeviceBuf::new(n*4), kv_bytes ends in checked_mul(4)), so the ctx-4096 export ring is 520.0 MiB and not the plan's 260.0 unless the export narrows -- writing the bf16 constant into the f32 row reddens with left: 545259520 right: 272629760. SECTION 12 (added 2026-08-30) lands worktree build isolation and, with it, a finding that outranks its own table: the per-worktree .cargo/config.toml files are INERT on this box, because /etc/security/pam_env.conf sets a box-wide CARGO_TARGET_DIR for every login and an environment variable outranks build.target-dir -- W3's first attempt returned two greens while both arms silently shared one directory, certifying an isolation that had never happened -- so the mechanism is an EXPLICIT per-invocation CARGO_TARGET_DIR, and the build.rs assert comparing compile-time to run-time CARGO_MANIFEST_DIR catches only the EXECUTED stale-binary half, since W2 stage 1 showed cargo replaying a sibling's cached build-script output without running the script at all.
+verdict: THE RULE THIS FILE NOW OPENS WITH, extracted from the M17 battery and generalising past this repo: a plant must be observed to have CHANGED THE TREE, and to have reddened THE ASSERTION UNDER TEST, before its result is evidence -- three of seventeen M17 plants produced a result meaning something other than it looked like (one reddened the BUILD via warnings = deny with no test executed, one reddened an EARLIER assert in the same body, and one NEVER APPLIED because rustfmt had reflowed the target line, so the suite ran green on an unmodified tree and reported exit=0 with everything passing, which is indistinguishable from a plant that failed to redden). Failed plants are kept rather than deleted, because a proof that missed is evidence about the harness. Every M0 gate and the M1 invariant registry were shown red before its green was believed — jscpd exit 7 on a planted 26-token clone, the docs registry FAILED on a one-sided verdict edit, the exemption ledger fired twice for real during the port, and RIVOLI_CS_REQUIRED turned CodeScene tool-absence into a panic naming the file; the CodeScene score-below-10 half is owed and standing, blocked only on CS_ACCESS_TOKEN. M7's anchor-decode gate is proven red in BOTH halves — deviceless (an absent capture name, a tolerance under its envelope) and on device (all four recipe rows executed 2026-08-16 with observed magnitudes matching old:'s, plus two recorded operator false-greens whose lesson is part of the record). M15's scored selection carries seven deviceless proofs on BOTH sides of its gate: a tie-rule flip reddening the oracle-side list-equality on a real tie (left [[9,8]] vs right [[8,9]]) — which the engine-side set gate provably could not have caught, since the set was unchanged — a reversed ranking comparator reddening that engine-vs-oracle gate (left {16,18} vs right {17,18}) while the below-cap identity stayed green, a dropped ascending emit reddening the below-cap byte-identity on both real and adversarial scores, a removed per-row rectangle check accepting a compensating-ragged buffer the aggregate total was blind to, and two standing fixtures pinning score-perturbation resolution above the boundary against provable inertness below it plus the keep-oldest sabotage's observability. M10's three gates split each proof into a CLASSIFIER half (paid 2026-08-16, deviceless: 6 planted defects red, --expect-red inverted both ways, the small-bucket row showing why the band alone is not the gate) and an ENGINE half (PAID 2026-08-21 on the device: profile and tf mutations confirmed red and restored; p4 confirmed via the STRICT branch under --arena-refresh after its shipped one-word red-proof corpus proved unpairable (762→763 tokens) and a 2-token swap sat under the measured noise floor — and the stock-defaults attempt surfaced an honest new outcome, UNCALIBRATED, the GLM wobble firing inside the gate) — plus one gate that reddened unplanted on its own author, the argmax fold that let a leading NaN win. M11's fp8 gates are PAID deviceless — layer_bytes stripped of its scale grid, sniff falling back to the compiled-in block, the converter at the wrong block and with one projection class skipped, and the parity script over six runs including both refusals and a green baseline — while its DEVICE half is OWED with recipes written down: the anti-fallback assert in glimmer_fp8_decode.rs. Slot::fill's third-zip-leg guard was RETIRED rather than proven - the parameter it checked was deleted, so the truncation has no shape. M11b's id pin is PAID on the real 27 MB tokenizer, 31 of 31 cases identical to apply_chat_template and red-proofed by closing a system turn with the non-stop token; its serve door ships BOTH halves (request framing and reply channel-splitting) after the request-half-only version was written and reverted as a regression, behind SIX red-proofed pure gates including the arch dispatch itself; a prefix-monotonicity property caught two streaming P0s that no non-streaming gate could see - a raw turn header streamed then the channel wedged forever, and a partial <|eot|> at the prefix boundary. Only the live SSE round-trip is OWED on the GPU. ADDED 2026-08-17: the GLM determinism gates (§6) — the id comparator, a prompt pinned by length+md5 that fired unplanted, INV-9 under a scan_free mutation, the probe's fold-slot layout under an inserted enum variant, and the column comparator's three refusals; the determinism gate's own 512-token GREEN was PAID 2026-08-21 on the MITIGATION arm — DETERMINISM_FIX_FLAGS='--arena-refresh' byte-identical over 512 against a same-day stock control that reddened exactly as the defect predicts (496 of 512 ids, first at position 11), so the green is interpretable and the engine's stock red stands unclosed. Also recorded there: a false EXCLUSION found in this round's own instrument — a fold omitted on dense layers made two runs 'agree' about a quantity neither measured, which no gate in this repo could see. ADDED 2026-08-17 (Phase 1): the per-fold probe flags — parse refusals, spin_rows reading nothing, and the column comparator refusing two logs from different fold configurations; the dash-for-disabled rendering was recorded OWED and PAID the same day, red-proofed by printing 0 instead. M17a's DFlash drafter oracle is registered here and recorded in glimmer-reference/anchor.md: nine deviceless plants, all re-run after the 2026-08-16 fixture re-vendor because a re-measured floor invalidates its old red proof, with the block-for-window substitution going from 1 of 10 tests red to 3; two rows the rewrite had DELETED rather than corrected -- the prefix-filter proof and the +1-ulp detection floor -- were restored and independently re-run 2026-08-17, both reproducing their pre-re-vendor results exactly, with their observed values kept in anchor.md alone. The restored prefix-filter row also carried a wrong MECHANISM (labelled salt pairing, when the planted rename cannot reach the salt assert -- dropping the LAST draft golden leaves the first correctly paired and the CENSUS assert is what reddens), and running the mirror plant to find what does exercise the pairing guard added a tenth plant: two independent guards, one plant each, both 7 of 10 red. M17b's drafter converter gate is proven red in all twelve of its tests AS FIRST LANDED by six plants, with two rows carrying the argument: a one-byte edit to the vendored checkpoint header reddens the LIVE-file comparison, which is what proves that conditional half is armed on this box rather than silently skipping, and a wrong drafter hidden_size reddens the POSITIVE pairing arm, which is what makes "the shipped drafter pairs with the shipped target" evidence rather than a run that failed early for an unrelated reason; the two refusal-only plants show each refusal arm reddening both when its guard is deleted and when its wording drifts, which a status-code-only refusal test cannot see. GREW the same day under review to 13 tests and NINE plants: the per-token budgets (drafter KV 20,480 B/token, hidden-state export 66,560 B/token, a 260.0 MiB ring at ctx 4096) were prose in a doc and gated nowhere and are now derived from the shipped config; the pin test was strengthened to derive its 36/22 verbatim-widened split from the real HEADER as well as from the census, red-proofed by a rank change that preserves every byte total; and RIVOLI_DRAFTER_CKPT_REQUIRED was added on RIVOLI_CS_REQUIRED's precedent because stating that the live comparison degrades when the mount vanishes is not the same as enforcing it -- proven in all THREE states, including the one people skip, the real path WITH the variable set, since a required mode never run in its required state is a mechanism rather than a gate. GREW AGAIN to 14 tests and ELEVEN plants with the mask-indexing gate, whose first plant is recorded as a FAILED proof: removing q_offset's use left the parameter unread, warnings = deny turned that into a compile error, and the run exited 101 without executing a single test -- an exit code alone would have read as "reddened". The replacement plant passes 0 at the CALL SITE, which is the mistake a kernel author actually makes, compiles, and reddens the gate with left: 0 right: 256. THREE MORE PLANTS (fifteen in all) close a discarded-count gap review found in the same gate -- the cache branch's strictly-bidirectional count was captured into `_` and thrown away while the commit message cited it, a guard that cannot fire -- and proving the new assertion red took all three attempts, because an assert earlier in the same test body hides every later one: two plants exited 101 with the test named while never touching the line under test, and only conditioning on q_offset separated the two fixture calls. A plant that reddens the TEST is not a plant that reddens the ASSERTION you added; read left/right, not the exit code. TWO MORE GATES AND TWO MORE PLANTS (15 tests, 17 plants) cover a SECOND fixture blindness: the reference's causal overlay has a STRICT lower edge and its bidirectional overlay an INCLUSIVE one, one row apart, and attn.hip::gqa_attend -- which already exists for Glimmer with the right grouping, layout and a start_pos that IS the q_offset -- implements the causal form with lo = pos - win + 1 (its own comment calls that off-by-one trap 14). Copying it and widening the bound drops exactly one KV row per query, 16 at the shipped geometry, and the vendored fixture changes on 0 of its 4 rows because at ctx 12 window 13 the lower edge clamps to 0 either way -- so the gate asserts the shipped arithmetic AND the blindness. A THIRD failed plant is recorded with them: rustfmt had reflowed the target line, the substitution matched nothing, and the suite ran green on an unmodified tree, reporting exit=0 15 passed -- indistinguishable from a plant that failed to redden. The invariant covering all three failures is that a plant must be observed to have CHANGED THE TREE before its result is evidence. SECTION 11 adds M17c's block-attend kernel: its census DEFERRED row is red-proofed on all three edges (row deleted while the gap exists; launcher renamed so the row names something absent; a test made to cover it, retiring the deferral), and a removed semicolon takes the BUILD to exit 101 -- which had to be run rather than assumed, because .jscpd.json is format:["rust"] so the duplication gate never scans .hip, and build.rs skips objects newer than their source so a fast rebuild proves nothing about whether hipcc ran. The kernel compiles for gfx1151 and has NEVER EXECUTED; the three defects its header names are invisible to a compiler and, by measurement, to the vendored goldens as well. Its duplication against gqa_attend is recorded as OWED rather than clean, because no gate can raise it and the factoring would refactor the GPU-parity-gated live attend path on a change this agent cannot verify. A TWELFTH plant guards the per-token budget gate's two dtype columns: the plan's three budgets are bf16 figures against an f32 engine (scratch is DeviceBuf::new(n*4), kv_bytes ends in checked_mul(4)), so the ctx-4096 export ring is 520.0 MiB and not the plan's 260.0 unless the export narrows -- writing the bf16 constant into the f32 row reddens with left: 545259520 right: 272629760. SECTION 12 (added 2026-08-30) lands worktree build isolation and, with it, a finding that outranks its own table: the per-worktree .cargo/config.toml files are INERT on this box, because /etc/security/pam_env.conf sets a box-wide CARGO_TARGET_DIR for every login and an environment variable outranks build.target-dir -- W3's first attempt returned two greens while both arms silently shared one directory, certifying an isolation that had never happened -- so the mechanism is an EXPLICIT per-invocation CARGO_TARGET_DIR, and the build.rs assert comparing compile-time to run-time CARGO_MANIFEST_DIR catches only the EXECUTED stale-binary half, since W2 stage 1 showed cargo replaying a sibling's cached build-script output without running the script at all. SECTION 13 (added 2026-08-31, re-specified the same day) is the harness bash-guard, and it is the first gate in this file whose TABLE IS A CARGO TEST rather than prose: crates/cli/tests/hook_guard.rs drives 78 payloads straight into .claude/hooks/bash-guard.sh and asserts the exit code, because as first landed the table was hand-run from a session /tmp scratchpad with a re-run trigger nothing enforced, i.e. an examined-count that could reach zero unnoticed. Its red evidence is the pre-fix matcher, which asked its questions of the WHOLE command string and therefore failed OPEN on ordinary composition: the same table scores 36 of 78 against it, 42 rows red, 33 false-ALLOWs and 9 false-BLOCKs, including a full unlocked device decode through cargo's built-in alias cargo r (exit 0, silent), a bare workspace test as the second arm after a deviceless first (exit 0), a second arm holding no lock after a flocked first (exit 0), and every relative artefact path under a target root (exit 0) -- four classes four independent reviewers each measured on the live file, none of which the section's own gap list had disclosed. Gap 4 was BACKWARDS and is rewritten from a re-run rather than appended to: it recorded a plain ls of a built binary as a cheap false-BLOCK, which does not reproduce (exit 0), while omitting the expensive false-ALLOW in the same rule and the opposite direction, the same relative path INVOKED (exit 0). Two further things are recorded there: R2's flock exemption is DELETED, because device scheduling and build isolation are independent and that exemption left the most-run build on this box outside the rule that exists to stop it sharing the pam_env target dir; and the Rust gate's own EXECUTION IS OWED -- its 68 rows were driven and agreed through the identical payload and exit-code contract from python, but no cargo ran this round because a timed GPU baseline held the box, so the green is evidence about the matcher and not yet about the harness around it.
 ---
 
 # M0 gate red proofs
@@ -1260,3 +1260,283 @@ back green means the reuse did not happen, which is not the same as the assert w
 assert also says nothing about whether jscpd itself scanned correctly once it did run (§1
 owns that), and nothing about dependency artifacts compiled against another checkout's
 sources. Its whole claim is: this build script belongs to the tree it is scanning.
+
+## 13. The harness bash-guard — a STANDING gate (added 2026-08-31, re-specified the same day)
+
+`.claude/hooks/bash-guard.sh`, wired as a `PreToolUse` hook on the `Bash` matcher in the
+now-versioned `.claude/settings.json`. It reads the tool payload as JSON on stdin and answers
+with an exit code: **0 allows, 2 blocks and hands the reason back on stderr**. Three rules —
+**R1** a command that reaches the device without `flock /var/run/sys-gpu.lock`, **R2** a cargo
+build verb with no explicit `CARGO_TARGET_DIR` (the §7e-bis/§12 defect, whose mechanism is
+this box's *default*), **R3** a mutating git verb in a tree other agents are writing to.
+
+**The table lives in `crates/cli/tests/hook_guard.rs`.** That is the first correction of the
+day and the one that outranks the rest: as first landed, §13 was a hand-run table whose two
+drivers sat in a session-scoped `/tmp` scratchpad — a directory CLAUDE.md forbids for exactly
+this failure — with "re-run after any edit to the hook" as its only trigger, which is prose
+enforced by nothing. Every row is a pure deviceless text decision, so the whole population is
+now a `cargo test` that runs in CI's own arm and reddens a build when the matcher moves. **A
+guard whose proof lives in a deleted scratchpad is a guard whose examined-count can reach zero
+without anyone noticing**, which is the failure mode CLAUDE.md names in its second paragraph.
+This section keeps the argument, the provenance and the gaps; the rows are code.
+
+**What this gate is NOT, stated before its greens.** It is the THIRD layer and it is not
+load-bearing. Hooks fire only for Bash calls made through the Claude Code harness: a raw
+terminal, a hand-opened ssh session, a cron job, or another tenant's agent is not scanned at
+all. So `flock` remains the cross-tenant guard and the per-arm contention witness remains the
+post-hoc detector; this hook only catches the agent that forgot, before the forgetting costs
+someone a discarded arm. A green table below is evidence about ONE population of commands.
+
+**Capture discipline.** Every row is driven **directly into the hook** — payload written to a
+file, the file redirected onto the hook's stdin, `returncode` read from the hook process
+itself. No pipeline appears anywhere in the harness, per this file's standing rule that
+§7e-bis's false green *was* a pipeline's exit code. `hook_guard.rs::drive` reproduces exactly
+that shape (`Stdio::from(File::open(payload))`, `wait_with_output`), and adds one check a
+bare exit code cannot make: **a `want: 2` row also asserts the stderr names a rule**, so a
+python traceback (exit 1) or the python3-missing branch cannot be counted as a block.
+
+### 13a. THE RED EVIDENCE: the same table against the pre-fix matcher
+
+The first version of this hook asked its questions of the **whole command string**. Four
+independent reviewers broke it the same way within one round, and the table above was believed
+wider than it was — none of the classes below appeared in its own gap list. Driven against
+that matcher on 2026-08-31, the current 78-row table scores **36 of 78: 42 rows red, 33
+false-ALLOWs and 9 false-BLOCKs.** The four the reviews led with, with their observed pre-fix
+exits, all **silent** (no stderr at all):
+
+| row | payload | pre-fix | why it got through |
+|---|---|---|---|
+| Z1 | `cargo r --release -- decode --model glm --prompt 'hi' --max-mem 100` | **0** | `r` is a cargo BUILT-IN alias for `run` (`cargo --list`: b c d r t). A full unlocked device decode, one character short of the spelled-out verb every pattern matched. |
+| N2 | `CARGO_TARGET_DIR=… cargo test --workspace --no-default-features && cargo test --workspace -- --test-threads=1` | **0** | the `--no-default-features` test was whole-command, so the deviceless arm disarmed R1 for the real one. The most natural two-arm line in this tree. |
+| L1 | `flock /var/run/sys-gpu.lock -c '…cargo test --workspace' && cargo test --workspace` | **0** | `locked_before` asked only whether `flock` and the lock path appeared anywhere EARLIER in the string. Arm 2 holds nothing — the recorded "lock PER ARM of an A/B" scar, reproduced by the guard meant to prevent it. |
+| Z3 | `cd /home/rhansen/workspace/constructive.dev/rivoli && target/release/rivoli bench --model glm` | **0** | every `TARGET_ROOTS` entry began with `/`, so the commonest spelling of a built binary was invisible while `./target/…` and the absolute form both blocked. |
+
+Two more classes are worth naming because they were not evasions of any kind. A **prose
+mention** armed the exemption in both directions: `echo 'run under flock /var/run/sys-gpu.lock
+next time' && cargo run --release -- decode` → **0** (row L2) and `echo 'CARGO_TARGET_DIR=' &&
+cargo check` → **0** (row T7). And the mirror image, **9 false-BLOCKs on work with no
+device in it**: `ls`/`du`/`rm -rf`/`cat`/`find` on paths under a build directory (rows F2–F6),
+cargo's own `--target-dir` (row T2, which CLAUDE.md and this very file both prescribe as a
+remedy), and — observed live on the coordinator, not in any driver — a read-only
+`ssh rh-anine 'pgrep -af "cargo test|test-threads"'` refused because the LITERAL STRING
+`cargo test` appeared as a `pgrep` argument (row Q1). The guard was refusing the fleet the
+right to read and to monitor its own doctrine.
+
+**Provenance of the pre-fix column, stated because it is weaker than the post-fix one.** The
+pre-fix hook was never committed (it is part of this same uncommitted change), and it was
+overwritten by the fix before these numbers were taken. The column above was therefore
+measured against a **reconstruction**: the file body was recovered from a review agent's
+transcript, where it appears as a `Read` result with `N\t` line-number prefixes, and every
+prefix was checked against its own index while stripping (194 lines, assertion on all 194).
+That is strong enough to believe the exits and not strong enough to call it the original
+inode; the four Z1/N2/L1/Z3 values independently reproduce what four reviewers each measured
+on the live file, which is the corroboration that matters.
+
+### 13b. The full table, both columns measured
+
+`want` is what the row demands; `pre-fix` and `post-fix` are observed. A bold pre-fix cell is
+a row that was red before the fix. `rule` is the rule that spoke post-fix.
+
+| # | payload `command` | want | pre-fix | post-fix | rule | what the row is for |
+|---|---|---|---|---|---|---|
+| 1 | `cargo test --workspace -- --test-threads=1` | 2 | 2 | **2** | R1 | the canonical device battery, bare |
+| 2 | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace -- --test-threads=1'` | 0 | 0 | **0** | — | row 2 REPAYLOADED: the lock is no longer an R2 exemption, so it carries the prefix |
+| 2b | `flock /var/run/sys-gpu.lock -c 'cargo test --workspace -- --test-threads=1'` | 2 | **0** | **2** | R2 | the supersession itself: flocked but no target dir -> R2 |
+| 3 | `cargo test --workspace --no-default-features` | 2 | 2 | **2** | R2 | deviceless, no target dir -> R2 |
+| 3b | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace --no-default-features` | 0 | 0 | **0** | — | THE canonical deviceless arm; a hook that blocks this is unconditionally red |
+| 3c | `env -u CARGO_TARGET_DIR cargo test --workspace --no-default-features` | 0 | 0 | **0** | — | the other remedy CLAUDE.md names |
+| 4 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace --no-default-features --features rocm` | 2 | 2 | **2** | R1 | R1 wins even with the prefix, and the fragment is the feature |
+| 5 | `cargo check` | 2 | 2 | **2** | R2 | R2 on a plain check |
+| 6a | `git status` | 0 | 0 | **0** | — | plain git |
+| 6b | `cargo fmt --check` | 0 | 0 | **0** | — | fmt is not a build verb |
+| 7 | `git stash` | 2 | 2 | **2** | R3 | R3 |
+| A | *(its own raw stdin — see the two cases below the table)* | 0 | 0 | **0** | — | the device command under tool_name Read -- matcher scope |
+| B | *(its own raw stdin — see the two cases below the table)* | 0 | 0 | **0** | — | unparseable stdin -- the guard fails OPEN by design |
+| C | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli /var/cache/rivoli/target/rivoli/debug/rivoli decode` | 2 | 2 | **2** | R1 | a target-dir BINARY with the prefix present, so only R1 can speak |
+| D | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli /var/cache/rivoli/target/rivoli/debug/rivoli decode'` | 0 | 0 | **0** | — | C behind the lock |
+| E | `tests/ppl-gates.sh profile` | 0 | 0 | **0** | — | the repo's own self-flocking scripts |
+| F | `ls -ld /var/cache/rivoli/target/rivoli` | 0 | 0 | **0** | — | a target DIRECTORY: no profile segment, no device |
+| G | `/var/cache/users/rhansen/cargo-target/debug/rivoli decode` | 2 | 2 | **2** | R1 | a binary under this box's pam_env DEFAULT target root |
+| Z1 | `cargo r --release -- decode --model glm --prompt 'hi' --max-mem 100` | 2 | **0** | **2** | R1 | PRE-FIX 0: `r` is cargo's built-in alias for run |
+| X1 | `cargo b --release` | 2 | **0** | **2** | R2 | alias b = build -> R2 |
+| X2 | `cargo c --no-default-features` | 2 | **0** | **2** | R2 | alias c = check -> R2 |
+| X3 | `cargo d --no-deps` | 2 | **0** | **2** | R2 | alias d = doc -> R2 |
+| X4 | `cargo t --workspace` | 2 | **0** | **2** | R1 | alias t = test -> R1 |
+| A6 | `cargo nextest run --workspace` | 2 | **0** | **2** | R1 | a third-party runner token must not hide `run` |
+| T8 | `cargo fix --allow-dirty` | 2 | **0** | **2** | R2 | fix compiles AND rewrites source -> R2 |
+| F1 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo build -F rocm` | 2 | **0** | **2** | R1 | cargo's short feature selector |
+| N2 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace --no-default-features && cargo test --workspace -- --test-threads=1` | 2 | **0** | **2** | R1 | PRE-FIX 0: deviceless arm then the real one -- the most natural two-arm line here |
+| N4 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace --no-default-features ; cargo test --workspace` | 2 | **0** | **2** | R1 | N2's semicolon form |
+| L1 | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace' && cargo test --workspace` | 2 | **0** | **2** | R1 | PRE-FIX 0: arm 2 holds no lock -- the `lock PER ARM of an A/B` scar |
+| L2 | `echo 'run under flock /var/run/sys-gpu.lock next time' && cargo run --release -- decode` | 2 | **0** | **2** | R1 | PRE-FIX 0: a PROSE mention of the lock armed the exemption |
+| L3 | `flock /var/run/sys-gpu.lock -c 'true'; cargo bench` | 2 | **0** | **2** | R1 | an emptied lock arm followed by a bare bench |
+| X11 | `flock /var/run/sys-gpu.lock -c 'true'␊cargo test --workspace` | 2 | **0** | **2** | R1 | the same across a newline |
+| T3 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo build --release && cargo test --workspace --no-default-features -- --test-threads=1` | 2 | **0** | **2** | R2 | PRE-FIX 0: a bash env prefix binds ONE command; arm 2 lands in the pam_env dir |
+| X12 | `env -u CARGO_TARGET_DIR cargo check --no-default-features && cargo build` | 2 | **0** | **2** | R2 | the same shape through the env wrapper |
+| T1 | `CARGO_TARGET_DIR= cargo test --workspace --no-default-features` | 2 | **0** | **2** | R2 | PRE-FIX 0: an EMPTY value selects no directory |
+| T7 | `echo 'CARGO_TARGET_DIR=' && cargo check` | 2 | **0** | **2** | R2 | PRE-FIX 0: a mention in an echo armed the exemption |
+| T2 | `cargo test --workspace --no-default-features --target-dir /var/cache/rivoli/target/rivoli` | 0 | **2** | **0** | — | PRE-FIX 2 (false-block): --target-dir is cargo's own flag and OUTRANKS the variable |
+| Z3 | `cd /home/rhansen/workspace/constructive.dev/rivoli && target/release/rivoli bench --model glm` | 2 | **0** | **2** | R1 | PRE-FIX 0: every root began with `/`, so the relative path was invisible |
+| P1 | `target/debug/rivoli decode --prompt hi` | 2 | **0** | **2** | R1 | PRE-FIX 0: bare relative artefact |
+| P2 | `./target/release/rivoli decode` | 2 | 2 | **2** | R1 | the control that blocked pre-fix too |
+| P3 | `cd target/debug && ./rivoli decode --prompt hi` | 2 | **0** | **2** | R1 | PRE-FIX 0: the cd carries the target root |
+| P4 | `$CARGO_TARGET_DIR/debug/rivoli decode` | 2 | **0** | **2** | R1 | PRE-FIX 0: the variable spelling of the same binary |
+| F2 | `ls -l /var/cache/rivoli/target/rivoli/debug/` | 0 | **2** | **0** | — | PRE-FIX 2 (false-block): a trailing slash was the whole difference from row F |
+| F3 | `du -sh /var/cache/rivoli/target/rivoli/debug/` | 0 | **2** | **0** | — | PRE-FIX 2 (false-block) |
+| F4 | `rm -rf /var/cache/rivoli/target/rivoli/debug/incremental` | 0 | **2** | **0** | — | PRE-FIX 2 (false-block): reclaiming disk is routine here |
+| F5 | `cat /var/cache/rivoli/target/rivoli/debug/build/rivoli-cli-abc/output` | 0 | **2** | **0** | — | PRE-FIX 2 (false-block): reading a build-script log |
+| F6 | `find /var/cache/rivoli/target/rivoli/debug/ -name '*.d'` | 0 | **2** | **0** | — | PRE-FIX 2 (false-block) |
+| X5 | `ls -l target/debug/rivoli` | 0 | 0 | **0** | — | the row 13 gap 4 had BACKWARDS: it exits 0, it was never a false-block |
+| Q1 | `ssh rh-anine 'pgrep -af "cargo test\|test-threads"'` | 0 | **2** | **0** | — | OBSERVED LIVE 2026-08-31: the pre-fix hook refused the coordinator's read-only probe |
+| Q2 | `grep -rn 'cargo test' docs/ CLAUDE.md` | 0 | **2** | **0** | — | PRE-FIX 2 (false-block): the fleet reading its own doctrine |
+| Q3 | `ssh rh-anine 'cargo test --workspace'` | 2 | 2 | **2** | R1 | the pair to Q1: a REAL remote device arm still blocks |
+| G2 | `git checkout main` | 2 | **0** | **2** | R3 | PRE-FIX 0 |
+| G3 | `git checkout -- crates/engine/src/lib.rs` | 2 | **0** | **2** | R3 | PRE-FIX 0 |
+| G4 | `git reset --hard origin/main` | 2 | **0** | **2** | R3 | PRE-FIX 0: not even recoverable |
+| G5 | `git clean -fdx` | 2 | **0** | **2** | R3 | PRE-FIX 0: would delete the untracked .claude/ tree |
+| G6 | `git restore .` | 2 | **0** | **2** | R3 | PRE-FIX 0 |
+| G8 | `git switch main` | 2 | **0** | **2** | R3 | PRE-FIX 0 |
+| G9 | `git rebase origin/main` | 2 | **0** | **2** | R3 | PRE-FIX 0 |
+| G10 | `git merge --no-ff wave/m12` | 2 | **0** | **2** | R3 | PRE-FIX 0 |
+| G7 | `git add -A && git commit -m wip` | 0 | 0 | **0** | — | ALLOWED on purpose: workers commit as soon as a change verifies |
+| G11 | `git commit -m 'fix the checkout path'` | 0 | 0 | **0** | — | the verb is found by POSITION: a message is not a checkout |
+| G12 | `git stash pop` | 2 | 2 | **2** | R3 | R3 sees the subcommand, not the whole line |
+| G13 | `git -C .claude/worktrees/wave-m12 stash` | 2 | 2 | **2** | R3 | `git -C <path>` is still a stash |
+| L4 | `flock /var/run/other.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace'` | 2 | 2 | **2** | R1 | the wrong lock guards nothing |
+| L5 | `flock /var/run/sys-gpu.lock.bak -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace'` | 2 | **0** | **2** | R1 | PRE-FIX 0: a bare substring counted `.bak` as the lock |
+| CM1 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo clippy --workspace --all-targets` | 0 | 0 | **0** | — | the rocm clippy arm: clippy compiles, it does not run the device |
+| CM2 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo clippy --workspace --all-targets --no-default-features` | 0 | 0 | **0** | — | the stub clippy arm |
+| CM3 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo build --release` | 0 | 0 | **0** | — | the benchmark build |
+| H1 | `cat > /var/tmp/note.txt <<'EOF'␊target/debug/rivoli decode was the false-allow␊EOF` | 2 | **0** | **2** | R1 | KNOWN false-block, kept as a standing fixture: a heredoc's prose line is scanned as a segment. It reddened on this fix's own author while writing section 13 |
+| H2 | `cat > /var/tmp/note.txt <<'EOF'␊the guard reads the text, nothing more␊EOF` | 0 | 0 | **0** | — | H1's pair: it is not `any heredoc blocks`, it is a prose line that parses as a command |
+| W1 | `timeout 300 cargo test --workspace` | 2 | 2 | **2** | R1 | the wrapper table: timeout's duration positional is skipped and the wrapped verb is judged |
+| W2 | `sh -c 'cargo test --workspace'` | 2 | 2 | **2** | R1 | sh -c's command string is re-entered |
+| W3 | `ssh -o BatchMode=yes rh-anine 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace --no-default-features'` | 0 | 0 | **0** | — | ssh's valued options are skipped before the host, and the remote deviceless arm is allowed |
+| R4 | `git log --grep=stash --oneline` | 0 | **2** | **0** | — | R3 by POSITION: a search FOR the word stash is not a stash |
+| R5 | `git stash list` | 2 | 2 | **2** | R3 | KNOWN false-block, accepted: a read-only spelling costs a rephrase and this rule prefers it |
+| P5 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace --no-default-features 2>&1 \| tee /var/tmp/log` | 0 | 0 | **0** | — | a `|` splits the line without breaking either half's own verdict |
+| P6 | `CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo build --release 2>&1` | 0 | 0 | **0** | — | a lone `&` is NOT a separator, so `2>&1` survives tokenization |
+| N1 | `echo 'oops` | 0 | 0 | **0** | — | an unbalanced quote falls back to a whitespace split rather than failing CLOSED on a typo |
+
+Rows `A` and `B` are the two that are ABOUT the stdin rather than about a command, and they
+live in their own test: **A** sends the same device command under `"tool_name": "Read"` (the
+matcher scope — this is what separates "the rules decided" from "the hook fails closed on
+everything"), and **B** sends stdin that is not JSON (**the guard fails OPEN by design**: a
+guard that cannot read its own input must not become a work stoppage, and the two layers below
+it are still in place). Both must be silent as well as zero.
+
+**Two rows carry rule CHANGES rather than matcher fixes, and are recorded as such.**
+
+- **Row 2 has a new payload.** It used to be the bare `flock … -c 'cargo test --workspace --
+  test-threads=1'` at want 0, and it was green only because R2 exempted anything lock-prefixed
+  — an exemption whose entire justification was making that row pass. The exemption is deleted:
+  device scheduling and build isolation are **independent**, so the single most-run build on
+  this box was permanently exempt from the rule that exists to stop it sharing the pam_env
+  target dir, and the hook contradicted the discipline block the same commit bakes into all six
+  agent definitions. Row 2 now carries the prefix, and **row 2b is the supersession itself** —
+  the old payload, at want **2**, R2.
+- **Row T2 accepts `--target-dir`.** It is cargo's own flag and it OUTRANKS `CARGO_TARGET_DIR`;
+  refusing it meant the hook refused one of the two remedies its own block text cited.
+
+**Gap 4 was BACKWARDS. Corrected in place, 2026-08-31.** The first version of this section
+recorded, under "gaps that remain": "``ls -l target/debug/rivoli`` is blocked (false-block,
+cheap)". Measured: **it exits 0** (row X5) — it was never blocked, and the sentence's second
+half ("a binary copied somewhere with no target root in its path is not seen") read as if the
+relative case were covered. What DID reproduce is the false-ALLOW in the same rule and the
+opposite direction: `target/debug/rivoli decode --prompt hi` → **0** (row P1). The doc named a
+cheap false-block that does not exist and omitted the expensive false-allow that does. Both
+directions now have rows on both sides of the fix: F/F2–F6/X5 for the blocks, C/G/P1–P4/Z3 for
+the allows. **A gap list is evidence about the guard, so a wrong entry is a wrong measurement,
+not a wording problem** — which is why this one is rewritten from a re-run rather than
+appended to.
+
+**It reddened unplanted, on its own author, within a minute of being wired up.** The first
+attempt at this table was a bash driver holding the row commands as arguments; the harness
+refused the Bash call with
+`PreToolUse:Bash hook error: ["$CLAUDE_PROJECT_DIR/.claude/hooks/bash-guard.sh"]: BLOCKED (R2,
+target dir): …`. That is worth more than any row above, because a stdin-driven row proves only
+that the *script* decides correctly, while this proves the `settings.json` wiring, the
+`$CLAUDE_PROJECT_DIR` expansion and the exit-code contract are live end to end — the half a
+direct drive cannot reach. It happened a second time on 2026-08-31, on the coordinator rather
+than the author: row Q1's `pgrep` probe was refused mid-task. `hook_guard.rs`'s third test
+asserts the wiring half that a payload drive cannot see (matcher `Bash`, the hook command
+naming this script), but the end-to-end expansion is still only witnessed by those two
+refusals.
+
+**The false-block that forced iteration 2, quoted (history, and still true of iteration 1).**
+Running `ls -ld /var/cache/rivoli/target/rivoli` to check whether the per-checkout target dir
+existed returned, from the harness rather than from any driver:
+
+```
+PreToolUse:Bash hook error: ["$CLAUDE_PROJECT_DIR/.claude/hooks/bash-guard.sh"]: BLOCKED (R1, GPU):
+this command reaches the device without holding the GPU lock.
+  offending fragment: /var/cache/rivoli/target/rivoli
+```
+
+`ls` reaches no device, and the fragment names a directory. The rule had been written as a
+list of path markers, one of which was a bare target root; iteration 2 required a profile
+segment after the root, and iteration 3 (this one) additionally requires the path to be in the
+segment's **executable position** — which is what finally makes F2–F6 green, since a profile
+segment appearing anywhere in an `ls` argument was still enough at iteration 2. **A marker
+list is a guess about paths; the thing being guarded is a class of file — and where in the
+command that file appears is part of the class.**
+
+**Gaps that remain, post-fix, stated here rather than discovered later.**
+
+1. **It is still text, not a shell.** Two concessions and no more: the segment split is
+   quote-aware, and a small table of wrappers whose arguments are a command (`flock`, `env`,
+   `sh -c`, `ssh`, `timeout`, `sudo`, `nohup`, `time`) is peeled so the wrapped command is
+   what gets judged. There is no variable expansion, no `$(…)`, no globbing, no subshell
+   semantics. `$CARGO_TARGET_DIR/debug/rivoli` (row P4) is caught by its literal spelling; the
+   same path held in a differently-named variable is not seen. A wrapper NOT in the table
+   (`xargs -I{} cargo build`, `parallel`, a shell function body: all measured at exit 0) hides
+   what it runs. **And a HEREDOC's body is scanned as if its lines were commands** — a prose
+   line whose first token parses as an executable is refused, which is rows H1/H2: H1 is a
+   `cat > note <<'EOF'` whose body begins `target/debug/rivoli decode …` and is BLOCKED, H2 is
+   the same heredoc with an ordinary sentence and is allowed. **H1 reddened live on this fix's
+   own author, while writing this very section** — the edit that appends the §13 verdict
+   sentence was refused because the sentence quoted a payload — which is why H1 is kept as a
+   standing fixture at want 2 rather than described: the class is now a row that will go red
+   if anyone closes it, instead of a paragraph nobody re-reads. The remedy is the same as the
+   original gap 1's: put the text in a FILE and run the file.
+2. **R1 knows only three shapes of device work**: a cargo device verb, a `rocm`-bearing
+   `--features`/`-F`, and a build artefact in executable position. `rocm-smi`, `hipcc -x hip k.hip
+   -o /tmp/k && /tmp/k`, and a torch/triton golden capture — which is `port-oracle-track`'s
+   whole job, and per the K3 record is a python run rather than a cargo run — are device work
+   this rule does not see. The first version's gap list did not state this class; it is stated
+   now, and it is the largest hole in R1.
+3. **`--features` is a substring test on the VALUE.** `--features rocm` and `--features=a,rocm`
+   both match, and a feature named e.g. `no-rocm` would match too and be blocked. False-block,
+   one-word remedy, deliberately left loose: the alternative is a feature registry this hook
+   cannot read.
+4. **Destructive verbs that are not builds are uncovered, and one of them deliberately.**
+   `cargo clean` is not in the build-verb list, so a bare `cargo clean` against the box-wide
+   pam_env dir is allowed; and row F4 ALLOWS `rm -rf …/target/rivoli/debug/incremental` on
+   purpose, because refusing filesystem work under a build directory was the false-block class
+   the executable-position rule removed. The tension is named rather than resolved: the
+   remedy for both is a human reading the command, which is what the shrunken
+   `permissions.allow` list preserves.
+5. **R3 blocks read-only spellings.** The verb is found by POSITION, so `git commit -m 'fix the
+   checkout path'` is correctly allowed (row G11) and `git log --grep=stash --oneline` is
+   allowed too (row R4 — one of the nine rows the pre-fix substring matcher got wrong in this
+   direction) — but `git stash list` is refused (row R5, kept at want 2 as a standing fixture
+   for the same reason as H1). That false-block costs a rephrase and this rule prefers it.
+6. **The python3-missing branch has no row.** If `python3` is absent the shim prints
+   `bash-guard: python3 missing — guard NOT enforced` to stderr and exits 0 — fail open, but
+   loudly, on build.rs's `cargo:warning=jscpd not run` precedent. No row can exercise it
+   without removing the interpreter the whole gate runs on; what the table DOES enforce is
+   that this branch cannot be mistaken for a block, since every `want: 2` row asserts the
+   stderr names a rule.
+7. **OWED: the Rust gate has not itself been executed.** Its 78 rows were driven, and agreed,
+   through the identical payload/exit contract from python on 2026-08-31 (78 of 78 post-fix,
+   36 of 78 pre-fix), and its table was cross-checked byte-for-byte against the driven one; but
+   `cargo test` was not run this round, because a timed GPU baseline held the box and no cargo
+   invocation could be allowed to contaminate it. **So the green above is evidence about the
+   MATCHER and not yet about the test harness around it** — the deviceless
+   `--test hook_guard` run is what pays that half, and until it runs, this row is the gap.
+
+**Re-run trigger — superseded, and that is the point.** It used to be "any edit to
+`.claude/hooks/bash-guard.sh` invalidates this table; re-run both drivers", which nothing
+enforced. It is now `crates/cli/tests/hook_guard.rs`, on every deviceless `cargo test`. What
+still needs a human: a NEW class of command (a new wrapper, a new device tool) is a new ROW,
+and adding the row is what makes the class evidence rather than an opinion.

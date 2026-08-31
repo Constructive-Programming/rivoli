@@ -7,5 +7,25 @@ __pycache__/
 
 # session/tooling artifacts that live in the working dir, never in the repo
 .claude/pruned-patches/
-.claude/settings.json
+.claude/settings.local.json
 .snapshot_path
+
+# HARNESS RUNTIME STATE, versioned here rather than only in `.git/info/exclude` (added
+# 2026-08-31, review). `.claude/` became repo content in this commit — settings.json, the
+# hook, the agent defs, the skills — and every pattern below was ignored ONLY by the local
+# exclude file, which is per-clone machine state and is never cloned. So on the first fresh
+# clone or worktree, `git add .claude` would sweep in live agent mailboxes, checkpoints and
+# registry state; `.claude/worktrees/` here already holds two complete checkouts, which git
+# would stage as mode-160000 gitlinks — two pseudo-submodules pointing at branch tips, and
+# `git ls-files -o` reports nothing there, so the mistake would be invisible in `status`.
+# The local exclude keeps its copies (ignoring is idempotent); these are the ones that travel.
+**/.claude/worktrees/
+**/.claude/checkpoints/
+**/.claude/mailbox/
+**/.claude/routines/.state/
+**/.claude/agent-registry.json
+**/.claude/agent-memory-local
+**/.claude/scheduled_tasks.json
+**/.claude/scheduled_tasks.lock
+**/.claude/assistant-daemon-state.json
+**/.claude/first-run

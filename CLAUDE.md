@@ -83,6 +83,22 @@ appears that enum dispatch cannot fill.
   the script is never run and its cached output is replayed silently (W2 stage 1), and no
   assert can speak from inside a binary that does not execute — that half is closed only by
   real target-dir isolation, i.e. the explicit per-invocation `CARGO_TARGET_DIR`.
+- **harness bash-guard** — `.claude/hooks/bash-guard.sh`, a `PreToolUse` hook on the `Bash`
+  matcher in the versioned `.claude/settings.json`: it reads the tool payload as JSON on stdin
+  and answers with an exit code (0 allows; 2 blocks and hands the reason back on stderr).
+  Three rules, each evaluated **per segment** of the command line (`;`, `&&`, `||`, `|`,
+  newline) and on the segment's **executable position**, never on a substring of an argument:
+  **R1** reaches the device without `flock /var/run/sys-gpu.lock` *in that same segment*;
+  **R2** a cargo build verb with no explicit `CARGO_TARGET_DIR` — and the lock is NOT an
+  exemption, because device scheduling and build isolation are independent; **R3** a mutating
+  git verb (`stash|checkout|restore|switch|clean|reset|merge|rebase`) on this shared tree,
+  with `add` and `commit` deliberately allowed. It is the THIRD layer and not load-bearing:
+  only Bash calls made through the harness are scanned, so `flock` stays the cross-tenant
+  guard and the per-arm contention witness stays the post-hoc detector. Standing red proof:
+  `crates/cli/tests/hook_guard.rs` — **78 rows** driven straight into the hook, deviceless, on
+  every `cargo test`; the same table scores **36 of 78 (42 rows red)** against the pre-fix
+  matcher, whose rules asked their questions of the whole command string
+  (`docs/measurement/gate-red-proofs.md` §13).
 - **warnings are errors, structurally** — `[workspace.lints.rust] warnings = deny` and
   `[workspace.lints.clippy] all = deny` in the manifest, so a local `cargo check`
   enforces what CI enforces (owner rule 2026-08-15; red-proofed with a planted unused
@@ -138,14 +154,24 @@ level of the DAG, so a bare `cargo build` is the real engine and a bare
 The deviceless refusal-stub arm is `--no-default-features`; it is what CI's hipcc-less
 runner builds, and the feature matrix pins every cell's exact set with it.
 
+Every line below carries its own `CARGO_TARGET_DIR` because on this box that is the only
+thing that isolates a build (`## Build cache and worktrees`); `rivoli` is the PRIMARY
+checkout's name, a worktree substitutes its own. Spelled out per invocation rather than
+`export`ed or held in a shell variable on purpose: a bash env prefix binds exactly the one
+command it prefixes, and the guard reads the prefix that is actually there.
+
 ```bash
-flock /var/run/sys-gpu.lock -c 'cargo test --workspace -- --test-threads=1'
+flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace -- --test-threads=1'
                                   # dev profile, host + device in one battery.
-cargo test --workspace --no-default-features   # the deviceless arm (CI's build); safe anywhere
-cargo clippy --workspace --all-targets                        # rocm arm
-cargo clippy --workspace --all-targets --no-default-features  # stub arm
-cargo build --release             # benchmarks and performance evaluation ONLY
+CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test --workspace --no-default-features   # the deviceless arm (CI's build); safe anywhere
+CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo clippy --workspace --all-targets                        # rocm arm
+CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo clippy --workspace --all-targets --no-default-features  # stub arm
+CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo build --release             # benchmarks and performance evaluation ONLY
 ```
+
+**All five lines are payload rows in `crates/cli/tests/hook_guard.rs`, not prose.** The version of this block without the prefixes was refused by this file's own guard
+(R2) — a quick-start a reader cannot run is a defect in the file, and it is the reason the
+guard's rows include the canonical arms explicitly.
 
 **A run that is not timing something is a dev-profile run.** `[profile.release]` compiles
 out every `debug_assert!`; that is what benchmarks are measured under, and it is also why
@@ -213,8 +239,9 @@ stops it while it is actually on the invocation.
 tooling — `isolation: "worktree"`, the worktree skills — creates scratch worktrees under
 `.claude/worktrees/` with a raw `git worktree add` and no `.cargo/config.toml`, and the
 script cannot intercept that. Such a worktree must NEVER run cargo without an explicit
-`CARGO_TARGET_DIR` on the invocation; the harness guard added in a later commit is what
-enforces it.
+`CARGO_TARGET_DIR` on the invocation; the harness guard (`.claude/hooks/bash-guard.sh`, rule
+R2 — see `## Gates`) is what enforces it, and `crates/cli/tests/hook_guard.rs` is what keeps
+the guard honest.
 
 **Read exit codes UNPIPED.** The same false green was a `cargo check … | grep … | head`
 followed by an unconditional `echo "CHECK OK"`: the pipeline reported its last stage and the
