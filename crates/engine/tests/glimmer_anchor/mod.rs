@@ -31,7 +31,7 @@
 #[path = "../../../oracles/tests/common/golden_read.rs"]
 pub mod golden_read;
 
-// Named by `Anchor`'s own field types and used by `GoldenSet::read_glimmer` below, so this
+// Named by `Anchor`'s own field types and used by the arch-indexed anchor reader below, so this
 // one is live in every consumer and takes no allow — keeping it out of the allow below is
 // what leaves it reportable if `read_glimmer` ever moves out.
 pub use golden_read::GoldenSet;
@@ -42,6 +42,7 @@ pub use golden_read::GoldenSet;
 pub use golden_read::{float, ints};
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::schema::parse_config;
+use rivoli_core::legality::Arch;
 use serde_json::Value;
 
 /// The two vendored text goldens and the two weight sets, by the same bytes
@@ -224,7 +225,7 @@ pub fn anchors() -> Vec<Anchor> {
         .iter()
         .map(|(name, caps, weights)| {
             let read = |b: &[u8], what: &str| {
-                GoldenSet::read_glimmer(&mut &b[..])
+                GoldenSet::read_anchor_for(Arch::MuseGlimmer, &mut &b[..])
                     .unwrap_or_else(|e| panic!("{name} {what}: {e:#}"))
             };
             let caps = read(caps, "captures");

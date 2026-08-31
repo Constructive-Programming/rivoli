@@ -35,22 +35,45 @@ use anyhow::{Context, Result, ensure};
 /// cannot name is one whose decode path we cannot choose, and choosing anyway is the exact
 /// failure this port is built to avoid — it does not crash, it produces fluent wrong text.
 ///
+/// **Both fields are read at the DOCUMENT ROOT, and both must be THERE — since 2026-08-31
+/// that is a check rather than a habit.** `Qwen4ExpForConditionalGeneration`'s
+/// `vision_config.model_type` is the root string verbatim (`qwen4_exp`), so a recursive
+/// search would match the vision block and resolve a trimmed or vision-only config as the
+/// whole model — the trap [`crate::arch::from_manifest_str`] documents in full. Root-only
+/// reading closes the recursive case; requiring both fields closes the case root-only cannot,
+/// which is a nested block PROMOTED to a document (`{"model_type": "qwen4_exp"}` plus vision
+/// dimensions), because a sub-config carries `model_type` alone and never `architectures`.
+///
+/// > **STRENGTHENED 2026-08-31 (S1 review).** This accepted a document declaring only ONE of
+/// > the two, and the paragraph above was a comment claiming a property nothing enforced. The
+/// > doc's own evidence is what makes the check safe: every checkpoint and every artifact this
+/// > engine has converted carries both (verified 2026-08-04 over all six manifests and source
+/// > configs; a converted artifact's `manifest.json` is the source `config.json` plus a
+/// > `format` section, so it inherits both fields). A file with one is hand-edited or
+/// > promoted, and choosing a decode path for it is the failure mode this function exists to
+/// > refuse.
+///
 /// Also returns the config string it resolved — so a refusal can quote the file rather
 /// than only the enum variant.
 fn arch_of_named(cfg: &serde_json::Value) -> Result<(Arch, String)> {
+    const MODEL_TYPE: &str = "model_type";
+    const ARCHITECTURES: &str = "architectures";
     let declared = cfg
-        .get("model_type")
+        .get(MODEL_TYPE)
         .and_then(|v| v.as_str())
+        .map(|s| (MODEL_TYPE, s))
         .into_iter()
         .chain(
-            cfg.get("architectures")
+            cfg.get(ARCHITECTURES)
                 .and_then(|v| v.as_array())
                 .into_iter()
                 .flatten()
-                .filter_map(|v| v.as_str()),
+                .filter_map(|v| v.as_str())
+                .map(|s| (ARCHITECTURES, s)),
         );
     let mut found: Option<(Arch, &str)> = None;
-    for s in declared {
+    let mut fields: Vec<&str> = Vec::new();
+    for (field, s) in declared {
         let a = crate::arch::from_manifest_str(s)
             .with_context(|| format!("unsupported architecture {s:?}"))?;
         if let Some((prev, prev_s)) = found {
@@ -59,15 +82,26 @@ fn arch_of_named(cfg: &serde_json::Value) -> Result<(Arch, String)> {
                 "config disagrees with itself: {prev_s:?} and {s:?} name different architectures"
             );
         }
+        fields.push(field);
         // Keep the FIRST — `model_type` when present, which is the canonical field and the
         // one a reader will grep for. The agreement check above already compared it to
         // every later spelling, so nothing is lost by not overwriting.
         found.get_or_insert((a, s));
     }
-    found.map(|(a, s)| (a, s.to_string())).context(
+    let (arch, spelling) = found.context(
         "config declares neither `model_type` nor `architectures` — refusing rather than \
          assuming one. Every checkpoint and every artifact this engine has converted carries both",
-    )
+    )?;
+    ensure!(
+        fields.contains(&MODEL_TYPE) && fields.contains(&ARCHITECTURES),
+        "config names {spelling:?} in `{}` alone — the other of `model_type` / `architectures` \
+         is absent or names nothing this engine recognises, so there is only ONE statement of \
+         identity here and nothing for it to agree with. A sub-config carries `model_type` \
+         without `architectures`, so this is the shape a nested block promoted to a document \
+         has, and Qwen3.8-Flash-Next's `vision_config.model_type` is its root string verbatim",
+        fields[0]
+    );
+    Ok((arch, spelling.to_string()))
 }
 
 /// `<dir>/manifest.json` if present (a converted artifact), else `<dir>/config.json` (a
@@ -235,4 +269,108 @@ pub(crate) fn ensure_f4_group_aligned(expert_in: usize, moe_inter: usize) -> Res
         crate::quant::F4_GROUP,
         stringify!(F4_GROUP),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    // tests: a firing panic IS the report, and the workspace denies both at lib level
+    // (`drafter_config.rs`'s inline module carries the same line for the same reason).
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// **The root-only, both-fields rule, against the SHIPPED document it exists for.**
+    ///
+    /// [`arch_of_named`]'s doc names Qwen3.8-Flash-Next's `vision_config.model_type` as the
+    /// reason it reads the root and requires both fields. That reason was a comment until this
+    /// test: `arch.rs`'s spelling test feeds four bare strings to `from_manifest_str` and
+    /// never sees a nested document at all, so nothing in the tree ran a real wrapper config
+    /// through the resolution path.
+    ///
+    /// The vendored `config.json` is the whole point — 71 KB of the shipped file, whose root
+    /// carries the wrapper's two spellings, whose `text_config.model_type` is `qwen4_exp_text`
+    /// and whose `vision_config.model_type` is `qwen4_exp` verbatim. Three cases, and the two
+    /// refusals are the ones that matter: a `vision_config` block promoted to a document
+    /// (which has no root identity at all) and a bare `model_type` with the vision dimensions
+    /// trimmed off (which has exactly one, and is what a hand-edit produces).
+    #[test]
+    fn the_shipped_qwen_wrapper_resolves_from_its_root_and_a_promoted_block_does_not() {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/measurement/qwen-reference/config.json"
+        ))
+        .expect("the vendored config must parse");
+        let (arch, spelling) = arch_of_named(&doc).expect("the shipped wrapper must resolve");
+        assert_eq!(arch, Arch::QwenFlashNext);
+        assert_eq!(
+            spelling, "qwen4_exp",
+            "the ROOT `model_type` is what resolved — not `text_config`'s `qwen4_exp_text`, \
+             which names the text half, and not `vision_config`'s identical `qwen4_exp`"
+        );
+        // The near-miss, asserted rather than assumed: if upstream renamed the vision block's
+        // model_type, this rule would still be right and its reason would be gone.
+        assert_eq!(
+            doc["vision_config"]["model_type"], doc["model_type"],
+            "the vision block's spelling is no longer the root's — re-argue the rule below"
+        );
+        for (why, promoted) in [
+            (
+                "a vision_config block promoted to a document declares no root identity",
+                serde_json::json!({"vision_config": {"model_type": "qwen4_exp"}}),
+            ),
+            (
+                "a bare `model_type` is ONE statement of identity, which is the shape a \
+                 hand-trimmed or promoted sub-config has",
+                serde_json::json!({"model_type": "qwen4_exp"}),
+            ),
+            (
+                "and the same, the other way round: `architectures` alone is also one",
+                serde_json::json!({"architectures": ["Qwen4ExpForConditionalGeneration"]}),
+            ),
+        ] {
+            let err = arch_of_named(&promoted)
+                .map(|(a, s)| format!("resolved as {a:?} via {s:?}"))
+                .expect_err(why);
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("model_type") && err.contains("architectures"),
+                "{why}: the refusal must name both fields, since which one is missing is the \
+                 actionable half — got {err}"
+            );
+        }
+    }
+
+    /// The both-fields rule binds every architecture, not just the fifth — so a GLM manifest
+    /// with one field is refused too.
+    ///
+    /// Its own case because the rule was ADDED for qwen's near-miss and a reader will ask
+    /// whether it was scoped to that row. It is not: two independent statements of identity is
+    /// a property of every config this engine has seen, and a per-architecture exemption would
+    /// be the "two authorities that can independently judge one configuration" hazard.
+    #[test]
+    fn one_field_is_refused_on_the_four_architectures_that_already_decode() {
+        for (mt, arch) in [
+            ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+            ("deepseek_v4", "DeepseekV4ForCausalLM"),
+            ("kimi_k3", "KimiK3ForConditionalGeneration"),
+            ("muse_glimmer", "MuseGlimmerForConditionalGeneration"),
+        ] {
+            let both = serde_json::json!({"model_type": mt, "architectures": [arch]});
+            assert!(
+                arch_of_named(&both).is_ok(),
+                "{mt}: a document with BOTH fields must still resolve — this rule tightens \
+                 what is refused, and tightening it into refusing real checkpoints is the \
+                 regression to catch here"
+            );
+            for one in [
+                serde_json::json!({"model_type": mt}),
+                serde_json::json!({"architectures": [arch]}),
+            ] {
+                assert!(
+                    arch_of_named(&one).is_err(),
+                    "{mt}: a document declaring one field alone must be refused, on every \
+                     architecture and not only on the one whose near-miss motivated the rule"
+                );
+            }
+        }
+    }
 }

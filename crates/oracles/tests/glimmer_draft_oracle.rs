@@ -170,8 +170,7 @@ fn draft_cases() -> Vec<Case> {
         .zip(WEIGHT_SETS)
         .map(|(v, (wname, wbytes))| {
             let golden = load(v);
-            let weights = GoldenSet::read_glimmer(&mut &wbytes[..])
-                .unwrap_or_else(|e| panic!("{wname}: {e:#}"));
+            let weights = anchor::load_bytes(wbytes).unwrap_or_else(|e| panic!("{wname}: {e:#}"));
             // The drafter borrows the TARGET's embedding and lm_head, so the pairing must be
             // by SALT, not by list position happening to line up.
             let salt = meta(&golden, "salt").to_owned();
@@ -334,7 +333,7 @@ fn scored(tr: &DraftTrace) -> Vec<(String, &'static str, Vec<f64>)> {
 #[test]
 fn the_salted_draws_regenerate_both_vendored_weight_sets_bit_for_bit() {
     for (wname, bytes) in WEIGHT_SETS {
-        let w = GoldenSet::read_glimmer(&mut &bytes[..]).expect("weights parse");
+        let w = anchor::load_bytes(bytes).expect("weights parse");
         let salt = meta(&w, "salt").to_owned();
         let names: Vec<&str> = w.floats.iter().map(|(n, _, _)| n.as_str()).collect();
         let vals = |name: &str| golden_read::float(&w, name).1;
@@ -372,7 +371,7 @@ fn the_salted_draws_regenerate_both_vendored_weight_sets_bit_for_bit() {
 /// supply: it turns `draw`'s two inputs one at a time, and only the seed is left.
 #[test]
 fn the_draw_gate_reds_on_a_wrong_seed() {
-    let w = GoldenSet::read_glimmer(&mut &WEIGHT_SETS[0].1[..]).expect("weights parse");
+    let w = anchor::load_bytes(WEIGHT_SETS[0].1).expect("weights parse");
     let salt = meta(&w, "salt");
     let name = "lm_head.weight";
     let want = golden_read::float(&w, name).1;

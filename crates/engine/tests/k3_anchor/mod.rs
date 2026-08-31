@@ -45,6 +45,7 @@ pub use golden_read::{GoldenSet, float};
 // gate is deviceless and never touches a state buffer (`k3/mod.rs` makes the same move).
 #[allow(unused_imports)]
 pub use golden_read::to_key_major;
+use rivoli_core::legality::Arch;
 use serde_json::Value;
 use tolerance::{Policy, Tol};
 
@@ -104,7 +105,7 @@ impl Anchor {
 pub fn anchors() -> Vec<Anchor> {
     let mut out = Vec::with_capacity(ANCHORS.len());
     for (name, bytes) in ANCHORS {
-        let caps = GoldenSet::read_k3(&mut &bytes[..])
+        let caps = GoldenSet::read_anchor_for(Arch::KimiK3, &mut &bytes[..])
             .unwrap_or_else(|e| panic!("{name}: the vendored golden must load: {e:#}"));
         let tiny = caps.k3_tiny_config();
         out.push(Anchor { name, caps, tiny });

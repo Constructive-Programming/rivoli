@@ -1,0 +1,202 @@
+# rivoli / docs/measurement/qwen-reference/tensor-families.tsv
+# Qwen3.8-Flash-Next (`qwen4_exp`) tensor census — S0 census item 4, track A deliverable.
+# Plan of record: docs/investigations/qwen-flash-next-port.md   House rules: CLAUDE.md
+#
+# THIS FILE IS DERIVED, NOT TRANSCRIBED. Every row below was computed from the safetensors
+# HEADERS of all 131 shards (HTTP range: first 8 bytes = LE u64 header length, then that
+# many bytes of JSON) plus model.safetensors.index.json, at the pinned revision. No tensor
+# payload was downloaded except 282 bytes named under I64 VALUES below. Nothing here is a
+# measurement of this box; it is a census of the source artifact.
+#
+# ---- REVISION PIN (census item 1) --------------------------------------------------------
+# repo          Qwen/Qwen3.8-Flash-Next-FP8   (HF, public, gated=false)
+# revision sha  236dfdf285828023ca3bcd3f37366c58a3469b13
+# lastModified  2026-08-31T08:19:15.000Z
+# fetched at    2026-08-31T11:21:09Z  (all fetches used resolve/<sha>/<file>, never /main/)
+# base repo     Qwen/Qwen3.8-Flash-Next @ de4b8e4d43b917e7706784d8bb445c9af86a3540 (not used)
+#
+# ---- VENDORED BYTES IN THIS DIRECTORY ---------------------------------------------------
+# config.json             bytes 72514  sha256 c22eb0a053eed62e18f0184d3ca62d3798f208c3e00b9feee939fc3dbacdc8ca  fnv1a64 6e35d0820f1ec218
+# generation_config.json  bytes 202  sha256 e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e  fnv1a64 1e944eccb21051f5
+# linear_attn_norm_l0.bin bytes 256  sha256 ba3568fc54135876bd054177a12d0742fd3fbab5689633a775d0740c834725c2  fnv1a64 7159c1b3a9e167f7
+#   `model.language_model.layers.0.linear_attn.norm.weight`, BF16 [128], RAW PAYLOAD bytes.
+#   Range-read 2026-08-31 from model-00001-of-00131.safetensors at absolute
+#   [110836264, 110836520) = 8 + header_len 39264 + data_offsets[0] 110796992.
+#   Vendored because it is the ONE measured weight qwen-architecture.md overrides a primary
+#   source with (T1: the tech report says zero-centred, the code and these bytes say
+#   ones-centred), and a verdict whose bytes are not in tree is prose. Recomputed from this
+#   file: mean +0.9667663574, min +0.875, max +1.0234375 over n=128 -- so S2 re-derives the
+#   verdict rather than trusting it. The other three measured tensors are NOT vendored; their
+#   shard, offsets, n and dtype are tabulated in qwen-architecture.md section T1 provenance,
+#   which is enough to re-fetch them byte-for-byte.
+#
+# ---- NOT VENDORED HERE (S4 converter AUX owns the tokenizer; shas pinned for its gate) --
+# model.safetensors.index.json  17410140 B  sha256 0419e2c2dfbb925257d7409405433a793cf7ff7d96f3eba882a815ec6d9fe7a6  fnv1a64 47204c21e6179606
+# tokenizer_config.json            17928 B  sha256 b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27  fnv1a64 86ba0fb128bfb10b
+# chat_template.jinja               8952 B  sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041  fnv1a64 8b6b0871c5db260b
+# tokenizer.json                12809320 B  sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3  (LFS oid via HF tree API; only
+#                              the first 8192 bytes were fetched, enough for model.type)
+#
+# ---- CENSUS CLOSURE (the assert this file exists to make checkable) ---------------------
+# tensors in model.safetensors.index.json  152089
+# sum of `count` over all family rows      152089
+# EQUAL: True   -- every tensor lands in exactly one family row
+# family rows                              109
+# index metadata.total_size                185502232570
+# sum of `total-bytes` over family rows    185502232570
+# EQUAL: True
+# grand total  185502232570 B = 185.50 GB(dec) = 172.76 GiB
+#   The plan's "~180 GB on disk" is the PARAMETER count, not the byte count: 180,007,507,860
+#   params (174,512,783,360 F8_E4M3 @1 B + 5,494,724,465 BF16 @2 B + 35 I64 @8 B) occupy
+#   185.50 GB. Report bytes/token budgets from the byte column, never from "180 GB" (P5).
+#   Split by v1-status, re-derived from shape x count on the rows below -- these are the
+#   figures the plan of record cites, so they are DECLARED here and recomputed by
+#   crates/artifact/tests/qwen_names.rs rather than retyped into prose:
+# STATUS v1                  params 176951272356  bytes 181906343962
+# STATUS EXCLUDED-v1-MTP     params 2607304448  bytes 2698026496
+# STATUS EXCLUDED-v1-VISION  params 448931056  bytes 897862112
+#
+# ---- I64 VALUES (282 B of payload fetched; the only tensor data read) -------------------
+# These are NOT hash tables. They are the n-gram HASH PARAMETERS, and they close the
+# geometry of the 51.2 GB table without any further download.
+#   ngram_heads_offsets      [16] = cumsum(ngram_heads_vocab_sizes), verified exactly
+#     0 20000003 40000026 60000059 80000106 100000165 120000228 140000297
+#     160000374 180000455 200000548 220000655 240000802 260000955 280001114 300001275
+#   ngram_heads_vocab_sizes  [16] = 16 distinct PRIMES just above 2e7 (all 16 verified prime)
+#     20000003 20000023 20000033 20000047 20000059 20000063 20000069 20000077
+#     20000081 20000093 20000107 20000147 20000153 20000159 20000161 20000171
+#   layer_multipliers        [3]  = 23703573157769 20109073645365 8052911324071
+#     three multipliers, one per position of ngram_size=3.
+#   ngram_embedding.weight_scale [1] BF16 = 0x3951 = 1.9931793212890625e-4  (PER-TENSOR
+#     fp8 scale for the WHOLE 51.2 GB table -- NOT block-128. `Fp8W`'s block path does not
+#     apply here; the n-gram gather needs a per-tensor-scale dequant. Independently
+#     confirmed by upstream huggingface/transformers issue #48350, still OPEN.)
+#   Closure: sum(vocab_sizes) = 320001446; the table is padded to 320001536 rows (+90) so
+#   that it divides by make_ngram_vocab_size_divisible_by=128 into split_ngram_parts=128
+#   shards of exactly 2500012 rows; 16 heads x 160 dims = ple_embed_dim 2560. All checked.
+#
+# ---- COLUMNS ----------------------------------------------------------------------------
+# v1-status   v1 | EXCLUDED-v1-MTP | EXCLUDED-v1-VISION. The EXCLUDED rows are NAMED, not
+#             omitted, so the S4 converter census (item 3) can be exhaustive by name.
+# name-pattern  indices collapsed: {L} layer, {E} expert, {B} vision block,
+#             {S} n-gram shard. No pattern is ragged: every pattern has exactly one
+#             (dtype, shape) row, so bytes-per-tensor is exact, not an average.
+# Rows sorted: v1 first, then by descending total-bytes.
+# The column-header row below is `#`-prefixed ON PURPOSE, so the families() parser idiom the
+# k3 census already uses -- `.lines().filter(|l| !l.starts_with('#'))` then split on tabs --
+# yields DATA rows only. Without the prefix that parser reaches
+# `"count-of-tensors-in-family".parse::<usize>()` and panics on the first line it reads.
+# The k3 contract is NOT this one (4 columns, no header row, count first), so the two
+# parsers cannot yet be one function; lifting a shared helper is owed at S4, when the
+# converter census gives the second reader a reason to exist
+# (crates/artifact/tests/qwen_names.rs, crates/artifact/tests/k3_names.rs::families).
+# v1-status	name-pattern	example-name	shape	dtype	count-of-tensors-in-family	bytes-per-tensor	total-bytes
+v1	model.language_model.layers.{L}.ple.ple_embedding.ngram_embedding.shard_{S}.weight	model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight	2500012x160	F8_E4M3	128	400001920	51200245760
+v1	model.language_model.layers.{L}.mlp.experts.{E}.down_proj.weight	model.language_model.layers.0.mlp.experts.0.down_proj.weight	2560x640	F8_E4M3	24576	1638400	40265318400
+v1	model.language_model.layers.{L}.mlp.experts.{E}.gate_proj.weight	model.language_model.layers.0.mlp.experts.0.gate_proj.weight	640x2560	F8_E4M3	24576	1638400	40265318400
+v1	model.language_model.layers.{L}.mlp.experts.{E}.up_proj.weight	model.language_model.layers.0.mlp.experts.0.up_proj.weight	640x2560	F8_E4M3	24576	1638400	40265318400
+v1	model.language_model.layers.{L}.linear_attn.in_proj_qkv.weight	model.language_model.layers.0.linear_attn.in_proj_qkv.weight	10240x2560	BF16	36	52428800	1887436800
+v1	lm_head.weight	lm_head.weight	248320x2560	BF16	1	1271398400	1271398400
+v1	model.language_model.embed_tokens.weight	model.language_model.embed_tokens.weight	248320x2560	BF16	1	1271398400	1271398400
+v1	model.language_model.layers.{L}.linear_attn.in_proj_z.weight	model.language_model.layers.0.linear_attn.in_proj_z.weight	6144x2560	BF16	36	31457280	1132462080
+v1	model.language_model.layers.{L}.linear_attn.out_proj.weight	model.language_model.layers.0.linear_attn.out_proj.weight	2560x6144	BF16	36	31457280	1132462080
+v1	model.language_model.layers.{L}.self_attn.q_proj.weight	model.language_model.layers.11.self_attn.q_proj.weight	12288x2560	BF16	12	62914560	754974720
+v1	model.language_model.layers.{L}.self_attn.o_proj.weight	model.language_model.layers.11.self_attn.o_proj.weight	2560x6144	BF16	12	31457280	377487360
+v1	model.language_model.layers.{L}.attn_hyper_connection.input_mix_weight_down.weight	model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down.weight	320x10240	BF16	48	6553600	314572800
+v1	model.language_model.layers.{L}.attn_hyper_connection.input_mix_weight_up.weight	model.language_model.layers.0.attn_hyper_connection.input_mix_weight_up.weight	10240x320	BF16	48	6553600	314572800
+v1	model.language_model.layers.{L}.mlp_hyper_connection.input_mix_weight_down.weight	model.language_model.layers.0.mlp_hyper_connection.input_mix_weight_down.weight	320x10240	BF16	48	6553600	314572800
+v1	model.language_model.layers.{L}.mlp_hyper_connection.input_mix_weight_up.weight	model.language_model.layers.0.mlp_hyper_connection.input_mix_weight_up.weight	10240x320	BF16	48	6553600	314572800
+v1	model.language_model.layers.{L}.mlp.shared_expert.down_proj.weight	model.language_model.layers.0.mlp.shared_expert.down_proj.weight	2560x640	BF16	48	3276800	157286400
+v1	model.language_model.layers.{L}.mlp.shared_expert.gate_proj.weight	model.language_model.layers.0.mlp.shared_expert.gate_proj.weight	640x2560	BF16	48	3276800	157286400
+v1	model.language_model.layers.{L}.mlp.shared_expert.up_proj.weight	model.language_model.layers.0.mlp.shared_expert.up_proj.weight	640x2560	BF16	48	3276800	157286400
+v1	model.language_model.layers.{L}.mlp.gate.weight	model.language_model.layers.0.mlp.gate.weight	512x2560	BF16	48	2621440	125829120
+v1	model.language_model.layers.{L}.ple.key_proj.weight	model.language_model.layers.1.ple.key_proj.weight	10240x2560	BF16	1	52428800	52428800
+v1	model.language_model.layers.{L}.self_attn.indexer.index_qk_proj.weight	model.language_model.layers.11.self_attn.indexer.index_qk_proj.weight	640x2560	BF16	12	3276800	39321600
+v1	model.language_model.layers.{L}.self_attn.k_proj.weight	model.language_model.layers.11.self_attn.k_proj.weight	512x2560	BF16	12	2621440	31457280
+v1	model.language_model.layers.{L}.self_attn.v_proj.weight	model.language_model.layers.11.self_attn.v_proj.weight	512x2560	BF16	12	2621440	31457280
+v1	model.language_model.layers.{L}.ple.value_proj.weight	model.language_model.layers.1.ple.value_proj.weight	2560x2560	BF16	1	13107200	13107200
+v1	model.language_model.layers.{L}.linear_attn.in_proj_a.weight	model.language_model.layers.0.linear_attn.in_proj_a.weight	48x2560	BF16	36	245760	8847360
+v1	model.language_model.layers.{L}.linear_attn.in_proj_b.weight	model.language_model.layers.0.linear_attn.in_proj_b.weight	48x2560	BF16	36	245760	8847360
+v1	model.language_model.hyper_connection_mixer.input_mix_weight_down.weight	model.language_model.hyper_connection_mixer.input_mix_weight_down.weight	320x10240	BF16	1	6553600	6553600
+v1	model.language_model.hyper_connection_mixer.input_mix_weight_up.weight	model.language_model.hyper_connection_mixer.input_mix_weight_up.weight	10240x320	BF16	1	6553600	6553600
+v1	model.language_model.layers.{L}.mlp.experts.{E}.down_proj.weight_scale_inv	model.language_model.layers.0.mlp.experts.0.down_proj.weight_scale_inv	20x5	BF16	24576	200	4915200
+v1	model.language_model.layers.{L}.mlp.experts.{E}.gate_proj.weight_scale_inv	model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv	5x20	BF16	24576	200	4915200
+v1	model.language_model.layers.{L}.mlp.experts.{E}.up_proj.weight_scale_inv	model.language_model.layers.0.mlp.experts.0.up_proj.weight_scale_inv	5x20	BF16	24576	200	4915200
+v1	model.language_model.layers.{L}.attn_hyper_connection.block_inject_weight.weight	model.language_model.layers.0.attn_hyper_connection.block_inject_weight.weight	4x10240	BF16	48	81920	3932160
+v1	model.language_model.layers.{L}.mlp_hyper_connection.block_inject_weight.weight	model.language_model.layers.0.mlp_hyper_connection.block_inject_weight.weight	4x10240	BF16	48	81920	3932160
+v1	model.language_model.layers.{L}.linear_attn.conv1d.weight	model.language_model.layers.0.linear_attn.conv1d.weight	10240x1x4	BF16	36	81920	2949120
+v1	model.language_model.layers.{L}.attn_hyper_connection.hc_norm.weight	model.language_model.layers.0.attn_hyper_connection.hc_norm.weight	10240	BF16	48	20480	983040
+v1	model.language_model.layers.{L}.mlp_hyper_connection.hc_norm.weight	model.language_model.layers.0.mlp_hyper_connection.hc_norm.weight	10240	BF16	48	20480	983040
+v1	model.language_model.layers.{L}.mlp.shared_expert_gate.weight	model.language_model.layers.0.mlp.shared_expert_gate.weight	1x2560	BF16	48	5120	245760
+v1	model.language_model.layers.{L}.ple.conv1d.weight	model.language_model.layers.1.ple.conv1d.weight	10240x1x4	BF16	1	81920	81920
+v1	model.language_model.hyper_connection_mixer.hc_norm.weight	model.language_model.hyper_connection_mixer.hc_norm.weight	10240	BF16	1	20480	20480
+v1	model.language_model.layers.{L}.ple.norm_conv.weight	model.language_model.layers.1.ple.norm_conv.weight	10240	BF16	1	20480	20480
+v1	model.language_model.layers.{L}.ple.norm_key.weight	model.language_model.layers.1.ple.norm_key.weight	10240	BF16	1	20480	20480
+v1	model.language_model.layers.{L}.ple.norm_query.weight	model.language_model.layers.1.ple.norm_query.weight	10240	BF16	1	20480	20480
+v1	model.language_model.layers.{L}.linear_attn.norm.weight	model.language_model.layers.0.linear_attn.norm.weight	128	BF16	36	256	9216
+v1	model.language_model.layers.{L}.self_attn.k_norm.weight	model.language_model.layers.11.self_attn.k_norm.weight	256	BF16	12	512	6144
+v1	model.language_model.layers.{L}.self_attn.q_norm.weight	model.language_model.layers.11.self_attn.q_norm.weight	256	BF16	12	512	6144
+v1	model.language_model.layers.{L}.linear_attn.A_log	model.language_model.layers.0.linear_attn.A_log	48	BF16	36	96	3456
+v1	model.language_model.layers.{L}.linear_attn.dt_bias	model.language_model.layers.0.linear_attn.dt_bias	48	BF16	36	96	3456
+v1	model.language_model.layers.{L}.self_attn.indexer.k_layernorm.weight	model.language_model.layers.11.self_attn.indexer.k_layernorm.weight	128	BF16	12	256	3072
+v1	model.language_model.layers.{L}.self_attn.indexer.q_layernorm.weight	model.language_model.layers.11.self_attn.indexer.q_layernorm.weight	128	BF16	12	256	3072
+v1	model.language_model.layers.{L}.ple.ple_embedding.ngram_heads_offsets	model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets	16	I64	1	128	128
+v1	model.language_model.layers.{L}.ple.ple_embedding.ngram_heads_vocab_sizes	model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes	16	I64	1	128	128
+v1	model.language_model.layers.{L}.ple.ple_embedding.layer_multipliers	model.language_model.layers.1.ple.ple_embedding.layer_multipliers	3	I64	1	24	24
+v1	model.language_model.layers.{L}.ple.ple_embedding.ngram_embedding.weight_scale	model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale	1	BF16	1	2	2
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.experts.{E}.down_proj.weight	mtp.layers.0.mlp.experts.0.down_proj.weight	2560x640	F8_E4M3	512	1638400	838860800
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.experts.{E}.gate_proj.weight	mtp.layers.0.mlp.experts.0.gate_proj.weight	640x2560	F8_E4M3	512	1638400	838860800
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.experts.{E}.up_proj.weight	mtp.layers.0.mlp.experts.0.up_proj.weight	640x2560	F8_E4M3	512	1638400	838860800
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.mlp.linear_fc1.weight	model.visual.blocks.0.mlp.linear_fc1.weight	4304x1152	BF16	27	9916416	267743232
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.mlp.linear_fc2.weight	model.visual.blocks.0.mlp.linear_fc2.weight	1152x4304	BF16	27	9916416	267743232
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.attn.qkv.weight	model.visual.blocks.0.attn.qkv.weight	3456x1152	BF16	27	7962624	214990848
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.attn.proj.weight	model.visual.blocks.0.attn.proj.weight	1152x1152	BF16	27	2654208	71663616
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.q_proj.weight	mtp.layers.0.self_attn.q_proj.weight	12288x2560	BF16	1	62914560	62914560
+EXCLUDED-v1-VISION	model.visual.merger.linear_fc1.weight	model.visual.merger.linear_fc1.weight	4608x4608	BF16	1	42467328	42467328
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.o_proj.weight	mtp.layers.0.self_attn.o_proj.weight	2560x6144	BF16	1	31457280	31457280
+EXCLUDED-v1-VISION	model.visual.merger.linear_fc2.weight	model.visual.merger.linear_fc2.weight	2560x4608	BF16	1	23592960	23592960
+EXCLUDED-v1-MTP	mtp.fc_embedding.weight	mtp.fc_embedding.weight	2560x2560	BF16	1	13107200	13107200
+EXCLUDED-v1-MTP	mtp.fc_hidden.weight	mtp.fc_hidden.weight	2560x2560	BF16	1	13107200	13107200
+EXCLUDED-v1-MTP	mtp.hyper_connection_mixer.input_mix_weight_down.weight	mtp.hyper_connection_mixer.input_mix_weight_down.weight	320x10240	BF16	1	6553600	6553600
+EXCLUDED-v1-MTP	mtp.hyper_connection_mixer.input_mix_weight_up.weight	mtp.hyper_connection_mixer.input_mix_weight_up.weight	10240x320	BF16	1	6553600	6553600
+EXCLUDED-v1-MTP	mtp.layers.{L}.attn_hyper_connection.input_mix_weight_down.weight	mtp.layers.0.attn_hyper_connection.input_mix_weight_down.weight	320x10240	BF16	1	6553600	6553600
+EXCLUDED-v1-MTP	mtp.layers.{L}.attn_hyper_connection.input_mix_weight_up.weight	mtp.layers.0.attn_hyper_connection.input_mix_weight_up.weight	10240x320	BF16	1	6553600	6553600
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp_hyper_connection.input_mix_weight_down.weight	mtp.layers.0.mlp_hyper_connection.input_mix_weight_down.weight	320x10240	BF16	1	6553600	6553600
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp_hyper_connection.input_mix_weight_up.weight	mtp.layers.0.mlp_hyper_connection.input_mix_weight_up.weight	10240x320	BF16	1	6553600	6553600
+EXCLUDED-v1-VISION	model.visual.pos_embed.weight	model.visual.pos_embed.weight	2304x1152	BF16	1	5308416	5308416
+EXCLUDED-v1-VISION	model.visual.patch_embed.proj.weight	model.visual.patch_embed.proj.weight	1152x3x2x16x16	BF16	1	3538944	3538944
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.shared_expert.down_proj.weight	mtp.layers.0.mlp.shared_expert.down_proj.weight	2560x640	BF16	1	3276800	3276800
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.shared_expert.gate_proj.weight	mtp.layers.0.mlp.shared_expert.gate_proj.weight	640x2560	BF16	1	3276800	3276800
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.shared_expert.up_proj.weight	mtp.layers.0.mlp.shared_expert.up_proj.weight	640x2560	BF16	1	3276800	3276800
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.indexer.index_qk_proj.weight	mtp.layers.0.self_attn.indexer.index_qk_proj.weight	640x2560	BF16	1	3276800	3276800
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.gate.weight	mtp.layers.0.mlp.gate.weight	512x2560	BF16	1	2621440	2621440
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.k_proj.weight	mtp.layers.0.self_attn.k_proj.weight	512x2560	BF16	1	2621440	2621440
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.v_proj.weight	mtp.layers.0.self_attn.v_proj.weight	512x2560	BF16	1	2621440	2621440
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.mlp.linear_fc1.bias	model.visual.blocks.0.mlp.linear_fc1.bias	4304	BF16	27	8608	232416
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.attn.qkv.bias	model.visual.blocks.0.attn.qkv.bias	3456	BF16	27	6912	186624
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.experts.{E}.down_proj.weight_scale_inv	mtp.layers.0.mlp.experts.0.down_proj.weight_scale_inv	20x5	BF16	512	200	102400
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.experts.{E}.gate_proj.weight_scale_inv	mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_inv	5x20	BF16	512	200	102400
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.experts.{E}.up_proj.weight_scale_inv	mtp.layers.0.mlp.experts.0.up_proj.weight_scale_inv	5x20	BF16	512	200	102400
+EXCLUDED-v1-MTP	mtp.layers.{L}.attn_hyper_connection.block_inject_weight.weight	mtp.layers.0.attn_hyper_connection.block_inject_weight.weight	4x10240	BF16	1	81920	81920
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp_hyper_connection.block_inject_weight.weight	mtp.layers.0.mlp_hyper_connection.block_inject_weight.weight	4x10240	BF16	1	81920	81920
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.attn.proj.bias	model.visual.blocks.0.attn.proj.bias	1152	BF16	27	2304	62208
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.mlp.linear_fc2.bias	model.visual.blocks.0.mlp.linear_fc2.bias	1152	BF16	27	2304	62208
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.norm1.bias	model.visual.blocks.0.norm1.bias	1152	BF16	27	2304	62208
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.norm1.weight	model.visual.blocks.0.norm1.weight	1152	BF16	27	2304	62208
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.norm2.bias	model.visual.blocks.0.norm2.bias	1152	BF16	27	2304	62208
+EXCLUDED-v1-VISION	model.visual.blocks.{B}.norm2.weight	model.visual.blocks.0.norm2.weight	1152	BF16	27	2304	62208
+EXCLUDED-v1-MTP	mtp.hyper_connection_mixer.hc_norm.weight	mtp.hyper_connection_mixer.hc_norm.weight	10240	BF16	1	20480	20480
+EXCLUDED-v1-MTP	mtp.layers.{L}.attn_hyper_connection.hc_norm.weight	mtp.layers.0.attn_hyper_connection.hc_norm.weight	10240	BF16	1	20480	20480
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp_hyper_connection.hc_norm.weight	mtp.layers.0.mlp_hyper_connection.hc_norm.weight	10240	BF16	1	20480	20480
+EXCLUDED-v1-MTP	mtp.pre_fc_norm_hidden.weight	mtp.pre_fc_norm_hidden.weight	10240	BF16	1	20480	20480
+EXCLUDED-v1-VISION	model.visual.merger.linear_fc1.bias	model.visual.merger.linear_fc1.bias	4608	BF16	1	9216	9216
+EXCLUDED-v1-VISION	model.visual.merger.linear_fc2.bias	model.visual.merger.linear_fc2.bias	2560	BF16	1	5120	5120
+EXCLUDED-v1-MTP	mtp.layers.{L}.mlp.shared_expert_gate.weight	mtp.layers.0.mlp.shared_expert_gate.weight	1x2560	BF16	1	5120	5120
+EXCLUDED-v1-MTP	mtp.pre_fc_norm_embedding.weight	mtp.pre_fc_norm_embedding.weight	2560	BF16	1	5120	5120
+EXCLUDED-v1-VISION	model.visual.merger.norm.bias	model.visual.merger.norm.bias	1152	BF16	1	2304	2304
+EXCLUDED-v1-VISION	model.visual.merger.norm.weight	model.visual.merger.norm.weight	1152	BF16	1	2304	2304
+EXCLUDED-v1-VISION	model.visual.patch_embed.proj.bias	model.visual.patch_embed.proj.bias	1152	BF16	1	2304	2304
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.k_norm.weight	mtp.layers.0.self_attn.k_norm.weight	256	BF16	1	512	512
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.q_norm.weight	mtp.layers.0.self_attn.q_norm.weight	256	BF16	1	512	512
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.indexer.k_layernorm.weight	mtp.layers.0.self_attn.indexer.k_layernorm.weight	128	BF16	1	256	256
+EXCLUDED-v1-MTP	mtp.layers.{L}.self_attn.indexer.q_layernorm.weight	mtp.layers.0.self_attn.indexer.q_layernorm.weight	128	BF16	1	256	256

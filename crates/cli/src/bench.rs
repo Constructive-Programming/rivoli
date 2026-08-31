@@ -13,10 +13,10 @@
 //! "a profile nothing fills" trap `ProfileSummary`'s doc names, one level up. This is its
 //! first caller.
 
-use crate::{Args, BENCH_PROMPT};
-use anyhow::{Context, Result, ensure};
+use crate::{BENCH_PROMPT, args::Args};
+use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::tokenizer::Tokenizer;
-use rivoli_core::legality::{ATTNS, Arch, MODES, name_in};
+use rivoli_core::legality::{ATTNS, Arch, MODES, QWEN_ARM_NOT_BUILT, name_in};
 use rivoli_engine::{Engine, GenSpec};
 use std::io::Write as _;
 
@@ -104,6 +104,12 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
         // > carries it). And the cross-reference was dangling: `convert_k3`'s module header
         // > records no such thing; the note lives beside its `AUX` list.
         Arch::KimiK3 => tok.encode(text),
+        // The SECOND door, and it quotes the first one's const. `check_legality` has already
+        // refused every flag a `--bench` invocation asks for on this architecture, so this arm
+        // is reachable only if the table stopped refusing — and the failure it would otherwise
+        // hide is the worst-shaped one available: a prompt framed in SOME model's markers,
+        // encoded, counted against `--ctx`, and reported as a bench that ran.
+        Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
     }
 }
 

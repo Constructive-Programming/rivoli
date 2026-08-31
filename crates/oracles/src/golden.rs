@@ -6,6 +6,7 @@
 
 use crate::v4oracle::forward::Capture;
 use anyhow::{Context, Result, bail};
+use rivoli_core::legality::Arch;
 use std::io::{Read, Write};
 
 // Model-bound AND user-visible: goldens are DeepSeek-V4 per-layer activations, and
@@ -39,6 +40,16 @@ const MAGIC_GLIMMER: &[u8; 8] = b"RIVGLGLD";
 // anchored in the rewrite tree rather than ported from the old one.
 const MAGIC_GLM: &[u8; 8] = b"RIVGMGLD";
 
+// Qwen3.8-Flash-Next's anchor — the fifth, and the only one that landed BEFORE the driver
+// that writes it (`docs/investigations/qwen-flash-next-port.md`: S1 reddens, S2 anchors).
+//
+// Why now rather than with the goldens: this file is shared by every model's gate, and the
+// eight bytes plus their reader are the whole of what an anchor track needs from it. Landing
+// them at S1 means track B adds fixtures and a suite, not an edit to a file four other models
+// read — the collision that a shared file plus parallel tracks otherwise guarantees. The
+// spelling is fixed by the port plan's identity table, so it is not track B's to choose later.
+const MAGIC_QWEN: &[u8; 8] = b"RIVQWGLD";
+
 /// The metadata key `v4-oracle emit` records its `--defect` under -- one constant, because
 /// the writer (the bin) and the readers below must agree on the spelling or the check
 /// silently degrades to "every file is legacy".
@@ -62,7 +73,7 @@ impl GoldenSet {
     }
 
     pub fn write(&self, w: &mut impl Write) -> Result<()> {
-        w.write_all(MAGIC)?;
+        w.write_all(Self::magic_of(Arch::DeepseekV4))?;
         put_u64(w, self.meta.len() as u64)?;
         for (k, v) in &self.meta {
             put_str(w, k)?;
@@ -73,17 +84,42 @@ impl GoldenSet {
     }
 
     pub fn read(r: &mut impl Read) -> Result<Self> {
-        Self::read_magic(r, MAGIC)
+        Self::read_magic(r, Self::magic_of(Arch::DeepseekV4))
     }
 
-    /// A Kimi-K3 anchor golden.
-    pub fn read_k3(r: &mut impl Read) -> Result<Self> {
-        Self::read_anchor(r, MAGIC_K3)
+    /// **The eight bytes that identify one architecture's anchor container.**
+    ///
+    /// > **INDEXED BY `Arch` 2026-08-31 (S1 review).** The port plan predicted golden.rs would
+    /// > redden on a fifth architecture and it did NOT — the magics were five loose consts
+    /// > behind five one-line `read_*` wrappers, so a new architecture added a wrapper and
+    /// > broke nothing. The prediction is now true: this match is exhaustive over [`Arch`], so
+    /// > a sixth variant is a compile error in this file, which is what the plan was counting
+    /// > on. It also collapsed four near-identical wrapper bodies that jscpd only tolerated by
+    /// > token luck.
+    ///
+    /// V4's magic is the odd one: [`GoldenSet::read`] reads it WITHOUT the `defect`-key
+    /// precondition, a dated concession to files emitted before 2026-08-07 that
+    /// [`GoldenSet::defect`] argues in full. So the mapping is total here while the two
+    /// READERS stay distinct — which is the honest shape, since the difference is a property
+    /// of V4's file history and not of its eight bytes.
+    fn magic_of(arch: Arch) -> &'static [u8; 8] {
+        match arch {
+            Arch::DeepseekV4 => MAGIC,
+            Arch::KimiK3 => MAGIC_K3,
+            Arch::MuseGlimmer => MAGIC_GLIMMER,
+            Arch::GlmMoeDsa => MAGIC_GLM,
+            Arch::QwenFlashNext => MAGIC_QWEN,
+        }
     }
 
-    /// A Muse Glimmer anchor golden.
-    pub fn read_glimmer(r: &mut impl Read) -> Result<Self> {
-        Self::read_anchor(r, MAGIC_GLIMMER)
+    /// One architecture's anchor golden, by architecture rather than by method name.
+    ///
+    /// The single entry point every anchor gate now calls. `arch` is passed rather than
+    /// inferred from the file: a gate that read whichever magic it found could not tell "the
+    /// right golden" from "some golden", and the usual mistake is a suite reaching for another
+    /// model's fixture — which is the one thing these eight bytes exist to catch.
+    pub fn read_anchor_for(arch: Arch, r: &mut impl Read) -> Result<Self> {
+        Self::read_anchor(r, Self::magic_of(arch))
     }
 
     /// The KDA gate's lower bound out of a parsed K3 `tiny_config` — the one f64 the
@@ -112,11 +148,6 @@ impl GoldenSet {
             .meta_get("tiny_config")
             .unwrap_or_else(|| panic!("this golden carries no tiny_config metadata"));
         serde_json::from_str(raw).unwrap_or_else(|e| panic!("tiny_config is not JSON: {e}"))
-    }
-
-    /// A GLM-5.2 anchor golden.
-    pub fn read_glm(r: &mut impl Read) -> Result<Self> {
-        Self::read_anchor(r, MAGIC_GLM)
     }
 
     /// A python-produced S1b anchor golden, of whichever model `want` names.
@@ -409,13 +440,18 @@ mod tests {
             .expect("the declared match must pass");
     }
 
-    /// A K3 golden with an empty tensor section and whatever metadata is asked for.
+    /// An anchor golden with `magic`, an empty tensor section, and whatever metadata is asked
+    /// for.
     ///
     /// Hand-built rather than round-tripped through [`GoldenSet::write`], which can only write the
-    /// V4 magic — and the point here is the K3 reader's own precondition.
-    fn k3_file(meta: &[(&str, &str)]) -> Vec<u8> {
+    /// V4 magic — and the point here is an anchor reader's own precondition.
+    ///
+    /// Took the magic as a parameter when the fifth one landed (S1, 2026-08-31): the alternative
+    /// was a second copy of these nine lines, which is what `build.rs`'s jscpd gate forbids and
+    /// what would have made the qwen test a clone of the K3 one.
+    fn anchor_file(magic: &[u8; 8], meta: &[(&str, &str)]) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC_K3);
+        buf.extend_from_slice(magic);
         put_u64(&mut buf, meta.len() as u64).expect("write");
         for (k, v) in meta {
             put_str(&mut buf, k).expect("write");
@@ -427,7 +463,7 @@ mod tests {
         buf
     }
 
-    /// [`GoldenSet::read_k3`] refuses a file with no `defect` key, where [`GoldenSet::read`]
+    /// [`GoldenSet::read_anchor_for`] refuses a file with no `defect` key, where [`GoldenSet::read`]
     /// tolerates it.
     ///
     /// The V4 fallback is a dated concession to files a pre-2026-08-07 binary produced; no such K3
@@ -436,12 +472,18 @@ mod tests {
     /// contract exists to prevent. Review found it 2026-08-11 and this is the proof it is shut.
     #[test]
     fn a_k3_golden_with_no_defect_key_is_refused() {
-        let err = GoldenSet::read_k3(&mut k3_file(&[("mode", "decode")]).as_slice())
-            .err()
-            .expect("a K3 golden with no defect key must not load");
+        let err = GoldenSet::read_anchor_for(
+            Arch::KimiK3,
+            &mut anchor_file(MAGIC_K3, &[("mode", "decode")]).as_slice(),
+        )
+        .err()
+        .expect("a K3 golden with no defect key must not load");
         assert!(err.to_string().contains(DEFECT_KEY), "{err}");
-        let ok = GoldenSet::read_k3(&mut k3_file(&[(DEFECT_KEY, "None")]).as_slice())
-            .expect("with the key it loads");
+        let ok = GoldenSet::read_anchor_for(
+            Arch::KimiK3,
+            &mut anchor_file(MAGIC_K3, &[(DEFECT_KEY, "None")]).as_slice(),
+        )
+        .expect("with the key it loads");
         ok.expect_defect("None").expect("and scores as None");
     }
 
@@ -451,7 +493,7 @@ mod tests {
     /// wrong model's golden gets a diagnosis rather than a parse error somewhere downstream.
     #[test]
     fn the_two_magics_do_not_cross() {
-        let k3 = k3_file(&[(DEFECT_KEY, "None")]);
+        let k3 = anchor_file(MAGIC_K3, &[(DEFECT_KEY, "None")]);
         let err = GoldenSet::read(&mut k3.as_slice())
             .err()
             .expect("V4 must refuse a K3 file");
@@ -464,10 +506,53 @@ mod tests {
         }
         .write(&mut v4)
         .expect("write");
-        let err = GoldenSet::read_k3(&mut v4.as_slice())
+        let err = GoldenSet::read_anchor_for(Arch::KimiK3, &mut v4.as_slice())
             .err()
             .expect("K3 must refuse a V4 file");
         assert!(err.to_string().contains("RIVK3GLD"), "{err}");
+    }
+
+    /// The fifth magic does not cross with the other three anchor readers, and its own reader
+    /// demands the `defect` key like every one of them.
+    ///
+    /// Landed with the refusals at S1, before track B's anchor exists, which is the point: the
+    /// reader is exercised by the container's own gate rather than waiting on a driver, so
+    /// the qwen magic is not a const with no reader, and the first real golden meets a reader
+    /// that has already been shown to refuse the four wrong files. It also gives the Glimmer
+    /// and GLM magics their first cross-check here —
+    /// [`the_two_magics_do_not_cross`] only ever compared V4 against K3.
+    #[test]
+    fn the_qwen_magic_crosses_with_nothing_and_its_reader_demands_the_defect_key() {
+        let qwen = anchor_file(MAGIC_QWEN, &[(DEFECT_KEY, "None")]);
+        GoldenSet::read_anchor_for(Arch::QwenFlashNext, &mut qwen.as_slice())
+            .expect("its own file must load");
+        for (who, refused) in [
+            (
+                "RIVK3GLD",
+                GoldenSet::read_anchor_for(Arch::KimiK3, &mut qwen.as_slice()),
+            ),
+            (
+                "RIVGLGLD",
+                GoldenSet::read_anchor_for(Arch::MuseGlimmer, &mut qwen.as_slice()),
+            ),
+            (
+                "RIVGMGLD",
+                GoldenSet::read_anchor_for(Arch::GlmMoeDsa, &mut qwen.as_slice()),
+            ),
+            ("RIVV4GLD", GoldenSet::read(&mut qwen.as_slice())),
+        ] {
+            let e = refused
+                .err()
+                .unwrap_or_else(|| panic!("{who}'s reader accepted a RIVQWGLD file"));
+            assert!(e.to_string().contains(who), "{e}");
+        }
+        let e = GoldenSet::read_anchor_for(
+            Arch::QwenFlashNext,
+            &mut anchor_file(MAGIC_QWEN, &[("mode", "decode")]).as_slice(),
+        )
+        .err()
+        .expect("a qwen golden with no defect key must not load");
+        assert!(e.to_string().contains(DEFECT_KEY), "{e}");
     }
 
     #[test]

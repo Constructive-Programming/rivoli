@@ -67,9 +67,9 @@ mod glimmer;
 mod http;
 mod oai;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::tokenizer::{ChatOpts, Tokenizer};
-use rivoli_core::legality::Arch;
+use rivoli_core::legality::{Arch, QWEN_ARM_NOT_BUILT};
 use rivoli_engine::{Decoded, Engine, GenSpec};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
@@ -304,6 +304,14 @@ fn frame_prompt(
                 tools,
             },
         ),
+        // The fifth architecture refuses PER REQUEST (a 400 carrying the table's own const),
+        // not by falling into the GLM group. `main` never opens a server on it — its dispatch
+        // bails first — so this is the second of two doors, and it is the one that would have
+        // to hold if the first ever moved. Deliberately NOT grouped with the arm above: that
+        // group is "GLM's template is right, or is a KNOWN GAP", and neither is true of a
+        // checkpoint whose own template ships with a `reasoning_effort` axis nothing here
+        // renders yet (S5 owns it).
+        Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
     }
 }
 
@@ -328,13 +336,33 @@ fn frame_prompt(
 /// in the streaming arm, not per reply — on a path that already re-decodes the whole prefix
 /// every token at a few tok/s, which is the measurement that makes it not worth thinking
 /// about.
-fn split_channels(text: &str, ask: &Ask, complete: bool) -> (String, String) {
+fn split_channels(text: &str, ask: &Ask, complete: bool) -> Result<(String, String)> {
     match ask.arch {
-        Arch::MuseGlimmer => glimmer::split_glimmer(text, complete),
+        Arch::MuseGlimmer => Ok(glimmer::split_glimmer(text, complete)),
         Arch::GlmMoeDsa | Arch::DeepseekV4 | Arch::KimiK3 => {
             let (r, c) = oai::split_think(text, ask.think);
-            (r.to_string(), c.to_string())
+            Ok((r.to_string(), c.to_string()))
         }
+        // **A refusal and not a panic**, quoting the same const the three doors in front of
+        // this one quote. There is still no third possibility to be honest about — the
+        // alternative to refusing is SILENTLY reading a reply back with some other model's
+        // channel markers, the exact M11b failure this pair of matches exists to stop, and
+        // returning the refusal as `content` would be worse still: it would reach a client as
+        // if the model had said it. What changed is only what happens when the impossible
+        // happens.
+        //
+        // > **WAS `unreachable!` UNTIL 2026-08-31 (S1 review).** Its proof lived in a
+        // > DIFFERENT function — [`frame_prompt`] refuses this architecture, and `main`
+        // > refuses before that — where `seam.rs:445`'s cited precedent proves itself on the
+        // > `?` one line above it. `Ask` is a plain record with an in-module `arch` field and a
+        // > test helper that builds one for any architecture, so the panic was one line of
+        // > future test away from printing a 708-character refusal as a panic payload in a
+        // > running server. An `Err` here is refused by the request that asked, which is what
+        // > every other impossible-but-reachable state in this file does. The typestate that
+        // > would make it uncompilable — `frame_prompt` returning the splitter it paired with —
+        // > is S6's, in the commit that gives this architecture a real arm and rewrites both
+        // > matches anyway.
+        Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
     }
 }
 
@@ -445,7 +473,13 @@ fn stream_decode(w: &mut impl Write, cx: &mut Ctx<'_, '_>, ask: &Ask) -> Result<
         let Ok(full) = tok.decode_all(&acc) else {
             return true;
         };
-        let (reasoning, content) = split_channels(&full, ask, false);
+        // Same shape as the `decode_all` let-else above, and the same reason: this closure
+        // reports "stop decoding" as `true`, and a reply this build cannot read back is a
+        // reason to stop rather than to keep spending the GPU on it. The refusal itself
+        // reaches the client through [`read_back`] in the epilogue.
+        let Ok((reasoning, content)) = split_channels(&full, ask, false) else {
+            return true;
+        };
         for (field, sent, target) in [
             ("reasoning_content", &mut sent_r, reasoning.as_str()),
             // Prose only. Tool calls leave as one structured delta once the whole
@@ -485,8 +519,8 @@ struct ReadBack {
     calls: Vec<Value>,
 }
 
-fn read_back(text: &str, ask: &Ask) -> ReadBack {
-    let (reasoning, content) = split_channels(text, ask, true);
+fn read_back(text: &str, ask: &Ask) -> Result<ReadBack> {
+    let (reasoning, content) = split_channels(text, ask, true)?;
     // **`parse_tool_calls` reads GLM's `<tool_call>` markup and runs on every arm, which is
     // sound only because no arm is TAUGHT another syntax.** `oai::glimmer_prompt` deliberately
     // withholds `tools` from Glimmer's template for exactly this reason — see its doc. On a
@@ -494,11 +528,11 @@ fn read_back(text: &str, ask: &Ask) -> ReadBack {
     // honest outcome; the day ATEM is advertised, this line is the thing that must change with
     // it.
     let (prose, calls) = oai::parse_tool_calls(&content, &ask.who.id);
-    ReadBack {
+    Ok(ReadBack {
         reasoning,
         prose,
         calls,
-    }
+    })
 }
 
 /// What a finished stream still owes the client: the tool calls, the stop reason, `[DONE]`.
@@ -506,7 +540,7 @@ fn read_back(text: &str, ask: &Ask) -> ReadBack {
 /// It sits here, after the single `decode_all` in [`chat`], because the streaming arm used
 /// to decode the whole generation a SECOND time to build it.
 fn stream_epilogue(w: &mut impl Write, ask: &Ask, text: &str, generated: usize) -> Result<()> {
-    let rb = read_back(text, ask);
+    let rb = read_back(text, ask)?;
     // Tool calls go out whole rather than as fragments: the markup is only parseable once
     // closed, and OpenAI's streamed tool-call shape (per-call `index`, arguments assembled
     // across deltas) is a reassembly protocol a client is free to receive in one piece.
@@ -529,7 +563,7 @@ fn stream_epilogue(w: &mut impl Write, ask: &Ask, text: &str, generated: usize) 
 }
 
 fn json_reply(w: &mut impl Write, ask: &Ask, text: &str, generated: usize) -> Result<()> {
-    let rb = read_back(text, ask);
+    let rb = read_back(text, ask)?;
     let mut message = json!({"role": "assistant", "content": rb.prose});
     // Only when there is some: a client that does not know the field should not have to
     // filter an empty one out of every non-thinking response.
@@ -599,6 +633,10 @@ fn warn_sampling_ignored() {
 
 #[cfg(test)]
 mod tests {
+    // As in `main.rs`'s module: `expect_used` only, so every panic below still names what it
+    // expected. `unwrap_used` stays denied.
+    #![allow(clippy::expect_used)]
+
     use super::*;
 
     /// **The arch DISPATCH, which is the pairing the M11b revert was about.**
@@ -627,19 +665,32 @@ mod tests {
             },
         };
         let reply = " to=user<|message|>hi<|eot|>";
+        let split = |arch| split_channels(reply, &ask(arch), true);
         assert_eq!(
-            split_channels(reply, &ask(Arch::MuseGlimmer), true),
-            (String::new(), "hi".to_string()),
+            split(Arch::MuseGlimmer).ok(),
+            Some((String::new(), "hi".to_string())),
             "the Glimmer arm must strip the turn markers"
         );
         // GLM's reader is told `thinking: true` and finds no `</think>`, so it calls the whole
         // thing reasoning and leaves content EMPTY — the visible signature of a mis-wired
         // dispatch, and the reason this pairing needs its own gate.
         assert_eq!(
-            split_channels(reply, &ask(Arch::GlmMoeDsa), true),
-            (reply.to_string(), String::new()),
+            split(Arch::GlmMoeDsa).ok(),
+            Some((reply.to_string(), String::new())),
             "the GLM arm must be left alone; if this ever equals the Glimmer answer, the \
              dispatch has collapsed and nothing else here would notice"
+        );
+        // The fifth arm, which used to be an `unreachable!` and is now a refusal — asserted
+        // here because `Ask` is a plain record and this helper reaches the state the panic
+        // said was impossible. It quotes the legality table's own const, so a server never
+        // prints a 708-character refusal as a panic payload.
+        let e = format!(
+            "{:#}",
+            split(Arch::QwenFlashNext).expect_err("the armless architecture must refuse")
+        );
+        assert!(
+            e.contains("no decode path for this architecture yet"),
+            "the refusal must be the table's own wording, not a second one invented here: {e}"
         );
     }
 

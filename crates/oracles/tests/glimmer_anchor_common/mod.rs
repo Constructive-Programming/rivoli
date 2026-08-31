@@ -27,10 +27,11 @@ use serde_json::Value;
 #[path = "../common/golden_read.rs"]
 pub mod golden_read;
 
+pub use golden_read::{GoldenSet, Vendored, ints, shape_of};
 /// Re-exported so a binary that reads goldens needs one import rather than two. Same argument
 /// `golden_read` itself makes for re-exporting `GoldenSet`: an import list is the one duplication
 /// Rust gives you no way to factor, so the fix is to have fewer imports.
-pub use golden_read::{GoldenSet, Vendored, ints, shape_of};
+pub use rivoli_core::legality::Arch;
 
 /// Which mode a vendored file holds, read off the entry's own name.
 ///
@@ -74,7 +75,19 @@ pub const REAL_CONFIG: &str =
     include_str!("../../../../docs/measurement/glimmer-reference/config.json");
 
 pub fn load(v: &Vendored) -> GoldenSet {
-    GoldenSet::read_glimmer(&mut &v.bytes[..]).unwrap_or_else(|e| panic!("{}: {e:#}", v.name))
+    load_bytes(v.bytes).unwrap_or_else(|e| panic!("{}: {e:#}", v.name))
+}
+
+/// [`load`]'s reader, for bytes that are not a [`Vendored`] entry — the two weight sets
+/// `glimmer_draft_oracle.rs` pairs by salt.
+///
+/// **Here rather than at each call site, because the architecture is a property of this
+/// harness.** `GoldenSet::read_anchor_for` takes the `Arch` deliberately (a gate that read
+/// whichever magic it found could not tell "the right golden" from "some golden"), and this
+/// harness is Glimmer's, so it answers that question once. Returns the `Result` so callers keep
+/// naming the weight set in their own panic.
+pub fn load_bytes(bytes: &[u8]) -> anyhow::Result<GoldenSet> {
+    GoldenSet::read_anchor_for(Arch::MuseGlimmer, &mut &bytes[..])
 }
 
 pub fn text_goldens() -> impl Iterator<Item = &'static Vendored> {

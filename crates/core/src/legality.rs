@@ -47,12 +47,23 @@ pub enum Arch {
     /// streamed. 52 layers of GQA 32Q/2KV with a sigmoid output gate, three sliding-window
     /// (2048) layers to every full one, and RoPE on the sliding layers only.
     MuseGlimmer,
+    /// Qwen3.8-Flash-Next (`qwen4_exp`): 36 gated-delta linear layers interleaved 3:1 with 12
+    /// indexed sparse-attention layers, MoE on EVERY layer, a 4-wide hyper-connected residual
+    /// stream in place of pre-norms, and a hashed n-gram table injected at one layer.
+    ///
+    /// **The first variant here with no engine arm behind it**, and the only one whose whole
+    /// legality row refuses: the sniff recognises such an artifact, and everything past the
+    /// sniff is owed. `docs/investigations/qwen-flash-next-port.md` is the plan of record and
+    /// `docs/reference/qwen-architecture.md` is the math; this variant landing before any of
+    /// it is the point — a surface that would have to refuse cannot be added quietly later,
+    /// so it is added, refusing, first (stage S1).
+    QwenFlashNext,
 }
 
 /// How many architectures [`Arch::ALL`] must carry. Hand-written on purpose: it is what
 /// turns "someone added a variant and forgot the list" from a silent hole into a length
 /// mismatch on `ALL`'s array type. See [`Arch::ordinal`].
-const ARCH_COUNT: usize = 4;
+const ARCH_COUNT: usize = 5;
 
 impl Arch {
     /// Every architecture, exactly once — the legality product test's first axis.
@@ -61,6 +72,7 @@ impl Arch {
         Arch::DeepseekV4,
         Arch::KimiK3,
         Arch::MuseGlimmer,
+        Arch::QwenFlashNext,
     ];
 
     /// Dense index, written out arm by arm rather than as `self as usize`, because the
@@ -79,6 +91,7 @@ impl Arch {
             Arch::DeepseekV4 => 1,
             Arch::KimiK3 => 2,
             Arch::MuseGlimmer => 3,
+            Arch::QwenFlashNext => 4,
         }
     }
 
@@ -89,6 +102,10 @@ impl Arch {
             Arch::DeepseekV4 => "deepseek-v4",
             Arch::KimiK3 => "kimi-k3",
             Arch::MuseGlimmer => "muse-glimmer",
+            // The docs scope and the kebab name are the same string on purpose (`SCOPES` in
+            // `crates/cli/tests/docs.rs`), so a refusal and the doc it sends the reader to
+            // are searchable by one word.
+            Arch::QwenFlashNext => "qwen",
         }
     }
 
@@ -100,6 +117,9 @@ impl Arch {
             Arch::DeepseekV4 => "shared-K=V MQA, sliding window + per-layer KV compression",
             Arch::KimiK3 => "69 KDA + 24 gated MLA (NoPE), latent-space routed experts",
             Arch::MuseGlimmer => "dense GQA 32Q/2KV, gated, 3 sliding (2048) per full layer",
+            Arch::QwenFlashNext => {
+                "36 gated-delta linear + 12 indexed sparse, MoE every layer, 4-wide residual"
+            }
         }
     }
 }
@@ -220,9 +240,16 @@ pub enum Flag {
 /// Where the valueless flags' ordinals start.
 const VALUELESS: usize = MODES.len() + ATTNS.len();
 
-/// How many (arch, flag) columns exist. Same contract as [`ARCH_COUNT`]: the `7` is the
-/// count of valueless [`Flag`] variants and is hand-written so that adding one cannot
-/// quietly skip [`Flag::ALL`].
+/// How many (arch, flag) columns exist. Same contract as [`ARCH_COUNT`]: the `5` is the
+/// count of valueless [`Flag`] variants — `CachePolicy`, `MaxMem`, `Ctx`, `Trace`, `Mtp` —
+/// and is hand-written so that adding one cannot quietly skip [`Flag::ALL`].
+///
+/// > **CORRECTED 2026-08-31 (S1 review).** This said `the 7 is the count of valueless
+/// > variants` while the expression below has always been `VALUELESS + 5` and there have
+/// > always been five. A comment restating a wrong number for the constant it documents is
+/// > worse than no comment: the reader who trusts it goes looking for two variants that do
+/// > not exist. The five are now named, so the next drift is a visible disagreement rather
+/// > than an arithmetic one.
 const FLAG_COUNT: usize = VALUELESS + 5;
 
 impl Flag {
@@ -405,6 +432,51 @@ const K3_MTP_NEEDS_TWO_KERNELS: &str = "speculative decode on this architecture 
      fixtures. There is no draft head loaded either, but the kernels are what would have to \
      arrive first";
 
+/// **The only refusal text in this table that is `pub`**, and the exception is argued rather
+/// than convenient: every other row's wording is consumed exclusively by [`decide`], so
+/// publishing it would invent API nobody imports. This one has three consumers OUTSIDE the
+/// table — `main`'s dispatch bail, `bench::frame_prompt` and `serve`'s two arch matches — each
+/// of which is a door a qwen artifact reaches only if the door in front of it moved. The
+/// alternative is one hand-written wording per door, which is precisely the "two authorities
+/// that can independently judge one configuration" hazard this module's header opens with; four
+/// wordings would be four. It stops being `pub` at S6, when the arm lands and the doors close.
+pub const QWEN_ARM_NOT_BUILT: &str = "there is no decode path for this architecture yet, so \
+     there is nothing for a flag to be legal ABOUT: the sniff recognises the artifact and \
+     everything behind it is owed — no config type, no converter, no kernel, no arm. This is \
+     the only row here that refuses every cell, and it refuses them for ONE reason rather \
+     than twelve: a knob cannot be honoured, degraded, or even honestly ignored by a run that \
+     cannot start, and a loud fallback would promise a run that main then bails on a few \
+     lines later. The stages are docs/investigations/qwen-flash-next-port.md — S2 anchors, \
+     S3 kernels, S4 artifact and converter, S5 chat encoding, S6 the arm, where this row \
+     flips in one commit together with tests/smoke-qwen.sh";
+
+/// Qwen's `--mtp` wording. **Not reachable from the CLI yet, and that is a property of the
+/// dispatch rather than of this row** — worth stating here because the text is the longest in
+/// the table and a reader will reasonably assume a user has seen it.
+///
+/// `main`'s `requested_flags` puts [`Flag::Mode`] first and `check_legality` bails on the
+/// FIRST `Refuse`, so `rivoli DIR --mtp …` prints [`QWEN_ARM_NOT_BUILT`] — the `--mode` cell's
+/// refusal — and stops before reaching this cell. Until the arm row flips at S6 this const is
+/// therefore reachable only from a unit test, and `tests/smoke-qwen.sh`'s `--mtp` cell must
+/// expect the ARM_NOT_BUILT fragment; afterwards `--mode` becomes `Support` and this text is
+/// what a user sees. Collecting every refusal and reporting the most specific one was
+/// CONSIDERED and declined in the same review: it changes the refusal contract for four
+/// shipped architectures to improve a message on a fifth that cannot start, and the ordering
+/// is honest — the run is blocked by the missing arm first, which is what it says.
+const QWEN_MTP_NOT_LOADED: &str = "speculative decode on this architecture is blocked THREE \
+     deep, and which blocker arrives first is the useful half: the DRAFT LAYER IS NOT IN THE \
+     ARTIFACT at all — the `mtp.*` tensors (a draft layer carrying its own full 512-expert MoE \
+     block, 2.607 B parameters, tabulated as the EXCLUDED-v1-MTP rows of \
+     docs/measurement/qwen-reference/tensor-families.tsv) are excluded BY NAME under the v1 \
+     scope decision. There is no head to load, rather than a head loaded and left unspent, \
+     which is what every other arm's --mtp refusal describes; the S4 converter is where that \
+     exclusion becomes an assert against the census, and no converter exists yet. \
+     Behind that, a verify pass needs a MULTI-TOKEN gated-delta step: 36 of the 48 layers fold \
+     their history into a recurrent state, and pushing two rows through a single-token \
+     recurrence is not a batched decode, it is two different states. Behind THAT, a \
+     routed-expert range would be instantiated at one row only, as on every arm here. And in \
+     front of all three, this architecture has no decode arm at all — see its other refusals";
+
 /// **The** legality decider. Total over `Arch × Flag` by the compiler: adding an
 /// architecture breaks this match, adding a flag breaks [`glm`], and either way the build
 /// stops until the new cell has an argued answer.
@@ -414,6 +486,7 @@ pub fn decide(arch: Arch, flag: Flag) -> Outcome {
         Arch::MuseGlimmer => muse_glimmer(flag),
         Arch::DeepseekV4 => deepseek_v4(flag),
         Arch::KimiK3 => kimi_k3(flag),
+        Arch::QwenFlashNext => qwen_flash_next(flag),
     }
 }
 
@@ -581,6 +654,48 @@ fn deepseek_v4(flag: Flag) -> Outcome {
         // designed in. Here the blocker is one instantiation lower down and no other arm
         // shares it, so quoting GLM's wording would tell a user to wait for the wrong thing.
         Flag::Mtp => Outcome::Refuse(V4_MTP_NEEDS_A_KERNEL),
+    }
+}
+
+/// Qwen3.8-Flash-Next's row of the table — **the interim row, and the whole of stage S1**:
+/// every cell refuses, because the arm behind them does not exist.
+///
+/// # Why one const answers eleven of the twelve cells
+///
+/// The other four rows argue cell by cell because each cell has its own architectural
+/// answer — the checkpoint owns the format, the cache is a ring plus pooled blocks, 69 of 93
+/// layers keep no rows at all. Here there is exactly one fact and it sits upstream of every
+/// cell: **nothing decodes.** Writing eleven distinct refusals would be inventing eleven
+/// distinctions this architecture does not yet have, each of them owed a re-argument when
+/// the arm lands. `--mtp` is the exception on merit rather than for variety: it stays refused
+/// AFTER the arm lands (the draft layer is excluded from the artifact by name — not a
+/// decode-loop increment), so its own wording is true now and stays true.
+///
+/// # Why `Refuse` and never `FallbackLoudly`
+///
+/// [`Outcome::FallbackLoudly`] means "the run proceeds, but not as asked". No run proceeds
+/// here, so a fallback cell would promise what `main`'s dispatch then bails on — and the
+/// refusal at the door is precisely what keeps that bail unreachable. Refusing `--mode` and
+/// `--attn` is also what makes this architecture ARMLESS in the sense `main`'s
+/// `the_arms_and_the_legality_table_agree_about_who_can_start` checks: that test's
+/// no-arm branch had never once been exercised, because since M9 every architecture had an
+/// arm. **This is the pre-M9 shape restored deliberately**, for exactly as long as it is true.
+///
+/// The row flips at S6 (`docs/investigations/qwen-flash-next-port.md`), in one commit with the
+/// arm and `tests/smoke-qwen.sh`, whose legality cells quote these two consts' own fragments.
+fn qwen_flash_next(flag: Flag) -> Outcome {
+    match flag {
+        // Its OWN wording, not the shared `MTP_DEFERRED`: that one says the draft head is not
+        // loaded, and here the draft layer is not even converted.
+        Flag::Mtp => Outcome::Refuse(QWEN_MTP_NOT_LOADED),
+        // Every other cell together, spelled by VALUE rather than with a wildcard, so a new
+        // `Mode` or `AttnKind` lands here as a compile error like everywhere else in this table.
+        Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid)
+        | Flag::Attn(AttnKind::Dense | AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa)
+        | Flag::CachePolicy
+        | Flag::MaxMem
+        | Flag::Ctx
+        | Flag::Trace => Outcome::Refuse(QWEN_ARM_NOT_BUILT),
     }
 }
 

@@ -186,14 +186,26 @@ fn muse_glimmer_row_is_the_m7_truth() {
 ///
 /// The defaults are spelled from [`MODES`]/[`ATTNS`] rather than as variants, because
 /// what is being pinned is the pair `main`'s clap attributes actually resolve to.
+///
+/// > **NARROWED 2026-08-31 (S1).** This iterated all of [`Arch::ALL`], with a note saying "as
+/// > of M9 every architecture HAS an arm — the day a fifth lands armless, restore a named list
+/// > here excluding it". That day is today: [`Arch::QwenFlashNext`] refuses every cell, so the
+/// > domain is `Arch::ALL` MINUS a named armless list, and the excluded one is asserted from
+/// > the other side by [`qwen_flash_next_row_refuses_every_flag_as_of_s1`]. Naming the
+/// > EXCLUSION and not the inclusion is deliberate twice over: a hand-written armed list was a
+/// > 35-token jscpd clone of `Arch::ALL` (caught on this change's first full build), and it
+/// > would have failed OPEN — a sixth architecture would have gone unchecked here instead of
+/// > reddening until someone said which side of the line it is on.
 #[test]
 fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
     let default_mode = parse_in(&MODES, "--mode", "int3-vq").expect("int3-vq parses");
     let default_attn = parse_in(&ATTNS, "--attn", "dense").expect("dense parses");
-    // Every architecture, because as of M9 every architecture HAS an arm — the day a
-    // fifth lands armless, restore a named list here excluding it (and `main`'s ARMS
-    // test is the cross-check that the two lists agree).
-    for arch in Arch::ALL {
+    // The architectures with NO engine arm, which is the shorter and the fail-closed half of
+    // the statement. `main`'s `the_arms_and_the_legality_table_agree_about_who_can_start` is
+    // the cross-check that this exclusion and the arms `main` dispatches to are the same
+    // set — including, since S1, its previously unexercised no-arm branch.
+    const ARMLESS: [Arch; 1] = [Arch::QwenFlashNext];
+    for arch in Arch::ALL.into_iter().filter(|a| !ARMLESS.contains(a)) {
         for flag in [Flag::Mode(default_mode), Flag::Attn(default_attn)] {
             assert!(
                 !matches!(decide(arch, flag), Outcome::Refuse(_)),
@@ -290,6 +302,60 @@ fn kimi_k3_row_is_the_m9_truth() {
     for f in [Flag::CachePolicy, Flag::MaxMem, Flag::Ctx] {
         assert_eq!(k3(f), Outcome::Support, "{} must decode", f.spelling());
     }
+}
+
+/// Qwen3.8-Flash-Next's row, cell by cell, as of S1 — **the reddening commit's own gate.**
+///
+/// The other four row tests are change-detectors on a working arm. This one is the opposite
+/// claim: that the fifth architecture refuses EVERYWHERE, with the two named consts and not
+/// with a sibling's wording, for as long as there is no arm. It is what makes
+/// [`every_architecture_with_an_arm_decodes_with_no_flags_typed`]'s narrowed domain honest —
+/// the excluded architecture is asserted here rather than merely omitted there.
+///
+/// Pinned to the CONSTS, so an arm landing without this test moving is a red diff rather than
+/// a silently accepted flag; and the fragments are pinned too, because
+/// `tests/smoke-qwen.sh` (S6) asserts the CLI's refusal text against the table's own message
+/// fragments, and a fragment that can drift here would drift there unnoticed.
+///
+/// > **CORRECTED 2026-08-31 (S1 review).** The sentence above implied the smoke script can
+/// > quote BOTH fragments today. It cannot: `main`'s `requested_flags` puts `Flag::Mode`
+/// > first and `check_legality` bails on the first `Refuse`, so a `--mtp` invocation prints
+/// > the ARM_NOT_BUILT text and never reaches the `Mtp` cell. This test is therefore the
+/// > ONLY reader of [`QWEN_MTP_NOT_LOADED`] until the row flips at S6 — the ordering is
+/// > written down beside the const, and the CLI half is gated by `main.rs`'s
+/// > `a_qwen_mtp_invocation_is_refused_by_the_mode_cell_first`.
+#[test]
+fn qwen_flash_next_row_refuses_every_flag_as_of_s1() {
+    for flag in Flag::ALL {
+        let want = if flag == Flag::Mtp {
+            QWEN_MTP_NOT_LOADED
+        } else {
+            QWEN_ARM_NOT_BUILT
+        };
+        assert_eq!(
+            decide(Arch::QwenFlashNext, flag),
+            Outcome::Refuse(want),
+            "{} must REFUSE on {} while the arm does not exist — a Support cell would let a \
+             run start into a dispatch that bails, and a FallbackLoudly cell would promise a \
+             run that never happens",
+            flag.spelling(),
+            Arch::QwenFlashNext.name()
+        );
+    }
+    // The two fragments the smoke script quotes. `--mtp` is the cell that stays refused after
+    // the arm lands, so its reason must name the DRAFT LAYER's absence from the artifact and
+    // the recurrence, not a decode-loop increment on a batch shape that already exists.
+    assert!(
+        QWEN_ARM_NOT_BUILT.contains("no decode path for this architecture yet"),
+        "the arm-not-built refusal must say there is no decode path"
+    );
+    assert!(
+        QWEN_MTP_NOT_LOADED.contains("DRAFT LAYER IS NOT IN THE ARTIFACT")
+            && QWEN_MTP_NOT_LOADED.contains("gated-delta"),
+        "qwen's --mtp reason must name the unconverted draft layer AND the recurrence a \
+         verify pass would have to step: quoting another arm's wording tells the user to \
+         wait for the wrong thing"
+    );
 }
 
 /// Every spelling parses back to the variant it names, which is what makes

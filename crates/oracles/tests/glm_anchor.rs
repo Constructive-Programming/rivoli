@@ -17,6 +17,7 @@ mod golden_read;
 // this file was first written; module preambles are where the duplication gate bites
 // every new anchor, and the facade is the honest fix rather than an exemption).
 use golden_read::{GoldenSet, Vendored, ints};
+use rivoli_core::legality::Arch;
 use serde_json::Value;
 
 /// The two salts, byte-pinned. A vendored fixture that changed by one byte cannot pass as
@@ -37,7 +38,7 @@ const GOLDENS: &[Vendored] = &[
 ];
 
 fn read(v: &Vendored) -> GoldenSet {
-    GoldenSet::read_glm(&mut &v.bytes[..]).expect(v.name)
+    GoldenSet::read_anchor_for(Arch::GlmMoeDsa, &mut &v.bytes[..]).expect(v.name)
 }
 
 fn cfg(g: &GoldenSet) -> Value {
@@ -59,7 +60,7 @@ fn a_wrong_magic_is_refused_by_name() {
     // A Glimmer golden in a GLM slot must refuse at the magic, not at a shape three
     // gates downstream.
     let glimmer = include_bytes!("glimmer-anchor-text-1.bin");
-    let Err(err) = GoldenSet::read_glm(&mut &glimmer[..]) else {
+    let Err(err) = GoldenSet::read_anchor_for(Arch::GlmMoeDsa, &mut &glimmer[..]) else {
         panic!("a Glimmer golden parsed as a GLM one");
     };
     let msg = format!("{err:#}");

@@ -10,7 +10,7 @@
 //! re-open the "two similar-but-not-identical writers" problem this module exists to
 //! close.
 
-use crate::Args;
+use crate::args::Args;
 use anyhow::{Context, Result, ensure};
 use rivoli_artifact::tokenizer::Tokenizer;
 use rivoli_core::legality::{ATTNS, MODES, name_in};

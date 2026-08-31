@@ -10,7 +10,7 @@
 //! reproduced only up to summation order, and what is out of scope.
 //!
 //! > **AMENDED 2026-08-11.** One file here is no longer V4-only: `golden.rs` is the shared
-//! > container, and it gained `read_k3` for Kimi-K3's S1b anchor goldens
+//! > container, and it gained an arch-indexed anchor reader for Kimi-K3's S1b goldens
 //! > (`docs/measurement/k3-reference/anchor.md`). The argument above still holds for everything
 //! > else — `forward.rs`, `numerics.rs`, `weights.rs` and `toy.rs` ARE a V4 transliteration and
 //! > are named for what they measure against. `golden.rs` is not; it is a length-prefixed tensor

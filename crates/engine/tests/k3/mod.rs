@@ -15,7 +15,7 @@
 //! regenerated its anchors during S2 for exactly this reason (its item 1 header records
 //! "found by walking up to write this file and finding nothing to launch with",
 //! `k3:tests/k3_kernels.rs:40`), and the pair vendored HERE is that S2 recapture — 290
-//! tensors, same `RIVK3GLD` container, read by the same [`GoldenSet::read_k3`]. The S1b pair
+//! tensors, same `RIVK3GLD` container, read by the same arch-indexed reader. The S1b pair
 //! next door stays untouched because `crates/oracles/tests/k3_anchor.rs` pins its bytes;
 //! reconciling the two vendorings is that gate's owner's call, not this port's — flagged in
 //! the port report rather than done quietly.
@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 use super::common::{Got, Want, worst_rel};
+use rivoli_core::legality::Arch;
 
 /// `Policy`/`Tol` — the tolerance-table SHAPE, shared with the anchor gates by `#[path]`
 /// exactly as `glimmer_anchor/mod.rs` includes `golden_read.rs`: one file on disk, so the
@@ -98,7 +99,8 @@ pub fn vendored() -> [Vendored; 2] {
 }
 
 pub fn load(bytes: &[u8]) -> GoldenSet {
-    GoldenSet::read_k3(&mut &bytes[..]).expect("the vendored golden must load")
+    GoldenSet::read_anchor_for(Arch::KimiK3, &mut &bytes[..])
+        .expect("the vendored golden must load")
 }
 
 /// The eps the reference's RMSNorm used, read off the golden's own `tiny_config`

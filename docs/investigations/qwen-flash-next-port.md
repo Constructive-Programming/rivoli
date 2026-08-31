@@ -1,7 +1,7 @@
 ---
 status: live
 scope: qwen
-verdict: NOTHING IS BUILT YET — the Qwen3.8-Flash-Next (qwen4_exp) port has a finalized plan and no code, and this is its in-tree plan of record: the transcribed model identity (125B MoE 6B-active + 51B n-gram table + 4B MTP, 48 layers, 12x(3x GatedDeltaNet+MoE -> 1x QSA+MoE), fp8 block-128 official checkpoint, thinking default, vision excluded from v1 — transcribed at an UNPINNED revision, so census item 1 still owes the pin), the census checklist, the A-E track split with exclusive file lists, the GPU lease protocol, and the exit-gate table whose tests/smoke-qwen.sh row lands WITH the port because smoke-k3.sh proved later means never. Part 1 platform work is in flight; anchors, tolerances and defect matrices are all OWED, so nothing here is measured evidence, and every figure quoted from another scope carries that scope inline.
+verdict: S0 and S1 ARE BUILT, S2-S8 are not -- the Qwen3.8-Flash-Next (qwen4_exp) port has its reference bytes vendored at a pinned revision and hash-gated in tree, its math extracted from primary sources, and a fifth Arch that REFUSES at every legality cell and every CLI and serve door; this file is its in-tree plan of record. Measured identity: 180,007,507,860 parameters occupying 185,502,232,570 B = 172.76 GiB in the official fp8 checkpoint at revision 236dfdf2, of which 2.607 B parameters are the MTP draft layer excluded by name for v1 and 0.449 B are vision; 48 layers as 12x(3x GatedDeltaNet+MoE -> 1x QSA+MoE), where the checkpoint's 12 full_attention entries are an ALIAS for layers that run the indexer; block-128 fp8 with BF16 scale grids on the routed experts and a single per-tensor scale on the 51.2 G-element n-gram table hosted at layer_idx 1; thinking default. Six figures the first draft transcribed were measured FALSE and are corrected in place with dates. What it carries: the census checklist with items 1, 2 and 6 CLOSED and 3, 4, 5, 7 owed, the A-E track split with exclusive file lists, the GPU lease protocol, and the exit-gate table whose tests/smoke-qwen.sh row lands WITH the arm because smoke-k3.sh proved later means never. Anchors, tolerances and defect matrices are all still OWED, so no number here about THIS BOX is measured evidence, and every figure quoted from another scope carries that scope inline.
 ---
 
 # Qwen3.8-Flash-Next (`qwen4_exp`): the port, in tree
@@ -36,28 +36,62 @@ Out-of-tree provenance (read for the full argument, cite THIS file in code and c
 - **S7** first decode + gate battery — parity window, ppl cells, floor; reference ids recorded.
 - **S8** closeout — every deferral retired or milestone-named, standing gates green.
 
-## Where the port stands (2026-08-31)
+## Where the port stands (2026-08-31, after S0 and S1)
 
-Nothing built. `Arch` still has four variants; no `qwen` config type, converter, arm,
-kernel, anchor or smoke exists. What exists is: the plan, and — as of this commit — the
-docs scope `qwen`, this file, and its INDEX row.
+> **CORRECTED 2026-08-31.** This section said "Nothing built. `Arch` still has four variants."
+> Both halves are now false, and this is the plan every track authors from.
 
-## Model identity as transcribed (revision NOT pinned)
+**S0 is closed and S1 has landed.** `Arch` has **five** variants: `Arch::QwenFlashNext` exists
+and REFUSES at every legality cell, at `main`'s dispatch, at `serve`'s two arch matches and at
+`bench::frame_prompt`, each quoting `rivoli_core::legality`'s own const. The reference bytes are
+vendored and hash-gated (`docs/measurement/qwen-reference/`), the math is extracted from primary
+sources (`docs/reference/qwen-architecture.md`), the golden container has its fifth magic
+(`RIVQWGLD`), and `crates/artifact/tests/qwen_names.rs` recomputes the census on every deviceless
+run. What does NOT exist: a `qwen` config type, a converter, a kernel, an anchor, an arm, a chat
+encoding, `tests/smoke-qwen.sh`. Stages S2-S8 below are all still owed.
 
-Released **2026-08-26** as the open-weight preview of the Qwen4 architecture. Every field
-below is **transcribed** from the HF model card + `config.json` **as read on 2026-08-30**
-— the **revision is not pinned anywhere**, and pinning it plus vendoring the bytes for a
-byte-compare IS census item 1 (S0). Until that lands, every figure below is *unverified
-transcription, not evidence*, and this file's own cross-track figure rule (below) applies
-to it like any other unwitnessed number. Tertiary write-ups contradicted each other (one
-claimed 60B active) and are not used. The tech report PDF is **unread** — every math
-detail marked **(TR)** is OWED and pinned from it before the code it governs is written.
+## Model identity (revision PINNED and vendored, 2026-08-31)
 
-- `model_type: qwen4_exp`, `architectures: [Qwen4ExpForConditionalGeneration]`.
-- ~180B on disk: **125B MoE (6B active/token) + 51B hashed n-gram table + 4B MTP**.
-  48 layers, hidden 2560, vocab 248,320 padded, RoPE theta 1e7, native ctx 262,144.
-- Layer pattern **12 × (3 × (GatedDeltaNet → MoE) → 1 × (QSA → MoE))**; `layer_types`
-  linear/full with `full_attention_interval: 4`.
+> **CORRECTED 2026-08-31, S0.** This section was headed "as transcribed (revision NOT pinned)"
+> and said "the revision is not pinned anywhere". It is:
+> **`Qwen/Qwen3.8-Flash-Next-FP8` @ `236dfdf285828023ca3bcd3f37366c58a3469b13`**, with
+> `config.json` (72,514 B) and `generation_config.json` (202 B) vendored under
+> `docs/measurement/qwen-reference/` and recomputed from the live bytes by
+> `crates/artifact/tests/qwen_names.rs`. The tech report is **read** (28 pp., pinned by blob in
+> `docs/reference/qwen-architecture.md`'s source table), so the `(TR)` markers below are
+> answered there rather than owed. Six figures in the bullets below were measured FALSE against
+> the vendored bytes in the same commit that vendored them; each is corrected at its own line.
+> Tertiary write-ups contradicted each other (one claimed 60B active) and are not used.
+>
+> **Read `docs/reference/qwen-architecture.md` for any math**, and
+> `docs/measurement/qwen-reference/tensor-families.tsv` for any count or byte figure. This
+> section is the identity summary, not the evidence.
+
+- `model_type: qwen4_exp`, `architectures: [Qwen4ExpForConditionalGeneration]` **at the
+  document ROOT**; `text_config.model_type` is `qwen4_exp_text` and
+  `vision_config.model_type` is `qwen4_exp`, the root string verbatim.
+- **180,007,507,860 parameters** occupying **185,502,232,570 B = 185.50 GB (dec) = 172.76 GiB**
+  on disk: 176.95 B v1 parameters + **2.607 B MTP** + 0.449 B vision. 48 layers, hidden 2560,
+  vocab 248,320 padded, RoPE theta 1e7, native ctx 262,144.
+  > **CORRECTED 2026-08-31, S0.** Read "~180B on disk: 125B MoE (6B active/token) + 51B hashed
+  > n-gram table + **4B MTP**". The MTP figure is wrong — the `mtp.*` families sum to
+  > **2,607,304,448** parameters, re-derived from shape × count and gated by
+  > `qwen_names.rs::the_parameter_counts_split_by_v1_status_are_re_derivable`. And "180B on
+  > disk" conflated two units: 180 G is the PARAMETER count, the BYTE count is 185.50 GB,
+  > because 5.49 B of the parameters are BF16 at 2 B each. Report bytes/token budgets from the
+  > byte column, never from "180 GB" (P5). The 125B-MoE / 51B-table split is unrecomputed here
+  > and is not cited by any gate; the tsv's per-family rows are.
+- Layer pattern **12 × (3 × (GatedDeltaNet → MoE) → 1 × (QSA → MoE))**; `layer_types` is 36
+  `"linear_attention"` + 12 **`"full_attention"`** at indices 3, 7, …, 47, with
+  `full_attention_interval: 4`.
+  > **CORRECTED 2026-08-31, S0.** Read "`layer_types` linear/full", neither of which is a value
+  > the file contains. **And the checkpoint's `full_attention` spelling is an ALIAS**: the
+  > reference rewrites it to `qwen_sparse_attention` before validating
+  > (`configuration_qwen4_exp.py:180-184`, comment: "layers that are actually using an
+  > indexer"), so those 12 layers RUN THE INDEXER. A dense reading of them is bit-identical
+  > below 2051 cached tokens — invisible to the free oracle, the parity window and the smoke
+  > decode cell alike. See `qwen-architecture.md` §3 and trap T19; any gate that must
+  > distinguish them needs > 2051 cached tokens.
 - GDN: conv kernel 4, **16 QK heads @128 / 48 V heads @128** (asymmetric). fla lineage,
   not KDA (TR: decay/gate form).
 - QSA: 24 Q / 2 KV heads @256, partial RoPE dim 64; lightning-indexer-style MQA indexer
@@ -65,30 +99,60 @@ detail marked **(TR)** is OWED and pinned from it before the code it governs is 
 - MoE **every** layer: 512 experts, top-10 + 1 shared, moe_intermediate 640 (TR: router).
 - Hyper-connections: `hc_count: 4`, `hc_lowrank: 320` — a 4-wide residual stream through
   all 48 layers, so every sublayer is wrapped pre/post (TR: static vs dynamic form).
-- Hashed n-gram embeddings: 20M entries (~51B), bigram/trigram, injected at layer 2 via
-  `ple_layer_ids` (TR: hash fn). Pure per-token row gather — an ordered-unit stream, P6.
-- Source artifact: the **official FP8 checkpoint**, fine-grained **block-128** e4m3 (the
-  scheme `Fp8W` already ingests); tensor dtypes BF16 + F8_E4M3 + I64.
-- **Thinking mode is the default.** Sampling differs per mode (thinking T=1.0/top_p .95/
-  top_k 20; non-thinking T=0.7/top_p .80/presence 1.5) — from `generation_config.json`,
-  vendored under item 1.
+- Hashed n-gram embeddings: 20M entries per head (~51.2 G elements), bigram/trigram, hosted on
+  **`layer_idx = 1`, the second layer**, via `ple_layer_ids: [2]`.
+  > **CORRECTED 2026-08-31, S0.** Read "injected at layer 2 via `ple_layer_ids`".
+  > **`ple_layer_ids` is ONE-INDEXED**: the reference tests `layer_idx + 1 in ple_layer_ids`
+  > (`modeling_qwen4_exp.py:1202`), its config validation rejects ids outside
+  > `[1, num_hidden_layers]`, and the checkpoint's only PLE tensors sit under `layers.1.`. A
+  > converter that emits `layers.2.ple.*` must fail its census (trap T12).
+  Pure per-token row gather — an ordered-unit stream, P6.
+- Source artifact: the **official FP8 checkpoint**; tensor dtypes BF16 + F8_E4M3 + I64.
+  Fine-grained **block-128 e4m3 with BF16 `weight_scale_inv` grids** covers the **routed
+  experts** — the only families not in the config's 943-entry `modules_to_not_convert` list —
+  and the **n-gram table is per-TENSOR**: one BF16 `weight_scale` scalar
+  (1.9931793212890625e-4) for all 51.2 G elements, listed under `modules_to_convert`.
+  > **CORRECTED 2026-08-31, S0.** Read "fine-grained block-128 e4m3 (the scheme `Fp8W` already
+  > ingests)". True of the routed experts only. `Fp8W`'s block path does **not** apply to the
+  > n-gram table, which needs a per-tensor-scale dequant; the scales are **BF16, not F32**; and
+  > the grid orientation is per projection — `down_proj` is [20, 5] while `gate_proj`/`up_proj`
+  > are [5, 20], a silent-dequant trap over 80.5 GB (trap T24's pair, `qwen-architecture.md`
+  > §5).
+- **Thinking mode is the default.** The vendored `generation_config.json` (202 B) carries ONE
+  sampling set — `temperature 1.0, top_p 0.95, top_k 20`, `do_sample true`,
+  `eos_token_id [248046, 248044]` — and it is the thinking set.
+  > **CORRECTED 2026-08-31, S0.** Read "Sampling differs per mode (thinking T=1.0/top_p .95/
+  > top_k 20; non-thinking T=0.7/top_p .80/presence 1.5) — from `generation_config.json`".
+  > The thinking numbers are right and are in that file. **The non-thinking numbers are not**:
+  > the whole file is 202 bytes, it has no `presence_penalty` key at all, and it declares no
+  > per-mode split. Their true source is **UNKNOWN until vendored** — probably the model card,
+  > which is pinned as CARD but not vendored — so track D must not encode them from this line.
+  > Whoever needs them vendors the source first and cites it here.
 - Owner scope decisions 2026-08-30: **text-only v1** (vision named as later milestones),
   FP8 official checkpoint as the source.
 
-**Box constraint that shapes every gate:** ~180B parameters total (125B MoE + 51B n-gram
-table + 4B MTP, per the unvendored config/card transcription above) at 1 byte/param in the
-released fp8 is **≈ 180 GB against this box's ~124 GB usable** — so no released precision
-fits resident on gfx1151, and the first-party reference cannot run here either. Anchors
-are therefore operator-level taps plus a frozen teacher-forced window, never a live
+**Box constraint that shapes every gate:** the released fp8 checkpoint is
+**185,502,232,570 B = 172.76 GiB on disk** (of which 174.51 GB is F8_E4M3 at 1 B/param and
+5.49 B parameters are BF16 at 2 B) against this box's **~124 GiB usable** — so no released
+precision fits resident on gfx1151, and the first-party reference cannot run here either.
+Anchors are therefore operator-level taps plus a frozen teacher-forced window, never a live
 side-by-side decode.
+
+> **CORRECTED 2026-08-31, S0.** This read "≈ 180 GB against this box's ~124 GB usable", from
+> "~180B parameters at 1 byte/param". The conclusion is unchanged and the arithmetic was two
+> errors that happened to cancel: 180 G is the parameter count (185.50 GB of bytes), and not
+> every parameter is one byte. The figure now comes from `metadata.total_size` in the
+> checkpoint's own index, re-summed from the family rows by `qwen_names.rs`. Excluding MTP and
+> vision leaves 181,906,343,962 B = 169.44 GiB for v1, which is still 1.37x the budget — the
+> conclusion survives with room to spare, which is why the wrong number was invisible.
 
 ## Census checklist (the eight items; each closes with an artifact, not a memory)
 
 | # | item | closes when | state |
 |---|---|---|---|
-| 1 | vendored config pins | `qwen-reference/config.json` **and `generation_config.json`** (the sampling-defaults source) vendored at a pinned revision, and the gate **recomputes** FNV-1a from the live file and byte-compares | OWED (S0) |
-| 2 | tokenizer TYPE first | HF `tokenizer.json` confirmed as the TYPE **before** 180 GB moves, **and** the chat template's real home located (it has shipped only in the fp8 SOURCE repo before), **and** its hand-port scheduled with id-pinned cases — the GLM scar is a hand-ported template that drifted to another family's framing for months | OWED (S0) |
-| 3 | converter `ensure!` counts | `convert_qwen` asserts exact consumed/emitted tensor counts, with MTP and vision excluded **by name** against `tensor-families.tsv` | OWED (S4) |
+| 1 | vendored config pins | `qwen-reference/config.json` **and `generation_config.json`** (the sampling-defaults source) vendored at a pinned revision, and the gate **recomputes** FNV-1a from the live file and byte-compares | **DONE 2026-08-31** — `Qwen/Qwen3.8-Flash-Next-FP8` @ `236dfdf285828023ca3bcd3f37366c58a3469b13`; `docs/measurement/qwen-reference/{config.json,generation_config.json,linear_attn_norm_l0.bin}` + `tensor-families.tsv`'s VENDORED BYTES block; recomputed by `crates/artifact/tests/qwen_names.rs::the_vendored_files_hash_as_the_header_records`, red-proofed by a one-digit pin flip |
+| 2 | tokenizer TYPE first | HF `tokenizer.json` confirmed as the TYPE **before** 172.76 GiB moves, **and** the chat template's real home located (it has shipped only in the fp8 SOURCE repo before), **and** its hand-port scheduled with id-pinned cases — the GLM scar is a hand-ported template that drifted to another family's framing for months | **DONE 2026-08-31** — `tokenizer.json` is `"model": {"type": "BPE"}` (first 8192 B fetched, sha pinned in the tsv) with `tokenizer_class: Qwen2Tokenizer`, so the `tokenizers` crate is the loader and no tiktoken path is needed. The template ships **in the FP8 repo itself, in two places that agree byte-for-byte**: `chat_template.jinja` (8,952 B) and `tokenizer_config.json`'s `chat_template` key (8,952 chars, identical modulo the file's trailing newline) — the GLM hazard (template only in the fp8 SOURCE) does not recur here, and a converter can copy either. Hand-port scheduled as track D / S5 with ~31 id-pinned cases (exit-gate table below) |
+| 3 | converter `ensure!` counts | `convert_qwen` asserts exact consumed/emitted tensor counts, with MTP and vision excluded **by name** against `tensor-families.tsv` (109 family rows, Σcount 152,089, all three status sums now gated deviceless) | OWED (S4) |
 | 4 | first-party anchors + defect matrix | tiny-width real-structure anchor from the model's own stack, two weight salts, **≥2 rows per each of the nine named operator classes (so ≥18 rows)** each shown to redden AND to hold, tolerances from fp64/fp32 floors on ≥2 draws BEFORE the kernels | OWED (S2) |
 | 5 | kernel census both ends | every new launcher has an oracle suite or a live DEFERRED row; **N/N/0 at closeout, or a deferral that is MILESTONE-NAMED** (a named later milestone, not a bare TODO) | OWED (S3) |
 | 6 | registration in the SAME change | `SCOPES` entry + this doc + exactly one INDEX row | **DONE, this commit** |
@@ -98,13 +162,34 @@ side-by-side decode.
 ## Identity decisions already fixed
 
 `Arch::QwenFlashNext` · kebab/docs scope `qwen` · manifest spellings
-`"Qwen4ExpForConditionalGeneration"` and `"qwen4_exp"` at top level (a nested
-`text_config` spelling is asserted by config validate, never accepted by the sniff) ·
+`"Qwen4ExpForConditionalGeneration"` and `"qwen4_exp"`, **both read at the document ROOT and
+both required** ·
 `crates/artifact/src/qwen_config.rs` · arm `crates/engine/src/qwen/` · golden magic
 `RIVQWGLD` ·
 `docs/measurement/qwen-reference/{anchor.md,config.json,generation_config.json,tensor-families.tsv}`
 · math in `docs/reference/qwen-architecture.md`. Milestone label MQ, stages S0–S8;
 M-numbers are owner-assigned.
+
+> **CORRECTED 2026-08-31, S0/S1.** The parenthesis read "a nested `text_config` spelling is
+> asserted by config validate, never accepted by the sniff", which reads backwards now that the
+> file is in tree. The nesting is not hypothetical: **the config IS nested**, and every
+> architecture dimension lives under `text_config`. What the sniff does is read the document
+> **ROOT only** — `crates/artifact/src/schema.rs::arch_of_named`, gated against the vendored
+> `config.json`. Five spellings are in play and only two resolve:
+>
+> | spelling | where | resolves? |
+> |---|---|---|
+> | `qwen4_exp` | root `model_type` | **yes** |
+> | `Qwen4ExpForConditionalGeneration` | root `architectures[0]` | **yes** |
+> | `qwen4_exp_text` | `text_config.model_type` | no — it names the text half |
+> | `qwen4_exp` | **`vision_config.model_type`, the root string VERBATIM** | no — root-only reading is what excludes it |
+> | `qwen3_next` | a real, foreign family member | no — no prefix or "close enough" match |
+>
+> The `vision_config` collision is why root-only is a decision rather than a habit, and why the
+> sniff now also requires **both** root fields: a promoted sub-config carries `model_type`
+> alone, and one statement of identity has nothing to agree with. Both halves are tested —
+> `schema::tests::the_shipped_qwen_wrapper_resolves_from_its_root_and_a_promoted_block_does_not`
+> runs the vendored file through the real resolution path.
 
 ## Track split and exclusive files
 
@@ -128,7 +213,7 @@ tensor census tsv is A's — so nothing in the census node is unowned.
 
 | track | exclusive files |
 |---|---|
-| Coordinator | `legality.rs` + tests, `arch.rs`, `main.rs`, `serve/mod.rs`, `docs.rs`, `golden.rs`, `seam.rs`, `engine/lib.rs`, `INDEX.md`, the how-to-measure floor row; hands the seam, `main.rs`, serve and the legality flip to E after A/C/D merge |
+| Coordinator | `legality.rs` + tests, `arch.rs`, `schema.rs`, `main.rs`, **`args.rs`**, `serve/mod.rs`, `bench.rs`, `docs.rs`, `golden.rs`, `seam.rs`, `engine/lib.rs`, `INDEX.md`, the how-to-measure floor row; hands the seam, `main.rs`, `args.rs`, serve and the legality flip to E after A/C/D merge |
 | A artifact | `qwen_config.rs` + tests, `bin/convert_qwen.rs`, `tests/qwen_convert.rs`, `tensor-families.tsv` |
 | B anchors | `qwen_anchor*.{rs,py}`, `tests/qwen-anchor.sh`, `qwen-anchor-*.bin`, `common/tolerance.rs`, `qwen-reference/{anchor.md,config.json,generation_config.json}`, `qwen-architecture.md` |
 | C kernels | `kernels/*.hip` (new sections), `hip_attn.rs`, `hip_blocks.rs`, `hip_linalg.rs`, `engine/tests/kernel_qwen_*.rs`, `kernel_coverage.rs` |
@@ -137,6 +222,15 @@ tensor census tsv is A's — so nothing in the census node is unowned.
 
 C authors deviceless against B's **vendored** fixtures, so C starts when the goldens are
 vendored — not when B's doc is finished.
+
+> **EXTENDED 2026-08-31, S1.** Three files were missing from every row and are now the
+> Coordinator's, because S1 could not compile without them: `crates/cli/src/bench.rs` (the
+> `frame_prompt` refusal arm), `crates/artifact/src/schema.rs` (the root-only sniff and its
+> tests), and `crates/cli/src/args.rs` — which did not exist before this round. `args.rs` is
+> the verbatim `Args`/parse block split out of `main.rs` to pay the 800-line soft cap **before**
+> S6 needs the headroom (838 → 566 lines), so E inherits both files together.
+> Also on the census gate: `crates/artifact/tests/qwen_names.rs` is A's, beside
+> `tensor-families.tsv`.
 
 ## GPU lease protocol (no daemon, no lease file, no env token)
 
@@ -168,7 +262,7 @@ waits for a **GO**.
 | gate | what it is | lands with | red proof |
 |---|---|---|---|
 | docs registry | this doc + `SCOPES` + one INDEX row, deviceless | **this commit** | the two natural mid-change reds, recorded in the worklog below |
-| S1 reddening commit | every census and legality surface refuses the fifth arch with **asserted message fragments** (`QWEN_ARM_NOT_BUILT` and its siblings), so no track can land silently | S1, before any track opens | the refusals themselves — each one observed firing, quoting its own fragment; a refusal that cannot be seen to fire is not a refusal |
+| S1 reddening commit | every census and legality surface refuses the fifth arch with **asserted message fragments** (`QWEN_ARM_NOT_BUILT` and its siblings), so no track can land silently | S1, before any track opens | the refusals themselves — each observed firing at the level it is REACHABLE from, quoting its own fragment; `QWEN_ARM_NOT_BUILT` fires from the CLI, `serve` and `bench`, and `QWEN_MTP_NOT_LOADED` from a unit test only until S6 (see the note below the table) |
 | anchors | tiny-width real-structure anchor from the first-party stack, all 48 layers, real `layer_types`/`ple_layer_ids`/hc=4/conv=4, **two weight salts** with disjointness asserted, vendored `RIVQWGLD` bytes read deviceless | S2, BEFORE any kernel | truncated golden reds every load; a mutated structural assert reds exactly that test |
 | defect matrix | **≥2 rows for each of the nine named classes, so ≥18 rows** (GDN decay form, conv tap order, output-gate activation, indexer relu/pool/budget, hc transpose + lowrank order, router bias/norm/w1w3, n-gram seed/order/layer, partial-rope width, eps homes), gated **both directions** | S2, with the anchor | a deleted EXPECT_GREEN row reds the both-directions gate |
 | tolerances | per-operator rows from fp32/fp64 floors on **≥2 weight draws**, under the existing derived-policy gate; `ExactOnly` where the margin collapses | S2, before the kernels they score | an under-floor tolerance reds the tolerance-rule gate |
@@ -177,8 +271,20 @@ waits for a **GO**.
 | parity window | frozen teacher-forced forward over a pinned ~64-token window (the M8 substitution — no live reference fits this box): per-position argmax agreement with flips confined to measured near-ties, NLL deltas within compounded tolerance and above the floor | S7 | a shadow artifact perturbed at scale — a single-byte flip is BELOW a short run's detection floor (scope: glm) |
 | ppl cells | `tests/ppl-gates.sh <artifact> profile` and `p4` (both arch-agnostic); the paired `tf` cell's analogue here is the parity window. **p4 self-calibrates: on a non-reproducing arm it reports UNCALIBRATED (exit 1)** — there it is a diagnostic, never a merge gate | S7 | p4's red-proof corpus |
 | determinism floor | A-vs-A twice on `tests/ppl-corpus.txt`, **before any dNLL claim** | S7, cell 3 — a precondition, not a result | the standing instrument's own self-test, `tests/determinism-glm.sh --self-test`: the comparator reddens on a changed id AND on a truncated stream. The qwen arm inherits that instrument; this floor **row** stays uncalibrated until it is measured on the qwen artifact |
-| `tests/smoke-qwen.sh` | the thin CLI door-to-door: `--mtp` refusal quoted from the table's own fragment, decode cell against recorded ids, `--attn` inertness cell, a prompt crossing the layer-2 n-gram injection decoding finite | **the script lands WITH the arm at S6 — not later** (`tests/smoke-k3.sh` was scheduled for "after the port" and never existed: the named later-means-never scar). Its legality cells are **green immediately**; its decode cell is **RED until S7 records the reference ids**, and that red is the TDD ordering, not a defect | a wrong message fragment must redden it; **a missing reference is RED, never a skip** — which is exactly what makes the S6→S7 red meaningful |
+| `tests/smoke-qwen.sh` | the thin CLI door-to-door: the `--mtp` cell quoted from the table's own fragment — **`QWEN_ARM_NOT_BUILT`'s fragment until S6 flips the row, `QWEN_MTP_NOT_LOADED`'s after** (see the note under this table), decode cell against recorded ids, `--attn` inertness cell, a prompt crossing the **layer-1** n-gram injection decoding finite | **the script lands WITH the arm at S6 — not later** (`tests/smoke-k3.sh` was scheduled for "after the port" and never existed: the named later-means-never scar). Its legality cells are **green immediately**; its decode cell is **RED until S7 records the reference ids**, and that red is the TDD ordering, not a defect | a wrong message fragment must redden it; **a missing reference is RED, never a skip** — which is exactly what makes the S6→S7 red meaningful |
 | closeout | docs registry + jscpd + CodeScene + line caps green; **N/N/0 at closeout, or a deferral that is MILESTONE-NAMED** (a named later milestone, not a bare TODO) | S8 | the standing fixtures |
+
+> **CORRECTED 2026-08-31, S1.** The smoke row said "`--mtp` refusal quoted from the table's own
+> fragment", which cannot pass as written before S6. `main`'s `requested_flags` puts
+> `Flag::Mode` first and `check_legality` bails on the FIRST `Refuse`, so `rivoli DIR --mtp …`
+> prints `QWEN_ARM_NOT_BUILT` and never reaches the `Mtp` cell — `QWEN_MTP_NOT_LOADED` is
+> reachable only from a unit test until the `--mode` cell becomes `Support`. The ordering is
+> written down beside the const in `legality.rs` and gated by
+> `main.rs::tests::a_qwen_mtp_invocation_is_refused_by_the_mode_cell_first`, which turns red in
+> the same commit that flips the row — exactly where the smoke expectation has to change.
+> Collecting every refusal and reporting the most specific one was considered and declined: it
+> changes the refusal contract for four shipped architectures to improve a message on a fifth
+> that cannot start.
 
 ## The cross-track figure rule
 
@@ -197,6 +303,58 @@ arrive first; the ~4B tensors stay excluded by name), YaRN beyond native 262k,
 `determinism-qwen.sh` (owed only if the S7 floor wobbles), release-runbook retrofit.
 
 ## Worklog
+
+**2026-08-31 — S0+S1 review-fix round: five red proofs run, and the gates they belong to.**
+Recorded here rather than in `docs/measurement/gate-red-proofs.md`, whose §14 is **OWED** — that
+file's verdict is a single paragraph summarising every section, so adding one is a rewrite of a
+scale this round did not carry, and the coordinator owns the call. Each plant below was observed
+to have CHANGED THE TREE (byte-compared against a saved copy) and to have reddened THE ASSERTION
+ADDED, read off `left`/`right` rather than off the exit code, then reverted and the tree observed
+green again with a genuine rebuild:
+
+1. `qwen_names.rs`, one digit of `config.json`'s recorded fnv1a (`6e35…` → `6e34…`) —
+   `the_vendored_files_hash_as_the_header_records` red, `left: "6e35d0820f1ec218"` (recomputed
+   from the live bytes) vs `right: "6e34d0820f1ec218"` (the pin); the other five tests stayed
+   green, so nothing was masking it.
+2. Same gate, the declared family-row count `109` → `108` —
+   `the_vendored_census_closes_against_its_own_header` red, `left: 109 right: 108`.
+3. Same gate, one digit of the declared MTP parameter count — the split-by-status test red,
+   `left: 2607304448 right: 2607304449`, message naming "summed over 35 rows".
+4. `schema.rs`, the both-fields `ensure!` short-circuited to `true ||` (the pre-round
+   behaviour) — BOTH new sniff tests red, including
+   `one_field_is_refused_on_the_four_architectures_that_already_decode` on `glm_moe_dsa`, which
+   is what shows the rule is not qwen-scoped.
+5. `serve/mod.rs`, the refusal replaced by a silent fallback
+   (`Ok((String::new(), text.to_string()))`) —
+   `the_reply_is_read_back_with_the_same_template_that_framed_it` red with
+   `the armless architecture must refuse: ("", " to=user<|message|>hi<|eot|>")`, i.e. the
+   fallback handing a client another model's raw turn markers, which is the failure the
+   `unreachable!` this replaced was defending against.
+
+A sixth plant is recorded as a **FAILED proof, and it cost a wrong belief for one run**:
+inverting `requested_flags`' flag order to redden
+`a_qwen_mtp_invocation_is_refused_by_the_mode_cell_first` reported **36 passed, exit 0**, with
+`Finished in 0.06s` and no `Compiling` line — `/home` is NFS and its attribute cache served the
+pre-edit mtime, so nothing was rebuilt. `touch`ing the file over ssh (so the mtime comes from
+the remote clock) and re-running produced the red, `got [Mtp, Mode(Int3Vq), Attn(Dense)]`, exit
+101. This is the stale-binary scar this file's own worklog already records, biting the same day
+it was written down. **Every verification in this round was afterwards checked for a `Compiling`
+line before its colour was believed.**
+
+**2026-08-31 — S0+S1 review pass: this file's own figures corrected in place.** Six statements
+of the model's identity were measured FALSE against the bytes vendored in the same commit, and
+this is the doc `CLAUDE.md` tells a reader to trust instead of opening the others — with its
+`verdict:` relayed verbatim into `INDEX.md`, which is the recorded scar "correct the verdict,
+not just the body". Corrected at their own sites, each with what measured it: the 4B MTP figure
+(2,607,304,448 parameters), "~180 GB on disk" (that is the PARAMETER count; the bytes are
+185.50 GB = 172.76 GiB), `layer_types` "linear/full" (the values are `linear_attention` and
+`full_attention`, and the second is an ALIAS for indexer layers), "injected at layer 2"
+(`ple_layer_ids` is ONE-indexed; the host is `layer_idx` 1), "the scheme `Fp8W` already ingests"
+(routed experts only, BF16 scales not F32, and the n-gram table is per-tensor), and the
+non-thinking sampling numbers cited to a 202-byte file that contains only the thinking set
+(their source is unknown until vendored). The `verdict:` was REWRITTEN rather than appended to,
+and the INDEX row rewritten with it. Census items 1 and 2 flipped OWED → DONE with pointers, and
+the smoke row's `--mtp` cell was corrected to the fragment a user actually gets before S6.
 
 **2026-08-30** — Part 2 plan finalized out of tree, unversioned
 (`/home/rhansen/.claude/plans/rivoli-part2-qwen4-exp-port.md`; `~/.claude` is not under

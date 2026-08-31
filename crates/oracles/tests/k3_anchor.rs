@@ -28,6 +28,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
+use rivoli_core::legality::Arch;
 use rivoli_oracles::golden::GoldenSet;
 use serde_json::Value;
 
@@ -57,7 +58,7 @@ const GOLDENS: &[Vendored] = &[
 const REAL_CONFIG: &str = include_str!("../../../docs/measurement/k3-reference/config.json");
 
 fn load(v: &Vendored) -> GoldenSet {
-    GoldenSet::read_k3(&mut &v.bytes[..])
+    GoldenSet::read_anchor_for(Arch::KimiK3, &mut &v.bytes[..])
         .unwrap_or_else(|e| panic!("the vendored {} golden must load: {e:#}", v.name))
 }
 
