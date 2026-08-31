@@ -302,6 +302,122 @@ pub const GLIMMER: &[Tol] = &[
     },
 ];
 
+/// Qwen3.8-Flash-Next, measured 2026-08-31 on **CPU** (this reference needs no device -- its
+/// GatedDeltaNet ships pure-torch bodies inside transformers, unlike K3's triton-only fla ops),
+/// `--mode decode`, **both weight draws**. Every number here is DERIVED by a recorded command
+/// rather than transcribed: `qwen_anchor_driver.py --tolerance-table <matrix dir>` reads the
+/// matrix's own goldens and prints exactly these floors, weakest defects and margins. Re-derive
+/// with the two commands in `qwen-reference/anchor.md` section "tolerances".
+///
+/// Nine rows, one per operator with at least one defect row that TARGETS it -- and "targets" is
+/// not a judgement here: `qwen_anchor_lib.EXPECT_FIRST_TOUCH` declares each defect's
+/// first-touched bucket and its operator IS the operator that row prices, which is also what the
+/// both-directions gate asserts. Floors are the max over the two draws, weakest defects the min
+/// over the two: a floor measured at one draw is not a floor (Glimmer's `attend` came out 2.1x
+/// apart), and a defect signal taken at its stronger draw would flatter the margin.
+///
+/// **The operators the anchor measures a floor for and deliberately does NOT give a row**, because
+/// a threshold for an operator nobody has a targeting defect for is a number that arrived from
+/// somewhere other than a measurement. **Do not score any of these against a threshold** —
+/// compare it exactly, or measure the floor the same way and add a row.
+///
+/// > **CORRECTED 2026-08-31.** This block said "Four operators" and then listed eight in five rows,
+/// > and it omitted `qk_norm` altogether — an operator with a measured floor (1.165e-5) and no row,
+/// > which is exactly the case the "do not score it against a threshold" warning exists for and the
+/// > one a reader consulting this table would not have found. The total is gone rather than
+/// > corrected: [`table_covers_exactly`] gates the nine rows that DO exist, nothing gates this list,
+/// > and a count nothing re-derives drifts again.
+///
+/// | operator | floor (max over draws) | why no row |
+/// |---|---|---|
+/// | `gdn_out` | 1.617e-5 | `out_proj` and the block output; every GDN defect reaches it by leaking downstream |
+/// | `hc_mlp` | 1.141e-5 | the post-MLP fold; the hc rows all target `hc_attn`, which is upstream |
+/// | `qsa` | 1.260e-5 | rope, `o_proj` and the block output — downstream of every attention defect (`qsa_proj` HAS a row, at 1.041e-5) |
+/// | `qk_norm` | 1.165e-5 | **no defect row targets it yet.** A floor is half a row; the other half is deciding which defects TARGET the operator, and that is per-kernel work S3 does |
+/// | `ple_inject` | 4.049e-7 | the PLE gate and dilated conv; the five n-gram rows all target `ngram_hash`, upstream of it |
+/// | `moe_shared` / `head` / `hc_collapse` / `residual` | 1.012e-4 / 8.390e-6 / 7.433e-6 / 7.068e-6 | localisation buckets the comparator uses, not kernels |
+///
+/// **And `ngram_hash` has no row for a different reason: its floor is exactly 0.000e0 at both
+/// draws.** The hashed row ids are int64 -- fp32 and fp64 runs produce the SAME integers -- so
+/// there is no rounding to bound and no `Rel` value is expressible (the margin is infinite, which
+/// [`tolerances_leave_room`] cannot state). A hash is exact or it is wrong: S3 and S4 compare
+/// those ids bit-for-bit, which is what `golden::diff`'s int section already does, and the five
+/// n-gram defect rows (weakest 1.691e0, `ngram_seed_wrong`) are what make that comparison
+/// non-vacuous.
+///
+/// **The load-bearing finding of this exercise is `gdn_op`, and it is a two-floor operator.**
+/// The reference ships TWO implementations of the same recurrence, so there are two honest
+/// floors:
+///
+/// * **1.4959e-5** -- fp32 against fp64 through `torch_recurrent_gated_delta_rule`, the per-token
+///   path the DECODE goldens were produced by and the one rivoli's decode kernel is;
+/// * **9.420e-5** -- `torch_chunk_gated_delta_rule` against `torch_recurrent_gated_delta_rule`,
+///   worst over all 36 GDN layers. Two real implementations of one recurrence disagreeing, which
+///   is what a HIP port will be -- and 6.3x the fp64 number, the same relationship K3 measured
+///   for KDA (6.301e-5 against a 5.99e-6 island).
+///
+/// The row below uses the FIRST, and the argument is that the fixture and the kernel associate
+/// the same way: a decode golden produced by the per-token path, scored against a per-token
+/// kernel, is not sensitive to the chunked path's association. **What that leaves OWED is
+/// stated rather than hidden**: at the chunked floor the weakest targeting defect
+/// (`l2norm_eps_dropped`, 1.610e-2) is only **171x** the floor, under the 297x a `Rel` policy
+/// needs -- so a CHUNKED prefill kernel scored against this fixture would have to be
+/// `ExactOnly`, which a kernel scored against a host oracle cannot satisfy. S3's prefill path
+/// therefore needs its own prefill-mode GDN fixture, or the l2-norm eps pinned by READING it
+/// (1e-6, hard-coded at MOD:261, not a config field) exactly as K3's MLA eps is. This anchor's
+/// prefill golden captures layer 3 only, which is QSA, so it does not close it.
+pub const QWEN: &[Tol] = &[
+    // The GDN short convolution. Floor 7.638e-6 (draw 1; draw 2 gave 7.006e-6). Weakest
+    // targeting defect `gdn_conv_tap_rotated` at 1.928e0 -- the cyclic rotation, which leaves
+    // the weight multiset intact and is therefore the one a symmetry check passes. Margin
+    // 252,441x.
+    rel_row("gdn_conv", 7.6380e-6, 1.9282e0, 7.64e-5),
+    // The gated delta rule itself -- see the two-floor discussion above. Weakest targeting
+    // defect is `l2norm_eps_dropped` at 1.610e-2, three orders below the decay-form rows
+    // (2.27e0 and up), because a 1e-6 additive term inside an rsqrt over 20 squared components
+    // is a small perturbation. It is COUNTED, not excluded: unlike Glimmer's `qk_scale_on_k`
+    // there is no algebraic identity hiding it -- a kernel handed eps 0 computes a genuinely
+    // different norm. Margin 1077x against the decode floor.
+    rel_row("gdn_op", 1.4959e-5, 1.6102e-2, 1.50e-4),
+    // The GDN output norm-gate. Weakest targeting defect `gdn_norm_unit_offset` at 9.729e-1 --
+    // the ones-vs-zero-centred form, which TR p.4 states one way and the code the other, and
+    // which the vendored 256 bytes of `linear_attn_norm_l0.bin` settle. Margin 58,824x.
+    rel_row("gdn_out_norm", 1.6539e-5, 9.7290e-1, 1.65e-4),
+    // The fused GDN input projections. Weakest targeting defect `gdn_qkv_head_interleaved` at
+    // 1.717e0 -- head-major against channel-major, which is shape-valid either way. Margin
+    // 144,996x.
+    rel_row("gdn_proj", 1.1838e-5, 1.7165e0, 1.18e-4),
+    // The pre-attention hyper-connection fold, and the bucket every norm-form and eps row lands
+    // in because it is the first module of the first layer. Weakest targeting defect
+    // `eps_outside_sqrt` at 7.278e-2 -- `x/(sqrt(m)+eps)` against `x*rsqrt(m+eps)`, one paren
+    // apart. Margin 5108x, so `Rel` is founded; had the activations been better scaled this is
+    // the row that would have collapsed to `ExactOnly` the way K3's MLA eps did.
+    rel_row("hc_attn", 1.4249e-5, 7.2782e-2, 1.42e-4),
+    // The QSA indexer: pooled keys, block starts, per-block scores and the selection mask.
+    // Weakest targeting defect `indexer_budget_one_block_short` at 1.000e0. Margin 87,800x.
+    //
+    // The scores are IN this bucket and that is what makes the row real. Three rows
+    // (`indexer_rope_at_block_end`, `rope_interleaved_pairs`, and a rejected max-over-heads
+    // reading) perturbed the scores without moving the top-2 and left the whole bucket
+    // bit-identical when only the final mask was captured -- argmax invariance, the same shape
+    // as this tree's recorded "ids moved by exactly 0.000e0" finding.
+    rel_row("indexer", 1.1390e-5, 1.0000e0, 1.14e-4),
+    // The routed experts. Weakest -- and only -- targeting defect `expert_gate_up_swapped` at
+    // 8.222e-1: the fused `gate_up_proj` halves exchanged, so SiLU lands on `up`. Margin
+    // 53,938x. One defect is enough for a row here because the operator has exactly one silent
+    // converter-side failure mode at this width; the OTHER one, the block-128 scale grid's
+    // per-projection orientation, does not exist at these widths and is a converter assert.
+    rel_row("moe", 1.5243e-5, 8.2217e-1, 1.52e-4),
+    // The router. Weakest targeting defect `router_sigmoid` at 2.864e-1 -- not
+    // `router_no_renorm` (4.15e0), which the flat untrained draw makes strong here and which a
+    // trained router would make weak. Margin 14,883x.
+    rel_row("moe_route", 1.9242e-5, 2.8638e-1, 1.92e-4),
+    // The attention's fused q/gate projection. Weakest targeting defect
+    // `attn_gate_block_split` at 1.470e0 -- per-head `[query|gate]` read as two blocks. Margin
+    // 141,202x.
+    rel_row("qsa_proj", 1.0408e-5, 1.4696e0, 1.04e-4),
+];
+
 /// The tolerance for one operator in one model's table, or `None` if that table does not cover it.
 pub fn tolerance(table: &'static [Tol], operator: &str) -> Option<&'static Policy> {
     table

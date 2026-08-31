@@ -37,7 +37,11 @@ mod golden_read;
 #[path = "common/tolerance.rs"]
 mod tolerance;
 
-use golden_read::{Vendored, float, shape_of};
+use golden_read::{
+    Vendored, capture_census, decay_rates_are_not_all_equal, declared_fields,
+    draws_are_independent, float, json_usize as field, logits_are_finite_and_spread,
+    one_row_of_logits, provenance, shape_of, top_k_is_in_range_and_distinct,
+};
 
 const GOLDENS: &[Vendored] = &[
     Vendored {
@@ -65,12 +69,6 @@ fn load(v: &Vendored) -> GoldenSet {
 /// The tiny config a golden was produced from.
 fn cfg(g: &GoldenSet) -> Value {
     serde_json::from_str(g.meta_get("tiny_config").expect("tiny_config")).expect("valid json")
-}
-
-fn field(c: &Value, key: &str) -> usize {
-    c[key]
-        .as_u64()
-        .unwrap_or_else(|| panic!("{key} is not an integer in tiny_config")) as usize
 }
 
 fn attn_field(c: &Value, key: &str) -> usize {
@@ -125,37 +123,35 @@ impl Structural<'_> {
 #[test]
 fn the_anchor_goldens_record_what_produced_them() {
     for v in GOLDENS {
-        let g = load(v);
-        g.expect_defect("None")
-            .expect("the vendored goldens are unperturbed runs");
-        assert_eq!(g.meta_get("salt"), Some(v.name), "salt");
-        for (key, want) in [
-            ("mode", "decode"),
-            ("seq", "8"),
-            ("dtype", "torch.float32"),
-            ("entry_point", "KimiLinearForCausalLM"),
-            ("quantized", "no"),
-            ("torch", "2.13.0+rocm7.2"),
-            ("transformers", "4.56.2"),
-            ("fla", "0.5.2"),
-            ("triton", "3.5.1"),
-            ("gpu", "AMD Radeon 8060S Graphics"),
-            // `eager`, not `flash_attention_2`: the reference's `__init__` forces the latter and the
-            // driver overrides it afterwards. Pinned because it is a DEVIATION — if a future run
-            // silently keeps flash, the goldens change meaning and nothing else would say so.
-            ("attn_implementation", "eager"),
-            ("capture_layers", "0,1,3,12,91,92"),
-            // The reference the whole independence argument rests on, at the pinned revision. Its
-            // sibling `real_config_sha256_16` was pinned from the start and this one was not, which
-            // is the asymmetry review noticed: a golden regenerated against a later revision of
-            // `modeling_kimi_linear.py` — one where a kernel kwarg or the LoRA eps changed — passed
-            // every test, with the metadata truthfully recording a hash nothing compared.
-            ("ref_modeling_sha256_16", "9e3564c70ac21854"),
-            ("ref_config_sha256_16", "735eb9ebe593e17d"),
-            ("real_config_sha256_16", "9710e121a58d03ac"),
-        ] {
-            assert_eq!(g.meta_get(key), Some(want), "{}: metadata {key}", v.name);
-        }
+        provenance(
+            &load(v),
+            v.name,
+            &[
+                ("mode", "decode"),
+                ("seq", "8"),
+                ("dtype", "torch.float32"),
+                ("entry_point", "KimiLinearForCausalLM"),
+                ("quantized", "no"),
+                ("torch", "2.13.0+rocm7.2"),
+                ("transformers", "4.56.2"),
+                ("fla", "0.5.2"),
+                ("triton", "3.5.1"),
+                ("gpu", "AMD Radeon 8060S Graphics"),
+                // `eager`, not `flash_attention_2`: the reference's `__init__` forces the latter and the
+                // driver overrides it afterwards. Pinned because it is a DEVIATION — if a future run
+                // silently keeps flash, the goldens change meaning and nothing else would say so.
+                ("attn_implementation", "eager"),
+                ("capture_layers", "0,1,3,12,91,92"),
+                // The reference the whole independence argument rests on, at the pinned revision. Its
+                // sibling `real_config_sha256_16` was pinned from the start and this one was not, which
+                // is the asymmetry review noticed: a golden regenerated against a later revision of
+                // `modeling_kimi_linear.py` — one where a kernel kwarg or the LoRA eps changed — passed
+                // every test, with the metadata truthfully recording a hash nothing compared.
+                ("ref_modeling_sha256_16", "9e3564c70ac21854"),
+                ("ref_config_sha256_16", "735eb9ebe593e17d"),
+                ("real_config_sha256_16", "9710e121a58d03ac"),
+            ],
+        );
     }
 }
 
@@ -215,54 +211,19 @@ fn the_vendored_bytes_are_the_measured_ones() {
     //
     // This was `assert_ne!(GOLDENS[0].fnv, GOLDENS[1].fnv)`, which a review showed carries no
     // information: each golden embeds its own `salt` string in its metadata, so the two files are
-    // guaranteed to differ whatever the weights did. A driver refactor that passed a literal
-    // `"k3-anchor-1"` to `init_weights`, or an `_gen` that stopped mixing the salt into its seed,
-    // would put bit-identical tensors in both files and pass every assertion here — while the
-    // fixture claimed the second draw whose whole purpose is that a bug degenerate at one draw's
-    // values cannot hide. Compared per tensor, over every float the goldens share.
-    let (a, b) = (load(&GOLDENS[0]), load(&GOLDENS[1]));
-    let mut shared = 0usize;
-    let mut identical: Vec<&str> = Vec::new();
-    for (name, _, va) in &a.floats {
-        let Some((_, _, vb)) = b.floats.iter().find(|(n, _, _)| n == name) else {
-            continue;
-        };
-        shared += 1;
-        // `to_bits`, because `-0.0 == 0.0` and `NaN != NaN` would each lie here in one direction.
-        if va
-            .iter()
-            .map(|x| x.to_bits())
-            .eq(vb.iter().map(|x| x.to_bits()))
-        {
-            identical.push(name);
-        }
-    }
-    assert!(
-        shared > 200,
-        "only {shared} float tensors are common to the two goldens — the draws should differ in \
-         VALUES, not in which tensors they hold"
-    );
-    assert!(
-        identical.is_empty(),
-        "{} of {shared} shared float tensors are bit-identical across the two salts, e.g. {:?}. \
-         Weights are drawn from `sha256(salt/parameter-name)`, so EVERY tensor must differ; any \
-         that do not mean the salt stopped reaching the draw and the second golden is the first \
-         one wearing a different label.",
-        identical.len(),
-        &identical[..identical.len().min(3)]
-    );
+    // guaranteed to differ whatever the weights did. The argument, and the per-tensor `to_bits`
+    // comparison that replaced it, now live in `golden_read::draws_are_independent` — factored
+    // 2026-08-31 when the Qwen anchor became a fourth caller and jscpd matched the two copies at
+    // 133 tokens.
+    //
+    // **The count went from `shared > 200` to an exact 223 in that move, and it is a
+    // strengthening rather than a translation.** A lower bound cannot see the intersection
+    // SHRINKING, which is the failure a driver refactor produces: one golden losing a tensor
+    // family leaves the other's still-present and the comparison quietly scores fewer of them.
+    // Verified green on both draws at the exact count in the same run.
+    draws_are_independent(&load(&GOLDENS[0]), &load(&GOLDENS[1]), 223);
 }
 
-/// Each tiny config keeps the real model's STRUCTURE, which is what the traps live in.
-///
-/// The driver asserts this at generation time; it is re-asserted from the file because the file is
-/// what survives, and a golden whose config drifted to something structurally unlike K3 would still
-/// load and still look like a few hundred plausible tensors.
-///
-/// The two lists are kept in step by `structural_asserted`: the driver writes every field it
-/// checked, and this test refuses to claim a field that list does not name. Two lists with nothing
-/// tying them together is the drift review found here — `gate_lower_bound` and
-/// `short_conv_kernel_size` were documented as asserted on both sides and were asserted on neither.
 #[test]
 fn the_tiny_configs_kept_the_real_structure() {
     let real: Value = serde_json::from_str(REAL_CONFIG).unwrap();
@@ -270,11 +231,7 @@ fn the_tiny_configs_kept_the_real_structure() {
     for v in GOLDENS {
         let g = load(v);
         let c = cfg(&g);
-        let declared: Vec<&str> = g
-            .meta_get("structural_asserted")
-            .expect("structural_asserted")
-            .split(',')
-            .collect();
+        let declared = declared_fields(&g);
         top_level_structure_survived(&c, real, &declared);
         linear_attn_structure_survived(&c, real, &declared);
     }
@@ -375,7 +332,7 @@ fn the_operator_fixtures_s2_needs_are_present() {
         moe_fixtures_are_shaped(&g, &c, hidden);
         attn_res_fixtures_are_shaped(&g, &c, hidden);
         assert_eq!(shape_of(&g, "model.norm"), vec![1, 1, hidden]);
-        assert_eq!(shape_of(&g, "logits"), vec![1, 1, field(&c, "vocab_size")]);
+        one_row_of_logits(&g, &c);
     }
 }
 
@@ -535,11 +492,7 @@ fn kda_draws_are_on_scale(g: &GoldenSet, name: &str) {
     // constant one makes every head decay identically and a kernel that ignored the term
     // entirely would still match. Only the FNV pin caught that before. Measured draws span
     // [1.41, 2.53] (salt-1) and [1.78, 2.60] (salt-2), so "not all equal" is far inside them.
-    assert!(
-        a_log.iter().any(|x| *x != a_log[0]),
-        "{name}: A_log is constant at {} — every head would decay identically",
-        a_log[0]
-    );
+    decay_rates_are_not_all_equal(a_log, name);
     let (_, dt) = float(g, &format!("{kda}.in.dt_bias"));
     assert!(
         dt.iter().all(|x| (-4.0..=1.0).contains(x)),
@@ -555,21 +508,6 @@ fn kda_draws_are_on_scale(g: &GoldenSet, name: &str) {
     );
 }
 
-/// The forward pass produced numbers and they are not one number: a collapsed head is the shape a
-/// golden of zeros takes at the far end of the model.
-fn logits_are_finite_and_spread(g: &GoldenSet, name: &str) {
-    let (_, logits) = float(g, "logits");
-    assert!(
-        logits.iter().all(|x| x.is_finite()),
-        "{name}: logits must be finite"
-    );
-    assert!(
-        logits.iter().any(|x| *x != logits[0]),
-        "{name}: all {} logits are identical — the forward pass collapsed",
-        logits.len()
-    );
-}
-
 /// Routing, as ints: selection is exact-or-not, and `golden::diff` scores the int section that way.
 /// Distinctness is the real check — `[0, 0]` is a pair top-k cannot produce, and a bound of
 /// `0..num_experts` alone would accept it.
@@ -582,15 +520,7 @@ fn routing_selected_distinct_experts(g: &GoldenSet, c: &Value, name: &str) {
         .expect("the router's top-k indices");
     let (top_k, n_experts) = (field(c, "num_experts_per_token"), field(c, "num_experts"));
     assert_eq!(idx_shape, &vec![1, top_k]);
-    assert!(
-        idx.iter().all(|&e| (e as usize) < n_experts),
-        "{name}: expert id out of range: {idx:?}"
-    );
-    assert_eq!(
-        idx.iter().collect::<std::collections::BTreeSet<_>>().len(),
-        top_k,
-        "{name}: top-{top_k} selected the same expert twice: {idx:?}"
-    );
+    top_k_is_in_range_and_distinct(idx, top_k, n_experts, name);
 }
 
 /// The gate WEIGHTS, which are what `--defect RouterBiasInWeight` moves and which nothing named
@@ -621,30 +551,7 @@ fn gate_weights_are_renormalised_and_alive(g: &GoldenSet, c: &Value, name: &str)
 #[test]
 fn exactly_the_declared_layers_were_captured() {
     for v in GOLDENS {
-        let g = load(v);
-        let declared: Vec<usize> = g
-            .meta_get("capture_layers")
-            .expect("capture_layers")
-            .split(',')
-            .map(|s| s.parse().unwrap())
-            .collect();
-        assert_eq!(declared, vec![0, 1, 3, 12, 91, 92]);
-        let mut seen: Vec<usize> = g
-            .floats
-            .iter()
-            .map(|(n, _, _)| n.as_str())
-            .chain(g.ints.iter().map(|(n, _, _)| n.as_str()))
-            .filter_map(|n| n.strip_prefix("model.layers."))
-            .filter_map(|rest| rest.split('.').next())
-            .map(|d| d.parse().unwrap())
-            .collect();
-        seen.sort_unstable();
-        seen.dedup();
-        assert_eq!(
-            seen, declared,
-            "{}: captured layers must be exactly the declared ones",
-            v.name
-        );
+        capture_census(&load(v), &[0, 1, 3, 12, 91, 92], v.name);
     }
 }
 
