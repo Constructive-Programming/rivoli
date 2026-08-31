@@ -7,6 +7,9 @@
 //! tokenizer, and the converters' sealed writer. Host-only and featureless:
 //! every test here runs in the featureless CI job.
 pub mod arch;
+/// The vendored tensor-family censuses and the reader they share. Library code rather than a
+/// test helper because `convert_qwen` reads one at runtime — its exclusion list IS the census.
+pub mod census;
 pub mod drafter_config;
 pub mod format;
 pub mod glimmer;
@@ -19,6 +22,7 @@ pub mod glimmer_encoding;
 pub mod glm_config;
 pub mod k3_config;
 pub mod quant;
+pub mod qwen_config;
 pub mod schema;
 pub mod tiktoken;
 pub mod tokenizer;
