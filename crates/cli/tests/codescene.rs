@@ -98,7 +98,10 @@ fn trunc(s: &str) -> String {
 /// Skip-or-panic on a tool that did not run, per the absent policy above. Returns only
 /// in skip mode; the caller's next statement is its `return`.
 fn tool_absent(context: &str, detail: &str) {
-    if std::env::var_os("RIVOLI_CS_REQUIRED").is_some() {
+    // Value-checked, not existence-checked: a CI `env:` entry whose expression yields ''
+    // still SETS the variable (run 33383324860 armed REQUIRED with no secret configured),
+    // so empty means unarmed — the same contract the workflow's own `-z` test uses.
+    if std::env::var_os("RIVOLI_CS_REQUIRED").is_some_and(|v| !v.is_empty()) {
         panic!("CodeScene gate REQUIRED but cs did not run ({context}): {detail}");
     }
     eprintln!(
