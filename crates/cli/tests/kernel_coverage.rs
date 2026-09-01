@@ -40,6 +40,27 @@ const DEFERRED: &[(&str, &str)] = &[
     // table can only shrink — within one architecture's port; the next port adds rows and
     // then removes them, and that cycle is the design.)
     //
+    // **FOURTH TURN: not opened at all, 2026-09-01 by the qwen S3 track — and the three-edge
+    // proof was run anyway.** Three launchers landed (`gdn_recurrent_f32`,
+    // `index_pool_norm_f32`, `gated_residual_collapse_f32`), each with its oracle suite in the
+    // same commit, so the table stays EMPTY and the count went 62/62/0 -> 65/65/0. Because no row
+    // was owed, this file's own three arms were proven by plant instead, each observed to change
+    // the tree (`cmp` rc 1 against a saved copy) and to redden with ITS OWN message, then reverted
+    // and observed green on a run that recompiled:
+    //
+    //  * a row naming `launch_gdn_recurrent_prefill_chunked_f32`, which is not a launcher ->
+    //    `:148` *"DEFERRED names `launch_gdn_recurrent_prefill_chunked_f32`, which is not a
+    //    launcher under crates/backend/src"*;
+    //  * a row naming `gdn_recurrent_f32`, which IS covered -> `:154` *"DEFERRED row for
+    //    `launch_gdn_recurrent_f32` … but a test now covers it"*;
+    //  * renaming the `launch_gated_residual_collapse_f32(` call in its suite so the launcher reads
+    //    as uncovered -> `:168` *"1 kernel(s) have a launcher under crates/backend/src and NO
+    //    oracle under crates/engine/tests"*, naming `gated_residual_collapse_f32`.
+    //
+    // The third is the arm that matters most and the one an empty table never exercises: it is the
+    // only one that fires when a launcher lands with no oracle AND no row, which is the miss this
+    // file exists for.
+    //
     // **THIRD TURN, opened AND CLOSED 2026-08-17 by M17c.** The cycle above predicted it — "the
     // next port adds rows and then removes them" — and this turn lasted one commit: the row was
     // added with `gqa_block_attend`'s launcher, and retired the moment

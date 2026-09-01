@@ -51,6 +51,29 @@
 //!   read MOD:681's `.mean(dim=1)`; this fixture cannot tell, and [`POOL_SUM_IS_CANCELLED`]
 //!   records the number so nobody re-derives it as a defect.
 //!
+//! # RED PROOF, OBSERVED 2026-09-01 — deviceless, on the host oracle
+//!
+//! Class: **indexer relu/pool/budget** (the matrix's `indexer_*` rows). [`pool_norm`]'s REFERENCE
+//! `base` was moved to `b * ratio + 1`; `cmp` against a saved copy returns 1 and the run
+//! recompiled.
+//!
+//! * [`the_host_pool_and_norm_reproduces_the_whole_ladder`] **RED** at the first rung —
+//!   `q3 k_layernorm: 6.136655e-1 is outside the 1.14e-4 operator tolerance`.
+//! * `kernel_qwen_gdn_recurrent` stayed **GREEN**, 8 passed, so the plant is scoped to the
+//!   operator it names.
+//! * Reverted, `cmp` rc 0, recompiled, 10 passed exit 0.
+//!
+//! **One thing the plant did that a red-proof note has to say out loud:**
+//! [`the_block_keys_are_roped_at_the_blocks_first_token`] did not fail its assertion — it PANICKED
+//! at `index out of bounds: the len is 384 but the index is 384`, because the last block then
+//! reads a row past the window. A crash is not the assertion going red, and had the primary rung
+//! test not existed the exit code alone would have read as "the proof worked".
+//!
+//! The partial-RoPE convention this pipeline composes with has its own suite,
+//! `kernel_qwen_rope.rs`: it is a claim about `launch_rope_split_half` and the QSA attention's own
+//! captures, not about the block-key stage, and it was split out here when this file crossed the
+//! 800-line soft cap.
+//!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -204,20 +227,6 @@ fn pool_norm(c: &Idx, n_blocks: usize, form: Pool) -> Vec<f32> {
     out
 }
 
-/// Split-half partial RoPE over the first `rd` dims of one row, at `pos`. The pair is
-/// `(j, j + rd/2)` and the frequency is `theta^(-2j/rd)` — the convention
-/// [`rivoli_backend::hip::launch_rope_split_half`] implements and MOD:566-600 specifies.
-fn rope_row(row: &mut [f32], rd: usize, pos: usize, theta: f64) {
-    let half = rd / 2;
-    for j in 0..half {
-        let ang = pos as f64 * theta.powf(-(2.0 * j as f64) / rd as f64);
-        let (cs, sn) = (ang.cos(), ang.sin());
-        let (a, b) = (f64::from(row[j]), f64::from(row[half + j]));
-        row[j] = (a * cs - b * sn) as f32;
-        row[half + j] = (b * cs + a * sn) as f32;
-    }
-}
-
 /// Where a block's RoPE position comes from. `Start` is the reference (MOD:683-688, TR Eq. 13-14:
 /// pooling before roping "avoids averaging token representations with different rotary phases").
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -235,7 +244,13 @@ fn rope_blocks(c: &Idx, kbar: &[f32], at: At) -> Vec<f32> {
             At::End => c.starts[b] as usize + c.ratio - 1,
             At::Zero => 0,
         };
-        rope_row(&mut out[b * c.hd..(b + 1) * c.hd], c.rd, pos, c.theta);
+        h::rope_row(
+            &mut out[b * c.hd..(b + 1) * c.hd],
+            h::Pairing::SplitHalf,
+            c.rd,
+            pos,
+            c.theta,
+        );
     }
     out
 }
@@ -267,7 +282,13 @@ fn last_query_roped(c: &Idx) -> Vec<f32> {
     let q = c.seq - 1;
     let mut rows = c.q_normed[q * c.heads * c.hd..(q + 1) * c.heads * c.hd].to_vec();
     for hh in 0..c.heads {
-        rope_row(&mut rows[hh * c.hd..(hh + 1) * c.hd], c.rd, q, c.theta);
+        h::rope_row(
+            &mut rows[hh * c.hd..(hh + 1) * c.hd],
+            h::Pairing::SplitHalf,
+            c.rd,
+            q,
+            c.theta,
+        );
     }
     rows
 }
@@ -479,7 +500,6 @@ fn the_host_block_scores_reproduce_the_reference() {
 fn every_pool_defect_prices_the_difference_it_names() {
     let c = window();
     let d = h::prefill_draw();
-    let b = h::Bar::at("indexer", HOST_WORST);
     let rungs = ladder(&c, &d);
     for (form, name, floor) in [
         (
@@ -499,17 +519,11 @@ fn every_pool_defect_prices_the_difference_it_names() {
             NORM_OVER_THE_SUM,
         ),
     ] {
-        let mut weakest = f32::INFINITY;
-        for (q, nb, want) in &rungs {
-            let moved = h::rel(&pool_norm(&c, *nb, form), want);
-            b.separates(&format!("q{q}"), name, moved);
-            weakest = weakest.min(moved);
-        }
-        assert!(
-            weakest >= floor * 0.9,
-            "{name}: the weakest rung now separates by {weakest:e}, well under the {floor:e} \
-             recorded — the variant is landing somewhere other than its name says"
-        );
+        let sites: Vec<(String, f32)> = rungs
+            .iter()
+            .map(|(q, nb, want)| (format!("q{q}"), h::rel(&pool_norm(&c, *nb, form), want)))
+            .collect();
+        h::separations(h::Bar::at("indexer", HOST_WORST), name, floor, &sites);
     }
 }
 
@@ -716,81 +730,4 @@ fn the_pool_launcher_refuses_geometry_it_cannot_mean() {
     );
     assert_guard(call(1, 4, 8, f32::NAN), Some(1006), "a NaN epsilon");
     assert_guard(call(2, 4, 8, 0.0), None, "eps zero is legal and exact");
-}
-
-/// **`launch_rope_split_half` IS Qwen3.8-Flash-Next's partial RoPE**, measured against the
-/// reference's own `rope.in`/`rope.out` triple rather than read off the two implementations.
-///
-/// The QSA attention captures both sides of the rotation at every layer and both draws, which is
-/// the only complete weightless triple in the decode goldens. Three things are pinned at once, and
-/// each is a trap:
-///
-/// * the PAIRING is split-half, `(j, j + rotary_dim/2)`, not interleaved `(2j, 2j+1)` — T16, and
-///   `mrope_interleaved: true` in the config invites exactly that confusion (it is about the mRoPE
-///   SECTIONS, not the pairing);
-/// * the rotation covers the FIRST `rotary_dim` of `head_dim` and dims above it pass through —
-///   which needs `head_dim > rotary_dim` to be visible at all, and 32 > 8 here;
-/// * the POSITION is `seq`, not `seq - 1`: the warm prefill occupies `0..seq`, so the decoded
-///   token is at `seq`. Both directions are asserted, because off by one here is a different
-///   rotation and not a rounding error.
-#[cfg(feature = "rocm")]
-#[test]
-fn the_split_half_rope_launcher_is_qwens_partial_rope() {
-    use common::{back, dev, f32b, f32v, ok};
-    use rivoli_backend::hip::launch_rope_split_half;
-
-    // No tolerance row targets the RoPE, so the bar is the `indexer` row it feeds, at the worst
-    // this composition measures on the vendored bytes (1.4596e-7 on q, 2.0805e-7 on k at the
-    // prefill widths; the decode sites are tighter).
-    let b = h::Bar::at("indexer", 2.0805e-7);
-    for d in h::decode_draws() {
-        let (hd, rd) = (d.w("head_dim"), d.w("rotary_dim"));
-        assert!(
-            hd > rd,
-            "head_dim {hd} must exceed rotary_dim {rd}, or the partial-RoPE claim is vacuous"
-        );
-        let pos = d.decode_pos();
-        for layer in [3usize, 27, 47] {
-            for (which, n) in [
-                ("q", d.w("num_attention_heads")),
-                ("k", d.w("num_key_value_heads")),
-            ] {
-                let a = format!("model.layers.{layer}.self_attn.rope");
-                let want = d.flat(&format!("{a}.out.{which}"), n * hd);
-                let mut x = dev(&f32b(&d.flat(&format!("{a}.in.{which}"), n * hd)));
-                let p = x.ptr_mut() as *mut f32;
-                // SAFETY: `x` holds `n · hd` f32 and the kernel rotates the first `rd` of each
-                // `hd`-strided row in place.
-                ok(
-                    unsafe { launch_rope_split_half(p, n, hd, rd, pos, d.rope_theta()) },
-                    "rope_split_half",
-                );
-                let got = f32v(&back(&x));
-                let at = format!("{} L{layer}", d.salt);
-                b.hold(&at, which, &got, &want);
-                // The dims above `rotary_dim` must be untouched — the half of the partial-RoPE
-                // claim that agreement on the whole row cannot separate from a full rotation
-                // whose tail happened to land close.
-                for hh in 0..n {
-                    let row = &got[hh * hd..(hh + 1) * hd];
-                    let src = &want[hh * hd..(hh + 1) * hd];
-                    assert_eq!(
-                        &row[rd..],
-                        &src[rd..],
-                        "{at} {which} head {hh}: the tail dims moved, so this is not a PARTIAL \
-                         rotation"
-                    );
-                }
-                // And the position is load-bearing: `pos - 1` must NOT reproduce it.
-                let mut y = dev(&f32b(&d.flat(&format!("{a}.in.{which}"), n * hd)));
-                let q = y.ptr_mut() as *mut f32;
-                // SAFETY: as above.
-                ok(
-                    unsafe { launch_rope_split_half(q, n, hd, rd, pos - 1, d.rope_theta()) },
-                    "rope_split_half at the previous position",
-                );
-                b.separates(&at, "one position early", h::rel(&f32v(&back(&y)), &want));
-            }
-        }
-    }
 }

@@ -51,6 +51,26 @@
 //! (`qwen-reference/anchor.md` §the load-bearing finding). A prefill kernel needs its own
 //! fixture and must not be scored here.
 //!
+//! # RED PROOF, OBSERVED 2026-09-01 — deviceless, on the host oracle
+//!
+//! Class: **GDN decay form** (`gdn_decay_sigmoid_gate`, the matrix's own row). The REFERENCE arm
+//! of [`gates`] was moved to `sigmoid(a + dt)`; `diff` shows the one line and `cmp` against a saved
+//! copy returns 1, so the tree changed, and the run recompiled (`Compiling rivoli-engine`).
+//!
+//! * [`the_fused_decay_and_write_gate_reproduce_the_rules_own_inputs`] **RED** —
+//!   `qwen-anchor-1 L0 g: 4.8897043e-1 is outside the 1.5e-4 operator tolerance`. That `hold` is
+//!   the FIRST assertion in the body, so nothing above it could have masked it.
+//! * [`the_host_recurrence_reproduces_the_anchor_at_every_gdn_layer`] **RED** —
+//!   `qwen-anchor-1 L0 o: 2.7860975e-2 …`, i.e. the decay's 4.9e-1 error reaches `o` two orders
+//!   weaker, which is why the fused-gate test exists beside the recurrence one.
+//! * Reverted, `cmp` rc 0, recompiled, 8 passed exit 0.
+//!
+//! **And the finding the plant produced:**
+//! [`every_defect_form_prices_the_difference_it_names`] stayed **GREEN** throughout. It scores
+//! variant-against-GOLDEN, so it never reads the reference arm and is structurally blind to a
+//! wrong one. A defect matrix built only from separations would pass on a broken oracle: the two
+//! kinds of test are independent and neither subsumes the other.
+//!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -183,10 +203,6 @@ fn softplus(x: f64) -> f64 {
     if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
 /// `(g, beta)` per V head — the two reductions the reference does before its call and this
 /// kernel does inside it.
 fn gates(c: &Gdn, form: Form) -> (Vec<f64>, Vec<f64>) {
@@ -195,7 +211,7 @@ fn gates(c: &Gdn, form: Form) -> (Vec<f64>, Vec<f64>) {
             let (a, dt) = (f64::from(c.a[hd]), f64::from(c.dt_bias[hd]));
             let scale = -f64::from(c.a_log[hd]).exp();
             let inner = match form {
-                Form::DecaySigmoidGate => sigmoid(a + dt),
+                Form::DecaySigmoidGate => h::sigmoid(a + dt),
                 Form::DtBiasOutsideSoftplus => softplus(a) + dt,
                 _ => softplus(a + dt),
             };
@@ -216,7 +232,7 @@ fn gates(c: &Gdn, form: Form) -> (Vec<f64>, Vec<f64>) {
             if form == Form::BetaPreSigmoid {
                 b
             } else {
-                sigmoid(b)
+                h::sigmoid(b)
             }
         })
         .collect();
@@ -462,7 +478,6 @@ fn the_repeated_qk_heads_are_interleaved_and_not_tiled() {
 /// what its name says.
 #[test]
 fn every_defect_form_prices_the_difference_it_names() {
-    let b = h::Bar::at("gdn_op", HOST_WORST);
     let forms = [
         (Form::L2EpsDropped, "l2norm_eps_dropped", L2_EPS_DROPPED),
         (Form::DecayClamped, "gdn_decay_clamped", DECAY_CLAMPED),
@@ -495,18 +510,15 @@ fn every_defect_form_prices_the_difference_it_names() {
         ),
     ];
     for (form, name, floor) in forms {
-        let mut weakest = f32::INFINITY;
+        let mut sites = Vec::new();
         for_each_gdn(|salt, layer, c| {
             let (o, state) = recurrence(c, form);
-            let moved = h::rel(&o, &c.want_o).max(h::rel(&state, &c.want_state));
-            b.separates(&format!("{salt} L{layer}"), name, moved);
-            weakest = weakest.min(moved);
+            sites.push((
+                format!("{salt} L{layer}"),
+                h::rel(&o, &c.want_o).max(h::rel(&state, &c.want_state)),
+            ));
         });
-        assert!(
-            weakest >= floor * 0.9,
-            "{name}: the weakest site now separates by {weakest:e}, well under the {floor:e} \
-             recorded for it — the variant is landing somewhere other than where its name says"
-        );
+        h::separations(h::Bar::at("gdn_op", HOST_WORST), name, floor, &sites);
     }
 }
 
@@ -612,26 +624,18 @@ fn the_launcher_refuses_geometry_it_cannot_mean() {
     let p = one.ptr() as *const f32;
     let state_out = st.ptr_mut() as *mut f32;
     let o_out = out.ptr_mut() as *mut f32;
+    // Named, because every one of these calls is REFUSED before a launch and so there is nothing
+    // for a stream to order — the same reason `common::stream`'s note gives for the guard tests
+    // that pass a null one. It also stops this closure's tail being token-identical to the sibling
+    // suite's, which jscpd reported.
+    let no_stream: *mut std::ffi::c_void = std::ptr::null_mut();
     let call = |qk: usize, vh: usize, dk: usize, dv: usize| {
         // SAFETY: the buffers above are large enough for every legal case below, and the
         // ILLEGAL ones are refused before a pointer is dereferenced — which is what is under
         // test.
         unsafe {
             launch_gdn_recurrent_f32(
-                p,
-                p,
-                p,
-                p,
-                p,
-                p,
-                p,
-                qk,
-                vh,
-                dk,
-                dv,
-                state_out,
-                o_out,
-                std::ptr::null_mut(),
+                p, p, p, p, p, p, p, qk, vh, dk, dv, state_out, o_out, no_stream,
             )
         }
     };

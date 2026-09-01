@@ -214,6 +214,64 @@ pub fn prefill_draw() -> Draw {
     Draw::of(&PREFILL)
 }
 
+/// The logistic sigmoid in `f64`.
+///
+/// Here rather than per suite because THREE of qwen's operators end in one — the GDN write gate,
+/// the GR branch gate and the GR inject scale — and jscpd matched the second and third copies the
+/// moment they were written. It is `f64` because every host oracle in these suites is.
+pub fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Which pairing a partial RoPE READS. The two write the same output slots.
+///
+/// **One function with a flag here, and two separate entry points in the kernel** — that is not an
+/// inconsistency. `activation.hip` keeps `rope_split_half` and `rope_interleave` apart precisely so
+/// no GLM or V4 call site can reach the other convention by changing an argument, and its note says
+/// so; a host oracle in a test has the opposite requirement, because the whole subject of
+/// `kernel_qwen_rope.rs` is COMPARING them, and two bodies would differ only in the read while
+/// duplicating the frequency and the write — which is exactly what jscpd reported when they were
+/// two.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pairing {
+    /// transformers' `rotate_half`: `(row[j], row[j + rd/2])`. Qwen's, measured.
+    SplitHalf,
+    /// Two adjacent elements: `(row[2j], row[2j+1])`. GLM's and V4's, and trap T16's wrong door.
+    Interleaved,
+}
+
+/// **Partial RoPE over the FIRST `rd` dims of one row, at `pos`, in place.**
+///
+/// `SplitHalf` is the convention [`rivoli_backend::hip::launch_rope_split_half`] implements and
+/// MOD:566-600 specifies; the frequency is `theta^(-2j/rd)` in both, which is the tree's own
+/// statement beside those kernels — "same frequency, same output positions; only the READ moves" —
+/// and having one body is what makes it checkable rather than stated. Dims `rd..` pass through.
+///
+/// In the harness because TWO suites rotate a row: `kernel_qwen_rope.rs` scores the convention
+/// against the attention's own captures, and `kernel_qwen_indexer.rs` composes it into the
+/// block-key pipeline at each block's first token. One definition, so the fixture that PROVES the
+/// convention and the fixture that USES it cannot disagree about what it is.
+///
+/// The snapshot is load-bearing for `Interleaved` and free for `SplitHalf`: reading `2j` while
+/// writing `j` overlaps, so an in-place interleaved rotation without it reads values it has already
+/// overwritten — which `activation.hip`'s own kernels solve with a `__syncthreads` between the read
+/// and the write.
+pub fn rope_row(row: &mut [f32], p: Pairing, rd: usize, pos: usize, theta: f64) {
+    let half = rd / 2;
+    let src = row.to_vec();
+    for j in 0..half {
+        let ang = pos as f64 * theta.powf(-(2.0 * j as f64) / rd as f64);
+        let (cs, sn) = (ang.cos(), ang.sin());
+        let (ai, bi) = match p {
+            Pairing::SplitHalf => (j, half + j),
+            Pairing::Interleaved => (2 * j, 2 * j + 1),
+        };
+        let (a, b) = (f64::from(src[ai]), f64::from(src[bi]));
+        row[j] = (a * cs - b * sn) as f32;
+        row[half + j] = (b * cs + a * sn) as f32;
+    }
+}
+
 /// The relative metric every site scores with: `max |got - want| / max |want|`, over the whole
 /// tensor.
 pub fn rel(got: &[f32], want: &[f32]) -> f32 {
@@ -306,6 +364,38 @@ impl Bar {
     }
 }
 
+/// **One defect row's separations over every site of a fixture, checked twice** — the fixture's own
+/// bar per site, then the recorded weakest over all of them.
+///
+/// The two checks answer different questions and the ORDER matters: the bar says the variant is
+/// visible at all, and the constant says it is visible *where its name claims*. A separation an
+/// order under its constant means the plant landed somewhere other than intended, which the bar
+/// alone cannot say. Factored into the harness after jscpd matched this loop across all three
+/// qwen suites — it was right about the substance as well as the tokens, since three copies are
+/// three places for that order to drift.
+///
+/// **Minima, never maxima.** The bar a variant must clear is the WEAKEST site's; quoting the
+/// strongest lets a form that is nearly invisible at one width pass on another's number. That is
+/// not hypothetical here — the indexer's first-row-only variant spans 1.24x across the ladder and
+/// the first draft of its constant, recorded as a maximum, reddened this assertion.
+pub fn separations(b: Bar, name: &str, floor: f32, sites: &[(String, f32)]) {
+    assert!(
+        !sites.is_empty(),
+        "{name}: zero sites were scored, so nothing was separated — an empty comparison is the \
+         examined-count-reaches-zero hole, not a pass"
+    );
+    for (at, moved) in sites {
+        b.separates(at, name, *moved);
+    }
+    let weakest = sites.iter().map(|(_, m)| *m).fold(f32::INFINITY, f32::min);
+    assert!(
+        weakest >= floor * 0.9,
+        "{name}: the weakest of {} sites separates by {weakest:e}, well under the {floor:e} \
+         recorded for it — the variant is landing somewhere other than where its name says",
+        sites.len()
+    );
+}
+
 // ── the spine's own claims ──────────────────────────────────────────────────────────────────
 
 /// Every vendored byte this port scores against is the byte track B pinned, recomputed from the
@@ -360,6 +450,32 @@ fn a_tripwire_looser_than_its_tolerance_is_refused() {
         caught.is_err(),
         "a measured worst of 1e-4 admits 1e-3, which is above the 1.5e-4 tolerance, and \
          `enforced` must refuse it — otherwise the site it protects has no bar"
+    );
+}
+
+/// `separations` refuses an EMPTY site list.
+///
+/// A standing fixture rather than a plant, because the failure it guards is the one that cannot be
+/// seen from outside: a fixture whose site loop stops yielding scores every defect row over zero
+/// comparisons and reports green. The `weakest` fold would return `INFINITY`, which passes every
+/// floor — so the emptiness has to be refused before the fold, and this is what says it is.
+///
+/// **RED PROOF, OBSERVED 2026-09-01.** Deleting [`separations`]' `!sites.is_empty()` assert (tree
+/// changed, `cmp` rc 1; the run recompiled) turns THIS test red at
+/// `kernel_qwen_harness.rs:415:5` — *"an empty site list must be refused: the weakest of nothing is
+/// INFINITY, which clears every floor there is"* — while the other four stay green, so nothing was
+/// masking it. Restored, `cmp` rc 0, 5 passed exit 0.
+#[test]
+fn a_defect_row_scored_over_zero_sites_is_refused() {
+    let b = Bar {
+        tol: 1.5e-4,
+        worst: 2.3e-7,
+    };
+    let caught = std::panic::catch_unwind(move || separations(b, "nothing", 1.0, &[]));
+    assert!(
+        caught.is_err(),
+        "an empty site list must be refused: the weakest of nothing is INFINITY, which clears \
+         every floor there is"
     );
 }
 

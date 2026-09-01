@@ -407,6 +407,50 @@ launchers! {
         stream: *mut c_void,
     );
 
+    // ── Gated Residual — Qwen3.8-Flash-Next's residual stream (S3) ──────────────────────────
+
+    /// **The read half of one Gated Residual sublayer wrapper** — collapse an `n_r`-wide residual
+    /// stream through a per-element gate and emit the `n_r` inject scales (TR Eq. 32-33 =
+    /// MOD:941-969). `kernels/residual.hip`'s last section carries the arithmetic and the four
+    /// measured defects.
+    ///
+    /// `rhat` and `mix` are `[n_r][dim]`, `inject` is `[n_r]`, `x` is `[dim]` and `scale` is
+    /// `[n_r]`.
+    ///
+    /// **NOT [`launch_hc_pre`], and the difference is structural rather than numeric.** V4 runs
+    /// Sinkhorn-normalised mHC with an `n_r x n_r` branch-mixing comb and `hc_sinkhorn_iters`; TR
+    /// §2.2 pp.10-11 derives GR by dropping that operator outright, and CKPT carries no `n_r x n_r`
+    /// tensor to feed one (trap T9). `hc_pre` also emits a `comb` this model has nothing to do
+    /// with.
+    ///
+    /// `rhat` is the NORMED stream and `mix` is `input_mix_weight_up`'s **pre-sigmoid** output;
+    /// `inject` is `block_inject_weight`'s, pre-sigmoid AND pre-division. The gate wraps `mix`,
+    /// the collapse is a MEAN over `n_r` (not a sum — 3.000e0 apart, and it compounds over 48
+    /// layers), and the `1/n_r` in the scale goes INSIDE the sigmoid, which is measured from the
+    /// reference's own capture rather than read off Eq. 33.
+    ///
+    /// `n_r` above 64 is refused (1003): it is `hc_count`, 4 here, and the scale row is written by
+    /// one block's first threads — `hc_lowrank` (320) and `hc_width` (10240) are each one config
+    /// field away and each larger.
+    ///
+    /// # Safety
+    /// `rhat` and `mix` are `n_r · dim` f32, `inject` is `n_r`, `x` is `dim` writable and `scale`
+    /// is `n_r` writable; all five are device buffers outliving `stream`'s completion and **none
+    /// may alias another** — every parameter is `__restrict__` in the kernel, so that covers `x`
+    /// against `rhat` as well as the two outputs against each other. `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
+    launch_gated_residual_collapse_f32 -> rivoli_gated_residual_collapse_f32,
+    "gated_residual_collapse_f32" (
+        rhat: *const f32,
+        mix: *const f32,
+        inject: *const f32,
+        n_r: usize as i32,
+        dim: usize as i32,
+        x: *mut f32,
+        scale: *mut f32,
+        stream: *mut c_void,
+    );
+
     // ── Block Attention Residuals — Kimi-K3's residual mixer (M9) ───────────────────────────
 
     /// Kimi-K3's Block Attention Residual fold: `out = softmax(<RMSNorm(src_s), fold>) @ src`.
