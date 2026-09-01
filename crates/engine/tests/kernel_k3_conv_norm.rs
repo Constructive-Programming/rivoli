@@ -32,8 +32,8 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli_backend::hip::launch_rmsnorm_gate_heads_f32;
 use rivoli_backend::hip::launch_short_conv_silu_f32;
+use rivoli_backend::hip::{HeadCount, HeadDim, launch_rmsnorm_gate_heads_f32};
 
 mod common;
 mod k3;
@@ -464,8 +464,8 @@ fn gate_norm_launch(
             ob.ptr() as *const f32,
             gb.ptr() as *const f32,
             wb.ptr() as *const f32,
-            heads,
-            head_dim,
+            HeadCount(heads),
+            HeadDim(head_dim),
             eps,
             out.ptr_mut() as *mut f32,
             s.raw(),
@@ -709,9 +709,23 @@ fn the_conv_and_gated_norm_guard_their_shapes() {
     // Without this case nothing reached 1002 at all: every other refusal here fires an
     // earlier guard, and a test that only asserts `is_err()` cannot tell which one did.
     assert_guard(launch_norm((2, 2048), 1e-5), Some(1002), "head_dim 2048");
-    // 96 is K3's HEAD COUNT, so a transposed argument pair lands exactly here — the same
-    // case the recurrence's guard test uses, for the same reason.
-    assert_guard(launch_norm((2, 96), 1e-5), Some(1003), "head_dim 96");
+    // **THE TRANSPOSED-PAIR ROW LIVED HERE AND IS GONE, 2026-09-01 — the case is now
+    // UNREPRESENTABLE rather than refused.** It read
+    // `assert_guard(launch_norm((2, 96), 1e-5), Some(1003), "head_dim 96")`, and its reason was
+    // that 96 is K3's HEAD COUNT, so a transposed argument pair landed exactly on a width guard
+    // 1003 refused for being a non-power-of-two. That guard was removed when the reduction was
+    // padded so Qwen3.8-Flash-Next's `head_dim` 20 could be scored, and it took the defence with
+    // it — a defence that was never about 96 in the first place.
+    //
+    // `launch_rmsnorm_gate_heads_f32` now takes `HeadCount` and `HeadDim`
+    // (`rivoli_backend::hip::HeadCount` carries the full argument), so
+    // `launch_rmsnorm_gate_heads_f32(.., HeadDim(96), HeadCount(2), ..)` is an `error[E0308]`
+    // naming both types. A compile error beats a runtime guard that only fires for the arm that
+    // thinks to try it, and it does not depend on 96 being an awkward number. The red proof is a
+    // compile failure and is recorded in `kernel_qwen_gdn_out_norm.rs`'s header.
+    //
+    // 1002 above still has its case, and it is the one that had to keep it: without
+    // `head_dim 2048` nothing in this test reaches 1002 at all.
     for bad in [-1.0f32, f32::NAN, f32::INFINITY] {
         assert_guard(launch_norm((2, 32), bad), Some(1006), &format!("eps {bad}"));
     }

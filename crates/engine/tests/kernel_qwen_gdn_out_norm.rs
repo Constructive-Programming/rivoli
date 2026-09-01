@@ -101,6 +101,26 @@
 //! > the next head's first output. A host stand-in for a kernel defect is a lower bound on it, not
 //! > a model of it — which is an argument for the device arm, not against the stand-in.
 //!
+//! # RED PROOF, 2026-09-01 — a COMPILE failure, which is the point
+//!
+//! `kernel_k3_conv_norm.rs`'s transposed-pair row is gone and the case is unrepresentable instead.
+//! Swapping this suite's own pair (tree changed, `cmp` rc 1):
+//!
+//! ```text
+//! error[E0308]: arguments to this function are incorrect
+//!    --> crates/engine/tests/kernel_qwen_gdn_out_norm.rs:591:13
+//! 595 |                 HeadDim(head_dim),
+//!     |                 ----------------- expected `HeadCount`, found `HeadDim`
+//! 596 |                 HeadCount(heads),
+//!     |                 ---------------- expected `HeadDim`, found `HeadCount`
+//! ```
+//!
+//! Reverted, `cmp` rc 0, the tree builds. **A compile error is a stronger proof than the runtime
+//! guard it replaces AND a weaker kind of evidence**, and both halves are worth saying: it fires
+//! for every caller rather than only the arm that thinks to try the case, and it can never be
+//! observed going red on hardware, because the code that would fail does not exist to run. That is
+//! the trade the coordinator called — kill the class rather than restore the guard.
+//!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -133,6 +153,14 @@ const HOST_WORST: f32 = 2.4683e-7;
 /// `neighbour_folded_in` is only **3.4x** the operator tolerance, so the bucket-level bound would
 /// nearly miss it and the fixture's own bar is what catches it.
 const MEAN_OVER_THE_PADDED_WIDTH: f32 = 5.7190e-3;
+/// > **A HOST STAND-IN IS A LOWER BOUND ON A KERNEL DEFECT, NOT A MODEL OF IT.** This constant
+/// > predicts 5.5533e-4 for an off-by-one mask; the real kernel plant measured **7.752174e-1** on
+/// > 2026-09-01, three orders larger. The variant folds a neighbour into the mean, and that is all
+/// > it can do from the host — the real off-by-one ALSO lets lane `head_dim` past
+/// > `if (!live) return;`, so it STORES to `out[off]` and clobbers the next head's first output. A
+/// > host variant reaches only the arithmetic the oracle models; a kernel defect reaches whatever
+/// > the kernel does. Use these numbers as floors on what a plant must clear, never as predictions
+/// > of what it will give, and do not "reconcile" a device red that comes in larger.
 const NEIGHBOUR_FOLDED_IN: f32 = 5.5533e-4;
 /// The eps rows. Huge here — 1.5e0 and up — because `o` is small at these widths, so `mean(o²)` is
 /// of order the 1e-6 itself and the epsilon is not a perturbation but a term. The contrast with the
@@ -459,7 +487,7 @@ fn launch(
     z: &[f32],
 ) -> Vec<f32> {
     use common::{DeviceBuf, back, dev, f32b, f32v, ok, zeros};
-    use rivoli_backend::hip::launch_rmsnorm_gate_heads_f32;
+    use rivoli_backend::hip::{HeadCount, HeadDim, launch_rmsnorm_gate_heads_f32};
 
     let cp = |d: &DeviceBuf| d.ptr() as *const f32;
     let (od, zd) = (dev(&f32b(o)), dev(&f32b(z)));
@@ -475,8 +503,8 @@ fn launch(
                 cp(&od),
                 cp(&zd),
                 cp(&w),
-                c.heads,
-                c.head_dim,
+                HeadCount(c.heads),
+                HeadDim(c.head_dim),
                 1e-6,
                 dst,
                 s.raw(),
@@ -549,6 +577,12 @@ fn the_masked_lanes_cannot_reach_the_result() {
         let nan_run = run(f32::NAN);
         let big_run = run(1e30);
         // Believed only if both are finite: an all-NaN pair is byte-identical and says nothing.
+        // **DO NOT SIMPLIFY THIS LOOP AWAY.** It is the finiteness precondition, and on 2026-09-01
+        // it FIRED on real hardware: under the off-by-one mask plant the NaN row leaked into the
+        // output and this assert stopped the run *before* the `assert_eq!` below could compare two
+        // all-NaN results and report them byte-identical. `f32::max` ignores NaN and this repo has
+        // a broken kernel passing 9 of 9 comparisons on record; here the trap was caught in the
+        // act, on silicon, by exactly these four lines.
         for (name, bits) in [("NaN-poisoned", &nan_run), ("1e30-poisoned", &big_run)] {
             assert!(
                 bits.iter().all(|b| f32::from_bits(*b).is_finite()),
@@ -574,17 +608,30 @@ fn the_masked_lanes_cannot_reach_the_result() {
 #[test]
 fn the_norm_gate_launcher_accepts_a_non_power_of_two_and_still_refuses_the_rest() {
     use common::{assert_guard, assert_guards, dev, f32b, zeros};
-    use rivoli_backend::hip::launch_rmsnorm_gate_heads_f32;
+    use rivoli_backend::hip::{HeadCount, HeadDim, launch_rmsnorm_gate_heads_f32};
 
     let src = dev(&f32b(&[0.25f32; 512]));
     let mut out = zeros(512 * 4);
     let dst = out.ptr_mut() as *mut f32;
     let p = src.ptr() as *const f32;
+    // Named for `kernel_qwen_gdn_recurrent.rs`'s reason: every call here is REFUSED before a
+    // launch, so there is nothing for a stream to order — and it keeps this closure's tail from
+    // being token-identical to the sibling suites', which jscpd reported.
+    let no_stream: *mut std::ffi::c_void = std::ptr::null_mut();
     let call = |heads: usize, head_dim: usize, eps: f32| {
         // SAFETY: the buffers cover every legal case below; the illegal ones are refused before a
         // pointer is read, which is what is under test.
         unsafe {
-            launch_rmsnorm_gate_heads_f32(p, p, p, heads, head_dim, eps, dst, std::ptr::null_mut())
+            launch_rmsnorm_gate_heads_f32(
+                p,
+                p,
+                p,
+                HeadCount(heads),
+                HeadDim(head_dim),
+                eps,
+                dst,
+                no_stream,
+            )
         }
     };
     assert_guard(

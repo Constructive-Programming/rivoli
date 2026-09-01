@@ -643,8 +643,10 @@ fn a_summing_pool_is_cancelled_by_the_norm_that_follows_it() {
 #[test]
 fn the_block_key_pipeline_matches_the_anchor() {
     use common::{DeviceBuf, back, dev, f32b, f32v, ok, stream, zeros};
+    use rivoli_backend::abi::ScoreDims;
     use rivoli_backend::hip::{
-        launch_index_pool_norm_f32, launch_index_score_blocks_f32, launch_rope_split_half,
+        ScoreBufs, launch_index_pool_norm_f32, launch_index_score_blocks_f32,
+        launch_rope_split_half,
     };
 
     let c = window();
@@ -718,14 +720,18 @@ fn the_block_key_pipeline_matches_the_anchor() {
     ok(
         unsafe {
             launch_index_score_blocks_f32(
-                q_out as *const f32,
-                kbar_out as *const f32,
-                cp(&w),
-                score_out,
-                1,
-                nb,
-                c.heads,
-                c.hd,
+                ScoreBufs {
+                    q: q_out as *const f32,
+                    kv: kbar_out as *const f32,
+                    w: cp(&w),
+                    score: score_out,
+                },
+                ScoreDims {
+                    s: 1,
+                    n_comp: nb,
+                    heads: c.heads,
+                    hd: c.hd,
+                },
                 s.raw(),
             )
         },

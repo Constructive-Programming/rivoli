@@ -117,6 +117,32 @@ impl ExpertDescF4 {
     }
 }
 
+/// **How many attention heads.** A newtype because `(heads, head_dim)` is two bare `usize` in a
+/// row at three launcher boundaries, and a transposed pair addresses real memory and returns a
+/// finite wrong answer.
+///
+/// > **It exists because a RUNTIME guard that caught that transposition by COINCIDENCE was removed,
+/// > 2026-09-01.** `rivoli_rmsnorm_gate_heads_f32` used to refuse a non-power-of-two `head_dim`
+/// > (1003) so `block_sum_lds`'s halving ladder could not drop elements, and
+/// > `kernel_k3_conv_norm.rs` exploited it: *"96 is K3's HEAD COUNT, so a transposed argument pair
+/// > lands exactly here."* Padding the reduction for qwen's `head_dim` 20 deleted 1003 and took
+/// > that defence with it. The defence was never about 96 — so it is restored as a TYPE rather
+/// > than reinstated as a bound: `launch_x(.., HeadDim(96), HeadCount(2), ..)` is an
+/// > `error[E0308]`, which no arm has to think to try and no width can make legal by accident.
+///
+/// The rule followed is CLAUDE.md's, not this incident's — *newtypes for units, never bare
+/// `usize`*; head counts and widths were the pair not yet done.
+///
+/// **What it does NOT make unrepresentable:** two counts, or two widths, swapped with each other.
+/// [`launch_gdn_recurrent_f32`] takes each twice, so `qk_heads`<->`v_heads` and `dk`<->`dv` still
+/// compile; those are checked at run time (1003) instead of becoming four types for one call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadCount(pub usize);
+
+/// **How wide one head is.** See [`HeadCount`] for why the pair is typed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadDim(pub usize);
+
 /// The four device buffers the sparse indexer's scoring reads and writes — the pointer half
 /// of [`launch_index_score_blocks`], whose `# Safety` section remains the single home for
 /// their sizing and non-aliasing contract.
@@ -320,6 +346,20 @@ unsafe extern "C" {
         hd: i32,
         stream: *mut c_void,
     ) -> i32;
+
+    // Qwen3.8-Flash-Next's fp32 twin of the scorer above (indexer.hip). Same nine arguments,
+    // different arithmetic — see `launch_index_score_blocks_f32`.
+    fn rivoli_index_score_blocks_f32(
+        q: *const f32,
+        kv: *const f32,
+        w: *const f32,
+        score: *mut f32,
+        s: i32,
+        n_comp: i32,
+        heads: i32,
+        hd: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Launcher return-code check: 0 = ok, POSITIVE = arg guard, NEGATIVE = -(hipError_t).
@@ -333,6 +373,43 @@ pub(crate) fn ensure_hip_status(r: i32, name: &str) -> Result<()> {
     } else {
         bail!("{name}: HIP error {}", -r)
     }
+}
+
+/// **Qwen3.8-Flash-Next's indexer block scoring, in fp32** —
+/// `score[t][b] = Σ_h w[t][h] · ReLU(⟨q_t^h, k̄_b⟩)` (MOD:690-693). `kernels/indexer.hip` carries
+/// the arithmetic and the full record.
+///
+/// > **NOT [`launch_index_score_blocks`], and the difference is a PRECISION CONTRACT that no host
+/// > oracle can see.** That kernel rounds to bf16 three times because DeepSeek-V4's indexer does;
+/// > qwen's runs fp32. The reuse was scored deviceless, argued correctly from the algebra, and
+/// > refuted by the first device arm at **2.8701737e-3** against a 1.14e-4 tolerance — bf16's
+/// > resolution. **The deviceless fixture could not have caught it: its oracle is f64 and the
+/// > roundings live only inside the kernel, so every host comparison agreed.** Read the next reuse
+/// > claim for its precision contract and not only for its algebra.
+///
+/// Separate entry point rather than a flag, for the reason `swiglu` and `swiglu_clamped_bf16` are
+/// separate. `w` carries the `1/sqrt(hd)` MOD:693 applies after the sum; there are no learned
+/// per-head weights (trap T6). Mask and top-k are the caller's.
+///
+/// # Safety
+/// Sizes, alignment and non-aliasing are [`launch_index_score_blocks`]'.
+pub unsafe fn launch_index_score_blocks_f32(
+    bufs: ScoreBufs,
+    dims: ScoreDims,
+    stream: *mut c_void,
+) -> Result<()> {
+    let ScoreBufs { q, kv, w, score } = bufs;
+    let ScoreDims {
+        s,
+        n_comp,
+        heads,
+        hd,
+    } = dims;
+    let (s, n_comp) = (s as i32, n_comp as i32);
+    let (heads, hd) = (heads as i32, hd as i32);
+    // SAFETY: caller's pointer contract; stream is a live HipStream handle or null.
+    let r = unsafe { rivoli_index_score_blocks_f32(q, kv, w, score, s, n_comp, heads, hd, stream) };
+    ensure_hip_status(r, "index_score_blocks_f32")
 }
 
 /// Block until all launched kernels retire — one join per token.

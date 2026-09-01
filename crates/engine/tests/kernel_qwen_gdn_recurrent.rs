@@ -568,7 +568,7 @@ fn every_defect_form_prices_the_difference_it_names() {
 #[test]
 fn the_gdn_recurrence_kernel_matches_the_anchor_at_every_gdn_layer() {
     use common::{DeviceBuf, back, dev, f32b, f32v, ok, stream, zeros};
-    use rivoli_backend::hip::launch_gdn_recurrent_f32;
+    use rivoli_backend::hip::{GdnBufs, HeadCount, HeadDim, launch_gdn_recurrent_f32};
 
     // Seven `x.ptr() as *const f32,` lines in a row is the shape jscpd matched against
     // `kernel_k3_conv_norm.rs`'s launch block, and it was right about the substance: the cast is
@@ -597,17 +597,19 @@ fn the_gdn_recurrence_kernel_matches_the_anchor_at_every_gdn_layer() {
         ok(
             unsafe {
                 launch_gdn_recurrent_f32(
-                    r(&q),
-                    r(&k),
-                    r(&v),
-                    r(&a),
-                    r(&bb),
-                    r(&a_log),
-                    r(&dt),
-                    c.qk_heads,
-                    c.v_heads,
-                    c.dk,
-                    c.dv,
+                    GdnBufs {
+                        q: r(&q),
+                        k: r(&k),
+                        v: r(&v),
+                        a: r(&a),
+                        b: r(&bb),
+                        a_log: r(&a_log),
+                        dt_bias: r(&dt),
+                    },
+                    HeadCount(c.qk_heads),
+                    HeadCount(c.v_heads),
+                    HeadDim(c.dk),
+                    HeadDim(c.dv),
                     state_out,
                     o_out,
                     s.raw(),
@@ -630,7 +632,7 @@ fn the_gdn_recurrence_kernel_matches_the_anchor_at_every_gdn_layer() {
 #[test]
 fn the_launcher_refuses_geometry_it_cannot_mean() {
     use common::{assert_guard, dev, f32b, zeros};
-    use rivoli_backend::hip::launch_gdn_recurrent_f32;
+    use rivoli_backend::hip::{GdnBufs, HeadCount, HeadDim, launch_gdn_recurrent_f32};
 
     let one = dev(&f32b(&[1.0f32; 64]));
     let mut st = zeros(64 * 4);
@@ -649,7 +651,22 @@ fn the_launcher_refuses_geometry_it_cannot_mean() {
         // test.
         unsafe {
             launch_gdn_recurrent_f32(
-                p, p, p, p, p, p, p, qk, vh, dk, dv, state_out, o_out, no_stream,
+                GdnBufs {
+                    q: p,
+                    k: p,
+                    v: p,
+                    a: p,
+                    b: p,
+                    a_log: p,
+                    dt_bias: p,
+                },
+                HeadCount(qk),
+                HeadCount(vh),
+                HeadDim(dk),
+                HeadDim(dv),
+                state_out,
+                o_out,
+                no_stream,
             )
         }
     };
