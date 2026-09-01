@@ -181,16 +181,35 @@ if ((${#missing[@]})); then
     echo "  reviewed change, not a side effect of running this script." >&2
     rc=1
 fi
+# The census line stays, and it is what makes a recorded green interpretable: "verified: 4 of 4"
+# is the claim, and a reader of a pasted log can see the denominator rather than infer it.
 echo "vendored goldens verified: $verified of ${#vendored_goldens[@]}"
+# **The EXIT CODE carries that census, and that is a 2026-09-01 correction.** This branch used to
+# print to stderr and leave `rc` alone, and the `verified == 0` guard below could not fire while
+# three of four had reproduced -- so
+# `QWEN_ANCHOR_SALTS=qwen-anchor-1 crates/oracles/tests/qwen-anchor.sh` regenerated half the
+# matrix, derived SINGLE-DRAW floors, printed "verified: 3 of 4" to stdout with the reason on
+# stderr, and exited **0** while this file's own header says the run is two draws. OBSERVED, not
+# reasoned: that arm was run on 2026-09-01 and returned exit 0 (`gate-red-proofs.md` section 14).
+# A green whose denominator is wrong is the false-green class this whole anchor exists inside.
+#
+# A narrowed run is a legitimate thing to DO -- it is how a single row gets re-scored cheaply --
+# and never a legitimate thing to PASS. So the rule is the census itself: exit 0 only when every
+# vendored golden was re-derived from the reference on this run.
 if ((${#unverified[@]})); then
     echo "NOT VERIFIED by this run (no fresh golden): ${unverified[*]}" >&2
     echo "  Their bytes are still FNV-pinned by crates/oracles/tests/qwen_anchor.rs, so they" >&2
     echo "  cannot drift unnoticed -- but nothing here re-derived them from the reference." >&2
 fi
-# A regeneration that reproduces NOTHING is the failure this whole check exists to catch, and it
-# is what an empty $OUT or a wrong --out path looks like from the outside.
-if ((verified == 0 && rc == 0)); then
-    echo "no vendored golden was reproduced at all -- did the driver write to \$OUT?" >&2
+if ((verified < ${#vendored_goldens[@]})); then
+    echo "NOT A FULL ANCHOR RUN: $verified of ${#vendored_goldens[@]} vendored goldens were" >&2
+    echo "  re-derived. Re-run without QWEN_ANCHOR_SALTS/QWEN_ANCHOR_MODES before citing" >&2
+    echo "  anything above -- the floors and weakest defects are per-draw worst cases." >&2
+    # A regeneration that reproduces NOTHING is the extreme of the same failure, and it is what an
+    # empty $OUT or a wrong --out path looks like from the outside.
+    if ((verified == 0)); then
+        echo "  no vendored golden was reproduced at all -- did the driver write to \$OUT?" >&2
+    fi
     rc=1
 fi
 exit $rc
