@@ -90,6 +90,7 @@ from qwen_anchor_lib import (  # noqa: F401
     write_golden,
 )
 from qwen_anchor_taps import (  # noqa: F401
+    REFERENCE_INDEXER,
     restore_reference,
     wrap_conv_ops,
     wrap_gdn_modules,
@@ -539,13 +540,22 @@ def indexer_identity(args):
     defect rows can substitute one line each. A transcription that drifts from a future revision
     of the reference would move the goldens for a reason that has nothing to do with any defect,
     and nothing else in this harness could tell. So the transcription at `variant=None` is run
-    against the reference in one process, on identical weights, and any difference at all is a
-    failure -- not a tolerance.
+    against the REFERENCE'S OWN `forward` in one process, on identical weights, and any difference
+    at all is a failure -- not a tolerance.
+
+    **The pristine arm is `REFERENCE_INDEXER`, and it is what makes this mode a gate.** `_install`
+    installs `wrap_indexer` on every model it builds, so the arm that is meant to be the reference
+    has to ask for no transcription EXPLICITLY. Until 2026-08-31 it did not: the second arm passed
+    `variant="identity"`, a string no branch inside the transcription tests, so both arms ran the
+    same transcribed body and the reference's `forward` never executed. The mode printed
+    `bit_identical True` and no possible state of the transcription could have made it print
+    anything else -- recorded in `qwen-reference/anchor.md` and in the taps module's header.
     """
-    ref = _logits_of(args, _fresh(args)[3], args.seq)
-    got = _logits_of(args, _fresh(args, variant="identity")[3], args.seq)
+    ref = _logits_of(args, _fresh(args, variant=REFERENCE_INDEXER)[3], args.seq)
+    got = _logits_of(args, _fresh(args)[3], args.seq)
     same = bool(torch.equal(ref, got))
-    print(f"# indexer transcription vs reference, variant=identity\nbit_identical\t{same}")
+    print("# transcribed indexer at variant=None vs the reference's own forward, same weights")
+    print(f"bit_identical\t{same}")
     if not same:
         raise SystemExit(
             "the transcribed indexer is NOT bit-identical to the reference at variant=None "

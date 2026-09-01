@@ -25,9 +25,15 @@ defaults to something other than the model file's own body:
     `torch._grouped_mm` out of `integrations/moe.py`, NOT `Qwen4ExpTextExperts.forward`'s own
     body at MOD:859-896 which `qwen-architecture.md` section 6 cites. The driver pins **eager**,
     which is that body -- and which is also the only one that compiles for fp64, so it is what
-    makes the tolerance floors measurable at all. The two disagree by 1.760e-6 relative on the
-    logits (measured, `anchor.md`), and that disagreement is a first-party-versus-first-party
-    floor in its own right.
+    makes the tolerance floors measurable at all. The two disagree by **4.673e-6** relative on the
+    logits, and that disagreement is a first-party-versus-first-party floor in its own right.
+
+    > **CORRECTED 2026-08-31.** This line said 1.760e-6, which disagreed with the same measurement
+    > in `anchor.md`'s two statements of it (4.673e-6) -- one number, three places, two values, and
+    > nothing re-derived any of them. Re-run rather than reconciled:
+    > `qwen_anchor_driver.py --config docs/measurement/qwen-reference/config.json --mode moe-equiv`
+    > printed `logits max_rel 4.673e-06` at salt `qwen-anchor-1`, exit 0, 3.0 s. That is the one
+    > number, and `anchor.md` now cites this run rather than an inherited figure.
   * the fla / `causal_conv1d` / `kernels` fallback above. The driver ASSERTS all three are
     absent rather than trusting the venv.
 

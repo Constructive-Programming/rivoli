@@ -23,10 +23,19 @@ to it:
     this file's reading of it.
 
 The one place this module transcribes reference code is [`indexer_variant_forward`], and the cost
-is paid explicitly: `--mode indexer-identity` runs the model twice in one process, with and
-without the transcription at `variant=None`, and refuses any difference. A copy that silently
-drifts from the reference is the failure mode; a copy with a bit-exact identity gate is a
-substitution vehicle.
+is paid explicitly: `--mode indexer-identity` runs the model twice in one process -- once with the
+transcription at `variant=None` and once with [`REFERENCE_INDEXER`], which installs no
+transcription at all and leaves `Qwen4ExpTextQSAIndexer.forward` as the reference ships it -- and
+refuses any difference. A copy that silently drifts from the reference is the failure mode; a copy
+with a bit-exact identity gate is a substitution vehicle.
+
+> **The sentinel arm is a fix, dated 2026-08-31, and what it replaced could not have failed.**
+> `qwen_anchor_driver._install` installs `wrap_indexer` on EVERY model it builds, so before the
+> sentinel existed both arms of the identity mode ran the transcription: one at `variant=None` and
+> one at `variant="identity"`, a string matching no branch inside the body and therefore producing
+> the identical code path. The mode compared the transcription against itself and the reference's
+> own `forward` never ran. It reported `bit_identical True` on every revision it was ever run on,
+> including revisions where it would have been wrong to.
 """
 
 import math
@@ -59,6 +68,14 @@ _CLASS_SYMBOLS = (
 )
 _TORCH_SYMBOLS = ("relu", "bitwise_xor")
 _PRISTINE = {}
+
+# **The variant that is not a variant: install NOTHING and let the reference's own indexer run.**
+# A unique object rather than a string, compared with `is`: every other variant is a string tested
+# by `==` inside [`indexer_variant_forward`], and a string sentinel that failed to match any branch
+# there is EXACTLY the defect this constant exists to remove -- it would read as "the reference"
+# and behave as "the transcription with no substitution". `object()` cannot be reached by an `==`
+# on a name, so the two arms of `--mode indexer-identity` cannot silently become one again.
+REFERENCE_INDEXER = object()
 
 
 def restore_reference(mdl_mod):
@@ -511,9 +528,11 @@ def indexer_variant_forward(variant, tap):
     Three of the six indexer defect rows -- the RoPE position the pooled keys are taken at, the
     order of pooling against normalisation, and the axis the per-head ReLU scores are summed
     over -- live inside this one 40-line function and cannot be reached by substituting a free
-    function or setting an attribute. `--mode indexer-identity` runs the model with
-    `variant=None` against the reference in one process and refuses any difference, so a copy
-    that drifts from a future revision is loud rather than silent.
+    function or setting an attribute. `--mode indexer-identity` runs this body at `variant=None`
+    against a second model on which [`REFERENCE_INDEXER`] left `cls.forward` untouched, in one
+    process and on identical weights, and refuses any difference -- so a copy that drifts from a
+    future revision is loud rather than silent. Until 2026-08-31 that mode had no pristine arm and
+    scored this body against itself; the sentinel's own note records it.
 
     Variants:
       * `rope_at_block_end` -- `group_starts = block_token_indices[:, -1]`. TR Eq. 13-14 and
@@ -660,7 +679,7 @@ def _rope(q, cos, sin, unsqueeze_dim):
 
 
 def wrap_indexer(mdl_mod, tap, variant=None):
-    """Count every indexer call, and install a variant or the dense bypass when asked.
+    """Count every indexer call, and install a variant, the dense bypass, or NOTHING.
 
     The counter is always on: `assert_captured` uses it to refuse a run in which the indexer did
     not reach all twelve `qwen_sparse_attention` layers, which is what a `layer_types` read at
@@ -668,10 +687,16 @@ def wrap_indexer(mdl_mod, tap, variant=None):
     (trap T19). At the real budget that defect is bit-identical below 2051 cached tokens and
     therefore invisible; at this fixture's budget of 8 the boundary is 11, so a 16-token window
     sees it.
+
+    **`variant is REFERENCE_INDEXER` makes `body` the reference's own `forward`** -- the counter
+    still wraps it, so the census is unchanged, but no transcribed arithmetic runs. That is the
+    pristine arm `--mode indexer-identity` needs and did not have: `_install` installs this
+    function on every model, so with no sentinel BOTH arms were the transcription and the
+    comparison was vacuous (see this module's header, dated 2026-08-31).
     """
     cls = mdl_mod.Qwen4ExpTextQSAIndexer
     orig = cls.forward
-    body = indexer_variant_forward(variant, tap)
+    body = orig if variant is REFERENCE_INDEXER else indexer_variant_forward(variant, tap)
 
     def counted(self, hidden_states, position_embeddings, attention_mask, past_key_values):
         tap.ctx["indexer_calls"] += 1
