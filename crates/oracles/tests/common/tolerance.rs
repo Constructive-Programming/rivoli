@@ -394,13 +394,45 @@ pub const QWEN: &[Tol] = &[
     // the row that would have collapsed to `ExactOnly` the way K3's MLA eps did.
     rel_row("hc_attn", 1.4249e-5, 7.2782e-2, 1.42e-4),
     // The QSA indexer: pooled keys, block starts, per-block scores and the selection mask.
-    // Weakest targeting defect `indexer_budget_one_block_short` at 1.000e0. Margin 87,800x.
+    // Weakest targeting defect 1.0000e0, printed against `indexer_budget_one_block_short`.
+    // Margin 87,800x -- and the two numbers in that sentence need the paragraphs below before
+    // either is read as a magnitude.
     //
-    // The scores are IN this bucket and that is what makes the row real. Three rows
-    // (`indexer_rope_at_block_end`, `rope_interleaved_pairs`, and a rejected max-over-heads
-    // reading) perturbed the scores without moving the top-2 and left the whole bucket
-    // bit-identical when only the final mask was captured -- argmax invariance, the same shape
-    // as this tree's recorded "ids moved by exactly 0.000e0" finding.
+    // The scores are IN this bucket and that is what makes the row real: a defect that moves the
+    // scores without moving the selection still reddens it, which is why the bucket captures
+    // `index_qk_proj`, `q_layernorm`, `k_layernorm`, `pooled_keys` and `scores` and not just the
+    // mask.
+    //
+    // > **CORRECTED 2026-09-01, from the matrix's own bytes.** This comment claimed the weakest
+    // > signal was `indexer_budget_one_block_short`'s and that `indexer_rope_at_block_end` and
+    // > `rope_interleaved_pairs` "perturbed the scores without moving the top-2". Re-derived
+    // > per defect and per tensor over both draws, three things are wrong with that:
+    // >
+    // > * **1.0000e0 is the mask SATURATING, not a measured magnitude.** The three captured
+    // >   selection masks (`model.layers.{3,27,47}.self_attn.indexer`) hold 0 and -3.40282e38 --
+    // >   the only tensors in the whole golden whose scale exceeds 1e30 -- so `|delta|/max|y|` is
+    // >   exactly 1.0 for ANY single flipped entry, at any draw, for any defect. It is a constant
+    // >   the metric emits, and it is why two unrelated rows report the same number.
+    // > * **It is a TIE.** `indexer_budget_one_block_short` and `rope_interleaved_pairs` both sit
+    // >   at exactly 1.0000e0 (both at draw 1; at draw 2 they are 1.425e0 and 1.591e0). The
+    // >   derivation used to break the tie by `EXPECT_FIRST_TOUCH`'s dict order, so `sets_the_row`
+    // >   named one of them for no measured reason; it now breaks ties by name, which happens to
+    // >   keep this row's printed name.
+    // > * **`rope_interleaved_pairs` DOES move the selection.** Compared bit-for-bit, it changes
+    // >   2 of the 3 masks at draw 1 and 1 of 3 at draw 2. The row that is selection-invariant is
+    // >   `indexer_rope_at_block_end` (0 of 3 at draw 1, 1 of 3 at draw 2), and its 1.685e0 is
+    // >   carried entirely by `pooled_keys`. The old sentence had the two rows the wrong way round.
+    // >
+    // > **The row itself does not move.** Excluding the three saturating masks, the weakest
+    // > indexer signal over both draws is 4.1458e-1 (`qsa_layer_is_dense`, whose whole intended
+    // > observable IS the mask, so what is left is leakage), a margin of 36,398x -- still two
+    // > orders above the 297x a `Rel` policy needs, so the 1.14e-4 threshold and the policy stand
+    // > on the conservative number rather than on the saturated one. **What S3 must not do is read
+    // > 1.0 as headroom**: the mask is compared EXACTLY, never against this threshold.
+    // >
+    // > Two entries in the same column are 1e-30-denominator artifacts for the same reason and are
+    // > equally not magnitudes: `indexer_relu_after_sum` 9.54e29 and `qsa_layer_is_dense` 3.40e68.
+    // > They are maxima, so they set nothing.
     rel_row("indexer", 1.1390e-5, 1.0000e0, 1.14e-4),
     // The routed experts. Weakest -- and only -- targeting defect `expert_gate_up_swapped` at
     // 8.222e-1: the fused `gate_up_proj` halves exchanged, so SiLU lands on `up`. Margin

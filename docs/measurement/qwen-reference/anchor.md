@@ -1,7 +1,7 @@
 ---
 scope: qwen
 status: data
-verdict: The S2 Qwen3.8-Flash-Next anchor exists and runs, its per-operator TOLERANCES are measured on both weight draws, and it needed NO GPU — transformers' own qwen4_exp (5.16.1, torch 2.13.0+cpu, python 3.14.6) ships pure-torch GatedDeltaNet bodies, so the whole matrix is CPU at a measured 252 s on nproc 32, and the driver ASSERTS fla, kernels and causal_conv1d are all absent rather than trusting the venv. FOUR goldens are vendored (crates/oracles/tests/qwen-anchor-{decode-qwen-anchor-1,decode-qwen-anchor-2,prefill-qwen-anchor-1,ngram-real}.bin at 338,050 / 338,050 / 399,035 / 2,891 B), all four reproduced byte-for-byte by a later independent run, and read deviceless by three test binaries (12 tests, no python, no venv, no network). THIRTY-EIGHT defect rows across 13 classes x 2 salts = 76 compare cells, all green in BOTH directions — each row's declared first-touched bucket reddens AND every captured bucket upstream of it stays bit-identical. NINE tolerance rows sit at 10x their floors, each floor measured fp32-against-fp64 at both draws and taken as the max: gdn_conv 7.638e-6, gdn_op 1.4959e-5, gdn_out_norm 1.6539e-5, gdn_proj 1.1838e-5, hc_attn 1.4249e-5, indexer 1.139e-5, moe 1.5243e-5, moe_route 1.9242e-5, qsa_proj 1.0408e-5, with the weakest targeting defect l2norm_eps_dropped at 1.610e-2 (margin 1077x). THE TOLERANCE FINDING: gdn_op has TWO honest floors and the second is the one a HIP port will be — the reference's chunked and recurrent bodies disagree by 9.420e-5 over 36 layers, 6.3x the fp64 number, at which the l2-norm eps margin falls to 171x and forces ExactOnly, so a CHUNKED prefill kernel needs its own prefill-mode GDN fixture or the 1e-6 eps pinned by reading it as K3's MLA eps is. ngram_hash gets no row at all because its floor is exactly 0.000e0 — the ids are int64 and fp32 and fp64 produce the same integers. THREE INHERITED DEFECTS were found by reading the vendored bytes back and are fixed: the prefill golden held THIRTEEN tensors under one name (the indexer norm runs once per query position and nothing had ever read that file), one width-audit row asserted a distinction the real config does not have (half_head_dim == indexer_head_dim == 128, which is also 2*rotary_dim), and one asserted an equality that was tautological by construction. FIVE red proofs are recorded and were observed left/right rather than by exit code, and one of them arms the per-class rule against bytes from a driver whose own rule was weaker; TWO FURTHER PLANTS LIED and are recorded rather than deleted — one returned a full green on an unmodified tree because its substitution never applied, and the other changed the tree correctly while the GENERATOR refused it, so the artifact under test never moved and the green meant nothing. A THIRD false green was found 2026-08-31 by reading the harness rather than its output and is NOT yet discharged: --mode indexer-identity had no pristine arm at all — _install installs wrap_indexer on every model, and the arm meant to be the reference asked for variant="identity", a string matching no branch, so BOTH arms ran the transcription and the mode reported bit_identical True on every revision it was ever run on; it is fixed by a REFERENCE_INDEXER object() sentinel compared with is, so no string can collapse the two arms again, and BOTH the re-run and the red proof were paid 2026-09-01 -- baseline exit 0 True, planted (taps.py md5 moved) exit 1 FALSE, reverted (md5 restored) exit 0 True, with a score-rescale plant rejected as a proof because topk is invariant under it and it would have reported green on a modified tree. The frozen teacher-forced window stays OWED — it needs the 172.76 GiB checkpoint, which is not on this box.
+verdict: The S2 Qwen3.8-Flash-Next anchor exists and runs, its per-operator TOLERANCES are measured on both weight draws, and it needed NO GPU — transformers' own qwen4_exp (5.16.1, torch 2.13.0+cpu, python 3.14.6) ships pure-torch GatedDeltaNet bodies, so the whole matrix is CPU at a measured 252 s on nproc 32, and the driver ASSERTS fla, kernels and causal_conv1d are all absent rather than trusting the venv. FOUR goldens are vendored (crates/oracles/tests/qwen-anchor-{decode-qwen-anchor-1,decode-qwen-anchor-2,prefill-qwen-anchor-1,ngram-real}.bin at 338,050 / 338,050 / 399,035 / 2,891 B), all four reproduced byte-for-byte by a later independent run, and read deviceless by three test binaries (12 tests, no python, no venv, no network). THIRTY-EIGHT defect rows across 13 classes x 2 salts = 76 compare cells, all green in BOTH directions — each row's declared first-touched bucket reddens AND every captured bucket upstream of it stays bit-identical. NINE tolerance rows sit at 10x their floors, each floor measured fp32-against-fp64 at both draws and taken as the max: gdn_conv 7.638e-6, gdn_op 1.4959e-5, gdn_out_norm 1.6539e-5, gdn_proj 1.1838e-5, hc_attn 1.4249e-5, indexer 1.139e-5, moe 1.5243e-5, moe_route 1.9242e-5, qsa_proj 1.0408e-5, with the weakest targeting defect l2norm_eps_dropped at 1.610e-2 (margin 1077x). THE TOLERANCE FINDING: gdn_op has TWO honest floors and the second is the one a HIP port will be — the reference's chunked and recurrent bodies disagree by 9.420e-5 over 36 layers, 6.3x the fp64 number, at which the l2-norm eps margin falls to 171x and forces ExactOnly, so a CHUNKED prefill kernel needs its own prefill-mode GDN fixture or the 1e-6 eps pinned by reading it as K3's MLA eps is. ngram_hash gets no row at all because its floor is exactly 0.000e0 — the ids are int64 and fp32 and fp64 produce the same integers. THREE INHERITED DEFECTS were found by reading the vendored bytes back and are fixed: the prefill golden held THIRTEEN tensors under one name (the indexer norm runs once per query position and nothing had ever read that file), one width-audit row asserted a distinction the real config does not have (half_head_dim == indexer_head_dim == 128, which is also 2*rotary_dim), and one asserted an equality that was tautological by construction. FIVE red proofs are recorded and were observed left/right rather than by exit code, and one of them arms the per-class rule against bytes from a driver whose own rule was weaker; TWO FURTHER PLANTS LIED and are recorded rather than deleted — one returned a full green on an unmodified tree because its substitution never applied, and the other changed the tree correctly while the GENERATOR refused it, so the artifact under test never moved and the green meant nothing. A THIRD false green was found 2026-08-31 by reading the harness rather than its output and was DISCHARGED 2026-09-01: --mode indexer-identity had no pristine arm at all — _install installs wrap_indexer on every model, and the arm meant to be the reference asked for variant="identity", a string matching no branch, so BOTH arms ran the transcription and the mode reported bit_identical True on every revision it was ever run on; it is fixed by a REFERENCE_INDEXER object() sentinel compared with is, so no string can collapse the two arms again, and BOTH the re-run and the red proof were paid 2026-09-01 -- baseline exit 0 True, planted (taps.py md5 moved) exit 1 FALSE, reverted (md5 restored) exit 0 True, with a score-rescale plant rejected as a proof because topk is invariant under it and it would have reported green on a modified tree. THE 2026-09-01 REVIEW ROUND closed three further paths that could not have gone red, each with an observed left/right (gate-red-proofs.md section 14b). (i) qwen-anchor.sh exited 0 on a QWEN_ANCHOR_SALTS-narrowed run while printing "vendored goldens verified: 3 of 4", so the exit code now carries that census. (ii) --tolerance-table counted nothing it examined: removing ONE golden of 82 made it print a table identical to the citable one on eight of nine rows and silently wrong on the ninth -- gdn_op weakest 4.9262e-2 instead of 1.6102e-2, which at the chunked floor reads 523x instead of 171x and therefore CROSSES the 297x a Rel policy needs, reversing the ExactOnly conclusion a chunked prefill kernel rests on -- so it now refuses unless the pairs examined equal 38 defect rows x the draws found, refuses a single-draw matrix outright, and breaks sets_the_row ties by name rather than by dict order. (iii) the tolerance table's measured-operator set was a hand-typed nine-element array that a tenth operator would bypass; it is now DERIVED from the golden's own first_touch map, proven by planting a tenth bucket into the vendored bytes (left 10 right 9) where the pre-fix body passed the same planted file GREEN. THE NINE TOLERANCE ROWS DID NOT MOVE, re-derived on a fresh full run. The indexer row is CORRECTED in place: its 1.0000e0 is the selection mask SATURATING (0 against -3.40282e38, the only three tensors in the golden whose scale exceeds 1e30) and a TIE between indexer_budget_one_block_short and rope_interleaved_pairs, not a measured magnitude; rope_interleaved_pairs DOES move the selection (2 of 3 masks at draw 1, 1 of 3 at draw 2) and indexer_rope_at_block_end is the invariant one, so the old sentence had the two rows the wrong way round; excluding the masks the weakest indexer signal over both draws is 4.1458e-1, a 36,398x margin, so Rel(1.14e-4) stands on the conservative number and S3 must never read 1.0 as headroom. ONE GATE IS OWED AND BLOCKED ON A BRANCH RATHER THAN ON A MEASUREMENT: asserting this anchor's int64 n-gram buffers against rivoli_artifact::census::qwen::ngram_hash(&cfg, 0) needs crates/artifact/src/census/, which exists only on track/qwen-artifact and not at the merge base, so it does not compile here -- the assertion was settled numerically instead (byte-exact at ple_layer_index 0, every value different at 1) and is a merge-order item for the coordinator. The frozen teacher-forced window stays OWED — it needs the 172.76 GiB checkpoint, which is not on this box.
 ---
 
 # The Qwen3.8-Flash-Next S2 anchor
@@ -328,6 +328,35 @@ multiset intact** — it is the one a symmetry check passes. `router_sigmoid` (2
 here than `router_no_renorm` (4.15e0) because the flat untrained draw makes the renormalisation
 cheap; a trained router inverts that, so neither row should be inherited to S4 without re-measuring.
 
+> **CORRECTED 2026-09-01: the `indexer` row's 1.0000e0 is the mask saturating, not a magnitude.**
+> The review asked whether that column really is ≥ 1.0 for the nine defects that declare `indexer`,
+> since `common/tolerance.rs`'s `indexer` row records two of them as perturbing the scores without
+> moving the top-2. Re-derived
+> per defect and per tensor over both draws, it is — and for a reason that makes the number mean
+> something other than what it reads as. The three captured selection masks
+> (`model.layers.{3,27,47}.self_attn.indexer`) hold `0` and `-3.40282e38`, and they are **the only
+> tensors in the whole golden whose scale exceeds 1e30**, so `|Δ|/max|y|` is exactly `1.0` for any
+> single flipped entry. Three consequences, all recorded at `common/tolerance.rs`'s row:
+>
+> * it is a **TIE** — `indexer_budget_one_block_short` and `rope_interleaved_pairs` both sit at
+>   exactly 1.0000e0 (both at draw 1; 1.425e0 and 1.591e0 at draw 2), and the derivation used to
+>   break the tie by dict order, so the printed `sets_the_row` name was not a measurement. It now
+>   breaks ties by name, which leaves this row's printed name unchanged;
+> * **`rope_interleaved_pairs` does move the selection** — bit-for-bit it changes 2 of the 3 masks
+>   at draw 1 and 1 of 3 at draw 2. The selection-invariant row is `indexer_rope_at_block_end`
+>   (0 of 3 at draw 1, 1 of 3 at draw 2), carried entirely by `pooled_keys` at 1.685e0 — so the
+>   `tolerance.rs` sentence had the two rows the wrong way round. (The review located that sentence
+>   in this file at lines 396-403; it is not here and never was, it is only at the table.);
+> * **the row's policy is unaffected.** Excluding the three masks, the weakest indexer signal over
+>   both draws is 4.1458e-1 (`qsa_layer_is_dense`, whose entire intended observable IS the mask, so
+>   the remainder is leakage) — a margin of **36,398x**, still two orders above the 297x a `Rel`
+>   policy needs. The threshold stays 1.14e-4, justified by the conservative number.
+>
+> **S3 must not read 1.0 as headroom.** The mask is compared exactly, never against this threshold.
+> Two other cells in the same column are 1e-30-denominator artifacts and equally not magnitudes:
+> `indexer_relu_after_sum` 9.54e29 and `qsa_layer_is_dense` 3.40e68. Both are maxima, so they set
+> nothing.
+
 ### The load-bearing finding: `gdn_op` has two floors
 
 The reference ships **two implementations of the same recurrence**, so there are two honest floors:
@@ -485,6 +514,25 @@ are `[0.0, 0.0, 0.712, 1.244]`. The tie is not a degenerate draw — the per-blo
 0.0**, and two such blocks tie exactly. The assertion was narrowed to the claim that matters: the
 score at rank `block_topk - 1` is strictly above the one at rank `block_topk`, by a real margin.
 
+### The 2026-09-01 review round: three more, and a counterfactual
+
+Full record with the tables: `gate-red-proofs.md` §14b. In brief, and all deviceless:
+
+| gate | plant | what reddened |
+|---|---|---|
+| `qwen-anchor.sh`'s vendored census | narrow to one salt | pre-fix **exit 0** with `verified: 3 of 4`; post-fix **exit 1** with the same census line |
+| `--tolerance-table` | remove 1 golden of 82 | left `75 (operator, defect) pairs`, right `want 76 pairs (38 defect rows x 2 draws)`; no table printed |
+| the measured-operator set | a tenth `first_touch` bucket written INTO the vendored golden (338,050 → 338,092 B) | `qwen_anchor.rs:442` **left 10 right 9** |
+
+**Two of the three carry a counterfactual, and that is what makes them worth the ink.** The
+81-file matrix run against the PRE-fix driver exits 0 and prints a table whose header still names
+both salts, identical to the citable one on eight of nine rows and silently wrong on the ninth:
+`gdn_op` weakest 4.9262e-2 rather than 1.6102e-2, which at the chunked GDN floor reads 523x rather
+than 171x — across the 297x a `Rel` policy needs, so one missing file of 82 reverses the
+`ExactOnly` conclusion the section above rests on. And the planted-tenth-bucket golden run against
+the PRE-fix test body passes **green**: the frozen nine-element array could not see the input the
+derived set exists to catch.
+
 ## Declared deviations
 
 Every one is in the metadata and pinned by a test.
@@ -516,6 +564,23 @@ Every one is in the metadata and pinned by a test.
   tie-break is not a perturbation of the reference's arithmetic, and this fixture cannot show it
   because its own cut is clean. S3 must settle it by reading the reference's selection, not by
   scoring against these bytes.
+* **The n-gram gate against track A's derivation is OWED, and it is blocked on a BRANCH, not on a
+  measurement.** The strongest available check on `qwen-anchor-ngram-real.bin` is to assert its
+  three int64 buffers against `rivoli_artifact::census::qwen::ngram_hash(&cfg, 0)` — 16 primes, 16
+  offsets, 3 multipliers, byte for byte — which turns this file's rule check into a comparison of
+  the port's own derivation against first-party observation. It cannot land on
+  `track/qwen-anchors`: `crates/artifact/src/census/` and `QwenTextConfig` exist only on
+  `track/qwen-artifact`, and the merge base `fac53c6` has neither, so the call does not compile
+  here and a test that does not compile is not a gate. **The assertion was settled numerically on
+  2026-09-01 instead**, so whoever lands it lands a known-true one: track A's derivation
+  transliterated and run against these bytes reproduces them EXACTLY at `ple_layer_index = 0`
+  (multipliers `[23703573157769, 20109073645365, 8052911324071]`, all 16 vocabularies and offsets,
+  `total_vocab_size` 320,001,446, 320,001,536 padded rows) and differs in every one of them at
+  index 1 (first prime 20000213 against 20000003) — so the gate is non-vacuous in the direction
+  that matters, distinguishing this checkpoint's PLE layer index. A merge-order item for the
+  coordinator. The second trial-division `is_prime` stays deliberately independent of A's, argued
+  at `qwen_anchor_windows.rs`: routing both through one walk would make the derivation and its
+  check agree by construction.
 * **`qk_norm` has a measured floor (1.165e-5) and no row**, because no defect targets it yet. A floor
   is half a row; the other half is deciding which defects TARGET the operator, and that is per-kernel
   work. **Do not score it against a threshold** — compare it exactly until a row exists.

@@ -172,6 +172,25 @@ fn the_ladder_partitions_the_queries(g: &GoldenSet, key: &str, ratio: usize, top
 /// fp8 block-128 scheme covers and excludes the n-gram table from it, and separately settles the
 /// GDN output norm's ones-centred form from 256 real bytes. This is the hash ARITHMETIC, which
 /// neither of those touches.
+///
+/// **OWED, and blocked on a branch rather than on a measurement** (2026-09-01). The strongest
+/// available gate is to assert these vendored int64 buffers against
+/// `rivoli_artifact::census::qwen::ngram_hash(&cfg, 0)` — 16 primes, 16 offsets, 3 multipliers,
+/// byte for byte — which turns a rule check into a comparison of the port's derivation against
+/// first-party observation. It cannot land here: `crates/artifact/src/census/` exists only on
+/// `track/qwen-artifact`, and the merge base of that branch and this one
+/// (`fac53c6`) has neither the module nor `QwenTextConfig`, so the call does not compile on this
+/// branch and a test that does not compile is not a gate.
+///
+/// **The assertion was settled numerically instead, so whoever lands it lands a known-true one.**
+/// Track A's derivation was transliterated and run against these bytes on 2026-09-01: at
+/// `ple_layer_index = 0` the multipliers `[23703573157769, 20109073645365, 8052911324071]`, all
+/// 16 vocabularies, all 16 offsets, `total_vocab_size` 320,001,446 and the 320,001,536 padded
+/// rows all match **exactly**; at `ple_layer_index = 1` every one of them differs
+/// (multipliers `[3352040966061, …]`, first prime 20000213 against 20000003). So the gate is
+/// non-vacuous in the direction that matters — it distinguishes this checkpoint's PLE layer
+/// index — and it is a merge-order item for the coordinator, not a measurement anyone still
+/// owes. See also the deliberate second `is_prime` below.
 #[test]
 fn the_real_parameter_ngram_anchor_pins_the_full_width_hash() {
     let g = load(&NGRAM_REAL);
@@ -333,6 +352,19 @@ fn every_hashed_id_lands_in_its_own_head(g: &GoldenSet) {
 /// Trial division. The vocabularies are around 2e7, so this is under 4500 divisions each — cheaper
 /// than a dependency, and cheaper than pinning 16 constants that would themselves become the thing
 /// nobody verified.
+///
+/// **A SECOND trial-division walk exists in the tree, and keeping it is deliberate** (2026-09-01).
+/// `rivoli_artifact::census::qwen::ngram_hash` (track A, `track/qwen-artifact`) carries its own
+/// `is_prime` over `u64`, and a reviewer proposed collapsing the pair. The old argument for this
+/// copy — "cheaper than a dependency" — does not cover that, because A's is not a dependency;
+/// this one does. **The check this file makes is a check ON that derivation.** The owed gate
+/// below asserts A's 16 primes equal the golden's vendored int64 bytes; the assertions above
+/// assert the golden's own primes ARE prime. Route both through one primality walk and a bug in
+/// it — an overflowing `d * d`, a mishandled small case — makes the derivation and its check
+/// agree by construction, which is the recorded "recovered-parameter gates live on an asymmetry"
+/// failure and cancels exactly the defect the gate is hunting. Independence is the point, so the
+/// duplication is priced rather than removed; jscpd does not report the pair (token floor, plus
+/// `i64` against `u64`), so this note is what keeps the decision visible.
 fn is_prime(n: i64) -> bool {
     if n < 2 {
         return false;
