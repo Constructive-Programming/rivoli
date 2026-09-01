@@ -23,7 +23,7 @@ pub mod quant;
 /// reason [`glimmer_encoding`] and [`v4_encoding`] are: this one builds a **string** that is
 /// tokenized afterwards where GLM's builds a token-ID list, and the old tree's own header says
 /// of that pair that "the two must not converge". Unlike its three siblings it returns a
-/// `Result`, because this checkpoint's template calls `raise_exception` in eight places and
+/// `Result`, because this checkpoint's template calls `raise_exception` in NINE places and
 /// three of them are reachable from an ordinary OpenAI client — see the module header.
 pub mod qwen_encoding;
 pub mod schema;

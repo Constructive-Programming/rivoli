@@ -23,8 +23,9 @@
 //! - **`enable_thinking` and `preserve_thinking`** — FOUR states each, because Jinja's
 //!   `is true`/`is false` are IDENTITY against the booleans, so `1`, `0`, `null` and `"true"`
 //!   land in a state neither branch was written for.
-//! - **the reject direction** — eight `raise_exception` sites, three of them reachable from an
-//!   ordinary OpenAI client.
+//! - **the reject direction** — NINE `raise_exception` sites, three of them reachable from an
+//!   ordinary OpenAI client. The count is a gate here, not a sentence: five files in this port
+//!   first said eight (review 2026-09-01), which is the prose-number class this repo punishes.
 //!
 //! The rest are the surfaces the row did name — framing, system turns, multi-turn, tools, tool
 //! calls, tool results, content parts, the trailing generation prompt — plus the vision
@@ -178,7 +179,7 @@ fn every_rendering_case_renders_byte_for_byte() {
 /// **The reject direction, which is the one a strict port gets wrong.** Every case the reference
 /// refused must be refused here with the SAME message.
 ///
-/// This template calls `raise_exception` in eight places and three are reachable from an
+/// This template calls `raise_exception` in nine places and three are reachable from an
 /// ordinary OpenAI client: a `developer` role is `Unexpected message role.` (Glimmer's template
 /// silently DROPS an unknown role, so a port that copied its neighbour would invent a framing
 /// the model has never seen), a conversation with no real user turn is `No user query found in
@@ -188,9 +189,67 @@ fn every_rendering_case_renders_byte_for_byte() {
 /// template renders content at the top of the loop body and checks the role after it, so a
 /// malformed content part on a bogus role reports the CONTENT error. A port that validated the
 /// role first would refuse both cases and pass a test that only checked "it refused".
+/// Which of the template's nine refusal sites the fixture actually reaches.
+///
+/// **The count gate in [`the_vendored_template_is_the_pinned_revisions_own_file`] says there are
+/// nine sites; this says eight of them are covered and names the ninth.** Each message is
+/// checked against the TEMPLATE's own bytes as well as against the cases, so the list is
+/// anchored at both ends rather than being a third transcription: a site the template no longer
+/// raises reddens here, and so does a regenerated fixture that dropped a refusal.
+///
+/// `No messages provided.` is the site no vendored case can carry, and it is unreachable by
+/// CONSTRUCTION rather than by omission: `apply_chat_template` raises `ValueError: Cannot apply
+/// chat template to an empty conversation.` before the template is entered (measured
+/// 2026-08-31), so the reference has no answer to record for it. `render` implements the
+/// template's own text anyway, and the last assertion here is the ONE self-asserted refusal in
+/// this file — labelled, because "the reference agrees" is the one claim it cannot make.
+fn check_every_refusal_site_is_covered(all: &[Value]) {
+    // `Unexpected reasoning effort ` ends at a space because the template interpolates the
+    // offending value with `~` there; that prefix is the whole of the site's own literal.
+    const COVERED: [&str; 8] = [
+        "System message cannot contain images.",
+        "System message cannot contain videos.",
+        "Unexpected item type in content.",
+        "Unexpected content type.",
+        "Unexpected reasoning effort ",
+        "No user query found in messages.",
+        "System message must be at the beginning.",
+        "Unexpected message role.",
+    ];
+    const UNREACHABLE: &str = "No messages provided.";
+    let raised = |site: &str| {
+        all.iter()
+            .filter_map(|c| c.get("raises").and_then(Value::as_str))
+            .any(|r| r.starts_with(site))
+    };
+    for site in COVERED {
+        assert!(
+            TEMPLATE.contains(site),
+            "the vendored template no longer raises {site:?}"
+        );
+        assert!(
+            raised(site),
+            "no vendored case covers the refusal site {site:?}"
+        );
+    }
+    assert!(TEMPLATE.contains(UNREACHABLE));
+    assert!(
+        !raised(UNREACHABLE),
+        "a vendored case now claims {UNREACHABLE:?} — the reference refuses an empty \
+         conversation BEFORE entering the template, so it cannot have produced that text"
+    );
+    // `Value::Null` is "no kwargs at all": every `get` on it is `None`, so this is the default
+    // render, and the only thing varied is that there are no messages.
+    let refused = render(&[], &opts_of(&Value::Null)).expect_err("an empty conversation refuses");
+    assert_eq!(refused.to_string(), UNREACHABLE, "the self-asserted site");
+}
+
 #[test]
 fn every_refusal_carries_the_templates_own_message() {
     let d = doc();
+    // Ahead of the per-case loop: both reach a fixture that lost a refusal, and the census names
+    // the SITE that lost its coverage where the loop names only the case whose text moved.
+    check_every_refusal_site_is_covered(cases(&d));
     let mut scored = 0usize;
     for case in cases(&d) {
         let Some(want) = case.get("raises").and_then(Value::as_str) else {
@@ -346,6 +405,16 @@ fn a_json_string_arguments_renders_as_the_object_the_reference_was_given() {
 fn the_vendored_template_is_the_pinned_revisions_own_file() {
     let d = doc();
     let p = &d["provenance"];
+    // **The refusal-site count, gated rather than stated.** Six files in this port said "eight"
+    // and nothing recomputed it (review 2026-09-01); the template raises at NINE sites, and a
+    // revision that adds a tenth is a refusal this port does not implement and no case covers.
+    // Deliberately AHEAD of the length and hash asserts: every plant that changes this count
+    // also changes the bytes, so behind them this line could never be observed red.
+    assert_eq!(
+        TEMPLATE.matches("raise_exception").count(),
+        9,
+        "the vendored template's raise_exception sites"
+    );
     assert_eq!(TEMPLATE.len(), 8952, "the vendored template's byte count");
     assert_eq!(
         p["chat_template.jinja"]["bytes"].as_u64(),

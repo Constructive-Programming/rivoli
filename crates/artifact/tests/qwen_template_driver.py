@@ -16,7 +16,7 @@ unnoticed is that the only thing it was ever checked against was a second readin
 author. A pin whose expected side comes from the model's own file cannot share a misreading
 with the port.
 
-**The negative cases are half the value.** This template calls `raise_exception` in eight
+**The negative cases are half the value.** This template calls `raise_exception` in nine
 places and three of them are reachable from an ordinary OpenAI client (a `developer` role, a
 conversation with no real user turn, a system turn that is not first). Those cases record the
 exception MESSAGE, and the Rust side asserts its own refusal carries the same text -- so the

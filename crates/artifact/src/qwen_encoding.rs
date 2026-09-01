@@ -692,7 +692,9 @@ fn generation_prompt(opts: &QwenChatOpts) -> String {
 /// cases are themselves JSON.
 ///
 /// **This returns `Result`, and that is the template's doing rather than a house preference.**
-/// `chat_template.jinja` calls `raise_exception` in eight places, and three of them are
+/// `chat_template.jinja` calls `raise_exception` in NINE places (a count gated by
+/// `qwen_template.rs`, because five files here first said eight and nothing recomputed it), and
+/// three of them are
 /// reachable from an ordinary client: a `developer` role (which OpenAI clients send) is
 /// `Unexpected message role.`, a conversation with no real user turn is `No user query found in
 /// messages.`, and a system turn that is not first is `System message must be at the

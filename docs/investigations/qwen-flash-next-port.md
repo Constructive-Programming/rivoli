@@ -304,6 +304,38 @@ arrive first; the ~4B tensors stay excluded by name), YaRN beyond native 262k,
 
 ## Worklog
 
+**2026-09-01 — S5 review-fix round (track D).**
+
+*Correction, dated in place*: the template raises at **NINE** `raise_exception` sites (lines 10,
+21, 33, 39, 43, 49, 100, 106, 160), not eight. "Eight" was stated in **six** places — `lib.rs`,
+`qwen_encoding.rs`, this file, `qwen_template.rs` twice, `qwen_template_driver.py` — and in
+commit `923abb8`'s message, which cannot be rewritten and is corrected by this line. Nothing
+recomputed the count, which is exactly the `inherited-numbers-are-unverified` class; it is now a
+gate — `qwen_template.rs::the_vendored_template_is_the_pinned_revisions_own_file` counts
+`raise_exception` in the vendored bytes and demands 9, placed AHEAD of the length and hash
+asserts because every plant that changes the count also changes the bytes. The CODE was right
+throughout: all nine messages are implemented, and **eight of the nine carry vendored cases** —
+which is now also a gate (`check_every_refusal_site_is_covered`, each site's text anchored in the
+TEMPLATE and in the fixture), with the ninth (`No messages provided.`) named as unreachable by
+construction and carrying this file's ONE self-asserted refusal.
+
+*Red proofs, each planted, byte-compared against a saved copy, observed red on the assertion
+ADDED, reverted, and green again on a run carrying a `Compiling` line:*
+
+- **count gate** — one `raise_exception` CALL removed from template line 33 (the message literal
+  kept, so the census could not fire instead), tree changed at byte 1592: `left: 8` /
+  `right: 9`. First attempt was rejected as a proof rather than as evidence: renaming the call to
+  `raise_exceptions` left the SUBSTRING in place and the count at 9 — `matches` counts
+  occurrences, so a rename is not a deletion.
+- **census, template end** — `'Unexpected message role.'` → `'…roles.'` in the template, byte
+  8663, count unchanged at 9: *"the vendored template no longer raises \"Unexpected message
+  role.\""*, and the count assert stayed green, which is what shows the two gates are
+  independent.
+- **census, fixture end** — one refusal case's `raises` text moved (`…in content.` →
+  `…in contents.`), fixture byte 115686: *"no vendored case covers the refusal site
+  \"Unexpected item type in content.\""*, and it was the ONLY red — the per-case loop never ran,
+  which is the census-before-detail ordering doing its job.
+
 **2026-08-31 — S5 (track D): the chat template is hand-ported and pinned, and the case count grew
 to 78.** `chat_template.jinja` is now VENDORED at
 `docs/measurement/qwen-reference/chat_template.jinja` — 8,952 B, sha256 `c3cf9e34…`, fnv1a64
@@ -328,7 +360,7 @@ anything else refuses; and the whole block is inert when thinking is off, so a b
 does NOT refuse. **(b) `enable_thinking`/`preserve_thinking`** — Jinja's `is true` and `is false`
 are IDENTITY against the booleans (measured on jinja2 3.1.6), so `1`, `0`, `null` and `"true"` are
 a FOURTH state neither branch was written for: no reasoning instructions, but an OPEN `<think>`.
-**(c) the reject direction** — the template calls `raise_exception` in eight places and three are
+**(c) the reject direction** — the template calls `raise_exception` in nine places and three are
 reachable from an ordinary OpenAI client (`developer` role, no real user turn, a system turn that
 is not first), which is why this port returns `Result` where its three siblings return `String`.
 The rest are the surfaces the row did name, plus the vision placeholders and the `|trim` rule
