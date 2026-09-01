@@ -424,19 +424,57 @@ fn the_three_named_asymmetries_are_in_the_recorded_widths(tiny: &Value, real: &V
 /// outputs are int64, so no `Rel` value is expressible at all. Each of those is argued at the table.
 /// **S3 must not score an operator with no row against a threshold** — compare it exactly, or
 /// measure the floor the same way (`--dtype float64`, then `--by-operator`) and add a row.
+///
+/// **The measured set is DERIVED from the golden's own `first_touch` map, not written here**
+/// (2026-09-01). It used to be a hand-written nine-element array, which is a transcription of the
+/// same declaration the matrix scores — so a tenth operator acquiring a targeting defect needed a
+/// manual edit in this file and NOTHING reddened if the edit was missed, which is the failure a
+/// both-ends check exists to prevent. The buckets that declared rows are exactly these nine plus
+/// `ngram_hash`, and `ngram_hash` is subtracted by name with its argument below rather than being
+/// filtered by some property, because "int64 outputs, floor exactly 0.000e0, no `Rel` value
+/// expressible" is a claim about the operator that only prose can carry.
 #[test]
 fn the_tolerance_table_is_supported_by_its_measurements() {
     tolerance::tolerances_leave_room(tolerance::QWEN);
-    const MEASURED: [&str; 9] = [
-        "gdn_conv",
-        "gdn_op",
-        "gdn_out_norm",
-        "gdn_proj",
-        "hc_attn",
-        "indexer",
-        "moe",
-        "moe_route",
-        "qsa_proj",
-    ];
-    tolerance::table_covers_exactly(tolerance::QWEN, &MEASURED);
+    for v in DECODE {
+        let measured = operators_with_a_targeting_defect(&load(v));
+        let measured: Vec<&str> = measured.iter().map(String::as_str).collect();
+        assert_eq!(
+            measured.len(),
+            9,
+            "{}: operators with a targeting defect",
+            v.name
+        );
+        tolerance::table_covers_exactly(tolerance::QWEN, &measured);
+    }
+}
+
+/// The operators the golden's own defect declaration prices, minus the one that cannot carry a
+/// `Rel` row.
+///
+/// **The subtraction is asserted, not assumed.** If `ngram_hash` ever stops being a declared
+/// first-touch bucket, removing it silently would shrink the set this gate compares against and
+/// the removal is exactly what nobody would notice — so its presence is a precondition.
+fn operators_with_a_targeting_defect(g: &rivoli_oracles::golden::GoldenSet) -> Vec<String> {
+    let touch = meta_json(g, "first_touch");
+    let mut ops: Vec<String> = touch
+        .as_object()
+        .expect("first_touch")
+        .values()
+        .map(|at| at[1].as_str().expect("a bucket name").to_owned())
+        .collect();
+    ops.sort_unstable();
+    ops.dedup();
+    // `ngram_hash`'s floor is exactly 0.000e0 at both draws — its outputs are int64, so fp32 and
+    // fp64 produce the same integers and there is no rounding to bound. Its five defect rows are
+    // scored bit-for-bit instead; `common/tolerance.rs` argues it in place.
+    let n = ops.len();
+    ops.retain(|op| op != "ngram_hash");
+    assert_eq!(
+        ops.len() + 1,
+        n,
+        "ngram_hash is no longer a declared first-touch bucket, so the exemption below subtracts \
+         nothing and this gate now compares against a set one operator wider than it reads"
+    );
+    ops
 }
