@@ -123,6 +123,9 @@ enum Form {
 /// Score one variant of one output at every site: the fixture's own bar first, then the recorded
 /// weakest separation.
 ///
+/// **Blind to a wrong REFERENCE arm, measured** — this stayed green under the plant that reddened
+/// [`the_host_gated_residual_reproduces_the_anchor_everywhere`]. See `h::separations`' doc.
+///
 /// Factored because the two tests below are the same loop over different rows — jscpd matched them
 /// as soon as the second existed. The two checks it forwards to [`h::separations`] — the fixture's
 /// own bar per site, then the recorded weakest — live there for the same reason, one level up: all

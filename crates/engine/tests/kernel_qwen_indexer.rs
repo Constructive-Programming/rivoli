@@ -428,6 +428,13 @@ fn the_host_pool_and_norm_reproduces_the_whole_ladder() {
 
 /// `pooled_keys` is the pool, the norm and the RoPE at the block's FIRST token — and neither of
 /// the two other plausible positions reproduces it.
+///
+/// > **This test is also where a red proof PANICKED instead of asserting, 2026-09-01.** The plant
+/// > that moved the reference pool to `b · ratio + 1` made the last block read a row past the
+/// > window, and this test died at `index out of bounds: the len is 384 but the index is 384`
+/// > rather than at its own comparison. The plant was still a good one — the ladder test reddened
+/// > properly at `q3 k_layernorm: 6.136655e-1` — but read off the exit code alone, a crash and a
+/// > reddened assertion are the same colour, and only one of them is evidence.
 #[test]
 fn the_block_keys_are_roped_at_the_blocks_first_token() {
     let c = window();

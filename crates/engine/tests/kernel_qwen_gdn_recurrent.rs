@@ -473,6 +473,11 @@ fn the_repeated_qk_heads_are_interleaved_and_not_tiled() {
 /// **Every defect form moves the operator clear of this fixture's own bar**, and by at least
 /// the minimum recorded for it.
 ///
+/// **This test is blind to a wrong REFERENCE arm** — it scores variant-against-golden and never
+/// reads one. Measured: it stayed green under the plant that reddened
+/// [`the_host_recurrence_reproduces_the_anchor_at_every_gdn_layer`]. `h::separations`' doc carries
+/// the general statement and the four observations behind it.
+///
 /// Two assertions per form, and the second is the one that catches a plant landing somewhere
 /// other than intended: a separation an order below its constant means the variant did not do
 /// what its name says.

@@ -483,6 +483,28 @@ launchers! {
     /// unlike [`launch_gated_delta_recurrent_f32`]'s L2 norm, which adds its own eps to the SUM.
     /// Negative, NaN and infinite `eps` are refused (1006); zero is legal and exact.
     ///
+    /// > **SECOND USER, and `head_dim` no longer has to be a power of two (2026-09-01, S3).**
+    /// > Qwen3.8-Flash-Next's GDN output gate IS this operator — `RMSNormGated`, bare `w . xhat`
+    /// > then `sigma(z)`, same order, same eps home (`qwen-architecture.md` §1, MOD:192-201) — so
+    /// > it is a REUSE and not a fifth kernel. What blocked it was guard **1003**, which refused
+    /// > every non-power-of-two width because `block_sum_lds` drops elements there, and qwen's S2
+    /// > anchor runs `linear_value_head_dim` **20**: the reuse was arithmetically right and
+    /// > unscorable, because the only fixture that could score it was refused. The kernel now
+    /// > launches `next_pow2(head_dim)` and masks the lanes past `head_dim`, and 1003 is gone from
+    /// > THIS launcher only — [`launch_gated_delta_recurrent_f32`] still returns it.
+    /// >
+    /// > **At every power-of-two `head_dim` the output is bit-identical by construction**, which is
+    /// > four structural claims spelled out at the kernel; the one thing they cannot cover is what
+    /// > the compiler emits for the inserted select, so the before/after byte comparison on
+    /// > `crates/engine/tests/kernel_k3_conv_norm.rs` is OWED to the next GPU lease. The masked
+    /// > lanes' own claim is a standing device test scored as BYTES
+    /// > (`kernel_qwen_gdn_out_norm.rs::the_masked_lanes_cannot_reach_the_result`).
+    /// >
+    /// > The signature is UNCHANGED — the `head_dim` the kernel now needs explicitly was already a
+    /// > parameter here — so `k3/forward.rs` and `k3/engine.rs` are untouched by this.
+    ///
+    /// **USED BY: Kimi-K3 and Qwen3.8-Flash-Next.**
+    ///
     /// # Safety
     /// Every pointer is a device buffer of the size above, live until `stream` completes, and none
     /// may alias another — all four are `__restrict__` in the kernel.

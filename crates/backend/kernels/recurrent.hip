@@ -300,37 +300,93 @@ extern "C" int rivoli_short_conv_silu_f32(const float* cur, const float* w, int 
 //
 // USED BY: Kimi-K3 (S3's layer loop; no engine caller yet — see
 // `crates/cli/tests/kernel_coverage.rs`).
+// > **PADDED 2026-09-01 (S3, qwen), and the head_dim it refused was the reason.** The launcher's
+// > guard 1003 refused every non-power-of-two `head_dim`, because `block_sum_lds` drops elements
+// > unless `blockDim.x` is a power of two. Qwen3.8-Flash-Next runs this exact operator — its GDN
+// > output gate IS `RMSNormGated`, bare `w . xhat` then `sigma(z)`, same order, same eps home
+// > (`qwen-architecture.md` §1, MOD:192-201) — and its S2 anchor runs `linear_value_head_dim`
+// > **20**. So the reuse was arithmetically right and UNSCORABLE: the only fixture that can score
+// > it was refused by the guard. The block is now `next_pow2(head_dim)` with the lanes past
+// > `head_dim` masked, exactly as `gdn_recurrent_f32` and `indexer.hip::index_pool_norm_f32` do,
+// > and 1003 is gone.
+// >
+// > **At every power-of-two `head_dim` the result is bit-identical BY CONSTRUCTION, not within a
+// > tolerance**, and that is four claims rather than a hope:
+// >
+// >  1. the block is unchanged — `next_pow2(hd) == hd` there, so the launch geometry, the LDS size
+// >     and the wave count are the same numbers they were;
+// >  2. every thread's contribution is unchanged — the predicate `t < head_dim` is universally
+// >     TRUE, so `red[t]` receives exactly the value it received before;
+// >  3. the divisor is unchanged — and this is the one line that had to MOVE. `d` used to be read
+// >     off `blockDim.x`; under padding that is the padded width, so `head_dim` is now an explicit
+// >     kernel parameter. Left as it was, every non-power-of-two head would have divided its mean
+// >     by the padded width — a plausible wrong, silent, and exactly the class this note exists
+// >     for;
+// >  4. the fold is unchanged — `block_sum_lds` is a barrier'd LDS ladder, so there is no
+// >     re-association for a compiler to find.
+// >
+// > What that argument does NOT cover is the compiler emitting something different for the select
+// > it now inserts. That is a silicon question, so the before/after byte comparison on
+// > `kernel_k3_conv_norm.rs` stays OWED to the next GPU lease and is on track C's arm list; the
+// > masked lanes' own claim — that they cannot reach the result — is a standing device test in
+// > `kernel_qwen_gdn_out_norm.rs`, scored as BYTES.
+// >
+// > **Owed duplication, recorded because no tool can see it.** The `next_pow2` rounding loop is
+// > now the THIRD copy under `kernels/` (here, `gdn_recurrent_f32`'s launcher above, and
+// > `indexer.hip::index_pool_norm_f32`'s). `crates/cli/build.rs`'s jscpd gate scans `crates` for
+// > Rust only, so `.hip` duplication is invisible to every tool in this tree except the compiler —
+// > the rule is the repo's, not the tool's. The natural single home is `reduce.hpp`, beside the
+// > `block_sum_lds` precondition it exists to satisfy; that file is not track C's, so this is
+// > flagged to the coordinator rather than done quietly.
 extern "C" __global__ void rmsnorm_gate_heads_f32(const float* __restrict__ o,
                                                   const float* __restrict__ gate,
-                                                  const float* __restrict__ weight, float eps,
-                                                  float* __restrict__ out) {
+                                                  const float* __restrict__ weight, int head_dim,
+                                                  float eps, float* __restrict__ out) {
     extern __shared__ float red[];
-    const int d = (int)blockDim.x;
-    const size_t off = (size_t)blockIdx.x * d + threadIdx.x;
-    const float x = o[off];
+    const int t = (int)threadIdx.x;
+    const int live = t < head_dim;
+    const size_t off = (size_t)blockIdx.x * head_dim + t;
+    // The mask is on the VALUE and never on the `block_sum_lds` call: the ladder is a block-wide
+    // barrier and every thread must reach it. It is also on the LOAD, not only on the store —
+    // `off` for a masked lane addresses the NEXT head's row, which is real memory holding real
+    // numbers, so an unmasked read would fold a neighbour into this head's mean and the last head
+    // would read past the buffer entirely.
+    const float x = live ? o[off] : 0.0f;
     // `eps` on the MEAN, which is RMSNorm's convention and NOT the recurrence's L2 norm above —
     // that one adds it to the SUM (§4 step 3). Two different conventions in one layer, and the
-    // reason each is spelled out where it is used rather than shared.
-    const float inv = 1.0f / sqrtf(block_sum_lds(x * x, red) / (float)d + eps);
+    // reason each is spelled out where it is used rather than shared. The divisor is `head_dim`
+    // and NOT `blockDim.x`: see point 3 of the note above.
+    const float inv = 1.0f / sqrtf(block_sum_lds(x * x, red) / (float)head_dim + eps);
+    if (!live) return;
     const float g = gate[off];
-    out[off] = x * inv * weight[threadIdx.x] * (1.0f / (1.0f + expf(-g)));
+    out[off] = x * inv * weight[t] * (1.0f / (1.0f + expf(-g)));
 }
 
 extern "C" int rivoli_rmsnorm_gate_heads_f32(const float* o, const float* gate,
                                              const float* weight, int heads, int head_dim,
                                              float eps, float* out, void* stream) {
     if (heads <= 0 || head_dim <= 0) return 1001;
+    // Bounded BEFORE the rounding loop below so it cannot spin or overflow, and 1024 is the launch
+    // limit `head_dim` inherits by being (the unpadded part of) the block.
     if (head_dim > 1024) return 1002;
-    // `block_sum_lds` halves the block, so a non-power-of-two drops elements — the same guard and
-    // the same code as the recurrence above, for the same reason.
-    if (head_dim & (head_dim - 1)) return 1003;
+    // **There is deliberately no power-of-two guard any more.** 1003 lived here until 2026-09-01
+    // and refused qwen's `linear_value_head_dim` 20 outright; the kernel pads and masks instead.
+    // The code is NOT retired, only this use of it: `gated_delta_recurrent_f32` above still returns
+    // 1003, because its `dt_bias` is indexed `[head][channel]` and a padded block there would need
+    // the same masking on a second buffer — a change with no fixture asking for it.
     // A non-finite or negative `eps` is refused rather than folded in: `rsqrt` of a negative
     // variance is NaN for the whole head, and zero is legal (it is what an exact RMSNorm is) so the
     // bound is one-sided.
     if (!(eps >= 0.0f && eps < INFINITY)) return 1006;
+    // `next_pow2(head_dim)`. Equal to `head_dim` at every power of two, which is what makes the
+    // shipped K3, V4 and Glimmer launches bit-identical to their pre-padding selves — point 1 of
+    // the kernel's note. THIRD copy of this loop under `kernels/`; the note records why.
+    int block = 1;
+    while (block < head_dim) block <<= 1;
     hipGetLastError();
-    hipLaunchKernelGGL(rmsnorm_gate_heads_f32, dim3((unsigned)heads), dim3((unsigned)head_dim),
-                       head_dim * sizeof(float), (hipStream_t)stream, o, gate, weight, eps, out);
+    hipLaunchKernelGGL(rmsnorm_gate_heads_f32, dim3((unsigned)heads), dim3((unsigned)block),
+                       block * sizeof(float), (hipStream_t)stream, o, gate, weight, head_dim, eps,
+                       out);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }

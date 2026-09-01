@@ -374,6 +374,16 @@ impl Bar {
 /// qwen suites — it was right about the substance as well as the tokens, since three copies are
 /// three places for that order to drift.
 ///
+/// **WHAT THIS CANNOT SEE, measured three times.** A separation is scored variant-against-GOLDEN,
+/// so it never reads the fixture's REFERENCE arm and is structurally blind to a wrong one. Observed
+/// on 2026-09-01 under four independent plants — a sigmoid decay in `kernel_qwen_gdn_recurrent.rs`,
+/// a dropped `1/n_r` in `kernel_qwen_hyper_residual.rs`, and both of
+/// `kernel_qwen_gdn_out_norm.rs`'s — every one of which reddened that suite's reference test and
+/// left its separations GREEN. **A defect matrix built only from separations passes on a broken
+/// oracle.** The two kinds of test are independent and neither subsumes the other, which is why
+/// every suite here carries both and why this note is at the shared helper rather than in one
+/// header.
+///
 /// **Minima, never maxima.** The bar a variant must clear is the WEAKEST site's; quoting the
 /// strongest lets a form that is nearly invisible at one width pass on another's number. That is
 /// not hypothetical here — the indexer's first-row-only variant spans 1.24x across the ladder and
