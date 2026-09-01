@@ -178,6 +178,11 @@ fn turned(s: &Site, turn: Turn) -> Vec<f32> {
 
 /// The host split-half rotation at position `seq` reproduces the reference, and the three wrong
 /// doors do not.
+///
+/// The two halves are independent and the second is **blind to a wrong REFERENCE arm**: a wrong
+/// door is scored against the anchor, never against the `Turn::Reference` rotation, so only the
+/// `hold` loop above it would notice if that rotation itself drifted. `h::separations`' doc records
+/// the four plants that measured this.
 #[test]
 fn the_host_split_half_rotation_is_the_reference_and_the_wrong_doors_are_not() {
     let b = h::Bar::at("indexer", HOST_WORST);

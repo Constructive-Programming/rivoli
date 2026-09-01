@@ -313,6 +313,10 @@ fn the_host_norm_gate_predicts_every_other_head() {
 
 /// **Every defect form prices itself, and the two that price the PADDING CHANGE are the two
 /// weakest.**
+///
+/// **Blind to a wrong REFERENCE arm, measured twice on this very suite** — it stayed green under
+/// both of the plants recorded in this file's header, each of which reddened
+/// [`the_host_norm_gate_predicts_every_other_head`]. See `h::separations`' doc.
 #[test]
 fn every_defect_form_prices_the_difference_it_names() {
     let rows = [

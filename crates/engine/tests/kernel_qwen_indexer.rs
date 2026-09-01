@@ -503,6 +503,10 @@ fn the_host_block_scores_reproduce_the_reference() {
 }
 
 /// Each pool-and-norm defect moves the ladder clear of the bar, by at least its recorded minimum.
+///
+/// **Blind to a wrong REFERENCE arm** — it scores variant-against-golden and never reads one, so it
+/// stayed green under the plant that reddened [`the_host_pool_and_norm_reproduces_the_whole_ladder`].
+/// `h::separations`' doc carries the general statement and the four observations behind it.
 #[test]
 fn every_pool_defect_prices_the_difference_it_names() {
     let c = window();
