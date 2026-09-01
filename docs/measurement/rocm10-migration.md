@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: ROCm 10 is INSTALLED AND WORKING on rh-anine as of 2026-09-01, and attempt 2's blocker is root-caused: the device fault was an alignment #GP, not a missing component — `-march=znver5` let clang emit 64-byte-aligned `vmovdqa64` stores into a `roc::VirtualGPU` that clr's own class-scope `ReferenceCountedObject::operator new(size_t)` heap-allocates 16-byte aligned (it hides C++17's aligned `operator new`; latent UB in AMD's source, invisible in AMD's generic-x86-64 prebuilt), fixed by one `append-flags -mno-avx` in the overlay's hip ebuild; BOTH named suspects are REFUTED — the unpackaged `librocm_kpack` (whose evidence was heap-layout noise that three bytes of environment flipped either way) and the LLVM link mode (no LLVM in hip's DT_NEEDED at all). Verified in this tree independently of that diagnosis: a freshly compiled four-line probe prints `rc=0` bare with the environment stripped, the installed library disassembles to 0 `%zmm` and 0 aligned `vmov`, and `rivoli-backend --lib` passes 4/4 including the `signal_resolves_and_latency` that segfaulted three times — SONAME and DT_NEEDED unchanged, so rivoli needed no rebuild. The ROCm 10 COLUMN IS STILL NOT MEASURED: its battery, pinned-decode, A-vs-A and bench cells need a tenant-parked window at the baseline's 100 GiB budget, and a Vulkan tenant holds 7.8 GB of GTT right now, so no throughput number here is citeable yet; the 7.14 binpkgs remain the 43 s rollback.
+verdict: ROCm 10.0.0 is INSTALLED, WORKING and MEASURED on rh-anine as of 2026-09-01, and the migration's open column is closed: after the overlay's hip was rebuilt with `-mno-avx` (the device fault was an alignment #GP — `-march=znver5` emitted 64-byte-aligned stores into a `roc::VirtualGPU` that clr's own class-scope `operator new(size_t)` heap-allocates 16-byte aligned, latent UB invisible in AMD's generic-x86-64 prebuilt; both suspects named by attempt 2, the unpackaged `librocm_kpack` and the LLVM link mode, are REFUTED), all seven cells of the pre-registered re-book spec are GREEN in a fresh target dir with witness-clean arms and tenants parked at the baseline's 17 MiB GTT floor: device battery 91 suites / 592 tests / 0 failed with zero `Compiling` inside the lock, pinned V4 decode x2 BYTE-IDENTICAL to each other AND to the 7.14 column (raw sha 431606e9, id-lines 67233d64), GLM A-vs-A 512/512 identical at the baseline's 100 GiB budget, the GLM bench cell's recorded ids, and tests/parity-glm.sh 32/32 identical to the pinned reference at full reference length. Numerics did not move — same goldens, same tolerances, and hit/miss counts equal TO THE DIGIT in every arm across the toolchain change. Throughput is unchanged within a percent and straddles zero (6.32/6.43 vs 6.32/6.40; 2.91/2.88 vs 2.93/2.94), so NO throughput claim is made. Under the pre-registered decision rule there is no red and nothing to roll back; the 7.14 binpkgs stay armed as the 43 s escape. Four conditions travel with the column, including that cells 2-3 ran at loadavg 10.9-12.9 (a sibling agent's CPU work, no GPU contact) and that parity-glm.sh exits 1 on a USAGE error, which is its codebook's value for a token mismatch.
 ---
 
 # ROCm 7.14 → 10.0.0 on rh-anine — the measured migration
@@ -246,3 +246,68 @@ bench) need the same tenant-parked window the baseline ran in. The witness on th
 live Vulkan tenant (llama-swap, invisible to KFD) that the baseline did not have. That does not
 weaken a functional green — a stream either creates or faults — but it disqualifies every
 throughput number, so none is quoted here. The column is booked, not measured.
+
+## ROCm 10 column — MEASURED 2026-09-01, every cell green
+
+> **SUPERSEDES the "not measured" heading above**, which was written for attempt 1's rollback
+> and stayed true through attempt 2's broken runtime. The protocol in that section is the spec
+> this column was run against; the spec itself is unchanged and is not restated here.
+
+Run after the hip rebuild, in a **fresh** `CARGO_TARGET_DIR=/var/cache/rivoli/target/rocm10-mig-new2`
+— fresh because the hip PACKAGE was reinstalled between attempt 2's build and this one, which is
+the §7e-bis/§12 class the spec's own rule guards. Driver, every log, every `.ids` file and every
+per-arm witness: `/var/cache/rivoli/scratch/rocm10-migration/new2/` on rh-anine; the driver is
+`/var/cache/rivoli/scratch/rocm10-column2.sh`.
+
+**Window conditions.** GPU tenants parked by hr-fleet at 16:2xZ — node label `hr-home.xyz/rocm`
+flipped to the value `disabled`, `llama-swap-rh-anine` scaled to 0 and its fleet bundle paused.
+`mem_info_gtt_used` 7,839,670,272 B → **18,673,664 B**, the same idle floor the 7.14 baseline ran
+against, verified here rather than relayed. Two deviations from the recorded park procedure are
+worth carrying: the Deployment was **renamed** by `e5f6c1bc` (`ai/llama-swap` no longer exists; it
+is now `llama-swap-rh-anine` for Vulkan and `llama-swap-hr-main` for CUDA), so the recorded command
+would have failed NotFound and read as "nothing to park"; and the manifest now carries an explicit
+`replicas: 1`, so the bundle pause is load-bearing in a way it was not on 08-30.
+
+| # | cell | exact form | exit | witness | result vs the 7.14 baseline |
+|---|---|---|---|---|---|
+| 0 | probe | four-line `hipStreamCreateWithFlags`, env stripped, flocked | 0 | n/a | `rc=0` against the INSTALLED library |
+| 1 | deviceless suite | `cargo test --workspace --no-default-features` | 0 | n/a | **91 suites, 0 failed** |
+| 2 | builds, OUTSIDE the lock | test bins, `--example glm_smoke`, `--release` | 0, 0, 0 | n/a | all three link `libamdhip64.so.7` |
+| 3 | **device battery** | flocked, `--test-threads=1`, dev profile | **0** | **CLEAN** (0 bytes) | **91 suites, 592 passed, 0 failed**; 17 min; **0 `Compiling` inside the lock**; GTT 17 MiB pre-arm. Baseline: 89 suites / 576 — the tree grew, the goldens and tolerances did not |
+| 4 | **pinned V4 decode ×2** | `--attn dsa --max-mem 100 --ctx 2048 --bench 32`, debug bin, **no build between** | 0, 0 | **CLEAN** ×2 | **BYTE-IDENTICAL to each other AND to the 7.14 column**: raw sha `431606e9…` on r1, r2 and the baseline's `03-r1.ids`; id-lines `67233d64…`. **6.32 / 6.43 tok/s** (baseline 6.32 / 6.40); **6217 hits / 1781 misses in all four runs** |
+| 5 | **GLM A-vs-A, 512 tokens, 100 GiB** | `determinism-glm.sh --self-test` first, then the pair | 0 | **CLEAN** ×2 | **512/512 ids IDENTICAL**; 2.91 / 2.88 tok/s (baseline 2.93 / 2.94); **223148 hits / 83452 misses in both arms and in both baseline arms** |
+| 6 | GLM bench cell | `--mode int3-vq --attn dense --max-mem 100 --bench 4`, debug bin | 0 | CLEAN | ids `[13041 1052 0 358]` == the recorded reference; 3.77 tok/s over 4 tokens — **not citeable** (n=4, cache warm from cell 5) |
+| 7 | **`tests/parity-glm.sh`** | `glm52-vq3-full 32 100`, never builds | **0** | **CLEAN** ×2 | **32 generated ids IDENTICAL to the pinned reference at reference full length** |
+
+**Verdict against the pre-registered decision rule: no red, nothing to roll back.** The rule said any
+red that is not a measured-and-accepted improvement rolls back to the 7.14 binpkgs. There is no red.
+Numerics did not move: the same vendored goldens at the same tolerances, and the two id-identity
+instruments (pinned decode, parity) are byte-equal ACROSS the toolchain change, not merely
+self-consistent within it.
+
+**Throughput: no change worth the name, as pre-registered.** The bump's expectation was set to
+modest-or-nothing before the A/B, and the measurement agrees — 6.32/6.43 against 6.32/6.40, and
+2.91/2.88 against 2.93/2.94, i.e. within a percent and straddling zero in both directions. **No
+throughput claim is made from this column.** The hit/miss counts being identical to the digit in
+every arm is the stronger statement: the streaming path executed the same work, not merely a
+similar amount of it.
+
+Four conditions this column carries, recorded rather than smoothed:
+
+1. **Cells 2 and 3 ran at loadavg 10.9–12.9, not the baseline's 2.4–4.7.** A sibling agent's
+   deviceless `cargo test --workspace` was on 32 cores at the time and said so. It never touched
+   `/dev/kfd` or GTT, so no contention witness is affected and the battery's colour is unaffected —
+   but had a throughput number come off those two cells it would have been uncitable. Cells 4–7 ran
+   at 3.2–4.9, inside the baseline's own band.
+2. **Cell 5 is not evidence about the standing GLM streaming-nondeterminism defect.** The 7.14
+   column was byte-identical here too; the gate's Poisson bound gives ~31–99% power at 512 tokens.
+   Both columns green means the defect did not fire in either, which is what the baseline's caveat 1
+   already said.
+3. **Cell 7 ran at the gate's default `ngen=32`, not a longer window.** That is the gate as it is
+   defined, and the 7.14 baseline recorded no parity arm at all, so this row is a new absolute
+   result rather than a comparison.
+4. **A defect in the gate's own error path, found by tripping it.** `parity-glm.sh` was first
+   invoked with no artifact argument; it printed its usage line and exited **1** — and 1 is its
+   codebook's value for *gate RED, token mismatch*, while setup errors are supposed to exit 2. A
+   wrapper classifying on the exit code alone would have recorded a parity failure under ROCm 10
+   that never ran. The run in the table is the re-invocation with the argument.
