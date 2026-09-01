@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: ROCm 10 attempt 2 (owner-installed 2026-08-31): rivoli COMPILES clean (117 crates, 15/15 HIP TUs, links .so.7) and the deviceless suite is green, but the device runtime is BROKEN — a deterministic SIGSEGV five frames inside the overlay-built libamdhip64.so.7.15.0's hipStreamCreateWithFlags, reproduced 3x with clean witnesses; the SAME test binary passes in 0.37 s under AMD's prebuilt 7.15.26333 lib dir, so the defect is the overlay HIP build (which also lacks ROCm 10's new librocm_kpack that AMD's hip links), not ROCm 10 and not rivoli; every rivoli device arm is blocked until hip is rebuilt to TheRock parity or the prebuilt runtime is installed — the 7.14 binpkgs remain a 43 s rollback.
+verdict: ROCm 10 is INSTALLED AND WORKING on rh-anine as of 2026-09-01, and attempt 2's blocker is root-caused: the device fault was an alignment #GP, not a missing component — `-march=znver5` let clang emit 64-byte-aligned `vmovdqa64` stores into a `roc::VirtualGPU` that clr's own class-scope `ReferenceCountedObject::operator new(size_t)` heap-allocates 16-byte aligned (it hides C++17's aligned `operator new`; latent UB in AMD's source, invisible in AMD's generic-x86-64 prebuilt), fixed by one `append-flags -mno-avx` in the overlay's hip ebuild; BOTH named suspects are REFUTED — the unpackaged `librocm_kpack` (whose evidence was heap-layout noise that three bytes of environment flipped either way) and the LLVM link mode (no LLVM in hip's DT_NEEDED at all). Verified in this tree independently of that diagnosis: a freshly compiled four-line probe prints `rc=0` bare with the environment stripped, the installed library disassembles to 0 `%zmm` and 0 aligned `vmov`, and `rivoli-backend --lib` passes 4/4 including the `signal_resolves_and_latency` that segfaulted three times — SONAME and DT_NEEDED unchanged, so rivoli needed no rebuild. The ROCm 10 COLUMN IS STILL NOT MEASURED: its battery, pinned-decode, A-vs-A and bench cells need a tenant-parked window at the baseline's 100 GiB budget, and a Vulkan tenant holds 7.8 GB of GTT right now, so no throughput number here is citeable yet; the 7.14 binpkgs remain the 43 s rollback.
 ---
 
 # ROCm 7.14 → 10.0.0 on rh-anine — the measured migration
@@ -199,3 +199,50 @@ NOT taken as an install, and (c) stays armed as the 43 s escape. rivoli device a
 blocked until that rebuild lands, and the ROCm 10 column below stays not-measured. The
 probe above is the acceptance test for the rebuild: it must print `rc=0` against the
 INSTALLED library, with nothing on `LD_LIBRARY_PATH`.
+
+## 2026-09-01, later the same day: the blocker is FIXED, and it was neither suspect
+
+> **CORRECTS the section above and attempt 2's paths list.** "Path (a) is chosen … rivoli device
+> arms stay blocked until that rebuild lands" was true for about four hours. The rebuild landed.
+> The two suspects that section named — the unpackaged `librocm_kpack` and the LLVM link mode —
+> are both **refuted**, so the sentence "it also narrows the fix" narrowed it toward the wrong
+> thing and is corrected here rather than deleted.
+
+**The defect** (diagnosed in hr-fleet's lane; its record is that repo's
+`docs/plans/2026-08-30-001-feat-rocm-10-rh-anine-plan.md` PART IX §43–46, the fix is overlay
+commit `001a4b9`): an **alignment #GP**, not a bad pointer. The faulting instruction is
+`vmovdqa64 %zmm1,0xc0(%rdi)` inside `roc::VirtualGPU`'s constructor with `rdi` 16-byte aligned.
+`VirtualGPU` declares two `alignas(64)` AQL packets, but is heap-allocated through clr's
+class-scope `amd::ReferenceCountedObject::operator new(size_t)`, which **hides C++17's
+`::operator new(size_t, align_val_t)`** — the compiler proved `alignof == 64` and emitted aligned
+stores, `new` returned 16. Latent UB in AMD's own source, reachable only because this overlay
+builds with `-march=znver5`; AMD's `therock-dist` builds generic x86-64 and emits no `%zmm` at
+all, which is why the same source version works there. The fix is one line in the hip ebuild,
+`append-flags -mno-avx`, chosen over patching the header because four more clr classes have the
+identical hole. No revbump, deliberately: the keyword file pins `=dev-util/hip-10.0.0` exactly,
+so an `-r1` would be masked and would arm a nightly `@world` **downgrade**.
+
+**Why the kpack evidence was noise, written down because it fooled attempt 2's write-up.**
+`LD_PRELOAD`ing kpack made the probe pass — and so did `env A=x` with no preload at all, while
+kpack + comgr together went back to 139 and a 34-byte environment variable failed. Three bytes of
+environment flipped it either way: that is a heap-layout coin toss, and mechanically a missing
+`DT_NEEDED` is a load-time failure, not a mid-constructor #GP. `librocm_kpack` was NOT packaged;
+nothing in this tree links it.
+
+**Verified in this tree, independently of that diagnosis** (the point of re-deriving rather than
+relaying: the fix's own author is the last party who should score it):
+
+| check | result |
+|---|---|
+| four-line probe, recompiled with the new `hipcc`, `env -u LD_LIBRARY_PATH -u LD_PRELOAD`, flocked | `hipStreamCreateWithFlags rc=0`, **exit 0** (exit read unpiped) |
+| `objdump -d` of the installed `libamdhip64.so.7.15.0-0000000` | **0** `%zmm`, **0** `vmovdqa`/`vmovaps` — matching what AMD's prebuilt has |
+| `cargo test -p rivoli-backend --lib -- --test-threads=1`, flocked, dev profile | **4 passed / 0 failed** in 0.22 s, including `gpustream::tests::signal_resolves_and_latency` — the exact test that SIGSEGV'd three times |
+| rebuild needed? | **no** — the workspace build was already fresh (0.11 s, no `Compiling`), SONAME and `DT_NEEDED` unchanged by the flag |
+
+**What is still owed: the ROCm 10 column itself.** The four cells the baseline table holds
+(device battery, pinned V4 decode ×2, GLM A-vs-A at the **100 GiB** budget the baseline used, GLM
+bench) need the same tenant-parked window the baseline ran in. The witness on the arm above was
+**not clean**: `mem_info_gtt_used` read 7,839,670,272 B before it and 7,839,715,328 B after, a
+live Vulkan tenant (llama-swap, invisible to KFD) that the baseline did not have. That does not
+weaken a functional green — a stream either creates or faults — but it disqualifies every
+throughput number, so none is quoted here. The column is booked, not measured.
