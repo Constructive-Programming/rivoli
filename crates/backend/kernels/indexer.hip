@@ -333,3 +333,154 @@ extern "C" int rivoli_index_topk(
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// ============= Qwen3.8-Flash-Next's QSA block-key stage — `qwen-architecture.md` §3 =============
+
+// Mean-pool `ratio` consecutive cached indexer keys into one block key and RMSNorm it, one block
+// row per HIP block. This is TR Eq. 13 and MOD:679-682 fused: `pooled = keys.float().mean(dim=1)`
+// then `k_layernorm(pooled)`.
+//
+// **Why this is not `index_pool_push`.** That kernel folds one token into a running block mean
+// whose width is the compile-time `MISA_BLOCK` (1024). Qwen's `indexer_compress_ratio` is **4**,
+// so the geometry is not reachable by any argument — and the reference pools a COMPLETE block
+// once rather than accumulating, because the pool feeds a norm and then a RoPE at the block's
+// first token position, and a running mean has no such moment.
+//
+// **Why the norm is FUSED in, and it is a measurement rather than a preference.**
+// `RMSNorm(c·x) = RMSNorm(x)` for every `c > 0`, so the norm divides out any per-row scale the
+// pool produced. Measured on the vendored prefill window: a pool that SUMS instead of averaging
+// moves the composition by 3.39e-5 to 4.84e-5, which is the epsilon term becoming 16x smaller
+// against a 4x larger row and not the 4x itself
+// (`crates/engine/tests/kernel_qwen_indexer.rs::a_summing_pool_is_cancelled_by_the_norm_that_follows_it`).
+// So there is no scoreable boundary between the two stages, splitting them would buy a second
+// pass over the keys and no evidence, and — the part that matters for whoever ports this —
+// **`.mean` versus `.sum` here has to be read off MOD:681; no fixture over these bytes can tell.**
+//
+// `eps` is the caller's `rms_norm_eps` and goes on the MEAN, inside the root. The three wrong eps
+// forms measure 2.77e-5 to 4.65e-4 at this boundary against a 1.14e-4 tolerance, so only one of
+// them is even distinguishable: like the pool's reduction, the epsilon is pinned by READING the
+// config field rather than by scoring, which is the conclusion K3's anchor reached for the MLA eps
+// on the same kind of arithmetic.
+//
+// **Only COMPLETE blocks are pooled.** `n_blocks` is `|visible| / ratio` FLOORED (MOD:672), and
+// the `|visible| mod ratio` tail is always attended and never scored (MOD:700-701). A kernel that
+// rounded up would read `ratio - 1` rows the cache does not hold on three of every four queries.
+//
+// The block is `next_pow2(hd)` with threads past `hd` masked, for the reason
+// `recurrent.hip::gdn_recurrent_f32` states at length: `block_sum_lds` needs a power of two and
+// this model's anchor runs `indexer_head_dim` **24** (128 at the real widths), so a guard would
+// refuse the only fixture that can score the kernel.
+//
+// **The keys are f32 here and bf16 in the cache the real model will keep.** MOD pools in fp32 and
+// casts back to the input dtype before the norm; at the anchor's fp32 that cast is a no-op, so
+// this kernel's agreement says nothing about where a bf16 rounding belongs. Owed to S6 with the
+// cache it will read.
+//
+// USED BY: Qwen3.8-Flash-Next (S6's QSA layers; no engine caller yet — see
+// `crates/cli/tests/kernel_coverage.rs`).
+extern "C" __global__ void index_pool_norm_f32(const float* __restrict__ keys,
+                                              const float* __restrict__ weight, int ratio, int hd,
+                                              float eps, float* __restrict__ out) {
+    extern __shared__ float red[];
+    const int b = (int)blockIdx.x;
+    const int t = (int)threadIdx.x;
+    // The masking is on the VALUE and never on the `block_sum_lds` call: the ladder is a
+    // block-wide barrier and every thread must reach it.
+    float m = 0.0f;
+    if (t < hd) {
+        float acc = 0.0f;
+        for (int r = 0; r < ratio; ++r) acc += keys[(size_t)(b * ratio + r) * hd + t];
+        m = acc / (float)ratio;
+    }
+    const float sum = block_sum_lds(m * m, red);
+    if (t >= hd) return;
+    out[(size_t)b * hd + t] = m * (1.0f / sqrtf(sum / (float)hd + eps)) * weight[t];
+}
+
+extern "C" int rivoli_index_pool_norm_f32(const float* keys, const float* weight, int n_blocks,
+                                          int ratio, int hd, float eps, float* out, void* stream) {
+    if (n_blocks <= 0 || ratio <= 0 || hd <= 0) return 1001;
+    if (hd > 1024) return 1002;
+    // `ratio == 1` is a per-token norm with a pooling loop around it, which means the caller read
+    // `indexer_compress_ratio` as something other than TOKENS PER BLOCK — trap T8, where "budget
+    // 2048" and "512 blocks" are the same fact stated twice. Refused rather than defined.
+    if (ratio < 2) return 1004;
+    // A non-finite or negative eps makes `rsqrt` of a negative variance NaN for the whole block
+    // row; zero is legal and is what an exact RMSNorm is, so the bound is one-sided.
+    if (!(eps >= 0.0f && eps < INFINITY)) return 1006;
+    int block = 1;
+    while (block < hd) block <<= 1;
+    hipGetLastError();
+    hipLaunchKernelGGL(index_pool_norm_f32, dim3((unsigned)n_blocks), dim3((unsigned)block),
+                       block * sizeof(float), (hipStream_t)stream, keys, weight, ratio, hd, eps,
+                       out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// The same scoring `blockindex.hip::index_score_blocks` performs, in fp32 throughout.
+//
+// **This exists because the REUSE was REFUTED on silicon, 2026-09-01, and the deviceless arm
+// could not have seen it.** Track C scored `launch_index_score_blocks` against qwen's anchor with
+// `w` filled with `1/sqrt(hd)`, argued that a positive uniform scale distributes over the sum, and
+// was right about the algebra and wrong about the arithmetic: that kernel rounds to **bf16 three
+// times** — after each head's dot, after the per-head weight multiply, and once more on the way
+// out — because DeepSeek-V4's indexer runs in bf16 and model.py:426-427 is what it transliterates.
+// Qwen's does not: MOD:690-693 computes the whole score in fp32 (`qwen-architecture.md` §3). The
+// first device arm measured **2.8701737e-3** against the `indexer` tolerance of 1.14e-4 — which is
+// bf16's ~3.9e-3 resolution, not a scale, an ordering or a mask.
+//
+// **Why no host oracle could have caught it.** The fixture's oracle is f64 and the roundings live
+// only inside the kernel, so every deviceless test agreed. That is the whole case for the device
+// arm existing, and it is the second time in this port that two implementations of one formula
+// differed in precision rather than in algebra.
+//
+// A separate entry point rather than a flag, which is this tree's standing rule for exactly this
+// situation — `swiglu` against `swiglu_clamped_bf16`, `rope_split_half` against `rope_interleave`:
+// a V4 call site must not be able to reach fp32 semantics by changing an argument, and a qwen call
+// site must not be able to reach bf16 ones. Placed HERE beside `index_pool_norm_f32` rather than in
+// `blockindex.hip` beside its bf16 twin, because the two kernels a qwen QSA layer runs back to back
+// should be read together; the twin's file carries the V4 spread and compressor it belongs with.
+//
+// The causal mask and the top-k are the CALLER's, as they are for the twin: this writes the full
+// pre-top-k score matrix, which is strictly stronger to compare than a selected set.
+//
+// USED BY: Qwen3.8-Flash-Next (S6's QSA layers; no engine caller yet — see
+// `crates/cli/tests/kernel_coverage.rs`).
+#pragma clang fp contract(off)
+extern "C" __global__ void index_score_blocks_f32(const float* __restrict__ q,
+                                                  const float* __restrict__ kv,
+                                                  const float* __restrict__ w,
+                                                  float* __restrict__ score, int s, int n_comp,
+                                                  int heads, int hd) {
+    size_t id = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // `size_t`, for the twin's reason: in `int` the product overflows at ~2.1M entries, reachable
+    // at a long prefill, and a negative bound makes every thread return while the launch reports
+    // success.
+    if (id >= (size_t)s * (size_t)n_comp) return;
+    int t = (int)(id / (size_t)n_comp), c = (int)(id % (size_t)n_comp);
+    const float* kvr = kv + (size_t)c * hd;
+    float acc = 0.0f;
+    for (int hh = 0; hh < heads; ++hh) {
+        const float* qh = q + ((size_t)t * heads + hh) * hd;
+        float dot = 0.0f;
+        for (int i = 0; i < hd; ++i) dot += qh[i] * kvr[i];
+        // ReLU on the fp32 dot, with NO rounding before it. The twin rounds first because the
+        // reference it mirrors does; here rounding first would move every score that the rounding
+        // carried across zero, and MOD:693's `relu(...)` sees the fp32 value.
+        acc += fmaxf(dot, 0.0f) * w[(size_t)t * heads + hh];
+    }
+    score[id] = acc;
+}
+
+extern "C" int rivoli_index_score_blocks_f32(const float* q, const float* kv, const float* w,
+                                             float* score, int s, int n_comp, int heads, int hd,
+                                             void* stream) {
+    if (s <= 0 || n_comp <= 0 || heads <= 0 || hd <= 0) return 1001;
+    size_t total = (size_t)s * (size_t)n_comp;
+    hipGetLastError();
+    hipLaunchKernelGGL(index_score_blocks_f32, dim3((unsigned)((total + 255) / 256)), dim3(256), 0,
+                       (hipStream_t)stream, q, kv, w, score, s, n_comp, heads, hd);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}

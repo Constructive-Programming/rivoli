@@ -50,6 +50,8 @@ const GENERATION: &[u8] =
     include_bytes!("../../../docs/measurement/qwen-reference/generation_config.json");
 const NORM_L0: &[u8] =
     include_bytes!("../../../docs/measurement/qwen-reference/linear_attn_norm_l0.bin");
+const CHAT_TEMPLATE: &[u8] =
+    include_bytes!("../../../docs/measurement/qwen-reference/chat_template.jinja");
 
 fn census() -> Census {
     Census::load().expect("the vendored qwen census must parse")
@@ -450,6 +452,7 @@ fn the_vendored_files_hash_as_the_header_records() {
         ("config.json", CONFIG),
         ("generation_config.json", GENERATION),
         ("linear_attn_norm_l0.bin", NORM_L0),
+        ("chat_template.jinja", CHAT_TEMPLATE),
     ] {
         let want_len: usize = FAMILIES
             .header_token(name, "bytes ")

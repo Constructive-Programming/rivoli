@@ -346,3 +346,86 @@ extern "C" int rivoli_hc_post(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
+
+// ====== Qwen3.8-Flash-Next's Gated Residual collapse — `qwen-architecture.md` §4 ======
+
+// The read half of one Gated Residual sublayer wrapper: collapse an `n_r`-wide residual stream to
+// one vector through a per-element gate, and emit the `n_r` scales the write half multiplies the
+// sublayer output by. TR Eq. 32 and Eq. 33 = MOD:941-969 (`GatedResidual`), the two lines of it
+// that are not a matmul:
+//
+//   x[j]     = (1/n_r) * sum_i sigmoid(mix[i][j]) * rhat[i][j]          Eq. 32 -- MEAN, not sum
+//   scale[i] = 2 * sigmoid(inject[i] / n_r)                             Eq. 33
+//
+// `rhat` is the group-RMSNormed stream, `mix` is `input_mix_weight_up`'s output (PRE-sigmoid) and
+// `inject` is `block_inject_weight`'s output (PRE-sigmoid, and pre-division). The two low-rank
+// matmuls that produce `mix` -- `W_u SiLU((1/n_r) W_d vec(rhat))` through the `hc_lowrank = 320`
+// bottleneck -- are GEMVs and stay GEMVs; what is here is what no GEMV expresses.
+//
+// **This is NOT DeepSeek-V4's mHC and must not reach `hc_pre`.** TR §2.2 pp.10-11 derives GR by
+// DROPPING the branch-mixing operator `H_res` outright ("`H_res` adds little") and finds the
+// static terms bring no improvement, so there is no `n_r x n_r` comb, no Sinkhorn normalisation
+// and no `hc_sinkhorn_iters` -- and CKPT carries no `n_r x n_r` tensor to feed one. `hc_pre` would
+// need all three. Trap T9.
+//
+// **Four things here are load-bearing and each is a measured defect**
+// (`crates/engine/tests/kernel_qwen_hyper_residual.rs`, 28 sites over both draws):
+//
+//  1. **MEAN, not sum** (T10). The two differ by exactly `n_r`, so the separation is 3.000e0 at
+//     every site -- and it COMPOUNDS over 48 layers, since every sublayer is wrapped.
+//  2. **the gate is a sigmoid**, applied to `mix` and not to the stream: raw gives 9.52e-1 and a
+//     SiLU 9.76e-1.
+//  3. **the 2 in Eq. 33**, which makes the inject scale centre on 1.0 rather than 0.5: dropping
+//     it is exactly 5.000e-1 at every site.
+//  4. **the `1/n_r` is INSIDE that sigmoid**, not outside it. Measured, because Eq. 33 can be
+//     read either way and the reference's own capture settles it: `2*sigmoid(inject)` misses by
+//     2.29e-1 to 5.37e-1 and `2*sigmoid(inject)/n_r` by 6.47e-1 to 7.52e-1.
+//
+// One thread per element of the collapsed vector, plus the first `n_r` threads of block 0 for the
+// scale row -- two outputs from one launch, the shape `hc_pre` already uses, so nothing sits
+// between them on the stream. `n_r` is 4 in this model and the loop over it is not where the time
+// goes; the traffic is `n_r * dim` reads of `rhat` and the same of `mix`, which at the real widths
+// is 4 x 2560 x 2 floats per sublayer per token, twice per layer, 48 layers.
+//
+// USED BY: Qwen3.8-Flash-Next (S6 wraps every sublayer of all 48 layers pre and post; no engine
+// caller yet -- see `crates/cli/tests/kernel_coverage.rs`).
+extern "C" __global__ void gated_residual_collapse_f32(const float* __restrict__ rhat,
+                                                       const float* __restrict__ mix,
+                                                       const float* __restrict__ inject, int n_r,
+                                                       int dim, float* __restrict__ x,
+                                                       float* __restrict__ scale) {
+    const int t = (int)threadIdx.x;
+    // The scale row, on block 0's first `n_r` threads. The launcher refuses `n_r` above 64, so
+    // this is always inside one block and needs no grid-wide agreement.
+    if (blockIdx.x == 0 && t < n_r) {
+        scale[t] = 2.0f / (1.0f + expf(-inject[t] / (float)n_r));
+    }
+    const int j = (int)(blockIdx.x * blockDim.x) + t;
+    if (j >= dim) return;
+    float acc = 0.0f;
+    for (int i = 0; i < n_r; ++i) {
+        const size_t at = (size_t)i * dim + j;
+        // The gate wraps `mix`, never `rhat` -- one identifier apart in the reference and 9.5e-1
+        // apart in the output.
+        acc += rhat[at] / (1.0f + expf(-mix[at]));
+    }
+    // Divided ONCE at the end rather than folded into the loop: this is the MEAN of Eq. 32, and
+    // the reference computes it the same way round.
+    x[j] = acc / (float)n_r;
+}
+
+extern "C" int rivoli_gated_residual_collapse_f32(const float* rhat, const float* mix,
+                                                  const float* inject, int n_r, int dim, float* x,
+                                                  float* scale, void* stream) {
+    if (n_r <= 0 || dim <= 0) return 1001;
+    // `n_r` is `hc_count`, 4 in this model, and the scale row is written by one block's first
+    // threads. 64 is far above any plausible residual width and far below the 256-thread block, so
+    // a caller past it has passed something other than `hc_count` -- `hc_lowrank` (320) and
+    // `hc_width` (10240) are both one field away and both larger.
+    if (n_r > 64) return 1003;
+    hipGetLastError();
+    hipLaunchKernelGGL(gated_residual_collapse_f32, dim3((unsigned)((dim + 255) / 256)), dim3(256),
+                       0, (hipStream_t)stream, rhat, mix, inject, n_r, dim, x, scale);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}

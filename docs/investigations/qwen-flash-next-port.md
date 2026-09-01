@@ -1,7 +1,7 @@
 ---
 status: live
 scope: qwen
-verdict: S0 and S1 ARE BUILT, S2-S8 are not -- the Qwen3.8-Flash-Next (qwen4_exp) port has its reference bytes vendored at a pinned revision and hash-gated in tree, its math extracted from primary sources, and a fifth Arch that REFUSES at every legality cell and every CLI and serve door; this file is its in-tree plan of record. Measured identity: 180,007,507,860 parameters occupying 185,502,232,570 B = 172.76 GiB in the official fp8 checkpoint at revision 236dfdf2, of which 2.607 B parameters are the MTP draft layer excluded by name for v1 and 0.449 B are vision; 48 layers as 12x(3x GatedDeltaNet+MoE -> 1x QSA+MoE), where the checkpoint's 12 full_attention entries are an ALIAS for layers that run the indexer; block-128 fp8 with BF16 scale grids on the routed experts and a single per-tensor scale on the 51.2 G-element n-gram table hosted at layer_idx 1; thinking default. Six figures the first draft transcribed were measured FALSE and are corrected in place with dates. What it carries: the census checklist with items 1, 2 and 6 CLOSED and 3, 4, 5, 7 owed, the A-E track split with exclusive file lists, the GPU lease protocol, and the exit-gate table whose tests/smoke-qwen.sh row lands WITH the arm because smoke-k3.sh proved later means never. Anchors, tolerances and defect matrices are all still OWED, so no number here about THIS BOX is measured evidence, and every figure quoted from another scope carries that scope inline.
+verdict: S0 THROUGH S5 ARE BUILT, S6-S8 are not -- MERGED 2026-09-02 from four track branches (anchors, artifact, chat, kernels; anchors first because the other gates read its bytes). the Qwen3.8-Flash-Next (qwen4_exp) port has its reference bytes vendored at a pinned revision and hash-gated in tree, its math extracted from primary sources, a fifth Arch that REFUSES at every legality cell and every CLI and serve door, a CPU-measured first-party anchor with vendored goldens, per-operator tolerances taken from fp32-vs-fp64 floors on both weight draws and a defect matrix that reddens where it should (S2, docs/measurement/qwen-reference/anchor.md), device-scored kernels with a both-ends census (S3, crates/engine/tests/kernel_qwen_*.rs), a config type, a name census and a converter with exact ensure! counts (S4, crates/cli/src/bin/convert_qwen.rs), and the chat template hand-ported with id-pinned rendering and refusal cases (S5, crates/artifact/src/qwen_encoding.rs); this file is its in-tree plan of record. Measured identity: 180,007,507,860 parameters occupying 185,502,232,570 B = 172.76 GiB in the official fp8 checkpoint at revision 236dfdf2, of which 2.607 B parameters are the MTP draft layer excluded by name for v1 and 0.449 B are vision; 48 layers as 12x(3x GatedDeltaNet+MoE -> 1x QSA+MoE), where the checkpoint's 12 full_attention entries are an ALIAS for layers that run the indexer; block-128 fp8 with BF16 scale grids on the routed experts and a single per-tensor scale on the 51.2 G-element n-gram table hosted at layer_idx 1; thinking default. Six figures the first draft transcribed were measured FALSE and are corrected in place with dates. What it carries: the census checklist with items 1-6 CLOSED and 7 owed to S6, the A-E track split with exclusive file lists, the GPU lease protocol, and the exit-gate table whose tests/smoke-qwen.sh row lands WITH the arm because smoke-k3.sh proved later means never. No arm exists yet, so no decode number about THIS BOX is measured evidence here, and every figure quoted from another scope carries that scope inline.
 ---
 
 # Qwen3.8-Flash-Next (`qwen4_exp`): the port, in tree
@@ -37,6 +37,16 @@ Out-of-tree provenance (read for the full argument, cite THIS file in code and c
 - **S8** closeout — every deferral retired or milestone-named, standing gates green.
 
 ## Where the port stands (2026-08-31, after S0 and S1)
+
+> **CORRECTED 2026-09-02, at the four-track merge.** The paragraph below was true after S1
+> and stays as the record of that state. S2 (anchors, track B), S3 (kernels, track C), S4
+> (config, census, converter, track A) and S5 (chat encoding, track D) have since landed on
+> `main`, in the order B, A, D, C — anchors first because the artifact and kernel gates read
+> its bytes. The one conflicting pair was A × D, in `crates/artifact/src/lib.rs` (keep both
+> `pub mod` lines, alphabetical) and this file's worklog (keep both blocks, S4 before S5).
+> What does NOT exist now: the arm (`crates/engine/src/qwen/`), `tests/smoke-qwen.sh`, a
+> decode, S7's gate battery, S8's closeout. The debts the merge left are the worklog entry
+> dated 2026-09-02 at the end of this file.
 
 > **CORRECTED 2026-08-31.** This section said "Nothing built. `Arch` still has four variants."
 > Both halves are now false, and this is the plan every track authors from.
@@ -152,9 +162,9 @@ side-by-side decode.
 |---|---|---|---|
 | 1 | vendored config pins | `qwen-reference/config.json` **and `generation_config.json`** (the sampling-defaults source) vendored at a pinned revision, and the gate **recomputes** FNV-1a from the live file and byte-compares | **DONE 2026-08-31** — `Qwen/Qwen3.8-Flash-Next-FP8` @ `236dfdf285828023ca3bcd3f37366c58a3469b13`; `docs/measurement/qwen-reference/{config.json,generation_config.json,linear_attn_norm_l0.bin}` + `tensor-families.tsv`'s VENDORED BYTES block; recomputed by `crates/artifact/tests/qwen_names.rs::the_vendored_files_hash_as_the_header_records`, red-proofed by a one-digit pin flip |
 | 2 | tokenizer TYPE first | HF `tokenizer.json` confirmed as the TYPE **before** 172.76 GiB moves, **and** the chat template's real home located (it has shipped only in the fp8 SOURCE repo before), **and** its hand-port scheduled with id-pinned cases — the GLM scar is a hand-ported template that drifted to another family's framing for months | **DONE 2026-08-31** — `tokenizer.json` is `"model": {"type": "BPE"}` (first 8192 B fetched, sha pinned in the tsv) with `tokenizer_class: Qwen2Tokenizer`, so the `tokenizers` crate is the loader and no tiktoken path is needed. The template ships **in the FP8 repo itself, in two places that agree byte-for-byte**: `chat_template.jinja` (8,952 B) and `tokenizer_config.json`'s `chat_template` key (8,952 chars) — the GLM hazard (template only in the fp8 SOURCE) does not recur here, and a converter can copy either. Hand-port scheduled as track D / S5. *Corrected 2026-09-01 (S5, track D)*: the two homes are **exactly** byte-identical — this cell said "identical modulo the file's trailing newline", and the `.jinja` file carries NO trailing newline, so there is no modulo (gated by `qwen_template.rs`, which asserts the vendored copy ends at the outer `endif`); and the case count is **78 = 65 rendering + 13 refusals**, not the ~31 scheduled here before the template was read — the three surfaces that account for the difference are in the worklog, and all three counts are asserted rather than stated |
-| 3 | converter `ensure!` counts | `convert_qwen` asserts exact consumed/emitted tensor counts, with MTP and vision excluded **by name** against `tensor-families.tsv` (109 family rows, Σcount 152,089, all three status sums now gated deviceless) | OWED (S4) |
-| 4 | first-party anchors + defect matrix | tiny-width real-structure anchor from the model's own stack, two weight salts, **≥2 rows per each of the nine named operator classes (so ≥18 rows)** each shown to redden AND to hold, tolerances from fp64/fp32 floors on ≥2 draws BEFORE the kernels | OWED (S2) |
-| 5 | kernel census both ends | every new launcher has an oracle suite or a live DEFERRED row; **N/N/0 at closeout, or a deferral that is MILESTONE-NAMED** (a named later milestone, not a bare TODO) | OWED (S3) |
+| 3 | converter `ensure!` counts | `convert_qwen` asserts exact consumed/emitted tensor counts, with MTP and vision excluded **by name** against `tensor-families.tsv` (109 family rows, Σcount 152,089, all three status sums now gated deviceless) | **DONE 2026-09-01 (S4, track A; merged 2026-09-02)** — `crates/cli/src/bin/convert_qwen.rs` with `crates/cli/tests/qwen_convert.rs`, and the name census in `crates/artifact/src/census/qwen/` |
+| 4 | first-party anchors + defect matrix | tiny-width real-structure anchor from the model's own stack, two weight salts, **≥2 rows per each of the nine named operator classes (so ≥18 rows)** each shown to redden AND to hold, tolerances from fp64/fp32 floors on ≥2 draws BEFORE the kernels | **DONE 2026-09-01 (S2, track B; merged 2026-09-02)** — `docs/measurement/qwen-reference/anchor.md` is the record; `crates/oracles/tests/qwen_anchor.rs`, `qwen_anchor_fixtures.rs` and `qwen_anchor_windows.rs` read the vendored goldens deviceless; `qwen_anchor_defects.py` is the matrix; red proof `gate-red-proofs.md` §14 |
+| 5 | kernel census both ends | every new launcher has an oracle suite or a live DEFERRED row; **N/N/0 at closeout, or a deferral that is MILESTONE-NAMED** (a named later milestone, not a bare TODO) | **DONE 2026-09-01 (S3, track C; merged 2026-09-02)** — `crates/engine/tests/kernel_qwen_*.rs`; `crates/cli/tests/kernel_coverage.rs` holds an EMPTY deferred table, and its count is the test's own println, not a number this row repeats |
 | 6 | registration in the SAME change | `SCOPES` entry + this doc + exactly one INDEX row | **DONE, this commit** |
 | 7 | thin end-to-end smoke | `tests/smoke-qwen.sh` lands WITH the exit gate | OWED (S6) |
 | 8 | behaviour+ABI naming | the rule binds **kernels, traits and structs** — none of those may be named `qwen_*`; membership is data in the census table. Arm directories and arch-scoped module/file names are the argued exception (`crates/engine/src/qwen/`, `qwen_config.rs`, `convert_qwen.rs`, `qwen_encoding.rs`): those name a *port boundary*, not a behaviour, and the exception is stated here so no reviewer has to guess | binding from S1 |
@@ -823,3 +833,24 @@ pre-edit mtime, so nothing was rebuilt. The generalisation for the fleet: **a re
 evidence only if the run that produced it actually rebuilt the tree** — check for the
 compile before believing either colour, and re-run rather than reasoning about the text.
 - **2026-08-31** — bait-launch red proof ATTEMPTED: spawning `reviewer-correctness` with a prompt instructing an unlocked device run was refused by the harness permission classifier before the agent existed — a fourth layer above the hook, observed but not the def-level proof. The def-level bait (an agent that runs and REFUSES) stays OWED for Part 2 launch.
+
+**2026-09-02 — the four-track merge, and what it left owed.** Merged by the owner's
+instruction, B → A → D → C, with the plan's verdict, INDEX row and census rows 3/4/5 corrected
+in the final merge commit (a stale `verdict:` is worse than a stale body — CLAUDE.md tells
+readers to trust the INDEX row instead of the doc, and `docs.rs` only checks the two agree).
+`chat_template.jinja`'s pin moved from `tensor-families.tsv`'s NOT-VENDORED block into VENDORED
+BYTES and joined `qwen_names.rs`'s recomputed list in the same commit, because the file and
+the header first shared a tree here. Note carried from track C: its tip was based on track B's
+OLDER tip, so C's suites had never compiled against B's fixed tolerance driver before this
+merge — the post-merge batteries below are what closes that. Owed, in order:
+
+1. the n-gram cross-gate neither track could land alone — B's golden holds the checkpoint's
+   real I64 buffers, A's `census::qwen::ngram_hash` derives them; B verified the equality
+   numerically (exact at `ple_layer_index = 0`, differs in every value at 1); now one test;
+2. `gate-red-proofs.md` §15 (track A's plants) and §16 (track C's — deviceless and on silicon),
+   which live in the suite headers until then;
+3. `launch_gated_delta_recurrent_f32` still takes a bare `(heads, head_dim)` pair — the last
+   in the wall; closing it needs `kernel_k3_recurrent.rs` and `k3_anchor_decode.rs`;
+4. `next_pow2` is a fourth copy under `kernels/` that jscpd (Rust-only) cannot see; its home
+   is `reduce.hpp`;
+5. `qwen_encoding.rs` sits at 799 lines against the 800 soft cap — the next edit shrinks it.

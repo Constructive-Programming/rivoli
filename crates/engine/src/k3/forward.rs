@@ -36,7 +36,7 @@ use crate::resident::Bf16Weight;
 use crate::routed::Selection;
 use anyhow::{Result, bail, ensure};
 use rivoli_backend::{
-    NULL_STREAM, device_sync, launch_attn_res, launch_embed_bf16_row_bcast,
+    HeadCount, HeadDim, NULL_STREAM, device_sync, launch_attn_res, launch_embed_bf16_row_bcast,
     launch_gated_delta_recurrent_f32, launch_gemm_bf16, launch_mha_attend, launch_moe_acc_drain_to,
     launch_moe_expert_range_f4_situ, launch_rmsnorm_gate_heads_f32, launch_rmsnorm_single,
     launch_short_conv_silu_f32, launch_sigmoid_gate, launch_situ_glu_f32, launch_vadd,
@@ -325,8 +325,8 @@ impl K3Engine<'_> {
                 self.ko.ptr().cast(),
                 self.gate.ptr().cast(),
                 w.o_norm,
-                la.num_heads,
-                la.head_dim,
+                HeadCount(la.num_heads),
+                HeadDim(la.head_dim),
                 self.cfg.rms_norm_eps as f32,
                 self.kon.ptr_mut().cast(),
                 NULL_STREAM,
