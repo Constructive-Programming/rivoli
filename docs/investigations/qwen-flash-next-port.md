@@ -304,6 +304,91 @@ arrive first; the ~4B tensors stay excluded by name), YaRN beyond native 262k,
 
 ## Worklog
 
+**2026-09-01 — S4 review-fix round, track A: two corrections to the record, and what changed in
+the tree.** The tree was right in both cases; the prose was not.
+
+- **Commit `029236e`'s message says "the host here is layer_idx 0". That is FALSE — the host is
+  `layer_idx` 1.** `ple_layer_ids` is `[2]` and ONE-INDEXED, so the single PLE layer is `layer_idx`
+  **1**, which is what `qwen_config.rs`'s `ple_layer_ids` doc, `geometry.rs::ple_host_layer` and
+  `qwen_names.rs`'s first assertion all say, and what this file's `verdict:` already said. The
+  message conflated two numbers: `layer_idx` (**1**) and `ple_layer_index` (**0**), the ORDINAL
+  within `ple_layer_ids`, which is what `ngram_hash`'s parameter means and what the byte-exact match
+  at 0 is evidence about. History is not rewritten — the correction lives here, because the commit
+  log is where this port's evidence lives. `ngram_hash.rs`'s header, its `ngram_hash` doc and
+  `qwen_names.rs`'s test doc now name the two meanings apart explicitly instead of saying "PLE layer
+  index", which is the phrase that let them be conflated.
+- **The chat template's two homes are EXACTLY byte-identical, not "identical modulo a trailing
+  newline".** Track D measured 8,952 B on each with NO trailing newline on either side. Three places
+  in track A's files asserted the newline difference as a fact about the source and are corrected in
+  place (`convert_qwen.rs`'s `confront_chat_template` doc and its refusal message, and
+  `qwen_convert.rs`'s fixture comment and test doc). The converter's trim over BOTH sides stays, now
+  argued for what it actually buys — a re-export that adds a newline to one home is a formatting
+  artefact, not a divergence — and the fixture keeps its one-sided newline as a deliberate SUPERSET
+  of the real case, which exercises the trim as well as the comparison. The census-checklist row at
+  item 2 above still carries the "modulo the file's trailing newline" phrasing; that is track D's row
+  and the coordinator's to flip, so it is flagged rather than edited here.
+
+**What changed in the tree this round**, each from a review finding and none of them a behaviour
+change for any real config:
+
+- the nine saturating `unwrap_or` conversions in `ngram_hash.rs` became two refusing helpers,
+  `u64_of` and `usize_of`. One of the nine — `u64::try_from(i + 1).unwrap_or(0)`, the multiplier
+  step — was the only one NOT followed by an `ensure!`, so a substituted `0` made `multipliers[i]`
+  the seed's own mix instead of refusing; two others SHARED a fallback, which let
+  `vocab_sizes.len() == heads` compare `0 == 0` and pass vacuously. Neither fallback is reachable on
+  a 64-bit target, so there is no red proof to record for this one and none is claimed: it is a
+  direction fix, not a new gate.
+- `census::qwen::Summary::of` deleted — zero callers in the workspace, and `pub` is exactly what
+  hides that from `dead_code`. `line()` already walks `per_role`.
+- `write_resident`'s excluded-role `ensure!` plus its `unreachable!("refused above")` folded into a
+  `bail!` in the match arm, refusal text unchanged. The converter must REFUSE, not abort; the
+  question is now asked once, at the point of writing, against the role in hand, and there is no
+  separate guard twelve lines up whose deletion would leave the `unreachable!` reachable. **No red
+  proof is possible for this one on this box and none is claimed**: every deviceless fixture stops at
+  the missing shard file, one step BEFORE `write_resident` runs, so neither the old `ensure!` nor the
+  new `bail!` is reachable until the live conversion (OWED above) opens real shards. That
+  unreachability is what the `unreachable!` was asserting; it is also why abort-versus-refuse is
+  worth fixing BEFORE the run that can reach it.
+- `RIVOLI_QWEN_CKPT_REQUIRED` is value-checked (`is_some_and(|v| !v.is_empty())`) rather than
+  existence-checked, citing `051a291` at the line: a CI `env:` expression yielding `''` still SETS
+  the variable, which is how a REQUIRED gate armed with no secret configured. Red proof recorded
+  below.
+- the new OWED item above (the shards' index IS row order) is this round's other finding: an
+  assumption with no gate and no witness, which cannot honestly be gated on this box.
+
+**Red proof, the value-check (finding 4) — 2026-09-01, deviceless, worktree `qwen-a`, target dir
+`/var/cache/rivoli/target/qwen-a`.** The only tree change this round whose behaviour a test can
+observe, so it is the only one carrying a proof. Six runs of
+`cargo test --test qwen_convert --no-default-features -- --exact
+the_live_checkpoint_comparison_runs_in_all_three_required_states`, exit codes read unpiped, each
+colour believed only after a `Compiling rivoli` line in its own log
+(`/var/cache/rivoli/scratch/qwen-a/arm{A,B,C}.{fixed,planted,reverted}.log`); the plant was
+byte-compared against a saved copy of the fixed file (sha256
+`32df662d…` fixed, `30a6beaa…` planted) before it was believed to be on disk:
+
+| arm | env | pre-fix `is_some()` (PLANTED) | post-fix `is_some_and(\|v\| !v.is_empty())` |
+| --- | --- | --- | --- |
+| A | `RIVOLI_QWEN_CKPT_REQUIRED=` — set, empty | **RED**, exit 101 | green, exit 0 |
+| B | `RIVOLI_QWEN_CKPT_REQUIRED=1`, no checkpoint | RED, exit 101 | RED, exit 101 |
+| C | unset | green, exit 0 | green, exit 0 |
+
+Arm A is the defect and the reason the fix exists: an empty value armed the required mode, the real
+checkpoint is not on this box, and the env-reading line's own `confront_live(dir, required)` then
+failed the test with
+
+```
+thread 'the_live_checkpoint_comparison_runs_in_all_three_required_states' panicked at
+crates/cli/tests/qwen_convert.rs:706:19:
+/swarm/storage/ai/rivoli/qwen38-flash-next-fp8: RIVOLI_QWEN_CKPT_REQUIRED is set but
+/swarm/storage/ai/rivoli/qwen38-flash-next-fp8 holds no model.safetensors.index.json — the live
+comparison examined NOTHING, and a check whose examined-count can reach zero is not a check
+```
+
+i.e. a REQUIRED gate reddening because nothing was configured. Arm B is the control that says the
+fix did not disarm the mechanism — the same message, from a genuinely armed run, in BOTH columns —
+and arm C says the unset path never moved. The plant was then reverted, the file byte-compared back
+to the fixed sha, and arm A re-run green with its own `Compiling` line.
+
 **2026-08-31 — S4, track A: the artifact lane. Config, census, converter, and 22 plants.**
 
 What landed, and the two files that are additions to track A's row rather than entries in it
@@ -423,6 +508,19 @@ passed with it — 8 clones were reported and all 8 were FACTORED or re-shaped, 
   proven in all three of its states (unset+absent, set+absent, set+present-against-a-fixture, via
   `RIVOLI_QWEN_CKPT`), but the run against the real bytes — and therefore the first `resident.safe
   tensors`, the first `L{ll}.experts.safetensors` and the first 128 n-gram shards — is owed.
+- **That the n-gram shards' INDEX is row ORDER.** `write_ngram_shards` names shard `s`'s output
+  `ngram.rows.{s x rows_per_shard}`, and what the gates assert is that 128 shards of
+  `2,500,012 x 160` TILE `[0, padded_rows)` exactly, both ends — the widths sum. The MAPPING is
+  assumed: that `shard_{s}` holds rows `[s x 2,500,012, (s+1) x 2,500,012)`. If the publisher's
+  shard index is not row order, every n-gram row a decode gathers is the wrong row, with every
+  shape, count, dtype and byte total intact, no crash and no refusal — the one place left in this
+  converter where a wrong answer has no witness. It CANNOT be closed on this box: the 172.76 GiB
+  source is not here, and track B's `ngram-real` golden carries token ids, not embeddings. No gate
+  was invented for it, deliberately — a gate over the synthesized shards would only assert the
+  convention it was built from. What would settle it: on the box that holds the checkpoint, gather
+  one known token's 16 rows out of the REAL shard bytes through `ngram_hash`'s offsets and compare
+  them against the reference stack's PLE embedding output for that token (S2 anchor, or the S6
+  loader's first decode). Written at `convert_qwen.rs`'s naming site as well as here.
 - **Census item 3's checklist row, this file's `verdict:` and its INDEX row.** The converter now
   asserts exact per-family counts against the 109-row census, both ends, with MTP and vision named.
   Flipping the row is the coordinator's: the `verdict:` is relayed verbatim into `INDEX.md`, and the

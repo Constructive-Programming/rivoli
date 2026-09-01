@@ -170,8 +170,11 @@ fn source(tag: &str, mutate: impl Fn(&mut serde_json::Value)) -> (PathBuf, PathB
                 "generation_config.json",
                 r#"{"eos_token_id":[248046,248044]}"#,
             ),
-            // The file home carries the trailing newline the embedded copy does not — which is
-            // exactly the difference the S0 finding records, and the comparison trims it.
+            // A trailing newline on the file home and none on the embedded copy is a DELIBERATE
+            // superset, not a photograph of the source: track D measured the two homes exactly
+            // byte-identical (8,952 B, neither carrying a trailing newline), so a fixture that
+            // differs by exactly what the converter trims exercises the trim as well as the
+            // comparison, and the real source is the easier case.
             ("chat_template.jinja", &format!("{template}\n")),
         ],
     );
@@ -397,9 +400,12 @@ fn every_missing_aux_file_is_refused_by_name() {
 
 /// **The chat template's two homes must agree, and the converter is where they are compared.**
 /// GLM's scar is a template that lived only in the fp8 SOURCE and drifted to another family's role
-/// framing for months once hand-ported. This checkpoint states it TWICE and the two agree modulo
-/// the file's trailing newline — which is what lets this port copy either one instead of
-/// hand-porting, so it is a property worth refusing on rather than recording.
+/// framing for months once hand-ported. This checkpoint states it TWICE and the two agree
+/// byte-for-byte — track D measured 8,952 B on each, neither with a trailing newline — which is
+/// what lets this port copy either one instead of hand-porting, so it is a property worth refusing
+/// on rather than recording. The converter still trims trailing newlines from both sides, and the
+/// fixture below feeds it one on one side only: a re-export that adds one is a formatting artefact,
+/// and the trim is what keeps the refusal reserved for a real divergence.
 ///
 /// RED OBSERVED (plant P15, the comparison short-circuited): `expected a refusal naming "are not the
 /// same template", got status Some(1)` — the converter silently copying a `chat_template.jinja` that
@@ -632,7 +638,9 @@ fn confront_live(dir: &Path, required: bool) -> anyhow::Result<usize> {
 ///
 /// The env READ is one line and it is exercised last, against whatever this box is set to — with
 /// the required arm asserted, so on a machine where the variable IS set and the checkpoint IS
-/// present, this cell is the real comparison.
+/// present, this cell is the real comparison. That line asks for a NON-EMPTY value: `051a291`
+/// records a CI `env:` expression yielding `''` arming a REQUIRED gate with nothing configured, so
+/// "set to the empty string" is the fourth state and it means unarmed.
 ///
 /// RED OBSERVED (plant P19, state 2's `ensure!(!required, …)` short-circuited): the
 /// absent-checkpoint arm returned `Ok(0)` and this test reddened with `the required mode must refuse
@@ -674,7 +682,12 @@ fn the_live_checkpoint_comparison_runs_in_all_three_required_states() {
 
     // And the env-reading line itself, once. Where the variable is set and the checkpoint is
     // there, this IS the live comparison; where it is not, the assertion above is what stands.
-    let required = std::env::var_os(REQUIRED).is_some();
+    //
+    // **Value-checked, not existence-checked.** A CI `env:` entry whose expression yields `''`
+    // still SETS the variable, which armed the CodeScene gate's REQUIRED mode with no secret
+    // configured; `051a291` corrected exactly this in `codescene.rs::tool_absent`, and an
+    // existence check here would have re-introduced it two commits later. Empty means unarmed.
+    let required = std::env::var_os(REQUIRED).is_some_and(|v| !v.is_empty());
     let dir = std::env::var_os(CKPT_OVERRIDE)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(CKPT_DIR));

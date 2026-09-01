@@ -296,14 +296,6 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// `(tensors, bytes)` for one role.
-    pub fn of(&self, role: Role) -> (u64, u64) {
-        self.per_role
-            .iter()
-            .find(|(r, _, _)| *r == role)
-            .map_or((0, 0), |&(_, t, b)| (t, b))
-    }
-
     /// `(tensors, bytes)` over every role that is NOT excluded — what the artifact holds.
     pub fn v1(&self) -> (u64, u64) {
         self.fold(|r| !r.is_excluded())

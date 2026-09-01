@@ -350,16 +350,25 @@ fn the_routed_scale_grids_are_per_projection_and_the_two_orientations_differ() {
 /// multipliers alone would not do: they do not depend on `head_idx` at all, so such a golden
 /// passes on a wrong `global_head_idx` and the 16 primes are where that error shows.
 ///
+/// **What this cell scores against, and what it deliberately leaves to track B.** The right-hand
+/// side here is the numbers the census header DECLARES, transcribed from the checkpoint's own three
+/// I64 buffers — deviceless, and the same header the converter's exclusion list is read from. The
+/// stronger arm is the derivation byte-compared against those buffers' ACTUAL bytes, which track B
+/// holds in its n-gram anchor golden; `rivoli-oracles` already dev-depends on `rivoli-artifact` and
+/// `census::qwen::ngram_hash` is `pub`, so that comparison belongs THERE and is not duplicated here.
+/// Two copies of one claim is how a header transcription gets scored against itself.
+///
 /// RED OBSERVED (plant P10, `splitmix64` without the golden-gamma increment):
 /// `left: [16547087256759, 23703573157769, 20109073645365]` against
 /// `right: [23703573157769, 20109073645365, 8052911324071]` — the sequence SHIFTED BY ONE, carrying
 /// two of the three correct multipliers in the wrong slots. A gate comparing them as a set, or
 /// checking only `m_1`, would have passed on it.
 ///
-/// The index-1
-/// arm is the other half: the byte-exact match at index 0 is what makes "this checkpoint's PLE
-/// layer index is 0" evidence rather than an assumption, and it is only evidence if index 1
-/// disagrees.
+/// The index-1 arm is the other half: the byte-exact match at `ple_layer_index` 0 is what makes
+/// "this checkpoint's PLE ORDINAL is 0" evidence rather than an assumption, and it is only evidence
+/// if 1 disagrees. **That ordinal is not the host `layer_idx`** — the two numbers are 0 and 1
+/// respectively for the same single layer, which is why the first assertion below pins `layer_idx`
+/// and every `ngram_hash` call below passes an ordinal.
 #[test]
 fn the_ngram_hash_parameters_are_re_derivable_at_index_zero_and_not_at_one() {
     let cfg = shipped();

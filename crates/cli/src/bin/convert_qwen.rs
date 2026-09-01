@@ -44,7 +44,7 @@
 //!
 //! Plan of record: `docs/investigations/qwen-flash-next-port.md` (stage S4).
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use rivoli_artifact::census::qwen::{Census, NgramHash, Role, ngram_hash};
 use rivoli_artifact::format::{
@@ -132,15 +132,18 @@ fn bounded_range(
 /// **The chat template ships TWICE and the two must be the same template.**
 ///
 /// `chat_template.jinja` is the file; `tokenizer_config.json`'s `chat_template` key is the same
-/// text as a JSON string. The S0 finding is that they agree byte-for-byte modulo the file's
-/// trailing newline — and that agreement is the reason this port can copy either one instead of
-/// hand-porting, which is exactly where GLM drifted to another family's role framing for months.
+/// text as a JSON string. The S0 finding is that they agree byte-for-byte — track D measured both
+/// at 8,952 B with NO trailing newline on either side — and that agreement is the reason this port
+/// can copy either one instead of hand-porting, which is exactly where GLM drifted to another
+/// family's role framing for months.
 /// So the agreement is asserted at convert time rather than recorded in prose: if a future
 /// revision lets them diverge, the port must choose deliberately, and this refusal is what makes
 /// it choose.
 ///
 /// Compared with trailing newlines trimmed from BOTH sides and both raw lengths named in the
-/// refusal, because "which of the two is longer" is the actionable half.
+/// refusal, because "which of the two is longer" is the actionable half. The trim is not what makes
+/// the pinned revision agree — it already does, exactly — it is there so that a re-export adding a
+/// newline to one home reads as the formatting artefact it is rather than as a divergence.
 fn confront_chat_template(src_dir: &str) -> Result<()> {
     let jinja_path = format!("{src_dir}/chat_template.jinja");
     let jinja =
@@ -164,8 +167,8 @@ fn confront_chat_template(src_dir: &str) -> Result<()> {
     ensure!(
         a == b,
         "chat_template.jinja ({} B) and tokenizer_config.json's `chat_template` ({} chars) are \
-         not the same template. They agree byte-for-byte modulo a trailing newline in the \
-         pinned revision, and copying either one is only safe while they do — the GLM scar is a \
+         not the same template. They agree byte-for-byte in the pinned revision (8,952 B each), \
+         and copying either one is only safe while they do — the GLM scar is a \
          hand-ported template that drifted to another family's role framing for months",
         jinja.len(),
         embedded.len()
@@ -328,6 +331,16 @@ fn write_ngram_shards(
             // Named by its GLOBAL first row rather than by its shard number, because the row is
             // what a gather divides by and the shard number is an artefact of how the publisher
             // split the upload.
+            //
+            // **UNGATED ASSUMPTION, named here and in the plan doc's OWED list: the shard INDEX is
+            // row ORDER.** The `ensure!` below gates that the 128 shards TILE `[0, padded_rows)` —
+            // the widths sum — and says nothing about which rows are in which file. If
+            // `shard_{s}` does not hold `[s * rows_per_shard, (s+1) * rows_per_shard)`, every row
+            // a decode gathers is the wrong row with every shape, count, dtype and byte total
+            // intact, no crash and no refusal. It cannot be gated here: the real bytes are not on
+            // this box, and a check over a synthesized source would only assert the convention it
+            // was built from. What settles it is one known token's 16 rows gathered from the REAL
+            // shards through `hash.offsets` against the reference stack's PLE embedding output.
             w.add(
                 format!("ngram.rows.{row}"),
                 Dtype::F8E4M3,
@@ -412,24 +425,26 @@ fn write_resident(
         }
         let (bytes, dtype, shape) = src.raw(name)?;
         let f = census.confront_tensor(name, dtype, shape)?;
-        // **The excluded guard, and it is deliberately not `in_scope`'s.** `in_scope` consults
-        // the same census, so a broken role predicate would open those shards AND stop filtering
-        // them — `convert_k3`'s measured lesson, where a structurally-zero counter printed
-        // "0 vision skipped" however broken the filter was. This asks the question again at the
-        // point of writing, against the role of the tensor actually in hand.
-        ensure!(
-            !f.role.is_excluded(),
-            "{name} reached the resident set with role {} — this converter builds the TEXT arm \
-             only, and the MTP draft layer and the vision tower must never enter the artifact",
-            f.role.label()
-        );
+        // **The excluded arm is a REFUSAL in the match, and it is deliberately not `in_scope`'s
+        // question re-asked.** `in_scope` consults the same census, so a broken role predicate
+        // would open those shards AND stop filtering them — `convert_k3`'s measured lesson, where
+        // a structurally-zero counter printed "0 vision skipped" however broken the filter was.
+        // Asking it here, in the arm, is what makes it unanswerable any other way: the question is
+        // put against the role of the tensor actually in hand at the point of writing, and there is
+        // no separate `ensure!` above whose deletion would leave an `unreachable!` to abort a
+        // converter that must refuse.
         match f.role {
             Role::RoutedWeight | Role::RoutedScale | Role::NgramShard => skipped += 1,
             Role::Resident | Role::HashParam | Role::NgramScale => {
                 w.add(name, dtype, shape.to_vec(), bytes);
                 kept += 1;
             }
-            Role::ExcludedMtp | Role::ExcludedVision => unreachable!("refused above"),
+            Role::ExcludedMtp | Role::ExcludedVision => bail!(
+                "{name} reached the resident set with role {} — this converter builds the TEXT \
+                 arm only, and the MTP draft layer and the vision tower must never enter the \
+                 artifact",
+                f.role.label()
+            ),
         }
     }
     ensure!(kept > 0, "the resident set is empty — nothing was in scope");

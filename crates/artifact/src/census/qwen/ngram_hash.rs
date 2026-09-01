@@ -7,13 +7,19 @@
 //! it belongs beside the converter, which byte-compares its output against the checkpoint's own
 //! three I64 buffers rather than trusting either.
 //!
-//! **The layer index is in BOTH halves of the per-PLE-layer indexing, and stating only one of them
-//! is the trap.** `base_seed = seed + 10007 * ple_layer_index` carries it for the multipliers;
+//! **`ple_layer_index` and `layer_idx` are two different numbers, and this file means only the
+//! first.** `ple_layer_index` is the ORDINAL of a layer within `ple_layer_ids` — the shipped file
+//! lists `[2]`, so there is exactly one PLE layer, its `ple_layer_index` is **0**, and its
+//! `layer_idx` is **1** (the ids are one-indexed; `QwenTextConfig::ple_host_layer` is the one place
+//! that conversion happens, and `layer_idx` never appears in the arithmetic below).
+//!
+//! **`ple_layer_index` is in BOTH halves of the per-PLE-layer indexing, and stating only one of
+//! them is the trap.** `base_seed = seed + 10007 * ple_layer_index` carries it for the multipliers;
 //! `global_head_idx = ple_layer_index * ngram_heads + head_idx` carries it for the vocabularies. At
-//! index 0 this reproduces the checkpoint byte-exactly and at index 1 it does not — which is the
-//! EVIDENCE that this checkpoint's PLE layer index is 0, rather than an assumption about it.
+//! `ple_layer_index` 0 this reproduces the checkpoint byte-exactly and at 1 it does not — which is
+//! the EVIDENCE that this checkpoint's PLE ordinal is 0, rather than an assumption about it.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 use crate::qwen_config::QwenTextConfig;
 
@@ -63,6 +69,30 @@ fn splitmix64(x: u64) -> u64 {
     rivoli_core::hash::splitmix_finalize(x.wrapping_add(GOLDEN_GAMMA))
 }
 
+/// `usize` -> `u64`, refusing with the name of the quantity.
+///
+/// **Every conversion in this file refuses rather than saturating, and that direction is the
+/// module's whole argument.** `rivoli_engine::resident::stream_units` saturates deliberately,
+/// because a clamped unit list is a refusal downstream where a truncated one is a wrong answer;
+/// here the opposite holds. The values feed an EXACT derivation that is byte-compared against the
+/// checkpoint's own I64 buffers, so a substituted `0` does not become a refusal — it makes
+/// `multipliers[i]` the seed's own mix, and the comparison then fails naming a wrong number rather
+/// than the wrong conversion. One function rather than nine `unwrap_or`s so the direction cannot
+/// be right at eight sites and wrong at the ninth, which is what review found.
+fn u64_of(what: &str, v: usize) -> Result<u64> {
+    u64::try_from(v).with_context(|| format!("{what} ({v}) does not fit a u64"))
+}
+
+/// `u64` -> `usize`, refusing with the name of the quantity — the same rule the other way.
+///
+/// The saturating form was WORSE here than at the `u64` sites: `take(try_from(heads).unwrap_or(0))`
+/// and `len() == try_from(heads).unwrap_or(0)` share the fallback, so on a target where the cast
+/// fails the take yields nothing and the count check compares `0 == 0` and passes. A guard whose
+/// own fallback can make it vacuous is not a guard.
+fn usize_of(what: &str, v: u64) -> Result<usize> {
+    usize::try_from(v).with_context(|| format!("{what} ({v}) does not fit a usize"))
+}
+
 /// Trial division to `sqrt(n)`: ~2,200 divisions per ~2e7 candidate and a few hundred candidates
 /// per call — nothing beside a 172.76 GiB conversion, and it keeps the derivation dependency-free.
 fn is_prime(n: u64) -> bool {
@@ -84,20 +114,22 @@ fn is_prime(n: u64) -> bool {
 
 /// **The 16 head vocabularies, their offsets and the 3 multipliers, re-derived from the config.**
 ///
-/// `ple_layer_index` is in BOTH halves of the per-layer indexing, and stating only one of them is
-/// the trap (`qwen-architecture.md` §5): `base_seed = seed + 10007 * ple_layer_index` carries it
-/// for the multipliers, `global_head_idx = ple_layer_index * ngram_heads + head_idx` carries it
-/// for the primes. At index 0 this reproduces the checkpoint's three I64 buffers byte-exactly and
-/// at index 1 it does not — which is the EVIDENCE that this checkpoint's PLE layer index is 0,
-/// rather than an assumption about it.
+/// `ple_layer_index` is the ORDINAL within `ple_layer_ids`, NOT a `layer_idx`: the one PLE layer
+/// has `ple_layer_index` 0 and `layer_idx` 1, and nothing here takes a `layer_idx`. That ordinal is
+/// in BOTH halves of the per-PLE-layer indexing, and stating only one of them is the trap
+/// (`qwen-architecture.md` §5): `base_seed = seed + 10007 * ple_layer_index` carries it for the
+/// multipliers, `global_head_idx = ple_layer_index * ngram_heads + head_idx` carries it for the
+/// primes. At ordinal 0 this reproduces the checkpoint's three I64 buffers byte-exactly and at 1 it
+/// does not — which is the EVIDENCE that this checkpoint's PLE ordinal is 0, rather than an
+/// assumption about it.
 ///
 /// Deriving it in Rust rather than vendoring the three multipliers as a golden is the point: the
 /// multipliers do not depend on `head_idx` at all, so a golden over them passes on a wrong
 /// `global_head_idx` and the 16 primes are where that error shows.
 pub fn ngram_hash(cfg: &QwenTextConfig, ple_layer_index: u64) -> Result<NgramHash> {
-    let heads = u64::try_from(cfg.ngram_heads()).unwrap_or(0);
+    let heads = u64_of("ngram_heads", cfg.ngram_heads())?;
     ensure!(heads > 0, "ngram_heads is 0; nothing to derive");
-    let vocab = u64::try_from(cfg.vocab).unwrap_or(0);
+    let vocab = u64_of("vocab_size", cfg.vocab)?;
     ensure!(vocab > 1, "vocab_size {} cannot bound the hash", cfg.vocab);
     // `half_bound = ((2^63 - 1) // vocab_size) // 2`, so `2 * (mix % half_bound) + 1` is odd and
     // stays inside the range a token-id product cannot overflow.
@@ -110,27 +142,30 @@ pub fn ngram_hash(cfg: &QwenTextConfig, ple_layer_index: u64) -> Result<NgramHas
     let base_seed = NGRAM_SEED.wrapping_add(NGRAM_LAYER_STRIDE.wrapping_mul(ple_layer_index));
     let multipliers = (0..cfg.ngram_size)
         .map(|i| {
-            let step = GOLDEN_GAMMA.wrapping_mul(u64::try_from(i + 1).unwrap_or(0));
-            2 * (splitmix64(base_seed.wrapping_add(step)) % half_bound) + 1
+            let step = GOLDEN_GAMMA.wrapping_mul(u64_of("the n-gram position", i + 1)?);
+            Ok(2 * (splitmix64(base_seed.wrapping_add(step)) % half_bound) + 1)
         })
-        .collect();
+        .collect::<Result<Vec<u64>>>()?;
 
     // The primes: the `(global_head_idx + 1)`-th prime strictly greater than `base - 1`, i.e.
     // simply the next `heads` primes after `base - 1`, skipped past this layer's offset.
-    let base = u64::try_from(cfg.ngram_vocab_size_base).unwrap_or(0);
+    let base = u64_of("ngram_vocab_size_base", cfg.ngram_vocab_size_base)?;
     ensure!(
         base > 1,
         "ngram_vocab_size_base {} is too small",
         cfg.ngram_vocab_size_base
     );
-    let skip = usize::try_from(ple_layer_index * heads).unwrap_or(usize::MAX);
+    let skip = usize_of("this layer's prime offset", ple_layer_index * heads)?;
+    // ONE conversion of `heads`, used by both the take and the count check below: two calls
+    // sharing a fallback is how the check could have gone vacuous (see [`usize_of`]).
+    let want = usize_of("ngram_heads", heads)?;
     let vocab_sizes: Vec<u64> = (base..)
         .filter(|&n| is_prime(n))
         .skip(skip)
-        .take(usize::try_from(heads).unwrap_or(0))
+        .take(want)
         .collect();
     ensure!(
-        vocab_sizes.len() == usize::try_from(heads).unwrap_or(0),
+        vocab_sizes.len() == want,
         "found {} head vocabularies, wanted {heads}",
         vocab_sizes.len()
     );
@@ -143,8 +178,11 @@ pub fn ngram_hash(cfg: &QwenTextConfig, ple_layer_index: u64) -> Result<NgramHas
         })
         .collect();
 
-    let divisor = u64::try_from(cfg.make_ngram_vocab_size_divisible_by).unwrap_or(0);
-    let parts = u64::try_from(cfg.split_ngram_parts).unwrap_or(0);
+    let divisor = u64_of(
+        "make_ngram_vocab_size_divisible_by",
+        cfg.make_ngram_vocab_size_divisible_by,
+    )?;
+    let parts = u64_of("split_ngram_parts", cfg.split_ngram_parts)?;
     ensure!(
         divisor > 0 && parts > 0,
         "make_ngram_vocab_size_divisible_by {divisor} / split_ngram_parts {parts} must both be \
