@@ -71,6 +71,15 @@
 //! wrong one. A defect matrix built only from separations would pass on a broken oracle: the two
 //! kinds of test are independent and neither subsumes the other.
 //!
+//! # DEVICE ARM, 2026-09-01 — rc 0, witness EMPTY, 11 passed
+//!
+//! Kernel-side red proof P1, `softplus` -> `sigmoid` in the decay (tree changed, `cmp` rc 1; built
+//! outside the lock): [`the_gdn_recurrence_kernel_matches_the_anchor_at_every_gdn_layer`] **RED**,
+//! `qwen-anchor-1 L0 o: 2.7860975e-2 is outside the 1.5e-4 operator tolerance`. Reverted, `cmp`
+//! rc 0, rebuilt, 11 passed rc 0, witness empty on both arms. The magnitude is **the same
+//! 2.7860975e-2 the host plant produced deviceless**, to every digit — the fixture and the kernel
+//! are computing the same thing.
+//!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom

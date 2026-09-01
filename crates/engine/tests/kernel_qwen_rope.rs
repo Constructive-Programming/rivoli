@@ -37,6 +37,12 @@
 //! `attention_factor = 0.1·ln(4) + 1` is recorded in `qwen-architecture.md` §7, and a kernel for it
 //! is a later milestone, not a deferral of this one.
 //!
+//! # DEVICE ARM, 2026-09-01 — rc 0, witness EMPTY, 7 passed
+//!
+//! No kernel-side plant: `rope_split_half` is an M7 kernel this port only REUSES, so the plants
+//! that price this claim are plants of the CALL and are listed in the device test's own
+//! RED-PROOF PLAN. What the arm establishes is the reuse itself, on silicon, at all twelve sites.
+//!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom

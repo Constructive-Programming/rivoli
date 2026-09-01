@@ -73,6 +73,34 @@
 //! only from separations reports green on a broken oracle. Three instances is a property, not a
 //! coincidence; `h::separations`' own doc now carries it.
 //!
+//! # DEVICE ARM, 2026-09-01 — rc 0, witness EMPTY, 12 passed, and the padding claim held
+//!
+//! **The BEFORE/AFTER byte comparison is DONE and the prediction HELD.** Two binaries — one built
+//! from `recurrent.hip` at 43bb83a, one from HEAD, both built outside the lock, both objects and
+//! executables verified distinct by md5 — were run back to back with **no rebuild between the
+//! arms**, both witnesses empty, both rc 0.
+//! [`the_power_of_two_widths_reproduce_the_host_oracle_and_print_their_bytes`]'s eight `BITS` rows
+//! (4 heads x head_dim 32 and 128) are **byte-identical**: `cmp` rc 0 over 5,956 bytes of hex, both
+//! sides md5 `a6b1b8a570a8712a6b48414fc28770cb`. The four-part construction argument is now a
+//! measurement at the widths the four shipped models run.
+//!
+//! **Kernel-side red proof P4**, `t < head_dim` -> `t <= head_dim`, is the one that paid twice:
+//!
+//! * [`the_norm_gate_launcher_matches_the_anchor_at_the_width_the_guard_refused`] **RED** at
+//!   `qwen-anchor-1 L0 norm: 7.752174e-1`;
+//! * [`the_masked_lanes_cannot_reach_the_result`] **RED** at *"the NaN-poisoned run produced a
+//!   non-finite output, so the two runs agreeing byte-for-byte would prove nothing — the masked
+//!   lanes ARE reaching the result"*. **The finiteness guard fired before the byte comparison
+//!   could**, which is the NaN trap this repo has on record catching a broken kernel that scored
+//!   9 of 9; here it caught one on silicon.
+//!
+//! > **The host variant UNDER-models the kernel plant, and the numbers say so.**
+//! > [`NEIGHBOUR_FOLDED_IN`] predicts 5.5533e-4 and the kernel plant measured **7.752174e-1**,
+//! > three orders larger. The host variant folds a neighbour into the mean; the real off-by-one
+//! > ALSO lets lane `head_dim` past `if (!live) return;`, so it STORES to `out[off]` and clobbers
+//! > the next head's first output. A host stand-in for a kernel defect is a lower bound on it, not
+//! > a model of it — which is an argument for the device arm, not against the stand-in.
+//!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -579,4 +607,70 @@ fn the_norm_gate_launcher_accepts_a_non_power_of_two_and_still_refuses_the_rest(
         ),
         (1006, "a NaN epsilon", call(4, 8, f32::NAN)),
     ]);
+}
+
+/// **The BEFORE/AFTER byte comparison for the guard-1003 padding change, at the power-of-two
+/// widths the four shipped models run.**
+///
+/// The four-part bit-identity argument at the kernel predicts that padding is inert here. This test
+/// is what makes the prediction falsifiable across two binaries: it drives the launcher at K3's
+/// anchor width (32) and the real width (128) on a DETERMINISTIC draw, asserts the result against
+/// the same f64 host oracle the rest of this suite uses, and prints every output word as raw hex
+/// bits.
+///
+/// **Why a printer and not a stdout diff of `kernel_k3_conv_norm.rs`.** That suite prints no
+/// numbers at all, so diffing its stdout compares pass/fail lines and wall-clock — two greens, and
+/// no bytes. Byte-identity is a claim about the kernel's OUTPUT, so the output is what gets
+/// printed. Run under `--nocapture` in a binary built from `recurrent.hip` at 43bb83a and again in
+/// one built from HEAD, then `diff` the `BITS` lines; they must be identical.
+///
+/// The assertion half stands on its own in either binary: the widths are powers of two, so the
+/// pre-padding kernel accepts them too and guard 1003 never fires.
+#[cfg(feature = "rocm")]
+#[test]
+fn the_power_of_two_widths_reproduce_the_host_oracle_and_print_their_bytes() {
+    use common::{fill, stream};
+
+    let s = stream();
+    let heads = 4usize;
+    for head_dim in [32usize, 128] {
+        assert_eq!(
+            padded(head_dim),
+            head_dim,
+            "this test's whole subject is the widths where padding is INERT"
+        );
+        let n = heads * head_dim;
+        // A fixed LCG draw, so the two binaries are handed the same bits. Scaled so `mean(o²)` is
+        // well above the 1e-6 eps — an input where the eps dominated would make the comparison a
+        // statement about the epsilon rather than about the reduction.
+        let c = GateNorm {
+            heads,
+            head_dim,
+            o: fill(n, 0x5157_454E, 1.0),
+            z: fill(n, 0x4E4F_524D, 1.0),
+            weight: fill(head_dim, 0x5041_4432, 1.0),
+            // `gate_norm` does not read this field; the oracle IS what fills it below.
+            want: Vec::new(),
+        };
+        let want = gate_norm(&c, Form::Reference);
+        let got = launch(&s, &c, &c.o, &c.z);
+        assert!(
+            want.iter().all(|x| x.is_finite()),
+            "the host oracle must be finite before any comparison is believed — `f32::max` \
+             ignores NaN, so an all-NaN pair scores as a perfect match"
+        );
+        h::Bar::at("gdn_out_norm", HOST_WORST).hold(
+            &format!("synthetic head_dim={head_dim}"),
+            "norm",
+            &got,
+            &want,
+        );
+        for hd in 0..heads {
+            let row: Vec<String> = got[hd * head_dim..(hd + 1) * head_dim]
+                .iter()
+                .map(|x| format!("{:08x}", x.to_bits()))
+                .collect();
+            println!("BITS head_dim={head_dim} head={hd} {}", row.join(" "));
+        }
+    }
 }

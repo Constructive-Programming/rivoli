@@ -18,12 +18,16 @@
 //!   `seg` elements of each `stride`-strided row, with `inv_freq = theta^(-2j/seg)` — which is
 //!   `apply_rotary_pos_emb` over `q[..., :rotary_dim]` with `rotate_half` exactly (MOD:566-600).
 //!   Measured, not read: [`the_split_half_rope_launcher_is_qwens_partial_rope`].
-//! * **REUSE `launch_index_score_blocks`.** Its `score[s][b] = sum_h w[s][h] · ReLU(<q, kv_b>)`
-//!   becomes qwen's formula with `w` filled with `1/sqrt(d)` — a positive uniform scale
-//!   distributes over the sum, and `w` is not an invented tensor but the scale MOD:693 applies
-//!   after it. Trap T6 says there are no learned per-head weights and there is no
-//!   `indexer_head_weights` tensor to plant; what this suite shows instead is that the existing
-//!   launcher, given that `w`, reproduces the reference's own `scores`.
+//! * **NEW `index_score_blocks_f32`, and it exists because a REUSE was REFUTED HERE.** The
+//!   scoring formula is `launch_index_score_blocks`' with `w` filled with `1/sqrt(d)`, and that
+//!   algebra is right — but the V4 kernel rounds to **bf16 three times** because its reference
+//!   does, and qwen's runs in fp32 (MOD:690-693). Every deviceless test agreed, because this
+//!   fixture's oracle is f64 and the roundings live only inside the kernel; the first device arm
+//!   measured **2.8701737e-3** against the 1.14e-4 tolerance, which is bf16's resolution and not a
+//!   scale, an ordering or a mask. Trap T6 still holds — there are no learned per-head weights and
+//!   no tensor to plant — and what this suite now shows is the fp32 twin reproducing the
+//!   reference's own `scores`. **The refutation is the finding: an algebraic reuse argument cannot
+//!   see a precision contract, and only the device arm could.**
 //!
 //! # `pooled_keys` is the POST-RoPE key, and that had to be measured
 //!
@@ -73,6 +77,23 @@
 //! `kernel_qwen_rope.rs`: it is a claim about `launch_rope_split_half` and the QSA attention's own
 //! captures, not about the block-key stage, and it was split out here when this file crossed the
 //! 800-line soft cap.
+//!
+//! # DEVICE ARM, 2026-09-01 — and the arm that REFUTED a reuse
+//!
+//! First run: rc 101, witness empty, `device scores: 2.8701737e-3 is outside the 1.14e-4 operator
+//! tolerance` while `pooled_keys` passed. That is bf16's resolution, and it is why
+//! `index_score_blocks_f32` exists — the header's first section carries the finding. With the fp32
+//! scorer: **rc 0, witness EMPTY, 13 passed.**
+//!
+//! Kernel-side red proofs, both built outside the lock, both reverted with `cmp` rc 0 and the tree
+//! re-run green:
+//!
+//! * **P2**, the pool grouped one token late in `index_pool_norm_f32` -> `device pooled_keys:
+//!   6.5731794e-1`. Note it reddened on `pooled_keys` — the FIRST scored quantity in the chain —
+//!   where the deviceless plant of the same shape reddened the ladder at 6.136655e-1;
+//! * **P5**, the ReLU dropped from `index_score_blocks_f32` -> `device scores: 6.86686e-1`, against
+//!   the 6.867e-1 the host variant measures. Same number, so the fp32 twin is computing the host
+//!   oracle's arithmetic.
 //!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
@@ -622,9 +643,8 @@ fn a_summing_pool_is_cancelled_by_the_norm_that_follows_it() {
 #[test]
 fn the_block_key_pipeline_matches_the_anchor() {
     use common::{DeviceBuf, back, dev, f32b, f32v, ok, stream, zeros};
-    use rivoli_backend::abi::ScoreDims;
     use rivoli_backend::hip::{
-        ScoreBufs, launch_index_pool_norm_f32, launch_index_score_blocks, launch_rope_split_half,
+        launch_index_pool_norm_f32, launch_index_score_blocks_f32, launch_rope_split_half,
     };
 
     let c = window();
@@ -683,29 +703,33 @@ fn the_block_key_pipeline_matches_the_anchor() {
         "rope_split_half on the indexer query",
     );
 
-    // The score REUSE: `w` filled with `1/sqrt(hd)` turns
-    // `score[s][b] = sum_h w[s][h]·ReLU(<q,kv_b>)` into MOD:693's
-    // `sum_h ReLU(<q,kbar_b>) / sqrt(hd)`. A positive uniform factor distributes over the sum, so
-    // the only difference from applying it after is the fp32 rounding order.
+    // The score: `w` filled with `1/sqrt(hd)`, which is the scale MOD:693 applies after the sum —
+    // a positive uniform factor distributes over it — and NOT a learned per-head weight, of which
+    // this model has none (trap T6).
+    //
+    // **`launch_index_score_blocks_f32` and not `launch_index_score_blocks`, and the earlier
+    // reading of this line is the reason it exists.** The bf16 twin was scored here as a REUSE and
+    // refuted by this very test on 2026-09-01 at 2.8701737e-3 — see the header.
     let w = dev(&f32b(&vec![1.0f32 / (c.hd as f32).sqrt(); c.heads]));
     let mut scores = zeros(nb * 4);
-    let bufs = ScoreBufs {
-        q: q_out as *const f32,
-        kv: kbar_out as *const f32,
-        w: cp(&w),
-        score: scores.ptr_mut() as *mut f32,
-    };
-    let dims = ScoreDims {
-        s: 1,
-        n_comp: nb,
-        heads: c.heads,
-        hd: c.hd,
-    };
+    let score_out = scores.ptr_mut() as *mut f32;
     // SAFETY: `q` is `1 · heads · hd`, `kv` is `n_comp · hd`, `w` is `1 · heads`, `score` is
     // `1 · n_comp`; all four are distinct live allocations outliving the stream.
     ok(
-        unsafe { launch_index_score_blocks(bufs, dims, s.raw()) },
-        "index_score_blocks",
+        unsafe {
+            launch_index_score_blocks_f32(
+                q_out as *const f32,
+                kbar_out as *const f32,
+                cp(&w),
+                score_out,
+                1,
+                nb,
+                c.heads,
+                c.hd,
+                s.raw(),
+            )
+        },
+        "index_score_blocks_f32",
     );
     b.hold("device", "scores", &f32v(&back(&scores)), &c.want_scores);
 }

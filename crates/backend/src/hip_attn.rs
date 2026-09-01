@@ -594,6 +594,46 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// **Qwen3.8-Flash-Next's indexer block scoring, in fp32** —
+    /// `score[t][b] = sum_h w[t][h] · ReLU(<q_t^h, kbar_b>)` (MOD:690-693). `kernels/indexer.hip`
+    /// carries the arithmetic.
+    ///
+    /// `q` is `s · heads · hd` f32, `kv` is `n_comp · hd`, `w` is `s · heads`, `score` is
+    /// `s · n_comp` writable. `w` carries the `1/sqrt(hd)` MOD:693 applies after the sum — a
+    /// positive uniform factor distributes over it — and there are no learned per-head weights in
+    /// this model (trap T6).
+    ///
+    /// > **This is NOT [`launch_index_score_blocks`], and the difference was MEASURED rather than
+    /// > read.** Track C scored the reuse deviceless, argued it from the algebra, and the first
+    /// > device arm refuted it at **2.8701737e-3** against a 1.14e-4 tolerance: that kernel rounds
+    /// > to bf16 three times because DeepSeek-V4's indexer does, and qwen's runs in fp32. The
+    /// > deviceless oracle is f64 and the roundings live only in the kernel, so nothing on the host
+    /// > could have seen it. A separate entry point rather than a flag, for the reason `swiglu` and
+    /// > `swiglu_clamped_bf16` are separate: neither call site may reach the other's arithmetic by
+    /// > changing an argument.
+    ///
+    /// **Nine positional arguments, three of them indistinguishable `*const f32`, and that is a
+    /// known regression against the twin.** [`launch_index_score_blocks`] groups them into
+    /// [`ScoreBufs`] and [`ScoreDims`] precisely because a transposed pair still addresses real
+    /// f32 and produces a finite wrong answer. That launcher is hand-written in `hip.rs`, which is
+    /// not track C's file; the grouping is owed and flagged rather than skipped silently.
+    ///
+    /// # Safety
+    /// Every pointer is a device buffer of the size above, live until `stream` completes, and
+    /// **none may alias another** — all four are `__restrict__` in the kernel. `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
+    launch_index_score_blocks_f32 -> rivoli_index_score_blocks_f32, "index_score_blocks_f32" (
+        q: *const f32,
+        kv: *const f32,
+        w: *const f32,
+        score: *mut f32,
+        s: usize as i32,
+        n_comp: usize as i32,
+        heads: usize as i32,
+        hd: usize as i32,
+        stream: *mut c_void,
+    );
+
     /// Select the DSA attend row set on device: `rows[0..min(k,nt))`, ASCENDING by index.
     ///
     /// Writes device-side only — no D2H, no host top-k, and no `device_sync`: the attend

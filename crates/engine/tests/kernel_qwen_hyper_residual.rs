@@ -46,6 +46,14 @@
 //!   GOLDEN, never against the reference arm.
 //! * Reverted, `cmp` rc 0, recompiled, 7 passed exit 0.
 //!
+//! # DEVICE ARM, 2026-09-01 — rc 0, witness EMPTY, 10 passed
+//!
+//! Kernel-side red proof P3, the `/ (float)n_r` dropped from `gated_residual_collapse_f32`:
+//! [`the_gated_residual_kernel_matches_the_anchor_everywhere`] **RED**, `qwen-anchor-1 L0
+//! attn_hyper_connection x: 3e0 is outside the 1.42e-4 operator tolerance` — **exactly 3, at the
+//! first site**, which is `n_r - 1` and what [`SUM_NOT_MEAN`] records the host variant giving at
+//! all 28. A pure factor is a pure factor on silicon too. Reverted, `cmp` rc 0, 10 passed rc 0.
+//!
 //! Device tests: `-- --test-threads=1` under `flock /var/run/sys-gpu.lock`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
