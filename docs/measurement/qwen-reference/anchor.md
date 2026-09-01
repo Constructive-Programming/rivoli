@@ -185,6 +185,17 @@ byte-for-byte** — `vendored goldens verified: 4 of 4`, script exit 0, 2026-08-
 enumerates the expected set rather than globbing it, so an unvendored golden is a named failure
 instead of a silently shorter loop.
 
+**Re-run 2026-09-01, after the harness was split into five modules, and it is the split that the
+run was for.** `qwen_anchor_lib` and `qwen_anchor_driver` had crossed the 800-line soft cap, so
+the scoring half moved to `qwen_anchor_compare` and the environment half to
+`qwen_anchor_provenance`. A move refactor is exactly the change that can relocate arithmetic
+without any static check noticing: resolving every free name and importing every module proves
+they LOAD, and proves nothing about what they compute. `vendored goldens verified: 4 of 4`,
+byte-for-byte, on all four — decode at both salts, prefill, and the ngram micro-anchor. The
+script is `set -euo pipefail`, so reaching that block at all means the 76 defect-matrix compare
+cells, the tolerance table and the two equivalence modes had already passed; a green there is a
+green for the whole run, not for its last stage.
+
 ## The defect matrix — both columns
 
 **38 rows across 13 classes, at 2 salts = 76 compare cells, all green in both directions.**
