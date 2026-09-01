@@ -151,7 +151,7 @@ side-by-side decode.
 | # | item | closes when | state |
 |---|---|---|---|
 | 1 | vendored config pins | `qwen-reference/config.json` **and `generation_config.json`** (the sampling-defaults source) vendored at a pinned revision, and the gate **recomputes** FNV-1a from the live file and byte-compares | **DONE 2026-08-31** — `Qwen/Qwen3.8-Flash-Next-FP8` @ `236dfdf285828023ca3bcd3f37366c58a3469b13`; `docs/measurement/qwen-reference/{config.json,generation_config.json,linear_attn_norm_l0.bin}` + `tensor-families.tsv`'s VENDORED BYTES block; recomputed by `crates/artifact/tests/qwen_names.rs::the_vendored_files_hash_as_the_header_records`, red-proofed by a one-digit pin flip |
-| 2 | tokenizer TYPE first | HF `tokenizer.json` confirmed as the TYPE **before** 172.76 GiB moves, **and** the chat template's real home located (it has shipped only in the fp8 SOURCE repo before), **and** its hand-port scheduled with id-pinned cases — the GLM scar is a hand-ported template that drifted to another family's framing for months | **DONE 2026-08-31** — `tokenizer.json` is `"model": {"type": "BPE"}` (first 8192 B fetched, sha pinned in the tsv) with `tokenizer_class: Qwen2Tokenizer`, so the `tokenizers` crate is the loader and no tiktoken path is needed. The template ships **in the FP8 repo itself, in two places that agree byte-for-byte**: `chat_template.jinja` (8,952 B) and `tokenizer_config.json`'s `chat_template` key (8,952 chars, identical modulo the file's trailing newline) — the GLM hazard (template only in the fp8 SOURCE) does not recur here, and a converter can copy either. Hand-port scheduled as track D / S5 with ~31 id-pinned cases (exit-gate table below) |
+| 2 | tokenizer TYPE first | HF `tokenizer.json` confirmed as the TYPE **before** 172.76 GiB moves, **and** the chat template's real home located (it has shipped only in the fp8 SOURCE repo before), **and** its hand-port scheduled with id-pinned cases — the GLM scar is a hand-ported template that drifted to another family's framing for months | **DONE 2026-08-31** — `tokenizer.json` is `"model": {"type": "BPE"}` (first 8192 B fetched, sha pinned in the tsv) with `tokenizer_class: Qwen2Tokenizer`, so the `tokenizers` crate is the loader and no tiktoken path is needed. The template ships **in the FP8 repo itself, in two places that agree byte-for-byte**: `chat_template.jinja` (8,952 B) and `tokenizer_config.json`'s `chat_template` key (8,952 chars) — the GLM hazard (template only in the fp8 SOURCE) does not recur here, and a converter can copy either. Hand-port scheduled as track D / S5. *Corrected 2026-09-01 (S5, track D)*: the two homes are **exactly** byte-identical — this cell said "identical modulo the file's trailing newline", and the `.jinja` file carries NO trailing newline, so there is no modulo (gated by `qwen_template.rs`, which asserts the vendored copy ends at the outer `endif`); and the case count is **78 = 65 rendering + 13 refusals**, not the ~31 scheduled here before the template was read — the three surfaces that account for the difference are in the worklog, and all three counts are asserted rather than stated |
 | 3 | converter `ensure!` counts | `convert_qwen` asserts exact consumed/emitted tensor counts, with MTP and vision excluded **by name** against `tensor-families.tsv` (109 family rows, Σcount 152,089, all three status sums now gated deviceless) | OWED (S4) |
 | 4 | first-party anchors + defect matrix | tiny-width real-structure anchor from the model's own stack, two weight salts, **≥2 rows per each of the nine named operator classes (so ≥18 rows)** each shown to redden AND to hold, tolerances from fp64/fp32 floors on ≥2 draws BEFORE the kernels | OWED (S2) |
 | 5 | kernel census both ends | every new launcher has an oracle suite or a live DEFERRED row; **N/N/0 at closeout, or a deferral that is MILESTONE-NAMED** (a named later milestone, not a bare TODO) | OWED (S3) |
@@ -267,7 +267,7 @@ waits for a **GO**.
 | defect matrix | **≥2 rows for each of the nine named classes, so ≥18 rows** (GDN decay form, conv tap order, output-gate activation, indexer relu/pool/budget, hc transpose + lowrank order, router bias/norm/w1w3, n-gram seed/order/layer, partial-rope width, eps homes), gated **both directions** | S2, with the anchor | a deleted EXPECT_GREEN row reds the both-directions gate |
 | tolerances | per-operator rows from fp32/fp64 floors on **≥2 weight draws**, under the existing derived-policy gate; `ExactOnly` where the margin collapses | S2, before the kernels they score | an under-floor tolerance reds the tolerance-rule gate |
 | kernel census | every new launcher has an oracle suite or a live DEFERRED row, checked both ends; **N/N/0 at closeout, or a deferral that is MILESTONE-NAMED** (a named later milestone, not a bare TODO) | S3 | the three-edge DEFERRED proof for any deferral; per-suite plants from the observed defect classes |
-| chat encoding (track D) | ~31 **id-pinned** template cases scored against the reference tokenizer's own output (gate G5): thinking and non-thinking framing, tool turns, multi-turn, the trailing-generation prompt | S5, with the encoder | a deliberately mis-framed turn (another family's role framing, the GLM drift) reddens the case set |
+| chat encoding (track D) | **78** template cases scored against the reference's own output (gate G5) — **65** rendering cases pinned byte-for-byte AND id-for-id through the reference tokenizer, plus **13** refusals pinned to the template's own message, *revised 2026-09-01 from the ~31 estimated here before the template was read; the delta is argued in the worklog and every count is asserted in `qwen_template.rs`*: thinking and non-thinking framing, tool turns, multi-turn, the trailing-generation prompt, the reject direction | S5, with the encoder | a deliberately mis-framed turn (another family's role framing, the GLM drift) reddens the case set |
 | parity window | frozen teacher-forced forward over a pinned ~64-token window (the M8 substitution — no live reference fits this box): per-position argmax agreement with flips confined to measured near-ties, NLL deltas within compounded tolerance and above the floor | S7 | a shadow artifact perturbed at scale — a single-byte flip is BELOW a short run's detection floor (scope: glm) |
 | ppl cells | `tests/ppl-gates.sh <artifact> profile` and `p4` (both arch-agnostic); the paired `tf` cell's analogue here is the parity window. **p4 self-calibrates: on a non-reproducing arm it reports UNCALIBRATED (exit 1)** — there it is a diagnostic, never a merge gate | S7 | p4's red-proof corpus |
 | determinism floor | A-vs-A twice on `tests/ppl-corpus.txt`, **before any dNLL claim** | S7, cell 3 — a precondition, not a result | the standing instrument's own self-test, `tests/determinism-glm.sh --self-test`: the comparator reddens on a changed id AND on a truncated stream. The qwen arm inherits that instrument; this floor **row** stays uncalibrated until it is measured on the qwen artifact |
@@ -543,6 +543,188 @@ passed with it — 8 clones were reported and all 8 were FACTORED or re-shaped, 
   live bytes. Written at the line itself rather than only here. It could NOT be written tolerantly
   in advance — `include_bytes!` on an absent file is a compile error, not a skip — so no
   cross-worktree coupling was created to close it early.
+
+**2026-09-01 — S5 review-fix round (track D).**
+
+*Disclosure, owed from the S5 commit*: `923abb8` edited **`crates/artifact/src/lib.rs`** — one
+doc comment plus `pub mod qwen_encoding;` — and that file is in no track's exclusive list. Track
+A names it in its own worklog and track B names all four of its out-of-list files; this round is
+where track D does the same. The hunk is disjoint from track A's two `pub mod` lines, so the
+merge is keep-both. Nothing else outside track D's list is touched by S5 or by this round, with
+the exception noted under finding 5 below: the plan's own census and exit-gate rows (lines 154
+and 270) are main's copy, corrected here in place because the numbers they carry are track D's
+and are now false — revert that hunk if the plan of record should own it instead.
+
+*Correction, dated in place*: the template raises at **NINE** `raise_exception` sites (lines 10,
+21, 33, 39, 43, 49, 100, 106, 160), not eight. "Eight" was stated in **six** places — `lib.rs`,
+`qwen_encoding.rs`, this file, `qwen_template.rs` twice, `qwen_template_driver.py` — and in
+commit `923abb8`'s message, which cannot be rewritten and is corrected by this line. Nothing
+recomputed the count, which is exactly the `inherited-numbers-are-unverified` class; it is now a
+gate — `qwen_template.rs::the_vendored_template_is_the_pinned_revisions_own_file` counts
+`raise_exception` in the vendored bytes and demands 9, placed AHEAD of the length and hash
+asserts because every plant that changes the count also changes the bytes. The CODE was right
+throughout: all nine messages are implemented, and **eight of the nine carry vendored cases** —
+which is now also a gate (`check_every_refusal_site_is_covered`, each site's text anchored in the
+TEMPLATE and in the fixture), with the ninth (`No messages provided.`) named as unreachable by
+construction and carrying this file's ONE self-asserted refusal.
+
+*Correction, dated in place*: the id pin's comment claimed `RIVOLI_QWEN_REQUIRED=1` is "what CI
+and the closeout run set". **CI sets no such thing** — `.github/workflows/ci.yml` sets exactly one
+`*_REQUIRED` variable, `RIVOLI_CS_REQUIRED` (line 85), this one appears in no workflow, and a CI
+runner has no tokenizer to point `RIVOLI_QWEN_ARTIFACT` at. The clause is deleted rather than
+softened; the `drafter_convert.rs` precedent it cites claims nothing about CI either. In a clean
+run the test was green having tokenized NOTHING, so the skip path now:
+
+- counts the id-bearing cases BEFORE the branch and asserts that count (65) on **both** paths, so
+  a fixture that lost its ids cannot make an unarmed run look like a full one;
+- says the size of the hole where a reader of the run can see it. `eprintln!` cannot: libtest's
+  capture is consulted by the print macros, so a printed skip in a PASSING test is invisible.
+  A write to the `Stderr` HANDLE is not intercepted. **Measured 2026-09-01, rustc 1.96.0**, one
+  passing test emitting both forms: without `--nocapture` the macro line appears **0** times and
+  the handle line **once**; with `--nocapture`, both. The real suite now prints
+  `SKIP qwen id pin: RIVOLI_QWEN_ARTIFACT unset — 65 id-bearing cases NOT examined` in a plain
+  `cargo test` run.
+- reads `RIVOLI_QWEN_REQUIRED` by VALUE (`is_some_and(|v| !v.is_empty())`), not by existence,
+  citing `051a291` in place — the commit that changed `codescene.rs` two commits before this
+  branch's S5 landed the existence form. An empty-valued variable is what a CI `env:` expression
+  yields, and the old form ARMED on it: `RIVOLI_QWEN_REQUIRED=` panicked before this fix and
+  skips after it.
+
+*The env gate, run in all FOUR states (the fourth is the one people skip):* both unset → skip,
+exit 0, the SKIP line visible without `--nocapture`; `REQUIRED=1` alone → **exit 101**, *"qwen id
+pin REQUIRED but did not run: RIVOLI_QWEN_ARTIFACT is unset, so 65 id-bearing cases were NOT
+examined"*; `REQUIRED=` (empty but SET) → skip, exit 0, which is the `051a291` contract and the
+opposite of what the old code did; and **the real path, re-run this round** against
+`tokenizer.json` fetched at the pinned revision — sha256 `0997f410…`, byte-equal to the one the
+fixture's provenance records, 12,809,320 B — **65 of 65 cases tokenized identically to
+`apply_chat_template`**, exit 0 in 1.07 s.
+
+*Also corrected*: the tokenizer is **12,809,320 B**, not the "12.84 MB" four files said
+(measured by `wc -c` on the file at the pinned revision, whose sha256 the fixture pins).
+
+*The flag pairs are enums now (`Media`, `Counting`, `Turn`), the lone flag is not.* Review
+reported `qwen_encoding.rs` as the diff's highest primitive-argument site and suggested three
+two-variant enums; the reason to take it is narrower and better than arity. `vision_part` and
+`trimmed_content` each took **two adjacent `bool`s**, so a transposed pair COMPILED and rendered
+a wrong prompt — a video numbered as a picture, or the reverse user-query scan advancing the
+counters only the main loop may advance. Measured: with the enums, transposing the two at the
+main-loop call site is `error[E0308] … expected Turn, found Counting`; as two `bool`s it built.
+`Media` also owns the label, the pad token, the counter and the system refusal, which collapses
+four `if image` branches and two `match` arms. `assistant_turn`'s `replay_thinking` stays a
+`bool` and the decline is argued at the function: it is alone in its signature, so there is no
+transposition to catch, and it is a predicate the caller already computes and names. The
+refactor changes NO output, and that is not an opinion — the pin scored it armed: **65 of 65
+cases still tokenize identically**, all 78 still byte- or message-identical.
+
+> `qwen_encoding.rs` went 742 → **799** lines and now sits one line under the 800 soft cap. The
+> +57 is enums and their arguments; ~14 lines of the new prose were compressed back out rather
+> than shipping a new `cargo:warning`, and one bare restatement of the code was deleted. **The
+> next edit to this file must shrink it** — S6, which wires the module, is where a split lands.
+
+*Red proofs, each planted, byte-compared against a saved copy, observed red on the assertion
+ADDED, reverted, and green again on a run carrying a `Compiling` line:*
+
+- **count gate** — one `raise_exception` CALL removed from template line 33 (the message literal
+  kept, so the census could not fire instead), tree changed at byte 1592: `left: 8` /
+  `right: 9`. First attempt was rejected as a proof rather than as evidence: renaming the call to
+  `raise_exceptions` left the SUBSTRING in place and the count at 9 — `matches` counts
+  occurrences, so a rename is not a deletion.
+- **census, template end** — `'Unexpected message role.'` → `'…roles.'` in the template, byte
+  8663, count unchanged at 9: *"the vendored template no longer raises \"Unexpected message
+  role.\""*, and the count assert stayed green, which is what shows the two gates are
+  independent.
+- **census, fixture end** — one refusal case's `raises` text moved (`…in content.` →
+  `…in contents.`), fixture byte 115686: *"no vendored case covers the refusal site
+  \"Unexpected item type in content.\""*, and it was the ONLY red — the per-case loop never ran,
+  which is the census-before-detail ordering doing its job.
+- **skip-path census** — one case's `ids` key renamed away, fixture byte 1047, run with the
+  tokenizer variable UNSET so the skip path is the one under test: `left: 64` / `right: 65`,
+  the only red in the run. That is the assertion that makes the skip non-vacuous, and it is
+  proven red on the path that used to examine zero cases and report green.
+
+**2026-08-31 — S5 (track D): the chat template is hand-ported and pinned, and the case count grew
+to 78.** `chat_template.jinja` is now VENDORED at
+`docs/measurement/qwen-reference/chat_template.jinja` — 8,952 B, sha256 `c3cf9e34…`, fnv1a64
+`8b6b0871c5db260b`, fetched at `resolve/236dfdf2…/` and byte-compared against the pin track A
+recorded in `tensor-families.tsv` before it was vendored. Deliverables:
+`crates/artifact/src/qwen_encoding.rs` (string renderer, no Jinja, UNWIRED — S6 owns the seam),
+`crates/artifact/tests/{qwen_template.rs,qwen-chat-cases.json,qwen_template_driver.py}`.
+
+*Census item 2's parenthesis is corrected by measurement*: the two homes of the template are
+**exactly byte-identical**, not "identical modulo the file's trailing newline" — the `.jinja` file
+carries NO trailing newline, so `tokenizer_config.json`'s `chat_template` key is the same 8,952
+bytes with no modulo. The gate asserts equality, and asserts the vendored copy ends at the outer
+`endif` rather than a newline.
+
+**Why 78 cases and not the exit-gate row's ~31.** The counts are **78 = 65 rendering + 13
+refusals**, and those three are the only case numbers stated anywhere, because they are the three
+`qwen_template.rs` asserts. That row was written before the template was read; three surfaces it
+does not name account for the difference, and none of them collapses: **(a) `reasoning_effort`** —
+three legal values (`xhigh`, `medium`, `low`), `xhigh` is the DEFAULT and `medium` is the only one
+that emits nothing, so a render with NO kwargs at all already carries a synthesised system turn;
+anything else refuses; and the whole block is inert when thinking is off, so a bogus value there
+does NOT refuse. **(b) `enable_thinking`/`preserve_thinking`** — Jinja's `is true` and `is false`
+are IDENTITY against the booleans (measured on jinja2 3.1.6), so `1`, `0`, `null` and `"true"` are
+a FOURTH state neither branch was written for: no reasoning instructions, but an OPEN `<think>`.
+**(c) the reject direction** — the template calls `raise_exception` in nine places and three are
+reachable from an ordinary OpenAI client (`developer` role, no real user turn, a system turn that
+is not first), which is why this port returns `Result` where its three siblings return `String`.
+The rest are the surfaces the row did name, plus the vision placeholders and the `|trim` rule
+(Jinja's `trim` is Python `str.strip()`, which strips U+001C–U+001F where Rust's `str::trim()`
+does not — measured on CPython 3.14.6 and pinned).
+
+> **A per-surface case table was written and DELETED, 2026-08-31.** Two attributions of the same
+> 78 cases disagreed — a count of kwargs occurrences (a case can set several) against an
+> exclusive one-surface-per-case partition — and neither is recomputed by anything. That is the
+> `inherited-numbers-are-unverified` class caught inside the round that would have introduced it,
+> so the only counts that survive are the three the gate asserts.
+
+**Red proofs — three, each observed to have CHANGED THE TREE (byte-compared against a saved
+copy), to redden the assertion ADDED (read off `left`/`right`, not the exit code), then reverted
+with the tree observed green again on a run that carried a `Compiling` line:**
+
+1. **The M11b plant — close a turn with a non-stop token.** `IM_END` `<|im_end|>` (248046, an
+   `eos_token_id`) → `<|vision_pad|>` (248055, not a stop). Tree changed at byte 6470. FOUR
+   assertions red, exit 101: the byte pin at `default_bare` byte 228, `got ...<|vision_pad|>\n`
+   vs `want ...<|im_end|>\n`; the id pin at id 40, `got 248055` vs `want 248046` **with the id
+   COUNT unchanged at 48/48**, so only the value catches it; the divergence pin; and the
+   template-literal check, `template lacks <|vision_pad|>`.
+2. **One case's ids perturbed by one.** `tool_call_arg_shapes`, index 140, `29` → `30` (of 281).
+   Reddened the id pin ALONE — `got 29` vs `want 30` at id 140 — with the byte pin green, which
+   is what shows the id half is independently load-bearing.
+3. **One byte of the vendored template.** `xhigh` → `xhigb` inside the effort sentence, byte 2503,
+   **same length** so the byte-count assert cannot see it. Reddened the pin recomputation alone:
+   `left: Some("5fc96b0e9ade2b71")` (recomputed from the live file) vs
+   `right: Some("8b6b0871c5db260b")` (the fixture's and the census's pin).
+
+The `RIVOLI_QWEN_REQUIRED` env gate is proven in all THREE states, including the one people skip:
+artifact unset + REQUIRED unset → skip; artifact unset + `REQUIRED=1` → **exit 101**, *"qwen id
+pin REQUIRED but did not run: RIVOLI_QWEN_ARTIFACT is unset"*; and the REAL path with the
+variable set — **65 of 65 cases tokenized identically to `apply_chat_template`** through the
+shipped 12,809,320 B `tokenizer.json`.
+
+**jscpd reported SIX clones on the first compile and all six were fixed, none exempted** — the
+`v4_encoding/render.rs` import run whose own comment predicts the clone (fixed by a braceless
+`use crate::tokenizer;`), two same-signature functions in this module (merged, since all four
+template call sites trim), a `match` over `Value` tailing into `python_json` twice, and three
+`glimmer_template.rs` helpers (the `as_bool` chain, the `tools`-shape match, the specials census).
+
+**OWED, and none of it is track D's to close:** (i) `tensor-families.tsv` still lists
+`chat_template.jinja` under **NOT VENDORED HERE** — one line to move, track A's file; (ii)
+`qwen_names.rs` does not recompute the template's hash (the fixture and `qwen_template.rs` do) —
+track A's; (iii) `docs/measurement/gate-red-proofs.md` §14 is still OWED, so the three proofs
+above live here; (iv) `python_json`'s float divergence from `json.dumps` (`1e-5` → `0.00001`
+against `1e-05`) is reachable from a tool argument and is gated only by
+`v4_encoding::tests::boundary::numeric_rendering_diverges_from_python`, so this fixture pins the
+AGREEING rows only and the complete fix stays crate-wide; (v) `messages=[]` and a mapping `tools`
+are refused by transformers before the template is entered, so neither is scored by this fixture.
+
+**Hand-off to S6/E:** the framing is `serve::oai::split_think`-compatible as it stands — thinking
+on ends the prompt at an OPEN `<think>` and the model closes it; thinking off puts `</think>` in
+the PROMPT so the generation carries no tags — and `<think>`/`</think>` are added tokens with
+`special: false`, so `skip_special_tokens` does not eat them. `qwen_encoding.rs` is deliberately
+UNWIRED: nothing in `serve/mod.rs`, `main.rs` or `bench.rs` calls it, and both
+`QWEN_ARM_NOT_BUILT` doors still refuse.
 
 **2026-08-31 — S0+S1 review-fix round: five red proofs run, and the gates they belong to.**
 Recorded here rather than in `docs/measurement/gate-red-proofs.md`, whose §14 is **OWED** — that

@@ -23,6 +23,13 @@ pub mod glm_config;
 pub mod k3_config;
 pub mod quant;
 pub mod qwen_config;
+/// Qwen3.8-Flash-Next's prompt encoding. A sibling of [`tokenizer`]'s GLM surface for the same
+/// reason [`glimmer_encoding`] and [`v4_encoding`] are: this one builds a **string** that is
+/// tokenized afterwards where GLM's builds a token-ID list, and the old tree's own header says
+/// of that pair that "the two must not converge". Unlike its three siblings it returns a
+/// `Result`, because this checkpoint's template calls `raise_exception` in NINE places and
+/// three of them are reachable from an ordinary OpenAI client — see the module header.
+pub mod qwen_encoding;
 pub mod schema;
 pub mod tiktoken;
 pub mod tokenizer;
