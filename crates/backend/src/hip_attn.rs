@@ -411,6 +411,63 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// **One decode step of Qwen3.8-Flash-Next's gated delta rule** — the recurrence inside its
+    /// 36 GatedDeltaNet layers (`qwen-architecture.md` §1). `kernels/recurrent.hip`'s fourth
+    /// section carries the arithmetic and the four-point argument for why it is not
+    /// [`launch_gated_delta_recurrent_f32`].
+    ///
+    /// `q` and `k` are `[qk_heads][dk]`, `v` is `[v_heads][dv]`, `a`, `b`, `a_log` and `dt_bias`
+    /// are each `[v_heads]`, `state` is `[v_heads][dk][dv]` **updated in place**, and `out` is
+    /// `[v_heads][dv]`.
+    ///
+    /// **Every input is RAW, and each one is a trap this signature cannot express.** `q` and `k`
+    /// arrive pre-L2-norm and **un-repeated** — the projection's own `qk_heads`, not the
+    /// reference's post-`repeat_interleave` `v_heads` — `v` is never normed, `a` is the bare
+    /// decay projection with neither `softplus` nor `A_log` nor `dt_bias` applied, and `b` is the
+    /// write gate pre-sigmoid. The kernel does every one of those, because the decode path's
+    /// boundary is here; `crates/engine/tests/kernel_qwen_gdn_recurrent.rs` scores the two
+    /// reductions against the reference's OWN captured `g` and `beta`, so the fusion is measured
+    /// rather than asserted.
+    ///
+    /// **`state` is `[key][value]`, and the axis order is NOT visible in the shape** — `dk == dv`
+    /// at the anchor's widths (20) and at the model's (128), so a transposed state is square and
+    /// every dimension check passes. TR p.3 pins `[d_k x d_v]` and MOD:391's `sum(dim=-2)` agrees,
+    /// which is already rivoli's coalescing order, so no transpose is owed; the fixture scores the
+    /// swapped reading at 9.6e-1 rather than trusting that.
+    ///
+    /// **In place, deliberately.** A per-layer state buffer is uploaded once and mutated every
+    /// token — the aliasing argument is at the kernel, and the fixture scores an in-place launch
+    /// by reading `out.state` back out of the buffer it uploaded `initial_state` into.
+    ///
+    /// `dk` or `dv` above 1024 is refused (1002): the block is `next_pow2(max(dk, dv))` and
+    /// inherits the launch limit. A `v_heads` that is not a multiple of `qk_heads` is refused
+    /// (1003) rather than floored — a floored repeat reads a real row of `q` for every head and
+    /// returns plausible numbers. **There is deliberately no power-of-two guard on either width**,
+    /// unlike [`launch_gated_delta_recurrent_f32`]'s 1003: this model's anchor runs `dv = 20`, so
+    /// such a guard would refuse the only fixture that can score the kernel.
+    ///
+    /// # Safety
+    /// Every pointer is a device buffer of the size above and must outlive `stream`'s completion.
+    /// **Every one is `__restrict__` in the kernel, so none may alias another** — including `state`
+    /// against `out`, which are the two written. `stream` is a live `hipStream_t`, or null for the
+    /// default stream.
+    launch_gdn_recurrent_f32 -> rivoli_gdn_recurrent_f32, "gdn_recurrent_f32" (
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        a: *const f32,
+        b: *const f32,
+        a_log: *const f32,
+        dt_bias: *const f32,
+        qk_heads: usize as i32,
+        v_heads: usize as i32,
+        dk: usize as i32,
+        dv: usize as i32,
+        state: *mut f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
     /// **Kimi-K3's fused gated head norm**, `k3-architecture.md` §4 steps 8-9:
     /// `out = o · rsqrt(mean(o²) + eps) · weight · sigmoid(gate)`, per head.
     ///
@@ -473,6 +530,46 @@ launchers! {
         wscale: f32,
         dscale: f32,
         scores: *mut f32,
+    );
+
+    /// **Qwen3.8-Flash-Next's QSA block-key stage**: mean-pool `ratio` consecutive cached indexer
+    /// keys into one block key and RMSNorm it (`qwen-architecture.md` §3, TR Eq. 13 =
+    /// MOD:679-682). `kernels/indexer.hip`'s last section carries the arithmetic.
+    ///
+    /// `keys` is `[n_blocks · ratio][hd]` f32, `weight` is `[hd]`, `out` is `[n_blocks][hd]`.
+    ///
+    /// **Not [`launch_index_pool_push`]**, whose block width is the compile-time `MISA_BLOCK`
+    /// (1024) and cannot express `indexer_compress_ratio = 4` through any argument.
+    ///
+    /// **The pool and the norm are ONE kernel because there is no scoreable boundary between
+    /// them**: `RMSNorm(c·x) = RMSNorm(x)`, so a pool that summed instead of averaging is
+    /// cancelled by the norm that follows it — measured at 3.4e-5 to 4.8e-5 residue, which is the
+    /// epsilon term and not the factor of four. That also means the reduction and the epsilon are
+    /// pinned by READING MOD:681 and `rms_norm_eps`; `crates/engine/tests/kernel_qwen_indexer.rs`
+    /// records both numbers so neither is re-derived as a defect.
+    ///
+    /// Only COMPLETE blocks: `n_blocks` is `|visible| / ratio` floored, and the
+    /// `|visible| mod ratio` tail is attended unscored. `ratio < 2` is refused (1004) — a caller
+    /// there read the budget as blocks rather than tokens (trap T8); `hd` above 1024 is refused
+    /// (1002), being the block; a negative, NaN or infinite `eps` is refused (1006) while zero is
+    /// legal. **No power-of-two guard on `hd`**, unlike the sibling reductions in this file: this
+    /// model's anchor runs `indexer_head_dim` 24, so such a guard would refuse the only fixture
+    /// that can score it.
+    ///
+    /// # Safety
+    /// `keys` (`n_blocks · ratio · hd` f32), `weight` (`hd` f32) and `out` (`n_blocks · hd`
+    /// writable f32) are device buffers outliving `stream`'s completion, and **none may alias
+    /// another** — all three are `__restrict__` in the kernel. `stream` is a live `hipStream_t`,
+    /// or null for the default stream.
+    launch_index_pool_norm_f32 -> rivoli_index_pool_norm_f32, "index_pool_norm_f32" (
+        keys: *const f32,
+        weight: *const f32,
+        n_blocks: usize as i32,
+        ratio: usize as i32,
+        hd: usize as i32,
+        eps: f32,
+        out: *mut f32,
+        stream: *mut c_void,
     );
 
     /// Select the DSA attend row set on device: `rows[0..min(k,nt))`, ASCENDING by index.

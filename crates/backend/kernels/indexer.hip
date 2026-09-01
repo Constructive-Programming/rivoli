@@ -333,3 +333,87 @@ extern "C" int rivoli_index_topk(
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
+
+// ============= Qwen3.8-Flash-Next's QSA block-key stage — `qwen-architecture.md` §3 =============
+
+// Mean-pool `ratio` consecutive cached indexer keys into one block key and RMSNorm it, one block
+// row per HIP block. This is TR Eq. 13 and MOD:679-682 fused: `pooled = keys.float().mean(dim=1)`
+// then `k_layernorm(pooled)`.
+//
+// **Why this is not `index_pool_push`.** That kernel folds one token into a running block mean
+// whose width is the compile-time `MISA_BLOCK` (1024). Qwen's `indexer_compress_ratio` is **4**,
+// so the geometry is not reachable by any argument — and the reference pools a COMPLETE block
+// once rather than accumulating, because the pool feeds a norm and then a RoPE at the block's
+// first token position, and a running mean has no such moment.
+//
+// **Why the norm is FUSED in, and it is a measurement rather than a preference.**
+// `RMSNorm(c·x) = RMSNorm(x)` for every `c > 0`, so the norm divides out any per-row scale the
+// pool produced. Measured on the vendored prefill window: a pool that SUMS instead of averaging
+// moves the composition by 3.39e-5 to 4.84e-5, which is the epsilon term becoming 16x smaller
+// against a 4x larger row and not the 4x itself
+// (`crates/engine/tests/kernel_qwen_indexer.rs::a_summing_pool_is_cancelled_by_the_norm_that_follows_it`).
+// So there is no scoreable boundary between the two stages, splitting them would buy a second
+// pass over the keys and no evidence, and — the part that matters for whoever ports this —
+// **`.mean` versus `.sum` here has to be read off MOD:681; no fixture over these bytes can tell.**
+//
+// `eps` is the caller's `rms_norm_eps` and goes on the MEAN, inside the root. The three wrong eps
+// forms measure 2.77e-5 to 4.65e-4 at this boundary against a 1.14e-4 tolerance, so only one of
+// them is even distinguishable: like the pool's reduction, the epsilon is pinned by READING the
+// config field rather than by scoring, which is the conclusion K3's anchor reached for the MLA eps
+// on the same kind of arithmetic.
+//
+// **Only COMPLETE blocks are pooled.** `n_blocks` is `|visible| / ratio` FLOORED (MOD:672), and
+// the `|visible| mod ratio` tail is always attended and never scored (MOD:700-701). A kernel that
+// rounded up would read `ratio - 1` rows the cache does not hold on three of every four queries.
+//
+// The block is `next_pow2(hd)` with threads past `hd` masked, for the reason
+// `recurrent.hip::gdn_recurrent_f32` states at length: `block_sum_lds` needs a power of two and
+// this model's anchor runs `indexer_head_dim` **24** (128 at the real widths), so a guard would
+// refuse the only fixture that can score the kernel.
+//
+// **The keys are f32 here and bf16 in the cache the real model will keep.** MOD pools in fp32 and
+// casts back to the input dtype before the norm; at the anchor's fp32 that cast is a no-op, so
+// this kernel's agreement says nothing about where a bf16 rounding belongs. Owed to S6 with the
+// cache it will read.
+//
+// USED BY: Qwen3.8-Flash-Next (S6's QSA layers; no engine caller yet — see
+// `crates/cli/tests/kernel_coverage.rs`).
+extern "C" __global__ void index_pool_norm_f32(const float* __restrict__ keys,
+                                              const float* __restrict__ weight, int ratio, int hd,
+                                              float eps, float* __restrict__ out) {
+    extern __shared__ float red[];
+    const int b = (int)blockIdx.x;
+    const int t = (int)threadIdx.x;
+    // The masking is on the VALUE and never on the `block_sum_lds` call: the ladder is a
+    // block-wide barrier and every thread must reach it.
+    float m = 0.0f;
+    if (t < hd) {
+        float acc = 0.0f;
+        for (int r = 0; r < ratio; ++r) acc += keys[(size_t)(b * ratio + r) * hd + t];
+        m = acc / (float)ratio;
+    }
+    const float sum = block_sum_lds(m * m, red);
+    if (t >= hd) return;
+    out[(size_t)b * hd + t] = m * (1.0f / sqrtf(sum / (float)hd + eps)) * weight[t];
+}
+
+extern "C" int rivoli_index_pool_norm_f32(const float* keys, const float* weight, int n_blocks,
+                                          int ratio, int hd, float eps, float* out, void* stream) {
+    if (n_blocks <= 0 || ratio <= 0 || hd <= 0) return 1001;
+    if (hd > 1024) return 1002;
+    // `ratio == 1` is a per-token norm with a pooling loop around it, which means the caller read
+    // `indexer_compress_ratio` as something other than TOKENS PER BLOCK — trap T8, where "budget
+    // 2048" and "512 blocks" are the same fact stated twice. Refused rather than defined.
+    if (ratio < 2) return 1004;
+    // A non-finite or negative eps makes `rsqrt` of a negative variance NaN for the whole block
+    // row; zero is legal and is what an exact RMSNorm is, so the bound is one-sided.
+    if (!(eps >= 0.0f && eps < INFINITY)) return 1006;
+    int block = 1;
+    while (block < hd) block <<= 1;
+    hipGetLastError();
+    hipLaunchKernelGGL(index_pool_norm_f32, dim3((unsigned)n_blocks), dim3((unsigned)block),
+                       block * sizeof(float), (hipStream_t)stream, keys, weight, ratio, hd, eps,
+                       out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}

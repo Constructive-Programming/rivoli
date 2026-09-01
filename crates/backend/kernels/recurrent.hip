@@ -15,6 +15,14 @@
 // a per-head state decayed by a per-key-channel gate, corrected by a rank-one update towards
 // the value, and read back with the query.
 
+// > **EXTENDED 2026-09-01 (S3, qwen).** This file is no longer only the verbatim K3 port. The
+// > header above is unchanged and still describes everything down to the gated head norm; the
+// > FOURTH section, at the bottom, is Qwen3.8-Flash-Next's gated delta rule, written here rather
+// > than in a file of its own because the family argument the header makes is exactly why: the
+// > two recurrences share a definition and differ in four places, and a reader comparing them
+// > should not have to open two files to do it. Nothing above that banner was touched, so the
+// > "verbatim port" claim still holds over the text it was made about.
+
 #include "common.hpp"
 
 // One decode step of the gated delta rule, one block per head. `S[i][j]` has `i` = key
@@ -323,6 +331,173 @@ extern "C" int rivoli_rmsnorm_gate_heads_f32(const float* o, const float* gate,
     hipGetLastError();
     hipLaunchKernelGGL(rmsnorm_gate_heads_f32, dim3((unsigned)heads), dim3((unsigned)head_dim),
                        head_dim * sizeof(float), (hipStream_t)stream, o, gate, weight, eps, out);
+    hipError_t e = hipGetLastError();
+    return e == hipSuccess ? 0 : -(int)e;
+}
+
+// ============ Qwen3.8-Flash-Next's gated delta rule — `qwen-architecture.md` §1 ============
+
+// One decode step of the GatedDeltaNet recurrence in Qwen3.8-Flash-Next's 36 linear-attention
+// layers. `S[i][j]` has `i` = key channel and `j` = value channel, the same layout and the same
+// four-step definition as `gated_delta_recurrent_f32` at the top of this file:
+//
+//   S[i][j] <- alpha * S[i][j]                        decay by ONE per-head scalar
+//   u[j]     = sum_i k[i] * S[i][j]                   from the ALREADY-DECAYED S
+//   S[i][j] <- S[i][j] + k[i] * beta * (v[j] - u[j])  rank-one; (v-u) is the prediction error
+//   o[j]     = sum_i q[i] * S[i][j]                   read the UPDATED S
+//
+// **FOUR things separate it from the K3 kernel above, and every one of them is a silent wrong
+// rather than a refusal, which is why the two are separate entry points.** The rule that
+// governs the split is the one `rmsnorm_gate_heads_f32` states two sections down: the families
+// must not share a kernel on the strength of both having a gate.
+//
+//  1. **the decay form.** K3's is fla's safe gate, `alpha = exp(lower_bound * sigmoid(z))` with
+//     a per-KEY-CHANNEL `z`. Qwen's is `alpha = exp(-exp(A_log) * softplus(a + dt_bias))`, one
+//     scalar per V head, with no bound anywhere — TR Eq. 10 p.4 and MOD:519, and CKPT carries no
+//     `gate_lower_bound` field at all. `softplus` and `sigmoid` differ only in scale on small
+//     inputs, which is `qwen-architecture.md` trap T20; the anchor prices the confusion at
+//     4.3e-2 and a lower-bound clamp at 3.0e-3 (`kernel_qwen_gdn_recurrent.rs`).
+//  2. **`dt_bias` rank.** K3's is `[heads][head_dim]`; qwen's is `[heads]` (T17; CKPT's
+//     `linear_attn.dt_bias` is BF16 [48]). Handing a `[heads]` buffer to a `[heads][head_dim]`
+//     reader runs off the end of the first head.
+//  3. **the head asymmetry.** 16 QK heads against 48 V heads at the real widths (3 against 9 at
+//     the anchor's), so `q` and `k` are read at `h / rep` while `v`, the state and `out` are
+//     read at `h`. The reference materialises the repeat with `repeat_interleave` before its own
+//     call (MOD:520-522); this kernel does not, so the caller passes the projection's own 16
+//     heads and 6 KB per layer per token stays unwritten. **`repeat_interleave` and not `repeat`
+//     is measured, not assumed** — the anchor's three copies of each head are bit-identical and
+//     the tiled reading is shown to disagree, at 1.2e0.
+//  4. **the widths are TWO parameters.** K3's launcher takes one `head_dim` and its own comment
+//     records that the equality `head_k_dim == head_v_dim` is "structurally unexpressible" there
+//     and would be silently wrong for a family member that broke it. This one takes `dk` and
+//     `dv`, so that hole is closed rather than inherited: the block is `next_pow2(max(dk, dv))`
+//     and the two axes are masked independently.
+//
+// **The block is a power of two by CONSTRUCTION, not by refusing the widths that are not.**
+// `block_sum_lds` drops elements unless `blockDim.x` is a power of two, and the K3 kernel
+// enforces that with a guard on `head_dim` — which refuses this model's anchor outright, because
+// `linear_value_head_dim` is **20** at the tiny widths (128 at the real ones). A kernel that
+// cannot be scored against the fixture that exists is not a scored kernel, so the launcher
+// rounds the block up and threads past each axis are masked: they contribute 0.0 to both
+// reductions and store nothing.
+//
+// **The raw projections come in and the two reductions happen HERE.** `a` and `b` are
+// `in_proj_a` and `in_proj_b` with neither softplus, sigmoid, `A_log` nor `dt_bias` applied, and
+// `q`/`k` are pre-L2-norm. That is not a fusion this kernel chose; it is where the decode path's
+// boundary is, and the anchor captures the reference's own `g` and `beta` one step further in, so
+// both reductions are scored against those captures directly.
+//
+// The L2 norm's `1e-6` is HARDCODED and that is deliberate: MOD:261 hardcodes it too — it is not
+// a config field — and `qwen-reference/anchor.md` measures the defect of dropping it at 3.9e-4 at
+// this boundary, only 4.6x the fixture's own bar, so it is pinned by READING the reference rather
+// than left to a caller. The eps goes on the SUM of squares inside the root, which is a different
+// convention from every RMSNorm in this tree and is therefore written out here rather than shared.
+//
+// Two passes over `S` and no cross-thread reduction inside the recurrence, for the reason the K3
+// kernel's own note gives at length: thread `t` owns value channel `t` for the whole kernel, `S`
+// is 64 KB per head at the real widths and will not sit in LDS, and the only block reductions are
+// the two L2 norms before it.
+//
+// USED BY: Qwen3.8-Flash-Next (S6's layer loop; no engine caller yet — see
+// `crates/cli/tests/kernel_coverage.rs`).
+extern "C" __global__ void gdn_recurrent_f32(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ a, const float* __restrict__ b, const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias, int rep, int dk, int dv, float* __restrict__ state,
+    float* __restrict__ out) {
+    // sh = [ qn (dk) | kn (dk) | reduction scratch (blockDim.x) ]. Dynamic because dk and dv are
+    // 20 at the anchor's widths and 128 at the model's, and a kernel whose LDS silently sized for
+    // one of them would be a ceiling nobody stated.
+    extern __shared__ float sh[];
+    const int h = (int)blockIdx.x;
+    const int t = (int)threadIdx.x;
+    float* qn = sh;
+    float* kn = sh + dk;
+    float* red = sh + 2 * dk;
+
+    // The QK head this V head reads. `rep` is `v_heads / qk_heads`, checked to divide exactly by
+    // the launcher — passed rather than derived from `gridDim.x` so the kernel does not depend on
+    // a launch shape to know what it is reading.
+    const size_t koff = (size_t)(h / rep) * dk + t;
+    const float qv = (t < dk) ? q[koff] : 0.0f;
+    const float kv = (t < dk) ? k[koff] : 0.0f;
+
+    // TWO block reductions back to back, which is what `block_sum_lds`'s trailing
+    // `__syncthreads` exists for. EVERY thread must reach both — the masking above is on the
+    // VALUE, never on the call, because the ladder is a block-wide barrier.
+    const float qsum = block_sum_lds(qv * qv, red);
+    const float ksum = block_sum_lds(kv * kv, red);
+    if (t < dk) {
+        // The `dk^-0.5` goes on q AFTER the norm and on nothing else (MOD's `scale = 1 /
+        // query.shape[-1] ** 0.5`, applied to `query` alone). Computed from `dk` rather than
+        // passed in: the reference overrides it nowhere, so a parameter would be a knob with one
+        // legal value. Dropping it is a pure 3.47e0 on the output at the anchor's dk.
+        qn[t] = qv * (1.0f / sqrtf(qsum + 1e-6f)) * (1.0f / sqrtf((float)dk));
+        kn[t] = kv * (1.0f / sqrtf(ksum + 1e-6f));
+    }
+
+    // The decay and the write gate, per V head, computed identically on every thread — both are
+    // one scalar for the whole head, so a broadcast through LDS would cost a barrier to save
+    // nothing. `softplus` takes torch's own branch: above 20 the `log1p(exp(x))` form overflows
+    // and `F.softplus` returns `x` (beta 1, threshold 20), and at `|a + dt_bias|` large enough to
+    // matter the two disagree by more than the tolerance.
+    const float z = a[h] + dt_bias[h];
+    const float sp = (z > 20.0f) ? z : log1pf(expf(z));
+    const float alpha = expf(-expf(a_log[h]) * sp);
+    const float beta = 1.0f / (1.0f + expf(-b[h]));
+    // qn/kn must be visible to every thread's state loops below. This barrier is the LAST one:
+    // after it the block diverges on `dv` and no thread may wait on another.
+    __syncthreads();
+    if (t >= dv) return;
+
+    float* s = state + (size_t)h * dk * dv;
+    const float vv = v[(size_t)h * dv + t];
+
+    // Decay and `u = S^T k` in one pass over the state, then the rank-one update and `o = S^T q`
+    // in one more. `#pragma unroll 4` on both, for the reason the K3 kernel's note measures:
+    // un-pragma'd, each loop issues one dword load and consumes it immediately, so a wave holds
+    // exactly one request in flight per round trip. The fold order is preserved — only the loads
+    // hoist above the chain — so this is byte-identical rather than a re-association.
+    float u = 0.0f;
+#pragma unroll 4
+    for (int i = 0; i < dk; ++i) {
+        const float sv = alpha * s[(size_t)i * dv + t];
+        s[(size_t)i * dv + t] = sv;
+        u += kn[i] * sv;
+    }
+    const float d = beta * (vv - u);
+    // `o` reads the UPDATED state, which is the ordering the delta rule is DEFINED by — reading
+    // the decayed-but-not-updated state instead moves the output by 6.8e-1 and no anchor bucket
+    // defect covers it, because it is arithmetic inside the call the anchor captures around.
+    float o = 0.0f;
+#pragma unroll 4
+    for (int i = 0; i < dk; ++i) {
+        const float sv = s[(size_t)i * dv + t] + kn[i] * d;
+        s[(size_t)i * dv + t] = sv;
+        o += qn[i] * sv;
+    }
+    out[(size_t)h * dv + t] = o;
+}
+
+extern "C" int rivoli_gdn_recurrent_f32(const float* q, const float* k, const float* v,
+                                       const float* a, const float* b, const float* a_log,
+                                       const float* dt_bias, int qk_heads, int v_heads, int dk,
+                                       int dv, float* state, float* out, void* stream) {
+    if (qk_heads <= 0 || v_heads <= 0 || dk <= 0 || dv <= 0) return 1001;
+    // Bounded FIRST so the rounding loop below cannot spin or overflow on an absurd width, and
+    // 1024 is the launch limit either axis inherits by being the block.
+    if (dk > 1024 || dv > 1024) return 1002;
+    // A V-head count that is not a multiple of the QK-head count means the caller read one of
+    // `linear_num_key_heads` / `linear_num_value_heads` wrong. Refused rather than floored: a
+    // floored `rep` reads a real row of `q` for every head and returns plausible numbers.
+    if (v_heads % qk_heads) return 1003;
+    int block = 1;
+    while (block < dk || block < dv) block <<= 1;
+    size_t lds = ((size_t)2 * dk + block) * sizeof(float);
+    hipGetLastError();
+    hipLaunchKernelGGL(gdn_recurrent_f32, dim3((unsigned)v_heads), dim3((unsigned)block), lds,
+                       (hipStream_t)stream, q, k, v, a, b, a_log, dt_bias, v_heads / qk_heads, dk,
+                       dv, state, out);
     hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -(int)e;
 }
