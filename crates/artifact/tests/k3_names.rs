@@ -30,12 +30,28 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
+use rivoli_artifact::census::Tsv;
 use rivoli_artifact::quant::{
     K3_PACKED, K3_PROJ, K3_SCALE, K3_TEXT_PREFIX, f4_expert_bytes, f4_groups, f4_row_bytes,
     k3_expert_base,
 };
 
-const FAMILIES: &str = include_str!("../../../docs/measurement/k3-reference/tensor-families.tsv");
+/// The vendored reduction, read through the SHARED census reader.
+///
+/// > **MIGRATED 2026-08-31, S4.** This was a local `&str` plus a hand-rolled `families()` and
+/// > `declared()`. `qwen_names.rs`'s header named the debt in place — "lifting one shared helper
+/// > is owed at S4, when the converter census gives the second reader a reason to exist" — and
+/// > S4 gave it three readers: `convert_qwen`, `qwen_convert.rs` and this file. jscpd had also
+/// > already reported the digits-walk in `declared` against the shared reader's copy of it, and
+/// > the response this repo prescribes is to factor. The COLUMN CONTRACT stays here, because K3's
+/// > (4 columns, count first, no header row) is not qwen's and neither is the other.
+const FAMILIES: Tsv = Tsv::new(
+    "docs/measurement/k3-reference/tensor-families.tsv",
+    include_str!("../../../docs/measurement/k3-reference/tensor-families.tsv"),
+);
+
+/// K3's column contract: `count \t dtype \t shape \t family`.
+const K3_COLS: usize = 4;
 
 /// One row of the vendored reduction.
 struct TsvFamily {
@@ -47,23 +63,27 @@ struct TsvFamily {
     name: String,
 }
 
-/// Parse the vendored `tensor-families.tsv`. Dimensions are `x`-separated.
+/// The vendored reduction's data rows, in K3's column order.
+///
+/// The `?`-to-empty rule for an unknown shape lives in the shared reader now (its `dims_at`
+/// documents it as K3's), which is where it belongs: it is a property of how a census records an
+/// unfetched shard header, not of this file.
 fn families() -> Vec<TsvFamily> {
+    let widen = |d: u64| usize::try_from(d).unwrap_or(usize::MAX);
     FAMILIES
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
-            assert_eq!(f.len(), 4, "malformed row: {l:?}");
-            TsvFamily {
-                count: f[0].parse().expect("count"),
-                dtype: f[1].to_string(),
-                shape: match f[2] {
-                    "?" => Vec::new(),
-                    s => s.split('x').map(|d| d.parse().expect("dim")).collect(),
-                },
-                name: f[3].to_string(),
-            }
+        .rows(K3_COLS)
+        .expect("the vendored K3 census must parse")
+        .iter()
+        .map(|r| TsvFamily {
+            count: widen(r.u64_at(0, "count").expect("count")),
+            dtype: r.str_at(1).expect("dtype").to_string(),
+            shape: r
+                .dims_at(2)
+                .expect("shape")
+                .into_iter()
+                .map(widen)
+                .collect(),
+            name: r.str_at(3).expect("family").to_string(),
         })
         .collect()
 }
@@ -107,21 +127,10 @@ fn find<'a>(fams: &'a [TsvFamily], name: &str) -> &'a TsvFamily {
 /// load-bearing. Panics if the phrase moves rather than defaulting, because a header reword
 /// must be a visible edit and not a check that quietly stops checking.
 fn declared(phrase: &str) -> usize {
-    let at = FAMILIES.find(phrase).unwrap_or_else(|| {
-        panic!("the TSV header no longer says `{phrase}`; this test reads its counts from there")
-    });
-    let digits: String = FAMILIES[..at]
-        .trim_end()
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits
-        .chars()
-        .rev()
-        .collect::<String>()
-        .parse()
-        .unwrap_or_else(|e| panic!("no number before `{phrase}` in the TSV header: {e}"))
+    let n = FAMILIES
+        .declared_before(phrase)
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 /// The reduction itself must be the file we think it is. A truncated or hand-edited TSV

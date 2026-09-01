@@ -34,6 +34,19 @@
 # model.safetensors.index.json  17410140 B  sha256 0419e2c2dfbb925257d7409405433a793cf7ff7d96f3eba882a815ec6d9fe7a6  fnv1a64 47204c21e6179606
 # tokenizer_config.json            17928 B  sha256 b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27  fnv1a64 86ba0fb128bfb10b
 # chat_template.jinja               8952 B  sha256 c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041  fnv1a64 8b6b0871c5db260b
+#   VENDORED 2026-08-31 by track D as `chat_template.jinja` BESIDE this file, on the artifact-
+#   provenance scar: GLM's template lived only in the fp8 SOURCE, was hand-ported, and drifted for
+#   months. The line stays under NOT-VENDORED-HERE while the two tracks are separate worktrees,
+#   because in track A's tree the file is genuinely absent and a header claiming otherwise is the
+#   decoration this census exists to refuse.
+#   OWED at merge (track A): move this line into VENDORED BYTES IN THIS DIRECTORY and add
+#   `("chat_template.jinja", include_bytes!(...))` to the pinned list in
+#   `crates/artifact/tests/qwen_names.rs::the_vendored_files_hash_as_the_header_records`, which
+#   recomputes fnv1a64 over the live bytes. Until that line lands, `8b6b0871c5db260b` is a pin
+#   NOTHING recomputes -- it was transcribed from track D's fetch, and a pin checked only against a
+#   copy of itself is decoration. It cannot be written tolerantly here: `include_bytes!` on an
+#   absent file is a compile error, so the test cannot be made to skip when the file is missing,
+#   and writing it in this tree would break the build rather than defer the check.
 # tokenizer.json                12809320 B  sha256 0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3  (LFS oid via HF tree API; only
 #                              the first 8192 bytes were fetched, enough for model.type)
 #

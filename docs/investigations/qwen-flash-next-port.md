@@ -304,6 +304,246 @@ arrive first; the ~4B tensors stay excluded by name), YaRN beyond native 262k,
 
 ## Worklog
 
+**2026-09-01 — S4 review-fix round, track A: two corrections to the record, and what changed in
+the tree.** The tree was right in both cases; the prose was not.
+
+- **Commit `029236e`'s message says "the host here is layer_idx 0". That is FALSE — the host is
+  `layer_idx` 1.** `ple_layer_ids` is `[2]` and ONE-INDEXED, so the single PLE layer is `layer_idx`
+  **1**, which is what `qwen_config.rs`'s `ple_layer_ids` doc, `geometry.rs::ple_host_layer` and
+  `qwen_names.rs`'s first assertion all say, and what this file's `verdict:` already said. The
+  message conflated two numbers: `layer_idx` (**1**) and `ple_layer_index` (**0**), the ORDINAL
+  within `ple_layer_ids`, which is what `ngram_hash`'s parameter means and what the byte-exact match
+  at 0 is evidence about. History is not rewritten — the correction lives here, because the commit
+  log is where this port's evidence lives. `ngram_hash.rs`'s header, its `ngram_hash` doc and
+  `qwen_names.rs`'s test doc now name the two meanings apart explicitly instead of saying "PLE layer
+  index", which is the phrase that let them be conflated.
+- **The chat template's two homes are EXACTLY byte-identical, not "identical modulo a trailing
+  newline".** Track D measured 8,952 B on each with NO trailing newline on either side. Three places
+  in track A's files asserted the newline difference as a fact about the source and are corrected in
+  place (`convert_qwen.rs`'s `confront_chat_template` doc and its refusal message, and
+  `qwen_convert.rs`'s fixture comment and test doc). The converter's trim over BOTH sides stays, now
+  argued for what it actually buys — a re-export that adds a newline to one home is a formatting
+  artefact, not a divergence — and the fixture keeps its one-sided newline as a deliberate SUPERSET
+  of the real case, which exercises the trim as well as the comparison. The census-checklist row at
+  item 2 above still carries the "modulo the file's trailing newline" phrasing; that is track D's row
+  and the coordinator's to flip, so it is flagged rather than edited here.
+
+**What changed in the tree this round**, each from a review finding and none of them a behaviour
+change for any real config:
+
+- the nine saturating `unwrap_or` conversions in `ngram_hash.rs` became two refusing helpers,
+  `u64_of` and `usize_of`. One of the nine — `u64::try_from(i + 1).unwrap_or(0)`, the multiplier
+  step — was the only one NOT followed by an `ensure!`, so a substituted `0` made `multipliers[i]`
+  the seed's own mix instead of refusing; two others SHARED a fallback, which let
+  `vocab_sizes.len() == heads` compare `0 == 0` and pass vacuously. Neither fallback is reachable on
+  a 64-bit target, so there is no red proof to record for this one and none is claimed: it is a
+  direction fix, not a new gate.
+- `census::qwen::Summary::of` deleted — zero callers in the workspace, and `pub` is exactly what
+  hides that from `dead_code`. `line()` already walks `per_role`.
+- `write_resident`'s excluded-role `ensure!` plus its `unreachable!("refused above")` folded into a
+  `bail!` in the match arm, refusal text unchanged. The converter must REFUSE, not abort; the
+  question is now asked once, at the point of writing, against the role in hand, and there is no
+  separate guard twelve lines up whose deletion would leave the `unreachable!` reachable. **No red
+  proof is possible for this one on this box and none is claimed**: every deviceless fixture stops at
+  the missing shard file, one step BEFORE `write_resident` runs, so neither the old `ensure!` nor the
+  new `bail!` is reachable until the live conversion (OWED above) opens real shards. That
+  unreachability is what the `unreachable!` was asserting; it is also why abort-versus-refuse is
+  worth fixing BEFORE the run that can reach it.
+- `RIVOLI_QWEN_CKPT_REQUIRED` is value-checked (`is_some_and(|v| !v.is_empty())`) rather than
+  existence-checked, citing `051a291` at the line: a CI `env:` expression yielding `''` still SETS
+  the variable, which is how a REQUIRED gate armed with no secret configured. Red proof recorded
+  below.
+- the new OWED item above (the shards' index IS row order) is this round's other finding: an
+  assumption with no gate and no witness, which cannot honestly be gated on this box.
+
+**Red proof, the value-check (finding 4) — 2026-09-01, deviceless, worktree `qwen-a`, target dir
+`/var/cache/rivoli/target/qwen-a`.** The only tree change this round whose behaviour a test can
+observe, so it is the only one carrying a proof. Six runs of
+`cargo test --test qwen_convert --no-default-features -- --exact
+the_live_checkpoint_comparison_runs_in_all_three_required_states`, exit codes read unpiped, each
+colour believed only after a `Compiling rivoli` line in its own log
+(`/var/cache/rivoli/scratch/qwen-a/arm{A,B,C}.{fixed,planted,reverted}.log`); the plant was
+byte-compared against a saved copy of the fixed file (sha256
+`32df662d…` fixed, `30a6beaa…` planted) before it was believed to be on disk:
+
+| arm | env | pre-fix `is_some()` (PLANTED) | post-fix `is_some_and(\|v\| !v.is_empty())` |
+| --- | --- | --- | --- |
+| A | `RIVOLI_QWEN_CKPT_REQUIRED=` — set, empty | **RED**, exit 101 | green, exit 0 |
+| B | `RIVOLI_QWEN_CKPT_REQUIRED=1`, no checkpoint | RED, exit 101 | RED, exit 101 |
+| C | unset | green, exit 0 | green, exit 0 |
+
+Arm A is the defect and the reason the fix exists: an empty value armed the required mode, the real
+checkpoint is not on this box, and the env-reading line's own `confront_live(dir, required)` then
+failed the test with
+
+```
+thread 'the_live_checkpoint_comparison_runs_in_all_three_required_states' panicked at
+crates/cli/tests/qwen_convert.rs:706:19:
+/swarm/storage/ai/rivoli/qwen38-flash-next-fp8: RIVOLI_QWEN_CKPT_REQUIRED is set but
+/swarm/storage/ai/rivoli/qwen38-flash-next-fp8 holds no model.safetensors.index.json — the live
+comparison examined NOTHING, and a check whose examined-count can reach zero is not a check
+```
+
+i.e. a REQUIRED gate reddening because nothing was configured. Arm B is the control that says the
+fix did not disarm the mechanism — the same message, from a genuinely armed run, in BOTH columns —
+and arm C says the unset path never moved. The plant was then reverted, the file byte-compared back
+to the fixed sha, and arm A re-run green with its own `Compiling` line.
+
+**2026-08-31 — S4, track A: the artifact lane. Config, census, converter, and 22 plants.**
+
+What landed, and the two files that are additions to track A's row rather than entries in it
+(flagged here so the coordinator can move or reject them rather than find them):
+`crates/artifact/src/qwen_config.rs` + `qwen_config/geometry.rs` (the derived widths, split under
+the 800-line cap), `crates/artifact/src/census.rs` + `census/qwen.rs` + `census/qwen/ngram_hash.rs`,
+`crates/cli/src/bin/convert_qwen.rs`, and the three gates
+`crates/artifact/tests/{qwen_config.rs,qwen_names.rs}` and `crates/cli/tests/qwen_convert.rs` — 35
+tests. Also `crates/artifact/src/lib.rs` (two `pub mod` lines) and
+`crates/artifact/tests/k3_names.rs` (the shared-parser debt, below); neither is in any track's
+exclusive list.
+
+**The S4 parser debt is PAID, and it went to the LIBRARY rather than to a test helper.**
+`qwen_names.rs`'s header named it: "lifting one shared helper is owed at S4, when the converter
+census gives the second reader a reason to exist". S4 gave it three readers, and one of them is a
+BINARY — `convert_qwen`'s exclusion list IS the census, read from
+`tensor-families.tsv` at compile time so there is exactly one copy of the 109 patterns rather than a
+frozen second copy in code. So the reader is `rivoli_artifact::census::Tsv` (library), the two
+column contracts stay with their own censuses, and `k3_names.rs::families`/`declared` moved onto it
+in the same commit. jscpd had already reported the digits-walk pair.
+
+**The census line, printed by the converter itself** (against a synthesized 152,089-name index; the
+real source is not on this box). Every arm named with its own tensor count and byte total, because a
+grand total balances while a class vanishes:
+
+```
+convert_qwen: census 152089 tensors / 185502232570 B, of which v1 148655/181906343962:
+routed-weight 73728/120795955200, routed-scale 73728/14745600, ngram-shard 128/51200245760,
+ngram-scale 1/2, hash-param 3/280, resident 1067/9895397120, excluded-mtp 3101/2698026496,
+excluded-vision 333/897862112
+```
+
+Those arms are pinned string-by-string by `qwen_convert.rs::the_synthesized_index_passes_every_
+check_before_the_weights`. Derived from them: the artifact is **181,921,089,562 B**, i.e. the v1
+source plus exactly one more copy of the scale grids (**+14,745,600 B**, the only bytes this tool
+produces); routed expert weight is **112.5000 GiB** and the resident set **9.2158 GiB**.
+
+**The n-gram hash is re-derivable, and the near-miss is measured.** `census::qwen::ngram_hash`
+reproduces the checkpoint's three I64 buffers byte-exactly at `ple_layer_index = 0` — 16 primes, 16
+offsets, 3 multipliers — and NOT at index 1, which is what makes "this checkpoint's PLE index is 0"
+evidence rather than an assumption. The gate §5 of `qwen-architecture.md` called owed is closed by
+`qwen_names.rs::the_ngram_hash_parameters_are_re_derivable_at_index_zero_and_not_at_one`. The
+converter byte-compares the derivation against the source's own buffers, which is also the
+mitigation for `NGRAM_SEED` being a constant rather than a config field: the JSON key for the seed
+is not recorded by any primary source this port has read, and a guessed `#[serde(default)]` key
+would be a guess wearing a schema.
+
+**22 plants, 19 red, and the three that did not go red each said something.** Every plant was
+applied ON the remote box (so the mtime comes from its clock, not from NFS's attribute cache), its
+file sha256 recorded before and after, its run checked for a `Compiling` line before its colour was
+believed, and then reverted. Full transcript: `/var/cache/rivoli/scratch/plants{,2,3}*.log`; each
+assertion's left/right is recorded beside the test it belongs to. The reds:
+
+- **P2** validate stubbed → `/text_config/model_type was mutated to a wrong value and the config
+  still parsed` (the ROOT string sitting in `text_config`).
+- **P3** the layer_types-vs-interval `ensure!` short-circuited → same shape on
+  `/text_config/full_attention_interval`.
+- **P4** `ple_host_layer` returning the ONE-BASED id → the `[4]` row parsed clean (its true host is
+  layer_idx 3, a QSA layer; the un-decremented 4 lands on a GDN layer), AND
+  `left: 2 right: 1` on the host index. Trap T12, both ends.
+- **P5'** the two rotary homes no longer compared → the `rope_parameters/partial_rotary_factor` row
+  parsed clean.
+- **P6a** `qsa_q_width` without its factor of 2 → `left: [12288, 2560] right: [6144, 2560]`.
+- **P6b** `gdn_qkv_width` halved → reddened EARLIER than expected, at config load, with `the GDN qkv
+  width does not decompose into q + k + v`; recorded in place, because the interesting fact is that
+  the config self-checks that width and does not self-check `q_proj`'s.
+- **P7'** the pattern lookup turned into a skip → the run walked past an unclassified family and
+  died on the weights instead of refusing.
+- **P9** `down_proj`'s grid transposed in the TSV → the DERIVED orientation check named
+  `[5, 20]` against `[20, 5]` over 40,265,318,400 B.
+- **P10** `splitmix64` without the golden-gamma increment →
+  `left: [16547087256759, 23703573157769, 20109073645365]` against
+  `right: [23703573157769, 20109073645365, 8052911324071]`: the sequence SHIFTS BY ONE and carries
+  two of the three correct multipliers in the wrong slots, so a set comparison would have passed.
+- **P11** the `NgramShard` role predicate stopped matching → caught by `check_role_layout` at census
+  load (`role resident wants Bf16 … but the row is F8E4M3 [2500012, 160]`), one layer before the
+  arm-tally cell; recorded in place.
+- **P12** `sparse_attention_layers` counting the GDN layers → `left: (73728, 147456) right: (24576,
+  49152)` on the QSA KV budget.
+- **P13/P13b** the layer-family bound forced open → each of the two families' refusals named its own
+  fragment, which is what says they are checked separately.
+- **P14** the per-pattern count relaxed to `<=` → the vanished-tensor run proceeded.
+- **P15** the chat-template comparison short-circuited; **P16** `chat_template.jinja` dropped from
+  `AUX`; **P17** the `total_size` confrontation short-circuited; **P18** the layer range clamped
+  instead of refused; **P1'** `#[serde(default)]` added to `mtp_use_dedicated_embeddings` → the key
+  moved from required to tolerated, printed as left/right lists.
+- **P19** the required mode's `ensure!(!required, …)` short-circuited → `the required mode must
+  refuse an absent source: 0`, i.e. a required gate passing on zero examinations.
+
+The three non-reds:
+
+1. **P1 was aimed at a test that never walks an absent key** — `norm_topk_prob` is not in the
+   shipped document, so the required-fields walk never sees it. Re-aimed as P1', which reddened.
+2. **P5** deleted a `validate_*` call, which made the function dead code and turned the run into a
+   COMPILE error under `-D warnings` — an exit 101 that is not a red. Re-plumbed as P5', an
+   in-function short-circuit.
+3. **P7**'s first form left an always-`Err` expression behind, so the test PASSED for the wrong
+   reason. That is the false-green shape on record, produced by the proof rather than by the tree,
+   and it is why the plant was re-read rather than believed.
+
+And one plant run **deliberately** to settle a question rather than to prove a gate: **P20** removed
+`#[serde(default)]` from `norm_topk_prob` and the shipped-config test stayed GREEN after a real
+rebuild. serde already treats an `Option<T>` field as absent-tolerant, so that attribute is
+documentation and not the mechanism — said so at its declaration rather than left implying
+enforcement.
+
+**Deviceless gates, unpiped exit codes** (worktree `qwen-a`, target dir
+`/var/cache/rivoli/target/qwen-a`): `cargo fmt --all --check` **0**; `cargo test --workspace
+--no-default-features` **0** (jscpd and both line caps are build-script gates on that run, so they
+passed with it — 8 clones were reported and all 8 were FACTORED or re-shaped, none exempted);
+`cargo clippy --workspace --all-targets --no-default-features` **0**.
+
+**OWED out of S4**, each named rather than left implicit:
+
+- **The live conversion.** The 172.76 GiB source is not on this box. Every arm above runs against a
+  synthesized index; the `RIVOLI_QWEN_CKPT_REQUIRED` cell is the mechanism for the real thing and is
+  proven in all three of its states (unset+absent, set+absent, set+present-against-a-fixture, via
+  `RIVOLI_QWEN_CKPT`), but the run against the real bytes — and therefore the first `resident.safe
+  tensors`, the first `L{ll}.experts.safetensors` and the first 128 n-gram shards — is owed.
+- **That the n-gram shards' INDEX is row ORDER.** `write_ngram_shards` names shard `s`'s output
+  `ngram.rows.{s x rows_per_shard}`, and what the gates assert is that 128 shards of
+  `2,500,012 x 160` TILE `[0, padded_rows)` exactly, both ends — the widths sum. The MAPPING is
+  assumed: that `shard_{s}` holds rows `[s x 2,500,012, (s+1) x 2,500,012)`. If the publisher's
+  shard index is not row order, every n-gram row a decode gathers is the wrong row, with every
+  shape, count, dtype and byte total intact, no crash and no refusal — the one place left in this
+  converter where a wrong answer has no witness. It CANNOT be closed on this box: the 172.76 GiB
+  source is not here, and track B's `ngram-real` golden carries token ids, not embeddings. No gate
+  was invented for it, deliberately — a gate over the synthesized shards would only assert the
+  convention it was built from. What would settle it: on the box that holds the checkpoint, gather
+  one known token's 16 rows out of the REAL shard bytes through `ngram_hash`'s offsets and compare
+  them against the reference stack's PLE embedding output for that token (S2 anchor, or the S6
+  loader's first decode). Written at `convert_qwen.rs`'s naming site as well as here.
+- **Census item 3's checklist row, this file's `verdict:` and its INDEX row.** The converter now
+  asserts exact per-family counts against the 109-row census, both ends, with MTP and vision named.
+  Flipping the row is the coordinator's: the `verdict:` is relayed verbatim into `INDEX.md`, and the
+  recorded scar is a body corrected while the verdict kept the false claim.
+- **`docs/measurement/gate-red-proofs.md` §14** is still OWED, as the S0/S1 round recorded; the 22
+  plants above are here for the same reason that round's five were.
+- **The norms are copied BF16 verbatim.** `convert_v4` widens because its loader reads f32; this
+  port's loader does not exist, so the decision belongs to whoever writes it (S6) and is written
+  down at `write_resident` rather than left to be discovered.
+- **`q_proj`'s doubled width is labelled, not confirmed.** [12288, 2560] against `o_proj`'s 6144
+  input forces `2 x n_heads x head_dim`; "q ‖ output-gate" is the reading, and the ORDER of the two
+  halves is S2's anchor to settle. Nothing downstream depends on the label.
+- **The n-gram seed's JSON key.** Bind it when a source states it; until then the constant plus the
+  byte-comparison against the checkpoint's own buffers is the guard.
+- **`chat_template.jinja`'s pin is not yet recomputed by anything.** Track D vendored the 8,952
+  bytes beside `tensor-families.tsv` in ITS worktree; track A's tree has the sha and the fnv1a64
+  (`8b6b0871c5db260b`) in the census header only, transcribed from D's fetch. At merge the TSV line
+  moves from NOT-VENDORED-HERE into VENDORED BYTES IN THIS DIRECTORY and the name joins
+  `qwen_names.rs::the_vendored_files_hash_as_the_header_records`, which recomputes FNV-1a over the
+  live bytes. Written at the line itself rather than only here. It could NOT be written tolerantly
+  in advance — `include_bytes!` on an absent file is a compile error, not a skip — so no
+  cross-worktree coupling was created to close it early.
+
 **2026-08-31 — S0+S1 review-fix round: five red proofs run, and the gates they belong to.**
 Recorded here rather than in `docs/measurement/gate-red-proofs.md`, whose §14 is **OWED** — that
 file's verdict is a single paragraph summarising every section, so adding one is a rewrite of a
