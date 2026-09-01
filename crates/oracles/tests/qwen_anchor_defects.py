@@ -3,7 +3,7 @@
 A golden with no defect runs is not evidence, it is a file. Every row here is a wrong-but-
 plausible reading taken from `docs/reference/qwen-architecture.md`'s traps table, and the table's
 class-to-row map is what this file answers: **nine named operator classes, two or more rows
-each.** `qwen_anchor_lib.EXPECT_FIRST_TOUCH` carries each row's declared first-touched bucket, so
+each.** `qwen_anchor_compare.EXPECT_FIRST_TOUCH` carries each row's declared first-touched bucket, so
 the matrix is gated in BOTH directions -- the row reddens where it should and holds where it
 should -- rather than only proving that something, somewhere, moved.
 

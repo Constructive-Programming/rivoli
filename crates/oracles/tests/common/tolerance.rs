@@ -310,7 +310,7 @@ pub const GLIMMER: &[Tol] = &[
 /// with the two commands in `qwen-reference/anchor.md` section "tolerances".
 ///
 /// Nine rows, one per operator with at least one defect row that TARGETS it -- and "targets" is
-/// not a judgement here: `qwen_anchor_lib.EXPECT_FIRST_TOUCH` declares each defect's
+/// not a judgement here: `qwen_anchor_compare.EXPECT_FIRST_TOUCH` declares each defect's
 /// first-touched bucket and its operator IS the operator that row prices, which is also what the
 /// both-directions gate asserts. Floors are the max over the two draws, weakest defects the min
 /// over the two: a floor measured at one draw is not a floor (Glimmer's `attend` came out 2.1x

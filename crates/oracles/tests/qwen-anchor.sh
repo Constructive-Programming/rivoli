@@ -78,7 +78,7 @@ for mode in "${MODES[@]}"; do
     # ONE `--compare` per defect, printing the matrix that was gated. It exits non-zero if the
     # defect changed nothing, if its own declared first-touched bucket stayed identical, if a
     # bucket UPSTREAM of that one moved, or if the two runs captured different tensors -- see
-    # `qwen_anchor_lib._gate_first_touch`. Two invocations (one to print, one to gate) would be
+    # `qwen_anchor_compare._gate_first_touch`. Two invocations (one to print, one to gate) would be
     # two independent scorings whose agreement is assumed.
     for d in "${DEFECTS[@]:1}"; do
         printf '%-34s ' "$d"
