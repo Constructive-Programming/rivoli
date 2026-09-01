@@ -274,8 +274,7 @@ struct Vision {
 /// then `'text' in item`, then raise. `in` on a dict is KEY membership, so `{"image_url": …}`
 /// is an image by its key alone and never reaches the text arm.
 enum Part {
-    Image,
-    Video,
+    Media(Media),
     Text,
     Unexpected,
 }
@@ -285,9 +284,9 @@ impl Part {
         let key = |k: &str| item.get(k).is_some();
         let typ = item.get("type").and_then(Value::as_str);
         if key("image") || key("image_url") || typ == Some("image") {
-            Self::Image
+            Self::Media(Media::Image)
         } else if key("video") || typ == Some("video") {
-            Self::Video
+            Self::Media(Media::Video)
         } else if key("text") {
             Self::Text
         } else {
@@ -296,26 +295,76 @@ impl Part {
     }
 }
 
-/// One vision placeholder, counting and numbering it the way the template does.
+/// Which vision placeholder a part carries, and the four things the template varies by it: the
+/// counter it advances, the label, the pad token, and the refusal a SYSTEM turn raises for it.
 ///
-/// The counter advances only when `do_count` — `false` for the system turn and for the
-/// reverse user-query scan, `true` in the main loop — so the numbering follows main-loop
-/// message order and a part scanned twice is counted once.
-fn vision_part(vision: &mut Vision, do_count: bool, image: bool) -> String {
-    let counter = if image {
-        &mut vision.image
-    } else {
-        &mut vision.video
-    };
-    if do_count {
+/// **A two-variant enum rather than the `image: bool` this file first carried, and the same for
+/// [`Counting`] and [`Turn`]** (review 2026-09-01). Not house style for its own sake:
+/// `vision_part` and `trimmed_content` each took TWO adjacent `bool`s, where a transposed pair
+/// COMPILES and renders a wrong prompt — a video numbered as a picture, or the reverse
+/// user-query scan advancing counters only the main loop may advance. Three distinct types make
+/// that a type error, and what varies by media now travels with the media instead of being an
+/// `if image` at three call depths.
+#[derive(Copy, Clone)]
+enum Media {
+    Image,
+    Video,
+}
+
+impl Media {
+    /// The `Picture`/`Video` label and the pad token, which the template always moves together.
+    fn label_and_pad(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Image => ("Picture", "<|image_pad|>"),
+            Self::Video => ("Video", "<|video_pad|>"),
+        }
+    }
+
+    /// The refusal a system turn raises for this media — the template's two separate messages,
+    /// both scored by `qwen_template.rs`'s refusal-site census against the vendored bytes.
+    fn system_refusal(self) -> &'static str {
+        match self {
+            Self::Image => "System message cannot contain images.",
+            Self::Video => "System message cannot contain videos.",
+        }
+    }
+
+    fn counter(self, vision: &mut Vision) -> &mut u32 {
+        match self {
+            Self::Image => &mut vision.image,
+            Self::Video => &mut vision.video,
+        }
+    }
+}
+
+/// Whether a content render ADVANCES the render-wide vision counters or only peeks — the
+/// template macro's `do_vision_count`. `Peek` is the synthesised system turn and the reverse
+/// user-query scan, both of which render content the output discards, so the numbering follows
+/// main-loop message order and a part scanned twice is counted once.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Counting {
+    Advance,
+    Peek,
+}
+
+/// Which content site a render is at — the macro's `is_system_content`. `System` refuses vision
+/// outright with [`Media::system_refusal`]; `Body` is every other call. Not collapsible into
+/// [`Counting`]: the reverse scan is `Peek` + `Body` where the system turn is `Peek` + `System`.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Turn {
+    System,
+    Body,
+}
+
+/// One vision placeholder, counting and numbering it the way the template does. Everything that
+/// differs between the two medias is asked of [`Media`]; the shape below is common to both.
+fn vision_part(vision: &mut Vision, counting: Counting, media: Media) -> String {
+    let counter = media.counter(vision);
+    if counting == Counting::Advance {
         *counter += 1;
     }
     let n = *counter;
-    let (label, pad) = if image {
-        ("Picture", "<|image_pad|>")
-    } else {
-        ("Video", "<|video_pad|>")
-    };
+    let (label, pad) = media.label_and_pad();
     let id = if vision.add_id {
         format!("{label} {n}: ")
     } else {
@@ -332,13 +381,15 @@ fn vision_part(vision: &mut Vision, do_count: bool, image: bool) -> String {
 /// main loop. Split in two they had the same four-parameter signature and jscpd matched them at
 /// 38 tokens; merged, the trim cannot be forgotten at a fifth call site either.
 ///
-/// The two flags are the macro's own parameters: `do_vision_count` and `is_system_content`. A
-/// system turn refuses vision outright, which is why they cannot be collapsed.
+/// The two flags are the macro's own parameters — `do_vision_count` and `is_system_content` —
+/// and they cannot be collapsed: a system turn refuses vision outright while the reverse
+/// user-query scan renders it without counting. [`Counting`] and [`Turn`] rather than two
+/// `bool`s for the reason at [`Media`]: adjacent and same-typed, a swapped pair compiles.
 fn trimmed_content(
     message: &Value,
     vision: &mut Vision,
-    do_count: bool,
-    is_system: bool,
+    counting: Counting,
+    turn: Turn,
 ) -> Result<String> {
     // A `String`, not a `Result<String>`: every `bail!` here is an early return, which is
     // exactly what the template's `raise_exception` is, so wrapping the match in a `Result` and
@@ -349,10 +400,8 @@ fn trimmed_content(
             let mut out = String::new();
             for item in parts {
                 match Part::of(item) {
-                    Part::Image if is_system => bail!("System message cannot contain images."),
-                    Part::Video if is_system => bail!("System message cannot contain videos."),
-                    Part::Image => out.push_str(&vision_part(vision, do_count, true)),
-                    Part::Video => out.push_str(&vision_part(vision, do_count, false)),
+                    Part::Media(m) if turn == Turn::System => bail!("{}", m.system_refusal()),
+                    Part::Media(m) => out.push_str(&vision_part(vision, counting, m)),
                     // `item.text` on a part whose `text` key holds a non-string renders that
                     // value through Jinja's `{{ }}`; only the string case is pinned, and a
                     // non-string `text` is a client error either way.
@@ -470,7 +519,7 @@ fn system_turn(messages: &[Value], opts: &QwenChatOpts, vision: &mut Vision) -> 
         .and_then(Value::as_str)
         == Some("system");
     let content = match (first_is_system, messages.first()) {
-        (true, Some(m)) => trimmed_content(m, vision, false, true)?,
+        (true, Some(m)) => trimmed_content(m, vision, Counting::Peek, Turn::System)?,
         _ => String::new(),
     };
     let Some(lines) = tool_json_lines(opts.tools) else {
@@ -529,7 +578,7 @@ fn last_query_index(messages: &[Value], vision: &mut Vision) -> Result<Option<us
         if message.get("role").and_then(Value::as_str) != Some("user") {
             continue;
         }
-        let content = trimmed_content(message, vision, false, false)?;
+        let content = trimmed_content(message, vision, Counting::Peek, Turn::Body)?;
         if !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>")) {
             return Ok(Some(i));
         }
@@ -612,6 +661,13 @@ fn tool_calls(message: &Value) -> &[Value] {
 /// `replay_thinking` is the caller's because it is a fact about this turn's POSITION —
 /// `preserve_thinking is undefined or is true or loop.index0 > last_query_index` — not about
 /// the message.
+///
+/// **It stays a `bool` where the content path's three flags became enums** — reviewed and
+/// declined 2026-09-01. [`Media`]'s argument is transposition, and each of those sat beside a
+/// same-typed `bool` in the same call; this one is alone in its signature and is a predicate the
+/// caller already computes and names, so an enum buys the name `replay` already carries and
+/// costs a second spelling of the test at the call site. Same for `QwenChatOpts`'s two bools,
+/// which mirror kwargs the caller passes as Python booleans.
 fn assistant_turn(message: &Value, content: &str, replay_thinking: bool) -> String {
     let reasoning = message
         .get("reasoning_content")
@@ -692,9 +748,8 @@ fn generation_prompt(opts: &QwenChatOpts) -> String {
 /// cases are themselves JSON.
 ///
 /// **This returns `Result`, and that is the template's doing rather than a house preference.**
-/// `chat_template.jinja` calls `raise_exception` in NINE places (a count gated by
-/// `qwen_template.rs`, because five files here first said eight and nothing recomputed it), and
-/// three of them are
+/// `chat_template.jinja` calls `raise_exception` in NINE places — a count `qwen_template.rs`
+/// gates, because six files here first said eight and nothing recomputed it — and three are
 /// reachable from an ordinary client: a `developer` role (which OpenAI clients send) is
 /// `Unexpected message role.`, a conversation with no real user turn is `No user query found in
 /// messages.`, and a system turn that is not first is `System message must be at the
@@ -720,7 +775,7 @@ pub fn render(messages: &[Value], opts: &QwenChatOpts) -> Result<String> {
         // Rendered BEFORE the role is checked, exactly as the template does — so a malformed
         // content part refuses ahead of a misplaced system turn, and the vision counters
         // advance for a message whose output is discarded.
-        let content = trimmed_content(message, vision, true, false)?;
+        let content = trimmed_content(message, vision, Counting::Advance, Turn::Body)?;
         match message.get("role").and_then(Value::as_str) {
             Some("system") => {
                 if i != 0 {

@@ -362,6 +362,25 @@ fixture's provenance records, 12,809,320 B — **65 of 65 cases tokenized identi
 *Also corrected*: the tokenizer is **12,809,320 B**, not the "12.84 MB" four files said
 (measured by `wc -c` on the file at the pinned revision, whose sha256 the fixture pins).
 
+*The flag pairs are enums now (`Media`, `Counting`, `Turn`), the lone flag is not.* Review
+reported `qwen_encoding.rs` as the diff's highest primitive-argument site and suggested three
+two-variant enums; the reason to take it is narrower and better than arity. `vision_part` and
+`trimmed_content` each took **two adjacent `bool`s**, so a transposed pair COMPILED and rendered
+a wrong prompt — a video numbered as a picture, or the reverse user-query scan advancing the
+counters only the main loop may advance. Measured: with the enums, transposing the two at the
+main-loop call site is `error[E0308] … expected Turn, found Counting`; as two `bool`s it built.
+`Media` also owns the label, the pad token, the counter and the system refusal, which collapses
+four `if image` branches and two `match` arms. `assistant_turn`'s `replay_thinking` stays a
+`bool` and the decline is argued at the function: it is alone in its signature, so there is no
+transposition to catch, and it is a predicate the caller already computes and names. The
+refactor changes NO output, and that is not an opinion — the pin scored it armed: **65 of 65
+cases still tokenize identically**, all 78 still byte- or message-identical.
+
+> `qwen_encoding.rs` went 742 → **799** lines and now sits one line under the 800 soft cap. The
+> +57 is enums and their arguments; ~14 lines of the new prose were compressed back out rather
+> than shipping a new `cargo:warning`, and one bare restatement of the code was deleted. **The
+> next edit to this file must shrink it** — S6, which wires the module, is where a split lands.
+
 *Red proofs, each planted, byte-compared against a saved copy, observed red on the assertion
 ADDED, reverted, and green again on a run carrying a `Compiling` line:*
 
