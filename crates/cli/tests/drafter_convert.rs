@@ -341,7 +341,15 @@ fn the_vendored_header_is_the_live_checkpoints_own_bytes() {
     // pointed out — this repo had already built the mechanism for exactly this failure mode and
     // this gate was not using it. Set the variable wherever the checkpoint is supposed to be
     // present and absence becomes a panic naming the path, rather than a silent pass.
-    let required = std::env::var_os("RIVOLI_DRAFTER_CKPT_REQUIRED").is_some();
+    // A VALUE, not an existence: `051a291` moved `crates/cli/tests/codescene.rs` off `is_some()`
+    // because a CI `env:` expression that evaluates to '' still SETS the variable, which armed
+    // REQUIRED with nothing configured behind it (run 33383324860). Same shape here, and the
+    // fix was red-proofed 2026-09-01 rather than assumed: the checkpoint IS present on this
+    // box, so the required branch is unreachable here and the proof had to plant an absent
+    // CKPT_DIR to reach it at all. Four arms — `=` empty under `is_some()` FAILED 101,
+    // `=` empty under this line passed, `=1` with the path absent still FAILED 101 (the
+    // mechanism is not disarmed), and the plant reverted green.
+    let required = std::env::var_os("RIVOLI_DRAFTER_CKPT_REQUIRED").is_some_and(|v| !v.is_empty());
     let Ok(meta) = missing else {
         assert!(
             !required,
