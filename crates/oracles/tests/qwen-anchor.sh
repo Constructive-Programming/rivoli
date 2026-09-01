@@ -121,10 +121,19 @@ for salt in "${SALTS[@]}"; do
     "$PY" "$DRIVER" --by-operator "$OUT/gold-decode-$salt-None.bin" "$OUT/gold-decode-$salt-fp64.bin"
 done
 
+# `rc` is declared HERE rather than beside the vendored census below, because the tolerance step
+# now feeds it: `set -e` would abort the run at a refusal there and the census -- the one line that
+# tells a reader how much of this run was real -- would never print. Every remaining check records
+# into `rc` and the script exits once, at the bottom, carrying all of them.
+rc=0
+
 # The per-operator tolerance rows, DERIVED from the goldens this run just wrote rather than read
 # off a table by hand. This is the command `common/tolerance.rs`'s QWEN block cites.
 echo "=== tolerance rows ==="
-"$PY" "$DRIVER" --tolerance-table "$OUT"
+if ! "$PY" "$DRIVER" --tolerance-table "$OUT"; then
+    echo "the tolerance derivation REFUSED -- nothing above it is citable; see the reason" >&2
+    rc=1
+fi
 
 # The real-parameter n-gram micro-anchor: the tiny config cannot see the 20M hash space, so the
 # three multipliers, the 16 prime head vocabularies, the 16 offsets and a pinned window's ids are
@@ -154,7 +163,6 @@ VENDORED=(
     "qwen-anchor-prefill-qwen-anchor-1:$OUT/gold-prefill-qwen-anchor-1-None.bin"
     "qwen-anchor-ngram-real:$OUT/gold-ngram-real.bin"
 )
-rc=0
 verified=0
 unverified=()
 missing=()
