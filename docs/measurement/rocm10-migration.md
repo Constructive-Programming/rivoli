@@ -169,3 +169,33 @@ configuration (package `rocm_kpack`, match AMD's LLVM link mode) — hr-fleet's 
 (c) roll back to the 7.14 binpkgs (43 s, proven) until (a) lands. Until one of these,
 EVERY rivoli device arm on this box faults at engine start — batteries, anchors' GPU
 sessions, S7 — while builds and deviceless suites keep working.
+
+## 2026-09-01: the fault reproduces WITHOUT rivoli, and (a) is the owner's chosen path
+
+Attempt 2's conviction rested on a rivoli test binary. It does not need one. A four-line
+translation unit — `hipStreamCreateWithFlags(&s, hipStreamNonBlocking)` and a `printf` of
+the returned `hipError_t`, nothing else, compiled by the installed
+`hipcc --offload-arch=gfx1151` — behaves as follows on this box today, both arms flocked:
+
+| runtime | result |
+|---|---|
+| installed overlay `libamdhip64.so.7.15.0-0000000` | **exit 139 (SIGSEGV)**, no line printed — the call never returns |
+| AMD prebuilt `lib/` + `prebuilt-libs/lib/` under `LD_LIBRARY_PATH` | `hipStreamCreateWithFlags rc=0`, **exit 0** |
+
+Probe and both invocations: `/var/cache/rivoli/scratch/hipprobe.hip`, built to
+`/var/cache/rivoli/scratch/hipprobe`. The prebuilt arm needs **both** directories on the
+path: `librocm_kpack.so.0` lives in `prebuilt-libs/lib`, and with only `rocm10/lib` the
+loader fails at exit 127 before the GPU is touched at all — which is a different failure
+from the one under test, and reading 127 as "the prebuilt is broken too" is the trap here.
+
+This removes rivoli, its kernels, its io_uring rings and its arena from the claim entirely:
+the defect is in the overlay HIP build, at the first HIP call any program makes. It also
+narrows the fix — `librocm_kpack.so.0` is a hard `DT_NEEDED` of AMD's own hip, and the
+overlay packages no such library.
+
+**Owner's call 2026-09-01: path (a).** `dev-util/hip` is rebuilt to TheRock's own
+configuration (package `rocm_kpack`, match AMD's LLVM link mode) in hr-fleet's lane; (b) is
+NOT taken as an install, and (c) stays armed as the 43 s escape. rivoli device arms stay
+blocked until that rebuild lands, and the ROCm 10 column below stays not-measured. The
+probe above is the acceptance test for the rebuild: it must print `rc=0` against the
+INSTALLED library, with nothing on `LD_LIBRARY_PATH`.
