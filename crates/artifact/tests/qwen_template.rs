@@ -36,13 +36,13 @@
 //! **The fixture and the driver are vendored together.** Vendoring the bytes without the
 //! program that produced them makes a pin nobody can re-derive; the anchor fixtures in
 //! `crates/oracles` carry their regeneration script for the same reason. Regenerating needs
-//! 12.84 MB of tokenizer and a pinned transformers install and is therefore not something this
+//! 12,809,320 B of tokenizer and a pinned transformers install and is therefore not something this
 //! suite does.
 //!
 //! No GPU, no lock, no network, no Python — the fixture and the template are bytes in the tree.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, io::Write};
 
 use rivoli_artifact::qwen_encoding::{
     IM_END, IM_START, JinjaFlag, QwenChatOpts, THINK_CLOSE, THINK_OPEN, render,
@@ -282,27 +282,32 @@ fn every_refusal_carries_the_templates_own_message() {
 /// `added_tokens_decoder`, 2026-08-31), a flag combination none of the four shipped
 /// architectures uses for a token the template emits.
 ///
-/// **The tokenizer is 12.84 MB and is not vendored**, so the directory is supplied by
+/// **The tokenizer is 12,809,320 B and is not vendored**, so the directory is supplied by
 /// `RIVOLI_QWEN_ARTIFACT` (a Qwen artifact, or the HF checkpoint — they carry identical
-/// `tokenizer.json`). Without it the id half cannot run, and this test does NOT then pass
-/// silently: `RIVOLI_QWEN_REQUIRED=1` turns the skip into a failure, which is what CI and the
-/// closeout run set. `eprintln!` alone would be invisible under libtest capture, which is the
-/// recorded reason "skips loudly" is not a thing here.
+/// `tokenizer.json`, sha256 `0997f410…`, which is the file the fixture's provenance pins and
+/// the one this pin was last run against). Without it the id half cannot run, and
+/// [`skipped_id_pin`] is what stops that from reading as a pass.
+///
+/// **Nothing here claims CI arms this, because CI does not.** An earlier version of this
+/// comment said `RIVOLI_QWEN_REQUIRED=1` "is what CI and the closeout run set":
+/// `.github/workflows/ci.yml` sets exactly one such variable, `RIVOLI_CS_REQUIRED` (line 85),
+/// this one appears in no workflow, and a CI runner has no 12.8 MB tokenizer to point
+/// `RIVOLI_QWEN_ARTIFACT` at — so the sentence told the next reader the id pin was armed
+/// somewhere it has never run, while a clean run had it green having tokenized NOTHING (review
+/// 2026-09-01). What arms it is a closeout run that sets both, which is all the
+/// `drafter_convert.rs` precedent claims for its own.
 #[test]
 fn rendered_prompts_tokenize_to_the_vendored_ids() {
     let d = doc();
     let all = cases(&d); // covers BOTH branches below, so an unset variable cannot read as coverage
+    // Counted BEFORE the branch: the skip path can then say how big the hole is, and neither
+    // path can be green over a fixture that quietly stopped carrying ids.
+    let id_bearing = all.iter().filter(|c| c.get("ids").is_some()).count();
+    assert_eq!(id_bearing, 65, "expected 65 id-bearing cases");
     let dir = match std::env::var("RIVOLI_QWEN_ARTIFACT") {
         Ok(dir) => dir,
         Err(_) => {
-            assert!(
-                std::env::var_os("RIVOLI_QWEN_REQUIRED").is_none(),
-                "qwen id pin REQUIRED but did not run: RIVOLI_QWEN_ARTIFACT is unset"
-            );
-            eprintln!(
-                "skip qwen id pin: RIVOLI_QWEN_ARTIFACT unset (set RIVOLI_QWEN_REQUIRED=1 to \
-                 make this a failure)"
-            );
+            skipped_id_pin(id_bearing);
             return;
         }
     };
@@ -332,8 +337,41 @@ fn rendered_prompts_tokenize_to_the_vendored_ids() {
         }
         scored += 1;
     }
-    assert_eq!(scored, 65, "expected 65 id-bearing cases");
+    // Against the count taken before the branch rather than against a second literal 65. The
+    // anti-vacuity check is the one ABOVE, which both paths run; this one exists because the
+    // predicate is written twice — `is_some` up there, `is_none()` + `continue` here — and it is
+    // what stops the two from drifting apart.
+    assert_eq!(scored, id_bearing, "an id-bearing case was not examined");
     println!("  id pin: {scored} cases tokenized identically to apply_chat_template");
+}
+
+/// The id pin's skip path: no tokenizer on this machine, so state the size of the hole and
+/// refuse to be quiet about it when the caller said the pin was required.
+///
+/// **`RIVOLI_QWEN_REQUIRED` is read by VALUE, not by existence.** `crates/cli/tests/codescene.rs`
+/// became `is_some_and(|v| !v.is_empty())` in commit `051a291` for exactly this: a GitHub Actions
+/// `env:` expression that evaluates to `''` still SETS the variable, and run 33383324860 armed a
+/// REQUIRED mode nobody had configured. This is the same contract, two commits later.
+///
+/// **The notice is written to the `Stderr` HANDLE, not through `eprintln!`.** libtest's output
+/// capture is consulted by the print macros and not by a direct handle write, so this line is
+/// visible in a plain `cargo test` run where the macro's is not. Measured 2026-09-01 on rustc
+/// 1.96.0, one passing test emitting both forms: without `--nocapture` the macro line appears 0
+/// times and the handle line once; with it, both. That is the half the `libtest-captures-SKIP-
+/// lines` note says a printed skip cannot do — and the asserted count above is the half that
+/// does not depend on anyone reading the run at all.
+fn skipped_id_pin(not_examined: usize) {
+    let required = std::env::var_os("RIVOLI_QWEN_REQUIRED").is_some_and(|v| !v.is_empty());
+    assert!(
+        !required,
+        "qwen id pin REQUIRED but did not run: RIVOLI_QWEN_ARTIFACT is unset, so {not_examined} \
+         id-bearing cases were NOT examined"
+    );
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIP qwen id pin: RIVOLI_QWEN_ARTIFACT unset — {not_examined} id-bearing cases NOT \
+         examined (set RIVOLI_QWEN_REQUIRED=1 to make this a failure)"
+    );
 }
 
 /// **The one deliberate divergence, pinned against the reference rather than asserted.**

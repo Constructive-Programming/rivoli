@@ -40,7 +40,7 @@ Usage (no GPU, no lock, no wrapper script -- one command, seconds):
         crates/artifact/tests/qwen_template_driver.py
 
 The checkpoint directory needs only `tokenizer.json`, `tokenizer_config.json` and
-`chat_template.jinja` -- 12.84 MB of a 172.76 GiB repo, so regenerating this does not need the
+`chat_template.jinja` -- 12,809,320 B of a 172.76 GiB repo, so regenerating this does not need the
 weights. Fetch them from `resolve/<REVISION>/<file>`, never from `/main/`. Measured versions
 are recorded in the output's `provenance` block and asserted by the Rust side.
 """

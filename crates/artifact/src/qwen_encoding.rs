@@ -40,7 +40,7 @@
 //! is measured rather than assumed: `<|im_start|>`/`<|im_end|>` are `special: true` added
 //! tokens and `<think>`/`</think>`/`<tool_call>`/`<tool_response>` are `special: false` ones
 //! (`tokenizer_config.json`'s `added_tokens_decoder`, all `normalized: false`), and the id pin
-//! runs this module's bytes through the shipped 12.8 MB `tokenizer.json`.
+//! runs this module's bytes through the shipped 12,809,320 B `tokenizer.json`.
 //!
 //! **There is no BOS.** `tokenizer_config.json` carries `bos_token: null` and
 //! `add_bos_token: false`, and the template emits no document-open token — a rendered prompt

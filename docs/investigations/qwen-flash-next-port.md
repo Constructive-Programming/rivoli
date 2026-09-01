@@ -319,6 +319,40 @@ which is now also a gate (`check_every_refusal_site_is_covered`, each site's tex
 TEMPLATE and in the fixture), with the ninth (`No messages provided.`) named as unreachable by
 construction and carrying this file's ONE self-asserted refusal.
 
+*Correction, dated in place*: the id pin's comment claimed `RIVOLI_QWEN_REQUIRED=1` is "what CI
+and the closeout run set". **CI sets no such thing** — `.github/workflows/ci.yml` sets exactly one
+`*_REQUIRED` variable, `RIVOLI_CS_REQUIRED` (line 85), this one appears in no workflow, and a CI
+runner has no tokenizer to point `RIVOLI_QWEN_ARTIFACT` at. The clause is deleted rather than
+softened; the `drafter_convert.rs` precedent it cites claims nothing about CI either. In a clean
+run the test was green having tokenized NOTHING, so the skip path now:
+
+- counts the id-bearing cases BEFORE the branch and asserts that count (65) on **both** paths, so
+  a fixture that lost its ids cannot make an unarmed run look like a full one;
+- says the size of the hole where a reader of the run can see it. `eprintln!` cannot: libtest's
+  capture is consulted by the print macros, so a printed skip in a PASSING test is invisible.
+  A write to the `Stderr` HANDLE is not intercepted. **Measured 2026-09-01, rustc 1.96.0**, one
+  passing test emitting both forms: without `--nocapture` the macro line appears **0** times and
+  the handle line **once**; with `--nocapture`, both. The real suite now prints
+  `SKIP qwen id pin: RIVOLI_QWEN_ARTIFACT unset — 65 id-bearing cases NOT examined` in a plain
+  `cargo test` run.
+- reads `RIVOLI_QWEN_REQUIRED` by VALUE (`is_some_and(|v| !v.is_empty())`), not by existence,
+  citing `051a291` in place — the commit that changed `codescene.rs` two commits before this
+  branch's S5 landed the existence form. An empty-valued variable is what a CI `env:` expression
+  yields, and the old form ARMED on it: `RIVOLI_QWEN_REQUIRED=` panicked before this fix and
+  skips after it.
+
+*The env gate, run in all FOUR states (the fourth is the one people skip):* both unset → skip,
+exit 0, the SKIP line visible without `--nocapture`; `REQUIRED=1` alone → **exit 101**, *"qwen id
+pin REQUIRED but did not run: RIVOLI_QWEN_ARTIFACT is unset, so 65 id-bearing cases were NOT
+examined"*; `REQUIRED=` (empty but SET) → skip, exit 0, which is the `051a291` contract and the
+opposite of what the old code did; and **the real path, re-run this round** against
+`tokenizer.json` fetched at the pinned revision — sha256 `0997f410…`, byte-equal to the one the
+fixture's provenance records, 12,809,320 B — **65 of 65 cases tokenized identically to
+`apply_chat_template`**, exit 0 in 1.07 s.
+
+*Also corrected*: the tokenizer is **12,809,320 B**, not the "12.84 MB" four files said
+(measured by `wc -c` on the file at the pinned revision, whose sha256 the fixture pins).
+
 *Red proofs, each planted, byte-compared against a saved copy, observed red on the assertion
 ADDED, reverted, and green again on a run carrying a `Compiling` line:*
 
@@ -335,6 +369,10 @@ ADDED, reverted, and green again on a run carrying a `Compiling` line:*
   `…in contents.`), fixture byte 115686: *"no vendored case covers the refusal site
   \"Unexpected item type in content.\""*, and it was the ONLY red — the per-case loop never ran,
   which is the census-before-detail ordering doing its job.
+- **skip-path census** — one case's `ids` key renamed away, fixture byte 1047, run with the
+  tokenizer variable UNSET so the skip path is the one under test: `left: 64` / `right: 65`,
+  the only red in the run. That is the assertion that makes the skip non-vacuous, and it is
+  proven red on the path that used to examine zero cases and report green.
 
 **2026-08-31 — S5 (track D): the chat template is hand-ported and pinned, and the case count grew
 to 78.** `chat_template.jinja` is now VENDORED at
@@ -395,7 +433,7 @@ The `RIVOLI_QWEN_REQUIRED` env gate is proven in all THREE states, including the
 artifact unset + REQUIRED unset → skip; artifact unset + `REQUIRED=1` → **exit 101**, *"qwen id
 pin REQUIRED but did not run: RIVOLI_QWEN_ARTIFACT is unset"*; and the REAL path with the
 variable set — **65 of 65 cases tokenized identically to `apply_chat_template`** through the
-shipped 12.8 MB `tokenizer.json`.
+shipped 12,809,320 B `tokenizer.json`.
 
 **jscpd reported SIX clones on the first compile and all six were fixed, none exempted** — the
 `v4_encoding/render.rs` import run whose own comment predicts the clone (fixed by a braceless
