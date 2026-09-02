@@ -77,7 +77,9 @@ use rivoli_artifact::format::{
 use rivoli_artifact::k3_config::K3Config;
 use rivoli_artifact::quant::f4::{f4_expert_bytes, f4_expert_stride, f4_slot_offsets};
 use rivoli_artifact::schema::parse_config;
-use rivoli_backend::{NULL_STREAM, device_sync, launch_gated_delta_recurrent_f32};
+use rivoli_backend::{
+    HeadCount, HeadDim, NULL_STREAM, device_sync, launch_gated_delta_recurrent_f32,
+};
 use rivoli_core::num::f32_to_bf16;
 use rivoli_engine::k3::engine::K3Engine;
 use rivoli_engine::k3::pin::K3Pin;
@@ -147,8 +149,8 @@ fn kda_step(a: &k3_anchor::Anchor, l: usize) -> (f32, f32) {
                 bufs[4].ptr().cast(),
                 bufs[5].ptr().cast(),
                 bufs[6].ptr().cast(),
-                nh,
-                hd,
+                HeadCount(nh),
+                HeadDim(hd),
                 lb,
                 state.ptr_mut().cast(),
                 out.ptr_mut().cast(),

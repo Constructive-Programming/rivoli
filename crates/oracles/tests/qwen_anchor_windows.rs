@@ -12,6 +12,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
+use rivoli_artifact::census::qwen::ngram_hash;
+use rivoli_artifact::qwen_config::QwenConfig;
+use rivoli_artifact::schema::parse_config;
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -173,24 +176,22 @@ fn the_ladder_partitions_the_queries(g: &GoldenSet, key: &str, ratio: usize, top
 /// GDN output norm's ones-centred form from 256 real bytes. This is the hash ARITHMETIC, which
 /// neither of those touches.
 ///
-/// **OWED, and blocked on a branch rather than on a measurement** (2026-09-01). The strongest
-/// available gate is to assert these vendored int64 buffers against
+/// **The strongest gate over these bytes is the NEXT test**, which asserts them against
 /// `rivoli_artifact::census::qwen::ngram_hash(&cfg, 0)` — 16 primes, 16 offsets, 3 multipliers,
-/// byte for byte — which turns a rule check into a comparison of the port's derivation against
-/// first-party observation. It cannot land here: `crates/artifact/src/census/` exists only on
-/// `track/qwen-artifact`, and the merge base of that branch and this one
-/// (`fac53c6`) has neither the module nor `QwenTextConfig`, so the call does not compile on this
-/// branch and a test that does not compile is not a gate.
+/// byte for byte — turning this rule check into a comparison of the port's derivation against
+/// first-party observation. It could not land on track B (2026-09-01): `crates/artifact/src/census/`
+/// existed only on `track/qwen-artifact`, and the merge base (`fac53c6`) had neither the module nor
+/// `QwenTextConfig`, so the call did not compile there and a test that does not compile is not a
+/// gate. It landed 2026-09-02, the first commit in which the two share a tree.
 ///
-/// **The assertion was settled numerically instead, so whoever lands it lands a known-true one.**
+/// **The assertion was settled numerically first, so what landed was a known-true one.**
 /// Track A's derivation was transliterated and run against these bytes on 2026-09-01: at
 /// `ple_layer_index = 0` the multipliers `[23703573157769, 20109073645365, 8052911324071]`, all
 /// 16 vocabularies, all 16 offsets, `total_vocab_size` 320,001,446 and the 320,001,536 padded
 /// rows all match **exactly**; at `ple_layer_index = 1` every one of them differs
 /// (multipliers `[3352040966061, …]`, first prime 20000213 against 20000003). So the gate is
 /// non-vacuous in the direction that matters — it distinguishes this checkpoint's PLE layer
-/// index — and it is a merge-order item for the coordinator, not a measurement anyone still
-/// owes. See also the deliberate second `is_prime` below.
+/// index. See also the deliberate second `is_prime` below.
 #[test]
 fn the_real_parameter_ngram_anchor_pins_the_full_width_hash() {
     let g = load(&NGRAM_REAL);
@@ -349,6 +350,79 @@ fn every_hashed_id_lands_in_its_own_head(g: &GoldenSet) {
     );
 }
 
+/// **The cross-gate the merge made possible: the port's own derivation against the checkpoint's own
+/// bytes.** `census::qwen::ngram_hash(&cfg, 0)` must reproduce the golden's vendored int64 buffers —
+/// 16 primes, 16 offsets, 3 multipliers IN ORDER, the band total and the padded row count — exactly,
+/// and at `ple_layer_index = 1` every prime, every multiplier and every offset past the first must
+/// differ (offset 0 is 0 at any ordinal, by definition of an exclusive prefix sum, so it is asserted
+/// AS zero rather than counted as a difference). Two arms because the equality alone is not evidence
+/// that the ordinal is 0: it is evidence only if 1 disagrees.
+///
+/// The config is `REAL_CONFIG` through `parse_config`, the converter's own resolution path — not a
+/// hand-built `QwenTextConfig` — so a field the port reads wrong reddens here with the same value the
+/// converter would spend. `crates/artifact/tests/qwen_names.rs` scores the same derivation against
+/// the TSV header's transcription; this is the scoring against first-party bytes, and the two are
+/// deliberately not one test (a header transcription scored against itself is the failure both avoid).
+///
+/// RED OBSERVED (plant: the equality arm handed ordinal 1 instead of 0, 2026-09-02):
+/// `left: [20000213, 20000231, ...] right: [20000003, 20000023, ...]` at the primes — the first
+/// assertion in the body, so nothing above it could have masked it. Reverted; 4 passed.
+#[test]
+fn the_ports_ngram_derivation_reproduces_the_goldens_int64_buffers_at_ordinal_zero_only() {
+    let g = load(&NGRAM_REAL);
+    let cfg: QwenConfig =
+        parse_config(REAL_CONFIG).expect("the vendored real config must load and validate");
+    let t = &cfg.text;
+    let as_u64 = |xs: &[i64]| -> Vec<u64> {
+        xs.iter()
+            .map(|&x| u64::try_from(x).expect("a non-negative int64"))
+            .collect()
+    };
+    let h0 = ngram_hash(t, 0).expect("the derivation at ordinal 0");
+    assert_eq!(
+        h0.vocab_sizes,
+        as_u64(ints(&g, "ngram_heads_vocab_sizes")),
+        "the 16 head vocabularies must be the checkpoint's own primes"
+    );
+    assert_eq!(
+        h0.offsets,
+        as_u64(ints(&g, "ngram_heads_offsets")),
+        "the 16 offsets must be the checkpoint's own exclusive prefix sums"
+    );
+    assert_eq!(
+        h0.multipliers,
+        as_u64(ints(&g, "layer_multipliers")),
+        "the 3 multipliers, IN ORDER — a set comparison passes on the shifted SplitMix64 form"
+    );
+    let totals = as_u64(ints(&g, "totals"));
+    assert_eq!(
+        h0.vocab_sizes.iter().sum::<u64>(),
+        totals[0],
+        "the band total"
+    );
+    assert_eq!(h0.padded_rows, totals[1], "the padded embedding row count");
+
+    // The discriminant: the same derivation at the NEXT ordinal shares nothing with the bytes.
+    let h1 = ngram_hash(t, 1).expect("the derivation at ordinal 1");
+    let all_differ =
+        |a: &[u64], b: &[u64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x != y);
+    assert!(
+        all_differ(&h1.vocab_sizes, &h0.vocab_sizes),
+        "every prime must move at ordinal 1: {:?} vs {:?}",
+        h1.vocab_sizes,
+        h0.vocab_sizes
+    );
+    assert!(
+        all_differ(&h1.multipliers, &h0.multipliers),
+        "every multiplier must move at ordinal 1 (`base_seed = seed + 10007 * ordinal`)"
+    );
+    assert_eq!(h1.offsets[0], 0, "offset 0 is 0 at any ordinal");
+    assert!(
+        all_differ(&h1.offsets[1..], &h0.offsets[1..]),
+        "every offset past the first must move at ordinal 1"
+    );
+}
+
 /// Trial division. The vocabularies are around 2e7, so this is under 4500 divisions each — cheaper
 /// than a dependency, and cheaper than pinning 16 constants that would themselves become the thing
 /// nobody verified.
@@ -357,8 +431,8 @@ fn every_hashed_id_lands_in_its_own_head(g: &GoldenSet) {
 /// `rivoli_artifact::census::qwen::ngram_hash` (track A, `track/qwen-artifact`) carries its own
 /// `is_prime` over `u64`, and a reviewer proposed collapsing the pair. The old argument for this
 /// copy — "cheaper than a dependency" — does not cover that, because A's is not a dependency;
-/// this one does. **The check this file makes is a check ON that derivation.** The owed gate
-/// below asserts A's 16 primes equal the golden's vendored int64 bytes; the assertions above
+/// this one does. **The check this file makes is a check ON that derivation.** The cross-gate
+/// above asserts A's 16 primes equal the golden's vendored int64 bytes; the rule assertions
 /// assert the golden's own primes ARE prime. Route both through one primality walk and a bug in
 /// it — an overflowing `d * d`, a mishandled small case — makes the derivation and its check
 /// agree by construction, which is the recorded "recovered-parameter gates live on an asymmetry"

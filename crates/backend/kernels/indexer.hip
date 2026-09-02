@@ -280,9 +280,8 @@ extern "C" int rivoli_index_score(
     const unsigned int* heads, int nt, int nh, int nact, int hd,
     float wscale, float dscale, float* scores) {
     if (nt <= 0 || nh <= 0 || nact <= 0 || nact > nh || hd <= 0) return 1001;
-    // block = next pow2 ≥ nact (the reduction assumes it), ≥ 32 to stage kf.
-    int bd = 1;
-    while (bd < nact) bd <<= 1;
+    // block = next_pow2(nact) (the reduction assumes it), ≥ 32 to stage kf.
+    int bd = next_pow2(nact);
     if (bd < 32) bd = 32;
     if (bd > 1024) return 1002;
     size_t lds = ((size_t)hd + bd) * sizeof(float);
@@ -308,9 +307,8 @@ extern "C" int rivoli_index_head_route(
     const float* q, const float* w, const float* pool,
     int m_blocks, int nh, int hd, float* e) {
     if (m_blocks <= 0 || nh <= 0 || hd <= 0) return 1001;
-    // block = next pow2 ≥ hd (the LDS reduction assumes it), capped at red[256].
-    int bd = 1;
-    while (bd < hd) bd <<= 1;
+    // block = next_pow2(hd) (the LDS reduction assumes it), capped at red[256].
+    int bd = next_pow2(hd);
     if (bd > 256) bd = 256;
     hipGetLastError();
     hipLaunchKernelGGL(index_head_route, dim3(nh), dim3(bd), 0, 0,
@@ -408,8 +406,7 @@ extern "C" int rivoli_index_pool_norm_f32(const float* keys, const float* weight
     // A non-finite or negative eps makes `rsqrt` of a negative variance NaN for the whole block
     // row; zero is legal and is what an exact RMSNorm is, so the bound is one-sided.
     if (!(eps >= 0.0f && eps < INFINITY)) return 1006;
-    int block = 1;
-    while (block < hd) block <<= 1;
+    int block = next_pow2(hd);
     hipGetLastError();
     hipLaunchKernelGGL(index_pool_norm_f32, dim3((unsigned)n_blocks), dim3((unsigned)block),
                        block * sizeof(float), (hipStream_t)stream, keys, weight, ratio, hd, eps,

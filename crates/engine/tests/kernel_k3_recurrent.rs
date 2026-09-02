@@ -39,7 +39,7 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli_backend::hip::launch_gated_delta_recurrent_f32;
+use rivoli_backend::hip::{HeadCount, HeadDim, launch_gated_delta_recurrent_f32};
 
 mod common;
 mod k3;
@@ -357,8 +357,8 @@ fn kda_launch(c: &Kda) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
             beta.ptr() as *const f32,
             a_log.ptr() as *const f32,
             dt.ptr() as *const f32,
-            c.heads,
-            c.head_dim,
+            HeadCount(c.heads),
+            HeadDim(c.head_dim),
             c.lb,
             sb.ptr_mut() as *mut f32,
             ob.ptr_mut() as *mut f32,

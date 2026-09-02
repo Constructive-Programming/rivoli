@@ -166,7 +166,10 @@ pub struct ScoreBufs {
 /// The `extern` type for one launcher argument: the `as`-cast target when the Rust side
 /// narrows at the call (`o_dim: usize as i32`), and the Rust type unchanged when it does not
 /// (`x: *const f32`). Exists only because `macro_rules!` cannot say "this one if present,
-/// otherwise that one" inline — two arms can.
+/// otherwise that one" inline — two arms can. The second arm also serves the `=>` form
+/// (`heads: HeadCount => i32`), where the Rust side is a NEWTYPE and the wrapper spells the
+/// call `heads.0 as i32` — added 2026-09-02 so a typed head geometry is a DSL row rather than
+/// the reason for a hand-written launcher (`hip_attn.rs`'s note under its gated-delta row).
 macro_rules! abi_ty {
     ($rt:ty) => {
         $rt
@@ -223,7 +226,7 @@ macro_rules! launchers {
     ($(
         $(#[$m:meta])*
         $rust:ident -> $sym:ident, $tag:literal (
-            $($arg:ident : $rt:ty $(as $ct:ty)? ,)*
+            $($arg:ident : $rt:ty $(as $ct:ty)? $(=> $nt:ty)? ,)*
         );
     )*) => {
         // ONE block, not one per launcher, so the expansion stays comparable to the
@@ -231,7 +234,7 @@ macro_rules! launchers {
         // `too_many_arguments` on an ABI mirror is noise by construction.
         #[allow(clippy::too_many_arguments)]
         unsafe extern "C" {
-            $( fn $sym($($arg: abi_ty!($rt $(, $ct)?)),*) -> i32; )*
+            $( fn $sym($($arg: abi_ty!($rt $(, $ct)? $(, $nt)?)),*) -> i32; )*
         }
 
         $(
@@ -239,7 +242,7 @@ macro_rules! launchers {
             #[allow(clippy::too_many_arguments)]
             pub unsafe fn $rust($($arg: $rt),*) -> Result<()> {
                 // SAFETY: caller's pointer contract.
-                let r = unsafe { $sym($($arg $(as $ct)?),*) };
+                let r = unsafe { $sym($($arg $(as $ct)? $(.0 as $nt)?),*) };
                 ensure_hip_status(r, $tag)
             }
         )*

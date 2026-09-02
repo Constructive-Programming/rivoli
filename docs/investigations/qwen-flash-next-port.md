@@ -854,3 +854,35 @@ merge — the post-merge batteries below are what closes that. Owed, in order:
 4. `next_pow2` is a fourth copy under `kernels/` that jscpd (Rust-only) cannot see; its home
    is `reduce.hpp`;
 5. `qwen_encoding.rs` sits at 799 lines against the 800 soft cap — the next edit shrinks it.
+
+**2026-09-02, later — the five debts above PAID, and the merged tree's housekeeping done.** Housekeeping
+first: worktrees `qwen-{a,b,c,d}` and `wave-m19` removed and their five branches deleted (all five
+`--merged main`, all five trees clean), and the target dirs no checkout claimed any more —
+twenty-one of them, 88 GB under `/var/cache/rivoli/target`, `qwen-*`, `review-*`, `verify-*`,
+`rocm10-mig-*`, `k3-s1a`, `wave-m11` — deleted; `wave-m12` stays (its branch is NOT merged: 11
+commits, 107 behind). Then the list, in its own order:
+
+1. **PAID** — `crates/oracles/tests/qwen_anchor_windows.rs::the_ports_ngram_derivation_reproduces_the_goldens_int64_buffers_at_ordinal_zero_only`:
+   A's `census::qwen::ngram_hash(&cfg, 0)` against B's `qwen-anchor-ngram-real.bin` int64 buffers,
+   exact on all five quantities, and ordinal 1 differing on every prime, every multiplier and every
+   offset past the first. The config goes through `parse_config`, the converter's own path. Red
+   proof: the equality arm handed ordinal 1 — `gate-red-proofs.md` §15's last table.
+2. **PAID** — `gate-red-proofs.md` §15 (track A's plants, the table) and §16 (track C's: 16a
+   deviceless, 16b silicon, 16c today's two structural changes). The per-test `RED OBSERVED` lines
+   and the kernel suites' header narratives stay where they are: the observation belongs beside the
+   assertion, and the registry points at it.
+3. **PAID** — `launch_gated_delta_recurrent_f32` takes `HeadCount`/`HeadDim`. Not as a fourth
+   hand-written launcher: `launchers!` grew a third argument form, `heads: HeadCount => i32`
+   (`hip.rs::abi_ty`, the wrapper spells `heads.0 as i32`), the gated-delta row took it, and
+   `launch_rmsnorm_gate_heads_f32` — hand-written on 2026-09-01 for exactly this — went back to
+   being a row. Callers: `k3/forward.rs`, `kernel_k3_recurrent.rs`, `k3_anchor_decode.rs`. Red proof
+   is the E0308 on a swapped pair, §16c.
+4. **PAID** — `reduce.hpp::next_pow2`, one definition; the FIVE loops it replaced (`recurrent.hip`
+   x2, `indexer.hip` x3 — two of those older than the note that counted three) are gone, and the
+   note in `recurrent.hip` now records the count and the date rather than the owing. No plant, and
+   §16c says why: the suites score results, not geometry.
+5. **PAID** — `qwen_encoding.rs` 799 → 704 lines: the `tools`/`tool_calls` half
+   (`tool_json_lines`, `tool_call_block`, `tool_calls` and the three helpers only they use) moved
+   verbatim to `qwen_encoding/tool_calls.rs`. The build script's soft-cap warning no longer names it.
+
+Batteries for the round, all on this box: deviceless `cargo test --workspace --no-default-features` exit 0, **494 passed** (493 before the cross-gate); clippy exit 0 on both arms; rocm `cargo build --workspace --all-targets` exit 0 with hipcc re-emitting the kernel objects after the edits; the flock'd GPU battery `cargo test --workspace -- --test-threads=1` rc 0, **699 passed**, witness EMPTY, GTT 17 MiB pre-arm — taken on `/run/sys-gpu.lock` because `/var/run` is dangling on this box since today's reboot (a stray ro bind of `/mnt` over `/`, mount 391; `gate-red-proofs.md` §16c has the mechanism). Red proofs observed left/right, not by exit code: the cross-gate at the primes, the pair swap as E0308.

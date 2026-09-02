@@ -403,21 +403,56 @@ launchers! {
         beta_pre: *const f32,
         a_log: *const f32,
         dt_bias: *const f32,
-        heads: usize as i32,
-        head_dim: usize as i32,
+        heads: HeadCount => i32,
+        head_dim: HeadDim => i32,
         lower_bound: f32,
         state: *mut f32,
         out: *mut f32,
         stream: *mut c_void,
     );
 
-    // ── three rows left this block on 2026-09-01, and none of them left the wall ──────────────
-    // `launch_rmsnorm_gate_heads_f32` and `launch_gdn_recurrent_f32` are hand-written below the
-    // ignore marker at the end of this file; `launch_index_score_blocks_f32` is in `hip.rs` beside
-    // the bf16 twin whose `ScoreBufs`/`ScoreDims` grouping it copies. All three needed a parameter
-    // this DSL has no syntax for — `HeadCount`/`HeadDim`, or a buffer group.
+    // ── three rows left this block on 2026-09-01; one came back 2026-09-02 ─────────────────────
+    // They left because the DSL had no syntax for a newtype or a buffer group. `=>` now spells
+    // the first (`heads: HeadCount => i32`, see `launchers!`), so `launch_rmsnorm_gate_heads_f32`
+    // is a row again (below) and `launch_gated_delta_recurrent_f32` above lost the wall's LAST
+    // bare `(heads, head_dim)` pair the same way — the debt `qwen-flash-next-port.md`'s
+    // 2026-09-02 worklog named. `launch_gdn_recurrent_f32` stays hand-written below the ignore
+    // marker for `GdnBufs`, and `launch_index_score_blocks{,_f32}` in `hip.rs` for
+    // `ScoreBufs`/`ScoreDims`: a group becoming four arguments is still not a 1:1 mirror.
     // `crates/cli/tests/kernel_coverage.rs` scans `crates/backend/src` recursively for both
-    // declaration forms, so the census is unaffected by the move.
+    // declaration forms, so the census is unaffected by any of these moves.
+
+    /// **Kimi-K3's and Qwen3.8-Flash-Next's fused gated head norm**:
+    /// `out = o · rsqrt(mean(o²) + eps) · weight · sigmoid(gate)`, per head.
+    /// `kernels/recurrent.hip` carries the arithmetic, the four-part bit-identity argument for its
+    /// padded reduction, and the reason NORM-THEN-GATE is trap 10.
+    ///
+    /// `o`, `gate` and `out` are `heads · head_dim` f32; `weight` is `head_dim`, shared across heads.
+    ///
+    /// **Typed geometry, not two `usize`**: `launch_rmsnorm_gate_heads_f32(.., HeadDim(96),
+    /// HeadCount(2), ..)` does not COMPILE — see [`HeadCount`] for the runtime guard whose removal
+    /// this replaces. Hand-written for exactly that from 2026-09-01 until the DSL grew `=>`, and a
+    /// row again since 2026-09-02, doc and all.
+    ///
+    /// `head_dim` above 1024 is refused (1002); a negative, NaN or infinite `eps` is refused (1006)
+    /// while zero is legal and exact. **There is no power-of-two requirement**: the kernel pads the
+    /// block to `next_pow2(head_dim)` and masks, which is what lets qwen's `head_dim` 20 through.
+    ///
+    /// # Safety
+    /// Every pointer is a device buffer of the size above, live until `stream` completes, and none
+    /// may alias another — all four are `__restrict__` in the kernel. `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
+    launch_rmsnorm_gate_heads_f32 -> rivoli_rmsnorm_gate_heads_f32,
+    "rmsnorm_gate_heads_f32" (
+        o: *const f32,
+        gate: *const f32,
+        weight: *const f32,
+        heads: HeadCount => i32,
+        head_dim: HeadDim => i32,
+        eps: f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
 
     // ── the sparse lightning indexer (DSA / MISA) ───────────────────────────────────────────
 
@@ -626,26 +661,18 @@ launchers! {
 
 // ── hand-written, because `launchers!` is a positional 1:1 mirror ──────────────────────────────
 //
-// Three of the wall's launchers cannot be DSL rows and all three fail the same way: a parameter the
-// mirror has no syntax for. `hip.rs::launch_index_score_blocks` set the precedent and its exemption
-// block carries the argument; `launch_index_score_blocks_f32` joined it there, beside its twin. The
-// two below are the attention family's and live here for cohesion — and because `hip.rs` measured
-// 836 lines with them, over the 800 ceiling this file was itself split out under.
+// A launcher that cannot be a DSL row fails one way: a parameter the mirror has no syntax for.
+// `hip.rs::launch_index_score_blocks` set the precedent (a buffer group becoming four arguments)
+// and its exemption block carries the argument; `launch_index_score_blocks_f32` joined it there,
+// beside its twin. `launch_gdn_recurrent_f32` below is the attention family's, for `GdnBufs`, and
+// lives here for cohesion — and because `hip.rs` measured 836 lines with it, over the 800 ceiling
+// this file was itself split out under. `launch_rmsnorm_gate_heads_f32` sat beside it from
+// 2026-09-01 for `HeadCount`/`HeadDim` alone and went back to being a row on 2026-09-02, when the
+// DSL grew `=>` for exactly that.
 //
 // Declared INSIDE this file's existing ignore region, so the wall gains no new exempt region and
 // each C signature still has exactly one copy in the tree.
 unsafe extern "C" {
-    fn rivoli_rmsnorm_gate_heads_f32(
-        o: *const f32,
-        gate: *const f32,
-        weight: *const f32,
-        heads: i32,
-        head_dim: i32,
-        eps: f32,
-        out: *mut f32,
-        stream: *mut c_void,
-    ) -> i32;
-
     fn rivoli_gdn_recurrent_f32(
         q: *const f32,
         k: *const f32,
@@ -688,50 +715,6 @@ pub struct GdnBufs {
     pub a_log: *const f32,
     /// `[v_heads]`, learned, per-HEAD and not per-channel — trap T17.
     pub dt_bias: *const f32,
-}
-
-/// **Kimi-K3's and Qwen3.8-Flash-Next's fused gated head norm**:
-/// `out = o · rsqrt(mean(o²) + eps) · weight · sigmoid(gate)`, per head.
-/// `kernels/recurrent.hip` carries the arithmetic, the four-part bit-identity argument for its
-/// padded reduction, and the reason NORM-THEN-GATE is trap 10.
-///
-/// `o`, `gate` and `out` are `heads · head_dim` f32; `weight` is `head_dim`, shared across heads.
-///
-/// **Hand-written, and taking [`HeadCount`]/[`HeadDim`] rather than two `usize`, is the whole
-/// point of moving it here.** `launchers!` is a positional 1:1 mirror of the C signature and
-/// cannot narrow a newtype; this is the same "refuses what it cannot prove mechanical" exception
-/// [`launch_index_score_blocks`] has. What the types buy is that
-/// `launch_rmsnorm_gate_heads_f32(.., HeadDim(96), HeadCount(2), ..)` does not COMPILE — see
-/// [`HeadCount`] for the runtime guard whose removal this replaces.
-///
-/// `head_dim` above 1024 is refused (1002); a negative, NaN or infinite `eps` is refused (1006)
-/// while zero is legal and exact. **There is no power-of-two requirement**: the kernel pads the
-/// block to `next_pow2(head_dim)` and masks, which is what lets qwen's `head_dim` 20 through.
-///
-/// # Safety
-/// Every pointer is a device buffer of the size above, live until `stream` completes, and none may
-/// alias another — all four are `__restrict__` in the kernel. `stream` is a live `hipStream_t`, or
-/// null for the default stream.
-// An ABI mirror: eight arguments because the C entry point has eight, and the `launchers!` block
-// this used to sit in carries the same allow for the same reason — `too_many_arguments` on a wall
-// is noise by construction. The newtypes are what the arity buys back.
-#[allow(clippy::too_many_arguments)]
-pub unsafe fn launch_rmsnorm_gate_heads_f32(
-    o: *const f32,
-    gate: *const f32,
-    weight: *const f32,
-    heads: HeadCount,
-    head_dim: HeadDim,
-    eps: f32,
-    out: *mut f32,
-    stream: *mut c_void,
-) -> Result<()> {
-    let (heads, head_dim) = (heads.0 as i32, head_dim.0 as i32);
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle or null.
-    let r = unsafe {
-        rivoli_rmsnorm_gate_heads_f32(o, gate, weight, heads, head_dim, eps, out, stream)
-    };
-    ensure_hip_status(r, "rmsnorm_gate_heads_f32")
 }
 
 /// **One decode step of Qwen3.8-Flash-Next's gated delta rule** — the recurrence inside its 36

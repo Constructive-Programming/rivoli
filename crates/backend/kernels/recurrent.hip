@@ -331,13 +331,13 @@ extern "C" int rivoli_short_conv_silu_f32(const float* cur, const float* w, int 
 // > masked lanes' own claim — that they cannot reach the result — is a standing device test in
 // > `kernel_qwen_gdn_out_norm.rs`, scored as BYTES.
 // >
-// > **Owed duplication, recorded because no tool can see it.** The `next_pow2` rounding loop is
-// > now the THIRD copy under `kernels/` (here, `gdn_recurrent_f32`'s launcher above, and
-// > `indexer.hip::index_pool_norm_f32`'s). `crates/cli/build.rs`'s jscpd gate scans `crates` for
-// > Rust only, so `.hip` duplication is invisible to every tool in this tree except the compiler —
-// > the rule is the repo's, not the tool's. The natural single home is `reduce.hpp`, beside the
-// > `block_sum_lds` precondition it exists to satisfy; that file is not track C's, so this is
-// > flagged to the coordinator rather than done quietly.
+// > **Duplication no tool could see, PAID 2026-09-02.** The `next_pow2` rounding loop had FIVE
+// > copies under `kernels/` (this launcher's, `gdn_recurrent_f32`'s, and three in `indexer.hip`,
+// > two of them older than this note). `crates/cli/build.rs`'s jscpd gate scans `crates` for Rust
+// > only, so `.hip` duplication is invisible to every tool in this tree except the compiler — the
+// > rule is the repo's, not the tool's. The one home is `reduce.hpp::next_pow2`, beside the
+// > `block_sum_lds` precondition it exists to satisfy. It was flagged here rather than done while
+// > `reduce.hpp` was another track's file, and done once the tracks merged.
 extern "C" __global__ void rmsnorm_gate_heads_f32(const float* __restrict__ o,
                                                   const float* __restrict__ gate,
                                                   const float* __restrict__ weight, int head_dim,
@@ -378,11 +378,10 @@ extern "C" int rivoli_rmsnorm_gate_heads_f32(const float* o, const float* gate,
     // variance is NaN for the whole head, and zero is legal (it is what an exact RMSNorm is) so the
     // bound is one-sided.
     if (!(eps >= 0.0f && eps < INFINITY)) return 1006;
-    // `next_pow2(head_dim)`. Equal to `head_dim` at every power of two, which is what makes the
-    // shipped K3, V4 and Glimmer launches bit-identical to their pre-padding selves — point 1 of
-    // the kernel's note. THIRD copy of this loop under `kernels/`; the note records why.
-    int block = 1;
-    while (block < head_dim) block <<= 1;
+    // `next_pow2(head_dim)` (reduce.hpp). Equal to `head_dim` at every power of two, which is what
+    // makes the shipped K3, V4 and Glimmer launches bit-identical to their pre-padding selves —
+    // point 1 of the kernel's note.
+    int block = next_pow2(head_dim);
     hipGetLastError();
     hipLaunchKernelGGL(rmsnorm_gate_heads_f32, dim3((unsigned)heads), dim3((unsigned)block),
                        block * sizeof(float), (hipStream_t)stream, o, gate, weight, head_dim, eps,
@@ -547,8 +546,7 @@ extern "C" int rivoli_gdn_recurrent_f32(const float* q, const float* k, const fl
     // `linear_num_key_heads` / `linear_num_value_heads` wrong. Refused rather than floored: a
     // floored `rep` reads a real row of `q` for every head and returns plausible numbers.
     if (v_heads % qk_heads) return 1003;
-    int block = 1;
-    while (block < dk || block < dv) block <<= 1;
+    int block = next_pow2(dk > dv ? dk : dv);
     size_t lds = ((size_t)2 * dk + block) * sizeof(float);
     hipGetLastError();
     hipLaunchKernelGGL(gdn_recurrent_f32, dim3((unsigned)v_heads), dim3((unsigned)block), lds,

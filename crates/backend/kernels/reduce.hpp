@@ -25,6 +25,20 @@
 #define WAVE 32
 #define ROWS_PER_BLOCK 8  // block = 256 threads = 8 waves → 8 output rows/block
 
+// The smallest power of two >= n: the block width a launcher hands `block_sum_lds`, whose
+// precondition (a power-of-two `blockDim.x`) is the reason this exists, with the lanes past `n`
+// masked in the kernel. Host-side, at launch. ONE definition since 2026-09-02: five copies of the
+// same two-line loop sat in `indexer.hip` and `recurrent.hip`, invisible to jscpd because that
+// gate scans Rust only (`.jscpd.json` format:["rust"]) — `recurrent.hip`'s note records the count
+// growing and `docs/investigations/qwen-flash-next-port.md` carried the fifth as a named debt.
+// The arithmetic is exactly what every copy had, including no upper bound: each caller bounds or
+// clamps the result, and an absurd width must be refused BEFORE this is called.
+static inline int next_pow2(int n) {
+    int b = 1;
+    while (b < n) b <<= 1;
+    return b;
+}
+
 // Sum a wave's partials into lane 0 (fixed __shfl_down order → deterministic).
 __device__ __forceinline__ float wave_sum(float v) {
     for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_down(v, o, WAVE);
