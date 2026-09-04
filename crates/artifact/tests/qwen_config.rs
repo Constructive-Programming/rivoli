@@ -475,7 +475,7 @@ fn every_width_of_zero_is_refused() {
 /// still parsed` — a document stating the rotary width twice and disagreeing with itself, where
 /// whichever half the arm happens to read decides how many of 256 dims rotate.
 #[test]
-fn the_structurally_wrong_relations_are_refused() {
+fn the_wrong_attention_gdn_and_hc_relations_are_refused() {
     refused(&[
         (
             "/text_config/num_key_value_heads",
@@ -517,6 +517,13 @@ fn the_structurally_wrong_relations_are_refused() {
             json!(99_999),
             "is not a rank BELOW the",
         ),
+    ]);
+}
+
+/// The MoE, vocabulary and MTP rows, plus the two cases a JSON-pointer row cannot express.
+#[test]
+fn the_wrong_moe_vocab_and_mtp_relations_are_refused() {
+    refused(&[
         (
             "/text_config/num_experts_per_tok",
             json!(513),
@@ -580,7 +587,7 @@ fn the_structurally_wrong_relations_are_refused() {
 /// downstream refuses. The two scalars are checked in the **f32 domain** because the kernels
 /// narrow them: `1e-46` passes an f64 positivity test and reaches every RMSNorm as `0.0f32`.
 #[test]
-fn the_silently_wrong_settings_and_narrowing_scalars_are_refused() {
+fn the_five_named_settings_are_refused() {
     refused(&[
         (
             "/text_config/dtype",
@@ -607,6 +614,14 @@ fn the_silently_wrong_settings_and_narrowing_scalars_are_refused() {
             json!("yarn"),
             "implements \"default\" only",
         ),
+    ]);
+}
+
+/// The three flags and the two narrowing scalars, plus the rotary width that needs BOTH homes
+/// moved -- otherwise it is a two-homes disagreement assertion, not a width assertion.
+#[test]
+fn the_flags_that_change_arithmetic_and_the_scalars_that_narrow_are_refused() {
+    refused(&[
         (
             "/text_config/rope_parameters/mrope_interleaved",
             json!(false),
