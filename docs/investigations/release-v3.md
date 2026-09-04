@@ -39,7 +39,7 @@ unless the row is a timing row. A row's green is recorded with its command line.
 | 6 | `crates/engine/tests/glimmer_fp8_decode.rs` (anti-fallback assert) + live serve SSE round-trip | ~20 m | the two owed M11 device halves |
 | 7 | `tests/determinism-glm.sh <artifact> 512` on the `--arena-refresh` arm, same-day stock control | ~1 h | a green is only interpretable WITH the control (gate's own rule); recorded as the mitigation arm's green, not the default's |
 | 8 | K3 first real decode — correctness only | hours (NFS) | ids finite, sane text, no crash, ctx ≤ 8192 (`ATTEND_MAX_KV`), small token count. Perf disclaimed (owner Q1: artifact is NFS-resident). A starved-looking job may be alive — verify by /proc PID before restarting. §8 of k3-first-checkpoint.md lists two checkpoint leads (A_log shape, lying MXFP4 target list) to check DURING this run's load |
-| 9 | CodeScene 10/10 (`RIVOLI_CS_REQUIRED=1`) | ~10 m, no GPU | WAITS ON `CS_ACCESS_TOKEN`; the standing red-proof fixture must still score <10 |
+| 9 | CodeScene 10/10 (`RIVOLI_CS_REQUIRED=1`) | ~~10 m~~ **a burn-down, not a run** — see §2c | ARMED 2026-09-04 (`cs` on the shared home + the PAT): the red-proof fixture passed, and **21 files scored below 10**. The row's estimate was wrong because it assumed arming was the work |
 
 ## 2b. The device halves, one-shot (added 2026-09-04)
 
@@ -70,7 +70,7 @@ those two lines, not by intention).
 | **A** M11 fp8 device half | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test glimmer_fp8_decode -- --test-threads=1 --nocapture'` (verbatim from the file's own header) | **no checkpoint** — the suite writes its own artifact via `glimmer_anchor::write_artifact` into `std::env::temp_dir()` | the fp8 arm's logits DIFFER from the bf16 arm's on the same input (anti-fallback) and the split is entered; the file's header warns a finite-but-wrong fp8 arithmetic survives both, so this is not a quality claim |
 | **B** live serve SSE round-trip | `tests/smoke-glm.sh <artifact-dir>` (its `serve` cell) | the GLM artifact | already-written assertions, not missing code: `tests/smoke-glm.sh:111-117` requires `^data: ` frames AND a `data: [DONE]` terminator over a live decode, after readiness and `/v1/models`. §13's "only the live SSE round-trip is OWED" is owed as a **run** |
 | **C** M17c block-attend execution | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test kernel_glimmer_block_attend -- --test-threads=1'` | none (host oracle + drawn weights, no skip path: 18 tests, no env gate, `#![cfg(feature = "rocm")]` is the only arm) | VERIFY-OR-PAY, and it is probably already paid: `crates/engine/tests/kernel_glimmer_block_attend.rs` is M17c's on-device gate and landed 2026-08-17, and both device batteries since (2026-09-01's 592 tests / 91 suites, 2026-09-02's 699 / 98) would have run it — but neither names suites, so neither is citeable for THIS claim. Record the suite name and its count, then correct §11's "has NEVER EXECUTED", CLAUDE.md's census paragraph, and §4's label **in the same commit**. The `gqa_attend` duplication stays owed regardless and is not a device matter: `.jscpd.json` is `format: ["rust"]`, so no gate can raise it |
-| **D** CodeScene 10/10 | `RIVOLI_CS_REQUIRED=1 CS_ACCESS_TOKEN=… CARGO_TARGET_DIR=… cargo test -p rivoli --test codescene` | **the token, and nothing else** — `cs` is already installed at `~/.local/bin/cs` (shared NFS home, so on every node; it runs, and reports 1.0.40 pending) | `codescene.rs` panics on tool-absent only under `RIVOLI_CS_REQUIRED`; the standing red-proof fixture must still score < 10 in the same run. Since no device is involved this row is **payable on rh-desktop today** — it is one `export` away, and it is the last thing standing between the tree and §13's "owed and standing, blocked only on `CS_ACCESS_TOKEN`" |
+| **D** CodeScene 10/10 | `RIVOLI_CS_REQUIRED=1 CS_ACCESS_TOKEN=… CARGO_TARGET_DIR=… cargo test -p rivoli --test codescene` | **the token, and nothing else** — `cs` is already installed at `~/.local/bin/cs` (shared NFS home, so on every node; it runs, and reports 1.0.40 pending) | `codescene.rs` panics on tool-absent only under `RIVOLI_CS_REQUIRED`; the standing red-proof fixture must still score < 10 in the same run. Since no device is involved this row was payable on rh-desktop immediately, **and it was paid on 2026-09-04**: the fixture half is green and §13's "blocked only on `CS_ACCESS_TOKEN`" is closed — which revealed the row was never about the token. See §2c |
 | **E** fp8 paired dNLL + tok/s + partition bit-identity | build the instruments outside the lock first: `cargo build --release --features teacher-forcing --bin rivoli --bin ppl`, then `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli tests/ppl-gates.sh <artifact-dir> all'` — the script reads `$PPL_BIN`/`$PPL_TOOL` from the target dir's `release/`, and `bin/ppl` consumes the per-token NLL files the engine writes under `--ppl <text> --ppl-out <path>` | BOTH Glimmer artifacts: bf16 55,712,428,144 B and fp8 30,554,903,564 B (the NFS pair measured in `docs/measurement/glimmer-fp8.md`); confirm both by length before the arm. The `tf` cell additionally needs the pinned reference at `$PPL_REF_BIN` (default `/var/cache/users/rhansen/m10-ref-tf-target/release/rivoli`, built with teacher-forcing) | **the stated blocker is stale.** `glimmer-fp8.md` says this is "blocked on M10's `--ppl`, which has zero commits" — `crates/cli/src/bin/ppl.rs` and `tests/ppl-gates.sh` both exist and their classifier and engine halves are PAID (§5, 2026-08-21). Run it, then correct that doc's blocker clause with a dated note |
 
 **What row A's command must not quietly do.** `temp_dir()` honors `TMPDIR`, and the default is
@@ -93,6 +93,65 @@ what used to catch that class, so a dangling citation is currently a legal state
 device; row D is an external credential. Two of the five claims that A/D/E were blocked on
 missing tree artifacts are wrong as of today, and the file that makes each one is named in its
 row so the correction lands beside the measurement rather than in a new document.
+
+## 2c. CodeScene, armed: the gate was never blocked on the token (2026-09-04)
+
+`RIVOLI_CS_REQUIRED=1 cargo test -p rivoli --no-default-features --test codescene` on
+rh-desktop, `cs` from `~/.local/bin/cs`, PAT supplied from outside the tree: **exit 101**
+after 371 s. `the_red_proof_fixture_scores_below_ten` **passed**, so the reviewer is really
+scoring and not returning 10.0s — which is what makes the other half's red evidence rather
+than noise: **21 files below 10/10**, with `codescene.rs`'s own standing rule that an EXEMPT
+row is for **frozen transliterations of the reference, never rivoli-authored code** (its
+comment records the first armed run refactoring `glimmer_draft_oracle.rs` and
+`v4_indexer_goldens.rs` to 10.0 on exactly that ground). So none of these 21 is exemption
+work; every one is a fix, and the score distribution says so — 16 of 21 sit in [9.0, 9.9],
+which is one long function or one over-wide argument list, not a structural disagreement
+with the tool.
+
+**Why the tree did not know.** Every one of these landed after 2026-08-21, the last day the
+gate could run: §13's verdict and CLAUDE.md both carry "blocked only on `CS_ACCESS_TOKEN`",
+and three weeks of merges — the whole Qwen S2–S5 arm (11 of the 21), M17b's templates, the
+K3 test module — went past a gate that warn-skips when unarmed. A gate that degrades to a
+warning when its credential is missing is a gate that reports green; `RIVOLI_CS_REQUIRED` is
+CI's protection and CI is the only place it is set, so locally the red was invisible. That is
+the §12 W3 class one level up: a silent skip that lets a claim stand as checked.
+
+**The 21, triaged by what can verify a fix on this box** (`cs review --output-format json`,
+per file):
+
+| file | score | findings | verifiable here? |
+|---|---|---|---|
+| `oracles/tests/qwen_anchor_taps.py` | 7.92 | Complex Method/Conditional, Deep Nested Complexity, Bumpy Road, arity | needs the anchor venv (CPU, but not on this node) |
+| `oracles/tests/qwen_anchor_driver.py` | 8.56 | Complex Method/Conditional, Overall Complexity | same |
+| `engine/tests/kernel_qwen_gdn_recurrent.rs` | 8.88 | Complex Method, Deep Nested Complexity, Bumpy Road | **no — device arm** |
+| `artifact/src/qwen_encoding.rs` | 9.09 | Complex Conditional, Deep Nested Complexity | yes (deviceless arm) |
+| `artifact/src/census/qwen.rs` | 9.24 | Complex Conditional, Complex Method | yes |
+| `engine/tests/kernel_qwen_indexer.rs` | 9.29 | Large Method, arity | **no — device arm** |
+| `oracles/tests/common/golden_read.rs` | 9.38 | Code Duplication | yes — and jscpd is the neighbouring smell, so both tools must stay green |
+| `oracles/tests/qwen_anchor_fixtures.rs` | 9.38 | Large Assertion Blocks | yes |
+| `artifact/tests/qwen_config.rs` | 9.52 | Large Method | yes |
+| `cli/build.rs` | 9.54 | Large Method | yes (every build runs it) |
+| `cli/src/bin/convert_qwen.rs` | 9.54 | Large Method | yes |
+| `artifact/tests/qwen_names.rs` | 9.58 | Large Method | yes |
+| `oracles/tests/qwen_anchor_compare.py` | 9.60 | Complex Method | needs the venv |
+| `artifact/tests/glimmer_template.rs` | 9.68 | arity | yes |
+| `backend/src/hip_attn.rs` | 9.68 | arity | **no — ABI wall, rocm arm** |
+| `engine/src/v4/engine.rs` | 9.68 | arity | **no — device arm** |
+| `engine/tests/k3/mod.rs` | 9.68 | Primitive Obsession | **no — device arm** |
+| `engine/tests/kernel_qwen_harness.rs` | 9.68 | arity | **no — device arm** |
+| `oracles/tests/qwen_anchor_provenance.py` | 9.68 | Complex Method | needs the venv |
+| `oracles/tests/qwen_anchor.rs` | 9.68 | String Heavy Function Arguments | yes (host oracle reads the goldens) |
+| `engine/tests/kernel_qwen_gdn_out_norm.rs` | 9.84 | Bumpy Road Ahead | **no — device arm** |
+
+**Seven need the device to verify, four need the anchor venv, ten are deviceless-verifiable
+on this box.** The gate needs all 21, so row 9 stays red until the last arm lands, and the
+split is the decision: burn down the ten now against `cargo test --workspace
+--no-default-features` (each re-score is ~20 s and the full gate ~6 min, so the loop is
+cheap), or hold the whole set for one reviewed branch that can verify the device nine too.
+Refactoring the nine blind — `hip_attn.rs` is the hand-written launcher side of the ABI wall
+and `v4/engine.rs` sits under the parity gate — is what §11 already declined once for the
+`gqa_attend` duplication, on the grounds that a change to GPU-parity-gated code that its
+author cannot verify is worse than an open debt.
 
 ## 3. After the gates, before the tag
 
