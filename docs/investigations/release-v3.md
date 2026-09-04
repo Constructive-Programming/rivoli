@@ -143,6 +143,19 @@ per file):
 | `oracles/tests/qwen_anchor.rs` | 9.68 | String Heavy Function Arguments | yes (host oracle reads the goldens) |
 | `engine/tests/kernel_qwen_gdn_out_norm.rs` | 9.84 | Bumpy Road Ahead | **no — device arm** |
 
+**The loop, proven on the first one (1 of 21: `cli/build.rs` 9.54 → 10.0).** `main()` was 118
+lines holding four independent gates, so it split at the phase seams into
+`assert_this_checkout → declare_scan_reruns → run_jscpd → warn_if_format_is_a_lower_bound →
+judge_jscpd`. What made the result trustworthy, in the order it caught things: the comments
+moved **byte-for-byte** because they are the measured findings, not decoration; `rustfmt
+--check` refused the first placement (a `//` block between a `///` summary and its `fn`);
+clippy then rejected two things that were genuinely worse than the code they replaced
+(`let_and_return`, and a `&root` that became `&&Path` once `root` was a parameter); and the
+behaviour was **diffed rather than eyeballed** — the build script's `cargo:warning=` set
+captured before and after is identical, including the quirk that an absent `npx` skips the
+soft-cap phase, which is now a named decision at the call site instead of an accident of
+control flow. Per-file cost is ~20 s of scoring and one arm; the loop is repeatable.
+
 **Seven need the device to verify, four need the anchor venv, ten are deviceless-verifiable
 on this box.** The gate needs all 21, so row 9 stays red until the last arm lands, and the
 split is the decision: burn down the ten now against `cargo test --workspace
