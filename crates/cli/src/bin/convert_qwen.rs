@@ -299,32 +299,16 @@ fn write_routed_layer(
 /// a row SPACE. `split_ngram_parts` is a checkpoint-side convention with no counterpart in the
 /// reference module (OPEN-2 in `qwen-architecture.md`), so the tiling is the only thing that
 /// says the convention was read correctly.
-fn write_ngram_shards(
-    src: &Safetensors,
-    cfg: &QwenTextConfig,
-    hash: &NgramHash,
-    host: usize,
-    out_dir: &str,
-) -> Result<()> {
-    let head_dim = cfg.ngram_head_dim()?;
+fn write_ngram_shards(src: &Safetensors, job: &NgramJob<'_>, out_dir: &str) -> Result<()> {
+    // Bound here so the body below keeps the names it has always used.
+    let (hash, host, parts, head_dim) = (job.hash, job.host, job.parts, job.head_dim);
     let mut row = 0u64;
-    for s in 0..cfg.split_ngram_parts {
+    for s in 0..parts {
         let name = format!(
             "model.language_model.layers.{host}.ple.ple_embedding.ngram_embedding.shard_{s}.weight"
         );
         let (bytes, shape) = src.typed(&name, Dtype::F8E4M3)?;
-        ensure!(
-            shape
-                == [
-                    usize::try_from(hash.rows_per_shard).unwrap_or(usize::MAX),
-                    head_dim
-                ],
-            "{name} is {shape:?}, but {} rows per shard x {head_dim} dims is what \
-             split_ngram_parts {} and the derived {} padded rows imply",
-            hash.rows_per_shard,
-            cfg.split_ngram_parts,
-            hash.padded_rows
-        );
+        confront_shard_shape(&name, shape, job)?;
         let path = format!("{out_dir}/ngram.{s:03}.safetensors");
         if std::fs::metadata(&path).is_err() {
             let mut w = SafeWriter::new();
@@ -356,12 +340,46 @@ fn write_ngram_shards(
         "the {} shards cover {row} rows, not the {} the derived head vocabularies imply — the \
          shards are ordered row RANGES and a gap or an overlap silently reads the wrong \
          embedding row",
-        cfg.split_ngram_parts,
+        parts,
         hash.padded_rows
     );
     eprintln!(
         "convert_qwen: wrote {} n-gram shards — {} rows x {head_dim} fp8 bytes, tiled exactly",
-        cfg.split_ngram_parts, hash.padded_rows
+        parts, hash.padded_rows
+    );
+    Ok(())
+}
+
+/// Where the n-gram table lives, how it is split, and which layers this run covers.
+///
+/// Three arguments that arrived separately at three call sites is the missing abstraction the
+/// code-health gate names: `host` and `hash` are ONE fact about the checkpoint (the PLE host and
+/// the derivation it hosts), and the range decides whether that fact is writable in this run.
+/// Bundling them is what gets every n-gram step back under the arity threshold without hiding one
+/// of them behind a boolean.
+struct NgramJob<'a> {
+    host: usize,
+    hash: &'a NgramHash,
+    range: std::ops::Range<usize>,
+    parts: usize,
+    head_dim: usize,
+}
+
+/// One shard's recorded shape, confronted against what the derivation implies, before a byte of
+/// it is copied. Split out because the loop's other job is the copy and this is the check -- and
+/// the message IS the argument, so it moves whole rather than being re-summarised.
+fn confront_shard_shape(name: &str, shape: &[usize], job: &NgramJob<'_>) -> Result<()> {
+    let (hash, head_dim, parts) = (job.hash, job.head_dim, job.parts);
+    ensure!(
+        shape
+            == [
+                usize::try_from(hash.rows_per_shard).unwrap_or(usize::MAX),
+                head_dim
+            ],
+        "{name} is {shape:?}, but {} rows per shard x {head_dim} dims is what \
+         split_ngram_parts {parts} and the derived {} padded rows imply",
+        hash.rows_per_shard,
+        hash.padded_rows
     );
     Ok(())
 }
@@ -374,7 +392,8 @@ fn write_ngram_shards(
 /// with every shape, count and byte total unchanged. `ngram_hash`'s own doc carries the near-miss
 /// that makes the ORDER load-bearing: the wrong SplitMix64 form yields a sequence containing two
 /// of the three correct multipliers in the wrong slots.
-fn confront_hash_buffers(src: &Safetensors, hash: &NgramHash, host: usize) -> Result<()> {
+fn confront_hash_buffers(src: &Safetensors, job: &NgramJob<'_>) -> Result<()> {
+    let (hash, host) = (job.hash, job.host);
     let stem = format!("model.language_model.layers.{host}.ple.ple_embedding");
     for (suffix, want) in [
         ("ngram_heads_vocab_sizes", &hash.vocab_sizes),
@@ -486,27 +505,11 @@ fn main() -> Result<()> {
     let t = &cfg.text;
     let census = Census::load()?;
 
-    // **The exhaustive census closure, on the INDEX, before a shard is opened.** Every name is
-    // classified, every index is bounded against the config, every pattern's count is
-    // confronted, and the `weight_scale_inv` grid orientations are checked family-wide. After
-    // this, `in_scope` below can treat an unclassifiable name as out of scope, because there is
-    // none.
-    let (names, declared_bytes) = index_names(&src_dir)?;
-    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
-    let summary = census.confront_index(t, &borrowed)?;
-    let (_, total_bytes) = summary.total();
-    ensure!(
-        total_bytes == declared_bytes,
-        "the census accounts for {total_bytes} B but {INDEX} declares metadata.total_size \
-         {declared_bytes} — every family count matched, so this is a byte-per-tensor \
-         disagreement rather than a missing family"
-    );
-    eprintln!("convert_qwen: {}", summary.line());
+    confront_index_against_census(&census, t, &src_dir)?;
 
     let range = bounded_range(t, from, to)?;
     let host = t.ple_host_layer()?;
     let hash = ngram_hash(t, 0)?;
-    let ngram_in_range = range.contains(&host);
     std::fs::create_dir_all(&out_dir)?;
 
     // ONE list of layers, driving which shards get opened, what the resident writer emits, and
@@ -524,7 +527,56 @@ fn main() -> Result<()> {
                 && (!n.contains(".layers.") || wanted.iter().any(|p| n.starts_with(p.as_str())))
         })
     };
+    let job = NgramJob {
+        host,
+        hash: &hash,
+        range: range.clone(),
+        parts: t.split_ngram_parts,
+        head_dim: t.ngram_head_dim()?,
+    };
     let src = Safetensors::open_indexed(&src_dir, in_scope)?;
+    print_plan(t, &range, &hash, host);
+
+    write_ngram_tables(&src, &job, &out_dir)?;
+    for l in range.clone() {
+        write_routed_layer(&src, t, l, &out_dir)?;
+    }
+    write_resident(&src, &census, &in_scope, &out_dir)?;
+    finish_artifact(
+        "convert_qwen",
+        dirs,
+        &build_manifest(&src_dir, &range)?,
+        AUX,
+    )?;
+    eprintln!("convert_qwen: done — {src_dir} → {out_dir}");
+    Ok(())
+}
+
+/// The exhaustive census closure, on the INDEX, before a shard is opened. After this, the
+/// `in_scope` in `main` can treat an unclassifiable name as out of scope, because there is none.
+fn confront_index_against_census(census: &Census, t: &QwenTextConfig, src_dir: &str) -> Result<()> {
+    // **The exhaustive census closure, on the INDEX, before a shard is opened.** Every name is
+    // classified, every index is bounded against the config, every pattern's count is
+    // confronted, and the `weight_scale_inv` grid orientations are checked family-wide. After
+    // this, `in_scope` below can treat an unclassifiable name as out of scope, because there is
+    // none.
+    let (names, declared_bytes) = index_names(src_dir)?;
+    let borrowed: Vec<&str> = names.iter().map(String::as_str).collect();
+    let summary = census.confront_index(t, &borrowed)?;
+    let (_, total_bytes) = summary.total();
+    ensure!(
+        total_bytes == declared_bytes,
+        "the census accounts for {total_bytes} B but {INDEX} declares metadata.total_size \
+         {declared_bytes} — every family count matched, so this is a byte-per-tensor \
+         disagreement rather than a missing family"
+    );
+    eprintln!("convert_qwen: {}", summary.line());
+    Ok(())
+}
+
+/// What the run is about to do, in one line -- printed before the first byte moves, because the
+/// point of the line is to be readable while 172.76 GiB is still ahead of you.
+fn print_plan(t: &QwenTextConfig, range: &std::ops::Range<usize>, hash: &NgramHash, host: usize) {
     eprintln!(
         "convert_qwen: hidden={} layers {}..{} (of {}, {} QSA / {} GDN) experts={} top_k={} \
          ple host={host} ngram {} rows in {} shards",
@@ -539,27 +591,23 @@ fn main() -> Result<()> {
         hash.padded_rows,
         t.split_ngram_parts
     );
+}
 
+/// The n-gram table, or the reason it is absent. Writing nothing is a LOUD branch: a range that
+/// excludes the PLE host produces an artifact with no n-gram shards, and the manifest records the
+/// range so the omission stays attributable afterwards.
+fn write_ngram_tables(src: &Safetensors, job: &NgramJob<'_>, out_dir: &str) -> Result<()> {
+    let (host, range) = (job.host, &job.range);
+    let ngram_in_range = range.contains(&host);
     if ngram_in_range {
-        confront_hash_buffers(&src, &hash, host)?;
-        write_ngram_shards(&src, t, &hash, host, &out_dir)?;
+        confront_hash_buffers(src, job)?;
+        write_ngram_shards(src, job, out_dir)?;
     } else {
         eprintln!(
-            "convert_qwen: PLE host layer {host} is outside [{}, {}) — no n-gram shards written, \
-             and the manifest's qwen_source records the range",
+            "convert_qwen: PLE host layer {host} is outside [{}, {}) — no n-gram shards \
+             written, and the manifest's qwen_source records the range",
             range.start, range.end
         );
     }
-    for l in range.clone() {
-        write_routed_layer(&src, t, l, &out_dir)?;
-    }
-    write_resident(&src, &census, &in_scope, &out_dir)?;
-    finish_artifact(
-        "convert_qwen",
-        dirs,
-        &build_manifest(&src_dir, &range)?,
-        AUX,
-    )?;
-    eprintln!("convert_qwen: done — {src_dir} → {out_dir}");
     Ok(())
 }
