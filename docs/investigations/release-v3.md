@@ -36,7 +36,7 @@ unless the row is a timing row. A row's green is recorded with its command line.
 | 3 | `tests/smoke-glm.sh` | ~45 m | refusals asserted against the table's own fragments |
 | 4 | `tests/smoke-v4.sh` | ~30 m | |
 | 5 | `tests/ppl-gates.sh` — the three cells INCLUDING the M10 engine halves | ~1 h | the owed halves need a source mutation each; recipes are in gate-red-proofs §5 |
-| 6 | `crates/engine/tests/glimmer_fp8_decode.rs` (anti-fallback assert) + live serve SSE round-trip | ~20 m | the two owed M11 device halves |
+| 6 | `crates/engine/tests/glimmer_fp8_decode.rs` (anti-fallback assert) + live serve SSE round-trip | ~20 m | **fp8 half PAID 2026-09-04** — `tests/device-halves.sh fp8` green at 1 passed / 0 failed, witness-clean; the SSE cell still rides row 3's smoke, which has not been run on this tree |
 | 7 | `tests/determinism-glm.sh <artifact> 512` on the `--arena-refresh` arm, same-day stock control | ~1 h | a green is only interpretable WITH the control (gate's own rule); recorded as the mitigation arm's green, not the default's |
 | 8 | K3 first real decode — correctness only | hours (NFS) | ids finite, sane text, no crash, ctx ≤ 8192 (`ATTEND_MAX_KV`), small token count. Perf disclaimed (owner Q1: artifact is NFS-resident). A starved-looking job may be alive — verify by /proc PID before restarting. §8 of k3-first-checkpoint.md lists two checkpoint leads (A_log shape, lying MXFP4 target list) to check DURING this run's load |
 | 9 | CodeScene 10/10 (`RIVOLI_CS_REQUIRED=1`) | ~~10 m~~ **a burn-down, not a run** — see §2c | ARMED 2026-09-04 (`cs` on the shared home + the PAT): the red-proof fixture passed, and **21 files scored below 10**. The row's estimate was wrong because it assumed arming was the work |
@@ -67,9 +67,9 @@ those two lines, not by intention).
 
 | row | command | needs | what green means |
 |---|---|---|---|
-| **A** M11 fp8 device half | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test glimmer_fp8_decode -- --test-threads=1 --nocapture'` (verbatim from the file's own header) | **no checkpoint** — the suite writes its own artifact via `glimmer_anchor::write_artifact` into `std::env::temp_dir()` | the fp8 arm's logits DIFFER from the bf16 arm's on the same input (anti-fallback) and the split is entered; the file's header warns a finite-but-wrong fp8 arithmetic survives both, so this is not a quality claim |
+| **A** M11 fp8 device half — **PAID 2026-09-04 (§2d)** | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test glimmer_fp8_decode -- --test-threads=1 --nocapture'` (verbatim from the file's own header) | **no checkpoint** — the suite writes its own artifact via `glimmer_anchor::write_artifact` into `std::env::temp_dir()` | the fp8 arm's logits DIFFER from the bf16 arm's on the same input (anti-fallback) and the split is entered; the file's header warns a finite-but-wrong fp8 arithmetic survives both, so this is not a quality claim |
 | **B** live serve SSE round-trip | `tests/smoke-glm.sh <artifact-dir>` (its `serve` cell) | the GLM artifact | already-written assertions, not missing code: `tests/smoke-glm.sh:111-117` requires `^data: ` frames AND a `data: [DONE]` terminator over a live decode, after readiness and `/v1/models`. §13's "only the live SSE round-trip is OWED" is owed as a **run** |
-| **C** M17c block-attend execution | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test kernel_glimmer_block_attend -- --test-threads=1'` | none (host oracle + drawn weights, no skip path: 18 tests, no env gate, `#![cfg(feature = "rocm")]` is the only arm) | VERIFY-OR-PAY, and it is probably already paid: `crates/engine/tests/kernel_glimmer_block_attend.rs` is M17c's on-device gate and landed 2026-08-17, and both device batteries since (2026-09-01's 592 tests / 91 suites, 2026-09-02's 699 / 98) would have run it — but neither names suites, so neither is citeable for THIS claim. Record the suite name and its count, then correct §11's "has NEVER EXECUTED", CLAUDE.md's census paragraph, and §4's label **in the same commit**. The `gqa_attend` duplication stays owed regardless and is not a device matter: `.jscpd.json` is `format: ["rust"]`, so no gate can raise it |
+| **C** M17c block-attend execution — **PAID 2026-09-04 (§2d)** | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test kernel_glimmer_block_attend -- --test-threads=1'` | none (host oracle + drawn weights, no skip path: 7 tests, no env gate, `#![cfg(feature = "rocm")]` is the only arm) | VERIFY-OR-PAY, and it is probably already paid: `crates/engine/tests/kernel_glimmer_block_attend.rs` is M17c's on-device gate and landed 2026-08-17, and both device batteries since (2026-09-01's 592 tests / 91 suites, 2026-09-02's 699 / 98) would have run it — but neither names suites, so neither is citeable for THIS claim. Record the suite name and its count, then correct §11's "has NEVER EXECUTED", CLAUDE.md's census paragraph, and §4's label **in the same commit**. The `gqa_attend` duplication stays owed regardless and is not a device matter: `.jscpd.json` is `format: ["rust"]`, so no gate can raise it |
 | **D** CodeScene 10/10 | `RIVOLI_CS_REQUIRED=1 CS_ACCESS_TOKEN=… CARGO_TARGET_DIR=… cargo test -p rivoli --test codescene` | **the token, and nothing else** — `cs` is already installed at `~/.local/bin/cs` (shared NFS home, so on every node; it runs, and reports 1.0.40 pending) | `codescene.rs` panics on tool-absent only under `RIVOLI_CS_REQUIRED`; the standing red-proof fixture must still score < 10 in the same run. Since no device is involved this row was payable on rh-desktop immediately, **and it was paid on 2026-09-04**: the fixture half is green and §13's "blocked only on `CS_ACCESS_TOKEN`" is closed — which revealed the row was never about the token. See §2c |
 | **E** fp8 paired dNLL + tok/s + partition bit-identity | build the instruments outside the lock first: `cargo build --release --features teacher-forcing --bin rivoli --bin ppl`, then `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli tests/ppl-gates.sh <artifact-dir> all'` — the script reads `$PPL_BIN`/`$PPL_TOOL` from the target dir's `release/`, and `bin/ppl` consumes the per-token NLL files the engine writes under `--ppl <text> --ppl-out <path>` | BOTH Glimmer artifacts: bf16 55,712,428,144 B and fp8 30,554,903,564 B (the NFS pair measured in `docs/measurement/glimmer-fp8.md`); confirm both by length before the arm. The `tf` cell additionally needs the pinned reference at `$PPL_REF_BIN` (default `/var/cache/users/rhansen/m10-ref-tf-target/release/rivoli`, built with teacher-forcing) | **the stated blocker is stale.** `glimmer-fp8.md` says this is "blocked on M10's `--ppl`, which has zero commits" — `crates/cli/src/bin/ppl.rs` and `tests/ppl-gates.sh` both exist and their classifier and engine halves are PAID (§5, 2026-08-21). Run it, then correct that doc's blocker clause with a dated note |
 
@@ -166,6 +166,55 @@ and `v4/engine.rs` sits under the parity gate — is what §11 already declined 
 `gqa_attend` duplication, on the grounds that a change to GPU-parity-gated code that its
 author cannot verify is worse than an open debt.
 
+## 2d. Rows A and C are PAID: the arms now have a script (2026-09-04)
+
+rh-anine came back at 22:54, and both device halves that §13 and row 6 owed were run the same
+evening — not from an ssh one-liner, but through `tests/device-halves.sh`, which sources
+`tests/gpu-witness.sh` so the flock and the contention witness are not optional:
+
+| arm | result | witness |
+|---|---|---|
+| `attend` (`kernel_glimmer_block_attend`) | **GREEN, 7 passed / 0 failed** in 0.54 s | empty, GTT 17 MiB pre-arm, loadavg 5.70 → 5.32 |
+| `fp8` (`glimmer_fp8_decode`) | **GREEN, 1 passed / 0 failed** in 0.17 s | empty, GTT 17 MiB pre-arm |
+
+Both were compiled OUTSIDE the lock first (`cargo test … --no-run`), and the target dir is
+this checkout's own (`/var/cache/rivoli/target/gch03rjwkfkv`) — the primary checkout's
+`…/target/rivoli` was deliberately not reused, because §12 makes a shared dir a correctness
+defect rather than a slow build. `hipcc` was confirmed by artifact, not by speed: the
+gfx1151 objects in the backend's `OUT_DIR` are newer than this build (§11's warning that a
+fast rebuild proves nothing about whether hipcc ran).
+
+Command, as run (build outside the lock first, per §12 and the measurement rules):
+
+```text
+CARGO_TARGET_DIR=/var/cache/rivoli/target/gch03rjwkfkv   cargo test -p rivoli-engine --test kernel_glimmer_block_attend --test glimmer_fp8_decode --no-run
+env TMPDIR=/var/cache/rivoli/scratch \
+  CARGO_TARGET_DIR=/var/cache/rivoli/target/gch03rjwkfkv tests/device-halves.sh all
+```
+
+`TMPDIR` is not decoration: `glimmer_fp8_decode` writes its artifact into `temp_dir()`, whose
+default is the 63 GB `/tmp` tmpfs competing with the same unified-memory budget the arm under
+test is spending. The evidence dir (`/var/cache/rivoli/scratch/device-halves.XXXXXX`, this run
+`.8IMNBY`) holds the per-arm witness files, stdout, log and the GTT/loadavg line — local NVMe,
+so cite the path the same evening or it is not citable from another node.
+
+**What these two greens retire.** §11's opening claim ("the kernel has never executed") and
+§4's label for it: the kernel's three named span defects are now scored as VALUES on silicon,
+against a host oracle that computes each span — which is also why §11's four plants stand
+unchanged. What they do NOT retire: `gqa_attend` duplication (still not raisable, jscpd is
+`format: ["rust"]`), row 3's live SSE smoke, row 7's determinism arm, row 8's K3 decode, and
+row E's paired dNLL — all still ahead.
+
+**The script reddened its own author before it was trusted.** Its first version classified both
+arms GREEN while grepping only the stderr file, so it printed "NO TEST RESULT LINE — the arm
+produced nothing to classify" in the same breath as `GREEN` — a zero examined count reading as
+a pass, inside the gate written to prevent that. Fixed by grepping both streams and refusing any
+arm whose scored count is absent or zero; the refusal is **red-proofed by plant**: a stub binary
+that exits 0 reporting `0 passed` yields `RED fp8: no scored tests (… rc=0)` and script exit 1,
+observed on the box and then removed. The suite's true size is **7 tests, not the 18 §2b first
+printed** — that number came from a `grep -c '^fn |#\[test\]'` which counts helper functions,
+and it is the same hand-count class §13 just closed.
+
 ## 3. After the gates, before the tag
 
 1. **Re-take the baseline** — all four arms, release profile, the ppl-gates-pinned prompt
@@ -186,8 +235,10 @@ author cannot verify is worse than an open debt.
 - **K3 decodes; nothing more.** No chat framing (bench/raw only — `--port` refuses),
   no benchmark (NFS-resident artifact), anchor tolerances carry one-draw floors,
   `moe_fixed` range unmeasured for K3.
-- **The M17c block-attend kernel has never executed** — compiled for gfx1151, census-
-  covered, not wired into any decode path; its duplication vs `gqa_attend` is OWED.
+- **The M17c block-attend kernel is not wired into any decode path.** It has executed since
+  2026-09-04 (witnessed, 7 passed / 0 failed) and it is census-covered, but nothing in a decode
+  reaches it, so it is a scored kernel rather than a shipped one; its duplication vs
+  `gqa_attend` remains OWED.
 - **CI has no GPU arm.** Every device gate above is exactly as fresh as its recorded run.
 - Deferred wholesale: `wave/m12-glm-chain` (M13 DSA), `wave/m19-k3` (K3 chain), the M1
   substrate deferrals, K3 both-draw tolerance refresh.

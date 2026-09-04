@@ -52,6 +52,11 @@ appears that enum dispatch cannot fill.
 
 - **jscpd** — duplication is a build error, zero budget (`crates/cli/build.rs`, every
   build, both feature arms). Precondition: rustfmt-clean, or the result is a lower bound.
+  Its real floor is `minTokens: 15` **and** jscpd's unset `minLines` default of 5: a 4-line
+  verbatim copy of a live function passed the gate (measured 2026-09-04, planted and
+  removed), while 5-line/41-token and 13-line/182-token copies both redden it. So "zero
+  budget" is zero clones of ≥ 5 lines, and a deliberate small copy is invisible — which
+  matters when a refactor is meant to be proven caught as well as when one is being avoided.
   **9** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
   where verbatim transcription of the reference is the point; four across the HIP ABI
   wall, which the 800-line ceiling split into `backend/hip.rs` — its extern declarations
@@ -134,6 +139,15 @@ appears that enum dispatch cannot fill.
   against the table's own message fragments, the bench cell pinned to the recorded
   reference ids, a live serve round-trip (readiness, /v1/models, non-stream, SSE).
   On-demand (GPU, ~45 min), not CI. Red-proofed 2026-08-16 (wrong fragment reddens).
+- **device halves** — `tests/device-halves.sh [attend|fp8|all]`: M17c's block-attend kernel and
+  M11's fp8 anti-fallback gate as witnessed arms. It sources `tests/gpu-witness.sh` so the flock
+  and the contention witness are not optional, and it **never builds** (§12: a build inside the
+  lock holds the device for compile time; a build between arms evicts page cache). Requires
+  `CARGO_TARGET_DIR` naming this checkout's own dir, and refuses a `cargo`-built default.
+  Both arms green 2026-09-04 on rh-anine (7/7 and 1/1, empty witness, GTT 17 MiB). Standing
+  red proof: the classifier reddens (`RED … no scored tests`, exit 1) on a stub binary that
+  exits 0 reporting `0 passed` — planted on the box, observed, removed. On-demand (GPU, ~1 min),
+  not CI.
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
   suite or a live deferral, checked both ends; **61/61/0** since 2026-08-17, when M17c's
   `gqa_block_attend` landed with its launcher and `kernel_glimmer_block_attend.rs`. Its
