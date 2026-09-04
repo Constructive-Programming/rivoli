@@ -372,10 +372,10 @@ fn the_routed_scale_grids_are_per_projection_and_the_two_orientations_differ() {
 /// respectively for the same single layer, which is why the first assertion below pins `layer_idx`
 /// and every `ngram_hash` call below passes an ordinal.
 #[test]
-fn the_ngram_hash_parameters_are_re_derivable_at_index_zero_and_not_at_one() {
+fn the_ngram_hash_parameters_are_re_derivable_at_index_zero() {
     let cfg = shipped();
     let t = &cfg.text;
-    // The host layer, one-indexed in the file and zero-based here — the trap T12 conversion.
+    // The host layer, one-indexed in the file and zero-based here -- the trap T12 conversion.
     assert_eq!(
         t.ple_host_layer().expect("a PLE host"),
         1,
@@ -395,7 +395,7 @@ fn the_ngram_hash_parameters_are_re_derivable_at_index_zero_and_not_at_one() {
     assert_eq!(
         h0.multipliers,
         header_inline("layer_multipliers", t.ngram_size),
-        "the three multipliers, IN ORDER — the wrong SplitMix64 form yields a sequence \
+        "the three multipliers, IN ORDER -- the wrong SplitMix64 form yields a sequence \
          containing two of these three in the wrong slots, so a set comparison or a single-value \
          check would pass on it"
     );
@@ -420,15 +420,22 @@ fn the_ngram_hash_parameters_are_re_derivable_at_index_zero_and_not_at_one() {
         h0.rows_per_shard * t.split_ngram_parts as u64,
         "the shards are ordered row RANGES and must tile the padded table exactly"
     );
+}
 
-    // Index 1 — the discriminant. BOTH halves of the per-layer indexing move, and if only one of
-    // them did, two PLE layers would collide onto the same rows with plausible output and no
-    // crash (`qwen-architecture.md` §5).
+/// Index 1 is the discriminant, so it is its own test and its own claim: the byte-exact match
+/// at index 0 is evidence that THIS checkpoint's index is 0 only if a second index moves. BOTH
+/// halves of the per-layer indexing must move, or two PLE layers collide onto the same rows
+/// with plausible output and no crash (`qwen-architecture.md` §5).
+#[test]
+fn the_second_ple_layer_index_continues_the_primes_and_reseeds_the_multipliers() {
+    let cfg = shipped();
+    let t = &cfg.text;
+    let h0 = ngram_hash(t, 0).expect("the derivation must run at index 0");
     let h1 = ngram_hash(t, 1).expect("the derivation must run at index 1 too");
     assert_ne!(
         h1.vocab_sizes, h0.vocab_sizes,
         "the head vocabularies must CONTINUE past the first layer's primes; if they restarted, \
-         the byte-exact match above would not be evidence that this checkpoint's index is 0"
+         the byte-exact match at index 0 would not be evidence that this checkpoint's index is 0"
     );
     assert_ne!(
         h1.multipliers, h0.multipliers,
@@ -616,18 +623,48 @@ fn the_vendored_config_carries_the_root_only_near_miss() {
 // The census against the CONFIG — two independent derivations of the same shapes.
 // ------------------------------------------------------------------------------------------
 
+/// The head-count table's one widening: the census stores u64, the config's widths are usize.
+///
+/// A module function rather than the closure it was, because `derived_shapes` is now seven
+/// family helpers and repeating the closure in each is the clone jscpd refuses at 15 tokens.
+fn w(v: &[usize]) -> Vec<u64> {
+    v.iter().map(|&d| d as u64).collect::<Vec<u64>>()
+}
+
 /// Every v1 family's shape, derived from `text_config`'s HEAD COUNTS rather than read off the
-/// census — `(census-pattern suffix, shape)`. The suffix match lets one row cover the three
-/// hyper-connection sites, which genuinely share a width; every row must match at least one family
-/// and every family exactly one row, so neither list can drift out from under the other.
+/// census -- `(census-pattern suffix, shape)`. The suffix match lets one row cover the three
+/// hyper-connection sites, which genuinely share a width; every row must match at least one
+/// family and every family exactly one row, so neither list can drift out from under the other.
+///
+/// Split by family on 2026-09-04 under the code-health gate. The families are how the rows are
+/// already commented, so the split moves each explanation beside the rows it explains instead
+/// of leaving a 40-row literal with six floating comments inside it. Concatenation order is the
+/// original order, so what this returns is byte-for-byte what it returned before.
 fn derived_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
-    let w = |v: &[usize]| v.iter().map(|&d| d as u64).collect::<Vec<u64>>();
-    let (h, hc, lo) = (t.hidden, t.hc_stream(), t.hc_lowrank);
-    let hash = ngram_hash(t, 0).expect("the n-gram derivation");
-    let rows = hash.rows_per_shard as usize;
+    let mut rows = trunk_shapes(t);
+    rows.extend(gdn_shapes(t));
+    rows.extend(qsa_shapes(t));
+    rows.extend(moe_shapes(t));
+    rows.extend(hc_shapes(t));
+    rows.extend(ple_shapes(t));
+    rows.extend(ngram_shapes(t));
+    rows
+}
+
+/// The two trunk matrices, both [vocab, hidden]: the tie that is NOT in force is what
+fn trunk_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
+    let h = t.hidden;
     vec![
         ("lm_head.weight", w(&[t.vocab, h])),
         ("embed_tokens.weight", w(&[t.vocab, h])),
+    ]
+}
+
+/// GatedDeltaNet, and the asymmetry is the whole point: qkv is 2 x 16 x 128 +
+/// 48 x 128.
+fn gdn_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
+    let h = t.hidden;
+    vec![
         // GDN, and the asymmetry is the whole point: qkv is 2 x 16 x 128 + 48 x 128.
         ("linear_attn.in_proj_qkv.weight", w(&[t.gdn_qkv_width(), h])),
         ("linear_attn.in_proj_z.weight", w(&[t.gdn_value_width(), h])),
@@ -647,6 +684,14 @@ fn derived_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
         ("linear_attn.A_log", w(&[t.linear_num_value_heads])),
         ("linear_attn.dt_bias", w(&[t.linear_num_value_heads])),
         ("linear_attn.norm.weight", w(&[t.linear_value_head_dim])),
+    ]
+}
+
+/// QSA. `q_proj` is TWICE the output width -- see `qsa_q_width`'s doc for the
+/// reading.
+fn qsa_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
+    let h = t.hidden;
+    vec![
         // QSA. `q_proj` is TWICE the output width — see `qsa_q_width`'s doc for the reading.
         ("self_attn.q_proj.weight", w(&[t.qsa_q_width(), h])),
         ("self_attn.o_proj.weight", w(&[h, t.qsa_out_width()])),
@@ -666,6 +711,14 @@ fn derived_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
             "self_attn.indexer.k_layernorm.weight",
             w(&[t.indexer_head_dim]),
         ),
+    ]
+}
+
+/// MoE. gate/up are [inter, hidden] and down is [hidden, inter] -- the pairing
+/// whose transposition is what `confront_scale_grids` catches on the routed side.
+fn moe_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
+    let h = t.hidden;
+    vec![
         // MoE. Note gate/up are [inter, hidden] and down is [hidden, inter] — the pairing whose
         // transposition is what `confront_scale_grids` catches on the routed side.
         ("mlp.gate.weight", w(&[t.num_experts, h])),
@@ -676,11 +729,26 @@ fn derived_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
         ("mlp.experts.{E}.gate_proj.weight", w(&[t.moe_inter, h])),
         ("mlp.experts.{E}.up_proj.weight", w(&[t.moe_inter, h])),
         ("mlp.experts.{E}.down_proj.weight", w(&[h, t.moe_inter])),
+    ]
+}
+
+/// Hyper-connections: a 4-wide stream mixed through a 320 rank, at three sites.
+fn hc_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
+    let (hc, lo) = (t.hc_stream(), t.hc_lowrank);
+    vec![
         // Hyper-connections: a 4-wide stream mixed through a 320 rank, at three sites.
         ("input_mix_weight_down.weight", w(&[lo, hc])),
         ("input_mix_weight_up.weight", w(&[hc, lo])),
         ("block_inject_weight.weight", w(&[t.hc_count, hc])),
         ("hc_norm.weight", w(&[hc])),
+    ]
+}
+
+/// PLE. `key_proj` maps hidden into the FULL hc stream, which is what makes the
+/// injected value 10240 wide rather than 2560.
+fn ple_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
+    let (h, hc) = (t.hidden, t.hc_stream());
+    vec![
         // PLE. `key_proj` maps hidden into the FULL hc stream, which is what makes the injected
         // value 10240 wide rather than 2560.
         ("ple.key_proj.weight", w(&[hc, h])),
@@ -689,6 +757,14 @@ fn derived_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
         ("ple.norm_key.weight", w(&[hc])),
         ("ple.norm_conv.weight", w(&[hc])),
         ("ple.conv1d.weight", w(&[hc, 1, t.ple_conv_kernel_size])),
+    ]
+}
+
+/// The n-gram table and its parameters.
+fn ngram_shapes(t: &QwenTextConfig) -> Vec<(&'static str, Vec<u64>)> {
+    let hash = ngram_hash(t, 0).expect("the n-gram derivation");
+    let rows = hash.rows_per_shard as usize;
+    vec![
         // The n-gram table and its parameters.
         (
             "ngram_embedding.shard_{S}.weight",
