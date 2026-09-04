@@ -409,39 +409,54 @@ fn trimmed_content(
     // then `?`-ing it would be a hop no arm can reach.
     let rendered: String = match message.get("content") {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => render_parts(parts, vision, counting, turn)?,
+        Some(Value::Array(parts)) => Render {
+            vision,
+            counting,
+            turn,
+        }
+        .parts(parts)?,
         None | Some(Value::Null) => String::new(),
         Some(_) => bail!("Unexpected content type."),
     };
     Ok(jinja_trim(&rendered).to_string())
 }
 
-/// The array form of `content`: each part rendered and concatenated, media routed through
-/// `vision`.
+/// The render context of one message: the vision counter, whether this pass counts, and whose
+/// turn it is.
 ///
-/// Lifted out of [`trimmed_content`] because that match was four levels deep — function, match,
-/// arm, loop, inner match — and the nesting is what the reviewer scores, not the length. The
-/// `bail!`s now return from here and the one `?` in the caller propagates the identical error,
-/// so the refusal text and its position in the stream are unchanged.
-fn render_parts(
-    parts: &[Value],
-    vision: &mut Vision,
+/// This type exists because jscpd matched the first version of [`Render::parts`] against
+/// `trimmed_content` at 38 tokens — and it was right: the two functions took the same three
+/// parameters in the same order, which is a missing abstraction rather than a style preference.
+/// The same three newtypes already carry the swapped-pair argument recorded at [`Media`].
+struct Render<'a> {
+    vision: &'a mut Vision,
     counting: Counting,
     turn: Turn,
-) -> Result<String> {
-    let mut out = String::new();
-    for item in parts {
-        match Part::of(item) {
-            Part::Media(m) if turn == Turn::System => bail!("{}", m.system_refusal()),
-            Part::Media(m) => out.push_str(&vision_part(vision, counting, m)),
-            // `item.text` on a part whose `text` key holds a non-string renders that
-            // value through Jinja's `{{ }}`; only the string case is pinned, and a
-            // non-string `text` is a client error either way.
-            Part::Text => out.push_str(item.get("text").and_then(Value::as_str).unwrap_or("")),
-            Part::Unexpected => bail!("Unexpected item type in content."),
+}
+
+impl Render<'_> {
+    /// The array form of `content`: each part rendered and concatenated, media routed through
+    /// the counter.
+    ///
+    /// Lifted out of `trimmed_content` because that match was four levels deep — function,
+    /// match, arm, loop, inner match — and the nesting is what the reviewer scores, not the
+    /// length. The `bail!`s return from here and the one `?` at the call site propagates the
+    /// identical error, so the refusal text and its position in the stream are unchanged.
+    fn parts(&mut self, parts: &[Value]) -> Result<String> {
+        let mut out = String::new();
+        for item in parts {
+            match Part::of(item) {
+                Part::Media(m) if self.turn == Turn::System => bail!("{}", m.system_refusal()),
+                Part::Media(m) => out.push_str(&vision_part(self.vision, self.counting, m)),
+                // `item.text` on a part whose `text` key holds a non-string renders that
+                // value through Jinja's `{{ }}`; only the string case is pinned, and a
+                // non-string `text` is a client error either way.
+                Part::Text => out.push_str(item.get("text").and_then(Value::as_str).unwrap_or("")),
+                Part::Unexpected => bail!("Unexpected item type in content."),
+            }
         }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// The reasoning-effort instruction the synthesised system turn carries, or `""`.
