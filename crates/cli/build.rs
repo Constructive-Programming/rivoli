@@ -30,6 +30,29 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    let root = assert_this_checkout();
+
+    // ONE list: the scan set and cargo's rerun set. `crates` covers every member's src,
+    // tests, and build scripts; vendored binary fixtures under tests/ are not `.rs`, so
+    // `.jscpd.json`'s `format: ["rust"]` skips them.
+    const SCAN: &[&str] = &["crates"];
+    declare_scan_reruns(&root, SCAN);
+
+    // `None` means jscpd could not be started and its own warning has been printed; the
+    // phases after it are skipped exactly as they were under this file's one-function form,
+    // where an absent `npx` returned early. Preserved deliberately: changing it would make
+    // the soft-cap warning appear or vanish depending on a tool's presence, and the two
+    // gates are independent.
+    let Some(out) = run_jscpd(&root, SCAN) else {
+        return;
+    };
+    warn_if_format_is_a_lower_bound(&root);
+    soft_line_cap(&root);
+    judge_jscpd(&out);
+}
+
+/// Assert that THIS binary is running for THIS checkout, then return the workspace root.
+fn assert_this_checkout() -> std::path::PathBuf {
     // THE GATE'S FIRST CLAIM IS THAT IT IS RUNNING IN THIS CHECKOUT. `env!` bakes the path
     // at the build script's OWN compile time; `var` is what cargo passes the binary it
     // decided to reuse. They differ exactly when a sibling worktree compiled this script
@@ -67,29 +90,31 @@ fn main() {
         ),
     }
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("crates/cli has a workspace root two levels up")
-        .to_path_buf();
+        .to_path_buf()
+}
 
-    // ONE list: the scan set and cargo's rerun set. `crates` covers every member's src,
-    // tests, and build scripts; vendored binary fixtures under tests/ are not `.rs`, so
-    // `.jscpd.json`'s `format: ["rust"]` skips them.
-    const SCAN: &[&str] = &["crates"];
-    for p in SCAN {
+/// Tell cargo what the scan covers, so an edit under it re-runs this script.
+fn declare_scan_reruns(root: &Path, scan: &[&str]) {
+    for p in scan {
         println!("cargo:rerun-if-changed={}", root.join(p).display());
     }
     println!(
         "cargo:rerun-if-changed={}",
         root.join(".jscpd.json").display()
     );
+}
 
+/// Run the duplication gate, or `None` if it could not be started.
+fn run_jscpd(root: &Path, scan: &[&str]) -> Option<std::process::Output> {
     // `-c` is explicit on purpose. jscpd's default is ".jscpd.json in <path>", and <path>
     // here is `crates` — a silent fall-back to the built-in minTokens 50 would leave the
     // gate more than three times looser than the file that is supposed to govern it.
-    let out = match Command::new("npx")
-        .current_dir(&root)
+    match Command::new("npx")
+        .current_dir(root)
         .args([
             "--no",
             "--",
@@ -99,16 +124,19 @@ fn main() {
             "--exitCode",
             "7",
         ])
-        .args(SCAN)
+        .args(scan)
         .output()
     {
-        Ok(o) => o,
+        Ok(o) => Some(o),
         Err(e) => {
             println!("cargo:warning=jscpd not run ({e}); Rust duplication unchecked");
-            return;
+            None
         }
-    };
+    }
+}
 
+/// The gate's correctness precondition, in a warning rather than a failure.
+fn warn_if_format_is_a_lower_bound(root: &Path) {
     // A CLEAN RESULT IS ONLY MEANINGFUL ON A RUSTFMT-CLEAN TREE — the gate's correctness
     // precondition, not a style preference. jscpd tokenizes: two blocks that differ only
     // in line breaking tokenize differently enough to fall under `minTokens`. Measured in
@@ -117,7 +145,7 @@ fn main() {
     // tree someone is mid-edit in must not refuse, and CI gates `cargo fmt --check` in
     // its own step anyway.
     let fmt_clean = Command::new("cargo")
-        .current_dir(&root)
+        .current_dir(root)
         .args(["fmt", "--check", "--quiet"])
         .output()
         .is_ok_and(|o| o.status.success());
@@ -128,9 +156,11 @@ fn main() {
              old tree 2026-08-06: 0 reported at 680 outstanding hunks, 52 after `cargo fmt`)"
         );
     }
+}
 
-    soft_line_cap(&root);
-
+/// The verdict on a jscpd run: 0 is silence, 7 is a build error, anything else names a gate
+/// that did not run.
+fn judge_jscpd(out: &std::process::Output) {
     match out.status.code() {
         Some(0) => {}
         // BOTH streams: the clone list is on stdout, but an invocation-level complaint can
