@@ -51,7 +51,14 @@ appears that enum dispatch cannot fill.
 ## Gates
 
 - **jscpd** — duplication is a build error, zero budget (`crates/cli/build.rs`, every
-  build, both feature arms). Precondition: rustfmt-clean, or the result is a lower bound.
+  build, both feature arms). The gate belongs to the `crates/cli` unit, so a verification
+  chain that never builds that package has not run it: measured 2026-09-04, an
+  `-p rivoli-artifact`-only chain plus one `cargo test` that died at argument parsing let a
+  38-token clone reach a commit. Cargo DOES re-run the script for an edit anywhere under
+  `crates/` (measured — an appended newline advanced the unit's `output` file), so the hole
+  was the chain, not the fingerprint; the last check before committing a `.rs` change is
+  `cargo build -p rivoli` or a workspace arm. Precondition: rustfmt-clean, or the result is
+  a lower bound.
   Its real floor is `minTokens: 15` **and** jscpd's unset `minLines` default of 5: a 4-line
   verbatim copy of a live function passed the gate (measured 2026-09-04, planted and
   removed), while 5-line/41-token and 13-line/182-token copies both redden it. So "zero

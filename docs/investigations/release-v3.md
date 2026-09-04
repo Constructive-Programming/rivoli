@@ -143,6 +143,16 @@ per file):
 | `oracles/tests/qwen_anchor.rs` | 9.68 | String Heavy Function Arguments | yes (host oracle reads the goldens) |
 | `engine/tests/kernel_qwen_gdn_out_norm.rs` | 9.84 | Bumpy Road Ahead | **no — device arm** |
 
+**Status 2026-09-04, later in the same session: 7 of 21 burned down, all ten of the
+deviceless-verifiable group except three.** Done: `cli/build.rs` 9.54, `glimmer_template.rs`
+9.68, `census/qwen.rs` 9.24, `qwen_config.rs` 9.52, `qwen_names.rs` 9.58, `convert_qwen.rs`
+9.54, `qwen_encoding.rs` 9.09 — each re-scored 10.0 with no advisories, each verified by the
+arm that owns it, none given an EXEMPT row. Remaining in this group: `golden_read.rs` 9.38
+(Code Duplication), `qwen_anchor_fixtures.rs` 9.38 (Large Assertion Blocks), `qwen_anchor.rs`
+9.68 (String Heavy Args). Then the nine that need a device or a venv, per the table.
+(The commit `cce5314` labels itself "8 of 21"; it is the follow-up that repaired
+`qwen_encoding.rs` after §12's W4, not an eighth file. The count here is the one to read.)
+
 **The loop, proven on the first one (1 of 21: `cli/build.rs` 9.54 → 10.0).** `main()` was 118
 lines holding four independent gates, so it split at the phase seams into
 `assert_this_checkout → declare_scan_reruns → run_jscpd → warn_if_format_is_a_lower_bound →

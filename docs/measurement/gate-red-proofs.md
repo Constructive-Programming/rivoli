@@ -1266,6 +1266,25 @@ assert also says nothing about whether jscpd itself scanned correctly once it di
 owns that), and nothing about dependency artifacts compiled against another checkout's
 sources. Its whole claim is: this build script belongs to the tree it is scanning.
 
+**W4 (2026-09-04) — the gate ran on the wrong unit, and a clone reached a commit.** A
+`cs(qwen_encoding)` change produced a free function whose parameter list cloned its caller's at
+38 tokens. The author's verification chain was `cargo test -p rivoli-artifact …` (which does not
+build `crates/cli`, so `build.rs` never ran) plus one `cargo test -p rivoli --test qwen_template`
+that failed at argument parsing — a target that lives in `rivoli-artifact`. The commit landed.
+The clone surfaced on the next real `crates/cli` build, and the fix is `cce5314`, which replaced
+the signature with the `Render` context type the duplication was pointing at.
+
+What this is NOT is a fingerprint defect, and the difference matters because §12's W2 is about
+exactly that: a probe appended a newline to one file under `crates/` and the cli unit's
+`build-script output` advanced 23:40:01 → 00:00:06 with no touch to the script, so cargo re-runs
+the gate for edits anywhere under the scanned tree. **The gate did not fail to run; it was never
+invoked.** The rule that follows is procedural and now sits in CLAUDE.md's jscpd bullet: the last
+check before committing a `.rs` change must build the package that OWNS the gate —
+`cargo build -p rivoli` or a workspace arm — because `-p <other>` silence is indistinguishable
+from a green, which is the same "an arm that examined nothing reads as a pass" shape §13 item 8
+found in its own row table on the same day.
+
+
 ## 13. The harness bash-guard — a STANDING gate (added 2026-08-31, re-specified the same day)
 
 `.claude/hooks/bash-guard.sh`, wired as a `PreToolUse` hook on the `Bash` matcher in the
