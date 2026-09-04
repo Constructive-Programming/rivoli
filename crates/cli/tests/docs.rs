@@ -450,13 +450,41 @@ fn the_jscpd_exemption_count_is_derived() {
     // correction quoting the superseded line; exactly-one forces a preserved quote to be
     // reworded — the same two-copies defect one more level out.
     let claude = std::fs::read_to_string(root.join("CLAUDE.md")).expect("read CLAUDE.md");
-    let want = format!("**{total}** regions are exempt");
-    let seen = claude.matches(&want).count();
-    assert_eq!(
-        seen,
-        1,
-        "CLAUDE.md says `**{total}** regions are exempt` {seen} times; it must say it \
-         exactly once, and {total} is what crates/ carries. Per-file: {}",
-        per_file.join(", ")
+    common::assert_count_said_once(
+        &claude,
+        "CLAUDE.md",
+        &format!("**{total}** regions are exempt"),
+        &format!(
+            "It is {total} because that is what crates/ carries. Per-file: {}",
+            per_file.join(", ")
+        ),
+    );
+}
+
+/// `CLAUDE.md`'s bash-guard row count is derived here, not asserted there — the ledger rule
+/// above, applied to the second count in that file that nothing computed.
+///
+/// Found 2026-09-04 by running the guard's table through real cargo for the first time:
+/// `CLAUDE.md` said the table drives 78 rows, `gate-red-proofs.md` §13's verdict said 68 and
+/// its body said 78 twice, and the committed table has held **76** (28 allow + 48 block)
+/// since it landed on 2026-08-31. `hook_guard.rs` now asserts `ROWS.len()` against the
+/// population in `tests/common`, so the table cannot shrink silently; this test closes the
+/// other half of the same rule, that the prose carries that population and no other number.
+#[test]
+fn the_guard_row_count_is_derived() {
+    let root = common::repo_root();
+    let claude = std::fs::read_to_string(root.join("CLAUDE.md")).expect("read CLAUDE.md");
+    let pop = common::GUARD_ROWS_POP;
+    common::assert_count_said_once(
+        &claude,
+        "CLAUDE.md",
+        &format!("**{pop}** rows driven straight into the hook"),
+        &format!(
+            "The guard's table holds {pop} rows ({} allow + {} block) and hook_guard.rs \
+             asserts itself against that census, so a prose count that differs is stale rather \
+             than measured.",
+            common::GUARD_ALLOW_POP,
+            common::GUARD_BLOCK_POP
+        ),
     );
 }

@@ -16,8 +16,10 @@
 //!
 //! **Non-vacuity is measured, not asserted.** Driven against the PRE-FIX matcher — the
 //! whole-string form this file's rows were written against, recovered byte-for-byte from a
-//! reviewer's transcript because it was never committed — the table scored **36 of 78, 42
-//! rows red** (2026-08-31): **33 false-ALLOWs** (`cargo r`/`b`/`c`/`d`/`t`, the `&&`-chained
+//! reviewer's transcript because it was never committed — the table scored **42 rows red**
+//! (2026-08-31: 33 false-allow + 9 false-block, and the green half is NOT re-derivable — the
+//! "36 of 78" this header first printed was a hand-count wrong on both sides, the committed
+//! table holding 76 rows, §13): **33 false-ALLOWs** (`cargo r`/`b`/`c`/`d`/`t`, the `&&`-chained
 //! second arm, a flock held by arm 1 only, a prose mention of the lock, an empty
 //! `CARGO_TARGET_DIR=`, every relative artefact path, seven of R3's eight verbs, the `.bak`
 //! lock path) and **9 false-BLOCKs** (`ls`/`du`/`rm`/`cat`/`find` under a build dir,
@@ -44,14 +46,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// away from the row it explains.
 type Row = (&'static str, &'static str, i32);
 
-/// The population this gate landed with, and the floors it asserts. Named constants rather
-/// than literals in the message because the two must move together: a row added or removed
-/// changes the population, and a floor that no longer sits below it is a floor that cannot
-/// fire. Measured 2026-08-31: 28 ALLOW rows and 48 BLOCK rows in `ROWS`.
-const ALLOW_POP: usize = 28;
-const BLOCK_POP: usize = 48;
+/// The floors this gate asserts, and the population they sit under.
+///
+/// The population is NOT restated here: it lives in [`common::GUARD_ROWS_POP`] because two
+/// gates read it and a third transcription is the defect this file exists to close. The
+/// floors stay local because nothing else scores them. Measured 2026-08-31: 28 ALLOW rows and
+/// 48 BLOCK rows in `ROWS`.
+const ALLOW_POP: usize = common::GUARD_ALLOW_POP;
+const BLOCK_POP: usize = common::GUARD_BLOCK_POP;
 const ALLOW_FLOOR: usize = 26;
 const BLOCK_FLOOR: usize = 45;
+
+// A floor at or above its population cannot fire, and clippy found the stronger version of
+// that objection: `assertions_on_constants` rejected the runtime assert, because the compiler
+// already knows the answer and a test that cannot fail is exactly the gate this file exists to
+// forbid. So it is a CONST assert — the BUILD stops, which is jscpd's own form of the rule and
+// §11's (a removed semicolon took the build to 101, and nothing has to remember to run it).
+// The message carries no arguments on purpose: if this fires the four constants are six lines
+// above it. Proven red by plant, twice — see gate-red-proofs.md §13 item 8.
+const _: () = assert!(
+    ALLOW_FLOOR < ALLOW_POP && BLOCK_FLOOR < BLOCK_POP,
+    "a bash-guard floor at or above its population cannot fire — move the floor WITH the row"
+);
 
 /// The table. Rows 1–7 and A–G are the gate's original population; every row tagged
 /// `PRE-FIX` is one a reviewer broke the first matcher with, kept here as the negative half.
@@ -473,6 +489,24 @@ fn every_row_gets_the_exit_code_it_expects() {
         3,
         "only these rules fired across the whole table: {rules:?} — a rule with no row is a \
          rule nothing scores"
+    );
+    // The examined count itself, not merely its balance. Added 2026-09-04 after the first run
+    // of this gate through real cargo, which found that nothing anywhere pinned how many rows
+    // the loop walks: the two floors above sit two and three below their populations, so a
+    // table that had lost three BLOCK rows and two ALLOW rows would still have passed every
+    // assert in this function. That is this file's own named defect — an examined-count that
+    // can silently reach zero — surviving inside the gate written to stop it, and it is how
+    // the count in prose came to read 78 in three files and 68 in a verdict beside a 76-row
+    // table.
+    let pop = ALLOW_POP + BLOCK_POP;
+    assert_eq!(
+        ROWS.len(),
+        pop,
+        "the table drives {} rows but its declared population is {ALLOW_POP} + {BLOCK_POP} = \
+         {pop}. The counts derived from that population (CLAUDE.md, gate-red-proofs.md §13, \
+         this file's header) are wrong by the difference. Move the population constant WITH \
+         the row, and keep that row's argument beside it.",
+        ROWS.len()
     );
 }
 

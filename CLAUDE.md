@@ -95,9 +95,12 @@ appears that enum dispatch cannot fill.
   with `add` and `commit` deliberately allowed. It is the THIRD layer and not load-bearing:
   only Bash calls made through the harness are scanned, so `flock` stays the cross-tenant
   guard and the per-arm contention witness stays the post-hoc detector. Standing red proof:
-  `crates/cli/tests/hook_guard.rs` — **78 rows** driven straight into the hook, deviceless, on
-  every `cargo test`; the same table scores **36 of 78 (42 rows red)** against the pre-fix
-  matcher, whose rules asked their questions of the whole command string
+  `crates/cli/tests/hook_guard.rs` — **76** rows driven straight into the hook, deviceless, on
+  every `cargo test`, the count gated twice rather than remembered (`ROWS.len()` against the
+  population in `tests/common`, and `docs.rs` against this sentence: CORRECTED 2026-09-04 from
+  78, a hand-count that stood in four files for four days beside a 76-row table, §13); the same
+  table scored **42 rows red** (33 false-allow, 9 false-block) against the pre-fix matcher,
+  whose rules asked their questions of the whole command string
   (`docs/measurement/gate-red-proofs.md` §13).
 - **warnings are errors, structurally** — `[workspace.lints.rust] warnings = deny` and
   `[workspace.lints.clippy] all = deny` in the manifest, so a local `cargo check`

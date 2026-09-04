@@ -410,6 +410,39 @@ pub fn assert_widened(art: &rivoli_artifact::format::Safetensors, t: &Tensor) {
     );
 }
 
+/// The bash-guard table's declared population: one home, read by TWO gates.
+///
+/// `hook_guard.rs` asserts the rows it actually drives against this census, and `docs.rs`
+/// asserts `CLAUDE.md`'s prose against it. It moved out of `hook_guard.rs` on this module's
+/// own rule — it grew when a second test needed the same helper — because the count had been
+/// prose in four files with nothing deriving it, and the copies disagreed with each other and
+/// with the table: the verdict of gate-red-proofs.md §13 says 68 rows, §13's body says 78
+/// twice, and the committed table has held 76 rows (28 allow + 48 block) since it landed on
+/// 2026-08-31. Measured 2026-09-04 by the first run of the gate through real cargo.
+pub const GUARD_ALLOW_POP: usize = 28;
+pub const GUARD_BLOCK_POP: usize = 48;
+pub const GUARD_ROWS_POP: usize = GUARD_ALLOW_POP + GUARD_BLOCK_POP;
+
+/// Assert that a DERIVED count appears in a document exactly once, as this whole phrase.
+///
+/// The rule both ledger tests in `docs.rs` share, factored because writing it twice is what
+/// jscpd is for: the first two copies were caught by the gate (41 tokens, `minTokens` is 15)
+/// while this file still had one call site each. Matching the phrase whole rather than the
+/// digits is measured behaviour, not taste — `contains` is satisfied by a dated note quoting
+/// the superseded number, and a second copy of the live one is the same transcription defect
+/// one level out. `argument` carries whatever only the calling gate knows: the jscpd one
+/// names the per-file tally, the guard one names the census the table asserts itself against.
+#[track_caller]
+pub fn assert_count_said_once(text: &str, file: &str, want: &str, argument: &str) {
+    let seen = text.matches(want).count();
+    assert_eq!(
+        seen, 1,
+        "{file} must say `{want}` exactly once and says it {seen} times. A derived count is a \
+         gate only when the phrase is matched whole and required once; reword any note that \
+         quotes a superseded value instead of leaving a second count standing. {argument}"
+    );
+}
+
 /// Remove a [`scratch`] root at the end of a passing test.
 ///
 /// Best-effort and infallible on purpose: a failed test should LEAVE its fixture behind to be
