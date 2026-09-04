@@ -206,18 +206,33 @@ fn dtype_of(census: &str) -> Result<Dtype> {
 /// tested here is one of 53 rows in a hash-gated file, so this is a lookup table written as
 /// predicates rather than a heuristic. `Resident` is the fallthrough for v1 ONLY — the excluded
 /// arms are decided by `status` first, so "everything else" never reaches an exclusion.
+/// The census's expert-scoped marker, spelled once.
+const EXPERT: &str = ".mlp.experts.{E}.";
+
+/// An expert-scoped row whose tail is exactly `tail`.
+///
+/// The two routed arms are the only places `v1_role` needs both halves of this test, and the
+/// reviewer counts the `&&` in the guard, not the arm: folding the conjunction into a named
+/// predicate is what moves that function off the Complex Method threshold while leaving its
+/// arm ORDER — which IS the contract, `Resident` being the fallthrough — untouched.
+fn expert_tail(pattern: &str, tail: &str) -> bool {
+    pattern.contains(EXPERT) && pattern.ends_with(tail)
+}
+
+/// The hash parameters live in two places: the per-layer head tables and the single
+/// per-tensor multiplier row. Both are I64 and neither takes part in a scale grid.
+fn ple_hash_param(pattern: &str) -> bool {
+    pattern.contains(".ple_embedding.ngram_heads_")
+        || pattern.ends_with(".ple_embedding.layer_multipliers")
+}
+
 fn v1_role(pattern: &str) -> Role {
-    let expert = pattern.contains(".mlp.experts.{E}.");
     match () {
-        () if expert && pattern.ends_with("_proj.weight") => Role::RoutedWeight,
-        () if expert && pattern.ends_with("_proj.weight_scale_inv") => Role::RoutedScale,
+        () if expert_tail(pattern, "_proj.weight") => Role::RoutedWeight,
+        () if expert_tail(pattern, "_proj.weight_scale_inv") => Role::RoutedScale,
         () if pattern.ends_with(".ngram_embedding.shard_{S}.weight") => Role::NgramShard,
         () if pattern.ends_with(".ngram_embedding.weight_scale") => Role::NgramScale,
-        () if pattern.contains(".ple_embedding.ngram_heads_")
-            || pattern.ends_with(".ple_embedding.layer_multipliers") =>
-        {
-            Role::HashParam
-        }
+        () if ple_hash_param(pattern) => Role::HashParam,
         () => Role::Resident,
     }
 }

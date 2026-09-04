@@ -71,13 +71,29 @@ fn ids_of(case: &Value) -> Vec<u32> {
 ///
 /// Reported this way rather than as a bare `assert_eq!` because the tool-definition cases are
 /// 2 KB of identical preamble, and a diff of two 4 KB strings is a diff nobody reads.
-fn assert_same<T: PartialEq, F: Fn(&[T]) -> String>(
-    name: &str,
-    unit: &str,
-    (got, want): (&[T], &[T]),
+/// How one comparison should read when it fails: the case, what its elements are called, and
+/// how much context a divergence shows. Bundled rather than passed loose because the three
+/// are ONE decision, and five arguments is what the code-health gate names as low cohesion —
+/// `common::assert_verbatim` took the same hop on the same grounds: the tuple already IS the
+/// value, and three labels around it are not three responsibilities.
+struct Report<'a> {
+    case: &'a str,
+    unit: &'a str,
     win: usize,
+}
+
+fn assert_same<T: PartialEq, F: Fn(&[T]) -> String>(
+    r: Report<'_>,
+    (got, want): (&[T], &[T]),
     show: F,
 ) {
+    // Destructured so the body below is untouched by the bundling: `name`, `unit` and `win`
+    // keep the names the panic message already interpolates.
+    let Report {
+        case: name,
+        unit,
+        win,
+    } = r;
     let Some(at) = got
         .iter()
         .zip(want)
@@ -120,9 +136,15 @@ fn every_case_renders_byte_for_byte() {
         let messages = kw["messages"].as_array().expect("kwargs has messages");
         let want = case["expected"].as_str().expect("case has expected text");
         let got = render(messages, &opts_of(kw));
-        assert_same(name, "byte", (got.as_bytes(), want.as_bytes()), 60, |w| {
-            format!("{:?}", String::from_utf8_lossy(w))
-        });
+        assert_same(
+            Report {
+                case: name,
+                unit: "byte",
+                win: 60,
+            },
+            (got.as_bytes(), want.as_bytes()),
+            |w| format!("{:?}", String::from_utf8_lossy(w)),
+        );
     }
 }
 
@@ -172,7 +194,15 @@ fn rendered_prompts_tokenize_to_the_vendored_ids() {
                 &opts_of(kw),
             ))
             .unwrap_or_else(|e| panic!("case `{name}`: encode failed: {e}"));
-        assert_same(name, "id", (&got, &want), 6, |w| format!("{w:?}"));
+        assert_same(
+            Report {
+                case: name,
+                unit: "id",
+                win: 6,
+            },
+            (&got, &want),
+            |w| format!("{w:?}"),
+        );
     }
     println!(
         "  id pin: {} cases tokenized identically to apply_chat_template",
