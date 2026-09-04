@@ -41,6 +41,59 @@ unless the row is a timing row. A row's green is recorded with its command line.
 | 8 | K3 first real decode — correctness only | hours (NFS) | ids finite, sane text, no crash, ctx ≤ 8192 (`ATTEND_MAX_KV`), small token count. Perf disclaimed (owner Q1: artifact is NFS-resident). A starved-looking job may be alive — verify by /proc PID before restarting. §8 of k3-first-checkpoint.md lists two checkpoint leads (A_log shape, lying MXFP4 target list) to check DURING this run's load |
 | 9 | CodeScene 10/10 (`RIVOLI_CS_REQUIRED=1`) | ~10 m, no GPU | WAITS ON `CS_ACCESS_TOKEN`; the standing red-proof fixture must still score <10 |
 
+## 2b. The device halves, one-shot (added 2026-09-04)
+
+§2's rows 5, 6 and 9 each carry a half that is a RUN and not code, and two of the three
+claims that they are blocked on something are now false. This section is what to type, what
+each arm actually needs, and what its green is evidence of — so the gate day does not stop to
+re-derive any of it.
+
+**Precondition, recorded because it is the current blocker on all of rows A–E.** As of
+2026-09-04 **rh-anine cannot start an ssh session**: the privileged parent authenticates (it
+reads `~/.ssh/authorized_keys` over NFS and echoes the key options), `ssh -N` holds the
+connection open, and `exec` of `echo`/`true` returns nothing at 20 s, 30 s and 75 s — from
+rh-desktop *and* from hr-main — while `sftp` hangs identically, so no session child of any
+kind starts. There is no `~/.ssh/rc`, and `~/.ssh/config`'s host-group `ForwardX11 Yes` is a
+separate, lesser defect that hangs the *first* attempt on xauth (use `-o ForwardX11=no`).
+That is a console fix, not a remote one. It also means **these arms cannot be evidenced after
+the fact from another node**: the batteries write to `/var/cache/rivoli/scratch`, which is
+rh-anine's local NVMe and invisible elsewhere, so each row must record its log path as it runs.
+
+Every row below: build OUTSIDE the lock, `flock /var/run/sys-gpu.lock`, an explicit
+`CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli`, `-- --test-threads=1`, witness per arm
+(`tests/gpu-witness.sh`) with a non-empty witness discarding the arm, and exit codes read
+UNPIPED (§12's stale-binary class and §7e-bis's pipeline-green class are both avoided by
+those two lines, not by intention).
+
+| row | command | needs | what green means |
+|---|---|---|---|
+| **A** M11 fp8 device half | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test glimmer_fp8_decode -- --test-threads=1 --nocapture'` (verbatim from the file's own header) | **no checkpoint** — the suite writes its own artifact via `glimmer_anchor::write_artifact` into `std::env::temp_dir()` | the fp8 arm's logits DIFFER from the bf16 arm's on the same input (anti-fallback) and the split is entered; the file's header warns a finite-but-wrong fp8 arithmetic survives both, so this is not a quality claim |
+| **B** live serve SSE round-trip | `tests/smoke-glm.sh <artifact-dir>` (its `serve` cell) | the GLM artifact | already-written assertions, not missing code: `tests/smoke-glm.sh:111-117` requires `^data: ` frames AND a `data: [DONE]` terminator over a live decode, after readiness and `/v1/models`. §13's "only the live SSE round-trip is OWED" is owed as a **run** |
+| **C** M17c block-attend execution | `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli cargo test -p rivoli-engine --features rocm --test kernel_glimmer_block_attend -- --test-threads=1'` | none (host oracle + drawn weights, no skip path: 18 tests, no env gate, `#![cfg(feature = "rocm")]` is the only arm) | VERIFY-OR-PAY, and it is probably already paid: `crates/engine/tests/kernel_glimmer_block_attend.rs` is M17c's on-device gate and landed 2026-08-17, and both device batteries since (2026-09-01's 592 tests / 91 suites, 2026-09-02's 699 / 98) would have run it — but neither names suites, so neither is citeable for THIS claim. Record the suite name and its count, then correct §11's "has NEVER EXECUTED", CLAUDE.md's census paragraph, and §4's label **in the same commit**. The `gqa_attend` duplication stays owed regardless and is not a device matter: `.jscpd.json` is `format: ["rust"]`, so no gate can raise it |
+| **D** CodeScene 10/10 | `RIVOLI_CS_REQUIRED=1 CS_ACCESS_TOKEN=… CARGO_TARGET_DIR=… cargo test -p rivoli --test codescene` | **the token, and nothing else** — `cs` is already installed at `~/.local/bin/cs` (shared NFS home, so on every node; it runs, and reports 1.0.40 pending) | `codescene.rs` panics on tool-absent only under `RIVOLI_CS_REQUIRED`; the standing red-proof fixture must still score < 10 in the same run. Since no device is involved this row is **payable on rh-desktop today** — it is one `export` away, and it is the last thing standing between the tree and §13's "owed and standing, blocked only on `CS_ACCESS_TOKEN`" |
+| **E** fp8 paired dNLL + tok/s + partition bit-identity | build the instruments outside the lock first: `cargo build --release --features teacher-forcing --bin rivoli --bin ppl`, then `flock /var/run/sys-gpu.lock -c 'CARGO_TARGET_DIR=/var/cache/rivoli/target/rivoli tests/ppl-gates.sh <artifact-dir> all'` — the script reads `$PPL_BIN`/`$PPL_TOOL` from the target dir's `release/`, and `bin/ppl` consumes the per-token NLL files the engine writes under `--ppl <text> --ppl-out <path>` | BOTH Glimmer artifacts: bf16 55,712,428,144 B and fp8 30,554,903,564 B (the NFS pair measured in `docs/measurement/glimmer-fp8.md`); confirm both by length before the arm. The `tf` cell additionally needs the pinned reference at `$PPL_REF_BIN` (default `/var/cache/users/rhansen/m10-ref-tf-target/release/rivoli`, built with teacher-forcing) | **the stated blocker is stale.** `glimmer-fp8.md` says this is "blocked on M10's `--ppl`, which has zero commits" — `crates/cli/src/bin/ppl.rs` and `tests/ppl-gates.sh` both exist and their classifier and engine halves are PAID (§5, 2026-08-21). Run it, then correct that doc's blocker clause with a dated note |
+
+**What row A's command must not quietly do.** `temp_dir()` honors `TMPDIR`, and the default is
+`/tmp` — a 63 GB tmpfs that competes with the same unified-memory budget the decode under test
+is spending (CLAUDE.md, *Build cache and worktrees*). Export `TMPDIR=/var/cache/rivoli/scratch`
+for arm A and say so in the recorded command line, or the arm is measuring under memory
+pressure it did not declare.
+
+**Two things found while writing this table, recorded because they are the reason to read the
+scripts rather than the summaries.** `ppl-gates.sh` refuses in three distinguishable ways — a
+missing `release/rivoli`, a `--no-default-features` build that "cannot decode at all", and a
+build that refuses `--ppl` for want of `--features teacher-forcing` — and the third is the one
+that would otherwise read as a scoring red: `--ppl` is an unconditional clap field, so the
+*binary* must be built with the feature while `main.rs` carries no `#[cfg]` at all. And
+`crates/cli/src/bin/ppl.rs:1` cites `docs/investigations/cache-conditional-routing.md`, which
+does not exist in this tree — the citation resolver `docs.rs` deliberately left unported is
+what used to catch that class, so a dangling citation is currently a legal state of this repo.
+
+**Nothing here is a TODO in the code.** Rows A, B, C and E are arms to run and record on the
+device; row D is an external credential. Two of the five claims that A/D/E were blocked on
+missing tree artifacts are wrong as of today, and the file that makes each one is named in its
+row so the correction lands beside the measurement rather than in a new document.
+
 ## 3. After the gates, before the tag
 
 1. **Re-take the baseline** — all four arms, release profile, the ppl-gates-pinned prompt
