@@ -72,18 +72,18 @@ fn gdn_fixtures_are_shaped(g: &GoldenSet, w: &Value) {
     );
     let op = "model.layers.0.linear_attn.gated_delta_rule";
     for leg in ["query", "key", "value"] {
-        assert_eq!(shape_of(g, &format!("{op}.in.{leg}")), vec![1, 1, nv, dk]);
+        assert_shape(g, &format!("{op}.in.{leg}"), &[1, 1, nv, dk]);
     }
     for leg in ["g", "beta"] {
-        assert_eq!(shape_of(g, &format!("{op}.in.{leg}")), vec![1, 1, nv]);
+        assert_shape(g, &format!("{op}.in.{leg}"), &[1, 1, nv]);
     }
     for leg in ["A_log", "dt_bias"] {
-        assert_eq!(shape_of(g, &format!("{op}.in.{leg}")), vec![nv]);
+        assert_shape(g, &format!("{op}.in.{leg}"), &[nv]);
     }
     let state = vec![1, nv, dk, dv];
-    assert_eq!(shape_of(g, &format!("{op}.in.initial_state")), state);
-    assert_eq!(shape_of(g, &format!("{op}.out.state")), state);
-    assert_eq!(shape_of(g, &format!("{op}.out.o")), vec![1, 1, nv, dk]);
+    assert_shape(g, &format!("{op}.in.initial_state"), &state);
+    assert_shape(g, &format!("{op}.out.state"), &state);
+    assert_shape(g, &format!("{op}.out.o"), &[1, 1, nv, dk]);
     gdn_projection_fixtures_are_shaped(g, w, nv, dv);
 }
 
@@ -93,6 +93,20 @@ fn gdn_fixtures_are_shaped(g: &GoldenSet, w: &Value) {
 /// module-level `causal_conv1d_fn` (MOD:477-496) and never calls the `nn.Conv1d` — so a forward
 /// hook on that module fires ZERO times, which is the shape of the bug K3's anchor carried for a
 /// day with three comments claiming otherwise.
+/// One captured tensor's shape, confronted with the width arithmetic the config implies.
+///
+/// Named because four tests here were walls of `assert_eq!(shape_of(…), vec![…])`, which the
+/// code-health reviewer scores as large assertion blocks. It is also the honest shape of the
+/// claim: every row says "this capture has this shape", and the capture name is what identifies
+/// a failure, so that message is stated once here rather than at every site.
+fn assert_shape(g: &GoldenSet, capture: &str, want: &[usize]) {
+    assert_eq!(
+        shape_of(g, capture),
+        want.to_vec(),
+        "{capture} fixture shape"
+    );
+}
+
 fn gdn_projection_fixtures_are_shaped(g: &GoldenSet, w: &Value, nv: usize, dv: usize) {
     let at = "model.layers.0.linear_attn";
     // `conv_dim` is `2*key_dim + value_dim` and is NOT `value_dim` — a pair the audit separates,
@@ -103,20 +117,21 @@ fn gdn_projection_fixtures_are_shaped(g: &GoldenSet, w: &Value, nv: usize, dv: u
         2 * width(w, "key_dim") + width(w, "value_dim"),
         "conv_dim must be the fused q|k|v width"
     );
-    assert_eq!(shape_of(g, &format!("{at}.in_proj_qkv")), vec![1, 1, conv]);
-    assert_eq!(
-        shape_of(g, &format!("{at}.in_proj_z")),
-        vec![1, 1, width(w, "value_dim")]
+    assert_shape(g, &format!("{at}.in_proj_qkv"), &[1, 1, conv]);
+    assert_shape(
+        g,
+        &format!("{at}.in_proj_z"),
+        &[1, 1, width(w, "value_dim")],
     );
     for leg in ["in_proj_a", "in_proj_b"] {
-        assert_eq!(shape_of(g, &format!("{at}.{leg}")), vec![1, 1, nv]);
+        assert_shape(g, &format!("{at}.{leg}"), &[1, 1, nv]);
     }
     let kernel = shape_of(g, &format!("{at}.conv.weight"));
     assert_eq!(kernel[0], conv, "the conv weight is [conv_dim, kernel]");
-    assert_eq!(shape_of(g, &format!("{at}.conv.in")), vec![1, conv, 1]);
-    assert_eq!(shape_of(g, &format!("{at}.conv.out")), vec![1, conv, 1]);
+    assert_shape(g, &format!("{at}.conv.in"), &[1, conv, 1]);
+    assert_shape(g, &format!("{at}.conv.out"), &[1, conv, 1]);
     // The output norm-gate is `[heads_v, d_v]` — per head, not flattened.
-    assert_eq!(shape_of(g, &format!("{at}.norm")), vec![nv, dv]);
+    assert_shape(g, &format!("{at}.norm"), &[nv, dv]);
 }
 
 /// The QSA indexer on layer 3, the first `qwen_sparse_attention` layer.
@@ -128,17 +143,15 @@ fn gdn_projection_fixtures_are_shaped(g: &GoldenSet, w: &Value, nv: usize, dv: u
 fn indexer_fixtures_are_shaped(g: &GoldenSet, w: &Value) {
     let ix = "model.layers.3.self_attn.indexer";
     let (heads, dim) = (4usize, width(w, "indexer_head_dim"));
-    assert_eq!(
-        shape_of(g, &format!("{ix}.index_qk_proj")),
-        vec![1, 1, width(w, "index_qk_width")]
+    assert_shape(
+        g,
+        &format!("{ix}.index_qk_proj"),
+        &[1, 1, width(w, "index_qk_width")],
     );
-    assert_eq!(
-        shape_of(g, &format!("{ix}.q_layernorm")),
-        vec![1, 1, heads, dim]
-    );
+    assert_shape(g, &format!("{ix}.q_layernorm"), &[1, 1, heads, dim]);
     let blocks = shape_of(g, &format!("{ix}.pooled_keys"))[0];
-    assert_eq!(shape_of(g, &format!("{ix}.k_layernorm")), vec![blocks, dim]);
-    assert_eq!(shape_of(g, &format!("{ix}.scores")), vec![blocks]);
+    assert_shape(g, &format!("{ix}.k_layernorm"), &[blocks, dim]);
+    assert_shape(g, &format!("{ix}.scores"), &[blocks]);
     assert_eq!(int_shape(g, &format!("{ix}.block_starts")), [blocks]);
     // 16 warm tokens plus the decoded one, over `compress_ratio` — derived, so a window change
     // cannot leave this passing on a stale literal.
@@ -156,12 +169,13 @@ fn indexer_fixtures_are_shaped(g: &GoldenSet, w: &Value) {
         width(w, "block_topk")
     );
     // The mask the module returns, over the 17 visible positions.
-    assert_eq!(shape_of(g, ix), vec![1, 1, 1, visible]);
+    assert_shape(g, ix, &[1, 1, 1, visible]);
     // The attention's own fused q/gate projection: `heads * head_dim * 2`, the per-head
     // `[query|gate]` interleave `attn_gate_block_split` prices.
-    assert_eq!(
-        shape_of(g, "model.layers.3.self_attn.q_proj"),
-        vec![1, 1, width(w, "q_proj_width")]
+    assert_shape(
+        g,
+        "model.layers.3.self_attn.q_proj",
+        &[1, 1, width(w, "q_proj_width")],
     );
 }
 
@@ -182,24 +196,15 @@ fn hyper_connection_fixtures_are_shaped(g: &GoldenSet, w: &Value) {
     );
     for fold in ["attn_hyper_connection", "mlp_hyper_connection"] {
         let at = format!("model.layers.0.{fold}");
-        assert_eq!(shape_of(g, &format!("{at}.hc_norm")), vec![1, 1, stack]);
+        assert_shape(g, &format!("{at}.hc_norm"), &[1, 1, stack]);
         // The low-rank mix, down then up. `hc_lowrank` is hidden/8 in the real config and is kept
         // at hidden/8 here, while staying distinct from the GDN key head width.
-        assert_eq!(
-            shape_of(g, &format!("{at}.input_mix_weight_down")),
-            vec![1, 1, low]
-        );
-        assert_eq!(
-            shape_of(g, &format!("{at}.input_mix_weight_up")),
-            vec![1, 1, stack]
-        );
-        assert_eq!(
-            shape_of(g, &format!("{at}.block_inject_weight")),
-            vec![1, 1, 4]
-        );
+        assert_shape(g, &format!("{at}.input_mix_weight_down"), &[1, 1, low]);
+        assert_shape(g, &format!("{at}.input_mix_weight_up"), &[1, 1, stack]);
+        assert_shape(g, &format!("{at}.block_inject_weight"), &[1, 1, 4]);
         // Output 0 is the collapsed hidden the block consumes; 1 is the updated stream stack.
-        assert_eq!(shape_of(g, &format!("{at}.0")), vec![1, 1, hidden]);
-        assert_eq!(shape_of(g, &format!("{at}.1")), vec![1, 1, stack]);
+        assert_shape(g, &format!("{at}.0"), &[1, 1, hidden]);
+        assert_shape(g, &format!("{at}.1"), &[1, 1, stack]);
     }
 }
 
@@ -209,22 +214,16 @@ fn moe_fixtures_are_shaped(g: &GoldenSet, w: &Value) {
     let (hidden, inter) = (width(w, "hidden_size"), width(w, "moe_intermediate_size"));
     let at = "model.layers.0.mlp";
     for leg in ["gate_proj", "up_proj"] {
-        assert_eq!(
-            shape_of(g, &format!("{at}.shared_expert.{leg}")),
-            vec![1, inter]
-        );
+        assert_shape(g, &format!("{at}.shared_expert.{leg}"), &[1, inter]);
     }
-    assert_eq!(
-        shape_of(g, &format!("{at}.shared_expert.down_proj")),
-        vec![1, hidden]
-    );
-    assert_eq!(shape_of(g, &format!("{at}.shared_expert_gate")), vec![1, 1]);
+    assert_shape(g, &format!("{at}.shared_expert.down_proj"), &[1, hidden]);
+    assert_shape(g, &format!("{at}.shared_expert_gate"), &[1, 1]);
     let (experts, topk) = (width(w, "num_experts"), width(w, "num_experts_per_tok"));
-    assert_eq!(shape_of(g, &format!("{at}.gate.0")), vec![1, experts]);
-    assert_eq!(shape_of(g, &format!("{at}.gate.1")), vec![1, topk]);
+    assert_shape(g, &format!("{at}.gate.0"), &[1, experts]);
+    assert_shape(g, &format!("{at}.gate.1"), &[1, topk]);
     assert_eq!(int_shape(g, &format!("{at}.gate.2")), [1, topk]);
-    assert_eq!(shape_of(g, &format!("{at}.experts")), vec![1, hidden]);
-    assert_eq!(shape_of(g, at), vec![1, 1, hidden]);
+    assert_shape(g, &format!("{at}.experts"), &[1, hidden]);
+    assert_shape(g, at, &[1, 1, hidden]);
 }
 
 // ---------------------------------------------------------------------------------------------
