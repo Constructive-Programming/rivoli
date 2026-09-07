@@ -21,34 +21,43 @@ pub use rivoli_oracles::golden::GoldenSet;
 /// found" is almost always a renamed capture and the next question is always "then what IS in
 /// there".
 pub fn float<'g>(g: &'g GoldenSet, name: &str) -> (&'g [usize], &'g [f32]) {
-    g.floats
-        .iter()
-        .find(|(n, _, _)| n == name)
-        .map(|(_, s, v)| (s.as_slice(), v.as_slice()))
-        .unwrap_or_else(|| {
-            let some: Vec<&String> = g.floats.iter().take(3).map(|(n, _, _)| n).collect();
-            panic!(
-                "{name} is not in the golden; it holds {} float tensors, e.g. {some:?}",
-                g.floats.len()
-            )
-        })
+    lookup(&g.floats, name).unwrap_or_else(|| absent(name, "float", &g.floats))
 }
 
 /// One int tensor's values, by name. Same panic-on-absent contract as [`float`], and for the same
 /// reason: a check that locates its input by name has a third outcome, and silently defaulting on
 /// it is a gate that reads as coverage and is zero.
 pub fn ints<'g>(g: &'g GoldenSet, name: &str) -> &'g [i64] {
-    g.ints
-        .iter()
+    lookup(&g.ints, name)
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| absent(name, "int", &g.ints))
+}
+
+/// The lookup both readers are the same question of.
+///
+/// Written twice as a find-map-unwrap_or_else over the same `(name, shape, values)` tuple, the
+/// code-health reviewer scored the pair as duplicated code and the file sank to 9.38; only the
+/// element type and one noun in the message differ, so the type is generic and the noun is an
+/// argument. Neither message moved, and neither did the contract: an absent name is a refusal
+/// that names what IS present, never a default.
+fn lookup<'g, X>(
+    rows: &'g [(String, Vec<usize>, Vec<X>)],
+    name: &str,
+) -> Option<(&'g [usize], &'g [X])> {
+    rows.iter()
         .find(|(n, _, _)| n == name)
-        .map(|(_, _, v)| v.as_slice())
-        .unwrap_or_else(|| {
-            let some: Vec<&String> = g.ints.iter().take(3).map(|(n, _, _)| n).collect();
-            panic!(
-                "{name} is not in the golden; it holds {} int tensors, e.g. {some:?}",
-                g.ints.len()
-            )
-        })
+        .map(|(_, s, v)| (s.as_slice(), v.as_slice()))
+}
+
+/// The absent-name panic, shared for the reason above. A renamed capture is the event this
+/// branch exists for, and "the golden holds 41 float tensors, e.g. […]" is what turns the next
+/// question into a lookup rather than a re-run with a print.
+fn absent<X>(name: &str, kind: &str, rows: &[(String, Vec<usize>, Vec<X>)]) -> ! {
+    let some: Vec<&String> = rows.iter().take(3).map(|(n, _, _)| n).collect();
+    panic!(
+        "{name} is not in the golden; it holds {} {kind} tensors, e.g. {some:?}",
+        rows.len()
+    )
 }
 
 pub fn shape_of(g: &GoldenSet, name: &str) -> Vec<usize> {
