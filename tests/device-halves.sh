@@ -21,7 +21,8 @@
 #     cargo test -p rivoli-engine --test kernel_glimmer_block_attend --test glimmer_fp8_decode --no-run
 #   CARGO_TARGET_DIR=/var/cache/rivoli/target/<this-checkout> tests/device-halves.sh all
 #
-# usage: tests/device-halves.sh [attend|fp8|all]        (default all)
+# usage: tests/device-halves.sh [attend|fp8|qwen|all]   (default all; `qwen` runs every built
+#        kernel_qwen_* suite that exists in the target dir, skipping the ones not built)
 # env:   CARGO_TARGET_DIR — required, and it must name THIS checkout's own target dir.
 #        §12: the box-wide pam_env value outranks `.cargo/config.toml`, and a shared dir
 #        makes cargo replay a SIBLING's build-script output — the duplication gate then
@@ -110,15 +111,36 @@ arm() { # $1 = cell, $2 = test stem, $3 = 1 to skip if absent (arch-dependent ce
     return 1
 }
 
+# The S3 device-scored kernels. A deviceless arm cannot stand in for this one: it compiles
+# every `#![cfg(feature = "rocm")]` suite away, so a green there says nothing about them.
+#
+# The stems are READ from the target dir, never typed here. A hand-written list is the §13/§14b
+# defect in miniature -- rename or add a suite and the cell quietly scores fewer tests than the
+# tree has, which is an examined count that can reach zero while the arm prints GREEN.
+run_qwen_cell() {
+    local found=0 stem
+    while IFS= read -r stem; do
+        found=$((found + 1))
+        arm "$stem" "$stem" || return 1
+    done < <(find "$TARGET/debug/deps" -maxdepth 1 -name 'kernel_qwen_*-*' ! -name '*.d' \
+                -printf '%f\n' | sed -E 's/-[0-9a-f]{16}$//' | sort -u)
+    [ "$found" -gt 0 ] || {
+        echo "RED qwen: no kernel_qwen-* binary in $TARGET/debug/deps — the arm examined" >&2
+        echo "    nothing; build with \`cargo test -p rivoli-engine --no-run\` first (§12)." >&2
+        return 1
+    }
+}
+
 rc=0
 case "$CELL" in
     attend) arm attend kernel_glimmer_block_attend || rc=1 ;;
     fp8)    arm fp8 glimmer_fp8_decode || rc=1 ;;
+    qwen)   run_qwen_cell || rc=1 ;;
     all)
         arm attend kernel_glimmer_block_attend || rc=1
         arm fp8 glimmer_fp8_decode || rc=1
-        ;;
-    *) echo "usage: $0 [attend|fp8|all]" >&2; exit 2 ;;
+        run_qwen_cell || rc=1 ;;
+    *) echo "usage: $0 [attend|fp8|qwen|all]" >&2; exit 2 ;;
 esac
 
 echo "   evidence: $SCRATCH (per-arm witness files, stdout, log; GTT and loadavg above)"
