@@ -172,7 +172,7 @@ fn the_tiny_configs_kept_the_real_structure() {
     for v in DECODE {
         let g = load(v);
         let c = meta_json(&g, "tiny_config");
-        let declared = declared_fields(&g);
+        let declared = DeclaredFields::of(declared_fields(&g));
         for key in [
             "num_hidden_layers",
             "full_attention_interval",
@@ -207,8 +207,33 @@ fn the_tiny_configs_kept_the_real_structure() {
 /// `ple_layer_ids` is ONE-INDEXED on disk — MOD:1202 tests `layer_idx + 1` — so `[2]` puts the
 /// injection on `layer_idx` 1. That was the S0 correction, and it is the reason a capture list
 /// written from the config's own digits would watch the wrong layer.
-fn layer_partition_survived(c: &Value, real: &Value, declared: &[&str]) {
-    field_was_declared(declared, "layer_types");
+/// The golden's own list of structurally-asserted fields, as a type.
+///
+/// Four helpers here took the list and a key as loose strings that only ever travel together,
+/// and every message they print names the list — `structural_asserted`. The reviewer read that
+/// as a string-heavy argument profile, and it was right: this is one subject with one question.
+/// As a type the refusal is written once, and no call site can pair a list from one draw with a
+/// key checked against another.
+struct DeclaredFields(Vec<String>);
+
+impl DeclaredFields {
+    fn of(fields: Vec<&str>) -> Self {
+        Self(fields.into_iter().map(str::to_owned).collect())
+    }
+
+    /// The declaration half alone, for a field whose VALUE is compared by a rule rather than by
+    /// equality — `layer_types`, which is compared against its aliased form, and the two
+    /// defaulted fields, which are compared against a class default the real file does not hold.
+    fn assert_has(&self, key: &str) {
+        assert!(
+            self.0.iter().any(|k| k == key),
+            "{key} is not in structural_asserted, so nothing on the generating side checked it"
+        );
+    }
+}
+
+fn layer_partition_survived(c: &Value, real: &Value, declared: &DeclaredFields) {
+    declared.assert_has("layer_types");
     let got = c["layer_types"].as_array().expect("layer_types");
     let want: Vec<String> = real["layer_types"]
         .as_array()
@@ -240,19 +265,9 @@ fn layer_partition_survived(c: &Value, real: &Value, declared: &[&str]) {
 /// at 26 tokens the moment they existed, which is the duplication gate doing exactly its job on
 /// this file's own author. The fix is this function — never a reverted format and never an
 /// exemption, because the matched tokens here are not the point of anything.
-fn structural_field_survived(declared: &[&str], c: &Value, real: &Value, key: &str) {
-    field_was_declared(declared, key);
+fn structural_field_survived(declared: &DeclaredFields, c: &Value, real: &Value, key: &str) {
+    declared.assert_has(key);
     assert_eq!(c[key], real[key], "tiny config lost {key}");
-}
-
-/// The declaration half alone, for a field whose VALUE is compared by a rule rather than by
-/// equality — `layer_types`, which is compared against its aliased form, and the two defaulted
-/// fields, which are compared against a class default the real file does not hold.
-fn field_was_declared(declared: &[&str], key: &str) {
-    assert!(
-        declared.contains(&key),
-        "{key} is not in structural_asserted, so nothing on the generating side checked it"
-    );
 }
 
 /// **The two structural fields that are ABSENT from the checkpoint's `config.json`**, and the
@@ -267,10 +282,10 @@ fn field_was_declared(declared: &[&str], key: &str) {
 fn the_defaulted_fields_are_asserted_against_their_default(
     c: &Value,
     real: &Value,
-    declared: &[&str],
+    declared: &DeclaredFields,
 ) {
     for (key, default) in [("norm_topk_prob", Value::Bool(true)), ("seed", 1234.into())] {
-        field_was_declared(declared, key);
+        declared.assert_has(key);
         assert!(
             real.get(key).is_none(),
             "{key} is now IN the checkpoint's config.json — it is no longer a class default, and \
