@@ -156,7 +156,7 @@ appears that enum dispatch cannot fill.
   exits 0 reporting `0 passed` — planted on the box, observed, removed. On-demand (GPU, ~1 min),
   not CI.
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
-  suite or a live deferral, checked both ends; **61/61/0** since 2026-08-17, when M17c's
+  suite or a live deferral, checked both ends; **66/66/0** as measured 2026-09-08 by `cargo test -p rivoli --no-default-features --test kernel_coverage -- --nocapture` (the figure stood at 61 for four milestones and nobody re-counted it — the same prose-drift class §13 caught in its own row count; `docs/reference/kernel-inventory.md` enumerates the same population row by row), and it rose past 61 when M17c's
   `gqa_block_attend` landed with its launcher and `kernel_glimmer_block_attend.rs`. Its
   DEFERRED row opened and closed the table's **third** turn within one commit — the census
   REFUSED the stale row rather than letting it stand, which is the both-ends check doing what
