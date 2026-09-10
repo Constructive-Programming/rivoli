@@ -163,7 +163,12 @@ appears that enum dispatch cannot fill.
   an exemption list cannot. Its `covered` scanner also grew a second form that day: a launcher
   handed to a shared launch helper as its first argument counts, matched against a
   whitespace-stripped corpus. Both halves were forced — jscpd refused the second per-file
-  launch wrapper, and without the new form a kernel covered since M7 read as uncovered. **INV-n registry** —
+  launch wrapper, and without the new form a kernel covered since M7 read as uncovered. A
+  second census in the same file (2026-09-10) asks the liveness question the oracle census
+  cannot: every launcher has a production caller under `crates/engine/src`/`crates/cli/src` or
+  a classified row in the inventory's uncalled table — both ends checked, the heading's row
+  count derived from the table itself; red-proofed the same day by four planted-and-restored
+  registry edits plus two kept failed plants (`docs/measurement/gate-red-proofs.md` §17). **INV-n registry** —
   `crates/cli/tests/invariants.rs`, doc-and-test must move together. **feature matrix** —
   `tests/feature-matrix.sh` + `crates/cli/tests/matrix.rs` (lists derived from the
   manifests; the resolve cell proves `--no-default-features` is genuinely deviceless).

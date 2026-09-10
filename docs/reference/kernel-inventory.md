@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: Every GPU kernel launcher in the tree as a row — 66 of them, the same population `crates/cli/tests/kernel_coverage.rs` censuses at 66/66/0 — with the models that call it, the production site that calls it, and the mode that reaches it, all derived from the `launchers!` DSL and from the engine's own call sites rather than from memory. It also carries the thirteen launchers that NO production code calls, each classified with the evidence that puts it in a category: superseded by a shipped sibling, implemented ahead of the arm that will call it (qwen S3 vs S6), or pending a deferred milestone (M13's GLM DSA). Reuse is measured, not hoped for: V4 is the most-shared kernel consumer (22 launchers) and `gemv_fp8`, `argmax`, `vadd` and `sigmoid_gate` each serve three or four architectures through one implementation.
+verdict: Every GPU kernel launcher in the tree as a row — 66 of them, the same population `crates/cli/tests/kernel_coverage.rs` censuses at 66/66/0 — with the models that call it, the production site that calls it, and the mode that reaches it, all derived from the `launchers!` DSL and from the engine's own call sites rather than from memory. It also carries the 13 launchers that NO production code calls, each classified with the evidence that puts it in a category: superseded by a shipped sibling, implemented ahead of the arm that will call it (qwen S3 vs S6), or pending a deferred milestone (M13's GLM DSA). Reuse is measured, not hoped for: V4 is the most-shared kernel consumer (22 launchers) and `gemv_fp8`, `argmax`, `vadd` and `sigmoid_gate` each serve three or four architectures through one implementation. The uncalled table is enforced, not remembered — `kernel_coverage.rs`'s liveness census refuses an uncalled launcher absent from it, a stale row, and a row naming a launcher that no longer exists.
 ---
 
 # The kernel inventory
@@ -28,7 +28,7 @@ column is a query, and a query can be wrong.
   location, the dispatch is named (e.g. `RoutedFmt::{I4,Vq3}` in `glm/mlp.rs`).
 * **The `Qwen` column is empty, and that is a result.** `Arch::QwenFlashNext` refuses at every
   door and `crates/engine/src/qwen/` does not exist (S6), so no qwen kernel can have a production
-  caller yet. Four of the thirteen uncalled launchers are exactly the qwen S3 set named in
+  caller yet. Four of the 13 uncalled launchers are exactly the qwen S3 set named in
   `kernel_coverage.rs`'s FOURTH TURN.
 * **What would make it lie.** A launcher reached only through a `dyn`/fn-pointer table or a macro
   that synthesises the name would read as uncalled; a `#[cfg]`-compiled-out call site would read
@@ -106,12 +106,21 @@ column is a query, and a query can be wrong.
 | `index_score_blocks` | `(hand-written)` | *(hand)* | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
 | `index_score_blocks_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
 
-## The thirteen that no production code calls
+## The 13 that no production code calls
 
 Classified with primary evidence. A launcher here is either **wired** (name the milestone),
 **superseded** (delete it and its kernel body), or **pending a deferred chain** — the fourth
 option, "kept because a test covers it", is the one this table exists to refuse, because
 `kernel_coverage.rs` already counts those as covered.
+
+Since 2026-09-10 this table is load-bearing, not prose: `kernel_coverage.rs`'s second census
+(`every_launcher_is_shipped_or_classified_uncalled`) re-derives the uncalled set from the
+production sources on every run and refuses an uncalled launcher missing from this table, a
+row whose launcher no longer exists, and a row whose launcher has gained a production caller
+— and the heading's count above is asserted against the table's own row count, so it cannot
+drift the way prose counts do. The four refusals are red-proofed — plants cmp-verified to
+have changed the tree, each reddening with its own message, the doc restored byte-identical —
+in `gate-red-proofs.md` §17 (2026-09-10).
 
 | launcher | TU | category | the evidence |
 |---|---|---|---|

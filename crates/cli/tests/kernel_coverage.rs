@@ -17,6 +17,14 @@
 //! exemption list is that both ends are checked: a row dies loudly the moment its
 //! launcher stops existing, and dies loudly the moment ANY test covers it — a deferral
 //! that outlives its reason is refused, so the table can only shrink.
+//!
+//! **Two censuses, two questions.** The oracle census above asks *"does a test exercise
+//! this launcher?"*; the liveness census (2026-09-10) asks *"does anything that ships
+//! call it?"* — a reference under `crates/engine/src` or `crates/cli/src`, where test
+//! files never count. A launcher with no production caller is refused unless it is a
+//! **classified row** in `docs/reference/kernel-inventory.md`'s uncalled table, and that
+//! table is checked at both ends exactly like DEFERRED: a row dies loudly when its
+//! launcher stops existing, and dies loudly the moment production code calls it.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)] // meta-gate: panic loudly
 
@@ -112,13 +120,12 @@ fn corpus(dir: &str, skip: &str) -> String {
         .join("\n")
 }
 
-#[test]
-fn every_launcher_has_an_oracle_or_a_live_deferral() {
+/// The launcher population plus the probe stem, shared by both censuses so they cannot
+/// disagree about what the backend contains.
+fn backend_launchers() -> (String, Vec<String>) {
     let decl = format!("pub unsafe fn {}", "launch_");
     let stem = format!("{}{}", "launch", "_");
-
-    let backend = corpus("crates/backend/src", "");
-    let launchers = launcher_names(&backend, &decl, &stem);
+    let launchers = launcher_names(&corpus("crates/backend/src", ""), &decl, &stem);
 
     // Anti-vacuity floor, re-derived for this tree: 53 measured 2026-08-15. A parse that
     // silently matches nothing passes forever; this has bitten the old census twice.
@@ -128,6 +135,30 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
          declaration pattern has changed underneath this scanner",
         launchers.len()
     );
+    (stem, launchers)
+}
+
+/// `plain` cites `base` in either form: a direct call `base(`, or `(base,` — handed to a
+/// shared launch helper as its FIRST argument, probed against `dense` (the caller's
+/// whitespace-stripped view of the same corpus) because rustfmt line-breaks long calls.
+/// The block comment at the oracle census's call site argues both forms and why the `(`
+/// is load-bearing.
+fn references(plain: &str, dense: &str, base: &str) -> bool {
+    plain.contains(&format!("{base}(")) || dense.contains(&format!("({base},"))
+}
+
+/// One name per line, indented — the shape both refusals print their populations in.
+fn bullet(names: &[&String]) -> String {
+    names
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n  ")
+}
+
+#[test]
+fn every_launcher_has_an_oracle_or_a_live_deferral() {
+    let (stem, launchers) = backend_launchers();
 
     // The oracle corpus: engine's device tests. No size floor — a truncated corpus only
     // makes launchers look UNCOVERED, which fails loudly by itself.
@@ -158,10 +189,7 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
     // passed with a stale DEFERRED row because of exactly this, which is a FALSE GREEN and the
     // reason the stripping is here rather than a comment about being careful.
     let dense: String = tests.chars().filter(|c| !c.is_whitespace()).collect();
-    let covered = |name: &str| {
-        let base = format!("{stem}{name}");
-        tests.contains(&format!("{base}(")) || dense.contains(&format!("({base},"))
-    };
+    let covered = |name: &str| references(&tests, &dense, &format!("{stem}{name}"));
 
     // Both ends of every deferral, before the census consults it.
     for (name, arrives) in DEFERRED {
@@ -193,11 +221,7 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
          compile and may be dispatched, and nothing has ever checked what they compute. \
          Either port the oracle file or add a DEFERRED row with its milestone.",
         missing.len(),
-        missing
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join("\n  ")
+        bullet(&missing)
     );
 
     println!(
@@ -205,5 +229,111 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
         launchers.len(),
         launchers.len() - DEFERRED.len(),
         DEFERRED.len()
+    );
+}
+
+/// The uncalled table in `docs/reference/kernel-inventory.md`: each row's launcher (first
+/// cell, backticks stripped) and its category cell. Loud at every step — a heading that
+/// went missing or a row without a category is a shrunken registry, and a shrunken
+/// registry lets a dead launcher pass as classified.
+fn inventory_uncalled_rows() -> Vec<(String, String)> {
+    let path = common::repo_root().join("docs/reference/kernel-inventory.md");
+    let doc = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let heading = doc
+        .lines()
+        .find(|l| l.starts_with("## ") && l.ends_with("that no production code calls"))
+        .expect("kernel-inventory.md lost its uncalled-launchers heading");
+    let rows: Vec<(String, String)> = doc
+        .split_once(heading)
+        .expect("heading came from doc")
+        .1
+        .split("\n## ")
+        .next()
+        .expect("split yields at least one piece")
+        .lines()
+        .filter(|l| l.starts_with("| `"))
+        .map(|l| {
+            let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+            assert!(
+                cells.len() >= 5 && !cells[3].is_empty(),
+                "inventory row {l:?} has no category cell — an unclassified row is not a \
+                 classification"
+            );
+            (cells[1].trim_matches('`').to_string(), cells[3].to_string())
+        })
+        .collect();
+    // The heading restates its own table's row count; derive it rather than trust it —
+    // prose counts drift (the census figure stood at 61 for four milestones, and CLAUDE.md
+    // §13 records a hand-count that stood four days beside a table one row shorter).
+    assert_eq!(
+        heading,
+        format!("## The {} that no production code calls", rows.len()),
+        "kernel-inventory.md's heading disagrees with its own table"
+    );
+    rows
+}
+
+#[test]
+fn every_launcher_is_shipped_or_classified_uncalled() {
+    let (stem, launchers) = backend_launchers();
+
+    // The production corpus: what ships. Test files never count — that distinction is the
+    // point (`kernel-inventory.md`, "Model columns"): the oracle census answers yes for
+    // every launcher while thirteen have no caller in any binary anyone ships, and only
+    // this test asks the second question. `crates/cli/src` is in because the converter is
+    // production (`vq_encode`'s only caller), and shared streaming infrastructure lives
+    // outside the arch directories (`hash_rows`) — both were misclassified once by a scan
+    // that looked only at architecture directories.
+    //
+    // Stated residual, same shape as the oracle probe's: a production comment or string
+    // literal containing `launch_x(` would read as live (none of the classified rows
+    // appears anywhere under either root, checked 2026-09-10), and a launcher reached
+    // only through a fn-pointer table would read as uncalled — which fails LOUDLY here,
+    // the safe direction.
+    let prod = format!(
+        "{}\n{}",
+        corpus("crates/engine/src", ""),
+        corpus("crates/cli/src", "")
+    );
+    let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
+    let live = |name: &str| references(&prod, &dense, &format!("{stem}{name}"));
+
+    // Both ends of every classification, before the census consults the table.
+    let rows = inventory_uncalled_rows();
+    for (name, category) in &rows {
+        assert!(
+            launchers.iter().any(|l| l == name),
+            "kernel-inventory.md classifies `{name}` ({category}) as uncalled, but it is \
+             not a launcher under crates/backend/src. A row for something that does not \
+             exist explains nothing — delete it."
+        );
+        assert!(
+            !live(name),
+            "kernel-inventory.md carries `{name}` as uncalled ({category}), but production \
+             code now calls `{stem}{name}`. The classification has outlived its reason — \
+             delete the row and light the model column instead."
+        );
+    }
+
+    let classified: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+    let unclassified: Vec<&String> = launchers
+        .iter()
+        .filter(|l| !live(l) && !classified.contains(&l.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "\n\n{} launcher(s) have no caller under crates/engine/src or crates/cli/src and \
+         no classified row in docs/reference/kernel-inventory.md's uncalled table:\n  \
+         {}\n\nAn oracle proves what a kernel computes, not that anything ships it. Wire \
+         the launcher, or classify it in the table with primary evidence.",
+        unclassified.len(),
+        bullet(&unclassified)
+    );
+
+    println!(
+        "{} launchers: {} with production callers, {} classified uncalled",
+        launchers.len(),
+        launchers.len() - rows.len(),
+        rows.len()
     );
 }
