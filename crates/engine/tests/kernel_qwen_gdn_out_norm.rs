@@ -244,14 +244,63 @@ fn padded(n: usize) -> usize {
     b
 }
 
-fn gate_norm(c: &GateNorm, form: Form) -> Vec<f32> {
-    let d = c.head_dim;
-    let eps = match form {
+/// The norm eps a form scores with. 1e-6 is the reference's own; `EpsFromTheWrongField` reads a
+/// different module's constant, and `EpsDropped` is the zero that still produces finite output —
+/// which is why it needs a tolerance row rather than a refusal.
+fn eps_for(form: Form) -> f64 {
+    match form {
         Form::EpsFromTheWrongField => 1e-5,
         Form::EpsDropped => 0.0,
         _ => 1e-6,
-    };
+    }
+}
+
+/// The divisor under the root. `NormOverTheSum` drops it (a sum, not a mean);
+/// `MeanOverThePaddedWidth` divides by the width the reduction WALKS instead of the real `d` —
+/// the padding question this suite exists to price, since guard 1003 exists precisely because
+/// padding drops elements. Two different mistakes, one shared symptom: a norm still finite and
+/// still plausible.
+fn divisor_for(form: Form, d: usize) -> f64 {
+    match form {
+        Form::NormOverTheSum => 1.0,
+        Form::MeanOverThePaddedWidth => padded(d) as f64,
+        _ => d as f64,
+    }
+}
+
+/// Does eps go after the root? The order defect: `1/rsqrt(m) + eps` reads identical to
+/// `1/rsqrt(m + eps)` at a glance and diverges at exactly the 1e-6 scale the tolerance row sits
+/// on, which is why it is a form rather than a comment.
+fn eps_after_root(form: Form) -> bool {
+    form == Form::EpsOnTheSqrt
+}
+
+/// The gate, applied to the right operand. The reference gates `z` with a bounded sigmoid
+/// (`output_gate_type: "sigmoid"` at CFG:193-195; TR p.4's "we use the bounded sigmoid gate");
+/// the three variants are the ways a port writes that sentence wrong — SiLU and tanh for the
+/// activation, and the normed stream in place of `z`.
+fn gate_for(form: Form, x: f64, zj: f64) -> f64 {
+    match form {
+        Form::GateOnTheNormedStream => h::sigmoid(x),
+        Form::GateSilu => zj * h::sigmoid(zj),
+        Form::GateTanh => zj.tanh(),
+        _ => h::sigmoid(zj),
+    }
+}
+
+/// The oracle: `out = o · rsqrt(mean(o²) + eps) · weight · σ(z)`, per head, in f64 on f32 in
+/// and f32 out. Accumulating in f64 is what keeps the comparison pricing the KERNEL — the
+/// tolerance rows are 10x fp32 floors measured fp32-against-fp64 (`qwen-reference/anchor.md`,
+/// `gdn_out_norm` 1.6539e-5), so an oracle that rounded like fp32 would absorb part of the very
+/// error it is there to detect. Every `Form` below is a defect the S2 matrix names; the plain
+/// arms are what `qwen-architecture.md` §1 reads out of MOD:192-201.
+fn gate_norm(c: &GateNorm, form: Form) -> Vec<f32> {
+    let d = c.head_dim;
+    let eps = eps_for(form);
     let mut out = vec![0.0f32; c.heads * d];
+    // Per head, never across the flattened buffer: the reduction's window is exactly one
+    // `[d]` row, which is the distinction the operator's whole shape turns on (a norm over the
+    // 48·d stream would be a different function and would still be finite).
     for hd in 0..c.heads {
         let row = &c.o[hd * d..(hd + 1) * d];
         let mut sq: f64 = row.iter().map(|x| f64::from(*x) * f64::from(*x)).sum();
@@ -262,25 +311,24 @@ fn gate_norm(c: &GateNorm, form: Form) -> Vec<f32> {
             let n = f64::from(c.o[((hd + 1) % c.heads) * d]);
             sq += n * n;
         }
-        let divisor = match form {
-            Form::NormOverTheSum => 1.0,
-            Form::MeanOverThePaddedWidth => padded(d) as f64,
-            _ => d as f64,
-        };
-        let inv = if form == Form::EpsOnTheSqrt {
-            1.0 / ((sq / divisor).sqrt() + eps)
+        // `rsqrt(mean(o²) + eps)`: the mean explicitly, and eps INSIDE the root — the two
+        // places this operator's wording hides a defect, so both are decisions with names.
+        let mean = sq / divisor_for(form, d);
+        let inv = if eps_after_root(form) {
+            1.0 / (mean.sqrt() + eps)
         } else {
-            1.0 / (sq / divisor + eps).sqrt()
+            1.0 / (mean + eps).sqrt()
         };
+        // The gate wraps `z`, not the normed stream — `output_gate_type: "sigmoid"` at
+        // CFG:193-195, and TR p.4's "we use the bounded sigmoid gate". `GateOnTheNormedStream`,
+        // `GateSilu` and `GateTanh` are the three ways a port writes that sentence wrong.
         for j in 0..d {
             let x = f64::from(row[j]) * inv;
             let zj = f64::from(c.z[hd * d + j]);
-            let g = match form {
-                Form::GateOnTheNormedStream => h::sigmoid(x),
-                Form::GateSilu => zj * h::sigmoid(zj),
-                Form::GateTanh => zj.tanh(),
-                _ => h::sigmoid(zj),
-            };
+            let g = gate_for(form, x, zj);
+            // Order as the reference writes it: normed value, then weight, then gate — bare
+            // `w ⊙ x̂` with no `(1 + w)` offset (§1, MOD:192-201). The narrowing back to f32
+            // happens once, here, so the accumulation above stays in f64.
             out[hd * d + j] = (x * f64::from(c.weight[j]) * g) as f32;
         }
     }
