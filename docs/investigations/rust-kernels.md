@@ -243,19 +243,19 @@ posted. `sha256sum -c artifacts.sha256` passed immediately before launch. Every 
 witness is CLEAN: the `/var/cache/rivoli/scratch/rk-prelude/probe/witness/witness-*`
 files are all empty, GTT was 17 MiB before every arm, and loadavg 2.2–2.8 on 32 cores.
 
-Evidence, all under `/var/cache/rivoli/scratch/rk-prelude/probe/` (hashed in
-`arms/outputs.sha256`):
-- raw outputs: `arms/<arm>.out` and `arms/run.log`;
-- re-judge: `rejudge-nan-class.py` → `arms/policy-*.out`, with verdicts in
-  `arms/policy-verdicts.txt`.
+Evidence, all under `/var/cache/rivoli/scratch/rk-prelude/` and every file below hashed in
+`probe/arms/outputs.sha256`:
+- raw outputs: `probe/arms/<arm>.out` and `probe/arms/run.log`;
+- verdicts under the owner's rule (below): `probe/arms/verdicts-nan-class.txt`, written by
+  `check-arm.py --byte-exact-rc` over the same raw outputs (no device re-run);
+- the checker's red proofs: `redproof-checker/verdicts.txt`.
 
-The script's verdict was **UNEXPECTED (rc 1)**, for one reason: NaN payloads. A red cell is
-`nan_payload_only` when every differing f32 word in it is NaN on BOTH sides. NaN against
-non-NaN counts as value-red, so this class cannot hide a value difference. Only 4-byte
-outputs are classified at all; 1-, 2- and 8-byte outputs are always value-red, which errs
-strict.
+`run-arms.sh` reported **UNEXPECTED (rc 1)** under the byte-exact rule it ran with, for
+one reason: NaN payloads. A red cell is `nan_payload_only` when every differing f32 word in
+it is NaN on BOTH sides. NaN against non-NaN counts as value-red, so this class cannot hide
+a value difference. Which outputs are classified is stated under the owner decision below.
 
-| arm | cells | red groups | value-red cells (where) | NaN-only cells | value verdict |
+| arm | cells | red groups (byte-exact) | value-red cells (where) | NaN-only cells | value verdict |
 |---|---|---|---|---|---|
 | A0 hipcc vs rustc | 13 956 | 85 / 222 | **0** | 442 | identical |
 | R-formats | 5 572 | 1 / 91 | 4 (`ex_f2e4m3` only) | 0 | PASS |
@@ -288,21 +288,52 @@ strict.
 
   R-fp8's must-hold groups (block 1/2) carry exactly A0's NaN cells.
 - **Every plant is value-red only where its CPU proof says.**
-  - The checker's two FAILs are NaN-only cells in must-hold groups (value-red there: 0).
+  - Under the byte-exact rule, the checker FAILed R-fp8 and R-nib, on NaN-only cells in
+    must-hold groups (value-red there: 0).
   - The 8 fp8 block ≥ 4 groups that held are the tiny shapes (i_dim 4 and 36). There each
     lane folds at most one quad into a zero accumulator, and `fma(s, q, 0) == 0 + s·q`
     exactly, so the defect cannot show.
-  - Re-judged with NaN-vs-NaN counted equal, every arm PASSes the same checker, and A0 has
-    0 red.
+  - Judged under the owner's rule below, every judged arm PASSes and A0 has 0 red groups
+    (`probe/arms/verdicts-nan-class.txt`). R-barrier is informational and not judged.
 
-**Proposed policy (not applied; coordinator/owner decision).** Compare f32 outputs with NaN
-as a CLASS: a word pair that is NaN on both sides counts as equal, and everything else
-stays byte-exact. Keep `nan_payload_only` printed per group so payload differences stay
-visible. Matching payloads instead would mean steering each compiler's commutative-operand
-order. No source spelling controls that, and the nib arm shows it moving between two Rust
-builds of the same loop. The engine treats any NaN as fatal (`flag_nonfinite`), and no
-oracle pins a payload. A known cost of the policy: a NaN that propagates through a dot lane
-masks any upstream value difference in that lane, as it already does under byte compare.
+**Owner decision 2026-11-18: NaN as a class.** A word that is NaN on BOTH sides counts as
+equal; every other value stays byte-exact. The decision rests on three things:
+- In A0, all **442 of 442** mismatched cells were NaN-payload-only, with 0 value-red.
+- No source spelling controls each compiler's commutative-operand order, and the nib arm
+  shows it moving between two Rust builds of the same loop.
+- No consumer reads a NaN payload; every one treats NaN as a class. The argmax skips NaN
+  (strict `>`, `crates/engine/src/glm/decode.rs:17-19`), and decode bails if the winning
+  logit is non-finite (`glm/decode.rs:71`; likewise `v4/decode.rs:62`, `k3/decode.rs:53`,
+  `glimmer/forward.rs:595`).
+
+How it is applied:
+- **Both verdict tools use the rule.** `harness.cpp` (`struct Group`) and `check-arm.py`
+  judge a group red iff `mismatched_cells > nan_payload_only`.
+- **The raw counts stay visible.** Every group line still prints the byte comparison's
+  `mismatched_cells` and `nan_payload_only`, and `check-arm.py` prints the arm's total
+  NaN-payload-only cells, so a payload change is still observable.
+- **Strict outside f32.** Every sweep call site states its output type (`enum class Out`),
+  and only `Out::F32` is NaN-classified, so a forgotten case stays strict. That covers the
+  1-, 2- and 8-byte outputs and the u32-code sweeps `ex_f2e2m1`/`ex_blk_shift`/`ex_nquad`.
+  The f32 `k_lut` cell is also judged strictly. Every `pair()` kernel (dots, reductions)
+  writes f32. The pre-rule binary that ran classified by size alone; that made no
+  difference here, because the integer sweeps had 0 mismatched cells in every arm.
+- **`check-arm.py` red-proofed deviceless** (`redproof-checker/verdicts.txt`):
+  - one A0 cell edited to carry a single value-red word → FAIL at harness rc 0 and rc 1;
+  - every NaN-only count zeroed (the byte-exact view) → FAIL, 85 red groups, at rc 0 and
+    rc 1;
+  - the real A0 → PASS only with `--byte-exact-rc` (the pre-rule rc 1 is accepted when the
+    RESULT line's red count equals the groups with any mismatched byte) and FAIL without;
+  - an expect-red arm with no RED_RE → FAIL.
+
+  **The harness's own copy of the rule is UNVERIFIED-NEEDS-GPU.** It has not executed. Its
+  first lease should reproduce A0 = rc 0, with R-actquant as its NaN-against-number red
+  proof (18 red groups, `nan_payload_only=0`).
+- **Known cost:** a NaN that propagates through a dot lane masks any upstream value
+  difference in that lane, as it already did under byte compare.
+- **Provenance.** The harness was rebuilt with the rule after the lease. `artifacts.sha256`
+  names the binary that ran (`68a0…`), but its exact source was overwritten and is NOT
+  preserved. `probe/arms/outputs.sha256` names the rebuilt binary and its source.
 
 **Measured sweep rate (first measurement).** These are arm wall-clock spans from
 `arms/*.out` mtimes (1 s resolution) against `arms/start.epoch`, so they include setup and
