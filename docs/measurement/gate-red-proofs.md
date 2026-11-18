@@ -1985,5 +1985,22 @@ The plant classifier (`--plant=<family>`, the script's `plant_spec` row; first w
 table with the must-hold made mandatory) was re-proven on five stubs against the fp8 row: red
 only inside the red RE with a must-hold row green → GREEN; a must-hold row red → RED; a red
 row outside the RE → RED; nothing red → RED; no must-hold row at all → RED. `--plant` with
-`--families` and `--plant=barrier` (no row) refuse with exit 2. The nine plant objects are
+`--families` and `--plant=barrier` (no row) refuse with exit 2. The plants themselves are
+patches applied to a scratch copy (`tests/bit-identity/plants/`). This file's opening rule
+says a plant must be observed to have changed the tree. The applier was shown to refuse both
+ways a plant can fail to do so, on temporary fixtures removed after:
+- a context line edited so the hunk no longer matches: "does not apply", exit 2;
+- a hunk whose `+` line equals its `-` line: "changed nothing (diff rc=0)", exit 2.
+
+It also refused, each with exit 2:
+- an unknown plant;
+- `--build-probes --families`;
+- a tampered `clean.stamp`, refused by the `--probes` arm before the lock.
+
+The formats and actquant rows changed with the patch form. Four stubs, using the harness's
+real row names, were judged against them:
+- formats, `ex_f2e4m3` and `ex_aq8` red with `ex_aq4` held: GREEN;
+- formats, `ex_aq4` red: RED;
+- actquant, `ex_aq8 s=1` and `ex_aq4 s=-2` red with `ex_aq8 s=NaN` held: GREEN;
+- actquant, `ex_aq4 s=NaN` red: RED. The nine plant objects are
 built; their device arms are owed to the probe lease.

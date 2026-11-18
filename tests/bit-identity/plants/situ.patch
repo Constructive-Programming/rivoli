@@ -1,0 +1,12 @@
+--- a/src/prelude/activation.rs
++++ b/src/prelude/activation.rs
+@@ -26,7 +26,8 @@
+ #[inline(always)]
+ fn tanh_ocml(x: f32) -> f32 {
+     let a = fabs(x);
+-    let z = if a < 0.625 {
++    let z = if a < 0.5 {
++        // PLANT: crossover moved from 0.625
+         let x2 = x * x;
+         let c = f32::from_bits;
+         let p = fmuladd(x2, c(0xBBBA_C73D), c(0x3CA9_08C9));

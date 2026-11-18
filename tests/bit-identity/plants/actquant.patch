@@ -1,0 +1,18 @@
+--- a/src/prelude/actquant.rs
++++ b/src/prelude/actquant.rs
+@@ -30,13 +30,8 @@
+ /// non-NaN operand and would launder a NaN into `-max`, where the oracle propagates it.
+ #[inline(always)]
+ fn clamp_nan_propagating(q: f32, max: f32) -> f32 {
+-    if q < -max {
+-        -max
+-    } else if q > max {
+-        max
+-    } else {
+-        q
+-    }
++    // PLANT: minnum/maxnum launder a NaN quotient into a finite bound.
++    super::llvm::minnum(super::llvm::maxnum(q, -max), max)
+ }
+ 
+ /// One element of a block-128 group through e4m3 and back.

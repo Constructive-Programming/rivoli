@@ -378,6 +378,18 @@ Arms A and R re-run on the lease-1 fixes; **witness CLEAN on both** (0 B witness
   whole gap). **`attn_res` 53.14 → 56.51 µs, ratio 1.063** (from 1.383) — above parity by ~6%,
   reported and NOT iterated inside the lease. The rest within 0.86–1.03 (`act_quant_f8` 1.030,
   `rope_interleave` 1.025, `rope_split_half` 1.014).
+- **OWED to Phase 1 timing work: `attn_res`'s 1.063** — not closed in this stretch. A static
+  read of the ISA gives a lead, not a cause. The two listings were produced with
+  `hipcc --offload-arch=gfx1151 -O3 --offload-device-only -S residual.hip` (the tag's file)
+  and `llvm-objdump -d --mcpu=gfx1151` of the shipped code object, and each was counted with
+  `grep -cE '^\s+(s_|v_|ds_|global_|buffer_|scratch_|flat_)'` over the `attn_res` body.
+  - **Body size:** 1617 instructions in Rust's body against 725 in hipcc's.
+  - **Static counts, by `grep -c` per mnemonic:** `s_barrier` 10 against 3, global loads 18
+    against 3, LDS ops 67 against 16, `v_fma` 127 against 46.
+  - **Reading:** hipcc keeps a loop over the sources, and the 16 straight-line `each_src`
+    slots expand it.
+  - **What is owed:** whether that growth (instruction cache, issue) is the 6% is
+    unmeasured, and isolating it is the owed work.
 
 ### Phase 0a — the prelude probe rows (2026-11-18, deviceless)
 
@@ -399,18 +411,41 @@ over the in-tree pair: the same single DIFF as their record (`k_i4_wave_r2`, wav
   verdict row with the launcher rows' tokens; NaN as a class and 0b's `Out` typing (only f32
   outputs NaN-classified); different fills per side; the compare runs ON THE DEVICE in
   hipcc-built `cmp_*` kernels added to `probe.hip` (the comparer is not the compared).
-- **Plants:** 0b's nine, features `plant_<family>` on `crates/kernels` (at most one per build,
-  a const assert — two together refuse to compile, observed), built by
-  `--build-probes=<family>` into `$CARGO_TARGET_DIR/probes/<family>` — all nine built
-  2026-11-18, every object distinct from the clean one. The plants that copy a live helper
-  (situ, fp8, nib, vq, barrier) sit in one jscpd exemption region (a plant IS a copy with one
-  defect; CLAUDE.md's count now 10); the file carries a CodeScene EXEMPT row at 9.6 (Primitive
-  Obsession on the helpers' own signatures) — **both need owner acceptance**.
+- **Plants:** 0b's nine. Each is a SMALL PATCH to the real prelude
+  (`tests/bit-identity/plants/<family>.patch`), 2–10 changed lines, every hunk marked
+  `PLANT`. There is no red-proof branch in shipped source, no copied helper, and no jscpd or
+  CodeScene exemption. That was the coordinator's ruling on 2026-11-18. It replaced the draft
+  in `604a5c0`, which copied the helpers into a cfg'd `plants.rs` and needed both exemptions.
+  - **What `--build-probes [--plant=<family>]` does:**
+    - copies `crates/kernels` into `$CARGO_TARGET_DIR/probes/<name>.src` with fresh mtimes;
+    - applies the patch with exact context (`patch -F0`);
+    - refuses unless the copy's `src/` now differs (diff rc exactly 1) and the checkout's
+      `crates/kernels`+`crates/abi` hash is unchanged;
+    - deletes the old object before building, and stamps the new one with that hash plus
+      the patch's;
+    - the arm refuses an object whose stamp no longer matches the tree.
+  - **Clean objects:** built from such a copy too, so a plant differs from clean by the patch
+    alone.
+  - **Red proofs** (temporary fixtures, removed after; `gate-red-proofs.md` §18): a moved
+    context line, a no-op hunk, an unknown plant, a tampered stamp, `--build-probes` with
+    `--families` — each refused, exit 2.
+  - **Built 2026-11-18:** all nine, each object distinct from the clean one. The clean object
+    from a copy is byte-identical (`3a23b8d7…`) to the in-place one. The fp8 and nib objects
+    are byte-identical to the draft's copied plants (`cae36d52…`, `3bd986b7…`).
+  - **Reach:** a patched helper reaches EVERY probe calling it.
+    - The formats plant (`f2e4m3_rne`) also reaches `ex_aq8`, so `plant_spec`'s red RE
+      includes it and its hold is `ex_aq4`.
+    - The actquant patch plants the shared `clamp_nan_propagating`, so both round trips
+      redden, as 0b's did.
+  - **Small diffs:** every plant could be written as one. Two needed a second hunk only to
+    stay warning-free under `warnings = deny` (`reduce`: `shfl_down` unused; `vq`: `quad`
+    unused).
 - **Judging a plant:** `--plant=<family>` reads the family's row in the script's `plant_spec`
   table — families, the rows that must redden, the rows that must hold (mandatory) — and
   applies 0b's `check-arm.py` rule on the same classifier. vq reaches every vq group (0b:
-  15/15), so its hold anchor is the reduce family. `barrier` has no row (a race; its gate is
-  the ISA census). Five stub arms red-proof the rule (`gate-red-proofs.md` §18).
+  15/15), so its hold anchor is the reduce family. `barrier` has a patch but no row: it is a race, and
+  its judge, 0b's scratch ISA census (`s_barrier` per kernel), is not in the tree yet. That
+  judge is OWED. Five stub arms red-proof the rule (`gate-red-proofs.md` §18).
 - **Census:** `every_prelude_probe_has_its_hipcc_twin` — 35 Rust probes, each with a
   same-named `__global__` in `probe.hip` and vice versa (documented one-sided: `cmp_*`,
   `k_vq_wave_r1`, each checked to exist), and every probe name is a string literal some

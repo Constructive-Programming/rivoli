@@ -1,0 +1,19 @@
+--- a/src/prelude/reduce.rs
++++ b/src/prelude/reduce.rs
+@@ -67,6 +67,7 @@
+ }
+ 
+ /// `__shfl_down(v, delta, WAVE)`: a lane whose source would leave the wave reads itself.
++#[allow(dead_code)] // PLANT: wave_sum no longer calls it
+ #[inline(always)]
+ fn shfl_down(v: f32, delta: u32) -> f32 {
+     let me = lane_id();
+@@ -97,7 +98,7 @@
+ pub fn wave_sum(v: f32) -> f32 {
+     [16, 8, 4, 2, 1]
+         .into_iter()
+-        .fold(v, |v, o| v + shfl_down(v, o))
++        .fold(v, |v, o| v + wave_shuffle(v, lane_id() ^ o)) // PLANT: xor butterfly
+ }
+ 
+ /// Max across a wave, on EVERY lane. A butterfly is legal because `maxnum` is exactly

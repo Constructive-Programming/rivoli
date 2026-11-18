@@ -93,8 +93,9 @@ pub fn rivoli_kernels(tc: &Toolchain) -> PathBuf {
     let target_dir = Path::new(&tc.out_dir).join("kernels-target");
     let flags = device_rustflags(tc, &device_libs()).join("\x1f");
     // The same flags, for `tests/bit-identity.sh --build-probes`: the gate builds the probe
-    // object (`--features probes[,plant_<family>]`) outside cargo, and reads the one spelling
-    // of the device flags from here rather than restating ROCm's bitcode paths.
+    // object (`--features probes`, from a copy of this crate that may carry a plant patch)
+    // outside cargo, and reads the one spelling of the device flags from here rather than
+    // restating ROCm's bitcode paths.
     std::fs::write(Path::new(&tc.out_dir).join("device-rustflags"), &flags)
         .expect("write device-rustflags");
     let mut cmd = Command::new("rustup");

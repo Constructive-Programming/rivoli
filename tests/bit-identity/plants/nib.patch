@@ -1,0 +1,11 @@
+--- a/src/prelude/dot_nib.rs
++++ b/src/prelude/dot_nib.rs
+@@ -164,7 +164,7 @@
+             let n = F::decode(u32::from(*w.w.add(i >> 1)) >> (4 * (i & 1)));
+             let s = scale(i);
+             for (r, a) in a0.iter_mut().enumerate() {
+-                *a = fmuladd(*x.at(r, i) * n, s, *a);
++                *a = fmuladd(*x.at(r, i), n * s, *a); // PLANT: tail as x·(n·s)
+             }
+         });
+     }

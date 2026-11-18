@@ -1,0 +1,26 @@
+--- a/src/prelude/dot_vq.rs
++++ b/src/prelude/dot_vq.rs
+@@ -8,7 +8,7 @@
+ 
+ use super::formats::bf16f;
+ use super::reduce::{WAVE, wave_sum};
+-use super::rowview::{F32x4, RowsView, for_strided, quad};
++use super::rowview::{F32x4, RowsView, for_strided}; // PLANT: quad unused
+ 
+ /// Must match quant.rs.
+ pub const VQ_DIM: usize = 4;
+@@ -63,7 +63,13 @@
+             let s = bf16f(*w.scale.add(t / VQ_SUBS_PER_GROUP));
+             for (r, a) in acc.iter_mut().enumerate() {
+                 let xv = F32x4::load(x.at(r, t * VQ_DIM)).0;
+-                *a = fmuladd(s, quad(xv, cv), *a);
++                // PLANT: the RIGHT product fused instead of the left.
++                let q = fmuladd(
++                    xv[3],
++                    cv[3],
++                    fmuladd(xv[2], cv[2], fmuladd(xv[1], cv[1], xv[0] * cv[0])),
++                );
++                *a = fmuladd(s, q, *a);
+             }
+         });
+     }

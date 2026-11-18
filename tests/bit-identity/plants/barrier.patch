@@ -1,0 +1,11 @@
+--- a/src/prelude/reduce.rs
++++ b/src/prelude/reduce.rs
+@@ -129,7 +129,6 @@
+         sync_threads();
+         tree(tid, block_dim, |t, s| *red.add(t) += *red.add(s));
+         let t = *red;
+-        sync_threads();
+-        t
++        t // PLANT: no trailing sync_threads()
+     }
+ }

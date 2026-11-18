@@ -1,0 +1,11 @@
+--- a/src/prelude/activation.rs
++++ b/src/prelude/activation.rs
+@@ -15,7 +15,7 @@
+ #[inline(always)]
+ pub fn swiglu_clamped(g: f32, u: f32, limit: f32) -> f32 {
+     let ut = minnum(maxnum(rbf16(u), -limit), limit);
+-    let gt = minnum(rbf16(g), limit);
++    let gt = minnum(maxnum(rbf16(g), -limit), limit); // PLANT: gate clamped both sides
+     gt * (1.0 / (1.0 + exp(-gt))) * ut
+ }
+ 

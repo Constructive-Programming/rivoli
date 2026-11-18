@@ -1,0 +1,14 @@
+--- a/src/prelude/formats.rs
++++ b/src/prelude/formats.rs
+@@ -133,6 +133,11 @@
+     }
+     let sign = if x.is_sign_negative() { 0x80 } else { 0x00 };
+     let a = x.abs();
++    // PLANT: e4m3's subnormal ties (above the round-to-zero threshold) round half UP.
++    let (scaled, m) = (a * 512.0, core::intrinsics::floor(a * 512.0));
++    if a > 0.000_976_562_5 && a < 0.015_625 && scaled - m == 0.5 {
++        return sign | (m as u8 + 1);
++    }
+     // 464 is the midpoint between 448 and the absent next code.
+     if a >= 464.0 {
+         return sign | 0x7e;

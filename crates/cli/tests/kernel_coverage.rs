@@ -449,17 +449,12 @@ fn every_prelude_probe_has_its_hipcc_twin() {
     const HIP_ONLY: [&str; 3] = ["cmp_bytes", "cmp_nan_words", "k_vq_wave_r1"];
     let src = corpus("crates/kernels/src/probes", "");
     let decl = format!("pub unsafe extern {:?} fn ", "gpu-kernel");
-    // Three spellings: a plain kernel, `sweep!(name, …)` and `probe!(name(…) = …)`.
-    let mut rust: Vec<String> = src
-        .lines()
-        .map(str::trim_start)
-        .filter_map(|l| {
-            let rest = l
-                .strip_prefix(decl.as_str())
-                .or_else(|| l.strip_prefix("sweep!("))
-                .or_else(|| l.strip_prefix("probe!("))?;
-            rest.split(['(', ',']).next()
-        })
+    // Three spellings: a plain kernel, `sweep!(name, …)` and `probe!(name(…) = …)` — matched
+    // anywhere, not per line, because rustfmt breaks a long macro call after its `(`.
+    let mut rust: Vec<String> = [decl.as_str(), "sweep!(", "probe!("]
+        .iter()
+        .flat_map(|opener| src.split(opener).skip(1))
+        .filter_map(|rest| rest.trim_start().split(['(', ',']).next())
         .filter(|n| !n.starts_with('$'))
         .map(String::from)
         .collect();

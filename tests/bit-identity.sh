@@ -21,13 +21,14 @@
 #   CARGO_TARGET_DIR=/var/cache/rivoli/target/<checkout> tests/bit-identity.sh
 #
 # CARGO_TARGET_DIR must be THIS checkout's dir (`/var/cache/rivoli/target/<basename of the
-# checkout>`): the binary, the device flags and the probe objects are all found under it, and
-# the login default (a shared dir) would hand this checkout a sibling's (§7e-bis).
+# checkout>`): the binary, the device flags, the probe objects and their scratch source copies
+# (`probes/<name>.src`, deleted and recreated by every build) all live under it, and the
+# login default (a shared dir) would hand this checkout a sibling's (§7e-bis).
 #
 # usage: tests/bit-identity.sh [--expect-red=ROWS] [test-binary]          launcher rows
 #        tests/bit-identity.sh --probes [--families=F,…] [test-binary]    prelude probe rows
 #        tests/bit-identity.sh --plant=FAMILY [test-binary]               a probe plant's arm
-#        tests/bit-identity.sh --build-probes[=FAMILY]                    deviceless build
+#        tests/bit-identity.sh --build-probes [--plant=FAMILY]            deviceless build
 #        --expect-red=ROWS  inverts the verdict, for a recorded red proof: GREEN only if every
 #                           row ran and examined something, EXACTLY the named rows are RED, and
 #                           every other row is BIT-IDENTICAL — a plant must redden the assertion
@@ -36,13 +37,17 @@
 #                           built from the in-tree probe.hip against the TAG's headers; the Rust
 #                           one is the clean object `--build-probes` built.
 #        --families=F,…     probe families to run (codec, reduce, fp8, i4, f4, vq).
-#        --plant=FAMILY     the probe rows against the `--build-probes=FAMILY` object, judged by
-#                           the family's row in plant_spec below: every red row matches its red
-#                           RE (at least one red), and at least one row matches its must-hold RE
-#                           and every such row is BIT-IDENTICAL (0b's check-arm.py rule).
-#        --build-probes[=F] build the Rust probe object (`--features probes[,plant_<F>]`) with
+#        --plant=FAMILY     the probe rows against that plant's object, judged by the family's
+#                           row in plant_spec below: every red row matches its red RE (at least
+#                           one red), and at least one row matches its must-hold RE and every
+#                           such row is BIT-IDENTICAL (0b's check-arm.py rule).
+#        --build-probes     build the Rust probe object (`--features probes`) from a scratch
+#                           COPY of crates/kernels (rivoli-abi still read in place), with
 #                           the device flags build/device.rs recorded for this checkout, into
-#                           $CARGO_TARGET_DIR/probes/<F or clean>, and print its path.
+#                           $CARGO_TARGET_DIR/probes/<FAMILY or clean>, and print its path. With
+#                           --plant, tests/bit-identity/plants/FAMILY.patch is applied to the
+#                           copy first: the plant is a small diff against the real prelude, so
+#                           no red-proof branch lives in shipped source and nothing is copied.
 #        test-binary        a specific built binary (a planted copy); default the newest built.
 #        BITIDENT_CLASSIFY=<stdout-file>  classify an existing arm's stdout and exit, no GPU and
 #                           no build — the classifier's own red proofs run this way.
@@ -63,11 +68,14 @@ ARCH=${RIVOLI_OFFLOAD_ARCH:-gfx1151}
 # A plant's arm: the families its defect can reach (plus a clean anchor where it reaches every
 # group of its own), the rows that must redden, and the rows that must hold. Derived from
 # 0b's CPU defect sets and device arms (rust-kernels.md §"Phase 0b — the prelude"), respelled
-# for this harness's row names (Rust float formatting: `s=NaN`). `barrier` has no row: a
-# missing barrier is a race the bits may not show, and its gate is the ISA census.
+# for this harness's row names (Rust float formatting: `s=NaN`). A patch plants the defect in
+# the real helper, so it reaches EVERY probe calling that helper (formats: `f2e4m3_rne` also
+# sits inside `ex_aq8`). `barrier` has a patch but no row: a missing barrier is a race the
+# bits may not show, and its judge (0b's scratch ISA census, `s_barrier` per kernel) is not
+# in the tree yet — owed.
 plant_spec() {
     case $1 in
-        formats) FAMILIES=codec RED_RE='^ex_f2e4m3$' HOLD_RE='^ex_(aq8|rbf16|f2bf16)' ;;
+        formats) FAMILIES=codec RED_RE='^ex_f2e4m3$|^ex_aq8 ' HOLD_RE='^ex_(aq4|rbf16|f2bf16)' ;;
         actquant) FAMILIES=codec RED_RE='^ex_aq[48] s=' HOLD_RE='^ex_aq[48] s=NaN$|^ex_f2e4m3$' ;;
         common) FAMILIES=codec RED_RE='^ex_swiglu ' HOLD_RE='^ex_situ_|^ex_moe_fixed$' ;;
         situ) FAMILIES=codec RED_RE='^ex_situ_' HOLD_RE='^ex_swiglu |^ex_moe_fixed$' ;;
@@ -88,14 +96,15 @@ while [ $# -gt 0 ]; do
         --probes) PROBES=1 ;;
         --families=?*) FAMILIES=${1#--families=} ;;
         --plant=?*) PLANT=${1#--plant=} PROBES=1 ;;
-        --build-probes) BUILD=clean ;;
-        --build-probes=?*) BUILD=${1#--build-probes=} ;;
+        --build-probes) BUILD=1 ;;
         --*) echo "FAIL: unknown option $1" >&2; exit 2 ;;
         *) break ;;
     esac
     shift
 done
-if [ -n "$PLANT" ]; then
+if [ -n "$BUILD" ]; then
+    [ -z "$EXPECT_RED$FAMILIES$*" ] || { echo "FAIL: --build-probes takes only --plant" >&2; exit 2; }
+elif [ -n "$PLANT" ]; then
     [ -z "$EXPECT_RED$FAMILIES" ] || { echo "FAIL: --plant sets its own verdict and families" >&2; exit 2; }
     plant_spec "$PLANT" || { echo "FAIL: no plant_spec row for '$PLANT'" >&2; exit 2; }
 fi
@@ -165,30 +174,58 @@ OWN=/var/cache/rivoli/target/$(basename "$ROOT")
 }
 # rustc names the code object `.elf`; `hipModuleLoad` takes it as-is.
 probe_object() { echo "$TARGET/probes/$1/amdgcn-amd-amdhsa/release/rivoli_kernels.elf"; }
+# What a probe object is built from: the crate sources (crates/abi included — the copy reads
+# it in place) and the plant's patch. Stamped at build, re-derived by the arm, so an object
+# left by an earlier build of an older tree or patch is refused rather than scored.
+probe_stamp() {
+    (cd "$ROOT" && find crates/kernels crates/abi -type f -print0 | sort -z | xargs -0 sha256sum |
+        sha256sum) || return 1
+    [ "$1" = clean ] || sha256sum <"$HERE/bit-identity/plants/$1.patch"
+}
 
 # ── Rust probe objects: deviceless, never inside the lock ────────────────────────────────
 if [ -n "$BUILD" ]; then
-    [ "$BUILD" = clean ] || [ "$BUILD" = barrier ] || plant_spec "$BUILD" ||
-        { echo "FAIL: no plant '$BUILD'" >&2; exit 2; }
+    NAME=${PLANT:-clean}
     FLAGS=$(find "$TARGET/debug/build" -path '*/rivoli-backend-*/out/device-rustflags' \
         -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     [ -n "$FLAGS" ] || { echo "FAIL: no device-rustflags under $TARGET — build the rocm arm first" >&2; exit 2; }
-    FEATURES=probes
-    [ "$BUILD" = clean ] || FEATURES=probes,plant_$BUILD
-    PT=$TARGET/probes/$BUILD
+    PT=$TARGET/probes/$NAME
+    SRC=$PT.src
+    STAMP=$(probe_stamp "$NAME") || { echo "FAIL: cannot stamp '$NAME' (no such plant?)" >&2; exit 2; }
+    # A failed build must not leave the previous object behind to be scored.
+    rm -rf "$SRC" "$PT.stamp" "$(probe_object "$NAME")" || exit 2
+    # The tree is copied whether or not a plant is applied, so a plant object and the clean one
+    # differ by the patch and nothing else. `cp -r`, not `-a`: fresh mtimes, so the nested
+    # cargo can never judge a copy Fresh against an object built from other source.
+    mkdir -p "$SRC" && cp -r "$ROOT/crates/kernels" "$SRC/" || exit 2
+    # rivoli-abi inherits its edition from the workspace root, so the copy points at it in
+    # place — the one manifest line that differs, in clean and plant copies alike (a miss
+    # leaves `../abi`, which does not exist beside the copy, and the build fails).
+    sed -i "s|path = \"../abi\"|path = \"$ROOT/crates/abi\"|" "$SRC/kernels/Cargo.toml" || exit 2
+    if [ -n "$PLANT" ]; then
+        # Exact context (-F0): a patch whose anchor moved refuses instead of landing elsewhere.
+        patch -p1 -F0 --no-backup-if-mismatch -d "$SRC/kernels" <"$HERE/bit-identity/plants/$NAME.patch" >&2 ||
+            { echo "FAIL: the $NAME patch does not apply" >&2; exit 2; }
+        diff -rq "$ROOT/crates/kernels/src" "$SRC/kernels/src" >/dev/null
+        drc=$?
+        [ "$drc" -eq 1 ] || { echo "FAIL: the $NAME patch changed nothing (diff rc=$drc)" >&2; exit 2; }
+        [ "$(probe_stamp "$NAME")" = "$STAMP" ] ||
+            { echo "FAIL: the checkout's crates/kernels changed under the patch" >&2; exit 2; }
+    fi
     mkdir -p "$PT" || exit 2
     # A clean environment rather than a list of variables to strip (the outer shell's
     # CARGO_TARGET_DIR, RUSTFLAGS, RUSTUP_TOOLCHAIN, wrappers…): nothing reaches the nested
     # build but the flags read above, and rustup resolves the pin from the crate's own
     # rust-toolchain.toml because the build runs in its directory.
-    (cd "$ROOT/crates/kernels" &&
+    (cd "$SRC/kernels" &&
         env -i PATH="$PATH" HOME="$HOME" ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
             ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} CARGO_ENCODED_RUSTFLAGS="$(cat "$FLAGS")" \
             cargo build --release --locked --target amdgcn-amd-amdhsa -Zbuild-std=core \
-            --target-dir "$PT" --features "$FEATURES") >"$PT.log" 2>&1
+            --target-dir "$PT" --features probes) >"$PT.log" 2>&1
     rc=$?
     [ "$rc" -eq 0 ] || { echo "FAIL: probe build rc=$rc (see $PT.log)" >&2; exit 2; }
-    probe_object "$BUILD"
+    printf '%s\n' "$STAMP" >"$PT.stamp" || exit 2
+    probe_object "$NAME"
     exit 0
 fi
 
@@ -220,7 +257,8 @@ if [ -n "$PROBES" ]; then
         "$ROOT/crates/engine/tests/bit_identity/probes/probe.hip" -o "$HP" \
         >"$SCRATCH/hipcc.log" 2>&1 || { echo "FAIL: hipcc (see $SCRATCH/hipcc.log)" >&2; exit 2; }
     RP=$(probe_object "${PLANT:-clean}")
-    [ -f "$RP" ] || { echo "FAIL: no $RP — run --build-probes${PLANT:+=$PLANT} first" >&2; exit 2; }
+    [ -f "$RP" ] && [ "$(cat "$TARGET/probes/${PLANT:-clean}.stamp" 2>/dev/null)" = "$(probe_stamp "${PLANT:-clean}")" ] ||
+        { echo "FAIL: no current $RP — run --build-probes${PLANT:+ --plant=$PLANT} first" >&2; exit 2; }
     # The reference source is the working tree's probe.hip (its bodies are thin calls into the
     # tag's headers); its hash and both objects' are printed so an arm names what it compared.
     sha256sum "$ROOT/crates/engine/tests/bit_identity/probes/probe.hip" "$HP" "$RP" |

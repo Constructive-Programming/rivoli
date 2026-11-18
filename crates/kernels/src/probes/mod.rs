@@ -6,15 +6,13 @@
 //! `archive/hip-kernels` headers), so `tests/bit-identity.sh --probes` launches both with
 //! one argument buffer and compares the outputs. Ported from Phase 0b's scratch harness
 //! (`docs/investigations/rust-kernels.md` §"Phase 0b — the prelude", 2026-11-18), which
-//! measured them on the device; each
-//! `plant_*` feature swaps ONE helper family for a defective copy in [`plants`].
+//! measured them on the device. A red-proof plant is a patch to the real prelude
+//! (`tests/bit-identity/plants/<family>.patch`), applied to a scratch copy, never a cfg here.
 
 use core::arch::amdgpu::{workgroup_id_x, workitem_id_x};
 use core::intrinsics::gpu::gpu_launch_sized_workgroup_mem;
 
 use crate::prelude::{self as p, dot_fp8, dot_nib, dot_vq, formats as f, reduce, rowview};
-
-mod plants;
 
 // Every probe launches 256-thread blocks; the block size is a constant, never read from
 // the dispatch packet (Phase 0c rule).
@@ -37,63 +35,50 @@ macro_rules! sweep {
     };
 }
 
-// The families a plant may replace are named through these paths.
-#[cfg(not(feature = "plant_formats"))]
-use f as fm;
-#[cfg(not(any(feature = "plant_common", feature = "plant_situ")))]
-use p as cm;
-#[cfg(not(feature = "plant_actquant"))]
-use p::actquant as aq;
-#[cfg(feature = "plant_actquant")]
-use plants::actquant as aq;
-#[cfg(any(feature = "plant_common", feature = "plant_situ"))]
-use plants::common as cm;
-#[cfg(feature = "plant_formats")]
-use plants::formats as fm;
-
 sweep!(ex_bf16f, f32, |b| f::bf16f(b as u16));
 sweep!(ex_rbf16, f32, |b| f::rbf16(f32::from_bits(b)));
-sweep!(ex_e4m3f, f32, |b| fm::e4m3f(b as u8));
-sweep!(ex_e2m1f, f32, |b| fm::e2m1f(b));
+sweep!(ex_e4m3f, f32, |b| f::e4m3f(b as u8));
+sweep!(ex_e2m1f, f32, |b| f::e2m1f(b));
 sweep!(ex_e8m0f, f32, |b| dot_nib::e8m0f(b as u8));
-sweep!(ex_frs, f32, |b, max_inv: f32| aq::fast_round_scale(
-    f32::from_bits(b),
-    max_inv
-));
-sweep!(ex_aq8, f32, |b, s: f32| aq::act_quant_roundtrip(
+sweep!(
+    ex_frs,
+    f32,
+    |b, max_inv: f32| p::actquant::fast_round_scale(f32::from_bits(b), max_inv)
+);
+sweep!(ex_aq8, f32, |b, s: f32| p::actquant::act_quant_roundtrip(
     f32::from_bits(b),
     s
 ));
-sweep!(ex_aq4, f32, |b, s: f32| aq::fp4_quant_roundtrip(
+sweep!(ex_aq4, f32, |b, s: f32| p::actquant::fp4_quant_roundtrip(
     f32::from_bits(b),
     s
 ));
 sweep!(ex_nib, f32, |b, k: i32| {
     <dot_nib::I4 as dot_nib::NibFormat>::decode(b >> (4 * k))
 });
-sweep!(ex_swiglu, f32, |b, limit: f32| cm::swiglu_clamped(
+sweep!(ex_swiglu, f32, |b, limit: f32| p::swiglu_clamped(
     f::bf16f((b >> 16) as u16),
     f::bf16f(b as u16),
     limit
 ));
-sweep!(ex_situ_g, f32, |b, u: f32, b1: f32, b2: f32| cm::situ_glu(
+sweep!(ex_situ_g, f32, |b, u: f32, b1: f32, b2: f32| p::situ_glu(
     f32::from_bits(b),
     u,
     b1,
     b2
 ));
-sweep!(ex_situ_u, f32, |b, g: f32, b1: f32, b2: f32| cm::situ_glu(
+sweep!(ex_situ_u, f32, |b, g: f32, b1: f32, b2: f32| p::situ_glu(
     g,
     f32::from_bits(b),
     b1,
     b2
 ));
-sweep!(ex_f2bf16, u16, |b| fm::f2bf16(f32::from_bits(b)));
-sweep!(ex_f2e4m3, u8, |b| fm::f2e4m3_rne(f32::from_bits(b)));
-sweep!(ex_f2e2m1, u32, |b| fm::f2e2m1(f32::from_bits(b)));
+sweep!(ex_f2bf16, u16, |b| f::f2bf16(f32::from_bits(b)));
+sweep!(ex_f2e4m3, u8, |b| f::f2e4m3_rne(f32::from_bits(b)));
+sweep!(ex_f2e2m1, u32, |b| f::f2e2m1(f32::from_bits(b)));
 sweep!(ex_blk_shift, u32, |b| rowview::blk_shift(b as i32) as u32);
 sweep!(ex_nquad, u32, |b| p::absorb_nquad(b as i32) as u32);
-sweep!(ex_moe_fixed, u64, |b| cm::moe_fixed(f32::from_bits(b)));
+sweep!(ex_moe_fixed, u64, |b| p::moe_fixed(f32::from_bits(b)));
 
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn k_lut(out: *mut f32) {
@@ -101,20 +86,15 @@ pub unsafe extern "gpu-kernel" fn k_lut(out: *mut f32) {
 }
 
 // ── reductions ──
-#[cfg(any(feature = "plant_reduce", feature = "plant_barrier"))]
-use plants::reduce as rd;
-#[cfg(not(any(feature = "plant_reduce", feature = "plant_barrier")))]
-use reduce as rd;
-
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn k_wave_sum(input: *const f32, out: *mut f32) {
     let g = gid() as usize;
-    unsafe { *out.add(g) = rd::wave_sum(*input.add(g)) }
+    unsafe { *out.add(g) = reduce::wave_sum(*input.add(g)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn k_wave_max(input: *const f32, out: *mut f32) {
     let g = gid() as usize;
-    unsafe { *out.add(g) = rd::wave_max(*input.add(g)) }
+    unsafe { *out.add(g) = reduce::wave_max(*input.add(g)) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn k_block_sum2(
@@ -127,27 +107,14 @@ pub unsafe extern "gpu-kernel" fn k_block_sum2(
     let t = workitem_id_x() as usize;
     let g = workgroup_id_x() as usize * bd as usize + t;
     unsafe {
-        let s = rd::block_sum_lds(*a.add(g), red, t, bd as usize);
-        let u = rd::block_sum_lds(*b.add(g), red, t, bd as usize);
+        let s = reduce::block_sum_lds(*a.add(g), red, t, bd as usize);
+        let u = reduce::block_sum_lds(*b.add(g), red, t, bd as usize);
         *out.add(2 * g) = s;
         *out.add(2 * g + 1) = u;
     }
 }
 
 // ── dots ──
-#[cfg(not(feature = "plant_fp8"))]
-use dot_fp8 as d8;
-#[cfg(not(feature = "plant_nib"))]
-use dot_nib as dn;
-#[cfg(not(feature = "plant_vq"))]
-use dot_vq as dv;
-#[cfg(feature = "plant_fp8")]
-use plants::dot_fp8 as d8;
-#[cfg(feature = "plant_nib")]
-use plants::dot_nib as dn;
-#[cfg(feature = "plant_vq")]
-use plants::dot_vq as dv;
-
 const W: usize = reduce::WAVE;
 
 /// One wave per weight row: (row, lane), or None past `o_dim`.
@@ -244,7 +211,7 @@ unsafe fn fp8_wave<const R: usize, const U: usize>(a: Fp8Args) {
     let row = unsafe { fp8_row(&a, wr.map_or(0, |(o, _)| o)) };
     unsafe {
         store_wave(a.out, wr, |_, lane| {
-            d8::dot_fp8_wave_r::<R, U>(a.x(), row, lane)
+            dot_fp8::dot_fp8_wave_r::<R, U>(a.x(), row, lane)
         })
     };
 }
@@ -257,7 +224,7 @@ unsafe fn fp8_splitk<const R: usize, const U: usize>(a: Fp8Args) {
         start: t,
         stride: BLOCK as usize,
     };
-    let acc = unsafe { d8::fp8_dot_strided_r::<R, U>(a.x(), row, span) };
+    let acc = unsafe { dot_fp8::fp8_dot_strided_r::<R, U>(a.x(), row, span) };
     unsafe { store_rows(a.out, (o, t, BLOCK as usize), acc) };
 }
 
@@ -294,7 +261,7 @@ unsafe fn nib_wave<F: dot_nib::NibFormat, const R: usize, const U: usize>(a: Nib
                 scale: a.scale.add(o * groups),
                 dim: d,
             };
-            dn::dot_nib_wave_r::<R, U, F>(rowview::RowsView { x: a.v, stride: d }, row, lane)
+            dot_nib::dot_nib_wave_r::<R, U, F>(rowview::RowsView { x: a.v, stride: d }, row, lane)
         })
     };
 }
@@ -331,7 +298,7 @@ unsafe fn vq_wave<const R: usize>(a: VqArgs) {
                 cb: a.cb,
                 i_dim: d,
             };
-            dv::dot_vq_wave_r::<R>(xs, row, lane)
+            dot_vq::dot_vq_wave_r::<R>(xs, row, lane)
         })
     };
 }

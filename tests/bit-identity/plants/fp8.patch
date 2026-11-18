@@ -1,0 +1,11 @@
+--- a/src/prelude/dot_fp8.rs
++++ b/src/prelude/dot_fp8.rs
+@@ -82,7 +82,7 @@
+             for (r, a) in acc.iter_mut().enumerate() {
+                 let xr = x.at(r, i0);
+                 let xq = [*xr, *xr.add(1), *xr.add(2), *xr.add(3)];
+-                *a = fmuladd(s, quad(xq, l), *a);
++                *a += s * quad(xq, l); // PLANT: the accumulator fma split
+             }
+         });
+         for_strided::<1>((n4 << 2) + span.start, w.i_dim, span.stride, |i| {
