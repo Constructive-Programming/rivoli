@@ -87,6 +87,8 @@ pub fn rivoli_kernels(tc: &Toolchain) -> PathBuf {
         "Cargo.lock",
         "../abi/src",
         "../abi/Cargo.toml",
+        // rivoli-abi inherits its edition and lints from the workspace root.
+        "../../Cargo.toml",
     ] {
         println!("cargo:rerun-if-changed={}", kdir.join(p).display());
     }

@@ -18,7 +18,7 @@ mod codec;
 mod dots;
 
 use crate::common::{DeviceBuf, dev};
-use rivoli_backend::{CodeObject, Geometry as Geom, fill_u32};
+use rivoli_backend::{CodeObject, Geometry as Geom, LdsBytes, fill_u32};
 use std::ffi::{CString, c_void};
 
 /// A device buffer of known length, as the probe rows use one.
@@ -109,6 +109,18 @@ impl Out {
     }
 }
 
+/// Every probe but `k_block_sum2` launches 256-thread blocks (the Rust probes' `BLOCK`).
+pub const BLOCK: u32 = 256;
+
+/// `n` blocks of [`BLOCK`] threads, no dynamic LDS — the common probe launch.
+pub fn blocks(n: u32) -> Geom {
+    Geom {
+        blocks: n,
+        threads: BLOCK,
+        lds: LdsBytes(0),
+    }
+}
+
 /// Kernels `(hipcc, Rust)` — the same name but for `k_vq_wave_r1` — and the geometry both
 /// launch at.
 pub type Pair<'a> = ((&'a str, &'a str), Geom);
@@ -178,7 +190,8 @@ impl Probes {
                 .p(o.b.ptr())
                 .p(n)
                 .p(c.ptr_mut());
-            self.hip.launch(k, (n.div_ceil(256) as u32, 256, 0), args);
+            self.hip
+                .launch(k, blocks(n.div_ceil(BLOCK as usize) as u32), args);
             let v = crate::common::back(&c);
             (
                 u64::from_le_bytes(v[..8].try_into().expect("8")),

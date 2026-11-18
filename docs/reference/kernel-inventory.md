@@ -11,7 +11,8 @@ column is a query, and a query can be wrong.
 
 ## How each column was built, and what would make it lie
 
-* **Rows.** The `launchers!` DSL rows in `crates/backend/src/{hip_linalg,hip_blocks,hip_attn}.rs`
+* **Rows.** The `launchers!` DSL rows in `crates/backend/src/{hip_linalg,hip_activation,hip_blocks,hip_attn}.rs`
+  (`hip_activation` split out of `hip_linalg` 2026-11-18)
   (grammar `rust_fn -> c_symbol, "tag" (args)`), plus the four hand-written launchers in
   `hip.rs`/`hip_attn.rs` that the macro refuses. 66 in total, which is the same population
   `kernel_coverage.rs` prints (`66 launchers: 66 with oracles, 0 deferred`, measured by
@@ -40,7 +41,8 @@ column is a query, and a query can be wrong.
 > **2026-11-18 (Rust-kernel Phase 0a):** the 13 rows whose TU reads `activation.rs` /
 > `residual.rs` are Rust now (`act_quant_f8`'s cell read `moe_f4.hip`, the TU that CALLS it
 > C-to-C — wrong before this move too; it still does, through the Rust export) — `crates/kernels/src/`, launched through `launchers!`'s `=>`
-> rows and `crates/backend/src/rk_launchers.rs`; `activation.hip` and `residual.hip` are
+> rows and `crates/backend/src/rk_launchers.rs` (split by family into `src/launch/` at the
+> Phase 0 merge review, 2026-11-18); `activation.hip` and `residual.hip` are
 > deleted, and each kernel is scored byte-for-byte against its tagged hipcc twin by
 > `tests/bit-identity.sh`. Names are unchanged in both columns.
 

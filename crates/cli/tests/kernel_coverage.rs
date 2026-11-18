@@ -30,6 +30,8 @@
 
 mod common;
 
+use std::path::Path;
+
 /// Launchers whose oracle files arrive with a later milestone. `arrives` names the
 /// milestone and the old-tree oracle file that covers it there, so the port task is
 /// written down where the gap is enforced.
@@ -78,7 +80,7 @@ const DEFERRED: &[(&str, &str)] = &[
 ];
 
 /// The two arrows a `launchers!` row may carry: `->` (a hipcc launcher, declared `extern`)
-/// and `=>` (a Rust launcher, `src/rk_launchers.rs`, since 2026-11-18).
+/// and `=>` (a Rust launcher, `src/launch/`, since 2026-11-18).
 ///
 /// **The `=>` form was added because the scanner went blind without it, and only half the
 /// census noticed.** With the 13 activation/residual rows moved to `=>` and this list still
@@ -88,18 +90,23 @@ const DEFERRED: &[(&str, &str)] = &[
 /// 2026-11-18, `docs/measurement/gate-red-proofs.md` §18). Hence also the floor below.
 const ARROWS: [&str; 2] = [" -> rivoli_", " => rivoli_"];
 
-/// Launcher names in `text`, under both declaration forms (hand-written `pub unsafe fn
+/// The launcher stem every census strips (a `const` here is no scanner hazard: no scanner
+/// matches the bare stem).
+const LAUNCH_STEM: &str = "launch_";
+
+/// Launcher names in the backend's sources, under both declaration forms (hand-written `pub unsafe fn
 /// launch_*` and the `launchers!` DSL's `launch_* -> rivoli_*` / `launch_* => rivoli_*`
-/// rows). `decl`/`stem` are built by the caller at runtime so this file's own text cannot
-/// trip its scanner.
-fn launcher_names(text: &str, decl: &str, stem: &str) -> Vec<String> {
-    text.lines()
+/// rows). The patterns are built at runtime so this file's own text cannot trip its scanner.
+fn launcher_names() -> Vec<String> {
+    let decl = format!("pub unsafe fn {}", LAUNCH_STEM);
+    corpus(Path::new("crates/backend/src"))
+        .lines()
         .map(str::trim_start)
         .filter_map(|l| {
-            l.strip_prefix(decl)
+            l.strip_prefix(decl.as_str())
                 .and_then(|rest| rest.split('(').next())
                 .or_else(|| {
-                    let rest = l.strip_prefix(stem)?;
+                    let rest = l.strip_prefix(LAUNCH_STEM)?;
                     let arrow = ARROWS.iter().find(|a| rest.contains(*a))?;
                     rest.split(*arrow).next()
                 })
@@ -109,24 +116,14 @@ fn launcher_names(text: &str, decl: &str, stem: &str) -> Vec<String> {
 }
 
 /// Every `.rs` under `dir` (workspace-relative), concatenated, read LOUDLY — a missing
-/// file is a shrunken corpus and a shrunken corpus is a silent pass. `skip` excludes this
-/// file itself from the corpus it searches (its own table text would satisfy any probe),
-/// and the exclusion must actually exclude something.
-fn corpus(dir: &str, skip: &str) -> String {
+/// file is a shrunken corpus and a shrunken corpus is a silent pass. (It once took a file
+/// name to skip, for when this file sat inside a corpus it searched; no caller has passed
+/// one since the censuses moved to `crates/cli/tests`, so the parameter is gone — 2026-11-18.)
+fn corpus(dir: &Path) -> String {
     let root = common::repo_root().join(dir);
     let all = common::walk(&root, "rs");
-    let kept: Vec<_> = all
-        .iter()
-        .filter(|p| p.file_name().is_none_or(|n| n != skip))
-        .collect();
-    assert_eq!(
-        all.len() - kept.len(),
-        usize::from(!skip.is_empty()),
-        "corpus({dir:?}) was told to skip {skip:?} and skipped {} file(s)",
-        all.len() - kept.len()
-    );
-    assert!(!kept.is_empty(), "corpus({dir:?}) is empty — wrong root?");
-    kept.iter()
+    assert!(!all.is_empty(), "corpus({dir:?}) is empty — wrong root?");
+    all.iter()
         .map(|p| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p:?}: {e}")))
         .collect::<Vec<_>>()
         .join("\n")
@@ -134,31 +131,56 @@ fn corpus(dir: &str, skip: &str) -> String {
 
 /// The launcher population plus the probe stem, shared by both censuses so they cannot
 /// disagree about what the backend contains.
-fn backend_launchers() -> (String, Vec<String>) {
-    let decl = format!("pub unsafe fn {}", "launch_");
-    let stem = format!("{}{}", "launch", "_");
-    let launchers = launcher_names(&corpus("crates/backend/src", ""), &decl, &stem);
+fn backend_launchers() -> Vec<String> {
+    let launchers = launcher_names();
 
-    // Anti-vacuity floor: 66 measured 2026-11-18 (53 on 2026-08-15, under a floor of 45 that
-    // then sat 21 BELOW the population — low enough that losing every Rust launcher at once
-    // passed, see `ARROWS`). A floor is only a check while it sits AT the population; raise
-    // it with each lane that adds launchers, never let the slack regrow.
+    // Anti-vacuity, DERIVED (Phase 0 merge review, 2026-11-18): the scanned population must
+    // equal `kernel-inventory.md`'s table, both ends. It was a hand-bumped floor — 45 under a
+    // population of 53 on 2026-08-15, low enough that losing every Rust launcher at once
+    // passed (see `ARROWS`), then 66 — and a floor is only a check while someone remembers to
+    // move it. A launcher added without its inventory row, or a row outliving its launcher,
+    // is now a deviceless red, and no number lives in this file.
+    let table = inventory_table();
+    let mut sorted = launchers.clone();
+    sorted.sort();
+    let (unlisted, stale) = one_sided(&sorted, &table);
     assert!(
-        launchers.len() >= 66,
-        "found only {} launchers under crates/backend/src (66 on 2026-11-18) — the \
-         declaration pattern has changed underneath this scanner",
-        launchers.len()
+        unlisted.is_empty() && stale.is_empty(),
+        "\n\nlaunchers with no kernel-inventory.md table row:\n  {}\n\ninventory rows naming no \
+         launcher (or the declaration pattern changed underneath this scanner):\n  {}",
+        bullet(&unlisted),
+        bullet(&stale)
     );
-    (stem, launchers)
+    launchers
 }
 
-/// `plain` cites `base` in either form: a direct call `base(`, or `(base,` — handed to a
-/// shared launch helper as its FIRST argument, probed against `dense` (the caller's
-/// whitespace-stripped view of the same corpus) because rustfmt line-breaks long calls.
-/// The block comment at the oracle census's call site argues both forms and why the `(`
-/// is load-bearing.
-fn references(plain: &str, dense: &str, base: &str) -> bool {
-    plain.contains(&format!("{base}(")) || dense.contains(&format!("({base},"))
+/// A corpus in both views the citation probe reads: as written, and whitespace-stripped
+/// (rustfmt line-breaks long calls, so `(launch_x,` may never appear literally).
+struct Cited {
+    plain: String,
+    dense: String,
+}
+
+impl Cited {
+    /// The `.rs` corpora under `dirs`, joined.
+    fn of(dirs: &[&Path]) -> Self {
+        let plain = dirs
+            .iter()
+            .map(|d| corpus(d))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dense = plain.chars().filter(|c| !c.is_whitespace()).collect();
+        Self { plain, dense }
+    }
+
+    /// The corpus cites launcher `name` (bare, as `launcher_names` yields it) in either
+    /// form: a direct call `launch_name(`, or `(launch_name,` — handed to a shared launch
+    /// helper as its FIRST argument, probed against the dense view. The block comment at
+    /// the oracle census's call site argues both forms and why the `(` is load-bearing.
+    fn cites(&self, name: &str) -> bool {
+        let base = format!("{LAUNCH_STEM}{name}");
+        self.plain.contains(&format!("{base}(")) || self.dense.contains(&format!("({base},"))
+    }
 }
 
 /// One name per line, indented — the shape both refusals print their populations in.
@@ -172,11 +194,11 @@ fn bullet(names: &[&String]) -> String {
 
 #[test]
 fn every_launcher_has_an_oracle_or_a_live_deferral() {
-    let (stem, launchers) = backend_launchers();
+    let (stem, launchers) = (LAUNCH_STEM, backend_launchers());
 
     // The oracle corpus: engine's device tests. No size floor — a truncated corpus only
     // makes launchers look UNCOVERED, which fails loudly by itself.
-    let tests = corpus("crates/engine/tests", "");
+    let tests = Cited::of(&[Path::new("crates/engine/tests")]);
     // **Two forms count as exercising a launcher, and the second was added 2026-08-17 because a
     // legitimate refactor made real coverage invisible.**
     //
@@ -202,8 +224,6 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
     // `fn_call_width`, so `(launch_x,` never appears literally. Measured 2026-08-17 — the census
     // passed with a stale DEFERRED row because of exactly this, which is a FALSE GREEN and the
     // reason the stripping is here rather than a comment about being careful.
-    let dense: String = tests.chars().filter(|c| !c.is_whitespace()).collect();
-    let covered = |name: &str| references(&tests, &dense, &format!("{stem}{name}"));
 
     // Both ends of every deferral, before the census consults it.
     for (name, arrives) in DEFERRED {
@@ -214,7 +234,7 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
              delete it. (was: {arrives})"
         );
         assert!(
-            !covered(name),
+            !tests.cites(name),
             "DEFERRED row for `{stem}{name}` ({arrives}) — but a test now covers it. The \
              deferral has outlived its reason; delete the row so the census owns the claim."
         );
@@ -225,7 +245,7 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
     // refused its own table, which is the check working on its author.
     let missing: Vec<&String> = launchers
         .iter()
-        .filter(|l| !covered(l) && !DEFERRED.iter().any(|(n, _)| n == l))
+        .filter(|l| !tests.cites(l) && !DEFERRED.iter().any(|(n, _)| n == l))
         .collect();
 
     assert!(
@@ -246,26 +266,104 @@ fn every_launcher_has_an_oracle_or_a_live_deferral() {
     );
 }
 
+/// A file or corpus the censuses scan, and every way they read one — the scanning lives
+/// here so each census states WHAT it reads, not how.
+struct Text(String);
+
+impl Text {
+    /// A workspace file, read loudly.
+    fn read(rel: &Path) -> Self {
+        let path = common::repo_root().join(rel);
+        Self(std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}")))
+    }
+
+    /// The `.rs` corpus under a workspace directory.
+    fn corpus(dir: &Path) -> Self {
+        Self(corpus(dir))
+    }
+
+    fn lines(&self) -> std::str::Lines<'_> {
+        self.0.lines()
+    }
+
+    /// The text from the first `start` to the next `end` (or to the end of the text),
+    /// whitespace-stripped — rustfmt breaks long entries anywhere, so a table is read in this
+    /// form. Loud if `start` is gone.
+    fn dense_between(&self, start: &str, end: &str) -> Self {
+        let rest = self
+            .0
+            .split_once(start)
+            .unwrap_or_else(|| panic!("lost {start:?}"))
+            .1;
+        let body = rest.split_once(end).map_or(rest, |(b, _)| b);
+        Self(body.chars().filter(|c| !c.is_whitespace()).collect())
+    }
+
+    /// The table rows (`| \`…`) of the section headed by the line `heading`, up to the
+    /// next `## `.
+    fn table(&self, heading: &str) -> Vec<&str> {
+        self.0
+            .split_once(&format!("\n{heading}\n"))
+            .unwrap_or_else(|| panic!("lost the {heading:?} section"))
+            .1
+            .split("\n## ")
+            .next()
+            .expect("split yields at least one piece")
+            .lines()
+            .filter(|l| l.starts_with("| `"))
+            .collect()
+    }
+
+    /// Every name that follows `opener`, up to `close` (trimmed), sorted.
+    fn names_after(&self, opener: &str, close: char) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .0
+            .split(opener)
+            .skip(1)
+            .filter_map(|rest| rest.split(close).next())
+            .map(|n| n.trim().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.0.contains(needle)
+    }
+}
+
+/// The first cell (backticks stripped) of every row of `kernel-inventory.md`'s main table
+/// — the launcher population, one row each. Loud when the section is gone or empty. Sorted.
+fn inventory_table() -> Vec<String> {
+    let heading = "## The table";
+    let doc = Text::read(Path::new("docs/reference/kernel-inventory.md"));
+    let mut rows: Vec<String> = doc
+        .table(heading)
+        .iter()
+        .filter_map(|l| l.strip_prefix("| `")?.split('`').next())
+        .map(String::from)
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "kernel-inventory.md's {heading:?} section has no rows"
+    );
+    rows.sort();
+    rows
+}
+
 /// The uncalled table in `docs/reference/kernel-inventory.md`: each row's launcher (first
 /// cell, backticks stripped) and its category cell. Loud at every step — a heading that
 /// went missing or a row without a category is a shrunken registry, and a shrunken
 /// registry lets a dead launcher pass as classified.
 fn inventory_uncalled_rows() -> Vec<(String, String)> {
-    let path = common::repo_root().join("docs/reference/kernel-inventory.md");
-    let doc = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    let doc = Text::read(Path::new("docs/reference/kernel-inventory.md"));
     let heading = doc
         .lines()
         .find(|l| l.starts_with("## ") && l.ends_with("that no production code calls"))
         .expect("kernel-inventory.md lost its uncalled-launchers heading");
     let rows: Vec<(String, String)> = doc
-        .split_once(heading)
-        .expect("heading came from doc")
-        .1
-        .split("\n## ")
-        .next()
-        .expect("split yields at least one piece")
-        .lines()
-        .filter(|l| l.starts_with("| `"))
+        .table(heading)
+        .into_iter()
         .map(|l| {
             let cells: Vec<&str> = l.split('|').map(str::trim).collect();
             assert!(
@@ -289,7 +387,7 @@ fn inventory_uncalled_rows() -> Vec<(String, String)> {
 
 #[test]
 fn every_launcher_is_shipped_or_classified_uncalled() {
-    let (stem, launchers) = backend_launchers();
+    let (stem, launchers) = (LAUNCH_STEM, backend_launchers());
 
     // The production corpus: what ships. Test files never count — that distinction is the
     // point (`kernel-inventory.md`, "Model columns"): the oracle census answers yes for
@@ -304,13 +402,7 @@ fn every_launcher_is_shipped_or_classified_uncalled() {
     // appears anywhere under either root, checked 2026-09-10), and a launcher reached
     // only through a fn-pointer table would read as uncalled — which fails LOUDLY here,
     // the safe direction.
-    let prod = format!(
-        "{}\n{}",
-        corpus("crates/engine/src", ""),
-        corpus("crates/cli/src", "")
-    );
-    let dense: String = prod.chars().filter(|c| !c.is_whitespace()).collect();
-    let live = |name: &str| references(&prod, &dense, &format!("{stem}{name}"));
+    let prod = Cited::of(&[Path::new("crates/engine/src"), Path::new("crates/cli/src")]);
 
     // Both ends of every classification, before the census consults the table.
     let rows = inventory_uncalled_rows();
@@ -322,7 +414,7 @@ fn every_launcher_is_shipped_or_classified_uncalled() {
              exist explains nothing — delete it."
         );
         assert!(
-            !live(name),
+            !prod.cites(name),
             "kernel-inventory.md carries `{name}` as uncalled ({category}), but production \
              code now calls `{stem}{name}`. The classification has outlived its reason — \
              delete the row and light the model column instead."
@@ -332,7 +424,7 @@ fn every_launcher_is_shipped_or_classified_uncalled() {
     let classified: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
     let unclassified: Vec<&String> = launchers
         .iter()
-        .filter(|l| !live(l) && !classified.contains(&l.as_str()))
+        .filter(|l| !prod.cites(l) && !classified.contains(&l.as_str()))
         .collect();
     assert!(
         unclassified.is_empty(),
@@ -352,20 +444,13 @@ fn every_launcher_is_shipped_or_classified_uncalled() {
     );
 }
 
-/// The Rust kernels' two ends, checked against each other (added 2026-11-18 with
-/// `crates/kernels`): every `#[no_mangle]` gpu-kernel in the device crate has exactly one
-/// host `Kernel::new(c"…")` handle, and every handle names a kernel that exists.
-///
-/// A handle without a kernel compiles and fails only at its first launch, on the GPU
-/// (`hipModuleGetFunction`), which no deviceless run ever reaches; a kernel without a handle
-/// is dead code in the shipped code object. This test is where both become a deviceless red.
-#[test]
-fn every_rust_kernel_has_exactly_one_host_handle() {
+/// The shipped gpu-kernels: every `pub unsafe extern "gpu-kernel" fn` under
+/// `crates/kernels/src` except the prelude PROBES (`src/probes`), which are not shipped — the
+/// gate launches them by name from a separate code object, so they owe no host handle and no
+/// gate row; their own census is `every_prelude_probe_has_its_hipcc_twin` below. Excluded by
+/// PATH, so a shipped kernel can never drop out by sharing a probe's name. Sorted.
+fn shipped_kernels() -> Vec<String> {
     let decl = format!("pub unsafe extern {:?} fn ", "gpu-kernel");
-    // The prelude PROBES (`crates/kernels/src/probes`) are not shipped kernels: the gate
-    // launches them by name from a separate code object, so they owe no host handle — their
-    // own census is `every_prelude_probe_has_its_hipcc_twin` below. Excluded by PATH, so a
-    // shipped kernel can never drop out of this census by sharing a probe's name.
     let root = common::repo_root().join("crates/kernels/src");
     let probes = root.join("probes");
     let shipped: Vec<String> = common::walk(&root, "rs")
@@ -384,24 +469,43 @@ fn every_rust_kernel_has_exactly_one_host_handle() {
         })
         .map(String::from)
         .collect();
-    // `Kernel::new(c"name")`, keyed by the C-string name the handle resolves — the name the
-    // code object exports. (A `=>` row naming a missing `rivoli_*` host half needs no census:
-    // the wrapper calls it, so that is a compile error, and an unused one is a denied
-    // dead-code warning — the compiler checks both ends of that pair.)
-    let mut host: Vec<String> = corpus("crates/backend/src", "")
-        .split(&format!("{}::new(c\"", "Kernel"))
-        .skip(1)
-        .filter_map(|rest| rest.split('"').next())
-        .map(String::from)
-        .collect();
     device.sort();
-    host.sort();
-    // Anti-vacuity: 14 measured 2026-11-18 (activation 9, residual 4, touch 1).
     assert!(
-        device.len() >= 14,
-        "found only {} gpu-kernels in crates/kernels/src",
-        device.len()
+        !device.is_empty(),
+        "no gpu-kernels found in crates/kernels/src"
     );
+    device
+}
+
+/// `Kernel::new(c"name")` handles in the backend, keyed by the C-string name the handle
+/// resolves — the name the code object exports. Sorted, duplicates kept (one census refuses
+/// them).
+fn host_handles() -> Vec<String> {
+    Text::corpus(Path::new("crates/backend/src"))
+        .names_after(&format!("{}::new(c\"", "Kernel"), '"')
+}
+
+/// Both ends of a pairing: what `a` has that `b` lacks, and the reverse.
+fn one_sided<'a, T: PartialEq>(a: &'a [T], b: &'a [T]) -> (Vec<&'a T>, Vec<&'a T>) {
+    (
+        a.iter().filter(|k| !b.contains(k)).collect(),
+        b.iter().filter(|k| !a.contains(k)).collect(),
+    )
+}
+
+/// The Rust kernels' two ends, checked against each other (added 2026-11-18 with
+/// `crates/kernels`): every `#[no_mangle]` gpu-kernel in the device crate has exactly one
+/// host `Kernel::new(c"…")` handle, and every handle names a kernel that exists.
+///
+/// A handle without a kernel compiles and fails only at its first launch, on the GPU
+/// (`hipModuleGetFunction`), which no deviceless run ever reaches; a kernel without a handle
+/// is dead code in the shipped code object. This test is where both become a deviceless red.
+#[test]
+fn every_rust_kernel_has_exactly_one_host_handle() {
+    // (A `=>` row naming a missing `rivoli_*` host half needs no census: the wrapper calls
+    // it, so that is a compile error, and an unused one is a denied dead-code warning — the
+    // compiler checks both ends of that pair.)
+    let (device, host) = (shipped_kernels(), host_handles());
     let dup: Vec<&String> = host
         .windows(2)
         .filter(|w| w[0] == w[1])
@@ -412,8 +516,7 @@ fn every_rust_kernel_has_exactly_one_host_handle() {
         "kernel(s) with more than one host handle:\n  {}",
         bullet(&dup)
     );
-    let orphans: Vec<&String> = device.iter().filter(|k| !host.contains(k)).collect();
-    let dangling: Vec<&String> = host.iter().filter(|k| !device.contains(k)).collect();
+    let (orphans, dangling) = one_sided(&device, &host);
     assert!(
         orphans.is_empty() && dangling.is_empty(),
         "\n\ngpu-kernels with no host handle (dead in the code object):\n  {}\n\nhost handles \
@@ -424,16 +527,114 @@ fn every_rust_kernel_has_exactly_one_host_handle() {
     println!("{} Rust kernels, each with one host handle", device.len());
 }
 
+/// The one shipped Rust kernel with no `launchers!` row and no bit-identity row:
+/// `touch_region` writes nothing comparable (its `sink` is stored only on an impossible
+/// value), and its launcher is the fetch path's hand-written `rivoli_touch_region_async`,
+/// reached from `engine/src/fetch/stage.rs` rather than through a `launch_*` wrapper. What
+/// stands in for a value comparison is its ISA (one `global_load_b128` per 16 bytes, the C's
+/// `uint4` read, checked deviceless at the Phase 0 merge review) and
+/// `tests/determinism-glm.sh` on the `--arena-refresh` arm, which is what the read exists for.
+const UNROWED: [&str; 1] = ["touch_region"];
+
+/// The bit-identity gate's `ROWS` table: each entry's kernel name, and whether its row
+/// function binds that kernel's tagged C launcher (`c"rivoli_<name>"`, the symbol it scores
+/// against) — so an entry pointing at another kernel's row cannot stand in for this one.
+fn gate_rows() -> Vec<(String, bool)> {
+    let dir = Path::new("crates/engine/tests/bit_identity");
+    let table = Text::read(&dir.join("main.rs")).dense_between("const ROWS: &[Row] = &[", "];");
+    table
+        .names_after("(\"", ')')
+        .iter()
+        .map(|entry| {
+            // `name",module::row`
+            let (name, path) = entry
+                .split_once("\",")
+                .expect("a ROWS entry is (name, row)");
+            // rustfmt leaves a trailing comma on an entry it broke across lines.
+            let path = path.trim_end_matches(',');
+            let (module, row) = path.split_once("::").expect("a row is module::fn");
+            let src = Text::read(&dir.join(format!("{module}.rs")));
+            let body = src.dense_between(&format!("pub fn {row}("), "\npub fn ");
+            (
+                name.to_string(),
+                body.contains(&format!("c\"rivoli_{name}\"")),
+            )
+        })
+        .collect()
+}
+
+/// Every shipped Rust kernel is scored by the bit-identity gate and reached through a
+/// `launchers!` `=>` row, and every gate row and `=>` row names a shipped Rust kernel — three
+/// populations, both directions each, with [`UNROWED`] the one argued exemption (checked to
+/// exist). Without it a lane could port a kernel with no row and every other census plus the
+/// gate would stay green; CLAUDE.md's "every Rust kernel with an output" was prose until this
+/// (Phase 0 merge review, 2026-11-18).
+#[test]
+fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
+    let device = shipped_kernels();
+    for u in UNROWED {
+        assert!(
+            device.iter().any(|k| k == u),
+            "UNROWED names `{u}`, which is not a shipped gpu-kernel — delete the exemption"
+        );
+    }
+    let rowed: Vec<String> = device
+        .iter()
+        .filter(|k| !UNROWED.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    // A `=>` row names its Rust host launcher `rivoli_<kernel>`; that launcher's own
+    // `Kernel::new(c"<kernel>")` is held by the host-handle census above.
+    // Only declaration lines (they start with the stem): the DSL's own docs spell the form.
+    let decls: String = Text::corpus(Path::new("crates/backend/src"))
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with(LAUNCH_STEM))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let arrows = Text(decls).names_after(ARROWS[1], '(');
+    let entries = gate_rows();
+    let unbound: Vec<&String> = entries.iter().filter(|(_, b)| !b).map(|(n, _)| n).collect();
+    let rows: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+    // Every finding from both populations, gathered before one assert, so a defect that
+    // breaks both shows both (a first assert would mask the second).
+    let report: Vec<String> = [
+        ("the bit-identity ROWS table", &rows),
+        ("the `=>` launchers! rows", &arrows),
+    ]
+    .iter()
+    .flat_map(|(what, population)| {
+        let (missing, extra) = one_sided(&rowed, population);
+        [
+            (format!("Rust kernels missing from {what}"), missing),
+            (
+                format!("entries in {what} naming no shipped Rust kernel"),
+                extra,
+            ),
+        ]
+    })
+    .chain([(
+        "ROWS entries whose row function never binds `c\"rivoli_<name>\"`".to_string(),
+        unbound,
+    )])
+    .filter(|(_, names)| !names.is_empty())
+    .map(|(head, names)| format!("{head}:\n  {}", bullet(&names)))
+    .collect();
+    assert!(report.is_empty(), "\n\n{}", report.join("\n\n"));
+    println!(
+        "{} Rust kernels: {} with a gate row and a `=>` row, {} argued exemption",
+        device.len(),
+        rows.len(),
+        UNROWED.len()
+    );
+}
+
 /// `__global__` kernel names in the bit-identity gate's hipcc probe source.
 fn hip_globals() -> Vec<String> {
-    let path = common::repo_root().join("crates/engine/tests/bit_identity/probes/probe.hip");
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {path:?}: {e}"))
-        .split("__global__ void ")
-        .skip(1)
-        .filter_map(|rest| rest.split('(').next())
-        .map(|n| n.trim().to_string())
-        .collect()
+    Text::read(Path::new(
+        "crates/engine/tests/bit_identity/probes/probe.hip",
+    ))
+    .names_after("__global__ void ", '(')
 }
 
 /// Every prelude probe kernel in `crates/kernels/src/probes` has a same-named hipcc twin in
@@ -447,7 +648,7 @@ fn hip_globals() -> Vec<String> {
 #[test]
 fn every_prelude_probe_has_its_hipcc_twin() {
     const HIP_ONLY: [&str; 3] = ["cmp_bytes", "cmp_nan_words", "k_vq_wave_r1"];
-    let src = corpus("crates/kernels/src/probes", "");
+    let src = corpus(Path::new("crates/kernels/src/probes"));
     let decl = format!("pub unsafe extern {:?} fn ", "gpu-kernel");
     // Three spellings: a plain kernel, `sweep!(name, …)` and `probe!(name(…) = …)` — matched
     // anywhere, not per line, because rustfmt breaks a long macro call after its `(`.
@@ -487,7 +688,7 @@ fn every_prelude_probe_has_its_hipcc_twin() {
         bullet(&rust_only),
         bullet(&hip_only)
     );
-    let harness = corpus("crates/engine/tests/bit_identity/probes", "");
+    let harness = corpus(Path::new("crates/engine/tests/bit_identity/probes"));
     let unlaunched: Vec<&str> = rust
         .iter()
         .map(String::as_str)

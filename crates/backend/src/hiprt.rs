@@ -3,14 +3,21 @@
 //! Until 2026-11-18 every host-side HIP call went through a hipcc-compiled shim
 //! (`kernels/async.hip` for streams/events/timelines/the pinned arena,
 //! `kernels/linalg.hip` for the device sync and the device-to-device copies,
-//! `kernels/vmm.hip`'s `fill_u32` kernel). The shims added nothing but a return-code
-//! convention, so they are gone and the conventions moved here **unchanged** — callers'
-//! diffs are their import line, nothing else:
+//! `kernels/vmm.hip`'s `fill_u32` kernel, now `hipMemsetD32Async`). The shims added nothing
+//! but a return-code convention, so they are gone and the conventions moved here
+//! **unchanged** — callers' diffs are their import line, nothing else. Four conventions, one
+//! per family of caller, each kept because its callers were written against it:
 //!
-//! - async.hip's functions return `0` or `HIP_ERR_BASE - hipError_t` (or `-1`, or null),
-//!   exactly as before; their callers only test `!= 0`.
-//! - linalg.hip's return `0` or `-(hipError_t)`, the launcher convention
-//!   [`crate::hip::ensure_hip_status`] decodes.
+//! - **`0` / `-(hipError_t)`** ([`neg`]) — linalg.hip's, the launcher convention
+//!   [`crate::hip::ensure_hip_status`] decodes (device sync, copies, `fill_u32`).
+//! - **`0` / `HIP_ERR_BASE - hipError_t`** ([`based`]) — async.hip's; its callers only test
+//!   `!= 0` (streams, events, the staging copy, `rivoli_touch_region_async`).
+//! - **`0` / `-1`** — the destroys (`rivoli_stream_destroy`; its one caller, `Drop`, ignores it).
+//! - **a handle, or null** (`handle_or_null`) — the creators (streams, events, the pinned
+//!   arena), where the caller has only a pointer to test.
+//!
+//! Beside all four, a POSITIVE guard code (1001…) is an argument refusal before any HIP call
+//! (`fill_u32`'s `bytes % 4`, the touch launcher's 1002) — the codes the C launchers returned.
 //!
 //! The `rivoli_` names are kept for the same reason: grep from any caller lands here.
 
@@ -100,7 +107,7 @@ fn neg(e: HipError) -> i32 {
 }
 
 /// `0` or `HIP_ERR_BASE - hipError_t` — async.hip's convention.
-fn based(e: HipError) -> i32 {
+pub(crate) fn based(e: HipError) -> i32 {
     if e == 0 { 0 } else { HIP_ERR_BASE - e }
 }
 
@@ -267,7 +274,7 @@ pub unsafe fn rivoli_memcpy_h2d_async(
 
 /// The touch-region read lives with the other Rust launchers; re-exported so
 /// `fetch/stage.rs` imports all four staging entry points from one module.
-pub use crate::rk_launchers::rivoli_touch_region_async;
+pub use crate::launch::rivoli_touch_region_async;
 
 // ── async.hip: the timeline (signal-memory counter) ─────────────────────────────────────
 //

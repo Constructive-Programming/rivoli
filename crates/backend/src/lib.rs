@@ -18,9 +18,12 @@ pub mod gpustream;
 pub mod hip;
 // The ABI wall's macro invocations, split out of `hip.rs` 2026-08-15 under the 800-line
 // file ceiling — and a third, `hip_attn`, split out of `hip_blocks` 2026-08-16 when the M9
-// launchers landed. PRIVATE and re-exported through `hip`, so the split is invisible from
+// launchers landed, and a fourth, `hip_activation`, split out of `hip_linalg` 2026-11-18 by
+// kernel family. PRIVATE and re-exported through `hip`, so the split is invisible from
 // outside: `rivoli_backend::hip::launch_*` is still the only path, and which invocation file
 // a launcher is declared in stays an authoring decision rather than an API one.
+#[cfg(feature = "rocm")]
+mod hip_activation;
 #[cfg(feature = "rocm")]
 mod hip_attn;
 #[cfg(feature = "rocm")]
@@ -36,10 +39,11 @@ pub mod hiprt;
 mod module;
 // The gate's module-load reference (and the geometry it launches at) — see `module.rs`.
 #[cfg(feature = "rocm")]
-pub use module::{CodeObject, Geometry};
-// The Rust kernels' host halves — guards, geometry, launch — wrapped by `launchers!` rows.
+pub use module::{CodeObject, Geometry, LdsBytes};
+// The Rust kernels' host halves — guards, geometry, launch — wrapped by `launchers!` rows,
+// one module per kernel family.
 #[cfg(feature = "rocm")]
-mod rk_launchers;
+mod launch;
 // The waist itself — Signal, block_on, NULL_STREAM, and the backend-neutral re-exports.
 // Its items sit at the crate root (`rivoli_backend::Stream`), exactly where the old tree's
 // `crate::backend::Stream` sat relative to its consumers.

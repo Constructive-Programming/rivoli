@@ -17,7 +17,7 @@
 # hipcc reference, also outside, before `run_arm` takes the lock — and the Rust probe objects
 # only when asked (`--build-probes`), never on an arm:
 #
-#   CARGO_TARGET_DIR=/var/cache/rivoli/target/<checkout> cargo build -p rivoli-engine --test bit_identity
+#   CARGO_TARGET_DIR=/var/cache/rivoli/target/<checkout> cargo build --workspace --tests --examples
 #   CARGO_TARGET_DIR=/var/cache/rivoli/target/<checkout> tests/bit-identity.sh
 #
 # CARGO_TARGET_DIR must be THIS checkout's dir (`/var/cache/rivoli/target/<basename of the
@@ -25,9 +25,9 @@
 # (`probes/<name>.src`, deleted and recreated by every build) all live under it, and the
 # login default (a shared dir) would hand this checkout a sibling's (§7e-bis).
 #
-# usage: tests/bit-identity.sh [--expect-red=ROWS] [test-binary]          launcher rows
-#        tests/bit-identity.sh --probes [--families=F,…] [test-binary]    prelude probe rows
-#        tests/bit-identity.sh --plant=FAMILY [test-binary]               a probe plant's arm
+# usage: tests/bit-identity.sh [--expect-red=ROWS test-binary]          launcher rows
+#        tests/bit-identity.sh --probes [--families=F,…]                  prelude probe rows
+#        tests/bit-identity.sh --plant=FAMILY                             a probe plant's arm
 #        tests/bit-identity.sh --build-probes [--plant=FAMILY]            deviceless build
 #        --expect-red=ROWS  inverts the verdict, for a recorded red proof: GREEN only if every
 #                           row ran and examined something, EXACTLY the named rows are RED, and
@@ -48,7 +48,8 @@
 #                           --plant, tests/bit-identity/plants/FAMILY.patch is applied to the
 #                           copy first: the plant is a small diff against the real prelude, so
 #                           no red-proof branch lives in shipped source and nothing is copied.
-#        test-binary        a specific built binary (a planted copy); default the newest built.
+#        test-binary        a PLANTED binary, only with --expect-red; default: the one the header's
+#                           build line produces, refused unless cargo reports it Fresh.
 #        BITIDENT_CLASSIFY=<stdout-file>  classify an existing arm's stdout and exit, no GPU and
 #                           no build — the classifier's own red proofs run this way.
 # exit:  0 verdict met · 1 verdict not met · 2 setup refused · 3 arm DISCARDED (contention)
@@ -230,17 +231,46 @@ if [ -n "$BUILD" ]; then
 fi
 
 LOCK=${GPU_LOCK:-/var/run/sys-gpu.lock}
-[ -e "$LOCK" ] || { echo "FAIL: $LOCK does not resolve (gate-red-proofs.md §1780)" >&2; exit 2; }
-
-BIN=${1:-$(find "$TARGET/debug/deps" -maxdepth 1 -name 'bit_identity-*' -type f -executable \
-    -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)}
-[ -n "$BIN" ] && [ -x "$BIN" ] || {
-    echo "FAIL: no built bit_identity binary — run the cargo build line in this header" >&2
+[ -e "$LOCK" ] || {
+    echo "FAIL: $LOCK does not resolve (gate-red-proofs.md §16, the /var/run bind defect)" >&2
     exit 2
 }
 
 SCRATCH=/var/cache/rivoli/scratch/bit-identity/$(date +%Y%m%dT%H%M%S)-$$
 mkdir -p "$SCRATCH/ref" || exit 2
+
+# ── the binary: built from THIS tree, by cargo's own fingerprint ────────────────────────
+# Not "the newest by mtime", which is how a binary built before the last edit got scored:
+# cargo is asked, with the header's exact build line, which bit_identity executable that
+# line produces and whether it was already Fresh. Fresh means nothing builds here; a stale
+# binary is rebuilt by that call (outside the lock) and the arm is REFUSED, so a run never
+# scores code the tree no longer holds. A positional binary is a PLANTED copy, built from a
+# planted tree on purpose, so it is accepted only with --expect-red and is named as such.
+if [ -n "${1:-}" ]; then
+    [ -n "$EXPECT_RED" ] || {
+        echo "FAIL: a positional binary is a planted copy; it is accepted only with --expect-red" >&2
+        exit 2
+    }
+    BIN=$1
+    echo "binary is PLANTED (positional, --expect-red): its freshness is not checked"
+else
+    # In $ROOT: cargo resolves the workspace (and rustup the toolchain) from the directory it
+    # runs in, so from anywhere else this would build ANOTHER checkout into this target dir.
+    (cd "$ROOT" && cargo build --workspace --tests --examples --message-format=json) \
+        >"$SCRATCH/fresh.json" 2>"$SCRATCH/fresh.err"
+    crc=$?
+    [ "$crc" -eq 0 ] || { echo "FAIL: cargo build rc=$crc (see $SCRATCH/fresh.err)" >&2; exit 2; }
+    read -r BIN FRESH < <(jq -r 'select(.reason == "compiler-artifact" and
+        .target.name == "bit_identity" and .executable) | "\(.executable) \(.fresh)"' \
+        "$SCRATCH/fresh.json")
+    [ -n "${BIN:-}" ] || { echo "FAIL: cargo named no bit_identity executable" >&2; exit 2; }
+    [ "$FRESH" = true ] || {
+        echo "FAIL: the bit_identity binary was STALE against the tree — cargo has just rebuilt" >&2
+        echo "      it (outside the lock); rerun to score the binary the tree now builds" >&2
+        exit 2
+    }
+fi
+[ -x "$BIN" ] || { echo "FAIL: $BIN is not an executable" >&2; exit 2; }
 
 # ── the reference, outside the lock ─────────────────────────────────────────────────────
 TAG_SHA=$(git -C "$ROOT" rev-parse "$TAG^{commit}") || { echo "FAIL: tag $TAG missing" >&2; exit 2; }

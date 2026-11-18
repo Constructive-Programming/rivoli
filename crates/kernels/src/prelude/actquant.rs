@@ -9,7 +9,8 @@ pub const FP8_MAX_INV: f32 = 1.0 / FP8_MAX;
 /// `T.max(amax, 1e-4)`: keeps an all-zero block from dividing by zero.
 pub const ACT_QUANT_AMAX_FLOOR: f32 = 1e-4;
 
-pub const FP4_QUANT_BLOCK: usize = 32;
+/// `rivoli_abi`'s, so the fp4 launcher's refusal and the kernel's group agree.
+pub const FP4_QUANT_BLOCK: usize = rivoli_abi::geom::FP4_QUANT_BLOCK as usize;
 pub const FP4_MAX: f32 = 6.0;
 pub const FP4_MAX_INV: f32 = 1.0 / FP4_MAX;
 /// `6·2^-126`, exact (2^-126 is f32's smallest normal).

@@ -2013,3 +2013,24 @@ arms.
 - The per-arm table and the comparison with 0b are in `rust-kernels.md` §5, under "Phase 0a —
   probe lease".
 - The barrier plant is unjudged; its ISA-census judge is owed.
+
+**Phase 0 merge-review gates (2026-11-18, deviceless).** Each plant was applied to the file,
+observed to have changed it, scored, and restored from a scratch copy (cmp-verified). The
+census then ran green again (5/5). The driver ran from outside the checkout. Each exit code
+was captured unpiped into its own `.rc` file beside the log, in
+`/var/cache/rivoli/scratch/rk-infra/classifier/merge2/`. (A first round, before review, had
+neither `.rc` files nor a reverse-side plant that reached the `=>` population; it is
+superseded by this one.)
+
+| plant | gate | observed |
+|---|---|---|
+| `rope_split_half`'s `ROWS` entry deleted | gate-rows census | exit 101, "Rust kernels missing from the bit-identity ROWS table: rope_split_half" |
+| `rope_split_half` added to `UNROWED` | both populations, reverse side | exit 101, `rope_split_half` listed both under "entries in the bit-identity ROWS table naming no shipped Rust kernel" and under the same line for the `=>` launchers! rows |
+| `rope_split_half`'s entry pointed at `activation::rope_interleave` | row binding | exit 101, "ROWS entries whose row function never binds `c"rivoli_<name>"`: rope_split_half" |
+| `UNROWED` names `touch_regionX` | the exemption's own existence check | exit 101, "UNROWED names `touch_regionX`" |
+| inventory row `rope_split_half` renamed `rope_split_halfX` | derived launcher floor | exit 101, both sides listed |
+| positional `/bin/true` without `--expect-red` | bit-identity binary rule | exit 2, "accepted only with --expect-red" |
+| `touch` of `bit_identity/inputs.rs` (mtime only) after a fresh build | bit-identity freshness | exit 2, "the bit_identity binary was STALE against the tree"; the next run accepted the rebuilt binary and stopped, before the lock, at the clean probe stamp moved aside for the purpose (restored after) |
+
+The aliased rows are new device cells and have no deviceless red proof; their first device
+run is the next lease's arm A.

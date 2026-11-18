@@ -4,7 +4,7 @@
 //! what the port decided. Every `a * b + c` below is a [`fma`] because hipcc's backend fused
 //! it (the C carries `contract` flags, not `fmuladd` — the fusion is in the ISA).
 
-use crate::gpu::{bid, fma, lds, tid};
+use crate::gpu::{bid, fma, for_i32, lds, tid};
 use crate::prelude::formats::rbf16;
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::{sync_threads, tree, wave_sum};
@@ -19,8 +19,9 @@ use rivoli_abi::kernarg::{AttnRes, GatedResidual, HcPost, HcPre};
 const HM: usize = HC_MULT as usize;
 
 /// `hc_pre`'s two streaming loops: the C's `#pragma unroll 8` — schedule only, the fold
-/// stays ascending. Without it the port ran 3.9x hipcc (rust-kernels.md §5, Phase 0a lease
-/// 1); the after-number is owed to lease 2.
+/// stays ascending. Without it the port ran 3.9x hipcc; with it, 1.002x (hipcc 14.58 µs, Rust
+/// 14.61 µs; rust-kernels.md §5, Phase 0a leases 1 and 2 — measured before the `for_i32`
+/// loops replaced the hand-written ones, so the next device run re-measures it).
 const HC_UNROLL: usize = 8;
 
 // `each_src` spells this many slots.
@@ -179,15 +180,13 @@ pub unsafe extern "gpu-kernel" fn hc_pre(a: HcPre) {
     }
     sync_threads();
     let yo = a.y.add(tok * dim);
-    let mut d = t as i32;
-    while d < a.dim {
+    for_i32(t as u32, a.dim, HC_PRE_BLOCK, |d| {
         let mut acc = 0.0f32;
         for c in 0..HM {
-            acc = fma(*l.pre.add(c), *flat.add(c * dim + d as usize), acc);
+            acc = fma(*l.pre.add(c), *flat.add(c * dim + d), acc);
         }
-        *yo.add(d as usize) = rbf16(acc);
-        d += HC_PRE_BLOCK as i32;
-    }
+        *yo.add(d) = rbf16(acc);
+    });
     if t < HM {
         *a.post.add(tok * HM + t) = *l.post.add(t);
     }
@@ -246,13 +245,11 @@ unsafe fn attn_res_score(
 ) {
     let t = tid();
     let (mut ss, mut dot) = (0.0f32, 0.0f32);
-    let mut i = t as i32;
-    while i < a.n {
-        let x = *v.add(i as usize);
+    for_i32(t, a.n, ATTN_RES_BLOCK, |i| {
+        let x = *v.add(i);
         ss = fma(x, x, ss);
-        dot = fma(x, *a.fold.add(i as usize), dot);
-        i += ATTN_RES_BLOCK as i32;
-    }
+        dot = fma(x, *a.fold.add(i), dot);
+    });
     *red_ss.add(t as usize) = ss;
     *red_dot.add(t as usize) = dot;
     sync_threads();
@@ -270,8 +267,12 @@ unsafe fn attn_res_score(
 /// the private `p[16]` is a constant and `p` stays in registers, as hipcc keeps it. A loop
 /// bounded by the runtime `nsrc` put `p` in scratch (`.private_segment_fixed_size` 144 per
 /// `llvm-readelf --notes` on the code object; 80 with a constant-bound loop LLVM did not
-/// unroll; 0 now) and `attn_res` ran 1.38x hipcc (rust-kernels.md §5, Phase 0a lease 1;
-/// after-number owed to lease 2). Same operations as the C, in its ascending order.
+/// unroll; 0 now) and `attn_res` ran 1.38x hipcc; with these slots it runs 1.063x (hipcc
+/// 53.14 µs, Rust 56.51 µs; rust-kernels.md §5, Phase 0a leases 1 and 2). The remaining 6% is
+/// OWED to Phase 1, and these slots are the suspect: the ISA read 1617 instructions to hipcc's
+/// 725 and 10 static `s_barrier` to 3, because hipcc keeps a loop over sources that the slots
+/// expand. (All measured before `for_i32`; the next device run re-measures them.)
+/// Same operations as the C, in its ascending order.
 #[inline(always)]
 fn each_src(ns: usize, mut f: impl FnMut(usize)) {
     macro_rules! slots {
@@ -307,13 +308,11 @@ pub unsafe extern "gpu-kernel" fn attn_res(a: AttnRes) {
     }
     let p = attn_res_probs(lds3[2], ns);
     let o = a.out.add(bid() as usize * n);
-    let mut i = tid() as i32;
-    while i < a.n {
+    for_i32(tid(), a.n, ATTN_RES_BLOCK, |i| {
         let mut acc = 0.0f32;
-        each_src(ns, |s| acc = fma(p[s], *v0.add(s * n + i as usize), acc));
-        *o.add(i as usize) = acc;
-        i += ATTN_RES_BLOCK as i32;
-    }
+        each_src(ns, |s| acc = fma(p[s], *v0.add(s * n + i), acc));
+        *o.add(i) = acc;
+    });
 }
 
 #[unsafe(no_mangle)]

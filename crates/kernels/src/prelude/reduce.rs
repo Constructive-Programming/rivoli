@@ -14,8 +14,9 @@ use super::llvm::{maxnum, wave_shuffle};
 /// gfx1151 is native wave32 — `rivoli_abi`'s constant, so a launcher and this prelude
 /// cannot disagree about it.
 pub const WAVE: usize = rivoli_abi::geom::WAVE as usize;
-/// block = 256 threads = 8 waves = 8 output rows.
-pub const ROWS_PER_BLOCK: usize = 8;
+/// block = 256 threads = 8 waves = 8 output rows — `rivoli_abi`'s, so a launcher's grid and
+/// the kernel's row index cannot disagree.
+pub const ROWS_PER_BLOCK: usize = rivoli_abi::geom::ROWS_PER_BLOCK as usize;
 
 /// `__syncthreads()` — HIP's workgroup-scope release fence, `s_barrier`, acquire fence, as
 /// gfx1151 (WGP mode) lowers them: LDS (`lgkmcnt`), vector loads (`vmcnt`) AND stores

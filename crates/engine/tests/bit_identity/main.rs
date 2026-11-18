@@ -18,7 +18,11 @@
 //! One `fn(&Ref, &mut Tally)` per launcher, in a module per `.hip` file, listed in
 //! [`ROWS`]; [`device::sweep`] runs shapes × [`inputs::SEEDS`] seeds and times the hot shape,
 //! [`device::Tally::guard`] compares one refusal. The script's `REF_SOURCES` gains the file.
-//! A row whose counts reach zero is RED, never skipped.
+//! A row whose counts reach zero is RED, never skipped. A ported kernel with no row here (or
+//! a row naming no shipped kernel) is a deviceless red in `kernel_coverage.rs`'s
+//! `every_rust_kernel_has_a_gate_row_and_a_launchers_row`; `touch_region` is its one argued
+//! exemption. Where production launches a kernel in place (`h == g`, `y == x`), the row
+//! sweeps that aliasing too.
 
 // Test code: a failed expectation IS the report, so `expect` is the right spelling.
 #![allow(clippy::expect_used)]

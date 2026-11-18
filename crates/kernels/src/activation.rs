@@ -9,7 +9,7 @@
 //! `__restrict__` on an aliased call is UB the C gets away with by one-read-then-one-write;
 //! Rust raw pointers make no such promise to the optimizer in the first place.
 
-use crate::gpu::{bid, fma, lds, ocml, tid};
+use crate::gpu::{bid, fma, for_i32, lds, ocml, tid};
 use crate::prelude::actquant::{
     ACT_QUANT_AMAX_FLOOR, FP8_MAX_INV, act_quant_roundtrip, fast_round_scale,
 };
@@ -53,12 +53,10 @@ pub unsafe extern "gpu-kernel" fn situ_glu_f32(a: GateSitu) {
 #[inline(always)]
 unsafe fn strided_sum_sq(x: *const f32, n: i32) -> f32 {
     let mut local = 0.0f32;
-    let mut i = tid() as i32;
-    while i < n {
-        let v = *x.add(i as usize);
+    for_i32(tid(), n, ROW_BLOCK, |i| {
+        let v = *x.add(i);
         local = fma(v, v, local);
-        i += ROW_BLOCK as i32;
-    }
+    });
     local
 }
 
@@ -66,12 +64,9 @@ unsafe fn strided_sum_sq(x: *const f32, n: i32) -> f32 {
 /// the C's association.
 #[inline(always)]
 unsafe fn row_scale(a: RowNorm, inv: f32, weight: impl Fn(f32) -> f32) {
-    let mut i = tid() as i32;
-    while i < a.n {
-        let k = i as usize;
+    for_i32(tid(), a.n, ROW_BLOCK, |k| {
         *a.y.add(k) = *a.x.add(k) * inv * weight(*a.w.add(k));
-        i += ROW_BLOCK as i32;
-    }
+    });
 }
 
 /// One row; the LDS ladder is spelled out rather than `block_sum_lds`, as in the C (which
@@ -106,11 +101,7 @@ pub unsafe extern "gpu-kernel" fn rmsnorm_weightless_batch(a: WeightlessNorm) {
     let p = strided_sum_sq(row, a.d);
     let rs = a.scale
         / sqrt(block_sum_lds(p, lds(), tid() as usize, ROW_BLOCK as usize) / a.d as f32 + a.eps);
-    let mut i = tid() as i32;
-    while i < a.d {
-        *row.add(i as usize) *= rs;
-        i += ROW_BLOCK as i32;
-    }
+    for_i32(tid(), a.d, ROW_BLOCK, |i| *row.add(i) *= rs);
 }
 
 /// One wave per `ACT_QUANT_BLOCK`-element group. `b >= nblk` is uniform per wave, so the
@@ -124,18 +115,14 @@ pub unsafe extern "gpu-kernel" fn act_quant_f8(a: ActQuant) {
     }
     let seg = a.v.add(b as usize * ACT_QUANT_BLOCK as usize);
     let mut amax = 0.0f32;
-    let mut i = lane;
-    while i < ACT_QUANT_BLOCK {
-        amax = maxnum(amax, (*seg.add(i as usize)).abs());
-        i += WAVE;
-    }
+    for_i32(lane, ACT_QUANT_BLOCK as i32, WAVE, |i| {
+        amax = maxnum(amax, (*seg.add(i)).abs());
+    });
     let s = fast_round_scale(maxnum(wave_max(amax), ACT_QUANT_AMAX_FLOOR), FP8_MAX_INV);
-    let mut i = lane;
-    while i < ACT_QUANT_BLOCK {
-        let e = seg.add(i as usize);
+    for_i32(lane, ACT_QUANT_BLOCK as i32, WAVE, |i| {
+        let e = seg.add(i);
         *e = act_quant_roundtrip(*e, s);
-        i += WAVE;
-    }
+    });
 }
 
 /// Both RoPE conventions: thread `j` reads the pair at the indices `read(j, seg / 2)` names,

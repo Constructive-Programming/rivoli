@@ -14,9 +14,11 @@
 //! | `dot_vq`       | dot_vq.hpp                | VQ-int3 codebook dot                       |
 //! | `llvm`         | (hipcc's IR)              | intrinsics `core` has only lookalikes of   |
 //!
-//! Bit-identity against the C++ was measured on the device by 0b's probe harness, which still
-//! lives in scratch (`rk-prelude/probe`, rust-kernels.md §5); moving its families into
-//! `tests/bit-identity.sh` as rows is owed, so until then it cannot go red for anyone else.
+//! Bit-identity against the C++ is the bit-identity gate's PROBE rows: each helper is exposed
+//! by a probe kernel (`crates/kernels/src/probes`, built only by `tests/bit-identity.sh
+//! --build-probes`) and scored against its hipcc twin by `tests/bit-identity.sh --probes` —
+//! 222/222 identical on the device, 2026-11-18, with red-proof plants as patches under
+//! `tests/bit-identity/plants/` (rust-kernels.md §5).
 
 pub mod activation;
 pub mod actquant;

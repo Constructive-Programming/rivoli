@@ -40,12 +40,12 @@ LOCK=${GPU_LOCK:-/var/run/sys-gpu.lock}
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/device-halves.XXXXXX")
 CELL=${1:-all}
 
-# The canonical lock path, not /run/sys-gpu.lock: §1780 records the 2026-09-02 window when a
+# The canonical lock path, not /run/sys-gpu.lock: gate-red-proofs.md §16 records the 2026-09-02 window when a
 # stray read-only bind over `/` made `/var/run -> ../run` dangle for every process on the box
 # and peers took to locking the resolved file instead. Refusing here is the point — an arm
 # that takes a different lock than its neighbours is an arm that believes it is sole tenant.
 [ -e "$LOCK" ] || {
-    echo "FAIL: $LOCK does not resolve. gate-red-proofs.md §1780 is the /var/run bind defect;" >&2
+    echo "FAIL: $LOCK does not resolve. gate-red-proofs.md §16 is the /var/run bind defect;" >&2
     echo "      do not fall back to /run/sys-gpu.lock — that hides the machine fault." >&2
     exit 2
 }

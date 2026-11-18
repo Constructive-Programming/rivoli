@@ -48,18 +48,39 @@ fn module() -> Result<Handle, HipError> {
 }
 
 /// One kernel in the embedded code object, typed by the `rivoli_abi::kernarg` block it
-/// takes — so a launch with another kernel's block is a compile error, not HIP copying the
-/// metadata's byte count from past the end of the wrong struct. (`fn(A)`, not `A`, so the
-/// handle stays `Sync` although the blocks hold raw pointers.)
+/// takes — so `launch` with a block of another type than the static's `A` is a compile
+/// error. What the compiler checks is that pairing of the static and its arguments; that
+/// the static's C name exports a kernel taking `A` is checked by `kernel_coverage.rs`'s
+/// host-handle census (the name) and the bit-identity gate (the behaviour), not by the type.
+/// (`fn(A)`, not `A`, so the handle stays `Sync` although the blocks hold raw pointers.)
 pub(crate) struct Kernel<A> {
     name: &'static CStr,
     func: OnceLock<Result<Handle, HipError>>,
     args: PhantomData<fn(A)>,
 }
 
-/// `(grid blocks, block threads, dynamic LDS bytes)` — 1-D, the only shape any ported
-/// launcher uses.
-pub type Geometry = (u32, u32, u32);
+/// Dynamic LDS bytes for a launch — a unit beside two other `u32`s it could be transposed
+/// with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LdsBytes(pub u32);
+
+/// A 1-D launch — the only shape any ported launcher uses: `blocks` workgroups of `threads`,
+/// each with `lds` of dynamic LDS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    pub blocks: u32,
+    pub threads: u32,
+    pub lds: LdsBytes,
+}
+
+/// HIP's two ways to hand a kernel its arguments, exactly one per launch: the
+/// `kernelParams` array (one pointer per parameter — here always one, the kernarg struct) or
+/// the `extra` packed-buffer list.
+#[derive(Clone, Copy)]
+enum KernArgs {
+    Params(*mut *mut c_void),
+    Packed(*mut *mut c_void),
+}
 
 impl<A: Copy> Kernel<A> {
     pub(crate) const fn new(name: &'static CStr) -> Self {
@@ -88,46 +109,40 @@ impl<A: Copy> Kernel<A> {
     /// Every pointer in `args` satisfies the kernel's buffer contract, and `stream` is live
     /// or null.
     #[must_use = "the launch status is the only report of a failed launch"]
-    pub(crate) unsafe fn launch(
-        &self,
-        (grid, block, lds): Geometry,
-        stream: *mut c_void,
-        args: &A,
-    ) -> i32 {
+    pub(crate) unsafe fn launch(&self, geom: Geometry, stream: *mut c_void, args: &A) -> i32 {
         let f = match self.func() {
             Ok(f) => f,
             Err(e) => return -e,
         };
         let mut params = [std::ptr::from_ref(args).cast_mut().cast::<c_void>()];
         // SAFETY: the caller's contract; HIP copies `size_of::<A>()` bytes per the metadata.
-        unsafe {
-            launch_raw(
-                f,
-                (grid, block, lds),
-                stream,
-                (params.as_mut_ptr(), std::ptr::null_mut()),
-            )
-        }
+        unsafe { launch_raw(f, geom, stream, KernArgs::Params(params.as_mut_ptr())) }
     }
 }
 
 /// `hipModuleLaunchKernel` on a 1-D geometry, `0` or `-(hipError_t)`.
 ///
 /// # Safety
-/// `(params, extra)` is a valid HIP argument description for `f`; `stream` is live or null.
-unsafe fn launch_raw(
-    f: Handle,
-    (grid, block, lds): Geometry,
-    stream: *mut c_void,
-    (params, extra): (*mut *mut c_void, *mut *mut c_void),
-) -> i32 {
+/// `args` is a valid HIP argument description for `f`; `stream` is live or null.
+unsafe fn launch_raw(f: Handle, geom: Geometry, stream: *mut c_void, args: KernArgs) -> i32 {
+    let null = std::ptr::null_mut();
+    let (params, extra) = match args {
+        KernArgs::Params(p) => (p, null),
+        KernArgs::Packed(e) => (null, e),
+    };
+    let Geometry {
+        blocks,
+        threads,
+        lds: LdsBytes(lds),
+    } = geom;
     // SAFETY: the caller's contract.
-    -unsafe { hipModuleLaunchKernel(f.0, grid, 1, 1, block, 1, 1, lds, stream, params, extra) }
+    -unsafe { hipModuleLaunchKernel(f.0, blocks, 1, 1, threads, 1, 1, lds, stream, params, extra) }
 }
 
 /// A code object loaded from a FILE — the bit-identity gate's module-load reference (the
-/// hipcc and Rust probe objects `tests/bit-identity.sh` builds). The engine never uses it; it lives here so the gate launches through the same path the shipped
-/// kernels do rather than through a second copy of it.
+/// hipcc and Rust probe objects `tests/bit-identity.sh` builds). The engine never uses it;
+/// it lives here so the gate launches through the same path the shipped kernels do rather
+/// than through a second copy of it.
 pub struct CodeObject(Handle);
 
 // `HIP_LAUNCH_PARAM_*` (hip_runtime_api.h): the packed-buffer form of `extra`.
@@ -164,8 +179,8 @@ impl CodeObject {
             std::ptr::from_mut(&mut size).cast(),
             PARAM_END as *mut c_void,
         ];
-        let null = std::ptr::null_mut();
         // SAFETY: the caller's contract; `extra` describes `args`.
-        unsafe { launch_raw(Handle(f), geom, null, (null.cast(), extra.as_mut_ptr())) }
+        let packed = KernArgs::Packed(extra.as_mut_ptr());
+        unsafe { launch_raw(Handle(f), geom, std::ptr::null_mut(), packed) }
     }
 }

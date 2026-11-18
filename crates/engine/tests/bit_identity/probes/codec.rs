@@ -2,7 +2,7 @@
 //! domain (2^32 f32 bit patterns where the input is an f32), in chunks, compared on the device.
 //! Groups, inputs and parameter lists are 0b's.
 
-use super::{Args, Dev, Group, Out, Outs, Probes, Table};
+use super::{Args, BLOCK, Dev, Group, Out, Outs, Probes, Table, blocks};
 
 /// Inputs per launch: 0b's chunk. The two output buffers hold one chunk of the widest output
 /// (u64), 512 MiB each — 1 GiB of device memory for the family, against this box's ~100 GiB
@@ -31,7 +31,7 @@ impl Sweeper<'_> {
         while base < n {
             let cnt = CHUNK.min(n - base) as u32;
             let bytes = cnt as usize * esz;
-            let geom = (cnt.div_ceil(256), 256, 0);
+            let geom = blocks(cnt.div_ceil(BLOCK));
             let args = |o| extra(Args::default().p(base as u32).p(cnt).p(o));
             let o = Outs {
                 a,
@@ -156,11 +156,8 @@ fn lut(s: &mut Sweeper) {
         bytes: 1024,
         ty: Out::U32,
     };
-    let c = s.p.cell(
-        (("k_lut", "k_lut"), (1, 256, 0)),
-        |o| Args::default().p(o),
-        o,
-    );
+    let c =
+        s.p.cell((("k_lut", "k_lut"), blocks(1)), |o| Args::default().p(o), o);
     g.cell(&c, 1024, || "lut".into());
     s.t.push("k_lut".into(), g);
 }

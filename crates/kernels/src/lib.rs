@@ -37,8 +37,10 @@
 // gpu-kernel ABI for aggregates is not promised stable; what is relied on here was CHECKED
 // (2026-11-18): each kernel's metadata is ONE `by_value` arg of `size_of` the struct, and
 // the ISA's `s_load` offsets are its `repr(C)` field offsets (`swiglu`: `n` at 0x18, `h` at
-// 0x10). The bit-identity gate exercises every kernel through that path, so a toolchain that
-// changed the lowering would go red there, not silently.
+// 0x10). The bit-identity gate exercises every kernel with an output through that path —
+// all but `touch_region`, whose only argued stand-in is its ISA and the determinism gate
+// (`kernel_coverage.rs`'s `UNROWED`) — so a toolchain that changed the lowering would go red
+// there, not silently.
 #![allow(improper_gpu_kernel_arg)]
 
 mod activation;

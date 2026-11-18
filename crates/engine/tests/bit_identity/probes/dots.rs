@@ -1,9 +1,10 @@
 //! The seeded families: the wave/block reductions and the four dot formats, every lane's
 //! result stored. Shapes, seed classes and launch geometry are 0b's; the draws come from this gate's `Lcg`, so the cells are new and the CLASSES are the same.
 
-use super::{Args, Dev, Geom, Group, Out, Outs, Probes, Table};
+use super::{Args, BLOCK, Dev, Geom, Group, Out, Outs, Probes, Table, blocks};
 use crate::common::Lcg;
 use crate::inputs::SEEDS;
+use rivoli_backend::LdsBytes;
 
 /// Seed classes: 0–5 of 8 normal draws with fixed edges, 6 wide magnitudes (2^±60, rounding
 /// and overflow), 7 nasty (inf, NaN payloads, −0, subnormals, NaN codes in the weights).
@@ -110,7 +111,7 @@ pub fn reductions(p: &Probes, t: &mut Table) {
             let xp = x.ptr();
             Launch {
                 k: (k, k),
-                geom: ((N / 256) as u32, 256, 0),
+                geom: blocks((N / BLOCK as usize) as u32),
                 out_bytes: N * 4,
                 _ins: vec![x],
                 args: Box::new(move |o| Args::default().p(xp).p(o)),
@@ -130,7 +131,11 @@ pub fn reductions(p: &Probes, t: &mut Table) {
             let k = ("k_block_sum2", "k_block_sum2");
             Launch {
                 k,
-                geom: (BLOCKS, bd, bd * 4),
+                geom: Geom {
+                    blocks: BLOCKS,
+                    threads: bd,
+                    lds: LdsBytes(bd * 4),
+                },
                 out_bytes: n * 8,
                 _ins: vec![x, y],
                 args,
@@ -220,7 +225,10 @@ fn fp8(p: &Probes, t: &mut Table) {
                     k: (k, k),
                     // The Rust twin builds its LUT in 1 KiB of dynamic LDS; hipcc's is a
                     // static array and leaves the dynamic bytes unread.
-                    geom: (grid, 256, 1024),
+                    geom: Geom {
+                        lds: LdsBytes(1024),
+                        ..blocks(grid)
+                    },
                     out_bytes: O_DIM as usize * r * width * 4,
                     _ins: vec![x, w, sc],
                     args: Box::new(move |o| {
@@ -246,7 +254,7 @@ fn wave_dot(k: (&'static str, &'static str), r: usize, width: i32, ins: Vec<Dev>
     let ptrs: Vec<_> = ins.iter().map(Dev::ptr).collect();
     Launch {
         k,
-        geom: (WAVE_GRID, 256, 0),
+        geom: blocks(WAVE_GRID),
         out_bytes: O_DIM as usize * r * 32 * 4,
         _ins: ins,
         args: Box::new(move |o| {

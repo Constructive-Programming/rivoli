@@ -24,6 +24,19 @@ pub fn lds<T>() -> *mut T {
     core::intrinsics::gpu::gpu_launch_sized_workgroup_mem::<T>()
 }
 
+/// `for (int i = start; i < end; i += stride) body(i);` — the C's `int` strided loop, kept in
+/// `i32` so the compare and the increment are the ones hipcc emitted, handing `body` the index
+/// as `usize`. `start` and `stride` are thread/block quantities (`u32`), `end` the C's `int`
+/// extent.
+#[inline(always)]
+pub fn for_i32(start: u32, end: i32, stride: u32, mut body: impl FnMut(usize)) {
+    let mut i = start as i32;
+    while i < end {
+        body(i as usize);
+        i += stride as i32;
+    }
+}
+
 /// A fused multiply-add, `a * b + c` with ONE rounding — `llvm.fma`, not `llvm.fmuladd`.
 /// Used exactly where hipcc's ISA shows a `v_fma_f32`/`v_fmac_f32`: fmuladd would leave the
 /// fuse-or-not decision to the backend, and the decision IS the bits.

@@ -64,13 +64,15 @@ appears that enum dispatch cannot fill.
   removed), while 5-line/41-token and 13-line/182-token copies both redden it. So "zero
   budget" is zero clones of ≥ 5 lines, and a deliberate small copy is invisible — which
   matters when a refactor is meant to be proven caught as well as when one is being avoided.
-  **9** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
-  where verbatim transcription of the reference is the point; four across the HIP ABI
+  **10** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
+  where verbatim transcription of the reference is the point; five across the HIP ABI
   wall, which the 800-line ceiling split into `backend/hip.rs` — its extern declarations
   and its one hand-written launcher — plus one per macro-invocation file,
-  `backend/hip_linalg.rs`, `backend/hip_blocks.rs` and `backend/hip_attn.rs` (the third
-  invocation file, split out 2026-08-16 with M9's launchers), since a marker pair cannot
-  span files; one in `core/routing.rs`, the frozen `route_into_pre` photograph — each argues
+  `backend/hip_linalg.rs`, `backend/hip_activation.rs`, `backend/hip_blocks.rs` and
+  `backend/hip_attn.rs` (the third invocation file split out 2026-08-16 with M9's launchers;
+  the fourth, `hip_activation.rs`, 2026-11-18, when the Phase 0 merge review split the
+  799-line `hip_linalg.rs` by kernel family so no Phase 1 lane's first edit crosses the cap),
+  since a marker pair cannot span files; one in `core/routing.rs`, the frozen `route_into_pre` photograph — each argues
   in place;
   `quant.rs`'s parameter-list exemption died 2026-08-15 when the `Fp8W`/`VqW`/
   `RowScaledW` views paid the hop its note had priced; and one in
@@ -160,26 +162,35 @@ appears that enum dispatch cannot fill.
   exits 0 reporting `0 passed` — planted on the box, observed, removed. On-demand (GPU, ~1 min),
   not CI.
 - **bit-identity** — `tests/bit-identity.sh` + `crates/engine/tests/bit_identity/`: every Rust
-  kernel with an output (all but `touch_region`, which has none to compare), through its
-  shipped `launch_*`, against the `rivoli_*` C launcher
-  of a shared object hipcc builds from `git archive archive/hip-kernels` (the tag, never the
-  tree) — byte-identical outputs with NaN compared as a class (owner, 2026-11-18), guard codes
-  and guard order, ≥ 64 seeds, adversarial inputs, the engine's shapes, per-kernel µs beside
+  kernel with an output (all but `touch_region`, which has none to compare — the one argued
+  exemption, `UNROWED` in `kernel_coverage.rs`), through its shipped `launch_*`, against the
+  `rivoli_*` C launcher of a shared object hipcc builds from `git archive archive/hip-kernels`
+  (the tag, never the tree) — byte-identical outputs with NaN compared as a class (owner,
+  2026-11-18), guard codes and guard order, ≥ 64 seeds, adversarial inputs, the engine's shapes
+  and its aliasing (`h == g`, `y == x` where production launches in place), per-kernel µs beside
   hipcc's. A row that examined nothing prints VACUOUS and fails; `--expect-red=ROWS` judges a
-  plant by exactly the rows it must redden. Never builds; flock + witness via `run_arm`.
-  Red proof `docs/measurement/gate-red-proofs.md` §18: classifier half PAID deviceless (eight
-  stub arms), the rope-unfused plant shown adversarial on CPU (23212/131072 outputs, 64/64
-  seeds); the device arm PAID 2026-11-18 (13/13 bit-identical; the plant reddens exactly the
-  two rope rows, scripted GREEN). `--probes` runs the PRELUDE probe rows (0b's families, 222
-  groups) against a hipcc probe object built from the tag's headers and a Rust one
-  `--build-probes` builds outside cargo — device arms owed (PAID 2026-11-18: 222/222
-  identical, all eight judged plants scripted GREEN, witness clean). A plant is a small patch to the
-  real prelude (`tests/bit-identity/plants/<family>.patch`), applied with exact context to a
-  scratch copy by `--build-probes --plant=<family>`; `--plant=<family>` judges it by its row
-  in the script's `plant_spec` table. On-demand (GPU; `--probes` plus the eight plants 281 s,
-  measured 2026-11-18; the launcher-row arm unmeasured), not CI.
+  plant by exactly the rows it must redden. It builds only the hipcc reference (and, on
+  request, the Rust probe objects), outside the lock; it scores the bit_identity binary cargo's
+  own fingerprint names Fresh for the header's build line and REFUSES a stale one (a planted
+  binary is accepted only with `--expect-red`); flock + witness via `run_arm`. Its population
+  is held by two censuses in `kernel_coverage.rs` (below). Red proof `docs/measurement/gate-red-proofs.md`
+  §18: classifier half PAID deviceless (eight stub arms), the rope-unfused plant shown
+  adversarial on CPU (23212/131072 outputs, 64/64 seeds); the device arm PAID 2026-11-18
+  (13/13 bit-identical; the plant reddens exactly the two rope rows, scripted GREEN).
+  `--probes` runs the PRELUDE probe rows (0b's families, 222 groups) against a hipcc probe
+  object built from the tag's headers and a Rust one `--build-probes` builds outside cargo —
+  PAID 2026-11-18 (222/222 identical, all eight judged plants scripted GREEN, witness clean). A
+  plant is a small patch to the real prelude (`tests/bit-identity/plants/<family>.patch`),
+  applied with exact context to a scratch copy by `--build-probes --plant=<family>`;
+  `--plant=<family>` judges it by its row in the script's `plant_spec` table. On-demand (GPU;
+  `--probes` plus the eight plants 281 s, measured 2026-11-18; the launcher-row arm
+  unmeasured), not CI.
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
-  suite or a live deferral, checked both ends; **66/66/0** as measured 2026-09-08 by `cargo test -p rivoli --no-default-features --test kernel_coverage -- --nocapture` (the figure stood at 61 for four milestones and nobody re-counted it — the same prose-drift class §13 caught in its own row count; `docs/reference/kernel-inventory.md` enumerates the same population row by row), and it rose past 61 when M17c's
+  suite or a live deferral, checked both ends; the launcher population itself must equal
+  `docs/reference/kernel-inventory.md`'s table, both ends (DERIVED since 2026-11-18 — no
+  hand-bumped floor), and `every_rust_kernel_has_a_gate_row_and_a_launchers_row` holds every
+  Rust kernel (`touch_region` excepted, argued at `UNROWED`) to a bit-identity `ROWS` entry
+  that binds its C twin and a `=>` row; **66/66/0** as measured 2026-09-08 by `cargo test -p rivoli --no-default-features --test kernel_coverage -- --nocapture` (the figure stood at 61 for four milestones and nobody re-counted it — the same prose-drift class §13 caught in its own row count; `docs/reference/kernel-inventory.md` enumerates the same population row by row), and it rose past 61 when M17c's
   `gqa_block_attend` landed with its launcher and `kernel_glimmer_block_attend.rs`. Its
   DEFERRED row opened and closed the table's **third** turn within one commit — the census
   REFUSED the stale row rather than letting it stand, which is the both-ends check doing what

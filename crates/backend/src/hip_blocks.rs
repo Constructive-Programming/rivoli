@@ -18,7 +18,7 @@
 //! between those buffers is written down. A primitive has operands; these have a layout.
 
 use crate::hip::{ExpertDesc, ExpertDescF4, abi_ty, ensure_hip_status, launchers};
-use crate::rk_launchers::{
+use crate::launch::{
     Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_post, rivoli_hc_pre,
 };
 use anyhow::Result;
@@ -29,10 +29,7 @@ use std::ffi::c_void;
 // twenty rewritten comments. (`CompFinish`/`CompGeom` and the attention-side links left with
 // their launchers in the 2026-08-16 split.)
 #[allow(unused_imports)]
-use crate::{
-    hip::device_sync,
-    hip_linalg::{launch_act_quant_f8, launch_vadd},
-};
+use crate::{hip::device_sync, hip_activation::launch_act_quant_f8, hip_linalg::launch_vadd};
 
 // jscpd:ignore-start
 //

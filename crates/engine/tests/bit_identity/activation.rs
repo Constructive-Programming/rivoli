@@ -67,28 +67,48 @@ fn gate_cell(n: usize, seed: u64) -> (Vec<Vec<f32>>, Vec<Out>) {
     (vec![g, draw(n, (seed, 2), 1.0, true)], vec![Out::Poison(n)])
 }
 
-fn gate_io(x: &mut Cell, side: Side, n: usize) -> GateIo {
-    (x.i(0), x.i(1), x.o(side, 0), n)
+/// How a gated combine's operands are laid out in a cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateLayout {
+    /// `g`, `u`, `h` three buffers; the sweep is timed at shape `hot`.
+    Separate { hot: usize },
+    /// `h == g`: one buffer starts as `g` on both sides and is passed as both — the in-place
+    /// form production uses (`glm/mlp.rs`'s `launch_swiglu(gp, up, .., gp, ..)`, `v4/moe.rs`'s
+    /// `launch_swiglu_clamped_bf16(g, u, .., g, ..)`, `k3/forward.rs`'s SiTU-GLU). Untimed.
+    Aliased,
 }
 
-/// The gated combines' sweep: [`GATE_SHAPES`] × seeds over [`gate_cell`], the per-seed
-/// scalar operand(s) from `extra`, timed at `time_at`.
+/// The gated combines' sweep: [`GATE_SHAPES`] × seeds over [`gate_cell`] in `layout`, the
+/// per-seed scalar operand(s) from `extra`.
 fn gate_sweep<P>(
     t: &mut Tally,
-    time_at: usize,
+    layout: GateLayout,
     extra: impl Fn(u64) -> P,
     launch: impl Fn(Side, GateIo, &P) -> i32,
 ) {
     let make = |n, seed| {
-        let (i, o) = gate_cell(n, seed);
-        (i, o, extra(seed))
+        let (mut ins, outs) = gate_cell(n, seed);
+        let outs = match layout {
+            GateLayout::Separate { .. } => outs,
+            GateLayout::Aliased => vec![Out::InPlace(ins.remove(0))],
+        };
+        (ins, outs, extra(seed))
+    };
+    let hot = match layout {
+        GateLayout::Separate { hot } => hot,
+        GateLayout::Aliased => 0, // no such shape: untimed
     };
     let shapes = Shapes {
         all: &GATE_SHAPES,
-        hot: time_at,
+        hot,
     };
     sweep(t, shapes, make, |side, x: &mut Cell, n, p| {
-        launch(side, gate_io(x, side, n), p)
+        let h = x.o(side, 0);
+        let io = match layout {
+            GateLayout::Separate { .. } => (x.i(0), x.i(1), h, n),
+            GateLayout::Aliased => (h.cast_const(), x.i(0), h, n),
+        };
+        launch(side, io, p)
     });
 }
 
@@ -103,7 +123,9 @@ fn swiglu_on(c: GateFn, side: Side, (g, u, h, n): GateIo) -> i32 {
 pub fn swiglu(r: &Ref, t: &mut Tally) {
     // SAFETY: `rivoli_swiglu`'s C signature.
     let c: GateFn = unsafe { r.sym(c"rivoli_swiglu") };
-    gate_sweep(t, 6144, |_| (), |side, io, _| swiglu_on(c, side, io));
+    for layout in [GateLayout::Separate { hot: 6144 }, GateLayout::Aliased] {
+        gate_sweep(t, layout, |_| (), |side, io, _| swiglu_on(c, side, io));
+    }
     t.guard("swiglu n=0", both(|side| swiglu_on(c, side, no_gate(0))));
 }
 
@@ -121,7 +143,9 @@ pub fn swiglu_clamped_bf16(r: &Ref, t: &mut Tally) {
     // SAFETY: `rivoli_swiglu_clamped_bf16`'s C signature.
     let c: ClampFn = unsafe { r.sym(c"rivoli_swiglu_clamped_bf16") };
     let limit = |seed| uniform(1, (seed, 3), 0.5..12.0)[0];
-    gate_sweep(t, 2048, limit, |side, io, &l| clamped_on(c, side, io, l));
+    for layout in [GateLayout::Separate { hot: 2048 }, GateLayout::Aliased] {
+        gate_sweep(t, layout, limit, |side, io, &l| clamped_on(c, side, io, l));
+    }
     // Every guard failing at once comes LAST in each table: it pins guard ORDER (the
     // extent check before the operand check), which single-failure cases cannot see.
     let cases = NOT_POSITIVE_FINITE
@@ -151,7 +175,9 @@ pub fn situ_glu_f32(r: &Ref, t: &mut Tally) {
         [b1, b2] if seed.is_multiple_of(2) => (b1, b2),
         _ => (4.0, 25.0),
     };
-    gate_sweep(t, 2048, betas, |side, io, &b| situ_on(c, side, io, b));
+    for layout in [GateLayout::Separate { hot: 2048 }, GateLayout::Aliased] {
+        gate_sweep(t, layout, betas, |side, io, &b| situ_on(c, side, io, b));
+    }
     let cases = [
         (0, (4.0, 25.0)),
         (8, (f32::NAN, 25.0)),
@@ -190,6 +216,25 @@ fn rmsnorm_on(c: NormFn, side: Side, (x, w, y, n, eps): NormIo) -> i32 {
     }
 }
 
+/// The single-row norms' `y == x` sweep, the in-place form production launches
+/// (`glm/attn.rs`'s `launch_rmsnorm_single(q, .., q)`, `glimmer/forward.rs`'s centered norm of
+/// `br` into itself): the buffer starts as `x` on both sides and is passed as both. Untimed.
+fn norm_sweep_aliased(t: &mut Tally, launch: impl Fn(Side, NormIo) -> i32) {
+    let shapes = Shapes {
+        all: &ROW_SHAPES,
+        hot: 0, // no such shape: untimed
+    };
+    let make = |n, seed| {
+        let (mut ins, _, eps) = norm_cell(n, seed);
+        let x = ins.remove(0);
+        (ins, vec![Out::InPlace(x)], eps)
+    };
+    sweep(t, shapes, make, |side, x: &mut Cell, n, &eps| {
+        let y = x.o(side, 0);
+        launch(side, (y.cast_const(), x.i(0), y, n, eps))
+    });
+}
+
 pub fn rmsnorm_single(r: &Ref, t: &mut Tally) {
     // SAFETY: `rivoli_rmsnorm_single`'s C signature.
     let c: NormFn = unsafe { r.sym(c"rivoli_rmsnorm_single") };
@@ -199,6 +244,7 @@ pub fn rmsnorm_single(r: &Ref, t: &mut Tally) {
         norm_cell,
         |side, x: &mut Cell, n, &eps| rmsnorm_on(c, side, norm_io(x, side, n, eps)),
     );
+    norm_sweep_aliased(t, |side, io| rmsnorm_on(c, side, io));
     let (gi, go) = guard_ptrs();
     let none = (gi, gi, go, 0, 1e-5);
     t.guard("rmsnorm_single n=0", both(|side| rmsnorm_on(c, side, none)));
@@ -223,6 +269,7 @@ pub fn rmsnorm_centered_single(r: &Ref, t: &mut Tally) {
         norm_cell,
         |side, x: &mut Cell, n, &eps| centered_on(c, side, norm_io(x, side, n, eps)),
     );
+    norm_sweep_aliased(t, |side, io| centered_on(c, side, io));
     let cases = NOT_POSITIVE_FINITE
         .map(|e| (8, e))
         .into_iter()

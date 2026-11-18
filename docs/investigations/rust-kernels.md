@@ -525,6 +525,88 @@ each.
     patched `f2e4m3_rne` sits inside `ex_aq8`.
 - The barrier plant has no arm; its judge is owed (above).
 
+### Phase 0 merge review — the fix list (2026-11-18, deviceless)
+
+The coordinator's merge review of `864f9b3` (two independent reviewers plus a deviceless run)
+found no launcher-semantics defect: guards, order, geometry, LDS, streams and return codes all
+match the C. It did find gaps in what holds that true, and in the shape Phase 1's four lanes
+will copy. Every MUST item was done; the SHOULD items were done or declined, as below.
+
+**Gates added (each red-proofed deviceless, `gate-red-proofs.md` §18):**
+- **Gate rows census** (`kernel_coverage.rs`, `every_rust_kernel_has_a_gate_row_and_a_launchers_row`).
+  Three populations, each checked against the others in both directions: the shipped Rust
+  kernels, the gate's `ROWS` entries, and the `launchers!` `=>` rows (by the `rivoli_<kernel>`
+  host launcher each names). Each `ROWS` entry's row function must also bind
+  `c"rivoli_<name>"`, so an entry pointing at another kernel's row cannot stand in. Every
+  finding is gathered before one assert, so a defect reaching both populations shows both.
+  `touch_region` is the one argued exemption (`UNROWED`, checked to exist). Before this, a
+  lane could port a kernel with no row and every census plus the gate would stay green.
+  Result: 14 kernels, 13 rowed, 1 exempt.
+- **Launcher floor, derived.** The scanned launcher population must equal
+  `kernel-inventory.md`'s table, in both directions. The hand-bumped `>= 66` is gone. The
+  shipped-kernel floor (`>= 14`) is gone too, replaced by the census above.
+- **Binary freshness** (`tests/bit-identity.sh`). The binary is the one cargo names for the
+  header's build line, run in the checkout's own root, and it must be Fresh. A stale binary is rebuilt by that call, outside
+  the lock, and the arm is refused. A positional (planted) binary is accepted only with
+  `--expect-red`. It used to be "the newest by mtime".
+- **Aliased rows.** These match how production launches each kernel in place:
+  - `swiglu` with `h == g` (`glm/mlp.rs`);
+  - `swiglu_clamped_bf16` with `h == g` (`v4/moe.rs`);
+  - `situ_glu_f32` with `h == g` (`k3/forward.rs`);
+  - `rmsnorm_single` with `y == x` (`glm/attn.rs`);
+  - `rmsnorm_centered_single` with `y == x` (`glimmer/forward.rs`).
+
+  The review listed three; its correctness reviewer found the other two production in-place
+  launches.
+
+  Each is an untimed sweep over the row's shapes, with the output buffer starting as the
+  operand on both sides. These are new cells, and the next device run is their first.
+
+**Phase 1 shape:**
+- **Host launchers:** `rk_launchers.rs` became `crates/backend/src/launch/`, one module per
+  kernel family (activation, residual, touch). `Geometry` is a named struct (`blocks`,
+  `threads`, `lds: LdsBytes`). `launch_raw` takes `(f, geom, stream, KernArgs)`, where
+  `KernArgs` is `Params | Packed`: HIP's exactly-one-of rule, made a type.
+- **ABI crate:** `rivoli_abi::kernarg` and `geom` became per-family modules, re-exported flat.
+  Each struct's size assert sits on the line after it, and each constant's shape assert sits
+  beside it. `ROWS_PER_BLOCK` and `FP4_QUANT_BLOCK` moved into `geom`, and the prelude now
+  derives its own from them.
+- **Invocation files:** `hip_linalg.rs` (799 lines) split by family into `hip_linalg.rs`
+  (matvec, embedding, elementwise: 392 lines) and `hip_activation.rs` (gates, quantizers,
+  norms, RoPE: 441 lines). A `launchers!` invocation file needs its own jscpd marker, so the
+  exemption count is **10** (CLAUDE.md). Both markers were re-measured with both deleted: 11
+  clones, 5 inside each file and 1 across them, every one a parameter-list prefix run. So
+  each marker is earned, not inherited.
+- **Build script:** `build/device.rs` now reruns on the root `Cargo.toml`, because
+  `rivoli-abi` inherits its edition and lints from it.
+
+**SHOULD items:**
+- **Done:**
+  - `gpu::for_i32` replaces 8 hand-written `int` strided loops in the kernels. The ISA moved,
+    and the next device run re-scores the bits.
+  - The touch launcher reuses `hiprt::based`.
+  - `hiprt`'s header documents its four return conventions plus the guard codes.
+  - `hip_activation.rs` imports explicitly (no glob).
+  - The `§1780` citation became §16 (the /var/run bind defect).
+- **Declined:**
+  - **Kernarg constructors:** a struct literal names every field at the row. A constructor
+    over `g, u, h` (three `*f32`) brings back the positional transposition the struct
+    removed.
+  - **A `twin!` helper and named shape structs in the gate template:** they would touch
+    every row adapter before a lease, for readability rather than gate strength. Left for the
+    first Phase 1 lane that adds rows, if it finds the template in the way.
+  - **`CodeObject` behind a test-only feature:** a backend feature joins the checked feature
+    matrix (`matrix.rs`), and `CodeObject` has no engine caller to leak into.
+
+**Text corrections:**
+- `residual.rs`: now cites 1.002 and 1.063, and names `each_src` as the suspect for the
+  remaining 6%.
+- The prelude's "probes in scratch" note.
+- `kernels/lib.rs`: "every kernel through that path" now excludes `touch_region`.
+- `module.rs`: the compile-error claim is narrowed to the static's type.
+- `stage.rs`: "negative" corrected to "positive".
+- CLAUDE.md's bit-identity bullet.
+
 ### Phase 0b — the prelude (2026-11-18)
 
 > **MERGED 2026-11-18 into `wave/rk-infra`:** 0a's manifest, `lib.rs` and build integration

@@ -1,26 +1,29 @@
 //! Minimal HIP surface: under `rocm` this binds the kernel launchers — the hipcc-built ones
 //! (fp8/int8/f32 linalg, VQ-int3 and int4 MoE, MLA, fwd glue) through `extern "C"`, and the
-//! Rust ones (`crates/kernels`, since 2026-11-18) through `rk_launchers.rs`. Without the
+//! Rust ones (`crates/kernels`, since 2026-11-18) through `launch/`. Without the
 //! feature the whole module compiles away.
 //!
-//! # The wall is four files, and this one is its shared quarter
+//! # The wall is five files, and this one is its shared fifth
 //!
-//! Split 2026-08-15 under the 800-line file ceiling (and again 2026-08-16, when M9's
-//! launchers pushed the fused-block half past it), by cohesion rather than by line count:
+//! Split 2026-08-15 under the 800-line file ceiling (again 2026-08-16, when M9's launchers
+//! pushed the fused-block half past it, and 2026-11-18 by kernel family), by cohesion rather
+//! than by line count:
 //! this file keeps what every launcher needs — the descriptor structs, the `launchers!` DSL
 //! that emits both halves of the ABI wall from one declaration, and the return-code check —
 //! plus the handful of entry points that are not launchers at all (the device sync, the two
 //! device-to-device copies, the fill, the scratch sizing). The macro invocations moved
 //! out whole:
 //!
-//! - `hip_linalg.rs` — the PRIMITIVE wall: one launch per matvec, matmul, embedding row,
-//!   elementwise op, activation quantizer, normalization or RoPE.
+//! - `hip_linalg.rs` — the PRIMITIVE wall: one launch per matvec, matmul, embedding row or
+//!   elementwise op.
+//! - `hip_activation.rs` — the primitive wall's activation family: gates, activation
+//!   quantizers, normalizations, RoPE (split from `hip_linalg.rs` 2026-11-18, by family).
 //! - `hip_blocks.rs` — the RESIDUAL-STREAM blocks: streaming MoE ranges and their
 //!   accumulator, and the residual mixers (mHC, K3's attn_res).
 //! - `hip_attn.rs` — the ATTENTION blocks: MLA/GQA/MHA attention, the KV slabs, the sparse
 //!   indexer, the KV compressor, and the KDA recurrent-state family.
 //!
-//! Both are re-exported here, so `rivoli_backend::hip::launch_*` and `waist.rs`'s
+//! All four are re-exported here, so `rivoli_backend::hip::launch_*` and `waist.rs`'s
 //! `pub use crate::hip::*` resolve exactly as they did when this was one file — which module
 //! a launcher is declared in is an authoring convenience and deliberately not part of any
 //! path. `crates/cli/tests/kernel_coverage.rs` scans `crates/backend/src` recursively for
@@ -39,6 +42,7 @@ use std::ffi::c_void;
 // the two that already exist (the declaration and `kernel_coverage.rs`'s census) are both
 // checked. This one would not be — a launcher left out of it would simply be invisible to
 // every consumer, which is the failure mode a wall like this cannot afford.
+pub use crate::hip_activation::*;
 pub use crate::hip_attn::*;
 pub use crate::hip_blocks::*;
 pub use crate::hip_linalg::*;
@@ -260,7 +264,7 @@ macro_rules! launchers {
     (@call -> $sym:ident $positional:tt) => {
         $sym $positional
     };
-    // `launch_x => rivoli_x(KernArg { .. }, ..)`: a RUST launcher (`src/rk_launchers.rs`,
+    // `launch_x => rivoli_x(KernArg { .. }, ..)`: a RUST launcher (`src/launch/`,
     // imported by the invocation file). Nothing to declare; the row's own call expression
     // builds the `rivoli_abi::kernarg` block from the wrapper's parameters, so the kernel's
     // parameter list is spelled once — in that struct — instead of in a C signature, a

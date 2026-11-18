@@ -53,9 +53,10 @@ pub unsafe fn copy_to_slot(
     check(rc)
 }
 
-/// `0` is HIP success at this boundary; anything else is the negative HIP code the C side
-/// folds through `HIP_ERR_BASE` (`hiprt`'s `HIP_ERR_BASE - hipError_t`, async.hip's convention). Factored because both staging calls end this way and the
-/// duplication gate is right that one tail should exist once.
+/// `0` is HIP success at this boundary; anything else is a POSITIVE code: a guard code, or
+/// `HIP_ERR_BASE - hipError_t` (`hiprt`'s fold, async.hip's convention). Factored because
+/// both staging calls end this way and the duplication gate is right that one tail should
+/// exist once.
 fn check(rc: i32) -> Result<(), String> {
     if rc == 0 {
         Ok(())

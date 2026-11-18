@@ -28,7 +28,7 @@ use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
 #[allow(unused_imports)]
 use crate::{
     hip::{attend_scratch_floats, device_sync},
-    hip_linalg::{launch_act_quant_f8_prefix, launch_sigmoid_gate},
+    hip_activation::{launch_act_quant_f8_prefix, launch_sigmoid_gate},
 };
 
 // jscpd:ignore-start
