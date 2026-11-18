@@ -8,6 +8,7 @@ use crate::gpu::{bid, fma, lds, tid};
 use crate::prelude::formats::rbf16;
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::{sync_threads, tree, wave_sum};
+use crate::prelude::rowview::for_strided;
 use core::intrinsics::{exp, sqrt, unchecked_div, unchecked_rem};
 use rivoli_abi::geom::{
     ATTN_RES_BLOCK, ATTN_RES_MAX_SRC, ELEMENTWISE_BLOCK, HC_MIX, HC_MULT, HC_PRE_BLOCK, HC_RED,
@@ -16,6 +17,14 @@ use rivoli_abi::geom::{
 use rivoli_abi::kernarg::{AttnRes, GatedResidual, HcPost, HcPre};
 
 const HM: usize = HC_MULT as usize;
+
+/// `hc_pre`'s two streaming loops: the C's `#pragma unroll 8` — schedule only, the fold
+/// stays ascending. Without it the port ran 3.9x hipcc (rust-kernels.md §5, Phase 0a lease
+/// 1); the after-number is owed to lease 2.
+const HC_UNROLL: usize = 8;
+
+// `each_src` spells this many slots.
+const _: () = assert!(ATTN_RES_MAX_SRC == 16, "each_src spells 16 slots");
 
 /// `hc_pre`'s five LDS arrays, carved from the one dynamic allocation in
 /// the order `rivoli_abi::geom::HC_PRE_LDS_BYTES` documents and sums.
@@ -121,11 +130,9 @@ unsafe fn hc_rms(HcRow { flat, hcd }: HcRow, norm_eps: f32, red: *mut f32) -> f3
     let t = tid();
     if t < HC_RED {
         let mut local = 0.0f32;
-        let mut i = t as usize;
-        while i < hcd {
+        for_strided::<HC_UNROLL>(t as usize, hcd, HC_RED as usize, |i| {
             local = fma(*flat.add(i), *flat.add(i), local);
-            i += HC_RED as usize;
-        }
+        });
         *red.add(t as usize) = local;
     }
     sync_threads();
@@ -144,11 +151,9 @@ unsafe fn hc_mixes(HcRow { flat, hcd }: HcRow, fnw: *const f32, rs: f32, mixes: 
     while j < HC_MIX {
         let wr = fnw.add(j as usize * hcd);
         let mut acc = 0.0f32;
-        let mut i = lane as usize;
-        while i < hcd {
+        for_strided::<HC_UNROLL>(lane as usize, hcd, WAVE as usize, |i| {
             acc = fma(*flat.add(i), *wr.add(i), acc);
-            i += WAVE as usize;
-        }
+        });
         let acc = wave_sum(acc);
         if lane == 0 {
             *mixes.add(j as usize) = acc * rs;
@@ -201,14 +206,22 @@ pub unsafe extern "gpu-kernel" fn hc_post(a: HcPost) {
     // SAFETY: `dim > 0` — the launcher refuses `dim <= 0` (1001), so no division by zero.
     let (q, d) = (unchecked_div(i, dim), unchecked_rem(i, dim));
     let (k, tok) = (q % HM, q / HM);
-    let mut acc = *a.post.add(tok * HM + k) * *a.x.add(tok * dim + d);
-    for j in 0..HM {
-        let src = tok * HM + j;
-        acc = fma(
-            *a.comb.add(src * HM + k),
-            *a.residual.add(src * dim + d),
-            acc,
-        );
+    // `post·x + comb₀·res₀` is `a·b + c·d`: hipcc fuses the LEFT product, `fma(post, x,
+    // comb₀·res₀)` (its ISA: one `v_mul`, then four `v_fmac`). Fusing the right one instead
+    // (this kernel's first spelling) passed every CPU check and went RED on the device:
+    // 26 words in 23 of 192 cells, bit-identity arm A, 2026-11-18.
+    let src = |j: usize| tok * HM + j;
+    let cell = |j: usize| {
+        (
+            *a.comb.add(src(j) * HM + k),
+            *a.residual.add(src(j) * dim + d),
+        )
+    };
+    let (c0, r0) = cell(0);
+    let mut acc = fma(*a.post.add(tok * HM + k), *a.x.add(tok * dim + d), c0 * r0);
+    for j in 1..HM {
+        let (c, r) = cell(j);
+        acc = fma(c, r, acc);
     }
     *a.y.add(i) = rbf16(acc);
 }
@@ -253,6 +266,20 @@ unsafe fn attn_res_score(
     sync_threads();
 }
 
+/// `f(s)` for `s = 0, 1, …, ns - 1`, as 16 straight-line guarded slots, so every index into
+/// the private `p[16]` is a constant and `p` stays in registers, as hipcc keeps it. A loop
+/// bounded by the runtime `nsrc` put `p` in scratch (`.private_segment_fixed_size` 144 per
+/// `llvm-readelf --notes` on the code object; 80 with a constant-bound loop LLVM did not
+/// unroll; 0 now) and `attn_res` ran 1.38x hipcc (rust-kernels.md §5, Phase 0a lease 1;
+/// after-number owed to lease 2). Same operations as the C, in its ascending order.
+#[inline(always)]
+fn each_src(ns: usize, mut f: impl FnMut(usize)) {
+    macro_rules! slots {
+        ($($s:literal)*) => { $( if $s < ns { f($s); } )* };
+    }
+    slots!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15);
+}
+
 /// Max-subtracted softmax over the `nsrc` scores, redundantly per thread (the C argues why).
 #[inline(always)]
 unsafe fn attn_res_probs(prob: *const f32, ns: usize) -> [f32; ATTN_RES_MAX_SRC as usize] {
@@ -265,9 +292,7 @@ unsafe fn attn_res_probs(prob: *const f32, ns: usize) -> [f32; ATTN_RES_MAX_SRC 
         z += exp(*prob.add(s) - m);
     }
     let mut p = [0.0f32; ATTN_RES_MAX_SRC as usize];
-    for (s, ps) in p.iter_mut().enumerate().take(ns) {
-        *ps = exp(*prob.add(s) - m) / z;
-    }
+    each_src(ns, |s| p[s] = exp(*prob.add(s) - m) / z);
     p
 }
 
@@ -285,9 +310,7 @@ pub unsafe extern "gpu-kernel" fn attn_res(a: AttnRes) {
     let mut i = tid() as i32;
     while i < a.n {
         let mut acc = 0.0f32;
-        for (s, &ps) in p.iter().enumerate().take(ns) {
-            acc = fma(ps, *v0.add(s * n + i as usize), acc);
-        }
+        each_src(ns, |s| acc = fma(p[s], *v0.add(s * n + i as usize), acc));
         *o.add(i as usize) = acc;
         i += ATTN_RES_BLOCK as i32;
     }

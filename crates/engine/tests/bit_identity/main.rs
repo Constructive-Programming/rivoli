@@ -69,6 +69,10 @@ const ROWS: &[Row] = &[
 #[ignore = "on-demand GPU gate — run through tests/bit-identity.sh"]
 fn every_rust_kernel_is_byte_identical_to_its_tagged_hipcc_twin() {
     let r = device::Ref::open();
+    // libtest prints `test <name> ... ` with no newline before `--nocapture` output; without
+    // this the first verdict line is mid-line and the classifier miscounts (rust-kernels.md §5,
+    // Phase 0a lease 1).
+    println!();
     let mut red = Vec::new();
     for (name, row) in ROWS {
         let mut t = device::Tally::default();

@@ -1955,3 +1955,13 @@ reference's code instead of faulting the shared GPU; each launcher has a case fa
 guards at once, which pins guard ORDER. NaN is compared as a class (owner, 2026-11-18), so the
 per-side output poisons are distinct FINITE sentinels — two NaN poisons would compare equal
 and an element neither twin wrote would pass.
+
+**Device arm, lease 1 (2026-11-18): the plant reddened exactly the rows it targets, and the
+scripted verdict still could not be read green.** `--expect-red=rope_interleave,rope_split_half`
+on the planted binary: `rope_interleave` RED 275/320 cells, `rope_split_half` RED 275/320
+cells, witness clean. Exit 1 anyway, for two reasons the real arm shared: a genuine third red
+row (`hc_post`, a mis-placed FMA found by the same lease — `rust-kernels.md` §5, Phase 0a —
+device arms, lease 1) and the
+classifier counting 12 rows of 13 because libtest's `test <name> ... ` swallowed the first
+verdict line's line start. The classifier refused in both cases — the fail-safe direction this
+file asks for — and both causes are fixed; the scripted verdict is owed to the next lease.

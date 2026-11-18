@@ -293,6 +293,70 @@ bridges the migration: `rivoli_act_quant_f8`, which `moe_f4.hip` still calls C-t
 - Bit-identity gate built; its CPU plant model green (rope unfused: 23212/131072 outputs,
   64/64 seeds). Device arms: pending the GPU lease.
 
+### Phase 0a — device arms, lease 1 (2026-11-18, commit `a2abd64`)
+
+Three arms, rh-anine, each through `run_arm`: **witness CLEAN on all three** (empty KFD
+witness file, GTT 17 MiB pre-arm; host loadavg 10.5→16.0 on A, 15.3→14.7 on R, 10.6→3.1
+on W — sibling builds, recorded, not a discard). Logs:
+`/var/cache/rivoli/scratch/bit-identity/20261118T184545-4013011` (A),
+`…/20261118T184629-4015490` (R), `/var/cache/rivoli/scratch/rk-infra/gpu/W.{out,err}` (W).
+
+**Arm A (real binary `bit_identity-efca1da5680a0280`): 12 of 13 rows BIT-IDENTICAL; `hc_post`
+RED** — 26 words over 23 of 192 cells, NaN-payload-only 0 on every row. Cause, read off hipcc's ISA afterwards: `post·x + comb₀·res₀` is `a·b + c·d`, and hipcc
+fuses the LEFT product (`fma(post, x, comb₀·res₀)`: one `v_mul`, four `v_fmac`) — the rule 0b
+recorded; the port fused the right one. A CPU check could not have told them apart; the
+gate did. The script's verdict line ALSO read RED for a second reason: libtest prints
+`test <name> ... ` with no newline before a `--nocapture` body, so the first row's token
+(`BIT-IDENTICAL swiglu`) landed mid-line and the anchored classifier counted 12 rows of 13
+and refused — the fail-safe direction, but it would refuse a clean arm too.
+
+Per-kernel µs, A's TIME lines (min of three 200-launch batches, hot shape, null stream):
+
+| kernel (shape) | hipcc µs | Rust µs | ratio |
+|---|---|---|---|
+| swiglu (6144) | 2.05 | 2.04 | 0.996 |
+| swiglu_clamped_bf16 (2048) | 2.05 | 2.02 | 0.985 |
+| situ_glu_f32 (2048) | 2.15 | 2.12 | 0.988 |
+| rmsnorm_single (6144) | 7.59 | 7.53 | 0.992 |
+| rmsnorm_centered_single (4096) | 6.14 | 5.72 | 0.931 |
+| rmsnorm_weightless_batch (32×128) | 2.99 | 2.55 | 0.853 |
+| act_quant_f8 (1×7168) | 3.26 | 3.28 | 1.008 |
+| rope_interleave (32,128,128) | 4.78 | 4.87 | 1.018 |
+| rope_split_half (32,128,128) | 4.78 | 4.86 | 1.017 |
+| **hc_pre (1×4096)** | **14.41** | **55.58** | **3.856** |
+| hc_post (1×4096) | 2.57 | 2.47 | 0.962 |
+| **attn_res (1,9,7168,9)** | **53.07** | **73.40** | **1.383** |
+| gated_residual_collapse_f32 (4×2560) | 2.75 | 2.36 | 0.860 |
+
+The small-launch gap is gone (Phase 0c's rule holds: ≤ 1.02 on every elementwise kernel).
+Two real slowdowns: `hc_pre` 3.9x — its C carries `#pragma unroll 8` on both streaming loops
+and records that load depth WAS the cost; the port had none — and `attn_res` 1.38x, whose
+private `p[16]` sat in 144 B of scratch where hipcc keeps it in registers.
+
+**Arm R (planted `rope` lo unfused): the plant reddened exactly its two rows** —
+`rope_interleave` 275/320 cells (53256 words), `rope_split_half` 275/320 cells (53002 words) —
+with every other row unchanged from A (including A's `hc_post` red). The script's
+`--expect-red` verdict was nevertheless NOT met, for A's two reasons (a third red row, and the
+merged first line), so the red proof is recorded as OBSERVED and its scripted verdict is owed
+to the re-run.
+
+**Arm W (the whole device battery, `--test-threads=1`): 705 passed, 1 failed, 1 ignored.**
+The pre-arm freshness check was `cargo build --workspace --tests` (0 `Compiling`, 118
+`Fresh`; the guard refuses `cargo test --no-run` without the lock) — and it is NOT an exact
+proxy: inside the lock `cargo test` still printed `Compiling rivoli-engine` and `Finished … in
+0.41s` (W.err line 5), cause not determined. A sub-second hold, but "nothing compiled in the
+lock" is false for this arm; the next battery needs a proxy that matches `cargo test`'s
+units. The one failure is the
+CodeScene test that is red on the base commit; the ignored test is the bit-identity gate.
+Every oracle suite over the 13 migrated launchers, the stream/event/timeline FFI and the
+fetch path passed unmodified.
+
+**Fixed after the lease, deviceless (re-run owed):** `hc_post` fuses the left product;
+`hc_pre`'s two loops use 0b's `rowview::for_strided::<8>` (the C's `#pragma unroll 8`);
+`attn_res` indexes `p` only through 16 straight-line constant slots (`each_src`), so its
+private segment is 0 B (`llvm-readelf --notes` on the new code object; 144 B before, per the
+correctness review's read of the old one); the gate prints a newline before its first verdict line.
+
 ### Phase 0b — the prelude (2026-11-18)
 
 > **MERGED 2026-11-18 into `wave/rk-infra`:** 0a's manifest, `lib.rs` and build integration
