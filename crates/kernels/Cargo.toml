@@ -21,6 +21,22 @@ publish = false
 # the file `hipModuleLoadData` takes.
 crate-type = ["cdylib"]
 
+[features]
+# The prelude PROBE kernels (`src/probes`): built only into the second code object
+# `tests/bit-identity.sh --build-probes` makes, never shipped.
+probes = []
+# One red-proof plant each (`src/probes/plants.rs`): a single defective helper family, built
+# on request only by `tests/bit-identity.sh --build-probes=<family>`; at most one per build.
+plant_formats = ["probes"]
+plant_actquant = ["probes"]
+plant_common = ["probes"]
+plant_situ = ["probes"]
+plant_reduce = ["probes"]
+plant_barrier = ["probes"]
+plant_fp8 = ["probes"]
+plant_nib = ["probes"]
+plant_vq = ["probes"]
+
 [dependencies]
 rivoli-abi = { path = "../abi" }
 

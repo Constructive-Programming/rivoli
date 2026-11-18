@@ -64,7 +64,7 @@ appears that enum dispatch cannot fill.
   removed), while 5-line/41-token and 13-line/182-token copies both redden it. So "zero
   budget" is zero clones of ≥ 5 lines, and a deliberate small copy is invisible — which
   matters when a refactor is meant to be proven caught as well as when one is being avoided.
-  **9** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
+  **10** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
   where verbatim transcription of the reference is the point; four across the HIP ABI
   wall, which the 800-line ceiling split into `backend/hip.rs` — its extern declarations
   and its one hand-written launcher — plus one per macro-invocation file,
@@ -77,7 +77,9 @@ appears that enum dispatch cannot fill.
   `engine/examples/arena_repro.rs`, added 2026-08-18, where two examples sharing a module
   cannot avoid emitting `mod common; fn main() { … common::start() }` — the matched tokens
   ARE the sharing, and the only way to unmatch them is to stop sharing, which is strictly
-  more duplication); the
+  more duplication; and one, added 2026-11-18, over the copying half of `kernels/src/probes/plants.rs`,
+  the bit-identity gate's red-proof plants — each IS a copy of a live prelude helper with one
+  deliberate defect, so the copy is the point); the
   count is derived by `crates/cli/tests/docs.rs`, and marker text may appear only on a
   bare marker line.
 - **CodeScene 10/10** — `crates/cli/tests/codescene.rs`, whole tree, hard threshold;
@@ -169,8 +171,11 @@ appears that enum dispatch cannot fill.
   plant by exactly the rows it must redden. Never builds; flock + witness via `run_arm`.
   Red proof `docs/measurement/gate-red-proofs.md` §18: classifier half PAID deviceless (eight
   stub arms), the rope-unfused plant shown adversarial on CPU (23212/131072 outputs, 64/64
-  seeds); the device arm OWED to the first GPU lease. 0b's prelude probe families are not rows
-  yet (owed). On-demand (GPU, wall-clock unmeasured), not CI.
+  seeds); the device arm PAID 2026-11-18 (13/13 bit-identical; the plant reddens exactly the
+  two rope rows, scripted GREEN). `--probes` runs the PRELUDE probe rows (0b's families, 222
+  groups) against a hipcc probe object built from the tag's headers and a Rust one
+  `--build-probes` builds outside cargo — device arms owed; `--plant=<family>` judges a plant
+  by its row in the script's `plant_spec` table. On-demand (GPU, wall-clock unmeasured), not CI.
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
   suite or a live deferral, checked both ends; **66/66/0** as measured 2026-09-08 by `cargo test -p rivoli --no-default-features --test kernel_coverage -- --nocapture` (the figure stood at 61 for four milestones and nobody re-counted it — the same prose-drift class §13 caught in its own row count; `docs/reference/kernel-inventory.md` enumerates the same population row by row), and it rose past 61 when M17c's
   `gqa_block_attend` landed with its launcher and `kernel_glimmer_block_attend.rs`. Its

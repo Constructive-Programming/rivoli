@@ -346,16 +346,87 @@ The pre-arm freshness check was `cargo build --workspace --tests` (0 `Compiling`
 proxy: inside the lock `cargo test` still printed `Compiling rivoli-engine` and `Finished … in
 0.41s` (W.err line 5), cause not determined. A sub-second hold, but "nothing compiled in the
 lock" is false for this arm; the next battery needs a proxy that matches `cargo test`'s
-units. The one failure is the
-CodeScene test that is red on the base commit; the ignored test is the bit-identity gate.
-Every oracle suite over the 13 migrated launchers, the stream/event/timeline FFI and the
-fetch path passed unmodified.
+units. The one failure is the CodeScene test that is red on the base commit; the ignored test
+is the bit-identity gate. Every oracle suite over the 13 migrated launchers, the
+stream/event/timeline FFI and the fetch path passed unmodified.
+
+> **CAUSE FOUND 2026-11-18 (after lease 2):** `cargo test` also builds every package's
+> EXAMPLE targets, and `cargo build --tests` does not — `crates/engine/examples/glm_smoke.rs`
+> and `arena_repro.rs` are what compiled in the lock (`cargo build --workspace --examples -v`
+> afterwards compiled exactly `rivoli-engine`'s two example crates). The battery's pre-check is
+> now `cargo build --workspace --tests --examples`, run twice, refusing unless the second run
+> compiles nothing; the workspace's doctests run nothing, so rustdoc compiles nothing either.
 
 **Fixed after the lease, deviceless (re-run owed):** `hc_post` fuses the left product;
 `hc_pre`'s two loops use 0b's `rowview::for_strided::<8>` (the C's `#pragma unroll 8`);
 `attn_res` indexes `p` only through 16 straight-line constant slots (`each_src`), so its
 private segment is 0 B (`llvm-readelf --notes` on the new code object; 144 B before, per the
 correctness review's read of the old one); the gate prints a newline before its first verdict line.
+
+### Phase 0a — device arms, lease 2 (2026-11-18, commit `15e7fbf`)
+
+Arms A and R re-run on the lease-1 fixes; **witness CLEAN on both** (0 B witness files, GTT
+17 MiB pre-arm, host loadavg ~1.6). Logs `/var/cache/rivoli/scratch/bit-identity/20261118T191409-4152605`
+(A) and `…/20261118T191428-4153446` (R).
+
+- **Arm A: 13 of 13 rows BIT-IDENTICAL**, script GREEN (`rows=13 of 13`), NaN-payload-only 0
+  on every row. `hc_post` is fixed by the left-product FMA.
+- **Arm R: GREEN (expect-red)** — exactly `rope_interleave` and `rope_split_half` red (275/320
+  cells each, 53256 / 53002 words), every other row bit-identical. The bit-identity gate's
+  red proof is now PAID on the device.
+- After-numbers: **`hc_pre` 14.58 → 14.61 µs, ratio 1.002** (from 3.856 — the unroll was the
+  whole gap). **`attn_res` 53.14 → 56.51 µs, ratio 1.063** (from 1.383) — above parity by ~6%,
+  reported and NOT iterated inside the lease. The rest within 0.86–1.03 (`act_quant_f8` 1.030,
+  `rope_interleave` 1.025, `rope_split_half` 1.014).
+
+### Phase 0a — the prelude probe rows (2026-11-18, deviceless)
+
+0b's scratch probe families are now rows of the gate. **A module-load reference beside the
+shared-object one:** a prelude helper has no launcher, so each is exposed by a probe kernel —
+`crates/engine/tests/bit_identity/probes/probe.hip` (0b's file, moved in) built by hipcc
+against the TAG's headers, and its twin in `crates/kernels/src/probes` behind a `probes`
+feature, built into a SECOND code object by `tests/bit-identity.sh --build-probes` (never
+embedded, and never part of a cargo build: the device flags come from the `device-rustflags`
+file `build/device.rs` writes, the nested build runs under `env -i` in the crate's directory,
+and its clean object is byte-identical — sha256 `3a23b8d7…` — to the one an earlier draft
+built inside `build.rs`) — and both are launched through the backend's new `CodeObject`
+(path-loaded module, packed kernarg buffer) from one argument list. The Rust probes take one `repr(C)`
+block per C parameter list (bytes = the positional kernarg layout); 0b's ISA census re-run
+over the in-tree pair: the same single DIFF as their record (`k_i4_wave_r2`, waves/SIMD
+16→12; VGPR 104 vs their 103).
+
+- **Rows:** codec (exhaustive 2^32 sweeps), reduce, fp8, i4, f4, vq — 222 groups, each a
+  verdict row with the launcher rows' tokens; NaN as a class and 0b's `Out` typing (only f32
+  outputs NaN-classified); different fills per side; the compare runs ON THE DEVICE in
+  hipcc-built `cmp_*` kernels added to `probe.hip` (the comparer is not the compared).
+- **Plants:** 0b's nine, features `plant_<family>` on `crates/kernels` (at most one per build,
+  a const assert — two together refuse to compile, observed), built by
+  `--build-probes=<family>` into `$CARGO_TARGET_DIR/probes/<family>` — all nine built
+  2026-11-18, every object distinct from the clean one. The plants that copy a live helper
+  (situ, fp8, nib, vq, barrier) sit in one jscpd exemption region (a plant IS a copy with one
+  defect; CLAUDE.md's count now 10); the file carries a CodeScene EXEMPT row at 9.6 (Primitive
+  Obsession on the helpers' own signatures) — **both need owner acceptance**.
+- **Judging a plant:** `--plant=<family>` reads the family's row in the script's `plant_spec`
+  table — families, the rows that must redden, the rows that must hold (mandatory) — and
+  applies 0b's `check-arm.py` rule on the same classifier. vq reaches every vq group (0b:
+  15/15), so its hold anchor is the reduce family. `barrier` has no row (a race; its gate is
+  the ISA census). Five stub arms red-proof the rule (`gate-red-proofs.md` §18).
+- **Census:** `every_prelude_probe_has_its_hipcc_twin` — 35 Rust probes, each with a
+  same-named `__global__` in `probe.hip` and vice versa (documented one-sided: `cmp_*`,
+  `k_vq_wave_r1`, each checked to exist), and every probe name is a string literal some
+  harness row launches; a renamed probe reddens it, and so does an unlaunched one (planted
+  `"ex_nquad"` → `"ex_nquadX"` in `codec.rs`: exit 101, `probes no harness row launches:
+  ["ex_nquad"]`; restored, `cmp` clean, green). The Rust-kernel handle census excludes the
+  probes by PATH (`crates/kernels/src/probes/`), so a shipped kernel cannot drop out by
+  sharing a probe's name.
+- **Divergences from 0b's harness, deliberate:** `k_lut` is judged as `u32` words, strictly
+  (0b's was strict too; an f32 reading would have let a NaN-code difference in the table
+  pass); fp8's hipcc twin launches with the same 1 KiB of dynamic LDS the Rust twin needs
+  (hipcc's LUT is a static array; the bytes are unread); inputs carry 0b's 64 bytes of zero
+  tail slack.
+- Inputs are this gate's own draws (`Lcg`, 0b's seed classes NORMAL/WIDE/NASTY and shapes), so
+  the cells are new; group names use Rust's float formatting (`s=NaN`, not 0b's `s=nan`),
+  which `plant_spec`'s regexes are written against.
 
 ### Phase 0b — the prelude (2026-11-18)
 

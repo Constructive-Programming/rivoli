@@ -217,7 +217,15 @@ enum Health {
 /// Complex Method cc=12 at 9.66, strictly worse. A conversion module's vocabulary IS one
 /// primitive in, one out; a newtype added to move the counter would be laundering. Floor
 /// 9.6 so real decay still reddens.
+/// `kernels/src/probes/plants.rs` joined 2026-11-18 (NEEDS OWNER ACCEPTANCE, like every row
+/// here): the bit-identity gate's red-proof plants. Each plant is a copy of a live prelude
+/// helper with one deliberate defect, so it MUST keep that helper's signature — its
+/// primitive arguments are the helper's (`f32` in, `f32`/`u8` out), and no newtype could be
+/// added without the plant ceasing to be a drop-in for the family it replaces. The only
+/// other finding (a three-term conditional) was split; Primitive Obsession is what remains.
+/// Floor 9.6 against a measured 9.68.
 const EXEMPT: &[(&str, f64)] = &[
+    ("crates/kernels/src/probes/plants.rs", 9.6),
     ("crates/oracles/src/v4oracle/numerics.rs", 9.6),
     ("crates/oracles/src/dflash.rs", 8.4),
     ("crates/core/src/num.rs", 9.6),

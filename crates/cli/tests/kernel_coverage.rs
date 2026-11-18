@@ -362,7 +362,19 @@ fn every_launcher_is_shipped_or_classified_uncalled() {
 #[test]
 fn every_rust_kernel_has_exactly_one_host_handle() {
     let decl = format!("pub unsafe extern {:?} fn ", "gpu-kernel");
-    let mut device: Vec<String> = corpus("crates/kernels/src", "")
+    // The prelude PROBES (`crates/kernels/src/probes`) are not shipped kernels: the gate
+    // launches them by name from a separate code object, so they owe no host handle — their
+    // own census is `every_prelude_probe_has_its_hipcc_twin` below. Excluded by PATH, so a
+    // shipped kernel can never drop out of this census by sharing a probe's name.
+    let root = common::repo_root().join("crates/kernels/src");
+    let probes = root.join("probes");
+    let shipped: Vec<String> = common::walk(&root, "rs")
+        .iter()
+        .filter(|p| !p.starts_with(&probes))
+        .map(|p| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p:?}: {e}")))
+        .collect();
+    let mut device: Vec<String> = shipped
+        .join("\n")
         .lines()
         .filter_map(|l| {
             l.trim_start()
@@ -410,4 +422,89 @@ fn every_rust_kernel_has_exactly_one_host_handle() {
         bullet(&dangling)
     );
     println!("{} Rust kernels, each with one host handle", device.len());
+}
+
+/// `__global__` kernel names in the bit-identity gate's hipcc probe source.
+fn hip_globals() -> Vec<String> {
+    let path = common::repo_root().join("crates/engine/tests/bit_identity/probes/probe.hip");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("read {path:?}: {e}"))
+        .split("__global__ void ")
+        .skip(1)
+        .filter_map(|rest| rest.split('(').next())
+        .map(|n| n.trim().to_string())
+        .collect()
+}
+
+/// Every prelude probe kernel in `crates/kernels/src/probes` has a same-named hipcc twin in
+/// `probe.hip`, and every hipcc probe has a Rust twin — both ends, so a family added on one
+/// side only, or renamed on one side, is a deviceless red instead of a `hipModuleGetFunction`
+/// failure on the device (added 2026-11-18 with the probe rows). The documented one-sided
+/// names: `cmp_bytes`/`cmp_nan_words` (the gate's device compare, hipcc-only on purpose) and
+/// `k_vq_wave_r1` (LTO merges the identical Rust function; the gate scores it against
+/// `k_vq_wave`) — each checked to exist. And every probe is LAUNCHED: its name is a string
+/// literal in the harness, so an orphan pair present on both sides cannot pass silently.
+#[test]
+fn every_prelude_probe_has_its_hipcc_twin() {
+    const HIP_ONLY: [&str; 3] = ["cmp_bytes", "cmp_nan_words", "k_vq_wave_r1"];
+    let src = corpus("crates/kernels/src/probes", "");
+    let decl = format!("pub unsafe extern {:?} fn ", "gpu-kernel");
+    // Three spellings: a plain kernel, `sweep!(name, …)` and `probe!(name(…) = …)`.
+    let mut rust: Vec<String> = src
+        .lines()
+        .map(str::trim_start)
+        .filter_map(|l| {
+            let rest = l
+                .strip_prefix(decl.as_str())
+                .or_else(|| l.strip_prefix("sweep!("))
+                .or_else(|| l.strip_prefix("probe!("))?;
+            rest.split(['(', ',']).next()
+        })
+        .filter(|n| !n.starts_with('$'))
+        .map(String::from)
+        .collect();
+    let all_hip = hip_globals();
+    let missing: Vec<&&str> = HIP_ONLY
+        .iter()
+        .filter(|n| !all_hip.iter().any(|h| h == *n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "HIP_ONLY names absent from probe.hip: {missing:?}"
+    );
+    let mut hip: Vec<String> = all_hip
+        .into_iter()
+        .filter(|n| !HIP_ONLY.contains(&n.as_str()))
+        .collect();
+    rust.sort();
+    hip.sort();
+    // Anti-vacuity: 35 measured 2026-11-18 (0b's probe set less the merged `k_vq_wave_r1`).
+    assert!(
+        rust.len() >= 35,
+        "found only {} probe kernels in crates/kernels/src/probes",
+        rust.len()
+    );
+    let rust_only: Vec<&String> = rust.iter().filter(|n| !hip.contains(n)).collect();
+    let hip_only: Vec<&String> = hip.iter().filter(|n| !rust.contains(n)).collect();
+    assert!(
+        rust_only.is_empty() && hip_only.is_empty(),
+        "\n\nRust probes with no hipcc twin in probe.hip:\n  {}\n\nhipcc probes with no Rust twin:\n  {}",
+        bullet(&rust_only),
+        bullet(&hip_only)
+    );
+    let harness = corpus("crates/engine/tests/bit_identity/probes", "");
+    let unlaunched: Vec<&str> = rust
+        .iter()
+        .map(String::as_str)
+        .chain(HIP_ONLY)
+        .filter(|n| !harness.contains(&format!("\"{n}\"")))
+        .collect();
+    assert!(
+        unlaunched.is_empty(),
+        "probes no harness row launches: {unlaunched:?}"
+    );
+    println!(
+        "{} prelude probes, each with its hipcc twin and a launching row",
+        rust.len()
+    );
 }

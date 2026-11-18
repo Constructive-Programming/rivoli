@@ -35,6 +35,7 @@ pub(crate) const HIP_ERR_BASE: i32 = 1_000_000;
 // The ABI mirror of `hip_runtime_api.h`'s prototypes, each line that header's signature.
 unsafe extern "C" {
     pub(crate) fn hipModuleLoadData(module: *mut *mut c_void, image: *const c_void) -> HipError;
+    pub(crate) fn hipModuleLoad(module: *mut *mut c_void, path: *const c_char) -> HipError;
     pub(crate) fn hipModuleGetFunction(
         f: *mut *mut c_void,
         module: *mut c_void,

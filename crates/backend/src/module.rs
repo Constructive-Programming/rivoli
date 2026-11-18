@@ -13,7 +13,9 @@
 
 #![cfg(feature = "rocm")]
 
-use crate::hiprt::{HipError, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoadData};
+use crate::hiprt::{
+    HipError, hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoad, hipModuleLoadData,
+};
 use std::ffi::{CStr, c_void};
 use std::marker::PhantomData;
 use std::sync::OnceLock;
@@ -57,7 +59,7 @@ pub(crate) struct Kernel<A> {
 
 /// `(grid blocks, block threads, dynamic LDS bytes)` — 1-D, the only shape any ported
 /// launcher uses.
-pub(crate) type Geometry = (u32, u32, u32);
+pub type Geometry = (u32, u32, u32);
 
 impl<A: Copy> Kernel<A> {
     pub(crate) const fn new(name: &'static CStr) -> Self {
@@ -98,21 +100,72 @@ impl<A: Copy> Kernel<A> {
         };
         let mut params = [std::ptr::from_ref(args).cast_mut().cast::<c_void>()];
         // SAFETY: the caller's contract; HIP copies `size_of::<A>()` bytes per the metadata.
-        let e = unsafe {
-            hipModuleLaunchKernel(
-                f.0,
-                grid,
-                1,
-                1,
-                block,
-                1,
-                1,
-                lds,
+        unsafe {
+            launch_raw(
+                f,
+                (grid, block, lds),
                 stream,
-                params.as_mut_ptr(),
-                std::ptr::null_mut(),
+                (params.as_mut_ptr(), std::ptr::null_mut()),
             )
-        };
-        -e
+        }
+    }
+}
+
+/// `hipModuleLaunchKernel` on a 1-D geometry, `0` or `-(hipError_t)`.
+///
+/// # Safety
+/// `(params, extra)` is a valid HIP argument description for `f`; `stream` is live or null.
+unsafe fn launch_raw(
+    f: Handle,
+    (grid, block, lds): Geometry,
+    stream: *mut c_void,
+    (params, extra): (*mut *mut c_void, *mut *mut c_void),
+) -> i32 {
+    // SAFETY: the caller's contract.
+    -unsafe { hipModuleLaunchKernel(f.0, grid, 1, 1, block, 1, 1, lds, stream, params, extra) }
+}
+
+/// A code object loaded from a FILE — the bit-identity gate's module-load reference (the
+/// hipcc and Rust probe objects `tests/bit-identity.sh` builds). The engine never uses it; it lives here so the gate launches through the same path the shipped
+/// kernels do rather than through a second copy of it.
+pub struct CodeObject(Handle);
+
+// `HIP_LAUNCH_PARAM_*` (hip_runtime_api.h): the packed-buffer form of `extra`.
+const PARAM_BUFFER_POINTER: usize = 1;
+const PARAM_BUFFER_SIZE: usize = 2;
+const PARAM_END: usize = 3;
+
+impl CodeObject {
+    /// `hipModuleLoad`, or the `hipError_t` it returned.
+    pub fn load(path: &CStr) -> Result<Self, HipError> {
+        let mut m = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated path.
+        let e = unsafe { hipModuleLoad(&mut m, path.as_ptr()) };
+        if e == 0 { Ok(Self(Handle(m))) } else { Err(e) }
+    }
+
+    /// Launch kernel `name` on the null stream with a PACKED argument buffer — the kernarg
+    /// bytes exactly as the kernel lays them out — `0` or `-(hipError_t)`.
+    ///
+    /// # Safety
+    /// `args` is the kernel's argument layout and every pointer in it is valid for the kernel.
+    pub unsafe fn dispatch_packed(&self, name: &CStr, geom: Geometry, args: &mut [u8]) -> i32 {
+        let mut f = std::ptr::null_mut();
+        // SAFETY: a live module and a NUL-terminated name.
+        let e = unsafe { hipModuleGetFunction(&mut f, (self.0).0, name.as_ptr()) };
+        if e != 0 {
+            return -e;
+        }
+        let mut size = args.len();
+        let mut extra = [
+            PARAM_BUFFER_POINTER as *mut c_void,
+            args.as_mut_ptr().cast(),
+            PARAM_BUFFER_SIZE as *mut c_void,
+            std::ptr::from_mut(&mut size).cast(),
+            PARAM_END as *mut c_void,
+        ];
+        let null = std::ptr::null_mut();
+        // SAFETY: the caller's contract; `extra` describes `args`.
+        unsafe { launch_raw(Handle(f), geom, null, (null.cast(), extra.as_mut_ptr())) }
     }
 }

@@ -12,17 +12,37 @@
 # rebuilt from the working tree would let a port that edited the C beside the Rust compare
 # against its own edit.
 #
-# **It never builds Rust** (device-halves.sh's rule: no build inside the lock, none between
-# arms). Build first, outside:
+# **Nothing builds inside the lock** (device-halves.sh's rule: no build inside the lock, none
+# between arms). The test binary is built first, outside; the script itself builds only the
+# hipcc reference, also outside, before `run_arm` takes the lock — and the Rust probe objects
+# only when asked (`--build-probes`), never on an arm:
 #
 #   CARGO_TARGET_DIR=/var/cache/rivoli/target/<checkout> cargo build -p rivoli-engine --test bit_identity
 #   CARGO_TARGET_DIR=/var/cache/rivoli/target/<checkout> tests/bit-identity.sh
 #
-# usage: tests/bit-identity.sh [--expect-red=ROW[,ROW…]] [test-binary]
+# CARGO_TARGET_DIR must be THIS checkout's dir (`/var/cache/rivoli/target/<basename of the
+# checkout>`): the binary, the device flags and the probe objects are all found under it, and
+# the login default (a shared dir) would hand this checkout a sibling's (§7e-bis).
+#
+# usage: tests/bit-identity.sh [--expect-red=ROWS] [test-binary]          launcher rows
+#        tests/bit-identity.sh --probes [--families=F,…] [test-binary]    prelude probe rows
+#        tests/bit-identity.sh --plant=FAMILY [test-binary]               a probe plant's arm
+#        tests/bit-identity.sh --build-probes[=FAMILY]                    deviceless build
 #        --expect-red=ROWS  inverts the verdict, for a recorded red proof: GREEN only if every
 #                           row ran and examined something, EXACTLY the named rows are RED, and
 #                           every other row is BIT-IDENTICAL — a plant must redden the assertion
 #                           under test, not merely some assertion (gate-red-proofs.md's rule).
+#        --probes           the PRELUDE probe rows (Phase 0b's families): the hipcc object is
+#                           built from the in-tree probe.hip against the TAG's headers; the Rust
+#                           one is the clean object `--build-probes` built.
+#        --families=F,…     probe families to run (codec, reduce, fp8, i4, f4, vq).
+#        --plant=FAMILY     the probe rows against the `--build-probes=FAMILY` object, judged by
+#                           the family's row in plant_spec below: every red row matches its red
+#                           RE (at least one red), and at least one row matches its must-hold RE
+#                           and every such row is BIT-IDENTICAL (0b's check-arm.py rule).
+#        --build-probes[=F] build the Rust probe object (`--features probes[,plant_<F>]`) with
+#                           the device flags build/device.rs recorded for this checkout, into
+#                           $CARGO_TARGET_DIR/probes/<F or clean>, and print its path.
 #        test-binary        a specific built binary (a planted copy); default the newest built.
 #        BITIDENT_CLASSIFY=<stdout-file>  classify an existing arm's stdout and exit, no GPU and
 #                           no build — the classifier's own red proofs run this way.
@@ -40,8 +60,45 @@ TAG=archive/hip-kernels
 REF_SOURCES=(activation residual)
 ARCH=${RIVOLI_OFFLOAD_ARCH:-gfx1151}
 
-EXPECT_RED=
-case "${1:-}" in --expect-red=?*) EXPECT_RED=${1#--expect-red=}; shift ;; esac
+# A plant's arm: the families its defect can reach (plus a clean anchor where it reaches every
+# group of its own), the rows that must redden, and the rows that must hold. Derived from
+# 0b's CPU defect sets and device arms (rust-kernels.md §"Phase 0b — the prelude"), respelled
+# for this harness's row names (Rust float formatting: `s=NaN`). `barrier` has no row: a
+# missing barrier is a race the bits may not show, and its gate is the ISA census.
+plant_spec() {
+    case $1 in
+        formats) FAMILIES=codec RED_RE='^ex_f2e4m3$' HOLD_RE='^ex_(aq8|rbf16|f2bf16)' ;;
+        actquant) FAMILIES=codec RED_RE='^ex_aq[48] s=' HOLD_RE='^ex_aq[48] s=NaN$|^ex_f2e4m3$' ;;
+        common) FAMILIES=codec RED_RE='^ex_swiglu ' HOLD_RE='^ex_situ_|^ex_moe_fixed$' ;;
+        situ) FAMILIES=codec RED_RE='^ex_situ_' HOLD_RE='^ex_swiglu |^ex_moe_fixed$' ;;
+        reduce) FAMILIES=reduce RED_RE='^k_wave_sum$' HOLD_RE='^k_wave_max$|^k_block_sum2' ;;
+        fp8) FAMILIES=fp8 RED_RE='^k_fp8_' HOLD_RE='block=[12]$' ;;
+        nib) FAMILIES=i4,f4 RED_RE='dim=(4224|1028|1000|999|130|7|1152|3712|136|2050|64)$'
+            HOLD_RE='^k_(i4_wave[a-z0-9_]* dim=(6144|2048|1280|1024)|f4_wave_r[0-9] dim=(4096|2048|7168|1280))$' ;;
+        # Every vq group is reached (0b: 15/15), so the anchor is a family it cannot touch.
+        vq) FAMILIES=vq,reduce RED_RE='^k_vq_' HOLD_RE='^k_wave_(sum|max)$' ;;
+        *) return 1 ;;
+    esac
+}
+
+EXPECT_RED= RED_RE= HOLD_RE= PROBES= FAMILIES= PLANT= BUILD=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --expect-red=?*) EXPECT_RED=${1#--expect-red=} ;;
+        --probes) PROBES=1 ;;
+        --families=?*) FAMILIES=${1#--families=} ;;
+        --plant=?*) PLANT=${1#--plant=} PROBES=1 ;;
+        --build-probes) BUILD=clean ;;
+        --build-probes=?*) BUILD=${1#--build-probes=} ;;
+        --*) echo "FAIL: unknown option $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+    shift
+done
+if [ -n "$PLANT" ]; then
+    [ -z "$EXPECT_RED$FAMILIES" ] || { echo "FAIL: --plant sets its own verdict and families" >&2; exit 2; }
+    plant_spec "$PLANT" || { echo "FAIL: no plant_spec row for '$PLANT'" >&2; exit 2; }
+fi
 
 # The verdict, from an arm's stdout ($1) and its exit code ($2). Counted from the binary's
 # per-row token lines and checked against the binary's own RESULT total — never from rc
@@ -61,6 +118,20 @@ classify() {
     fi
     if [ "$vac" -ne 0 ]; then
         echo "RED: $vac row(s) VACUOUS — examined nothing, which is not a verdict" >&2
+        return 1
+    fi
+    if [ -n "$RED_RE" ]; then
+        local stray holds held_red
+        stray=$(grep -E '^RED ' "$out" | sed -E 's/^RED ([^:]+):.*/\1/' | grep -vcE "$RED_RE")
+        holds=$(grep -E '^(BIT-IDENTICAL|RED) ' "$out" | sed -E 's/^[A-Z-]+ ([^:]+):.*/\1/' | grep -cE "$HOLD_RE")
+        held_red=$(grep -E '^RED ' "$out" | sed -E 's/^RED ([^:]+):.*/\1/' | grep -cE "$HOLD_RE")
+        echo "plant $PLANT: red=$reds outside-RE=$stray must-hold rows=$holds of which red=$held_red"
+        if [ "$reds" -gt 0 ] && [ "$stray" -eq 0 ] && [ "$rc" -ne 0 ] &&
+            [ "$holds" -gt 0 ] && [ "$held_red" -eq 0 ]; then
+            echo "GREEN (plant $PLANT): red only where the defect reaches, held where it cannot"
+            return 0
+        fi
+        echo "RED (plant $PLANT): see the counts above (rc=$rc)" >&2
         return 1
     fi
     if [ -n "$EXPECT_RED" ]; then
@@ -86,10 +157,43 @@ if [ -n "${BITIDENT_CLASSIFY:-}" ]; then
     exit $?
 fi
 
+TARGET=${CARGO_TARGET_DIR:-}
+OWN=/var/cache/rivoli/target/$(basename "$ROOT")
+[ "$TARGET" = "$OWN" ] || {
+    echo "FAIL: CARGO_TARGET_DIR=${TARGET:-<unset>} is not this checkout's $OWN (§12)" >&2
+    exit 2
+}
+# rustc names the code object `.elf`; `hipModuleLoad` takes it as-is.
+probe_object() { echo "$TARGET/probes/$1/amdgcn-amd-amdhsa/release/rivoli_kernels.elf"; }
+
+# ── Rust probe objects: deviceless, never inside the lock ────────────────────────────────
+if [ -n "$BUILD" ]; then
+    [ "$BUILD" = clean ] || [ "$BUILD" = barrier ] || plant_spec "$BUILD" ||
+        { echo "FAIL: no plant '$BUILD'" >&2; exit 2; }
+    FLAGS=$(find "$TARGET/debug/build" -path '*/rivoli-backend-*/out/device-rustflags' \
+        -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    [ -n "$FLAGS" ] || { echo "FAIL: no device-rustflags under $TARGET — build the rocm arm first" >&2; exit 2; }
+    FEATURES=probes
+    [ "$BUILD" = clean ] || FEATURES=probes,plant_$BUILD
+    PT=$TARGET/probes/$BUILD
+    mkdir -p "$PT" || exit 2
+    # A clean environment rather than a list of variables to strip (the outer shell's
+    # CARGO_TARGET_DIR, RUSTFLAGS, RUSTUP_TOOLCHAIN, wrappers…): nothing reaches the nested
+    # build but the flags read above, and rustup resolves the pin from the crate's own
+    # rust-toolchain.toml because the build runs in its directory.
+    (cd "$ROOT/crates/kernels" &&
+        env -i PATH="$PATH" HOME="$HOME" ${RUSTUP_HOME:+RUSTUP_HOME="$RUSTUP_HOME"} \
+            ${CARGO_HOME:+CARGO_HOME="$CARGO_HOME"} CARGO_ENCODED_RUSTFLAGS="$(cat "$FLAGS")" \
+            cargo build --release --locked --target amdgcn-amd-amdhsa -Zbuild-std=core \
+            --target-dir "$PT" --features "$FEATURES") >"$PT.log" 2>&1
+    rc=$?
+    [ "$rc" -eq 0 ] || { echo "FAIL: probe build rc=$rc (see $PT.log)" >&2; exit 2; }
+    probe_object "$BUILD"
+    exit 0
+fi
+
 LOCK=${GPU_LOCK:-/var/run/sys-gpu.lock}
 [ -e "$LOCK" ] || { echo "FAIL: $LOCK does not resolve (gate-red-proofs.md §1780)" >&2; exit 2; }
-TARGET=${CARGO_TARGET_DIR:-}
-[ -n "$TARGET" ] || { echo "FAIL: CARGO_TARGET_DIR unset (§12)" >&2; exit 2; }
 
 BIN=${1:-$(find "$TARGET/debug/deps" -maxdepth 1 -name 'bit_identity-*' -type f -executable \
     -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)}
@@ -105,21 +209,41 @@ mkdir -p "$SCRATCH/ref" || exit 2
 TAG_SHA=$(git -C "$ROOT" rev-parse "$TAG^{commit}") || { echo "FAIL: tag $TAG missing" >&2; exit 2; }
 git -C "$ROOT" archive "$TAG" crates/backend/kernels | tar -x -C "$SCRATCH/ref" || exit 2
 KDIR=$SCRATCH/ref/crates/backend/kernels
-SRCS=()
-for s in "${REF_SOURCES[@]}"; do SRCS+=("$KDIR/$s.hip"); done
-SO=$SCRATCH/ref/rivoli_ref.so
 echo "reference: $TAG @ $TAG_SHA, $(hipcc --version 2>/dev/null | grep -m1 -i 'hip version')"
-hipcc "--offload-arch=$ARCH" -O3 -fPIC -shared -Wl,-Bsymbolic "${SRCS[@]}" -o "$SO" \
-    >"$SCRATCH/hipcc.log" 2>&1 || { echo "FAIL: hipcc (see $SCRATCH/hipcc.log)" >&2; exit 2; }
 echo "binary:    $BIN"
+ENVS=()
+if [ -n "$PROBES" ]; then
+    # The prelude probes: the in-tree probe.hip compiled against the TAG's headers, with 0b's
+    # flags (`--offload-device-only --no-gpu-bundle-output`, -O3) — a code object, not a .so.
+    HP=$SCRATCH/ref/probes.hsaco
+    hipcc "--offload-arch=$ARCH" -O3 --offload-device-only --no-gpu-bundle-output -I"$KDIR" \
+        "$ROOT/crates/engine/tests/bit_identity/probes/probe.hip" -o "$HP" \
+        >"$SCRATCH/hipcc.log" 2>&1 || { echo "FAIL: hipcc (see $SCRATCH/hipcc.log)" >&2; exit 2; }
+    RP=$(probe_object "${PLANT:-clean}")
+    [ -f "$RP" ] || { echo "FAIL: no $RP — run --build-probes${PLANT:+=$PLANT} first" >&2; exit 2; }
+    # The reference source is the working tree's probe.hip (its bodies are thin calls into the
+    # tag's headers); its hash and both objects' are printed so an arm names what it compared.
+    sha256sum "$ROOT/crates/engine/tests/bit_identity/probes/probe.hip" "$HP" "$RP" |
+        sed 's/^/sha256:    /'
+    TEST=every_prelude_probe_is_identical_to_its_hipcc_twin
+    ENVS+=(RIVOLI_BITIDENT_PROBES_HIP="$HP" RIVOLI_BITIDENT_PROBES_RUST="$RP")
+    [ -n "$FAMILIES" ] && ENVS+=(RIVOLI_BITIDENT_FAMILIES="$FAMILIES")
+else
+    SRCS=()
+    for s in "${REF_SOURCES[@]}"; do SRCS+=("$KDIR/$s.hip"); done
+    SO=$SCRATCH/ref/rivoli_ref.so
+    hipcc "--offload-arch=$ARCH" -O3 -fPIC -shared -Wl,-Bsymbolic "${SRCS[@]}" -o "$SO" \
+        >"$SCRATCH/hipcc.log" 2>&1 || { echo "FAIL: hipcc (see $SCRATCH/hipcc.log)" >&2; exit 2; }
+    TEST=every_rust_kernel_is_byte_identical_to_its_tagged_hipcc_twin
+    ENVS+=(RIVOLI_BITIDENT_REF="$SO")
+fi
 
 # ── the arm ─────────────────────────────────────────────────────────────────────────────
 rc=0
 run_arm bit-identity "$SCRATCH/arm.stdout" "$SCRATCH/arm.log" \
-    env RIVOLI_BITIDENT_REF="$SO" "$BIN" --ignored --exact \
-    every_rust_kernel_is_byte_identical_to_its_tagged_hipcc_twin --test-threads=1 --nocapture || rc=$?
+    env "${ENVS[@]}" "$BIN" --ignored --exact "$TEST" --test-threads=1 --nocapture || rc=$?
 [ "$rc" -eq 3 ] && exit 3
 
-grep -hE '^(BIT-IDENTICAL|RED|VACUOUS) |^    |^RESULT ' "$SCRATCH/arm.stdout" || true
+grep -hE '^(BIT-IDENTICAL|RED|VACUOUS) |^    |^RESULT |^probes: ' "$SCRATCH/arm.stdout" || true
 echo "logs: $SCRATCH"
 classify "$SCRATCH/arm.stdout" "$rc"

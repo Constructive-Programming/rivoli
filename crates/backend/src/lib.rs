@@ -34,6 +34,9 @@ pub mod hiprt;
 // The embedded Rust code object and the launch path (`crates/kernels`).
 #[cfg(feature = "rocm")]
 mod module;
+// The gate's module-load reference (and the geometry it launches at) — see `module.rs`.
+#[cfg(feature = "rocm")]
+pub use module::{CodeObject, Geometry};
 // The Rust kernels' host halves — guards, geometry, launch — wrapped by `launchers!` rows.
 #[cfg(feature = "rocm")]
 mod rk_launchers;

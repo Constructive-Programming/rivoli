@@ -32,6 +32,8 @@ mod activation;
 #[cfg(feature = "rocm")]
 mod device;
 #[cfg(feature = "rocm")]
+mod probes;
+#[cfg(feature = "rocm")]
 mod residual;
 
 /// The table Phase 1 extends: `(launcher, row)`.
@@ -87,12 +89,37 @@ fn every_rust_kernel_is_byte_identical_to_its_tagged_hipcc_twin() {
             red.push(*name);
         }
     }
+    finish(&red, ROWS.len(), "");
+}
+
+/// The RESULT line the script checks its row count against, then the test's own verdict.
+#[cfg(feature = "rocm")]
+fn finish(red: &[&str], total: usize, note: &str) {
     println!(
-        "RESULT {} of {} rows BIT-IDENTICAL",
-        ROWS.len() - red.len(),
-        ROWS.len()
+        "RESULT {} of {total} rows BIT-IDENTICAL{note}",
+        total - red.len()
     );
     assert!(red.is_empty(), "RED rows: {red:?}");
+}
+
+/// The prelude probe rows (`probes`): Phase 0b's families against the hipcc probe object,
+/// one verdict line per group, the same tokens and RESULT line the launcher rows print.
+#[cfg(feature = "rocm")]
+#[test]
+#[ignore = "on-demand GPU gate — run through tests/bit-identity.sh --probes"]
+fn every_prelude_probe_is_identical_to_its_hipcc_twin() {
+    let p = probes::Probes::open();
+    println!();
+    let t = probes::run(&p);
+    let red: Vec<&str> = t
+        .rows
+        .iter()
+        .filter(|(name, g)| !g.verdict(name).1)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let nan: u64 = t.rows.iter().map(|(_, g)| g.nan_only).sum();
+    let note = format!(" (NaN as a class; {nan} NaN-payload-only cells)");
+    finish(&red, t.rows.len(), &note);
 }
 
 /// The CPU half of the recorded red proof (`docs/measurement/gate-red-proofs.md` §18): the

@@ -47,6 +47,8 @@ mod gpu;
 // `warnings = deny` a private module's not-yet-called helpers (the dot families, `rowview`,
 // `moe_fixed`) are denied dead code; it can go private when Phase 1 calls them.
 pub mod prelude;
+#[cfg(feature = "probes")]
+mod probes;
 mod residual;
 mod touch;
 
