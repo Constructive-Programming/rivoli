@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: OPEN 2026-11-18 — migrate every HIP C++ kernel (crates/backend/kernels, 15 .hip + 8 .hpp, 8115 lines, 66 launchers) to Rust on amdgcn-amd-amdhsa, owner decision for a smaller unified codebase. The spike proved bit-identity on two kernels and named three hazards (FMA contraction, missing workgroup-scope fence, a ~1 µs small-launch gap, isolated by Phase 0c 2026-11-18 to the dispatch-packet blockDim read); this plan is a hypothesis, and a measured reason to stop is a valid outcome.
+verdict: OPEN 2026-11-18 — migrate every HIP C++ kernel (crates/backend/kernels, 15 .hip + 8 .hpp, 8115 lines, 66 launchers) to Rust on amdgcn-amd-amdhsa, owner decision for a smaller unified codebase. The spike proved bit-identity on two kernels (and Phase 0a/0b proved the whole prelude bit-identical on device, 2026-11-18: 222/222 probe groups, eight plants red where their CPU proofs say) and named three hazards (FMA contraction, missing workgroup-scope fence, a ~1 µs small-launch gap, isolated by Phase 0c 2026-11-18 to the dispatch-packet blockDim read); this plan is a hypothesis, and a measured reason to stop is a valid outcome.
 ---
 
 # Rust kernels — migration plan
@@ -291,7 +291,7 @@ bridges the migration: `rivoli_act_quant_f8`, which `moe_f4.hip` still calls C-t
   > counts moved (`v_add` 7 → 21, `v_dual_add` 8 → 1 — VOPD pairing, which this census cannot
   > see through), so for it and the other reductions the device gate is the only evidence.
 - Bit-identity gate built; its CPU plant model green (rope unfused: 23212/131072 outputs,
-  64/64 seeds). Device arms: pending the GPU lease.
+  64/64 seeds). Device arms: pending the GPU lease. (Run 2026-11-18 — leases 1 and 2 below.)
 
 ### Phase 0a — device arms, lease 1 (2026-11-18, commit `a2abd64`)
 
@@ -462,6 +462,68 @@ over the in-tree pair: the same single DIFF as their record (`k_i4_wave_r2`, wav
 - Inputs are this gate's own draws (`Lcg`, 0b's seed classes NORMAL/WIDE/NASTY and shapes), so
   the cells are new; group names use Rust's float formatting (`s=NaN`, not 0b's `s=nan`),
   which `plant_spec`'s regexes are written against.
+
+### Phase 0a — probe lease (2026-11-18, commit `1759536`)
+
+Probe A and the eight judged plant arms ran in that order, once each, under the default
+`/var/run/sys-gpu.lock` (`GPU_LOCK` was unset). **The witness was clean on all nine arms:**
+every witness file was 0 B, GTT was 17 MiB before each arm, and no arm was discarded.
+Probe A took 57 s; the whole run took 281 s. Host loadavg ranged from 4.38 to 14.19 on 32
+cores across the run.
+
+Each arm rebuilds the hipcc reference from the same `probe.hip` (`a90bdaef…`). The object
+hashes differ only by hipcc's `__hip_cuid_*` symbol: the correctness review extracted
+`.text` from three of them and found it identical (`701c2290…`). Probe A's hipcc object is
+`7ef34996…`, and the Rust clean object is `3a23b8d7…`. The verdicts below are the
+script's GREEN lines, read from stdout; the scripts' own exit codes were not captured
+separately.
+
+**Probe A: 222 of 222 rows BIT-IDENTICAL, scripted GREEN.** Logs:
+`/var/cache/rivoli/scratch/bit-identity/20261118T204419-491791`.
+- **What was compared:** 13 956 cells over the 222 rows. A codec cell is one 2^26-input
+  chunk, so the 91 codec rows' 5 572 cells cover 87 exhaustive 2^32 sweeps plus four smaller
+  full domains (`ex_bf16f`, `ex_e4m3f`, `ex_e8m0f`, `k_lut`, one cell each). A dot cell is
+  one seed's launch.
+- **NaN-payload-only: 231 cells raw**, with no value-red cell anywhere. They fall in 62
+  groups, all dots:
+
+  | family | groups | cells |
+  |---|---|---|
+  | fp8 split-K | 17 | 83 |
+  | fp8 wave | 15 | 62 |
+  | fp4 | 14 | 52 |
+  | vq | 12 | 30 |
+  | int4 | 4 | 4 |
+
+- **Against 0b:** 0b's scratch A0 had 442 NaN-only cells in 85 groups. Why the count moved
+  is inferred, not isolated: this gate draws its own inputs (`Lcg`), and the Rust object is a
+  different build. 0b's record already shows NaN payloads moving between two Rust builds of
+  the same loop.
+
+**Plant arms: all eight scripted `GREEN (plant <family>)`.** The test binary exited 101 in
+each.
+
+| arm | rows | red | must-hold (red) | NaN-only cells | logs `…/bit-identity/` |
+|---|---|---|---|---|---|
+| formats | 91 | 6: `ex_f2e4m3` (4 cells) + `ex_aq8` at s = 1, 2^-10, 2^20, 0.3, −2 | 12 (0) | 0 | `20261118T204516-496644` |
+| actquant | 91 | 18: `ex_aq8`/`ex_aq4` at every non-NaN scale (inf included) | 3 (0) | 0 | `20261118T204606-502170` |
+| common | 91 | 4: `ex_swiglu` at all four limits | 45 (0) | 0 | `20261118T204657-512091` |
+| situ | 91 | 30: `ex_situ_*` | 5 (0) | 0 | `20261118T204750-520269` |
+| reduce | 8 | 1: `k_wave_sum` (64/64) | 7 (0) | 0 | `20261118T204842-527753` |
+| fp8 | 60 | 34 | 18 (0) | 84 | `20261118T204845-528098` |
+| nib | 48 | 28, every one at a dim with a tail | 20 (0) | 55 | `20261118T204852-528919` |
+| vq | 23 | 15, every vq group | 2 (0) | 19 | `20261118T204856-529420` |
+
+- **Red RE check:** for fp8 and vq the red RE matches every row of the family, so
+  "no red outside the RE" cannot fail there. Locality rests on the must-hold anchors instead:
+  fp8's 18 `block=[12]` groups, and vq's two reduce rows.
+- **Against 0b's scratch arms** (compared name by name, by the correctness review):
+  - reduce, fp8 and nib: the value-red sets are identical.
+  - vq: the same 15 groups.
+  - actquant, common and situ: equal counts per name pattern.
+  - formats: the five extra `ex_aq8` rows are new. The patch form predicted them: the
+    patched `f2e4m3_rne` sits inside `ex_aq8`.
+- The barrier plant has no arm; its judge is owed (above).
 
 ### Phase 0b — the prelude (2026-11-18)
 

@@ -172,10 +172,12 @@ appears that enum dispatch cannot fill.
   seeds); the device arm PAID 2026-11-18 (13/13 bit-identical; the plant reddens exactly the
   two rope rows, scripted GREEN). `--probes` runs the PRELUDE probe rows (0b's families, 222
   groups) against a hipcc probe object built from the tag's headers and a Rust one
-  `--build-probes` builds outside cargo — device arms owed. A plant is a small patch to the
+  `--build-probes` builds outside cargo — device arms owed (PAID 2026-11-18: 222/222
+  identical, all eight judged plants scripted GREEN, witness clean). A plant is a small patch to the
   real prelude (`tests/bit-identity/plants/<family>.patch`), applied with exact context to a
   scratch copy by `--build-probes --plant=<family>`; `--plant=<family>` judges it by its row
-  in the script's `plant_spec` table. On-demand (GPU, wall-clock unmeasured), not CI.
+  in the script's `plant_spec` table. On-demand (GPU; `--probes` plus the eight plants 281 s,
+  measured 2026-11-18; the launcher-row arm unmeasured), not CI.
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
   suite or a live deferral, checked both ends; **66/66/0** as measured 2026-09-08 by `cargo test -p rivoli --no-default-features --test kernel_coverage -- --nocapture` (the figure stood at 61 for four milestones and nobody re-counted it — the same prose-drift class §13 caught in its own row count; `docs/reference/kernel-inventory.md` enumerates the same population row by row), and it rose past 61 when M17c's
   `gqa_block_attend` landed with its launcher and `kernel_glimmer_block_attend.rs`. Its
