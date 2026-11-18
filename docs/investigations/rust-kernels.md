@@ -238,4 +238,79 @@ the subnormal path and rounds to the same even zero (CPU: 0 inputs differ). It i
 spike's sub-threshold-plant lesson again, caught on the CPU this time instead of on the
 GPU.
 
-**Device results: PENDING the GPU lease** (READY-FOR-GPU posted 2026-11-18).
+**Device results, 2026-11-18, rh-anine.** One lease, running `run-arms.sh` exactly as
+posted. `sha256sum -c artifacts.sha256` passed immediately before launch. Every arm's
+witness is CLEAN: the `/var/cache/rivoli/scratch/rk-prelude/probe/witness/witness-*`
+files are all empty, GTT was 17 MiB before every arm, and loadavg 2.2–2.8 on 32 cores.
+
+Evidence, all under `/var/cache/rivoli/scratch/rk-prelude/probe/` (hashed in
+`arms/outputs.sha256`):
+- raw outputs: `arms/<arm>.out` and `arms/run.log`;
+- re-judge: `rejudge-nan-class.py` → `arms/policy-*.out`, with verdicts in
+  `arms/policy-verdicts.txt`.
+
+The script's verdict was **UNEXPECTED (rc 1)**, for one reason: NaN payloads. A red cell is
+`nan_payload_only` when every differing f32 word in it is NaN on BOTH sides. NaN against
+non-NaN counts as value-red, so this class cannot hide a value difference. Only 4-byte
+outputs are classified at all; 1-, 2- and 8-byte outputs are always value-red, which errs
+strict.
+
+| arm | cells | red groups | value-red cells (where) | NaN-only cells | value verdict |
+|---|---|---|---|---|---|
+| A0 hipcc vs rustc | 13 956 | 85 / 222 | **0** | 442 | identical |
+| R-formats | 5 572 | 1 / 91 | 4 (`ex_f2e4m3` only) | 0 | PASS |
+| R-actquant | 5 572 | 18 / 91 | 38 (`ex_aq8`/`ex_aq4`; s = NaN held) | 0 | PASS |
+| R-common | 5 572 | 4 / 91 | 54 (`ex_swiglu` only) | 0 | PASS |
+| R-situ | 5 572 | 30 / 91 | 60 (`ex_situ_*` only) | 0 | PASS |
+| R-reduce | 512 | 1 / 8 | 64 (`k_wave_sum`; `wave_max`, `block_sum` held) | 0 | PASS |
+| R-fp8 | 3 840 | 40 / 60 | 1728 (34 of the 42 block ≥ 4 groups) | 103 | PASS on values |
+| R-nib | 3 072 | 36 / 48 | 1508 (28 groups, all at dims with a tail) | 48 | PASS on values |
+| R-vq | 960 | 15 / 15 | 897 (every group) | 21 | PASS |
+| R-barrier | 512 | 0 / 8 | 0 | 0 | race not observed (census is its gate) |
+
+- **Every non-NaN output is bit-identical.** That covers all 87 exhaustive 2^32 codec
+  sweeps (including every NaN input, whose outputs match bit for bit), every reduction, and
+  all 64 seeds of every dot shape.
+- **The A0 reds are only in the dots:** fp8 35 groups, int4 23, fp4 15, vq 12. Every
+  group's FIRST red seed is in the nasty class (7/15/23/31/39/55; `harness.cpp`: seed%8 ==
+  7, which is 8 of the 64 seeds), and no group has more than 8 red cells. That fits "nasty
+  seeds only", but the harness records only the first seed per group, so this is not
+  proven.
+- **Cause (read from the ISA before the run, INFERRED rather than isolated).** The
+  compilers order commutative operands differently: hipcc emits `a1 + a0` before the nibble
+  `wave_sum` and `l0·x0` in the fp8 quad (`probe/hip.dis` vs `probe/rust.dis`, kernels
+  `k_f4_wave_r1`, `k_i4_wave`, `k_fp8_wave_r1`). That is consistent with RDNA keeping one
+  fixed operand's NaN payload. **vq's 12 groups (21 cells) have no site identified.**
+- **The order is not even stable across Rust builds.** The nib plant edits only the tail,
+  yet it changed NaN payloads outside it:
+  - int4 no-tail groups: 76 NaN-only cells in A0, 0 in R-nib;
+  - fp4 no-tail groups: 63 → 25.
+
+  R-fp8's must-hold groups (block 1/2) carry exactly A0's NaN cells.
+- **Every plant is value-red only where its CPU proof says.**
+  - The checker's two FAILs are NaN-only cells in must-hold groups (value-red there: 0).
+  - The 8 fp8 block ≥ 4 groups that held are the tiny shapes (i_dim 4 and 36). There each
+    lane folds at most one quad into a zero accumulator, and `fma(s, q, 0) == 0 + s·q`
+    exactly, so the defect cannot show.
+  - Re-judged with NaN-vs-NaN counted equal, every arm PASSes the same checker, and A0 has
+    0 red.
+
+**Proposed policy (not applied; coordinator/owner decision).** Compare f32 outputs with NaN
+as a CLASS: a word pair that is NaN on both sides counts as equal, and everything else
+stays byte-exact. Keep `nan_payload_only` printed per group so payload differences stay
+visible. Matching payloads instead would mean steering each compiler's commutative-operand
+order. No source spelling controls that, and the nib arm shows it moving between two Rust
+builds of the same loop. The engine treats any NaN as fatal (`flag_nonfinite`), and no
+oracle pins a payload. A known cost of the policy: a NaN that propagates through a dot lane
+masks any upstream value difference in that lane, as it already does under byte compare.
+
+**Measured sweep rate (first measurement).** These are arm wall-clock spans from
+`arms/*.out` mtimes (1 s resolution) against `arms/start.epoch`, so they include setup and
+are LOWER bounds on throughput:
+- **Codec arms:** 48–49 s each for 87 full 2^32 sweeps plus 4 small ones, i.e. ≈ 0.55 s per
+  2^32 sweep. Each input is evaluated by both kernels; both buffers are refilled and compared
+  on the device, 6 × element-size bytes of traffic. Over the 1.49·10^12 compared bytes of a
+  codec arm that is ≈ 185 GB/s.
+- **A0:** 50 s.
+- **Whole run:** 247 s to the last arm's output, 267 s to `arms/end.epoch`. The posted
+  READY-FOR-GPU estimate was 25–35 min.
