@@ -221,7 +221,7 @@ fn the_host_split_half_rotation_is_the_reference_and_the_wrong_doors_are_not() {
 /// # RED-PROOF PLAN — for the integrator's first device run
 ///
 /// This kernel is not new, so the plants belong to the CALL rather than to
-/// `kernels/activation.hip`, and each is one argument away — which is the point of the suite:
+/// `kernels/activation.hip` (at tag `archive/hip-kernels`), and each is one argument away — which is the point of the suite:
 ///
 /// * call `launch_rope_interleave` instead — ~6.2e-1, the whole of trap T16;
 /// * pass `pos - 1` — ~3.3e-1;

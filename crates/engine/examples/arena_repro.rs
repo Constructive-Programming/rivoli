@@ -7,7 +7,7 @@
 //! not read it diverges, and both cells that do are clean. The suspected gap is that io_uring's CQE
 //! establishes the NVMe DMA's writes are visible to the CPU while the agent that actually reads the
 //! arena is the GPU's copy path, and nothing orders those two — see
-//! `kernels/async.hip::rivoli_pinned_alloc` for the full chain.
+//! `kernels/async.hip::rivoli_pinned_alloc` (at tag `archive/hip-kernels`) for the full chain.
 //!
 //! The engine reproduces that at roughly **one event per 40,000–80,000 reads**, i.e. a 20-minute
 //! arm per sample. This does the same reads in a hot loop and verifies every one, which turns the

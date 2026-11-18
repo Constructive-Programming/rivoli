@@ -11,14 +11,10 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 15] = [
+const KERNELS: [&str; 12] = [
+    // `activation` and `residual` (split out of this file 2026-08-15/16) left this list
+    // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below.
     "linalg",
-    // Split out of `linalg.hip` 2026-08-15 (the per-token activation transforms), and
-    // listed next to it because the pair is one cut, not two subsystems.
-    "activation",
-    // Split out of `activation.hip` 2026-08-16 (the residual-stream mixers: V4's mHC pair
-    // and K3's attn_res) — same one-cut argument, listed next to its source.
-    "residual",
     "moe",
     // Split out of `moe.hip` 2026-08-16 (the FP4 routed-expert family, V4's pair and K3's
     // situ pair) — same argument again.
@@ -34,7 +30,8 @@ const KERNELS: [&str; 15] = [
     "fwd",
     "vmm",
     "indexer",
-    "async",
+    // `async` left 2026-11-18: its host half is direct FFI (`src/hiprt.rs`), its one kernel
+    // (`touch_region`) is Rust.
     "kvcompress",
     "blockindex",
     "headtail",
@@ -177,6 +174,11 @@ fn emit_link_flags(out_dir: &str) {
     println!("cargo:rustc-link-lib=dylib=amdhip64");
 }
 
+// The Rust device crate (`crates/kernels`) — its own file, because it is a different
+// toolchain doing a different job: the hipcc half above dies in Phase 2, this one stays.
+#[path = "build/device.rs"]
+mod device;
+
 fn main() {
     if std::env::var("CARGO_FEATURE_ROCM").is_err() {
         return; // CPU-only build: no HIP toolchain required.
@@ -190,5 +192,10 @@ fn main() {
     }
     let objs: Vec<String> = KERNELS.iter().map(|k| tc.object(k, &hdrs)).collect();
     archive(&tc.out_dir, &objs);
+    // `src/module.rs` embeds it with `include_bytes!(env!("RIVOLI_KERNELS_HSACO"))`.
+    println!(
+        "cargo:rustc-env=RIVOLI_KERNELS_HSACO={}",
+        device::rivoli_kernels(&tc).display()
+    );
     emit_link_flags(&tc.out_dir);
 }

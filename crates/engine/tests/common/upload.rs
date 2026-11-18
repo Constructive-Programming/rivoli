@@ -141,6 +141,7 @@ pub struct AttendIo {
     pub out: *mut f32,
 }
 
+#[cfg(feature = "rocm")]
 impl AttendIo {
     /// The addresses of four live buffers.
     ///
@@ -203,6 +204,7 @@ pub type AttendLauncher = unsafe fn(
 /// one) of `hkv * d` f32 each; none alias another, and all live until the next device sync. A
 /// REJECTED call returns before any kernel launch and dereferences nothing, which is what lets a
 /// guard table pass aliased addresses.
+#[cfg(feature = "rocm")]
 pub unsafe fn attend_launch(
     f: AttendLauncher,
     io: AttendIo,
@@ -230,6 +232,7 @@ pub unsafe fn attend_launch(
     }
 }
 
+#[cfg(feature = "rocm")]
 pub fn dev(b: &[u8]) -> rivoli_engine::device::DeviceBuf {
     let mut d = rivoli_engine::device::DeviceBuf::new(b.len().max(1)).expect("alloc");
     d.copy_in_at(0, b).expect("fill");

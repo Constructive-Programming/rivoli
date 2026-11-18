@@ -6,7 +6,7 @@
 //! The ring is the `io-uring` crate (talks to the io_uring syscalls directly — no
 //! liburing system lib). This module owns the O_DIRECT alignment math (block-aligned
 //! offset/length/buffer), the fds, and the VMM destination pointers; the two BACKEND ops
-//! (host staging arena, async H2D copy) are `rivoli_*` wrappers in `kernels/async.hip` under
+//! (host staging arena, async H2D copy) are `rivoli_*` wrappers in `rivoli_backend::hiprt` (once `kernels/async.hip`) under
 //! `rocm` — see [`stage`], which was the whole of the per-backend difference until the
 //! Vulkan half was deleted with that backend on 2026-08-06.
 //!
@@ -163,7 +163,7 @@ pub struct Streamer {
     /// ARENA REFRESH: enqueue a full-width device read of the just-written arena window on the
     /// fetch stream BEFORE the copy. The only intervention measured to make GLM decode
     /// reproduce itself; a MITIGATION with an unexplained mechanism, not a root-cause fix.
-    /// Evidence, the fifteen refuted alternatives, and the ceiling: `kernels/async.hip` and
+    /// Evidence, the fifteen refuted alternatives, and the ceiling: `kernels/async.hip` (at tag `archive/hip-kernels`) and
     /// `docs/investigations/glm-nondeterminism-closeout.md`.
     arena_refresh: bool,
     /// `--copy-via-cpu`: the bounce→slot hop as a host memcpy on the reaper thread — see
@@ -450,7 +450,7 @@ impl Streamer {
         // is owned and in bounds.
         let src = unsafe { self.arena.add(ud * self.span) };
         // ARENA REFRESH, enqueued BEFORE the copy on the fetch stream. See the struct field and
-        // `kernels/async.hip` for the evidence, the fifteen alternatives that did not work, and
+        // `kernels/async.hip` (at tag `archive/hip-kernels`) for the evidence, the fifteen alternatives that did not work, and
         // the ceiling. Stream-ordered ahead of the copy, so it needs no sync of its own.
         // SAFETY: `src` is this slot's arena window, valid for `nbytes[ud]` bytes; the stream is
         // live; `refresh_sink` is a mapped, writable word the kernel never stores to.

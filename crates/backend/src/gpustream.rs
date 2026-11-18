@@ -12,25 +12,12 @@ use crate::Signal;
 use anyhow::{Result, bail, ensure};
 use std::ffi::c_void;
 
-unsafe extern "C" {
-    fn rivoli_stream_create() -> *mut c_void;
-    fn rivoli_stream_destroy(s: *mut c_void) -> i32;
-    fn rivoli_stream_host_signal(
-        s: *mut c_void,
-        cb: extern "C" fn(*mut c_void),
-        user: *mut c_void,
-    ) -> i32;
-    fn rivoli_event_create() -> *mut c_void;
-    fn rivoli_event_record(ev: *mut c_void, stream: *mut c_void) -> i32;
-    fn rivoli_event_elapsed(start: *mut c_void, end: *mut c_void, ms: *mut f32) -> i32;
-    fn rivoli_event_destroy(ev: *mut c_void);
-    fn rivoli_timeline_create() -> *mut c_void;
-    fn rivoli_timeline_destroy(t: *mut c_void);
-    fn rivoli_timeline_wait(stream: *mut c_void, t: *mut c_void, value: u64) -> i32;
-    fn rivoli_timeline_signal(stream: *mut c_void, t: *mut c_void, value: u64) -> i32;
-    fn rivoli_timeline_completed(t: *mut c_void) -> u64;
-    fn rivoli_timeline_release(t: *mut c_void, value: u64);
-}
+use crate::hiprt::{
+    rivoli_event_create, rivoli_event_destroy, rivoli_event_elapsed, rivoli_event_record,
+    rivoli_stream_create, rivoli_stream_destroy, rivoli_stream_host_signal,
+    rivoli_timeline_completed, rivoli_timeline_create, rivoli_timeline_destroy,
+    rivoli_timeline_release, rivoli_timeline_signal, rivoli_timeline_wait,
+};
 
 /// A timing event: bracket GPU work on a stream to recover the true duration the
 /// async overlap hides from wall-clock. Record two, then read the ms between them
@@ -40,8 +27,8 @@ unsafe impl Send for HipEvent {}
 
 impl HipEvent {
     pub fn new() -> Result<Self> {
-        // SAFETY: no args; null on failure.
-        let e = unsafe { rivoli_event_create() };
+        // Null on failure.
+        let e = rivoli_event_create();
         if e.is_null() {
             bail!("hipEventCreate failed");
         }
@@ -92,8 +79,8 @@ unsafe impl Send for HipStream {}
 
 impl HipStream {
     pub fn new() -> Result<Self> {
-        // SAFETY: no args; returns null on failure.
-        let s = unsafe { rivoli_stream_create() };
+        // Null on failure.
+        let s = rivoli_stream_create();
         if s.is_null() {
             bail!("hipStreamCreate failed");
         }
@@ -265,8 +252,8 @@ unsafe impl Sync for Timeline {}
 
 impl Timeline {
     pub fn new() -> Result<Self> {
-        // SAFETY: no arguments; returns null on allocation failure, checked below.
-        let p = unsafe { rivoli_timeline_create() };
+        // Null on allocation failure, checked below.
+        let p = rivoli_timeline_create();
         ensure!(
             !p.is_null(),
             "hipMallocSignalMemory failed — hipDeviceAttributeCanUseStreamWaitValue is 1 on \
@@ -311,7 +298,7 @@ impl Timeline {
     /// tickets, and the decode hung on the device rather than surfacing the fetch error.
     /// Monotone, so releasing cannot move a slot backwards.
     pub fn release(&self, value: u64) {
-        // SAFETY: `self.0` is live signal memory; the C side does a monotone CAS on it.
+        // SAFETY: `self.0` is live signal memory; `hiprt::rivoli_timeline_release` raises it monotonically (`fetch_max`).
         unsafe { rivoli_timeline_release(self.0, value) };
     }
 }

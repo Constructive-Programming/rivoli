@@ -267,7 +267,7 @@ pub struct PoolKnobs<'a> {
     /// protocol compares two release binaries differing in exactly one flag, and a fix that
     /// can only be reached in a probe build cannot be measured against a stock one. They apply
     /// to every routed arm because every routed arm has the same arena and the same suspected
-    /// ordering gap (`kernels/async.hip::rivoli_pinned_alloc`). The investigation's nine
+    /// ordering gap (`kernels/async.hip::rivoli_pinned_alloc` (at tag `archive/hip-kernels`)). The investigation's nine
     /// diagnostic knobs rode here too until 2026-08-20 —
     /// `docs/investigations/glm-nondeterminism-closeout.md` is the record.
     pub arena_refresh: bool,

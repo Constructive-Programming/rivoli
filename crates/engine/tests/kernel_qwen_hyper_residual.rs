@@ -319,7 +319,8 @@ fn the_collapse_is_a_sigmoid_gated_mean() {
 ///
 /// # RED-PROOF PLAN — for the integrator's first device run
 ///
-/// Mutations go in `kernels/residual.hip`'s `gated_residual_collapse_f32`; each must redden this
+/// Mutations go in `crates/kernels/src/residual.rs`'s `gated_residual_collapse_f32` (Rust since
+/// 2026-11-18; `kernels/residual.hip` before); each must redden this
 /// test while [`the_host_gated_residual_reproduces_the_anchor_everywhere`] stays green. The
 /// magnitudes are the constants above, all shown reachable deviceless:
 ///

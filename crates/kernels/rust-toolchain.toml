@@ -1,0 +1,9 @@
+# The pin. `rustc 1.102.0-nightly (59cbdee2e 2026-11-17)` — the compiler the spike proved
+# bit-identity with (docs/investigations/rust-kernels.md §1). A dated channel, not
+# `nightly`: a floating nightly would move the LLVM under every bit-identity claim without
+# a diff to review. `crates/backend/build/device.rs` reads this file and passes the channel to
+# rustup explicitly, because the outer stable cargo's environment would otherwise win.
+[toolchain]
+channel = "nightly-2026-11-18"
+components = ["rust-src"]
+profile = "minimal"

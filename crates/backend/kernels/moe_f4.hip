@@ -47,7 +47,8 @@
 // aperture on this APU; no LDS or scratch address can reach a descriptor. It asserts only
 // the address SPACE — what the pointer may alias is untouched.
 
-// Defined in activation.hip [CORRECTED 2026-08-16 with the move here: this said
+// Defined in Rust since 2026-11-18 — the `#[no_mangle]` export in `src/rk_launchers.rs`
+// (activation.hip is deleted). [Earlier: defined in activation.hip; CORRECTED 2026-08-16 with the move here: this said
 // "linalg.hip", stale since the 2026-08-15 activation split]. Declared rather than called
 // from Rust so the sequence gate/up → re-quantize → down cannot be issued with the middle
 // step missing; see `rivoli_moe_expert_range_f4`.

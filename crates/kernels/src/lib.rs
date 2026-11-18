@@ -1,0 +1,51 @@
+//! # rivoli-kernels — the GPU kernels, in Rust, for `amdgcn-amd-amdhsa`
+//!
+//! Built ONLY by `crates/backend/build.rs` under the `rocm` feature (this crate's manifest
+//! argues why it is not a workspace member), linked against ROCm's device libraries, and
+//! embedded in `rivoli-backend` as one code object loaded once with `hipModuleLoadData`.
+//!
+//! Each kernel is a bit-for-bit twin of a hipcc kernel at tag `archive/hip-kernels`, and
+//! `crates/engine/tests/bit_identity/` is the gate that says so — byte-identical outputs
+//! over ≥ 64 seeds and adversarial inputs, or RED. The migration plan and its record are
+//! `docs/investigations/rust-kernels.md`. What a port must get right, every time:
+//!
+//! - **FMA contraction.** hipcc fuses every `a * b + c` the backend can (`-ffp-contract=
+//!   fast-honor-pragmas`); Rust never contracts. Every fused site is an explicit
+//!   [`gpu::fma`], placed where hipcc's ISA shows a `v_fma`/`v_fmac` — read, never guessed.
+//! - **blockDim is never read from the dispatch packet** (Phase 0c, ~1.1 µs/launch). A
+//!   launcher-fixed block size is a `rivoli_abi::geom` constant both sides name.
+//! - **Math functions are ROCm's own.** A `.hip` call into `__ocml_*` (`tanhf`, `pow`, `sin`,
+//!   `cos`) is the SAME symbol here, LTO-linked from the device library hipcc links
+//!   ([`gpu::ocml`]); a `__builtin_*` one (`expf`, `sqrtf`, `fmaxf`) is the same LLVM
+//!   intrinsic through `core::intrinsics`.
+#![no_std]
+#![feature(abi_gpu_kernel, core_intrinsics, gpu_intrinsics, stdarch_amdgpu)]
+#![feature(asm_experimental_arch, link_llvm_intrinsics)]
+// `core_intrinsics` is how the LLVM intrinsics hipcc's builtins lower to are reached at all.
+#![allow(internal_features)]
+// Kernels are raw-pointer code by construction: every pointer is a device buffer whose
+// extent the launcher's guards establish, which is the `# Safety` contract the whole crate
+// shares. Per-site `unsafe` blocks inside an `unsafe extern "gpu-kernel" fn` would restate
+// it at every load.
+#![allow(unsafe_op_in_unsafe_fn, clippy::missing_safety_doc)]
+// Every kernel takes one `rivoli_abi::kernarg` struct by value. The lint warns that rustc's
+// gpu-kernel ABI for aggregates is not promised stable; what is relied on here was CHECKED
+// (2026-11-18): each kernel's metadata is ONE `by_value` arg of `size_of` the struct, and
+// the ISA's `s_load` offsets are its `repr(C)` field offsets (`swiglu`: `n` at 0x18, `h` at
+// 0x10). The bit-identity gate exercises every kernel through that path, so a toolchain that
+// changed the lowering would go red there, not silently.
+#![allow(improper_gpu_kernel_arg)]
+
+mod activation;
+mod gpu;
+mod prelude;
+mod residual;
+mod touch;
+
+/// A kernel has no one to unwind to and no host to print to. A trap ends the dispatch with
+/// a queue error the host sees as a failed launch — loud, where `loop {}` would hang the
+/// stream and a silent `s_endpgm` would leave the output half-written and plausible.
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    core::intrinsics::abort_immediate()
+}

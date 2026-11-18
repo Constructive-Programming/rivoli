@@ -18,7 +18,11 @@
 //! between those buffers is written down. A primitive has operands; these have a layout.
 
 use crate::hip::{ExpertDesc, ExpertDescF4, abi_ty, ensure_hip_status, launchers};
+use crate::rk_launchers::{
+    Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_post, rivoli_hc_pre,
+};
 use anyhow::Result;
+use rivoli_abi::kernarg::{AttnRes, GatedResidual, HcPost, HcPre};
 use std::ffi::c_void;
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
@@ -338,15 +342,15 @@ launchers! {
     /// outlive `stream`'s completion — await its
     /// [`Signal`](crate::gpustream::Signal) — and no output may alias `h`, which is
     /// `__restrict__` in the kernel.
-    launch_hc_pre -> rivoli_hc_pre, "hc_pre" (
+    launch_hc_pre => rivoli_hc_pre(Rows(s as i32), hc as i32, HcPre { h, fnw, scale, base, y, post, comb, dim: dim as i32, iters: iters as i32, norm_eps, hc_eps }, stream), "hc_pre" (
         h: *const f32,
         fnw: *const f32,
         scale: *const f32,
         base: *const f32,
-        s: usize as i32,
-        hc: usize as i32,
-        dim: usize as i32,
-        iters: usize as i32,
+        s: usize,
+        hc: usize,
+        dim: usize,
+        iters: usize,
         norm_eps: f32,
         hc_eps: f32,
         y: *mut f32,
@@ -370,14 +374,14 @@ launchers! {
     /// want and it is wrong twice over: the two are `__restrict__`, and thread `i` writes
     /// `y[i]` while other threads are still reading every source copy of `residual`, with no
     /// barrier between them.
-    launch_hc_post -> rivoli_hc_post, "hc_post" (
+    launch_hc_post => rivoli_hc_post(hc as i32, HcPost { x, residual, post, comb, y, s: s as i32, dim: dim as i32 }, stream), "hc_post" (
         x: *const f32,
         residual: *const f32,
         post: *const f32,
         comb: *const f32,
-        s: usize as i32,
-        hc: usize as i32,
-        dim: usize as i32,
+        s: usize,
+        hc: usize,
+        dim: usize,
         y: *mut f32,
         stream: *mut c_void,
     );
@@ -411,7 +415,7 @@ launchers! {
 
     /// **The read half of one Gated Residual sublayer wrapper** — collapse an `n_r`-wide residual
     /// stream through a per-element gate and emit the `n_r` inject scales (TR Eq. 32-33 =
-    /// MOD:941-969). `kernels/residual.hip`'s last section carries the arithmetic and the four
+    /// MOD:941-969). `kernels/residual.hip`'s last section (tag `archive/hip-kernels`) carries the arithmetic and the four
     /// measured defects.
     ///
     /// `rhat` and `mix` are `[n_r][dim]`, `inject` is `[n_r]`, `x` is `[dim]` and `scale` is
@@ -439,13 +443,13 @@ launchers! {
     /// may alias another** — every parameter is `__restrict__` in the kernel, so that covers `x`
     /// against `rhat` as well as the two outputs against each other. `stream` is a live
     /// `hipStream_t`, or null for the default stream.
-    launch_gated_residual_collapse_f32 -> rivoli_gated_residual_collapse_f32,
+    launch_gated_residual_collapse_f32 => rivoli_gated_residual_collapse_f32(GatedResidual { rhat, mix, inject, x, scale, n_r: n_r as i32, dim: dim as i32 }, stream),
     "gated_residual_collapse_f32" (
         rhat: *const f32,
         mix: *const f32,
         inject: *const f32,
-        n_r: usize as i32,
-        dim: usize as i32,
+        n_r: usize,
+        dim: usize,
         x: *mut f32,
         scale: *mut f32,
         stream: *mut c_void,
@@ -457,7 +461,7 @@ launchers! {
     /// Ported from `k3:src/backend/hip.rs` (M9).
     ///
     /// `src` is `[tokens][nsrc][n]` and `out` is `[tokens][n]`. The softmax mixes the sources
-    /// **unnormalised** — `kernels/residual.hip` carries the argument and the defect that prices
+    /// **unnormalised** — `kernels/residual.hip` (at tag `archive/hip-kernels`) carries the argument and the defect that prices
     /// it.
     ///
     /// **`src_stride` is the element distance between tokens in `src`, and it is NOT `nsrc·n`.**
@@ -475,12 +479,12 @@ launchers! {
     /// the next [`device_sync`]. `out` must NOT alias `src`: every thread reads all `nsrc` sources
     /// for its column after the block has already written scores, and a caller aliasing them would
     /// have the mixing loop read values it has itself overwritten.
-    launch_attn_res -> rivoli_attn_res, "attn_res" (
+    launch_attn_res => rivoli_attn_res(Rows(tokens as i32), AttnRes { src, fold, out, src_stride: src_stride as u64, nsrc: nsrc as i32, n: n as i32, eps }), "attn_res" (
         src: *const f32,
         fold: *const f32,
-        tokens: usize as i32,
-        nsrc: usize as i32,
-        n: usize as i32,
+        tokens: usize,
+        nsrc: usize,
+        n: usize,
         src_stride: usize,
         eps: f32,
         out: *mut f32,

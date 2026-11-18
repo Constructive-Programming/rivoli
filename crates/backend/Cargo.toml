@@ -13,6 +13,7 @@ default = ["rocm"]
 rocm = ["dep:atomic-waker", "dep:anyhow"]
 
 [dependencies]
+rivoli-abi = { path = "../abi" }
 anyhow = { version = "1", optional = true }
 atomic-waker = { version = "1", optional = true }
 

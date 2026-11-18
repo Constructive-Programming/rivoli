@@ -1,6 +1,8 @@
 # Virtual workspace — the layering IS the dependency graph, and the graph is enforced here.
 #
-# core ← {artifact, oracles} ← engine ← cli, with backend independent below engine. Two
+# core ← {artifact, oracles} ← engine ← cli, with backend independent below engine and
+# `abi` (no_std, no deps) below backend — the one crate `crates/kernels`, outside this
+# workspace on its pinned nightly, also compiles. Two
 # structural consequences, each precluding a defect the old tree carries:
 #   - `rivoli-core` cannot name a weight format: `Fmt` lives in `rivoli-artifact`, which
 #     core does not depend on. The hybrid format-follows-residency defect (old tree's #2
@@ -17,6 +19,7 @@ members = [
     "crates/core",
     "crates/artifact",
     "crates/oracles",
+    "crates/abi",
     "crates/backend",
     "crates/engine",
     "crates/cli",

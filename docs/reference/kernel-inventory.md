@@ -37,16 +37,23 @@ column is a query, and a query can be wrong.
 
 ## The table
 
+> **2026-11-18 (Rust-kernel Phase 0a):** the 13 rows whose TU reads `activation.rs` /
+> `residual.rs` are Rust now (`act_quant_f8`'s cell read `moe_f4.hip`, the TU that CALLS it
+> C-to-C — wrong before this move too; it still does, through the Rust export) — `crates/kernels/src/`, launched through `launchers!`'s `=>`
+> rows and `crates/backend/src/rk_launchers.rs`; `activation.hip` and `residual.hip` are
+> deleted, and each kernel is scored byte-for-byte against its tagged hipcc twin by
+> `tests/bit-identity.sh`. Names are unchanged in both columns.
+
 | kernel (`launch_…`) | C entry | TU | GLM | V4 | K3 | Glimmer | Qwen | activated at (module :: fn) |
 |---|---|---|---|---|---|---|---|
-| `rmsnorm_centered_single` | `rmsnorm_centered_single` | activation.hip | · | · | · | **✓** | · | glimmer/forward :: branch_add, pre_norm |
-| `rmsnorm_single` | `rmsnorm_single` | activation.hip | **✓** | · | **✓** | **✓** | · | glimmer/forward; glm/attn; glm/forward; k3/forward :: cache_and_absorb, embed_rows, qkv_project, rms_vec |
-| `rmsnorm_weightless_batch` | `rmsnorm_weightless_batch` | activation.hip | · | · | · | **✓** | · | glimmer/forward :: attention, embed |
-| `rope_interleave` | `rope_interleave` | activation.hip | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
-| `rope_split_half` | `rope_split_half` | activation.hip | · | · | · | **✓** | · | glimmer/forward :: attention |
-| `situ_glu_f32` | `situ_glu_f32` | activation.hip | · | · | **✓** | · | · | k3/forward :: situ_mlp |
-| `swiglu` | `swiglu` | activation.hip | **✓** | · | · | **✓** | · | glimmer/forward; glm/mlp :: desc_of, mlp |
-| `swiglu_clamped_bf16` | `swiglu_clamped_bf16` | activation.hip | · | **✓** | · | · | · | v4/moe :: shared_expert |
+| `rmsnorm_centered_single` | `rmsnorm_centered_single` | activation.rs | · | · | · | **✓** | · | glimmer/forward :: branch_add, pre_norm |
+| `rmsnorm_single` | `rmsnorm_single` | activation.rs | **✓** | · | **✓** | **✓** | · | glimmer/forward; glm/attn; glm/forward; k3/forward :: cache_and_absorb, embed_rows, qkv_project, rms_vec |
+| `rmsnorm_weightless_batch` | `rmsnorm_weightless_batch` | activation.rs | · | · | · | **✓** | · | glimmer/forward :: attention, embed |
+| `rope_interleave` | `rope_interleave` | activation.rs | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
+| `rope_split_half` | `rope_split_half` | activation.rs | · | · | · | **✓** | · | glimmer/forward :: attention |
+| `situ_glu_f32` | `situ_glu_f32` | activation.rs | · | · | **✓** | · | · | k3/forward :: situ_mlp |
+| `swiglu` | `swiglu` | activation.rs | **✓** | · | · | **✓** | · | glimmer/forward; glm/mlp :: desc_of, mlp |
+| `swiglu_clamped_bf16` | `swiglu_clamped_bf16` | activation.rs | · | **✓** | · | · | · | v4/moe :: shared_expert |
 | `attend` | `mla_attend` | attn.hip | **✓** | · | · | · | · | glm/attn :: attend_rows |
 | `gather_attn_shared_kv` | `gather_attn_shared_kv` | attn.hip | · | **✓** | · | · | · | v4/attn :: attend_rows |
 | `gqa_attend` | `gqa_attend` | attn.hip | · | · | · | **✓** | · | glimmer/forward :: attention |
@@ -91,16 +98,16 @@ column is a query, and a query can be wrong.
 | `moe_acc_drain_to` | `moe_acc_drain_to_s` | moe.hip | · | · | **✓** | · | · | k3/forward :: moe_ffn |
 | `moe_expert_range` | `moe_expert_range` | moe.hip | **✓** | · | · | · | · | glm/mlp :: expert_range |
 | `moe_expert_range_i4` | `moe_expert_range_i4` | moe.hip | **✓** | · | · | · | · | glm/mlp :: expert_range |
-| `act_quant_f8` | `act_quant_f8` | moe_f4.hip | · | **✓** | · | · | · | v4/moe :: shared_expert |
+| `act_quant_f8` | `act_quant_f8` | activation.rs | · | **✓** | · | · | · | v4/moe :: shared_expert |
 | `moe_expert_range_f4` | `moe_expert_range_f4` | moe_f4.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: expert_range |
 | `moe_expert_range_f4_situ` | `moe_expert_range_f4_situ` | moe_f4.hip | · | · | **✓** | · | · | k3/forward :: expert_range |
 | `gated_delta_recurrent_f32` | `gated_delta_recurrent_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
 | `rmsnorm_gate_heads_f32` | `rmsnorm_gate_heads_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
 | `short_conv_silu_f32` | `short_conv_silu_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
-| `attn_res` | `attn_res` | residual.hip | · | · | **✓** | · | · | k3/forward :: fold_into_h |
-| `gated_residual_collapse_f32` | `gated_residual_collapse_f32` | residual.hip | · | · | · | · | · | *(no production reference)* |
-| `hc_post` | `hc_post` | residual.hip | · | **✓** | · | · | · | v4/forward :: layer |
-| `hc_pre` | `hc_pre` | residual.hip | · | **✓** | · | · | · | v4/forward :: pre_norm |
+| `attn_res` | `attn_res` | residual.rs | · | · | **✓** | · | · | k3/forward :: fold_into_h |
+| `gated_residual_collapse_f32` | `gated_residual_collapse_f32` | residual.rs | · | · | · | · | · | *(no production reference)* |
+| `hc_post` | `hc_post` | residual.rs | · | **✓** | · | · | · | v4/forward :: layer |
+| `hc_pre` | `hc_pre` | residual.rs | · | **✓** | · | · | · | v4/forward :: pre_norm |
 | `gdn_recurrent_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
 | `hash_rows` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
 | `index_score_blocks` | `(hand-written)` | *(hand)* | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
@@ -135,7 +142,7 @@ in `gate-red-proofs.md` §17 (2026-09-10).
 | `gqa_block_attend` | attn.hip | **not wired — by decision** | M17c's drafter attend: oracle-covered and executed (7/7, witnessed 2026-09-04), but §4 states it is a scored kernel rather than a shipped one. Its `gqa_attend` duplication is still OWED because jscpd cannot see `.hip` |
 | `gdn_recurrent_f32` | recurrent.hip | **qwen S3 ahead of S6** | named in `kernel_coverage.rs`'s FOURTH TURN as one of three launchers that landed with their oracles; the arm that would call them is S6 |
 | `index_pool_norm_f32` | indexer.hip | **qwen S3 ahead of S6** | same |
-| `gated_residual_collapse_f32` | residual.hip | **qwen S3 ahead of S6** | same |
+| `gated_residual_collapse_f32` | residual.rs | **qwen S3 ahead of S6** | same |
 | `index_score_blocks_f32` | blockindex.hip | **qwen S3 ahead of S6** | the f32 sibling of V4's live `index_score_blocks`; `v4/blocksel.rs` calls the f4 pair, not this one |
 
 **Two near-misses worth recording, because they were classified wrong before being checked.**

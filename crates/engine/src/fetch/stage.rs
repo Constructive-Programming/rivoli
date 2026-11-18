@@ -8,37 +8,15 @@
 
 use std::ffi::c_void;
 
-mod ffi {
-    use std::ffi::c_void;
-    unsafe extern "C" {
-        /// Pinned host arena for the bounce path (kernels/async.hip). Null on failure.
-        pub fn rivoli_pinned_alloc(bytes: u64) -> *mut c_void;
-        pub fn rivoli_pinned_free(p: *mut c_void);
-        /// Async H2D copy on `stream` (bounce slot → VMM slot). 0 ok, else negative.
-        pub fn rivoli_memcpy_h2d_async(
-            dst: *mut c_void,
-            src: *const c_void,
-            n: u64,
-            stream: *mut c_void,
-        ) -> i32;
-        /// Full-width device read of a pinned-arena window on `stream`, value discarded —
-        /// the ARENA REFRESH mitigation (`kernels/async.hip` carries the evidence and the
-        /// ceiling). `sink` is written only on an impossible value and exists solely to
-        /// stop the loads being optimised away.
-        pub fn rivoli_touch_region_async(
-            src: *const c_void,
-            n: u64,
-            stream: *mut c_void,
-            sink: *mut u64,
-        ) -> i32;
-    }
-}
+/// async.hip's four staging entry points, direct FFI since 2026-11-18 — same names, same
+/// return convention (`rivoli_backend::hiprt` carries both and the touch-region record).
+use rivoli_backend::hiprt as ffi;
 
 /// A HIP-PINNED host arena, which is what makes the copy below a DMA rather than a
 /// staged CPU memcpy. Null on failure.
 pub fn alloc(bytes: usize) -> *mut u8 {
-    // SAFETY: no pointer args; null on failure.
-    unsafe { ffi::rivoli_pinned_alloc(bytes as u64) as *mut u8 }
+    // Null on failure.
+    ffi::rivoli_pinned_alloc(bytes as u64) as *mut u8
 }
 
 /// HIP tracks the pinned registration's size itself, so this takes only the pointer.
@@ -76,7 +54,7 @@ pub unsafe fn copy_to_slot(
 }
 
 /// `0` is HIP success at this boundary; anything else is the negative HIP code the C side
-/// folded through `HIP_ERR_BASE`. Factored because both staging calls end this way and the
+/// folds through `HIP_ERR_BASE` (`hiprt`'s `HIP_ERR_BASE - hipError_t`, async.hip's convention). Factored because both staging calls end this way and the
 /// duplication gate is right that one tail should exist once.
 fn check(rc: i32) -> Result<(), String> {
     if rc == 0 {

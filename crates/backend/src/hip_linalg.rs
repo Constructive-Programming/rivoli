@@ -14,7 +14,9 @@
 //! exemption argument for both invocation files is under this file's opening marker.
 
 use crate::hip::{abi_ty, ensure_hip_status, launchers};
+use crate::rk_launchers::*;
 use anyhow::Result;
+use rivoli_abi::kernarg::{Gate, GateClamped, GateSitu, Rope, RowNorm, WeightlessNorm};
 use std::ffi::c_void;
 
 // Doc links only. An intra-doc link resolves in the module it is WRITTEN in, so the moment
@@ -399,10 +401,10 @@ launchers! {
     /// # Safety
     /// Device pointers (`g`, `u`, `h` each `n` f32) live until the next [`device_sync`];
     /// `stream` is null or a live stream ordering every producer of `g`/`u`.
-    launch_swiglu -> rivoli_swiglu, "swiglu" (
+    launch_swiglu => rivoli_swiglu(Gate { g, u, h, n: n as i32 }, stream), "swiglu" (
         g: *const f32,
         u: *const f32,
-        n: usize as i32,
+        n: usize,
         h: *mut f32,
         stream: *mut c_void,
     );
@@ -453,10 +455,10 @@ launchers! {
     /// `g`, `u` and `h` are each `n` f32 and must outlive `stream`'s completion. `h` may alias
     /// `g` or `u` — every thread reads both, then writes once, and that write depends on both
     /// reads. `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_swiglu_clamped_bf16 -> rivoli_swiglu_clamped_bf16, "swiglu_clamped_bf16" (
+    launch_swiglu_clamped_bf16 => rivoli_swiglu_clamped_bf16(GateClamped { gate: Gate { g, u, h, n: n as i32 }, limit }, stream), "swiglu_clamped_bf16" (
         g: *const f32,
         u: *const f32,
-        n: usize as i32,
+        n: usize,
         limit: f32,
         h: *mut f32,
         stream: *mut c_void,
@@ -485,10 +487,10 @@ launchers! {
     /// `g`, `u` and `h` are each `n` f32 and must outlive `stream`'s completion. `h` may alias
     /// `g` or `u` — every thread reads both, then writes once, and that write depends on both
     /// reads. `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_situ_glu_f32 -> rivoli_situ_glu_f32, "situ_glu_f32" (
+    launch_situ_glu_f32 => rivoli_situ_glu_f32(GateSitu { gate: Gate { g, u, h, n: n as i32 }, b1, b2 }, stream), "situ_glu_f32" (
         g: *const f32,
         u: *const f32,
-        n: usize as i32,
+        n: usize,
         b1: f32,
         b2: f32,
         h: *mut f32,
@@ -565,10 +567,10 @@ launchers! {
     ///
     /// # Safety
     /// `v` is `n_rows · row_len` live f32 for `stream`'s duration.
-    launch_act_quant_f8 -> rivoli_act_quant_f8, "act_quant_f8" (
+    launch_act_quant_f8 => rivoli_act_quant_f8(v, n_rows as i32, row_len as i32, stream), "act_quant_f8" (
         v: *mut f32,
-        n_rows: usize as i32,
-        row_len: usize as i32,
+        n_rows: usize,
+        row_len: usize,
         stream: *mut c_void,
     );
 
@@ -630,10 +632,10 @@ launchers! {
     ///
     /// # Safety
     /// Device pointers (`x`, `w`, `y` each `n` f32) live until the next [`device_sync`].
-    launch_rmsnorm_single -> rivoli_rmsnorm_single, "rmsnorm_single" (
+    launch_rmsnorm_single => rivoli_rmsnorm_single(RowNorm { x, w, y, n: n as i32, eps }), "rmsnorm_single" (
         x: *const f32,
         w: *const f32,
-        n: usize as i32,
+        n: usize,
         eps: f32,
         y: *mut f32,
     );
@@ -659,10 +661,10 @@ launchers! {
     /// [`device_sync`]; `y` may alias `x` (each thread reads and writes only index `i` after the
     /// block-wide reduction has completed). `stream` is null or a live stream ordering every
     /// producer of `x` and `w`.
-    launch_rmsnorm_centered_single -> rivoli_rmsnorm_centered_single, "rmsnorm_centered_single" (
+    launch_rmsnorm_centered_single => rivoli_rmsnorm_centered_single(RowNorm { x, w, y, n: n as i32, eps }, stream), "rmsnorm_centered_single" (
         x: *const f32,
         w: *const f32,
-        n: usize as i32,
+        n: usize,
         eps: f32,
         y: *mut f32,
         stream: *mut c_void,
@@ -701,10 +703,10 @@ launchers! {
     /// (review, 2026-08-13). The realistic violation is a `--trace` or `--pred-probe` readback of q
     /// expecting `q_proj`'s output and getting post-norm, post-3.87 bytes; no fixture can see it,
     /// which is the same shape as the null-stream finding this port already carries.
-    launch_rmsnorm_weightless_batch -> rivoli_rmsnorm_weightless_batch, "rmsnorm_weightless_batch" (
+    launch_rmsnorm_weightless_batch => rivoli_rmsnorm_weightless_batch(Rows(rows as i32), WeightlessNorm { x, d: d as i32, eps, scale }, stream), "rmsnorm_weightless_batch" (
         x: *mut f32,
-        rows: usize as i32,
-        d: usize as i32,
+        rows: usize,
+        d: usize,
         eps: f32,
         scale: f32,
         stream: *mut c_void,
@@ -744,12 +746,12 @@ launchers! {
     ///
     /// # Safety
     /// `base` is a device buffer of `count·stride` f32, live until the next [`device_sync`].
-    launch_rope_interleave -> rivoli_rope_interleave, "rope_interleave" (
+    launch_rope_interleave => rivoli_rope_interleave(Rows(count as i32), Rope { base, theta, stride: stride as i32, seg: seg as i32, pos: pos as i32 }), "rope_interleave" (
         base: *mut f32,
-        count: usize as i32,
-        stride: usize as i32,
-        seg: usize as i32,
-        pos: usize as i32,
+        count: usize,
+        stride: usize,
+        seg: usize,
+        pos: usize,
         theta: f64,
     );
 
@@ -765,12 +767,12 @@ launchers! {
     ///
     /// # Safety
     /// `base` is a device buffer of `count·stride` f32, live until the next [`device_sync`].
-    launch_rope_split_half -> rivoli_rope_split_half, "rope_split_half" (
+    launch_rope_split_half => rivoli_rope_split_half(Rows(count as i32), Rope { base, theta, stride: stride as i32, seg: seg as i32, pos: pos as i32 }), "rope_split_half" (
         base: *mut f32,
-        count: usize as i32,
-        stride: usize as i32,
-        seg: usize as i32,
-        pos: usize as i32,
+        count: usize,
+        stride: usize,
+        seg: usize,
+        pos: usize,
         theta: f64,
     );
 

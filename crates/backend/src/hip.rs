@@ -1,6 +1,7 @@
-//! Minimal HIP surface: under `rocm` this binds the hipcc-built kernel launchers
-//! (fp8/int8/f32 linalg, VQ-int3 and int4 MoE, MLA, fwd glue). Without the feature
-//! the whole module compiles away.
+//! Minimal HIP surface: under `rocm` this binds the kernel launchers — the hipcc-built ones
+//! (fp8/int8/f32 linalg, VQ-int3 and int4 MoE, MLA, fwd glue) through `extern "C"`, and the
+//! Rust ones (`crates/kernels`, since 2026-11-18) through `rk_launchers.rs`. Without the
+//! feature the whole module compiles away.
 //!
 //! # The wall is four files, and this one is its shared quarter
 //!
@@ -28,6 +29,9 @@
 #![cfg(feature = "rocm")]
 
 use crate::abi::ScoreDims;
+use crate::hiprt::{
+    rivoli_device_sync, rivoli_fill_u32, rivoli_memcpy_dtod, rivoli_memcpy_dtod_async,
+};
 use anyhow::{Result, bail, ensure};
 use std::ffi::c_void;
 
@@ -225,7 +229,7 @@ macro_rules! abi_ty {
 macro_rules! launchers {
     ($(
         $(#[$m:meta])*
-        $rust:ident -> $sym:ident, $tag:literal (
+        $rust:ident $kind:tt $sym:ident $( ( $($call:tt)* ) )?, $tag:literal (
             $($arg:ident : $rt:ty $(as $ct:ty)? $(=> $nt:ty)? ,)*
         );
     )*) => {
@@ -234,7 +238,7 @@ macro_rules! launchers {
         // `too_many_arguments` on an ABI mirror is noise by construction.
         #[allow(clippy::too_many_arguments)]
         unsafe extern "C" {
-            $( fn $sym($($arg: abi_ty!($rt $(, $ct)? $(, $nt)?)),*) -> i32; )*
+            $( launchers!(@decl $kind $sym ($($arg: abi_ty!($rt $(, $ct)? $(, $nt)?)),*)); )*
         }
 
         $(
@@ -242,10 +246,29 @@ macro_rules! launchers {
             #[allow(clippy::too_many_arguments)]
             pub unsafe fn $rust($($arg: $rt),*) -> Result<()> {
                 // SAFETY: caller's pointer contract.
-                let r = unsafe { $sym($($arg $(as $ct)? $(.0 as $nt)?),*) };
+                let r = unsafe {
+                    launchers!(@call $kind $sym ($($arg $(as $ct)? $(.0 as $nt)?),*) $( ( $($call)* ) )?)
+                };
                 ensure_hip_status(r, $tag)
             }
         )*
+    };
+    // `launch_x -> rivoli_x`: a hipcc launcher — declared `extern "C"`, called positionally.
+    (@decl -> $sym:ident $params:tt) => {
+        fn $sym $params -> i32;
+    };
+    (@call -> $sym:ident $positional:tt) => {
+        $sym $positional
+    };
+    // `launch_x => rivoli_x(KernArg { .. }, ..)`: a RUST launcher (`src/rk_launchers.rs`,
+    // imported by the invocation file). Nothing to declare; the row's own call expression
+    // builds the `rivoli_abi::kernarg` block from the wrapper's parameters, so the kernel's
+    // parameter list is spelled once — in that struct — instead of in a C signature, a
+    // launch call and an extern mirror. The wrapper keeps its name, signature and status
+    // mapping, so no caller sees the migration.
+    (@decl => $sym:ident $params:tt) => {};
+    (@call => $sym:ident $positional:tt $named:tt) => {
+        $sym $named
     };
 }
 
@@ -316,15 +339,6 @@ pub(crate) use {abi_ty, launchers};
 // parameter lists for different kernels. Re-measured 2026-08-06 with the markers deleted: 6
 // clones, all of them parameter lists, none logic.
 unsafe extern "C" {
-    fn rivoli_device_sync() -> i32;
-    fn rivoli_memcpy_dtod(dst: *mut u8, src: *const u8, bytes: usize) -> i32;
-    fn rivoli_memcpy_dtod_async(
-        dst: *mut u8,
-        src: *const u8,
-        bytes: usize,
-        stream: *mut c_void,
-    ) -> i32;
-    fn rivoli_fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> i32;
     fn rivoli_hash_rows(
         x: *const f32,
         n: i32,
@@ -417,8 +431,7 @@ pub unsafe fn launch_index_score_blocks_f32(
 
 /// Block until all launched kernels retire — one join per token.
 pub fn device_sync() -> Result<()> {
-    // SAFETY: hipDeviceSynchronize, no pointers.
-    ensure_hip_status(unsafe { rivoli_device_sync() }, "device_sync")
+    ensure_hip_status(rivoli_device_sync(), "device_sync")
 }
 
 /// Synchronous device-to-device copy of `bytes` from `src` to `dst` — the routed
@@ -472,7 +485,8 @@ pub unsafe fn memcpy_dtod_async(
 /// Fill `bytes` at `dst` with the 32-bit pattern `pat` (`bytes` must be a multiple of 4).
 ///
 /// Poisons a freshly admitted slot so a read-before-write is DETERMINISTIC rather than
-/// dependent on what happened to be in memory. See kernels/vmm.hip::fill_u32.
+/// dependent on what happened to be in memory. `hiprt::rivoli_fill_u32` carries the
+/// mechanism (`hipMemsetD32Async` on the null stream since 2026-11-18; a kernel before).
 ///
 /// # Safety
 /// `dst` must be a device pointer owning at least `bytes`.
@@ -501,6 +515,14 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 // > reader who believes it will look for a gate that is not there; the honest boundary is
 // > "everything in the two invocation files and this block is exempt, and `gpustream.rs` and
 // > `waist.rs` are where this crate's logic is gated".
+// >
+// > **2026-11-18:** the clone that sentence cites is gone — `rivoli_device_sync`, the two
+// > device-to-device copies and `rivoli_fill_u32` left this `extern` block for direct FFI
+// > (`hiprt.rs`), and their wrappers here call those Rust functions. Re-measured the same
+// > day with both markers deleted: FOUR clones, so the region is still load-bearing — the
+// > two `rivoli_index_score_blocks{,_f32}` extern lists (88 tokens), their two wrappers'
+// > destructure-and-call bodies (87 and 39 tokens), and `memcpy_dtod_async`'s wrapper
+// > against the signature it now forwards to in `hiprt.rs` (43 tokens).
 
 /// f32 count for the split-KV partial scratch — allocate once per session (never
 /// per token). Mirrors the kernel's worst-case (MLA_MAX_SPLITS) sizing.
@@ -520,7 +542,7 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 // expert set — the layer's routed fetch is now real work to hide compute behind.
 //
 // The set converts together or not at all, and that is correctness, not neatness. rivoli's
-// streams are `hipStreamNonBlocking` (`async.hip`), so the null stream carries NO implicit
+// streams are `hipStreamNonBlocking` (`hiprt::rivoli_stream_create`), so the null stream carries NO implicit
 // ordering against them: one stream-capable launcher beside a null-stream neighbour over the
 // same buffer is an unordered read, which is silently wrong, where leaving the whole block
 // on the null stream is merely slow. A half-converted set is worse than either end.

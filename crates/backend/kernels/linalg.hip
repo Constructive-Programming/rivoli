@@ -399,43 +399,5 @@ extern "C" int rivoli_vq_encode(
     return e == hipSuccess ? 0 : -(int)e;
 }
 
-// One join point per token: block until all launched kernels retire.
-extern "C" int rivoli_device_sync() {
-    hipError_t e = hipDeviceSynchronize();
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
-// Synchronous device-to-device copy — the routed arena's slot relocation (compaction).
-// Blocks so the moved expert's bytes are in place before the layer's MoE compute (or a
-// later cold read) touches the new location. `dst`/`src` are distinct slots, so the
-// regions never overlap.
-extern "C" int rivoli_memcpy_dtod(void* dst, const void* src, size_t bytes) {
-    hipError_t e = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToDevice);
-    return e == hipSuccess ? 0 : -(int)e;
-}
-
-// STREAM-ORDERED device-to-device copy, for a pipeline whose kernels are on a stream.
-//
-// A separate entry point rather than a `stream` parameter on `rivoli_memcpy_dtod`, because
-// the two are not the same operation with a knob — the one above BLOCKS THE HOST, and the
-// arena relocation it serves needs exactly that. `memory/routed.rs` moves an expert's slot
-// while later reads may still resolve to the old address, and this repo has a measured
-// defect from a read outliving its layer and getting its slot copied out from under it
-// (9 of 8452 reads at `--max-mem 30`, non-deterministic output; pins do not stop
-// compaction). Making that path stream-ordered would replace a host barrier with a
-// per-stream one and reopen it. So: two names, and the blocking one keeps its callers.
-//
-// Why this exists at all — DeepSeek-V4's attention block interleaves six device-to-device
-// copies with sixteen kernel launches (`attn.rs::v4::attention`: `x -> xq`, `qr -> qrq`, and
-// four KV ring writes, of which one or two run depending on the phase). Once those kernels take a stream, a blocking `hipMemcpy` between two of them
-// does NOT wait on the stream: rivoli's streams are `hipStreamNonBlocking` (`async.hip`), so
-// the null stream has no implicit ordering against them. The copy would read `s.qr` before
-// `rmsnorm_batch` wrote it. Found 2026-08-05 while converting that block's six launchers —
-// converting six of the seven operations would have introduced the very race the earlier
-// decline of the partial fix predicted.
-extern "C" int rivoli_memcpy_dtod_async(void* dst, const void* src, size_t bytes,
-                                        void* stream) {
-    hipError_t e = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice,
-                                  (hipStream_t)stream);
-    return e == hipSuccess ? 0 : -(int)e;
-}
+// `rivoli_device_sync`, `rivoli_memcpy_dtod` and `rivoli_memcpy_dtod_async` lived here until
+// 2026-11-18; they are direct FFI now (`src/hiprt.rs`), with their notes.

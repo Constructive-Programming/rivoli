@@ -226,7 +226,7 @@ pub fn sigmoid(x: f64) -> f64 {
 /// Which pairing a partial RoPE READS. The two write the same output slots.
 ///
 /// **One function with a flag here, and two separate entry points in the kernel** — that is not an
-/// inconsistency. `activation.hip` keeps `rope_split_half` and `rope_interleave` apart precisely so
+/// inconsistency. `activation.hip` (at tag `archive/hip-kernels`) keeps `rope_split_half` and `rope_interleave` apart precisely so
 /// no GLM or V4 call site can reach the other convention by changing an argument, and its note says
 /// so; a host oracle in a test has the opposite requirement, because the whole subject of
 /// `kernel_qwen_rope.rs` is COMPARING them, and two bodies would differ only in the read while
@@ -254,7 +254,7 @@ pub enum Pairing {
 ///
 /// The snapshot is load-bearing for `Interleaved` and free for `SplitHalf`: reading `2j` while
 /// writing `j` overlaps, so an in-place interleaved rotation without it reads values it has already
-/// overwritten — which `activation.hip`'s own kernels solve with a `__syncthreads` between the read
+/// overwritten — which `activation.hip`'s own kernels (tag `archive/hip-kernels`) solve with a `__syncthreads` between the read
 /// and the write.
 pub fn rope_row(row: &mut [f32], p: Pairing, rd: usize, pos: usize, theta: f64) {
     let half = rd / 2;

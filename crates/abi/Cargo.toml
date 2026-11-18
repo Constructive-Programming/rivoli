@@ -1,0 +1,13 @@
+[package]
+name = "rivoli-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# `no_std`, no dependencies, no features: compiled by the host on stable (as a workspace member
+# of `rivoli-backend`'s graph) AND by `crates/kernels` on the pinned nightly for
+# `amdgcn-amd-amdhsa`. That double compile is the whole point — host and device read ONE
+# definition of every type and constant that crosses the wall.
+
+[lints]
+workspace = true

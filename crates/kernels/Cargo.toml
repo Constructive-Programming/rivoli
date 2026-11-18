@@ -1,0 +1,37 @@
+# The device crate: rivoli's GPU kernels in Rust, for `amdgcn-amd-amdhsa`.
+#
+# NOT a workspace member, and the empty `[workspace]` below says so: it needs the pinned
+# nightly in `rust-toolchain.toml` (gpu-kernel ABI, core intrinsics, build-std), and a member
+# would drag that into every stable `cargo` run — including the deviceless arm CI builds,
+# which must need neither nightly nor ROCm. The only builder is `crates/backend/build.rs`,
+# under the `rocm` feature, into its own target dir under OUT_DIR; it passes the target,
+# `-Zbuild-std=core`, the cpu and the ROCm device-library link line, so nothing here
+# depends on a config file a hand build would also have to find.
+[package]
+name = "rivoli-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace]
+
+[lib]
+# A cdylib is what rustc links into an AMDGPU code object (ELF, `e_machine` AMDGPU) —
+# the file `hipModuleLoadData` takes.
+crate-type = ["cdylib"]
+
+[dependencies]
+rivoli-abi = { path = "../abi" }
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+
+# Not a workspace member, so the workspace's lint tables do not reach this crate; restated
+# here so a warning in a kernel is the same build error it is everywhere else. (Clippy does
+# not run on it: the pinned toolchain is `profile = "minimal"` — recorded in
+# rust-kernels.md §5 as a gap.)
+[lints.rust]
+warnings = { level = "deny", priority = -1 }

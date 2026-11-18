@@ -77,9 +77,21 @@ const DEFERRED: &[(&str, &str)] = &[
     // cannot. EMPTY again, for the third time.)
 ];
 
+/// The two arrows a `launchers!` row may carry: `->` (a hipcc launcher, declared `extern`)
+/// and `=>` (a Rust launcher, `src/rk_launchers.rs`, since 2026-11-18).
+///
+/// **The `=>` form was added because the scanner went blind without it, and only half the
+/// census noticed.** With the 13 activation/residual rows moved to `=>` and this list still
+/// `["->"]`, the oracle census PASSED at 53 launchers — thirteen fewer, under a floor of 45 —
+/// and the liveness census reddened only because one of the thirteen
+/// (`gated_residual_collapse_f32`) happens to carry an uncalled-table row (measured
+/// 2026-11-18, `docs/measurement/gate-red-proofs.md` §18). Hence also the floor below.
+const ARROWS: [&str; 2] = [" -> rivoli_", " => rivoli_"];
+
 /// Launcher names in `text`, under both declaration forms (hand-written `pub unsafe fn
-/// launch_*` and the `launchers!` DSL's `launch_* -> rivoli_*` rows). `decl`/`stem` are
-/// built by the caller at runtime so this file's own text cannot trip its scanner.
+/// launch_*` and the `launchers!` DSL's `launch_* -> rivoli_*` / `launch_* => rivoli_*`
+/// rows). `decl`/`stem` are built by the caller at runtime so this file's own text cannot
+/// trip its scanner.
 fn launcher_names(text: &str, decl: &str, stem: &str) -> Vec<String> {
     text.lines()
         .map(str::trim_start)
@@ -87,9 +99,9 @@ fn launcher_names(text: &str, decl: &str, stem: &str) -> Vec<String> {
             l.strip_prefix(decl)
                 .and_then(|rest| rest.split('(').next())
                 .or_else(|| {
-                    l.strip_prefix(stem)
-                        .filter(|_| l.contains(" -> rivoli_"))
-                        .and_then(|rest| rest.split(" ->").next())
+                    let rest = l.strip_prefix(stem)?;
+                    let arrow = ARROWS.iter().find(|a| rest.contains(*a))?;
+                    rest.split(*arrow).next()
                 })
         })
         .map(String::from)
@@ -127,11 +139,13 @@ fn backend_launchers() -> (String, Vec<String>) {
     let stem = format!("{}{}", "launch", "_");
     let launchers = launcher_names(&corpus("crates/backend/src", ""), &decl, &stem);
 
-    // Anti-vacuity floor, re-derived for this tree: 53 measured 2026-08-15. A parse that
-    // silently matches nothing passes forever; this has bitten the old census twice.
+    // Anti-vacuity floor: 66 measured 2026-11-18 (53 on 2026-08-15, under a floor of 45 that
+    // then sat 21 BELOW the population — low enough that losing every Rust launcher at once
+    // passed, see `ARROWS`). A floor is only a check while it sits AT the population; raise
+    // it with each lane that adds launchers, never let the slack regrow.
     assert!(
-        launchers.len() >= 45,
-        "found only {} launchers under crates/backend/src (53 on 2026-08-15) — the \
+        launchers.len() >= 66,
+        "found only {} launchers under crates/backend/src (66 on 2026-11-18) — the \
          declaration pattern has changed underneath this scanner",
         launchers.len()
     );
@@ -336,4 +350,64 @@ fn every_launcher_is_shipped_or_classified_uncalled() {
         launchers.len() - rows.len(),
         rows.len()
     );
+}
+
+/// The Rust kernels' two ends, checked against each other (added 2026-11-18 with
+/// `crates/kernels`): every `#[no_mangle]` gpu-kernel in the device crate has exactly one
+/// host `Kernel::new(c"…")` handle, and every handle names a kernel that exists.
+///
+/// A handle without a kernel compiles and fails only at its first launch, on the GPU
+/// (`hipModuleGetFunction`), which no deviceless run ever reaches; a kernel without a handle
+/// is dead code in the shipped code object. This test is where both become a deviceless red.
+#[test]
+fn every_rust_kernel_has_exactly_one_host_handle() {
+    let decl = format!("pub unsafe extern {:?} fn ", "gpu-kernel");
+    let mut device: Vec<String> = corpus("crates/kernels/src", "")
+        .lines()
+        .filter_map(|l| {
+            l.trim_start()
+                .strip_prefix(decl.as_str())?
+                .split('(')
+                .next()
+        })
+        .map(String::from)
+        .collect();
+    // `Kernel::new(c"name")`, keyed by the C-string name the handle resolves — the name the
+    // code object exports. (A `=>` row naming a missing `rivoli_*` host half needs no census:
+    // the wrapper calls it, so that is a compile error, and an unused one is a denied
+    // dead-code warning — the compiler checks both ends of that pair.)
+    let mut host: Vec<String> = corpus("crates/backend/src", "")
+        .split(&format!("{}::new(c\"", "Kernel"))
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .map(String::from)
+        .collect();
+    device.sort();
+    host.sort();
+    // Anti-vacuity: 14 measured 2026-11-18 (activation 9, residual 4, touch 1).
+    assert!(
+        device.len() >= 14,
+        "found only {} gpu-kernels in crates/kernels/src",
+        device.len()
+    );
+    let dup: Vec<&String> = host
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| &w[0])
+        .collect();
+    assert!(
+        dup.is_empty(),
+        "kernel(s) with more than one host handle:\n  {}",
+        bullet(&dup)
+    );
+    let orphans: Vec<&String> = device.iter().filter(|k| !host.contains(k)).collect();
+    let dangling: Vec<&String> = host.iter().filter(|k| !device.contains(k)).collect();
+    assert!(
+        orphans.is_empty() && dangling.is_empty(),
+        "\n\ngpu-kernels with no host handle (dead in the code object):\n  {}\n\nhost handles \
+         naming no gpu-kernel (would fail at first launch, on the device):\n  {}",
+        bullet(&orphans),
+        bullet(&dangling)
+    );
+    println!("{} Rust kernels, each with one host handle", device.len());
 }
