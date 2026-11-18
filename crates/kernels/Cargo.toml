@@ -1,0 +1,26 @@
+# MINIMAL SKELETON from Phase 0b (prelude) so `src/prelude/` compiles on its own. Phase 0a
+# (infra) owns this file, `src/lib.rs` and the build integration; on merge theirs wins and
+# only `pub mod prelude;` needs to survive into their lib.rs.
+#
+# Device-only, nightly: built for amdgcn-amd-amdhsa with -Zbuild-std=core, so it is its
+# own workspace root rather than a member of the stable host workspace.
+[package]
+name = "rivoli-kernels"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+# The root manifest's lint policy, restated: lints do not inherit across workspace roots.
+# (0a: keep these equal to the root tables when this file becomes yours.)
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[lints]
+workspace = true
