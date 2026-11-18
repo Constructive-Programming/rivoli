@@ -164,9 +164,11 @@ pub(crate) unsafe fn rivoli_memcpy_dtod_async(
 /// weights (finite, plausible, silently WRONG); a quiet-NaN pattern collapses both into the
 /// loud case, so a fault seen one run in sixteen is seen every time it occurs.
 ///
-/// UNVERIFIED on this ROCm: the old path was a kernel store, which cannot refuse an address;
-/// a memset into a `hipMemMap`'d pool slot (`--features trace`'s admission fill) is owed a
-/// device run (rust-kernels.md §5).
+/// VERIFIED on the device 2026-11-18 (rust-kernels.md §5, the merge-review lease, arm T):
+/// `--features trace`'s admission fill (`routed.rs`, rc propagated) ran into `hipMemMap`'d
+/// pool slots during a 32-token GLM decode (4612 decode misses), rc 0, the first 4 ids at the
+/// reference. That it ran on every admission rests on the code path; there is no per-fill
+/// counter.
 ///
 /// # Safety
 /// `dst` owns `bytes` device bytes.

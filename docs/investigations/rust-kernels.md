@@ -272,7 +272,8 @@ bridges the migration: `rivoli_act_quant_f8`, which `moe_f4.hip` still calls C-t
   now compare equal and hide an element neither twin wrote.
 - Known gaps, stated: clippy does not run on `crates/kernels` (the pinned toolchain is
   `minimal`; its manifest denies rustc warnings); `fill_u32` as `hipMemsetD32Async` into a
-  `hipMemMap`'d pool slot is unverified on this ROCm; `attn_res`'s private `p[16]` lands in
+  `hipMemMap`'d pool slot is unverified on this ROCm (CLOSED 2026-11-18, §5's merge-review
+  lease, arm T); `attn_res`'s private `p[16]` lands in
   scratch (144 B) where hipcc keeps it in registers — a speed question the TIME line answers;
   0b's probe families (`/var/cache/rivoli/scratch/rk-prelude/probe/`) are not yet rows.
 - **Barrier, versus Phase 0b's:** both wait `vmcnt`/`lgkmcnt`/`vscnt` and invalidate L0;
@@ -606,6 +607,72 @@ will copy. Every MUST item was done; the SHOULD items were done or declined, as 
 - `module.rs`: the compile-error claim is narrowed to the static's type.
 - `stage.rs`: "negative" corrected to "positive".
 - CLAUDE.md's bit-identity bullet.
+
+### Phase 0 merge review — the device lease (2026-11-18, commit `3706fdc`)
+
+Six arms ran in order, once each: A, R, P (probes plus 8 plants), W, D, T. The lock was the
+default `/var/run/sys-gpu.lock`. **No arm was discarded.** Every witness file was 0 B, and GTT
+read 18702336 B (17.8 MiB) before each arm.
+
+For D and T, `mem_info_gtt_used` was also read immediately AFTER the arm, because llama-swap's
+embedding model reloads on demand and the witness samples GTT only before an arm. The rise was
+0 on both.
+
+The wrapper that does that read (`gpu/gttwrap.sh`) was self-tested once, wrapping `true`, at
+22:09, inside W's window (`lease4/selftest.gtt`). That was a sysfs read, not a device command.
+
+Evidence is in `/var/cache/rivoli/scratch/rk-infra/lease4/` and in the log directory each arm
+names. Exit codes for A, R and P were not captured separately: `bit-identity.sh` exits 0 only
+after printing a GREEN line, so those codes are implied by the scripted verdict. The codes for
+W, D and T were captured.
+
+| arm | scripted verdict | rc | witness | notes |
+|---|---|---|---|---|
+| A (launcher rows) | GREEN: 13/13 BIT-IDENTICAL | 0 (implied) | 0 B | logs `…/bit-identity/20261118T220249-907555` |
+| R (rope plant, rebuilt at `3706fdc`) | GREEN (expect-red): exactly `rope_interleave`, `rope_split_half` | 0 (implied; binary 101) | 0 B | 275/320 cells red on each, as before |
+| P: `--probes` | GREEN: 222/222 | 0 (implied) | 0 B | 231 NaN-payload-only cells, the same as the probe lease |
+| P: 8 plants | `GREEN (plant <family>)` ×8 | 0 (implied) each | 0 B each | red counts 6/18/4/30/1/34/28/15, the same as the probe lease |
+| W (full battery, `--test-threads=1`) | 707 passed, 1 failed, 2 ignored | 101 | 0 B | the failure is CodeScene, 31 files as on the base; 0 units compiled inside the lock; about 17 min |
+| D (`determinism-glm.sh`, `--arena-refresh`, ngen 1024) | GREEN: ids identical to 1024 | 0 | 0 B / 0 B | GTT rise 0; decode 376 / 346 s (2.72 / 2.96 tok/s); about 20 min |
+| T (trace build, 32-token GLM decode) | GREEN | 0 | 0 B | the first 4 of 32 ids `[13041 1052 0 358]` match the reference; 0 `READ-BEFORE-WRITE`; GTT rise 0; 4612 decode misses |
+
+**What this settles:**
+- **A: the outputs after the `for_i32` loop rewrite, and the five aliased rows' first device
+  cells, are bit-identical.**
+  - The aliased rows are `swiglu`, `swiglu_clamped_bf16` and `situ_glu_f32` (1024 cells each,
+    was 512) and `rmsnorm_single` and `rmsnorm_centered_single` (768 each, was 384).
+  - Their in-place moved counts are 512 for each gate row, 320 for `rmsnorm_single` and 384 for
+    `rmsnorm_centered_single`; a row with any in-place cells must have a non-zero count to be
+    green.
+  - The aliased rows still have no red proof: nothing planted here breaks the in-place path.
+- **The gate kernels' timing swings between arms, cause unknown.** In A the three gate rows timed
+  1.12–1.17× hipcc (swiglu: hipcc 2.16 µs, Rust 2.47 µs). In R, which runs the same tree minus
+  rope, the same rows timed 0.96–0.99×. Lease 2's R read up to 1.21× on the same rows. The swing
+  is mostly on the Rust side, and there is no A-vs-A control. Nothing here is a measured
+  regression, and nothing here rules one out.
+- **`hc_pre` and `attn_res` after `for_i32`:**
+  - `hc_pre`: 1.006×.
+  - `attn_res`: 1.042× in A and 1.045× in R, against 1.063× at lease 2. It is still above
+    parity and still owed to Phase 1.
+- **D: the rustc-built `touch_region` still mitigates GLM's nondeterminism at 1024 tokens.**
+  - If the touch were broken, P(detect) = 1 − exp(−2n/rate) (`glm-nondeterminism.md`'s
+    table) at n = 1024 is:
+    - 97% at the conservative rate (1 per 578);
+    - 99.89% at the matched rate (1 per 299);
+    - about 52% at the conservative interval's pessimistic end (1 per 2804).
+  - It bounds the rate; it does not prove determinism.
+  - The engine logged `slot_stalls 0`, the INV-9 soundness precondition.
+  - The script's own scratch is under `${TMPDIR:-/tmp}` (not this file's to change); the
+    evidence was copied to `lease4/D-scratch/`.
+- **T: `fill_u32` (`hipMemsetD32Async`) into the routed pool's `hipMemMap`'d slots is
+  accepted.**
+  - Under `--features trace`, `routed.rs` poisons each admitted slot through it. The result is
+    propagated with `?`, and so is the `device_sync` that follows, so a refused fill fails the
+    run.
+  - The limit: there is no per-fill counter, so "on every admission" rests on the code path,
+    not on a log line.
+  - Only the first 4 ids have a recorded reference (`smoke-glm.sh`), so a poison leaking into
+    compute after position 4 would not be seen.
 
 ### Phase 0b — the prelude (2026-11-18)
 

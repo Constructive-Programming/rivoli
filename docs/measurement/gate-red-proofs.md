@@ -2033,4 +2033,9 @@ superseded by this one.)
 | `touch` of `bit_identity/inputs.rs` (mtime only) after a fresh build | bit-identity freshness | exit 2, "the bit_identity binary was STALE against the tree"; the next run accepted the rebuilt binary and stopped, before the lock, at the clean probe stamp moved aside for the purpose (restored after) |
 
 The aliased rows are new device cells and have no deviceless red proof; their first device
-run is the next lease's arm A.
+run is the next lease's arm A. (Run 2026-11-18, merge-review lease arm A: 13/13 bit-identical.
+A green first run is not a red proof, and the aliased rows' red proof is still OWED.)
+
+**Merge-review lease (2026-11-18, `3706fdc`).** Arm R's rope plant, rebuilt at `3706fdc`,
+reddened exactly its two rows, so the red proof is PAID again. The probe and plant re-runs
+were all GREEN, and the witness was clean on every arm. The table is in `rust-kernels.md` §5.
