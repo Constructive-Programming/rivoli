@@ -9,11 +9,14 @@
 //! `__restrict__` on an aliased call is UB the C gets away with by one-read-then-one-write;
 //! Rust raw pointers make no such promise to the optimizer in the first place.
 
-use crate::gpu::{bid, fma, fmaxf, lds, ocml, sync_threads, tid, tree};
-use crate::prelude::{
-    ACT_QUANT_AMAX_FLOOR, FP8_MAX_INV, act_quant_roundtrip, block_sum_lds, fast_round_scale, rbf16,
-    situ_glu, swiglu_clamped, wave_max,
+use crate::gpu::{bid, fma, lds, ocml, tid};
+use crate::prelude::actquant::{
+    ACT_QUANT_AMAX_FLOOR, FP8_MAX_INV, act_quant_roundtrip, fast_round_scale,
 };
+use crate::prelude::formats::rbf16;
+use crate::prelude::llvm::maxnum;
+use crate::prelude::reduce::{block_sum_lds, sync_threads, tree, wave_max};
+use crate::prelude::{situ_glu, swiglu_clamped};
 use core::intrinsics::{exp, sqrt};
 use rivoli_abi::geom::{ACT_QUANT_BLOCK, ACT_QUANT_THREADS, ELEMENTWISE_BLOCK, ROW_BLOCK, WAVE};
 use rivoli_abi::kernarg::{ActQuant, Gate, GateClamped, GateSitu, Rope, RowNorm, WeightlessNorm};
@@ -78,7 +81,9 @@ pub unsafe extern "gpu-kernel" fn rmsnorm_single(a: RowNorm) {
     let red = lds::<f32>();
     *red.add(tid() as usize) = strided_sum_sq(a.x, a.n);
     sync_threads();
-    tree::<ROW_BLOCK>(|t, s| *red.add(t) += *red.add(s));
+    tree(tid() as usize, ROW_BLOCK as usize, |t, s| {
+        *red.add(t) += *red.add(s)
+    });
     let inv = 1.0 / sqrt(*red / a.n as f32 + a.eps);
     row_scale(a, inv, |w| w);
 }
@@ -86,7 +91,10 @@ pub unsafe extern "gpu-kernel" fn rmsnorm_single(a: RowNorm) {
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn rmsnorm_centered_single(a: RowNorm) {
     let local = strided_sum_sq(a.x, a.n);
-    let inv = 1.0 / sqrt(block_sum_lds::<ROW_BLOCK>(local, lds()) / a.n as f32 + a.eps);
+    let inv = 1.0
+        / sqrt(
+            block_sum_lds(local, lds(), tid() as usize, ROW_BLOCK as usize) / a.n as f32 + a.eps,
+        );
     row_scale(a, inv, |w| 1.0 + w);
 }
 
@@ -96,7 +104,8 @@ pub unsafe extern "gpu-kernel" fn rmsnorm_weightless_batch(a: WeightlessNorm) {
     let row =
         a.x.wrapping_add((bid() as usize).wrapping_mul(a.d as isize as usize));
     let p = strided_sum_sq(row, a.d);
-    let rs = a.scale / sqrt(block_sum_lds::<ROW_BLOCK>(p, lds()) / a.d as f32 + a.eps);
+    let rs = a.scale
+        / sqrt(block_sum_lds(p, lds(), tid() as usize, ROW_BLOCK as usize) / a.d as f32 + a.eps);
     let mut i = tid() as i32;
     while i < a.d {
         *row.add(i as usize) *= rs;
@@ -117,10 +126,10 @@ pub unsafe extern "gpu-kernel" fn act_quant_f8(a: ActQuant) {
     let mut amax = 0.0f32;
     let mut i = lane;
     while i < ACT_QUANT_BLOCK {
-        amax = fmaxf(amax, (*seg.add(i as usize)).abs());
+        amax = maxnum(amax, (*seg.add(i as usize)).abs());
         i += WAVE;
     }
-    let s = fast_round_scale(fmaxf(wave_max(amax), ACT_QUANT_AMAX_FLOOR), FP8_MAX_INV);
+    let s = fast_round_scale(maxnum(wave_max(amax), ACT_QUANT_AMAX_FLOOR), FP8_MAX_INV);
     let mut i = lane;
     while i < ACT_QUANT_BLOCK {
         let e = seg.add(i as usize);

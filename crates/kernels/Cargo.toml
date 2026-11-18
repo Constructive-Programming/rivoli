@@ -3,8 +3,8 @@
 # NOT a workspace member, and the empty `[workspace]` below says so: it needs the pinned
 # nightly in `rust-toolchain.toml` (gpu-kernel ABI, core intrinsics, build-std), and a member
 # would drag that into every stable `cargo` run — including the deviceless arm CI builds,
-# which must need neither nightly nor ROCm. The only builder is `crates/backend/build.rs`,
-# under the `rocm` feature, into its own target dir under OUT_DIR; it passes the target,
+# which must need neither nightly nor ROCm. The only builder is `crates/backend/build/device.rs`
+# (called from `build.rs`) under the `rocm` feature, into its own target dir under OUT_DIR; it passes the target,
 # `-Zbuild-std=core`, the cpu and the ROCm device-library link line, so nothing here
 # depends on a config file a hand build would also have to find.
 [package]
@@ -29,9 +29,13 @@ panic = "abort"
 lto = true
 codegen-units = 1
 
-# Not a workspace member, so the workspace's lint tables do not reach this crate; restated
-# here so a warning in a kernel is the same build error it is everywhere else. (Clippy does
-# not run on it: the pinned toolchain is `profile = "minimal"` — recorded in
-# rust-kernels.md §5 as a gap.)
+# Not a workspace member, so the root lint tables do not reach this crate; their deny entries
+# are restated (not the root's two allows) so a warning in a kernel is the same build error it
+# is everywhere else. Clippy does not run here (CLAUDE.md, the clippy gate).
 [lints.rust]
 warnings = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"

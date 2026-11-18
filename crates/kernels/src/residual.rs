@@ -4,8 +4,10 @@
 //! what the port decided. Every `a * b + c` below is a [`fma`] because hipcc's backend fused
 //! it (the C carries `contract` flags, not `fmuladd` — the fusion is in the ISA).
 
-use crate::gpu::{bid, fma, fmaxf, lds, sync_threads, tid, tree};
-use crate::prelude::{rbf16, wave_sum};
+use crate::gpu::{bid, fma, lds, tid};
+use crate::prelude::formats::rbf16;
+use crate::prelude::llvm::maxnum;
+use crate::prelude::reduce::{sync_threads, tree, wave_sum};
 use core::intrinsics::{exp, sqrt, unchecked_div, unchecked_rem};
 use rivoli_abi::geom::{
     ATTN_RES_BLOCK, ATTN_RES_MAX_SRC, ELEMENTWISE_BLOCK, HC_MIX, HC_MULT, HC_PRE_BLOCK, HC_RED,
@@ -72,7 +74,7 @@ unsafe fn comb_softmax(comb: *mut f32, eps: f32) {
         let row = comb.add(j * HM);
         let mut m = *row;
         for t in 1..HM {
-            m = fmaxf(m, *row.add(t));
+            m = maxnum(m, *row.add(t));
         }
         let mut s = 0.0f32;
         for t in 0..HM {
@@ -127,7 +129,9 @@ unsafe fn hc_rms(HcRow { flat, hcd }: HcRow, norm_eps: f32, red: *mut f32) -> f3
         *red.add(t as usize) = local;
     }
     sync_threads();
-    tree::<HC_RED>(|t, s| *red.add(t) += *red.add(s));
+    tree(t as usize, HC_RED as usize, |t, s| {
+        *red.add(t) += *red.add(s)
+    });
     1.0 / sqrt(*red / hcd as f32 + norm_eps)
 }
 
@@ -239,7 +243,7 @@ unsafe fn attn_res_score(
     *red_ss.add(t as usize) = ss;
     *red_dot.add(t as usize) = dot;
     sync_threads();
-    tree::<ATTN_RES_BLOCK>(|t, k| {
+    tree(t as usize, ATTN_RES_BLOCK as usize, |t, k| {
         *red_ss.add(t) += *red_ss.add(k);
         *red_dot.add(t) += *red_dot.add(k);
     });
@@ -254,7 +258,7 @@ unsafe fn attn_res_score(
 unsafe fn attn_res_probs(prob: *const f32, ns: usize) -> [f32; ATTN_RES_MAX_SRC as usize] {
     let mut m = *prob;
     for s in 1..ns {
-        m = fmaxf(m, *prob.add(s));
+        m = maxnum(m, *prob.add(s));
     }
     let mut z = 0.0f32;
     for s in 0..ns {

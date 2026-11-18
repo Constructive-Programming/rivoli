@@ -1,6 +1,6 @@
 //! # rivoli-kernels — the GPU kernels, in Rust, for `amdgcn-amd-amdhsa`
 //!
-//! Built ONLY by `crates/backend/build.rs` under the `rocm` feature (this crate's manifest
+//! Built ONLY by `crates/backend/build/device.rs` under the `rocm` feature (this crate's manifest
 //! argues why it is not a workspace member), linked against ROCm's device libraries, and
 //! embedded in `rivoli-backend` as one code object loaded once with `hipModuleLoadData`.
 //!
@@ -12,15 +12,20 @@
 //! - **FMA contraction.** hipcc fuses every `a * b + c` the backend can (`-ffp-contract=
 //!   fast-honor-pragmas`); Rust never contracts. Every fused site is an explicit
 //!   [`gpu::fma`], placed where hipcc's ISA shows a `v_fma`/`v_fmac` — read, never guessed.
+//!   In `a·b + c·d` hipcc fuses the LEFT product: `fma(a, b, c·d)`. (The prelude spells its
+//!   sites `fmuladd`, measured identical by 0b's device arms; unifying the two spellings is
+//!   owed to a device run, not done blind.)
 //! - **blockDim is never read from the dispatch packet** (Phase 0c, ~1.1 µs/launch). A
 //!   launcher-fixed block size is a `rivoli_abi::geom` constant both sides name.
-//! - **Math functions are ROCm's own.** A `.hip` call into `__ocml_*` (`tanhf`, `pow`, `sin`,
-//!   `cos`) is the SAME symbol here, LTO-linked from the device library hipcc links
-//!   ([`gpu::ocml`]); a `__builtin_*` one (`expf`, `sqrtf`, `fmaxf`) is the same LLVM
-//!   intrinsic through `core::intrinsics`.
+//! - **Math functions are ROCm's own.** A `.hip` call into `__ocml_*` (`pow`, `sin`, `cos`)
+//!   is the SAME symbol here, LTO-linked from the device library hipcc links
+//!   ([`gpu::ocml`]); `tanhf` is the prelude's transliteration of ocml's body. A
+//!   `__builtin_*` call (`expf`, `sqrtf`) is the same LLVM intrinsic through
+//!   `core::intrinsics`, and one `core` only has a lookalike of (`fmaxf` → `llvm.maxnum`,
+//!   not `f32::max`) is in `prelude::llvm`.
 #![no_std]
 #![feature(abi_gpu_kernel, core_intrinsics, gpu_intrinsics, stdarch_amdgpu)]
-#![feature(asm_experimental_arch, link_llvm_intrinsics)]
+#![feature(asm_experimental_arch, link_llvm_intrinsics, f16)]
 // `core_intrinsics` is how the LLVM intrinsics hipcc's builtins lower to are reached at all.
 #![allow(internal_features)]
 // Kernels are raw-pointer code by construction: every pointer is a device buffer whose
@@ -38,7 +43,10 @@
 
 mod activation;
 mod gpu;
-mod prelude;
+// The `common.hpp` port (Phase 0b, merged 2026-11-18). `pub` because in a cdylib with
+// `warnings = deny` a private module's not-yet-called helpers (the dot families, `rowview`,
+// `moe_fixed`) are denied dead code; it can go private when Phase 1 calls them.
+pub mod prelude;
 mod residual;
 mod touch;
 

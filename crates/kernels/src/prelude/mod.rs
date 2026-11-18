@@ -1,42 +1,61 @@
-//! The slice of `kernels/common.hpp` (and the headers it includes) that `activation.hip`
-//! and `residual.hip` use, ported inline so Phase 0a could migrate those two files before
-//! the prelude port (Phase 0b) lands. **0b's module replaces this one wholesale**; nothing
-//! here is meant to outlive that merge, and each item names its C source so the swap is a
-//! name-for-name check.
+//! The device prelude every kernel uses: port of `common.hpp` and the eight headers it
+//! includes, at tag `archive/hip-kernels` (= migration base `abd065fe`). C++ templates are
+//! const generics (`R` rows, `U` unroll depth) and a trait (`dot_nib::NibFormat`).
 //!
-//! | here | C source |
-//! |---|---|
-//! | `formats::rbf16` (`bf16f`, `f2bf16`) | `formats.hpp` |
-//! | `formats::{e4m3f, f2e4m3_rne}` (+ `e4m3_subnormal_mantissa`, `e4m3_normal_code`, `rne_rounds_up`) | `formats.hpp` |
-//! | `actquant::{fast_round_scale, act_quant_roundtrip}`, `FP8_MAX`, `FP8_MAX_INV`, `ACT_QUANT_AMAX_FLOOR` | `actquant.hpp` |
-//! | `reduce::{wave_sum, wave_max, block_sum_lds}` | `reduce.hpp` |
-//! | `swiglu_clamped`, `situ_glu` (here) | `common.hpp` |
+//! | module         | C++ origin                | owns                                       |
+//! |----------------|---------------------------|--------------------------------------------|
+//! | `formats`      | formats.hpp               | scalar codecs: bf16, e4m3, e2m1            |
+//! | `actquant`     | actquant.hpp              | block activation quantization              |
+//! | `activation`   | common.hpp                | clamped SwiGLU, SiTU-GLU (+ ocml tanh)     |
+//! | `reduce`       | reduce.hpp                | geometry, barrier, wave/block reductions   |
+//! | `rowview`      | rowview.hpp               | by-value views, the shared quad, unrolling |
+//! | `dot_fp8`      | dot_fp8.hpp               | fp8 tile-scaled dot + LUT                  |
+//! | `dot_nib`      | dot_i4.hpp + dot_f4.hpp   | int4 / fp4 dots (one loop), e8m0 decode    |
+//! | `dot_vq`       | dot_vq.hpp                | VQ-int3 codebook dot                       |
+//! | `llvm`         | (hipcc's IR)              | intrinsics `core` has only lookalikes of   |
+//!
+//! Bit-identity against the C++ was measured on the device by 0b's probe harness, which still
+//! lives in scratch (`rk-prelude/probe`, rust-kernels.md §5); moving its families into
+//! `tests/bit-identity.sh` as rows is owed, so until then it cannot go red for anyone else.
 
-//! Split by C header, the layout 0b's port mirrors, so the replacement is file-for-file.
-
+pub mod activation;
 pub mod actquant;
+pub mod dot_fp8;
+pub mod dot_nib;
+pub mod dot_vq;
 pub mod formats;
+pub mod llvm;
 pub mod reduce;
+pub mod rowview;
 
-pub use actquant::{ACT_QUANT_AMAX_FLOOR, FP8_MAX_INV, act_quant_roundtrip, fast_round_scale};
-pub use formats::rbf16;
-pub use reduce::{block_sum_lds, wave_max, wave_sum};
+pub use activation::{situ_glu, swiglu_clamped};
 
-use crate::gpu::{fmaxf, fminf, ocml};
-use core::intrinsics::exp;
+use llvm::{maxnum, minnum, rint};
 
-/// `swiglu_clamped`: `silu(min(bf16(g), L)) · clamp(bf16(u), ±L)`, multiply form, UNROUNDED.
-/// The four load-bearing points are `common.hpp`'s.
+/// Expert contributions are summed as integers at scale 2^-44, which makes the MoE sum
+/// associative (independent of stream completion order). `MAX` derives from `SHIFT` so that
+/// 16 clamped terms stay inside i64: `16·MAX·2^SHIFT <= 2^62`. The sizing argument (measured
+/// partials |v| <= 15.25 over 21.5M samples) is in the tag's `common.hpp`.
+pub const MOE_ACC_SHIFT: u32 = 44;
+pub const MOE_ACC_SCALE: f32 = (1u64 << MOE_ACC_SHIFT) as f32;
+pub const MOE_ACC_MAX: f32 = (1u64 << (58 - MOE_ACC_SHIFT)) as f32;
+
+/// f32 → fixed point, SATURATING rather than wrapping: a wrapped overflow is a finite wrong
+/// value `flag_nonfinite` cannot see. `maxnum`/`minnum` also launder a NaN into a finite
+/// bound, as C++'s `fminf`/`fmaxf` do.
 #[inline(always)]
-pub fn swiglu_clamped(g: f32, u: f32, limit: f32) -> f32 {
-    let gt = fminf(rbf16(g), limit); // ASYMMETRIC: no lower clamp on the gate
-    let ut = fminf(fmaxf(rbf16(u), -limit), limit);
-    gt * (1.0 / (1.0 + exp(-gt))) * ut
+pub fn moe_fixed(v: f32) -> u64 {
+    let r = rint(minnum(maxnum(v, -MOE_ACC_MAX), MOE_ACC_MAX) * MOE_ACC_SCALE);
+    // SAFETY: the clamp bounds `r` to ±2^58, finite and inside i64.
+    unsafe { r.to_int_unchecked::<i64>() as u64 }
 }
 
-/// `situ_glu`: Kimi-K3's SiTU-GLU, `b1·tanh(g/b1)·sigmoid(g) · b2·tanh(u/b2)`, UNROUNDED.
+/// i-quads per head in `mla_absorb_fp8`. In C++ ONE definition served the kernel and the
+/// launcher's grid so the two could not disagree (a short grid leaves columns unwritten,
+/// silently); the Rust launcher is host code and cannot import this device crate. That crate
+/// now exists (`rivoli_abi::geom`, merged 2026-11-18) and is where this moves when L3 ports
+/// `mla_absorb_fp8` and its launcher — the tie stays OPEN until then.
 #[inline(always)]
-pub fn situ_glu(g: f32, u: f32, b1: f32, b2: f32) -> f32 {
-    let a = b1 * ocml::tanh(g / b1) * (1.0 / (1.0 + exp(-g)));
-    a * (b2 * ocml::tanh(u / b2))
+pub const fn absorb_nquad(kvl: i32) -> i32 {
+    kvl.wrapping_add(3) >> 2
 }

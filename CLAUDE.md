@@ -118,7 +118,11 @@ appears that enum dispatch cannot fill.
   `[workspace.lints.clippy] all = deny` in the manifest, so a local `cargo check`
   enforces what CI enforces (owner rule 2026-08-15; red-proofed with a planted unused
   variable). Per-file `#![allow]` needs its argument written beside it.
-- **clippy** `--all-targets` plus the deviceless feature-union run.
+- **clippy** `--all-targets` plus the deviceless feature-union run. **It does not reach the
+  device crate** (`crates/kernels`, 2026-11-18): that crate is not a workspace member and its
+  pinned nightly is `profile = "minimal"` (no clippy); its manifest restates the root's deny
+  entries so they bind the day clippy runs there, and jscpd, CodeScene and the
+  line caps do scan it.
 - **docs registry** — status/scope/verdict front matter + INDEX agreement, test-enforced.
 - **parity** — `tests/parity-glm.sh`: the rewrite's greedy ids token-identical to the
   pinned reference (prefix rule: the reference can stop at EOS, the smoke cannot yet),
@@ -155,6 +159,18 @@ appears that enum dispatch cannot fill.
   red proof: the classifier reddens (`RED … no scored tests`, exit 1) on a stub binary that
   exits 0 reporting `0 passed` — planted on the box, observed, removed. On-demand (GPU, ~1 min),
   not CI.
+- **bit-identity** — `tests/bit-identity.sh` + `crates/engine/tests/bit_identity/`: every Rust
+  kernel with an output (all but `touch_region`, which has none to compare), through its
+  shipped `launch_*`, against the `rivoli_*` C launcher
+  of a shared object hipcc builds from `git archive archive/hip-kernels` (the tag, never the
+  tree) — byte-identical outputs with NaN compared as a class (owner, 2026-11-18), guard codes
+  and guard order, ≥ 64 seeds, adversarial inputs, the engine's shapes, per-kernel µs beside
+  hipcc's. A row that examined nothing prints VACUOUS and fails; `--expect-red=ROWS` judges a
+  plant by exactly the rows it must redden. Never builds; flock + witness via `run_arm`.
+  Red proof `docs/measurement/gate-red-proofs.md` §18: classifier half PAID deviceless (eight
+  stub arms), the rope-unfused plant shown adversarial on CPU (23212/131072 outputs, 64/64
+  seeds); the device arm OWED to the first GPU lease. 0b's prelude probe families are not rows
+  yet (owed). On-demand (GPU, wall-clock unmeasured), not CI.
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
   suite or a live deferral, checked both ends; **66/66/0** as measured 2026-09-08 by `cargo test -p rivoli --no-default-features --test kernel_coverage -- --nocapture` (the figure stood at 61 for four milestones and nobody re-counted it — the same prose-drift class §13 caught in its own row count; `docs/reference/kernel-inventory.md` enumerates the same population row by row), and it rose past 61 when M17c's
   `gqa_block_attend` landed with its launcher and `kernel_glimmer_block_attend.rs`. Its
