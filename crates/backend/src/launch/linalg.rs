@@ -8,15 +8,16 @@ use rivoli_abi::kernarg::{Gemv, GemvFp8, Scaled, Vq, VqEncode};
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
-/// `[R = 1, R = 2]` for each batched GEMV — `nrow` picks the instantiation.
-static GEMV_FP8: [Kernel<GemvFp8>; 2] = [Kernel::new(c"gemv_fp8"), Kernel::new(c"gemv_fp8_r2")];
-static GEMV_FP8_SPLITK: [Kernel<GemvFp8>; 2] = [
-    Kernel::new(c"gemv_fp8_splitk"),
-    Kernel::new(c"gemv_fp8_splitk_r2"),
-];
-static GEMV_I8: [Kernel<Gemv<Scaled>>; 2] = [Kernel::new(c"gemv_i8"), Kernel::new(c"gemv_i8_r2")];
-static GEMV_F32: [Kernel<Gemv<*const f32>>; 2] =
-    [Kernel::new(c"gemv_f32"), Kernel::new(c"gemv_f32_r2")];
+// One handle per instantiation: `nrow` (1 or 2) picks `R`, and each launcher names every
+// static it launches in its own body (the census's `LAUNCHED_BY` rule).
+static GEMV_FP8: Kernel<GemvFp8> = Kernel::new(c"gemv_fp8");
+static GEMV_FP8_R2: Kernel<GemvFp8> = Kernel::new(c"gemv_fp8_r2");
+static GEMV_FP8_SPLITK: Kernel<GemvFp8> = Kernel::new(c"gemv_fp8_splitk");
+static GEMV_FP8_SPLITK_R2: Kernel<GemvFp8> = Kernel::new(c"gemv_fp8_splitk_r2");
+static GEMV_I8: Kernel<Gemv<Scaled>> = Kernel::new(c"gemv_i8");
+static GEMV_I8_R2: Kernel<Gemv<Scaled>> = Kernel::new(c"gemv_i8_r2");
+static GEMV_F32: Kernel<Gemv<*const f32>> = Kernel::new(c"gemv_f32");
+static GEMV_F32_R2: Kernel<Gemv<*const f32>> = Kernel::new(c"gemv_f32_r2");
 static GEMV_I4: Kernel<Gemv<Scaled>> = Kernel::new(c"gemv_i4");
 static GEMV_VQ: Kernel<Gemv<Vq>> = Kernel::new(c"gemv_vq");
 static VQ_ENCODE: Kernel<VqEncode> = Kernel::new(c"vq_encode");
@@ -40,47 +41,59 @@ fn row_grid<W>(g: &Gemv<W>, lds: u32) -> Checked {
 }
 
 /// `nrow` in `{1, 2}` (1004) — `R` is a const generic, so only the two instantiations exist.
-/// Yields `nrow`'s kernel index.
-fn nrow_index(nrow: i32) -> Result<usize, i32> {
-    match nrow {
-        1 | 2 => Ok(nrow as usize - 1),
-        _ => Err(1004),
+fn nrow_checked(nrow: i32) -> Result<(), i32> {
+    if nrow == 1 || nrow == 2 {
+        Ok(())
+    } else {
+        Err(1004)
     }
 }
 
-/// The fp8 GEMV's refusals in the C's order: extents or `block` (1001), a tile that is not a
-/// power of two (1003, `blk_shift` needs one), then `nrow` (1004).
-fn fp8_checked(a: &GemvFp8, nrow: i32) -> Result<usize, i32> {
+/// A batched GEMV's refusals in the C's order — extents (1001), then `nrow` (1004) — else its
+/// row grid.
+fn batched_checked<W>(a: &Gemv<W>, nrow: i32) -> Checked {
+    let geom = row_grid(a, 0)?;
+    nrow_checked(nrow)?;
+    Ok(geom)
+}
+
+/// The fp8 GEMV's refusals in the C's order — extents or `block` (1001), a tile that is not a
+/// power of two (1003, `blk_shift` needs one), then `nrow` (1004) — else its geometry: the
+/// row grid, or on the split-K route one block per output row.
+fn fp8_checked(a: &GemvFp8, nrow: i32, splitk: bool) -> Checked {
+    let g = &a.gemv;
     if a.block <= 0 {
         return Err(1001);
     }
-    row_grid(&a.gemv, 0)?;
+    let rows = row_grid(g, GEMV_FP8_LDS_BYTES)?;
     if a.block & (a.block - 1) != 0 {
         return Err(1003);
     }
-    nrow_index(nrow)
+    nrow_checked(nrow)?;
+    if !splitk {
+        return Ok(rows);
+    }
+    Ok(Geometry {
+        blocks: g.o_dim as u32,
+        threads: GEMV_BLOCK,
+        lds: LdsBytes(gemv_fp8_splitk_lds_bytes(nrow as u32)),
+    })
 }
 
 /// # Safety
 /// The `launch_gemv_fp8` contract. Null stream, as the C.
 pub(crate) unsafe fn rivoli_gemv_fp8(a: GemvFp8, nrow: i32) -> i32 {
-    let g = &a.gemv;
-    let r = match fp8_checked(&a, nrow) {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
-    let (kernel, geom) = if g.i_dim >= GEMV_SPLITK_MIN_IDIM {
-        // One block per output row, every wave striding it.
-        let geom = Geometry {
-            blocks: g.o_dim as u32,
-            threads: GEMV_BLOCK,
-            lds: LdsBytes(gemv_fp8_splitk_lds_bytes(nrow as u32)),
-        };
-        (&GEMV_FP8_SPLITK[r], Ok(geom))
-    } else {
-        (&GEMV_FP8[r], row_grid(g, GEMV_FP8_LDS_BYTES))
-    };
-    unsafe { run(kernel, geom, null_mut(), &a) }
+    // ONE route decision, so the kernel and its geometry cannot disagree.
+    let splitk = a.gemv.i_dim >= GEMV_SPLITK_MIN_IDIM;
+    let checked = fp8_checked(&a, nrow, splitk);
+    // `_` is `nrow == 1`: any other `nrow` is already a refusal in `checked`, which `run`
+    // returns unlaunched.
+    match (splitk, nrow) {
+        (true, 2) => unsafe { run(&GEMV_FP8_SPLITK_R2, checked, null_mut(), &a) },
+        (true, _) => unsafe { run(&GEMV_FP8_SPLITK, checked, null_mut(), &a) },
+        (false, 2) => unsafe { run(&GEMV_FP8_R2, checked, null_mut(), &a) },
+        (false, _) => unsafe { run(&GEMV_FP8, checked, null_mut(), &a) },
+    }
 }
 
 /// # Safety
@@ -95,34 +108,29 @@ pub(crate) unsafe fn rivoli_gemv_i4(a: Gemv<Scaled>) -> i32 {
     unsafe { run(&GEMV_I4, row_grid(&a, 0), null_mut(), &a) }
 }
 
-/// One of a batched GEMV's two instantiations, by `nrow`, on the row grid.
-///
-/// # Safety
-/// `a` satisfies the kernels' contract; `stream` is live or null.
-unsafe fn batched<W: Copy>(
-    k: &[Kernel<Gemv<W>>; 2],
-    a: &Gemv<W>,
-    nrow: i32,
-    stream: *mut c_void,
-) -> i32 {
-    // The C's order: extents (1001) before `nrow` (1004).
-    let checked = row_grid(a, 0).and_then(|geom| Ok((nrow_index(nrow)?, geom)));
-    match checked {
-        Ok((r, geom)) => unsafe { run(&k[r], Ok(geom), stream, a) },
-        Err(code) => code,
-    }
-}
-
 /// # Safety
 /// The `launch_gemv_i8` contract.
 pub(crate) unsafe fn rivoli_gemv_i8(a: Gemv<Scaled>, nrow: i32) -> i32 {
-    unsafe { batched(&GEMV_I8, &a, nrow, null_mut()) }
+    let checked = batched_checked(&a, nrow);
+    // `else` is `nrow == 1`: any other `nrow` is already a refusal in `checked`, which `run`
+    // returns unlaunched.
+    if nrow == 2 {
+        unsafe { run(&GEMV_I8_R2, checked, null_mut(), &a) }
+    } else {
+        unsafe { run(&GEMV_I8, checked, null_mut(), &a) }
+    }
 }
 
 /// # Safety
 /// The `launch_gemv_f32` contract.
 pub(crate) unsafe fn rivoli_gemv_f32(a: Gemv<*const f32>, nrow: i32, stream: *mut c_void) -> i32 {
-    unsafe { batched(&GEMV_F32, &a, nrow, stream) }
+    let checked = batched_checked(&a, nrow);
+    // `else` as in `rivoli_gemv_i8`.
+    if nrow == 2 {
+        unsafe { run(&GEMV_F32_R2, checked, stream, &a) }
+    } else {
+        unsafe { run(&GEMV_F32, checked, stream, &a) }
+    }
 }
 
 /// # Safety

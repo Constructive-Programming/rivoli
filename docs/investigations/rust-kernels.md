@@ -973,12 +973,14 @@ are deleted and out of `build.rs`'s hipcc list. Device arms: OWED to the GPU lea
   counted on one shape's misaligned rows alone moved 40/64. The `fwd` alternative
   `f2e4m3`'s `fma(a, 512, 0.5)` split was not tried: `a·512` is exact, so it is a no-op by
   construction (§1's lesson, caught on paper).
-- **Census.** `every_rust_kernel_has_a_gate_row_and_a_launchers_row` is RED as expected: the
-  `_r2`/split-K instantiations and the two `hc_head_collapse` kernels have no same-named launcher.
-  It waits on the coordinator's `LAUNCHED_BY` table (L4, landing on main); the other four
-  censuses are green (66 launchers, unchanged).
+- **Census.** Before main's `LAUNCHED_BY` table (d6a6f1b) the gate-row census was RED on
+  exactly the seven kernels no same-named launcher runs — `gemv_fp8_r2`, `gemv_fp8_splitk`/`_r2`,
+  `gemv_i8_r2`, `gemv_f32_r2`, `hc_head_collapse_gate`/`_blend` — and those are its seven rows
+  now. The table's rule (the launcher's own body names each static) replaced the launchers'
+  `[Kernel; 2]` arrays with one static per instantiation. After the merge: 5/5 censuses green.
 - **Deviceless gates.** jscpd 0 clones (≈ 30 found on the way, removed by restructuring, none
   exempted — including one against `rivoli_core::num`'s e4m3 oracle); clippy both arms clean;
   CodeScene 10.0 on every file touched except `hip_attn.rs` (9.68 at the base, two rows edited);
-  `cargo test --workspace --no-default-features`: 501 passed, 2 failed — the CodeScene test (the
-  31 base files) and the census above.
+  `cargo test --workspace --no-default-features --no-fail-fast` on the merged tree: 505 passed,
+  1 failed — the CodeScene test (the 31 base files); docs, hook_guard, kernel_coverage,
+  line_limit and matrix each confirmed RUN and green.

@@ -6,14 +6,28 @@ use super::{Text, UNROWED, gate_rows, shipped_kernels};
 use std::path::Path;
 
 /// `(kernel, launcher)`: kernels run by a launcher of ANOTHER name, as one phase of a
-/// multi-kernel launch (a split-softmax pass and its combine). The census otherwise pairs each
+/// multi-kernel launch (a split-softmax pass and its combine) or as one of the instantiations
+/// a launcher selects per call (`nrow`'s R = 2, fp8's split-K route). The census otherwise pairs each
 /// kernel with a `rivoli_<kernel>` of its own name, which one launcher cannot have twice; a
 /// listed kernel is rowed under `rivoli_<launcher>`, whose gate row and `=>` row score and
 /// reach it. Checked at both ends ([`stale_launched_by`] names each refusal); an unlisted
 /// phase reads as missing from both populations, like any unrowed kernel. That a row reaches
-/// EVERY phase (a split needs a shape that splits) is argued by the row's shapes, at the row.
-/// Empty until the first multi-kernel launcher lands (Phase 1, 2026-11-19).
-pub(super) const LAUNCHED_BY: [(&str, &str); 0] = [];
+/// EVERY phase or selectable instantiation (a split needs a shape that splits) is argued by
+/// the row's shapes, at the row.
+/// First rows 2026-11-19: linalg's R = 2 and split-K instantiations, and `hc_head_collapse`'s
+/// two phases.
+pub(super) const LAUNCHED_BY: [(&str, &str); 7] = [
+    // `nrow` picks R = 2, `i_dim >= GEMV_SPLITK_MIN_IDIM` the split-K route (linalg's gemv
+    // rows sweep both).
+    ("gemv_fp8_r2", "gemv_fp8"),
+    ("gemv_fp8_splitk", "gemv_fp8"),
+    ("gemv_fp8_splitk_r2", "gemv_fp8"),
+    ("gemv_i8_r2", "gemv_i8"),
+    ("gemv_f32_r2", "gemv_f32"),
+    // The gate, then the blend, on one stream.
+    ("hc_head_collapse_gate", "hc_head_collapse"),
+    ("hc_head_collapse_blend", "hc_head_collapse"),
+];
 
 /// The names the shipped kernels are rowed under — less [`UNROWED`], each kernel's
 /// [`LAUNCHED_BY`] launcher where it has one and its own name otherwise — sorted and
