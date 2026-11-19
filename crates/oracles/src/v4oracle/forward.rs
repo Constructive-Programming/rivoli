@@ -259,7 +259,7 @@ impl Oracle {
     /// Whether the device would dispatch this GEMV to `gemv_fp8_bf16_splitk` — the oracle
     /// half of the ONE dispatch predicate, spec'd in
     /// `docs/investigations/v4-decode-decomposition.md` §M9 and mirrored by
-    /// `kernels/mla.hip::rivoli_gemv_fp8_bf16`.
+    /// `crates/kernels/src/mla.rs::gemv_fp8_bf16`.
     ///
     /// `WMat::Fp8` here stands for "goes through `gemv_fp8_bf16`" — every fp8-quantized
     /// linear on the oracle's path does, and the one fp8-on-disk tensor consumed as Dense
@@ -360,7 +360,7 @@ impl Oracle {
     /// Split out for the head tail alone, which needs both halves independently: the store is
     /// what `Defect::HeadNormNotBf16` suppresses, and `d` is what `HeadNormOverAllTokens`
     /// widens to `s * dim`. Both are choices a device implementation actually faces —
-    /// `kernels/mla.hip::rmsnorm_batch` bf16-rounds and is one block per row, while
+    /// `crates/kernels/src/mla.rs::rmsnorm_batch` bf16-rounds and is one block per row, while
     /// `kernels/linalg.hip::rmsnorm_single` neither rounds nor spans rows.
     pub(super) fn rmsnorm_raw(&self, x: &mut [f32], d: usize, w: &[f32]) {
         // `zip` below stops at the shorter side, so a short `w` would leave the tail of every
@@ -387,7 +387,7 @@ impl Oracle {
     /// the unflatten to (heads, head_dim), with **no learnable weight** (model.py:504).
     ///
     /// `pub` since 2026-08-06 so `tests/headtail.rs` can score
-    /// `kernels/mla.hip::qk_norm` against it. The alternative was a host transliteration
+    /// `crates/kernels/src/mla.rs::qk_norm` against it. The alternative was a host transliteration
     /// of the seven lines below, which `build.rs`'s duplication gate would have rejected —
     /// and rightly, because a reference carrying the same bf16 placement as the thing it
     /// scores is wrong in the same places.

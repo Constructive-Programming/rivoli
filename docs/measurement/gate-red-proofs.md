@@ -2060,6 +2060,7 @@ Each plant was first shown adversarial on the gate's own inputs by
 | `indexer` | `index_topk`'s key drops the `-0.0` → `+0.0` canonicalisation (a tie-break defect: `-0.0` orders below `+0.0` instead of tying and falling to the index rule) | 126/256 partial-selection cells select a different row set: 30–48/64 seeds at the three shapes whose boundary falls in the `±0` run, 0 at `(65536, 2048)`, whose boundary sits in the positive ties | `index_topk` |
 | `blockindex` | `index_score_blocks` drops the per-term bf16 rounding before the f32 accumulator | 203/256 cells: 64/64 seeds at three shapes, 11/64 at the single-block `[1, 1, 64, 128]` | `index_score_blocks` |
 | `kvcompress` | `gemm_bf16`'s dot accumulator unfused (`acc += x·w` instead of hipcc's `v_fmac`) | 266/320 cells: 64/64 seeds at the four real shapes, 10/64 at the ragged `[3, 7, 33]` | `gemm_bf16` |
+| `mla` | `mla_absorb_fp8`'s hoisted `lut · s` re-associated (`fma(q·lut, s, acc)`): the parenthesisation the C's note says to preserve | 256/256 quad-path cells (the two scalar-fallback shapes cannot move: the patch touches the quad path only) | `mla_absorb_fp8` |
 
 **The plant first written for `kvcompress` failed, and what it measured is kept.** It was the
 compressor RoPE fusing the wrong product of `a·s + b·c`. This port briefly had exactly that

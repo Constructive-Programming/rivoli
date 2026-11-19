@@ -42,6 +42,8 @@ mod device;
 mod indexer;
 #[cfg(feature = "rocm")]
 mod kvcompress;
+#[cfg(feature = "rocm")]
+mod mla;
 mod plant_models;
 #[cfg(feature = "rocm")]
 mod probes;
@@ -90,6 +92,13 @@ const ROWS: &[Row] = &[
     ("kv_compress_deposit", kvcompress::kv_compress_deposit),
     ("kv_compress_prefill", kvcompress::kv_compress_prefill),
     ("kv_compress_decode", kvcompress::kv_compress_decode),
+    ("mla_absorb_fp8", mla::mla_absorb_fp8),
+    ("mla_value_fp8", mla::mla_value_fp8),
+    ("act_quant_f8_prefix", mla::act_quant_f8_prefix),
+    ("rmsnorm_batch", mla::rmsnorm_batch),
+    ("qk_norm", mla::qk_norm),
+    ("rope_adjacent", mla::rope_adjacent),
+    ("gemv_fp8_bf16", mla::gemv_fp8_bf16),
 ];
 
 #[cfg(feature = "rocm")]

@@ -26,6 +26,8 @@ mod indexer;
 pub(crate) use indexer::*;
 mod kvcompress;
 pub(crate) use kvcompress::*;
+mod mla;
+pub(crate) use mla::*;
 mod residual;
 pub(crate) use residual::*;
 mod touch;

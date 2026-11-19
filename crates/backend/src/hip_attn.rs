@@ -25,11 +25,12 @@ use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
     Rows, rivoli_index_append, rivoli_index_head_route, rivoli_index_pool_norm_f32,
     rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk, rivoli_kv_compress_decode,
-    rivoli_kv_compress_deposit, rivoli_kv_compress_prefill,
+    rivoli_kv_compress_deposit, rivoli_kv_compress_prefill, rivoli_mla_absorb_fp8,
+    rivoli_mla_value_fp8,
 };
 use rivoli_abi::kernarg::{
-    CompressDecode, CompressPrefill, Deposit, HeadRoute, IndexAppend, IndexScore, PoolNorm,
-    PoolPush, TopK,
+    CompressDecode, CompressPrefill, Deposit, Fp8KvB, HeadRoute, IndexAppend, IndexScore,
+    MlaAbsorb, MlaValue, PoolNorm, PoolPush, TopK,
 };
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
@@ -72,9 +73,9 @@ launchers! {
     /// absorb rows (rbase = head·(nope+vh)), head-batched. kv_b fp8-e4m3 block-scaled.
     ///
     /// # Safety
-    /// Async device pointers live until the next [`device_sync`]: `q` (`h·qh` f32),
-    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `qabs` (`h·kvl` f32).
-    launch_mla_absorb_fp8 -> rivoli_mla_absorb_fp8, "mla_absorb_fp8" (
+    /// Async device pointers live until the next [`device_sync`]: `q` (`nrow·h·qh` f32),
+    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `qabs` (`nrow·h·kvl` f32).
+    launch_mla_absorb_fp8 => rivoli_mla_absorb_fp8(nrow as i32, MlaAbsorb { q, qabs, kvb: Fp8KvB { w: kvb, scale: kvb_scale, h: h as i32, nope: nope as i32, vh: vh as i32, kvl: kvl as i32, block: block as i32 }, qh: qh as i32 }), "mla_absorb_fp8" (
         q: *const f32,
         kvb: *const u8,
         kvb_scale: *const f32,
@@ -92,9 +93,9 @@ launchers! {
     /// value rows, head-batched. kv_b fp8-e4m3 block-scaled.
     ///
     /// # Safety
-    /// Async device pointers live until the next [`device_sync`]: `clat` (`h·kvl` f32),
-    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `ctx` (`h·vh` f32).
-    launch_mla_value_fp8 -> rivoli_mla_value_fp8, "mla_value_fp8" (
+    /// Async device pointers live until the next [`device_sync`]: `clat` (`nrow·h·kvl` f32),
+    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `ctx` (`nrow·h·vh` f32).
+    launch_mla_value_fp8 => rivoli_mla_value_fp8(nrow as i32, MlaValue { clat, ctx, kvb: Fp8KvB { w: kvb, scale: kvb_scale, h: h as i32, nope: nope as i32, vh: vh as i32, kvl: kvl as i32, block: block as i32 } }), "mla_value_fp8" (
         clat: *const f32,
         kvb: *const u8,
         kvb_scale: *const f32,

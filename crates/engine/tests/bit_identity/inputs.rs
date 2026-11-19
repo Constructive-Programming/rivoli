@@ -81,6 +81,24 @@ pub fn words32(v: &[u32]) -> Vec<f32> {
     v.iter().map(|&u| f32::from_bits(u)).collect()
 }
 
+/// `n` seeded fp8-e4m3 BYTES — every finite code, the subnormals and both zeros included — packed
+/// four per word. The NaN codes (`0x7f`/`0xff`) are remapped to their finite neighbours: at 2/256
+/// one NaN in a 4096-wide dot is near-certain, every output would be NaN on both sides, and the
+/// NaN-as-a-class compare would then examine nothing (correctness review, 2026-11-19 — the
+/// GEMV's hot shape had compared zero finite words).
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn fp8_words(n: usize, (seed, stream): (u64, u64)) -> Vec<f32> {
+    let mut r = Lcg(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) ^ stream);
+    // One draw per byte: an f32-scaled `u32` would keep 24 mantissa bits and zero the low byte.
+    let mut byte = || match ((r.f() + 1.0) * 128.0) as u32 & 0xff {
+        b if b & 0x7f == 0x7f => b - 1,
+        b => b,
+    };
+    (0..n.div_ceil(4))
+        .map(|_| f32::from_bits(byte() | byte() << 8 | byte() << 16 | byte() << 24))
+        .collect()
+}
+
 /// A bf16 operand by truncation of a [`draw`] — so the edges (±0, subnormals, the ±100s) reach a
 /// bf16 cache as themselves — packed two halves per word (an odd count padded with a zero half).
 #[cfg_attr(not(feature = "rocm"), allow(dead_code))]

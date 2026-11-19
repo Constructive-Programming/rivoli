@@ -441,7 +441,7 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
     );
 }
 
-/// `kernels/mla.hip::qk_norm` against `Oracle::qk_norm`.
+/// `crates/kernels/src/mla.rs::qk_norm` against `Oracle::qk_norm`.
 ///
 /// Here rather than in `tests/f4_attn.rs` because of what it IS rather than where it is
 /// called: it is a per-row bf16-rounded RMS normalisation, the direct sibling of

@@ -3,7 +3,7 @@
 //! operands (`plant_models.rs`), and apart from it because they are layouts over the draws, not
 //! draws: the block scorers, `gemm_bf16`, and the compressor's geometries and prefill.
 
-use super::inputs::{bf16_words, draw, uniform};
+use super::inputs::{bf16_words, draw, fp8_words, uniform};
 use rivoli_backend::abi::CompGeom;
 
 /// The block scorers' `(s, n_comp, heads, hd)`: V4's decode (one query against 512 blocks, 64
@@ -90,5 +90,35 @@ pub fn gemm_ins([m, n, k]: [usize; 3], seed: u64) -> Vec<Vec<f32>> {
     vec![
         draw(m * k, (seed, 1), 1.0, true),
         bf16_words(&draw(n * k, (seed, 2), 0.05, true)),
+    ]
+}
+
+/// The MLA dims in `kv_b` order, `[h, qh, nope, vh, kvl, block]`, plus the token-row count.
+pub type MlaShape = ([usize; 6], usize);
+
+pub const MLA_DIMS: [MlaShape; 6] = [
+    ([64, 256, 192, 256, 512, 128], 1),
+    ([64, 256, 192, 256, 512, 128], 2),
+    ([96, 192, 128, 128, 512, 128], 1),
+    ([96, 192, 128, 128, 512, 128], 2),
+    ([3, 64, 48, 32, 37, 128], 2),
+    ([2, 32, 16, 8, 64, 2], 1),
+];
+
+/// One MLA cell's `[x, kv_b, scales]`: `x` is `q` (`nrow · h · qh`) or `clat` (`nrow · h · kvl`).
+pub fn mla_ins(
+    ([h, _, nope, vh, kvl, block], _): MlaShape,
+    x_len: usize,
+    seed: u64,
+) -> Vec<Vec<f32>> {
+    let rows = h * (nope + vh);
+    vec![
+        draw(x_len, (seed, 1), 1.0, true),
+        fp8_words(rows * kvl, (seed, 2)),
+        uniform(
+            rows.div_ceil(block) * kvl.div_ceil(block),
+            (seed, 3),
+            1e-3..1e-1,
+        ),
     ]
 }

@@ -976,3 +976,43 @@ present in the Rust ISA.
 by hipcc's 3–4× unroll of the entry loops.
 
 *Device arms.* OWED.
+
+**mla, deviceless half (2026-11-19).**
+
+*Ported.* Nine kernels behind seven launchers:
+- `mla_absorb_fp8{,_r2}` and `mla_value_fp8{,_r2}`, where each launcher picks a kernel by token
+  rows;
+- `act_quant_f8_prefix`, `rmsnorm_batch`, `qk_norm`, `rope_adjacent` and `gemv_fp8_bf16`.
+
+`mla.hip` is deleted, and `absorb_nquad` moved from the prelude to `rivoli_abi::geom`, closing
+the grid tie its note had left open.
+
+*A file-scope pragma decided the bits.* `mla.hip`'s `#pragma clang fp contract(off)` sits before
+`act_quant_f8_prefix` at FILE scope, so every kernel after it is unfused in hipcc's IR. The first
+draft fused `rmsnorm_batch`'s `Σx²` and `rope_adjacent`'s rotation, by the habit of every other
+norm and RoPE in the tree. The ISA census caught both before any device run: hipcc's
+`rope_adjacent` has 4 `v_mul`, 1 `v_add`, 1 `v_sub` and no fma. `gemv_fp8_bf16`'s dot stays
+fused because `dot_fp8.hpp` is included above the pragma.
+
+*The harness compared nothing on one row, and review found it.* `fp8_words` first drew every
+byte, the e4m3 NaN codes included. At k = 4096 essentially every GEMV output was NaN on both
+sides, NaN compares equal as a class, and the hot shape examined zero finite words. The draws
+now remap the NaN codes to their finite neighbours.
+
+*Two more measured gaps, fixed.*
+- Guard cases now assert the exact code they claim (`Tally::guard_code`), with the
+  non-1001 orderings included.
+- The ragged GEMV shape no longer makes misaligned dword loads.
+
+*Register spill, found and fixed.* The first `mla_absorb_fp8` spilled 32 B (R=1) and 160 B (R=2)
+to scratch where hipcc spills none: iterator-indexed accumulator arrays. Constant-bound index
+loops removed it.
+
+*ISA census.* After the fixes, every float op class matches hipcc for the value pair, the norms,
+the RoPE and the GEMV. The absorb differs only by unroll and 64-bit index arithmetic.
+
+*Census still red.* `kernel_coverage`'s gate-row/`=>`-row census reads the two `_r2` kernels as
+having no row of their own. They are launched (and swept: `nrow ∈ {1,2}`) by their family's
+launcher, and await the coordinator's `LAUNCHED_BY` table.
+
+*Device arms.* OWED.

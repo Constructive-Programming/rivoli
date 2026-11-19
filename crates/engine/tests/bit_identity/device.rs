@@ -300,6 +300,21 @@ pub fn code(r: anyhow::Result<()>) -> i32 {
     }
 }
 
+/// One side of an adapter: the reference's C launcher (`hip`, its status as it returned it) or the
+/// shipped wrapper (`rust`, mapped through [`code`]). The `match side` the older rows spell inline,
+/// as one call: `mla.rs`'s seven adapters, spelled with the match, were jscpd clones of each other
+/// (the match arms' boilerplate around differing argument lists), and this states each pair once.
+pub fn twin(
+    side: Side,
+    hip: impl FnOnce() -> i32,
+    rust: impl FnOnce() -> anyhow::Result<()>,
+) -> i32 {
+    match side {
+        Side::Hip => hip(),
+        Side::Rust => code(rust()),
+    }
+}
+
 /// Both twins' status for one call; `call(side)` launches (or refuses) on that side.
 pub fn both(call: impl Fn(Side) -> i32) -> [i32; 2] {
     [call(Side::Hip), call(Side::Rust)]

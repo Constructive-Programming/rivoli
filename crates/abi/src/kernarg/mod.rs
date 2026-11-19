@@ -44,11 +44,14 @@ pub struct Strided<A> {
 // Spelled unlike `geom`'s identical family list on purpose (brace re-export, `pub(crate) mod`):
 // the two lists grow in lockstep, one line per family, and as plain `pub use x::*;` / `mod x;`
 // runs they cross jscpd's 5-line floor at the fourth family (measured 2026-11-19, 26 tokens).
-pub use self::{activation::*, blockindex::*, indexer::*, kvcompress::*, residual::*, touch::*};
+pub use self::{
+    activation::*, blockindex::*, indexer::*, kvcompress::*, mla::*, residual::*, touch::*,
+};
 
 pub(crate) mod activation;
 pub(crate) mod blockindex;
 pub(crate) mod indexer;
 pub(crate) mod kvcompress;
+pub(crate) mod mla;
 pub(crate) mod residual;
 pub(crate) mod touch;

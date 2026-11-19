@@ -33,6 +33,7 @@ mod activation;
 mod blockindex;
 mod indexer;
 mod kvcompress;
+mod mla;
 mod residual;
 mod touch;
 
@@ -40,5 +41,6 @@ pub use activation::*;
 pub use blockindex::*;
 pub use indexer::*;
 pub use kvcompress::*;
+pub use mla::*;
 pub use residual::*;
 pub use touch::*;

@@ -15,9 +15,9 @@
 //! exemption argument for both invocation files is under this file's opening marker.
 
 use crate::hip::{abi_ty, ensure_hip_status, launchers};
-use crate::launch::rivoli_gemm_bf16;
+use crate::launch::{rivoli_gemm_bf16, rivoli_gemv_fp8_bf16};
 use anyhow::Result;
-use rivoli_abi::kernarg::GemmBf16;
+use rivoli_abi::kernarg::{GemmBf16, GemvFp8Bf16};
 use std::ffi::c_void;
 
 // Doc links only. An intra-doc link resolves in the module it is WRITTEN in, so the moment
@@ -215,7 +215,7 @@ launchers! {
     /// signature took the row and group strides separately, where the in-bounds relation was
     /// a three-way inequality nothing checked. `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_gemv_fp8_bf16 -> rivoli_gemv_fp8_bf16, "gemv_fp8_bf16" (
+    launch_gemv_fp8_bf16 => rivoli_gemv_fp8_bf16(GemvFp8Bf16 { x, w, wscale, out, m: m as i32, n_out: n_out as i32, k: k as i32, block: block as i32, groups: groups as i32 }, stream), "gemv_fp8_bf16" (
         x: *const f32,
         w: *const u8,
         wscale: *const f32,

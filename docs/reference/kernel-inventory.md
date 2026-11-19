@@ -50,8 +50,9 @@ column is a query, and a query can be wrong.
 > Rust likewise (`indexer.hip`, `blockindex.hip` deleted). The two block scorers were the
 > `hip.rs` hand-written pair; they are `=>` rows now, so their declaration cells name the kernel.
 >
-> **2026-11-19 (Phase 1 L3, same day):** the `kvcompress.rs` rows likewise (`kvcompress.hip`
-> deleted).
+> **2026-11-19 (Phase 1 L3, same day):** the `kvcompress.rs` and `mla.rs` rows likewise
+> (`kvcompress.hip`, `mla.hip` deleted). `mla_absorb_fp8`/`mla_value_fp8` each launch one of two
+> kernels (`_r2` at two token rows), as they did in C.
 
 | kernel (`launch_…`) | C entry | TU | GLM | V4 | K3 | Glimmer | Qwen | activated at (module :: fn) |
 |---|---|---|---|---|---|---|---|
@@ -96,13 +97,13 @@ column is a query, and a query can be wrong.
 | `gemv_i8` | `gemv_i8` | linalg.hip | **✓** | · | · | · | · | glm/forward :: tail |
 | `gemv_vq` | `gemv_vq` | linalg.hip | · | · | · | · | · | *(no production reference)* |
 | `vq_encode` | `vq_encode` | linalg.hip | · | · | · | · | · | *(no production reference)* |
-| `act_quant_f8_prefix` | `act_quant_f8_prefix` | mla.hip | · | **✓** | · | · | · | v4/attn; v4/kvcompress; v4/moe :: emit, output_project, qkv_project, quantize_activation |
-| `gemv_fp8_bf16` | `gemv_fp8_bf16` | mla.hip | · | **✓** | · | · | · | v4/attn; v4/engine :: max_ctx, output_project |
-| `mla_absorb_fp8` | `mla_absorb_fp8` | mla.hip | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
-| `mla_value_fp8` | `mla_value_fp8` | mla.hip | **✓** | · | · | · | · | glm/attn :: output_project |
-| `qk_norm` | `qk_norm` | mla.hip | · | **✓** | · | · | · | v4/attn :: qkv_project |
-| `rmsnorm_batch` | `rmsnorm_batch` | mla.hip | · | **✓** | · | · | · | v4/attn; v4/forward :: head_tail, pre_norm, qkv_project |
-| `rope_adjacent` | `rope_adjacent` | mla.hip | · | **✓** | · | · | · | v4/attn; v4/blocksel :: output_project, qkv_project, raw_scores |
+| `act_quant_f8_prefix` | `act_quant_f8_prefix` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/kvcompress; v4/moe :: emit, output_project, qkv_project, quantize_activation |
+| `gemv_fp8_bf16` | `gemv_fp8_bf16` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/engine :: max_ctx, output_project |
+| `mla_absorb_fp8` | `mla_absorb_fp8` | mla.rs | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
+| `mla_value_fp8` | `mla_value_fp8` | mla.rs | **✓** | · | · | · | · | glm/attn :: output_project |
+| `qk_norm` | `qk_norm` | mla.rs | · | **✓** | · | · | · | v4/attn :: qkv_project |
+| `rmsnorm_batch` | `rmsnorm_batch` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/forward :: head_tail, pre_norm, qkv_project |
+| `rope_adjacent` | `rope_adjacent` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/blocksel :: output_project, qkv_project, raw_scores |
 | `moe_acc_drain` | `moe_acc_drain_s` | moe.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: desc_of, routed_experts |
 | `moe_acc_drain_to` | `moe_acc_drain_to_s` | moe.hip | · | · | **✓** | · | · | k3/forward :: moe_ffn |
 | `moe_expert_range` | `moe_expert_range` | moe.hip | **✓** | · | · | · | · | glm/mlp :: expert_range |

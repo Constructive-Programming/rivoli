@@ -5,12 +5,12 @@
 //! on the drawn inputs proves nothing.
 
 use super::cells::{
-    GEMM_SHAPES, GEOMS, PREFILL_SHAPES, SCORE_BLOCKS_DIMS, gemm_ins, geom, prefill_ins,
-    score_blocks_ins,
+    GEMM_SHAPES, GEOMS, MLA_DIMS, MlaShape, PREFILL_SHAPES, SCORE_BLOCKS_DIMS, gemm_ins, geom,
+    mla_ins, prefill_ins, score_blocks_ins,
 };
 use super::inputs::{SEEDS, TOPK_SHAPES, topk_scores};
 use rivoli_backend::abi::CompGeom;
-use rivoli_core::num::{bf16_to_f32, f32_to_bf16};
+use rivoli_core::num::{bf16_to_f32, e4m3_to_f32, f32_to_bf16};
 
 /// A plant's verdict: print its rate, and refuse it below `num/den` of the cells — the demand each
 /// test argues for its own plant, never a round number that merely passes.
@@ -20,6 +20,25 @@ fn demand(plant: &str, (moved, cells): (usize, usize), (num, den): (usize, usize
         moved * den >= cells * num,
         "{plant} plant moved only {moved}/{cells} cells — sub-threshold"
     );
+}
+
+/// Over `shapes` × every seed, how many cells `moves(shape, seed)` says the plant moves, printing
+/// each shape's count: `(moved, cells)`.
+fn rate<S: Copy + std::fmt::Debug>(
+    plant: &str,
+    shapes: impl IntoIterator<Item = S>,
+    moves: impl Fn(S, u64) -> bool,
+) -> (usize, usize) {
+    shapes.into_iter().fold((0, 0), |(moved, cells), shape| {
+        let m = (1..=SEEDS).filter(|&seed| moves(shape, seed)).count();
+        println!("{plant} at {shape:?}: {m}/{SEEDS} seeds move");
+        (moved + m, cells + SEEDS as usize)
+    })
+}
+
+/// Whether the clean arm (`arm(true)`) and the planted one (`arm(false)`) part, bit for bit.
+fn splits(arm: impl Fn(bool) -> f32) -> bool {
+    arm(true).to_bits() != arm(false).to_bits()
 }
 
 /// `index_topk`'s order-preserving key; `canonical == false` is the `indexer` plant (the `-0.0`
@@ -52,23 +71,13 @@ fn select(s: &[f32], k: usize, canonical: bool) -> Vec<usize> {
 /// one differing word.
 #[test]
 fn topk_signed_zero_plant_is_adversarial_on_cpu() {
-    let (mut cells, mut moved) = (0usize, 0usize);
-    for &(nt, k) in TOPK_SHAPES.iter().filter(|(nt, k)| k < nt) {
-        let m = (1..=SEEDS)
-            .filter(|&seed| {
-                let s = topk_scores(nt, seed);
-                select(&s, k, true) != select(&s, k, false)
-            })
-            .count();
-        println!("index_topk signed-zero plant at ({nt}, {k}): {m}/{SEEDS} seeds move");
-        cells += SEEDS as usize;
-        moved += m;
-    }
-    demand(
-        "index_topk signed-zero (partial selections)",
-        (moved, cells),
-        (1, 3),
-    );
+    let plant = "index_topk signed-zero (partial selections)";
+    let partial = TOPK_SHAPES.into_iter().filter(|(nt, k)| k < nt);
+    let r = rate(plant, partial, |(nt, k), seed| {
+        let s = topk_scores(nt, seed);
+        select(&s, k, true) != select(&s, k, false)
+    });
+    demand(plant, r, (1, 3));
 }
 
 fn rbf16(x: f32) -> f32 {
@@ -101,27 +110,16 @@ fn score_cell(
 /// 3/256 sub-threshold plant.
 #[test]
 fn score_blocks_per_term_plant_is_adversarial_on_cpu() {
-    let (mut cells, mut moved) = (0usize, 0usize);
-    for dims in SCORE_BLOCKS_DIMS {
-        let [s, n_comp, ..] = dims;
-        let m = (1..=SEEDS)
-            .filter(|&seed| {
-                let ins = score_blocks_ins(dims, seed);
-                (0..s * n_comp).any(|id| {
-                    let tc = (id / n_comp, id % n_comp);
-                    let (a, b) = (
-                        score_cell(&ins, dims, tc, true),
-                        score_cell(&ins, dims, tc, false),
-                    );
-                    a.to_bits() != b.to_bits()
-                })
-            })
-            .count();
-        println!("index_score_blocks per-term plant at {dims:?}: {m}/{SEEDS} seeds move");
-        cells += SEEDS as usize;
-        moved += m;
-    }
-    demand("index_score_blocks per-term", (moved, cells), (3, 4));
+    let plant = "index_score_blocks per-term";
+    let r = rate(plant, SCORE_BLOCKS_DIMS, |dims, seed| {
+        let ins = score_blocks_ins(dims, seed);
+        let n_comp = dims[1];
+        (0..dims[0] * n_comp).any(|id| {
+            let tc = (id / n_comp, id % n_comp);
+            splits(|clean| score_cell(&ins, dims, tc, clean))
+        })
+    });
+    demand(plant, r, (3, 4));
 }
 
 /// One `kv_compress_prefill` output row on the CPU up to the RoPE — the pool, the bf16 store and
@@ -175,22 +173,19 @@ fn prefill_pairs(ins: &[Vec<f32>], p: &CompGeom, b: usize) -> Vec<[f32; 4]> {
 /// `kvcompress` plant is `gemm_bf16`'s, and why the RoPE sites rest on the ISA reading.
 #[test]
 fn compress_rope_fusion_is_visible_to_the_prefill_rows() {
-    let (mut cells, mut moved) = (0usize, 0usize);
-    for (gi, nblk) in PREFILL_SHAPES {
-        let p = geom(GEOMS[gi].0, GEOMS[gi].1);
-        let m = (1..=SEEDS)
-            .filter(|&seed| {
-                let ins = prefill_ins(&p, nblk, seed);
-                (0..nblk).any(|b| {
-                    prefill_pairs(&ins, &p, b).iter().any(|&[x, y, c, s]| {
-                        rbf16(x.mul_add(s, y * c)).to_bits() != rbf16(y.mul_add(c, x * s)).to_bits()
-                    })
+    let (moved, cells) = rate(
+        "kv_compress_prefill rope mis-fusion",
+        PREFILL_SHAPES,
+        |(gi, nblk), seed| {
+            let p = geom(GEOMS[gi].0, GEOMS[gi].1);
+            let ins = prefill_ins(&p, nblk, seed);
+            (0..nblk).any(|b| {
+                prefill_pairs(&ins, &p, b).iter().any(|&[x, y, c, s]| {
+                    rbf16(x.mul_add(s, y * c)).to_bits() != rbf16(y.mul_add(c, x * s)).to_bits()
                 })
             })
-            .count();
-        cells += SEEDS as usize;
-        moved += m;
-    }
+        },
+    );
     println!("kv_compress_prefill rope mis-fusion: {moved}/{cells} cells differ");
     assert!(moved > 0, "no prefill cell can see a RoPE mis-fusion");
 }
@@ -236,20 +231,57 @@ fn gemm_out(ins: &[Vec<f32>], [_, n, k]: [usize; 3], o: usize, fused: bool) -> f
 /// shapes, 10/64 at the ragged `[3, 7, 33]` (one or two products per lane), 266/320 overall.
 #[test]
 fn gemm_unfused_plant_is_adversarial_on_cpu() {
-    let (mut cells, mut moved) = (0usize, 0usize);
-    for dims in GEMM_SHAPES {
-        let m = (1..=SEEDS)
-            .filter(|&seed| {
-                let ins = gemm_ins(dims, seed);
-                (0..dims[0] * dims[1]).any(|o| {
-                    gemm_out(&ins, dims, o, true).to_bits()
-                        != gemm_out(&ins, dims, o, false).to_bits()
-                })
-            })
-            .count();
-        println!("gemm_bf16 unfused plant at {dims:?}: {m}/{SEEDS} seeds move");
-        cells += SEEDS as usize;
-        moved += m;
-    }
-    demand("gemm_bf16 unfused", (moved, cells), (3, 4));
+    let unfused = |dims: [usize; 3], seed| {
+        let ins = gemm_ins(dims, seed);
+        (0..dims[0] * dims[1]).any(|o| splits(|clean| gemm_out(&ins, dims, o, clean)))
+    };
+    demand(
+        "gemm_bf16 unfused",
+        rate("gemm_bf16 unfused", GEMM_SHAPES, unfused),
+        (3, 4),
+    );
+}
+
+/// `mla_absorb_fp8`'s output `(r, head, i)` on the quad path: `Σ_d fma(q, lut·s, acc)`, the
+/// product `lut·s` rounded first (hipcc's hoist, the C's parenthesisation); `hoisted == false` is
+/// the `mla` plant, `fma(q·lut, s, acc)`.
+fn absorb_out(
+    ins: &[Vec<f32>],
+    (dims, _): MlaShape,
+    (r, head, i): (usize, usize, usize),
+    hoisted: bool,
+) -> f32 {
+    let [h, qh, nope, vh, kvl, block] = dims;
+    let byte = |j: usize| (ins[1][j / 4].to_bits() >> (8 * (j % 4))) as u8;
+    let rbase = head * (nope + vh);
+    (0..nope).fold(0.0f32, |acc, d| {
+        let l = e4m3_to_f32(byte((rbase + d) * kvl + i));
+        let s = ins[2][((rbase + d) / block) * kvl.div_ceil(block) + i / block];
+        let q = ins[0][r * h * qh + head * qh + d];
+        if hoisted {
+            q.mul_add(l * s, acc)
+        } else {
+            (q * l).mul_add(s, acc)
+        }
+    })
+}
+
+/// The `mla` plant (the absorb's hoisted `lut · s` re-associated) moves every quad-path cell: the
+/// output is f32, unrounded, and each sums `nope` (128-192) products. The two scalar-fallback
+/// shapes cannot move — the patch touches only the quad path — and are excluded by construction.
+#[test]
+fn absorb_reassociation_plant_is_adversarial_on_cpu() {
+    let plant = "mla_absorb_fp8 re-association (quad path)";
+    let quads = MLA_DIMS
+        .into_iter()
+        .filter(|(d, _)| d[4] % 4 == 0 && d[5] >= 4);
+    let r = rate(plant, quads, |shape, seed| {
+        let ([h, qh, _, _, kvl, _], nrow) = shape;
+        let ins = mla_ins(shape, nrow * h * qh, seed);
+        (0..nrow * h * kvl).any(|o| {
+            let at = (o / (h * kvl), o / kvl % h, o % kvl);
+            splits(|clean| absorb_out(&ins, shape, at, clean))
+        })
+    });
+    demand(plant, r, (9, 10));
 }
