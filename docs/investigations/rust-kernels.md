@@ -1053,7 +1053,17 @@ hipcc+`gu8p` (the down kernels counted; the gate/up kernels had no flat load in 
   `fast_round_scale`) are the prelude's, ported as plain Rust (which never contracts).
 - **Device arms and TIME lines are owed to the lease.**
 
-**Device lease, 2026-11-19, commit `60ac104`, two arms, rh-anine.** Both arms ran through
+**Device lease, 2026-11-19, commit `60ac104`, two arms, rh-anine.**
+
+> **CORRECTED 2026-11-19 (superseded by the `79e218c` lease below).** In this lease's range
+> rows, the up rows of every expert past the first read the down scales' planted edge codes
+> (bf16/f32 NaN or ±inf; e8m0 NaN or 2^127). One `h` word was therefore non-finite on both
+> sides, and every down contribution took the same clamp bound. So for every shape whose live
+> experts sat past expert 0 — every real GLM, V4 and K3 shape — the down-pass comparisons were
+> vacuous, and the MoE TIME lines below timed a down pass on NaN `h`. Its 23/23 is evidence
+> for every non-range row and, almost everywhere, for the gate/up pass. Cause and fix are under
+> "After the lease".
+ Both arms ran through
 `tests/bit-identity.sh`, detached with `setsid` (own PGID). The waits were on the result files,
 not on process absence. Both witnesses CLEAN: the `witness-bit-identity` files are 0 B and GTT
 was 17 MiB before each arm (the script reads GTT only pre-arm). Host loadavg, from the script's
@@ -1076,7 +1086,8 @@ during the lease.
   | `moe` | 360/384 on each GLM row |
   | `moe_f4` | **48/320, all in the small (32, 32, 0, 1, 1) cell** |
 
-- **OPEN — the `moe_f4` plant does not reach K3's real shapes.**
+- **OPEN — the `moe_f4` plant does not reach K3's real shapes.** *(CLOSED 2026-11-19: a
+  harness defect, see "After the lease"; the `79e218c` lease's R is red at both K3 shapes.)*
   - **What the log shows.** The row's first six mismatch notes (`Tally` keeps six, in run
     order) are all from the LAST shape, `(32, 32, 0, 1, 1)`, and that shape runs after the two
     real K3 shapes. Every other K3 cell compared identical under the plant: the two real
@@ -1114,17 +1125,19 @@ Phase 0 merge review recorded. So differences of a few percent here are not reso
 | `moe_expert_range_f4_situ` K3 (3584, 3072), 1 expert | 60.48 | 62.55 | 1.034 | — (planted) |
 | `moe_expert_range_f4_situ` K3, 4-expert batch | 714.82 | 726.09 | 1.016 | — (planted) |
 
-- **Obligation 1, timing half.** The fp4 rows run at 1.019–1.036 across both samples, within
+- *(CORRECTED 2026-11-19: reopened for K3 by the `79e218c` lease, below; these samples timed a
+  down pass on NaN `h`.)* **Obligation 1, timing half.** The fp4 rows run at 1.019–1.036 across both samples, within
   the lane's threshold, with the down kernels' loads at `global_load` (census above). No
   fallback is needed. Phase 0b's L2 obligation is recorded as met: census identical, timing
   within threshold on two samples, no A-vs-A floor.
-- **Obligation 2.** The GLM int4 range at 6144 × 2048, nrow 2, read 1.042 in A. In R it read
+- *(CORRECTED 2026-11-19: see the `79e218c` lease, where A read 1.070.)* **Obligation 2.** The GLM int4 range at 6144 × 2048, nrow 2, read 1.042 in A. In R it read
   1.014: R's `moe` plant changes only the gate/up SiLU, so `moe_down_i4_r2` was the same
   kernel in both arms.
   - The 16 → 12 waves crossing (obligation-2 table above) is a candidate cost, not a measured
     one. The launcher row times both passes together.
   - Both samples are within the threshold.
 - **Atomics.** No CAS loop: the accumulation is the native `global_atomic_add_u64` (above).
+  *(The ≤ 1.036 bound below is CORRECTED 2026-11-19 by the `79e218c` lease's 1.070 rows.)*
   Every MoE row except the int4 nrow 2 one is ≤ 1.036.
 - **The one slow row: `gated_delta_recurrent_f32`, 1.647 in A.** The lead below comes from a
   static ISA read and is UNTESTED.
@@ -1180,7 +1193,10 @@ Phase 0 merge review recorded. So differences of a few percent here are not reso
 - **The plant's CPU model is now the real cell.** `moe_f4_late_bf16_plant_reaches_k3_production_shapes`
   runs the actual K3 cells (`ranges::cell_inputs`, the row's betas) through both passes. The bf16-after-weight plant moves 48/48 of the
   seeds on which pass 2 is live, at BOTH (3584, 3072, 2, 1, 1) and (3584, 3072, 0, 4, 1). The
-  excluded 16 are the NaN-`x` and edge seeds: one non-finite `h` and no pass-2 plant can move.
+  excluded 16 are the NaN-`x` and edge seeds. *(CORRECTED 2026-11-19: on an edge seed, an
+  expert past the first sits beyond the gate scales' planted NaN, so pass 2 can be live there.
+  The device reddened 1–2 such seeds per K3 shape; the model filters those seeds out by class
+  and so makes no prediction about them.)*
   Red proof of the model: with the padding removed (copied aside, edited, run, restored, `cmp`
   rc 0), the same test reads 0/48 at (3584, 3072, 2, 1, 1), the device's result. Cost: about
   70 s of the deviceless suite.
@@ -1200,4 +1216,69 @@ Phase 0 merge review recorded. So differences of a few percent here are not reso
 - **The i32 counter, tried separately on top: rejected.** It added remainder copies (25 → 33
   loads, 19 → 27 stores), and its main loop already had the four loads in flight. The 64-bit
   counter stays.
-- **Timing is owed to the next lease.**
+- **Timing is owed to the next lease.** *(Paid 2026-11-19, the `79e218c` lease below.)*
+
+**Device lease, 2026-11-19, commit `79e218c` (after the arena fix), two arms, rh-anine.** The
+procedure was the `60ac104` lease's, with A then R run from one `setsid`-launched script. Both
+witnesses CLEAN: 0 B witness files, GTT 17 MiB pre-arm. Host loadavg was 4.46 → 3.38 on A and
+3.19 → 6.48 on R (32 cores). That is three to four times the `60ac104` lease's load, and is a
+possible contributor to the two rows above 1.05 below. Neither arm was discarded.
+
+| arm | binary | scripted verdict | rc | wall | logs `…/bit-identity/` |
+|---|---|---|---|---|---|
+| A | `bit_identity-efca1da5680a0280` (cargo's metadata hash, not a content hash); the script's freshness check passed at `79e218c` | GREEN: 23/23 BIT-IDENTICAL | 0 | 168 s | `20261119T133613-3151723` |
+| R | `…/rk-l2-moe/plant/bit_identity-l2-plants`: `git archive 79e218c` plus the three `plants/*.patch`, built into `target/rk-l2-moe-plant` | GREEN (expect-red): exactly the five planted rows | 0 (binary 101) | 158 s | `20261119T133901-3157318` |
+
+- **A.** The only NaN-payload-only words are on `moe_expert_range`: 1520. Every other row
+  has 0.
+- **What shows the down pass is now compared for real.**
+  - On the device, only K3: the `moe_f4` plant reaches pass 2 and is red at both production
+    shapes.
+  - For GLM's VQ and int4 and for V4's fp4, it is inferred from the `Layout` fix and the CPU
+    models; no plant reaches their down pass.
+- **R — red cells by shape**, from the new tally:
+  - `moe_expert_range_f4_situ` is **red at both K3 production shapes**: (3584, 3072, 2, 1, 1)
+    49/64 and (3584, 3072, 0, 4, 1) 50/64. Also (96, 64, 0, 3, 1) 48/64, (160, 96, 1, 2, 1)
+    50/64 and (32, 32, 0, 1, 1) 48/64. At most 16 of each shape's held seeds are NaN-`x` or edge
+    seeds. The 1–2 edge seeds that went red are live because their live expert sits past the
+    gate scales' planted NaN (see the dated note under "After the lease").
+  - `moe_expert_range` and `moe_expert_range_i4`: every shape red, 56/64 at nrow 1 and 64/64
+    at nrow 2. At nrow 1, `nan_some`'s NaN in `x` row 0 hides the SiLU on the 8 nasty seeds;
+    row 1 of an nrow-2 cell has no NaN.
+  - `gated_delta_recurrent_f32`: (96, 128) 64/64, (4, 32) 64/64, (3, 64) 64/64,
+    (2, 2) 40/64, (1, 1024) 55/64 and (1, 1) 0/64.
+  - `gdn_recurrent_f32`: 64/64 at every shape except (1, 1, 1, 1), 0/64.
+  - At `d` = 1 the only `k` is the 100.0 edge, on every seed. `100 · rn(1/sqrt(10000 + 1e-6))`
+    rounds to exactly 1.0f32, so the fused and unfused updates round identically.
+  - Every unplanted row held, 0 red at every shape.
+
+**TIME lines.** Same method as before: the minimum of three 200-launch batches, Rust ÷ hipcc.
+These supersede the `60ac104` lease's MoE and recurrent rows. Every other row read
+0.882–1.018 in A, except Phase 0's `attn_res` (in the table).
+
+| row (shape) | hipcc µs | Rust µs | A ratio | R |
+|---|---|---|---|---|
+| `gated_delta_recurrent_f32` (96, 128) | 29.02 | 28.92 | **0.997** (was 1.647) | planted |
+| `gdn_recurrent_f32` (16, 48, 128, 128) | 45.25 | 18.82 | **0.416** (was 0.999) | planted |
+| `moe_expert_range` GLM (6144, 2048) nrow 1 | 112.06 | 113.06 | 1.009 | gate/up planted, down unchanged: 1.006 |
+| `moe_expert_range` GLM nrow 2 | 121.29 | 125.75 | 1.037 | gate/up planted, down unchanged: 1.018 |
+| `moe_expert_range_i4` GLM nrow 1 | 242.82 | 245.32 | 1.010 | gate/up planted, down unchanged: 1.008 |
+| `moe_expert_range_i4` GLM nrow 2 | 313.75 | 335.85 | **1.070** | gate/up planted, down unchanged: 1.035 |
+| `moe_expert_range_f4` V4 (4096, 2048), 1 expert | 55.27 | 56.82 | 1.028 | unplanted: 1.027 |
+| `moe_expert_range_f4` V4, 6-expert batch | 766.64 | 787.40 | 1.027 | unplanted: 1.021 |
+| `moe_expert_range_f4_situ` K3 (3584, 3072), 1 expert | 60.74 | 64.99 | **1.070** | planted |
+| `moe_expert_range_f4_situ` K3, 4-expert batch | 707.37 | 707.06 | 1.000 | planted |
+| `attn_res` (1, 9, 7168, 9) — Phase 0, owed | 53.62 | 57.43 | 1.071 | 1.013 (unplanted) |
+
+- **The two delta rules.** The load-before-store groups closed `gated_delta`'s gap, and `gdn`'s
+  predicted win landed. Both are single samples, since both were planted in R.
+- **Rows above ~1.05.** Only the `79e218c` samples count here, because the `60ac104` MoE samples
+  timed a NaN `h`.
+  - **`moe_expert_range_i4` nrow 2: 1.070 in A.** R's planted-gate/up binary read 1.035 with
+    the same down kernel. The row contains `moe_down_i4_r2`, the 16 → 12 waves kernel. With no
+    A-vs-A floor, the crossing's cost is unmeasured.
+  - **`moe_expert_range_f4_situ` single expert: 1.070 in A.** There is no second sample: it
+    was planted in R.
+- **Obligation 1, timing half.**
+  - **V4: met.** The fp4 range reads 1.021–1.028 over two samples, with the down pass now real.
+  - **K3: OPEN.** Its single expert reads 1.070 in the only valid sample.
