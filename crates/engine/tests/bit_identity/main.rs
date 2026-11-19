@@ -30,11 +30,18 @@
 #[path = "../common/mod.rs"]
 mod common;
 mod inputs;
+mod plant_models;
 
 #[cfg(feature = "rocm")]
 mod activation;
 #[cfg(feature = "rocm")]
 mod device;
+#[cfg(feature = "rocm")]
+mod fwd;
+#[cfg(feature = "rocm")]
+mod headtail;
+#[cfg(feature = "rocm")]
+mod linalg;
 #[cfg(feature = "rocm")]
 mod probes;
 #[cfg(feature = "rocm")]
@@ -68,6 +75,23 @@ const ROWS: &[Row] = &[
         "gated_residual_collapse_f32",
         residual::gated_residual_collapse_f32,
     ),
+    ("gemv_fp8", linalg::gemv_fp8),
+    ("gemv_i8", linalg::gemv_i8),
+    ("gemv_i4", linalg::gemv_i4),
+    ("gemv_vq", linalg::gemv_vq),
+    ("gemv_f32", linalg::gemv_f32),
+    ("vq_encode", linalg::vq_encode),
+    ("embed_bf16_row_bcast", headtail::embed_bf16_row_bcast),
+    ("hc_head_collapse", headtail::hc_head_collapse),
+    ("embed_i8_row", fwd::embed_i8_row),
+    ("append_kv", fwd::append_kv),
+    ("gather_rope", fwd::gather_rope),
+    ("vadd", fwd::vadd),
+    ("sigmoid_gate", fwd::sigmoid_gate),
+    ("logit_softcap", fwd::logit_softcap),
+    ("argmax", fwd::argmax),
+    ("flag_nonfinite", fwd::flag_nonfinite),
+    ("hash_rows", fwd::hash_rows),
 ];
 
 #[cfg(feature = "rocm")]

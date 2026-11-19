@@ -75,7 +75,7 @@ pub fn walk(
 /// index), NaN never wins because `NaN > x` is false. Returns `(index, value)`.
 ///
 /// **The seed is `(0, -inf)`, and it is the whole correctness of this function.** It is
-/// what `argmax_reduce`'s identity is (`kernels/fwd.hip`: `float best = -INFINITY; int
+/// what `argmax_reduce`'s identity is (`kernels/fwd.hip` (tag `archive/hip-kernels`): `float best = -INFINITY; int
 /// bidx = 0;`), and seeding from `row[0]` instead — which this did until 2026-08-16, and
 /// which its own NaN test caught — silently diverges on exactly one input: a row whose
 /// FIRST element is NaN. `NaN > x` is false in both directions, so a `row[0]` seed makes

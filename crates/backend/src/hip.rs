@@ -35,7 +35,7 @@ use crate::abi::ScoreDims;
 use crate::hiprt::{
     rivoli_device_sync, rivoli_fill_u32, rivoli_memcpy_dtod, rivoli_memcpy_dtod_async,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, bail};
 use std::ffi::c_void;
 
 // Glob, not a curated list: a curated one is a third place a launcher has to be spelled, and
@@ -343,15 +343,6 @@ pub(crate) use {abi_ty, launchers};
 // parameter lists for different kernels. Re-measured 2026-08-06 with the markers deleted: 6
 // clones, all of them parameter lists, none logic.
 unsafe extern "C" {
-    fn rivoli_hash_rows(
-        x: *const f32,
-        n: i32,
-        stride: i32,
-        i_base: u64,
-        out: *mut u64,
-        stream: *mut c_void,
-    ) -> i32;
-
     fn rivoli_mla_attend_scratch_floats(h: i32, kvl: i32) -> usize;
 
     // DSA lightning indexer (indexer.hip).
@@ -627,16 +618,6 @@ pub unsafe fn launch_index_score_blocks(
 }
 // jscpd:ignore-end
 
-// Deliberately BELOW the duplication-gate exemption that closes just above — the placement is
-// the point. This first landed INSIDE that region, which would have put brand-new code under a
-// build-error gate that had been told not to look at it. The region's argument is about the ABI
-// wall's same-shaped parameter lists; this is an ordinary wrapper and has no business borrowing
-// the exemption (review, 2026-08-17). An over-broad exemption is a hole in the gate.
-//
-// (The marker is named rather than spelled, because `crates/cli/tests/docs.rs` refuses a
-// mid-sentence mention of it: jscpd treats one as a real marker, so a comment that quoted it
-// would silently move where the exemption ends. That check caught this very comment.)
-
 /// The sampled index space one hash fold walks — the scalar half of [`launch_hash_rows`],
 /// grouped for [`ScoreBufs`]'s reason on the integer axis: `n` and `stride` are two bare
 /// counts side by side, so no type check tells one from the other, and a transposed pair
@@ -644,9 +625,10 @@ pub unsafe fn launch_index_score_blocks(
 /// move that mistake to the construction site, where it has a name.
 ///
 /// Like [`ScoreBufs`], NOT an ABI type and deliberately not `repr(C)`: nothing here
-/// crosses the wall (see that struct's note for the destructure-before-the-call
-/// convention this follows). Defined BELOW the exemption markers, beside the launcher it
-/// belongs to, for the placement argument recorded above.
+/// crosses the wall; the Rust launcher (`launch/fwd.rs`) destructures it. Its wrapper is a
+/// `launchers!` row in `hip_linalg.rs` since 2026-11-19, when the kernel became Rust, so it
+/// sits below the exemption markers as ordinary code (an over-broad exemption is a hole in
+/// the gate — review, 2026-08-17).
 #[derive(Clone, Copy)]
 pub struct HashSpan {
     /// Element count — the fold visits indices `0, stride, 2*stride, … < n`.
@@ -660,51 +642,4 @@ pub struct HashSpan {
     /// and still be sensitive to which buffer each element came from; pass 0 for a single
     /// buffer. The reference is `rivoli_core::hash::xor_fold_from`.
     pub i_base: u64,
-}
-
-/// XOR-fold the exact bits of `x[0..n]` into `*out` — the `--divergence-log` probe.
-///
-/// The device twin of `rivoli_core::hash::xor_fold`, which carries the argument for why the
-/// fold is an XOR and adds no sync; `crates/engine/tests/fwd_kernel.rs::
-/// hash_rows_matches_the_host_fold` scores the two against each other.
-///
-/// Hand-written here rather than a `launchers!` row in `hip_linalg.rs`, and the reason is the
-/// 800-line soft cap: that file sits at 797 and the row would have carried it over. It also
-/// belongs with `fill_u32` and `memcpy_dtod` on cohesion — the three are utilities over raw
-/// device bytes rather than operators the model graph names.
-///
-/// The walk itself — count, stride, index offset — rides in [`HashSpan`], whose field docs
-/// carry what `stride` and `i_base` mean.
-///
-/// `stream` is trailing and null is the null stream. On the fetch path it MUST be the fetch
-/// stream: the folds bracket the bounce->slot copy, and rivoli's streams are
-/// `hipStreamNonBlocking`, so a null-stream launch would race the copy it is meant to bracket.
-///
-/// # Safety
-/// `x` must be `n` device f32; `out` one device u64, ZEROED before the first fold into it —
-/// XOR against uninitialised memory is silently wrong, and `hipMalloc` does not zero. `stream`
-/// must be a live `hipStream_t`, or null.
-pub unsafe fn launch_hash_rows(
-    x: *const f32,
-    span: HashSpan,
-    out: *mut u64,
-    stream: *mut c_void,
-) -> Result<()> {
-    // Destructured here rather than field-accessed at the call — the same move
-    // `launch_index_score_blocks` makes, and for its reason: the raw call below stays
-    // readable 1:1 against the C signature, which is the wall's point.
-    let HashSpan { n, stride, i_base } = span;
-    // The ABI takes an i32. Every current call site is a few times 10^4 elements, so this is
-    // defensive — but a silent wrap would fold a NEGATIVE length, which the kernel's `n <= 0`
-    // guard turns into a no-op and the probe would report two runs agreeing about a quantity it
-    // never hashed. That is the instrument's one unacceptable failure, so it is a check.
-    ensure!(
-        n <= i32::MAX as usize,
-        "hash_rows: {n} elements exceeds the i32 ABI"
-    );
-    // SAFETY: caller's pointer contract.
-    ensure_hip_status(
-        unsafe { rivoli_hash_rows(x, n as i32, stride as i32, i_base, out, stream) },
-        "hash_rows",
-    )
 }

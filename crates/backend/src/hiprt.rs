@@ -16,6 +16,12 @@
 //! - **a handle, or null** (`handle_or_null`) — the creators (streams, events, the pinned
 //!   arena), where the caller has only a pointer to test.
 //!
+//! > **2026-11-19:** vmm.hip's allocator followed (Phase 1, the linalg lane), and it is the
+//! > one exception to "callers' diffs are their import line": [`rivoli_vmm_alloc`] returns
+//! > `Result<VmmMapping, i32>` — the C's codes (`1001`, `-(hipError_t)`) in the `Err` — where
+//! > the C filled three out-pointers, and its one caller (`engine/src/device.rs`) changed
+//! > with it.
+//!
 //! Beside all four, a POSITIVE guard code (1001…) is an argument refusal before any HIP call
 //! (`fill_u32`'s `bytes % 4`, the touch launcher's 1002) — the codes the C launchers returned.
 //!
@@ -99,6 +105,21 @@ unsafe extern "C" {
         mask: u64,
     ) -> HipError;
     fn hipStreamWriteValue64(s: *mut c_void, p: *mut c_void, value: u64, flags: u32) -> HipError;
+    fn hipMemGetAllocationGranularity(g: *mut usize, prop: *const MemProp, opt: i32) -> HipError;
+    fn hipMemCreate(h: *mut *mut c_void, size: usize, prop: *const MemProp, flags: u64)
+    -> HipError;
+    fn hipMemAddressReserve(
+        p: *mut *mut c_void,
+        size: usize,
+        align: usize,
+        addr: *mut c_void,
+        flags: u64,
+    ) -> HipError;
+    fn hipMemMap(p: *mut c_void, size: usize, off: usize, h: *mut c_void, flags: u64) -> HipError;
+    fn hipMemSetAccess(p: *mut c_void, size: usize, desc: *const MemAccess, n: usize) -> HipError;
+    fn hipMemUnmap(p: *mut c_void, size: usize) -> HipError;
+    fn hipMemRelease(h: *mut c_void) -> HipError;
+    fn hipMemAddressFree(p: *mut c_void, size: usize) -> HipError;
 }
 
 /// `0` or `-(hipError_t)` — the launcher convention.
@@ -337,4 +358,178 @@ pub(crate) unsafe fn rivoli_timeline_completed(t: *mut c_void) -> u64 {
 /// As [`rivoli_timeline_completed`].
 pub(crate) unsafe fn rivoli_timeline_release(t: *mut c_void, value: u64) {
     unsafe { AtomicU64::from_ptr(t.cast()) }.fetch_max(value, Ordering::AcqRel);
+}
+
+// ── vmm.hip: device-local memory the CPU can fill in place ──────────────────────────────
+//
+// The escape from the coherent read tax (docs/reference/architecture.md §1): on this APU
+// `hipHostMalloc` of any grain maps system-domain (MTYPE_NC/UC, 4 KiB pages) and reads
+// slower than `hipMalloc`; the VMM API allocates DEVICE-LOCAL physical memory (MTYPE_RW) and
+// then grants the CPU access too, so weights are `pread` straight in and read in place. The
+// ~9% read figure has no live measurement behind it (vmm.hip's SOURCES note at tag
+// `archive/hip-kernels`: the probe was deleted, recoverable with `git show
+// 3e1bd96:docs/probes/vmm_probe.cpp`); what is measured today is the write side,
+// architecture.md §3.
+
+/// `hipMemLocation` (driver_types.h): a location type and its id.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MemLocation {
+    kind: i32,
+    id: i32,
+}
+
+/// `hipMemAllocationProp` (hip_runtime_api.h:1919), with the fields this allocator leaves
+/// zero spelled as such: the handle type (`hipMemHandleTypeNone`), the win32 metadata and
+/// `allocFlags`.
+#[repr(C)]
+struct MemProp {
+    kind: i32,
+    handle_type: i32,
+    location: MemLocation,
+    win32: *mut c_void,
+    alloc_flags: u32,
+}
+const _: () = assert!(size_of::<MemProp>() == 32);
+
+/// `hipMemAccessDesc` (hip_runtime_api.h:1287).
+#[repr(C)]
+struct MemAccess {
+    location: MemLocation,
+    flags: i32,
+}
+const _: () = assert!(size_of::<MemAccess>() == 12);
+
+const HIP_MEM_ALLOCATION_TYPE_PINNED: i32 = 1; // hip_runtime_api.h:1299
+const HIP_MEM_LOCATION_TYPE_DEVICE: i32 = 1; // driver_types.h:439
+const HIP_MEM_LOCATION_TYPE_HOST: i32 = 2; // driver_types.h:440
+const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: i32 = 3; // hip_runtime_api.h:1279
+const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: i32 = 0; // :1967
+
+/// A live [`rivoli_vmm_alloc`] mapping: the VA, the physical handle, and the
+/// granularity-rounded size [`rivoli_vmm_free`] needs verbatim.
+#[derive(Clone, Copy, Debug)]
+pub struct VmmMapping {
+    pub ptr: *mut c_void,
+    pub handle: *mut c_void,
+    pub mapped: usize,
+}
+
+/// `hipMemSetAccess` read-write over `[ptr, ptr + size)` for one location.
+///
+/// # Safety
+/// `[ptr, ptr + size)` is a live mapping.
+unsafe fn grant(ptr: *mut c_void, size: usize, location: MemLocation) -> HipError {
+    let desc = MemAccess {
+        location,
+        flags: HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
+    };
+    unsafe { hipMemSetAccess(ptr, size, &desc, 1) }
+}
+
+/// Device `dev` read-write, then the host (the domain-crossing grant): two calls, the proven
+/// probe sequence. The first failure, or `0`.
+///
+/// # Safety
+/// `[ptr, ptr + size)` is a live mapping.
+unsafe fn grant_both(ptr: *mut c_void, size: usize, dev: i32) -> HipError {
+    let at = |kind, id| MemLocation { kind, id };
+    let e = unsafe { grant(ptr, size, at(HIP_MEM_LOCATION_TYPE_DEVICE, dev)) };
+    if e != 0 {
+        return e;
+    }
+    unsafe { grant(ptr, size, at(HIP_MEM_LOCATION_TYPE_HOST, 0)) }
+}
+
+/// Reserve a VA range for the physical allocation `h`, map it, and grant both sides. On
+/// failure everything this acquired is released (not `h`) and the error returned.
+///
+/// # Safety
+/// `h` is a live `msize`-byte physical allocation.
+unsafe fn map_both(h: *mut c_void, msize: usize, dev: i32) -> Result<*mut c_void, HipError> {
+    let mut ptr = std::ptr::null_mut();
+    // SAFETY (every call): out-parameters and the range just reserved.
+    let e = unsafe { hipMemAddressReserve(&mut ptr, msize, 0, std::ptr::null_mut(), 0) };
+    if e != 0 {
+        return Err(e);
+    }
+    let e = unsafe { hipMemMap(ptr, msize, 0, h, 0) };
+    if e != 0 {
+        unsafe { hipMemAddressFree(ptr, msize) };
+        return Err(e);
+    }
+    let e = unsafe { grant_both(ptr, msize, dev) };
+    if e != 0 {
+        unsafe {
+            hipMemUnmap(ptr, msize);
+            hipMemAddressFree(ptr, msize);
+        }
+        return Err(e);
+    }
+    Ok(ptr)
+}
+
+/// Allocate `size` bytes of device-local memory on device `dev`, mapped for BOTH device and
+/// host. `Err(1001)` for `size == 0`, else `Err(-(hipError_t))` with everything acquired so
+/// far released — vmm.hip's codes.
+pub fn rivoli_vmm_alloc(size: usize, dev: i32) -> Result<VmmMapping, i32> {
+    if size == 0 {
+        return Err(1001);
+    }
+    let prop = MemProp {
+        kind: HIP_MEM_ALLOCATION_TYPE_PINNED,
+        handle_type: 0,
+        location: MemLocation {
+            kind: HIP_MEM_LOCATION_TYPE_DEVICE,
+            id: dev,
+        },
+        win32: std::ptr::null_mut(),
+        alloc_flags: 0,
+    };
+    let mut gran = 0usize;
+    // SAFETY (every call): out-parameters, and the handle just created.
+    let e = unsafe {
+        hipMemGetAllocationGranularity(&mut gran, &prop, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM)
+    };
+    if e != 0 {
+        return Err(neg(e));
+    }
+    let msize = size.div_ceil(gran) * gran;
+    let mut h = std::ptr::null_mut();
+    let e = unsafe { hipMemCreate(&mut h, msize, &prop, 0) };
+    if e != 0 {
+        return Err(neg(e));
+    }
+    match unsafe { map_both(h, msize, dev) } {
+        Ok(ptr) => Ok(VmmMapping {
+            ptr,
+            handle: h,
+            mapped: msize,
+        }),
+        Err(e) => {
+            unsafe { hipMemRelease(h) };
+            Err(neg(e))
+        }
+    }
+}
+
+/// Tear down a [`rivoli_vmm_alloc`] mapping — unmap, release, free, all three attempted —
+/// reporting the first failure as `-(hipError_t)`.
+///
+/// # Safety
+/// `m` came from [`rivoli_vmm_alloc`] and is freed once.
+pub unsafe fn rivoli_vmm_free(m: VmmMapping) -> i32 {
+    let VmmMapping {
+        ptr,
+        handle,
+        mapped,
+    } = m;
+    let codes = unsafe {
+        [
+            hipMemUnmap(ptr, mapped),
+            hipMemRelease(handle),
+            hipMemAddressFree(ptr, mapped),
+        ]
+    };
+    neg(codes.into_iter().find(|&e| e != 0).unwrap_or(0))
 }

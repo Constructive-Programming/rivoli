@@ -75,3 +75,34 @@ pub fn rope_at(seed: u64) -> (usize, f64) {
     let pos = [0, 1, 7, 4095, 65_535, 131_071][(seed % 6) as usize] + seed as usize;
     (pos, [1e4, 1e6, 5e7][(seed % 3) as usize])
 }
+
+/// `n` random bytes for `(seed, stream)` — every bit pattern a packed weight code can take.
+pub fn bytes(n: usize, (seed, stream): (u64, u64)) -> Vec<u8> {
+    let mut r = Lcg(seed.wrapping_mul(0xa076_1d64_78bd_642f) ^ stream);
+    (0..n)
+        .map(|_| {
+            r.f();
+            (r.0 >> 56) as u8
+        })
+        .collect()
+}
+
+/// Bytes as the f32 WORDS a cell uploads, bit patterns untouched (NaN payloads included —
+/// nothing here does arithmetic on them), zero-padded to a whole word.
+// Only the device rows build cells; the deviceless build compiles the plant models alone.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn words(b: &[u8]) -> Vec<f32> {
+    b.chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            f32::from_bits(u32::from_le_bytes(w))
+        })
+        .collect()
+}
+
+/// Halfwords (bf16 or fp16 bits) as cell words.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn u16_words(v: impl IntoIterator<Item = u16>) -> Vec<f32> {
+    words(&v.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
+}

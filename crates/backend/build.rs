@@ -11,10 +11,11 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 12] = [
+const KERNELS: [&str; 8] = [
     // `activation` and `residual` (split out of this file 2026-08-15/16) left this list
     // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below.
-    "linalg",
+    // `linalg`, `fwd`, `headtail` (kernels) and `vmm` (host-only, now `src/hiprt.rs`) left
+    // 2026-11-19, Phase 1 lane L1.
     "moe",
     // Split out of `moe.hip` 2026-08-16 (the FP4 routed-expert family, V4's pair and K3's
     // situ pair) — same argument again.
@@ -27,14 +28,11 @@ const KERNELS: [&str; 12] = [
     // half; the QUIET half this list once shipped was a stale object from an untracked
     // header, and `headers()` below is what closed it.
     "recurrent",
-    "fwd",
-    "vmm",
     "indexer",
     // `async` left 2026-11-18: its host half is direct FFI (`src/hiprt.rs`), its one kernel
     // (`touch_region`) is Rust.
     "kvcompress",
     "blockindex",
-    "headtail",
 ];
 
 /// EVERY header under `kernels/`, DISCOVERED rather than listed — the result is BOTH a

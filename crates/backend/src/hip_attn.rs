@@ -22,6 +22,8 @@ use std::ffi::c_void;
 
 use crate::abi::{CompFinish, CompGeom};
 use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
+use crate::launch::{rivoli_append_kv, rivoli_gather_rope};
+use rivoli_abi::kernarg::{AppendKv, GatherRope};
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
 // twenty rewritten comments.
@@ -134,7 +136,7 @@ launchers! {
     /// Device pointers live until the next [`device_sync`]: `latent` (`kvl` f32), `rope`
     /// (`ropn` f32), `lc8`/`lscale`/`rc` the KV slabs (row `pos` in-bounds; `n_blocks =
     /// kvl/128`).
-    launch_append_kv -> rivoli_append_kv, "append_kv" (
+    launch_append_kv => rivoli_append_kv(AppendKv { latent, rope, lc8, lscale, rc, pos: pos as i32, kvl: kvl as i32, ropn: ropn as i32, n_blocks: n_blocks as i32 }), "append_kv" (
         latent: *const f32,
         rope: *const f32,
         lc8: *mut u8,
@@ -151,7 +153,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `q` (`h·qh` f32), `qrope`
     /// (`h·ropn` f32).
-    launch_gather_rope -> rivoli_gather_rope, "gather_rope" (
+    launch_gather_rope => rivoli_gather_rope(GatherRope { q, qrope, h: h as i32, qh: qh as i32, nope: nope as i32, ropn: ropn as i32 }), "gather_rope" (
         q: *const f32,
         qrope: *mut f32,
         h: usize as i32,
@@ -292,7 +294,7 @@ launchers! {
     /// `d` — this signature has no rope argument because the caller concatenates.
     ///
     /// K3's MLA output gate — `attn *= sigmoid(gate)`, between this attend and `o_proj` — is the
-    /// EXISTING [`launch_sigmoid_gate`], not a new launcher; `kernels/fwd.hip` records the M9
+    /// EXISTING [`launch_sigmoid_gate`], not a new launcher; `kernels/fwd.hip` (tag `archive/hip-kernels`) records the M9
     /// decision. The trap-10 twin it must not be confused with is
     /// [`launch_rmsnorm_gate_heads_f32`] below: MLA gates with no norm, KDA norms then gates.
     ///

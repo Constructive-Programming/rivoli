@@ -2,6 +2,7 @@
 //! LDS, explicit FMA, and the OCML bindings LTO-linked from ROCm's bitcode.
 
 use core::arch::amdgpu;
+use rivoli_abi::geom::ELEMENTWISE_BLOCK;
 
 /// `threadIdx.x`.
 #[inline(always)]
@@ -13,6 +14,18 @@ pub fn tid() -> u32 {
 #[inline(always)]
 pub fn bid() -> u32 {
     amdgpu::workgroup_id_x()
+}
+
+/// `body(i)` for the thread's one elementwise index when `i < n` — the C's `if (i < n)` /
+/// `if (i >= n) return;`. `i` is HIP's `blockIdx.x * blockDim.x + threadIdx.x` at the
+/// launcher-fixed `ELEMENTWISE_BLOCK`: unsigned and wrapping, as the C computes it, then read
+/// as the C's `int` for the signed bound test.
+#[inline(always)]
+pub fn elementwise(n: i32, body: impl FnOnce(usize)) {
+    let i = bid().wrapping_mul(ELEMENTWISE_BLOCK).wrapping_add(tid()) as i32;
+    if i < n {
+        body(i as usize);
+    }
 }
 
 /// The dispatch's dynamic LDS, as `T`. Sized by the launcher's `sharedMemBytes`, which

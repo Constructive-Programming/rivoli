@@ -908,3 +908,77 @@ are LOWER bounds on throughput:
 - **A0:** 50 s.
 - **Whole run:** 247 s to the last arm's output, 267 s to `arms/end.epoch`. The posted
   READY-FOR-GPU estimate was 25–35 min.
+
+### Phase 1 L1 (linalg, vmm, headtail, fwd)
+
+**Deviceless half, 2026-11-19 (branch `wave/rk-l1-linalg`, base `933554c`).** All four files
+are deleted and out of `build.rs`'s hipcc list. Device arms: OWED to the GPU lease.
+
+- **What moved.** 23 kernels became Rust: `crates/kernels/src/{linalg,fwd,headtail}.rs`
+  (`gemv_fp8`/`_r2`, `gemv_fp8_splitk`/`_r2`, `gemv_i8`/`_r2`, `gemv_f32`/`_r2`, `gemv_i4`,
+  `gemv_vq`, `vq_encode`; `embed_i8_row`, `append_kv`, `gather_rope`, `vadd`, `sigmoid_gate`,
+  `logit_softcap`, `argmax` (the C's `argmax_reduce`, renamed for its launcher), `flag_nonfinite`,
+  `hash_rows`; `embed_bf16_row_bcast`, `hc_head_collapse_gate`/`_blend`). Their 17 launchers are
+  `launch/{linalg,fwd,headtail}.rs` behind `=>` rows. vmm.hip was host-only: `rivoli_vmm_alloc`/
+  `_free` are `hiprt.rs` FFI now, returning a `VmmMapping` instead of filling three
+  out-pointers. `hash_rows` was hand-written in `hip.rs` for an 800-line cap `hip_linalg.rs` no
+  longer presses; it is a `launchers!` row, and the wrapper's `i32` overflow bail is a guard
+  code (1002, now also for a `stride` past `i32` and an `n + stride − 1` that overflows — the C
+  wrapped both silently).
+- **ABI.** The GEMVs share ONE generic argument block, `kernarg::Gemv<W>`, the weight operand
+  `W` the only field the formats differ in (`Scaled`, `*const f32`, `Vq`); `GemvFp8` adds
+  `block`. Block sizes: `GEMV_BLOCK = ROWS_PER_BLOCK · WAVE` (not `geom::ROW_BLOCK`, the norms'
+  tree, which is 256 by coincidence), `ARGMAX_BLOCK`, `HASH_BLOCK`, `HC_HEAD_GATE_BLOCK = WAVE`,
+  `ELEMENTWISE_BLOCK` for the rest. `hash_rows` read `gridDim·blockDim` for its grid stride; the
+  launcher passes it (0c's rule). `append_kv` launches `kvl` threads and reads only `threadIdx`.
+- **Fused sites** were read from the tag's ISA (`hipcc -O3 --cuda-device-only -S`) and are
+  listed with their instructions in each kernel module's header. The one worth repeating:
+  `gemv_i8`'s dword step is `acc + quad` with the quad fused and the accumulate a PLAIN
+  `v_add`, because no scale wraps it (fp8's and int4's are `fma(s, quad, acc)`).
+- **ISA census, hipcc vs Rust, all 23 kernels** (`census.py`-style count of FMA-family ops incl.
+  both VOPD halves, `v_mul_f32`, `v_add_f32`, `v_sub_f32`): **identical in 22**; the 23rd,
+  `hc_head_collapse_blend`, has 5 FMAs to hipcc's 1 because LLVM unrolled its runtime `hc` loop
+  by four — schedule only, the fold stays ascending. Scratch **0 B in all 23** (`llvm-readelf
+  --notes`); VGPRs within one granule of hipcc's everywhere (max 35, `gemv_i4`, hipcc 32).
+  **The scratch check caught one:** threading `gemv_i8`'s accumulators as `&mut [f32; R]` and
+  stepping them with `iter_mut` put 8 B (R=1) / 12 B (R=2) in scratch and moved its FP counts;
+  passing them by value through `from_fn` restored 0 B and the identical census. Other static
+  differences, for the timing arm to price: `argmax`/`hash_rows` unroll their 256-leaf tree
+  (`s_barrier` 2 → 9, the C's `blockDim.x/2` loop became a constant); `hash_rows`' system-scope
+  `fetch_xor` lowers to a `global_atomic_cmpswap_b64` loop where hipcc's agent-scope `atomicXor`
+  is one `global_atomic_xor_b64` (one per block, ≤ 1024 blocks; bits are the same either way);
+  `embed_bf16_row_bcast` unrolls its `hc` stores.
+- **Gate rows.** 17 rows (`bit_identity/{linalg,fwd,headtail}.rs`), ≥ 64 seeds, the engine's
+  `i_dim`s at a few dozen rows plus a timed hot shape that fills the machine (a GEMV row's bits
+  depend on `i_dim`, never `o_dim`). Every tail is reached: fp8 `block < 4` and the one-aligned-
+  row `i_dim % 4` tail, the split-K route and its 4096 threshold, int8's scalar tail and
+  misaligned-row fallback, int4's unaligned rows, `append_kv` at `pos` 131071, argmax ties /
+  all-NaN / all-`-inf` / `+inf`, the hash past its 1024-block cap. NaN codes and NaN scales are
+  PLANTED on one seed in eight (a random fp8 code is NaN 2 in 256, which would NaN every 6144-long
+  dot and leave the NaN-class compare nothing to see). New harness pieces: `Out::PoisonBits`/
+  `ZeroBits` — integer outputs compared bit for bit, never as a NaN class — and `guards()`. Slab
+  outputs (`append_kv`) are sized to row `pos` exactly, the kernel handed the base `pos` rows
+  before it, so the per-side poison sees every element.
+- **Red proofs, CPU first** (`bit_identity/plant_models.rs`, deviceless, patches in
+  `tests/bit-identity/plants/{linalg,fwd,headtail}.patch`):
+
+  | plant | expect red | CPU (cells moved) |
+  |---|---|---|
+  | `linalg`: `lane_cols` unfused | `gemv_f32`, `gemv_i8` | 64/64 (`gemv_f32` 160×6144); 64/64 (`gemv_i8` scalar-tail rows) |
+  | `fwd`: `sigmoid_gate` as `x / (1+e)` | `sigmoid_gate` | 64/64 at n = 257, 2048, 6144 |
+  | `headtail`: the gate's `lane_dot` unfused | `hc_head_collapse` | 64/64 (seed over s = 1 and 3) |
+
+  **Two first plants were sub-threshold, and the CPU model refused them:** the gate's mix
+  `fma(m, scale, base)` split moved 18/64 cells (the sigmoid swallows it), and `gemv_i8`'s tail
+  counted on one shape's misaligned rows alone moved 40/64. The `fwd` alternative
+  `f2e4m3`'s `fma(a, 512, 0.5)` split was not tried: `a·512` is exact, so it is a no-op by
+  construction (§1's lesson, caught on paper).
+- **Census.** `every_rust_kernel_has_a_gate_row_and_a_launchers_row` is RED as expected: the
+  `_r2`/split-K instantiations and the two `hc_head_collapse` kernels have no same-named launcher.
+  It waits on the coordinator's `LAUNCHED_BY` table (L4, landing on main); the other four
+  censuses are green (66 launchers, unchanged).
+- **Deviceless gates.** jscpd 0 clones (≈ 30 found on the way, removed by restructuring, none
+  exempted — including one against `rivoli_core::num`'s e4m3 oracle); clippy both arms clean;
+  CodeScene 10.0 on every file touched except `hip_attn.rs` (9.68 at the base, two rows edited);
+  `cargo test --workspace --no-default-features`: 501 passed, 2 failed — the CodeScene test (the
+  31 base files) and the census above.

@@ -1,9 +1,10 @@
 //! The host halves of the Rust kernels — what the tag's `extern "C" int rivoli_*` launchers
 //! did: the argument guards, the grid geometry, the launch. One module per kernel family
-//! (`activation`, `residual`, `touch`); a Phase 1 lane adds its family's file here.
+//! (`activation`, `fwd`, `headtail`, `linalg`, `residual`, `touch`); a Phase 1 lane adds its family's file here.
 //!
 //! Each launcher keeps its C twin's name and return codes (`0`, POSITIVE guard code,
-//! `-(hipError_t)`) exactly, so a `launch_x => rivoli_x(..)` row in a `launchers!`
+//! `-(hipError_t)`) exactly — `rivoli_hash_rows`' 1002 is the one code added, for a `usize`
+//! walk the C's `int`s could not even be handed — so a `launch_x => rivoli_x(..)` row in a `launchers!`
 //! invocation file maps the status unchanged and `crates/engine/tests/bit_identity/` can
 //! compare guard codes against the tagged C launcher it replaces.
 //!
@@ -17,11 +18,16 @@
 #![cfg(feature = "rocm")]
 
 mod activation;
-mod residual;
-mod touch;
-
 pub(crate) use activation::*;
+mod fwd;
+pub(crate) use fwd::*;
+mod headtail;
+pub(crate) use headtail::*;
+mod linalg;
+pub(crate) use linalg::*;
+mod residual;
 pub(crate) use residual::*;
+mod touch;
 pub use touch::rivoli_touch_region_async;
 
 use crate::module::{Geometry, Kernel, LdsBytes};
@@ -47,6 +53,14 @@ unsafe fn run<A: Copy>(k: &Kernel<A>, checked: Checked, stream: *mut c_void, arg
         Ok(geom) => unsafe { k.launch(geom, stream, args) },
         Err(code) => code,
     }
+}
+
+/// A row gather's refusal (1001: a negative `token`), then [`elementwise`] over its `hidden`.
+fn row_gather(token: i32, hidden: i32) -> Checked {
+    if token < 0 {
+        return Err(1001);
+    }
+    elementwise(i64::from(hidden))
 }
 
 /// `!(x > 0 && x < INFINITY)` — the C guards' one-compare form, which refuses NaN, zero,

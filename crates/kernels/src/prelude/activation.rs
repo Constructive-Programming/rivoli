@@ -24,7 +24,7 @@ pub fn swiglu_clamped(g: f32, u: f32, limit: f32) -> f32 {
 /// `1 − 2/(e^{2|x|} + 1)` through the 1-ulp `rcp`. PINNED to that device-lib build — a ROCm
 /// upgrade can move the C++ side, and the bit-identity sweep is what would notice.
 #[inline(always)]
-fn tanh_ocml(x: f32) -> f32 {
+pub fn tanh_ocml(x: f32) -> f32 {
     let a = fabs(x);
     let z = if a < 0.625 {
         let x2 = x * x;

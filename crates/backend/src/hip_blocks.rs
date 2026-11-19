@@ -19,10 +19,11 @@
 
 use crate::hip::{ExpertDesc, ExpertDescF4, abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
-    Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_post, rivoli_hc_pre,
+    Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_head_collapse,
+    rivoli_hc_post, rivoli_hc_pre,
 };
 use anyhow::Result;
-use rivoli_abi::kernarg::{AttnRes, GatedResidual, HcPost, HcPre};
+use rivoli_abi::kernarg::{AttnRes, GatedResidual, HcHeadGate, HcPost, HcPre};
 use std::ffi::c_void;
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
@@ -141,7 +142,7 @@ launchers! {
     ///
     /// **`x` must already be fp8-quantized** by [`launch_act_quant_f8`] — V4 quantizes the
     /// activation in front of every quantized `Linear` and this path cannot do it per output
-    /// row (see `linalg.hip::act_quant_f8`). The `h` re-quantization between the two passes IS
+    /// row (see `crates/kernels/src/activation.rs::act_quant_f8`). The `h` re-quantization between the two passes IS
     /// done here, because forgetting it is silent.
     ///
     /// `n_desc` is the length of the `descs` array. It exists because `.f4` holds
@@ -393,7 +394,7 @@ launchers! {
     /// `pre` is `s * hc` writable; `y` is `s * dim` writable. None aliases another (every kernel
     /// parameter is `__restrict__`) and all outlive `stream`'s completion. `stream` is a live
     /// `hipStream_t`, or null for the default stream.
-    launch_hc_head_collapse -> rivoli_hc_head_collapse, "hc_head_collapse" (
+    launch_hc_head_collapse => rivoli_hc_head_collapse(HcHeadGate { h, fnw, base, scale, pre, s: s as i32, hc: hc as i32, dim: dim as i32, eps, hc_eps }, y, stream), "hc_head_collapse" (
         h: *const f32,
         fnw: *const f32,
         base: *const f32,

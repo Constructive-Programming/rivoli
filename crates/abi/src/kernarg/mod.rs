@@ -19,10 +19,15 @@
 //! way a single definition could still disagree with itself is a target whose ABI lays it
 //! out differently, and either compile would fail.
 
-pub use activation::*;
-pub use residual::*;
-pub use touch::*;
-
 mod activation;
+pub use activation::*;
+mod fwd;
+pub use fwd::*;
+mod headtail;
+pub use headtail::*;
+mod linalg;
+pub use linalg::*;
 mod residual;
+pub use residual::*;
 mod touch;
+pub use touch::*;

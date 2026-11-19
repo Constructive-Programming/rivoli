@@ -15,8 +15,8 @@ const RTLD_NOW: i32 = 2;
 /// glibc's default, spelled so the `-Bsymbolic` argument below is visible at the call.
 const RTLD_LOCAL: i32 = 0;
 
-/// The reference: `kernels/{activation,residual}.hip` at tag `archive/hip-kernels`, built by
-/// `tests/bit-identity.sh` with hipcc into a shared object whose `rivoli_*` C launchers are
+/// The reference: the script's `REF_SOURCES` (`kernels/*.hip`) at tag `archive/hip-kernels`,
+/// built by `tests/bit-identity.sh` with hipcc into a shared object whose `rivoli_*` C launchers are
 /// called here exactly as the engine called them before the migration — guards, grid
 /// geometry and kernel together. Loaded `RTLD_LOCAL` and linked `-Bsymbolic`, so its
 /// launchers bind to its OWN kernels and never to a same-named symbol in this process
@@ -87,10 +87,19 @@ pub enum Side {
 /// side, so an element either side failed to write is a mismatch by construction — two
 /// launches that both did nothing cannot agree. `InPlace` outputs start as the same input
 /// on both sides (the kernel reads them), and the row instead demands that at least one
-/// cell changed them (see [`Tally::in_place`]).
+/// cell changed them (the [`Tally::moved`] count).
+#[derive(Clone)]
 pub enum Out {
     Poison(usize),
     InPlace(Vec<f32>),
+    /// An INTEGER output of `n` words (codes, indices, flags, hashes), poisoned per side as
+    /// [`Out::Poison`] but compared bit for bit: the NaN class is an f32 rule, and two
+    /// integer words that happen to spell NaNs must not compare equal.
+    PoisonBits(usize),
+    /// An integer accumulator of `n` words the kernel folds into (`flag_nonfinite`'s flag,
+    /// `hash_rows`' XOR), starting ZERO on both sides — the contract's precondition —
+    /// compared bit for bit and held to the in-place rule (at least one cell must move it).
+    ZeroBits(usize),
 }
 
 /// Two DIFFERENT finite sentinels (±3.39e38 with distinct mantissas), not NaNs: under the
@@ -100,19 +109,27 @@ pub enum Out {
 const POISON: [u32; 2] = [0x7f7f_1234, 0xff7f_5678];
 
 impl Out {
-    /// A second output with the same starting contents (the timing cell's own).
-    fn fresh(&self) -> Self {
+    /// The starting words on `side`.
+    fn start(&self, side: Side) -> Vec<f32> {
         match self {
-            Out::Poison(n) => Out::Poison(*n),
-            Out::InPlace(v) => Out::InPlace(v.clone()),
+            Out::Poison(n) | Out::PoisonBits(n) => vec![f32::from_bits(POISON[side as usize]); *n],
+            Out::InPlace(v) => v.clone(),
+            Out::ZeroBits(n) => vec![0.0; *n],
         }
     }
 
     fn upload(&self, side: Side) -> DeviceBuf {
-        match self {
-            Out::Poison(n) => dev(&f32b(&vec![f32::from_bits(POISON[side as usize]); *n])),
-            Out::InPlace(v) => dev(&f32b(v)),
-        }
+        dev(&f32b(&self.start(side)))
+    }
+
+    /// Integer outputs compare bit for bit; f32 outputs NaN-as-a-class.
+    fn strict(&self) -> bool {
+        matches!(self, Out::PoisonBits(_) | Out::ZeroBits(_))
+    }
+
+    /// An output both sides start from the same contents of, which a row must move.
+    fn in_place(&self) -> bool {
+        matches!(self, Out::InPlace(_) | Out::ZeroBits(_))
     }
 }
 
@@ -175,13 +192,17 @@ impl Tally {
         for (k, init) in cell.init.iter().enumerate() {
             let (hip, rust) = (back(&cell.outs[0][k]), back(&cell.outs[1][k]));
             let words = hip.len() as u64 / 4;
-            let (diff, nan_only) = compare_f32(&hip, &rust);
+            let (diff, nan_only) = if init.strict() {
+                (compare_bits(&hip, &rust), 0)
+            } else {
+                compare_f32(&hip, &rust)
+            };
             self.nan_payload_only += nan_only;
             self.words += words;
             bad += diff;
-            if let Out::InPlace(v) = init {
+            if init.in_place() {
                 self.in_place_rows = true;
-                self.moved += u64::from(hip != f32b(v));
+                self.moved += u64::from(hip != f32b(&init.start(Side::Hip)));
             }
             if diff > 0 && self.notes.len() < 6 {
                 self.notes
@@ -284,6 +305,21 @@ pub fn both(call: impl Fn(Side) -> i32) -> [i32; 2] {
     [call(Side::Hip), call(Side::Rust)]
 }
 
+/// One [`Tally::guard`] per case, labelled `what case`: `call(side, case, guard_ptrs())`
+/// refuses (or, if a guard regressed, launches on the [`guard_ptrs`] buffer) on each twin.
+/// Opt-in: the Phase 0 rows predate it and spell the same loop by hand.
+pub fn guards<C: Copy + std::fmt::Debug>(
+    t: &mut Tally,
+    what: &str,
+    cases: &[C],
+    call: impl Fn(Side, C, (I, O)) -> i32,
+) {
+    for &case in cases {
+        let refusal = both(|side| call(side, case, guard_ptrs()));
+        t.guard(&format!("{what} {case:?}"), refusal);
+    }
+}
+
 /// A row's shapes: every one is swept, and `hot` — the engine's hot shape for the kernel —
 /// is also timed, at its seed-1 cell.
 #[derive(Clone, Copy)]
@@ -307,7 +343,7 @@ pub fn sweep<S: Copy + PartialEq + std::fmt::Debug, P>(
             let (ins, outs, p) = make(shape, seed);
             let go = |side, c: &mut Cell| accepted(launch(side, c, shape, &p), side, &what);
             if shape == shapes.hot && seed == 1 {
-                let timed = outs.iter().map(Out::fresh).collect();
+                let timed = outs.clone();
                 t.time(&format!("{shape:?}"), &mut Cell::new(&ins, timed), go);
             }
             t.run(&what, Cell::new(&ins, outs), go);
@@ -344,6 +380,14 @@ pub fn guard_ptrs() -> (I, O) {
         b.ptr_mut() as usize
     });
     (a as I, a as O)
+}
+
+/// Differing 32-bit words over two integer buffers — no NaN class.
+fn compare_bits(hip: &[u8], rust: &[u8]) -> u64 {
+    hip.chunks_exact(4)
+        .zip(rust.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count() as u64
 }
 
 /// `(differing, nan_payload_only)` over two f32 buffers. **NaN is compared as a class**
