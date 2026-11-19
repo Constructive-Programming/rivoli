@@ -2068,7 +2068,8 @@ when the kernel:
   dropped, must contain `run(&STATIC,` or `STATIC.launch…` for the kernel's `static` handle.
 
 An entry whose launcher has no rows reddens through the census's ordinary demand. The table
-ships empty. Review questions shaped two of these checks:
+ships empty. (2026-11-19: L2's 14 MoE rows are its first entries, with one more plant recorded
+in `rust-kernels.md` §5, Phase 1 L2.) Review questions shaped two of these checks:
 - An entry mapping an unrelated kernel to a rowed launcher would have passed a
   kernel-exists-only check.
 - A comment naming the static would have passed a mention-based check.

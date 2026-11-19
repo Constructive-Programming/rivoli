@@ -84,8 +84,8 @@ const ROWS: &[Row] = &[
     ("gdn_recurrent_f32", recurrent::gdn_recurrent_f32),
     ("moe_expert_range", moe::moe_expert_range),
     ("moe_expert_range_i4", moe::moe_expert_range_i4),
-    ("moe_acc_drain", moe::moe_acc_drain),
-    ("moe_acc_drain_to", moe::moe_acc_drain_to),
+    ("moe_acc_drain_s", moe::moe_acc_drain_s),
+    ("moe_acc_drain_to_s", moe::moe_acc_drain_to_s),
     ("moe_expert_range_f4", moe_f4::moe_expert_range_f4),
     ("moe_expert_range_f4_situ", moe_f4::moe_expert_range_f4_situ),
 ];

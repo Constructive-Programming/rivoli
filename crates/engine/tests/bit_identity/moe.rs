@@ -554,14 +554,14 @@ fn drain_row(t: &mut Tally, (c, name): (Drain, &str)) {
     }
 }
 
-pub fn moe_acc_drain(r: &Ref, t: &mut Tally) {
+pub fn moe_acc_drain_s(r: &Ref, t: &mut Tally) {
     // SAFETY: `rivoli_moe_acc_drain_s`'s C signature.
     let c = Drain::Add(unsafe { r.sym(c"rivoli_moe_acc_drain_s") });
-    drain_row(t, (c, "moe_acc_drain"));
+    drain_row(t, (c, "moe_acc_drain_s"));
 }
 
-pub fn moe_acc_drain_to(r: &Ref, t: &mut Tally) {
+pub fn moe_acc_drain_to_s(r: &Ref, t: &mut Tally) {
     // SAFETY: `rivoli_moe_acc_drain_to_s`'s C signature.
     let c = Drain::To(unsafe { r.sym(c"rivoli_moe_acc_drain_to_s") });
-    drain_row(t, (c, "moe_acc_drain_to"));
+    drain_row(t, (c, "moe_acc_drain_to_s"));
 }

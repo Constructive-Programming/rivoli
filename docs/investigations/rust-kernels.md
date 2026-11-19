@@ -948,7 +948,20 @@ Nothing else pairs a multiply with an add.
 `global_atomic_add_u64 … off` = `DD0E0000 007C0200`, with no cache bits. The output is integer,
 so it does not depend on the order the waves land in.
 
-**L2 obligation 1 — fp4 global vs flat loads: CLOSED deviceless, without a fallback.**
+**L2 obligation 1 — fp4 global vs flat loads: the census half is CLOSED deviceless, without a
+fallback.** Phase 0b's L2 obligation (§ Phase 0b, *Not expressible: `gu8p`*) was "a
+flat-vs-global load census of `moe_gateup_f4`/`moe_down_f4` plus a timing row against hipcc. A
+buffer_load fallback ships only with a measured timing at parity." No fallback is needed; the
+timing row is owed to the lease (below). The census of the real kernels, load mnemonics against
+hipcc+`gu8p` (the down kernels counted; the gate/up kernels had no flat load in any build):
+
+| kernel | hipcc | Rust, descriptor by reference | Rust, descriptor by value (shipped) |
+|---|---|---|---|
+| `moe_down_f4` | 6 `global_load_b32` + 7 `global_load_u8` | 5 `flat_load_b32` + 7 `flat_load_u8` + 1 `global_load_b32` | identical to hipcc |
+| `moe_down_f4_weighted` | 7 `global_load_b32` + 7 `global_load_u8` | 5 `flat_load_b32` + 7 `flat_load_u8` + 2 `global_load_b32` | identical to hipcc |
+| `moe_gateup_f4` | no flat load | no flat load | identical to hipcc on every counted mnemonic |
+| `moe_gateup_f4_situ` | no flat load | no flat load | loads identical; one `v_fmamk` spelled `v_fmac` |
+
 - **The cause.** 0b's finding reproduced exactly on the real `moe_down_f4`: 5 `flat_load_b32`
   plus 7 `flat_load_u8`, against hipcc's `global_load`. The cause is not the atomic. With the
   atomic replaced by a plain store, or removed entirely, the loads stayed flat. The cause is how
@@ -1028,4 +1041,14 @@ so it does not depend on the order the waves land in.
   | `moe` | the range kernels' SiLU in multiply form | 64/64 (1101/4096 gate rows) | `--expect-red=moe_expert_range,moe_expert_range_i4` |
   | `moe_f4` | K3's pass-2 bf16 moved after the routing weight | 64/64 (4096/4096 rows) | `--expect-red=moe_expert_range_f4_situ` |
 
+- **The census's `LAUNCHED_BY` rows** (14: the 12 range-kernel phases under their four range
+  launchers, and the two single-kernel drains under the tag's `_s` launcher names, whose gate
+  rows are renamed `moe_acc_drain_s`/`moe_acc_drain_to_s`). Each launcher's own body launches
+  its kernels' statics. Plant: the `(moe_down_i4_r2, moe_expert_range_i4)` entry's launcher
+  REPLACED with `moe_expert_range` reddened the census (`rivoli_<launcher> does not launch the
+  kernel's static handle`); restored by copy, `cmp` rc 0. A static of the wrong format inside
+  the right launcher is not this census's to see: the bit-identity rows own that defect.
+- **No file-scope `#pragma clang fp contract(off)`** in the three files or the headers they
+  include; the two function-scope ones (`formats.hpp`'s e4m3 subnormal, `actquant.hpp`'s
+  `fast_round_scale`) are the prelude's, ported as plain Rust (which never contracts).
 - **Device arms and TIME lines are owed to the lease.**
