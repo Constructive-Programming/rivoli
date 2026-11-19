@@ -27,6 +27,7 @@
 // Test code: a failed expectation IS the report, so `expect` is the right spelling.
 #![allow(clippy::expect_used)]
 
+mod cells;
 #[path = "../common/mod.rs"]
 mod common;
 mod inputs;
@@ -40,7 +41,16 @@ mod attn_gqa;
 mod attn_inputs;
 mod attn_plants;
 #[cfg(feature = "rocm")]
+mod blockindex;
+#[cfg(feature = "rocm")]
 mod device;
+#[cfg(feature = "rocm")]
+mod indexer;
+#[cfg(feature = "rocm")]
+mod kvcompress;
+#[cfg(feature = "rocm")]
+mod mla;
+mod plant_models;
 #[cfg(feature = "rocm")]
 mod probes;
 #[cfg(feature = "rocm")]
@@ -79,6 +89,27 @@ const ROWS: &[Row] = &[
     ("gqa_attend", attn_gqa::gqa_attend),
     ("gqa_block_attend", attn_gqa::gqa_block_attend),
     ("mha_attend", attn_gqa::mha_attend),
+    ("layernorm", indexer::layernorm),
+    ("index_append", indexer::index_append),
+    ("index_score", indexer::index_score),
+    ("index_pool_push", indexer::index_pool_push),
+    ("index_head_route", indexer::index_head_route),
+    ("index_topk", indexer::index_topk),
+    ("index_pool_norm_f32", indexer::index_pool_norm_f32),
+    ("index_score_blocks_f32", indexer::index_score_blocks_f32),
+    ("act_quant_f4_rotated", blockindex::act_quant_f4_rotated),
+    ("index_score_blocks", blockindex::index_score_blocks),
+    ("gemm_bf16", kvcompress::gemm_bf16),
+    ("kv_compress_deposit", kvcompress::kv_compress_deposit),
+    ("kv_compress_prefill", kvcompress::kv_compress_prefill),
+    ("kv_compress_decode", kvcompress::kv_compress_decode),
+    ("mla_absorb_fp8", mla::mla_absorb_fp8),
+    ("mla_value_fp8", mla::mla_value_fp8),
+    ("act_quant_f8_prefix", mla::act_quant_f8_prefix),
+    ("rmsnorm_batch", mla::rmsnorm_batch),
+    ("qk_norm", mla::qk_norm),
+    ("rope_adjacent", mla::rope_adjacent),
+    ("gemv_fp8_bf16", mla::gemv_fp8_bf16),
 ];
 
 #[cfg(feature = "rocm")]

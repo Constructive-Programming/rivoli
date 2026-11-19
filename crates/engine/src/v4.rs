@@ -6,7 +6,7 @@
 //! # Why the module is named for the model, when the house rule says otherwise
 //!
 //! "Name code for behaviour, not the model" is this repo's rule and it holds for kernels,
-//! traits and formats — `kvcompress.hip`, `.f4`, `swiglu_clamped_bf16`. It does not hold for
+//! traits and formats — `kvcompress.rs`, `.f4`, `swiglu_clamped_bf16`. It does not hold for
 //! an ARM, because an arm's whole content is "which model this is": [`crate::glm`] and
 //! [`crate::glimmer`] are already named that way, `lib.rs` names this one before it exists,
 //! and a behaviour name here would have to describe an architecture no other checkpoint

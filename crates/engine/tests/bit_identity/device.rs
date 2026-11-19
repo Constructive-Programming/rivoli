@@ -15,9 +15,9 @@ const RTLD_NOW: i32 = 2;
 /// glibc's default, spelled so the `-Bsymbolic` argument below is visible at the call.
 const RTLD_LOCAL: i32 = 0;
 
-/// The reference: the tagged `kernels/*.hip` the script's `REF_SOURCES` lists, built by
-/// `tests/bit-identity.sh` with hipcc into a shared object whose `rivoli_*` C launchers are
-/// called here exactly as the engine called them before the migration — guards, grid
+/// The reference: the `kernels/*.hip` files `REF_SOURCES` names, at tag `archive/hip-kernels`,
+/// built by `tests/bit-identity.sh` with hipcc into a shared object whose `rivoli_*` C launchers
+/// are called here exactly as the engine called them before the migration — guards, grid
 /// geometry and kernel together. Loaded `RTLD_LOCAL` and linked `-Bsymbolic`, so its
 /// launchers bind to its OWN kernels and never to a same-named symbol in this process
 /// (`rivoli_act_quant_f8` is one: the Rust launcher exports it for `moe_f4.hip`).
@@ -91,6 +91,10 @@ pub enum Side {
 pub enum Out {
     Poison(usize),
     InPlace(Vec<f32>),
+    /// An INTEGER output — indices, packed bf16 halves — starting as the inner `Out` does and
+    /// compared BYTE FOR BYTE: NaN-as-a-class is a rule about f32 values, and a word here that
+    /// happens to read as a NaN is an index or two halves, where any difference is a difference.
+    Exact(Box<Out>),
 }
 
 /// Two DIFFERENT finite sentinels (±3.39e38 with distinct mantissas), not NaNs: under the
@@ -105,6 +109,7 @@ impl Out {
         match self {
             Out::Poison(n) => Out::Poison(*n),
             Out::InPlace(v) => Out::InPlace(v.clone()),
+            Out::Exact(o) => Out::Exact(Box::new(o.fresh())),
         }
     }
 
@@ -112,6 +117,7 @@ impl Out {
         match self {
             Out::Poison(n) => dev(&f32b(&vec![f32::from_bits(POISON[side as usize]); *n])),
             Out::InPlace(v) => dev(&f32b(v)),
+            Out::Exact(o) => o.upload(side),
         }
     }
 }
@@ -175,7 +181,10 @@ impl Tally {
         for (k, init) in cell.init.iter().enumerate() {
             let (hip, rust) = (back(&cell.outs[0][k]), back(&cell.outs[1][k]));
             let words = hip.len() as u64 / 4;
-            let (diff, nan_only) = compare_f32(&hip, &rust);
+            let (init, (diff, nan_only)) = match init {
+                Out::Exact(o) => (&**o, (compare_exact(&hip, &rust), 0)),
+                o => (o, compare_f32(&hip, &rust)),
+            };
             self.nan_payload_only += nan_only;
             self.words += words;
             bad += diff;
@@ -206,6 +215,18 @@ impl Tally {
             self.notes
                 .push(format!("{what}: hipcc refused {hip_rc}, Rust {rust_rc}"));
         }
+    }
+
+    /// [`Tally::guard`] for a case that claims a CODE: the reference must refuse with exactly
+    /// `want`, so a case that drifted onto an earlier guard fails the harness instead of passing
+    /// as coverage of a guard it never reached (correctness review, 2026-11-19).
+    pub fn guard_code(&mut self, what: &str, want: i32, rc: [i32; 2]) {
+        assert_eq!(
+            rc[0], want,
+            "{what}: the reference refused {}, the case claims {want}",
+            rc[0]
+        );
+        self.guard(what, rc);
     }
 
     /// Per-launch µs of each twin at one shape — the gate cannot see a slowdown, this does.
@@ -279,6 +300,21 @@ pub fn code(r: anyhow::Result<()>) -> i32 {
     }
 }
 
+/// One side of an adapter: the reference's C launcher (`hip`, its status as it returned it) or the
+/// shipped wrapper (`rust`, mapped through [`code`]). The `match side` the older rows spell inline,
+/// as one call: `mla.rs`'s seven adapters, spelled with the match, were jscpd clones of each other
+/// (the match arms' boilerplate around differing argument lists), and this states each pair once.
+pub fn twin(
+    side: Side,
+    hip: impl FnOnce() -> i32,
+    rust: impl FnOnce() -> anyhow::Result<()>,
+) -> i32 {
+    match side {
+        Side::Hip => hip(),
+        Side::Rust => code(rust()),
+    }
+}
+
 /// Both twins' status for one call; `call(side)` launches (or refuses) on that side.
 pub fn both(call: impl Fn(Side) -> i32) -> [i32; 2] {
     [call(Side::Hip), call(Side::Rust)]
@@ -344,6 +380,14 @@ pub fn guard_ptrs() -> (I, O) {
         b.ptr_mut() as usize
     });
     (a as I, a as O)
+}
+
+/// Differing 4-byte words, strictly — [`Out::Exact`]'s compare.
+fn compare_exact(hip: &[u8], rust: &[u8]) -> u64 {
+    hip.chunks_exact(4)
+        .zip(rust.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count() as u64
 }
 
 /// `(differing, nan_payload_only)` over two f32 buffers. **NaN is compared as a class**

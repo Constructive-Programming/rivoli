@@ -18,8 +18,13 @@
 pub mod geom;
 pub mod kernarg;
 
-/// The `repr(C)` mirror of `kernels/kvcompress.hip`'s `CompGeom`, and the only part of the
-/// compressor's geometry that crosses the ABI wall.
+/// The compressor's geometry as it crosses the ABI wall: the only part of it that does.
+///
+/// > **2026-11-19 (Rust-kernel Phase 1 L3):** this WAS the mirror of `kernels/kvcompress.hip`'s
+/// > `CompGeom`; the compressor kernels are Rust now and take THIS struct inside their argument
+/// > blocks, so there is one definition. The C struct survives at tag `archive/hip-kernels` as
+/// > the bit-identity gate's reference, which is handed `&CompGeom` — the assert below is what
+/// > keeps that comparison reading the same bytes.
 ///
 /// Fields are PUBLIC, and that is a reviewed retreat, not an oversight: the old tree
 /// enforced "only `Geom` constructs this" with module privacy, which a crate boundary
@@ -45,19 +50,21 @@ pub struct CompGeom {
     pub eps: f32,
 }
 
-// The `repr(C)` mirror, pinned at compile time. The run-time `compress_guard` already
-// catches a REORDER of the six `int`s — swap `ratio`/`coff` or `cd`/`ents` and guard 1003
-// fires — which a size check cannot do, since a reorder is size-invariant. What the guard
+// The layout, pinned at compile time — the tag's C struct is still read through it (above).
+// The run-time `compress_guard` already catches a REORDER of the six `int`s — swap
+// `ratio`/`coff` or `cd`/`ents` and guard 1003 fires — which a size check cannot do, since a
+// reorder is size-invariant. What the guard
 // cannot catch is a field being ADDED, REMOVED, or changed WIDTH on one side only, because
 // then the two structs are different objects and the guard is reading whichever bytes
 // happen to line up. This catches that, at the file where the edit was made.
 const _: () = assert!(
     size_of::<CompGeom>() == 28 && align_of::<CompGeom>() == 4,
-    "CompGeom must stay six i32 and one f32 — the layout kernels/kvcompress.hip's CompGeom declares"
+    "CompGeom must stay six i32 and one f32 — the tagged kvcompress.hip CompGeom's layout"
 );
 
 /// What the compressor's finish stage reads and writes — the same three pointers for both
-/// pool kernels, in `kernels/kvcompress.hip`'s `CompFinish` layout.
+/// pool kernels, in the tagged `kernels/kvcompress.hip`'s `CompFinish` layout (one definition since
+/// 2026-11-19, as `CompGeom`'s note says).
 ///
 /// One struct rather than three parameters because the three must AGREE with each other
 /// and nothing in a flat argument list makes them: `freqs` must be the layer's

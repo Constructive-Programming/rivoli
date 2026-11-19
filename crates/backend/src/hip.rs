@@ -35,7 +35,9 @@ use crate::abi::ScoreDims;
 use crate::hiprt::{
     rivoli_device_sync, rivoli_fill_u32, rivoli_memcpy_dtod, rivoli_memcpy_dtod_async,
 };
+use crate::launch::{rivoli_index_score_blocks, rivoli_index_score_blocks_f32};
 use anyhow::{Result, bail, ensure};
+use rivoli_abi::kernarg::ScoreBlocks;
 use std::ffi::c_void;
 
 // Glob, not a curated list: a curated one is a third place a launcher has to be spelled, and
@@ -151,25 +153,11 @@ pub struct HeadCount(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadDim(pub usize);
 
-/// The four device buffers the sparse indexer's scoring reads and writes — the pointer half
-/// of [`launch_index_score_blocks`], whose `# Safety` section remains the single home for
-/// their sizing and non-aliasing contract.
-///
-/// Grouped for [`ScoreDims`]'s reason and on stronger evidence: `q`, `kv` and `w` are three
-/// `*const f32` in a row, so no type check can tell any of them from another, and a
-/// transposed pair still addresses real f32 — finite, plausible, wrong. Named fields move
-/// that mistake to the construction site, where it has a name.
-///
-/// NOT an ABI type, deliberately not `repr(C)`, and not in `abi.rs`: nothing here crosses
-/// the wall. The launcher destructures it back into four positional arguments before the
-/// call, so the C signature still reads 1:1 off the Rust one.
-#[derive(Clone, Copy)]
-pub struct ScoreBufs {
-    pub q: *const f32,
-    pub kv: *const f32,
-    pub w: *const f32,
-    pub score: *mut f32,
-}
+/// The four device buffers the block scorers read and write. ONE definition since the scorers moved
+/// to Rust (2026-11-19): it is `rivoli_abi`'s, embedded in the kernel's argument block, where it
+/// was a host-only group the hand-written launcher destructured back into four positionals.
+/// [`launch_index_score_blocks`]' `# Safety` section remains the home of the sizing contract.
+pub use rivoli_abi::kernarg::ScoreBufs;
 
 /// The `extern` type for one launcher argument: the `as`-cast target when the Rust side
 /// narrows at the call (`o_dim: usize as i32`), and the Rust type unchanged when it does not
@@ -310,20 +298,25 @@ pub(crate) use {abi_ty, launchers};
 // The gate stays live over everything else in this file — it found four genuine
 // duplicated-logic clones here on 2026-08-01 (`record_barrier`, `Stream::live`,
 // `refill_from_mapping`, `dispatch_on`), all outside this block.
+//
 // jscpd:ignore-start
 //
-// EXEMPT FROM THE DUPLICATION GATE — the residual hand-written half of the ABI wall.
+// EXEMPT FROM THE DUPLICATION GATE — the scorer rows' parameter lists and the wrappers whose
+// signatures mirror the C they call (retitled 2026-11-19; it read "the residual hand-written half
+// of the ABI wall").
 //
-// ONE launcher does not fit `launchers!` above, and the macro refuses what it cannot prove
-// mechanical rather than reshaping it.
-//
-//   `launch_index_score_blocks`  destructures `ScoreBufs` and `ScoreDims` into four pointers
-//                              and four i32s before the call, with prose in place saying each
-//                              struct exists to keep its own four in the right order. A
-//                              positional 1:1 DSL cannot express one parameter becoming four
-//                              arguments, and the alternative — four bare `usize` beside three
-//                              indistinguishable `*const f32` — deletes what the structs are
-//                              for.
+// > **UPDATED 2026-11-19 (Rust-kernel migration, Phase 1 L3): no launcher here is hand-written
+// > any more.** This region existed for ONE: `launch_index_score_blocks`, which destructured
+// > `ScoreBufs`/`ScoreDims` into four pointers and four i32s because a positional 1:1 DSL could
+// > not express one parameter becoming four arguments. A Rust `=>` row can — its call
+// > expression builds the kernel's argument block (`score_blocks` below) — so both block
+// > scorers are `launchers!` rows now, and `ScoreBufs` is `rivoli_abi`'s, one definition
+// > embedded in the kernel's argument block. **The region did NOT retire with them, measured:**
+// > with both markers deleted, jscpd found 2 clones in it — the two scorer rows' identical
+// > `bufs, dims, stream` lists (30 tokens; the class every invocation file's marker exempts) and
+// > `memcpy_dtod_async`'s signature against `hiprt.rs`'s extern for it (43 tokens, hidden here
+// > since before the migration). What it exempts now is those: an invocation's parameter lists,
+// > and the wrappers whose signatures mirror the C they call.
 //
 // > **FIVE MORE WERE CONVERTED 2026-08-06, and how says more than what.** This list read six.
 // > `launch_attend` was never a real exception: the extern scanner terminated on `-> i32;`, and
@@ -351,34 +344,6 @@ unsafe extern "C" {
         out: *mut u64,
         stream: *mut c_void,
     ) -> i32;
-
-    // DSA lightning indexer (indexer.hip).
-
-    fn rivoli_index_score_blocks(
-        q: *const f32,
-        kv: *const f32,
-        w: *const f32,
-        score: *mut f32,
-        s: i32,
-        n_comp: i32,
-        heads: i32,
-        hd: i32,
-        stream: *mut c_void,
-    ) -> i32;
-
-    // Qwen3.8-Flash-Next's fp32 twin of the scorer above (indexer.hip). Same nine arguments,
-    // different arithmetic — see `launch_index_score_blocks_f32`.
-    fn rivoli_index_score_blocks_f32(
-        q: *const f32,
-        kv: *const f32,
-        w: *const f32,
-        score: *mut f32,
-        s: i32,
-        n_comp: i32,
-        heads: i32,
-        hd: i32,
-        stream: *mut c_void,
-    ) -> i32;
 }
 
 /// Launcher return-code check: 0 = ok, POSITIVE = arg guard, NEGATIVE = -(hipError_t).
@@ -394,41 +359,76 @@ pub(crate) fn ensure_hip_status(r: i32, name: &str) -> Result<()> {
     }
 }
 
-/// **Qwen3.8-Flash-Next's indexer block scoring, in fp32** —
-/// `score[t][b] = Σ_h w[t][h] · ReLU(⟨q_t^h, k̄_b⟩)` (MOD:690-693). `kernels/indexer.hip` carries
-/// the arithmetic and the full record.
-///
-/// > **NOT [`launch_index_score_blocks`], and the difference is a PRECISION CONTRACT that no host
-/// > oracle can see.** That kernel rounds to bf16 three times because DeepSeek-V4's indexer does;
-/// > qwen's runs fp32. The reuse was scored deviceless, argued correctly from the algebra, and
-/// > refuted by the first device arm at **2.8701737e-3** against a 1.14e-4 tolerance — bf16's
-/// > resolution. **The deviceless fixture could not have caught it: its oracle is f64 and the
-/// > roundings live only inside the kernel, so every host comparison agreed.** Read the next reuse
-/// > claim for its precision contract and not only for its algebra.
-///
-/// Separate entry point rather than a flag, for the reason `swiglu` and `swiglu_clamped_bf16` are
-/// separate. `w` carries the `1/sqrt(hd)` MOD:693 applies after the sum; there are no learned
-/// per-head weights (trap T6). Mask and top-k are the caller's.
-///
-/// # Safety
-/// Sizes, alignment and non-aliasing are [`launch_index_score_blocks`]'.
-pub unsafe fn launch_index_score_blocks_f32(
-    bufs: ScoreBufs,
-    dims: ScoreDims,
-    stream: *mut c_void,
-) -> Result<()> {
-    let ScoreBufs { q, kv, w, score } = bufs;
-    let ScoreDims {
-        s,
-        n_comp,
-        heads,
-        hd,
-    } = dims;
-    let (s, n_comp) = (s as i32, n_comp as i32);
-    let (heads, hd) = (heads as i32, hd as i32);
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle or null.
-    let r = unsafe { rivoli_index_score_blocks_f32(q, kv, w, score, s, n_comp, heads, hd, stream) };
-    ensure_hip_status(r, "index_score_blocks_f32")
+/// The block scorers' kernel argument block from the host's two groups: the four extents narrowed
+/// to the kernel's `int`s once, all together, so no row spells the `as i32` soup beside the
+/// pointers.
+fn score_blocks(bufs: ScoreBufs, d: ScoreDims) -> ScoreBlocks {
+    ScoreBlocks {
+        bufs,
+        s: d.s as i32,
+        n_comp: d.n_comp as i32,
+        heads: d.heads as i32,
+        hd: d.hd as i32,
+    }
+}
+
+// The block scorers' rows, INSIDE this exemption: their identical `bufs, dims, stream` lists are
+// exactly what every invocation file's marker exempts (measured, in the note at the region's top).
+// Each row narrows the host's `ScoreDims` into the kernel's `ScoreBlocks` once, in
+// [`score_blocks`].
+launchers! {
+    /// `Indexer.forward`'s scoring (model.py:425-427): `einsum("bshd,btd->bsht")`, `relu_()`,
+    /// the per-head `weights` multiply, and the sum over heads — into `[s, n_comp]`.
+    ///
+    /// Writes the FULL pre-top-k score matrix, not a selection. That is deliberate and it is
+    /// what makes this scoreable: the shipped goldens' selected sets are invariant at
+    /// `index_topk = 512` (`docs/investigations/v4-flash-port.md`, "A hole S3 inherits"), so a
+    /// set comparison accepts an arbitrarily wrong ranking, while the score matrix cannot hide
+    /// one. The causal mask and the top-k are the caller's, exactly as `Oracle::indexer` splits
+    /// them.
+    ///
+    /// Bit-exact against a faithful host reference by construction rather than by tolerance —
+    /// the kernel's note says why the reduction is not parallelised, and why it accumulates in
+    /// f32 and rounds once, which is what `torch.sum` over a bf16 tensor measurably does.
+    /// `Oracle::indexer` still folds per term; until that is fixed the two disagree, and the
+    /// disagreement is the oracle's.
+    ///
+    /// # Safety
+    /// `q` is `s · heads · hd` f32; `kv` is `n_comp · hd` f32; `w` is `s · heads` f32; `score`
+    /// is `s · n_comp` writable f32. **None may alias another** — every kernel parameter is
+    /// `__restrict__`, so that covers the three inputs against each other and not only `score`
+    /// against them. All 4-byte aligned, device-resident, and outliving `stream`'s completion;
+    /// `stream` is a live `hipStream_t`, or null for the default stream.
+    launch_index_score_blocks => rivoli_index_score_blocks(score_blocks(bufs, dims), stream), "index_score_blocks" (
+        bufs: ScoreBufs,
+        dims: ScoreDims,
+        stream: *mut c_void,
+    );
+
+    /// **Qwen3.8-Flash-Next's indexer block scoring, in fp32** —
+    /// `score[t][b] = Σ_h w[t][h] · ReLU(⟨q_t^h, k̄_b⟩)` (MOD:690-693). `kernels/indexer.hip` at
+    /// tag `archive/hip-kernels` carries the arithmetic and the full record.
+    ///
+    /// > **NOT [`launch_index_score_blocks`], and the difference is a PRECISION CONTRACT that no
+    /// > host oracle can see.** That kernel rounds to bf16 three times because DeepSeek-V4's
+    /// > indexer does; qwen's runs fp32. The reuse was scored deviceless, argued correctly from the
+    /// > algebra, and refuted by the first device arm at **2.8701737e-3** against a 1.14e-4
+    /// > tolerance — bf16's resolution. **The deviceless fixture could not have caught it: its
+    /// > oracle is f64 and the roundings live only inside the kernel, so every host comparison
+    /// > agreed.** Read the next reuse claim for its precision contract and not only for its
+    /// > algebra.
+    ///
+    /// Separate entry point rather than a flag, for the reason `swiglu` and `swiglu_clamped_bf16`
+    /// are separate. `w` carries the `1/sqrt(hd)` MOD:693 applies after the sum; there are no
+    /// learned per-head weights (trap T6). Mask and top-k are the caller's.
+    ///
+    /// # Safety
+    /// Sizes, alignment and non-aliasing are [`launch_index_score_blocks`]'.
+    launch_index_score_blocks_f32 => rivoli_index_score_blocks_f32(score_blocks(bufs, dims), stream), "index_score_blocks_f32" (
+        bufs: ScoreBufs,
+        dims: ScoreDims,
+        stream: *mut c_void,
+    );
 }
 
 /// Block until all launched kernels retire — one join per token.
@@ -525,6 +525,9 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 // > two `rivoli_index_score_blocks{,_f32}` extern lists (88 tokens), their two wrappers'
 // > destructure-and-call bodies (87 and 39 tokens), and `memcpy_dtod_async`'s wrapper
 // > against the signature it now forwards to in `hiprt.rs` (43 tokens).
+// >
+// > **SUPERSEDED 2026-11-19:** the extern lists and the destructure bodies are gone (the scorers
+// > are `=>` rows); re-measured, TWO clones remain — the region's top note has them.
 
 /// f32 count for the split-KV partial scratch — allocate once per session (never
 /// per token). Mirrors the kernel's worst-case (MLA_MAX_SPLITS) sizing.
@@ -579,56 +582,6 @@ pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
 // `qk_norm` on their own. An earlier version of this line said `f4_attn.rs` covered all
 // six and was wrong about two.
 
-// --- head tail (S3) -------------------------------------------------------------------
-// Appended as one block so the merge against the other V4 stages stays reviewable.
-
-/// `Indexer.forward`'s scoring (model.py:425-427): `einsum("bshd,btd->bsht")`, `relu_()`,
-/// the per-head `weights` multiply, and the sum over heads — into `[s, n_comp]`.
-///
-/// Writes the FULL pre-top-k score matrix, not a selection. That is deliberate and it is
-/// what makes this scoreable: the shipped goldens' selected sets are invariant at
-/// `index_topk = 512` (`docs/investigations/v4-flash-port.md`, "A hole S3 inherits"), so a
-/// set comparison accepts an arbitrarily wrong ranking, while the score matrix cannot hide
-/// one. The causal mask and the top-k are the caller's, exactly as `Oracle::indexer` splits
-/// them.
-///
-/// Bit-exact against a faithful host reference by construction rather than by tolerance —
-/// the kernel's note says why the reduction is not parallelised, and why it accumulates in
-/// f32 and rounds once, which is what `torch.sum` over a bf16 tensor measurably does.
-/// `Oracle::indexer` still folds per term; until that is fixed the two disagree, and the
-/// disagreement is the oracle's.
-///
-/// # Safety
-/// `q` is `s · heads · hd` f32; `kv` is `n_comp · hd` f32; `w` is `s · heads` f32; `score`
-/// is `s · n_comp` writable f32. **None may alias another** — every kernel parameter is
-/// `__restrict__`, so that covers the three inputs against each other and not only `score`
-/// against them. All 4-byte aligned, device-resident, and outliving `stream`'s completion;
-/// `stream` is a live `hipStream_t`, or null for the default stream.
-pub unsafe fn launch_index_score_blocks(
-    bufs: ScoreBufs,
-    dims: ScoreDims,
-    stream: *mut c_void,
-) -> Result<()> {
-    // Both groups are destructured here rather than field-accessed at the call, so the
-    // argument list below stays readable 1:1 against the C signature — the wall's point.
-    let ScoreBufs { q, kv, w, score } = bufs;
-    // `dims`, not `d`: `d` means a head width everywhere else in this file, including in
-    // `launch_act_quant_f4_rotated` directly above.
-    //
-    // Narrowed once, all four together, so the `as i32` soup is not interleaved with the
-    // pointers at the call. `ScoreDims` is what keeps the four in the right order.
-    let ScoreDims {
-        s,
-        n_comp,
-        heads,
-        hd,
-    } = dims;
-    let (s, n_comp) = (s as i32, n_comp as i32);
-    let (heads, hd) = (heads as i32, hd as i32);
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle.
-    let r = unsafe { rivoli_index_score_blocks(q, kv, w, score, s, n_comp, heads, hd, stream) };
-    ensure_hip_status(r, "index_score_blocks")
-}
 // jscpd:ignore-end
 
 // Deliberately BELOW the duplication-gate exemption that closes just above — the placement is

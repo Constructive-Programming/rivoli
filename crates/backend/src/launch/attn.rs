@@ -4,7 +4,7 @@
 //! by) and the LDS the C declared `static` (`red`, `w`), which the Rust kernels carve from the
 //! dynamic allocation and the launcher therefore requests.
 
-use super::{Checked2, Rows, run_2d};
+use super::{Checked2, Rows, any_nonpositive, run_2d};
 use crate::module::{Geometry, Kernel, LdsBytes};
 use rivoli_abi::geom::{
     GATHER_ATTN_ACC, GATHER_ATTN_THREADS, GQA_ACC, GQA_THREADS, GQA_TILE, MHA_THREADS,
@@ -14,8 +14,7 @@ use rivoli_abi::geom::{
 use rivoli_abi::kernarg::{
     GatherAttn, Gqa, GqaBlock, GqaRing, MhaAttend, MlaAttend, MlaCombine, MlaIo,
 };
-use std::ffi::c_void;
-use std::ptr::null_mut;
+use std::{ffi::c_void, ptr::null_mut};
 
 static MLA_LATENT_ATTEND: Kernel<MlaAttend> = Kernel::new(c"mla_latent_attend");
 static MLA_ATTEND_COMBINE: Kernel<MlaCombine> = Kernel::new(c"mla_attend_combine");
@@ -66,9 +65,7 @@ fn plan_splits(h: i32, nr: i32, have_scratch: bool) -> SplitPlan {
 /// past the accumulator registers or not a multiple of 128 (1004, the C argues both) — or
 /// the tile's LDS bytes.
 fn mla_checked(io: &MlaIo) -> Result<u32, i32> {
-    let extents = [io.h, io.nr, io.kvl, io.rope, io.n_blocks]
-        .iter()
-        .all(|&x| x > 0);
+    let extents = !any_nonpositive(&[io.h, io.nr, io.kvl, io.rope, io.n_blocks]);
     // i64: the extents may be negative here, and the C's `size_t` sum only ever met positives.
     let lds = i64::from(MLA_TILE) * (i64::from(io.kvl) + i64::from(io.rope)) * F32;
     let registers = io.kvl <= (MLA_ACC_REGS * WAVE) as i32 && io.kvl % 128 == 0;
@@ -130,7 +127,7 @@ pub(crate) unsafe fn rivoli_mla_attend(io: MlaIo, partial: *mut f32) -> i32 {
 /// `red[GATHER_ATTN_THREADS]` and `bc[2]` — then a `(h, m)` grid of `GATHER_ATTN_THREADS`.
 /// The Rust kernel carves `qs | lg | red` from the dynamic allocation (no `bc`).
 fn gather_checked(Rows(m): Rows, a: &GatherAttn) -> Checked2 {
-    let extents = [m, a.h, a.d, a.topk].iter().all(|&x| x > 0);
+    let extents = !any_nonpositive(&[m, a.h, a.d, a.topk]);
     let lds = (i64::from(a.d) + i64::from(a.topk)) * F32;
     let statics = F32 * (i64::from(GATHER_ATTN_THREADS) + 2);
     let geom = Geometry {
@@ -162,7 +159,7 @@ pub(crate) unsafe fn rivoli_gather_attn_shared_kv(
 /// a K and a V tile of `GQA_TILE` rows. No LDS guard: the `d` cap bounds it under 64 KiB
 /// (`rivoli_abi::geom`'s assert).
 fn gqa_checked(g: &Gqa, Rows(tq): Rows, [bad_args, bad_geometry]: [bool; 2]) -> Checked2 {
-    let extents = [g.hq, g.hkv, g.d, tq].iter().all(|&x| x > 0);
+    let extents = !any_nonpositive(&[g.hq, g.hkv, g.d, tq]);
     // i64, and narrowed only once accepted: `d` may be anything here.
     let lds = 2 * i64::from(GQA_TILE) * i64::from(g.d) * F32;
     let geom = Geometry {
@@ -219,7 +216,7 @@ pub(crate) unsafe fn rivoli_gqa_block_attend(tq: Rows, a: GqaBlock, stream: *mut
 /// Refusals: extents (1001), then `kv` outside `1..=ATTEND_MAX_KV` (1004). LDS is the score
 /// row plus the C's static `red[MHA_THREADS]`.
 pub(crate) unsafe fn rivoli_mha_attend(Rows(heads): Rows, a: MhaAttend) -> i32 {
-    let extents = [heads, a.d, a.dv].iter().all(|&x| x > 0);
+    let extents = !any_nonpositive(&[heads, a.d, a.dv]);
     match () {
         () if !extents => 1001,
         () if !(1..=ATTEND_MAX_KV).contains(&a.kv) => 1004,

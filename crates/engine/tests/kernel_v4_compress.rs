@@ -54,7 +54,7 @@
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
 //! Never executed: no `rocm` CI arm, and no checkpoint or GPU for this port. Two mutations, in
-//! `kernels/kvcompress.hip`:
+//! `crates/kernels/src/kvcompress.rs` (the `.hip` it replaced, 2026-11-19):
 //!
 //! * In `kv_compress_prefill`'s finish, RoPE each block at its block INDEX (`blk`) instead of at
 //!   its first absolute position (`blk * ratio`). [`the_four_cells_reproduce_the_oracle`] must go

@@ -7,7 +7,7 @@
 //! MLA, e4m3's NaN codes in the cache. NaN is compared as a class (`device.rs`).
 
 use super::common::{Lcg, f32v, u16b};
-use super::inputs::draw;
+use super::inputs::{draw, words32};
 use rivoli_core::num::f32_to_bf16;
 
 /// Every `NASTY`-th seed (from seed 7) carries non-finite inputs.
@@ -36,12 +36,6 @@ pub fn index_words(n: usize, below: usize, r: &mut Lcg) -> Vec<u32> {
     (0..n)
         .map(|_| (((r.f() + 1.0) * 0.5 * below as f32) as usize).min(below - 1) as u32)
         .collect()
-}
-
-/// Raw words as an f32 buffer, bit for bit — how a byte, bf16 or index operand rides in a
-/// [`Cell`].
-pub fn as_words(w: &[u32]) -> Vec<f32> {
-    w.iter().map(|&x| f32::from_bits(x)).collect()
 }
 
 /// One MLA cell's shape: `h` heads, `nr` attended rows, latent width `kvl` (rope 64), `sparse`
@@ -92,7 +86,7 @@ pub fn mla_inputs(s: Mla, seed: u64) -> Vec<Vec<f32>> {
         .map(f32_to_bf16)
         .collect();
     let rows = if s.sparse {
-        as_words(&index_words(s.nr, tokens, &mut r))
+        words32(&index_words(s.nr, tokens, &mut r))
     } else {
         Vec::new()
     };

@@ -427,7 +427,8 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
     // launcher, so the compiler folded them and no change to either could turn them red. That
     // is the "guard that cannot fire" this port has shipped twice, and it is deleted rather
     // than left to look like coverage. The real-extent argument lives in
-    // `kvcompress.hip`'s own comment, beside the `(size_t)` cast that carries it.
+    // `crates/kernels/src/kvcompress.rs::gemm_bf16`'s comment, beside the `size_t` bound that
+    // carries it (`kvcompress.hip`'s until 2026-11-19).
     let f = Fixture::new(512, 1024, 2);
     let (_, _, w_lg) = f.oracle();
     let (_, _, g_lg, _) = f.device();
@@ -440,7 +441,7 @@ fn the_lm_head_needs_no_kernel_of_its_own() {
     );
 }
 
-/// `kernels/mla.hip::qk_norm` against `Oracle::qk_norm`.
+/// `crates/kernels/src/mla.rs::qk_norm` against `Oracle::qk_norm`.
 ///
 /// Here rather than in `tests/f4_attn.rs` because of what it IS rather than where it is
 /// called: it is a per-row bf16-rounded RMS normalisation, the direct sibling of

@@ -18,14 +18,21 @@
 // must stay (the region is anchored to the macro invocation so additions outside it are
 // gated).
 use anyhow::Result;
-use rivoli_abi::kernarg::{GatherAttn, Gqa, GqaBlock, GqaRing, MhaAttend, MlaIo};
 use std::ffi::c_void;
 
 use crate::abi::{CompFinish, CompGeom};
 use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
     Rows, rivoli_gather_attn_shared_kv, rivoli_gqa_attend, rivoli_gqa_block_attend,
-    rivoli_mha_attend, rivoli_mla_attend,
+    rivoli_index_append, rivoli_index_head_route, rivoli_index_pool_norm_f32,
+    rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk, rivoli_kv_compress_decode,
+    rivoli_kv_compress_deposit, rivoli_kv_compress_prefill, rivoli_mha_attend,
+    rivoli_mla_absorb_fp8, rivoli_mla_attend, rivoli_mla_value_fp8,
+};
+use rivoli_abi::kernarg::{
+    CompressDecode, CompressPrefill, Deposit, Fp8KvB, GatherAttn, Gqa, GqaBlock, GqaRing,
+    HeadRoute, IndexAppend, IndexScore, MhaAttend, MlaAbsorb, MlaIo, MlaValue, PoolNorm, PoolPush,
+    TopK,
 };
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
@@ -68,9 +75,9 @@ launchers! {
     /// absorb rows (rbase = head·(nope+vh)), head-batched. kv_b fp8-e4m3 block-scaled.
     ///
     /// # Safety
-    /// Async device pointers live until the next [`device_sync`]: `q` (`h·qh` f32),
-    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `qabs` (`h·kvl` f32).
-    launch_mla_absorb_fp8 -> rivoli_mla_absorb_fp8, "mla_absorb_fp8" (
+    /// Async device pointers live until the next [`device_sync`]: `q` (`nrow·h·qh` f32),
+    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `qabs` (`nrow·h·kvl` f32).
+    launch_mla_absorb_fp8 => rivoli_mla_absorb_fp8(nrow as i32, MlaAbsorb { q, qabs, kvb: Fp8KvB { w: kvb, scale: kvb_scale, h: h as i32, nope: nope as i32, vh: vh as i32, kvl: kvl as i32, block: block as i32 }, qh: qh as i32 }), "mla_absorb_fp8" (
         q: *const f32,
         kvb: *const u8,
         kvb_scale: *const f32,
@@ -88,9 +95,9 @@ launchers! {
     /// value rows, head-batched. kv_b fp8-e4m3 block-scaled.
     ///
     /// # Safety
-    /// Async device pointers live until the next [`device_sync`]: `clat` (`h·kvl` f32),
-    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `ctx` (`h·vh` f32).
-    launch_mla_value_fp8 -> rivoli_mla_value_fp8, "mla_value_fp8" (
+    /// Async device pointers live until the next [`device_sync`]: `clat` (`nrow·h·kvl` f32),
+    /// `kvb` (`h·(nope+vh)·kvl` bytes), `kvb_scale` (block-scale f32), `ctx` (`nrow·h·vh` f32).
+    launch_mla_value_fp8 => rivoli_mla_value_fp8(nrow as i32, MlaValue { clat, ctx, kvb: Fp8KvB { w: kvb, scale: kvb_scale, h: h as i32, nope: nope as i32, vh: vh as i32, kvl: kvl as i32, block: block as i32 } }), "mla_value_fp8" (
         clat: *const f32,
         kvb: *const u8,
         kvb_scale: *const f32,
@@ -466,7 +473,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `kcache`
     /// (row `pos` in-bounds).
-    launch_index_append -> rivoli_index_append, "index_append" (
+    launch_index_append => rivoli_index_append(IndexAppend { k, kcache, pos: pos as i32, hd: hd as i32 }), "index_append" (
         k: *const f32,
         kcache: *mut u16,
         pos: usize as i32,
@@ -480,7 +487,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
     /// f32), `kcache` (`nt·hd` bf16), `heads` (`nact` u32 or null), `scores` (`nt` f32).
-    launch_index_score -> rivoli_index_score, "index_score" (
+    launch_index_score => rivoli_index_score(nh as i32, IndexScore { q, w, kcache, heads, scores, nt: nt as i32, nact: nact as i32, hd: hd as i32, wscale, dscale }), "index_score" (
         q: *const f32,
         w: *const f32,
         kcache: *const u16,
@@ -496,7 +503,8 @@ launchers! {
 
     /// **Qwen3.8-Flash-Next's QSA block-key stage**: mean-pool `ratio` consecutive cached indexer
     /// keys into one block key and RMSNorm it (`qwen-architecture.md` §3, TR Eq. 13 =
-    /// MOD:679-682). `kernels/indexer.hip`'s last section carries the arithmetic.
+    /// MOD:679-682). `kernels/indexer.hip`'s last section (tag `archive/hip-kernels`) carries the
+    /// arithmetic.
     ///
     /// `keys` is `[n_blocks · ratio][hd]` f32, `weight` is `[hd]`, `out` is `[n_blocks][hd]`.
     ///
@@ -523,7 +531,7 @@ launchers! {
     /// writable f32) are device buffers outliving `stream`'s completion, and **none may alias
     /// another** — all three are `__restrict__` in the kernel. `stream` is a live `hipStream_t`,
     /// or null for the default stream.
-    launch_index_pool_norm_f32 -> rivoli_index_pool_norm_f32, "index_pool_norm_f32" (
+    launch_index_pool_norm_f32 => rivoli_index_pool_norm_f32(Rows(n_blocks as i32), PoolNorm { keys, weight, out, ratio: ratio as i32, hd: hd as i32, eps }, stream), "index_pool_norm_f32" (
         keys: *const f32,
         weight: *const f32,
         n_blocks: usize as i32,
@@ -546,7 +554,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `scores` (`nt` f32), `rows`
     /// (at least `min(k, nt)` u32 — the kernel writes exactly that many).
-    launch_index_topk -> rivoli_index_topk, "index_topk" (
+    launch_index_topk => rivoli_index_topk(TopK { s: scores, rows, nt: nt as i32, k: k as i32 }), "index_topk" (
         scores: *const f32,
         nt: usize as i32,
         k: usize as i32,
@@ -558,7 +566,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `pool`
     /// (block `t/MISA_BLOCK` in-bounds).
-    launch_index_pool_push -> rivoli_index_pool_push, "index_pool_push" (
+    launch_index_pool_push => rivoli_index_pool_push(PoolPush { k, pool, t: t as i32, hd: hd as i32 }), "index_pool_push" (
         k: *const f32,
         pool: *mut f32,
         t: usize as i32,
@@ -570,7 +578,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
     /// f32), `pool` (`m_blocks·hd` f32), `e` (`nh` f32).
-    launch_index_head_route -> rivoli_index_head_route, "index_head_route" (
+    launch_index_head_route => rivoli_index_head_route(HeadRoute { q, w, pool, e, m_blocks: m_blocks as i32, nh: nh as i32, hd: hd as i32 }), "index_head_route" (
         q: *const f32,
         w: *const f32,
         pool: *const f32,
@@ -586,9 +594,9 @@ launchers! {
     /// distinguished only by `slot0`.
     ///
     /// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
-    /// decode deposits its single row at slot `start_pos % ratio`. See
-    /// `kernels/kvcompress.hip::kv_compress_deposit` for why that is a unification and not a
-    /// coincidence.
+    /// decode deposits its single row at slot `start_pos % ratio`. See `kv_compress_deposit` in
+    /// `kernels/kvcompress.hip` (tag `archive/hip-kernels`) for why that is a unification and not
+    /// a coincidence.
     ///
     /// Must be launched on **every** call, including one that emits no block: the reference
     /// writes the state and only then returns `None`. At ratio 128 that is every prompt under
@@ -603,7 +611,7 @@ launchers! {
     /// parameter is `__restrict__`. `p` is read host-side before the launch; the device buffers
     /// must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or null for the
     /// default stream.
-    launch_kv_compress_deposit -> rivoli_kv_compress_deposit, "kv_compress_deposit" (
+    launch_kv_compress_deposit => rivoli_kv_compress_deposit(Deposit { kv, score, ape, kv_state, score_state, p: *p, s: s as i32, slot0: slot0 as i32 }, stream), "kv_compress_deposit" (
         kv: *const f32,
         score: *const f32,
         ape: *const f32,
@@ -631,7 +639,7 @@ launchers! {
     /// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
     /// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
     /// null for the default stream.
-    launch_kv_compress_prefill -> rivoli_kv_compress_prefill, "kv_compress_prefill" (
+    launch_kv_compress_prefill => rivoli_kv_compress_prefill(Rows(nblk as i32), CompressPrefill { kv, score, ape, f: *f, p: *p }, stream), "kv_compress_prefill" (
         kv: *const f32,
         score: *const f32,
         ape: *const f32,
@@ -654,7 +662,7 @@ launchers! {
     /// [`CompFinish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
     /// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
     /// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_kv_compress_decode -> rivoli_kv_compress_decode, "kv_compress_decode" (
+    launch_kv_compress_decode => rivoli_kv_compress_decode(CompressDecode { kv_state, score_state, f: *f, p: *p, start_pos: start_pos as i32 }, stream), "kv_compress_decode" (
         kv_state: *mut f32,
         score_state: *mut f32,
         f: &CompFinish as *const CompFinish,
@@ -668,9 +676,10 @@ launchers! {
 //
 // A launcher that cannot be a DSL row fails one way: a parameter the mirror has no syntax for.
 // `hip.rs::launch_index_score_blocks` set the precedent (a buffer group becoming four arguments)
-// and its exemption block carries the argument; `launch_index_score_blocks_f32` joined it there,
-// beside its twin. `launch_gdn_recurrent_f32` below is the attention family's, for `GdnBufs`, and
-// lives here for cohesion — and because `hip.rs` measured 836 lines with it, over the 800 ceiling
+// and `launch_index_score_blocks_f32` joined it there, beside its twin — both are `=>` rows since
+// 2026-11-19, when their kernels moved to Rust and a row could build the kernel's argument block
+// (`hip.rs`'s exemption note has the record). `launch_gdn_recurrent_f32` below is the attention
+// family's, for `GdnBufs`, and lives here for cohesion — and because `hip.rs` measured 836 lines with it, over the 800 ceiling
 // this file was itself split out under. `launch_rmsnorm_gate_heads_f32` sat beside it from
 // 2026-09-01 for `HeadCount`/`HeadDim` alone and went back to being a row on 2026-09-02, when the
 // DSL grew `=>` for exactly that.

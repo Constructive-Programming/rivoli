@@ -4,7 +4,9 @@
 //! agree on.
 
 /// MISA router block size (pooled tokens per running-mean key). MUST match
-/// `MISA_BLOCK` in kernels/indexer.hip — the block pool the head router scores over.
+/// `rivoli_abi::geom::MISA_BLOCK`, which `crates/kernels/src/indexer.rs::index_pool_push` indexes
+/// by — the block pool the head router scores over. (This crate does not depend on `rivoli-abi`;
+/// the pair was a cross-file honour tie under hipcc too.)
 pub const MISA_BLOCK: usize = 1024;
 
 /// LayerNorm epsilon for the indexer's `k_norm` (which, unlike every model RMSNorm,

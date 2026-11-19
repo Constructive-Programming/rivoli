@@ -9,12 +9,17 @@
 
 use crate::hip::{abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
-    Rows, rivoli_act_quant_f8, rivoli_rmsnorm_centered_single, rivoli_rmsnorm_single,
-    rivoli_rmsnorm_weightless_batch, rivoli_rope_interleave, rivoli_rope_split_half,
-    rivoli_situ_glu_f32, rivoli_swiglu, rivoli_swiglu_clamped_bf16,
+    Rows, rivoli_act_quant_f4_rotated, rivoli_act_quant_f8, rivoli_act_quant_f8_prefix,
+    rivoli_layernorm, rivoli_qk_norm, rivoli_rmsnorm_batch, rivoli_rmsnorm_centered_single,
+    rivoli_rmsnorm_single, rivoli_rmsnorm_weightless_batch, rivoli_rope_adjacent,
+    rivoli_rope_interleave, rivoli_rope_split_half, rivoli_situ_glu_f32, rivoli_swiglu,
+    rivoli_swiglu_clamped_bf16,
 };
 use anyhow::Result;
-use rivoli_abi::kernarg::{Gate, GateClamped, GateSitu, Rope, RowNorm, WeightlessNorm};
+use rivoli_abi::kernarg::{
+    ActQuantPrefix, F4Rotate, Gate, GateClamped, GateSitu, LayerNorm, QkNorm, RmsNormRows, Rope,
+    RopeAdjacent, RowNorm, WeightlessNorm,
+};
 use std::ffi::c_void;
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports.
@@ -38,8 +43,8 @@ launchers! {
     /// SwiGLU combine `h = silu(g)·u` (GLM's dense fp8 MLP, and V4's shared-expert chain;
     /// safe in place, `h` may alias `g`).
     ///
-    /// `stream` is trailing and null is the null stream, per the `mla.hip` V4-launcher
-    /// contract: V4's shared-expert chain is stream-ordered as a SET (§M7), and GLM's one
+    /// `stream` is trailing and null is the null stream, per the `mla.hip` (tag
+    /// `archive/hip-kernels`) V4-launcher contract: V4's shared-expert chain is stream-ordered as a SET (§M7), and GLM's one
     /// call site passes null — unchanged to the byte.
     ///
     /// # Safety
@@ -234,7 +239,7 @@ launchers! {
     /// `src` and `dst` are device buffers of at least `rows * row_stride` f32 (the same
     /// buffer, or non-overlapping ones), and must outlive `stream`'s completion. `stream`
     /// is a live `hipStream_t`, or null for the default stream.
-    launch_act_quant_f8_prefix -> rivoli_act_quant_f8_prefix, "act_quant_f8_prefix" (
+    launch_act_quant_f8_prefix => rivoli_act_quant_f8_prefix(ActQuantPrefix { src, dst, rows: rows as i32, row_stride: row_stride as i32, n: n as i32, block: block as i32 }, stream), "act_quant_f8_prefix" (
         src: *const f32,
         dst: *mut f32,
         rows: usize as i32,
@@ -263,7 +268,7 @@ launchers! {
     /// `x` is `rows · d` writable, 4-byte-aligned, device-resident f32, read and written in
     /// place, and outlives `stream`'s completion. `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_act_quant_f4_rotated -> rivoli_act_quant_f4_rotated, "act_quant_f4_rotated" (
+    launch_act_quant_f4_rotated => rivoli_act_quant_f4_rotated(Rows(rows as i32), F4Rotate { x, d: d as i32 }, stream), "act_quant_f4_rotated" (
         x: *mut f32,
         rows: usize as i32,
         d: usize as i32,
@@ -320,7 +325,7 @@ launchers! {
     /// # Safety
     /// Device pointers must outlive `stream`'s completion: `x` (`rows * d` f32), `w` (`d` f32).
     /// `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_rmsnorm_batch -> rivoli_rmsnorm_batch, "rmsnorm_batch" (
+    launch_rmsnorm_batch => rivoli_rmsnorm_batch(Rows(rows as i32), RmsNormRows { x, w, d: d as i32, eps }, stream), "rmsnorm_batch" (
         x: *mut f32,
         w: *const f32,
         rows: usize as i32,
@@ -334,7 +339,7 @@ launchers! {
     /// Q passes `qk_scale_factor` (3.87) and K passes 1.0 — the scale is Q's alone
     /// (`glimmer-architecture.md` trap 3), and it is folded here rather than given a second pass
     /// over the tensor. **Not `rmsnorm_batch`** (which multiplies a learned weight and stores bf16)
-    /// **and not `mla.hip::qk_norm`** (whose statistic is bf16 by DeepSeek-V4's reference); the
+    /// **and not `mla.rs::qk_norm`** (whose statistic is bf16 by DeepSeek-V4's reference); the
     /// kernel's own comment carries both arguments.
     ///
     /// # Safety
@@ -360,7 +365,7 @@ launchers! {
     ///
     /// # Safety
     /// Device pointers (`x`, `w`, `b`, `y` each `n` f32) live until the next [`device_sync`].
-    launch_layernorm -> rivoli_layernorm, "layernorm" (
+    launch_layernorm => rivoli_layernorm(LayerNorm { row: RowNorm { x, w, y, n: n as i32, eps }, b }), "layernorm" (
         x: *const f32,
         w: *const f32,
         b: *const f32,
@@ -376,7 +381,7 @@ launchers! {
     /// # Safety
     /// `q` is a device buffer of at least `rows * d` f32, and must outlive `stream`'s
     /// completion. `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_qk_norm -> rivoli_qk_norm, "qk_norm" (
+    launch_qk_norm => rivoli_qk_norm(Rows(rows as i32), QkNorm { q, d: d as i32, eps }, stream), "qk_norm" (
         q: *mut f32,
         rows: usize as i32,
         d: usize as i32,
@@ -428,7 +433,7 @@ launchers! {
     /// Device pointers must outlive `stream`'s completion: `x` (`rows * row_len` f32), `tbl`
     /// (at least `(pos0 + rows / rows_per_pos) * rd` f32, interleaved cos/sin). `stream` is a
     /// live `hipStream_t`, or null for the default stream.
-    launch_rope_adjacent -> rivoli_rope_adjacent, "rope_adjacent" (
+    launch_rope_adjacent => rivoli_rope_adjacent(Rows(rows as i32), RopeAdjacent { x, tbl, row_len: row_len as i32, rd: rd as i32, pos0: pos0 as i32, rows_per_pos: rows_per_pos as i32, inverse: i32::from(inverse) }, stream), "rope_adjacent" (
         x: *mut f32,
         tbl: *const f32,
         rows: usize as i32,

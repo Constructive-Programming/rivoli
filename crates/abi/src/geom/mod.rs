@@ -31,10 +31,18 @@ pub const ELEMENTWISE_BLOCK: u32 = 256;
 
 mod activation;
 mod attn;
+mod blockindex;
+mod indexer;
+mod kvcompress;
+mod mla;
 mod residual;
 mod touch;
 
 pub use activation::*;
 pub use attn::*;
+pub use blockindex::*;
+pub use indexer::*;
+pub use kvcompress::*;
+pub use mla::*;
 pub use residual::*;
 pub use touch::*;

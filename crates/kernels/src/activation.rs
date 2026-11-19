@@ -9,7 +9,7 @@
 //! `__restrict__` on an aliased call is UB the C gets away with by one-read-then-one-write;
 //! Rust raw pointers make no such promise to the optimizer in the first place.
 
-use crate::gpu::{bid, fma, for_i32, lds, ocml, tid};
+use crate::gpu::{bid, elementwise_id, fma, for_i32, lds, ocml, tid};
 use crate::prelude::actquant::{
     ACT_QUANT_AMAX_FLOOR, FP8_MAX_INV, act_quant_roundtrip, fast_round_scale,
 };
@@ -18,15 +18,13 @@ use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::{block_sum_lds, sync_threads, tree, wave_max};
 use crate::prelude::{situ_glu, swiglu_clamped};
 use core::intrinsics::{exp, sqrt};
-use rivoli_abi::geom::{ACT_QUANT_BLOCK, ACT_QUANT_THREADS, ELEMENTWISE_BLOCK, ROW_BLOCK, WAVE};
+use rivoli_abi::geom::{ACT_QUANT_BLOCK, ACT_QUANT_THREADS, ROW_BLOCK, WAVE};
 use rivoli_abi::kernarg::{ActQuant, Gate, GateClamped, GateSitu, Rope, RowNorm, WeightlessNorm};
 
 /// The gated combines' shared shape: `h[i] = f(g[i], u[i])` for the thread's one `i < n`.
-/// The index is HIP's `blockIdx.x * blockDim.x + threadIdx.x` — unsigned, wrapping — read
-/// as `int` for the signed bound test, exactly as the C does.
 #[inline(always)]
 unsafe fn gate_map(a: Gate, f: impl FnOnce(f32, f32) -> f32) {
-    let i = bid().wrapping_mul(ELEMENTWISE_BLOCK).wrapping_add(tid()) as i32;
+    let i = elementwise_id();
     if i < a.n {
         let i = i as usize;
         *a.h.add(i) = f(*a.g.add(i), *a.u.add(i));

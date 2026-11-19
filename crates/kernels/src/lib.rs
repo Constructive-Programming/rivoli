@@ -45,7 +45,11 @@
 
 mod activation;
 mod attn;
+mod blockindex;
 mod gpu;
+mod indexer;
+mod kvcompress;
+mod mla;
 // The `common.hpp` port (Phase 0b, merged 2026-11-18). `pub` because in a cdylib with
 // `warnings = deny` a private module's not-yet-called helpers (the dot families, `rowview`,
 // `moe_fixed`) are denied dead code; it can go private when Phase 1 calls them.

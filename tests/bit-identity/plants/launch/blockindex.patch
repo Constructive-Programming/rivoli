@@ -1,0 +1,9 @@
+--- a/src/blockindex.rs
++++ b/src/blockindex.rs
+@@ -68,5 +68,5 @@
+ /// the f32 accumulator, and the one rounding `.sum` performs on the way out.
+ #[unsafe(no_mangle)]
+ pub unsafe extern "gpu-kernel" fn index_score_blocks(a: ScoreBlocks) {
+-    score_blocks(a, |dot, w| rbf16(maxnum(rbf16(dot), 0.0) * w), rbf16);
++    score_blocks(a, |dot, w| maxnum(rbf16(dot), 0.0) * w, rbf16); // PLANT: per-term bf16 rounding dropped
+ }

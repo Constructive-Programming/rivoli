@@ -8,12 +8,10 @@
 //!
 //! Inputs: `attn_inputs.rs`.
 
-use super::attn_inputs::{
-    Mla, ROPE, as_words, index_words, mla, mla_inputs, nasty, plant_nonfinite,
-};
+use super::attn_inputs::{Mla, ROPE, index_words, mla, mla_inputs, nasty, plant_nonfinite};
 use super::common::Lcg;
 use super::device::{Cell, I, O, Out, Ref, S, Shapes, Side, Tally, both, code, guard_ptrs, sweep};
-use super::inputs::draw;
+use super::inputs::{draw, words32};
 use rivoli_backend::hip;
 use std::ptr::{null, null_mut};
 
@@ -195,7 +193,7 @@ fn gather_idxs((m, _, _, topk, rows): GatherShape, seed: u64) -> Vec<f32> {
             *w = u32::MAX; // -1
         }
     }
-    as_words(&ix)
+    words32(&ix)
 }
 
 pub fn gather_attn_shared_kv(r: &Ref, t: &mut Tally) {

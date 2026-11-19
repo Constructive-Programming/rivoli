@@ -1,0 +1,11 @@
+--- a/src/kvcompress.rs
++++ b/src/kvcompress.rs
+@@ -38,7 +38,7 @@
+     let wr = a.w.add(c as usize * a.k as usize);
+     let mut acc = 0.0f32;
+     for_i32(lane, a.k, WAVE, |i| {
+-        acc = fma(*xr.add(i), bf16f(*wr.add(i)), acc)
++        acc += *xr.add(i) * bf16f(*wr.add(i)) // PLANT: the dot's fma split
+     });
+     acc = wave_sum(acc);
+     if lane == 0 {

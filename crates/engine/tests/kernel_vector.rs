@@ -1,7 +1,7 @@
 //! The kernels whose operand is a VECTOR rather than a weight matrix, each against a host
 //! oracle written beside it: `argmax_reduce` and `vadd` (fwd.hip glue), `index_topk` (the
 //! attention row selector), `swiglu` and `vq_encode` (linalg.hip), and `rope_interleave`
-//! (mla.hip's rotary).
+//! (`mla.hip`'s rotary, tag `archive/hip-kernels`).
 //!
 //! **Split out of `kernel.rs` on 2026-08-15, with the MoE oracles that went to
 //! `kernel_moe.rs` — by COHESION, not by size alone.** `kernel.rs` had reached 2263 lines
@@ -268,8 +268,8 @@ fn swiglu_matches_the_division_form_in_place() {
 ///   (`cos 0 = 1`, `sin 0 = 0`), so `v[j] = v[2j]` and `v[half+j] = v[2j+1]` exactly — no
 ///   transcendental, no tolerance, one thread per element. This is what pins the layout
 ///   half of the kernel: the adjacent-pair READ and the half-split WRITE.
-///   `kernels/mla.hip` calls confusing that permutation with V4's adjacent-pair rotation
-///   "the single most likely silent-wrong" in the port, and both spellings produce fluent
+///   `kernels/mla.hip` (tag `archive/hip-kernels`) calls confusing that permutation with V4's
+///   adjacent-pair rotation "the single most likely silent-wrong" in the port, and both spellings produce fluent
 ///   text, so it is worth a gate that cannot be widened.
 /// * **A real position** for the angles, at a tolerance, since `pow`/`cos`/`sin` are libm
 ///   on both sides and are not required to agree bit for bit.

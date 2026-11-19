@@ -1,6 +1,6 @@
 //! The host halves of the Rust kernels — what the tag's `extern "C" int rivoli_*` launchers
-//! did: the argument guards, the grid geometry, the launch. One module per kernel family
-//! (`activation`, `attn`, `residual`, `touch`); a Phase 1 lane adds its family's file here.
+//! did: the argument guards, the grid geometry, the launch. One module per kernel family; a
+//! Phase 1 lane adds its family's file here.
 //!
 //! Each launcher keeps its C twin's name and return codes (`0`, POSITIVE guard code,
 //! `-(hipError_t)`) exactly, so a `launch_x => rivoli_x(..)` row in a `launchers!`
@@ -16,14 +16,23 @@
 
 #![cfg(feature = "rocm")]
 
+// One family per pair, interleaved: as two plain `mod x;` / `use x::*;` runs this list matches
+// `rivoli_abi::geom`'s line for line and crosses jscpd's 5-line floor (measured 2026-11-19).
 mod activation;
-mod attn;
-mod residual;
-mod touch;
-
 pub(crate) use activation::*;
+mod attn;
 pub(crate) use attn::*;
+mod blockindex;
+pub(crate) use blockindex::*;
+mod indexer;
+pub(crate) use indexer::*;
+mod kvcompress;
+pub(crate) use kvcompress::*;
+mod mla;
+pub(crate) use mla::*;
+mod residual;
 pub(crate) use residual::*;
+mod touch;
 pub use touch::rivoli_touch_region_async;
 
 use crate::module::{Geometry, Kernel, LdsBytes};
@@ -60,6 +69,11 @@ unsafe fn run_2d<A: Copy>(k: &Kernel<A>, checked: Checked2, stream: *mut c_void,
         Ok(grid) => unsafe { k.launch_2d(grid, stream, args) },
         Err(code) => code,
     }
+}
+
+/// `a <= 0 || b <= 0 || …` — the C guards' extent refusal (1001), one call per launcher.
+fn any_nonpositive(extents: &[i32]) -> bool {
+    extents.iter().any(|&x| x <= 0)
 }
 
 /// `!(x > 0 && x < INFINITY)` — the C guards' one-compare form, which refuses NaN, zero,

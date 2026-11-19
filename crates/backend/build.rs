@@ -11,7 +11,7 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 11] = [
+const KERNELS: [&str; 7] = [
     // `activation` and `residual` (split out of this file 2026-08-15/16) left this list
     // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below.
     "linalg",
@@ -19,7 +19,7 @@ const KERNELS: [&str; 11] = [
     // Split out of `moe.hip` 2026-08-16 (the FP4 routed-expert family, V4's pair and K3's
     // situ pair) — same argument again.
     "moe_f4",
-    "mla",
+    // `mla` left 2026-11-19 (Phase 1 L3): Rust now, `crates/kernels/src/mla.rs`.
     // `attn` left 2026-11-19: Rust now, `crates/kernels/src/attn/` (Phase 1 L4).
     // NEW with M9: Kimi-K3's gated-delta-rule family (recurrence, short conv, gated head
     // norm), ported verbatim from `k3:kernels/recurrent.hip`. A `.hip` absent from this
@@ -29,11 +29,10 @@ const KERNELS: [&str; 11] = [
     "recurrent",
     "fwd",
     "vmm",
-    "indexer",
+    // `indexer` left 2026-11-19 (Phase 1 L3): Rust now, `crates/kernels/src/indexer.rs`.
     // `async` left 2026-11-18: its host half is direct FFI (`src/hiprt.rs`), its one kernel
     // (`touch_region`) is Rust.
-    "kvcompress",
-    "blockindex",
+    // `kvcompress` and `blockindex` left 2026-11-19 (Phase 1 L3): Rust now, `crates/kernels/src/`.
     "headtail",
 ];
 

@@ -77,7 +77,8 @@ sweep!(ex_f2bf16, u16, |b| f::f2bf16(f32::from_bits(b)));
 sweep!(ex_f2e4m3, u8, |b| f::f2e4m3_rne(f32::from_bits(b)));
 sweep!(ex_f2e2m1, u32, |b| f::f2e2m1(f32::from_bits(b)));
 sweep!(ex_blk_shift, u32, |b| rowview::blk_shift(b as i32) as u32);
-sweep!(ex_nquad, u32, |b| p::absorb_nquad(b as i32) as u32);
+sweep!(ex_nquad, u32, |b| rivoli_abi::geom::absorb_nquad(b as i32)
+    as u32);
 sweep!(ex_moe_fixed, u64, |b| p::moe_fixed(f32::from_bits(b)));
 
 #[unsafe(no_mangle)]

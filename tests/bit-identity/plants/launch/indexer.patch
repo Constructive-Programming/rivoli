@@ -1,0 +1,11 @@
+--- a/src/indexer.rs
++++ b/src/indexer.rs
+@@ -151,7 +151,7 @@
+ /// The C's order-preserving key: `-0.0` canonicalised to `+0.0`, then the sign-flip map.
+ #[inline(always)]
+ fn topk_key(v: f32) -> u32 {
+-    let b = if v == 0.0 { 0 } else { v.to_bits() };
++    let b = v.to_bits(); // PLANT: -0.0 no longer canonicalised to +0.0
+     b ^ (((b as i32) >> 31) as u32 | 0x8000_0000)
+ }
+ 

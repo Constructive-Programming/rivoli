@@ -100,9 +100,9 @@ pub enum FoldProbe {
 ///
 /// Measured in this tree, not assumed — `kernels/linalg.hip` prices a 32 B/wave access as "a
 /// quarter line at a time against a 128 B cache line" (117 of 256 GB/s) and `kernels/mla.hip`
-/// records a 128 B wave load as "exactly one cache line". An earlier version of this constant said
-/// 64 B / 16 f32 with no citation, which would have made the sweep touch every OTHER line and the
-/// arm test a quantity nobody named.
+/// (tag `archive/hip-kernels`) records a 128 B wave load as "exactly one cache line". An earlier
+/// version of this constant said 64 B / 16 f32 with no citation, which would have made the sweep
+/// touch every OTHER line and the arm test a quantity nobody named.
 pub const LINE_F32: usize = 32;
 
 /// The two device u64 a cold read XOR-folds into: the bounce arena before the copy, the pool slot

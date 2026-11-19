@@ -6,17 +6,21 @@ use super::{Text, UNROWED, gate_rows, shipped_kernels};
 use std::path::Path;
 
 /// `(kernel, launcher)`: kernels run by a launcher of ANOTHER name, as one phase of a
-/// multi-kernel launch (a split-softmax pass and its combine). The census otherwise pairs each
-/// kernel with a `rivoli_<kernel>` of its own name, which one launcher cannot have twice; a
-/// listed kernel is rowed under `rivoli_<launcher>`, whose gate row and `=>` row score and
-/// reach it. Checked at both ends ([`stale_launched_by`] names each refusal); an unlisted
+/// multi-kernel launch (a split-softmax pass and its combine) or a variant the launcher picks by
+/// an argument. The census otherwise pairs each kernel with a `rivoli_<kernel>` of its own
+/// name, which one launcher cannot have twice; a listed kernel is rowed under
+/// `rivoli_<launcher>`, whose gate row and `=>` row score and reach it. Checked at both ends ([`stale_launched_by`] names each refusal); an unlisted
 /// phase reads as missing from both populations, like any unrowed kernel. That a row reaches
 /// EVERY phase (a split needs a shape that splits) is argued by the row's shapes, at the row.
-pub(super) const LAUNCHED_BY: [(&str, &str); 2] = [
+pub(super) const LAUNCHED_BY: [(&str, &str); 4] = [
     // `rivoli_mla_attend`: the split-KV attend, then (when the plan splits) the combine. Its
     // gate row's shapes reach both: `nr` from 1 (one split) past 2048 (16).
     ("mla_latent_attend", "mla_attend"),
     ("mla_attend_combine", "mla_attend"),
+    // Phase 1 L3 (2026-11-19): the MLA pair's two-token-row kernels, which the launcher picks
+    // by `nrow` — the rows sweep `nrow ∈ {1, 2}`, so each reaches both kernels.
+    ("mla_absorb_fp8_r2", "mla_absorb_fp8"),
+    ("mla_value_fp8_r2", "mla_value_fp8"),
 ];
 
 /// The names the shipped kernels are rowed under — less [`UNROWED`], each kernel's

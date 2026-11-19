@@ -51,13 +51,3 @@ pub fn moe_fixed(v: f32) -> u64 {
     // SAFETY: the clamp bounds `r` to ±2^58, finite and inside i64.
     unsafe { r.to_int_unchecked::<i64>() as u64 }
 }
-
-/// i-quads per head in `mla_absorb_fp8`. In C++ ONE definition served the kernel and the
-/// launcher's grid so the two could not disagree (a short grid leaves columns unwritten,
-/// silently); the Rust launcher is host code and cannot import this device crate. That crate
-/// now exists (`rivoli_abi::geom`, merged 2026-11-18) and is where this moves when L3 ports
-/// `mla_absorb_fp8` and its launcher — the tie stays OPEN until then.
-#[inline(always)]
-pub const fn absorb_nquad(kvl: i32) -> i32 {
-    kvl.wrapping_add(3) >> 2
-}

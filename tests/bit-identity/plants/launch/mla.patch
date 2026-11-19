@@ -1,0 +1,16 @@
+--- a/src/mla.rs
++++ b/src/mla.rs
+@@ -122,11 +122,11 @@
+     for d in 0..k.nope as usize {
+         let p = *w4;
+         let s = *k.scale.add(((q.rbase + d) >> bsh) * q.sc_cols + sc_col);
+-        let ls = |b: u32| *q.lut.add((b & 0xff) as usize) * s;
++        let ls = |b: u32| *q.lut.add((b & 0xff) as usize); // PLANT: `lut · s` no longer hoisted
+         let l = [ls(p), ls(p >> 8), ls(p >> 16), ls(p >> 24)];
+         for r in 0..R {
+             let qd = qrow(r, d);
+-            acc[r] = core::array::from_fn(|c| fma(qd, l[c], acc[r][c]));
++            acc[r] = core::array::from_fn(|c| fma(qd * l[c], s, acc[r][c])); // PLANT
+         }
+         w4 = w4.add(kvl >> 2);
+     }

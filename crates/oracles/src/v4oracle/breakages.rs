@@ -230,7 +230,7 @@ defects! {
     HeadNormSkipped,
     /// Run the final `RMSNorm` but return f32, skipping the bf16 store `RMSNorm.forward`
     /// performs on the way out. Measured at 7.5e-3 on a 3.1 max (0.24%) elsewhere in this
-    /// port, and it is a live choice on the device: `kernels/mla.hip::rmsnorm_batch` bf16-rounds
+    /// port, and it is a live choice on the device: `crates/kernels/src/mla.rs::rmsnorm_batch` bf16-rounds
     /// and `kernels/linalg.hip::rmsnorm_single` does not.
     HeadNormNotBf16,
     /// Take the final `RMSNorm`'s statistic JOINTLY over all `s * dim` values instead of per
