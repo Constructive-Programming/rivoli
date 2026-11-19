@@ -1443,7 +1443,8 @@ so a verdict on a ~2 µs row below ~1.15 is inside noise.
 
 In Rfwd, the L1 ~2 µs rows `embed_i8_row`, `gather_rope`, `vadd` and `flag_nonfinite` read
 1.118–1.147. In the other three arms they read 0.98–1.04. The Phase 0 gate kernel `swiglu` read
-0.981–1.171 across the four arms, and `attn_res` read 1.046–1.082 (still owed, as before).
+0.981–1.171 across the four arms, and `attn_res` read 1.046–1.082 (still owed, as before; *paid 2026-11-19, 0.995 / 1.000 on the
+integration lease, Phase 1 integration Step 4*).
 This is the same unexplained ~2 µs swing as Phase 0's merge-review lease, now with replicates.
 
 **Slow rows, read from the ISA** (`llvm-objdump` of the shipped object against the tag's
@@ -1865,7 +1866,7 @@ These supersede the `60ac104` lease's MoE and recurrent rows. Every other row re
 | `moe_expert_range_f4` V4, 6-expert batch | 766.64 | 787.40 | 1.027 | unplanted: 1.021 |
 | `moe_expert_range_f4_situ` K3 (3584, 3072), 1 expert | 60.74 | 64.99 | **1.070** | planted |
 | `moe_expert_range_f4_situ` K3, 4-expert batch | 707.37 | 707.06 | 1.000 | planted |
-| `attn_res` (1, 9, 7168, 9) — Phase 0, owed | 53.62 | 57.43 | 1.071 | 1.013 (unplanted) |
+| `attn_res` (1, 9, 7168, 9) — Phase 0, owed *(paid 2026-11-19: 0.995 / 1.000 on the integration lease, Step 4)* | 53.62 | 57.43 | 1.071 | 1.013 (unplanted) |
 
 - **The two delta rules.** The load-before-store groups closed `gated_delta`'s gap, and `gdn`'s
   predicted win landed. Both are single samples, since both were planted in R.
@@ -1878,7 +1879,8 @@ These supersede the `60ac104` lease's MoE and recurrent rows. Every other row re
     was planted in R.
 - **Obligation 1, timing half.**
   - **V4: met.** The fp4 range reads 1.021–1.028 over two samples, with the down pass now real.
-  - **K3: OPEN.** Its single expert reads 1.070 in the only valid sample.
+  - **K3: OPEN.** Its single expert reads 1.070 in the only valid sample. *(Closed 2026-11-19:
+    1.034 / 1.041 on the integration lease's A/A′, not slow — Phase 1 integration, Step 4.)*
 
 ### Phase 1 integration (2026-11-19, branch `wave/rk-integrate`)
 
@@ -2022,7 +2024,7 @@ unrolling hipcc does too (`kv_compress_decode`); the last column says which:
 | `attn_res` (1.04–1.07) | 725 | 1590 | 1583 | **left:** Phase 0's 16-slot `each_src` is what keeps `p[16]` out of scratch (144 B → 0, 1.38× → 1.06×); within noise for its size |
 | `hash_rows` (1.8–1.9, `--divergence-log` only) | 169 | 262 | 262 | **left:** system-scope `fetch_xor` = a CAS loop; an agent-scope XOR needs inline asm or a syncscope route, neither available in nightly 1.102's `core`. Diagnostic-only |
 | `moe_down_i4_r2` (int4 nrow 2, 1.070) | 802 | 801 | 801 | **left:** VGPR 100 against hipcc's 95, 12 against 16 waves. A prelude property (`dot_nib_wave_r::<2>`); any change re-scores every nib caller |
-| K3 fp4 single expert (1.070, one sample) | — | — | — | **left:** no ISA difference was identified in L2's census; the lease's A/A′ spread decides whether it is real |
+| K3 fp4 single expert (1.070, one sample) | — | — | — | **left:** no ISA difference was identified in L2's census; the lease's A/A′ spread decides whether it is real *(decided: not slow, Step 4)* |
 
 Four kernels outside the table also changed:
 - `gemv_fp8_bf16` 906 → 823 and `mla_absorb_fp8` 1044 → 1002, both from (c). Neither was owed:
@@ -2031,3 +2033,116 @@ Four kernels outside the table also changed:
 
 None of these is a timing claim. Each row's ratio is judged on the lease, against the A vs A′
 spread.
+
+**Step 4 — the integration lease (2026-11-19, commit `f926d2e`, rh-anine).** `lease.sh` ran the
+whole lease from one `setsid`-detached driver, with its own PGID and SID, from 16:21 to 20:48.
+- **Waiting and builds:** waits were on progress content lines, never on process absence.
+  Every binary was built outside the lock before the GO: the dev build checked at 0 units to
+  compile, `bit_identity` Fresh, the 13 plant binaries (`git archive f926d2e` + patch, in their
+  own target dir, with restoration checked by `diff -r`), the probe objects with current
+  stamps, and the release `rivoli`.
+- **Witness:** **26 arms, none discarded; every witness 0 B; GTT 17.8 MiB before every arm; 0
+  units compiled inside the lock.** GTT read 17 MiB (the witness rounds down) before every arm;
+  18702336 B exact around D. Host loadavg stayed at 1.1–3.6, except at the end of R-indexer and
+  into R-blockindex (27.8; a foreign `java` process, seen in `ps` during the lease, CPU only and
+  not a GPU tenant) and at the end of D (11.5).
+- **Evidence:** `/var/cache/rivoli/scratch/rk-integrate/lease/` (`progress`, `<arm>.out`,
+  `timing-AA2.txt`, `D.gtt`, `D-tmp/`); per-arm logs are in the `…/bit-identity/<stamp>` each
+  `.out` names.
+
+| arm | verdict | rc | wall |
+|---|---|---|---|
+| A | GREEN: 66/66 rows BIT-IDENTICAL | 0 | 15.3 min |
+| A′ (A again, the timing control) | GREEN: 66/66 | 0 | 15.4 min |
+| 13 launcher-row plant arms (the 15 patches, L2's three in one binary) | each GREEN (expect-red), exactly its own rows red | 0 each | 15.0–16.9 min each |
+| `--probes` | GREEN: every probe row identical | 0 | 0.9 min |
+| 8 probe plants | each GREEN: red only where the defect reaches | 0 each | ≤ 0.9 min each |
+| W (full battery, `--test-threads=1`) | 720 passed, 2 failed: CodeScene (the 30 base files) and `kernel_qwen_indexer::the_block_key_pipeline_matches_the_anchor` — a TEST defect, below | 101 | 18.9 min |
+| D (`determinism-glm.sh`, `--arena-refresh`, ngen 1024) | GREEN: ids identical to 1024 | 0 | 13.5 min |
+
+- **Bits.** The combined tree is byte-identical to the tagged hipcc on every launcher row. That
+  includes every Step 2/3 change: nsw, the unchecked divisions, the `f2e2m1` boolean (also
+  through the probes' exhaustive `ex_f2e2m1` sweep), `each_live` and gather's `int` counter.
+- **Plants.** Every plant re-proved itself individually on the combined tree, with cell counts
+  equal to the lanes' own leases and CPU models:
+  - L1: `gemv_f32` 196, `gemv_i8` 172, `sigmoid_gate` 256, `hc_head_collapse` 167;
+  - L3: `index_topk` 126, `index_score_blocks` 203, `gemm_bf16` 266, `mla_absorb_fp8` 256;
+  - L2 (one binary, all three plants): exactly its five rows;
+  - L4: `mla_attend` 551, `gather_attn_shared_kv` 187, grid-y's `mla_attend` 384, and the GQA and
+    MHA rows red as planted;
+  - rope 275, on its first run as a patch;
+  - the probe plants' red-group counts, 6/18/4/30/1/34/28/15, are Phase 0's exactly, so the
+    regenerated `situ` plant works.
+- **D.** GTT read 18702336 B both before and after (rise 0); witness a/b 0 B; `slot_stalls 0`;
+  decode at 2.86 and 2.76 tok/s (Phase 0's D ran at 2.72 and 2.96). Like every D, this bounds
+  the nondeterminism rate; it does not prove determinism.
+
+**The A vs A′ noise floor** (`timing-AA2.txt`; the minimum of three 200-launch batches per
+shape):
+- Most rows of 10 µs and up repeat within ±0.005; the widest are `kv_compress_prefill` 0.037,
+  `moe_expert_range_i4` nrow 1 0.028, `argmax` 0.026, `vq_encode` 0.018 and `index_topk` 0.017.
+- The ~2 µs rows swing by up to 0.20: `swiglu` 0.128, `swiglu_clamped_bf16` 0.181,
+  `situ_glu_f32` 0.145, `embed_bf16_row_bcast` 0.197, `rope_adjacent` 0.120. That is the
+  "unexplained swing" of every earlier lease, now measured as a per-row floor.
+- **Rule (coordinator, fixed before the result):** a row is slow only if its mean A/A′ ratio
+  exceeds 1 + max(0.05, its A/A′ spread).
+
+| owed row | lease ratio before | A / A′ now | verdict |
+|---|---|---|---|
+| `mla_attend` | 1.20 | 1.003 / 1.004 | not slow |
+| `gqa_attend` | 1.14 | 0.988 / 0.988 | not slow |
+| `gqa_block_attend` | 1.07 | 1.009 / 1.008 | not slow |
+| `act_quant_f4_rotated` | 1.47 | 0.959 / 0.957 | not slow |
+| `gemv_f32` | 1.09–1.10 | 1.036 / 1.034 | not slow |
+| `gemv_i8` | 1.06–1.08 | 1.021 / 1.020 | not slow |
+| `gemv_fp8` split-K | ≤ 1.09 | 1.018 / 1.012 | not slow |
+| `vq_encode` (L1's `i32` fix) | 1.61 | 0.967 / 0.949 | not slow |
+| `kv_compress_deposit` | 1.06 | 1.037 / 1.020 | not slow |
+| int4 range nrow 2 (`moe_down_i4_r2`) | 1.070 | 1.035 / 1.036 | not slow |
+| K3 fp4, single expert | 1.070 | 1.034 / 1.041 | not slow |
+| `attn_res` | 1.04–1.07 | 0.995 / 1.000 | not slow |
+| the gated combines | 0.96–1.17 | 0.98–1.16 | not slow (inside a 0.13–0.18 spread) |
+| **`gather_attn_shared_kv`** | 1.21 | 1.109 / 1.106 | **slow**: no loop-shape cause found; 22 `s_nop` hazard pads outside the hot loops unpriced (Step 3) |
+| **`kv_compress_decode`** | 1.22 | 1.060 / 1.070 | **slow**: loops now hipcc-shaped, the rest unexplained |
+| **`mla_value_fp8`** | 1.055 | 1.060 / 1.062 | **slow**: float census identical to hipcc's (L3) |
+| **`hash_rows`** | 1.8–1.9 | 1.932 / 1.897 | **slow**: the system-scope atomic, `--divergence-log` only |
+
+Also faster than hipcc, as before: `mha_attend` 0.27×, `gdn_recurrent_f32` 0.42×, the block
+scorers 0.18×.
+
+**W's second failure: a race in the test, confirmed and fixed (coordinator-directed).**
+- **The race.** `kernel_qwen_indexer.rs` launched `index_pool_norm_f32` on `s` (from
+  `common::stream()`, non-blocking). It then ran `launch_rope_split_half`, which takes no
+  stream and so runs on the null stream, in place on the same `kbar` rows with no join. The null
+  stream does not order against a non-blocking stream.
+- **Why it surfaced now.** The kernel was byte-identical to hipcc in A and A′. The hipcc build
+  passed by winning the race; the Rust launch path lost it (`pooled_keys` 7.1479464e-1 against
+  1.14e-4).
+- **The fix.** A `device_sync()` after the pool-norm. The same join also went after the query
+  RoPE, the reverse order on `qrows`, which had been ordered only by two blocking uploads that
+  happen to sit between the launches. The tolerance is untouched.
+- **Confirmed on the device** (`scratch/rk-integrate/confirm/`, six witnessed arms under the
+  flock, all witnesses 0 B):
+  - the unfixed binary (W's own, copied before the fix) failed 2 of 3 runs, at the same
+    7.1479464e-1;
+  - the fixed binary passed 3 of 3. That is thin on its own (at the unfixed binary's 1-in-3 pass
+    rate, three straight passes would happen about 4% of the time), and the fix stands first on
+    the code argument.
+- **The sweep for the class** (deviceless, over every test and `crates/engine/src`,
+  `crates/cli/src`) found no other race. Every engine cross-stream edge is ordered, all by an
+  explicit `device_sync` except the one below, which a blocking readback orders.
+- **OWED hardening, not a defect today:** `glm/mlp.rs`'s `launch_moe`. The compute and miss
+  streams read the null stream's writes of `xn` (and the gate GEMV) with no explicit join; only
+  the blocking gate-logits D2H (`copy_out_into`) orders them. V4 (`v4/moe.rs`) and K3
+  (`k3/forward.rs`) make that an explicit join. Remove the readback and GLM would race.
+
+**Left owed:**
+- the four slow rows above;
+- the `glm/mlp.rs` join;
+- Phase 2: the dead hipcc half of `build.rs`, the 9 headers, the `launchers!` matcher's
+  decorative annotations and the census's `->` arrow;
+- L2's `MoeRange` literals;
+- one shared plant-threshold helper;
+- from Step 1: L2's gdn `rep` computed in the row; the L1/L2 launcher-row plants at the plants
+  root rather than `plants/launch/`;
+- CodeScene: the 30 inherited files below 10/10, unchanged by this branch.

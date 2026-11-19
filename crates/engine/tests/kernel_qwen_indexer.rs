@@ -645,7 +645,7 @@ fn the_block_key_pipeline_matches_the_anchor() {
     use common::{DeviceBuf, back, dev, f32b, f32v, ok, stream, zeros};
     use rivoli_backend::abi::ScoreDims;
     use rivoli_backend::hip::{
-        ScoreBufs, launch_index_pool_norm_f32, launch_index_score_blocks_f32,
+        ScoreBufs, device_sync, launch_index_pool_norm_f32, launch_index_score_blocks_f32,
         launch_rope_split_half,
     };
 
@@ -676,6 +676,16 @@ fn the_block_key_pipeline_matches_the_anchor() {
         },
         "index_pool_norm_f32",
     );
+    // **Join `s` before the RoPE: a defect in this TEST, fixed 2026-11-19 (`rust-kernels.md` §5,
+    // Phase 1 integration, Step 4).** The pool-norm runs on `s`, which `common::stream()` creates
+    // non-blocking; `launch_rope_split_half` takes no stream, so it runs on the legacy null stream,
+    // which does not order against a non-blocking one — the in-place RoPE raced the pool-norm
+    // writing `kbar`. The hipcc build passed by winning that race on timing; the Rust launch path
+    // lost it. The tolerance is untouched: the fix is the missing join, not a looser bar.
+    ok(
+        device_sync(),
+        "join the pool-norm's stream before the null-stream RoPE",
+    );
     // One RoPE launch per block, each at that block's FIRST token position. `count = 1` and
     // `stride = hd` address exactly one row; `seg = rotary_dim` is the partial width, so dims
     // `rotary_dim..hd` pass through untouched — which is the half of trap T16 a fixture with
@@ -703,6 +713,13 @@ fn the_block_key_pipeline_matches_the_anchor() {
     ok(
         unsafe { launch_rope_split_half(q_out, c.heads, c.hd, c.rd, q, c.theta) },
         "rope_split_half on the indexer query",
+    );
+    // The same race in reverse, joined for the same reason: this RoPE ran on the null stream and
+    // the score below reads `qrows` on `s`. It was ordered only by accident, by the two blocking
+    // null-stream uploads (`w`, `scores`) that happen to sit between the launches.
+    ok(
+        device_sync(),
+        "join the null-stream RoPE before the score on `s`",
     );
 
     // The score: `w` filled with `1/sqrt(hd)`, which is the scale MOD:693 applies after the sum —
