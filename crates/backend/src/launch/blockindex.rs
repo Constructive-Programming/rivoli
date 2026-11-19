@@ -1,4 +1,6 @@
 //! `blockindex.hip`'s launchers: V4's rotated fp4 activation simulator and the bf16 block scorer.
+//!
+//! The `.hip` file named here is deleted from the tree; cite it at tag `archive/hip-kernels`.
 
 use super::{Rows, any_nonpositive, elementwise, run};
 use crate::module::{Geometry, Kernel, LdsBytes};

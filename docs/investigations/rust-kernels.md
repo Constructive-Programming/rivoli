@@ -944,4 +944,35 @@ So the count stays 9.
 
 *Plants.* Two launcher-row plants, each with a CPU proof, recorded in `gate-red-proofs.md` §18.
 
+**kvcompress, deviceless half (2026-11-19).**
+
+*Ported.* `gemm_bf16`, `kv_compress_deposit`, `kv_compress_prefill`, `kv_compress_decode`;
+`kvcompress.hip` deleted. `CompGeom`/`CompFinish` are no longer mirrors: they ride by value
+inside the kernels' argument blocks.
+
+*The deposit's grid stride.* It read `gridDim.x · blockDim.x`, so it now arrives as
+`kernarg::Strided::threads`, set by the launcher from the grid it launches.
+
+*A defect introduced by an ISA misreading, and caught by review on the IR.* The first draft
+fused the RoPE `hi` correctly: hipcc fuses the LEFT product of `a·s + b·c`, `fma(a, s, b·c)`.
+That is `%add84 = fadd(%mul82 = s·a, %mul83 = c·b)` in the IR, and in the ISA
+`v_mul c·b; v_fmac += s·a`, where `v[12:13]` is `seg`, the pair the store writes back.
+
+A census follow-up then swapped the register roles, "fixed" the kernel to the right product,
+and wrote a correction to `kernels/lib.rs` saying the left-product rule does not hold. The
+correctness reviewer re-derived both sites from the IR. Phase 0's `rope` is written
+`b·cs + a·sn`, so its fused `b·cs` is also the left product. Everything was reverted before
+commit; the rule stands.
+
+Two lessons:
+- Read register roles off the loads and stores, not off which product "looks" like the pair.
+- The CPU model shows the gate would have seen this defect on only 10/384 prefill cells
+  (`gate-red-proofs.md` §18, Phase 1 L3).
+
+*The masked-`ape` `+ 0.0`.* The decode pool's add survives (`-0.0 + 0.0 = +0.0`); it is
+present in the Rust ISA.
+
+*ISA census.* Identical to hipcc for `gemm_bf16` and the deposit. The pooling kernels differ
+by hipcc's 3–4× unroll of the entry loops.
+
 *Device arms.* OWED.

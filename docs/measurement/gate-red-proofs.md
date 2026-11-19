@@ -2059,6 +2059,17 @@ Each plant was first shown adversarial on the gate's own inputs by
 |---|---|---|---|
 | `indexer` | `index_topk`'s key drops the `-0.0` → `+0.0` canonicalisation (a tie-break defect: `-0.0` orders below `+0.0` instead of tying and falling to the index rule) | 126/256 partial-selection cells select a different row set: 30–48/64 seeds at the three shapes whose boundary falls in the `±0` run, 0 at `(65536, 2048)`, whose boundary sits in the positive ties | `index_topk` |
 | `blockindex` | `index_score_blocks` drops the per-term bf16 rounding before the f32 accumulator | 203/256 cells: 64/64 seeds at three shapes, 11/64 at the single-block `[1, 1, 64, 128]` | `index_score_blocks` |
+| `kvcompress` | `gemm_bf16`'s dot accumulator unfused (`acc += x·w` instead of hipcc's `v_fmac`) | 266/320 cells: 64/64 seeds at the four real shapes, 10/64 at the ragged `[3, 7, 33]` | `gemm_bf16` |
+
+**The plant first written for `kvcompress` failed, and what it measured is kept.** It was the
+compressor RoPE fusing the wrong product of `a·s + b·c`. This port briefly had exactly that
+mistake: an ISA misreading "fixed" a correct draft backwards, and the correctness review caught
+it on the IR before any device run (`rust-kernels.md` §5, Phase 1 L3). On the gate's prefill inputs it moves only
+**10/384** cells (10/64 at the 512-block hot shape, none elsewhere), because the final bf16
+store erases a 1-ulp FMA difference. That is the spike's sub-threshold regime. So the rows CAN
+see that defect, and `compress_rope_fusion_is_visible_to_the_prefill_rows` asserts at least one
+cell does, but no device arm should be trusted to catch it. The compressor's FMA sites rest on
+the ISA reading, and the family's red proof is the GEMM plant.
 
 The first CPU run of the `indexer` model REFUSED (126/448). Three of the seven shapes select
 every entry (`k >= nt`), so no tie rule can move them. The model now counts only partial

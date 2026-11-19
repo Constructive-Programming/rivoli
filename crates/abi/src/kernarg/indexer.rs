@@ -1,16 +1,8 @@
 //! `kernels/indexer.hip`'s kernels: the DSA/MISA lightning indexer (key LayerNorm, cache append,
 //! scoring, the MISA pool and head router, the device top-k) and Qwen's QSA block-key stage — plus
 //! the block scorers both `indexer.hip` and `blockindex.hip` launch over one operand set.
-
-/// A kernel whose block size the LAUNCHER chooses at run time (`next_pow2` of an extent) takes it
-/// here rather than from the dispatch packet (Phase 0c: ~1.1 µs per launch). `block` is exactly the
-/// `blockDim.x` the launcher passes, set by the launcher and never by a caller.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Blocked<A> {
-    pub a: A,
-    pub block: u32,
-}
+//!
+//! The `.hip` file named here is deleted from the tree; cite it at tag `archive/hip-kernels`.
 
 /// `layernorm` — `y = (x - mean)/sqrt(var + eps)·w + b` over one row of `n`: a `RowNorm`
 /// plus the bias the indexer's `k_norm` ships and no model RMSNorm does.
@@ -50,7 +42,7 @@ pub struct IndexScore {
     pub dscale: f32,
 }
 const _: () = assert!(size_of::<IndexScore>() == 64);
-const _: () = assert!(size_of::<Blocked<IndexScore>>() == 72);
+const _: () = assert!(size_of::<super::Blocked<IndexScore>>() == 72);
 
 /// `index_pool_push` — fold token `t`'s key into its MISA block's running mean.
 #[repr(C)]
@@ -76,7 +68,7 @@ pub struct HeadRoute {
     pub hd: i32,
 }
 const _: () = assert!(size_of::<HeadRoute>() == 48);
-const _: () = assert!(size_of::<Blocked<HeadRoute>>() == 56);
+const _: () = assert!(size_of::<super::Blocked<HeadRoute>>() == 56);
 
 /// `index_topk` — `rows[0..k)` the top-`k` of `s[0..nt)`, ascending by index; `k <= nt` (the
 /// launcher clamps).
@@ -102,7 +94,7 @@ pub struct PoolNorm {
     pub eps: f32,
 }
 const _: () = assert!(size_of::<PoolNorm>() == 40);
-const _: () = assert!(size_of::<Blocked<PoolNorm>>() == 48);
+const _: () = assert!(size_of::<super::Blocked<PoolNorm>>() == 48);
 
 /// The block scorers' four buffers — `q` `[s, heads, hd]`, `kv` `[n_comp, hd]`, `w` `[s, heads]`,
 /// `score` `[s, n_comp]`. ONE definition for the engine's call sites and both kernels: three

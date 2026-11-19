@@ -24,9 +24,13 @@ use crate::abi::{CompFinish, CompGeom};
 use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
     Rows, rivoli_index_append, rivoli_index_head_route, rivoli_index_pool_norm_f32,
-    rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk,
+    rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk, rivoli_kv_compress_decode,
+    rivoli_kv_compress_deposit, rivoli_kv_compress_prefill,
 };
-use rivoli_abi::kernarg::{HeadRoute, IndexAppend, IndexScore, PoolNorm, PoolPush, TopK};
+use rivoli_abi::kernarg::{
+    CompressDecode, CompressPrefill, Deposit, HeadRoute, IndexAppend, IndexScore, PoolNorm,
+    PoolPush, TopK,
+};
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
 // twenty rewritten comments.
@@ -587,9 +591,9 @@ launchers! {
     /// distinguished only by `slot0`.
     ///
     /// A prefill of `s` tokens deposits its `s % ratio` trailing rows starting at slot 0; a
-    /// decode deposits its single row at slot `start_pos % ratio`. See
-    /// `kernels/kvcompress.hip::kv_compress_deposit` for why that is a unification and not a
-    /// coincidence.
+    /// decode deposits its single row at slot `start_pos % ratio`. See `kv_compress_deposit` in
+    /// `kernels/kvcompress.hip` (tag `archive/hip-kernels`) for why that is a unification and not
+    /// a coincidence.
     ///
     /// Must be launched on **every** call, including one that emits no block: the reference
     /// writes the state and only then returns `None`. At ratio 128 that is every prompt under
@@ -604,7 +608,7 @@ launchers! {
     /// parameter is `__restrict__`. `p` is read host-side before the launch; the device buffers
     /// must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or null for the
     /// default stream.
-    launch_kv_compress_deposit -> rivoli_kv_compress_deposit, "kv_compress_deposit" (
+    launch_kv_compress_deposit => rivoli_kv_compress_deposit(Deposit { kv, score, ape, kv_state, score_state, p: *p, s: s as i32, slot0: slot0 as i32 }, stream), "kv_compress_deposit" (
         kv: *const f32,
         score: *const f32,
         ape: *const f32,
@@ -632,7 +636,7 @@ launchers! {
     /// `nblk · p.d()` and `freqs` covering position `(nblk - 1) · p.ratio()`. None may alias
     /// another. All must outlive `stream`'s completion; `stream` is a live `hipStream_t`, or
     /// null for the default stream.
-    launch_kv_compress_prefill -> rivoli_kv_compress_prefill, "kv_compress_prefill" (
+    launch_kv_compress_prefill => rivoli_kv_compress_prefill(Rows(nblk as i32), CompressPrefill { kv, score, ape, f: *f, p: *p }, stream), "kv_compress_prefill" (
         kv: *const f32,
         score: *const f32,
         ape: *const f32,
@@ -655,7 +659,7 @@ launchers! {
     /// [`CompFinish`]'s field contract with `out` sized one row of `p.d()` and `freqs` covering
     /// position `(start_pos / ratio) * ratio`. None may alias another. All must outlive
     /// `stream`'s completion; `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_kv_compress_decode -> rivoli_kv_compress_decode, "kv_compress_decode" (
+    launch_kv_compress_decode => rivoli_kv_compress_decode(CompressDecode { kv_state, score_state, f: *f, p: *p, start_pos: start_pos as i32 }, stream), "kv_compress_decode" (
         kv_state: *mut f32,
         score_state: *mut f32,
         f: &CompFinish as *const CompFinish,

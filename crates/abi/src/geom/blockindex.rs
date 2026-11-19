@@ -1,4 +1,6 @@
 //! `kernels/blockindex.hip`'s geometry.
+//!
+//! The `.hip` file named here is deleted from the tree; cite it at tag `archive/hip-kernels`.
 
 use super::{F32, FP4_QUANT_BLOCK};
 

@@ -24,6 +24,8 @@ mod blockindex;
 pub(crate) use blockindex::*;
 mod indexer;
 pub(crate) use indexer::*;
+mod kvcompress;
+pub(crate) use kvcompress::*;
 mod residual;
 pub(crate) use residual::*;
 mod touch;

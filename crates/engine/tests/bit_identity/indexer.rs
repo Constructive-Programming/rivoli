@@ -8,12 +8,12 @@
 //!
 //! `index_topk`'s rows are TIE-HEAVY by construction ([`topk_scores`]): random scores almost never
 //! tie, and its output is integers, where a tie-break difference is a byte difference.
+//!
+//! The `.hip` file named here is deleted from the tree; cite it at tag `archive/hip-kernels`.
 
+use super::cells::{SCORE_BLOCKS_DIMS, score_blocks_ins};
 use super::device::{Cell, I, O, Out, Ref, S, Shapes, Side, Tally, both, code, guard_ptrs, sweep};
-use super::inputs::{
-    SCORE_BLOCKS_DIMS, TOPK_SHAPES, bf16_words, draw, score_blocks_ins, topk_scores, uniform,
-    words32,
-};
+use super::inputs::{TOPK_SHAPES, bf16_words, draw, topk_scores, uniform, words32};
 use rivoli_backend::abi::ScoreDims;
 use rivoli_backend::hip::{self, ScoreBufs};
 use std::ptr::{null, null_mut};

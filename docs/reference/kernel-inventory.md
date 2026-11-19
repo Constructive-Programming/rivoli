@@ -49,6 +49,9 @@ column is a query, and a query can be wrong.
 > **2026-11-19 (Rust-kernel Phase 1 L3):** the rows reading `indexer.rs` / `blockindex.rs` are
 > Rust likewise (`indexer.hip`, `blockindex.hip` deleted). The two block scorers were the
 > `hip.rs` hand-written pair; they are `=>` rows now, so their declaration cells name the kernel.
+>
+> **2026-11-19 (Phase 1 L3, same day):** the `kvcompress.rs` rows likewise (`kvcompress.hip`
+> deleted).
 
 | kernel (`launch_…`) | C entry | TU | GLM | V4 | K3 | Glimmer | Qwen | activated at (module :: fn) |
 |---|---|---|---|---|---|---|---|
@@ -83,10 +86,10 @@ column is a query, and a query can be wrong.
 | `index_score` | `index_score` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 | `index_topk` | `index_topk` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 | `layernorm` | `layernorm` | indexer.rs | · | · | · | · | · | *(no production reference)* |
-| `gemm_bf16` | `gemm_bf16` | kvcompress.hip | · | **✓** | **✓** | **✓** | · | glimmer/forward; k3/forward; v4/blocksel; v4/forward; v4/kvcompress :: bproj, deposit, head_tail, proj |
-| `kv_compress_decode` | `kv_compress_decode` | kvcompress.hip | · | **✓** | · | · | · | v4/kvcompress :: emit |
-| `kv_compress_deposit` | `kv_compress_deposit` | kvcompress.hip | · | **✓** | · | · | · | v4/kvcompress :: deposit |
-| `kv_compress_prefill` | `kv_compress_prefill` | kvcompress.hip | · | **✓** | · | · | · | v4/kvcompress :: emit |
+| `gemm_bf16` | `gemm_bf16` | kvcompress.rs | · | **✓** | **✓** | **✓** | · | glimmer/forward; k3/forward; v4/blocksel; v4/forward; v4/kvcompress :: bproj, deposit, head_tail, proj |
+| `kv_compress_decode` | `kv_compress_decode` | kvcompress.rs | · | **✓** | · | · | · | v4/kvcompress :: emit |
+| `kv_compress_deposit` | `kv_compress_deposit` | kvcompress.rs | · | **✓** | · | · | · | v4/kvcompress :: deposit |
+| `kv_compress_prefill` | `kv_compress_prefill` | kvcompress.rs | · | **✓** | · | · | · | v4/kvcompress :: emit |
 | `gemv_f32` | `gemv_f32` | linalg.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: gate, route_layer |
 | `gemv_fp8` | `gemv_fp8` | linalg.hip | **✓** | · | · | **✓** | · | glimmer/forward; glm/attn; glm/mlp :: desc_of, output_project, proj, qkv_project |
 | `gemv_i4` | `gemv_i4` | linalg.hip | · | · | · | · | · | *(no production reference)* |

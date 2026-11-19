@@ -4,8 +4,23 @@
 //! spike's first plant passed at 8 seeds (§1 of `rust-kernels.md`), so a plant that moves no cell
 //! on the drawn inputs proves nothing.
 
-use super::inputs::{SCORE_BLOCKS_DIMS, SEEDS, TOPK_SHAPES, score_blocks_ins, topk_scores};
+use super::cells::{
+    GEMM_SHAPES, GEOMS, PREFILL_SHAPES, SCORE_BLOCKS_DIMS, gemm_ins, geom, prefill_ins,
+    score_blocks_ins,
+};
+use super::inputs::{SEEDS, TOPK_SHAPES, topk_scores};
+use rivoli_backend::abi::CompGeom;
 use rivoli_core::num::{bf16_to_f32, f32_to_bf16};
+
+/// A plant's verdict: print its rate, and refuse it below `num/den` of the cells — the demand each
+/// test argues for its own plant, never a round number that merely passes.
+fn demand(plant: &str, (moved, cells): (usize, usize), (num, den): (usize, usize)) {
+    println!("{plant} plant: {moved}/{cells} cells move");
+    assert!(
+        moved * den >= cells * num,
+        "{plant} plant moved only {moved}/{cells} cells — sub-threshold"
+    );
+}
 
 /// `index_topk`'s order-preserving key; `canonical == false` is the `indexer` plant (the `-0.0`
 /// canonicalisation dropped, so `-0.0` orders strictly below `+0.0` instead of tying with it).
@@ -49,10 +64,10 @@ fn topk_signed_zero_plant_is_adversarial_on_cpu() {
         cells += SEEDS as usize;
         moved += m;
     }
-    println!("index_topk signed-zero plant: {moved}/{cells} partial-selection cells move");
-    assert!(
-        moved * 3 >= cells,
-        "plant moved only {moved}/{cells} cells — sub-threshold"
+    demand(
+        "index_topk signed-zero (partial selections)",
+        (moved, cells),
+        (1, 3),
     );
 }
 
@@ -106,9 +121,135 @@ fn score_blocks_per_term_plant_is_adversarial_on_cpu() {
         cells += SEEDS as usize;
         moved += m;
     }
-    println!("index_score_blocks per-term plant: {moved}/{cells} cells differ");
-    assert!(
-        moved * 4 >= cells * 3,
-        "plant moved only {moved}/{cells} cells — sub-threshold"
-    );
+    demand("index_score_blocks per-term", (moved, cells), (3, 4));
+}
+
+/// One `kv_compress_prefill` output row on the CPU up to the RoPE — the pool, the bf16 store and
+/// the norm — as its rope pairs `[x, y, c, s]`. The host's `exp` and a sequential norm sum stand
+/// in for the device's, so this measures a rate on these operands, not the device's cells.
+fn prefill_pairs(ins: &[Vec<f32>], p: &CompGeom, b: usize) -> Vec<[f32; 4]> {
+    let (ratio, cd, d, rd) = (p.ratio as usize, p.cd as usize, p.d as usize, p.rd as usize);
+    let (kv, sc, ape, norm, freqs) = (&ins[0], &ins[1], &ins[2], &ins[3], &ins[4]);
+    // `overlap_transform`'s index map: entry j's (source offset, ape offset), or masked.
+    let entry = |j: usize| match (p.coff == 2, j >= ratio, b > 0) {
+        (false, ..) => Some(((b * ratio + j) * cd, j * cd)),
+        (true, true, _) => Some(((b * ratio + j - ratio) * cd + d, (j - ratio) * cd + d)),
+        (true, false, true) => Some((((b - 1) * ratio + j) * cd, j * cd)),
+        (true, false, false) => None,
+    };
+    let live: Vec<(usize, usize)> = (0..p.ents as usize).filter_map(entry).collect();
+    let row: Vec<f32> = (0..d)
+        .map(|e| {
+            let score = |&(src, a): &(usize, usize)| sc[src + e] + ape[a + e];
+            let mx = live.iter().map(score).fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = live.iter().map(|x| (score(x) - mx).exp()).sum();
+            let pool = live.iter().fold(0.0f32, |acc, x| {
+                kv[x.0 + e].mul_add((score(x) - mx).exp() / sum, acc)
+            });
+            rbf16(pool)
+        })
+        .collect();
+    let ss = row.iter().fold(0.0f32, |a, &v| v.mul_add(v, a));
+    let rs = 1.0 / (ss / d as f32 + p.eps).sqrt();
+    let at = |k: usize| rbf16(norm[k] * (row[k] * rs));
+    let t = &freqs[b * ratio * rd..];
+    (0..rd / 2)
+        .map(|i| {
+            [
+                at(d - rd + 2 * i),
+                at(d - rd + 2 * i + 1),
+                t[2 * i],
+                t[2 * i + 1],
+            ]
+        })
+        .collect()
+}
+
+/// NOT a plant's proof — a SENSITIVITY measurement: a compressor RoPE that fuses the wrong product
+/// of `a·s + b·c` (`fma(b, c, a·s)` against hipcc's `fma(a, s, b·c)`) mostly vanishes in the final
+/// bf16 store. This port nearly shipped exactly that: an ISA misread "fixed" a correct draft
+/// backwards, and the correctness review caught it on the IR before any device run. Measured
+/// 2026-11-19: 10/384 prefill cells move, all at the 512-block hot shape (10/64), none at the small
+/// ones. The rows CAN see it — `Tally::verdict` reddens a row on one differing word — and this
+/// asserts at least one cell moves, but at the spike's sub-threshold rate. That is why the
+/// `kvcompress` plant is `gemm_bf16`'s, and why the RoPE sites rest on the ISA reading.
+#[test]
+fn compress_rope_fusion_is_visible_to_the_prefill_rows() {
+    let (mut cells, mut moved) = (0usize, 0usize);
+    for (gi, nblk) in PREFILL_SHAPES {
+        let p = geom(GEOMS[gi].0, GEOMS[gi].1);
+        let m = (1..=SEEDS)
+            .filter(|&seed| {
+                let ins = prefill_ins(&p, nblk, seed);
+                (0..nblk).any(|b| {
+                    prefill_pairs(&ins, &p, b).iter().any(|&[x, y, c, s]| {
+                        rbf16(x.mul_add(s, y * c)).to_bits() != rbf16(y.mul_add(c, x * s)).to_bits()
+                    })
+                })
+            })
+            .count();
+        cells += SEEDS as usize;
+        moved += m;
+    }
+    println!("kv_compress_prefill rope mis-fusion: {moved}/{cells} cells differ");
+    assert!(moved > 0, "no prefill cell can see a RoPE mis-fusion");
+}
+
+/// `gemm_bf16`'s output `o` on the CPU: 32 lanes each fold their strided share (`fused` = hipcc's
+/// `v_fmac`; `false` = the `kvcompress` plant, product then sum), then `wave_sum`'s shuffle-down
+/// ladder into lane 0.
+fn gemm_out(ins: &[Vec<f32>], [_, n, k]: [usize; 3], o: usize, fused: bool) -> f32 {
+    let (r, c) = (o / n, o % n);
+    let w = |i: usize| {
+        let j = c * k + i;
+        bf16_to_f32((ins[1][j / 2].to_bits() >> (16 * (j % 2))) as u16)
+    };
+    let mut lanes: Vec<f32> = (0..32)
+        .map(|l| {
+            (l..k).step_by(32).fold(0.0f32, |acc, i| {
+                let x = ins[0][r * k + i];
+                if fused {
+                    x.mul_add(w(i), acc)
+                } else {
+                    acc + x * w(i)
+                }
+            })
+        })
+        .collect();
+    for off in [16, 8, 4, 2, 1] {
+        lanes = (0..32)
+            .map(|l| {
+                lanes[l]
+                    + if l + off < 32 {
+                        lanes[l + off]
+                    } else {
+                        lanes[l]
+                    }
+            })
+            .collect();
+    }
+    lanes[0]
+}
+
+/// The `kvcompress` plant (the GEMM's dot accumulator unfused) moves nearly every cell: the output
+/// is f32 with no rounding store after it. Measured 2026-11-19: 64/64 seeds at the four real
+/// shapes, 10/64 at the ragged `[3, 7, 33]` (one or two products per lane), 266/320 overall.
+#[test]
+fn gemm_unfused_plant_is_adversarial_on_cpu() {
+    let (mut cells, mut moved) = (0usize, 0usize);
+    for dims in GEMM_SHAPES {
+        let m = (1..=SEEDS)
+            .filter(|&seed| {
+                let ins = gemm_ins(dims, seed);
+                (0..dims[0] * dims[1]).any(|o| {
+                    gemm_out(&ins, dims, o, true).to_bits()
+                        != gemm_out(&ins, dims, o, false).to_bits()
+                })
+            })
+            .count();
+        println!("gemm_bf16 unfused plant at {dims:?}: {m}/{SEEDS} seeds move");
+        cells += SEEDS as usize;
+        moved += m;
+    }
+    demand("gemm_bf16 unfused", (moved, cells), (3, 4));
 }

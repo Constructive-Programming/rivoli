@@ -139,23 +139,3 @@ pub fn topk_scores(n: usize, seed: u64) -> Vec<f32> {
     }
     v
 }
-
-/// The block scorers' `(s, n_comp, heads, hd)`: V4's decode (one query against 512 blocks, 64
-/// heads of 128) first — the hot shape — then a prefill tile at Qwen's anchor width 24, a single
-/// block, and a 64-row prefill.
-pub const SCORE_BLOCKS_DIMS: [[usize; 4]; 4] = [
-    [1, 512, 64, 128],
-    [7, 37, 4, 24],
-    [1, 1, 64, 128],
-    [64, 300, 16, 128],
-];
-
-/// One block-scorer cell's `[q, kv, w]`: the edges in `q` and `kv` (so dots cross zero, which is
-/// where the ReLU and the bf16 roundings disagree), small positive per-head weights.
-pub fn score_blocks_ins([s, n_comp, heads, hd]: [usize; 4], seed: u64) -> Vec<Vec<f32>> {
-    vec![
-        draw(s * heads * hd, (seed, 1), 1.0, true),
-        draw(n_comp * hd, (seed, 2), 1.0, true),
-        uniform(s * heads, (seed, 3), 0.0..0.2),
-    ]
-}

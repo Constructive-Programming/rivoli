@@ -11,7 +11,7 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 10] = [
+const KERNELS: [&str; 9] = [
     // `activation` and `residual` (split out of this file 2026-08-15/16) left this list
     // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below.
     "linalg",
@@ -32,8 +32,7 @@ const KERNELS: [&str; 10] = [
     // `indexer` left 2026-11-19 (Phase 1 L3): Rust now, `crates/kernels/src/indexer.rs`.
     // `async` left 2026-11-18: its host half is direct FFI (`src/hiprt.rs`), its one kernel
     // (`touch_region`) is Rust.
-    "kvcompress",
-    // `blockindex` left 2026-11-19 (Phase 1 L3): Rust now, `crates/kernels/src/blockindex.rs`.
+    // `kvcompress` and `blockindex` left 2026-11-19 (Phase 1 L3): Rust now, `crates/kernels/src/`.
     "headtail",
 ];
 

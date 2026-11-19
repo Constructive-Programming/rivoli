@@ -1,6 +1,8 @@
 //! `kernels/indexer.hip`'s geometry. The run-time block sizes (`index_score`, `index_head_route`,
 //! `index_pool_norm_f32`) are not here: each launcher derives one per launch and hands it over in
 //! `kernarg::Blocked`.
+//!
+//! The `.hip` file named here is deleted from the tree; cite it at tag `archive/hip-kernels`.
 
 use super::F32;
 

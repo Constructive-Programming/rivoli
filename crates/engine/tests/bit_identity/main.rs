@@ -27,6 +27,7 @@
 // Test code: a failed expectation IS the report, so `expect` is the right spelling.
 #![allow(clippy::expect_used)]
 
+mod cells;
 #[path = "../common/mod.rs"]
 mod common;
 mod inputs;
@@ -39,6 +40,8 @@ mod blockindex;
 mod device;
 #[cfg(feature = "rocm")]
 mod indexer;
+#[cfg(feature = "rocm")]
+mod kvcompress;
 mod plant_models;
 #[cfg(feature = "rocm")]
 mod probes;
@@ -83,6 +86,10 @@ const ROWS: &[Row] = &[
     ("index_score_blocks_f32", indexer::index_score_blocks_f32),
     ("act_quant_f4_rotated", blockindex::act_quant_f4_rotated),
     ("index_score_blocks", blockindex::index_score_blocks),
+    ("gemm_bf16", kvcompress::gemm_bf16),
+    ("kv_compress_deposit", kvcompress::kv_compress_deposit),
+    ("kv_compress_prefill", kvcompress::kv_compress_prefill),
+    ("kv_compress_decode", kvcompress::kv_compress_decode),
 ];
 
 #[cfg(feature = "rocm")]

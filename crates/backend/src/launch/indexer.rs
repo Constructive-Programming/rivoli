@@ -2,6 +2,8 @@
 //! stage, and the fp32 block scorer (its bf16 twin is `blockindex.rs`'s, over the same
 //! `ScoreBlocks` operand set). Three kernels take a run-time block size; their launchers compute it
 //! exactly as the C did and hand it over in `Blocked`, never through the dispatch packet.
+//!
+//! The `.hip` file named here is deleted from the tree; cite it at tag `archive/hip-kernels`.
 
 use super::{Checked, Rows, any_nonpositive, elementwise, run};
 use crate::module::{Geometry, Kernel, LdsBytes};

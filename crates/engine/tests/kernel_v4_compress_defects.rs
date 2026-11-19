@@ -33,7 +33,7 @@
 //! Never executed: no `rocm` CI arm, and no checkpoint or GPU for this port. Two mutations, and
 //! the second is the one that matters:
 //!
-//! * In `kernels/kvcompress.hip`'s pooling, drop the `overlap_transform` term (make the
+//! * In `crates/kernels/src/kvcompress.rs`'s pooling (`kvcompress.hip` until 2026-11-19), drop the `overlap_transform` term (make the
 //!   overlapping branch behave like the non-overlapping one).
 //!   [`the_overlap_defect_is_inert_at_ratio_128_and_live_at_ratio_4`] must go RED on its ratio-4
 //!   arm — the kernel now IS the no-overlap kernel, so `sep` collapses toward the quantization

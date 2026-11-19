@@ -15,7 +15,9 @@
 //! exemption argument for both invocation files is under this file's opening marker.
 
 use crate::hip::{abi_ty, ensure_hip_status, launchers};
+use crate::launch::rivoli_gemm_bf16;
 use anyhow::Result;
+use rivoli_abi::kernarg::GemmBf16;
 use std::ffi::c_void;
 
 // Doc links only. An intra-doc link resolves in the module it is WRITTEN in, so the moment
@@ -300,7 +302,7 @@ launchers! {
     /// `x` is `m · k` live f32, `w` is `n · k` live u16, `out` is `m · n` writable f32, none
     /// aliasing another (every kernel parameter is `__restrict__`), all live until `stream`
     /// completes. `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_gemm_bf16 -> rivoli_gemm_bf16, "gemm_bf16" (
+    launch_gemm_bf16 => rivoli_gemm_bf16(GemmBf16 { x, w, out, m: m as i32, n: n as i32, k: k as i32 }, stream), "gemm_bf16" (
         x: *const f32,
         w: *const u16,
         out: *mut f32,

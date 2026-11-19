@@ -217,6 +217,18 @@ impl Tally {
         }
     }
 
+    /// [`Tally::guard`] for a case that claims a CODE: the reference must refuse with exactly
+    /// `want`, so a case that drifted onto an earlier guard fails the harness instead of passing
+    /// as coverage of a guard it never reached (correctness review, 2026-11-19).
+    pub fn guard_code(&mut self, what: &str, want: i32, rc: [i32; 2]) {
+        assert_eq!(
+            rc[0], want,
+            "{what}: the reference refused {}, the case claims {want}",
+            rc[0]
+        );
+        self.guard(what, rc);
+    }
+
     /// Per-launch µs of each twin at one shape — the gate cannot see a slowdown, this does.
     /// Three alternating batches of 200 after a warm-up; the minimum batch per side.
     pub fn time(&mut self, what: &str, cell: &mut Cell, launch: impl Fn(Side, &mut Cell)) {

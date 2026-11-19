@@ -4,6 +4,8 @@
 //! plus every power-of-two width the launcher admits; the bf16 block scorer at the fp32 twin's
 //! shapes (`inputs::SCORE_BLOCKS_DIMS`). `act_quant_f4_rotated` is in place in production — the
 //! only way it is launched — so its row is in place.
+//!
+//! The `.hip` file named here is deleted from the tree; cite it at tag `archive/hip-kernels`.
 
 use super::device::{Cell, O, Out, Ref, S, Shapes, Side, Tally, both, code, guard_ptrs, sweep};
 use super::indexer::score_blocks_row;
