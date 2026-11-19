@@ -2076,3 +2076,68 @@ The first CPU run of the `indexer` model REFUSED (126/448). Three of the seven s
 every entry (`k >= nt`), so no tie rule can move them. The model now counts only partial
 selections and records the shape the plant cannot reach. The device arms are OWED to the L3 GPU
 lease (`rust-kernels.md` §5, Phase 1 L3).
+
+
+## 19. Phase 1 shared shapes: 2-D grids and `LAUNCHED_BY` (added 2026-11-19, deviceless)
+
+Two changes land before any Phase 1 kernel, in one commit owned by L4 for every lane.
+
+**2-D grids. OWED.** `module.rs::launch_raw` takes `(Geometry, blocks_y)`, and
+`Kernel::launch_2d` is the entry for kernels that read `blockIdx.y` (attention).
+- `launch` is `launch_2d((geom, 1), ..)`, and `CodeObject::dispatch_packed` passes 1 too. So
+  every existing launch sends the same packet as before, and `Geometry` is untouched.
+- Phase 0's launcher rows, re-run at the first lease that touches main, show only that the
+  1-D path did not regress.
+- No current row can see the new axis go into the wrong slot. With `blocks_y = 1` a
+  gridDimZ/gridDimY swap sends the same packet.
+- The red proof is owed to the first kernel that reads `blockIdx.y`. Its bit-identity row
+  must run cells with `blocks_y > 1` (L4's attention rows).
+
+**`LAUNCHED_BY`** (`crates/cli/tests/kernel_coverage/launched_by.rs`, split out of
+`kernel_coverage.rs` to stay under its soft cap). It is a table of `(kernel, launcher)` pairs
+for the kernels that a launcher of another name runs (a split pass and its combine). The
+gate-rows census rows each such kernel under its launcher. `stale_launched_by` refuses an entry
+when the kernel:
+- is not shipped, or is `UNROWED`;
+- is listed twice;
+- has a row of its own;
+- is not launched by `rivoli_<launcher>`. The launcher's top-level body, with comment lines
+  dropped, must contain `run(&STATIC,` or `STATIC.launch…` for the kernel's `static` handle.
+
+An entry whose launcher has no rows reddens through the census's ordinary demand. The table
+ships empty. Review questions shaped two of these checks:
+- An entry mapping an unrelated kernel to a rowed launcher would have passed a
+  kernel-exists-only check.
+- A comment naming the static would have passed a mention-based check.
+
+**Plants.** Each was copied aside, applied, run, and restored by copy. `cmp` returned rc 0
+after every restore. The run command was
+`CARGO_TARGET_DIR=/var/cache/rivoli/target/rk-l4-attn cargo test -p rivoli --no-default-features --test kernel_coverage every_rust_kernel_has_a_gate_row`,
+and its rc was captured unpiped. The driver (`run.sh`) and its logs, including `summary.txt`,
+are in `/var/cache/rivoli/scratch/rk-l4-attn/shared-redproof/`.
+
+"The rename" in the table means: `rope_split_half`'s device kernel and its host handle were
+renamed `rope_split_half_b`, which stands in for a launcher that runs a kernel of another name.
+`M` is `("rope_split_half_b", "rope_split_half")`. "Isolated" marks an arm whose ONLY finding
+is the check under test, so that arm is the check's red proof. The other arms co-fire with the
+population lines, so their stale line is a sharper message, not an independent gate.
+
+A first round of these arms is DISCARDED, per this file's opening rule: it ran against a
+misplaced module path, and every arm exited 101 on a compile error (E0583), not on the
+assertion. The table below is the rerun.
+
+| plant | observed |
+|---|---|
+| `("swiglu_gone", "swiglu")` | exit 101, stale: "not a shipped gpu-kernel" — isolated |
+| `("touch_region", "swiglu")` | exit 101, stale: "an UNROWED kernel" — isolated |
+| `("swiglu", "rope_split_half")` | exit 101, `swiglu` extra in both populations, and stale: "the kernel has a row of its own" |
+| `("rope_split_half", "rope_nowhere")` | exit 101, `rope_nowhere` missing from both populations (stale: own row) |
+| the rename, unmapped | exit 101, `rope_split_half_b` missing from both populations |
+| the rename, `("rope_split_half_b", "swiglu")` | exit 101, `rope_split_half` extra in both populations, and stale: "does not launch the kernel's `static` handle" |
+| the rename, `M` listed twice | exit 101, stale: "listed twice" — isolated |
+| the rename, `M`, `rivoli_rope_split_half` launching `ROPE_INTERLEAVE` | exit 101, stale: "does not launch" — isolated |
+| as above, plus a comment line `// run(&ROPE_SPLIT_HALF, ...)` in the body | exit 101, stale: "does not launch" — isolated (a mention is not a launch) |
+| the rename, `M` | exit 0 (the positive control) |
+| restored | exit 0 |
+| L3 (2026-11-19): `("mla_absorb_fp8_r2", …)` deleted | exit 101, `mla_absorb_fp8_r2` missing from both populations; restored by byte copy (`cmp` rc 0), green |
+| L3: `rivoli_mla_absorb_fp8` back to `let kernel = if nrow == 2 { &R2 } else { &R1 }; run(kernel, …)` | exit 101, stale: "does not launch the kernel's `static` handle" — the reason the launcher spells both `run(&STATIC, …)` calls; restored (`cmp` rc 0), green |

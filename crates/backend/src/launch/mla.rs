@@ -56,12 +56,14 @@ pub(crate) unsafe fn rivoli_mla_absorb_fp8(nrow: i32, a: MlaAbsorb) -> i32 {
             Ok(g)
         })
     };
-    let kernel = if nrow == 2 {
-        &MLA_ABSORB_FP8_R2
-    } else {
-        &MLA_ABSORB_FP8
-    };
-    unsafe { run(kernel, checked, null_mut(), &a) }
+    // Both kernels named in this body, as `LAUNCHED_BY` requires of a multi-kernel launcher.
+    unsafe {
+        if nrow == 2 {
+            run(&MLA_ABSORB_FP8_R2, checked, null_mut(), &a)
+        } else {
+            run(&MLA_ABSORB_FP8, checked, null_mut(), &a)
+        }
+    }
 }
 
 /// The extents (1001), the tile and row count, then `kvl % 4 == 0` (1002) — the value rows'
@@ -82,12 +84,14 @@ pub(crate) unsafe fn rivoli_mla_value_fp8(nrow: i32, a: MlaValue) -> i32 {
             }
         })
     };
-    let kernel = if nrow == 2 {
-        &MLA_VALUE_FP8_R2
-    } else {
-        &MLA_VALUE_FP8
-    };
-    unsafe { run(kernel, checked, null_mut(), &a) }
+    // As in `rivoli_mla_absorb_fp8`: both `run(&STATIC, …)` calls written out for `LAUNCHED_BY`.
+    unsafe {
+        if nrow == 2 {
+            run(&MLA_VALUE_FP8_R2, checked, null_mut(), &a)
+        } else {
+            run(&MLA_VALUE_FP8, checked, null_mut(), &a)
+        }
+    }
 }
 
 /// Extents and `row_stride >= n` (1001), a strided copy (1002: `src != dst` needs contiguous

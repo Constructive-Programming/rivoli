@@ -1011,8 +1011,10 @@ loops removed it.
 *ISA census.* After the fixes, every float op class matches hipcc for the value pair, the norms,
 the RoPE and the GEMV. The absorb differs only by unroll and 64-bit index arithmetic.
 
-*Census still red.* `kernel_coverage`'s gate-row/`=>`-row census reads the two `_r2` kernels as
-having no row of their own. They are launched (and swept: `nrow ∈ {1,2}`) by their family's
-launcher, and await the coordinator's `LAUNCHED_BY` table.
+*Census.* The two `_r2` kernels are rowed through `LAUNCHED_BY` (main `d6a6f1b`, merged
+2026-11-19). Each launcher names both statics in its own body (`run(&MLA_*_R2, …)` beside
+`run(&MLA_*, …)`), and its row sweeps `nrow ∈ {1,2}`. The census is green, printing "37 Rust
+kernels: 34 with a gate row and a `=>` row, 1 argued exemption" (`cargo test -p rivoli
+--no-default-features --test kernel_coverage -- --nocapture`, 2026-11-19).
 
 *Device arms.* OWED.
