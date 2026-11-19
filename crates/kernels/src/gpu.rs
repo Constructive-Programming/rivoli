@@ -15,6 +15,12 @@ pub fn bid() -> u32 {
     amdgpu::workgroup_id_x()
 }
 
+/// `blockIdx.y` — the launcher's `blocks_y` axis (`Kernel::launch_2d`).
+#[inline(always)]
+pub fn bid_y() -> u32 {
+    amdgpu::workgroup_id_y()
+}
+
 /// The dispatch's dynamic LDS, as `T`. Sized by the launcher's `sharedMemBytes`, which
 /// every launcher takes from the `rivoli_abi::geom` layout the kernel carves it by. HIP's
 /// kernels declared static `__shared__` arrays; Rust has no LDS statics, and where the

@@ -1,0 +1,11 @@
+--- a/crates/kernels/src/attn/gqa.rs
++++ b/crates/kernels/src/attn/gqa.rs
+@@ -89,7 +89,7 @@
+     let mx = maxnum(st.r.m, s);
+     let (rescale, w) = (exp(st.r.m - mx), exp(s - mx));
+     each_column(d, |c, i| {
+-        st.r.acc[c] = st.r.acc[c] * rescale + w * *tile.v.add(at(i))
++        st.r.acc[c] = crate::gpu::fma(st.r.acc[c], rescale, w * *tile.v.add(at(i))) /* PLANT: fused */
+     });
+     st.r.l = st.r.l * rescale + w;
+     st.r.m = mx;

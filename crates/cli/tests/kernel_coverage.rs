@@ -633,9 +633,11 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
     .collect();
     assert!(report.is_empty(), "\n\n{}", report.join("\n\n"));
     println!(
-        "{} Rust kernels: {} with a gate row and a `=>` row, {} argued exemption",
+        "{} Rust kernels: {} rows (a gate row and a `=>` row each; {} kernels rowed via \
+         LAUNCHED_BY), {} argued exemption",
         device.len(),
         rows.len(),
+        launched_by::LAUNCHED_BY.len(),
         UNROWED.len()
     );
 }

@@ -15,7 +15,7 @@ const RTLD_NOW: i32 = 2;
 /// glibc's default, spelled so the `-Bsymbolic` argument below is visible at the call.
 const RTLD_LOCAL: i32 = 0;
 
-/// The reference: `kernels/{activation,residual}.hip` at tag `archive/hip-kernels`, built by
+/// The reference: the tagged `kernels/*.hip` the script's `REF_SOURCES` lists, built by
 /// `tests/bit-identity.sh` with hipcc into a shared object whose `rivoli_*` C launchers are
 /// called here exactly as the engine called them before the migration — guards, grid
 /// geometry and kernel together. Loaded `RTLD_LOCAL` and linked `-Bsymbolic`, so its

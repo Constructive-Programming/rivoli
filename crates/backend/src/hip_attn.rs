@@ -18,10 +18,15 @@
 // must stay (the region is anchored to the macro invocation so additions outside it are
 // gated).
 use anyhow::Result;
+use rivoli_abi::kernarg::{GatherAttn, Gqa, GqaBlock, GqaRing, MhaAttend, MlaIo};
 use std::ffi::c_void;
 
 use crate::abi::{CompFinish, CompGeom};
 use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
+use crate::launch::{
+    Rows, rivoli_gather_attn_shared_kv, rivoli_gqa_attend, rivoli_gqa_block_attend,
+    rivoli_mha_attend, rivoli_mla_attend,
+};
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
 // twenty rewritten comments.
@@ -110,7 +115,7 @@ launchers! {
     /// `qrope` (`h·rope` f32), `lc8`/`lscale`/`rc` the KV cache (indexed by token — up to
     /// `pos+1` rows; `n_blocks = kvl/128`), `rows` (`nr` u32 or null), `clat` (`h·kvl`
     /// f32), `partial` ([`attend_scratch_floats`] f32 or null = single split).
-    launch_attend -> rivoli_mla_attend, "mla_attend" (
+    launch_attend => rivoli_mla_attend(MlaIo { qabs, qrope, lc8, lscale, rc, rows, clat, h: h as i32, nr: nr as i32, kvl: kvl as i32, rope: rope as i32, n_blocks: n_blocks as i32, scale }, partial), "mla_attend" (
         qabs: *const f32,
         qrope: *const f32,
         lc8: *const u8,
@@ -169,7 +174,7 @@ launchers! {
     /// per row, indexed by `idxs`, so at least `max(idxs) + 1` rows), `sink` (`h` f32), `idxs`
     /// (`m * topk` i32), `o` (`m * h * d` f32). `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_gather_attn_shared_kv -> rivoli_gather_attn_shared_kv, "gather_attn_shared_kv" (
+    launch_gather_attn_shared_kv => rivoli_gather_attn_shared_kv(Rows(m as i32), GatherAttn { q, kv, sink, idxs, o, h: h as i32, d: d as i32, topk: topk as i32, scale }, stream), "gather_attn_shared_kv" (
         q: *const f32,
         kv: *const f32,
         sink: *const f32,
@@ -214,7 +219,7 @@ launchers! {
     /// positions live at once and a `win`-slot ring overwrites its own oldest row mid-launch.
     /// Decode (`tq == 1`) is the case where `ring_cap == win` suffices, and it is the only case
     /// the goldens can reach.
-    launch_gqa_attend -> rivoli_gqa_attend, "gqa_attend" (
+    launch_gqa_attend => rivoli_gqa_attend(Rows(tq as i32), GqaRing { gqa: Gqa { q, k, v, out, hq: hq as i32, hkv: hkv as i32, d: d as i32, win: win as i32, scale }, start_pos: start_pos as i32, ring_cap: ring_cap as i32 }, stream), "gqa_attend" (
         q: *const f32,
         k: *const f32,
         v: *const f32,
@@ -263,7 +268,7 @@ launchers! {
     /// inclusive-vs-strict lower edge, and the target's `qk_scale_factor` leaking in. They are
     /// gated deviceless from the shipped config by `crates/cli/tests/drafter_convert.rs`;
     /// `glimmer-reference/drafter-checkpoint.md` carries the measurements.
-    launch_gqa_block_attend -> rivoli_gqa_block_attend, "gqa_block_attend" (
+    launch_gqa_block_attend => rivoli_gqa_block_attend(Rows(tq as i32), GqaBlock { gqa: Gqa { q, k, v, out, hq: hq as i32, hkv: hkv as i32, d: d as i32, win: win as i32, scale }, q_offset: q_offset as i32, kv_len: kv_len as i32 }, stream), "gqa_block_attend" (
         q: *const f32,
         k: *const f32,
         v: *const f32,
@@ -303,7 +308,7 @@ launchers! {
     /// `q` is `heads·d` f32, `k` is `heads·kv·d`, `v` is `heads·kv·dv`, `out` is `heads·dv`, and
     /// `mask` — if non-null — is `kv` f32. All live until the next [`device_sync`], and `out` must
     /// not alias any input.
-    launch_mha_attend -> rivoli_mha_attend, "mha_attend" (
+    launch_mha_attend => rivoli_mha_attend(Rows(heads as i32), MhaAttend { q, k, v, mask, out, kv: kv as i32, d: d as i32, dv: dv as i32, scale }), "mha_attend" (
         q: *const f32,
         k: *const f32,
         v: *const f32,

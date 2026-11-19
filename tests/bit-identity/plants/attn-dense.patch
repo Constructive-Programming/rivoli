@@ -1,0 +1,20 @@
+--- a/crates/kernels/src/attn/dense.rs
++++ b/crates/kernels/src/attn/dense.rs
+@@ -53,7 +53,7 @@
+             let kr = a.kv.add(p as usize * d);
+             let mut acc = 0.0f32;
+             for i in 0..d {
+-                acc += *g.qs.add(i) * *kr.add(i);
++                acc = crate::gpu::fma(*g.qs.add(i), *kr.add(i), acc); // PLANT: fused dot
+             }
+             l = acc * a.scale;
+         }
+@@ -157,7 +157,7 @@
+         let ks = kh.add(s * d);
+         let mut acc = 0.0f32;
+         for i in 0..d {
+-            acc += *qh.add(i) * *ks.add(i);
++            acc = crate::gpu::fma(*qh.add(i), *ks.add(i), acc); // PLANT: fused dot
+         }
+         let mask = if a.mask.is_null() {
+             0.0

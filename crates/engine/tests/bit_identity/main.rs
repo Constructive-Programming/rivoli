@@ -34,6 +34,12 @@ mod inputs;
 #[cfg(feature = "rocm")]
 mod activation;
 #[cfg(feature = "rocm")]
+mod attn;
+#[cfg(feature = "rocm")]
+mod attn_gqa;
+mod attn_inputs;
+mod attn_plants;
+#[cfg(feature = "rocm")]
 mod device;
 #[cfg(feature = "rocm")]
 mod probes;
@@ -68,6 +74,11 @@ const ROWS: &[Row] = &[
         "gated_residual_collapse_f32",
         residual::gated_residual_collapse_f32,
     ),
+    ("mla_attend", attn::mla_attend),
+    ("gather_attn_shared_kv", attn::gather_attn_shared_kv),
+    ("gqa_attend", attn_gqa::gqa_attend),
+    ("gqa_block_attend", attn_gqa::gqa_block_attend),
+    ("mha_attend", attn_gqa::mha_attend),
 ];
 
 #[cfg(feature = "rocm")]

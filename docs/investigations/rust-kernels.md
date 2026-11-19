@@ -908,3 +908,130 @@ are LOWER bounds on throughput:
 - **A0:** 50 s.
 - **Whole run:** 247 s to the last arm's output, 267 s to `arms/end.epoch`. The posted
   READY-FOR-GPU estimate was 25–35 min.
+
+### Phase 1 L4 (attn)
+
+**Deviceless half (2026-11-19, branch `wave/rk-l4-attn`). Device arms are OWED to the GPU
+lease.** `attn.hip` (950 lines, 6 kernels, 5 launchers + the scratch-size function) is ported
+and deleted, and it is gone from `build.rs`'s hipcc list.
+
+**Where it went:**
+- **Kernels:** `crates/kernels/src/attn/` is split by shape, not by the C's order.
+  - `mla.rs`: `mla_latent_attend`, `mla_attend_combine`.
+  - `gqa.rs`: `gqa_attend` and `gqa_block_attend`, which are ONE body over a row window. The C
+    spelled them twice, and `kernel-inventory.md`'s owed duplication note is closed.
+  - `dense.rs`: `gather_attn_shared_kv`, `mha_attend`, sharing one `block_reduce`.
+  - `mod.rs`: the wave score helper and the online-softmax `Running` state.
+- **Argument blocks:** `rivoli_abi::kernarg::attn`. `MlaIo` is what the caller hands over;
+  `MlaAttend` adds the split plan. `Gqa` is shared by `GqaRing`/`GqaBlock`.
+- **Geometry:** `rivoli_abi::geom::attn`. `MLA_HB`/`TILE`/`ACC_REGS`/`MAX_SPLITS`,
+  `GATHER_ATTN_*`, `GQA_*` and `MHA_THREADS` are constants both sides name, so no kernel reads
+  blockDim.
+- **Launchers:** `crates/backend/src/launch/attn.rs`. Guards, order and codes are the C's. The
+  split plan and the scratch size are host functions.
+- **`=>` rows:** in `hip_attn.rs`.
+
+**Shapes this lane added for everyone** (commit `d6a6f1b`, `wave/rk-shared`):
+`Kernel::launch_2d` covers the C's `dim3(x, y)` grids. attn is the only `.hip` file with
+grid.y: the MLA split and the (head, row) grids. `LAUNCHED_BY` covers multi-kernel launchers.
+The record is `gate-red-proofs.md` §19.
+
+**Fused sites, read off hipcc's ISA:**
+- The MLA half compiles with contraction on. hipcc fuses:
+  - both score dots;
+  - the accumulator's LEFT product, `fma(acc, corr, p·L)`;
+  - `l·corr + p`;
+  - the combine's two sums;
+  - one site no source reading predicts. In `p = expf(s − m_new)`, the subtraction absorbs
+    `s = scale·total` (`v_fma_f32 v, scale, total, −m_new`), while `m_new = fmaxf(m, s)`
+    keeps the rounded `s`.
+- From the gather kernel on, the C carries `contract(off)`, and that pragma holds to the end of
+  the file, `mha_attend` included. Those four kernels' `v_fma`s are all `expf` range reduction
+  or the IEEE divide, so the Rust carries no `fma` there.
+
+**ISA census (deviceless):**
+- Method: hipcc `-O3 --cuda-device-only -S` on the tag against `llvm-objdump -d` of the shipped
+  code object, counted per kernel over each whole function (`.Lfunc_end`, not the first
+  `s_endpgm`; a first count that stopped at an early exit undercounted hipcc).
+- **FMA-class counts are identical in all six kernels:** 30/13/22/9/9/7.
+- **Private segment is 0 B in all six.** A first build had 64 B in
+  `gather_attn_shared_kv`: two `zip`-iterated loops over its `acc[4]` did not unroll. Indexed
+  loops fixed it.
+- VGPRs, hipcc → Rust: MLA 46 → 47, combine 15 → 15, gather 28 → 23, gqa 38 → 35, block
+  37 → 35, mha 16 → 19. Every pair sits in the same 24-register occupancy granule, except
+  gather, which drops a granule in Rust's favour.
+- Static instruction count is 1.23–1.65× hipcc (`census.txt` TOTAL). `mha_attend`'s tree is unrolled against the constant
+  `MHA_THREADS`, where hipcc loops over blockDim: 20 static `s_barrier` against 6. The TIME
+  lines judge whether it costs anything.
+
+**Bit-identity rows (5, one per launcher)**, `crates/engine/tests/bit_identity/attn{,_gqa}.rs`.
+Inputs are in `attn_inputs.rs`, which is deviceless so the CPU plant models read the same
+cells.
+- 64 seeds per shape.
+- Edge seeds carry `EDGES`. Every 8th seed plants ±inf/NaN in Q (and V for GQA), and e4m3's NaN
+  codes in the MLA cache.
+- Each row has guard cases that pin order.
+- Branches reached:
+  - **MLA**, at GLM's 64 heads:
+    - nr 1/17/64 → 1 split;
+    - 130 → 2 (ragged last);
+    - 1000 → 13;
+    - 2048 → 16, the ceiling;
+    - 4100 → 16 (tps 17);
+    - 2048 without scratch → the unsplit path at long context;
+    - 128 heads at 2048 → 10 splits, the `by_grid` bound (tps 13);
+    - 20 heads → an idle tail of waves, with sparse `rows` (duplicates possible);
+    - kvl 256 → 8 of 16 registers.
+    - The split partials are compared too: `InPlace` zero-filled scratch, so every written
+      `acc`/`(m, l)` must match.
+    - The C's scratch-size function is compared at 5 points.
+  - **Gather:** V4's decode at topk 128 and 640, a 7-row prefill, d 100/1000/8, topk 2000
+    (strided past the block) and 16118 (exactly at the C's LDS ceiling; the guard refuses
+    16119). On nasty seeds query row 0 is
+    fully masked, which must produce the C's NaN.
+  - **GQA:** Glimmer's ring before filling, at the fill, past one wrap and deep in a later one;
+    a global layer at rows 0 and 8191; a 4-row batch on a `win + tq − 1` ring; d 8/100/256.
+  - **Block:** ctx 4096 (shipped), the golden's `q_offset` 0, clamps.
+  - **MHA:** K3's 96 heads × 1024 behind the mask, kv 1, kv 8192 (the ceiling), unmasked odd
+    widths. Nasty seeds give a fully masked row (NaN) with one NaN mask slot.
+- **No aliased rows:** no production call of these launchers runs in place. There are four call
+  sites (`gqa_block_attend` has none, unwired by decision), and every output is a distinct
+  buffer.
+
+**Red proofs.** One plant per family plus the 2-D axis, `tests/bit-identity/plants/attn-{mla,gqa,dense}.patch`,
+each shown adversarial on CPU first (`attn_plants.rs`, `gate-red-proofs.md` §20):
+
+| plant | expected red rows | CPU |
+|---|---|---|
+| `attn-mla`: right product fused | `mla_attend` | 35140/81920 acc values, 40/40 eligible seeds |
+| `attn-gqa`: acc update fused | `gqa_attend`, `gqa_block_attend` | 4904/32768, 64/64 |
+| `attn-dense`: score dot fused | `gather_attn_shared_kv`, `mha_attend` | gather 40214/65536 logits, 64/64; mha 22442/57600, 62/64 |
+| `grid-y`: `blocks_y` passed as gridDimZ (§19's OWED slot) | the four 2-D rows | structural |
+
+The MLA model's first plant was `p`'s fused site written unfused. It was **sub-threshold on
+these inputs**: it moved only 41/64 seeds (`scratch/rk-l4-attn/plants-cpu.log`).
+The exact-rounding subtraction only differs from the rounded one under cancellation. It is
+recorded and was replaced by the hc_post defect class. The model also showed that 24/64 MLA
+seeds are degenerate for any accumulator plant: the 8 nasty seeds are all NaN, and in the 16
+scale-edge seeds one token's ×100 latent dominates. Its bar counts the other 40. Those classes
+stay in the device rows for what they do test.
+
+**Deviceless gates:**
+- `cargo test --workspace --no-default-features` (`gates/test-nodef.log`): 505 passed, 1 failed (CodeScene, exactly the
+  31 base files).
+- Clippy is clean on both arms; jscpd is 0. The first kernel-covering build's clones were
+  removed by restructuring, none exempted.
+- Every new or touched file is CodeScene 10, except `hip_attn.rs` at 9.68, which is base.
+- The census (`gates/census.log`, `--nocapture`) prints:
+  - `20 Rust kernels: 18 rows (a gate row and a `=>` row each; 2 kernels rowed via
+    LAUNCHED_BY), 1 argued exemption`;
+  - `66 launchers: 66 with oracles`;
+  - `53 with production callers, 13 classified uncalled`.
+
+  Every log cited here is under `/var/cache/rivoli/scratch/rk-l4-attn/` (`gates/`, `isa/`).
+
+**OWED to the lease:**
+- arm A (18 rows);
+- four expect-red arms on planted binaries (`grid-y` pays §19's `blocks_y` proof);
+- TIME lines;
+- the attention oracle suites, unmodified, in the battery.

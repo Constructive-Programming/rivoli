@@ -1,6 +1,6 @@
 //! The host halves of the Rust kernels — what the tag's `extern "C" int rivoli_*` launchers
 //! did: the argument guards, the grid geometry, the launch. One module per kernel family
-//! (`activation`, `residual`, `touch`); a Phase 1 lane adds its family's file here.
+//! (`activation`, `attn`, `residual`, `touch`); a Phase 1 lane adds its family's file here.
 //!
 //! Each launcher keeps its C twin's name and return codes (`0`, POSITIVE guard code,
 //! `-(hipError_t)`) exactly, so a `launch_x => rivoli_x(..)` row in a `launchers!`
@@ -17,10 +17,12 @@
 #![cfg(feature = "rocm")]
 
 mod activation;
+mod attn;
 mod residual;
 mod touch;
 
 pub(crate) use activation::*;
+pub(crate) use attn::*;
 pub(crate) use residual::*;
 pub use touch::rivoli_touch_region_async;
 
@@ -37,14 +39,25 @@ pub(crate) struct Rows(pub(crate) i32);
 /// A guard's verdict: the geometry to launch at, or the POSITIVE code to return.
 type Checked = Result<Geometry, i32>;
 
+/// A 2-D guard's verdict: the `(geometry, blocks_y)` grid, or the POSITIVE code.
+type Checked2 = Result<(Geometry, u32), i32>;
+
 /// Launch `k` with `args` if the guard passed, else return its code — the one tail every
 /// launcher shares.
 ///
 /// # Safety
 /// `args` is `k`'s argument block and satisfies its buffer contract; `stream` is live or null.
 unsafe fn run<A: Copy>(k: &Kernel<A>, checked: Checked, stream: *mut c_void, args: &A) -> i32 {
+    unsafe { run_2d(k, checked.map(|geom| (geom, 1)), stream, args) }
+}
+
+/// [`run`] on a 2-D grid (`Kernel::launch_2d`).
+///
+/// # Safety
+/// As [`run`].
+unsafe fn run_2d<A: Copy>(k: &Kernel<A>, checked: Checked2, stream: *mut c_void, args: &A) -> i32 {
     match checked {
-        Ok(geom) => unsafe { k.launch(geom, stream, args) },
+        Ok(grid) => unsafe { k.launch_2d(grid, stream, args) },
         Err(code) => code,
     }
 }

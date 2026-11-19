@@ -352,8 +352,6 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    fn rivoli_mla_attend_scratch_floats(h: i32, kvl: i32) -> usize;
-
     // DSA lightning indexer (indexer.hip).
 
     fn rivoli_index_score_blocks(
@@ -531,8 +529,14 @@ pub unsafe fn fill_u32(dst: *mut u8, pat: u32, bytes: usize) -> Result<()> {
 /// f32 count for the split-KV partial scratch — allocate once per session (never
 /// per token). Mirrors the kernel's worst-case (MLA_MAX_SPLITS) sizing.
 pub fn attend_scratch_floats(h: usize, kvl: usize) -> usize {
-    // SAFETY: pure arithmetic, no pointers.
-    unsafe { rivoli_mla_attend_scratch_floats(h as i32, kvl as i32) }
+    // `[MLA_MAX_SPLITS·h·kvl]` accumulators, then `[MLA_MAX_SPLITS·h·2]` `(m, l)` pairs; an
+    // empty extent is 0, as the C's `H <= 0 || kvl <= 0` was.
+    let splits = rivoli_abi::geom::MLA_MAX_SPLITS as usize;
+    if h == 0 || kvl == 0 {
+        0
+    } else {
+        splits * h * (kvl + 2)
+    }
 }
 
 // ── DSA lightning indexer ───────────────────────────────────────────────────────

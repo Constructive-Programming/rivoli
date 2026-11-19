@@ -63,7 +63,7 @@ source "$HERE/gpu-witness.sh"
 
 TAG=archive/hip-kernels
 # The tagged files with a Rust twin. Phase 1 lanes append theirs.
-REF_SOURCES=(activation residual)
+REF_SOURCES=(activation residual attn)
 ARCH=${RIVOLI_OFFLOAD_ARCH:-gfx1151}
 
 # A plant's arm: the families its defect can reach (plus a clean anchor where it reaches every

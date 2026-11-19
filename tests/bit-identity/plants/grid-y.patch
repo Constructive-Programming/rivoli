@@ -1,0 +1,11 @@
+--- a/crates/backend/src/module.rs
++++ b/crates/backend/src/module.rs
+@@ -163,7 +163,7 @@
+     // SAFETY: the caller's contract.
+     -unsafe {
+         hipModuleLaunchKernel(
+-            f.0, blocks, blocks_y, 1, threads, 1, 1, lds, stream, params, extra,
++            f.0, blocks, 1, blocks_y, threads, 1, 1, lds, stream, params, extra, // PLANT: y in z
+         )
+     }
+ }

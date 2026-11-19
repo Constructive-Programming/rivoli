@@ -1,0 +1,11 @@
+--- a/crates/kernels/src/attn/mla.rs
++++ b/crates/kernels/src/attn/mla.rs
+@@ -99,7 +99,7 @@
+     let corr = exp(st.r.m - m_new);
+     let p = exp(fma(io.scale, total, -m_new));
+     each_acc(kvl, |k, i| {
+-        st.r.acc[k] = fma(st.r.acc[k], corr, p * *lrow.add(i))
++        st.r.acc[k] = fma(p, *lrow.add(i), st.r.acc[k] * corr) /* PLANT: RIGHT product fused */
+     });
+     st.r.l = fma(st.r.l, corr, p);
+     st.r.m = m_new;

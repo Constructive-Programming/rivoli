@@ -12,8 +12,12 @@ use std::path::Path;
 /// reach it. Checked at both ends ([`stale_launched_by`] names each refusal); an unlisted
 /// phase reads as missing from both populations, like any unrowed kernel. That a row reaches
 /// EVERY phase (a split needs a shape that splits) is argued by the row's shapes, at the row.
-/// Empty until the first multi-kernel launcher lands (Phase 1, 2026-11-19).
-pub(super) const LAUNCHED_BY: [(&str, &str); 0] = [];
+pub(super) const LAUNCHED_BY: [(&str, &str); 2] = [
+    // `rivoli_mla_attend`: the split-KV attend, then (when the plan splits) the combine. Its
+    // gate row's shapes reach both: `nr` from 1 (one split) past 2048 (16).
+    ("mla_latent_attend", "mla_attend"),
+    ("mla_attend_combine", "mla_attend"),
+];
 
 /// The names the shipped kernels are rowed under — less [`UNROWED`], each kernel's
 /// [`LAUNCHED_BY`] launcher where it has one and its own name otherwise — sorted and

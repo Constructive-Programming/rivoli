@@ -2102,3 +2102,52 @@ assertion. The table below is the rerun.
 | as above, plus a comment line `// run(&ROPE_SPLIT_HALF, ...)` in the body | exit 101, stale: "does not launch" — isolated (a mention is not a launch) |
 | the rename, `M` | exit 0 (the positive control) |
 | restored | exit 0 |
+
+## 20. Rust kernels, Phase 1 L4 — the attention rows' plants (added 2026-11-19)
+
+Four plants. Each is a small patch under `tests/bit-identity/plants/`, relative to the repo
+root, with every hunk marked `PLANT`. No red-proof branch lives in shipped source. Each patch
+builds a PLANTED `bit_identity` binary, which the device arm runs under
+`tests/bit-identity.sh --expect-red=ROWS <binary>`. The patch is applied in place, the binary is
+built and copied to scratch, and the file is restored by copy and checked with `cmp`.
+
+The three numeric plants were shown adversarial on CPU first, over the rows' own inputs, by
+`crates/engine/tests/bit_identity/attn_plants.rs`. Those tests are deviceless, not ignored, and
+run in every `cargo test`. Each demands that the plant move at least 90% of eligible seeds. The table's figures are
+from `/var/cache/rivoli/scratch/rk-l4-attn/gates/plants-cpu.log` (`--nocapture`).
+
+| plant | defect | must redden | CPU (deviceless, 2026-11-19) |
+|---|---|---|---|
+| `attn-mla` | accumulator `acc·corr + p·L` fused on the RIGHT product (the `hc_post` class) | `mla_attend` | 35140/81920 accumulators differ, 40/40 eligible seeds |
+| `attn-gqa` | accumulator update fused where the C has `contract(off)` | `gqa_attend`, `gqa_block_attend` | 4904/32768, 64/64 |
+| `attn-dense` | score dot fused in both two-pass kernels (two hunks) | `gather_attn_shared_kv`, `mha_attend` | gather 40214/65536 logits, 64/64; mha 22442/57600, 62/64 |
+| `grid-y` | `launch_raw` passes `blocks_y` as gridDimZ — the slot §19 left OWED | `mla_attend`, `gather_attn_shared_kv`, `gqa_attend`, `gqa_block_attend` | structural: no FP |
+
+**`grid-y` needs no CPU model.** Every 2-D cell reaches its rows with `y ≥ 1` only through
+`blockIdx.y`:
+- the MLA splits;
+- the gather's prefill rows;
+- the GQA batches.
+
+With the axis in z, those rows are launched with `blockIdx.y = 0`:
+- gather and GQA rows with `y ≥ 1` stay at their per-side poison;
+- MLA's attend blocks all write split 0's slot, and the combine then merges it with
+  zero-filled `(m, l) = (0, 0)` slots, so `clat` is wrong rather than poisoned.
+
+Every 2-D row reddens by construction. `mha_attend` is 1-D and must hold.
+
+**A plant that refused to be a plant, kept as a finding.** The MLA model's first plant was the
+`p = expf(s − m_new)` site written unfused: hipcc absorbs `s = scale·total` into the
+subtraction. It moved 41/64 seeds on the row's inputs
+(`/var/cache/rivoli/scratch/rk-l4-attn/plants-cpu.log`, before the latent scales were
+softened). That is sub-threshold, because the fused and unfused subtraction differ only under
+cancellation. The model is the reason the gate does not stake an MLA red proof on that site. It
+was replaced by the right-product plant.
+
+The same model measured which seeds can carry an accumulator plant at all, and 24 of 64 cannot:
+- the 8 nasty seeds, where every score is NaN and is compared as a class;
+- the 16 scale-edge seeds, where one token's ×100 latent dominates and `p·L = 0` elsewhere.
+
+The model's 90% bar is taken over the other 40, and it says so at the test.
+
+Device arms: OWED to the lease (`rust-kernels.md` §5, Phase 1 L4).

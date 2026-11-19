@@ -44,6 +44,7 @@
 #![allow(improper_gpu_kernel_arg)]
 
 mod activation;
+mod attn;
 mod gpu;
 // The `common.hpp` port (Phase 0b, merged 2026-11-18). `pub` because in a cdylib with
 // `warnings = deny` a private module's not-yet-called helpers (the dot families, `rowview`,

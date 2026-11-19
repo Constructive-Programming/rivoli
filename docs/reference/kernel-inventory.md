@@ -38,6 +38,14 @@ column is a query, and a query can be wrong.
 
 ## The table
 
+> **2026-11-19 (Rust-kernel Phase 1 L4):** the five rows whose TU read `attn.hip` are Rust now,
+> in `crates/kernels/src/attn/` (`mla.rs`, `dense.rs`, `gqa.rs`), launched through `=>` rows and
+> `crates/backend/src/launch/attn.rs`; `attn.hip` is deleted and each launcher is to be scored by
+> `tests/bit-identity.sh` against the tagged hipcc twin (device arms OWED: `rust-kernels.md` §5,
+> Phase 1 L4). `mla_attend` is two kernels (the attend
+> and its split combine) behind one launcher, rowed under it by `kernel_coverage.rs`'s
+> `LAUNCHED_BY`. Names are unchanged in both columns.
+
 > **2026-11-18 (Rust-kernel Phase 0a):** the 13 rows whose TU reads `activation.rs` /
 > `residual.rs` are Rust now (`act_quant_f8`'s cell read `moe_f4.hip`, the TU that CALLS it
 > C-to-C — wrong before this move too; it still does, through the Rust export) — `crates/kernels/src/`, launched through `launchers!`'s `=>`
@@ -56,11 +64,11 @@ column is a query, and a query can be wrong.
 | `situ_glu_f32` | `situ_glu_f32` | activation.rs | · | · | **✓** | · | · | k3/forward :: situ_mlp |
 | `swiglu` | `swiglu` | activation.rs | **✓** | · | · | **✓** | · | glimmer/forward; glm/mlp :: desc_of, mlp |
 | `swiglu_clamped_bf16` | `swiglu_clamped_bf16` | activation.rs | · | **✓** | · | · | · | v4/moe :: shared_expert |
-| `attend` | `mla_attend` | attn.hip | **✓** | · | · | · | · | glm/attn :: attend_rows |
-| `gather_attn_shared_kv` | `gather_attn_shared_kv` | attn.hip | · | **✓** | · | · | · | v4/attn :: attend_rows |
-| `gqa_attend` | `gqa_attend` | attn.hip | · | · | · | **✓** | · | glimmer/forward :: attention |
-| `gqa_block_attend` | `gqa_block_attend` | attn.hip | · | · | · | · | · | *(no production reference)* |
-| `mha_attend` | `mha_attend` | attn.hip | · | · | **✓** | · | · | k3/forward :: mla_attention |
+| `attend` | `mla_attend` | attn/mla.rs | **✓** | · | · | · | · | glm/attn :: attend_rows |
+| `gather_attn_shared_kv` | `gather_attn_shared_kv` | attn/dense.rs | · | **✓** | · | · | · | v4/attn :: attend_rows |
+| `gqa_attend` | `gqa_attend` | attn/gqa.rs | · | · | · | **✓** | · | glimmer/forward :: attention |
+| `gqa_block_attend` | `gqa_block_attend` | attn/gqa.rs | · | · | · | · | · | *(no production reference)* |
+| `mha_attend` | `mha_attend` | attn/dense.rs | · | · | **✓** | · | · | k3/forward :: mla_attention |
 | `act_quant_f4_rotated` | `act_quant_f4_rotated` | blockindex.hip | · | **✓** | · | · | · | v4/blocksel; v4/kvcompress :: emit, raw_scores |
 | `append_kv` | `append_kv` | fwd.hip | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
 | `argmax` | `argmax` | fwd.hip | **✓** | **✓** | **✓** | **✓** | · | glimmer/forward; glm/decode; k3/decode; v4/decode :: argmax, argmax_rows, sample |
@@ -141,7 +149,7 @@ in `gate-red-proofs.md` §17 (2026-09-10).
 | `index_head_route` | indexer.hip | **pending M13** | as above |
 | `index_pool_push` | indexer.hip | **pending M13** | as above |
 | `layernorm` | indexer.hip | **pending M13** | used only by that pipeline ("`k_norm` … feeds `layernorm` below"); no other module imports it |
-| `gqa_block_attend` | attn.hip | **not wired — by decision** | M17c's drafter attend: oracle-covered and executed (7/7, witnessed 2026-09-04), but §4 states it is a scored kernel rather than a shipped one. Its `gqa_attend` duplication is still OWED because jscpd cannot see `.hip` |
+| `gqa_block_attend` | attn/gqa.rs | **not wired — by decision** | M17c's drafter attend: oracle-covered and executed (7/7, witnessed 2026-09-04), but §4 states it is a scored kernel rather than a shipped one. Its `gqa_attend` duplication was OWED because jscpd could not see `.hip`; CLOSED 2026-11-19 by the Rust port (Phase 1 L4), where both kernels are one body, `attn/gqa.rs::attend`, over a row window |
 | `gdn_recurrent_f32` | recurrent.hip | **qwen S3 ahead of S6** | named in `kernel_coverage.rs`'s FOURTH TURN as one of three launchers that landed with their oracles; the arm that would call them is S6 |
 | `index_pool_norm_f32` | indexer.hip | **qwen S3 ahead of S6** | same |
 | `gated_residual_collapse_f32` | residual.rs | **qwen S3 ahead of S6** | same |
