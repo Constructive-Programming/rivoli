@@ -29,7 +29,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)] // meta-gate: panic loudly
 
 mod common;
+#[path = "kernel_coverage/launched_by.rs"]
+mod launched_by;
 
+use launched_by::{rowed_names, stale_launched_by};
 use std::path::Path;
 
 /// Launchers whose oracle files arrive with a later milestone. `arrives` names the
@@ -566,9 +569,10 @@ fn gate_rows() -> Vec<(String, bool)> {
 /// Every shipped Rust kernel is scored by the bit-identity gate and reached through a
 /// `launchers!` `=>` row, and every gate row and `=>` row names a shipped Rust kernel — three
 /// populations, both directions each, with [`UNROWED`] the one argued exemption (checked to
-/// exist). Without it a lane could port a kernel with no row and every other census plus the
-/// gate would stay green; CLAUDE.md's "every Rust kernel with an output" was prose until this
-/// (Phase 0 merge review, 2026-11-18).
+/// exist) and [`launched_by::LAUNCHED_BY`] rowing a multi-kernel launcher's phases under that
+/// launcher (checked at both ends). Without it a lane could port a kernel with no row and
+/// every other census plus the gate would stay green; CLAUDE.md's "every Rust kernel with an
+/// output" was prose until this (Phase 0 merge review, 2026-11-18).
 #[test]
 fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
     let device = shipped_kernels();
@@ -578,11 +582,7 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
             "UNROWED names `{u}`, which is not a shipped gpu-kernel — delete the exemption"
         );
     }
-    let rowed: Vec<String> = device
-        .iter()
-        .filter(|k| !UNROWED.contains(&k.as_str()))
-        .cloned()
-        .collect();
+    let (rowed, stale) = (rowed_names(), stale_launched_by());
     // A `=>` row names its Rust host launcher `rivoli_<kernel>`; that launcher's own
     // `Kernel::new(c"<kernel>")` is held by the host-handle census above.
     // Only declaration lines (they start with the stem): the DSL's own docs spell the form.
@@ -606,17 +606,28 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
     .flat_map(|(what, population)| {
         let (missing, extra) = one_sided(&rowed, population);
         [
-            (format!("Rust kernels missing from {what}"), missing),
             (
-                format!("entries in {what} naming no shipped Rust kernel"),
+                format!("row names (a kernel, or its LAUNCHED_BY launcher) missing from {what}"),
+                missing,
+            ),
+            (
+                format!(
+                    "entries in {what} that are no row name (a kernel, or its LAUNCHED_BY launcher)"
+                ),
                 extra,
             ),
         ]
     })
-    .chain([(
-        "ROWS entries whose row function never binds `c\"rivoli_<name>\"`".to_string(),
-        unbound,
-    )])
+    .chain([
+        (
+            "ROWS entries whose row function never binds `c\"rivoli_<name>\"`".to_string(),
+            unbound,
+        ),
+        (
+            "stale LAUNCHED_BY entries".to_string(),
+            stale.iter().collect(),
+        ),
+    ])
     .filter(|(_, names)| !names.is_empty())
     .map(|(head, names)| format!("{head}:\n  {}", bullet(&names)))
     .collect();
