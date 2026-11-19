@@ -2187,5 +2187,48 @@ hipcc's `-S` of the tag (`scratch/rk-integrate/ref/`), plus a new per-loop VALU/
 - **Bits: OWED to the lease.** The argument: every change moves address arithmetic, load order,
   or a load from vector to scalar memory; no float operation changes value or order, and the
   three that move VALU → SALU are the same IEEE ops (above).
+  > **SETTLED 2026-11-19 (the lease, below):** 66/66 rows BIT-IDENTICAL in A and A′.
 - **Plants.** All 24 patches still apply under `patch -p1 -F0`.
+
+**The lease (2026-11-19, commit `fe02120`, rh-anine).** One `setsid`-detached driver,
+`scratch/rk-perf/lease/lease.sh`, ran 22:08:59–23:28:34 +01:00. Every binary was built outside
+the lock, and 0 units compiled inside it (`W.out`). No arm was discarded: every arm that reached
+the device had an empty witness, and GTT read 17 MiB before each (17.8 MiB exact around D).
+
+| arm | verdict | rc | wall |
+|---|---|---|---|
+| A | GREEN: every row BIT-IDENTICAL | 0 | 15.1 min |
+| A′ (timing control) | GREEN: every row BIT-IDENTICAL | 0 | 15.4 min |
+| launcher plants, one binary (fwd, launch/kvcompress, launch/mla, attn-dense) | GREEN (expect-red): exactly `gather_attn_shared_kv` 187, `mha_attend` 209, `gemm_bf16` 266, `mla_absorb_fp8` 256, `sigmoid_gate` 256 cells red | 0 | 15.4 min |
+| `--probes` | GREEN: 222/222 probe rows identical | 0 | 0.9 min |
+| `--plant=reduce` | GREEN: `k_wave_sum` red 64/64, the must-hold rows held | 0 | 2 s |
+| `--plant=barrier` | **refused at setup** (`no plant_spec row for 'barrier'`): that plant's arm is owed (its judge, a per-kernel `s_barrier` census, is not in the tree). Listing it was a planning error in the READY post. Not rerun. | 2 | 0 s |
+| W (full battery, `--test-threads=1`) | 721 passed, 1 failed: CodeScene, the same 30 inherited files as Step 4's W (lists diffed equal) | 101 | 19.2 min |
+| D (`determinism-glm.sh`, `--arena-refresh`, ngen 1024) | GREEN: ids identical to 1024; GTT rise 0; `slot_stalls 0`; 2.73 and 2.82 tok/s | 0 | 13.5 min |
+
+- **In place of the barrier arm, deviceless:** the census that plant's judge would read. The
+  per-kernel `s_barrier` and `buffer_gl0_inv` counts are identical before and after in all 84
+  kernels, 39 of which have barriers (`lease/barrier-census.txt`). W and D are the race arms the
+  coordinator added for the barrier change: D is green, and W's one red is CodeScene.
+- **The four rows, by the fixed rule** (closed when the mean ratio is ≤ 1 + max(0.05, A/A′
+  spread)):
+
+  | row | before (Step 4 mean) | A / A′ | mean | verdict |
+  |---|---|---|---|---|
+  | `gather_attn_shared_kv` | 1.107 | 1.000 / 0.994 | 0.997 | **closed** |
+  | `kv_compress_decode` | 1.065 | 0.963 / 0.973 | 0.968 | **closed** |
+  | `mla_value_fp8` | 1.061 | 1.021 / 1.018 | 1.019 | **closed** |
+  | `hash_rows` | 1.914 | 0.908 / 0.910 | 0.909 | **closed** (now faster than hipcc) |
+
+- **Every other row against Step 4's table** (`scratch/rk-perf/lease/cmp.txt`, `bin/cmp.py`).
+  A row "moved" when its mean changed by more than the larger of the two leases' A/A′ spreads.
+  Of the 71 timed shapes, none is slow by the fixed rule. Three ~2 µs rows sit above 1.05 and
+  pass on their spread alone (A′ spiked about +0.17 on each): `swiglu` 1.085, `index_append`
+  1.077, `index_pool_push` 1.084.
+  - **Faster:** 16 moved faster, the four above and 12 more, largest `logit_softcap` −0.022.
+  - **Slower, three rows, all still at parity** (the move threshold is the larger spread, 0.001
+    for the fp4 row):
+    - `hc_post` 0.923 → 0.961 (+0.037; a 2.4 µs row whose spread is 0.024–0.025);
+    - `act_quant_f4_rotated` 0.958 → 0.968 (+0.010);
+    - `moe_expert_range_f4` single expert 1.018 → 1.020 (+0.002).
 
