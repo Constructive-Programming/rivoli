@@ -247,9 +247,14 @@ pub unsafe extern "gpu-kernel" fn kv_compress_decode(a: CompressDecode) {
     sync_threads();
     if overlap {
         let n = p.ratio as usize * cd;
+        // Both loads before either store: the C's `__restrict__` lets hipcc hoist the score load
+        // over the kv store, and raw pointers do not, which left one more serial global round
+        // trip per element (rust-kernels.md §5 "Perf follow-up"). The two buffers are distinct
+        // and `[n, 2n)` never meets `[0, n)`, so the values are the same.
         for_usize(tid() as usize, n, COMPRESS_BLOCK as usize, |i| {
-            *a.kv_state.add(i) = *a.kv_state.add(n + i);
-            *a.score_state.add(i) = *a.score_state.add(n + i);
+            let (kv, score) = (*a.kv_state.add(n + i), *a.score_state.add(n + i));
+            *a.kv_state.add(i) = kv;
+            *a.score_state.add(i) = score;
         });
     }
 }

@@ -72,6 +72,8 @@ Spike tree: `/var/cache/rivoli/scratch/rust-amdgpu-spike/` (scratch, not vendore
    > in core's source); the device crate binds the LLVM intrinsics directly.
    > **2026-11-18 (0a/0b merge):** that `sync_threads` now lives in `prelude::reduce`, and
    > the `maxnum`/`minnum` bindings in `prelude::llvm`; `gpu.rs`'s copies are gone.
+   > **CHANGED 2026-11-19:** the ordering moved from the asm's memory clobbers to two
+   > `compiler_fence(SeqCst)`, same instructions (§5, Perf follow-up).
 3. **Small-launch gap, UNEXPLAINED.** Rust `swiglu` is 1.38–1.68× hipcc at 6k–12k
    elements (2.0 → 3.3 µs), 1.01–1.06× at 1M, survives order reversal. The only kernel-
    descriptor difference found: Rust enables the dispatch-ptr user SGPRs (blockDim read
@@ -2146,3 +2148,44 @@ scorers 0.18×.
 - from Step 1: L2's gdn `rep` computed in the row; the L1/L2 launcher-row plants at the plants
   root rather than `plants/launch/`;
 - CodeScene: the 30 inherited files below 10/10, unchanged by this branch.
+
+### Perf follow-up (2026-11-19, branch `wave/rk-perf`, base `51ab275`)
+
+The four rows Step 4 left slow. Method as Step 3: the shipped code object (built from
+`crates/kernels` with `device.rs`'s flags, `scratch/rk-perf/bin/kb.sh`) read loop by loop against
+hipcc's `-S` of the tag (`scratch/rk-integrate/ref/`), plus a new per-loop VALU/SALU/VMEM split
+(`bin/loopclass.py`, `bin/cls.py`). Every experiment's ELF and per-kernel ISA are in
+`scratch/rk-perf/{elf,isa}/` (`base` = `51ab275`). Each row had its own cause:
+
+| row (A / A′) | cause | change | static instructions, hipcc / before / after |
+|---|---|---|---|
+| `gather_attn_shared_kv` (1.109 / 1.106) | **The barrier's asm hid uniform loads.** The values loop reads `ix[j]`, uniform per block. hipcc loads it with `s_load_b32` (scalar cache, `lgkmcnt`), Rust with `global_load_b32` + `v_readfirstlane` (a vector-memory round trip per slot, 640 slots at the timed shape, then the dependent `kv` load). AMDGPU makes a uniform global load scalar only if `isClobberedInFunction` finds no clobber above it; that analysis skips fences and barrier intrinsics, but `sync_threads`'s asm memory clobbers counted as writes to every address. | `sync_threads`: the asm is `nomem`, and two `compiler_fence(SeqCst)` carry the ordering (argued in `prelude/reduce.rs`). The values loop is now hipcc's per slot (`s_load_b32`, `s_cmp`/`scc` branch), 2× unrolled. | 720 / 897 / 890 |
+| `kv_compress_decode` (1.060 / 1.070) | **A lost `__restrict__` serialised the window slide.** Pooling, finish and every other loop matched hipcc or were leaner (the tree is unrolled where hipcc loops on `blockDim`). The slide was not: hipcc issues `kv_state[n+i]` and `score_state[n+i]` before either store, while Rust waited `vmcnt(0)` between them, because the score load may alias the kv store through raw pointers. That is one more serial global round trip per element, 16 per thread, in a one-block kernel. L2's `gated_delta` cause again (loads before stores). | Both loads first, then both stores. The buffers are distinct and `[n, 2n)` never meets `[0, n)`, so the values are unchanged. The loop is now hipcc's: two loads, `vmcnt(1)`, store, `vmcnt(0)`, store. | 1017 / 1144 / 1158 |
+| `mla_value_fp8` (1.060 / 1.062) | **`usize` where the C has `int`, in a VALU-heavy kernel.** Estimated from static counts on the timed path: 16384 waves of about 250 VALU each keep the 80 SIMDs issuing for roughly two thirds of the 27 µs, so VALU count tracks time. Rust ran about 22 more VALU per wave than hipcc (≈ 9%): 10 in the prologue (`head`/`j` from the 64-bit `r / vh` stayed 64-bit, so `head · (nope + vh)` became full 64×64 products) and 3 per iteration of the 4-iteration dword loop. The C's `int head` lets clang use 32×32→64 `v_mad_i64_i32`. | `head`, `j` (and `nope + vh`) as `i32`, as the C has them. Same values: `head < h`, `j < vh`, all `i32` kernarg fields. Prologue VALU 125 → 115, hipcc's count; multiply count 23 → 18, hipcc's. | 424 / 445 / 448 |
+| `hash_rows` (1.932 / 1.897) | **Atomic scope**, as Step 3 found: core's system-scope 64-bit `fetch_xor` expands to a load + `global_atomic_cmpswap_b64` retry loop (32-bit halves expand the same way, measured). | `fwd.rs::agent_xor`: one `global_atomic_xor_b64` in asm, hipcc's instruction, no return. The memory-model argument is at `fwd.rs::agent_xor`. | 169 / 262 / 242 |
+
+- **What remains, by row (ISA, not timing):**
+  - `mla_value_fp8`'s dword loop is still 31 VALU against hipcc's 28. The three extra are a
+    `v_add_nc_u32 v, 0, v` on three of the four LUT reads: the dynamic-LDS base is a link-time symbol (resolved to
+    0), so codegen cannot fold it the way hipcc folds a static `__shared__` array's offset. That
+    is structural for every kernel that addresses dynamic LDS through computed indices;
+    Rust has no LDS statics. The 64-bit loop counters and hipcc's sign extensions roughly cancel:
+    an `i32` loop in `fp8_dot_strided_r` (`expC`) came to 30, and was left out, because it changes
+    the shared fp8 prelude under every `gemv_fp8*` row for about 4 VALU per wave here.
+  - `kv_compress_decode`, `gather_attn_shared_kv` and `hash_rows`: no further difference found
+    (`hash_rows`' sample loop is hipcc's, 43 instructions each). Static counts stay above hipcc's
+    because Rust unrolls the block-size-constant LDS trees that hipcc loops on `blockDim`.
+- **The barrier change reaches every kernel.** Totals: FP-op census identical in 79/84 kernels.
+  The other five, all argued:
+  - `gated_delta_recurrent_f32` moves 2 `v_fma` and 1 `v_add` to `s_fmac_f32`/`s_add_f32`: the
+    same IEEE ops on SALU, now that their uniform operands load scalar. hipcc does this itself,
+    and the base tree's bit-identical `hc_pre` already had 32 `s_fmac_f32`.
+  - `hc_pre` only swaps `v_fma` for `v_fmac` encodings, 350 each.
+  - `gdn_recurrent_f32` and the two `mla_value_fp8` rows differ in `v_cndmask`: integer selects,
+    in the division and in loop control. They are not FP values.
+- **Occupancy:** no kernel changes waves. `mla_value_fp8` goes from 24 to 25 VGPR, still 16 waves.
+- **Bits: OWED to the lease.** The argument: every change moves address arithmetic, load order,
+  or a load from vector to scalar memory; no float operation changes value or order, and the
+  three that move VALU → SALU are the same IEEE ops (above).
+- **Plants.** All 24 patches still apply under `patch -p1 -F0`.
+

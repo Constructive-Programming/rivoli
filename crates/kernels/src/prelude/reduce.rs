@@ -8,6 +8,7 @@
 //! from the kernel, which knows it as a constant or a kernel argument.
 
 use core::arch::amdgpu::mbcnt_lo;
+use core::sync::atomic::{Ordering::SeqCst, compiler_fence};
 
 use super::llvm::{maxnum, wave_shuffle};
 
@@ -28,16 +29,32 @@ pub const ROWS_PER_BLOCK: usize = rivoli_abi::geom::ROWS_PER_BLOCK as usize;
 /// The barrier is the `llvm.amdgcn.s.barrier` intrinsic, not `s_barrier` in the asm
 /// (CHANGED 2026-11-18 at the 0a/0b merge; rust-kernels.md §5 has the record): the intrinsic
 /// is `convergent`, so LLVM cannot duplicate it into divergent branches, and inline asm is
-/// not. It is also `IntrNoMem`, which is what the two asm blocks are for — each is opaque
-/// memory access, so no load or store crosses either, nor the barrier between them.
+/// not. It is also `IntrNoMem`, so something else must keep memory operations from crossing.
+///
+/// **That something is two compiler fences, not the asm** (CHANGED 2026-11-19, rust-kernels.md
+/// §5 "Perf follow-up"). As opaque memory clobbers the asm counted as a write to every
+/// address, so AMDGPU's uniform-load analysis (`isClobberedInFunction`, which skips fences)
+/// kept every uniform global load after a barrier a per-lane `global_load` where hipcc gets an
+/// `s_load`. A fence of any scope is a MemoryDef that alias analysis treats as reading and
+/// writing all non-constant memory, so no load or store crosses one in IR; in machine code the
+/// fences and the asm all have side effects, which keeps memory instructions on their side.
+/// `singlethread` fences emit nothing, so the asm stays the whole hardware sequence. The
+/// cross-lane ordering rests on that alias-analysis and side-effect behaviour, as hipcc's
+/// does, not on LLVM's formal synchronization rules.
 #[inline(always)]
 pub fn sync_threads() {
     // SAFETY: waits and a cache invalidate; no registers or memory are written. Every caller
     // must reach the barrier uniformly across the block, as `__syncthreads` requires.
     unsafe {
-        core::arch::asm!("s_waitcnt vmcnt(0) lgkmcnt(0)", "s_waitcnt_vscnt null, 0x0");
+        compiler_fence(SeqCst);
+        core::arch::asm!(
+            "s_waitcnt vmcnt(0) lgkmcnt(0)",
+            "s_waitcnt_vscnt null, 0x0",
+            options(nomem, nostack, preserves_flags)
+        );
         core::arch::amdgpu::s_barrier();
-        core::arch::asm!("buffer_gl0_inv");
+        core::arch::asm!("buffer_gl0_inv", options(nomem, nostack, preserves_flags));
+        compiler_fence(SeqCst);
     }
 }
 

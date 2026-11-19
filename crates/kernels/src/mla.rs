@@ -184,9 +184,14 @@ unsafe fn value<const R: usize>(a: MlaValue) {
     if r >= h * vh {
         return;
     }
-    // SAFETY: `vh > 0` (1001).
-    let (head, j) = (unchecked_div(r, vh), unchecked_rem(r, vh));
-    let row = head * (k.nope as usize + vh) + k.nope as usize + j;
+    // SAFETY: `vh > 0` (1001). `head < h`, `j < vh` and `nope + vh` are the C's `int`s, so
+    // LLVM multiplies 32×32→64 as hipcc does, not 64×64 (prologue VALU per wave 125 → 115,
+    // rust-kernels.md §5 "Perf follow-up").
+    let (head, j) = (
+        unchecked_div(r, vh) as i32 as usize,
+        unchecked_rem(r, vh) as i32 as usize,
+    );
+    let row = head * (k.nope + k.vh) as usize + k.nope as usize + j;
     let w = Fp8Row {
         w: k.w.add(row * kvl),
         scale: k

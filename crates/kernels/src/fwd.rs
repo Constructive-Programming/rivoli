@@ -10,7 +10,8 @@
 //!
 //! **Atomics:** hipcc's `atomicCAS`/`atomicXor` are `syncscope("agent") monotonic`; Rust's
 //! `Atomic*` are system scope. The scope moves no value — the CAS's winner and the XOR's
-//! result are each defined by the operation — and the ISA is read for the instruction.
+//! result are each defined by the operation — but it can move the instruction: the system
+//! XOR became a CAS loop, so `hash_rows` writes the agent-scope XOR out (`agent_xor`).
 
 use crate::gpu::{bid, elementwise, fma, for_i32, lds, tid};
 use crate::prelude::activation::tanh_ocml;
@@ -18,7 +19,7 @@ use crate::prelude::formats::f2bf16;
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::{sync_threads, tree};
 use core::intrinsics::{exp, fabs, floor, unchecked_div, unchecked_rem};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use rivoli_abi::geom::{APPEND_KV_GROUP, ARGMAX_BLOCK, HASH_BLOCK};
 use rivoli_abi::kernarg::{
     AppendKv, Argmax, EmbedI8, FlagNonfinite, GatherRope, HashRows, InPlaceBinary, Softcap,
@@ -231,6 +232,34 @@ pub unsafe extern "gpu-kernel" fn hash_rows(a: HashRows) {
     sync_threads();
     tree(t, HASH_BLOCK as usize, |t, s| *red.add(t) ^= *red.add(s));
     if t == 0 {
-        AtomicU64::from_ptr(a.out).fetch_xor(*red, Ordering::Relaxed);
+        agent_xor(a.out, *red);
+    }
+}
+
+/// `atomicXor(out, v)` as hipcc emits it: one relaxed, agent-scope `global_atomic_xor_b64`,
+/// no return. Core's atomics are system scope, and LLVM expands a system-scope 64-bit XOR into a
+/// load + `global_atomic_cmpswap_b64` retry loop, which timed `hash_rows` at 1.9× hipcc
+/// (rust-kernels.md §5, "Perf follow-up"); nightly 1.102 has no syncscope route.
+///
+/// - **Scope.** Agent scope is hipcc's, and the readback is unchanged: `out` is device memory
+///   the host reads only through a sync and a D2H copy.
+/// - **Ordering.** The asm keeps its default memory clobber: a stronger compiler barrier than
+///   relaxed, never a weaker one.
+/// - **Counters.** `SIInsertWaitcnts` does not see the asm's `vscnt` increment. Nothing after it
+///   reads memory and `s_endpgm` needs no wait; code added after it that reads `out` must wait
+///   `vscnt` itself.
+///
+/// # Safety
+/// `out` is a valid, 8-byte-aligned device address.
+#[inline(always)]
+unsafe fn agent_xor(out: *mut u64, v: u64) {
+    // SAFETY: the caller's contract; the instruction writes only `*out`.
+    unsafe {
+        core::arch::asm!(
+            "global_atomic_xor_b64 {a}, {v}, off",
+            a = in(vgpr64) out,
+            v = in(vgpr64) v,
+            options(nostack, preserves_flags)
+        );
     }
 }
