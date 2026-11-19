@@ -51,6 +51,7 @@ mod gpu;
 pub mod prelude;
 #[cfg(feature = "probes")]
 mod probes;
+mod recurrent;
 mod residual;
 mod touch;
 

@@ -13,8 +13,9 @@ column is a query, and a query can be wrong.
 
 * **Rows.** The `launchers!` DSL rows in `crates/backend/src/{hip_linalg,hip_activation,hip_blocks,hip_attn}.rs`
   (`hip_activation` split out of `hip_linalg` 2026-11-18)
-  (grammar `rust_fn -> c_symbol, "tag" (args)`), plus the four hand-written launchers in
-  `hip.rs`/`hip_attn.rs` that the macro refuses. 66 in total, which is the same population
+  (grammar `rust_fn -> c_symbol, "tag" (args)` for a hipcc launcher, `rust_fn => rivoli_x(..),
+  "tag" (args)` for a Rust one), plus the three hand-written launchers in `hip.rs` that the
+  macro refuses. 66 in total, which is the same population
   `kernel_coverage.rs` prints (`66 launchers: 66 with oracles, 0 deferred`, measured by
   `--nocapture` on a deviceless run) — two independent derivations agreeing is the only reason
   the count is stated rather than counted.
@@ -45,6 +46,11 @@ column is a query, and a query can be wrong.
 > Phase 0 merge review, 2026-11-18); `activation.hip` and `residual.hip` are
 > deleted, and each kernel is scored byte-for-byte against its tagged hipcc twin by
 > `tests/bit-identity.sh`. Names are unchanged in both columns.
+>
+> **2026-11-19 (Rust-kernel Phase 1, L2):** the four `recurrent.rs` rows likewise — `recurrent.hip`
+> is deleted. `gdn_recurrent_f32` was a hand-written launcher (`GdnBufs`); its launcher is Rust
+> now and a `=>` row's call expression is free-form, so it is a DSL row again and its row
+> moved up beside its family.
 
 | kernel (`launch_…`) | C entry | TU | GLM | V4 | K3 | Glimmer | Qwen | activated at (module :: fn) |
 |---|---|---|---|---|---|---|---|
@@ -103,14 +109,14 @@ column is a query, and a query can be wrong.
 | `act_quant_f8` | `act_quant_f8` | activation.rs | · | **✓** | · | · | · | v4/moe :: shared_expert |
 | `moe_expert_range_f4` | `moe_expert_range_f4` | moe_f4.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: expert_range |
 | `moe_expert_range_f4_situ` | `moe_expert_range_f4_situ` | moe_f4.hip | · | · | **✓** | · | · | k3/forward :: expert_range |
-| `gated_delta_recurrent_f32` | `gated_delta_recurrent_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
-| `rmsnorm_gate_heads_f32` | `rmsnorm_gate_heads_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
-| `short_conv_silu_f32` | `short_conv_silu_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `gated_delta_recurrent_f32` | `gated_delta_recurrent_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `rmsnorm_gate_heads_f32` | `rmsnorm_gate_heads_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `short_conv_silu_f32` | `short_conv_silu_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `gdn_recurrent_f32` | `gdn_recurrent_f32` | recurrent.rs | · | · | · | · | · | *(no production reference)* |
 | `attn_res` | `attn_res` | residual.rs | · | · | **✓** | · | · | k3/forward :: fold_into_h |
 | `gated_residual_collapse_f32` | `gated_residual_collapse_f32` | residual.rs | · | · | · | · | · | *(no production reference)* |
 | `hc_post` | `hc_post` | residual.rs | · | **✓** | · | · | · | v4/forward :: layer |
 | `hc_pre` | `hc_pre` | residual.rs | · | **✓** | · | · | · | v4/forward :: pre_norm |
-| `gdn_recurrent_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
 | `hash_rows` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
 | `index_score_blocks` | `(hand-written)` | *(hand)* | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
 | `index_score_blocks_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
@@ -142,7 +148,7 @@ in `gate-red-proofs.md` §17 (2026-09-10).
 | `index_pool_push` | indexer.hip | **pending M13** | as above |
 | `layernorm` | indexer.hip | **pending M13** | used only by that pipeline ("`k_norm` … feeds `layernorm` below"); no other module imports it |
 | `gqa_block_attend` | attn.hip | **not wired — by decision** | M17c's drafter attend: oracle-covered and executed (7/7, witnessed 2026-09-04), but §4 states it is a scored kernel rather than a shipped one. Its `gqa_attend` duplication is still OWED because jscpd cannot see `.hip` |
-| `gdn_recurrent_f32` | recurrent.hip | **qwen S3 ahead of S6** | named in `kernel_coverage.rs`'s FOURTH TURN as one of three launchers that landed with their oracles; the arm that would call them is S6 |
+| `gdn_recurrent_f32` | recurrent.rs | **qwen S3 ahead of S6** | named in `kernel_coverage.rs`'s FOURTH TURN as one of three launchers that landed with their oracles; the arm that would call them is S6 |
 | `index_pool_norm_f32` | indexer.hip | **qwen S3 ahead of S6** | same |
 | `gated_residual_collapse_f32` | residual.rs | **qwen S3 ahead of S6** | same |
 | `index_score_blocks_f32` | blockindex.hip | **qwen S3 ahead of S6** | the f32 sibling of V4's live `index_score_blocks`; `v4/blocksel.rs` calls the f4 pair, not this one |

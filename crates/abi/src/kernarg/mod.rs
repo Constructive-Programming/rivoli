@@ -20,9 +20,11 @@
 //! out differently, and either compile would fail.
 
 pub use activation::*;
+pub use recurrent::*;
 pub use residual::*;
 pub use touch::*;
 
 mod activation;
+mod recurrent;
 mod residual;
 mod touch;

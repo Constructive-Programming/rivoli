@@ -11,9 +11,10 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 12] = [
+const KERNELS: [&str; 11] = [
     // `activation` and `residual` (split out of this file 2026-08-15/16) left this list
-    // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below.
+    // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below. So is
+    // `recurrent` (Phase 1 L2).
     "linalg",
     "moe",
     // Split out of `moe.hip` 2026-08-16 (the FP4 routed-expert family, V4's pair and K3's
@@ -21,12 +22,6 @@ const KERNELS: [&str; 12] = [
     "moe_f4",
     "mla",
     "attn",
-    // NEW with M9: Kimi-K3's gated-delta-rule family (recurrence, short conv, gated head
-    // norm), ported verbatim from `k3:kernels/recurrent.hip`. A `.hip` absent from this
-    // list is silently never built and the archive then fails to link — which is the loud
-    // half; the QUIET half this list once shipped was a stale object from an untracked
-    // header, and `headers()` below is what closed it.
-    "recurrent",
     "fwd",
     "vmm",
     "indexer",
