@@ -46,9 +46,12 @@
 mod activation;
 mod gpu;
 // The `common.hpp` port (Phase 0b, merged 2026-11-18). `pub` because in a cdylib with
-// `warnings = deny` a private module's not-yet-called helpers (the dot families, `rowview`,
-// `moe_fixed`) are denied dead code; it can go private when Phase 1 calls them.
+// `warnings = deny` a private module's not-yet-called helpers (`dot_fp8`, the probes-only
+// paths) are denied dead code; it can go private when Phase 1 calls them all. (The nibble and
+// VQ dots and `moe_fixed` are called since L2's MoE port.)
 pub mod prelude;
+mod moe;
+mod moe_f4;
 #[cfg(feature = "probes")]
 mod probes;
 mod recurrent;

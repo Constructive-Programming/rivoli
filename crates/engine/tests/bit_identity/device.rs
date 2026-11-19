@@ -20,7 +20,8 @@ const RTLD_LOCAL: i32 = 0;
 /// called here exactly as the engine called them before the migration — guards, grid
 /// geometry and kernel together. Loaded `RTLD_LOCAL` and linked `-Bsymbolic`, so its
 /// launchers bind to its OWN kernels and never to a same-named symbol in this process
-/// (`rivoli_act_quant_f8` is one: the Rust launcher exports it for `moe_f4.hip`).
+/// (`rivoli_act_quant_f8` was one while the Rust launcher exported it for `moe_f4.hip`; the
+/// tagged `moe_f4.hip` in the reference still calls the tagged C one, as it must).
 pub struct Ref(*mut c_void);
 
 impl Ref {
@@ -88,9 +89,14 @@ pub enum Side {
 /// launches that both did nothing cannot agree. `InPlace` outputs start as the same input
 /// on both sides (the kernel reads them), and the row instead demands that at least one
 /// cell changed them (see [`Tally::in_place`]).
+#[derive(Clone)]
 pub enum Out {
     Poison(usize),
     InPlace(Vec<f32>),
+    /// An in-place INTEGER output (the MoE fixed-point accumulator), as raw bytes and compared
+    /// strictly: read as f32 words, a negative i64's high half is a NaN pattern, and the
+    /// NaN-as-a-class rule would pass two different accumulators.
+    Words(Vec<u8>),
 }
 
 /// Two DIFFERENT finite sentinels (±3.39e38 with distinct mantissas), not NaNs: under the
@@ -100,18 +106,11 @@ pub enum Out {
 const POISON: [u32; 2] = [0x7f7f_1234, 0xff7f_5678];
 
 impl Out {
-    /// A second output with the same starting contents (the timing cell's own).
-    fn fresh(&self) -> Self {
-        match self {
-            Out::Poison(n) => Out::Poison(*n),
-            Out::InPlace(v) => Out::InPlace(v.clone()),
-        }
-    }
-
     fn upload(&self, side: Side) -> DeviceBuf {
         match self {
             Out::Poison(n) => dev(&f32b(&vec![f32::from_bits(POISON[side as usize]); *n])),
             Out::InPlace(v) => dev(&f32b(v)),
+            Out::Words(b) => dev(b),
         }
     }
 }
@@ -126,12 +125,25 @@ pub struct Cell {
 
 impl Cell {
     pub fn new(ins: &[Vec<f32>], init: Vec<Out>) -> Self {
+        let bytes: Vec<Vec<u8>> = ins.iter().map(|v| f32b(v)).collect();
+        Self::from_bytes(&bytes, init)
+    }
+
+    /// [`Cell::new`] over raw input bytes (packed weights, scale codes, codebooks).
+    pub fn from_bytes(ins: &[Vec<u8>], init: Vec<Out>) -> Self {
         let set = |side| init.iter().map(|o| o.upload(side)).collect();
         Self {
-            ins: ins.iter().map(|v| dev(&f32b(v))).collect(),
+            ins: ins.iter().map(|b| dev(b)).collect(),
             outs: [set(Side::Hip), set(Side::Rust)],
             init,
         }
+    }
+
+    /// One more input, uploaded after the others so it can hold their device addresses (a
+    /// descriptor array); returns its index for [`Cell::i`].
+    pub fn push(&mut self, bytes: &[u8]) -> usize {
+        self.ins.push(dev(bytes));
+        self.ins.len() - 1
     }
 
     /// Input `i`'s device address.
@@ -161,6 +173,10 @@ pub struct Tally {
     /// In-place cells whose output moved from its input — must be > 0 for a row with any.
     pub moved: u64,
     pub in_place_rows: bool,
+    /// Per output slot, how many cells moved it (`None` for a poisoned slot): EVERY in-place
+    /// output must move in some cell, so a row whose accumulator never changed cannot pass on
+    /// the strength of its `h` having moved.
+    pub moved_by_out: Vec<Option<u64>>,
     pub notes: Vec<String>,
     pub timing: Vec<String>,
 }
@@ -175,13 +191,26 @@ impl Tally {
         for (k, init) in cell.init.iter().enumerate() {
             let (hip, rust) = (back(&cell.outs[0][k]), back(&cell.outs[1][k]));
             let words = hip.len() as u64 / 4;
-            let (diff, nan_only) = compare_f32(&hip, &rust);
+            let (diff, nan_only) = match init {
+                Out::Words(_) => (compare_words(&hip, &rust), 0),
+                _ => compare_f32(&hip, &rust),
+            };
             self.nan_payload_only += nan_only;
             self.words += words;
             bad += diff;
-            if let Out::InPlace(v) = init {
+            let start = match init {
+                Out::InPlace(v) => Some(f32b(v)),
+                Out::Words(b) => Some(b.clone()),
+                Out::Poison(_) => None,
+            };
+            if self.moved_by_out.len() <= k {
+                self.moved_by_out.resize(k + 1, None);
+            }
+            if let Some(start) = start {
+                let m = u64::from(hip != start);
                 self.in_place_rows = true;
-                self.moved += u64::from(hip != f32b(v));
+                self.moved += m;
+                *self.moved_by_out[k].get_or_insert(0) += m;
             }
             if diff > 0 && self.notes.len() < 6 {
                 self.notes
@@ -243,7 +272,7 @@ impl Tally {
     /// never moved), which is neither verdict and fails both the gate and its red proof.
     pub fn verdict(&self, row: &str) -> (String, bool) {
         let examined = self.cells > 0 && self.words > 0 && self.guards > 0;
-        let wrote = !self.in_place_rows || self.moved > 0;
+        let wrote = !self.in_place_rows || self.moved_by_out.iter().flatten().all(|&m| m > 0);
         let clean = self.bad_words == 0 && self.bad_guards == 0;
         let token = match (examined && wrote, clean) {
             (false, _) => "VACUOUS",
@@ -307,7 +336,7 @@ pub fn sweep<S: Copy + PartialEq + std::fmt::Debug, P>(
             let (ins, outs, p) = make(shape, seed);
             let go = |side, c: &mut Cell| accepted(launch(side, c, shape, &p), side, &what);
             if shape == shapes.hot && seed == 1 {
-                let timed = outs.iter().map(Out::fresh).collect();
+                let timed = outs.clone();
                 t.time(&format!("{shape:?}"), &mut Cell::new(&ins, timed), go);
             }
             t.run(&what, Cell::new(&ins, outs), go);
@@ -363,4 +392,12 @@ fn compare_f32(hip: &[u8], rust: &[u8]) -> (u64, u64) {
                 (false, false) => (d + 1, n),
             }
         })
+}
+
+/// Differing 4-byte words, strictly — for [`Out::Words`].
+fn compare_words(hip: &[u8], rust: &[u8]) -> u64 {
+    hip.chunks_exact(4)
+        .zip(rust.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count() as u64
 }

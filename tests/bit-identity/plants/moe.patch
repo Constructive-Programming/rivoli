@@ -1,0 +1,11 @@
+--- a/src/moe.rs
++++ b/src/moe.rs
+@@ -27,7 +27,7 @@
+ /// `x / (1 + e^-x)` — `moe.hip::siluf`, the division form.
+ #[inline(always)]
+ fn silu(x: f32) -> f32 {
+-    x / (1.0 + exp(-x))
++    x * (1.0 / (1.0 + exp(-x))) // PLANT: silu in the multiply form
+ }
+ 
+ /// The wave's `(lane, e, j)`: wave `r` of the grid is row `j = r % len` of absolute expert

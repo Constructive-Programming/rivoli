@@ -11,6 +11,10 @@
 //! family — moved whole to `hip_attn.rs`, on the cut "what mixes the residual stream" against
 //! "what reads or writes per-position context state".
 //!
+//! The MoE launchers are Rust since Phase 1 L2 (`launch/moe.rs`, kernels in
+//! `crates/kernels/src/moe{,_f4}.rs`); the `kernels/moe.hip` and `moe_f4.hip` their docs cite are
+//! at tag `archive/hip-kernels`, which keeps the arguments those docs point at.
+//!
 //! What separates these from `hip_linalg.rs`'s primitives is a contract, not a size: a block
 //! launcher owns intermediate device buffers the caller must size but never reads (`h`,
 //! `post`, `comb`, `pre`, the partial scratch), it is stream-ordered as a SET with its
@@ -19,10 +23,15 @@
 
 use crate::hip::{ExpertDesc, ExpertDescF4, abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
-    Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_post, rivoli_hc_pre,
+    DescRows, Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_post,
+    rivoli_hc_pre, rivoli_moe_acc_drain_s, rivoli_moe_acc_drain_to_s, rivoli_moe_expert_range,
+    rivoli_moe_expert_range_f4, rivoli_moe_expert_range_f4_situ, rivoli_moe_expert_range_i4,
 };
 use anyhow::Result;
-use rivoli_abi::kernarg::{AttnRes, GatedResidual, HcPost, HcPre};
+use rivoli_abi::kernarg::{
+    AccDrain, AccDrainTo, AttnRes, GatedResidual, HcPost, HcPre, MoeF4, MoeF4Situ, MoeRange,
+    MoeSpan, MoeVq,
+};
 use std::ffi::c_void;
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
@@ -95,7 +104,7 @@ launchers! {
     /// Every device pointer (`descs`/codebooks/`wexpert`/`x`/`h`/`acc`) must outlive
     /// `stream`'s completion — await its [`Signal`](crate::gpustream::Signal), and each must
     /// own `nrow` rows in the layout above.
-    launch_moe_expert_range -> rivoli_moe_expert_range, "moe_expert_range" (
+    launch_moe_expert_range => rivoli_moe_expert_range(MoeVq { range: MoeRange { x, descs, h, wexpert, acc, span: MoeSpan { hidden: hidden as i32, inter: inter as i32, e_start: e_start as i32, e_count: e_count as i32 } }, cb: [gate_cb, up_cb, down_cb] }, nrow as i32, stream), "moe_expert_range" (
         x: *const f32,
         hidden: usize as i32,
         inter: usize as i32,
@@ -120,7 +129,7 @@ launchers! {
     /// # Safety
     /// Every device pointer (`descs`/packed weights/`wexpert`/`x`/`h`/`acc`) must
     /// outlive `stream`'s completion — await its [`Signal`](crate::gpustream::Signal).
-    launch_moe_expert_range_i4 -> rivoli_moe_expert_range_i4, "moe_expert_range_i4" (
+    launch_moe_expert_range_i4 => rivoli_moe_expert_range_i4(MoeRange { x, descs, h, wexpert, acc, span: MoeSpan { hidden: hidden as i32, inter: inter as i32, e_start: e_start as i32, e_count: e_count as i32 } }, nrow as i32, stream), "moe_expert_range_i4" (
         x: *const f32,
         hidden: usize as i32,
         inter: usize as i32,
@@ -174,7 +183,7 @@ launchers! {
     /// of one need not.
     ///
     /// `x` and `h` must not ALIAS: both are `__restrict__` in the kernel.
-    launch_moe_expert_range_f4 -> rivoli_moe_expert_range_f4, "moe_expert_range_f4" (
+    launch_moe_expert_range_f4 => rivoli_moe_expert_range_f4(MoeF4 { range: MoeRange { x, descs, h, wexpert, acc, span: MoeSpan { hidden: hidden as i32, inter: inter as i32, e_start: e_start as i32, e_count: e_count as i32 } }, limit: swiglu_limit }, DescRows { n_desc: n_desc as i32, nrow: nrow as i32 }, stream), "moe_expert_range_f4" (
         x: *const f32,
         hidden: usize as i32,
         inter: usize as i32,
@@ -237,7 +246,7 @@ launchers! {
     /// `nrow` must be 1 (guard 1003) — K3 has no speculative decode (`num_nextn_predict_layers` is
     /// 0), and pass 1 is the one kernel of the pair that is NOT row-templated, so `nrow > 1` is a
     /// two-kernel change rather than a parameter.
-    launch_moe_expert_range_f4_situ -> rivoli_moe_expert_range_f4_situ, "moe_expert_range_f4_situ" (
+    launch_moe_expert_range_f4_situ => rivoli_moe_expert_range_f4_situ(MoeF4Situ { range: MoeRange { x, descs, h, wexpert, acc, span: MoeSpan { hidden: expert_in as i32, inter: inter as i32, e_start: e_start as i32, e_count: e_count as i32 } }, b1, b2 }, DescRows { n_desc: n_desc as i32, nrow: nrow as i32 }, stream), "moe_expert_range_f4_situ" (
         x: *const f32,
         expert_in: usize as i32,
         inter: usize as i32,
@@ -270,7 +279,7 @@ launchers! {
     /// # Safety
     /// `x` and `acc` hold `n` f32 / `n` u64; EVERY stream that accumulated into `acc` must
     /// already have completed.
-    launch_moe_acc_drain -> rivoli_moe_acc_drain_s, "moe_acc_drain" (
+    launch_moe_acc_drain => rivoli_moe_acc_drain_s(AccDrain { to: AccDrainTo { out: x, acc, n: n as i32, rows: rows as i32 }, gain }, stream), "moe_acc_drain" (
         x: *mut f32,
         acc: *mut u64,
         n: usize as i32,
@@ -305,7 +314,7 @@ launchers! {
     /// `out` holds `n` f32 and `acc` holds `rows·n` u64; EVERY stream that accumulated into `acc`
     /// must already have completed. `out` must not alias `acc`, and — unlike the sibling — it does
     /// NOT need to be zeroed first, because this assigns.
-    launch_moe_acc_drain_to -> rivoli_moe_acc_drain_to_s, "moe_acc_drain_to" (
+    launch_moe_acc_drain_to => rivoli_moe_acc_drain_to_s(AccDrainTo { out, acc, n: n as i32, rows: rows as i32 }, stream), "moe_acc_drain_to" (
         out: *mut f32,
         acc: *mut u64,
         n: usize as i32,

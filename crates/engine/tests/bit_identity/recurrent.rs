@@ -5,7 +5,7 @@
 //! engine launches it.
 
 use super::device::{Cell, I, O, Out, Ref, S, Shapes, Side, Tally, both, code, guard_ptrs, sweep};
-use super::inputs::{draw, uniform};
+use super::inputs::{draw, nan_some, uniform};
 use rivoli_backend::hip::{self, GdnBufs, HeadCount, HeadDim};
 use std::ptr::null_mut;
 
@@ -51,17 +51,6 @@ const GDN_SWEEP: Shapes<GdnCell> = Shapes {
     ],
     hot: (16, 48, 128, 128),
 };
-
-/// A NaN on one seed in eight (slot 14 of `x`), so most seeds stay unmasked by propagation
-/// and every shape with more than 14 elements carries a NaN cell.
-fn nan_some(mut x: Vec<f32>, seed: u64) -> Vec<f32> {
-    if seed % 8 == 7
-        && let Some(s) = x.get_mut(14)
-    {
-        *s = f32::NAN;
-    }
-    x
-}
 
 /// `f(ins[0], …, ins[6], rest…)`: the seven read buffers both delta rules take first, spelled
 /// once rather than in every C and Rust call.

@@ -47,10 +47,12 @@ column is a query, and a query can be wrong.
 > deleted, and each kernel is scored byte-for-byte against its tagged hipcc twin by
 > `tests/bit-identity.sh`. Names are unchanged in both columns.
 >
-> **2026-11-19 (Rust-kernel Phase 1, L2):** the four `recurrent.rs` rows likewise — `recurrent.hip`
-> is deleted. `gdn_recurrent_f32` was a hand-written launcher (`GdnBufs`); its launcher is Rust
-> now and a `=>` row's call expression is free-form, so it is a DSL row again and its row
-> moved up beside its family.
+> **2026-11-19 (Rust-kernel Phase 1, L2):** the four `recurrent.rs` rows and the six `moe.rs` /
+> `moe_f4.rs` rows likewise — `recurrent.hip`, `moe.hip` and `moe_f4.hip` are deleted. The C
+> entry column keeps the tag's launcher names (`moe_acc_drain_s`): the Rust launchers kept
+> them. `gdn_recurrent_f32` was a hand-written launcher (`GdnBufs`); its launcher is Rust now
+> and a `=>` row's call expression is free-form, so it is a DSL row again and its row moved up
+> beside its family.
 
 | kernel (`launch_…`) | C entry | TU | GLM | V4 | K3 | Glimmer | Qwen | activated at (module :: fn) |
 |---|---|---|---|---|---|---|---|
@@ -102,13 +104,13 @@ column is a query, and a query can be wrong.
 | `qk_norm` | `qk_norm` | mla.hip | · | **✓** | · | · | · | v4/attn :: qkv_project |
 | `rmsnorm_batch` | `rmsnorm_batch` | mla.hip | · | **✓** | · | · | · | v4/attn; v4/forward :: head_tail, pre_norm, qkv_project |
 | `rope_adjacent` | `rope_adjacent` | mla.hip | · | **✓** | · | · | · | v4/attn; v4/blocksel :: output_project, qkv_project, raw_scores |
-| `moe_acc_drain` | `moe_acc_drain_s` | moe.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: desc_of, routed_experts |
-| `moe_acc_drain_to` | `moe_acc_drain_to_s` | moe.hip | · | · | **✓** | · | · | k3/forward :: moe_ffn |
-| `moe_expert_range` | `moe_expert_range` | moe.hip | **✓** | · | · | · | · | glm/mlp :: expert_range |
-| `moe_expert_range_i4` | `moe_expert_range_i4` | moe.hip | **✓** | · | · | · | · | glm/mlp :: expert_range |
+| `moe_acc_drain` | `moe_acc_drain_s` | moe.rs | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: desc_of, routed_experts |
+| `moe_acc_drain_to` | `moe_acc_drain_to_s` | moe.rs | · | · | **✓** | · | · | k3/forward :: moe_ffn |
+| `moe_expert_range` | `moe_expert_range` | moe.rs | **✓** | · | · | · | · | glm/mlp :: expert_range |
+| `moe_expert_range_i4` | `moe_expert_range_i4` | moe.rs | **✓** | · | · | · | · | glm/mlp :: expert_range |
 | `act_quant_f8` | `act_quant_f8` | activation.rs | · | **✓** | · | · | · | v4/moe :: shared_expert |
-| `moe_expert_range_f4` | `moe_expert_range_f4` | moe_f4.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: expert_range |
-| `moe_expert_range_f4_situ` | `moe_expert_range_f4_situ` | moe_f4.hip | · | · | **✓** | · | · | k3/forward :: expert_range |
+| `moe_expert_range_f4` | `moe_expert_range_f4` | moe_f4.rs | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: expert_range |
+| `moe_expert_range_f4_situ` | `moe_expert_range_f4_situ` | moe_f4.rs | · | · | **✓** | · | · | k3/forward :: expert_range |
 | `gated_delta_recurrent_f32` | `gated_delta_recurrent_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
 | `rmsnorm_gate_heads_f32` | `rmsnorm_gate_heads_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
 | `short_conv_silu_f32` | `short_conv_silu_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |

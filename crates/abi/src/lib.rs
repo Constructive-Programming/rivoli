@@ -15,8 +15,11 @@
 //! [`geom`]'s value and the kernel strides by it, so there is no second spelling to drift.
 #![no_std]
 
+mod expert;
 pub mod geom;
 pub mod kernarg;
+
+pub use expert::{ExpertDesc, ExpertDescF4};
 
 /// The `repr(C)` mirror of `kernels/kvcompress.hip`'s `CompGeom`, and the only part of the
 /// compressor's geometry that crosses the ABI wall.

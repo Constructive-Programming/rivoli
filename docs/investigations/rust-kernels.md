@@ -908,3 +908,124 @@ are LOWER bounds on throughput:
 - **A0:** 50 s.
 - **Whole run:** 247 s to the last arm's output, 267 s to `arms/end.epoch`. The posted
   READY-FOR-GPU estimate was 25–35 min.
+
+### Phase 1 L2 (moe, moe_f4, recurrent)
+
+**Deviceless half, 2026-11-19 (branch `wave/rk-l2-moe`).** `recurrent.hip`, `moe.hip` and
+`moe_f4.hip` are Rust: 18 kernels in `crates/kernels/src/{recurrent,moe,moe_f4}.rs`, their 10
+launchers in `crates/backend/src/launch/{recurrent,moe}.rs`, `=>` rows in `hip_attn.rs` and
+`hip_blocks.rs`. The three `.hip` files are deleted and out of `build.rs`.
+
+**The shape the port took:**
+- **One kernel argument block per range FORMAT, not per kernel** (`rivoli_abi::kernarg::moe`).
+  A range launcher issues gate/up then down over the same span, descriptors, `h` and routing
+  weights, so both kernels take one struct (`MoeRange<D>`, plus the VQ codebooks or the fp4
+  parameters).
+- **`ExpertDesc`/`ExpertDescF4` live in `rivoli_abi`.** The kernels read the definition the
+  engine writes. `rivoli_backend::hip` re-exports both, so no caller moved.
+- **`launch_gdn_recurrent_f32` is a DSL row again.** A `=>` row's call expression is free-form,
+  so its `GdnBufs` group reaches the kernel whole, as `DeltaInputs`. The hand-written wrapper
+  and its `extern` are gone.
+- **The C export `rivoli_act_quant_f8` is gone.** `moe_f4.hip` was its only C caller. The V4
+  launcher now calls the Rust function between its passes.
+- **No kernel reads `blockDim`.**
+  - The delta rule takes its block as `head_dim`.
+  - The two masked kernels re-derive theirs with `rivoli_abi::geom::reduce_block`, which their
+    launchers also launch with. It is `next_pow2`, as `u32::next_power_of_two`.
+  - The passes stride by `ROWS_PER_BLOCK` waves.
+  - The drains and the conv stride by `ELEMENTWISE_BLOCK`.
+
+**Fused sites, read from hipcc's IR and confirmed by the ISA census:**
+- The delta rules' three per-loop pairs (`u += k·sv`, `s + k·dv`, `o += q·sv`).
+- The conv's `acc += w·win`.
+- The drain's `x += gain·f`.
+- Everything inside the prelude's dots.
+
+Nothing else pairs a multiply with an add.
+
+**The atomic.** hipcc emits `atomicrmw add … syncscope("agent") monotonic`. `core`'s
+`AtomicU64::fetch_add(Relaxed)` is SYSTEM scope. Both lower to the identical encoding,
+`global_atomic_add_u64 … off` = `DD0E0000 007C0200`, with no cache bits. The output is integer,
+so it does not depend on the order the waves land in.
+
+**L2 obligation 1 — fp4 global vs flat loads: CLOSED deviceless, without a fallback.**
+- **The cause.** 0b's finding reproduced exactly on the real `moe_down_f4`: 5 `flat_load_b32`
+  plus 7 `flat_load_u8`, against hipcc's `global_load`. The cause is not the atomic. With the
+  atomic replaced by a plain store, or removed entirely, the loads stayed flat. The cause is how
+  the descriptor was handed to the dot. As `&*descs.add(e)`, the pointer loads reached
+  `AMDGPUPromoteKernelArguments` without `!amdgpu.noclobber` (read from the LTO
+  `precodegen.bc`, `--save-temps`). Copied by value, as the C's
+  `const ExpertDescF4 d = descs[e]`, they were marked noclobber and promoted.
+- **The ISA census after the change** (0b's `census.py`, extended to count stores, atomics and
+  scratch, at `/var/cache/rivoli/scratch/rk-l2-moe/census.py`: the Rust code object against
+  `hipcc --offload-arch=gfx1151 -O3 -fPIC --offload-device-only --no-gpu-bundle-output` of each
+  tagged file, both disassembled with `llvm-objdump -d --mcpu=gfx1151`; output
+  `census-final.txt` beside it):
+  - **fp4 is load-type identical to hipcc+`gu8p`.** `moe_down_f4`, `moe_down_f4_weighted` and
+    `moe_gateup_f4` count SAME on every FP, load and atomic mnemonic.
+  - **VQ and int4 go one better.** The six GLM down/gate-up kernels now use `global_load` where
+    hipcc, with no `gu8p` on those formats, emits `flat_load`. For example, `moe_gateup_i4` has
+    22 `flat_load_b32` in hipcc's code and 0 in Rust's.
+- **The timing row against hipcc at real shapes is the device lease's.**
+
+**L2 obligation 2 — `moe_*_i4` occupancy:**
+
+| kernel | hipcc VGPR | Rust VGPR | waves/SIMD |
+|---|---|---|---|
+| `moe_gateup_i4` | 93 | 93 | 16 / 16 |
+| `moe_gateup_i4_r2` | 127 | 129 | 10 / 10 |
+| `moe_down_i4` | 89 | 88 | 16 / 16 |
+| **`moe_down_i4_r2`** | **95** | **100** | **16 / 12** |
+
+- Only the R=2 down pass crosses a granule. It is the same edge 0b's probe `k_i4_wave_r2` showed:
+  96 → 103 there, and hipcc's R=2 int4 dot sits right at 96.
+- It is a prelude property (`dot_nib_wave_r::<2, 4, I4>`) and not one this lane can move without
+  re-scoring every prelude caller.
+- Its cost is the TIME line at GLM's real (6144, 2048) nrow=2 shape. That line is the lease's.
+
+**Other ISA differences, none a value difference:**
+- `rmsnorm_gate_heads_f32` counts SAME.
+- **The delta rules** carry more loop copies, because `for_strided::<4>` unrolls its remainder.
+  They also carry one extra `v_ldexp`, because `d as f32` converts from a u64 where the C
+  converts from an i32. That conversion is exact for d ≤ 1024.
+- **`gated_delta_recurrent_f32`** evaluates `exp(a_log)` on the VALU where hipcc used the SALU.
+- **`short_conv_silu_f32`**: rustc vectorises the in-place shift loop to b128, which is legal for
+  a forward shift. VGPR 9 → 25, still 16 waves.
+- **`moe_acc_drain{,_to}`**: rustc unrolls the rows loop.
+- **`moe_gateup_f4_situ`**: one `v_fmamk` is spelled `v_fmac` with the literal in a register.
+  That is the same fused op.
+
+**Gate:**
+- **Ten launcher rows** in `crates/engine/tests/bit_identity/{recurrent,moe,moe_f4}.rs`, each
+  over 64 seeds per shape.
+- **Real shapes:**
+  - GLM 6144 × 2048 at nrow 1 and 2;
+  - V4 4096 × 2048, as one streamed expert and as the six-expert resident batch;
+  - K3 3584 × 3072, plus 96 heads × 128;
+  - Qwen 16/48 heads × 128;
+  - the anchors' 32 and 20.
+- **Small, ragged and padded widths** alongside them.
+- **Range cells are real descriptor arrays** into weight and scale arenas, with a per-expert
+  shift that alternates 4-byte alignment, so odd experts take the dots' scalar tail on every row.
+- **Scales carry NaN, ±inf, −0 and subnormal codes**: bf16; f32; and e8m0 `0xff`/`0x00`/`0xfe`.
+- **Routing weights carry exact ±0 and a NaN.**
+- **`h`, the recurrent state and `acc` start identical on both sides.** `acc` is compared as
+  strict integer words, through a new `Out::Words`, because under NaN-as-a-class a negative
+  i64's high half is a NaN pattern.
+- **Guard rows pin every code**, and a pair per adjacent two in each launcher's order. They run
+  against a live guard descriptor array and an offset guard buffer, so a regressed guard reads
+  RED instead of faulting the GPU.
+- **Every in-place output must move in some cell** (`Tally::moved_by_out`), so a range row
+  whose accumulator never changed cannot pass on the strength of its `h` having moved.
+- **Routing-weight specials sit inside the range and always leave one live weight**, and the
+  gate/up scale and codebook edges ride a seed class (`seed % 8 == 3`) apart from the NaN-`x`
+  seeds, which would otherwise turn every R=1 gate/up dot NaN and hide them.
+- **Three plants**, each shown adversarial on CPU (`bit_identity/plants.rs`):
+
+  | plant | defect | CPU seeds moved | device arm |
+  |---|---|---|---|
+  | `recurrent` | the rank-one update unfused | 64/64 | `--expect-red=gated_delta_recurrent_f32,gdn_recurrent_f32` |
+  | `moe` | the range kernels' SiLU in multiply form | 64/64 (1101/4096 gate rows) | `--expect-red=moe_expert_range,moe_expert_range_i4` |
+  | `moe_f4` | K3's pass-2 bf16 moved after the routing weight | 64/64 (4096/4096 rows) | `--expect-red=moe_expert_range_f4_situ` |
+
+- **Device arms and TIME lines are owed to the lease.**

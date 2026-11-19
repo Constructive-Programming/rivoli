@@ -37,6 +37,10 @@ mod activation;
 #[cfg(feature = "rocm")]
 mod device;
 #[cfg(feature = "rocm")]
+mod moe;
+#[cfg(feature = "rocm")]
+mod moe_f4;
+#[cfg(feature = "rocm")]
 mod probes;
 #[cfg(feature = "rocm")]
 mod recurrent;
@@ -78,6 +82,12 @@ const ROWS: &[Row] = &[
     ("short_conv_silu_f32", recurrent::short_conv_silu_f32),
     ("rmsnorm_gate_heads_f32", recurrent::rmsnorm_gate_heads_f32),
     ("gdn_recurrent_f32", recurrent::gdn_recurrent_f32),
+    ("moe_expert_range", moe::moe_expert_range),
+    ("moe_expert_range_i4", moe::moe_expert_range_i4),
+    ("moe_acc_drain", moe::moe_acc_drain),
+    ("moe_acc_drain_to", moe::moe_acc_drain_to),
+    ("moe_expert_range_f4", moe_f4::moe_expert_range_f4),
+    ("moe_expert_range_f4_situ", moe_f4::moe_expert_range_f4_situ),
 ];
 
 #[cfg(feature = "rocm")]

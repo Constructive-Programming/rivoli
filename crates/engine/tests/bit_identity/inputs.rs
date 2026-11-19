@@ -58,8 +58,6 @@ pub fn draw(n: usize, (seed, stream): (u64, u64), scale: f32, edges: bool) -> Ve
 
 /// `n` uniform draws in `range` for `(seed, stream)`, for operands that are a positive config value or a
 /// probability-like weight rather than an activation.
-// The deviceless build compiles only the CPU plant model, which draws activations only.
-#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
 pub fn uniform(n: usize, (seed, stream): (u64, u64), range: std::ops::Range<f32>) -> Vec<f32> {
     let (lo, hi) = (range.start, range.end);
     let mut r = Lcg(seed.wrapping_mul(0xd1b5_4a32_d192_ed03) ^ stream);
@@ -74,4 +72,36 @@ pub fn uniform(n: usize, (seed, stream): (u64, u64), range: std::ops::Range<f32>
 pub fn rope_at(seed: u64) -> (usize, f64) {
     let pos = [0, 1, 7, 4095, 65_535, 131_071][(seed % 6) as usize] + seed as usize;
     (pos, [1e4, 1e6, 5e7][(seed % 3) as usize])
+}
+
+/// `n` uniformly random bytes for `(seed, stream)` — packed weights and index streams, where
+/// every bit pattern is a legal code and all of them should occur.
+pub fn bytes(n: usize, (seed, stream): (u64, u64)) -> Vec<u8> {
+    let mut r = Lcg(seed.wrapping_mul(0xa076_1d64_78bd_642f) ^ stream);
+    (0..n)
+        .map(|_| {
+            r.f();
+            (r.0 >> 40) as u8
+        })
+        .collect()
+}
+
+/// A NaN on one seed in eight (slot 14 of `x`), so most seeds stay unmasked by propagation
+/// and every shape with more than 14 elements carries a NaN cell.
+// Device rows only; the deviceless build's plant models avoid the NaN seeds' rows.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn nan_some(mut x: Vec<f32>, seed: u64) -> Vec<f32> {
+    if nasty(seed)
+        && let Some(s) = x.get_mut(14)
+    {
+        *s = f32::NAN;
+    }
+    x
+}
+
+/// The seed class that carries non-finite values into every operand (one in eight).
+// Device rows only, as `nan_some`.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn nasty(seed: u64) -> bool {
+    seed % 8 == 7
 }

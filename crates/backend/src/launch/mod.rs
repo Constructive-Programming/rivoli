@@ -1,6 +1,7 @@
 //! The host halves of the Rust kernels — what the tag's `extern "C" int rivoli_*` launchers
 //! did: the argument guards, the grid geometry, the launch. One module per kernel family
-//! (`activation`, `recurrent`, `residual`, `touch`); a Phase 1 lane adds its family's file here.
+//! (`activation`, `moe`, `recurrent`, `residual`, `touch`); a Phase 1 lane adds its family's
+//! file here.
 //!
 //! Each launcher keeps its C twin's name and return codes (`0`, POSITIVE guard code,
 //! `-(hipError_t)`) exactly, so a `launch_x => rivoli_x(..)` row in a `launchers!`
@@ -17,11 +18,13 @@
 #![cfg(feature = "rocm")]
 
 mod activation;
+mod moe;
 mod recurrent;
 mod residual;
 mod touch;
 
 pub(crate) use activation::*;
+pub(crate) use moe::*;
 pub(crate) use recurrent::*;
 pub(crate) use residual::*;
 pub use touch::rivoli_touch_region_async;

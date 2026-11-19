@@ -11,15 +11,11 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 11] = [
+const KERNELS: [&str; 9] = [
     // `activation` and `residual` (split out of this file 2026-08-15/16) left this list
-    // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below. So is
-    // `recurrent` (Phase 1 L2).
+    // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below. So are
+    // `recurrent`, `moe` and `moe_f4` (Phase 1 L2).
     "linalg",
-    "moe",
-    // Split out of `moe.hip` 2026-08-16 (the FP4 routed-expert family, V4's pair and K3's
-    // situ pair) — same argument again.
-    "moe_f4",
     "mla",
     "attn",
     "fwd",

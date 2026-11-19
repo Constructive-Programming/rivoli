@@ -30,11 +30,12 @@ pub const ROWS_PER_BLOCK: u32 = 8;
 pub const ELEMENTWISE_BLOCK: u32 = 256;
 
 mod activation;
-mod recurrent;
-mod residual;
-mod touch;
-
 pub use activation::*;
+mod moe;
+pub use moe::*;
+mod recurrent;
 pub use recurrent::*;
+mod residual;
 pub use residual::*;
+mod touch;
 pub use touch::*;
