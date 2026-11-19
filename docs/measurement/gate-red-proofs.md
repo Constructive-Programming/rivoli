@@ -2077,6 +2077,12 @@ every entry (`k >= nt`), so no tie rule can move them. The model now counts only
 selections and records the shape the plant cannot reach. The device arms are OWED to the L3 GPU
 lease (`rust-kernels.md` §5, Phase 1 L3).
 
+**Device arms, PAID (2026-11-19, `bf43d2e`).** All four plant arms scripted
+`GREEN (expect-red)`, each reddening exactly its row. The device red-cell counts equal the CPU
+models': indexer 126, blockindex 203, kvcompress 266, mla 256. Arm A was 34/34 BIT-IDENTICAL.
+The witness was clean on all five arms. Table and logs: `rust-kernels.md` §5, "The L3 device
+lease".
+
 
 ## 19. Phase 1 shared shapes: 2-D grids and `LAUNCHED_BY` (added 2026-11-19, deviceless)
 

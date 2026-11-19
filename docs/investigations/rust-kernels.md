@@ -1018,3 +1018,87 @@ kernels: 34 with a gate row and a `=>` row, 1 argued exemption" (`cargo test -p 
 --no-default-features --test kernel_coverage -- --nocapture`, 2026-11-19).
 
 *Device arms.* OWED.
+
+**The L3 device lease (2026-11-19, commit `bf43d2e`).**
+
+Five arms ran in order, once each, all through `tests/bit-identity.sh`.
+
+**The witness was clean on every arm:** empty KFD witness file, GTT 17 MiB pre-arm. Host
+loadavg ran between 0.6 and 3.8 on 32 cores.
+
+Logs: `/var/cache/rivoli/scratch/rk-l3-mla/gpu/lease-20261119T120910/` (`progress`, per-arm
+`.out`/`.err`) and `/var/cache/rivoli/scratch/bit-identity/20261119T12{0910,1320,1731,2140,2551}-*`.
+
+| arm | scripted verdict | rc | wall |
+|---|---|---|---|
+| A (34 rows: the 13 Phase 0 rows + L3's 21) | GREEN: 34 of 34 BIT-IDENTICAL, NaN-payload-only 0 on every row | 0 | 250 s |
+| plant `indexer` (`--expect-red=index_topk`) | GREEN (expect-red): 126 of 448 cells red, all partial selections | 0 | 251 s |
+| plant `blockindex` (`--expect-red=index_score_blocks`) | GREEN (expect-red): 203/256 cells red | 0 | 249 s |
+| plant `kvcompress` (`--expect-red=gemm_bf16`) | GREEN (expect-red): 266/320 cells red | 0 | 251 s |
+| plant `mla` (`--expect-red=mla_absorb_fp8`) | GREEN (expect-red): 256/384 cells red | 0 | 249 s |
+
+**Every plant's device red count equals its CPU model's count**: 126, 203, 266, 256. The CPU
+models drew the gate's own inputs (`gate-red-proofs.md` §18, Phase 1 L3).
+
+**TIME, L3's rows** (arm A; min of three 200-launch batches, hot shape, null stream). This is
+one arm with no A-vs-A noise floor measured, so ratios within a few percent of 1 do not rank:
+
+| row | hipcc µs | Rust µs | ratio |
+|---|---|---|---|
+| layernorm 128 | 3.05 | 2.68 | 0.881 |
+| index_append (5, 128) | 2.02 | 2.03 | 1.001 |
+| index_score (4096, 64, 64, 128) | 50.27 | 50.86 | 1.012 |
+| index_pool_push (1, 128) | 2.06 | 2.03 | 0.989 |
+| index_head_route (4, 64, 128) | 4.28 | 4.26 | 0.995 |
+| index_topk (4096, 2048) | 44.88 | 46.12 | 1.028 |
+| index_pool_norm_f32 (512, 4, 128) | 4.81 | 4.48 | 0.932 |
+| index_score_blocks_f32 [1, 512, 64, 128] | 627.98 | 114.66 | 0.183 |
+| **act_quant_f4_rotated (64, 128)** | 4.98 | 7.31 | **1.469** |
+| index_score_blocks [1, 512, 64, 128] | 627.92 | 115.78 | 0.184 |
+| gemm_bf16 [1, 1024, 4096] | 29.77 | 30.98 | 1.041 |
+| **kv_compress_deposit (decode step)** | 2.14 | 2.27 | **1.060** |
+| kv_compress_prefill (ratio 4, 512 blocks) | 88.06 | 89.87 | 1.020 |
+| **kv_compress_decode (ratio 4, d 512)** | 11.72 | 14.31 | **1.222** |
+| mla_absorb_fp8 (GLM-class, 1 row) | 27.65 | 25.73 | 0.931 |
+| **mla_value_fp8 (GLM-class, 1 row)** | 27.61 | 29.12 | **1.055** |
+| act_quant_f8_prefix (1, 4096) | 54.67 | 53.88 | 0.985 |
+| rmsnorm_batch (1, 1024) | 3.59 | 3.32 | 0.925 |
+| qk_norm (64, 512) | 3.36 | 3.00 | 0.892 |
+| rope_adjacent (64 heads, 512) | 2.82 | 2.57 | 0.911 |
+| gemv_fp8_bf16 (V4 `wo_a` slice) | 13.05 | 13.27 | 1.017 |
+
+**Four rows exceed 1.05, reported and not fixed. The causes below are read off the ISA; none is
+isolated.**
+
+*L4's suspect.* L4 suspected the shared `gpu::for_i32` helper: its increment lacks the C's `nsw`,
+which shows as a sign-extend, a shift and a 64-bit add per iteration. Counted with
+`llvm-objdump --disassemble-symbols=<k>` on the embedded object against hipcc's `.s` in
+`/var/cache/rivoli/scratch/rk-l3-mla/` (`v_ashrrev_i32|v_lshlrev_b64|v_lshl_add_u64`):
+- Three rows carry FEWER of these instructions than hipcc: `kv_compress_decode` 12 vs 18,
+  `mla_value_fp8` 8 vs 16, `kv_compress_deposit` 4 vs 6.
+- **`act_quant_f4_rotated` carries the pattern**, 4 vs 0, found by the correctness review of this
+  record. Its two global loops over `row[i]` (load into LDS, store back) each sign-extend `i`
+  and shift it in 64 bits per iteration, where hipcc increments a pointer.
+- At the timed shape, though, those loops run ONCE per thread (d = 128 over 128 threads). So
+  the pattern is present but cannot explain 2.3 µs there. It would weigh at wider rows, and the
+  shared helper is L4's to change.
+
+*What the ISA does show* (op counts from `bin/census.sh`):
+- **`act_quant_f4_rotated`, 1.469.** At d = 128 only 4 threads per block do the fp4 work, each
+  a serial 32-element round trip with an IEEE divide per element. hipcc unrolls that loop 2×
+  (`%div.i`/`%div.i.1` in its IR); Rust leaves it rolled. The inferred cause is the dependency
+  chain, about twice as long. Fix candidate: a manual 2× unroll. It should not change bits,
+  since every element is independent; a gate re-run is owed either way.
+- **`kv_compress_decode`, 1.222.** This is a single-block kernel, so it is latency-bound, and
+  its pooling loops run over a run-time `ents`. hipcc unrolls the entry loops about 4× (census:
+  exp 8 vs 2, max 27 vs 2); Rust keeps them rolled. Fix candidate: the same manual unroll.
+- **`kv_compress_deposit`, 1.060, and `mla_value_fp8`, 1.055.** These are within ~0.1–1.5 µs on
+  launch-sized work: the deposit is 2.1 µs, and the value pair's float census is identical to
+  hipcc's. They sit in the same band as Phase 0's `swiglu` (1.050). Not investigated further.
+
+**The block scorers run 5.5× faster than hipcc.** hipcc's `contract(off)` dot loop runs rolled
+with 64-bit index arithmetic per iteration. Rust unrolls it 4× with wider loads (census: gload
+7 vs 3).
+
+Also outside this lane, for the record: Phase 0's `swiglu_clamped_bf16` (1.135) and
+`situ_glu_f32` (1.137) exceeded 1.05 on this lease.
