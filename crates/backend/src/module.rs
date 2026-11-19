@@ -64,8 +64,9 @@ pub(crate) struct Kernel<A> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LdsBytes(pub u32);
 
-/// A 1-D launch — the only shape any ported launcher uses: `blocks` workgroups of `threads`,
-/// each with `lds` of dynamic LDS.
+/// A launch's x axis: `blocks` workgroups of `threads`, each with `lds` of dynamic LDS. A 1-D
+/// launcher hands it to [`Kernel::launch`]; a 2-D one pairs it with `blocks_y` for
+/// [`Kernel::launch_2d`] (2026-11-19), which is why the y extent is not a field here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
     pub blocks: u32,
@@ -110,21 +111,45 @@ impl<A: Copy> Kernel<A> {
     /// or null.
     #[must_use = "the launch status is the only report of a failed launch"]
     pub(crate) unsafe fn launch(&self, geom: Geometry, stream: *mut c_void, args: &A) -> i32 {
+        // SAFETY: the caller's contract.
+        unsafe { self.launch_2d((geom, 1), stream, args) }
+    }
+
+    /// [`launch`](Self::launch) on a `blocks × blocks_y` grid — HIP's `dim3(x, y)` — for the
+    /// kernels that read `blockIdx.y` (attention's split and query-row axes). `grid` is
+    /// `(geom, blocks_y)`: a pair and not a [`Geometry`] field, so the 1-D launchers' literals
+    /// stay as they are, and one parameter rather than two, which keeps this inside
+    /// CodeScene's argument budget (five parameters scored 9.68 on 2026-11-19).
+    ///
+    /// # Safety
+    /// As [`launch`](Self::launch).
+    #[must_use = "the launch status is the only report of a failed launch"]
+    pub(crate) unsafe fn launch_2d(
+        &self,
+        grid: (Geometry, u32),
+        stream: *mut c_void,
+        args: &A,
+    ) -> i32 {
         let f = match self.func() {
             Ok(f) => f,
             Err(e) => return -e,
         };
         let mut params = [std::ptr::from_ref(args).cast_mut().cast::<c_void>()];
         // SAFETY: the caller's contract; HIP copies `size_of::<A>()` bytes per the metadata.
-        unsafe { launch_raw(f, geom, stream, KernArgs::Params(params.as_mut_ptr())) }
+        unsafe { launch_raw(f, grid, stream, KernArgs::Params(params.as_mut_ptr())) }
     }
 }
 
-/// `hipModuleLaunchKernel` on a 1-D geometry, `0` or `-(hipError_t)`.
+/// `hipModuleLaunchKernel` on a `geom.blocks × blocks_y` grid, `0` or `-(hipError_t)`.
 ///
 /// # Safety
 /// `args` is a valid HIP argument description for `f`; `stream` is live or null.
-unsafe fn launch_raw(f: Handle, geom: Geometry, stream: *mut c_void, args: KernArgs) -> i32 {
+unsafe fn launch_raw(
+    f: Handle,
+    (geom, blocks_y): (Geometry, u32),
+    stream: *mut c_void,
+    args: KernArgs,
+) -> i32 {
     let null = std::ptr::null_mut();
     let (params, extra) = match args {
         KernArgs::Params(p) => (p, null),
@@ -136,7 +161,11 @@ unsafe fn launch_raw(f: Handle, geom: Geometry, stream: *mut c_void, args: KernA
         lds: LdsBytes(lds),
     } = geom;
     // SAFETY: the caller's contract.
-    -unsafe { hipModuleLaunchKernel(f.0, blocks, 1, 1, threads, 1, 1, lds, stream, params, extra) }
+    -unsafe {
+        hipModuleLaunchKernel(
+            f.0, blocks, blocks_y, 1, threads, 1, 1, lds, stream, params, extra,
+        )
+    }
 }
 
 /// A code object loaded from a FILE — the bit-identity gate's module-load reference (the
@@ -181,6 +210,6 @@ impl CodeObject {
         ];
         // SAFETY: the caller's contract; `extra` describes `args`.
         let packed = KernArgs::Packed(extra.as_mut_ptr());
-        unsafe { launch_raw(Handle(f), geom, std::ptr::null_mut(), packed) }
+        unsafe { launch_raw(Handle(f), (geom, 1), std::ptr::null_mut(), packed) }
     }
 }
