@@ -1153,3 +1153,51 @@ Phase 0 merge review recorded. So differences of a few percent here are not reso
     deviceless against the `vmcnt(3)/(1)/(0)` pattern, then re-timed on the device.
 - **The 13 Phase 0 rows** in A lie between 0.853 and 1.014, except `attn_res` at 1.048, which
   is already owed.
+
+**After the lease, deviceless (2026-11-19): the `moe_f4` gap was a HARNESS defect, now fixed.**
+- **Cause, found by the CPU model before any re-run.** The range rows' arenas packed `[gate, up,
+  down]` back to back, and each expert's spans shift by `e · W_SHIFT`/`e · S_SHIFT`. So the
+  last up rows of every expert past the first read the first bytes of the DOWN scales, where
+  the edge codes sit (e8m0 `0xff` NaN, `0xfe` = 2^127; the bf16/f32 NaN and ±inf). One
+  non-finite `h[j]` makes every down dot NaN, and `moe_fixed` clamps every NaN contribution to
+  the same bound on both sides. A model of the real (3584, 3072, 2, 1, 1) cell printed
+  `dv=NaN` on all 64 down rows of expert 2, seed 1.
+- **Reach.** In every range row (VQ, int4 and both fp4), at every shape whose live experts sat
+  past expert 0, pass 2 compared nothing real: GLM's real shapes start at expert 3. Arm A's
+  23/23 is therefore NOT evidence for the down kernels at those shapes. Pass 1 (`h`) was
+  compared genuinely almost everywhere (the experts past the first carried one NaN `h` word on both sides); that is why the `moe` plant reddened 360/384.
+- **Fix** (`bit_identity/ranges.rs`, `Layout::new`). Each projection is padded by every
+  expert's shift, so no span crosses into the next projection; the down edges now poison only
+  their own down row. The range inputs moved to `ranges.rs` (deviceless) so the CPU models
+  build the very cells the rows launch.
+- **Live weights on every expert.** The routing-weight specials (±0, 0.3/NaN) now rotate with
+  the seed, so each expert of a range — the first and the last included — is live on some
+  seeds: on (live − 2)/live of them (1/2 for K3's 4-expert batch, 1/3 for a 3-expert range).
+- **Projection bases stay aligned.** The padding is rounded to 16 bytes, so only the deliberate
+  per-expert shift misaligns a span.
+- **Per-shape tally.** Every row now prints `red by shape: <shape> red/cells, …`
+  (`Tally::by_shape`), not only its first six mismatch notes.
+- **The plant's CPU model is now the real cell.** `moe_f4_late_bf16_plant_reaches_k3_production_shapes`
+  runs the actual K3 cells (`ranges::cell_inputs`, the row's betas) through both passes. The bf16-after-weight plant moves 48/48 of the
+  seeds on which pass 2 is live, at BOTH (3584, 3072, 2, 1, 1) and (3584, 3072, 0, 4, 1). The
+  excluded 16 are the NaN-`x` and edge seeds: one non-finite `h` and no pass-2 plant can move.
+  Red proof of the model: with the padding removed (copied aside, edited, run, restored, `cmp`
+  rc 0), the same test reads 0/48 at (3584, 3072, 2, 1, 1), the device's result. Cost: about
+  70 s of the deviceless suite.
+
+**`gated_delta_recurrent_f32`, the load-before-store form.**
+- **Change.** `state_passes` now walks the state through `each_row`: four named row loads per
+  group, then the four stores, then a scalar remainder.
+- **ISA.** Both state loops of `gated_delta_recurrent_f32` and of `gdn_recurrent_f32` now issue
+  four `global_load_b32` before their stores and consume them under `vmcnt(2)`/`(1)`/`(0)`,
+  hipcc's `gated_delta` pattern in place of the one-in-flight `vmcnt(0)` chain. hipcc's `gdn`
+  still serializes, so the Rust `gdn` should now beat it.
+- **A first spelling spilled.** It used an array of four pointers, which landed in scratch
+  (`scratch_store_b128`) with `flat` stores; named scalars fixed that.
+- **Bits.** The same loads, multiplies and FMAs on the same values in the same order. A load
+  issued before the preceding rows' stores reads the same value because the rows are distinct:
+  the stride is ≥ 1, by the launchers' guard 1001. The device gate re-scores it.
+- **The i32 counter, tried separately on top: rejected.** It added remainder copies (25 → 33
+  loads, 19 → 27 stores), and its main loop already had the four loads in flight. The 64-bit
+  counter stays.
+- **Timing is owed to the next lease.**

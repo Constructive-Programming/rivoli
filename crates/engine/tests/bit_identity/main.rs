@@ -31,6 +31,7 @@
 mod common;
 mod inputs;
 mod plants;
+mod ranges;
 
 #[cfg(feature = "rocm")]
 mod activation;
@@ -108,6 +109,7 @@ fn every_rust_kernel_is_byte_identical_to_its_tagged_hipcc_twin() {
         t.timing
             .iter()
             .for_each(|l| println!("    TIME {name} {l}"));
+        println!("    {}", t.shapes_line());
         t.notes.iter().for_each(|l| println!("    {l}"));
         if !green {
             red.push(*name);

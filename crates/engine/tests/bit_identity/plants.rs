@@ -240,42 +240,158 @@ fn rbf16(x: f32) -> f32 {
     rivoli_core::num::bf16_to_f32(rivoli_core::num::f32_to_bf16(x))
 }
 
-/// One fp4 down-row dot, with the e8m0 scales the rows store (the exponent of each stream-4
-/// draw at 2^-6) and the weight arena stream 3 — but a STAND-IN `h` (stream 5 draws), where the
-/// device's `h` is the gate/up pass's bf16 SiTU output: the plant's rate depends on `dv` only
-/// through where its bf16 rounding falls, which any non-power-of-two weight moves.
-fn f4_down_dot(
-    RowAt {
-        seed,
-        dim: inter,
-        row: o,
-    }: RowAt,
-) -> f32 {
-    const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let h = draw(inter, (seed, 5), 1.0, false);
-    let w = bytes(inter / 2 * (o + 1), (seed, 3));
-    let s = uniform(inter / 32 * (o + 1), (seed, 4), 0.25..2.0);
-    let pow2 = |v: f32| f32::from_bits((v * 2f32.powi(-6)).to_bits() & 0xff80_0000);
-    (0..inter)
-        .map(|i| {
-            let nib = (w[o * inter / 2 + i / 2] >> (4 * (i & 1))) & 0xf;
-            let mag = E2M1[usize::from(nib & 7)];
-            let n = if nib & 8 != 0 { -mag } else { mag };
-            h[i] * n * pow2(s[o * inter / 32 + i / 32])
+/// Expert `e`'s projection `p` (gate, up, down) at output `row`, reducing over `dim`.
+#[derive(Clone, Copy)]
+struct ProjRow {
+    e: usize,
+    p: usize,
+    row: usize,
+    dim: usize,
+}
+
+/// Which K3 cell: its range and seed. (`CellAt` and `Activ` are what took this file from
+/// CodeScene 9.68 to 10 — measured with each removed, primitive obsession — not decoration.)
+#[derive(Clone, Copy)]
+struct CellAt {
+    range: super::ranges::Range,
+    seed: u64,
+}
+
+/// The activation a projection row reduces: `x` for gate/up, `h` for down.
+#[derive(Clone, Copy)]
+struct Activ<'a>(&'a [f32]);
+
+/// `moe_fixed`'s saturation bound, `MOE_ACC_MAX` = 2^(58 − 44) in the kernels' prelude.
+const MOE_ACC_MAX: f32 = 16384.0;
+
+/// One K3 range cell as the `moe_f4` row builds it (`ranges::cell_inputs`: the same arenas,
+/// scale codes, routing weights, per-expert descriptor shifts and betas) through both passes,
+/// summed sequentially rather than in the wave's fold — so `dv` is a proxy for the device's
+/// bits, close enough to measure whether a plant can move a cell. One token row only.
+struct K3Cell {
+    range: super::ranges::Range,
+    lay: super::ranges::Layout,
+    betas: (f32, f32),
+    x: Vec<f32>,
+    w: Vec<f32>,
+    wb: Vec<u8>,
+    sb: Vec<u8>,
+    /// e2m1 nibble (sign in bit 3) and e8m0 byte (`2^(b−127)`, 0xff NaN) → f32.
+    e2m1: [f32; 16],
+    e8m0: [f32; 256],
+}
+
+impl K3Cell {
+    fn new(CellAt { range, seed }: CellAt) -> Self {
+        use super::ranges::{K3, cell_inputs, k3_betas};
+        assert_eq!(range.4, 1, "K3Cell models one token row");
+        let (lay, ins) = cell_inputs(&K3, range, seed);
+        let (x, w) = (super::common::f32v(&ins[0]), super::common::f32v(&ins[1]));
+        let [_, _, wb, sb]: [Vec<u8>; 4] = ins.try_into().expect("four range inputs");
+        const MAG: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let e2m1 = std::array::from_fn(|n| MAG[n & 7] * if n & 8 != 0 { -1.0 } else { 1.0 });
+        let e8m0 = std::array::from_fn(|b| match b {
+            0xff => f32::NAN,
+            _ => 2f32.powi(b as i32 - 127),
+        });
+        let betas = k3_betas(seed);
+        Self {
+            range,
+            lay,
+            betas,
+            x,
+            w,
+            wb,
+            sb,
+            e2m1,
+            e8m0,
+        }
+    }
+
+    /// One row of one expert's projection against `v`: `Σ v[i]·e2m1·e8m0` over its `dim`.
+    fn dot(&self, at: ProjRow, Activ(v): Activ) -> f32 {
+        use super::ranges::{S_SHIFT, W_SHIFT};
+        let ProjRow { e, p, row, dim } = at;
+        let (wo, so) = (self.lay.w[p] + e * W_SHIFT, self.lay.s[p] + e * S_SHIFT);
+        let (rb, ng) = (dim / 2, dim.div_ceil(32));
+        (0..dim)
+            .map(|i| {
+                let nib = (self.wb[wo + row * rb + i / 2] >> (4 * (i & 1))) & 0xf;
+                let scale = self.e8m0[usize::from(self.sb[so + row * ng + i / 32])];
+                v[i] * self.e2m1[usize::from(nib)] * scale
+            })
+            .sum()
+    }
+
+    /// Whether the `moe_f4` plant (`bf16(dv·w)` for hipcc's `bf16(dv)·w`) changes any of the
+    /// first 16 down rows' `moe_fixed` contributions of any live expert: NaN goes to the bound
+    /// (`max`/`min` drop it, as `fmaxf`/`fminf` do), then `·2^44`, rounded to even.
+    fn plant_moves(&self) -> bool {
+        let (hidden, inter, es, ec, _) = self.range;
+        let (b1, b2) = self.betas;
+        // Not `clamp`: it passes a NaN through, where `moe_fixed`'s `fmaxf`/`fminf` send it to a
+        // bound — which is the behaviour being modelled.
+        #[allow(clippy::manual_clamp)]
+        let fixed = |v: f32| {
+            (v.max(-MOE_ACC_MAX).min(MOE_ACC_MAX) * 2f32.powi(44)).round_ties_even() as i64
+        };
+        (es..es + ec).filter(|&e| self.w[e] != 0.0).any(|e| {
+            let base = ProjRow {
+                e,
+                p: 0,
+                row: 0,
+                dim: hidden,
+            };
+            let h: Vec<f32> = (0..inter)
+                .map(|j| {
+                    let gate = ProjRow { row: j, ..base };
+                    let g = self.dot(gate, Activ(&self.x));
+                    let u = self.dot(ProjRow { p: 1, ..gate }, Activ(&self.x));
+                    rbf16(b1 * (g / b1).tanh() * sigmoid(g) * (b2 * (u / b2).tanh()))
+                })
+                .collect();
+            (0..16).any(|o| {
+                let dv = self.dot(
+                    ProjRow {
+                        p: 2,
+                        row: o,
+                        dim: inter,
+                        ..base
+                    },
+                    Activ(&h),
+                );
+                let w = self.w[e];
+                fixed(rbf16(dv) * w) != fixed(rbf16(dv * w))
+            })
         })
-        .sum()
+    }
 }
 
 /// `moe_f4.patch` moves K3's pass-2 bf16 store after the routing weight — `bf16(dv·w)`, V4's
 /// fold, against hipcc's `bf16(dv)·w` (the trap `moe_f4.hip`'s `WEIGHTED` note argues). It
 /// reaches only `moe_down_f4_weighted`, so its device arm is
-/// `--expect-red=moe_expert_range_f4_situ` with V4's `moe_expert_range_f4` holding. Modelled on
-/// 64 down rows of the real (3584, 3072, 0, 4, 1) cell's live expert per seed: slots 0-2 of its
-/// four routing weights are the specials (0, −0, 0.3/NaN), so the weight is slot 3's draw.
+/// `--expect-red=moe_expert_range_f4_situ` with V4's `moe_expert_range_f4` holding.
+///
+/// Modelled on BOTH of K3's production shapes, on the cells the row builds (`K3Cell`), and
+/// required to move ≥ 90% of the seeds where pass 2 is live, at EACH production shape. Pass 2
+/// is dead on the nasty seeds (a NaN in `x`) and the edge seeds (non-finite gate/up scale
+/// codes): one non-finite `h` makes every `dv` NaN on both sides there. Its first version modelled a stand-in `h` and claimed 64/64 while the
+/// device reddened 0 cells at these shapes: the arenas then let every expert past the first
+/// read a planted NaN scale into `h` (`ranges::Layout::new`'s note). The model now builds the
+/// real cell, so it would have seen that.
 #[test]
-fn moe_f4_late_bf16_plant_is_adversarial_on_cpu() {
-    row_plant("moe_f4 late-bf16 plant", 3072, |at| {
-        let (w, dv) = (uniform(4, (at.seed, 2), 0.0..1.0)[3], f4_down_dot(at));
-        (rbf16(dv) * w).to_bits() != rbf16(dv * w).to_bits()
-    });
+fn moe_f4_late_bf16_plant_reaches_k3_production_shapes() {
+    for range in [(3584, 3072, 2, 1, 1), (3584, 3072, 0, 4, 1)] {
+        let live = |s: u64| !super::inputs::nasty(s) && !super::ranges::edge_seed(s);
+        let finite: Vec<u64> = (1..=SEEDS).filter(|&s| live(s)).collect();
+        let moved = finite
+            .iter()
+            .filter(|&&s| K3Cell::new(CellAt { range, seed: s }).plant_moves())
+            .count() as u64;
+        assert_adversarial(
+            &format!("moe_f4 late-bf16 plant at {range:?}"),
+            moved,
+            finite.len() as u64,
+        );
+    }
 }

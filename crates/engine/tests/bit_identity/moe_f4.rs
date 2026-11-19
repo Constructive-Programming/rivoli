@@ -7,7 +7,8 @@
 
 use super::device::{I, O, Ref, S, Tally};
 use super::inputs::uniform;
-use super::moe::{Args, Format, RangeBufs, U64, no_extras, range_call, range_row, vecs};
+use super::moe::{Args, RangeBufs, U64, range_call, range_row};
+use super::ranges::{K3, Range, V4, k3_betas};
 use rivoli_backend::hip;
 use std::ffi::c_void;
 
@@ -17,59 +18,8 @@ type F4Fn = unsafe extern "C" fn(I, i32, i32, i32, i32, i32, *const c_void, I, f
 #[rustfmt::skip]
 type SituFn = unsafe extern "C" fn(I, i32, i32, i32, i32, i32, *const c_void, I, f32, f32, O, U64, i32, S) -> i32;
 
-/// fp4 rows: `i_dim / 2` packed bytes and `ceil(i_dim / 32)` e8m0 scales.
-fn f4_row(i_dim: usize) -> (usize, usize) {
-    (i_dim / 2, i_dim.div_ceil(32))
-}
-
-/// A positive finite draw as its e8m0 code (the exponent byte: a power-of-two scale).
-fn e8m0(v: f32) -> Vec<u8> {
-    vec![(v.to_bits() >> 23) as u8]
-}
-
-/// e8m0's NaN, its 2^-127 floor, its 2^127 ceiling, and 2^-126.
-fn e8m0_edges() -> Vec<Vec<u8>> {
-    vecs([0xffu8, 0x00, 0xfe, 0x01].map(|b| [b]))
-}
-
-/// Both fp4 formats' arenas; they differ in launcher and shapes only.
-const fn f4_format(name: &'static str, shapes: &'static [super::moe::Range]) -> Format {
-    Format {
-        name,
-        row: f4_row,
-        scale_width: 1,
-        scale: e8m0,
-        edges: e8m0_edges,
-        extras: no_extras,
-        shapes,
-        timed: 2,
-    }
-}
-
-const V4: Format = f4_format(
-    "moe_expert_range_f4",
-    &[
-        (4096, 2048, 2, 1, 1),
-        (4096, 2048, 0, 6, 1),
-        (256, 128, 0, 3, 1),
-        (384, 256, 1, 2, 1),
-        (128, 128, 0, 1, 1),
-    ],
-);
-
-const K3: Format = f4_format(
-    "moe_expert_range_f4_situ",
-    &[
-        (3584, 3072, 2, 1, 1),
-        (3584, 3072, 0, 4, 1),
-        (96, 64, 0, 3, 1),
-        (160, 96, 1, 2, 1),
-        (32, 32, 0, 1, 1),
-    ],
-);
-
 /// The range end exactly on odd seeds, one descriptor past it on even ones.
-fn n_desc((_, _, es, ec, _): super::moe::Range, seed: u64) -> usize {
+fn n_desc((_, _, es, ec, _): Range, seed: u64) -> usize {
     es + ec + usize::from(seed.is_multiple_of(2))
 }
 
@@ -131,13 +81,7 @@ pub fn moe_expert_range_f4_situ(r: &Ref, t: &mut Tally) {
     // SAFETY: `rivoli_moe_expert_range_f4_situ`'s C signature.
     let c: SituFn = unsafe { r.sym(c"rivoli_moe_expert_range_f4_situ") };
     // K3's betas (4, 25) on odd seeds; seeded positives elsewhere, so tanh's range moves.
-    let value = |range, seed: u64| {
-        let betas = match uniform(2, (seed, 7), 0.25..40.0)[..] {
-            [b1, b2] if seed.is_multiple_of(2) => (b1, b2),
-            _ => (4.0, 25.0),
-        };
-        (n_desc(range, seed), betas)
-    };
+    let value = |range, seed: u64| (n_desc(range, seed), k3_betas(seed));
     let bad = [
         (f32::NAN, 25.0),
         (4.0, f32::INFINITY),

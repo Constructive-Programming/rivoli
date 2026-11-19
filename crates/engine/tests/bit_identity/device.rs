@@ -157,6 +157,13 @@ impl Cell {
     }
 }
 
+/// One shape's red cells out of its cells, for [`Tally::by_shape`].
+pub struct ShapeTally {
+    pub shape: String,
+    pub red: u64,
+    pub cells: u64,
+}
+
 /// One row's counts. Every count is printed, and the gate refuses a row where any is zero:
 /// a comparison that examined nothing is not a pass.
 #[derive(Default)]
@@ -177,6 +184,11 @@ pub struct Tally {
     /// output must move in some cell, so a row whose accumulator never changed cannot pass on
     /// the strength of its `h` having moved.
     pub moved_by_out: Vec<Option<u64>>,
+    /// Per shape (the cell name before ` seed `), `(shape, red cells, cells)` in run order:
+    /// where a red row is red, so a plant's REACH is visible by shape and not only through
+    /// the first six notes (added 2026-11-19 when those six hid that a plant reached only the
+    /// last, smallest shape of its row).
+    pub by_shape: Vec<ShapeTally>,
     pub notes: Vec<String>,
     pub timing: Vec<String>,
 }
@@ -219,6 +231,38 @@ impl Tally {
         }
         self.bad_words += bad;
         self.bad_cells += u64::from(bad > 0);
+        self.count_shape(what, bad > 0);
+    }
+
+    /// One cell into [`Tally::by_shape`]: the shape is the cell name (`sweep`'s and
+    /// `range_row`'s `"{shape:?} seed {seed}"`) before ` seed `.
+    fn count_shape(&mut self, what: &str, red: bool) {
+        let shape = what.split_once(" seed ").map_or(what, |(s, _)| s);
+        let at = match self.by_shape.iter().position(|t| t.shape == shape) {
+            Some(at) => at,
+            None => {
+                let tally = ShapeTally {
+                    shape: shape.to_string(),
+                    red: 0,
+                    cells: 0,
+                };
+                self.by_shape.push(tally);
+                self.by_shape.len() - 1
+            }
+        };
+        let entry = &mut self.by_shape[at];
+        entry.red += u64::from(red);
+        entry.cells += 1;
+    }
+
+    /// The row's red cells per shape, one line.
+    pub fn shapes_line(&self) -> String {
+        let cells: Vec<String> = self
+            .by_shape
+            .iter()
+            .map(|t| format!("{} {}/{}", t.shape, t.red, t.cells))
+            .collect();
+        format!("red by shape: {}", cells.join(", "))
     }
 
     /// One refusal, as `[hipcc, rust]` codes (see [`code`]): the reference's must be

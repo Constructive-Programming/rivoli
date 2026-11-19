@@ -1,11 +1,11 @@
 --- a/src/recurrent.rs
 +++ b/src/recurrent.rs
-@@ -59,7 +59,7 @@
+@@ -87,7 +87,7 @@
+     let dv = delta(u);
      let mut o = 0.0f32;
-     for_strided::<STATE_UNROLL>(0, rows, 1, |i| {
-         let p = s.add(i * stride);
--        let sv = fma(*kn.add(i), dv, *p);
-+        let sv = *p + *kn.add(i) * dv; // PLANT: the rank-one update unfused
-         *p = sv;
+     each_row(col, |i, s| {
+-        let sv = fma(*kn.add(i), dv, s);
++        let sv = s + *kn.add(i) * dv; // PLANT: the rank-one update unfused
          o = fma(*qn.add(i), sv, o);
+         sv
      });

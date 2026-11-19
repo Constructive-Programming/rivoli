@@ -10,19 +10,19 @@
 //!   loop's running sum `acc += x·sv` is `fma(x, sv, acc)`, the rank-one update
 //!   `s + k·dv` is `fma(k, dv, s)`, and the conv's `acc += w·win`. Nothing else pairs a
 //!   multiply with an add.
-//! - **`#pragma unroll 4`** on the four state loops is `for_strided::<4>` — schedule only, the
-//!   fold stays ascending.
+//! - **`#pragma unroll 4`** on the four state loops is `each_row`'s groups of four, loads before
+//!   stores — schedule only, the fold stays ascending.
 
 use crate::gpu::{bid, fma, lds, ocml, tid};
 use crate::prelude::reduce::{block_sum_lds, sync_threads};
-use crate::prelude::rowview::for_strided;
 use crate::residual::sigmoid;
 use core::intrinsics::{exp, sqrt};
 use rivoli_abi::geom::{ELEMENTWISE_BLOCK, reduce_block};
 use rivoli_abi::kernarg::{GateHeads, GatedDelta, Gdn, ShortConv};
 
-/// The C's `#pragma unroll 4` on every state loop.
+/// The C's `#pragma unroll 4` on every state loop (`each_row` spells its four rows).
 const STATE_UNROLL: usize = 4;
+const _: () = assert!(STATE_UNROLL == 4, "each_row names exactly four rows");
 
 /// `x · (1/sqrt(sum + 1e-6))` — both kernels' L2 norm, eps on the SUM.
 #[inline(always)]
@@ -38,6 +38,37 @@ struct Column {
     stride: usize,
 }
 
+/// `S[i] = step(i, S[i])` for `i` in `0..rows`, in groups of [`STATE_UNROLL`] whose state loads
+/// are all issued before any of the group's stores, then a scalar remainder — the schedule
+/// hipcc's `#pragma unroll 4` produces where it knows the stride non-zero (its `d` is
+/// `blockDim.x`). Rust reads `d` from the kernel argument, could not prove the rows distinct,
+/// and kept each load behind the previous row's store: one request in flight, measured 1.647x
+/// hipcc on `gated_delta_recurrent_f32` (rust-kernels.md §5, Phase 1 L2). The values and their
+/// order are unchanged: the rows ARE distinct (the stride — `head_dim`, or `dv` — is ≥ 1 by the
+/// launchers' guard 1001), so a
+/// load issued early reads what it would have read late.
+#[inline(always)]
+unsafe fn each_row(col: Column, mut step: impl FnMut(usize, f32) -> f32) {
+    let Column { s, rows, stride } = col;
+    let at = |i: usize| s.add(i * stride);
+    let mut i = 0;
+    // Four named loads, then four stores: an array of pointers here was measured to land in
+    // scratch (`scratch_store_b128`), and the stores to go `flat`.
+    while i + STATE_UNROLL <= rows {
+        let (p0, p1, p2, p3) = (at(i), at(i + 1), at(i + 2), at(i + 3));
+        let (v0, v1, v2, v3) = (*p0, *p1, *p2, *p3);
+        *p0 = step(i, v0);
+        *p1 = step(i + 1, v1);
+        *p2 = step(i + 2, v2);
+        *p3 = step(i + 3, v3);
+        i += STATE_UNROLL;
+    }
+    while i < rows {
+        *at(i) = step(i, *at(i));
+        i += 1;
+    }
+}
+
 /// Both passes over a [`Column`]: decay by `decay(i)` and read `u = Σ k[i]·S[i]`, then
 /// `dv = delta(u)`, the rank-one update and `o = Σ q[i]·S[i]` of the UPDATED state. Returns `o`.
 #[inline(always)]
@@ -47,21 +78,18 @@ unsafe fn state_passes(
     decay: impl Fn(usize) -> f32,
     delta: impl FnOnce(f32) -> f32,
 ) -> f32 {
-    let Column { s, rows, stride } = col;
     let mut u = 0.0f32;
-    for_strided::<STATE_UNROLL>(0, rows, 1, |i| {
-        let p = s.add(i * stride);
-        let sv = decay(i) * *p;
-        *p = sv;
+    each_row(col, |i, s| {
+        let sv = decay(i) * s;
         u = fma(*kn.add(i), sv, u);
+        sv
     });
     let dv = delta(u);
     let mut o = 0.0f32;
-    for_strided::<STATE_UNROLL>(0, rows, 1, |i| {
-        let p = s.add(i * stride);
-        let sv = fma(*kn.add(i), dv, *p);
-        *p = sv;
+    each_row(col, |i, s| {
+        let sv = fma(*kn.add(i), dv, s);
         o = fma(*qn.add(i), sv, o);
+        sv
     });
     o
 }

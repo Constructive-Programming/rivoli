@@ -9,11 +9,13 @@
 //! (`acc` compared strictly: it is integers), so a write outside the range or a missed
 //! accumulation is a mismatch. Scales carry NaN/inf/−0/subnormal codes: in the down
 //! projection on every seed (each poisons only its own output rows), everywhere on the nasty
-//! seeds; routing weights carry exact `0.0` and `-0.0` (both skipped) and a nasty-seed NaN.
+//! seeds; routing weights carry exact `0.0` and `-0.0` (both skipped), a 0.3 or nasty-seed NaN,
+//! at slots that rotate with the seed so every expert of a range is live on some seeds. The
+//! inputs themselves are `ranges.rs`'s, shared with the CPU plant models.
 
-use super::common::f32b;
 use super::device::{Cell, I, O, Out, Ref, S, Side, Tally, accepted, both, code, guard_ptrs};
-use super::inputs::{SEEDS, bytes, draw, nan_some, nasty, uniform};
+use super::inputs::{SEEDS, draw, uniform};
+use super::ranges::{Format, Range, cell_inputs, edge_seed, fixed_words, no_extras, vecs};
 use rivoli_backend::hip::{self, ExpertDesc};
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -27,86 +29,11 @@ type RangeI4Fn = unsafe extern "C" fn(I, i32, i32, i32, i32, *const c_void, I, O
 type DrainFn = unsafe extern "C" fn(O, U64, i32, i32, f32, S) -> i32;
 type DrainToFn = unsafe extern "C" fn(O, U64, i32, i32, S) -> i32;
 
-/// `(hidden, inter, e_start, e_count, nrow)` of one range cell.
-pub type Range = (usize, usize, usize, usize, usize);
-
 /// The cell's fixed inputs, in [`Cell::i`] order; the descriptor array is pushed after them.
 const X: usize = 0;
 const WEXPERT: usize = 1;
 const WEIGHTS: usize = 2;
 const SCALES: usize = 3;
-/// Bytes between consecutive experts' weight and scale spans in the arenas.
-const W_SHIFT: usize = 2;
-const S_SHIFT: usize = 4;
-
-/// Per-row byte extents of one format: `(weight bytes, scale bytes)` of a row whose reduction
-/// dim is the argument.
-type RowBytes = fn(usize) -> (usize, usize);
-
-/// Byte offsets of `[gate, up, down]` in the weight and scale arenas, and their totals.
-struct Layout {
-    w: [usize; 3],
-    s: [usize; 3],
-    w_len: usize,
-    s_len: usize,
-}
-
-impl Layout {
-    /// Gate and up are `inter` rows over `hidden`, down is `hidden` rows over `inter`.
-    fn new((hidden, inter, ..): Range, row: RowBytes) -> Self {
-        let (gate, down) = (row(hidden), row(inter));
-        let (wg, sg) = (inter * gate.0, inter * gate.1);
-        Self {
-            w: [0, wg, 2 * wg],
-            s: [0, sg, 2 * sg],
-            w_len: 2 * wg + hidden * down.0,
-            s_len: 2 * sg + hidden * down.1,
-        }
-    }
-
-    /// The scale arena's `[gate/up, down]` split, for the scale fills.
-    fn down_scales(&self) -> usize {
-        self.s[2]
-    }
-
-    /// `n` experts' descriptors as raw bytes: six pointers, `(weights, scales)` per projection —
-    /// the layout `ExpertDesc` and `ExpertDescF4` share.
-    fn descs(&self, (w, s): (usize, usize), n: usize) -> Vec<u8> {
-        (0..n)
-            .flat_map(|k| {
-                (0..3).flat_map(move |p| [w + self.w[p] + k * W_SHIFT, s + self.s[p] + k * S_SHIFT])
-            })
-            .flat_map(|a| (a as u64).to_le_bytes())
-            .collect()
-    }
-}
-
-/// One range cell's inputs before the descriptors: `x`, `wexpert`, both arenas (with room for
-/// every expert's shift), then the format's extras.
-fn range_inputs(
-    (hidden, _, e_start, e_count, nrow): Range,
-    seed: u64,
-    lay: &Layout,
-    scales: Vec<u8>,
-) -> Vec<Vec<u8>> {
-    let n_desc = e_start + e_count;
-    let mut w = uniform(n_desc * nrow, (seed, 2), 0.0..1.0);
-    // Inside the range, and always leaving one slot a live weight: exact zeros of both signs
-    // are skipped rows, and the third is a non-power-of-two weight (so a bf16 rounding before
-    // or after it differs) or, on the nasty seeds, a NaN that takes the clamp.
-    let specials = [0.0, -0.0, if nasty(seed) { f32::NAN } else { 0.3 }];
-    let live = e_count * nrow;
-    for (slot, v) in w[e_start * nrow..].iter_mut().zip(specials).take(live - 1) {
-        *slot = v;
-    }
-    vec![
-        f32b(&nan_some(draw(nrow * hidden, (seed, 1), 1.0, true), seed)),
-        f32b(&w),
-        bytes(lay.w_len + n_desc * W_SHIFT, (seed, 3)),
-        scales,
-    ]
-}
-
 /// `h` (in place, as f32) and `acc` (in place, strict) for a range cell.
 fn range_outputs((hidden, inter, e_start, e_count, nrow): Range, seed: u64) -> Vec<Out> {
     let acc = fixed_words(nrow * hidden, (seed, 6));
@@ -119,47 +46,6 @@ fn range_outputs((hidden, inter, e_start, e_count, nrow): Range, seed: u64) -> V
         )),
         Out::Words(acc),
     ]
-}
-
-/// A format's scale arena (with room for `n_desc` experts' shifts): its `scale` code of each
-/// finite draw (`scale_width` bytes) — at 2^-6, near the real checkpoints' group scales, so a
-/// dot over thousands of weights stays in range — with its `edges`, the non-finite/−0/subnormal
-/// codes, planted in the DOWN scales every seed and in all of them on the [`edge_seed`]s.
-fn scale_fill(lay: &Layout, (seed, n_desc): (u64, usize), fmt: &Format) -> Vec<u8> {
-    let (width, code, edges) = (fmt.scale_width, fmt.scale, (fmt.edges)());
-    let n = (lay.s_len + n_desc * S_SHIFT) / width;
-    let vals = uniform(n, (seed, 4), 0.25..2.0);
-    let mut s: Vec<u8> = vals.iter().flat_map(|&v| code(v * 2f32.powi(-6))).collect();
-    let starts = [lay.down_scales() / width, 0];
-    let spots = if edge_seed(seed) {
-        &starts[..]
-    } else {
-        &starts[..1]
-    };
-    for &at in spots {
-        for (k, e) in edges.iter().enumerate() {
-            let i = (at + 3 + 7 * k) * width;
-            s[i..i + width].copy_from_slice(e);
-        }
-    }
-    s
-}
-
-/// The seed class whose gate/up scales and codebooks carry the edge codes (one in eight). NOT
-/// the nasty class: those seeds put a NaN in `x`, which would turn every R=1 gate/up dot NaN
-/// and hide the edges from the activations.
-fn edge_seed(seed: u64) -> bool {
-    seed % 8 == 3
-}
-
-/// `n` fixed-point accumulator words for `(seed, stream)`: draws (|v| ≤ 16) at the kernels'
-/// scale `MOE_ACC_SCALE` = 2^44, so up to the 2^48 `moe.hip`'s drain note sizes the f64 convert
-/// for.
-fn fixed_words(n: usize, at: (u64, u64)) -> Vec<u8> {
-    let v = draw(n, at, 1.0, false);
-    v.iter()
-        .flat_map(|x| ((x * 2f32.powi(44)) as i64).to_le_bytes())
-        .collect()
 }
 
 /// One range launch's buffers on one side: `x`, `wexpert`, `h`, `acc`, the descriptor array
@@ -178,20 +64,6 @@ pub struct RangeBufs {
 /// `int`, so a guard case can pass `-1` (the Rust wrapper gets `usize::MAX`, which its
 /// `as i32` narrows back).
 pub type Args = (usize, usize, i32, usize, usize);
-
-/// What separates one format's range row from another's: its launcher's name, the arena
-/// extents, the scale codes, the extras, and the shapes.
-pub struct Format {
-    pub name: &'static str,
-    pub row: RowBytes,
-    pub scale_width: usize,
-    pub scale: fn(f32) -> Vec<u8>,
-    pub edges: fn() -> Vec<Vec<u8>>,
-    pub extras: fn(u64) -> Vec<Vec<u8>>,
-    pub shapes: &'static [Range],
-    /// How many of `shapes`, from the first, are also timed (the engine's real shapes).
-    pub timed: usize,
-}
 
 /// A whole range row: every shape × seed cell (descriptors pushed after the arenas they
 /// address; `value(range, seed)` the format's scalar operands), then each guard case. The
@@ -215,9 +87,7 @@ pub fn range_row<P: Copy + std::fmt::Debug>(
     for &range in fmt.shapes {
         for seed in 1..=SEEDS {
             let what = format!("{range:?} seed {seed}");
-            let lay = Layout::new(range, fmt.row);
-            let scales = scale_fill(&lay, (seed, range.2 + range.3), fmt);
-            let mut ins = range_inputs(range, seed, &lay, scales);
+            let (lay, mut ins) = cell_inputs(fmt, range, seed);
             let first_extra = ins.len();
             ins.extend((fmt.extras)(seed));
             let (hi, it, es, ec, nr) = range;
@@ -333,11 +203,6 @@ fn bf16_edges() -> Vec<Vec<u8>> {
     vecs([0x7fc1u16, 0x7f80, 0xff80, 0x8000, 0x0001].map(u16::to_le_bytes))
 }
 
-/// Byte codes as the owned rows `scale_fill` plants.
-pub fn vecs<const W: usize>(codes: impl IntoIterator<Item = [u8; W]>) -> Vec<Vec<u8>> {
-    codes.into_iter().map(|c| c.to_vec()).collect()
-}
-
 /// The three fp16 codebooks `[gate, up, down]`, 4096 × 4 each; fp16 inf and NaN entries on the
 /// [`edge_seed`]s.
 fn codebooks(seed: u64) -> Vec<Vec<u8>> {
@@ -437,11 +302,6 @@ fn f32_edges() -> Vec<Vec<u8>> {
         0x0000_0001,
     ];
     vecs(codes.map(u32::to_le_bytes))
-}
-
-/// No format extras.
-pub fn no_extras(_: u64) -> Vec<Vec<u8>> {
-    vec![]
 }
 
 const I4: Format = Format {
