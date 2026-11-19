@@ -22,6 +22,11 @@ use std::ffi::c_void;
 
 use crate::abi::{CompFinish, CompGeom};
 use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
+use crate::launch::{
+    Rows, rivoli_index_append, rivoli_index_head_route, rivoli_index_pool_norm_f32,
+    rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk,
+};
+use rivoli_abi::kernarg::{HeadRoute, IndexAppend, IndexScore, PoolNorm, PoolPush, TopK};
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
 // twenty rewritten comments.
@@ -461,7 +466,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `kcache`
     /// (row `pos` in-bounds).
-    launch_index_append -> rivoli_index_append, "index_append" (
+    launch_index_append => rivoli_index_append(IndexAppend { k, kcache, pos: pos as i32, hd: hd as i32 }), "index_append" (
         k: *const f32,
         kcache: *mut u16,
         pos: usize as i32,
@@ -475,7 +480,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
     /// f32), `kcache` (`nt·hd` bf16), `heads` (`nact` u32 or null), `scores` (`nt` f32).
-    launch_index_score -> rivoli_index_score, "index_score" (
+    launch_index_score => rivoli_index_score(nh as i32, IndexScore { q, w, kcache, heads, scores, nt: nt as i32, nact: nact as i32, hd: hd as i32, wscale, dscale }), "index_score" (
         q: *const f32,
         w: *const f32,
         kcache: *const u16,
@@ -491,7 +496,8 @@ launchers! {
 
     /// **Qwen3.8-Flash-Next's QSA block-key stage**: mean-pool `ratio` consecutive cached indexer
     /// keys into one block key and RMSNorm it (`qwen-architecture.md` §3, TR Eq. 13 =
-    /// MOD:679-682). `kernels/indexer.hip`'s last section carries the arithmetic.
+    /// MOD:679-682). `kernels/indexer.hip`'s last section (tag `archive/hip-kernels`) carries the
+    /// arithmetic.
     ///
     /// `keys` is `[n_blocks · ratio][hd]` f32, `weight` is `[hd]`, `out` is `[n_blocks][hd]`.
     ///
@@ -518,7 +524,7 @@ launchers! {
     /// writable f32) are device buffers outliving `stream`'s completion, and **none may alias
     /// another** — all three are `__restrict__` in the kernel. `stream` is a live `hipStream_t`,
     /// or null for the default stream.
-    launch_index_pool_norm_f32 -> rivoli_index_pool_norm_f32, "index_pool_norm_f32" (
+    launch_index_pool_norm_f32 => rivoli_index_pool_norm_f32(Rows(n_blocks as i32), PoolNorm { keys, weight, out, ratio: ratio as i32, hd: hd as i32, eps }, stream), "index_pool_norm_f32" (
         keys: *const f32,
         weight: *const f32,
         n_blocks: usize as i32,
@@ -541,7 +547,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `scores` (`nt` f32), `rows`
     /// (at least `min(k, nt)` u32 — the kernel writes exactly that many).
-    launch_index_topk -> rivoli_index_topk, "index_topk" (
+    launch_index_topk => rivoli_index_topk(TopK { s: scores, rows, nt: nt as i32, k: k as i32 }), "index_topk" (
         scores: *const f32,
         nt: usize as i32,
         k: usize as i32,
@@ -553,7 +559,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `k` (`hd` f32), `pool`
     /// (block `t/MISA_BLOCK` in-bounds).
-    launch_index_pool_push -> rivoli_index_pool_push, "index_pool_push" (
+    launch_index_pool_push => rivoli_index_pool_push(PoolPush { k, pool, t: t as i32, hd: hd as i32 }), "index_pool_push" (
         k: *const f32,
         pool: *mut f32,
         t: usize as i32,
@@ -565,7 +571,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `q` (`nh·hd` f32), `w` (`nh`
     /// f32), `pool` (`m_blocks·hd` f32), `e` (`nh` f32).
-    launch_index_head_route -> rivoli_index_head_route, "index_head_route" (
+    launch_index_head_route => rivoli_index_head_route(HeadRoute { q, w, pool, e, m_blocks: m_blocks as i32, nh: nh as i32, hd: hd as i32 }), "index_head_route" (
         q: *const f32,
         w: *const f32,
         pool: *const f32,
@@ -663,9 +669,10 @@ launchers! {
 //
 // A launcher that cannot be a DSL row fails one way: a parameter the mirror has no syntax for.
 // `hip.rs::launch_index_score_blocks` set the precedent (a buffer group becoming four arguments)
-// and its exemption block carries the argument; `launch_index_score_blocks_f32` joined it there,
-// beside its twin. `launch_gdn_recurrent_f32` below is the attention family's, for `GdnBufs`, and
-// lives here for cohesion — and because `hip.rs` measured 836 lines with it, over the 800 ceiling
+// and `launch_index_score_blocks_f32` joined it there, beside its twin — both are `=>` rows since
+// 2026-11-19, when their kernels moved to Rust and a row could build the kernel's argument block
+// (`hip.rs`'s exemption note has the record). `launch_gdn_recurrent_f32` below is the attention
+// family's, for `GdnBufs`, and lives here for cohesion — and because `hip.rs` measured 836 lines with it, over the 800 ceiling
 // this file was itself split out under. `launch_rmsnorm_gate_heads_f32` sat beside it from
 // 2026-09-01 for `HeadCount`/`HeadDim` alone and went back to being a row on 2026-09-02, when the
 // DSL grew `=>` for exactly that.

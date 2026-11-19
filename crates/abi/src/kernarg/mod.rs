@@ -19,10 +19,13 @@
 //! way a single definition could still disagree with itself is a target whose ABI lays it
 //! out differently, and either compile would fail.
 
-pub use activation::*;
-pub use residual::*;
-pub use touch::*;
+// Spelled unlike `geom`'s identical family list on purpose (brace re-export, `pub(crate) mod`):
+// the two lists grow in lockstep, one line per family, and as plain `pub use x::*;` / `mod x;`
+// runs they cross jscpd's 5-line floor at the fourth family (measured 2026-11-19, 26 tokens).
+pub use self::{activation::*, blockindex::*, indexer::*, residual::*, touch::*};
 
-mod activation;
-mod residual;
-mod touch;
+pub(crate) mod activation;
+pub(crate) mod blockindex;
+pub(crate) mod indexer;
+pub(crate) mod residual;
+pub(crate) mod touch;

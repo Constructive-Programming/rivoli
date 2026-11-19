@@ -45,6 +45,10 @@ column is a query, and a query can be wrong.
 > Phase 0 merge review, 2026-11-18); `activation.hip` and `residual.hip` are
 > deleted, and each kernel is scored byte-for-byte against its tagged hipcc twin by
 > `tests/bit-identity.sh`. Names are unchanged in both columns.
+>
+> **2026-11-19 (Rust-kernel Phase 1 L3):** the rows reading `indexer.rs` / `blockindex.rs` are
+> Rust likewise (`indexer.hip`, `blockindex.hip` deleted). The two block scorers were the
+> `hip.rs` hand-written pair; they are `=>` rows now, so their declaration cells name the kernel.
 
 | kernel (`launch_…`) | C entry | TU | GLM | V4 | K3 | Glimmer | Qwen | activated at (module :: fn) |
 |---|---|---|---|---|---|---|---|
@@ -61,7 +65,7 @@ column is a query, and a query can be wrong.
 | `gqa_attend` | `gqa_attend` | attn.hip | · | · | · | **✓** | · | glimmer/forward :: attention |
 | `gqa_block_attend` | `gqa_block_attend` | attn.hip | · | · | · | · | · | *(no production reference)* |
 | `mha_attend` | `mha_attend` | attn.hip | · | · | **✓** | · | · | k3/forward :: mla_attention |
-| `act_quant_f4_rotated` | `act_quant_f4_rotated` | blockindex.hip | · | **✓** | · | · | · | v4/blocksel; v4/kvcompress :: emit, raw_scores |
+| `act_quant_f4_rotated` | `act_quant_f4_rotated` | blockindex.rs | · | **✓** | · | · | · | v4/blocksel; v4/kvcompress :: emit, raw_scores |
 | `append_kv` | `append_kv` | fwd.hip | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
 | `argmax` | `argmax` | fwd.hip | **✓** | **✓** | **✓** | **✓** | · | glimmer/forward; glm/decode; k3/decode; v4/decode :: argmax, argmax_rows, sample |
 | `embed_i8_row` | `embed_i8_row` | fwd.hip | **✓** | · | · | · | · | glm/forward :: embed_rows |
@@ -72,13 +76,13 @@ column is a query, and a query can be wrong.
 | `vadd` | `vadd` | fwd.hip | **✓** | · | **✓** | **✓** | · | glimmer/forward; glm/attn; glm/mlp; k3/forward :: add_sub_to_pref, branch_add, desc_of, moe_ffn |
 | `embed_bf16_row_bcast` | `embed_bf16_row_bcast` | headtail.hip | · | **✓** | **✓** | **✓** | · | glimmer/forward; k3/forward; v4/forward :: begin_step, embed, rms_vec |
 | `hc_head_collapse` | `hc_head_collapse` | headtail.hip | · | **✓** | · | · | · | v4/forward :: head_tail |
-| `index_append` | `index_append` | indexer.hip | · | · | · | · | · | *(no production reference)* |
-| `index_head_route` | `index_head_route` | indexer.hip | · | · | · | · | · | *(no production reference)* |
-| `index_pool_norm_f32` | `index_pool_norm_f32` | indexer.hip | · | · | · | · | · | *(no production reference)* |
-| `index_pool_push` | `index_pool_push` | indexer.hip | · | · | · | · | · | *(no production reference)* |
-| `index_score` | `index_score` | indexer.hip | · | · | · | · | · | *(no production reference)* |
-| `index_topk` | `index_topk` | indexer.hip | · | · | · | · | · | *(no production reference)* |
-| `layernorm` | `layernorm` | indexer.hip | · | · | · | · | · | *(no production reference)* |
+| `index_append` | `index_append` | indexer.rs | · | · | · | · | · | *(no production reference)* |
+| `index_head_route` | `index_head_route` | indexer.rs | · | · | · | · | · | *(no production reference)* |
+| `index_pool_norm_f32` | `index_pool_norm_f32` | indexer.rs | · | · | · | · | · | *(no production reference)* |
+| `index_pool_push` | `index_pool_push` | indexer.rs | · | · | · | · | · | *(no production reference)* |
+| `index_score` | `index_score` | indexer.rs | · | · | · | · | · | *(no production reference)* |
+| `index_topk` | `index_topk` | indexer.rs | · | · | · | · | · | *(no production reference)* |
+| `layernorm` | `layernorm` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 | `gemm_bf16` | `gemm_bf16` | kvcompress.hip | · | **✓** | **✓** | **✓** | · | glimmer/forward; k3/forward; v4/blocksel; v4/forward; v4/kvcompress :: bproj, deposit, head_tail, proj |
 | `kv_compress_decode` | `kv_compress_decode` | kvcompress.hip | · | **✓** | · | · | · | v4/kvcompress :: emit |
 | `kv_compress_deposit` | `kv_compress_deposit` | kvcompress.hip | · | **✓** | · | · | · | v4/kvcompress :: deposit |
@@ -112,8 +116,8 @@ column is a query, and a query can be wrong.
 | `hc_pre` | `hc_pre` | residual.rs | · | **✓** | · | · | · | v4/forward :: pre_norm |
 | `gdn_recurrent_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
 | `hash_rows` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
-| `index_score_blocks` | `(hand-written)` | *(hand)* | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
-| `index_score_blocks_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
+| `index_score_blocks` | `index_score_blocks` | blockindex.rs | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
+| `index_score_blocks_f32` | `index_score_blocks_f32` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 
 ## The 13 that no production code calls
 
@@ -135,17 +139,17 @@ in `gate-red-proofs.md` §17 (2026-09-10).
 |---|---|---|---|
 | `gemv_vq` | linalg.hip | **superseded** | GLM's int3-vq experts run through `moe_expert_range` + `gemv_f32`/`gemv_fp8` (`glm/mlp.rs:558`, `RoutedFmt::Vq3`) |
 | `gemv_i4` | linalg.hip | **superseded** | same shape: `RoutedFmt::I4 => launch_moe_expert_range_i4` (`glm/mlp.rs:555`) |
-| `index_score` | indexer.hip | **pending M13** | `indexer.hip`'s header: "device port of the old int4 tree's indexer, adapted to the fp8 checkpoint… fed straight into the sparse `mla_attend` gather" — and sparse is refused: `SPARSE_ATTN_DEFERRED` at `core/src/legality.rs:360` ("only `--attn dense` decodes today"), with M13's chain deferred wholesale (`wave/m12-glm-chain`, §4) |
-| `index_append` | indexer.hip | **pending M13** | as above |
-| `index_topk` | indexer.hip | **pending M13, and the header argues against itself** | it says "the top-`index_topk` scores are picked host-side", so even the ported flow may not need the kernel form; M13 must answer that, not inherit it |
-| `index_head_route` | indexer.hip | **pending M13** | as above |
-| `index_pool_push` | indexer.hip | **pending M13** | as above |
-| `layernorm` | indexer.hip | **pending M13** | used only by that pipeline ("`k_norm` … feeds `layernorm` below"); no other module imports it |
+| `index_score` | indexer.rs | **pending M13** | `indexer.hip`'s header (tag `archive/hip-kernels`): "device port of the old int4 tree's indexer, adapted to the fp8 checkpoint… fed straight into the sparse `mla_attend` gather" — and sparse is refused: `SPARSE_ATTN_DEFERRED` at `core/src/legality.rs:360` ("only `--attn dense` decodes today"), with M13's chain deferred wholesale (`wave/m12-glm-chain`, §4) |
+| `index_append` | indexer.rs | **pending M13** | as above |
+| `index_topk` | indexer.rs | **pending M13, and the header argues against itself** | it says "the top-`index_topk` scores are picked host-side", so even the ported flow may not need the kernel form; M13 must answer that, not inherit it |
+| `index_head_route` | indexer.rs | **pending M13** | as above |
+| `index_pool_push` | indexer.rs | **pending M13** | as above |
+| `layernorm` | indexer.rs | **pending M13** | used only by that pipeline ("`k_norm` … feeds `layernorm` below"); no other module imports it |
 | `gqa_block_attend` | attn.hip | **not wired — by decision** | M17c's drafter attend: oracle-covered and executed (7/7, witnessed 2026-09-04), but §4 states it is a scored kernel rather than a shipped one. Its `gqa_attend` duplication is still OWED because jscpd cannot see `.hip` |
 | `gdn_recurrent_f32` | recurrent.hip | **qwen S3 ahead of S6** | named in `kernel_coverage.rs`'s FOURTH TURN as one of three launchers that landed with their oracles; the arm that would call them is S6 |
-| `index_pool_norm_f32` | indexer.hip | **qwen S3 ahead of S6** | same |
+| `index_pool_norm_f32` | indexer.rs | **qwen S3 ahead of S6** | same |
 | `gated_residual_collapse_f32` | residual.rs | **qwen S3 ahead of S6** | same |
-| `index_score_blocks_f32` | blockindex.hip | **qwen S3 ahead of S6** | the f32 sibling of V4's live `index_score_blocks`; `v4/blocksel.rs` calls the f4 pair, not this one |
+| `index_score_blocks_f32` | indexer.rs | **qwen S3 ahead of S6** | the f32 sibling of V4's live `index_score_blocks`; `v4/blocksel.rs` calls the f4 pair, not this one |
 
 **Two near-misses worth recording, because they were classified wrong before being checked.**
 `hash_rows` and `vq_encode` both look uncalled to a scan that only looks at `crates/engine/src`:

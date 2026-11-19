@@ -15,6 +15,15 @@ pub fn bid() -> u32 {
     amdgpu::workgroup_id_x()
 }
 
+/// The elementwise kernels' index, `blockIdx.x * ELEMENTWISE_BLOCK + threadIdx.x` — unsigned and
+/// wrapping, as HIP computes it — read as the C's `int` for the signed bound test.
+#[inline(always)]
+pub fn elementwise_id() -> i32 {
+    bid()
+        .wrapping_mul(rivoli_abi::geom::ELEMENTWISE_BLOCK)
+        .wrapping_add(tid()) as i32
+}
+
 /// The dispatch's dynamic LDS, as `T`. Sized by the launcher's `sharedMemBytes`, which
 /// every launcher takes from the `rivoli_abi::geom` layout the kernel carves it by. HIP's
 /// kernels declared static `__shared__` arrays; Rust has no LDS statics, and where the

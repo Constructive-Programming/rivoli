@@ -2039,3 +2039,28 @@ A green first run is not a red proof, and the aliased rows' red proof is still O
 **Merge-review lease (2026-11-18, `3706fdc`).** Arm R's rope plant, rebuilt at `3706fdc`,
 reddened exactly its two rows, so the red proof is PAID again. The probe and plant re-runs
 were all GREEN, and the witness was clean on every arm. The table is in `rust-kernels.md` §5.
+
+**Phase 1 L3 — launcher-row plants (2026-11-19, deviceless half).** A launcher row's plant is a
+patch to `crates/kernels` that the probe route cannot score, because the planted kernel ships
+inside the embedded code object, not a probe object. So these patches live apart, in
+`tests/bit-identity/plants/launch/`. There `--plant=` and `--build-probes --plant=` refuse them
+(no `plant_spec` row, and no `plants/<name>.patch` to stamp) instead of silently building a
+probe object that no row reads. The arm is a PLANTED TEST BINARY:
+
+1. apply with `patch -p1 -F0 -d crates/kernels`;
+2. build `bit_identity` into a separate target dir and copy the binary aside;
+3. reverse with `patch -R` and check that `git diff --quiet crates/kernels` passes;
+4. run `tests/bit-identity.sh --expect-red=<rows> <binary>`.
+
+Each plant was first shown adversarial on the gate's own inputs by
+`crates/engine/tests/bit_identity/plant_models.rs`, run under `--no-default-features`:
+
+| plant | defect | CPU proof | expect-red |
+|---|---|---|---|
+| `indexer` | `index_topk`'s key drops the `-0.0` → `+0.0` canonicalisation (a tie-break defect: `-0.0` orders below `+0.0` instead of tying and falling to the index rule) | 126/256 partial-selection cells select a different row set: 30–48/64 seeds at the three shapes whose boundary falls in the `±0` run, 0 at `(65536, 2048)`, whose boundary sits in the positive ties | `index_topk` |
+| `blockindex` | `index_score_blocks` drops the per-term bf16 rounding before the f32 accumulator | 203/256 cells: 64/64 seeds at three shapes, 11/64 at the single-block `[1, 1, 64, 128]` | `index_score_blocks` |
+
+The first CPU run of the `indexer` model REFUSED (126/448). Three of the seven shapes select
+every entry (`k >= nt`), so no tie rule can move them. The model now counts only partial
+selections and records the shape the plant cannot reach. The device arms are OWED to the L3 GPU
+lease (`rust-kernels.md` §5, Phase 1 L3).

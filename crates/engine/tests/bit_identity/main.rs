@@ -34,7 +34,12 @@ mod inputs;
 #[cfg(feature = "rocm")]
 mod activation;
 #[cfg(feature = "rocm")]
+mod blockindex;
+#[cfg(feature = "rocm")]
 mod device;
+#[cfg(feature = "rocm")]
+mod indexer;
+mod plant_models;
 #[cfg(feature = "rocm")]
 mod probes;
 #[cfg(feature = "rocm")]
@@ -68,6 +73,16 @@ const ROWS: &[Row] = &[
         "gated_residual_collapse_f32",
         residual::gated_residual_collapse_f32,
     ),
+    ("layernorm", indexer::layernorm),
+    ("index_append", indexer::index_append),
+    ("index_score", indexer::index_score),
+    ("index_pool_push", indexer::index_pool_push),
+    ("index_head_route", indexer::index_head_route),
+    ("index_topk", indexer::index_topk),
+    ("index_pool_norm_f32", indexer::index_pool_norm_f32),
+    ("index_score_blocks_f32", indexer::index_score_blocks_f32),
+    ("act_quant_f4_rotated", blockindex::act_quant_f4_rotated),
+    ("index_score_blocks", blockindex::index_score_blocks),
 ];
 
 #[cfg(feature = "rocm")]

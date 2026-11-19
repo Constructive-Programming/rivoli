@@ -9,12 +9,15 @@
 
 use crate::hip::{abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
-    Rows, rivoli_act_quant_f8, rivoli_rmsnorm_centered_single, rivoli_rmsnorm_single,
-    rivoli_rmsnorm_weightless_batch, rivoli_rope_interleave, rivoli_rope_split_half,
-    rivoli_situ_glu_f32, rivoli_swiglu, rivoli_swiglu_clamped_bf16,
+    Rows, rivoli_act_quant_f4_rotated, rivoli_act_quant_f8, rivoli_layernorm,
+    rivoli_rmsnorm_centered_single, rivoli_rmsnorm_single, rivoli_rmsnorm_weightless_batch,
+    rivoli_rope_interleave, rivoli_rope_split_half, rivoli_situ_glu_f32, rivoli_swiglu,
+    rivoli_swiglu_clamped_bf16,
 };
 use anyhow::Result;
-use rivoli_abi::kernarg::{Gate, GateClamped, GateSitu, Rope, RowNorm, WeightlessNorm};
+use rivoli_abi::kernarg::{
+    F4Rotate, Gate, GateClamped, GateSitu, LayerNorm, Rope, RowNorm, WeightlessNorm,
+};
 use std::ffi::c_void;
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports.
@@ -263,7 +266,7 @@ launchers! {
     /// `x` is `rows · d` writable, 4-byte-aligned, device-resident f32, read and written in
     /// place, and outlives `stream`'s completion. `stream` is a live `hipStream_t`, or null for
     /// the default stream.
-    launch_act_quant_f4_rotated -> rivoli_act_quant_f4_rotated, "act_quant_f4_rotated" (
+    launch_act_quant_f4_rotated => rivoli_act_quant_f4_rotated(Rows(rows as i32), F4Rotate { x, d: d as i32 }, stream), "act_quant_f4_rotated" (
         x: *mut f32,
         rows: usize as i32,
         d: usize as i32,
@@ -360,7 +363,7 @@ launchers! {
     ///
     /// # Safety
     /// Device pointers (`x`, `w`, `b`, `y` each `n` f32) live until the next [`device_sync`].
-    launch_layernorm -> rivoli_layernorm, "layernorm" (
+    launch_layernorm => rivoli_layernorm(LayerNorm { row: RowNorm { x, w, y, n: n as i32, eps }, b }), "layernorm" (
         x: *const f32,
         w: *const f32,
         b: *const f32,

@@ -908,3 +908,40 @@ are LOWER bounds on throughput:
 - **A0:** 50 s.
 - **Whole run:** 247 s to the last arm's output, 267 s to `arms/end.epoch`. The posted
   READY-FOR-GPU estimate was 25–35 min.
+
+### Phase 1 L3 (mla, kvcompress, blockindex, indexer)
+
+**indexer + blockindex, deviceless half (2026-11-19).**
+
+*Ported.* Ten kernels in two families: the eight `indexer.hip` kernels and `blockindex.hip`'s
+`act_quant_f4_rotated` and `index_score_blocks`. Both `.hip` files are deleted.
+
+*FMA sites.* Each was read off hipcc's ISA:
+- `+= a * b` dot accumulators are `v_fmac`;
+- `layernorm`'s variance is `fma(-mean, mean, Σx²/n)` and its output
+  `fma((x − mean)·inv, w, b)`;
+- neither block scorer has any (both are `contract(off)`).
+
+*ISA census.* FMA, div, rcp and sqrt counts match hipcc on nine of the ten kernels. The
+remaining count differences are unroll (constant-trip trees and scans unrolled, the scorers'
+inner loop unrolled 4×). `act_quant_f4_rotated` has fewer fma/div/cvt ops in Rust because hipcc
+unrolled its 32-element fp4 round-trip loop 2× (`%div.i`/`%div.i.1` in its IR). No kernel uses
+scratch.
+
+*Run-time blocks.* `index_score`, `index_head_route` and `index_pool_norm_f32` take their
+launcher-sized block in `kernarg::Blocked`, never from the dispatch packet.
+
+*Shared operand set.* `ScoreBufs` is now `rivoli_abi`'s, one definition embedded in the
+scorers' `ScoreBlocks`. Both scorers became `=>` rows. **The `hip.rs` exemption did NOT retire,
+measured:** with its markers deleted, jscpd found 2 clones:
+- the two rows' parameter lists;
+- `memcpy_dtod_async` against `hiprt.rs`, hidden there since before the migration.
+
+So the count stays 9.
+
+*Harness.* Integer outputs (top-k rows, the bf16 cache) are compared byte for byte
+(`Out::Exact`). The top-k scores are tie-heavy by construction (`inputs::topk_scores`).
+
+*Plants.* Two launcher-row plants, each with a CPU proof, recorded in `gate-red-proofs.md` §18.
+
+*Device arms.* OWED.

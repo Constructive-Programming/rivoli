@@ -16,12 +16,17 @@
 
 #![cfg(feature = "rocm")]
 
+// One family per pair, interleaved: as two plain `mod x;` / `use x::*;` runs this list matches
+// `rivoli_abi::geom`'s line for line and crosses jscpd's 5-line floor (measured 2026-11-19).
 mod activation;
-mod residual;
-mod touch;
-
 pub(crate) use activation::*;
+mod blockindex;
+pub(crate) use blockindex::*;
+mod indexer;
+pub(crate) use indexer::*;
+mod residual;
 pub(crate) use residual::*;
+mod touch;
 pub use touch::rivoli_touch_region_async;
 
 use crate::module::{Geometry, Kernel, LdsBytes};
@@ -47,6 +52,11 @@ unsafe fn run<A: Copy>(k: &Kernel<A>, checked: Checked, stream: *mut c_void, arg
         Ok(geom) => unsafe { k.launch(geom, stream, args) },
         Err(code) => code,
     }
+}
+
+/// `a <= 0 || b <= 0 || …` — the C guards' extent refusal (1001), one call per launcher.
+fn any_nonpositive(extents: &[i32]) -> bool {
+    extents.iter().any(|&x| x <= 0)
 }
 
 /// `!(x > 0 && x < INFINITY)` — the C guards' one-compare form, which refuses NaN, zero,

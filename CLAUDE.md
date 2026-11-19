@@ -67,7 +67,8 @@ appears that enum dispatch cannot fill.
   **10** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
   where verbatim transcription of the reference is the point; five across the HIP ABI
   wall, which the 800-line ceiling split into `backend/hip.rs` — its extern declarations
-  and its one hand-written launcher — plus one per macro-invocation file,
+  and C-mirroring wrappers (its one hand-written launcher became two `=>` rows 2026-11-19;
+  re-measured, the region still exempts 2 clones) — plus one per macro-invocation file,
   `backend/hip_linalg.rs`, `backend/hip_activation.rs`, `backend/hip_blocks.rs` and
   `backend/hip_attn.rs` (the third invocation file split out 2026-08-16 with M9's launchers;
   the fourth, `hip_activation.rs`, 2026-11-18, when the Phase 0 merge review split the
