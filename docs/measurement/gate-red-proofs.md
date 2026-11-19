@@ -2055,6 +2055,8 @@ Two changes land before any Phase 1 kernel, in one commit owned by L4 for every 
   gridDimZ/gridDimY swap sends the same packet.
 - The red proof is owed to the first kernel that reads `blockIdx.y`. Its bit-identity row
   must run cells with `blocks_y > 1` (L4's attention rows).
+  > **PAID 2026-11-19 (§20, `grid-y`):** `blocks_y` planted into gridDimZ reddened exactly
+  > the four 2-D attention rows on the device, and the 1-D `mha_attend` held.
 
 **`LAUNCHED_BY`** (`crates/cli/tests/kernel_coverage/launched_by.rs`, split out of
 `kernel_coverage.rs` to stay under its soft cap). It is a table of `(kernel, launcher)` pairs
@@ -2150,4 +2152,6 @@ The same model measured which seeds can carry an accumulator plant at all, and 2
 
 The model's 90% bar is taken over the other 40, and it says so at the test.
 
-Device arms: OWED to the lease (`rust-kernels.md` §5, Phase 1 L4).
+**Device arms: PAID 2026-11-19** (commit `731a047`, witness 0 B on every arm). Each planted
+binary scripted `GREEN (expect-red)`, reddening exactly the rows in the table above. Arm A, unplanted, was 18/18 BIT-IDENTICAL. The per-arm table is in `rust-kernels.md` §5,
+`### Phase 1 L4 — device lease`.

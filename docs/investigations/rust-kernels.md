@@ -912,7 +912,7 @@ are LOWER bounds on throughput:
 ### Phase 1 L4 (attn)
 
 **Deviceless half (2026-11-19, branch `wave/rk-l4-attn`). Device arms are OWED to the GPU
-lease.** `attn.hip` (950 lines, 6 kernels, 5 launchers + the scratch-size function) is ported
+lease.** *(PAID 2026-11-19 except W: `### Phase 1 L4 — device lease` below.)* `attn.hip` (950 lines, 6 kernels, 5 launchers + the scratch-size function) is ported
 and deleted, and it is gone from `build.rs`'s hipcc list.
 
 **Where it went:**
@@ -1030,8 +1030,84 @@ stay in the device rows for what they do test.
 
   Every log cited here is under `/var/cache/rivoli/scratch/rk-l4-attn/` (`gates/`, `isa/`).
 
-**OWED to the lease:**
+**OWED to the lease** (PAID 2026-11-19 except W):
 - arm A (18 rows);
 - four expect-red arms on planted binaries (`grid-y` pays §19's `blocks_y` proof);
 - TIME lines;
-- the attention oracle suites, unmodified, in the battery.
+- the attention oracle suites, unmodified, in the battery — OWED (W, deferred to the
+  integrated four-lane battery).
+
+### Phase 1 L4 — device lease (2026-11-19, commit `731a047`)
+
+Commit `731a047` on `d6a6f1b`. The coordinator's GO covered arms 1–5; W was deferred to the
+integrated four-lane battery. Five arms ran in order through `tests/bit-identity.sh`, detached
+with `setsid`, under the default lock. **No arm
+was discarded.** Every witness file was 0 B, GTT was 17 MiB before each arm, and no arm logged a
+fault. Host loadavg was 0.45 → 17.79 over arm A (presumed sibling builds, no process list taken)
+and 1.08–3.05 in the later arms. Driver and logs: `/var/cache/rivoli/scratch/rk-l4-attn/gpu/`
+(`arms.sh`, `arms.log`, `<arm>.out`), plus the log directories below.
+
+| arm | binary | scripted verdict | rc | wall | logs `…/bit-identity/` |
+|---|---|---|---|---|---|
+| A | fresh, `bit_identity-efca1da5680a0280` | GREEN: 18/18 BIT-IDENTICAL | 0 | 427 s | `20261119T112806-2630525` |
+| R-mla | `plant/bit_identity-attn-mla` | GREEN (expect-red): exactly `mla_attend` (551/704 cells) | 0 (binary 101) | 406 s | `20261119T113513-2713787` |
+| R-gqa | `plant/bit_identity-attn-gqa` | GREEN (expect-red): exactly `gqa_attend` (544/640), `gqa_block_attend` (320/384) | 0 (101) | 393 s | `20261119T114159-2771059` |
+| R-dense | `plant/bit_identity-attn-dense` | GREEN (expect-red): exactly `gather_attn_shared_kv` (187/448), `mha_attend` (209/320) | 0 (101) | 377 s | `20261119T114832-2804828` |
+| R-grid | `plant/bit_identity-grid-y` | GREEN (expect-red): exactly the four 2-D rows (MLA 384/704, gather 128/448, gqa 192/640, block 320/384) | 0 (101) | 393 s | `20261119T115449-2818885` |
+
+- **Arm A: every attention row is BIT-IDENTICAL.**
+  - MLA: 704 cells, 337 567 744 words, 16 guards, partials included.
+  - Gather: 448 cells; GQA: 640; block: 384; MHA: 320.
+  - NaN-payload-only words: 0 for MLA and gather, 10 080 for GQA, 5 984 for block, 70 for
+    MHA. All are on the nasty seeds, and all are NaN on both sides under the owner's rule.
+  - The 13 Phase 0 rows stayed identical on the new `launch_raw`, the first device check of
+    `d6a6f1b`'s 1-D path.
+- **Every gather guard refused cleanly,** so the poisoned-index-buffer risk named before the
+  lease did not arise.
+
+**TIME, arm A (min of three 200-launch batches, hot shapes).** Every ratio above 1.05 is
+flagged with ⚑.
+
+| kernel (shape) | hipcc µs | Rust µs | ratio | ratio in the other arms where the row ran unplanted |
+|---|---|---|---|---|
+| ⚑ mla_attend (64 heads, nr 2048, 16 splits) | 424.22 | 509.66 | 1.201 | 1.191, 1.216 |
+| ⚑ gather_attn_shared_kv (1, 64, 512, 640, 640) | 152.35 | 184.89 | 1.214 | 1.215, 1.216 |
+| ⚑ gqa_attend (decode, pos 4095, ring 2048) | 2598.50 | 2969.34 | 1.143 | 1.147, 1.141 |
+| ⚑ gqa_block_attend (ctx 4096, block 16) | 9132.52 | 9798.95 | 1.073 | 1.067, 1.061 |
+| mha_attend (96 heads × 1024) | 2333.48 | 634.41 | **0.272** | 0.272, 0.278, 0.267 |
+
+- **The attention ratios repeat across arms within ±0.03.** They are not this lease's noise.
+- That cannot be said of the three gated combines, the same code Phase 0 timed at 0.96–1.17
+  across leases. They read 1.15–1.17 here (swiglu 1.167, clamped 1.174, situ 1.148: Rust
+  2.46–2.51 µs vs hipcc 2.09–2.19 µs), but 0.97–1.00 in the four plant arms, except R-mla's
+  `situ_glu_f32` at 1.201. They remain the unexplained swing recorded at the merge-review
+  lease.
+- The rest of Phase 0, in arm A, is within 0.86–1.04: `rmsnorm_weightless_batch` 0.863,
+  `attn_res` 1.035, `hc_pre` 1.000, `rope_*` 1.00/1.02. `attn_res` reads 1.03–1.07 across
+  the arms (1.071 in R-gqa), still the 6% Phase 0 owed.
+- **`mha_attend` runs at 0.27× hipcc**, the reverse of the risk named before the lease. The
+  Rust tree is unrolled against the constant `MHA_THREADS`, and the kernel never reads
+  blockDim. Why that buys 3.7× is not isolated.
+
+**ISA evidence for the ⚑ rows (deviceless, read after the lease):**
+- **MLA: the C's `int` loops are `nsw`, `gpu::for_i32`'s are not.** `i += stride` wraps in
+  Rust, so LLVM cannot turn the score dots' `qa[i]` into a pointer increment. Every iteration
+  re-extends and re-shifts the index: `v_ashrrev_i32` + `v_lshlrev_b64` + a 64-bit add
+  (`isa/rs_mla_latent_attend.s`), where hipcc adds `0x80` to a pointer
+  (`isa/mla_latent_attend.s`, `.LBB0_23`).
+  - Experiment: a scratch copy of `crates/kernels` with `for_i32`'s increment changed to
+    `unchecked_add` (`scratch/rk-l4-attn/exp-nsw/`).
+  - Result (counted by `census.sh`'s rule, `exp-nsw/counts.txt`): MLA drops from 1249 to
+    1107 static instructions (hipcc 979), and both dot loops become the same instructions as
+    hipcc's, scheduled slightly differently.
+  - **Untimed.** It is a shared Phase 0 helper (every `for_i32` kernel), so the change and
+    its device check belong to the coordinator, not this lane.
+  - The same experiment leaves gather (918 → 914) and gqa (915 → 915) essentially unmoved, so
+    it is not their cause.
+- **Gather and GQA: no cause isolated.** The logits loops match hipcc's shape (gather: ×8
+  unrolled, `global_load_b128`).
+  - Gather's values pass carries `u64` loop-counter bookkeeping hipcc does not have
+    (`for j in 0..topk as usize` against the C's `int j`), plus the same per-column exec-mask
+    branches.
+  - GQA's static size is 1.33× hipcc, with occupancy equal or better.
+  - **OWED:** these are attention's decode-path kernels.

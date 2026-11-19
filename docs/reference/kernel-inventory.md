@@ -40,9 +40,9 @@ column is a query, and a query can be wrong.
 
 > **2026-11-19 (Rust-kernel Phase 1 L4):** the five rows whose TU read `attn.hip` are Rust now,
 > in `crates/kernels/src/attn/` (`mla.rs`, `dense.rs`, `gqa.rs`), launched through `=>` rows and
-> `crates/backend/src/launch/attn.rs`; `attn.hip` is deleted and each launcher is to be scored by
-> `tests/bit-identity.sh` against the tagged hipcc twin (device arms OWED: `rust-kernels.md` §5,
-> Phase 1 L4). `mla_attend` is two kernels (the attend
+> `crates/backend/src/launch/attn.rs`; `attn.hip` is deleted and each launcher is scored by
+> `tests/bit-identity.sh` against the tagged hipcc twin (all five BIT-IDENTICAL in arm A,
+> 18/18 rows, 2026-11-19; `rust-kernels.md` §5, Phase 1 L4 — device lease). `mla_attend` is two kernels (the attend
 > and its split combine) behind one launcher, rowed under it by `kernel_coverage.rs`'s
 > `LAUNCHED_BY`. Names are unchanged in both columns.
 
