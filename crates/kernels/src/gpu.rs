@@ -52,12 +52,24 @@ pub fn lds<T>() -> *mut T {
 /// `i32` so the compare and the increment are the ones hipcc emitted, handing `body` the index
 /// as `usize`. `start` and `stride` are thread/block quantities (`u32`), `end` the C's `int`
 /// extent.
+///
+/// **The increment is `nsw`** (Phase 1 integration, 2026-11-19): it lets LLVM widen `i` and
+/// strength-reduce `p[i]` to a pointer bump, where a wrapping `+=` re-extended and re-shifted the
+/// index every iteration (`v_ashrrev_i32` + `v_lshlrev_b64` + a 64-bit add, L4's
+/// `mla_latent_attend` finding, `rust-kernels.md` §5). For a C loop striding by a constant this
+/// is exactly clang's `nsw`; for one striding by `blockDim.x` (`int + unsigned` is unsigned in C,
+/// so no `nsw`) it is a stronger promise than the C made, sound because every stride is a block
+/// size and every `end` a launcher-guarded extent: overflow needs `end + stride > i32::MAX + 1`.
+/// The `debug_assert!` states that bound; the device crate builds `--release`, so it is
+/// documentation, not a check.
 #[inline(always)]
 pub fn for_i32(start: u32, end: i32, stride: u32, mut body: impl FnMut(usize)) {
+    debug_assert!(stride <= i32::MAX as u32 && i64::from(end) + i64::from(stride) <= 1 << 31);
     let mut i = start as i32;
     while i < end {
         body(i as usize);
-        i += stride as i32;
+        // SAFETY: `i < end` and the bound above, so `i + stride <= i32::MAX`.
+        i = unsafe { i.unchecked_add(stride as i32) };
     }
 }
 

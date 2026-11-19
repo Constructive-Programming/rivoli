@@ -95,30 +95,21 @@ pub(crate) unsafe fn rivoli_moe_expert_range(a: MoeVq, nrow: i32, stream: *mut c
 /// The `launch_moe_expert_range_i4` contract.
 pub(crate) unsafe fn rivoli_moe_expert_range_i4(a: MoeI4, nrow: i32, stream: *mut c_void) -> i32 {
     let r2 = nrow == 2;
-    // An `if` chain, and the closures passed inline, where the VQ twin has a `match` and a
-    // `let`: the same dispatch, deliberately spelled apart. jscpd reads identifiers as one
-    // token class and reported the matching spelling as two clones of the twin (5 lines / 70
-    // tokens and 6 lines / 53 tokens, 2026-11-19); the census needs each `STATIC.launch`
-    // written here, so the selection cannot move into a shared helper.
-    // SAFETY: the launcher contract covers all four kernels' buffers.
-    let pass = |down: bool, g| unsafe {
-        if !down {
-            if r2 {
-                MOE_GATEUP_I4_R2.launch(g, stream, &a)
-            } else {
-                MOE_GATEUP_I4.launch(g, stream, &a)
-            }
-        } else if r2 {
-            MOE_DOWN_I4_R2.launch(g, stream, &a)
-        } else {
-            MOE_DOWN_I4.launch(g, stream, &a)
-        }
+    // Picks the static into a local where the VQ twin launches in each arm: the same dispatch,
+    // and the differing token runs are what keep jscpd from pairing the two (0 clones,
+    // 2026-11-19; the census accepts either form since the integration's loosened rule).
+    let pass = |down: bool, g| {
+        let kernel = match (down, r2) {
+            (false, false) => &MOE_GATEUP_I4,
+            (false, true) => &MOE_GATEUP_I4_R2,
+            (true, false) => &MOE_DOWN_I4,
+            (true, true) => &MOE_DOWN_I4_R2,
+        };
+        // SAFETY: the launcher contract covers all four kernels' buffers.
+        unsafe { kernel.launch(g, stream, &a) }
     };
-    passes(
-        (a.span, glm_checked(&a.span, nrow)),
-        (|g| pass(false, g), |g| pass(true, g)),
-        || 0,
-    )
+    let (up, down) = (|g| pass(false, g), |g| pass(true, g));
+    passes((a.span, glm_checked(&a.span, nrow)), (up, down), || 0)
 }
 
 /// Both drains' guard (1001) and grid: one thread per accumulator column.

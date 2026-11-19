@@ -84,7 +84,7 @@ pub(crate) unsafe fn rivoli_mla_value_fp8(nrow: i32, a: MlaValue) -> i32 {
             }
         })
     };
-    // As in `rivoli_mla_absorb_fp8`: both `run(&STATIC, …)` calls written out for `LAUNCHED_BY`.
+    // As in `rivoli_mla_absorb_fp8`: both statics named in this body, for `LAUNCHED_BY`.
     unsafe {
         if nrow == 2 {
             run(&MLA_VALUE_FP8_R2, checked, null_mut(), &a)

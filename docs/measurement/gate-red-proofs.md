@@ -2147,11 +2147,19 @@ assertion. The table below is the rerun.
 | the rename, `("rope_split_half_b", "swiglu")` | exit 101, `rope_split_half` extra in both populations, and stale: "does not launch the kernel's `static` handle" |
 | the rename, `M` listed twice | exit 101, stale: "listed twice" — isolated |
 | the rename, `M`, `rivoli_rope_split_half` launching `ROPE_INTERLEAVE` | exit 101, stale: "does not launch" — isolated |
-| as above, plus a comment line `// run(&ROPE_SPLIT_HALF, ...)` in the body | exit 101, stale: "does not launch" — isolated (a mention is not a launch) |
+| as above, plus a comment line `// run(&ROPE_SPLIT_HALF, ...)` in the body | exit 101, stale: "does not launch" — isolated (a mention is not a launch). *Still red after the 2026-11-19 loosening, because comments are dropped; a mention in CODE now counts (P5 below).* |
 | the rename, `M` | exit 0 (the positive control) |
 | restored | exit 0 |
 | L3 (2026-11-19): `("mla_absorb_fp8_r2", …)` deleted | exit 101, `mla_absorb_fp8_r2` missing from both populations; restored by byte copy (`cmp` rc 0), green |
-| L3: `rivoli_mla_absorb_fp8` back to `let kernel = if nrow == 2 { &R2 } else { &R1 }; run(kernel, …)` | exit 101, stale: "does not launch the kernel's `static` handle" — the reason the launcher spells both `run(&STATIC, …)` calls; restored (`cmp` rc 0), green |
+| L3: `rivoli_mla_absorb_fp8` back to `let kernel = if nrow == 2 { &R2 } else { &R1 }; run(kernel, …)` | exit 101, stale: "does not launch the kernel's `static` handle" — the reason the launcher spells both `run(&STATIC, …)` calls; restored (`cmp` rc 0), green. *Superseded 2026-11-19: this form is accepted under the loosened rule below.* |
+| **Integration (2026-11-19): the rule LOOSENED** — the body must name the static as a whole identifier and contain a launch (`run(`, `run_2d(`, `.launch`); trailing `//` comments are now dropped as well as comment lines. The row above's form is ACCEPTED from here on, by decision. Plants are text edits to `rivoli_moe_expert_range_i4` (restored to the `match`-into-a-local form), the census binary run directly, the file restored by copy and `cmp` rc 0 each time; logs in `/var/cache/rivoli/scratch/rk-integrate/redproof-lb/` | |
+| P1: the `(true, true)` arm picks `&MOE_DOWN_I4`, so `MOE_DOWN_I4_R2` is named nowhere in the body | exit 101, stale: `(moe_down_i4_r2, moe_expert_range_i4)` "does not launch" — isolated |
+| P2: as P1, plus a trailing `// MOE_DOWN_I4_R2` on that arm | exit 101, the same single refusal (the trailing comment is dropped; before this change it would have counted as naming the static) |
+| P3: `kernel.launch(` → `kernel.go(` (every static still named, nothing launched) | exit 101, stale on all four `moe_expert_range_i4` entries |
+| P4: the `(true, false)` arm picks `&MOE_DOWN_I4_R2`, leaving `MOE_DOWN_I4` only as a prefix of another name | exit 101, stale: `(moe_down_i4, moe_expert_range_i4)` alone (the identifier boundary holds) |
+| P5: the `(true, true)` arm is `{ let _ = &MOE_DOWN_I4_R2; &MOE_DOWN_I4 }` — named in code, never launched, while another static is | **exit 0: ACCEPTED, the class the loosening gives up, by decision.** The bit-identity row, whose R = 2 down shapes would read the wrong kernel, is what catches it |
+| P6: `kernel.launch(` → `kernel.launched_by(` | exit 101, stale on all four entries (`.launch(`/`.launch_2d(` are matched with their parenthesis) |
+| clean tree | exit 0 |
 
 ## 20. Rust kernels, Phase 1 L4 — the attention rows' plants (added 2026-11-19)
 

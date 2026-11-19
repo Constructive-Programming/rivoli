@@ -76,9 +76,16 @@ pub(super) fn rowed_names() -> Vec<String> {
 }
 
 /// The [`LAUNCHED_BY`] entries to refuse, each with its reason: the kernel is not shipped or
-/// is `UNROWED`, is listed twice, has a row of its own, or is not LAUNCHED (`run(&STATIC, …)`
-/// or `STATIC.launch…`, comment lines dropped) in `rivoli_<launcher>`'s own top-level body —
-/// so a launcher must name every phase's static itself, not reach it through a helper.
+/// is `UNROWED`, is listed twice, has a row of its own, or is not launched by
+/// `rivoli_<launcher>`'s own top-level body (comments dropped): the body must name the
+/// kernel's `STATIC` as an identifier and contain a launch ([`has_launch`]) — so a launcher must
+/// name every phase's static itself, not reach it through a helper. LOOSENED 2026-11-19 (Phase 1
+/// integration, coordinator decision) from "`run(&STATIC,` or `STATIC.launch…` written
+/// literally": that form forced L2's int4 range launcher into an `if` chain where its VQ twin
+/// used a `match`, purely so jscpd would not pair them — code bent to satisfy a gate. A launcher
+/// may now pick a static into a local and launch the local. The class this gives up, accepted:
+/// a body that names a static in code it never launches while it launches another
+/// (`gate-red-proofs.md` §19, P5).
 pub(super) fn stale_launched_by() -> Vec<String> {
     let device = shipped_kernels();
     let rows: Vec<String> = gate_rows().into_iter().map(|(n, _)| n).collect();
@@ -89,35 +96,28 @@ pub(super) fn stale_launched_by() -> Vec<String> {
     let handle = |k: &str| {
         let (before, _) = dense.split_once(&format!("=Kernel::new(c\"{k}\");"))?;
         let (name, ty) = before.rsplit_once("static")?.1.split_once(":Kernel<")?;
-        let ident = name.chars().all(|c| c.is_alphanumeric() || c == '_');
-        (ident && !ty.contains(';')).then(|| name.to_string())
+        (name.chars().all(ident) && !ty.contains(';')).then(|| name.to_string())
     };
-    // `rivoli_<l>`'s top-level body (to its column-0 `}`, refused if there is none), comment
-    // lines dropped and whitespace stripped.
+    // `rivoli_<l>`'s top-level body (to its column-0 `}`, refused if there is none), comments
+    // dropped and whitespace stripped.
     let body = |l: &str| {
         let (_, rest) = launch.0.split_once(&format!("fn rivoli_{l}("))?;
         let (body, _) = rest.split_once("\n}\n")?;
-        let code = body.lines().filter(|x| !x.trim_start().starts_with("//"));
+        // Trailing comments too, since 2026-11-19: once naming the static is what counts, a
+        // `// MOE_X` after code would otherwise stand in for it.
+        let code = body
+            .lines()
+            .map(|x| x.split_once("//").map_or(x, |(code, _)| code));
         Some(
             code.flat_map(str::chars)
                 .filter(|c| !c.is_whitespace())
                 .collect::<String>(),
         )
     };
-    // Whether `body` LAUNCHES the static `h` — `run(&h, …)` or `h.launch…(` — rather than
-    // merely naming it.
-    let launches = |body: &str, h: &str| {
-        let via_run = body.contains(&format!("run(&{h},"));
-        let via_method = body.match_indices(&format!("{h}.launch")).any(|(at, _)| {
-            let left = body[..at].chars().next_back();
-            !left.is_some_and(|c| c.is_alphanumeric() || c == '_')
-        });
-        via_run || via_method
-    };
     let runs = |k: &str, l: &str| {
         handle(k)
             .zip(body(l))
-            .is_some_and(|(h, b)| launches(&b, &h))
+            .is_some_and(|(h, b)| names_ident(&b, &h) && has_launch(&b))
     };
     let reason = |i: usize, k: &str, l: &str| -> Option<&'static str> {
         let checks = [
@@ -146,4 +146,30 @@ pub(super) fn stale_launched_by() -> Vec<String> {
         .enumerate()
         .filter_map(|(i, &(k, l))| Some(format!("({k}, {l}): {}", reason(i, k, l)?)))
         .collect()
+}
+
+fn ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `body` names `h` as a whole identifier — not as a prefix or suffix of another name.
+/// Comments never count: [`stale_launched_by`] drops them before asking.
+fn names_ident(body: &str, h: &str) -> bool {
+    body.match_indices(h).any(|(at, _)| {
+        let left = body[..at].chars().next_back();
+        let right = body[at + h.len()..].chars().next();
+        !left.is_some_and(ident) && !right.is_some_and(ident)
+    })
+}
+
+/// Whether `body` launches anything: `run(`, `run_2d(`, `.launch(` or `.launch_2d(`.
+fn has_launch(body: &str) -> bool {
+    let free_call = |l: &str| {
+        body.match_indices(l)
+            .any(|(at, _)| !body[..at].chars().next_back().is_some_and(ident))
+    };
+    free_call("run(")
+        || free_call("run_2d(")
+        || body.contains(".launch(")
+        || body.contains(".launch_2d(")
 }

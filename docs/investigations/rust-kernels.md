@@ -1879,3 +1879,92 @@ These supersede the `60ac104` lease's MoE and recurrent rows. Every other row re
 - **Obligation 1, timing half.**
   - **V4: met.** The fp4 range reads 1.021–1.028 over two samples, with the down pass now real.
   - **K3: OPEN.** Its single expert reads 1.070 in the only valid sample.
+
+### Phase 1 integration (2026-11-19, branch `wave/rk-integrate`)
+
+**Step 1 — the four lanes merged** onto `d6a6f1b`, in the order L4 (fast-forward, `464237f`),
+L3 (`600447d`), L1 (`3e027e2`), L2 (`3b6b936`). After each merge the build, clippy (both
+arms), jscpd and the deviceless suite (`--no-fail-fast`) were run, and docs, hook_guard,
+kernel_coverage, line_limit and matrix were each confirmed to have run green. The only failure
+was CodeScene on the inherited list of files below 10/10: 31 files, then 30 once L2's merge took
+`hip_attn.rs` off the list.
+Logs: `/var/cache/rivoli/scratch/rk-integrate/gates/<step>/`.
+- **Censuses after L2:** 84 Rust kernels, 66 rows (25 kernels rowed via `LAUNCHED_BY`), 1
+  argued exemption; 66/66 launchers with oracles; 53 with production callers, 13 classified.
+  `REF_SOURCES` names all 13 tagged `.hip` files. hipcc's `KERNELS` is **empty**; the hipcc/`ar`
+  half of `build.rs` compiles nothing and stays until Phase 2.
+- **What the merges had to reconcile, beyond list unions:**
+  - Three lanes had each invented an integer-output `Out` variant: L3's `Exact(Box<Out>)`, L1's
+    `PoisonBits`/`ZeroBits` and L2's `Words(Vec<u8>)`. They are one 2×2 now:
+    `Poison`/`InPlace` (f32, NaN as a class) and `PoisonBits`/`InPlaceBits` (bit for bit).
+    L2's per-output `moved_by_out` rule and per-shape tally apply to every row.
+  - L1 and L2 had both written `inputs::bytes`, drawing different LCG bits (56..63 against
+    40..47). Both are kept, as `bytes` and `weight_bytes`, so each lane's recorded CPU plant
+    rates still describe the cells its rows launch.
+  - Both L1 and L3 shipped a `plant_models.rs`; L1's is `linalg_plants.rs` now.
+  - `fp8_lut` existed twice, as identical copies in `linalg.rs` and `mla.rs`; it is one function
+    in `gpu.rs` now. `nasty()` and `rbf16` are deduplicated across lanes.
+  - With no hipcc row left, `launchers!`'s `->` arm, its `extern "C"` emission and `abi_ty!`
+    are deleted. `hip.rs`'s last extern block went with L1's `hash_rows`, and its jscpd region
+    now ends after the memcpy/fill wrappers.
+- **Plants checked by hand:** all 24 patches under `tests/bit-identity/plants/` (the 8 probe
+  plants, `barrier` and 15 launcher-row plants) apply to the merged tree, two of them only after
+  being regenerated with the same defect:
+  - `linalg.patch` broke on the integration's own `fp8_lut` import;
+  - **Phase 0's `situ` probe plant broke on L1's `pub fn tanh_ocml`.** No lane gate covers a
+    probe plant's context, so it would have surfaced only as a refused build on the next lease.
+
+  Phase 0's rope plant had existed only as a prebuilt binary
+  (`scratch/rk-infra/plant/bit_identity-rope-unfused`). It is
+  `tests/bit-identity/plants/launch/rope.patch` now, the `lo` write unfused, matching
+  `plants.rs::rope_unfused_plant_is_adversarial_on_cpu`.
+- **Declined at the merge reviews, each recorded for its owner:**
+  - Phase 2 owns: the dead hipcc half of `build.rs` and the 9 headers under
+    `crates/backend/kernels/` (the reference reads them from the tag, never the tree); the
+    `launchers!` matcher's now-decorative `as`/`=>` annotations; and the census's `->` arrow.
+  - L2 owns: the four `MoeRange` literals inside `hip_blocks.rs`'s exempt region, and the gdn
+    `rep` computed in the row.
+  - A follow-up owns: one shared plant-threshold helper in place of four.
+  - L1's and L2's launcher-row plants sit at the plants root, not `plants/launch/`, so
+    `--build-probes --plant=moe` would build a probe object no row reads. That is a usability
+    hole, not a gate hole: no arm uses that route.
+
+**Step 2a — `gpu::for_i32` is `nsw`** (coordinator decision, L4's prepared patch). The
+increment is `i.unchecked_add(stride)`, UB only if `end + stride > i32::MAX + 1`. For a C loop
+striding by a constant (`SUBW`, `*_BLOCK`) that is exactly clang's `nsw`. **For a C loop striding
+by `blockDim.x` it is not** (review): `int + unsigned` is unsigned in C, so hipcc emitted no
+`nsw` there (`kvcompress.hip`, `mla.hip`, parts of `linalg.hip`, `attn.hip`'s combine). The Rust
+increment promises more than the C did. It is sound because every stride is a block size and
+every `end` a launcher-guarded extent, but those kernels' loops no longer mirror hipcc's
+codegen. A `debug_assert!` states the bound. It is compiled out, because the device crate always
+builds `--release`. Static census of all 84 kernels, before
+and after (`bin/census.py`, `isa/nsw-census.txt`):
+- **The FP-op census is identical in 84/84 kernels** (`bin/fpcensus.py`: every
+  fma/mul/add/sub/max/min/exp/rcp/sqrt/cvt/cndmask mnemonic, VOPD halves included). The change
+  moves only address arithmetic, so the bits are argued unchanged; the lease re-scores them.
+- **Total static instructions:** 40495 → 40464. 24 kernels moved; the largest, as static
+  instruction deltas: `mla_latent_attend` −142 (1249 → 1107; VGPR 47 → 45),
+  `rmsnorm_weightless_batch` −24, `rmsnorm_centered_single` −15, `rmsnorm_batch` −10,
+  `gemv_f32`/`_r2` −8 each; `kv_compress_decode` +38, `kv_compress_prefill` +37, `index_topk`
+  +33, `hc_pre` +31, `rope_adjacent` +11, `act_quant_f4_rotated` +10, `gemv_i8` +10. The two
+  kv_compress kernels are blockDim-strided in the C (above). Every growth is loop restructuring
+  with the FP census unchanged; timing judges them.
+- **Occupancy: no kernel changes waves/SIMD.** One crosses the 24-VGPR boundary of the
+  occupancy table (the census's 24-register rounding, `bin/census.py`): `gather_attn_shared_kv`
+  23 → 25 VGPR, as L4 found. Below 96 VGPRs every kernel sits at the
+  16-wave cap, so the granule costs nothing here. The kernels nearest the 96 edge did not move:
+  `hc_pre` stays at 94, and the MoE int4 R=2 pair sits above it, unchanged.
+
+**Step 2b — the `LAUNCHED_BY` rule loosened** (coordinator decision). A launcher's top-level
+body must still name each listed kernel's static as a whole identifier. It no longer has to
+spell `run(&STATIC,` or `STATIC.launch`: a `run(`, `run_2d(` or `.launch` anywhere in the body
+suffices. Trailing `//` comments are now dropped along with comment lines, or a
+`// STATIC` after code would count as naming it.
+- **Red-proofed:** five text plants, each red on exactly the entries it targets, and the clean
+  tree green (`gate-red-proofs.md` §19, integration rows). A sixth records the class the
+  loosening gives up, by decision: a body that names a static in code it never launches while it
+  launches another (exit 0). The bit-identity row is what would catch that.
+- **L2's int4 launcher is back to the natural form:** a `match` on `(down, r2)` picks the
+  static into a local, which is launched once. jscpd measures 0 clones: the VQ twin launches
+  in each arm, so the token runs differ. Bits are unaffected, since the same static is
+  launched with the same arguments.
