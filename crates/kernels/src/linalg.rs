@@ -220,13 +220,19 @@ unsafe fn gemv_i8_rows<const R: usize>(a: Gemv<Scaled>) {
         let rows_aligned = R == 1 || a.i_dim & 3 == 0;
         let aligned = row as usize & 3 == 0 && a.x as usize & 15 == 0;
         if aligned && rows_aligned {
-            let step = (WAVE * 4) as i32;
-            while base + step <= a.i_dim {
-                let col = base as usize + lane * 4;
+            const STEP: usize = WAVE * 4;
+            // A `usize` column stepped beside the `int` bound. Re-deriving it from `base` emitted
+            // a `v_ashrrev_i32 …, 31` + `v_lshlrev_b64` per iteration where hipcc bumps pointers
+            // by `0x80`/`0x200` (ISA read, unpriced; rust-kernels.md §5, the L1 device lease). An
+            // array of advanced pointers lost the `x` load's global address space
+            // (`flat_load_b128`). Same addresses either way.
+            let mut col = lane * 4;
+            while base + STEP as i32 <= a.i_dim {
                 let p = *row.add(col).cast::<u32>();
                 let wq = [p, p >> 8, p >> 16, p >> 24].map(|b| f32::from(b as i8));
                 acc = core::array::from_fn(|r| acc[r] + quad(F32x4::load(x.at(r, col)).0, wq));
-                base += step;
+                col += STEP;
+                base += STEP as i32;
             }
         }
         let acc = lane_cols(&a, base as u32 + lane as u32, acc, |i| {
@@ -269,14 +275,18 @@ pub unsafe extern "gpu-kernel" fn vq_encode(a: VqEncode) {
     elementwise(a.n, |i| {
         let sub = a.sub.add(i * VQ_DIM);
         let sv: [f32; VQ_DIM] = core::array::from_fn(|d| *sub.add(d));
-        let (mut best, mut bk) = (3.4e38f32, 0usize);
-        for k in 0..VQ_K {
-            let c = a.codebook.add(k * VQ_DIM);
+        // `int` counter and argmin, as the C. With `usize` (ISA read, 2026-11-19, unpriced) each
+        // argmin update was two `v_cndmask_b32_e64` (a 64-bit select), and the range's guarded
+        // step stayed a `v_cmp_gt_u64` in every unrolled copy, with four `s_load_b128` where
+        // hipcc issues one `s_load_b512`. An `i32` range gives hipcc's loop, merge included.
+        let (mut best, mut bk) = (3.4e38f32, 0i32);
+        for k in 0..VQ_K as i32 {
+            let c = a.codebook.add(k as usize * VQ_DIM);
             let mut dot = 0.0f32;
             for (d, s) in sv.iter().enumerate() {
                 dot += s * *c.add(d);
             }
-            let dist = *a.cbnorm.add(k) - 2.0 * dot;
+            let dist = *a.cbnorm.add(k as usize) - 2.0 * dot;
             if dist < best {
                 best = dist;
                 bk = k;

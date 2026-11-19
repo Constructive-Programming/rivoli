@@ -1067,8 +1067,8 @@ ablated, so each is a candidate, not a priced cause.**
   range keeps `Range::next`'s guarded increment (`k + (k < 0x1000)`, a `v_cmp_gt_u64`) in every
   unrolled copy. That makes each copy's codebook address depend on the previous compare, which
   plausibly blocks merging the four rows into hipcc's one `s_load_b512`; Rust issues four
-  `s_load_b128` and four `s_load_b32` instead. Fix candidate, not applied: an `i32` counter and an
-  `i32` `bk`, as the C has.
+  `s_load_b128` and four `s_load_b32` instead. Fix candidate: an `i32` counter and an `i32` `bk`,
+  as the C has (applied — see the 2026-11-19 note below).
 - **`hash_rows` — neither class: atomic scope.** Rust's system-scope `AtomicU64::fetch_xor`
   lowers to a `global_load_b64` + `global_atomic_cmpswap_b64` retry loop, and 24 blocks contend for
   one address. hipcc's agent-scope `atomicXor` is one `global_atomic_xor_b64`. The unrolled
@@ -1081,3 +1081,28 @@ ablated, so each is a candidate, not a priced cause.**
   two `v_lshlrev_b64` per iteration) and is still faster, so (a) alone is not a sufficient cost
   model. The loads match. The combine reads the eight partials as `ds_load_2addr_b32` pairs where
   hipcc uses two `ds_load_b128`. Whether that is the 2–9% is unmeasured.
+
+> **ISA-MATCHED 2026-11-19 (deviceless; bit-identity and timing OWED to the combined branch's
+> device run, still to come):** the two slow rows whose causes were in this lane's own code.
+> Whether these were the 1.06× and 1.61× is unmeasured until that run.
+> - **`vq_encode`:** an `i32` range and an `i32` `bk`, as the C has. The loop now has hipcc's
+>   structure: one `s_load_b512` (four codebook rows) and one `s_load_b128` (four norms) per
+>   unrolled step, one `v_cndmask_b32_e64` per argmin update, no `v_cmp_gt_u64`, and exit on
+>   `s_cmpk_lg_i32 s26, 0x1003`. An `i32` `for` range and a hand-written `i32` counter compile
+>   to the same merged loop (both tried), so the `usize` type was the blocker.
+> - **`gemv_i8`'s dword loop:** a `usize` column stepped beside the `int` bound. The loop no
+>   longer has the per-iteration index sign-extend (`v_ashrrev_i32 …, 31`) or `v_lshlrev_b64`.
+>   The remaining `v_ashrrev_i32 …, 24` is the top-byte decode, and hipcc has it too. `x` is a
+>   pointer bumped by `0x200`, as in hipcc, and the weight offset is a scalar bumped by `0x80`. A
+>   first attempt (an array of advanced pointers) lost `x`'s global address space
+>   (`flat_load_b128`); the ISA read caught that, and it was rejected. The scalar tail is still
+>   `for_i32` (cause (a)), left for the shared helper's change at integration.
+>
+> Bits should not move. That is argued, not gated: both are pure index and type changes over the
+> same addresses, and the FP-op census still matches hipcc for `vq_encode`, `gemv_i8` and
+> `gemv_i8_r2`. Their bit-identity rows are OWED to the same run. Scratch is 0 B. VGPR is 23
+> (was 17; hipcc 24), 19 (was 16; hipcc 18) and 24 (was 21; hipcc 23). Left for the integration
+> perf pass, per the coordinator's brief: `gemv_f32`'s `for_i32`, and `hash_rows`' atomic. An
+> agent-scope XOR needs either inline asm (`global_atomic_xor_b64`, which hides the operation
+> from the compiler) or a `syncscope("agent")` route. `core::sync::atomic` and `core::intrinsics`
+> both lower to the default system scope in nightly 1.102, and no other route was tried.
