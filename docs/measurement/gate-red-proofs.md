@@ -2114,8 +2114,9 @@ when the kernel:
 
 An entry whose launcher has no rows reddens through the census's ordinary demand. The table
 ships empty. *(CORRECTED 2026-11-19, Phase 1 integration: it shipped with L4's two `mla_attend`
-phases, and each lane's merge adds its own entries; the count is the table's, in
-`launched_by.rs`.)* Review questions shaped two of these checks:
+phases, and each lane's merge adds its own entries — L2's 14 MoE rows, with one more plant
+recorded in `rust-kernels.md` §5, Phase 1 L2; the count is the table's, in `launched_by.rs`.)*
+Review questions shaped two of these checks:
 - An entry mapping an unrelated kernel to a rowed launcher would have passed a
   kernel-exists-only check.
 - A comment naming the static would have passed a mention-based check.

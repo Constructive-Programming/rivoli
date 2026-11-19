@@ -1,3 +1,7 @@
+//! > **2026-11-19 (Phase 1 integration): no hipcc-built launcher remains** — every one is Rust,
+//! > through `launch/` and a `=>` row; the `extern "C"` half described below is the record of the
+//! > hipcc era, and Phase 2's docs rewrite retires that prose.
+//!
 //! Minimal HIP surface: under `rocm` this binds the kernel launchers — the hipcc-built ones
 //! (fp8/int8/f32 linalg, VQ-int3 and int4 MoE, MLA, fwd glue) through `extern "C"`, and the
 //! Rust ones (`crates/kernels`, since 2026-11-18) through `launch/`. Without the
@@ -49,83 +53,10 @@ pub use crate::hip_attn::*;
 pub use crate::hip_blocks::*;
 pub use crate::hip_linalg::*;
 
-/// One routed expert's six device pointers (per projection: a data ptr + a scale
-/// ptr). ONE layout for both formats — byte-identical six-pointer `repr(C)` structs,
-/// the kernel picks the interpretation: for int3-VQ (`launch_moe_expert_range`) the
-/// pairs are packed 12-bit indices + bf16 group scales (`moe.hip ExpertDescVq`); for
-/// int4 (`launch_moe_expert_range_i4`) they are packed 4-bit weights + f32 group
-/// scales, one per `I4_GROUP` weights (`moe.hip ExpertDescI4`). Both formats are
-/// group-scaled; only the scale WIDTH and the weight coding differ. The scale pointer
-/// is typed `*const u16` here
-/// (built from the VQ carrier) but its VALUE just addresses whatever the kernel reads.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ExpertDesc {
-    pub gate_indices: *const u8,
-    pub gate_scales: *const u16,
-    pub up_indices: *const u8,
-    pub up_scales: *const u16,
-    pub down_indices: *const u8,
-    pub down_scales: *const u16,
-}
-
-/// One DeepSeek-V4 routed expert's six device pointers — `moe.hip`'s `ExpertDescF4`.
-///
-/// Separate from [`ExpertDesc`] rather than a third interpretation of it. Dispatching a
-/// `.f4` block through [`launch_moe_expert_range_i4`] would decode e2m1 nibbles as
-/// `nibble − 8` at group 128 instead of group 32 — plausible magnitudes from the wrong
-/// codebook, and there is no shape, size or scale check downstream that could find it. The
-/// scales are `*const u8` because e8m0 IS one byte, a third width beside VQ's bf16 and
-/// int4's f32, which is where [`ExpertDesc`]'s "one layout, kernel picks the
-/// interpretation" stops being honest.
-///
-/// **The separation is a signpost, not a proof.** Every real dispatch reaches its
-/// descriptor array through `buf.ptr() as *const _`, and that cast compiles either way —
-/// only construction sites are type-checked. Making it a proof needs the keep-alive buffer
-/// and the typed address to be ONE value (a `DescArray<T>` owning the `DeviceBuf` and
-/// handing out only `*const T`), which reaches `gpu.rs`'s own
-/// `self.descs_buf.ptr() as *const ExpertDesc` and so belongs to S3's wiring rather than
-/// here.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ExpertDescF4 {
-    /// `w1` — the GATE projection, `[inter, hidden]` as e2m1 nibble pairs.
-    pub gate_packed: *const u8,
-    /// `[inter, ceil(hidden / F4_GROUP)]` e8m0 bytes, row-major, one scale ROW per output
-    /// row — not the 128x128 tile grid fp8 uses.
-    pub gate_scale: *const u8,
-    /// `w3` — the UP projection. Same shape as `w1`, which is exactly why a swap of the
-    /// two is invisible to every structural check (`quant.rs::V4_PROJ`).
-    pub up_packed: *const u8,
-    /// `[inter, ceil(hidden / F4_GROUP)]` — same grid as `gate_scale`.
-    pub up_scale: *const u8,
-    /// `w2` — the DOWN projection, `[hidden, inter]`.
-    pub down_packed: *const u8,
-    /// `[hidden, ceil(inter / F4_GROUP)]` — the reduction dim is `inter` here, not `hidden`.
-    pub down_scale: *const u8,
-}
-
-impl ExpertDescF4 {
-    /// A descriptor that faults if it is ever read.
-    ///
-    /// Launch-order descriptor tables are sized `n_experts`, so most entries sit past any
-    /// one token's selection and no launch names them. Filling those with nulls rather than
-    /// with a copy of some resolved expert is the difference between a fault and a
-    /// plausible wrong weight the day a range is computed wrongly. On the type because
-    /// every arm with an F4 table wants the same defence — the V4 and K3 engines each
-    /// carried a verbatim copy under its own name.
-    pub fn null() -> Self {
-        let n = std::ptr::null();
-        Self {
-            gate_packed: n,
-            gate_scale: n,
-            up_packed: n,
-            up_scale: n,
-            down_packed: n,
-            down_scale: n,
-        }
-    }
-}
+// The two expert descriptors live in `rivoli-abi` since the L2 port (the kernels read the same
+// definition the engine writes); re-exported here so `rivoli_backend::hip::ExpertDesc` resolves
+// as it always has.
+pub use rivoli_abi::{ExpertDesc, ExpertDescF4};
 
 /// **How many attention heads.** A newtype because `(heads, head_dim)` is two bare `usize` in a
 /// row at three launcher boundaries, and a transposed pair addresses real memory and returns a
@@ -158,22 +89,6 @@ pub struct HeadDim(pub usize);
 /// was a host-only group the hand-written launcher destructured back into four positionals.
 /// [`launch_index_score_blocks`]' `# Safety` section remains the home of the sizing contract.
 pub use rivoli_abi::kernarg::ScoreBufs;
-
-/// The `extern` type for one launcher argument: the `as`-cast target when the Rust side
-/// narrows at the call (`o_dim: usize as i32`), and the Rust type unchanged when it does not
-/// (`x: *const f32`). Exists only because `macro_rules!` cannot say "this one if present,
-/// otherwise that one" inline — two arms can. The second arm also serves the `=>` form
-/// (`heads: HeadCount => i32`), where the Rust side is a NEWTYPE and the wrapper spells the
-/// call `heads.0 as i32` — added 2026-09-02 so a typed head geometry is a DSL row rather than
-/// the reason for a hand-written launcher (`hip_attn.rs`'s note under its gated-delta row).
-macro_rules! abi_ty {
-    ($rt:ty) => {
-        $rt
-    };
-    ($rt:ty, $ct:ty) => {
-        $ct
-    };
-}
 
 /// Declare a HIP entry point ONCE and get both halves of the ABI wall from it: the
 /// `extern "C"` declaration and the `pub unsafe fn launch_*` wrapper that casts, calls and
@@ -218,6 +133,11 @@ macro_rules! abi_ty {
 /// against the same output before the change. Seen red 2026-08-06 by transposing
 /// `o_dim`/`i_dim` in `launch_gemv_vq`'s call — same types, compiles clean, and the
 /// expansion diff caught it in 6 lines. That is the defect class a macro can introduce.
+///
+/// > **2026-11-19 (Rust-kernel Phase 1 integration): every row is a `=>` row.** The last hipcc
+/// > kernel left with L2, so the `->` form, the `extern "C"` half it declared and the `abi_ty!`
+/// > helper that typed it were deleted; a `->` row no longer parses. What is said above about
+/// > the extern half is the record of the hipcc era.
 macro_rules! launchers {
     ($(
         $(#[$m:meta])*
@@ -225,14 +145,6 @@ macro_rules! launchers {
             $($arg:ident : $rt:ty $(as $ct:ty)? $(=> $nt:ty)? ,)*
         );
     )*) => {
-        // ONE block, not one per launcher, so the expansion stays comparable to the
-        // hand-written original. The block-level `allow` replaces 17 per-item copies:
-        // `too_many_arguments` on an ABI mirror is noise by construction.
-        #[allow(clippy::too_many_arguments)]
-        unsafe extern "C" {
-            $( launchers!(@decl $kind $sym ($($arg: abi_ty!($rt $(, $ct)? $(, $nt)?)),*)); )*
-        }
-
         $(
             $(#[$m])*
             #[allow(clippy::too_many_arguments)]
@@ -245,29 +157,21 @@ macro_rules! launchers {
             }
         )*
     };
-    // `launch_x -> rivoli_x`: a hipcc launcher — declared `extern "C"`, called positionally.
-    (@decl -> $sym:ident $params:tt) => {
-        fn $sym $params -> i32;
-    };
-    (@call -> $sym:ident $positional:tt) => {
-        $sym $positional
-    };
     // `launch_x => rivoli_x(KernArg { .. }, ..)`: a RUST launcher (`src/launch/`,
     // imported by the invocation file). Nothing to declare; the row's own call expression
     // builds the `rivoli_abi::kernarg` block from the wrapper's parameters, so the kernel's
     // parameter list is spelled once — in that struct — instead of in a C signature, a
     // launch call and an extern mirror. The wrapper keeps its name, signature and status
     // mapping, so no caller sees the migration.
-    (@decl => $sym:ident $params:tt) => {};
     (@call => $sym:ident $positional:tt $named:tt) => {
         $sym $named
     };
 }
 
-// Both macros are `pub(crate)` items rather than `#[macro_export]`ed: the invocation files are
-// siblings in this crate and nothing outside it may declare a launcher, so exporting them at
+// The macro is a `pub(crate)` item rather than `#[macro_export]`ed: the invocation files are
+// siblings in this crate and nothing outside it may declare a launcher, so exporting it at
 // the crate root would widen the ABI wall's authoring surface to every consumer of the waist.
-pub(crate) use {abi_ty, launchers};
+pub(crate) use launchers;
 
 //
 // EXEMPT FROM THE DUPLICATION GATE, and this is the only kind of thing that is.

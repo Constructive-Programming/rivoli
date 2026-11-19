@@ -5,16 +5,17 @@
 use super::{Text, UNROWED, gate_rows, shipped_kernels};
 use std::path::Path;
 
-/// `(kernel, launcher)`: kernels run by a launcher of ANOTHER name, as one phase of a
-/// multi-kernel launch (a split-softmax pass and its combine) or as one of the instantiations
-/// a launcher selects per call (`nrow`'s R = 2, fp8's split-K route). The census otherwise
-/// pairs each kernel with a `rivoli_<kernel>` of its own name, which one launcher cannot have
-/// twice; a listed kernel is rowed under `rivoli_<launcher>`, whose gate row and `=>` row score
-/// and reach it. Checked at both ends ([`stale_launched_by`] names each refusal); an unlisted
+/// `(kernel, launcher)`: kernels run by a launcher of ANOTHER name — one phase of a
+/// multi-kernel launch (a split-softmax pass and its combine), one of the instantiations a
+/// launcher selects per call (`nrow`'s R = 2, fp8's split-K route), or a single kernel under a
+/// launcher whose name the tag fixed (the drains' `_s`). The census otherwise pairs each
+/// kernel with a `rivoli_<kernel>` of its own name, which one launcher cannot have twice; a
+/// listed kernel is rowed under `rivoli_<launcher>`, whose gate row and `=>` row score and
+/// reach it. Checked at both ends ([`stale_launched_by`] names each refusal); an unlisted
 /// phase reads as missing from both populations, like any unrowed kernel. That a row reaches
 /// EVERY phase or selectable instantiation (a split needs a shape that splits) is argued by
 /// the row's shapes, at the row.
-pub(super) const LAUNCHED_BY: [(&str, &str); 11] = [
+pub(super) const LAUNCHED_BY: [(&str, &str); 25] = [
     // `rivoli_mla_attend`: the split-KV attend, then (when the plan splits) the combine. Its
     // gate row's shapes reach both: `nr` from 1 (one split) past 2048 (16).
     ("mla_latent_attend", "mla_attend"),
@@ -33,6 +34,24 @@ pub(super) const LAUNCHED_BY: [(&str, &str); 11] = [
     // The gate, then the blend, on one stream.
     ("hc_head_collapse_gate", "hc_head_collapse"),
     ("hc_head_collapse_blend", "hc_head_collapse"),
+    // Phase 1 L2 (2026-11-19): each GLM range launcher runs a gate/up and a down pass at R = 1
+    // or 2; its row's shapes cover both widths (`bit_identity/moe.rs`, `VQ`/`I4`).
+    ("moe_gateup_vq", "moe_expert_range"),
+    ("moe_gateup_vq_r2", "moe_expert_range"),
+    ("moe_down_vq", "moe_expert_range"),
+    ("moe_down_vq_r2", "moe_expert_range"),
+    ("moe_gateup_i4", "moe_expert_range_i4"),
+    ("moe_gateup_i4_r2", "moe_expert_range_i4"),
+    ("moe_down_i4", "moe_expert_range_i4"),
+    ("moe_down_i4_r2", "moe_expert_range_i4"),
+    // The fp4 pairs: two passes each, R = 1 only.
+    ("moe_gateup_f4", "moe_expert_range_f4"),
+    ("moe_down_f4", "moe_expert_range_f4"),
+    ("moe_gateup_f4_situ", "moe_expert_range_f4_situ"),
+    ("moe_down_f4_weighted", "moe_expert_range_f4_situ"),
+    // The drains: one kernel each, under the tag's `_s` launcher names.
+    ("moe_acc_drain", "moe_acc_drain_s"),
+    ("moe_acc_drain_to", "moe_acc_drain_to_s"),
 ];
 
 /// The names the shipped kernels are rowed under — less [`UNROWED`], each kernel's

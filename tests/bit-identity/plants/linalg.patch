@@ -4,12 +4,12 @@
  //! `R` (token rows through one read of the weights) is a const generic, so each `_r2` kernel
  //! is its own instantiation exactly as each C template instance was.
  
--use crate::gpu::{bid, elementwise, fma, for_i32, lds, tid};
-+use crate::gpu::{bid, elementwise, for_i32, lds, tid}; // PLANT: `fma` unused (warnings = deny)
- use crate::prelude::dot_fp8::{Fp8Row, dot_fp8_wave_r, e4m3_lut_build, fp8_dot_strided_r};
+-use crate::gpu::{bid, elementwise, fma, for_i32, fp8_lut, tid};
++use crate::gpu::{bid, elementwise, for_i32, fp8_lut, tid}; // PLANT: `fma` unused (warnings = deny)
+ use crate::prelude::dot_fp8::{Fp8Row, dot_fp8_wave_r, fp8_dot_strided_r};
  use crate::prelude::dot_nib::{I4_GROUP, I4Row, NibRow, dot_nib_wave_r};
  use crate::prelude::dot_vq::{VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VQ_K, VqRow, dot_vq_wave_r};
-@@ -181,7 +181,7 @@
+@@ -172,7 +172,7 @@
      let x = x_rows(a);
      for_i32(start, a.i_dim, WAVE as u32, |i| {
          let wi = w(i);

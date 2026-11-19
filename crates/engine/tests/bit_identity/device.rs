@@ -20,7 +20,8 @@ const RTLD_LOCAL: i32 = 0;
 /// called here exactly as the engine called them before the migration — guards, grid
 /// geometry and kernel together. Loaded `RTLD_LOCAL` and linked `-Bsymbolic`, so its
 /// launchers bind to its OWN kernels and never to a same-named symbol in this process
-/// (`rivoli_act_quant_f8` is one: the Rust launcher exports it for `moe_f4.hip`).
+/// (`rivoli_act_quant_f8` was one while the Rust launcher exported it for `moe_f4.hip`; the
+/// tagged `moe_f4.hip` in the reference still calls the tagged C one, as it must).
 pub struct Ref(*mut c_void);
 
 impl Ref {
@@ -87,7 +88,7 @@ pub enum Side {
 /// side, so an element either side failed to write is a mismatch by construction — two
 /// launches that both did nothing cannot agree. `InPlace` outputs start as the same input
 /// on both sides (the kernel reads them), and the row instead demands that at least one
-/// cell changed them (the [`Tally::moved`] count).
+/// cell changed them (see [`Tally::moved_by_out`]).
 #[derive(Clone)]
 pub enum Out {
     Poison(usize),
@@ -97,9 +98,9 @@ pub enum Out {
     /// integer words that happen to spell NaNs must not compare equal.
     PoisonBits(usize),
     /// An INTEGER output both sides start from the same words — an accumulator the kernel
-    /// folds into (`flag_nonfinite`'s flag and `hash_rows`' XOR from zero), or a cache it
-    /// writes into — compared bit for bit and held to the in-place rule (at least one cell
-    /// must move it).
+    /// folds into (`flag_nonfinite`'s flag and `hash_rows`' XOR from zero, the MoE fixed-point
+    /// accumulator, whose negative i64 high halves spell NaNs), or a cache it writes into —
+    /// compared bit for bit and held to the in-place rule (at least one cell must move it).
     InPlaceBits(Vec<f32>),
 }
 
@@ -143,12 +144,25 @@ pub struct Cell {
 
 impl Cell {
     pub fn new(ins: &[Vec<f32>], init: Vec<Out>) -> Self {
+        let bytes: Vec<Vec<u8>> = ins.iter().map(|v| f32b(v)).collect();
+        Self::from_bytes(&bytes, init)
+    }
+
+    /// [`Cell::new`] over raw input bytes (packed weights, scale codes, codebooks).
+    pub fn from_bytes(ins: &[Vec<u8>], init: Vec<Out>) -> Self {
         let set = |side| init.iter().map(|o| o.upload(side)).collect();
         Self {
-            ins: ins.iter().map(|v| dev(&f32b(v))).collect(),
+            ins: ins.iter().map(|b| dev(b)).collect(),
             outs: [set(Side::Hip), set(Side::Rust)],
             init,
         }
+    }
+
+    /// One more input, uploaded after the others so it can hold their device addresses (a
+    /// descriptor array); returns its index for [`Cell::i`].
+    pub fn push(&mut self, bytes: &[u8]) -> usize {
+        self.ins.push(dev(bytes));
+        self.ins.len() - 1
     }
 
     /// Input `i`'s device address.
@@ -160,6 +174,13 @@ impl Cell {
     pub fn o(&mut self, side: Side, o: usize) -> *mut f32 {
         self.outs[side as usize][o].ptr_mut().cast()
     }
+}
+
+/// One shape's red cells out of its cells, for [`Tally::by_shape`].
+pub struct ShapeTally {
+    pub shape: String,
+    pub red: u64,
+    pub cells: u64,
 }
 
 /// One row's counts. Every count is printed, and the gate refuses a row where any is zero:
@@ -178,6 +199,15 @@ pub struct Tally {
     /// In-place cells whose output moved from its input — must be > 0 for a row with any.
     pub moved: u64,
     pub in_place_rows: bool,
+    /// Per output slot, how many cells moved it (`None` for a poisoned slot): EVERY in-place
+    /// output must move in some cell, so a row whose accumulator never changed cannot pass on
+    /// the strength of its `h` having moved.
+    pub moved_by_out: Vec<Option<u64>>,
+    /// Per shape (the cell name before ` seed `), `(shape, red cells, cells)` in run order:
+    /// where a red row is red, so a plant's REACH is visible by shape and not only through
+    /// the first six notes (added 2026-11-19 when those six hid that a plant reached only the
+    /// last, smallest shape of its row).
+    pub by_shape: Vec<ShapeTally>,
     pub notes: Vec<String>,
     pub timing: Vec<String>,
 }
@@ -200,9 +230,14 @@ impl Tally {
             self.nan_payload_only += nan_only;
             self.words += words;
             bad += diff;
+            if self.moved_by_out.len() <= k {
+                self.moved_by_out.resize(k + 1, None);
+            }
             if init.in_place() {
+                let m = u64::from(hip != f32b(&init.start(Side::Hip)));
                 self.in_place_rows = true;
-                self.moved += u64::from(hip != f32b(&init.start(Side::Hip)));
+                self.moved += m;
+                *self.moved_by_out[k].get_or_insert(0) += m;
             }
             if diff > 0 && self.notes.len() < 6 {
                 self.notes
@@ -211,6 +246,38 @@ impl Tally {
         }
         self.bad_words += bad;
         self.bad_cells += u64::from(bad > 0);
+        self.count_shape(what, bad > 0);
+    }
+
+    /// One cell into [`Tally::by_shape`]: the shape is the cell name (`sweep`'s and
+    /// `range_row`'s `"{shape:?} seed {seed}"`) before ` seed `.
+    fn count_shape(&mut self, what: &str, red: bool) {
+        let shape = what.split_once(" seed ").map_or(what, |(s, _)| s);
+        let at = match self.by_shape.iter().position(|t| t.shape == shape) {
+            Some(at) => at,
+            None => {
+                let tally = ShapeTally {
+                    shape: shape.to_string(),
+                    red: 0,
+                    cells: 0,
+                };
+                self.by_shape.push(tally);
+                self.by_shape.len() - 1
+            }
+        };
+        let entry = &mut self.by_shape[at];
+        entry.red += u64::from(red);
+        entry.cells += 1;
+    }
+
+    /// The row's red cells per shape, one line.
+    pub fn shapes_line(&self) -> String {
+        let cells: Vec<String> = self
+            .by_shape
+            .iter()
+            .map(|t| format!("{} {}/{}", t.shape, t.red, t.cells))
+            .collect();
+        format!("red by shape: {}", cells.join(", "))
     }
 
     /// One refusal, as `[hipcc, rust]` codes (see [`code`]): the reference's must be
@@ -276,7 +343,7 @@ impl Tally {
     /// never moved), which is neither verdict and fails both the gate and its red proof.
     pub fn verdict(&self, row: &str) -> (String, bool) {
         let examined = self.cells > 0 && self.words > 0 && self.guards > 0;
-        let wrote = !self.in_place_rows || self.moved > 0;
+        let wrote = !self.in_place_rows || self.moved_by_out.iter().flatten().all(|&m| m > 0);
         let clean = self.bad_words == 0 && self.bad_guards == 0;
         let token = match (examined && wrote, clean) {
             (false, _) => "VACUOUS",

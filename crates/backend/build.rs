@@ -1,3 +1,7 @@
+//! > **2026-11-19 (Phase 1 integration):** `KERNELS` is empty — every kernel is Rust, built by
+//! > `build/device.rs` — so the hipcc/`ar` half below compiles nothing and archives nothing until
+//! > Phase 2 deletes it (`rust-kernels.md` §4); only the libamdhip64 link it emits still matters.
+//!
 //! Compile the HIP kernels with hipcc and link libamdhip64 — only under the `rocm`
 //! feature, so `cargo check` / CPU-side dev needs no GPU toolchain. Ported from the old
 //! tree's build.rs HIP half (`wt/glimmer-s2` @ 6b7f496); the duplication gate that shared
@@ -11,28 +15,14 @@ use std::process::Command;
 
 /// Every `.hip` translation unit that goes into the archive. One list, so a kernel added
 /// here is compiled, archived and rerun-tracked by the same pass.
-const KERNELS: [&str; 3] = [
-    // `activation` and `residual` (split out of this file 2026-08-15/16) left this list
-    // 2026-11-18: they are Rust now, in `crates/kernels` — `rivoli_kernels()` below.
-    // `linalg`, `fwd`, `headtail` (kernels) and `vmm` (host-only, now `src/hiprt.rs`) left
-    // 2026-11-19, Phase 1 lane L1.
-    "moe",
-    // Split out of `moe.hip` 2026-08-16 (the FP4 routed-expert family, V4's pair and K3's
-    // situ pair) — same argument again.
-    "moe_f4",
-    // `mla` left 2026-11-19 (Phase 1 L3): Rust now, `crates/kernels/src/mla.rs`.
-    // `attn` left 2026-11-19: Rust now, `crates/kernels/src/attn/` (Phase 1 L4).
-    // NEW with M9: Kimi-K3's gated-delta-rule family (recurrence, short conv, gated head
-    // norm), ported verbatim from `k3:kernels/recurrent.hip`. A `.hip` absent from this
-    // list is silently never built and the archive then fails to link — which is the loud
-    // half; the QUIET half this list once shipped was a stale object from an untracked
-    // header, and `headers()` below is what closed it.
-    "recurrent",
-    // `indexer`, `kvcompress` and `blockindex` left 2026-11-19 (Phase 1 L3): Rust now,
-    // `crates/kernels/src/`.
-    // `async` left 2026-11-18: its host half is direct FFI (`src/hiprt.rs`), its one kernel
-    // (`touch_region`) is Rust.
-];
+// EMPTY since the Phase 1 integration (2026-11-19): every `.hip` translation unit is Rust now,
+// in `crates/kernels` — `rivoli_kernels()` below. The list, the hipcc pass and the (now empty)
+// archive leave in Phase 2 (`rust-kernels.md` §4); until then an empty archive links nothing.
+// Who left when: `activation`, `residual` and `async` 2026-11-18 (Phase 0a; `async`'s host half
+// is direct FFI, `src/hiprt.rs`); 2026-11-19 `attn` (L4), `mla`, `kvcompress`, `blockindex`,
+// `indexer` (L3), `linalg`, `fwd`, `headtail`, `vmm` (L1; `vmm` host-only, now `src/hiprt.rs`),
+// `recurrent`, `moe`, `moe_f4` (L2).
+const KERNELS: [&str; 0] = [];
 
 /// EVERY header under `kernels/`, DISCOVERED rather than listed — the result is BOTH a
 /// rerun trigger and a staleness input, and the two must never drift apart or an edited

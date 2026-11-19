@@ -2,7 +2,7 @@
 +++ b/src/prelude/activation.rs
 @@ -26,7 +26,8 @@
  #[inline(always)]
- fn tanh_ocml(x: f32) -> f32 {
+ pub fn tanh_ocml(x: f32) -> f32 {
      let a = fabs(x);
 -    let z = if a < 0.625 {
 +    let z = if a < 0.5 {

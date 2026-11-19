@@ -155,12 +155,25 @@ pub fn topk_scores(n: usize, seed: u64) -> Vec<f32> {
 }
 
 /// `n` random bytes for `(seed, stream)` — every bit pattern a packed weight code can take.
-pub fn bytes(n: usize, (seed, stream): (u64, u64)) -> Vec<u8> {
+pub fn bytes(n: usize, seed: (u64, u64)) -> Vec<u8> {
+    lcg_bytes(n, seed, 56)
+}
+
+/// `n` uniformly random bytes for `(seed, stream)` like [`bytes`], but taken from the LCG's bits
+/// 40..47 where [`bytes`] takes 56..63 — the MoE/recurrent rows' operand draw. Two lanes wrote
+/// this function under one name with different bits; both are kept so each lane's recorded CPU
+/// plant rates still describe the cells its rows launch (Phase 1 integration, 2026-11-19).
+pub fn weight_bytes(n: usize, seed: (u64, u64)) -> Vec<u8> {
+    lcg_bytes(n, seed, 40)
+}
+
+/// One byte per LCG step, from bit `shift` up.
+fn lcg_bytes(n: usize, (seed, stream): (u64, u64), shift: u32) -> Vec<u8> {
     let mut r = Lcg(seed.wrapping_mul(0xa076_1d64_78bd_642f) ^ stream);
     (0..n)
         .map(|_| {
             r.f();
-            (r.0 >> 56) as u8
+            (r.0 >> shift) as u8
         })
         .collect()
 }
@@ -183,4 +196,23 @@ pub fn words(b: &[u8]) -> Vec<f32> {
 #[cfg_attr(not(feature = "rocm"), allow(dead_code))]
 pub fn u16_words(v: impl IntoIterator<Item = u16>) -> Vec<f32> {
     words(&v.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
+}
+
+/// A NaN on one seed in eight (slot 14 of `x`), so most seeds stay unmasked by propagation
+/// and every shape with more than 14 elements carries a NaN cell.
+// Device rows only; the deviceless build's plant models avoid the NaN seeds' rows.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn nan_some(mut x: Vec<f32>, seed: u64) -> Vec<f32> {
+    if nasty(seed)
+        && let Some(s) = x.get_mut(14)
+    {
+        *s = f32::NAN;
+    }
+    x
+}
+
+/// The seed class that carries non-finite values into every operand (one in eight, from seed 7)
+/// — every lane's rows share it (L4's attention rows re-export it from `attn_inputs`).
+pub fn nasty(seed: u64) -> bool {
+    seed % 8 == 7
 }

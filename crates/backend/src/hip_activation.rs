@@ -124,7 +124,8 @@ launchers! {
     /// warns against for `swiglu`/`swiglu_clamped` — the same hazard, one model over.
     ///
     /// **This is the DENSE path only** — layer 0's MLP and the shared MLP. The routed experts
-    /// fuse the same helper inside `moe_f4.hip`'s fp4 expert kernel and never come through here,
+    /// fuse the same helper inside the fp4 expert kernel (`crates/kernels/src/moe_f4.rs`) and
+    /// never come through here,
     /// so a change made here alone leaves every routed expert wrong (plan §3b).
     ///
     /// Both betas must be finite and positive; `<= 0`, NaN and `+/-inf` are refused (1006, the

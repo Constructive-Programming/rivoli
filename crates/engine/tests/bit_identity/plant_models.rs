@@ -1,5 +1,5 @@
 //! The CPU halves of Phase 1 L3's red proofs (`docs/measurement/gate-red-proofs.md` §18, its
-//! "Phase 1 L3" paragraph): each launcher-row plant under `tests/bit-identity/plants/launch/` is
+//! "Phase 1 L3" paragraph): each L3 launcher-row plant under `tests/bit-identity/plants/launch/` is
 //! shown ADVERSARIAL on the gate's own inputs here, deviceless, before its device arm runs — the
 //! spike's first plant passed at 8 seeds (§1 of `rust-kernels.md`), so a plant that moves no cell
 //! on the drawn inputs proves nothing.
@@ -80,7 +80,8 @@ fn topk_signed_zero_plant_is_adversarial_on_cpu() {
     demand(plant, r, (1, 3));
 }
 
-fn rbf16(x: f32) -> f32 {
+/// A float through bf16 and back (round to nearest even) — shared with `plants.rs`.
+pub(super) fn rbf16(x: f32) -> f32 {
     bf16_to_f32(f32_to_bf16(x))
 }
 

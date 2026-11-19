@@ -21,18 +21,20 @@ use anyhow::Result;
 use std::ffi::c_void;
 
 use crate::abi::{CompFinish, CompGeom};
-use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
+use crate::hip::{HeadCount, HeadDim, ensure_hip_status, launchers};
 use crate::launch::{
-    Rows, rivoli_append_kv, rivoli_gather_attn_shared_kv, rivoli_gather_rope, rivoli_gqa_attend,
-    rivoli_gqa_block_attend, rivoli_index_append, rivoli_index_head_route,
-    rivoli_index_pool_norm_f32, rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk,
-    rivoli_kv_compress_decode, rivoli_kv_compress_deposit, rivoli_kv_compress_prefill,
-    rivoli_mha_attend, rivoli_mla_absorb_fp8, rivoli_mla_attend, rivoli_mla_value_fp8,
+    Rows, rivoli_append_kv, rivoli_gated_delta_recurrent_f32, rivoli_gather_attn_shared_kv,
+    rivoli_gather_rope, rivoli_gdn_recurrent_f32, rivoli_gqa_attend, rivoli_gqa_block_attend,
+    rivoli_index_append, rivoli_index_head_route, rivoli_index_pool_norm_f32,
+    rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk, rivoli_kv_compress_decode,
+    rivoli_kv_compress_deposit, rivoli_kv_compress_prefill, rivoli_mha_attend,
+    rivoli_mla_absorb_fp8, rivoli_mla_attend, rivoli_mla_value_fp8, rivoli_rmsnorm_gate_heads_f32,
+    rivoli_short_conv_silu_f32,
 };
 use rivoli_abi::kernarg::{
-    AppendKv, CompressDecode, CompressPrefill, Deposit, Fp8KvB, GatherAttn, GatherRope, Gqa,
-    GqaBlock, GqaRing, HeadRoute, IndexAppend, IndexScore, MhaAttend, MlaAbsorb, MlaIo, MlaValue,
-    PoolNorm, PoolPush, TopK,
+    AppendKv, CompressDecode, CompressPrefill, DeltaInputs, Deposit, Fp8KvB, GateHeads, GatedDelta,
+    GatherAttn, GatherRope, Gdn, Gqa, GqaBlock, GqaRing, HeadRoute, IndexAppend, IndexScore,
+    MhaAttend, MlaAbsorb, MlaIo, MlaValue, PoolNorm, PoolPush, ShortConv, TopK,
 };
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
@@ -362,7 +364,7 @@ launchers! {
     /// Every pointer is a device buffer of the size above, live until `stream` completes. `win` is
     /// written and must not alias `cur`, `w` or `out`; `out` may not alias `cur` (each thread reads
     /// its own channel and writes it, so aliasing is safe by index, but both are `__restrict__`).
-    launch_short_conv_silu_f32 -> rivoli_short_conv_silu_f32, "short_conv_silu_f32" (
+    launch_short_conv_silu_f32 => rivoli_short_conv_silu_f32(ShortConv { cur, w, win, out, channels: channels as i32, taps: taps as i32 }, stream), "short_conv_silu_f32" (
         cur: *const f32,
         w: *const f32,
         channels: usize as i32,
@@ -373,8 +375,9 @@ launchers! {
     );
 
     /// **One decode step of the gated delta rule** — the recurrence inside Kimi-K3's 69 KDA layers,
-    /// `k3-architecture.md` §4 steps 3-7. `kernels/recurrent.hip` carries the arithmetic and the
-    /// argument for its two-pass shape.
+    /// `k3-architecture.md` §4 steps 3-7. `kernels/recurrent.hip` (tag `archive/hip-kernels`; Rust
+    /// twin `crates/kernels/src/recurrent.rs`) carries the arithmetic and the argument for its
+    /// two-pass shape.
     ///
     /// `q`, `k`, `v` and `g` are each `[heads][head_dim]`, `beta_pre` and `a_log` are `[heads]`,
     /// `dt_bias` is `[heads][head_dim]`, `state` is `[heads][head_dim][head_dim]` **updated in
@@ -406,7 +409,7 @@ launchers! {
     /// Corrected 2026-08-12 by review — the requirement was right and stricter than the index
     /// arithmetic needs, and the reason given for it was wrong, which invites relaxing it.)
     /// `stream` is a live `hipStream_t`, or null for the default stream.
-    launch_gated_delta_recurrent_f32 -> rivoli_gated_delta_recurrent_f32,
+    launch_gated_delta_recurrent_f32 => rivoli_gated_delta_recurrent_f32(Rows(heads.0 as i32), GatedDelta { inp: DeltaInputs { q, k, v, decay: g, beta: beta_pre, a_log, dt_bias }, state, out, head_dim: head_dim.0 as i32, lower_bound }, stream),
     "gated_delta_recurrent_f32" (
         q: *const f32,
         k: *const f32,
@@ -428,16 +431,17 @@ launchers! {
     // the first (`heads: HeadCount => i32`, see `launchers!`), so `launch_rmsnorm_gate_heads_f32`
     // is a row again (below) and `launch_gated_delta_recurrent_f32` above lost the wall's LAST
     // bare `(heads, head_dim)` pair the same way — the debt `qwen-flash-next-port.md`'s
-    // 2026-09-02 worklog named. `launch_gdn_recurrent_f32` stays hand-written below the ignore
-    // marker for `GdnBufs`, and `launch_index_score_blocks{,_f32}` in `hip.rs` for
-    // `ScoreBufs`/`ScoreDims`: a group becoming four arguments is still not a 1:1 mirror.
+    // 2026-09-02 worklog named. `launch_gdn_recurrent_f32` came back as a `=>` row with the L2
+    // port (its Rust launcher takes `GdnBufs` whole); `launch_index_score_blocks{,_f32}` are `=>`
+    // rows in `hip.rs` since L3 (2026-11-19).
     // `crates/cli/tests/kernel_coverage.rs` scans `crates/backend/src` recursively for both
     // declaration forms, so the census is unaffected by any of these moves.
 
     /// **Kimi-K3's and Qwen3.8-Flash-Next's fused gated head norm**:
     /// `out = o · rsqrt(mean(o²) + eps) · weight · sigmoid(gate)`, per head.
-    /// `kernels/recurrent.hip` carries the arithmetic, the four-part bit-identity argument for its
-    /// padded reduction, and the reason NORM-THEN-GATE is trap 10.
+    /// `kernels/recurrent.hip` (tag `archive/hip-kernels`; Rust twin
+    /// `crates/kernels/src/recurrent.rs`) carries the arithmetic, the four-part bit-identity
+    /// argument for its padded reduction, and the reason NORM-THEN-GATE is trap 10.
     ///
     /// `o`, `gate` and `out` are `heads · head_dim` f32; `weight` is `head_dim`, shared across heads.
     ///
@@ -454,7 +458,7 @@ launchers! {
     /// Every pointer is a device buffer of the size above, live until `stream` completes, and none
     /// may alias another — all four are `__restrict__` in the kernel. `stream` is a live
     /// `hipStream_t`, or null for the default stream.
-    launch_rmsnorm_gate_heads_f32 -> rivoli_rmsnorm_gate_heads_f32,
+    launch_rmsnorm_gate_heads_f32 => rivoli_rmsnorm_gate_heads_f32(Rows(heads.0 as i32), GateHeads { o, gate, weight, out, head_dim: head_dim.0 as i32, eps }, stream),
     "rmsnorm_gate_heads_f32" (
         o: *const f32,
         gate: *const f32,
@@ -462,6 +466,45 @@ launchers! {
         heads: HeadCount => i32,
         head_dim: HeadDim => i32,
         eps: f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// **One decode step of Qwen3.8-Flash-Next's gated delta rule** — the recurrence inside its 36
+    /// GatedDeltaNet layers. `kernels/recurrent.hip`'s fourth section (tag `archive/hip-kernels`;
+    /// Rust twin `crates/kernels/src/recurrent.rs`) carries the arithmetic and the four-point
+    /// argument for why it is not [`launch_gated_delta_recurrent_f32`]; what is here is the ABI.
+    ///
+    /// [`GdnBufs`] are the seven read buffers; `state` is `v_heads · dk · dv` **updated in place** and
+    /// `out` is `v_heads · dv`.
+    ///
+    /// **Every input is RAW** — `q`/`k` pre-L2-norm and **un-repeated** (the projection's own
+    /// `qk_heads`, not the reference's post-`repeat_interleave` `v_heads`), `v` never normed, `a` and
+    /// `b` the bare projections. The kernel does all of it, and
+    /// `crates/engine/tests/kernel_qwen_gdn_recurrent.rs` scores the two reductions against the
+    /// reference's OWN captured `g` and `beta`.
+    ///
+    /// **`state` is `[key][value]` and the axis order is NOT visible in the shape** — `dk == dv` at the
+    /// anchor's widths (20) and the model's (128), so a transposed state is square and every dimension
+    /// check passes. TR p.3 and MOD:391 pin it; the fixture scores the swapped reading at 9.6e-1.
+    ///
+    /// `dk` or `dv` above 1024 is refused (1002); a `v_heads` that is not a multiple of `qk_heads` is
+    /// refused (1003) rather than floored. No power-of-two guard on either width, by design. Note the
+    /// residual [`HeadCount`] records: two counts and two widths means `qk_heads`<->`v_heads` and
+    /// `dk`<->`dv` still compile, and 1003 is what catches the first.
+    ///
+    /// # Safety
+    /// Every pointer is a device buffer of the size above and must outlive `stream`'s completion.
+    /// **Every one is `__restrict__` in the kernel, so none may alias another** — including `state`
+    /// against `out`, the two written.
+    launch_gdn_recurrent_f32 => rivoli_gdn_recurrent_f32(Rows(v_heads.0 as i32), qk_heads.0 as i32, Gdn { inp: bufs.into(), state, out, rep: (v_heads.0 / qk_heads.0.max(1)) as i32, dk: dk.0 as i32, dv: dv.0 as i32 }, stream),
+    "gdn_recurrent_f32" (
+        bufs: GdnBufs,
+        qk_heads: HeadCount => i32,
+        v_heads: HeadCount => i32,
+        dk: HeadDim => i32,
+        dv: HeadDim => i32,
+        state: *mut f32,
         out: *mut f32,
         stream: *mut c_void,
     );
@@ -672,38 +715,9 @@ launchers! {
     );
 }
 
-// ── hand-written, because `launchers!` is a positional 1:1 mirror ──────────────────────────────
-//
-// A launcher that cannot be a DSL row fails one way: a parameter the mirror has no syntax for.
-// `hip.rs::launch_index_score_blocks` set the precedent (a buffer group becoming four arguments)
-// and `launch_index_score_blocks_f32` joined it there, beside its twin — both are `=>` rows since
-// 2026-11-19, when their kernels moved to Rust and a row could build the kernel's argument block
-// (`hip.rs`'s exemption note has the record). `launch_gdn_recurrent_f32` below is the attention
-// family's, for `GdnBufs`, and lives here for cohesion — and because `hip.rs` measured 836 lines with it, over the 800 ceiling
-// this file was itself split out under. `launch_rmsnorm_gate_heads_f32` sat beside it from
-// 2026-09-01 for `HeadCount`/`HeadDim` alone and went back to being a row on 2026-09-02, when the
-// DSL grew `=>` for exactly that.
-//
-// Declared INSIDE this file's existing ignore region, so the wall gains no new exempt region and
-// each C signature still has exactly one copy in the tree.
-unsafe extern "C" {
-    fn rivoli_gdn_recurrent_f32(
-        q: *const f32,
-        k: *const f32,
-        v: *const f32,
-        a: *const f32,
-        b: *const f32,
-        a_log: *const f32,
-        dt_bias: *const f32,
-        qk_heads: i32,
-        v_heads: i32,
-        dk: i32,
-        dv: i32,
-        state: *mut f32,
-        out: *mut f32,
-        stream: *mut c_void,
-    ) -> i32;
-}
+// jscpd:ignore-end
+
+// ── `GdnBufs`, the buffer group `launch_gdn_recurrent_f32`'s row takes (history above, at the row).
 
 /// The seven device buffers Qwen3.8-Flash-Next's gated delta rule READS — the pointer half of
 /// [`launch_gdn_recurrent_f32`], whose `# Safety` section remains the single home for their sizing
@@ -731,62 +745,17 @@ pub struct GdnBufs {
     pub dt_bias: *const f32,
 }
 
-/// **One decode step of Qwen3.8-Flash-Next's gated delta rule** — the recurrence inside its 36
-/// GatedDeltaNet layers. `kernels/recurrent.hip`'s fourth section carries the arithmetic and the
-/// four-point argument for why it is not [`launch_gated_delta_recurrent_f32`]; what is here is the
-/// ABI.
-///
-/// [`GdnBufs`] are the seven read buffers; `state` is `v_heads · dk · dv` **updated in place** and
-/// `out` is `v_heads · dv`.
-///
-/// **Every input is RAW** — `q`/`k` pre-L2-norm and **un-repeated** (the projection's own
-/// `qk_heads`, not the reference's post-`repeat_interleave` `v_heads`), `v` never normed, `a` and
-/// `b` the bare projections. The kernel does all of it, and
-/// `crates/engine/tests/kernel_qwen_gdn_recurrent.rs` scores the two reductions against the
-/// reference's OWN captured `g` and `beta`.
-///
-/// **`state` is `[key][value]` and the axis order is NOT visible in the shape** — `dk == dv` at the
-/// anchor's widths (20) and the model's (128), so a transposed state is square and every dimension
-/// check passes. TR p.3 and MOD:391 pin it; the fixture scores the swapped reading at 9.6e-1.
-///
-/// `dk` or `dv` above 1024 is refused (1002); a `v_heads` that is not a multiple of `qk_heads` is
-/// refused (1003) rather than floored. No power-of-two guard on either width, by design. Note the
-/// residual [`HeadCount`] records: two counts and two widths means `qk_heads`<->`v_heads` and
-/// `dk`<->`dv` still compile, and 1003 is what catches the first.
-///
-/// # Safety
-/// Every pointer is a device buffer of the size above and must outlive `stream`'s completion.
-/// **Every one is `__restrict__` in the kernel, so none may alias another** — including `state`
-/// against `out`, the two written.
-#[allow(clippy::too_many_arguments)] // an ABI mirror; the newtypes are what the arity buys back
-pub unsafe fn launch_gdn_recurrent_f32(
-    bufs: GdnBufs,
-    qk_heads: HeadCount,
-    v_heads: HeadCount,
-    dk: HeadDim,
-    dv: HeadDim,
-    state: *mut f32,
-    out: *mut f32,
-    stream: *mut c_void,
-) -> Result<()> {
-    let GdnBufs {
-        q,
-        k,
-        v,
-        a,
-        b,
-        a_log,
-        dt_bias,
-    } = bufs;
-    let (qk_heads, v_heads) = (qk_heads.0 as i32, v_heads.0 as i32);
-    let (dk, dv) = (dk.0 as i32, dv.0 as i32);
-    // SAFETY: caller's pointer contract; stream is a live HipStream handle or null.
-    let r = unsafe {
-        rivoli_gdn_recurrent_f32(
-            q, k, v, a, b, a_log, dt_bias, qk_heads, v_heads, dk, dv, state, out, stream,
-        )
-    };
-    ensure_hip_status(r, "gdn_recurrent_f32")
+impl From<GdnBufs> for DeltaInputs {
+    /// Qwen's names onto the roles the kernel argument block shares with K3's rule.
+    fn from(b: GdnBufs) -> Self {
+        Self {
+            q: b.q,
+            k: b.k,
+            v: b.v,
+            decay: b.a,
+            beta: b.b,
+            a_log: b.a_log,
+            dt_bias: b.dt_bias,
+        }
+    }
 }
-
-// jscpd:ignore-end

@@ -55,9 +55,9 @@ impl HcLds {
     }
 }
 
-/// `1 / (1 + e^-x)` — the division form every sigmoid in this file uses.
+/// `1 / (1 + e^-x)` — the division form every sigmoid in this file (and `recurrent.rs`) uses.
 #[inline(always)]
-fn sigmoid(x: f32) -> f32 {
+pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + exp(-x))
 }
 

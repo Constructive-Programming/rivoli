@@ -13,12 +13,12 @@ column is a query, and a query can be wrong.
 
 * **Rows.** The `launchers!` DSL rows in `crates/backend/src/{hip_linalg,hip_activation,hip_blocks,hip_attn}.rs`
   (`hip_activation` split out of `hip_linalg` 2026-11-18)
-  (grammar `rust_fn -> c_symbol, "tag" (args)` for a hipcc kernel, `rust_fn => c_symbol(..)`
-  for a Rust one), plus the one hand-written launcher in `hip_attn.rs` (`gdn_recurrent_f32`)
-  that the macro refuses. (CORRECTED 2026-11-19: four until `hash_rows` (L1) and the two block
-  scorers (L3) became `launchers!` rows when their kernels moved to Rust — the scorers' rows
-  live in `hip.rs`. The TU column names the Rust file for every launcher whose kernel is
-  Rust.) 66 in total, which is the same population
+  (grammar `rust_fn -> c_symbol, "tag" (args)` for a hipcc launcher, `rust_fn => rivoli_x(..),
+  "tag" (args)` for a Rust one); no launcher is hand-written any more. (CORRECTED 2026-11-19:
+  four were, until `hash_rows` (L1), the two block scorers (L3) and `gdn_recurrent_f32` (L2)
+  became `launchers!` rows when their kernels moved to Rust — the scorers' rows live in
+  `hip.rs`. The TU column names the Rust file for every launcher, every kernel being Rust after
+  the Phase 1 integration.) 66 in total, which is the same population
   `kernel_coverage.rs` prints (`66 launchers: 66 with oracles, 0 deferred`, measured by
   `--nocapture` on a deviceless run) — two independent derivations agreeing is the only reason
   the count is stated rather than counted.
@@ -52,7 +52,8 @@ column is a query, and a query can be wrong.
 
 > **2026-11-18 (Rust-kernel Phase 0a):** the 13 rows whose TU reads `activation.rs` /
 > `residual.rs` are Rust now (`act_quant_f8`'s cell read `moe_f4.hip`, the TU that CALLS it
-> C-to-C — wrong before this move too; it still does, through the Rust export) — `crates/kernels/src/`, launched through `launchers!`'s `=>`
+> C-to-C — wrong before this move too; it still does, through the Rust export; *2026-11-19: that
+> export went with L2, whose Rust `moe_f4` launcher calls the Rust function directly*) — `crates/kernels/src/`, launched through `launchers!`'s `=>`
 > rows and `crates/backend/src/rk_launchers.rs` (split by family into `src/launch/` at the
 > Phase 0 merge review, 2026-11-18); `activation.hip` and `residual.hip` are
 > deleted, and each kernel is scored byte-for-byte against its tagged hipcc twin by
@@ -65,6 +66,13 @@ column is a query, and a query can be wrong.
 > **2026-11-19 (Phase 1 L3, same day):** the `kvcompress.rs` and `mla.rs` rows likewise
 > (`kvcompress.hip`, `mla.hip` deleted). `mla_absorb_fp8`/`mla_value_fp8` each launch one of two
 > kernels (`_r2` at two token rows), as they did in C.
+>
+> **2026-11-19 (Rust-kernel Phase 1, L2):** the four `recurrent.rs` rows and the six `moe.rs` /
+> `moe_f4.rs` rows likewise — `recurrent.hip`, `moe.hip` and `moe_f4.hip` are deleted. The C
+> entry column keeps the tag's launcher names (`moe_acc_drain_s`): the Rust launchers kept
+> them. `gdn_recurrent_f32` was a hand-written launcher (`GdnBufs`); its launcher is Rust now
+> and a `=>` row's call expression is free-form, so it is a DSL row again and its row moved up
+> beside its family.
 
 | kernel (`launch_…`) | C entry | TU | GLM | V4 | K3 | Glimmer | Qwen | activated at (module :: fn) |
 |---|---|---|---|---|---|---|---|
@@ -116,21 +124,21 @@ column is a query, and a query can be wrong.
 | `qk_norm` | `qk_norm` | mla.rs | · | **✓** | · | · | · | v4/attn :: qkv_project |
 | `rmsnorm_batch` | `rmsnorm_batch` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/forward :: head_tail, pre_norm, qkv_project |
 | `rope_adjacent` | `rope_adjacent` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/blocksel :: output_project, qkv_project, raw_scores |
-| `moe_acc_drain` | `moe_acc_drain_s` | moe.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: desc_of, routed_experts |
-| `moe_acc_drain_to` | `moe_acc_drain_to_s` | moe.hip | · | · | **✓** | · | · | k3/forward :: moe_ffn |
-| `moe_expert_range` | `moe_expert_range` | moe.hip | **✓** | · | · | · | · | glm/mlp :: expert_range |
-| `moe_expert_range_i4` | `moe_expert_range_i4` | moe.hip | **✓** | · | · | · | · | glm/mlp :: expert_range |
+| `moe_acc_drain` | `moe_acc_drain_s` | moe.rs | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: desc_of, routed_experts |
+| `moe_acc_drain_to` | `moe_acc_drain_to_s` | moe.rs | · | · | **✓** | · | · | k3/forward :: moe_ffn |
+| `moe_expert_range` | `moe_expert_range` | moe.rs | **✓** | · | · | · | · | glm/mlp :: expert_range |
+| `moe_expert_range_i4` | `moe_expert_range_i4` | moe.rs | **✓** | · | · | · | · | glm/mlp :: expert_range |
 | `act_quant_f8` | `act_quant_f8` | activation.rs | · | **✓** | · | · | · | v4/moe :: shared_expert |
-| `moe_expert_range_f4` | `moe_expert_range_f4` | moe_f4.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: expert_range |
-| `moe_expert_range_f4_situ` | `moe_expert_range_f4_situ` | moe_f4.hip | · | · | **✓** | · | · | k3/forward :: expert_range |
-| `gated_delta_recurrent_f32` | `gated_delta_recurrent_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
-| `rmsnorm_gate_heads_f32` | `rmsnorm_gate_heads_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
-| `short_conv_silu_f32` | `short_conv_silu_f32` | recurrent.hip | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `moe_expert_range_f4` | `moe_expert_range_f4` | moe_f4.rs | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: expert_range |
+| `moe_expert_range_f4_situ` | `moe_expert_range_f4_situ` | moe_f4.rs | · | · | **✓** | · | · | k3/forward :: expert_range |
+| `gated_delta_recurrent_f32` | `gated_delta_recurrent_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `rmsnorm_gate_heads_f32` | `rmsnorm_gate_heads_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `short_conv_silu_f32` | `short_conv_silu_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
+| `gdn_recurrent_f32` | `gdn_recurrent_f32` | recurrent.rs | · | · | · | · | · | *(no production reference)* |
 | `attn_res` | `attn_res` | residual.rs | · | · | **✓** | · | · | k3/forward :: fold_into_h |
 | `gated_residual_collapse_f32` | `gated_residual_collapse_f32` | residual.rs | · | · | · | · | · | *(no production reference)* |
 | `hc_post` | `hc_post` | residual.rs | · | **✓** | · | · | · | v4/forward :: layer |
 | `hc_pre` | `hc_pre` | residual.rs | · | **✓** | · | · | · | v4/forward :: pre_norm |
-| `gdn_recurrent_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
 | `hash_rows` | `hash_rows` | fwd.rs | · | · | · | · | · | *(no production reference)* |
 | `index_score_blocks` | `index_score_blocks` | blockindex.rs | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
 | `index_score_blocks_f32` | `index_score_blocks_f32` | indexer.rs | · | · | · | · | · | *(no production reference)* |
@@ -162,7 +170,7 @@ in `gate-red-proofs.md` §17 (2026-09-10).
 | `index_pool_push` | indexer.rs | **pending M13** | as above |
 | `layernorm` | indexer.rs | **pending M13** | used only by that pipeline ("`k_norm` … feeds `layernorm` below"); no other module imports it |
 | `gqa_block_attend` | attn/gqa.rs | **not wired — by decision** | M17c's drafter attend: oracle-covered and executed (7/7, witnessed 2026-09-04), but §4 states it is a scored kernel rather than a shipped one. Its `gqa_attend` duplication was OWED because jscpd could not see `.hip`; CLOSED 2026-11-19 by the Rust port (Phase 1 L4), where both kernels are one body, `attn/gqa.rs::attend`, over a row window |
-| `gdn_recurrent_f32` | recurrent.hip | **qwen S3 ahead of S6** | named in `kernel_coverage.rs`'s FOURTH TURN as one of three launchers that landed with their oracles; the arm that would call them is S6 |
+| `gdn_recurrent_f32` | recurrent.rs | **qwen S3 ahead of S6** | named in `kernel_coverage.rs`'s FOURTH TURN as one of three launchers that landed with their oracles; the arm that would call them is S6 |
 | `index_pool_norm_f32` | indexer.rs | **qwen S3 ahead of S6** | same |
 | `gated_residual_collapse_f32` | residual.rs | **qwen S3 ahead of S6** | same |
 | `index_score_blocks_f32` | indexer.rs | **qwen S3 ahead of S6** | the f32 sibling of V4's live `index_score_blocks`; `v4/blocksel.rs` calls the f4 pair, not this one |

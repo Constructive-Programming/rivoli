@@ -81,7 +81,7 @@ pub fn fma(a: f32, b: f32, c: f32) -> f32 {
 }
 
 /// ROCm's OCML entry points, by the names HIP's `__clang_hip_math.h` maps the C calls to
-/// (`pow`, `cos`, `sin`). The bodies come from `ocml.bc`, LTO-linked by
+/// (`pow`, `cos`, `sin`, `log1pf`). The bodies come from `ocml.bc`, LTO-linked by
 /// `crates/backend/build/device.rs` with the same `oclc_*` control libraries hipcc links, so
 /// a call here inlines the code hipcc inlined.
 pub mod ocml {
@@ -92,6 +92,8 @@ pub mod ocml {
         pub safe fn cos(x: f64) -> f64;
         #[link_name = "__ocml_sin_f64"]
         pub safe fn sin(x: f64) -> f64;
+        #[link_name = "__ocml_log1p_f32"]
+        pub safe fn log1pf(x: f32) -> f32;
     }
 }
 

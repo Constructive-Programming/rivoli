@@ -11,7 +11,7 @@
 //!
 //! **On-demand and `#[ignore]`d**: it needs the GPU (run it only through the script, which
 //! takes the flock and the contention witness) and the reference object. The deviceless
-//! test below is not ignored: it is the CPU half of the recorded red proof.
+//! tests in `plants` are not ignored: they are the CPU halves of the recorded red proofs.
 //!
 //! ## Adding a row (Phase 1 lanes)
 //!
@@ -35,6 +35,8 @@ mod common;
 mod inputs;
 mod linalg_plants;
 mod plant_models;
+mod plants;
+mod ranges;
 
 #[cfg(feature = "rocm")]
 mod activation;
@@ -59,7 +61,13 @@ mod linalg;
 #[cfg(feature = "rocm")]
 mod mla;
 #[cfg(feature = "rocm")]
+mod moe;
+#[cfg(feature = "rocm")]
+mod moe_f4;
+#[cfg(feature = "rocm")]
 mod probes;
+#[cfg(feature = "rocm")]
+mod recurrent;
 #[cfg(feature = "rocm")]
 mod residual;
 
@@ -134,6 +142,19 @@ const ROWS: &[Row] = &[
     ("argmax", fwd::argmax),
     ("flag_nonfinite", fwd::flag_nonfinite),
     ("hash_rows", fwd::hash_rows),
+    (
+        "gated_delta_recurrent_f32",
+        recurrent::gated_delta_recurrent_f32,
+    ),
+    ("short_conv_silu_f32", recurrent::short_conv_silu_f32),
+    ("rmsnorm_gate_heads_f32", recurrent::rmsnorm_gate_heads_f32),
+    ("gdn_recurrent_f32", recurrent::gdn_recurrent_f32),
+    ("moe_expert_range", moe::moe_expert_range),
+    ("moe_expert_range_i4", moe::moe_expert_range_i4),
+    ("moe_acc_drain_s", moe::moe_acc_drain_s),
+    ("moe_acc_drain_to_s", moe::moe_acc_drain_to_s),
+    ("moe_expert_range_f4", moe_f4::moe_expert_range_f4),
+    ("moe_expert_range_f4_situ", moe_f4::moe_expert_range_f4_situ),
 ];
 
 #[cfg(feature = "rocm")]
@@ -154,6 +175,7 @@ fn every_rust_kernel_is_byte_identical_to_its_tagged_hipcc_twin() {
         t.timing
             .iter()
             .for_each(|l| println!("    TIME {name} {l}"));
+        println!("    {}", t.shapes_line());
         t.notes.iter().for_each(|l| println!("    {l}"));
         if !green {
             red.push(*name);
@@ -190,45 +212,4 @@ fn every_prelude_probe_is_identical_to_its_hipcc_twin() {
     let nan: u64 = t.rows.iter().map(|(_, g)| g.nan_only).sum();
     let note = format!(" (NaN as a class; {nan} NaN-payload-only cells)");
     finish(&red, t.rows.len(), &note);
-}
-
-/// The CPU half of the recorded red proof (`docs/measurement/gate-red-proofs.md` §18): the
-/// planted defect is `rope`'s `lo` without its FMA — `x·cs − y·sn` rounded twice instead of
-/// once — and this shows it is ADVERSARIAL on the gate's own rope inputs before any device
-/// arm runs. §1's lesson is why the order matters: the spike's first plant was
-/// sub-threshold and passed at 8 seeds, so a plant must be shown to move outputs on the
-/// inputs the gate actually draws, or a green run says nothing.
-///
-/// `cos`/`sin` here are the host's, not OCML's — the device values differ in the last bits,
-/// so this measures the plant's RATE on these operands, not the device's exact cells. A rate
-/// far from zero is the claim; the device arm is the measurement.
-#[test]
-fn rope_unfused_plant_is_adversarial_on_cpu() {
-    let (mut cells, mut moved, mut elems, mut diff) = (0, 0, 0, 0);
-    for seed in 1..=inputs::SEEDS {
-        let (pos, theta) = inputs::rope_at(seed);
-        let v = inputs::draw(32 * 128, (seed, 1), 1.0, true);
-        let before = diff;
-        for head in v.chunks_exact(128) {
-            for j in 0..64 {
-                let (x, y) = (head[2 * j], head[2 * j + 1]);
-                let ang = pos as f64 * theta.powf(-2.0 * j as f64 / 128.0);
-                let (cs, sn) = (ang.cos() as f32, ang.sin() as f32);
-                elems += 1;
-                diff +=
-                    usize::from(x.mul_add(cs, -(y * sn)).to_bits() != (x * cs - y * sn).to_bits());
-            }
-        }
-        cells += 1;
-        moved += usize::from(diff > before);
-    }
-    println!(
-        "rope unfused plant: {diff}/{elems} lo outputs differ; {moved}/{cells} seeds affected"
-    );
-    // The gate reddens on ONE differing word. Demand the plant move most seeds, so it cannot
-    // be the §1 kind that hides in a lucky draw.
-    assert!(
-        moved * 10 >= cells * 9,
-        "plant moved only {moved}/{cells} seeds — sub-threshold"
-    );
 }

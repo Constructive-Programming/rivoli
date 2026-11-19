@@ -1505,3 +1505,377 @@ ablated, so each is a candidate, not a priced cause.**
 > agent-scope XOR needs either inline asm (`global_atomic_xor_b64`, which hides the operation
 > from the compiler) or a `syncscope("agent")` route. `core::sync::atomic` and `core::intrinsics`
 > both lower to the default system scope in nightly 1.102, and no other route was tried.
+
+### Phase 1 L2 (moe, moe_f4, recurrent)
+
+**Deviceless half, 2026-11-19 (branch `wave/rk-l2-moe`).** `recurrent.hip`, `moe.hip` and
+`moe_f4.hip` are Rust: 18 kernels in `crates/kernels/src/{recurrent,moe,moe_f4}.rs`, their 10
+launchers in `crates/backend/src/launch/{recurrent,moe}.rs`, `=>` rows in `hip_attn.rs` and
+`hip_blocks.rs`. The three `.hip` files are deleted and out of `build.rs`.
+
+**The shape the port took:**
+- **One kernel argument block per range FORMAT, not per kernel** (`rivoli_abi::kernarg::moe`).
+  A range launcher issues gate/up then down over the same span, descriptors, `h` and routing
+  weights, so both kernels take one struct (`MoeRange<D>`, plus the VQ codebooks or the fp4
+  parameters).
+- **`ExpertDesc`/`ExpertDescF4` live in `rivoli_abi`.** The kernels read the definition the
+  engine writes. `rivoli_backend::hip` re-exports both, so no caller moved.
+- **`launch_gdn_recurrent_f32` is a DSL row again.** A `=>` row's call expression is free-form,
+  so its `GdnBufs` group reaches the kernel whole, as `DeltaInputs`. The hand-written wrapper
+  and its `extern` are gone.
+- **The C export `rivoli_act_quant_f8` is gone.** `moe_f4.hip` was its only C caller. The V4
+  launcher now calls the Rust function between its passes.
+- **No kernel reads `blockDim`.**
+  - The delta rule takes its block as `head_dim`.
+  - The two masked kernels re-derive theirs with `rivoli_abi::geom::reduce_block`, which their
+    launchers also launch with. It is `next_pow2`, as `u32::next_power_of_two`.
+  - The passes stride by `ROWS_PER_BLOCK` waves.
+  - The drains and the conv stride by `ELEMENTWISE_BLOCK`.
+
+**Fused sites, read from hipcc's IR and confirmed by the ISA census:**
+- The delta rules' three per-loop pairs (`u += k·sv`, `s + k·dv`, `o += q·sv`).
+- The conv's `acc += w·win`.
+- The drain's `x += gain·f`.
+- Everything inside the prelude's dots.
+
+Nothing else pairs a multiply with an add.
+
+**The atomic.** hipcc emits `atomicrmw add … syncscope("agent") monotonic`. `core`'s
+`AtomicU64::fetch_add(Relaxed)` is SYSTEM scope. Both lower to the identical encoding,
+`global_atomic_add_u64 … off` = `DD0E0000 007C0200`, with no cache bits. The output is integer,
+so it does not depend on the order the waves land in.
+
+**L2 obligation 1 — fp4 global vs flat loads: the census half is CLOSED deviceless, without a
+fallback.** Phase 0b's L2 obligation (§ Phase 0b, *Not expressible: `gu8p`*) was "a
+flat-vs-global load census of `moe_gateup_f4`/`moe_down_f4` plus a timing row against hipcc. A
+buffer_load fallback ships only with a measured timing at parity." No fallback is needed; the
+timing row is owed to the lease (below). The census of the real kernels, load mnemonics against
+hipcc+`gu8p` (the down kernels counted; the gate/up kernels had no flat load in any build):
+
+| kernel | hipcc | Rust, descriptor by reference | Rust, descriptor by value (shipped) |
+|---|---|---|---|
+| `moe_down_f4` | 6 `global_load_b32` + 7 `global_load_u8` | 5 `flat_load_b32` + 7 `flat_load_u8` + 1 `global_load_b32` | identical to hipcc |
+| `moe_down_f4_weighted` | 7 `global_load_b32` + 7 `global_load_u8` | 5 `flat_load_b32` + 7 `flat_load_u8` + 2 `global_load_b32` | identical to hipcc |
+| `moe_gateup_f4` | no flat load | no flat load | identical to hipcc on every counted mnemonic |
+| `moe_gateup_f4_situ` | no flat load | no flat load | loads identical; one `v_fmamk` spelled `v_fmac` |
+
+- **The cause.** 0b's finding reproduced exactly on the real `moe_down_f4`: 5 `flat_load_b32`
+  plus 7 `flat_load_u8`, against hipcc's `global_load`. The cause is not the atomic. With the
+  atomic replaced by a plain store, or removed entirely, the loads stayed flat. The cause is how
+  the descriptor was handed to the dot. As `&*descs.add(e)`, the pointer loads reached
+  `AMDGPUPromoteKernelArguments` without `!amdgpu.noclobber` (read from the LTO
+  `precodegen.bc`, `--save-temps`). Copied by value, as the C's
+  `const ExpertDescF4 d = descs[e]`, they were marked noclobber and promoted.
+- **The ISA census after the change** (0b's `census.py`, extended to count stores, atomics and
+  scratch, at `/var/cache/rivoli/scratch/rk-l2-moe/census.py`: the Rust code object against
+  `hipcc --offload-arch=gfx1151 -O3 -fPIC --offload-device-only --no-gpu-bundle-output` of each
+  tagged file, both disassembled with `llvm-objdump -d --mcpu=gfx1151`; output
+  `census-final.txt` beside it):
+  - **fp4 is load-type identical to hipcc+`gu8p`.** `moe_down_f4`, `moe_down_f4_weighted` and
+    `moe_gateup_f4` count SAME on every FP, load and atomic mnemonic.
+  - **VQ and int4 go one better.** The six GLM down/gate-up kernels now use `global_load` where
+    hipcc, with no `gu8p` on those formats, emits `flat_load`. For example, `moe_gateup_i4` has
+    22 `flat_load_b32` in hipcc's code and 0 in Rust's.
+- **The timing row against hipcc at real shapes is the device lease's.**
+
+**L2 obligation 2 — `moe_*_i4` occupancy:**
+
+| kernel | hipcc VGPR | Rust VGPR | waves/SIMD |
+|---|---|---|---|
+| `moe_gateup_i4` | 93 | 93 | 16 / 16 |
+| `moe_gateup_i4_r2` | 127 | 129 | 10 / 10 |
+| `moe_down_i4` | 89 | 88 | 16 / 16 |
+| **`moe_down_i4_r2`** | **95** | **100** | **16 / 12** |
+
+- Only the R=2 down pass crosses a granule. It is the same edge 0b's probe `k_i4_wave_r2` showed:
+  96 → 103 there, and hipcc's R=2 int4 dot sits right at 96.
+- It is a prelude property (`dot_nib_wave_r::<2, 4, I4>`) and not one this lane can move without
+  re-scoring every prelude caller.
+- Its cost is the TIME line at GLM's real (6144, 2048) nrow=2 shape. That line is the lease's.
+
+**Other ISA differences, none a value difference:**
+- `rmsnorm_gate_heads_f32` counts SAME.
+- **The delta rules** carry more loop copies, because `for_strided::<4>` unrolls its remainder.
+  They also carry one extra `v_ldexp`, because `d as f32` converts from a u64 where the C
+  converts from an i32. That conversion is exact for d ≤ 1024.
+- **`gated_delta_recurrent_f32`** evaluates `exp(a_log)` on the VALU where hipcc used the SALU.
+- **`short_conv_silu_f32`**: rustc vectorises the in-place shift loop to b128, which is legal for
+  a forward shift. VGPR 9 → 25, still 16 waves.
+- **`moe_acc_drain{,_to}`**: rustc unrolls the rows loop.
+- **`moe_gateup_f4_situ`**: one `v_fmamk` is spelled `v_fmac` with the literal in a register.
+  That is the same fused op.
+
+**Gate:**
+- **Ten launcher rows** in `crates/engine/tests/bit_identity/{recurrent,moe,moe_f4}.rs`, each
+  over 64 seeds per shape.
+- **Real shapes:**
+  - GLM 6144 × 2048 at nrow 1 and 2;
+  - V4 4096 × 2048, as one streamed expert and as the six-expert resident batch;
+  - K3 3584 × 3072, plus 96 heads × 128;
+  - Qwen 16/48 heads × 128;
+  - the anchors' 32 and 20.
+- **Small, ragged and padded widths** alongside them.
+- **Range cells are real descriptor arrays** into weight and scale arenas, with a per-expert
+  shift that alternates 4-byte alignment, so odd experts take the dots' scalar tail on every row.
+- **Scales carry NaN, ±inf, −0 and subnormal codes**: bf16; f32; and e8m0 `0xff`/`0x00`/`0xfe`.
+- **Routing weights carry exact ±0 and a NaN.**
+- **`h`, the recurrent state and `acc` start identical on both sides.** `acc` is compared as
+  strict integer words, through a new `Out::Words`, because under NaN-as-a-class a negative
+  i64's high half is a NaN pattern.
+- **Guard rows pin every code**, and a pair per adjacent two in each launcher's order. They run
+  against a live guard descriptor array and an offset guard buffer, so a regressed guard reads
+  RED instead of faulting the GPU.
+- **Every in-place output must move in some cell** (`Tally::moved_by_out`), so a range row
+  whose accumulator never changed cannot pass on the strength of its `h` having moved.
+- **Routing-weight specials sit inside the range and always leave one live weight**, and the
+  gate/up scale and codebook edges ride a seed class (`seed % 8 == 3`) apart from the NaN-`x`
+  seeds, which would otherwise turn every R=1 gate/up dot NaN and hide them.
+- **Three plants**, each shown adversarial on CPU (`bit_identity/plants.rs`):
+
+  | plant | defect | CPU seeds moved | device arm |
+  |---|---|---|---|
+  | `recurrent` | the rank-one update unfused | 64/64 | `--expect-red=gated_delta_recurrent_f32,gdn_recurrent_f32` |
+  | `moe` | the range kernels' SiLU in multiply form | 64/64 (1101/4096 gate rows) | `--expect-red=moe_expert_range,moe_expert_range_i4` |
+  | `moe_f4` | K3's pass-2 bf16 moved after the routing weight | 64/64 (4096/4096 rows) | `--expect-red=moe_expert_range_f4_situ` |
+
+- **The census's `LAUNCHED_BY` rows** (14: the 12 range-kernel phases under their four range
+  launchers, and the two single-kernel drains under the tag's `_s` launcher names, whose gate
+  rows are renamed `moe_acc_drain_s`/`moe_acc_drain_to_s`). Each launcher's own body launches
+  its kernels' statics. Plant: the `(moe_down_i4_r2, moe_expert_range_i4)` entry's launcher
+  REPLACED with `moe_expert_range` reddened the census (`rivoli_<launcher> does not launch the
+  kernel's static handle`); restored by copy, `cmp` rc 0. A static of the wrong format inside
+  the right launcher is not this census's to see: the bit-identity rows own that defect.
+- **No file-scope `#pragma clang fp contract(off)`** in the three files or the headers they
+  include; the two function-scope ones (`formats.hpp`'s e4m3 subnormal, `actquant.hpp`'s
+  `fast_round_scale`) are the prelude's, ported as plain Rust (which never contracts).
+- **Device arms and TIME lines are owed to the lease.**
+
+**Device lease, 2026-11-19, commit `60ac104`, two arms, rh-anine.**
+
+> **CORRECTED 2026-11-19 (superseded by the `79e218c` lease below).** In this lease's range
+> rows, the up rows of every expert past the first read the down scales' planted edge codes
+> (bf16/f32 NaN or ±inf; e8m0 NaN or 2^127). One `h` word was therefore non-finite on both
+> sides, and every down contribution took the same clamp bound. So for every shape whose live
+> experts sat past expert 0 — every real GLM, V4 and K3 shape — the down-pass comparisons were
+> vacuous, and the MoE TIME lines below timed a down pass on NaN `h`. Its 23/23 is evidence
+> for every non-range row and, almost everywhere, for the gate/up pass. Cause and fix are under
+> "After the lease".
+ Both arms ran through
+`tests/bit-identity.sh`, detached with `setsid` (own PGID). The waits were on the result files,
+not on process absence. Both witnesses CLEAN: the `witness-bit-identity` files are 0 B and GTT
+was 17 MiB before each arm (the script reads GTT only pre-arm). Host loadavg, from the script's
+own samples: 0.98 → 1.88 on A and 1.33 → 2.14 on R, on 32 cores; L1 was compiling deviceless
+during the lease.
+
+| arm | binary | scripted verdict | rc | wall | logs `…/bit-identity/` |
+|---|---|---|---|---|---|
+| A | `bit_identity-efca1da5680a0280`, the script's freshness check passed at `60ac104` | GREEN: 23/23 BIT-IDENTICAL | 0 | 158 s | `20261119T125122-2978620` |
+| R | `…/rk-l2-moe/plant/bit_identity-l2-plants`: `git archive 60ac104` plus the three `plants/*.patch`, built into `target/rk-l2-moe-plant` | GREEN (expect-red): exactly the five planted rows | 0 (binary 101) | 161 s | `20261119T125453-2997362` |
+
+- **A.** `moe_expert_range` reports 1542 NaN-payload-only words: NaN in both twins, payloads
+  different, equal under the owner's NaN-as-a-class rule. Every other L2 row has 0.
+- **R.** Every unplanted row held: V4's `moe_expert_range_f4`, plus `short_conv_silu_f32`,
+  `rmsnorm_gate_heads_f32` and both `_s` drains. Cells red per plant:
+
+  | plant | cells red |
+  |---|---|
+  | `recurrent` | 287/384 (`gated_delta`), 320/384 (`gdn`) |
+  | `moe` | 360/384 on each GLM row |
+  | `moe_f4` | **48/320, all in the small (32, 32, 0, 1, 1) cell** |
+
+- **OPEN — the `moe_f4` plant does not reach K3's real shapes.** *(CLOSED 2026-11-19: a
+  harness defect, see "After the lease"; the `79e218c` lease's R is red at both K3 shapes.)*
+  - **What the log shows.** The row's first six mismatch notes (`Tally` keeps six, in run
+    order) are all from the LAST shape, `(32, 32, 0, 1, 1)`, and that shape runs after the two
+    real K3 shapes. Every other K3 cell compared identical under the plant: the two real
+    shapes, `(96, 64, 0, 3, 1)` and `(160, 96, 1, 2, 1)`. 48 is 64 seeds less the 8 NaN-`x`
+    and 8 edge seeds.
+  - **Why this contradicts the CPU model.** Every shape carries at least one live,
+    non-power-of-two routing weight, and the CPU model moved 4096 of 4096 rows.
+  - **Lead (untested).** The one red shape is the only one whose live weight is expert 0. The
+    blind shapes' live weights sit at expert index ≥ 2.
+  - **Consequence.** The gate is not yet shown able to catch a bf16-after-weight defect in
+    K3's pass 2 at production shapes.
+  - **Owed.** Per-shape red counts from a re-run of R. The `Tally` gap this exposed is that it
+    keeps no per-shape count.
+
+**TIME lines at the hot shapes.** Each is the minimum of three 200-launch batches, Rust ÷ hipcc.
+The lane's threshold, from the coordinator's brief, is "≤ ~1.05 parity". There is no A-vs-A
+control in this lease. Arm R's unplanted rows are a second sample: the same gate rows swung
+0.999 → 1.194 (`swiglu`) and 1.004 → 1.159 (`situ_glu_f32`) between the two arms, the swing the
+Phase 0 merge review recorded. So differences of a few percent here are not resolved.
+
+| row (shape) | hipcc µs | Rust µs | A ratio | R ratio (unplanted rows) |
+|---|---|---|---|---|
+| `gated_delta_recurrent_f32` (96, 128) | 28.98 | 47.73 | **1.647** | — (planted) |
+| `short_conv_silu_f32` (12288, 4) | 4.31 | 3.96 | 0.919 | 0.924 |
+| `rmsnorm_gate_heads_f32` (96, 128) | 2.89 | 2.70 | 0.932 | 0.938 |
+| `gdn_recurrent_f32` (16, 48, 128, 128) | 45.48 | 45.45 | 0.999 | — (planted) |
+| `moe_expert_range` GLM (6144, 2048) nrow 1 | 110.27 | 113.03 | 1.025 | — (planted) |
+| `moe_expert_range` GLM nrow 2 | 122.55 | 125.55 | 1.025 | — (planted) |
+| `moe_expert_range_i4` GLM nrow 1 | 243.28 | 245.67 | 1.010 | — (planted; down unchanged: 1.009) |
+| `moe_expert_range_i4` GLM nrow 2 | 307.01 | 319.99 | 1.042 | — (planted; down unchanged: 1.014) |
+| `moe_acc_drain_s` (12288, 2) | 3.95 | 3.88 | 0.983 | 0.973 |
+| `moe_acc_drain_to_s` (12288, 2) | 3.88 | 3.76 | 0.969 | 0.983 |
+| `moe_expert_range_f4` V4 (4096, 2048), 1 expert | 54.09 | 55.20 | 1.021 | 1.019 |
+| `moe_expert_range_f4` V4, 6-expert batch | 775.17 | 791.57 | 1.021 | 1.036 |
+| `moe_expert_range_f4_situ` K3 (3584, 3072), 1 expert | 60.48 | 62.55 | 1.034 | — (planted) |
+| `moe_expert_range_f4_situ` K3, 4-expert batch | 714.82 | 726.09 | 1.016 | — (planted) |
+
+- *(CORRECTED 2026-11-19: reopened for K3 by the `79e218c` lease, below; these samples timed a
+  down pass on NaN `h`.)* **Obligation 1, timing half.** The fp4 rows run at 1.019–1.036 across both samples, within
+  the lane's threshold, with the down kernels' loads at `global_load` (census above). No
+  fallback is needed. Phase 0b's L2 obligation is recorded as met: census identical, timing
+  within threshold on two samples, no A-vs-A floor.
+- *(CORRECTED 2026-11-19: see the `79e218c` lease, where A read 1.070.)* **Obligation 2.** The GLM int4 range at 6144 × 2048, nrow 2, read 1.042 in A. In R it read
+  1.014: R's `moe` plant changes only the gate/up SiLU, so `moe_down_i4_r2` was the same
+  kernel in both arms.
+  - The 16 → 12 waves crossing (obligation-2 table above) is a candidate cost, not a measured
+    one. The launcher row times both passes together.
+  - Both samples are within the threshold.
+- **Atomics.** No CAS loop: the accumulation is the native `global_atomic_add_u64` (above).
+  *(The ≤ 1.036 bound below is CORRECTED 2026-11-19 by the `79e218c` lease's 1.070 rows.)*
+  Every MoE row except the int4 nrow 2 one is ≤ 1.036.
+- **The one slow row: `gated_delta_recurrent_f32`, 1.647 in A.** The lead below comes from a
+  static ISA read and is UNTESTED.
+  - **What the ISA shows.** In hipcc's state loop, each 4-way unrolled step issues all four
+    `global_load_b32` before its stores and consumes them under `vmcnt(3)`/`(1)`/`(0)`. In
+    Rust's, each load is issued only after the previous step's store and is consumed at once
+    (`vmcnt(0)`): one request in flight.
+  - **The precedent.** That disease is the one `recurrent.hip`'s `#pragma unroll 4` note cites
+    from `dot_f4_wave_r` (+33.2%, 146.63 → 195.27 GB/s). That note marks the magnitude
+    unmeasured for this kernel.
+  - **Lead: hipcc carries a value range on the stride `d`, and Rust does not.**
+    - hipcc reads `d` from `blockDim.x`, and its loop masks it with `0x7fc` (bounded below
+      2048), which lets it prove the rows `i·d + t` and `(i+1)·d + t` distinct and hoist the
+      loads.
+    - The Rust kernel reads `d` from the kernel argument (Phase 0c's rule), with no range.
+  - **Control.** In `gdn_recurrent_f32` BOTH compilers serialize the same way: load,
+    `vmcnt(0)`, store, step after step. Its stride `dv` is a kernel argument in the C too, so
+    the twins run 0.999 / 1.001. The two runs agree, but they do not show the fix.
+    `gdn`'s dominating `t >= dv` exit (which implies `dv ≥ 1`) did not make hipcc hoist, so
+    an `assert_unchecked(d != 0)` is not shown to work.
+  - **Secondary, a type choice.** The Rust loop counter is 64-bit (`usize`:
+    `s_add_u32`/`s_addc_u32`, `v_cmp_ge_u64`) where the C's is `int`.
+  - **Status: reported, not fixed.** Two candidate fixes: loading each unroll group before
+    storing it, which is the known-good form; or a range fact on `d` (≤ 1024, which the
+    launcher's guard 1002 guarantees), which is unproven. Either one is to be checked
+    deviceless against the `vmcnt(3)/(1)/(0)` pattern, then re-timed on the device.
+- **The 13 Phase 0 rows** in A lie between 0.853 and 1.014, except `attn_res` at 1.048, which
+  is already owed.
+
+**After the lease, deviceless (2026-11-19): the `moe_f4` gap was a HARNESS defect, now fixed.**
+- **Cause, found by the CPU model before any re-run.** The range rows' arenas packed `[gate, up,
+  down]` back to back, and each expert's spans shift by `e · W_SHIFT`/`e · S_SHIFT`. So the
+  last up rows of every expert past the first read the first bytes of the DOWN scales, where
+  the edge codes sit (e8m0 `0xff` NaN, `0xfe` = 2^127; the bf16/f32 NaN and ±inf). One
+  non-finite `h[j]` makes every down dot NaN, and `moe_fixed` clamps every NaN contribution to
+  the same bound on both sides. A model of the real (3584, 3072, 2, 1, 1) cell printed
+  `dv=NaN` on all 64 down rows of expert 2, seed 1.
+- **Reach.** In every range row (VQ, int4 and both fp4), at every shape whose live experts sat
+  past expert 0, pass 2 compared nothing real: GLM's real shapes start at expert 3. Arm A's
+  23/23 is therefore NOT evidence for the down kernels at those shapes. Pass 1 (`h`) was
+  compared genuinely almost everywhere (the experts past the first carried one NaN `h` word on both sides); that is why the `moe` plant reddened 360/384.
+- **Fix** (`bit_identity/ranges.rs`, `Layout::new`). Each projection is padded by every
+  expert's shift, so no span crosses into the next projection; the down edges now poison only
+  their own down row. The range inputs moved to `ranges.rs` (deviceless) so the CPU models
+  build the very cells the rows launch.
+- **Live weights on every expert.** The routing-weight specials (±0, 0.3/NaN) now rotate with
+  the seed, so each expert of a range — the first and the last included — is live on some
+  seeds: on (live − 2)/live of them (1/2 for K3's 4-expert batch, 1/3 for a 3-expert range).
+- **Projection bases stay aligned.** The padding is rounded to 16 bytes, so only the deliberate
+  per-expert shift misaligns a span.
+- **Per-shape tally.** Every row now prints `red by shape: <shape> red/cells, …`
+  (`Tally::by_shape`), not only its first six mismatch notes.
+- **The plant's CPU model is now the real cell.** `moe_f4_late_bf16_plant_reaches_k3_production_shapes`
+  runs the actual K3 cells (`ranges::cell_inputs`, the row's betas) through both passes. The bf16-after-weight plant moves 48/48 of the
+  seeds on which pass 2 is live, at BOTH (3584, 3072, 2, 1, 1) and (3584, 3072, 0, 4, 1). The
+  excluded 16 are the NaN-`x` and edge seeds. *(CORRECTED 2026-11-19: on an edge seed, an
+  expert past the first sits beyond the gate scales' planted NaN, so pass 2 can be live there.
+  The device reddened 1–2 such seeds per K3 shape; the model filters those seeds out by class
+  and so makes no prediction about them.)*
+  Red proof of the model: with the padding removed (copied aside, edited, run, restored, `cmp`
+  rc 0), the same test reads 0/48 at (3584, 3072, 2, 1, 1), the device's result. Cost: about
+  70 s of the deviceless suite.
+
+**`gated_delta_recurrent_f32`, the load-before-store form.**
+- **Change.** `state_passes` now walks the state through `each_row`: four named row loads per
+  group, then the four stores, then a scalar remainder.
+- **ISA.** Both state loops of `gated_delta_recurrent_f32` and of `gdn_recurrent_f32` now issue
+  four `global_load_b32` before their stores and consume them under `vmcnt(2)`/`(1)`/`(0)`,
+  hipcc's `gated_delta` pattern in place of the one-in-flight `vmcnt(0)` chain. hipcc's `gdn`
+  still serializes, so the Rust `gdn` should now beat it.
+- **A first spelling spilled.** It used an array of four pointers, which landed in scratch
+  (`scratch_store_b128`) with `flat` stores; named scalars fixed that.
+- **Bits.** The same loads, multiplies and FMAs on the same values in the same order. A load
+  issued before the preceding rows' stores reads the same value because the rows are distinct:
+  the stride is ≥ 1, by the launchers' guard 1001. The device gate re-scores it.
+- **The i32 counter, tried separately on top: rejected.** It added remainder copies (25 → 33
+  loads, 19 → 27 stores), and its main loop already had the four loads in flight. The 64-bit
+  counter stays.
+- **Timing is owed to the next lease.** *(Paid 2026-11-19, the `79e218c` lease below.)*
+
+**Device lease, 2026-11-19, commit `79e218c` (after the arena fix), two arms, rh-anine.** The
+procedure was the `60ac104` lease's, with A then R run from one `setsid`-launched script. Both
+witnesses CLEAN: 0 B witness files, GTT 17 MiB pre-arm. Host loadavg was 4.46 → 3.38 on A and
+3.19 → 6.48 on R (32 cores). That is three to four times the `60ac104` lease's load, and is a
+possible contributor to the two rows above 1.05 below. Neither arm was discarded.
+
+| arm | binary | scripted verdict | rc | wall | logs `…/bit-identity/` |
+|---|---|---|---|---|---|
+| A | `bit_identity-efca1da5680a0280` (cargo's metadata hash, not a content hash); the script's freshness check passed at `79e218c` | GREEN: 23/23 BIT-IDENTICAL | 0 | 168 s | `20261119T133613-3151723` |
+| R | `…/rk-l2-moe/plant/bit_identity-l2-plants`: `git archive 79e218c` plus the three `plants/*.patch`, built into `target/rk-l2-moe-plant` | GREEN (expect-red): exactly the five planted rows | 0 (binary 101) | 158 s | `20261119T133901-3157318` |
+
+- **A.** The only NaN-payload-only words are on `moe_expert_range`: 1520. Every other row
+  has 0.
+- **What shows the down pass is now compared for real.**
+  - On the device, only K3: the `moe_f4` plant reaches pass 2 and is red at both production
+    shapes.
+  - For GLM's VQ and int4 and for V4's fp4, it is inferred from the `Layout` fix and the CPU
+    models; no plant reaches their down pass.
+- **R — red cells by shape**, from the new tally:
+  - `moe_expert_range_f4_situ` is **red at both K3 production shapes**: (3584, 3072, 2, 1, 1)
+    49/64 and (3584, 3072, 0, 4, 1) 50/64. Also (96, 64, 0, 3, 1) 48/64, (160, 96, 1, 2, 1)
+    50/64 and (32, 32, 0, 1, 1) 48/64. At most 16 of each shape's held seeds are NaN-`x` or edge
+    seeds. The 1–2 edge seeds that went red are live because their live expert sits past the
+    gate scales' planted NaN (see the dated note under "After the lease").
+  - `moe_expert_range` and `moe_expert_range_i4`: every shape red, 56/64 at nrow 1 and 64/64
+    at nrow 2. At nrow 1, `nan_some`'s NaN in `x` row 0 hides the SiLU on the 8 nasty seeds;
+    row 1 of an nrow-2 cell has no NaN.
+  - `gated_delta_recurrent_f32`: (96, 128) 64/64, (4, 32) 64/64, (3, 64) 64/64,
+    (2, 2) 40/64, (1, 1024) 55/64 and (1, 1) 0/64.
+  - `gdn_recurrent_f32`: 64/64 at every shape except (1, 1, 1, 1), 0/64.
+  - At `d` = 1 the only `k` is the 100.0 edge, on every seed. `100 · rn(1/sqrt(10000 + 1e-6))`
+    rounds to exactly 1.0f32, so the fused and unfused updates round identically.
+  - Every unplanted row held, 0 red at every shape.
+
+**TIME lines.** Same method as before: the minimum of three 200-launch batches, Rust ÷ hipcc.
+These supersede the `60ac104` lease's MoE and recurrent rows. Every other row read
+0.882–1.018 in A, except Phase 0's `attn_res` (in the table).
+
+| row (shape) | hipcc µs | Rust µs | A ratio | R |
+|---|---|---|---|---|
+| `gated_delta_recurrent_f32` (96, 128) | 29.02 | 28.92 | **0.997** (was 1.647) | planted |
+| `gdn_recurrent_f32` (16, 48, 128, 128) | 45.25 | 18.82 | **0.416** (was 0.999) | planted |
+| `moe_expert_range` GLM (6144, 2048) nrow 1 | 112.06 | 113.06 | 1.009 | gate/up planted, down unchanged: 1.006 |
+| `moe_expert_range` GLM nrow 2 | 121.29 | 125.75 | 1.037 | gate/up planted, down unchanged: 1.018 |
+| `moe_expert_range_i4` GLM nrow 1 | 242.82 | 245.32 | 1.010 | gate/up planted, down unchanged: 1.008 |
+| `moe_expert_range_i4` GLM nrow 2 | 313.75 | 335.85 | **1.070** | gate/up planted, down unchanged: 1.035 |
+| `moe_expert_range_f4` V4 (4096, 2048), 1 expert | 55.27 | 56.82 | 1.028 | unplanted: 1.027 |
+| `moe_expert_range_f4` V4, 6-expert batch | 766.64 | 787.40 | 1.027 | unplanted: 1.021 |
+| `moe_expert_range_f4_situ` K3 (3584, 3072), 1 expert | 60.74 | 64.99 | **1.070** | planted |
+| `moe_expert_range_f4_situ` K3, 4-expert batch | 707.37 | 707.06 | 1.000 | planted |
+| `attn_res` (1, 9, 7168, 9) — Phase 0, owed | 53.62 | 57.43 | 1.071 | 1.013 (unplanted) |
+
+- **The two delta rules.** The load-before-store groups closed `gated_delta`'s gap, and `gdn`'s
+  predicted win landed. Both are single samples, since both were planted in R.
+- **Rows above ~1.05.** Only the `79e218c` samples count here, because the `60ac104` MoE samples
+  timed a NaN `h`.
+  - **`moe_expert_range_i4` nrow 2: 1.070 in A.** R's planted-gate/up binary read 1.035 with
+    the same down kernel. The row contains `moe_down_i4_r2`, the 16 → 12 waves kernel. With no
+    A-vs-A floor, the crossing's cost is unmeasured.
+  - **`moe_expert_range_f4_situ` single expert: 1.070 in A.** There is no second sample: it
+    was planted in R.
+- **Obligation 1, timing half.**
+  - **V4: met.** The fp4 range reads 1.021–1.028 over two samples, with the down pass now real.
+  - **K3: OPEN.** Its single expert reads 1.070 in the only valid sample.

@@ -46,7 +46,7 @@ pub struct Strided<A> {
 // runs they cross jscpd's 5-line floor at the fourth family (measured 2026-11-19, 26 tokens).
 pub use self::{
     activation::*, attn::*, blockindex::*, fwd::*, headtail::*, indexer::*, kvcompress::*,
-    linalg::*, mla::*, residual::*, touch::*,
+    linalg::*, mla::*, moe::*, recurrent::*, residual::*, touch::*,
 };
 
 pub(crate) mod activation;
@@ -58,5 +58,7 @@ pub(crate) mod indexer;
 pub(crate) mod kvcompress;
 pub(crate) mod linalg;
 pub(crate) mod mla;
+pub(crate) mod moe;
+pub(crate) mod recurrent;
 pub(crate) mod residual;
 pub(crate) mod touch;

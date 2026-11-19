@@ -7,16 +7,9 @@
 //! MLA, e4m3's NaN codes in the cache. NaN is compared as a class (`device.rs`).
 
 use super::common::{Lcg, f32v, u16b};
+pub use super::inputs::nasty;
 use super::inputs::{draw, words32};
 use rivoli_core::num::f32_to_bf16;
-
-/// Every `NASTY`-th seed (from seed 7) carries non-finite inputs.
-const NASTY: u64 = 8;
-
-/// Whether `seed` is a nasty one.
-pub fn nasty(seed: u64) -> bool {
-    seed % NASTY == NASTY - 1
-}
 
 /// Plant `+inf`, `−inf` and NaN at three seeded positions of `v` past the `EDGES` slots, on
 /// nasty seeds only.

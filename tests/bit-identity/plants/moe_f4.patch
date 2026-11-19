@@ -1,0 +1,9 @@
+--- a/src/moe_f4.rs
++++ b/src/moe_f4.rs
+@@ -83,5 +83,5 @@
+     // `routed` multiplies `w · y` where the C wrote `y · w`: IEEE multiplication commutes, so
+     // only a NaN's payload could differ, and `moe_fixed` clamps every NaN to the same bound.
+     let routed = routed(a.range.wexpert);
+-    down_f4(&a.range, |k, dv| routed(k, rbf16(dv)));
++    down_f4(&a.range, |k, dv| routed(k, dv).map(rbf16)); // PLANT: V4's fold, bf16 after the weight
+ }

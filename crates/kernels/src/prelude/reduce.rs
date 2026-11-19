@@ -115,7 +115,7 @@ pub fn wave_max(v: f32) -> f32 {
 ///
 /// REQUIRES a power-of-two `block_dim` (the halving ladder drops the odd element otherwise)
 /// and that `block_dim` IS the launch width. Re-associated against the oracle's sequential
-/// fold. The trailing barrier makes `red` reusable for a second reduction — `recurrent.hip`
+/// fold. The trailing barrier makes `red` reusable for a second reduction — `recurrent.rs`
 /// reduces twice back to back — so the count is 2 + log2(block_dim), as in C++.
 ///
 /// # Safety

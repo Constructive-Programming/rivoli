@@ -1,6 +1,6 @@
 //! The CPU half of the linalg, fwd and headtail red proofs — one plant per family, each a
 //! patch under `tests/bit-identity/plants/` — shown ADVERSARIAL on the gate's own inputs
-//! before any device arm runs (the rope model's rule in `main.rs`, and §1's lesson: a plant
+//! before any device arm runs (the rope model's rule in `plants.rs`, and §1's lesson: a plant
 //! must move outputs on the draws the gate actually makes, or its green says nothing).
 //!
 //! Host `exp` and an f64 stand-in for the gate's mixes are not the device's bits, so each

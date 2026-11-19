@@ -111,14 +111,9 @@ pub(crate) unsafe fn rivoli_rmsnorm_weightless_batch(
 }
 
 /// # Safety
-/// The `launch_act_quant_f8` contract.
-///
-/// **Also a C symbol**, and the only one among the launchers: `kernels/moe_f4.hip`'s fp4
-/// expert launcher calls `rivoli_act_quant_f8` between its two passes, C to C, and that file
-/// is still hipcc's until Phase 1's L2 lane ports it. The signature was C-shaped already, so
-/// the export costs the two attributes; drop them (and this paragraph) when moe_f4 lands.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn rivoli_act_quant_f8(
+/// The `launch_act_quant_f8` contract. Also called between the V4 fp4 expert range's passes
+/// (`launch/moe.rs`); until that range was Rust it was a C symbol for `moe_f4.hip`.
+pub(crate) unsafe fn rivoli_act_quant_f8(
     v: *mut f32,
     n_rows: i32,
     row_len: i32,

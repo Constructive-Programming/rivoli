@@ -1,0 +1,11 @@
+--- a/src/recurrent.rs
++++ b/src/recurrent.rs
+@@ -87,7 +87,7 @@
+     let dv = delta(u);
+     let mut o = 0.0f32;
+     each_row(col, |i, s| {
+-        let sv = fma(*kn.add(i), dv, s);
++        let sv = s + *kn.add(i) * dv; // PLANT: the rank-one update unfused
+         o = fma(*qn.add(i), sv, o);
+         sv
+     });
