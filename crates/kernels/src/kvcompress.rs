@@ -21,7 +21,7 @@ use crate::gpu::{bid, fma, for_i32, for_usize, lds, tid};
 use crate::prelude::formats::{bf16f, rbf16};
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::{block_sum_lds, sync_threads, wave_sum};
-use core::intrinsics::{exp, sqrt};
+use core::intrinsics::{exp, sqrt, unchecked_div, unchecked_rem};
 use rivoli_abi::geom::{COMPRESS_BLOCK, COMPRESS_ENTS_MAX, GEMM_BF16_BLOCK, WAVE};
 use rivoli_abi::kernarg::{CompressDecode, CompressPrefill, Deposit, GemmBf16, Strided};
 use rivoli_abi::{CompFinish, CompGeom};
@@ -39,7 +39,8 @@ pub unsafe extern "gpu-kernel" fn gemm_bf16(a: GemmBf16) {
     if gw as usize >= a.m as usize * a.n as usize {
         return;
     }
-    let (r, c) = (gw / a.n, gw % a.n);
+    // SAFETY: `n > 0` (1001).
+    let (r, c) = (unchecked_div(gw, a.n), unchecked_rem(gw, a.n));
     let xr = a.x.add(r as usize * a.k as usize);
     let wr = a.w.add(c as usize * a.k as usize);
     let mut acc = 0.0f32;
@@ -84,32 +85,37 @@ impl Window {
     }
 }
 
+/// `f(j)` for each live window entry, ascending — the C's `for (int j = 0; j < ents; ++j) { if
+/// (!scp[j]) continue; … }`. As `(0..ents).filter(live)` it compiled to a nested find-next scan on
+/// 64-bit counters, where hipcc unrolls the plain loop 8× with the loads in flight (Phase 1
+/// integration, 2026-11-19; the L3 lease timed `kv_compress_decode` at 1.22× hipcc).
+#[inline(always)]
+unsafe fn each_live(w: &Window, ents: i32, mut f: impl FnMut(usize)) {
+    for_i32(0, ents, 1, |j| {
+        if !(*w.scp.add(j)).is_null() {
+            f(j)
+        }
+    });
+}
+
 /// model.py:346 on one output row: per feature, the softmax over the window's live entries, then
 /// the weighted sum, sequential in the entry order. `ape(j, e)` is the position embedding added to
 /// each score (`0.0` at decode, where the deposit already added it — see the module note).
 #[inline(always)]
 unsafe fn pool_row(w: &Window, ape: impl Fn(usize, usize) -> f32, p: &CompGeom, out: *mut f32) {
-    let ents = p.ents as usize;
     for_i32(tid(), p.d, COMPRESS_BLOCK, |e| {
-        let live = |j: usize| !(*w.scp.add(j)).is_null();
         let score = |j: usize| *(*w.scp.add(j)).add(e) + ape(j, e);
         let mut mx = f32::NEG_INFINITY;
-        for j in (0..ents).filter(|&j| live(j)) {
-            mx = maxnum(mx, score(j));
-        }
+        each_live(w, p.ents, |j| mx = maxnum(mx, score(j)));
         // Every entry masked: the oracle's zero row (unreachable through either launcher).
         if !mx.is_finite() {
             *out.add(e) = 0.0;
             return;
         }
         let mut sum = 0.0f32;
-        for j in (0..ents).filter(|&j| live(j)) {
-            sum += exp(score(j) - mx);
-        }
+        each_live(w, p.ents, |j| sum += exp(score(j) - mx));
         let mut acc = 0.0f32;
-        for j in (0..ents).filter(|&j| live(j)) {
-            acc = fma(*(*w.kvp.add(j)).add(e), exp(score(j) - mx) / sum, acc);
-        }
+        each_live(w, p.ents, |j| acc = fma(*(*w.kvp.add(j)).add(e), exp(score(j) - mx) / sum, acc));
         *out.add(e) = acc;
     });
 }
@@ -154,7 +160,9 @@ unsafe fn finish_row(row: *mut f32, (f, p): (&CompFinish, &CompGeom), pos: i32, 
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn kv_compress_deposit(g: Strided<Deposit>) {
     let (a, p) = (g.a, g.a.p);
-    let remainder = a.s % p.ratio;
+    // SAFETY: `ratio > 1` (1001); and for the `cd` divisions below, `d > 0`, `coff ∈ {1, 2}`
+    // (1001) and `cd == coff · d` (1003, wrapping), so `cd as usize` is nonzero.
+    let remainder = unchecked_rem(a.s, p.ratio);
     let cutoff = a.s - remainder;
     let overlap = p.coff == 2;
     let state_off = if overlap { p.ratio } else { 0 };
@@ -164,7 +172,7 @@ pub unsafe extern "gpu-kernel" fn kv_compress_deposit(g: Strided<Deposit>) {
     if overlap && cutoff >= p.ratio {
         let base = (cutoff - p.ratio) as usize;
         for_usize(t, p.ratio as usize * cd, stride, |i| {
-            let src = (base + i / cd) * cd + i % cd;
+            let src = (base + unchecked_div(i, cd)) * cd + unchecked_rem(i, cd);
             *a.kv_state.add(i) = *a.kv.add(src);
             *a.score_state.add(i) = *a.score.add(src) + *a.ape.add(i);
         });
@@ -173,7 +181,7 @@ pub unsafe extern "gpu-kernel" fn kv_compress_deposit(g: Strided<Deposit>) {
         let dst0 = (state_off + a.slot0) as usize * cd;
         let ape0 = a.slot0 as usize * cd;
         for_usize(t, remainder as usize * cd, stride, |i| {
-            let src = (cutoff as usize + i / cd) * cd + i % cd;
+            let src = (cutoff as usize + unchecked_div(i, cd)) * cd + unchecked_rem(i, cd);
             *a.kv_state.add(dst0 + i) = *a.kv.add(src);
             *a.score_state.add(dst0 + i) = *a.score.add(src) + *a.ape.add(ape0 + i);
         });
@@ -232,7 +240,8 @@ pub unsafe extern "gpu-kernel" fn kv_compress_decode(a: CompressDecode) {
     finish_row(
         a.f.out,
         (&a.f, &p),
-        (a.start_pos / p.ratio) * p.ratio,
+        // SAFETY: `ratio > 1` (1001).
+        unchecked_div(a.start_pos, p.ratio) * p.ratio,
         w.red,
     );
     sync_threads();

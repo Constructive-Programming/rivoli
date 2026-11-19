@@ -1968,3 +1968,66 @@ suffices. Trailing `//` comments are now dropped along with comment lines, or a
   static into a local, which is launched once. jscpd measures 0 clones: the VQ twin launches
   in each arm, so the token runs differ. Bits are unaffected, since the same static is
   launched with the same arguments.
+
+**Step 3 — the performance pass (deviceless; every change is re-scored and re-timed on the
+integration lease).** The method was to read each owed row's loops in the shipped code object
+against hipcc's `--cuda-device-only -S` of the tag, with backward branches found and body
+mnemonics counted (`scratch/rk-integrate/bin/{kisa.sh,loops.py}`). The bits argument for every
+change is the FP-op census (`bin/fpcensus.py`): identical where a loop kept its shape, and where
+LLVM now unrolls, different only by the extra unrolled copies, with each element's or entry's
+operations unchanged in kind and order (no fp reassociation without fast-math).
+
+Three causes were found, lettered on from L1's (a) and (b), and all three generalize beyond the
+rows that exposed them:
+- **(c) Rust's checked integer division.** `/` and `%` on a runtime divisor carry a divide-by-zero
+  (and, for signed types, an overflow) panic path: an `s_trap` block, plus the per-lane
+  exec-mask branching the check needs, inside whatever loop holds it. C division is UB on
+  exactly those inputs, so hipcc emits neither.
+  - `core::intrinsics::unchecked_div`/`unchecked_rem` now carry the C's contract, as
+    `linalg`/`fwd`/`headtail`/`residual` already did. Each site cites the launcher guard that
+    makes its divisor nonzero. (A generic `cdiv<T>` wrapper was tried and dropped: calling the
+    intrinsic through a type parameter ICEs this nightly, and the wrapper only added a second
+    convention.)
+  - Applied to `attn/gqa.rs`, `attn/mla.rs`, `mla.rs` and `kvcompress.rs`.
+  - Traps were removed in `gqa_attend` (7), `gqa_block_attend` (6), MLA attend (2), the fp8
+    MLA family (3 each),
+    `gemv_fp8_bf16` (7), and the compressor (deposit 4, decode 2).
+  - Still carrying one or two traps each: the MoE range kernels, `gdn_recurrent_f32`, the block
+    scorers (`indexer.rs`'s `id / n_comp`) and `moe.rs`'s `r / len`. Those rows are at parity
+    and were left.
+- **(d) A short-circuit `||` kept as divergent branches.** `f2e2m1`'s
+  `a > m || (a == m && i odd)` compiled to `v_cmpx_eq_f32` + `s_cbranch_execz` at the three odd
+  midpoints, where clang selects. Now `(a > m) | ((a == m) & odd)`, the same truth table. This
+  is a prelude codec: the probe arm's exhaustive `ex_f2e2m1` sweep re-scores it.
+- **(e) An iterator adapter.** `(0..ents).filter(live)` became a nested find-next scan on 64-bit
+  counters, where hipcc unrolls `for (int j…) { if (!live) continue; … }` 8×. Now
+  `kvcompress::each_live`, an `int` loop in the C's shape.
+
+Static instructions, hipcc vs before nsw (`pre`) vs now (`post`). A larger `post` can be the
+unrolling hipcc does too (`kv_compress_decode`); the last column says which:
+
+| row (lease ratio) | hipcc | pre | post | what changed, and whether the loop shape now matches hipcc |
+|---|---|---|---|---|
+| `gqa_attend` (1.14) | 689 | 915 | 684 | (c): the tile load's `idx / d`, `j % ring_cap`; exec-mask structure = hipcc's (53 `s_and_saveexec` each) |
+| `gqa_block_attend` (1.07) | 653 | 802 | 644 | (c), as above |
+| `mla_attend` (1.20) | 979 | 1249 | 994 | nsw (dot loops = hipcc's), then (c) in the tile load (`/ kvl`, `/ rope`) |
+| `gather_attn_shared_kv` (1.21) | 720 | 918 | 897 | values loop on the C's `int` counter (L4's lead; drops `v_cmp_lt_u64`). **No cause found:** per iteration, the logits, exp and values loops match hipcc's (Rust unrolls the j-loop 2× with the same per-j work); 22 `s_nop` hazard pads, against hipcc's 0, sit outside the hot loops |
+| `gemv_f32` (1.09–1.10) | 101 | 111 | 103 | nsw: lane loop = hipcc's (one extra `s_delay_alu`) |
+| `gemv_i8` (1.06–1.08) | 170 | 178 | 188 | nsw + L1's dword-loop change: dword loop 32 vs 30 (a 64-bit scalar offset bump), tail loop identical |
+| `gemv_fp8` split-K (≤ 1.09) | 278 | 324 | 324 | main loop 52 vs 51, tail identical; L1's unpriced combine difference (`ds_load_2addr_b32` against `ds_load_b128`) left |
+| `act_quant_f4_rotated` (1.47) | 377 | 394 | 415 | (d): the round trip is branchless and LLVM now unrolls it 2× unaided, 103 vs hipcc's 102 instructions per two elements. Remaining: the amax loop reads LDS as `ds_load_2addr_b32` where hipcc uses `ds_load_b128` |
+| `kv_compress_decode` (1.22) | 1017 | 841 | 1144 | (e) + (c): entry loops unrolled 8× like hipcc's (max 95/93, sum 101/99, weighted sum 117/113) |
+| `kv_compress_deposit` (1.06) | 482 | 573 | 499 | (c) |
+| `mla_value_fp8` (1.055) | 424 | 516 | 445 | (c) |
+| `attn_res` (1.04–1.07) | 725 | 1590 | 1583 | **left:** Phase 0's 16-slot `each_src` is what keeps `p[16]` out of scratch (144 B → 0, 1.38× → 1.06×); within noise for its size |
+| `hash_rows` (1.8–1.9, `--divergence-log` only) | 169 | 262 | 262 | **left:** system-scope `fetch_xor` = a CAS loop; an agent-scope XOR needs inline asm or a syncscope route, neither available in nightly 1.102's `core`. Diagnostic-only |
+| `moe_down_i4_r2` (int4 nrow 2, 1.070) | 802 | 801 | 801 | **left:** VGPR 100 against hipcc's 95, 12 against 16 waves. A prelude property (`dot_nib_wave_r::<2>`); any change re-scores every nib caller |
+| K3 fp4 single expert (1.070, one sample) | — | — | — | **left:** no ISA difference was identified in L2's census; the lease's A/A′ spread decides whether it is real |
+
+Four kernels outside the table also changed:
+- `gemv_fp8_bf16` 906 → 823 and `mla_absorb_fp8` 1044 → 1002, both from (c). Neither was owed:
+  `mla_absorb_fp8` already ran faster than hipcc and `gemv_fp8_bf16` at parity (1.017).
+- `rope_adjacent` 192 → 156 and `act_quant_f8_prefix` 422 → 367, also (c).
+
+None of these is a timing claim. Each row's ratio is judged on the lease, against the A vs A′
+spread.

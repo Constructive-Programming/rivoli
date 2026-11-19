@@ -168,7 +168,10 @@ pub fn f2e2m1(x: f32) -> u32 {
     let code = MID
         .iter()
         .enumerate()
-        .map(|(i, &m)| u32::from(a > m || (a == m && i & 1 == 1)))
+        // `|`/`&`, not `||`/`&&`: the same truth table, but the short-circuit forms compiled to
+        // per-lane exec-mask branches (`v_cmpx_eq_f32` + `s_cbranch_execz` at the three odd
+        // midpoints) where clang selects (Phase 1 integration, 2026-11-19).
+        .map(|(i, &m)| u32::from((a > m) | ((a == m) & (i & 1 == 1))))
         .sum::<u32>();
     if x.is_sign_negative() { 8 | code } else { code }
 }

@@ -14,7 +14,7 @@ use crate::gpu::{bid, bid_y, fma, for_i32, lds, tid};
 use crate::prelude::formats::{bf16f, e4m3f};
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::sync_threads;
-use core::intrinsics::exp;
+use core::intrinsics::{exp, unchecked_div};
 use rivoli_abi::geom::{
     MLA_ACC_REGS, MLA_ATTEND_THREADS, MLA_COMBINE_THREADS, MLA_HB, MLA_MAX_SPLITS, MLA_TILE, WAVE,
 };
@@ -45,7 +45,8 @@ unsafe fn load_tile(io: &MlaIo, tile: Tile, t0: i32, tcount: i32) {
         }
     };
     for_i32(tid(), tcount * kvl, MLA_ATTEND_THREADS, |idx| {
-        let tt = idx as i32 / kvl;
+        // SAFETY: `kvl > 0`, `rope > 0` (1001).
+        let tt = unchecked_div(idx as i32, kvl);
         let i = idx as i32 - tt * kvl;
         let t = token(tt);
         let l8 = *io.lc8.add(t * kvl as usize + i as usize);
@@ -53,7 +54,8 @@ unsafe fn load_tile(io: &MlaIo, tile: Tile, t0: i32, tcount: i32) {
         *tile.lt.add(idx) = e4m3f(l8) * s;
     });
     for_i32(tid(), tcount * rope, MLA_ATTEND_THREADS, |idx| {
-        let tt = idx as i32 / rope;
+        // SAFETY: as above.
+        let tt = unchecked_div(idx as i32, rope);
         let d = idx as i32 - tt * rope;
         *tile.rt.add(idx) = bf16f(*io.rc.add(token(tt) * rope as usize + d as usize));
     });

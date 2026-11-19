@@ -8,7 +8,7 @@ use super::{Running, wave_total};
 use crate::gpu::{bid, bid_y, lds, tid};
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::sync_threads;
-use core::intrinsics::exp;
+use core::intrinsics::{exp, unchecked_div, unchecked_rem};
 use rivoli_abi::geom::{GQA_ACC, GQA_THREADS, GQA_TILE};
 use rivoli_abi::kernarg::{Gqa, GqaBlock, GqaRing};
 
@@ -58,10 +58,16 @@ unsafe fn stage(g: &Gqa, win: Window, tile: Tile, (j0, cnt): (i32, i32)) {
     let d = g.d;
     let mut idx = tid() as i32;
     while idx < cnt * d {
-        let tt = idx / d;
+        // C `int` division, unchecked as the C's is UB on a zero divisor or `MIN / -1`. Rust's `/`
+        // and `%` kept divide-by-zero and overflow panic paths here (`s_trap` blocks plus the
+        // per-lane exec-mask branching the checks need): 915 → 684 static instructions with
+        // them gone, hipcc 689, its exec-mask structure restored (Phase 1 integration,
+        // 2026-11-19). The same rule holds wherever a kernel divides by a runtime value.
+        // SAFETY: `d > 0` (1001) and `ring_cap != 0` on this branch.
+        let tt = unchecked_div(idx, d);
         let j = j0 + tt;
         let slot = if win.ring_cap != 0 {
-            (j % win.ring_cap) as usize
+            unchecked_rem(j, win.ring_cap) as usize
         } else {
             j as usize
         };
@@ -106,7 +112,9 @@ unsafe fn attend(g: Gqa, row: usize, win: Window) {
     let tile = Tile {
         k: kt,
         v: kt.add((TILE * d) as usize),
-        kvh: (head / (g.hq / g.hkv)) as usize, // a per-head block repeat, not an interleave
+        // A per-head block repeat, not an interleave. SAFETY: `hkv > 0` and `hq % hkv == 0`, so
+        // `hq / hkv >= 1` (1001, 1003).
+        kvh: unchecked_div(head, unchecked_div(g.hq, g.hkv)) as usize,
     };
     let at = (row * g.hq as usize + head as usize) * d as usize;
     let mut st = Online {

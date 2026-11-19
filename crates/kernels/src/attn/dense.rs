@@ -80,12 +80,12 @@ unsafe fn accumulate(acc: &mut [f32; GATHER_ATTN_ACC as usize], e: f32, kr: *con
 unsafe fn values(a: &GatherAttn, g: Gather) -> [f32; GATHER_ATTN_ACC as usize] {
     let d = a.d as usize;
     let mut acc = [0.0f32; GATHER_ATTN_ACC as usize];
-    for j in 0..a.topk as usize {
+    for_i32(0, a.topk, 1, |j| {
         let p = *g.ix.add(j);
         if p >= 0 {
             accumulate(&mut acc, *g.lg.add(j), a.kv.add(p as usize * d), d);
         }
-    }
+    });
     acc
 }
 

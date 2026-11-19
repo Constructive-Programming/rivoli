@@ -29,16 +29,19 @@ use crate::prelude::formats::rbf16;
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::{ROWS_PER_BLOCK, WAVE, block_sum_lds, sync_threads};
 use crate::prelude::rowview::{RowsView, blk_shift};
-use core::intrinsics::sqrt;
+use core::intrinsics::{sqrt, unchecked_div, unchecked_rem};
 use rivoli_abi::geom::{ROW_BLOCK, absorb_nquad};
 use rivoli_abi::kernarg::{
     ActQuantPrefix, GemvFp8Bf16, MlaAbsorb, MlaValue, QkNorm, RmsNormRows, RopeAdjacent,
 };
 
 /// Scale-tile columns of an `n`-column fp8 weight, `ceil(n / block)` in the C's `int`.
+///
+/// # Safety
+/// `block > 0` — every caller's launcher refuses `block <= 0` (1001).
 #[inline(always)]
-fn tiles(n: i32, block: i32) -> usize {
-    ((n + block - 1) / block) as usize
+unsafe fn tiles(n: i32, block: i32) -> usize {
+    unchecked_div(n + block - 1, block) as usize
 }
 
 /// One absorb thread's place: the LUT, its head, its quad's first column, the head's `kv_b` row
@@ -139,11 +142,12 @@ unsafe fn absorb<const R: usize>(a: MlaAbsorb) {
     if idx >= k.h as usize * nquad {
         return;
     }
-    let head = idx / nquad;
+    // SAFETY: `kvl > 0` (1001), so `nquad = (kvl + 3) >> 2 >= 1`.
+    let head = unchecked_div(idx, nquad);
     let q = Quad {
         lut,
         head,
-        i0: ((idx % nquad) as i32) << 2,
+        i0: (unchecked_rem(idx, nquad) as i32) << 2,
         rbase: head * (k.nope + k.vh) as usize,
         kvl: k.kvl as usize,
         bsh: blk_shift(k.block) as usize,
@@ -180,7 +184,8 @@ unsafe fn value<const R: usize>(a: MlaValue) {
     if r >= h * vh {
         return;
     }
-    let (head, j) = (r / vh, r % vh);
+    // SAFETY: `vh > 0` (1001).
+    let (head, j) = (unchecked_div(r, vh), unchecked_rem(r, vh));
     let row = head * (k.nope as usize + vh) + k.nope as usize + j;
     let w = Fp8Row {
         w: k.w.add(row * kvl),
@@ -216,14 +221,15 @@ pub unsafe extern "gpu-kernel" fn mla_value_fp8_r2(a: MlaValue) {
 /// One thread per `block`-wide group of a row's first `n`; `src` may be `dst`.
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn act_quant_f8_prefix(a: ActQuantPrefix) {
-    let nb = (a.n / a.block) as usize;
+    // SAFETY: `block > 0`, `n > 0` and `n % block == 0` (1001, 1004), so `nb >= 1`.
+    let nb = unchecked_div(a.n, a.block) as usize;
     // `as u32 as usize`: the unsigned 32-bit index widened, which equals the C's `size_t` product
     // for every grid under 2^32 threads (the launcher's `dim3` is 32-bit too).
     let id = elementwise_id() as u32 as usize;
     if id >= a.rows as usize * nb {
         return;
     }
-    let off = (id / nb) * a.row_stride as usize + (id % nb) * a.block as usize;
+    let off = unchecked_div(id, nb) * a.row_stride as usize + unchecked_rem(id, nb) * a.block as usize;
     let (seg, out) = (a.src.add(off), a.dst.add(off));
     let mut amax = ACT_QUANT_AMAX_FLOOR;
     for i in 0..a.block as usize {
@@ -270,7 +276,8 @@ pub unsafe extern "gpu-kernel" fn rope_adjacent(a: RopeAdjacent) {
     let seg = row.add((a.row_len - a.rd) as usize);
     let t = a
         .tbl
-        .add((a.pos0 + b / a.rows_per_pos) as usize * a.rd as usize);
+        // SAFETY: `rows_per_pos > 0` (1001).
+        .add((a.pos0 + unchecked_div(b, a.rows_per_pos)) as usize * a.rd as usize);
     for_i32(tid(), a.rd / 2, ROW_BLOCK, |i| {
         let c = *t.add(2 * i);
         let s = if a.inverse != 0 {
@@ -298,10 +305,11 @@ pub unsafe extern "gpu-kernel" fn gemv_fp8_bf16(a: GemvFp8Bf16) {
     if id >= a.m as usize * n_out {
         return;
     }
-    let (r, j) = (id / n_out, id % n_out);
+    // SAFETY: `n_out > 0`, `groups > 0`, `n_out % groups == 0` (1001, 1004).
+    let (r, j) = (unchecked_div(id, n_out), unchecked_rem(id, n_out));
     let k = a.k as usize;
     // The C's `int` division, `(size_t)(j / (n_out / groups))`.
-    let group = (j as i32 / (a.n_out / a.groups)) as usize;
+    let group = unchecked_div(j as i32, unchecked_div(a.n_out, a.groups)) as usize;
     let x = RowsView {
         x: a.x.add((r * a.groups as usize + group) * k),
         stride: 0,
