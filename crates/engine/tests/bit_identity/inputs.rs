@@ -102,10 +102,7 @@ pub fn fp8_words(n: usize, (seed, stream): (u64, u64)) -> Vec<f32> {
 /// bf16 cache as themselves — packed two halves per word (an odd count padded with a zero half).
 #[cfg_attr(not(feature = "rocm"), allow(dead_code))]
 pub fn bf16_words(v: &[f32]) -> Vec<f32> {
-    let half = |x: Option<&f32>| x.map_or(0, |x| x.to_bits() >> 16);
-    v.chunks(2)
-        .map(|p| f32::from_bits(half(p.first()) | half(p.get(1)) << 16))
-        .collect()
+    u16_words(v.iter().map(|x| (x.to_bits() >> 16) as u16))
 }
 
 /// `(nt, k)`. `k` near 0.6·nt puts the selection boundary inside the `±0` run of the tie classes
@@ -155,4 +152,35 @@ pub fn topk_scores(n: usize, seed: u64) -> Vec<f32> {
             .for_each(|(s, &o)| *s = o);
     }
     v
+}
+
+/// `n` random bytes for `(seed, stream)` — every bit pattern a packed weight code can take.
+pub fn bytes(n: usize, (seed, stream): (u64, u64)) -> Vec<u8> {
+    let mut r = Lcg(seed.wrapping_mul(0xa076_1d64_78bd_642f) ^ stream);
+    (0..n)
+        .map(|_| {
+            r.f();
+            (r.0 >> 56) as u8
+        })
+        .collect()
+}
+
+/// Bytes as the f32 WORDS a cell uploads, bit patterns untouched (NaN payloads included —
+/// nothing here does arithmetic on them), zero-padded to a whole word.
+// Only the device rows build cells; the deviceless build compiles the plant models alone.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn words(b: &[u8]) -> Vec<f32> {
+    b.chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            f32::from_bits(u32::from_le_bytes(w))
+        })
+        .collect()
+}
+
+/// Halfwords (bf16 or fp16 bits) as cell words.
+#[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+pub fn u16_words(v: impl IntoIterator<Item = u16>) -> Vec<f32> {
+    words(&v.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
 }

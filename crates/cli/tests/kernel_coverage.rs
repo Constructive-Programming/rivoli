@@ -48,7 +48,7 @@ const DEFERRED: &[(&str, &str)] = &[
     // were added that day and retired with M9's `kernel_k3_{attn_res,attend,latent,situ,
     // expert_f4,recurrent,conv_norm}.rs`, ported from `k3:tests/k3_kernels.rs`. K3's MLA
     // output gate never had a row: it maps onto the EXISTING `sigmoid_gate` launcher (in
-    // place, covered since M7; `kernels/fwd.hip` records the decision), and the k3 tests'
+    // place, covered since M7; `kernels/fwd.hip` (tag `archive/hip-kernels`) records the decision), and the k3 tests'
     // out-of-place gate fixture took the one-buffer adaptation in `kernel_k3_attend.rs`. The
     // table can only shrink — within one architecture's port; the next port adds rows and
     // then removes them, and that cycle is the design.)

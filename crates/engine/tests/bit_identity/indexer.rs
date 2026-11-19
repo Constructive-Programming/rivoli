@@ -100,7 +100,7 @@ pub fn index_append(r: &Ref, t: &mut Tally) {
     // other half must come back untouched — compared byte for byte.
     let make = |(pos, hd): (usize, usize), seed: u64| {
         let cache = bf16_words(&draw((pos + 1) * hd, (seed, 2), 1.0, true));
-        let out = Out::Exact(Box::new(Out::InPlace(cache)));
+        let out = Out::InPlaceBits(cache);
         (vec![draw(hd, (seed, 1), 1.0, true)], vec![out], ())
     };
     sweep(t, rows_at, make, |side, x: &mut Cell, (pos, hd), _| {
@@ -343,7 +343,7 @@ pub fn index_topk(r: &Ref, t: &mut Tally) {
         hot: (4096, 2048),
     };
     let make = |(nt, k): (usize, usize), seed: u64| {
-        let rows = Out::Exact(Box::new(Out::Poison(k.min(nt))));
+        let rows = Out::PoisonBits(k.min(nt));
         (vec![topk_scores(nt, seed)], vec![rows], ())
     };
     sweep(t, arrays, make, |side, x: &mut Cell, (nt, k), _| {

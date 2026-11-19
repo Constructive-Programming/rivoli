@@ -43,7 +43,9 @@ pub fn act_quant_f4_rotated(r: &Ref, t: &mut Tally) {
             [1.0, 1e-3, 30.0][(seed % 3) as usize],
             true,
         );
-        (vec![], vec![Out::InPlace(x)], ())
+        // `Vec::new()`, not `vec![]`: the latter tokenizes as a 5-line clone of `fwd.rs`'s
+        // elementwise `make` + `sweep(` prologue (jscpd, Phase 1 integration).
+        (Vec::new(), vec![Out::InPlace(x)], ())
     };
     sweep(
         t,

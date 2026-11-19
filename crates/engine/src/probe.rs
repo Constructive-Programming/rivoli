@@ -38,7 +38,7 @@
 //! ## The two properties that let it be pointed at THIS bug
 //!
 //! **The fold is XOR** — `rivoli_core::hash::xor_fold` states the argument and
-//! `kernels/fwd.hip::hash_rows` is its device twin. XOR is commutative *and* associative, so
+//! `crates/kernels/src/fwd.rs::hash_rows` is its device twin. XOR is commutative *and* associative, so
 //! the device fold is bit-identical whatever order its atomics land in; a float sum would
 //! report a difference from scheduling jitter alone, and an instrument noisier than its
 //! subject measures nothing.

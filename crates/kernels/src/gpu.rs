@@ -2,6 +2,7 @@
 //! LDS, explicit FMA, and the OCML bindings LTO-linked from ROCm's bitcode.
 
 use core::arch::amdgpu;
+use rivoli_abi::geom::ELEMENTWISE_BLOCK;
 
 /// `threadIdx.x`.
 #[inline(always)]
@@ -25,9 +26,17 @@ pub fn bid_y() -> u32 {
 /// wrapping, as HIP computes it — read as the C's `int` for the signed bound test.
 #[inline(always)]
 pub fn elementwise_id() -> i32 {
-    bid()
-        .wrapping_mul(rivoli_abi::geom::ELEMENTWISE_BLOCK)
-        .wrapping_add(tid()) as i32
+    bid().wrapping_mul(ELEMENTWISE_BLOCK).wrapping_add(tid()) as i32
+}
+
+/// `body(i)` for the thread's one [`elementwise_id`] when `i < n` — the C's `if (i < n)` /
+/// `if (i >= n) return;`.
+#[inline(always)]
+pub fn elementwise(n: i32, body: impl FnOnce(usize)) {
+    let i = elementwise_id();
+    if i < n {
+        body(i as usize);
+    }
 }
 
 /// The dispatch's dynamic LDS, as `T`. Sized by the launcher's `sharedMemBytes`, which
@@ -84,4 +93,17 @@ pub mod ocml {
         #[link_name = "__ocml_sin_f64"]
         pub safe fn sin(x: f64) -> f64;
     }
+}
+
+/// The block's e4m3 decode table at the base of the dynamic LDS, built by the first 256
+/// threads and barriered — every fp8 kernel's first step (the GEMVs and the MLA pair).
+///
+/// # Safety
+/// The launch requests at least `FP8_LUT_ENTRIES` floats of LDS and has >= 256 threads.
+#[inline(always)]
+pub unsafe fn fp8_lut() -> *mut f32 {
+    let lut = lds::<f32>();
+    crate::prelude::dot_fp8::e4m3_lut_build(lut, tid() as usize);
+    crate::prelude::reduce::sync_threads();
+    lut
 }

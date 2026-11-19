@@ -9,7 +9,7 @@
 //! `__restrict__` on an aliased call is UB the C gets away with by one-read-then-one-write;
 //! Rust raw pointers make no such promise to the optimizer in the first place.
 
-use crate::gpu::{bid, elementwise_id, fma, for_i32, lds, ocml, tid};
+use crate::gpu::{bid, elementwise, fma, for_i32, lds, ocml, tid};
 use crate::prelude::actquant::{
     ACT_QUANT_AMAX_FLOOR, FP8_MAX_INV, act_quant_roundtrip, fast_round_scale,
 };
@@ -24,11 +24,7 @@ use rivoli_abi::kernarg::{ActQuant, Gate, GateClamped, GateSitu, Rope, RowNorm, 
 /// The gated combines' shared shape: `h[i] = f(g[i], u[i])` for the thread's one `i < n`.
 #[inline(always)]
 unsafe fn gate_map(a: Gate, f: impl FnOnce(f32, f32) -> f32) {
-    let i = elementwise_id();
-    if i < a.n {
-        let i = i as usize;
-        *a.h.add(i) = f(*a.g.add(i), *a.u.add(i));
-    }
+    elementwise(a.n, |i| *a.h.add(i) = f(*a.g.add(i), *a.u.add(i)));
 }
 
 #[unsafe(no_mangle)]

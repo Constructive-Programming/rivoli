@@ -1143,7 +1143,8 @@ measured:** with its markers deleted, jscpd found 2 clones:
 So the count stays 9.
 
 *Harness.* Integer outputs (top-k rows, the bf16 cache) are compared byte for byte
-(`Out::Exact`). The top-k scores are tie-heavy by construction (`inputs::topk_scores`).
+(`Out::Exact`; *2026-11-19, Phase 1 integration: now `Out::PoisonBits`/`Out::InPlaceBits`, the
+one integer-output pair three lanes' variants were unified into*). The top-k scores are tie-heavy by construction (`inputs::topk_scores`).
 
 *Plants.* Two launcher-row plants, each with a CPU proof, recorded in `gate-red-proofs.md` §18.
 
@@ -1305,3 +1306,202 @@ with 64-bit index arithmetic per iteration. Rust unrolls it 4× with wider loads
 
 Also outside this lane, for the record: Phase 0's `swiglu_clamped_bf16` (1.135) and
 `situ_glu_f32` (1.137) exceeded 1.05 on this lease.
+
+### Phase 1 L1 (linalg, vmm, headtail, fwd)
+
+**Deviceless half, 2026-11-19 (branch `wave/rk-l1-linalg`, base `933554c`).** All four files
+are deleted and out of `build.rs`'s hipcc list. Device arms: OWED to the GPU lease.
+> **2026-11-19:** the bit-identity arms are paid on the device (the lease below); the
+> oracle-suite battery W, which also exercises the vmm FFI, is still OWED.
+
+- **What moved.** 23 kernels became Rust: `crates/kernels/src/{linalg,fwd,headtail}.rs`
+  (`gemv_fp8`/`_r2`, `gemv_fp8_splitk`/`_r2`, `gemv_i8`/`_r2`, `gemv_f32`/`_r2`, `gemv_i4`,
+  `gemv_vq`, `vq_encode`; `embed_i8_row`, `append_kv`, `gather_rope`, `vadd`, `sigmoid_gate`,
+  `logit_softcap`, `argmax` (the C's `argmax_reduce`, renamed for its launcher), `flag_nonfinite`,
+  `hash_rows`; `embed_bf16_row_bcast`, `hc_head_collapse_gate`/`_blend`). Their 17 launchers are
+  `launch/{linalg,fwd,headtail}.rs` behind `=>` rows. vmm.hip was host-only: `rivoli_vmm_alloc`/
+  `_free` are `hiprt.rs` FFI now, returning a `VmmMapping` instead of filling three
+  out-pointers. `hash_rows` was hand-written in `hip.rs` for an 800-line cap `hip_linalg.rs` no
+  longer presses; it is a `launchers!` row, and the wrapper's `i32` overflow bail is a guard
+  code (1002, now also for a `stride` past `i32` and an `n + stride − 1` that overflows — the C
+  wrapped both silently).
+- **ABI.** The GEMVs share ONE generic argument block, `kernarg::Gemv<W>`, the weight operand
+  `W` the only field the formats differ in (`Scaled`, `*const f32`, `Vq`); `GemvFp8` adds
+  `block`. Block sizes: `GEMV_BLOCK = ROWS_PER_BLOCK · WAVE` (not `geom::ROW_BLOCK`, the norms'
+  tree, which is 256 by coincidence), `ARGMAX_BLOCK`, `HASH_BLOCK`, `HC_HEAD_GATE_BLOCK = WAVE`,
+  `ELEMENTWISE_BLOCK` for the rest. `hash_rows` read `gridDim·blockDim` for its grid stride; the
+  launcher passes it (0c's rule). `append_kv` launches `kvl` threads and reads only `threadIdx`.
+- **Fused sites** were read from the tag's ISA (`hipcc -O3 --cuda-device-only -S`) and are
+  listed with their instructions in each kernel module's header. The one worth repeating:
+  `gemv_i8`'s dword step is `acc + quad` with the quad fused and the accumulate a PLAIN
+  `v_add`, because no scale wraps it (fp8's and int4's are `fma(s, quad, acc)`).
+- **ISA census, hipcc vs Rust, all 23 kernels** (`census.py`-style count of FMA-family ops incl.
+  both VOPD halves, `v_mul_f32`, `v_add_f32`, `v_sub_f32`): **identical in 22**; the 23rd,
+  `hc_head_collapse_blend`, has 5 FMAs to hipcc's 1 because LLVM unrolled its runtime `hc` loop
+  by four — schedule only, the fold stays ascending. Scratch **0 B in all 23** (`llvm-readelf
+  --notes`); VGPRs within one granule of hipcc's everywhere (max 35, `gemv_i4`, hipcc 32).
+  **The scratch check caught one:** threading `gemv_i8`'s accumulators as `&mut [f32; R]` and
+  stepping them with `iter_mut` put 8 B (R=1) / 12 B (R=2) in scratch and moved its FP counts;
+  passing them by value through `from_fn` restored 0 B and the identical census. Other static
+  differences, for the timing arm to price: `argmax`/`hash_rows` unroll their 256-leaf tree
+  (`s_barrier` 2 → 9, the C's `blockDim.x/2` loop became a constant); `hash_rows`' system-scope
+  `fetch_xor` lowers to a `global_atomic_cmpswap_b64` loop where hipcc's agent-scope `atomicXor`
+  is one `global_atomic_xor_b64` (one per block, ≤ 1024 blocks; bits are the same either way);
+  `embed_bf16_row_bcast` unrolls its `hc` stores. (Priced 2026-11-19: see the device lease below.)
+- **Gate rows.** 17 rows (`bit_identity/{linalg,fwd,headtail}.rs`), ≥ 64 seeds, the engine's
+  `i_dim`s at a few dozen rows plus a timed hot shape that fills the machine (a GEMV row's bits
+  depend on `i_dim`, never `o_dim`). Every tail is reached: fp8 `block < 4` and the one-aligned-
+  row `i_dim % 4` tail, the split-K route and its 4096 threshold, int8's scalar tail and
+  misaligned-row fallback, int4's unaligned rows, `append_kv` at `pos` 131071, argmax ties /
+  all-NaN / all-`-inf` / `+inf`, the hash past its 1024-block cap. NaN codes and NaN scales are
+  PLANTED on one seed in eight (a random fp8 code is NaN 2 in 256, which would NaN every 6144-long
+  dot and leave the NaN-class compare nothing to see). New harness pieces: `Out::PoisonBits`/
+  `ZeroBits` (*2026-11-19, integration: `ZeroBits(n)` is now `InPlaceBits(vec![0.0; n])`*) — integer outputs compared bit for bit, never as a NaN class — and `guards()`. Slab
+  outputs (`append_kv`) are sized to row `pos` exactly, the kernel handed the base `pos` rows
+  before it, so the per-side poison sees every element.
+- **Red proofs, CPU first** (`bit_identity/linalg_plants.rs`, deviceless, patches in
+  `tests/bit-identity/plants/{linalg,fwd,headtail}.patch`). *2026-11-19 (integration): the file
+  was `plant_models.rs` on the lane branch; renamed because L3's file of that name landed too.*
+
+  | plant | expect red | CPU (cells moved) |
+  |---|---|---|
+  | `linalg`: `lane_cols` unfused | `gemv_f32`, `gemv_i8` | 64/64 (`gemv_f32` 160×6144); 64/64 (`gemv_i8` scalar-tail rows) |
+  | `fwd`: `sigmoid_gate` as `x / (1+e)` | `sigmoid_gate` | 64/64 at n = 257, 2048, 6144 |
+  | `headtail`: the gate's `lane_dot` unfused | `hc_head_collapse` | 64/64 (seed over s = 1 and 3) |
+
+  **Two first plants were sub-threshold, and the CPU model refused them:** the gate's mix
+  `fma(m, scale, base)` split moved 18/64 cells (the sigmoid swallows it), and `gemv_i8`'s tail
+  counted on one shape's misaligned rows alone moved 40/64. The `fwd` alternative
+  `f2e4m3`'s `fma(a, 512, 0.5)` split was not tried: `a·512` is exact, so it is a no-op by
+  construction (§1's lesson, caught on paper).
+- **Census.** Before main's `LAUNCHED_BY` table (d6a6f1b) the gate-row census was RED on
+  exactly the seven kernels no same-named launcher runs — `gemv_fp8_r2`, `gemv_fp8_splitk`/`_r2`,
+  `gemv_i8_r2`, `gemv_f32_r2`, `hc_head_collapse_gate`/`_blend` — and those are its seven rows
+  now. The table's rule (the launcher's own body names each static) replaced the launchers'
+  `[Kernel; 2]` arrays with one static per instantiation. After the merge: 5/5 censuses green.
+- **Deviceless gates.** jscpd 0 clones (≈ 30 found on the way, removed by restructuring, none
+  exempted — including one against `rivoli_core::num`'s e4m3 oracle); clippy both arms clean;
+  CodeScene 10.0 on every file touched except `hip_attn.rs` (9.68 at the base, two rows edited);
+  `cargo test --workspace --no-default-features --no-fail-fast` on the merged tree: 505 passed,
+  1 failed — the CodeScene test (the 31 base files); docs, hook_guard, kernel_coverage,
+  line_limit and matrix each confirmed RUN and green.
+
+**Device lease, 2026-11-19 (commit `3ab7b71`, the merged tree).** Arms A, Rlinalg, Rfwd and
+Rheadtail ran once each, in that order, detached (`setsid`, own PGID), through
+`tests/bit-identity.sh`. The plant binaries were `3ab7b71` plus
+`tests/bit-identity/plants/<family>.patch`, built outside the lock into a separate target dir
+(`/var/cache/rivoli/scratch/rk-l1-linalg/plant/build.sh`), and the tree was restored, checked
+by `git diff`. **Witness clean on all four:** every witness file 0 B, GTT 17 MiB before each arm
+(as `gpu-witness.sh` prints it), host loadavg 0.6–3.9 on 32 cores. Logs:
+`/var/cache/rivoli/scratch/bit-identity/20261119T123500-2927154` (A), `…/20261119T123727-2934726`
+(Rlinalg), `…/20261119T123956-2943625` (Rfwd), `…/20261119T124219-2953372` (Rheadtail); per-arm
+stdout and `arms.log` in `/var/cache/rivoli/scratch/rk-l1-linalg/gpu/`.
+
+| arm | scripted verdict | rc (script / test binary; 101 expected under `--expect-red`) | wall |
+|---|---|---|---|
+| A | GREEN: 30 of 30 rows BIT-IDENTICAL, NaN-payload-only 0 on every row | 0 / 0 | 147 s |
+| Rlinalg | GREEN (expect-red): exactly `gemv_f32` (196/320 cells, 30346 words) and `gemv_i8` (172/448 cells, 669 words) | 0 / 101 | 149 s |
+| Rfwd | GREEN (expect-red): exactly `sigmoid_gate` (256/320 cells, 405603 words) | 0 / 101 | 143 s |
+| Rheadtail | GREEN (expect-red): exactly `hc_head_collapse` (167/320 cells, 530 words) | 0 / 101 | 141 s |
+
+The 30 rows are Phase 0's 13 plus L1's 17. The 17 reach all 23 L1 kernels: the `_r2` and split-K
+instantiations through the R = 2 and `i_dim >= 4096` shapes, and both `hc_head_collapse` phases
+through its one row. The Phase 0 rows stayed identical through the `gate_map → elementwise`
+refactor. **Still OWED:** the oracle-suite battery (W, script prepared at `…/gpu/W.sh`, dropped
+from this lease by the coordinator to run once on all four lanes' integrated result). The vmm
+host port (`rivoli_vmm_alloc`/`_free`) has no device evidence until then, because no
+bit-identity row reaches it.
+
+**Timing.** Each plant arm leaves every L1 kernel
+unmodified except its planted one, so the four arms are same-code replicates — the A-vs-A
+control Phase 0 said it lacked. The range below is over the arms where the kernel is
+unmodified: 3 arms for `gemv_f32`, `gemv_i8`, `sigmoid_gate` and `hc_head_collapse`, 4 for the
+rest. **No parity band was pre-registered.** The coordinator's brief flags > 1.05. The measured
+cross-arm spread of unmodified ~2 µs rows in this lease is 0.94–1.17, which sits above that line,
+so a verdict on a ~2 µs row below ~1.15 is inside noise.
+
+| kernel (hot shape) | hipcc µs (A) | Rust µs (A) | ratio range | reading |
+|---|---|---|---|---|
+| `gemv_fp8` (2048, 6144, 128, 1) | 31.69 | 32.80 | 1.029–1.168 | 1.029, 1.035 in A/Rlinalg; 1.070 Rheadtail, 1.168 Rfwd: > 1.05 in 2 of 4, no cause sought |
+| `gemv_fp8` split-K (1024, 16384, 128, 1) | 36.31 | 38.49 | 1.017–1.087 | **> 1.05 in 3 of 4** |
+| `gemv_i8` (2048, 6144, 1) | 28.34 | 30.37 | 1.058–1.076 | **slow** |
+| `gemv_i4` (2048, 6144, 1) | 17.36 | 17.13 | 0.947–0.999 | parity |
+| `gemv_vq` (2048, 6144) | 32.87 | 33.53 | 1.015–1.020 | parity |
+| `gemv_f32` (256, 7168, 1) | 42.45 | 46.29 | 1.090–1.104 | **slow** |
+| `vq_encode` 8192 | 117.30 | 188.01 | 1.603–1.622 | **slow** |
+| `embed_bf16_row_bcast` (5, 4096, 4) | 2.13 | 2.13 | 1.000–1.027 | parity |
+| `hc_head_collapse` (1, 4, 4096) | 239.77 | 236.73 | 0.987–0.999 | parity |
+| `embed_i8_row` (5, 6144) | 2.04 | 2.03 | 0.994–1.147 | within the 2 µs spread |
+| `append_kv` (512, 64, 777) | 2.60 | 2.65 | 1.003–1.038 | within the 2 µs spread |
+| `gather_rope` (64, 192, 128, 64) | 2.04 | 2.00 | 0.982–1.118 | within the 2 µs spread |
+| `vadd` 6144 | 2.00 | 2.01 | 0.982–1.141 | within the 2 µs spread |
+| `sigmoid_gate` 6144 | 2.03 | 1.99 | 0.980–0.987 | parity |
+| `logit_softcap` 202048 | 3.95 | 3.82 | 0.942–0.969 | parity |
+| `argmax` 151552 | 86.35 | 85.69 | 0.992–1.007 | parity in all 4 |
+| `flag_nonfinite` 6144 | 2.02 | 2.01 | 0.986–1.133 | within the 2 µs spread |
+| `hash_rows` (6144, 1) | 2.79 | 5.27 | 1.808–1.933 | **slow** |
+
+In Rfwd, the L1 ~2 µs rows `embed_i8_row`, `gather_rope`, `vadd` and `flag_nonfinite` read
+1.118–1.147. In the other three arms they read 0.98–1.04. The Phase 0 gate kernel `swiglu` read
+0.981–1.171 across the four arms, and `attn_res` read 1.046–1.082 (still owed, as before).
+This is the same unexplained ~2 µs swing as Phase 0's merge-review lease, now with replicates.
+
+**Slow rows, read from the ISA** (`llvm-objdump` of the shipped object against the tag's
+`--offload-device-only` object, loop bodies compared). Two compiler-level classes were named by
+the L3/L4 leases. **(a)** `gpu::for_i32`'s wrapping `i32` increment carries no `nsw`, so each
+iteration sign-extends and shifts the index into a 64-bit address, where hipcc strength-reduces
+to pointer increments. **(b)** rustc's LLVM leaves a runtime-count loop rolled that hipcc
+unrolls (or the reverse). **Each cause below is the only loop-body difference found. None was
+ablated, so each is a candidate, not a priced cause.**
+- **`gemv_f32` — (a).** Its lane loop is `for_i32`. Each Rust iteration does `v_ashrrev_i32` +
+  `v_lshlrev_b64` + two 64-bit adds. hipcc's loop increments two pointers by `0x80`. Neither side
+  unrolls, so not (b).
+- **`gemv_i8` — (a), twice.** The scalar tail is `lane_cols` → `for_i32`, the same pattern. The
+  dword loop is this file's own `while base + step <= i_dim`, whose
+  `col = base as usize + lane·4` re-derives the `x` address with a `v_lshlrev_b64` per iteration,
+  where hipcc increments its pointers by `0x80`/`0x200`. That is the same missing-`nsw` class,
+  outside the shared helper.
+- **`vq_encode` — neither class; both sides unroll ×4.** `bk` is a `usize` where the C's is
+  `int`, so every argmin update is two `v_cndmask_b32_e64` instead of one. The `0..VQ_K` usize
+  range keeps `Range::next`'s guarded increment (`k + (k < 0x1000)`, a `v_cmp_gt_u64`) in every
+  unrolled copy. That makes each copy's codebook address depend on the previous compare, which
+  plausibly blocks merging the four rows into hipcc's one `s_load_b512`; Rust issues four
+  `s_load_b128` and four `s_load_b32` instead. Fix candidate: an `i32` counter and an `i32` `bk`,
+  as the C has (applied — see the 2026-11-19 note below).
+- **`hash_rows` — neither class: atomic scope.** Rust's system-scope `AtomicU64::fetch_xor`
+  lowers to a `global_load_b64` + `global_atomic_cmpswap_b64` retry loop, and 24 blocks contend for
+  one address. hipcc's agent-scope `atomicXor` is one `global_atomic_xor_b64`. The unrolled
+  256-leaf tree (`s_barrier` 2 → 9) is the other difference, and these numbers cannot separate the
+  two. `argmax` carries the same tree change at parity, which points to the atomic. The cost is
+  ~2.5 µs over hipcc per call, live only under `--divergence-log`. A fix needs an agent-scope XOR,
+  which `core::sync::atomic` does not expose.
+- **`gemv_fp8` split-K — one difference, unpriced.** The main loop is the prelude's `usize`
+  `for_strided`, with no (a) pattern. hipcc's own loop here carries it (three `v_ashrrev_i32`,
+  two `v_lshlrev_b64` per iteration) and is still faster, so (a) alone is not a sufficient cost
+  model. The loads match. The combine reads the eight partials as `ds_load_2addr_b32` pairs where
+  hipcc uses two `ds_load_b128`. Whether that is the 2–9% is unmeasured.
+
+> **ISA-MATCHED 2026-11-19 (deviceless; bit-identity and timing OWED to the combined branch's
+> device run, still to come):** the two slow rows whose causes were in this lane's own code.
+> Whether these were the 1.06× and 1.61× is unmeasured until that run.
+> - **`vq_encode`:** an `i32` range and an `i32` `bk`, as the C has. The loop now has hipcc's
+>   structure: one `s_load_b512` (four codebook rows) and one `s_load_b128` (four norms) per
+>   unrolled step, one `v_cndmask_b32_e64` per argmin update, no `v_cmp_gt_u64`, and exit on
+>   `s_cmpk_lg_i32 s26, 0x1003`. An `i32` `for` range and a hand-written `i32` counter compile
+>   to the same merged loop (both tried), so the `usize` type was the blocker.
+> - **`gemv_i8`'s dword loop:** a `usize` column stepped beside the `int` bound. The loop no
+>   longer has the per-iteration index sign-extend (`v_ashrrev_i32 …, 31`) or `v_lshlrev_b64`.
+>   The remaining `v_ashrrev_i32 …, 24` is the top-byte decode, and hipcc has it too. `x` is a
+>   pointer bumped by `0x200`, as in hipcc, and the weight offset is a scalar bumped by `0x80`. A
+>   first attempt (an array of advanced pointers) lost `x`'s global address space
+>   (`flat_load_b128`); the ISA read caught that, and it was rejected. The scalar tail is still
+>   `for_i32` (cause (a)), left for the shared helper's change at integration.
+>
+> Bits should not move. That is argued, not gated: both are pure index and type changes over the
+> same addresses, and the FP-op census still matches hipcc for `vq_encode`, `gemv_i8` and
+> `gemv_i8_r2`. Their bit-identity rows are OWED to the same run. Scratch is 0 B. VGPR is 23
+> (was 17; hipcc 24), 19 (was 16; hipcc 18) and 24 (was 21; hipcc 23). Left for the integration
+> perf pass, per the coordinator's brief: `gemv_f32`'s `for_i32`, and `hash_rows`' atomic. An
+> agent-scope XOR needs either inline asm (`global_atomic_xor_b64`, which hides the operation
+> from the compiler) or a `syncscope("agent")` route. `core::sync::atomic` and `core::intrinsics`
+> both lower to the default system scope in nightly 1.102, and no other route was tried.

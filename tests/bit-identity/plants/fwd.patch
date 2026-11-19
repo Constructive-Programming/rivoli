@@ -1,0 +1,11 @@
+--- a/src/fwd.rs
++++ b/src/fwd.rs
+@@ -127,7 +127,7 @@
+ /// `1/(1+exp(-g))`, the division form `torch.sigmoid` computes (the C's note).
+ #[unsafe(no_mangle)]
+ pub unsafe extern "gpu-kernel" fn sigmoid_gate(a: InPlaceBinary) {
+-    elementwise(a.n, |i| *a.x.add(i) *= 1.0 / (1.0 + exp(-*a.y.add(i))));
++    elementwise(a.n, |i| *a.x.add(i) /= 1.0 + exp(-*a.y.add(i))); // PLANT: the gate as a division
+ }
+ 
+ /// Non-finite passes THROUGH (the C's note: laundering ±Inf deletes the argmax detector).

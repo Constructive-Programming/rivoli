@@ -13,8 +13,12 @@ column is a query, and a query can be wrong.
 
 * **Rows.** The `launchers!` DSL rows in `crates/backend/src/{hip_linalg,hip_activation,hip_blocks,hip_attn}.rs`
   (`hip_activation` split out of `hip_linalg` 2026-11-18)
-  (grammar `rust_fn -> c_symbol, "tag" (args)`), plus the four hand-written launchers in
-  `hip.rs`/`hip_attn.rs` that the macro refuses. 66 in total, which is the same population
+  (grammar `rust_fn -> c_symbol, "tag" (args)` for a hipcc kernel, `rust_fn => c_symbol(..)`
+  for a Rust one), plus the one hand-written launcher in `hip_attn.rs` (`gdn_recurrent_f32`)
+  that the macro refuses. (CORRECTED 2026-11-19: four until `hash_rows` (L1) and the two block
+  scorers (L3) became `launchers!` rows when their kernels moved to Rust — the scorers' rows
+  live in `hip.rs`. The TU column names the Rust file for every launcher whose kernel is
+  Rust.) 66 in total, which is the same population
   `kernel_coverage.rs` prints (`66 launchers: 66 with oracles, 0 deferred`, measured by
   `--nocapture` on a deviceless run) — two independent derivations agreeing is the only reason
   the count is stated rather than counted.
@@ -78,16 +82,16 @@ column is a query, and a query can be wrong.
 | `gqa_block_attend` | `gqa_block_attend` | attn/gqa.rs | · | · | · | · | · | *(no production reference)* |
 | `mha_attend` | `mha_attend` | attn/dense.rs | · | · | **✓** | · | · | k3/forward :: mla_attention |
 | `act_quant_f4_rotated` | `act_quant_f4_rotated` | blockindex.rs | · | **✓** | · | · | · | v4/blocksel; v4/kvcompress :: emit, raw_scores |
-| `append_kv` | `append_kv` | fwd.hip | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
-| `argmax` | `argmax` | fwd.hip | **✓** | **✓** | **✓** | **✓** | · | glimmer/forward; glm/decode; k3/decode; v4/decode :: argmax, argmax_rows, sample |
-| `embed_i8_row` | `embed_i8_row` | fwd.hip | **✓** | · | · | · | · | glm/forward :: embed_rows |
-| `flag_nonfinite` | `flag_nonfinite` | fwd.hip | **✓** | · | · | · | · | glm/forward :: embed_rows |
-| `gather_rope` | `gather_rope` | fwd.hip | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
-| `logit_softcap` | `logit_softcap` | fwd.hip | · | · | · | **✓** | · | glimmer/forward :: sample |
-| `sigmoid_gate` | `sigmoid_gate` | fwd.hip | · | · | **✓** | **✓** | · | glimmer/forward; k3/forward :: attention, mla_attention |
-| `vadd` | `vadd` | fwd.hip | **✓** | · | **✓** | **✓** | · | glimmer/forward; glm/attn; glm/mlp; k3/forward :: add_sub_to_pref, branch_add, desc_of, moe_ffn |
-| `embed_bf16_row_bcast` | `embed_bf16_row_bcast` | headtail.hip | · | **✓** | **✓** | **✓** | · | glimmer/forward; k3/forward; v4/forward :: begin_step, embed, rms_vec |
-| `hc_head_collapse` | `hc_head_collapse` | headtail.hip | · | **✓** | · | · | · | v4/forward :: head_tail |
+| `append_kv` | `append_kv` | fwd.rs | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
+| `argmax` | `argmax` | fwd.rs | **✓** | **✓** | **✓** | **✓** | · | glimmer/forward; glm/decode; k3/decode; v4/decode :: argmax, argmax_rows, sample |
+| `embed_i8_row` | `embed_i8_row` | fwd.rs | **✓** | · | · | · | · | glm/forward :: embed_rows |
+| `flag_nonfinite` | `flag_nonfinite` | fwd.rs | **✓** | · | · | · | · | glm/forward :: embed_rows |
+| `gather_rope` | `gather_rope` | fwd.rs | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
+| `logit_softcap` | `logit_softcap` | fwd.rs | · | · | · | **✓** | · | glimmer/forward :: sample |
+| `sigmoid_gate` | `sigmoid_gate` | fwd.rs | · | · | **✓** | **✓** | · | glimmer/forward; k3/forward :: attention, mla_attention |
+| `vadd` | `vadd` | fwd.rs | **✓** | · | **✓** | **✓** | · | glimmer/forward; glm/attn; glm/mlp; k3/forward :: add_sub_to_pref, branch_add, desc_of, moe_ffn |
+| `embed_bf16_row_bcast` | `embed_bf16_row_bcast` | headtail.rs | · | **✓** | **✓** | **✓** | · | glimmer/forward; k3/forward; v4/forward :: begin_step, embed, rms_vec |
+| `hc_head_collapse` | `hc_head_collapse` | headtail.rs | · | **✓** | · | · | · | v4/forward :: head_tail |
 | `index_append` | `index_append` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 | `index_head_route` | `index_head_route` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 | `index_pool_norm_f32` | `index_pool_norm_f32` | indexer.rs | · | · | · | · | · | *(no production reference)* |
@@ -99,12 +103,12 @@ column is a query, and a query can be wrong.
 | `kv_compress_decode` | `kv_compress_decode` | kvcompress.rs | · | **✓** | · | · | · | v4/kvcompress :: emit |
 | `kv_compress_deposit` | `kv_compress_deposit` | kvcompress.rs | · | **✓** | · | · | · | v4/kvcompress :: deposit |
 | `kv_compress_prefill` | `kv_compress_prefill` | kvcompress.rs | · | **✓** | · | · | · | v4/kvcompress :: emit |
-| `gemv_f32` | `gemv_f32` | linalg.hip | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: gate, route_layer |
-| `gemv_fp8` | `gemv_fp8` | linalg.hip | **✓** | · | · | **✓** | · | glimmer/forward; glm/attn; glm/mlp :: desc_of, output_project, proj, qkv_project |
-| `gemv_i4` | `gemv_i4` | linalg.hip | · | · | · | · | · | *(no production reference)* |
-| `gemv_i8` | `gemv_i8` | linalg.hip | **✓** | · | · | · | · | glm/forward :: tail |
-| `gemv_vq` | `gemv_vq` | linalg.hip | · | · | · | · | · | *(no production reference)* |
-| `vq_encode` | `vq_encode` | linalg.hip | · | · | · | · | · | *(no production reference)* |
+| `gemv_f32` | `gemv_f32` | linalg.rs | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: gate, route_layer |
+| `gemv_fp8` | `gemv_fp8` | linalg.rs | **✓** | · | · | **✓** | · | glimmer/forward; glm/attn; glm/mlp :: desc_of, output_project, proj, qkv_project |
+| `gemv_i4` | `gemv_i4` | linalg.rs | · | · | · | · | · | *(no production reference)* |
+| `gemv_i8` | `gemv_i8` | linalg.rs | **✓** | · | · | · | · | glm/forward :: tail |
+| `gemv_vq` | `gemv_vq` | linalg.rs | · | · | · | · | · | *(no production reference)* |
+| `vq_encode` | `vq_encode` | linalg.rs | · | · | · | · | · | *(no production reference)* |
 | `act_quant_f8_prefix` | `act_quant_f8_prefix` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/kvcompress; v4/moe :: emit, output_project, qkv_project, quantize_activation |
 | `gemv_fp8_bf16` | `gemv_fp8_bf16` | mla.rs | · | **✓** | · | · | · | v4/attn; v4/engine :: max_ctx, output_project |
 | `mla_absorb_fp8` | `mla_absorb_fp8` | mla.rs | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
@@ -127,7 +131,7 @@ column is a query, and a query can be wrong.
 | `hc_post` | `hc_post` | residual.rs | · | **✓** | · | · | · | v4/forward :: layer |
 | `hc_pre` | `hc_pre` | residual.rs | · | **✓** | · | · | · | v4/forward :: pre_norm |
 | `gdn_recurrent_f32` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
-| `hash_rows` | `(hand-written)` | *(hand)* | · | · | · | · | · | *(no production reference)* |
+| `hash_rows` | `hash_rows` | fwd.rs | · | · | · | · | · | *(no production reference)* |
 | `index_score_blocks` | `index_score_blocks` | blockindex.rs | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
 | `index_score_blocks_f32` | `index_score_blocks_f32` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 
@@ -149,8 +153,8 @@ in `gate-red-proofs.md` §17 (2026-09-10).
 
 | launcher | TU | category | the evidence |
 |---|---|---|---|
-| `gemv_vq` | linalg.hip | **superseded** | GLM's int3-vq experts run through `moe_expert_range` + `gemv_f32`/`gemv_fp8` (`glm/mlp.rs:558`, `RoutedFmt::Vq3`) |
-| `gemv_i4` | linalg.hip | **superseded** | same shape: `RoutedFmt::I4 => launch_moe_expert_range_i4` (`glm/mlp.rs:555`) |
+| `gemv_vq` | linalg.rs | **superseded** | GLM's int3-vq experts run through `moe_expert_range` + `gemv_f32`/`gemv_fp8` (`glm/mlp.rs:558`, `RoutedFmt::Vq3`) |
+| `gemv_i4` | linalg.rs | **superseded** | same shape: `RoutedFmt::I4 => launch_moe_expert_range_i4` (`glm/mlp.rs:555`) |
 | `index_score` | indexer.rs | **pending M13** | `indexer.hip`'s header (tag `archive/hip-kernels`): "device port of the old int4 tree's indexer, adapted to the fp8 checkpoint… fed straight into the sparse `mla_attend` gather" — and sparse is refused: `SPARSE_ATTN_DEFERRED` at `core/src/legality.rs:360` ("only `--attn dense` decodes today"), with M13's chain deferred wholesale (`wave/m12-glm-chain`, §4) |
 | `index_append` | indexer.rs | **pending M13** | as above |
 | `index_topk` | indexer.rs | **pending M13, and the header argues against itself** | it says "the top-`index_topk` scores are picked host-side", so even the ported flow may not need the kernel form; M13 must answer that, not inherit it |

@@ -20,11 +20,11 @@
 //!
 //! blockDim is never read: each block size is a `geom` constant its launcher launches with.
 
-use crate::gpu::{bid, elementwise_id, fma, for_i32, lds, tid};
+use crate::gpu::{bid, elementwise_id, fma, for_i32, fp8_lut, lds, tid};
 use crate::prelude::actquant::{
     ACT_QUANT_AMAX_FLOOR, FP8_MAX_INV, act_quant_roundtrip, fast_round_scale,
 };
-use crate::prelude::dot_fp8::{FP8_SINGLE_ROW_UNROLL, Fp8Row, dot_fp8_wave_r, e4m3_lut_build};
+use crate::prelude::dot_fp8::{FP8_SINGLE_ROW_UNROLL, Fp8Row, dot_fp8_wave_r};
 use crate::prelude::formats::rbf16;
 use crate::prelude::llvm::maxnum;
 use crate::prelude::reduce::{ROWS_PER_BLOCK, WAVE, block_sum_lds, sync_threads};
@@ -34,15 +34,6 @@ use rivoli_abi::geom::{ROW_BLOCK, absorb_nquad};
 use rivoli_abi::kernarg::{
     ActQuantPrefix, GemvFp8Bf16, MlaAbsorb, MlaValue, QkNorm, RmsNormRows, RopeAdjacent,
 };
-
-/// The block's e4m3 decode table in LDS, built by the first 256 threads and barriered.
-#[inline(always)]
-unsafe fn fp8_lut() -> *mut f32 {
-    let lut = lds::<f32>();
-    e4m3_lut_build(lut, tid() as usize);
-    sync_threads();
-    lut
-}
 
 /// Scale-tile columns of an `n`-column fp8 weight, `ceil(n / block)` in the C's `int`.
 #[inline(always)]

@@ -66,7 +66,7 @@ appears that enum dispatch cannot fill.
   matters when a refactor is meant to be proven caught as well as when one is being avoided.
   **10** regions are exempt via ignore markers (three in the ported frozen V4 oracle,
   where verbatim transcription of the reference is the point; five across the HIP ABI
-  wall, which the 800-line ceiling split into `backend/hip.rs` — its extern declarations
+  wall, which the 800-line ceiling split into `backend/hip.rs` — its scorer rows' parameter lists
   and C-mirroring wrappers (its one hand-written launcher became two `=>` rows 2026-11-19;
   re-measured, the region still exempts 2 clones) — plus one per macro-invocation file,
   `backend/hip_linalg.rs`, `backend/hip_activation.rs`, `backend/hip_blocks.rs` and

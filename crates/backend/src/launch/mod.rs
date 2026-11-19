@@ -3,7 +3,8 @@
 //! Phase 1 lane adds its family's file here.
 //!
 //! Each launcher keeps its C twin's name and return codes (`0`, POSITIVE guard code,
-//! `-(hipError_t)`) exactly, so a `launch_x => rivoli_x(..)` row in a `launchers!`
+//! `-(hipError_t)`) exactly — `rivoli_hash_rows`' 1002 is the one code added, for a `usize`
+//! walk the C's `int`s could not even be handed — so a `launch_x => rivoli_x(..)` row in a `launchers!`
 //! invocation file maps the status unchanged and `crates/engine/tests/bit_identity/` can
 //! compare guard codes against the tagged C launcher it replaces.
 //!
@@ -24,10 +25,16 @@ mod attn;
 pub(crate) use attn::*;
 mod blockindex;
 pub(crate) use blockindex::*;
+mod fwd;
+pub(crate) use fwd::*;
+mod headtail;
+pub(crate) use headtail::*;
 mod indexer;
 pub(crate) use indexer::*;
 mod kvcompress;
 pub(crate) use kvcompress::*;
+mod linalg;
+pub(crate) use linalg::*;
 mod mla;
 pub(crate) use mla::*;
 mod residual;
@@ -74,6 +81,14 @@ unsafe fn run_2d<A: Copy>(k: &Kernel<A>, checked: Checked2, stream: *mut c_void,
 /// `a <= 0 || b <= 0 || …` — the C guards' extent refusal (1001), one call per launcher.
 fn any_nonpositive(extents: &[i32]) -> bool {
     extents.iter().any(|&x| x <= 0)
+}
+
+/// A row gather's refusal (1001: a negative `token`), then [`elementwise`] over its `hidden`.
+fn row_gather(token: i32, hidden: i32) -> Checked {
+    if token < 0 {
+        return Err(1001);
+    }
+    elementwise(i64::from(hidden))
 }
 
 /// `!(x > 0 && x < INFINITY)` — the C guards' one-compare form, which refuses NaN, zero,

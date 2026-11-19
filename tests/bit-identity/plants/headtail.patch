@@ -1,0 +1,11 @@
+--- a/src/headtail.rs
++++ b/src/headtail.rs
+@@ -35,7 +35,7 @@
+ unsafe fn lane_dot(a: *const f32, b: *const f32, n: usize) -> f32 {
+     let mut acc = 0.0f32;
+     for_strided::<1>(tid() as usize, n, WAVE, |i| {
+-        acc = fma(*a.add(i), *b.add(i), acc)
++        acc = *a.add(i) * *b.add(i) + acc // PLANT: the gate dot fma split
+     });
+     acc
+ }

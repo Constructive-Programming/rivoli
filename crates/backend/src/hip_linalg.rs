@@ -14,10 +14,17 @@
 //! Read `hip.rs` first for the DSL, the descriptor structs and the return-code check; the
 //! exemption argument for both invocation files is under this file's opening marker.
 
-use crate::hip::{abi_ty, ensure_hip_status, launchers};
-use crate::launch::{rivoli_gemm_bf16, rivoli_gemv_fp8_bf16};
+use crate::hip::{HashSpan, ensure_hip_status, launchers};
+use crate::launch::{
+    rivoli_argmax, rivoli_embed_bf16_row_bcast, rivoli_embed_i8_row, rivoli_flag_nonfinite,
+    rivoli_gemm_bf16, rivoli_gemv_f32, rivoli_gemv_fp8, rivoli_gemv_fp8_bf16, rivoli_gemv_i4,
+    rivoli_gemv_i8, rivoli_gemv_vq, rivoli_hash_rows, rivoli_vadd, rivoli_vq_encode,
+};
 use anyhow::Result;
-use rivoli_abi::kernarg::{GemmBf16, GemvFp8Bf16};
+use rivoli_abi::kernarg::{
+    Argmax, EmbedBf16, EmbedI8, FlagNonfinite, GemmBf16, Gemv, GemvFp8, GemvFp8Bf16, InPlaceBinary,
+    Scaled, Vq, VqEncode,
+};
 use std::ffi::c_void;
 
 // Doc links only. An intra-doc link resolves in the module it is WRITTEN in, so the moment
@@ -167,7 +174,7 @@ launchers! {
     ///
     /// # Safety
     /// Device pointers live until the next [`device_sync`].
-    launch_gemv_vq -> rivoli_gemv_vq, "gemv_vq" (
+    launch_gemv_vq => rivoli_gemv_vq(Gemv { x, w: Vq { indices, scales, codebook }, y, o_dim: o_dim as i32, i_dim: i_dim as i32 }), "gemv_vq" (
         x: *const f32,
         indices: *const u8,
         scales: *const u16,
@@ -187,7 +194,7 @@ launchers! {
     /// # Safety
     /// Async device pointers live until the next [`device_sync`]: `x` (`nrow·i_dim` f32),
     /// `packed` (`o_dim·i_dim` bytes), `scale` (block-scale f32), `y` (`nrow·o_dim` f32).
-    launch_gemv_fp8 -> rivoli_gemv_fp8, "gemv_fp8" (
+    launch_gemv_fp8 => rivoli_gemv_fp8(GemvFp8 { gemv: Gemv { x, w: Scaled { packed, scale }, y, o_dim: o_dim as i32, i_dim: i_dim as i32 }, block: block as i32 }, nrow as i32), "gemv_fp8" (
         x: *const f32,
         packed: *const u8,
         scale: *const f32,
@@ -234,7 +241,7 @@ launchers! {
     ///
     /// # Safety
     /// Device pointers live until the next [`device_sync`].
-    launch_gemv_i4 -> rivoli_gemv_i4, "gemv_i4" (
+    launch_gemv_i4 => rivoli_gemv_i4(Gemv { x, w: Scaled { packed, scale }, y, o_dim: o_dim as i32, i_dim: i_dim as i32 }), "gemv_i4" (
         x: *const f32,
         packed: *const u8,
         scale: *const f32,
@@ -248,7 +255,7 @@ launchers! {
     /// # Safety
     /// Async device pointers live until the next [`device_sync`]: `x` (`i_dim` f32),
     /// `packed` (`o_dim·i_dim` bytes), `scale` (`o_dim` f32), `y` (`o_dim` f32).
-    launch_gemv_i8 -> rivoli_gemv_i8, "gemv_i8" (
+    launch_gemv_i8 => rivoli_gemv_i8(Gemv { x, w: Scaled { packed, scale }, y, o_dim: o_dim as i32, i_dim: i_dim as i32 }, nrow as i32), "gemv_i8" (
         x: *const f32,
         packed: *const u8,
         scale: *const f32,
@@ -279,7 +286,7 @@ launchers! {
     /// # Safety
     /// Device pointers must outlive `stream`'s completion. `stream` is a live `hipStream_t`, or
     /// null for the default stream.
-    launch_gemv_f32 -> rivoli_gemv_f32, "gemv_f32" (
+    launch_gemv_f32 => rivoli_gemv_f32(Gemv { x, w, y, o_dim: o_dim as i32, i_dim: i_dim as i32 }, nrow as i32, stream), "gemv_f32" (
         x: *const f32,
         w: *const f32,
         o_dim: usize as i32,
@@ -319,7 +326,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `packed` (`≥(token+1)·hidden`
     /// bytes), `scale` (`≥token+1` f32), `x` (`hidden` f32).
-    launch_embed_i8_row -> rivoli_embed_i8_row, "embed_i8_row" (
+    launch_embed_i8_row => rivoli_embed_i8_row(EmbedI8 { packed, scale, x, token: token as i32, hidden: hidden as i32 }), "embed_i8_row" (
         packed: *const u8,
         scale: *const f32,
         token: usize as i32,
@@ -334,7 +341,7 @@ launchers! {
     /// `w` is `>= (token + 1) * hidden` live u16, `x` is `hc * hidden` writable f32, they do not
     /// alias (both are `__restrict__`), and both outlive `stream`'s completion. `stream` is a
     /// live `hipStream_t`, or null for the default stream.
-    launch_embed_bf16_row_bcast -> rivoli_embed_bf16_row_bcast, "embed_bf16_row_bcast" (
+    launch_embed_bf16_row_bcast => rivoli_embed_bf16_row_bcast(EmbedBf16 { w, x, token: token as i32, hidden: hidden as i32, hc: hc as i32 }, stream), "embed_bf16_row_bcast" (
         w: *const u16,
         token: usize as i32,
         hidden: usize as i32,
@@ -355,7 +362,7 @@ launchers! {
     ///
     /// # Safety
     /// `x` and `y` must be device pointers to at least `n` f32.
-    launch_vadd -> rivoli_vadd, "vadd" (
+    launch_vadd => rivoli_vadd(InPlaceBinary { x, y, n: n as i32 }), "vadd" (
         x: *mut f32,
         y: *const f32,
         n: usize as i32,
@@ -367,7 +374,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `logits` (`n` f32),
     /// `out_idx` (one i32), `out_val` (one f32).
-    launch_argmax -> rivoli_argmax, "argmax" (
+    launch_argmax => rivoli_argmax(Argmax { logits, out_idx, out_val, n: n as i32 }), "argmax" (
         logits: *const f32,
         n: usize as i32,
         out_idx: *mut i32,
@@ -382,18 +389,44 @@ launchers! {
     ///
     /// # Safety
     /// `x` must be `n` device f32; `flag` one device u32, zeroed before the run.
-    launch_flag_nonfinite -> rivoli_flag_nonfinite, "flag_nonfinite" (
+    launch_flag_nonfinite => rivoli_flag_nonfinite(FlagNonfinite { x, flag, n: n as i32, tag }), "flag_nonfinite" (
         x: *const f32,
         n: usize as i32,
         tag: u32,
         flag: *mut u32,
     );
 
+    /// XOR-fold the exact bits of `x[0..n]` into `*out` — the `--divergence-log` probe.
+    ///
+    /// The device twin of `rivoli_core::hash::xor_fold`, which carries the argument for why the
+    /// fold is an XOR and adds no sync; `crates/engine/tests/fwd_kernel.rs::
+    /// hash_rows_matches_the_host_fold` scores the two against each other. The walk — count,
+    /// stride, index offset — rides in [`HashSpan`], whose field docs carry what `stride` and
+    /// `i_base` mean. A walk past `i32` is refused (1002): wrapped, `n` would fold a NEGATIVE
+    /// length, which the kernel's guard turns into a no-op and the probe into two runs agreeing
+    /// about a quantity it never hashed. (Hand-written in `hip.rs` until 2026-11-19.)
+    ///
+    /// `stream` is trailing and null is the null stream. On the fetch path it MUST be the fetch
+    /// stream: the folds bracket the bounce->slot copy, and rivoli's streams are
+    /// `hipStreamNonBlocking`, so a null-stream launch would race the copy it is meant to
+    /// bracket.
+    ///
+    /// # Safety
+    /// `x` must be `n` device f32; `out` one device u64, ZEROED before the first fold into it —
+    /// XOR against uninitialised memory is silently wrong, and `hipMalloc` does not zero.
+    /// `stream` must be a live `hipStream_t`, or null.
+    launch_hash_rows => rivoli_hash_rows(x, span, out, stream), "hash_rows" (
+        x: *const f32,
+        span: HashSpan,
+        out: *mut u64,
+        stream: *mut c_void,
+    );
+
     /// Batched VQ encode (offline converter accelerator): `idx[i] = argmin_k …`.
     ///
     /// # Safety
     /// Device pointers live until the next [`device_sync`].
-    launch_vq_encode -> rivoli_vq_encode, "vq_encode" (
+    launch_vq_encode => rivoli_vq_encode(VqEncode { sub, codebook, cbnorm, idx, n: n as i32 }), "vq_encode" (
         sub: *const f32,
         codebook: *const f32,
         cbnorm: *const f32,

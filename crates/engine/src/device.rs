@@ -108,19 +108,10 @@ mod ffi {
         pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
         pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     }
-    // VMM device-local host-fillable allocator (kernels/vmm.hip, in
-    // librivolikernels.a). Gives MTYPE_RW device-bandwidth memory the CPU can fill
-    // in place — see docs/reference/architecture.md §1.
-    unsafe extern "C" {
-        pub fn rivoli_vmm_alloc(
-            size: usize,
-            dev: i32,
-            out_ptr: *mut *mut c_void,
-            out_handle: *mut u64,
-            out_mapped: *mut usize,
-        ) -> i32;
-        pub fn rivoli_vmm_free(ptr: *mut c_void, handle: u64, mapped: usize) -> i32;
-    }
+    // VMM device-local host-fillable allocator — MTYPE_RW device-bandwidth memory the CPU
+    // can fill in place (docs/reference/architecture.md §1). Direct FFI in the backend since
+    // kernels/vmm.hip left the build (2026-11-19).
+    pub use rivoli_backend::hiprt::{rivoli_vmm_alloc, rivoli_vmm_free};
     pub const HIP_MEMCPY_H2D: i32 = 1;
     pub const HIP_MEMCPY_D2H: i32 = 2;
     pub const HIP_SUCCESS: i32 = 0;
@@ -446,27 +437,15 @@ mod tier {
     /// side, which IS measured there: DMA into VMM pages runs 5.66 GB/s against
     /// 12.4 GB/s into the pinned arena.
     pub struct VmmBuf {
-        ptr: *mut u8,
-        handle: u64,
-        mapped: usize, // granularity-rounded size, needed verbatim to free
+        m: rivoli_backend::hiprt::VmmMapping,
     }
 
     impl VmmBuf {
         pub fn new(len: usize) -> Result<Self> {
-            let mut ptr: *mut c_void = std::ptr::null_mut();
-            let mut handle: u64 = 0;
-            let mut mapped: usize = 0;
-            // SAFETY: out-pointers are valid; the shim owns the mapping until free.
-            let e = unsafe { rivoli_vmm_alloc(len, 0, &mut ptr, &mut handle, &mut mapped) };
-            ensure!(
-                e == 0 && !ptr.is_null(),
-                "rivoli_vmm_alloc({len}) failed ({e})"
-            );
-            Ok(Self {
-                ptr: ptr as *mut u8,
-                handle,
-                mapped,
-            })
+            let m = rivoli_vmm_alloc(len, 0)
+                .map_err(|e| anyhow::anyhow!("rivoli_vmm_alloc({len}) failed ({e})"))?;
+            ensure!(!m.ptr.is_null(), "rivoli_vmm_alloc({len}) returned null");
+            Ok(Self { m })
         }
 
         /// Host-writable pointer — the caller fills in place (`pread`/memcpy, or an
@@ -493,7 +472,7 @@ mod tier {
         /// or a fill from a background HIP thread, must re-verify or insert an
         /// explicit fence.
         pub fn ptr_mut(&mut self) -> *mut u8 {
-            self.ptr
+            self.m.ptr.cast::<u8>()
         }
 
         /// The HOST base. Under HIP unified addressing it is the SAME NUMBER as
@@ -506,7 +485,7 @@ mod tier {
         /// unenforced by the type system, so KEEPING the two spellings is what stops the
         /// coincidence from being silently baked into call sites. The ordering rules for
         /// filling through it are on `ptr_mut` above. Spelled as a call to it rather than
-        /// as a second read of `self.ptr`, so the coincidence is stated once.
+        /// as a second read of `self.m.ptr`, so the coincidence is stated once.
         pub fn host_mut(&mut self) -> *mut u8 {
             self.ptr_mut()
         }
@@ -551,8 +530,8 @@ mod tier {
             // Deliberately unreported: a `Drop` cannot return an error, and a device already in
             // a bad state is exactly when the unmap below must still run.
             let _ = rivoli_backend::hip::device_sync();
-            // SAFETY: (ptr,handle,mapped) came from rivoli_vmm_alloc, freed once.
-            unsafe { rivoli_vmm_free(self.ptr as *mut c_void, self.handle, self.mapped) };
+            // SAFETY: `m` came from rivoli_vmm_alloc and is freed once.
+            unsafe { rivoli_vmm_free(self.m) };
         }
     }
 }

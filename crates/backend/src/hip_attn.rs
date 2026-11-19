@@ -23,16 +23,16 @@ use std::ffi::c_void;
 use crate::abi::{CompFinish, CompGeom};
 use crate::hip::{HeadCount, HeadDim, abi_ty, ensure_hip_status, launchers};
 use crate::launch::{
-    Rows, rivoli_gather_attn_shared_kv, rivoli_gqa_attend, rivoli_gqa_block_attend,
-    rivoli_index_append, rivoli_index_head_route, rivoli_index_pool_norm_f32,
-    rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk, rivoli_kv_compress_decode,
-    rivoli_kv_compress_deposit, rivoli_kv_compress_prefill, rivoli_mha_attend,
-    rivoli_mla_absorb_fp8, rivoli_mla_attend, rivoli_mla_value_fp8,
+    Rows, rivoli_append_kv, rivoli_gather_attn_shared_kv, rivoli_gather_rope, rivoli_gqa_attend,
+    rivoli_gqa_block_attend, rivoli_index_append, rivoli_index_head_route,
+    rivoli_index_pool_norm_f32, rivoli_index_pool_push, rivoli_index_score, rivoli_index_topk,
+    rivoli_kv_compress_decode, rivoli_kv_compress_deposit, rivoli_kv_compress_prefill,
+    rivoli_mha_attend, rivoli_mla_absorb_fp8, rivoli_mla_attend, rivoli_mla_value_fp8,
 };
 use rivoli_abi::kernarg::{
-    CompressDecode, CompressPrefill, Deposit, Fp8KvB, GatherAttn, Gqa, GqaBlock, GqaRing,
-    HeadRoute, IndexAppend, IndexScore, MhaAttend, MlaAbsorb, MlaIo, MlaValue, PoolNorm, PoolPush,
-    TopK,
+    AppendKv, CompressDecode, CompressPrefill, Deposit, Fp8KvB, GatherAttn, GatherRope, Gqa,
+    GqaBlock, GqaRing, HeadRoute, IndexAppend, IndexScore, MhaAttend, MlaAbsorb, MlaIo, MlaValue,
+    PoolNorm, PoolPush, TopK,
 };
 
 // Doc links only — see the same block in `hip_linalg.rs` for why these are imports and not
@@ -146,7 +146,7 @@ launchers! {
     /// Device pointers live until the next [`device_sync`]: `latent` (`kvl` f32), `rope`
     /// (`ropn` f32), `lc8`/`lscale`/`rc` the KV slabs (row `pos` in-bounds; `n_blocks =
     /// kvl/128`).
-    launch_append_kv -> rivoli_append_kv, "append_kv" (
+    launch_append_kv => rivoli_append_kv(AppendKv { latent, rope, lc8, lscale, rc, pos: pos as i32, kvl: kvl as i32, ropn: ropn as i32, n_blocks: n_blocks as i32 }), "append_kv" (
         latent: *const f32,
         rope: *const f32,
         lc8: *mut u8,
@@ -163,7 +163,7 @@ launchers! {
     /// # Safety
     /// Device pointers live until the next [`device_sync`]: `q` (`h·qh` f32), `qrope`
     /// (`h·ropn` f32).
-    launch_gather_rope -> rivoli_gather_rope, "gather_rope" (
+    launch_gather_rope => rivoli_gather_rope(GatherRope { q, qrope, h: h as i32, qh: qh as i32, nope: nope as i32, ropn: ropn as i32 }), "gather_rope" (
         q: *const f32,
         qrope: *mut f32,
         h: usize as i32,
@@ -304,7 +304,7 @@ launchers! {
     /// `d` — this signature has no rope argument because the caller concatenates.
     ///
     /// K3's MLA output gate — `attn *= sigmoid(gate)`, between this attend and `o_proj` — is the
-    /// EXISTING [`launch_sigmoid_gate`], not a new launcher; `kernels/fwd.hip` records the M9
+    /// EXISTING [`launch_sigmoid_gate`], not a new launcher; `kernels/fwd.hip` (tag `archive/hip-kernels`) records the M9
     /// decision. The trap-10 twin it must not be confused with is
     /// [`launch_rmsnorm_gate_heads_f32`] below: MLA gates with no norm, KDA norms then gates.
     ///

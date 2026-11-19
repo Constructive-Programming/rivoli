@@ -46,9 +46,12 @@
 mod activation;
 mod attn;
 mod blockindex;
+mod fwd;
 mod gpu;
+mod headtail;
 mod indexer;
 mod kvcompress;
+mod linalg;
 mod mla;
 // The `common.hpp` port (Phase 0b, merged 2026-11-18). `pub` because in a cdylib with
 // `warnings = deny` a private module's not-yet-called helpers (the dot families, `rowview`,

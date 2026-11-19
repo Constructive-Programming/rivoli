@@ -20,8 +20,7 @@ pub(crate) const F32: u32 = 4;
 /// gfx11 is wave32. A kernel that assumes a wave width assumes THIS one.
 pub const WAVE: u32 = 32;
 /// Rows per block for the wave-per-row kernels (the prelude's dot families): 256 threads =
-/// 8 waves = 8 output rows. Device-only until Phase 1's first dot launcher reads it for its
-/// grid — placed here now so that launcher cannot spell its own.
+/// 8 waves = 8 output rows. The GEMV launchers' grid (`ceil(o_dim / ROWS_PER_BLOCK)`).
 pub const ROWS_PER_BLOCK: u32 = 8;
 
 /// `swiglu`, `swiglu_clamped_bf16`, `situ_glu_f32`, `hc_post`, `gated_residual_collapse_f32`:
@@ -32,8 +31,10 @@ pub const ELEMENTWISE_BLOCK: u32 = 256;
 mod activation;
 mod attn;
 mod blockindex;
+mod fwd;
 mod indexer;
 mod kvcompress;
+mod linalg;
 mod mla;
 mod residual;
 mod touch;
@@ -41,8 +42,10 @@ mod touch;
 pub use activation::*;
 pub use attn::*;
 pub use blockindex::*;
+pub use fwd::*;
 pub use indexer::*;
 pub use kvcompress::*;
+pub use linalg::*;
 pub use mla::*;
 pub use residual::*;
 pub use touch::*;

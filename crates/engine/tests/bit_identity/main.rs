@@ -27,10 +27,14 @@
 // Test code: a failed expectation IS the report, so `expect` is the right spelling.
 #![allow(clippy::expect_used)]
 
+mod attn_inputs;
+mod attn_plants;
 mod cells;
 #[path = "../common/mod.rs"]
 mod common;
 mod inputs;
+mod linalg_plants;
+mod plant_models;
 
 #[cfg(feature = "rocm")]
 mod activation;
@@ -38,19 +42,22 @@ mod activation;
 mod attn;
 #[cfg(feature = "rocm")]
 mod attn_gqa;
-mod attn_inputs;
-mod attn_plants;
 #[cfg(feature = "rocm")]
 mod blockindex;
 #[cfg(feature = "rocm")]
 mod device;
 #[cfg(feature = "rocm")]
+mod fwd;
+#[cfg(feature = "rocm")]
+mod headtail;
+#[cfg(feature = "rocm")]
 mod indexer;
 #[cfg(feature = "rocm")]
 mod kvcompress;
 #[cfg(feature = "rocm")]
+mod linalg;
+#[cfg(feature = "rocm")]
 mod mla;
-mod plant_models;
 #[cfg(feature = "rocm")]
 mod probes;
 #[cfg(feature = "rocm")]
@@ -110,6 +117,23 @@ const ROWS: &[Row] = &[
     ("qk_norm", mla::qk_norm),
     ("rope_adjacent", mla::rope_adjacent),
     ("gemv_fp8_bf16", mla::gemv_fp8_bf16),
+    ("gemv_fp8", linalg::gemv_fp8),
+    ("gemv_i8", linalg::gemv_i8),
+    ("gemv_i4", linalg::gemv_i4),
+    ("gemv_vq", linalg::gemv_vq),
+    ("gemv_f32", linalg::gemv_f32),
+    ("vq_encode", linalg::vq_encode),
+    ("embed_bf16_row_bcast", headtail::embed_bf16_row_bcast),
+    ("hc_head_collapse", headtail::hc_head_collapse),
+    ("embed_i8_row", fwd::embed_i8_row),
+    ("append_kv", fwd::append_kv),
+    ("gather_rope", fwd::gather_rope),
+    ("vadd", fwd::vadd),
+    ("sigmoid_gate", fwd::sigmoid_gate),
+    ("logit_softcap", fwd::logit_softcap),
+    ("argmax", fwd::argmax),
+    ("flag_nonfinite", fwd::flag_nonfinite),
+    ("hash_rows", fwd::hash_rows),
 ];
 
 #[cfg(feature = "rocm")]

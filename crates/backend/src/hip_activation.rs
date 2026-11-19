@@ -7,18 +7,18 @@
 //!
 //! Read `hip.rs` first for the DSL, the descriptor structs and the return-code check.
 
-use crate::hip::{abi_ty, ensure_hip_status, launchers};
+use crate::hip::{ensure_hip_status, launchers};
 use crate::launch::{
     Rows, rivoli_act_quant_f4_rotated, rivoli_act_quant_f8, rivoli_act_quant_f8_prefix,
-    rivoli_layernorm, rivoli_qk_norm, rivoli_rmsnorm_batch, rivoli_rmsnorm_centered_single,
-    rivoli_rmsnorm_single, rivoli_rmsnorm_weightless_batch, rivoli_rope_adjacent,
-    rivoli_rope_interleave, rivoli_rope_split_half, rivoli_situ_glu_f32, rivoli_swiglu,
-    rivoli_swiglu_clamped_bf16,
+    rivoli_layernorm, rivoli_logit_softcap, rivoli_qk_norm, rivoli_rmsnorm_batch,
+    rivoli_rmsnorm_centered_single, rivoli_rmsnorm_single, rivoli_rmsnorm_weightless_batch,
+    rivoli_rope_adjacent, rivoli_rope_interleave, rivoli_rope_split_half, rivoli_sigmoid_gate,
+    rivoli_situ_glu_f32, rivoli_swiglu, rivoli_swiglu_clamped_bf16,
 };
 use anyhow::Result;
 use rivoli_abi::kernarg::{
-    ActQuantPrefix, F4Rotate, Gate, GateClamped, GateSitu, LayerNorm, QkNorm, RmsNormRows, Rope,
-    RopeAdjacent, RowNorm, WeightlessNorm,
+    ActQuantPrefix, F4Rotate, Gate, GateClamped, GateSitu, InPlaceBinary, LayerNorm, QkNorm,
+    RmsNormRows, Rope, RopeAdjacent, RowNorm, Softcap, WeightlessNorm,
 };
 use std::ffi::c_void;
 
@@ -159,7 +159,7 @@ launchers! {
     /// USED BY Kimi-K3's gated MLA too (M9): §5's output gate is this same arithmetic at the
     /// same seam — between [`launch_mha_attend`](crate::hip_attn::launch_mha_attend) and
     /// `o_proj` — so the k3 tree's out-of-place copy was deliberately NOT ported
-    /// (`kernels/fwd.hip` records the decision, and trap 10's twin is
+    /// (`kernels/fwd.hip` (tag `archive/hip-kernels`) records the decision, and trap 10's twin is
     /// [`launch_rmsnorm_gate_heads_f32`](crate::hip_attn::launch_rmsnorm_gate_heads_f32),
     /// which norms first and must not be reached for here).
     ///
@@ -172,7 +172,7 @@ launchers! {
     /// live stream ordering every producer of `x` and `g` — this kernel runs BETWEEN the attend
     /// and the o_proj GEMV, so at any stream-ordered call site null is the unordered-read bug,
     /// not a default.
-    launch_sigmoid_gate -> rivoli_sigmoid_gate, "sigmoid_gate" (
+    launch_sigmoid_gate => rivoli_sigmoid_gate(InPlaceBinary { x, y: g, n: n as i32 }, stream), "sigmoid_gate" (
         x: *mut f32,
         g: *const f32,
         n: usize as i32,
@@ -196,7 +196,7 @@ launchers! {
     /// # Safety
     /// `x` is `n` writable f32, live until the next [`device_sync`]; `stream` is null or a live
     /// stream ordering the head GEMV that produced `x`.
-    launch_logit_softcap -> rivoli_logit_softcap, "logit_softcap" (
+    launch_logit_softcap => rivoli_logit_softcap(Softcap { x, n: n as i32, mult, cap }, stream), "logit_softcap" (
         x: *mut f32,
         n: usize as i32,
         mult: f32,
@@ -411,7 +411,7 @@ launchers! {
     /// interchangeable.** Applying one where the other is meant produces fluent wrong text and no
     /// error — `glimmer-architecture.md` §9 trap 9. They are separate entry points rather than one
     /// with a flag precisely so a GLM or V4 call site cannot reach this convention by changing an
-    /// argument; `kernels/linalg.hip` carries the argument, and `swiglu`/`swiglu_clamped_bf16` is
+    /// argument; `kernels/linalg.hip` (tag `archive/hip-kernels`) carries the argument, and `swiglu`/`swiglu_clamped_bf16` is
     /// the precedent.
     ///
     /// # Safety
