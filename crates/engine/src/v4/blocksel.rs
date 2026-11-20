@@ -36,7 +36,7 @@
 //! scored_rows-vs-oracle comparison at equal scores) plus the NLL-smoothness measurement
 //! across the old boundary, never a bitwise selection claim at real depth.
 
-use super::engine::{V4Engine, gemv_fp8};
+use super::engine::{Ceiling, Fp8Bf16Gemv, V4Engine};
 use super::geometry::LayerKind;
 use super::kvcompress::{CompInput, LayerCompressor, narrow_to_bf16};
 use super::select::{
@@ -121,9 +121,9 @@ impl IndexerBank {
         pin: &V4Pin,
         cfg: &V4Config,
         kinds: &[(usize, LayerKind)],
-        max_ctx: usize,
-        max_m: usize,
+        ceil: Ceiling,
     ) -> Result<Option<Self>> {
+        let (max_ctx, max_m) = (ceil.max_ctx(), ceil.max_m());
         if max_ctx < positional_context_limit(cfg.index_topk) {
             return Ok(None);
         }
@@ -203,7 +203,13 @@ impl IndexerBank {
         // that the decode loop visits every position from 0, not anything ingest does. All
         // on the null stream, so ordering holds.
         unsafe {
-            gemv_fp8(q.qrq, q.wq_b, m, (h * hd, q_lora), iq, NULL_STREAM)?;
+            let from_qrq = Fp8Bf16Gemv {
+                x: q.qrq,
+                m,
+                k: q_lora,
+                stream: NULL_STREAM,
+            };
+            from_qrq.proj(q.wq_b, h * hd, iq)?;
             launch_rope_adjacent(
                 iq,
                 q.freqs,

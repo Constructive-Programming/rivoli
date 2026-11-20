@@ -138,6 +138,22 @@ pub fn place_fp8(
     })
 }
 
+/// The tier, tensors and fp8 block a GLM/V4 layer placer passes to [`place_fp8`] — one
+/// parameter for the triple that enters `place_layers`/`place_shared` together, so their
+/// signatures list only what varies (config, layer, range). Built with [`Fp8Source::new`] at
+/// every site so the two `build`s do not repeat a five-line literal.
+pub struct Fp8Source<'a> {
+    pub tier: &'a mut DeviceTier,
+    pub st: &'a Safetensors,
+    pub block: usize,
+}
+
+impl<'a> Fp8Source<'a> {
+    pub fn new(tier: &'a mut DeviceTier, st: &'a Safetensors, block: usize) -> Self {
+        Self { tier, st, block }
+    }
+}
+
 /// Every `*.safetensors` byte in `dir`, optionally skipping one file by name.
 ///
 /// **It is the artifact's own file length, not a second derivation of the placement layout.**

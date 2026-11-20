@@ -18,7 +18,7 @@
 //! every layer, which is one seventh of the FFN and reads as ordinary drift.
 
 use super::ROWS;
-use super::engine::{MOE_ACC_ROWS, V4Engine, desc_of_f4, gemv_fp8};
+use super::engine::{Fp8Bf16Gemv, MOE_ACC_ROWS, V4Engine, desc_of_f4};
 use super::geometry::FP8_BLOCK;
 use crate::device::as_le_bytes;
 use crate::routed::Selection;
@@ -415,15 +415,21 @@ impl V4Engine<'_> {
         let u = self.sh_u.ptr_mut().cast::<f32>();
         let out = self.sub.ptr_mut().cast::<f32>();
         let xq = self.xq.ptr().cast::<f32>();
-        // One loop rather than two spelled-out launches: the two differ ONLY in (weight,
-        // dest), and spelling the other eight arguments twice is how `m`/`inter`/`dim` get
+        let from_xq = Fp8Bf16Gemv {
+            x: xq,
+            m,
+            k: dim,
+            stream,
+        };
+        // One loop rather than two spelled-out launches over the one bound input: the two
+        // differ ONLY in (weight, dest), and spelling the extents twice is how `inter`/`dim` get
         // transposed in one copy and not the other. jscpd does not catch that pair — it is
         // under the token floor — so it is on the reader, and now it is not.
         //
         // SAFETY: `xq` holds `m * dim` fp8-quantized f32; both weights are pin placements
         // outliving this engine; `g` and `u` are `max_m * inter`, three distinct allocations.
         for (w, dst) in [(sh.gate, g), (sh.up, u)] {
-            unsafe { gemv_fp8(xq, w, m, (inter, dim), dst, stream)? };
+            unsafe { from_xq.proj(w, inter, dst)? };
         }
         // SAFETY: `g`/`u` hold `m * inter` live f32 and `out` is `max_m * dim`; the combine is
         // safe in place (each thread reads both operands, then writes once).
@@ -435,7 +441,13 @@ impl V4Engine<'_> {
             launch_act_quant_f8(g, m, inter, stream)?;
             // WRITES the sublayer buffer — does not accumulate into it. See this module's
             // header for why that order is the architecture's and not a convenience.
-            gemv_fp8(g, sh.down, m, (dim, inter), out, stream)?;
+            let from_g = Fp8Bf16Gemv {
+                x: g,
+                m,
+                k: inter,
+                stream,
+            };
+            from_g.proj(sh.down, dim, out)?;
         }
         Ok(())
     }

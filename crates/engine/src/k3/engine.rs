@@ -198,67 +198,87 @@ pub struct K3Engine<'a> {
     pub(super) prof: Phases,
 }
 
+/// [`K3Engine::new`]'s startup refusals, in the order they have always run: the context
+/// ceiling, then the dense-prefix seam, then the partial-artifact warning — so the warning
+/// never precedes a refusal.
+fn admit(pin: &K3Pin, cfg: &K3TextConfig, max_ctx: usize) -> Result<()> {
+    // Checked a second time here (the seam checks at the door): a hand-built caller
+    // never passed the door, and the cache sizing in `layer_states` and the mask's
+    // in `new` assume the ceiling.
+    check_context(max_ctx)?;
+    // The `.f4` range must START at the dense prefix's end: the resident file of a
+    // partial artifact only covers `0..first_dense ∪ range`, and a forward pass has no
+    // residual stream to skip a hole. A short END is a golden-comparison prefix.
+    let moe = pin.moe_layers();
+    ensure!(
+        moe.start == cfg.first_k_dense_replace,
+        "this artifact's experts start at layer {} but the dense prefix ends at {} — \
+         the layers between have no weights anywhere. Convert from layer {}.",
+        moe.start,
+        cfg.first_k_dense_replace,
+        cfg.first_k_dense_replace,
+    );
+    let n_layers = pin.layers();
+    if n_layers < cfg.n_layers {
+        tracing::warn!(
+            "PARTIAL ARTIFACT: layers [0, {n_layers}) of {}. This is NOT the model — \
+             the logits are a prefix's, and any text decoded from them is meaningless.",
+            cfg.n_layers
+        );
+    }
+    Ok(())
+}
+
+/// Every layer's persistent state, allocated in layer order — the KDA recurrent slab and
+/// conv rings, or the MLA caches, by what the pin placed at that layer.
+fn layer_states(pin: &K3Pin, cfg: &K3TextConfig, max_ctx: usize) -> Result<Vec<LayerState>> {
+    let (d, la) = (pin.d, &cfg.linear_attn_config);
+    let f32s = |n: usize| DeviceBuf::new(n * size_of::<f32>());
+    let zeroed = |n: usize| -> Result<DeviceBuf> {
+        let mut b = DeviceBuf::new(n * size_of::<f32>())?;
+        // SAFETY: the fill is the allocation's own byte count, one line above.
+        unsafe { fill_u32(b.ptr_mut(), 0, n * size_of::<f32>())? };
+        Ok(b)
+    };
+    let ch = d.kda_ch;
+    let n_layers = pin.layers();
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        layers.push(match pin.layer(l)?.attn {
+            Attn::Kda(_) => LayerState::Kda {
+                state: f32s(la.num_heads * la.head_dim * la.head_dim)?,
+                win_q: f32s(ch * la.short_conv_kernel_size)?,
+                win_k: f32s(ch * la.short_conv_kernel_size)?,
+                win_v: f32s(ch * la.short_conv_kernel_size)?,
+            },
+            // ZEROED at allocation, once — hipMalloc hands back recycled in-process
+            // memory, and the additive mask only makes an unwritten row unread when its
+            // garbage is FINITE: a NaN/inf K-row poisons pass 2's softmax denominator
+            // (`fmaxf` skips the NaN, `expf(NaN - m)` does not), and `0.0 * inf` in the
+            // V mix is NaN at weight zero. Review 2026-08-16; the reset path still
+            // skips re-zeroing, because rows a PREVIOUS sequence wrote are finite and
+            // the mask genuinely does the rest.
+            Attn::Mla(_) => LayerState::Mla {
+                kc: zeroed(cfg.n_heads * max_ctx * d.q_head)?,
+                vc: zeroed(cfg.n_heads * max_ctx * cfg.v_head_dim)?,
+            },
+        });
+    }
+    Ok(layers)
+}
+
 impl<'a> K3Engine<'a> {
     /// Build the engine over `pin`: allocate every buffer and every layer's persistent
     /// state ONCE.
     pub fn new(pin: K3Pin, cfg: &'a K3TextConfig, max_ctx: usize) -> Result<Self> {
-        // Checked a second time here (the seam checks at the door): a hand-built caller
-        // never passed the door, and the mask/cache sizing below assumes the ceiling.
-        check_context(max_ctx)?;
+        admit(&pin, cfg, max_ctx)?;
         // The widths the PIN was placed under, not a re-derivation — `K3Pin::build` already
         // ran `Dims::from_config` and its refusals.
         let d = pin.d;
         let la = &cfg.linear_attn_config;
-        // The `.f4` range must START at the dense prefix's end: the resident file of a
-        // partial artifact only covers `0..first_dense ∪ range`, and a forward pass has no
-        // residual stream to skip a hole. A short END is a golden-comparison prefix.
-        let moe = pin.moe_layers();
-        ensure!(
-            moe.start == cfg.first_k_dense_replace,
-            "this artifact's experts start at layer {} but the dense prefix ends at {} — \
-             the layers between have no weights anywhere. Convert from layer {}.",
-            moe.start,
-            cfg.first_k_dense_replace,
-            cfg.first_k_dense_replace,
-        );
-        let n_layers = pin.layers();
-        if n_layers < cfg.n_layers {
-            tracing::warn!(
-                "PARTIAL ARTIFACT: layers [0, {n_layers}) of {}. This is NOT the model — \
-                 the logits are a prefix's, and any text decoded from them is meaningless.",
-                cfg.n_layers
-            );
-        }
         let f32s = |n: usize| DeviceBuf::new(n * size_of::<f32>());
-        let zeroed = |n: usize| -> Result<DeviceBuf> {
-            let mut b = DeviceBuf::new(n * size_of::<f32>())?;
-            // SAFETY: the fill is the allocation's own byte count, one line above.
-            unsafe { fill_u32(b.ptr_mut(), 0, n * size_of::<f32>())? };
-            Ok(b)
-        };
         let (hid, ch, ne) = (cfg.hidden, d.kda_ch, cfg.n_experts);
-        let mut layers = Vec::with_capacity(n_layers);
-        for l in 0..n_layers {
-            layers.push(match pin.layer(l)?.attn {
-                Attn::Kda(_) => LayerState::Kda {
-                    state: f32s(la.num_heads * la.head_dim * la.head_dim)?,
-                    win_q: f32s(ch * la.short_conv_kernel_size)?,
-                    win_k: f32s(ch * la.short_conv_kernel_size)?,
-                    win_v: f32s(ch * la.short_conv_kernel_size)?,
-                },
-                // ZEROED at allocation, once — hipMalloc hands back recycled in-process
-                // memory, and the additive mask only makes an unwritten row unread when its
-                // garbage is FINITE: a NaN/inf K-row poisons pass 2's softmax denominator
-                // (`fmaxf` skips the NaN, `expf(NaN - m)` does not), and `0.0 * inf` in the
-                // V mix is NaN at weight zero. Review 2026-08-16; the reset path still
-                // skips re-zeroing, because rows a PREVIOUS sequence wrote are finite and
-                // the mask genuinely does the rest.
-                Attn::Mla(_) => LayerState::Mla {
-                    kc: zeroed(cfg.n_heads * max_ctx * d.q_head)?,
-                    vc: zeroed(cfg.n_heads * max_ctx * cfg.v_head_dim)?,
-                },
-            });
-        }
+        let layers = layer_states(&pin, cfg, max_ctx)?;
         let mut e = Self {
             d,
             layers,
