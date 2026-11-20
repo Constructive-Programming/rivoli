@@ -76,6 +76,12 @@ def preflight_env():
     """
     import transformers
 
+    _refuse_forbidden_packages()
+    _refuse_version_drift(transformers)
+
+
+def _refuse_forbidden_packages():
+    """`preflight_env`'s first half: none of the packages that swap a body may be importable."""
     present = [p for p in FORBIDDEN_PACKAGES if importlib.util.find_spec(p) is not None]
     if present:
         raise SystemExit(
@@ -84,6 +90,10 @@ def preflight_env():
             "  the golden would pin a different implementation and say otherwise. Use a venv\n"
             "  without them."
         )
+
+
+def _refuse_version_drift(transformers):
+    """`preflight_env`'s second half: this env's versions against the vendored golden's own."""
     vendored = sorted(pathlib.Path(__file__).parent.glob("qwen-anchor-decode-*.bin"))
     if not vendored:
         print("qwen-anchor: no vendored golden to check this env against", file=sys.stderr)

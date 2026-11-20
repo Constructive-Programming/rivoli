@@ -31,7 +31,9 @@ use rivoli_backend::hip::{
 use rivoli_engine::device::DeviceBuf;
 use rivoli_engine::v4::geometry::{Geom, KV_QUANT_BLOCK, LayerKind, Quantize};
 use rivoli_engine::v4::select::{Extent, compress_dst};
-use rivoli_oracles::v4oracle::forward::{CompState, CompressorW, Counters, Oracle};
+use rivoli_oracles::v4oracle::forward::{
+    CompSinks, CompState, CompressIn, CompressorW, Counters, Oracle,
+};
 use rivoli_oracles::v4oracle::weights::{Checkpoint, V4Config as OracleV4Config, fixed_bf16};
 use std::ffi::c_void;
 
@@ -249,15 +251,17 @@ impl Cell {
             // reproducible and a rerun compares the same numbers.
             let tag = format!("l{}-s{seqlen}-p{start_pos}", self.layer);
             let x = fixed_bf16(&tag, seqlen * self.dim, 1.0);
-            if let Some(v) = o.compressor(
-                &self.cw,
-                &mut cs,
-                &x,
-                seqlen,
+            let inp = CompressIn {
+                x: &x,
+                s: seqlen,
                 start_pos,
-                o.freqs(self.layer),
-                &mut ctr,
-            ) {
+                freqs: o.freqs(self.layer),
+            };
+            let sinks = CompSinks {
+                st: &mut cs,
+                counters: &mut ctr,
+            };
+            if let Some(v) = o.compressor(&self.cw, inp, sinks) {
                 want.extend_from_slice(&v);
             }
             // ONE draw, handed to both sides. Re-drawing it for the device from the same tag

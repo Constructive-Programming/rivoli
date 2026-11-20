@@ -24,7 +24,7 @@
 
 use rivoli_engine::v4::geometry::LayerKind;
 use rivoli_engine::v4::select::{Extent, Sel, SelRule, scored_rows};
-use rivoli_oracles::v4oracle::forward::{Counters, Defect, LayerCtx, Oracle};
+use rivoli_oracles::v4oracle::forward::{CompSinks, Counters, Defect, IndexerIn, LayerCtx, Oracle};
 use rivoli_oracles::v4oracle::toy;
 use rivoli_oracles::v4oracle::weights::{V4Config, fixed_bf16};
 use std::collections::BTreeSet;
@@ -84,7 +84,6 @@ fn capture_with(prompt: usize, decode_steps: usize) -> (V4Config, Vec<Golden>) {
         let tag = format!("p{start_pos}");
         let x = fixed_bf16(&format!("x-{tag}"), s * cfg.dim, 1.0);
         let qr = fixed_bf16(&format!("qr-{tag}"), s * cfg.q_lora_rank, 1.0);
-        let mut scores = Vec::new();
         let mut ctr = Counters::default();
         let step = LayerCtx {
             lw,
@@ -94,17 +93,17 @@ fn capture_with(prompt: usize, decode_steps: usize) -> (V4Config, Vec<Golden>) {
             input_ids: &[],
             step_tag: &tag,
         };
-        let sel = o.indexer(
-            &step,
-            iw,
-            cs,
-            &x,
-            &qr,
+        let inp = IndexerIn {
+            w: iw,
+            x: &x,
+            qr: &qr,
             offset,
-            o.freqs(LAYER),
-            &mut ctr,
-            &mut scores,
-        );
+        };
+        let sinks = CompSinks {
+            st: &mut *cs,
+            counters: &mut ctr,
+        };
+        let (sel, scores) = o.indexer(&step, inp, sinks);
         assert!(ctr.indexer_ran, "{tag}: the indexer must have run");
         let n_comp = (start_pos + s) / 4;
         assert_eq!(scores.len(), s * n_comp, "{tag}: exported matrix shape");

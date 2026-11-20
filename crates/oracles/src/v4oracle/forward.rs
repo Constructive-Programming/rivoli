@@ -100,6 +100,7 @@ use crate::v4oracle::weights::{V4Config, WMat};
 pub use crate::v4oracle::attention::{compress_topk, window_topk};
 pub use crate::v4oracle::breakages::{Defect, splitk_combine, splitk_fold, wave_ladder};
 pub use crate::v4oracle::capture::{Capture, Counters};
+pub use crate::v4oracle::compress::{CompSinks, CompressIn, IndexerIn};
 pub use crate::v4oracle::head::{HeadRows, HeadTailW};
 pub use crate::v4oracle::layer::{
     CompState, CompressorW, ExpertW, IndexerW, LayerCtx, LayerRings, LayerW,
@@ -424,13 +425,12 @@ impl Oracle {
     /// `RopeAllDims` covers more dims than the table has frequencies, so it cycles the
     /// table. There is no "right" way to be wrong here; cycling is what a kernel written
     /// with the wrong slice bound and the reference's own `freqs_cis` would do.
-    pub(super) fn rope_row(
-        &self,
-        row: &mut [f32],
-        rd: usize,
-        f: (usize, &[(f32, f32)]),
-        inverse: bool,
-    ) {
+    ///
+    /// `rd` is `cfg.rope_head_dim`, read here rather than passed: every caller passed exactly
+    /// that, and an argument that can only take one value is a slot for a wrong one (dropped
+    /// 2026-11-20 under the CodeScene gate's Excess Arguments finding).
+    pub(super) fn rope_row(&self, row: &mut [f32], f: (usize, &[(f32, f32)]), inverse: bool) {
+        let rd = self.cfg.rope_head_dim;
         let (pos, table) = f;
         let len = row.len();
         let (start, n) = match self.defect {

@@ -19,7 +19,7 @@ to it:
     the offsets are `nn.Buffer`s, so they are reachable, but the defects that move them have to
     be applied through the REFERENCE'S OWN `_build_layer_multipliers` and
     `_find_nth_prime_after` rather than through a re-derivation here. That is what
-    `rebuild_ngram_tables` does, and it is the difference between scoring the model and scoring
+    `reseed_`/`reindex_ngram_tables` do, and it is the difference between scoring the model and scoring
     this file's reading of it.
 
 The one place this module transcribes reference code is [`indexer_variant_forward`], and the cost
@@ -38,6 +38,7 @@ with a bit-exact identity gate is a substitution vehicle.
 > including revisions where it would have been wrong to.
 """
 
+import dataclasses
 import math
 
 from qwen_anchor_capture import torch
@@ -431,48 +432,56 @@ def rope_on_tail_dims(orig_rotate_half):
 # The n-gram tables, rebuilt through the reference's own functions.
 
 
-def rebuild_ngram_tables(mdl_mod, model, *, seed=None, ple_layer_index=None, mode=None):
-    """Move the hash by rebuilding its buffers with the REFERENCE'S OWN derivation.
-
-    Three of the five n-gram defect rows are "the derivation was run with the wrong argument",
-    and the only honest way to say that is to run it with the wrong argument:
-    `_build_layer_multipliers(vocab, ngram_size, ple_layer_index, seed)` and
-    `_find_nth_prime_after(base - 1, global_head_idx + 1)` are both module-level in MOD
-    (MOD:986 and MOD:1009). Re-deriving the primes here would score this file's reading of
-    section 5 of `qwen-architecture.md`.
-
-    `mode="round"` is the exception and is not a wrong argument but a wrong RULE: every head
-    reduced modulo `ngram_vocab_size_base` -- the round number the config field is named after
-    -- instead of modulo its own prime. The offsets stay, so the 16 heads collide into
-    overlapping row ranges: plausible-looking output, not a crash.
+def reseed_ngram_tables(mdl_mod, model, seed):
+    """The multipliers re-derived at the wrong `seed`, by the REFERENCE'S OWN
+    `_build_layer_multipliers` (MOD:986) -- re-deriving here would score this file's reading of
+    `qwen-architecture.md` section 5, not the model. One function per n-gram defect since
+    2026-11-20 (was `rebuild_ngram_tables` with three optional keywords, one per caller).
     """
-    for m in model.modules():
-        if type(m).__name__ != "Qwen4ExpTextNGramEmbedding":
-            continue
-        index = m.ple_layer_index if ple_layer_index is None else ple_layer_index
-        if seed is not None or ple_layer_index is not None:
-            m.layer_multipliers.copy_(
-                mdl_mod._build_layer_multipliers(
-                    m.unigram_vocab_size, m.ngram_size, index, m.seed if seed is None else seed
-                ).to(m.layer_multipliers.device)
-            )
-        if ple_layer_index is not None:
-            sizes = [
-                mdl_mod._find_nth_prime_after(m.ngram_vocab_size_base - 1, index * m.ngram_heads + h + 1)
-                for h in range(m.ngram_heads)
-            ]
-            _write_head_tables(m, sizes)
-        if mode == "round":
-            _write_head_tables(m, [m.ngram_vocab_size_base] * m.ngram_heads, keep_offsets=True)
-        if mode == "order_swapped":
-            # Bigram heads are 0..7 and trigram heads 8..15 (MOD:1098-1100, where
-            # `start_idx = (ngram - 2) * heads_per_ngram`). Swapping the two halves of BOTH
-            # tables is the "trigram first" reading, and because every head has its own prime a
-            # swap changes every id.
-            half = m.ngram_heads // 2
-            for buf in (m.ngram_heads_vocab_sizes, m.ngram_heads_offsets):
-                rolled = torch.cat([buf[half:], buf[:half]]).clone()
-                buf.copy_(rolled)
+    for m in _ngram_modules(model):
+        _rebuild_multipliers(mdl_mod, m, m.ple_layer_index, seed)
+
+
+def reindex_ngram_tables(mdl_mod, model, ple_layer_index):
+    """The rebuild at the wrong `ple_layer_index`, which is in BOTH halves: the multipliers'
+    `base_seed`, and the head vocabularies' prime ranks via `_find_nth_prime_after` (MOD:1009)."""
+    for m in _ngram_modules(model):
+        _rebuild_multipliers(mdl_mod, m, ple_layer_index, m.seed)
+        sizes = [
+            mdl_mod._find_nth_prime_after(m.ngram_vocab_size_base - 1, ple_layer_index * m.ngram_heads + h + 1)
+            for h in range(m.ngram_heads)
+        ]
+        _write_head_tables(m, sizes)
+
+
+def round_ngram_heads(model):
+    """A wrong RULE: every head modulo the round `ngram_vocab_size_base` instead of its own prime.
+    The offsets stay, so the heads collide into overlapping rows: plausible output, no crash."""
+    for m in _ngram_modules(model):
+        _write_head_tables(m, [m.ngram_vocab_size_base] * m.ngram_heads, keep_offsets=True)
+
+
+def swap_ngram_orders(model):
+    """Bigram heads are 0..7 and trigram heads 8..15 (MOD:1098-1100, where
+    `start_idx = (ngram - 2) * heads_per_ngram`). Swapping the two halves of BOTH tables is the
+    "trigram first" reading, and because every head has its own prime a swap changes every id."""
+    for m in _ngram_modules(model):
+        half = m.ngram_heads // 2
+        for buf in (m.ngram_heads_vocab_sizes, m.ngram_heads_offsets):
+            rolled = torch.cat([buf[half:], buf[:half]]).clone()
+            buf.copy_(rolled)
+
+
+def _ngram_modules(model):
+    return (m for m in model.modules() if type(m).__name__ == "Qwen4ExpTextNGramEmbedding")
+
+
+def _rebuild_multipliers(mdl_mod, m, index, seed):
+    m.layer_multipliers.copy_(
+        mdl_mod._build_layer_multipliers(m.unigram_vocab_size, m.ngram_size, index, seed).to(
+            m.layer_multipliers.device
+        )
+    )
 
 
 def _write_head_tables(m, sizes, keep_offsets=False):
@@ -560,19 +569,8 @@ def indexer_variant_forward(variant, tap):
 
     def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values):
         batch_size, seq_length, _ = hidden_states.shape
-        hidden_shape = (batch_size, seq_length, -1, self.index_head_dim)
         full_cos, full_sin = position_embeddings
-        current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
-
-        qk = self.index_qk_proj(hidden_states)
-        q, token_k = torch.split(
-            qk,
-            [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim],
-            dim=-1,
-        )
-        q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)
-        q = self.q_layernorm(q)
-        q = _rope(q, current_cos, current_sin, 2)
+        q, raw_keys = _queries_and_keys(self, hidden_states, position_embeddings)
 
         if past_key_values is not None:
             raw_keys = past_key_values.update_indexer(raw_keys, self.layer_idx)
@@ -590,61 +588,129 @@ def indexer_variant_forward(variant, tap):
                 ncb = local.shape[-1] // self.compress_ratio
                 if ncb > 0:
                     flat_visible = local[: ncb * self.compress_ratio]
-                    if variant == "blocks_strided":
-                        block = flat_visible.view(self.compress_ratio, ncb).t().contiguous()
-                    else:
-                        block = flat_visible.view(ncb, self.compress_ratio)
-                    groups = raw_keys[b].index_select(0, block.flatten())
-                    groups = groups.view(*block.shape, self.index_head_dim)
-                    starts = block[:, -1] if variant == "rope_at_block_end" else block[:, 0]
-                    cos = full_cos[b].index_select(0, starts)
-                    sin = full_sin[b].index_select(0, starts)
-                    if variant == "rope_before_pool":
-                        flat = _rope(
-                            groups.reshape(ncb * self.compress_ratio, 1, self.index_head_dim),
-                            full_cos[b].index_select(0, block.flatten()),
-                            full_sin[b].index_select(0, block.flatten()),
-                            1,
-                        )
-                        pooled = flat.view(ncb, self.compress_ratio, self.index_head_dim)
-                        pooled = pooled.float().mean(dim=1).to(raw_keys.dtype)
-                        keys = self.k_layernorm(pooled)
-                    else:
-                        pooled = groups.float().mean(dim=1).to(raw_keys.dtype)
-                        pooled = self.k_layernorm(pooled)
-                        keys = _rope(pooled.unsqueeze(1), cos, sin, 1).squeeze(1)
+                    block = _form_blocks(variant, flat_visible, ncb, self.compress_ratio)
+                    row = _BatchRow(raw_keys[b], full_cos[b], full_sin[b])
+                    keys, starts = _block_keys(variant, self, block, row)
                     scores = torch.matmul(q[b, qi].float(), keys.float().transpose(-1, -2))
                     scores = scores.transpose(-1, -2)
-                    if variant == "relu_after_sum":
-                        scored = torch.relu(scores.sum(dim=-1))
-                    else:
-                        scored = torch.relu(scores).sum(dim=-1)
+                    scored = _head_sum(variant, scores)
                     scores = scored / math.sqrt(self.index_head_dim)
                     picked = scores.topk(min(self.block_topk, ncb), dim=0).indices
                     selected = block.index_select(0, picked).flatten()
-                    _record_scores(tap, self, qi, seq_length, keys, starts, scores)
+                    _record_scores(tap, self, qi == seq_length - 1, _BlockScores(keys, starts, scores))
                 else:
                     selected = torch.tensor([], device=hidden_states.device)
                 tail = local[ncb * self.compress_ratio :]
                 selected = torch.cat([selected, tail]).to(torch.int32)
                 selected_token_indices[b, qi, : selected.numel()] = selected
 
-        kv_length = attention_mask.shape[-1]
-        mask = torch.zeros(
-            (*selected_token_indices.shape[:-1], kv_length + 1),
-            device=attention_mask.device,
-            dtype=torch.bool,
-        )
-        scatter = torch.where(selected_token_indices >= 0, selected_token_indices, kv_length)
-        mask = mask.scatter(-1, scatter, True)[..., :kv_length].unsqueeze(1)
-        if attention_mask.is_floating_point():
-            mask = torch.where(mask, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min)
-        return mask
+        return _selection_mask(selected_token_indices, attention_mask)
 
     return forward
 
 
-def _record_scores(tap, indexer, query_idx, seq_length, keys, starts, scores):
+# Split out of [`indexer_variant_forward`] 2026-11-20 under the CodeScene gate (nesting 4, cc 13,
+# 112 lines): each variant's substitution is one call at the line it replaces; a variant matching
+# no branch gets the reference's line.
+
+
+@dataclasses.dataclass(frozen=True)
+class _BatchRow:
+    """One batch row of the indexer's inputs: its raw keys and its full RoPE tables."""
+
+    raw_keys: object
+    full_cos: object
+    full_sin: object
+
+
+@dataclasses.dataclass(frozen=True)
+class _BlockScores:
+    """The three per-block tensors the reference computes and discards (see `_record_scores`)."""
+
+    keys: object
+    starts: object
+    scores: object
+
+
+def _form_blocks(variant, flat_visible, ncb, ratio):
+    """MOD:673-675's contiguous `.view(ncb, r)`, or `blocks_strided`'s `.view(r, ncb).t()`."""
+    if variant == "blocks_strided":
+        return flat_visible.view(ratio, ncb).t().contiguous()
+    return flat_visible.view(ncb, ratio)
+
+
+def _block_keys(variant, indexer, block, row):
+    """The block keys and the positions they were roped at: pool, norm, then rope at each
+    block's first token (MOD:683-688) -- or a variant's substitution."""
+    groups = row.raw_keys.index_select(0, block.flatten())
+    groups = groups.view(*block.shape, indexer.index_head_dim)
+    starts = block[:, -1] if variant == "rope_at_block_end" else block[:, 0]
+    cos = row.full_cos.index_select(0, starts)
+    sin = row.full_sin.index_select(0, starts)
+    if variant == "rope_before_pool":
+        return _rope_then_pool(indexer, groups, block, row), starts
+    pooled = groups.float().mean(dim=1).to(row.raw_keys.dtype)
+    pooled = indexer.k_layernorm(pooled)
+    return _rope(pooled.unsqueeze(1), cos, sin, 1).squeeze(1), starts
+
+
+def _head_sum(variant, scores):
+    """TR Eq. 15's `sum_h relu(.)`, or `relu_after_sum`'s `relu(sum_h .)`."""
+    if variant == "relu_after_sum":
+        return torch.relu(scores.sum(dim=-1))
+    return torch.relu(scores).sum(dim=-1)
+
+
+def _queries_and_keys(indexer, hidden_states, position_embeddings):
+    """MOD's prologue: `index_qk_proj` split into normed, roped queries and the raw keys."""
+    batch_size, seq_length, _ = hidden_states.shape
+    hidden_shape = (batch_size, seq_length, -1, indexer.index_head_dim)
+    full_cos, full_sin = position_embeddings
+    current_cos, current_sin = full_cos[:, -seq_length:, :], full_sin[:, -seq_length:, :]
+
+    qk = indexer.index_qk_proj(hidden_states)
+    q, token_k = torch.split(
+        qk,
+        [indexer.index_n_heads * indexer.index_head_dim, indexer.index_kv_heads * indexer.index_head_dim],
+        dim=-1,
+    )
+    q, raw_keys = q.reshape(*hidden_shape), token_k.reshape(*hidden_shape).squeeze(2)
+    q = indexer.q_layernorm(q)
+    q = _rope(q, current_cos, current_sin, 2)
+    return q, raw_keys
+
+
+def _rope_then_pool(indexer, groups, block, row):
+    """`rope_before_pool`: rope the raw keys at their own positions, then pool and normalise."""
+    ncb, ratio = block.shape
+    flat = _rope(
+        groups.reshape(ncb * ratio, 1, indexer.index_head_dim),
+        row.full_cos.index_select(0, block.flatten()),
+        row.full_sin.index_select(0, block.flatten()),
+        1,
+    )
+    pooled = flat.view(ncb, ratio, indexer.index_head_dim)
+    pooled = pooled.float().mean(dim=1).to(groups.dtype)
+    return indexer.k_layernorm(pooled)
+
+
+def _selection_mask(selected_token_indices, attention_mask):
+    """The selected positions scattered into a `[.., kv_length]` mask, as a bool mask or an
+    additive float one to match the mask the layer was handed (MOD:705-717)."""
+    kv_length = attention_mask.shape[-1]
+    mask = torch.zeros(
+        (*selected_token_indices.shape[:-1], kv_length + 1),
+        device=attention_mask.device,
+        dtype=torch.bool,
+    )
+    scatter = torch.where(selected_token_indices >= 0, selected_token_indices, kv_length)
+    mask = mask.scatter(-1, scatter, True)[..., :kv_length].unsqueeze(1)
+    if attention_mask.is_floating_point():
+        mask = torch.where(mask, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min)
+    return mask
+
+
+def _record_scores(tap, indexer, is_last_query, tensors):
     """The three tensors the reference computes and throws away, for the LAST query only.
 
     Last query rather than all of them because the tensor COUNT must not be a function of the
@@ -657,12 +723,14 @@ def _record_scores(tap, indexer, query_idx, seq_length, keys, starts, scores):
     the scores and `block_topk`, and the module's own output mask carries it -- which is where
     that row reddens.
     """
-    if query_idx != seq_length - 1 or indexer.layer_idx not in tap.layers or not tap.ctx["capturing"]:
+    if not is_last_query:
+        return
+    if indexer.layer_idx not in tap.layers or not tap.ctx["capturing"]:
         return
     tag = f"model.layers.{indexer.layer_idx}.self_attn.indexer"
-    tap.cap.add(f"{tag}.pooled_keys", keys)
-    tap.cap.add(f"{tag}.block_starts", starts)
-    tap.cap.add(f"{tag}.scores", scores)
+    tap.cap.add(f"{tag}.pooled_keys", tensors.keys)
+    tap.cap.add(f"{tag}.block_starts", tensors.starts)
+    tap.cap.add(f"{tag}.scores", tensors.scores)
 
 
 def _rope(q, cos, sin, unsqueeze_dim):

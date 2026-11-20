@@ -281,6 +281,12 @@ def _gate_first_touch(defect, per):
     if not any(diff for _, diff, _ in per.values()):
         raise SystemExit(f"--defect {defect} changed NOTHING; that is not a defect run")
     first = EXPECT_FIRST_TOUCH[defect]
+    _gate_own_bucket(defect, per, first)
+    _gate_upstream_identical(defect, per, first)
+
+
+def _gate_own_bucket(defect, per, first):
+    """The declared first-touched bucket was captured, and it reddens."""
     if first not in per:
         raise SystemExit(
             f"--defect {defect} declares {first} as its first touched bucket, but nothing "
@@ -292,6 +298,10 @@ def _gate_first_touch(defect, per):
             f"--defect {defect} left its OWN first bucket {first} bit-identical. Either the "
             f"perturbation missed the operator it names, or EXPECT_FIRST_TOUCH is wrong.",
         )
+
+
+def _gate_upstream_identical(defect, per, first):
+    """Every captured bucket strictly before the first-touched one is bit-identical."""
     rank = _bucket_rank(first)
     reddened = [b for b in per if _bucket_rank(b) < rank and per[b][1]]
     if reddened:
