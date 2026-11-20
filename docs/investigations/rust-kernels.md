@@ -2446,7 +2446,7 @@ starts or ends above 10 is reported load-confounded, the verdict given with and 
   the ROCm behaviour, or put the uploads behind an event both MoE streams wait on.
   > **CLOSED 2026-11-20 by citation ("stage_batch ordering" below):** ROCm's synchronous
   > `hipMemcpy` does wait for completion, which is both documented and visible in the source. No
-  > event was added. The device tripwire is pending its lease.
+  > event was added. The device tripwire is PAID 2026-11-20 ("stage_batch ordering" below).
 - The trace-only poison fill inside `submit` (`hipMemsetD32Async` on the null stream) is
   unordered against the fetch write and the miss-stream read of the same slot. Owed: order the
   fill behind the slot's fetch, or argue that the trace's poison may be unordered.
@@ -2521,8 +2521,34 @@ It is the same loop with the upload replaced by a 64 MiB `hash_rows` delay kerne
 reads at EVERY size. The delay is what gives it power at the real sub-KiB sizes, because without
 it a small copy finishes before the reader starts. If a small size reads 0 stale even so (for
 example, if HIP placed both streams on one hardware queue, whose barrier bit would serialise
-them), the fixture fails and says the tripwire has no power at that size. Device arm: **OWED**
+them), the fixture fails and says the tripwire has no power at that size. Device arm: **PAID**
+(see the dated note below).
 (READY-FOR-GPU).
 
 **Decode cost.** Nothing in the decode path changed, so there is no decode A/B to run.
 
+### CodeScene and stage_batch lease (2026-11-20, branch `wave/cs-integrate` @ `d6eb521`)
+
+**CodeScene 1.0.58 green.** Thirty pre-existing files scored below 10 under CLI 1.0.58 (18 of
+46 issues "Excess Number of Function Arguments"). Four lanes refactored them structure-only —
+named parameter structs and newtypes (tuple-packing to dodge the argument count was refused as
+hiding arity), phase-split constructors, flattened test nests, the V4 oracle's compressor and
+indexer split into helpers — with no threshold or config change and no new EXEMPT row. Converter
+output byte-identical (312 files across six converter suites), V4 oracle goldens and the qwen
+anchor's 80 goldens byte-identical, an independent correctness read of the oracle refactor clean.
+`codescene.rs` passes on the integrated tree (deviceless arm 517 passed, 0 failed; the gate
+scored the whole tree in 253 s and its red-proof fixture stayed below 10).
+
+**Device lease** (coordinator-run, 17:59–18:49 +01:00; every witness 0 B, GTT 17.8 MiB before and
+after D and P, nothing compiled inside the lock):
+
+| arm | result |
+|---|---|
+| H, `h2d_ordering` | blocking pageable upload 0 stale reads at all nine sizes (36 B … 16 MiB, 16–256 iterations each); the standing red fixture stale on every iteration at every size (256/256, 16/16) — the tripwire has power and the citation holds on this device |
+| A, bit-identity | GREEN, every row BIT-IDENTICAL, barrier census SAME |
+| W, full battery | 724 passed, 0 failed, 2 ignored — the first fully green battery (CodeScene included); every refactored suite ran |
+| D, determinism (`--arena-refresh`, 1024) | GREEN, identical ids to 1024 |
+| P, parity-glm | GREEN, 32 generated ids identical to the pinned reference |
+
+GLM MoE is correct after the refactors and the stage_batch citation: parity, determinism and
+the battery's GLM suites all green on the integrated tree.
