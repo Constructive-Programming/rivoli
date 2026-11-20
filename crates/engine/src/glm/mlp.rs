@@ -421,6 +421,8 @@ impl GlmEngine<'_> {
         // the end (it did once in the old tree: "len is 8 but the index is 8").
         self.wexpert.extend(std::iter::repeat_n(1.0, nrow));
         self.tickets.push(Ticket::RESIDENT);
+        // No event: `copy_in_at` returns only once the bytes are on the device (its doc
+        // cites HIP and the CLR source), and the experts are enqueued after it returns.
         self.descs_buf.copy_in_at(0, as_le_bytes(&self.descs))?;
         self.wexpert_buf.copy_in_at(0, as_le_bytes(&self.wexpert))?;
         Ok(())
