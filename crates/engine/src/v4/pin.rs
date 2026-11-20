@@ -39,8 +39,8 @@
 use super::geometry::FP8_BLOCK;
 use crate::device::DeviceTier;
 use crate::resident::{
-    Batch, Bf16Weight, Fp8Mlp, Fp8Weight, PinCfg, PoolPlan, dims2, place_bf16, place_f32,
-    place_fp8, safetensors_bytes, stream_units,
+    Batch, Bf16Weight, Fp8Mlp, Fp8Source, Fp8Weight, PinCfg, PoolPlan, dims2, place_bf16,
+    place_f32, place_fp8, safetensors_bytes, stream_units,
 };
 use crate::routed::{RoutedGeom, RoutedPool};
 use anyhow::{Context, Result, ensure};
@@ -451,7 +451,7 @@ impl V4Pin {
         );
         let mut tier = DeviceTier::new(tier_cap)?;
         let g = Globals::place(&mut tier, &st)?;
-        let layers = place_layers(&mut tier, &st, cfg, &range, block)?;
+        let layers = place_layers(Fp8Source::new(&mut tier, &st, block), cfg, &range)?;
         Ok(Self {
             tier,
             embed: g.embed,
@@ -517,12 +517,11 @@ impl Globals {
 /// mutably across the pool construction, and a 90-line layer body inlined there put the
 /// partition arithmetic and the tensor names in one function that scored badly on both.
 fn place_layers(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
+    from: Fp8Source<'_>,
     cfg: &V4Config,
     range: &std::ops::Range<usize>,
-    block: usize,
 ) -> Result<Vec<V4LayerPin>> {
+    let Fp8Source { tier, st, block } = from;
     let mut layers = Vec::with_capacity(range.len());
     for l in range.clone() {
         let lb = format!("layers.{l}");
@@ -565,7 +564,7 @@ fn place_layers(
             route,
             hc_attn: place_hc(tier, st, &format!("{lb}.hc_attn"))?,
             hc_ffn: place_hc(tier, st, &format!("{lb}.hc_ffn"))?,
-            shared: place_shared(tier, st, cfg, l, block)?,
+            shared: place_shared(Fp8Source::new(tier, st, block), cfg, l)?,
             // Driven off the CONFIG, never off `st.has(..)` — the same choice the converter
             // made and for the same reason: a layer whose tensors disagree with
             // `compress_ratios` must fail here, not silently take whichever branch the
@@ -624,13 +623,8 @@ fn place_route(st: &Safetensors, cfg: &V4Config, l: usize, lb: &str) -> Result<G
 /// `e == n_experts` selects `ffn.shared_experts` — the convention `v4_expert_base` owns. The
 /// slot meanings must match [`Fp8Mlp`]'s FIELDS rather than the tensors' names, which is what
 /// `V4_PROJ`'s `[w1, w3, w2]` order carries: gate/up/down against w1/w3/w2.
-fn place_shared(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
-    cfg: &V4Config,
-    l: usize,
-    block: usize,
-) -> Result<Fp8Mlp> {
+fn place_shared(from: Fp8Source<'_>, cfg: &V4Config, l: usize) -> Result<Fp8Mlp> {
+    let Fp8Source { tier, st, block } = from;
     let base = rivoli_artifact::quant::v4_expert_base(l, cfg.n_experts, cfg.n_experts);
     let [w1, w3, w2] = V4_PROJ;
     let mut sh = |p: &str| place_fp8(tier, st, &format!("{base}.{p}"), block);

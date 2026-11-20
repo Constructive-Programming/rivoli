@@ -136,10 +136,10 @@ impl DeviceLayer {
     fn new(
         cfg: &V4Config,
         kind: LayerKind,
-        max_ctx: usize,
-        max_m: usize,
+        ceil: Ceiling,
         cw: Option<&CompressorWeights>,
     ) -> Result<Self> {
+        let (max_ctx, max_m) = (ceil.max_ctx(), ceil.max_m());
         // `max_ctx / ratio` is the reference's own sizing of `kv_cache[:, window_size:]`, and
         // 0 on a ratio-0 layer. `div_ceil` and not `/`: at `max_ctx = 13, ratio = 4` the block
         // completed at position 11 is real and `13 / 4 == 3` sizes the region exactly, but at
@@ -337,68 +337,16 @@ impl<'a> V4Engine<'a> {
     /// [`V4Engine::max_m`] for why this arm has no smaller number to use.
     pub fn new(pin: V4Pin, cfg: &'a V4Config, max_ctx: usize) -> Result<Self> {
         let range = pin.range();
-        // **A decode has to start at layer 0.** `V4Pin::build` deliberately does not enforce
-        // this — which layers a file holds is a property of the LOADER, and refusing a partial
-        // artifact there made every one but the first unloadable — but a forward pass has no
-        // residual stream to enter at layer 3. `V4Pin::layer` takes ABSOLUTE ids, so a pin
-        // over 3..6 answers every lookup correctly and the arithmetic is a different model's,
-        // with nothing anywhere to notice.
-        ensure!(
-            range.start == 0,
-            "this artifact holds layers [{}, {}) and a decode must start at layer 0 — there is \
-             no residual stream to enter the model at layer {}. Convert from layer 0.",
-            range.start,
-            range.end,
-            range.start
-        );
-        // The largest prompt this engine can be handed, and therefore what every `[m, ..]`
-        // buffer is sized for. `max_ctx - 1` and not `max_ctx`: a run that spent the whole
-        // ceiling on its prompt has no room to generate, so `Emit` would stop before the
-        // first token.
-        ensure!(
-            max_ctx >= 2,
-            "--ctx {max_ctx} leaves no room for a prompt and a generated token"
-        );
-        let max_m = max_ctx - 1;
-        if range.end < cfg.n_layers {
-            // Not refused: a short prefix IS what a per-layer golden comparison is for. But
-            // three layers of a 43-layer model is not a decode, and calling it one is a
-            // reading the reference had to retract twice — so it says so, loudly, once.
-            tracing::warn!(
-                "PARTIAL ARTIFACT: layers [0, {}) of {}. This is NOT the model — the logits \
-                 are a {}-layer prefix's, and any text decoded from them is meaningless.",
-                range.end,
-                cfg.n_layers,
-                range.end
-            );
-        }
+        let ceil = admit(&range, cfg, max_ctx)?;
+        let (max_m, idx_cols, a_kv_rows) = (ceil.max_m(), ceil.idx_cols(cfg), ceil.a_kv_rows());
         let dims = Dims::from_config(cfg).context("v4 attention dims from the artifact")?;
         let (dim, hc, hd) = (cfg.hidden, cfg.hc_mult, cfg.head_dim);
         let (nhd, n_desc) = (cfg.n_heads * hd, cfg.n_experts);
         let f32s = |n: usize| DeviceBuf::new(n * size_of::<f32>());
-        // The widest selection any step can ask for: prefill is `m` rows of
-        // `min(m, win) + m/ratio`, decode is one row of `win + max_ctx/ratio`. Taken as the
-        // bound of BOTH rather than assumed to be one of them, and at the tightest ratio
-        // because one buffer serves every layer class.
-        let tightest = tightest_ratio();
-        let idx_cols = cfg.sliding_window + max_ctx.div_ceil(tightest);
-        let a_kv_rows = max_m + max_m.div_ceil(tightest);
-        let mut layers = Vec::with_capacity(range.len());
-        let mut kinds = Vec::with_capacity(range.len());
-        for l in range.clone() {
-            let kind =
-                LayerKind::from_config(cfg, l).with_context(|| format!("classifying layer {l}"))?;
-            // The pin's compressor for this layer, so `LayerCompressor` can narrow its
-            // weights. Read through `V4Pin::layer`, which applies the artifact-order offset
-            // exactly once, and passed rather than looked up again inside — the two answers
-            // (`Geom::attention` and the pin's `Option`) are ASSERTED to agree there.
-            let cw = pin.layer(l)?.compressor;
-            layers.push(DeviceLayer::new(cfg, kind, max_ctx, max_m, cw.as_ref())?);
-            kinds.push((l, kind));
-        }
+        let (layers, kinds) = layer_states(&pin, cfg, ceil)?;
         // The scored-selection bank, built from the same classification the layers were —
         // `None` below the boundary, where its absence IS the below-cap byte-identity.
-        let indexer = IndexerBank::new(&pin, cfg, &kinds, max_ctx, max_m)?;
+        let indexer = IndexerBank::new(&pin, cfg, &kinds, ceil)?;
 
         let mut e = Self {
             dims,
@@ -457,20 +405,25 @@ impl<'a> V4Engine<'a> {
             pin,
             cfg,
         };
-        // The pool is single-format and this arm builds `ExpertDescF4` unconditionally, so a
-        // `.vq3` or `.i4` slot reaching the dispatch would be found at exactly the right
-        // addresses and decoded with the wrong arithmetic: `.f4` and `.i4` tile IDENTICALLY
-        // for a quarter of all `i_dim`, this model's included, so no length, offset or
-        // descriptor check downstream could see it. `V4Pin::build` opens the set as `F4`, so
-        // this cannot fire today — it is here because the consequence if a second FP4
-        // container is ever paired with `.f4` is not a fault.
-        ensure!(
-            e.pin.routed.fmt() == rivoli_artifact::format::RoutedFmt::F4,
-            "the V4 pool resolved a {:?} set and this arm dispatches ExpertDescF4",
-            e.pin.routed.fmt()
-        );
+        e.ensure_f4_dispatch()?;
         e.reset()?;
         Ok(e)
+    }
+
+    /// The pool is single-format and this arm builds `ExpertDescF4` unconditionally, so a
+    /// `.vq3` or `.i4` slot reaching the dispatch would be found at exactly the right
+    /// addresses and decoded with the wrong arithmetic: `.f4` and `.i4` tile IDENTICALLY
+    /// for a quarter of all `i_dim`, this model's included, so no length, offset or
+    /// descriptor check downstream could see it. `V4Pin::build` opens the set as `F4`, so
+    /// this cannot fire today — it is here because the consequence if a second FP4
+    /// container is ever paired with `.f4` is not a fault.
+    fn ensure_f4_dispatch(&self) -> Result<()> {
+        ensure!(
+            self.pin.routed.fmt() == rivoli_artifact::format::RoutedFmt::F4,
+            "the V4 pool resolved a {:?} set and this arm dispatches ExpertDescF4",
+            self.pin.routed.fmt()
+        );
+        Ok(())
     }
 
     /// Clear every layer's persistent state and the accumulator. **Between sequences, not
@@ -516,6 +469,119 @@ impl<'a> V4Engine<'a> {
     }
 }
 
+/// The run's KV ceiling and the whole-prompt row bound it implies — what `DeviceLayer::new`
+/// and `IndexerBank::new` are sized by. `max_m` is derived, never chosen: [`Ceiling::new`] is
+/// the one place that happens, so neither constructor can be handed a `max_m` the ceiling does
+/// not imply.
+#[derive(Clone, Copy)]
+pub(super) struct Ceiling {
+    max_ctx: usize,
+    max_m: usize,
+}
+
+impl Ceiling {
+    fn new(max_ctx: usize) -> Result<Self> {
+        // The largest prompt this engine can be handed, and therefore what every `[m, ..]`
+        // buffer is sized for. `max_ctx - 1` and not `max_ctx`: a run that spent the whole
+        // ceiling on its prompt has no room to generate, so `Emit` would stop before the
+        // first token.
+        ensure!(
+            max_ctx >= 2,
+            "--ctx {max_ctx} leaves no room for a prompt and a generated token"
+        );
+        Ok(Self {
+            max_ctx,
+            max_m: max_ctx - 1,
+        })
+    }
+
+    /// The KV ceiling, in tokens — [`V4Engine::max_ctx`].
+    pub(super) fn max_ctx(self) -> usize {
+        self.max_ctx
+    }
+
+    /// Query rows every `[m, ..]` buffer is sized for — [`V4Engine::max_m`].
+    pub(super) fn max_m(self) -> usize {
+        self.max_m
+    }
+
+    /// Columns of the selection-index buffer: the widest selection any step can ask for.
+    /// Prefill is `m` rows of `min(m, win) + m/ratio`, decode is one row of
+    /// `win + max_ctx/ratio`. Taken as the bound of BOTH rather than assumed to be one of
+    /// them, and at the tightest ratio because one buffer serves every layer class.
+    fn idx_cols(self, cfg: &V4Config) -> usize {
+        cfg.sliding_window + self.max_ctx.div_ceil(tightest_ratio())
+    }
+
+    /// `head_dim` rows of [`V4Engine::a_kv`] before its decode slack: `max_m` prompt rows plus
+    /// their compressed tail, at the tightest ratio for the same one-buffer reason.
+    fn a_kv_rows(self) -> usize {
+        self.max_m + self.max_m.div_ceil(tightest_ratio())
+    }
+}
+
+/// [`V4Engine::new`]'s startup refusals, in the order they have always run: the layer range,
+/// then the ceiling, then the partial-artifact warning — so a run that fails two of them
+/// reports the same one it always did, and the warning never precedes a refusal.
+fn admit(range: &std::ops::Range<usize>, cfg: &V4Config, max_ctx: usize) -> Result<Ceiling> {
+    // **A decode has to start at layer 0.** `V4Pin::build` deliberately does not enforce
+    // this — which layers a file holds is a property of the LOADER, and refusing a partial
+    // artifact there made every one but the first unloadable — but a forward pass has no
+    // residual stream to enter at layer 3. `V4Pin::layer` takes ABSOLUTE ids, so a pin
+    // over 3..6 answers every lookup correctly and the arithmetic is a different model's,
+    // with nothing anywhere to notice.
+    ensure!(
+        range.start == 0,
+        "this artifact holds layers [{}, {}) and a decode must start at layer 0 — there is \
+         no residual stream to enter the model at layer {}. Convert from layer 0.",
+        range.start,
+        range.end,
+        range.start
+    );
+    let ceil = Ceiling::new(max_ctx)?;
+    if range.end < cfg.n_layers {
+        // Not refused: a short prefix IS what a per-layer golden comparison is for. But
+        // three layers of a 43-layer model is not a decode, and calling it one is a
+        // reading the reference had to retract twice — so it says so, loudly, once.
+        tracing::warn!(
+            "PARTIAL ARTIFACT: layers [0, {}) of {}. This is NOT the model — the logits \
+             are a {}-layer prefix's, and any text decoded from them is meaningless.",
+            range.end,
+            cfg.n_layers,
+            range.end
+        );
+    }
+    Ok(ceil)
+}
+
+/// Each layer's ABSOLUTE id and class, in engine order — the shape [`IndexerBank::new`] reads.
+type Classified = Vec<(usize, LayerKind)>;
+
+/// Every layer's persistent state, allocated in layer order, and the classification it was
+/// built from — which [`IndexerBank::new`] is handed next so the bank and the layers cannot
+/// classify a layer two ways.
+fn layer_states(
+    pin: &V4Pin,
+    cfg: &V4Config,
+    ceil: Ceiling,
+) -> Result<(Vec<DeviceLayer>, Classified)> {
+    let range = pin.range();
+    let mut layers = Vec::with_capacity(range.len());
+    let mut kinds = Vec::with_capacity(range.len());
+    for l in range {
+        let kind =
+            LayerKind::from_config(cfg, l).with_context(|| format!("classifying layer {l}"))?;
+        // The pin's compressor for this layer, so `LayerCompressor` can narrow its
+        // weights. Read through `V4Pin::layer`, which applies the artifact-order offset
+        // exactly once, and passed rather than looked up again inside — the two answers
+        // (`Geom::attention` and the pin's `Option`) are ASSERTED to agree there.
+        let cw = pin.layer(l)?.compressor;
+        layers.push(DeviceLayer::new(cfg, kind, ceil, cw.as_ref())?);
+        kinds.push((l, kind));
+    }
+    Ok((layers, kinds))
+}
+
 // `check_context` — the startup refusal of any `--ctx` at or past
 // `positional_context_limit` — was DELETED with M15's scored selection, which is the
 // "the ceiling goes away when the indexer does" its own doc promised. The boundary itself
@@ -523,40 +589,50 @@ impl<'a> V4Engine<'a> {
 // the arm is the pre-M15 one bit for bit), and `Sel::shape` still refuses a POSITIONAL
 // fill past it, because that fill is as wrong as it ever was.
 
-/// A `groups = 1` fp8-e4m3 GEMV with a bf16-rounded output — every projection on this arm
-/// except the grouped output one.
+/// A `groups = 1` fp8-e4m3 GEMV with a bf16-rounded output (`launch_gemv_fp8_bf16`, NOT the
+/// f32-output `launch_gemv_fp8`) — every projection on this arm except the grouped output one.
 ///
-/// One helper for the attention block's nine and the shared expert's three, because they
-/// differ ONLY in `(weight, extents, destination)` and spelling the other six arguments twelve
-/// times is how `m`/`k`/`n_out` get transposed in one copy and not the others. The block size
-/// is the config's, checked equal to [`super::geometry::FP8_BLOCK`] at pin build, so it is
-/// spelled once here rather than read off each weight.
+/// One helper for every attention, indexer and shared-expert projection, because they differ
+/// ONLY in `(activation, weight, extents, destination)` and spelling the rest at every site is
+/// how `m`/`k`/`n_out` get transposed in one copy and not the others. The block size is the
+/// config's, checked equal to [`super::geometry::FP8_BLOCK`] at pin build, so it is spelled
+/// once here rather than read off each weight.
 ///
-/// # Safety
-/// `x` holds `m * k` **already fp8-quantized** f32, `w` is a pin placement, `out` holds
-/// `m * n_out` f32, none aliasing another, all live until `stream` completes.
-pub(super) unsafe fn gemv_fp8(
-    x: *const f32,
-    w: Fp8Weight,
-    m: usize,
-    (n_out, k): (usize, usize),
-    out: *mut f32,
-    stream: *mut std::ffi::c_void,
-) -> Result<()> {
-    // SAFETY: forwarded verbatim from this function's own contract.
-    unsafe {
-        rivoli_backend::launch_gemv_fp8_bf16(
-            x,
-            w.packed,
-            w.scale,
-            m,
-            n_out,
-            k,
-            super::geometry::FP8_BLOCK,
-            1,
-            out,
-            stream,
-        )
+/// The activation side `(x, m, k, stream)` is bound once by NAME and each projection is one
+/// [`Fp8Bf16Gemv::proj`]: one quantized activation feeds several weights, and the one extent
+/// `proj` takes positionally is the only `usize` among its arguments, so no two extents can
+/// trade places silently.
+#[derive(Clone, Copy)]
+pub(super) struct Fp8Bf16Gemv {
+    /// `[m, k]` f32, **already fp8-quantized**.
+    pub(super) x: *const f32,
+    pub(super) m: usize,
+    pub(super) k: usize,
+    pub(super) stream: *mut std::ffi::c_void,
+}
+
+impl Fp8Bf16Gemv {
+    /// `out = x · wᵀ` with `w` read as `[n_out, k]`.
+    ///
+    /// # Safety
+    /// `x` holds `m * k` **already fp8-quantized** f32, `w` is a pin placement, `out` holds
+    /// `m * n_out` f32, none aliasing another, all live until `stream` completes.
+    pub(super) unsafe fn proj(self, w: Fp8Weight, n_out: usize, out: *mut f32) -> Result<()> {
+        // SAFETY: forwarded verbatim from this function's own contract.
+        unsafe {
+            rivoli_backend::launch_gemv_fp8_bf16(
+                self.x,
+                w.packed,
+                w.scale,
+                self.m,
+                n_out,
+                self.k,
+                super::geometry::FP8_BLOCK,
+                1,
+                out,
+                self.stream,
+            )
+        }
     }
 }
 

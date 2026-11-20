@@ -133,63 +133,98 @@ pub struct GlmEngine<'a> {
     pub(super) prof: crate::telemetry::Phases,
 }
 
+/// [`GlmEngine::new`]'s geometry refusals, in the order they have always run — all before
+/// the first device allocation, so a refused config costs no KV slab.
+fn check_geometry(cfg: &ModelConfig) -> Result<()> {
+    // The MoE block folds the shared expert into the routed batch at a single
+    // kernel `inter = moe_inter`. Only valid when the shared expert has the routed
+    // width, i.e. n_shared == 1 (GLM-5.2).
+    ensure!(
+        cfg.n_shared == 1,
+        "GPU decode assumes n_shared==1 (shared folded into the routed batch); \
+         n_shared={}",
+        cfg.n_shared
+    );
+    let kvl = cfg.kv_lora_rank;
+    ensure!(
+        kvl.is_multiple_of(E4M3_BLOCK),
+        "kv_lora_rank ({kvl}) must be a multiple of {E4M3_BLOCK} (fp8 KV block size)",
+    );
+    // `mla_attend` holds its online accumulator in 512 registers per lane and
+    // rejects a wider kvl. Check HERE: the kernel guard would not fire until the
+    // first decoded token, by which point the whole resident pin is allocated.
+    ensure!(
+        kvl <= 512,
+        "kv_lora_rank ({kvl}) exceeds 512, the attend kernel's register-resident \
+         accumulator cap",
+    );
+    Ok(())
+}
+
+/// The per-layer fp8 KV cache — the fields of the same names on [`GlmEngine`], staged.
+struct KvSlabs {
+    latent: Vec<DeviceBuf>,
+    latent_scale: Vec<DeviceBuf>,
+    rope: Vec<DeviceBuf>,
+}
+
+impl KvSlabs {
+    /// Sized to `max_ctx`, because the server sizes its context once and every request fits.
+    fn new(cfg: &ModelConfig, max_ctx: usize, n_kv_blocks: usize) -> Result<Self> {
+        let (kvl, rd) = (cfg.kv_lora_rank, cfg.qk_rope_head_dim);
+        let mut latent = Vec::with_capacity(cfg.n_layers);
+        let mut latent_scale = Vec::with_capacity(cfg.n_layers);
+        let mut rope = Vec::with_capacity(cfg.n_layers);
+        for _ in 0..cfg.n_layers {
+            latent.push(DeviceBuf::new(max_ctx * kvl)?); // e4m3 latent (1 byte)
+            latent_scale.push(DeviceBuf::new(max_ctx * n_kv_blocks * 4)?); // f32 block scales
+            rope.push(DeviceBuf::new(max_ctx * rd * 2)?); // bf16 roped key
+        }
+        Ok(Self {
+            latent,
+            latent_scale,
+            rope,
+        })
+    }
+}
+
+/// Rows the residual stream `x` is allocated for, announced once at startup.
+///
+/// Layer-major prefill keeps the WHOLE prompt's residual stream live across the
+/// model, so `x` has to hold it. `max_ctx` is the honest bound — the server
+/// sizes its context once and every prompt it accepts fits inside it.
+fn announce_residual_rows(cfg: &ModelConfig, max_ctx: usize, layer_major_prefill: bool) -> usize {
+    let x_rows = match layer_major_prefill {
+        true => max_ctx.max(MAXROW),
+        false => MAXROW,
+    };
+    tracing::info!(
+        "residual stream: {x_rows} rows ({:.1} MB){}",
+        (x_rows * cfg.hidden * 4) as f64 / 1e6,
+        match layer_major_prefill {
+            true => " — layer-major prefill",
+            false =>
+                " — token-major prefill (--trace: layer-major mis-segments a \
+                       v2 capture)",
+        }
+    );
+    x_rows
+}
+
 impl<'a> GlmEngine<'a> {
     /// Build the engine over `pin`: allocate every per-token scratch buffer and the KV
     /// slabs ONCE, so the decode loop allocates nothing.
     pub fn new(pin: GlmPin<'a>, cfg: &'a ModelConfig, max_ctx: usize) -> Result<Self> {
         let layer_major_prefill = !pin.routed.tracing();
-        // The MoE block folds the shared expert into the routed batch at a single
-        // kernel `inter = moe_inter`. Only valid when the shared expert has the routed
-        // width, i.e. n_shared == 1 (GLM-5.2).
-        ensure!(
-            cfg.n_shared == 1,
-            "GPU decode assumes n_shared==1 (shared folded into the routed batch); \
-             n_shared={}",
-            cfg.n_shared
-        );
+        check_geometry(cfg)?;
         let (kvl, rope, h) = (cfg.kv_lora_rank, cfg.qk_rope_head_dim, cfg.n_heads);
         // Descriptor slots per MoE launch: the union of every row's picks plus the
         // shared expert. Rows overlap ~31% in practice (measured), so the union is
         // ~13.5 of the 16 the routed half reserves.
         let slots = cfg.top_k * MAXROW + cfg.n_shared;
-        ensure!(
-            kvl.is_multiple_of(E4M3_BLOCK),
-            "kv_lora_rank ({kvl}) must be a multiple of {E4M3_BLOCK} (fp8 KV block size)",
-        );
-        // `mla_attend` holds its online accumulator in 512 registers per lane and
-        // rejects a wider kvl. Check HERE: the kernel guard would not fire until the
-        // first decoded token, by which point the whole resident pin is allocated.
-        ensure!(
-            kvl <= 512,
-            "kv_lora_rank ({kvl}) exceeds 512, the attend kernel's register-resident \
-             accumulator cap",
-        );
         let n_kv_blocks = kvl / E4M3_BLOCK;
-        let mut kv_latent = Vec::with_capacity(cfg.n_layers);
-        let mut kv_latent_scale = Vec::with_capacity(cfg.n_layers);
-        let mut kv_rope = Vec::with_capacity(cfg.n_layers);
-        for _ in 0..cfg.n_layers {
-            kv_latent.push(DeviceBuf::new(max_ctx * kvl)?); // e4m3 latent (1 byte)
-            kv_latent_scale.push(DeviceBuf::new(max_ctx * n_kv_blocks * 4)?); // f32 block scales
-            kv_rope.push(DeviceBuf::new(max_ctx * rope * 2)?); // bf16 roped key
-        }
-        // Layer-major prefill keeps the WHOLE prompt's residual stream live across the
-        // model, so `x` has to hold it. `max_ctx` is the honest bound — the server
-        // sizes its context once and every prompt it accepts fits inside it.
-        let x_rows = match layer_major_prefill {
-            true => max_ctx.max(MAXROW),
-            false => MAXROW,
-        };
-        tracing::info!(
-            "residual stream: {x_rows} rows ({:.1} MB){}",
-            (x_rows * cfg.hidden * 4) as f64 / 1e6,
-            match layer_major_prefill {
-                true => " — layer-major prefill",
-                false =>
-                    " — token-major prefill (--trace: layer-major mis-segments a \
-                           v2 capture)",
-            }
-        );
+        let kv = KvSlabs::new(cfg, max_ctx, n_kv_blocks)?;
+        let x_rows = announce_residual_rows(cfg, max_ctx, layer_major_prefill);
         let f = |n: usize| DeviceBuf::new(n * 4); // f32 buffer of n elems
         Ok(Self {
             cfg,
@@ -233,9 +268,9 @@ impl<'a> GlmEngine<'a> {
                 b.copy_in_at(0, &[0u8; ARGMAX_BYTES])?;
                 b
             },
-            kv_latent,
-            kv_latent_scale,
-            kv_rope,
+            kv_latent: kv.latent,
+            kv_latent_scale: kv.latent_scale,
+            kv_rope: kv.rope,
             n_kv_blocks,
             scores: vec![0.0; cfg.n_experts],
             choice: vec![0.0; cfg.n_experts],

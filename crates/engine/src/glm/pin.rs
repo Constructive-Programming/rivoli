@@ -20,7 +20,8 @@ use crate::device::DeviceTier;
 // three (M8) — same types, same bodies, one home. Re-exported below so every
 // `crate::glm::pin::Fp8Weight` path in this arm is unchanged.
 use crate::resident::{
-    Batch, PinCfg, PoolPlan, dims2, place_f32, place_fp8, safetensors_bytes, stream_units,
+    Batch, Fp8Source, PinCfg, PoolPlan, dims2, place_f32, place_fp8, safetensors_bytes,
+    stream_units,
 };
 use crate::routed::{ExpertSlot, RoutedGeom, RoutedPool, slot_at};
 use anyhow::{Result, ensure};
@@ -229,7 +230,7 @@ impl<'a> GlmPin<'a> {
         let embed = place_i8(&mut tier, &st, "model.embed_tokens.weight")?;
         let lm_head = place_i8(&mut tier, &st, "lm_head.weight")?;
         let final_norm = place_f32(&mut tier, &st, "model.norm.weight")?;
-        let (layers, moe_bias) = place_layers(&mut tier, &st, cfg, &src, block)?;
+        let (layers, moe_bias) = place_layers(Fp8Source::new(&mut tier, &st, block), cfg, &src)?;
 
         let routed = RoutedPool::new(pool, geom)?;
 
@@ -262,12 +263,11 @@ impl<'a> GlmPin<'a> {
 /// `format!`s and the dense/MoE split. Returns the layers and the host-side router
 /// bias, which accrete together because both are per-MoE-layer.
 fn place_layers(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
+    from: Fp8Source<'_>,
     cfg: &ModelConfig,
     src: &ExpertSet,
-    block: usize,
 ) -> Result<(Vec<LayerPin>, Vec<Vec<f32>>)> {
+    let Fp8Source { tier, st, block } = from;
     let off = src.slot_offsets();
     let mut layers = Vec::with_capacity(cfg.n_layers);
     let mut moe_bias = Vec::new();

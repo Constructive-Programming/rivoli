@@ -427,7 +427,7 @@ impl V4Engine<'_> {
         // the compressor advanced with no way to retry the step.
         let persist = compress_dst(kind, win, at);
         let sel = compress_dst(kind, compress_offset(win, at), at);
-        self.check_block_room(layer, li, persist, sel)?;
+        self.check_block_room(layer, persist, sel)?;
 
         let (blocks, src) = self.run_compress(layer, at)?;
         let Some((sel_base, _)) = sel else {
@@ -492,10 +492,12 @@ impl V4Engine<'_> {
     fn check_block_room(
         &self,
         layer: usize,
-        li: usize,
         persist: Option<(usize, usize)>,
         sel: Option<(usize, usize)>,
     ) -> Result<()> {
+        // Derived here rather than passed beside `layer`: it is the caller's own
+        // `layer - range.start`, and a second argument could only disagree with it.
+        let li = layer - self.range.start;
         let Some((persist_base, blocks)) = persist else {
             return Ok(());
         };

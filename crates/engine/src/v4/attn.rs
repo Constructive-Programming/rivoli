@@ -46,7 +46,7 @@
 //! * **`Dims` is validated at entry**, not only at construction: it is `Copy` with public
 //!   fields, so a struct literal or a later assignment skips `from_config` entirely.
 
-use super::engine::{V4Engine, gemv_fp8};
+use super::engine::{Fp8Bf16Gemv, V4Engine};
 use super::geometry::{FP8_BLOCK, KV_QUANT_BLOCK};
 use super::select::{Extent, Sel};
 use crate::device::as_le_bytes;
@@ -244,6 +244,13 @@ impl V4Engine<'_> {
         let (nh, hd, rd, dim) = (d.n_heads, d.head_dim, d.rope_head_dim, d.dim);
         let (q_lora, eps, pos0) = (d.q_lora_rank, d.norm_eps, at.start_pos);
         let fused = if at.is_prefill() { None } else { w.wqkv };
+        // `xq` is projected through the fused qkv, or through `wq_a` and `wkv`.
+        let from_xq = Fp8Bf16Gemv {
+            x: p.xq,
+            m,
+            k: dim,
+            stream: NULL_STREAM,
+        };
         // SAFETY: every pointer is live device scratch or a resident weight for its dims; each
         // launch's inputs are produced by a prior launch on the same (null) stream, so ordering
         // holds. A `Some(wqkv)` caller granted `kv` the `hd + q_lora` floats the fused row
@@ -257,17 +264,23 @@ impl V4Engine<'_> {
                     // — so a `Some` here with a misaligned `head_dim` is unreachable through
                     // `V4Pin::build`.
                     debug_assert!(hd.is_multiple_of(FP8_BLOCK));
-                    gemv_fp8(p.xq, f, m, (hd + q_lora, dim), p.kv, NULL_STREAM)?;
+                    from_xq.proj(f, hd + q_lora, p.kv)?;
                     p.kv.add(hd)
                 }
                 None => {
-                    gemv_fp8(p.xq, w.wq_a, m, (q_lora, dim), p.qr, NULL_STREAM)?;
+                    from_xq.proj(w.wq_a, q_lora, p.qr)?;
                     p.qr
                 }
             };
             launch_rmsnorm_batch(qr, w.q_norm, m, q_lora, eps, NULL_STREAM)?;
             launch_act_quant_f8_prefix(qr, p.qrq, m, q_lora, q_lora, FP8_BLOCK, NULL_STREAM)?;
-            gemv_fp8(p.qrq, w.wq_b, m, (nh * hd, q_lora), p.q, NULL_STREAM)?;
+            // Same rows and stream as `xq`; the q-lora activation the line above quantized.
+            let from_qrq = Fp8Bf16Gemv {
+                x: p.qrq,
+                k: q_lora,
+                ..from_xq
+            };
+            from_qrq.proj(w.wq_b, nh * hd, p.q)?;
             // QK-norm BEFORE the rotary. Read off the reference rather than inferred from a
             // green test: the two orders differ only through a bf16-rounded statistic, so the
             // distance between them measures the ROUNDING scale rather than a defect's reach —
@@ -278,7 +291,7 @@ impl V4Engine<'_> {
             // At a fused decode the kv entry is already at `p.kv`'s base — the concat's kv rows
             // came first precisely so this chain runs unchanged from here down.
             if fused.is_none() {
-                gemv_fp8(p.xq, w.wkv, m, (hd, dim), p.kv, NULL_STREAM)?;
+                from_xq.proj(w.wkv, hd, p.kv)?;
             }
             launch_rmsnorm_batch(p.kv, w.kv_norm, m, hd, eps, NULL_STREAM)?;
             launch_rope_adjacent(p.kv, p.freqs, m, hd, rd, pos0, 1, false, NULL_STREAM)?;
@@ -421,7 +434,13 @@ impl V4Engine<'_> {
                 NULL_STREAM,
             )?;
             launch_act_quant_f8_prefix(p.y, p.y, m, gr, gr, FP8_BLOCK, NULL_STREAM)?;
-            gemv_fp8(p.y, w.wo_b, m, (d.dim, gr), p.out, NULL_STREAM)?;
+            let from_y = Fp8Bf16Gemv {
+                x: p.y,
+                m,
+                k: gr,
+                stream: NULL_STREAM,
+            };
+            from_y.proj(w.wo_b, d.dim, p.out)?;
         }
         Ok(())
     }
