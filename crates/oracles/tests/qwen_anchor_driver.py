@@ -533,37 +533,77 @@ def tolerance_table(directory):
     Runs deviceless over vendored or scratch bytes; no torch.
     """
     root = pathlib.Path(directory)
-    salts = sorted({p.name.split("-None.bin")[0][len("gold-decode-"):] for p in root.glob("gold-decode-*-None.bin")})
-    if not salts:
-        raise SystemExit(f"no gold-decode-<salt>-None.bin under {root}")
+    salts = _salts_under(root)
     floors, weakest = {}, {}
     pairs, fp64_draws = 0, 0
     for salt in salts:
-        base = root / f"gold-decode-{salt}-None.bin"
-        fp64 = root / f"gold-decode-{salt}-fp64.bin"
-        if fp64.exists():
-            fp64_draws += 1
-            for op, rel in operator_scores(base, fp64).items():
-                floors[op] = max(floors.get(op, 0.0), rel)
-        for defect, bucket in EXPECT_FIRST_TOUCH.items():
-            other = root / f"gold-decode-{salt}-{defect}.bin"
-            if not other.exists():
-                continue
-            op = bucket[1]
-            scores = operator_scores(base, other)
-            if op not in scores:
-                # `.get(op, 0.0)` lived here and would have made an operator the golden does not
-                # capture read as a weakest signal of ZERO -- a row that then claims no margin at
-                # all rather than naming the capture that is missing.
-                raise SystemExit(
-                    f"{other.name}: {defect} declares first touch in {op!r}, which this golden "
-                    f"does not capture (has {sorted(scores)}) -- the capture set and "
-                    f"EXPECT_FIRST_TOUCH disagree",
-                )
-            pairs += 1
-            key = (op, defect)
-            weakest[key] = min(weakest.get(key, float("inf")), scores[op])
+        fp64_draws += _fold_floor(root, salt, floors)
+        pairs += _fold_weakest(root, salt, weakest)
     _refuse_a_partial_matrix(root, salts, pairs, fp64_draws)
+    _print_table(salts, pairs, floors, _rows_by_operator(weakest))
+    if len(salts) < 2:
+        raise SystemExit(
+            f"SINGLE DRAW ({salts[0]}): the table above is printed as a diagnostic and is NOT "
+            f"citable. Floors are a max and weakest defects a min over the draws, so one draw "
+            f"gives a table that is wrong in BOTH directions -- measured 2026-09-01, salt 1 "
+            f"alone puts gdn_op's weakest at 4.9262e-2 against the two-draw 1.6102e-2, which at "
+            f"the chunked GDN floor reads as a 523x margin instead of 171x and would have said a "
+            f"chunked prefill kernel can be scored Rel when it cannot.",
+        )
+
+
+def _salts_under(root):
+    """Every weight draw with a `None` golden under `root`, sorted; refused when there is none."""
+    salts = sorted({p.name.split("-None.bin")[0][len("gold-decode-"):] for p in root.glob("gold-decode-*-None.bin")})
+    if not salts:
+        raise SystemExit(f"no gold-decode-<salt>-None.bin under {root}")
+    return salts
+
+
+def _fold_floor(root, salt, floors):
+    """Fold one draw's fp32 rounding floors -- `None` against `fp64` -- into `floors` as a max
+    per operator. Returns 1 if the draw has an fp64 run, else 0."""
+    fp64 = root / f"gold-decode-{salt}-fp64.bin"
+    if not fp64.exists():
+        return 0
+    for op, rel in operator_scores(root / f"gold-decode-{salt}-None.bin", fp64).items():
+        floors[op] = max(floors.get(op, 0.0), rel)
+    return 1
+
+
+def _fold_weakest(root, salt, weakest):
+    """Fold one draw's signal per `(operator, defect)` -- in the operator the defect TARGETS --
+    into `weakest` as a min. Returns how many pairs this draw contributed."""
+    base = root / f"gold-decode-{salt}-None.bin"
+    pairs = 0
+    for defect, bucket in EXPECT_FIRST_TOUCH.items():
+        other = root / f"gold-decode-{salt}-{defect}.bin"
+        if not other.exists():
+            continue
+        op = bucket[1]
+        rel = _targeted_score(other, defect, op, operator_scores(base, other))
+        pairs += 1
+        key = (op, defect)
+        weakest[key] = min(weakest.get(key, float("inf")), rel)
+    return pairs
+
+
+def _targeted_score(other, defect, op, scores):
+    """`scores[op]`, refused when the golden does not capture the operator the row declares."""
+    if op not in scores:
+        # `.get(op, 0.0)` lived here and would have made an operator the golden does not
+        # capture read as a weakest signal of ZERO -- a row that then claims no margin at
+        # all rather than naming the capture that is missing.
+        raise SystemExit(
+            f"{other.name}: {defect} declares first touch in {op!r}, which this golden "
+            f"does not capture (has {sorted(scores)}) -- the capture set and "
+            f"EXPECT_FIRST_TOUCH disagree",
+        )
+    return scores[op]
+
+
+def _rows_by_operator(weakest):
+    """The defect that sets each operator's row: its weakest `(signal, defect)`."""
     per_op = {}
     for (op, defect), rel in weakest.items():
         # The tie is broken by NAME, not by `EXPECT_FIRST_TOUCH`'s dict order. `indexer` has two
@@ -572,6 +612,10 @@ def tolerance_table(directory):
         # made `sets_the_row` a function of the order the table happens to be written in.
         if (rel, defect) < per_op.get(op, (float("inf"), "")):
             per_op[op] = (rel, defect)
+    return per_op
+
+
+def _print_table(salts, pairs, floors, per_op):
     print(
         f"# salts {','.join(salts)} ({len(salts)} draw{'' if len(salts) == 1 else 's'}); "
         f"{pairs} (operator, defect) pairs examined; "
@@ -583,15 +627,6 @@ def tolerance_table(directory):
         rel, defect = per_op[op]
         margin = rel / floor if floor else float("inf")
         print(f"{op}	{floor:.4e}	{rel:.4e}	{margin:.1f}	{defect}")
-    if len(salts) < 2:
-        raise SystemExit(
-            f"SINGLE DRAW ({salts[0]}): the table above is printed as a diagnostic and is NOT "
-            f"citable. Floors are a max and weakest defects a min over the draws, so one draw "
-            f"gives a table that is wrong in BOTH directions -- measured 2026-09-01, salt 1 "
-            f"alone puts gdn_op's weakest at 4.9262e-2 against the two-draw 1.6102e-2, which at "
-            f"the chunked GDN floor reads as a 523x margin instead of 171x and would have said a "
-            f"chunked prefill kernel can be scored Rel when it cannot.",
-        )
 
 
 def _refuse_a_partial_matrix(root, salts, pairs, fp64_draws):
@@ -647,12 +682,18 @@ def _parse_args():
     ap.add_argument("--experts-impl", default="eager", choices=("eager", "grouped_mm"), dest="experts_impl")
     args = ap.parse_args()
     args.capture_layers_parsed = tuple(int(x) for x in args.capture_layers.split(",") if x != "")
-    if args.compare or args.by_operator or args.tolerance_table:
+    if any((args.compare, args.by_operator, args.tolerance_table)):
         return args
-    for req in ("config",) + (() if args.mode in ("gdn-equiv", "moe-equiv", "indexer-identity") else ("out",)):
+    for req in _required_for(args.mode):
         if getattr(args, req) is None:
             ap.error(f"--{req} is required for --mode {args.mode}")
     return args
+
+
+def _required_for(mode):
+    """The arguments a generation run in `mode` needs: `--config` always, `--out` unless the
+    mode is a measurement that writes no golden."""
+    return ("config",) if mode in ("gdn-equiv", "moe-equiv", "indexer-identity") else ("config", "out")
 
 
 _MEASUREMENT_MODES = {

@@ -71,7 +71,9 @@ use rivoli_backend::hip::{
 };
 use rivoli_engine::device::DeviceBuf;
 use rivoli_engine::v4::geometry::{Geom, LayerKind, Quantize};
-use rivoli_oracles::v4oracle::forward::{Counters, Defect, IndexerW, Oracle};
+use rivoli_oracles::v4oracle::forward::{
+    CompSinks, CompressIn, Counters, Defect, IndexerW, Oracle,
+};
 use rivoli_oracles::v4oracle::numerics::{
     bf16_decode, bf16_encode, fp4_act_quant_inplace, hadamard_rotate,
 };
@@ -488,14 +490,21 @@ fn indexer_score_is_bit_identical_on_the_checkpoints_compressed_kv() {
     let o = Oracle::new(c.oracle.clone(), Defect::None);
     let mut cs = o.fresh_state(2).idx_comp.expect("layer 2 has an indexer");
     let mut ctr = Counters::default();
+    let x = fixed_bf16("l2-x", n * c.engine.hidden, 1.0);
+    let inp = CompressIn {
+        x: &x,
+        s: n,
+        start_pos: 0,
+        freqs: o.freqs(2),
+    };
+    let counters = &mut ctr;
     o.compressor(
         &iw.compressor,
-        &mut cs,
-        &fixed_bf16("l2-x", n * c.engine.hidden, 1.0),
-        n,
-        0,
-        o.freqs(2),
-        &mut ctr,
+        inp,
+        CompSinks {
+            st: &mut cs,
+            counters,
+        },
     );
     assert_eq!(
         ctr.compressed_blocks,

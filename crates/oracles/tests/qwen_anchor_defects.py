@@ -26,8 +26,11 @@ should -- rather than only proving that something, somewhere, moved.
 
 from qwen_anchor_capture import torch
 from qwen_anchor_taps import (
-    rebuild_ngram_tables,
+    reindex_ngram_tables,
+    reseed_ngram_tables,
     rope_interleaved_rotate_half,
+    round_ngram_heads,
+    swap_ngram_orders,
 )
 from qwen_anchor_taps import rope_on_tail_dims as _rope_tail_apply
 
@@ -417,7 +420,7 @@ def ngram_seed_wrong(model, mdl_mod, ctx):
     """The multipliers reseeded. `base_seed = seed + 10007 * ple_layer_index` with `seed`
     defaulting to 1234 (CFG:156, absent from the checkpoint), so the seed is a default nobody
     reading the file would find."""
-    rebuild_ngram_tables(mdl_mod, model, seed=model.config.seed + 1)
+    reseed_ngram_tables(mdl_mod, model, model.config.seed + 1)
 
 
 def ple_layer_index_off_by_one(model, mdl_mod, ctx):
@@ -431,21 +434,21 @@ def ple_layer_index_off_by_one(model, mdl_mod, ctx):
     20000213..20000429. Rebuilt through `_build_layer_multipliers` and `_find_nth_prime_after`
     themselves, so what is scored is the reference's derivation at the wrong argument.
     """
-    rebuild_ngram_tables(mdl_mod, model, ple_layer_index=1)
+    reindex_ngram_tables(mdl_mod, model, 1)
 
 
 def ngram_order_swapped(model, mdl_mod, ctx):
     """Bigram heads and trigram heads swapped. Heads 0..7 are bigram and 8..15 trigram
     (MOD:1098-1100, `start_idx = (ngram - 2) * heads_per_ngram`), and because each head owns its
     own prime a swap changes every id."""
-    rebuild_ngram_tables(mdl_mod, model, mode="order_swapped")
+    swap_ngram_orders(model)
 
 
 def ngram_mod_round(model, mdl_mod, ctx):
     """Every head reduced modulo `ngram_vocab_size_base` -- the round 20,000,000 the config field
     is named after -- instead of modulo its own prime. The offsets stay, so the heads collide
     into overlapping row ranges: plausible-looking output, not a crash."""
-    rebuild_ngram_tables(mdl_mod, model, mode="round")
+    round_ngram_heads(model)
 
 
 def ngram_mix_add(model, mdl_mod, ctx):

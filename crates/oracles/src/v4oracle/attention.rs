@@ -23,7 +23,9 @@
 //! that moved, and `forward.rs` re-exports both, so every existing
 //! `v4oracle::forward::{window_topk, compress_topk}` path still resolves.
 
-use crate::v4oracle::forward::{Capture, Defect, LayerCtx, LayerRings, Oracle};
+use crate::v4oracle::forward::{
+    Capture, CompSinks, CompressIn, Defect, IndexerIn, LayerCtx, LayerRings, Oracle,
+};
 
 /// `[[f(t, j) for j in range(cols)] for t in range(seqlen)]` — the shape BOTH prefill
 /// comprehensions in `model.py` have, and nothing else.
@@ -246,7 +248,7 @@ impl Oracle {
     fn attn_q(&self, step: &LayerCtx, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let (lw, layer, s, start_pos) = (step.lw, step.layer, step.s, step.start_pos);
         let c = &self.cfg;
-        let (rd, d, nh) = (c.rope_head_dim, c.head_dim, c.n_heads);
+        let (d, nh) = (c.head_dim, c.n_heads);
         let freqs = self.freqs(layer);
         let mut qr = self.linear(x, s, &lw.wq_a);
         self.round_bf16(&mut qr);
@@ -263,7 +265,7 @@ impl Oracle {
         }
         for i in 0..s * nh {
             let row = &mut q[i * d..(i + 1) * d];
-            self.rope_row(row, rd, (start_pos + i / nh, freqs), false);
+            self.rope_row(row, (start_pos + i / nh, freqs), false);
         }
         if after {
             self.qk_norm(&mut q, d, &lw.q_norm);
@@ -282,7 +284,7 @@ impl Oracle {
         self.rmsnorm(&mut kv, d, &lw.kv_norm);
         for t in 0..s {
             let row = &mut kv[t * d..(t + 1) * d];
-            self.rope_row(row, rd, (start_pos + t, freqs), false);
+            self.rope_row(row, (start_pos + t, freqs), false);
             self.kv_act_quant(row, d, rd);
         }
         kv
@@ -325,19 +327,17 @@ impl Oracle {
         let Some((iw, ics)) = lw.indexer.as_ref().zip(sk.st.idx_comp.as_mut()) else {
             return compress_topk(self.cfg.compress_ratio(layer), s, start_pos, offset);
         };
-        let (freqs, cnt) = (self.freqs(layer), &mut sk.cap.counters);
-        let mut scores = Vec::new();
-        let e = self.indexer(
-            step,
-            iw,
-            ics,
-            act.x,
-            act.qr,
+        let inp = IndexerIn {
+            w: iw,
+            x: act.x,
+            qr: act.qr,
             offset,
-            freqs,
-            cnt,
-            &mut scores,
-        );
+        };
+        let sinks = CompSinks {
+            st: ics,
+            counters: &mut sk.cap.counters,
+        };
+        let (e, scores) = self.indexer(step, inp, sinks);
         let rows = if scores.is_empty() { 0 } else { s };
         let cols = scores.len().checked_div(rows).unwrap_or(0);
         let tag = format!("{}.indexer_scores", step.tag());
@@ -383,8 +383,14 @@ impl Oracle {
         let compressed = match (ratio, &lw.compressor, sk.st.comp.as_mut()) {
             (0, _, _) => None,
             (_, Some(cw), Some(cs)) => {
-                let cnt = &mut sk.cap.counters;
-                self.compressor(cw, cs, act.x, s, start_pos, freqs, cnt)
+                let inp = CompressIn {
+                    x: act.x,
+                    s,
+                    start_pos,
+                    freqs,
+                };
+                let counters = &mut sk.cap.counters;
+                self.compressor(cw, inp, CompSinks { st: cs, counters })
             }
             _ => None,
         };
@@ -414,12 +420,12 @@ impl Oracle {
         }
         let (layer, s, start_pos) = (step.layer, step.s, step.start_pos);
         let c = &self.cfg;
-        let (rd, d, nh) = (c.rope_head_dim, c.head_dim, c.n_heads);
+        let (d, nh) = (c.head_dim, c.n_heads);
         let freqs = self.freqs(layer);
         let inverse = self.defect != Defect::OutputDerotationForward;
         for i in 0..s * nh {
             let row = &mut o[i * d..(i + 1) * d];
-            self.rope_row(row, rd, (start_pos + i / nh, freqs), inverse);
+            self.rope_row(row, (start_pos + i / nh, freqs), inverse);
         }
     }
 

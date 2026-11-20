@@ -21,12 +21,12 @@ use crate::v4oracle::forward::Oracle;
 use crate::v4oracle::layer::{ExpertW, LayerCtx};
 use crate::v4oracle::numerics::silu;
 
-/// `up`'s clamp, which the reference applies SYMMETRICALLY (model.py:606), and whether the
-/// bound bit. The count is EVENTS, not elements: one element contributes here and again in
-/// [`Oracle::clamp_gate`], which is what [`Counters::swiglu_clamp_events`] is named for.
-fn clamp_up(ui: f32, limit: f32) -> (f32, usize) {
-    let hit = usize::from(ui < -limit || ui > limit);
-    (ui.clamp(-limit, limit), hit)
+/// One element pair after [`Oracle::clamp_pair`]: named, because `gate` and `up` are both `f32`
+/// and a positional pair of them is a swap the compiler cannot see.
+struct Clamped {
+    gate: f32,
+    up: f32,
+    events: usize,
 }
 
 /// `expert id -> [(row, routing weight)]`, in ascending expert id.
@@ -143,33 +143,43 @@ impl Oracle {
         for (i, o) in h.iter_mut().enumerate() {
             let (mut gi, mut ui) = (g[i], u[i]);
             if limit > 0.0 {
-                let (cu, eu) = clamp_up(ui, limit);
-                let (cg, eg) = self.clamp_gate(gi, limit);
-                counters.swiglu_clamp_events += eu + eg;
-                ui = cu;
-                gi = cg;
+                let c = self.clamp_pair(gi, ui, limit);
+                counters.swiglu_clamp_events += c.events;
+                ui = c.up;
+                gi = c.gate;
             }
             *o = silu(gi) * ui;
         }
         h
     }
 
-    /// `gate`'s clamp, which the reference applies from ABOVE only (model.py:607), and
-    /// whether the bound bit. `SwigluClampGateBothSides` is the symmetric mistake: it
-    /// borrows `up`'s rule, which is one line above it in the reference.
-    fn clamp_gate(&self, gi: f32, limit: f32) -> (f32, usize) {
+    /// SwiGLU's two clamps of one element pair (model.py:606-607), and how many bounds bit.
+    ///
+    /// `up` is clamped SYMMETRICALLY (model.py:606); `gate` from ABOVE only (model.py:607).
+    /// `SwigluClampGateBothSides` is the symmetric mistake: it borrows `up`'s rule, which is
+    /// one line above it in the reference. The count is EVENTS, not elements: one element
+    /// can contribute once per clamp, which is what [`Counters::swiglu_clamp_events`] is
+    /// named for. One method rather than one per clamp (merged 2026-11-20 under the
+    /// CodeScene gate's Primitive Obsession finding) because the reference applies them as
+    /// a pair at one shared limit, and the count is theirs jointly.
+    fn clamp_pair(&self, gi: f32, ui: f32, limit: f32) -> Clamped {
+        let up_hit = ui < -limit || ui > limit;
         let both = self.defect == Defect::SwigluClampGateBothSides;
-        let hit = if both {
+        let gate_hit = if both {
             gi > limit || gi < -limit
         } else {
             gi > limit
         };
-        let out = if both {
+        let gate = if both {
             gi.clamp(-limit, limit)
         } else {
             gi.min(limit)
         };
-        (out, usize::from(hit))
+        Clamped {
+            gate,
+            up: ui.clamp(-limit, limit),
+            events: usize::from(up_hit) + usize::from(gate_hit),
+        }
     }
 
     /// `MoE.forward`. Accumulates in f32 in ASCENDING EXPERT ID, then adds the shared
