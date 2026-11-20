@@ -1,7 +1,7 @@
 ---
 status: closed-shipped
 scope: engine
-verdict: COMPLETE 2026-11-20 — every HIP C++ kernel (66 launchers) is Rust on amdgcn-amd-amdhsa and hipcc is out of the build; the C++ survives only at tag archive/hip-kernels as the bit-identity reference. Witnessed on b5ca13a: 66/66 launcher rows byte-identical to the tagged hipcc, battery green bar the 30 inherited CodeScene files, determinism 1024/1024 under --arena-refresh, parity-glm 32/32, and GLM decode not slower than the pre-migration build under the pre-registered rule (3.031 vs 3.093 tok/s, identical ids and hit/miss counts). Open, not blocking: the migrated build's attention bucket ran ~1.6 ms/token high; ~1.5 of it is attributed post hoc to GLM's JOIN 1 device_sync, now replaced by a zero-cost token, its confirmation lease owed (§5 Phase 2 follow-up). The body is the per-lane port log: open §1's hazards only when writing a new device kernel, and §5 Phase 2 for the closing evidence.
+verdict: COMPLETE 2026-11-20 — every HIP C++ kernel (66 launchers) is Rust on amdgcn-amd-amdhsa and hipcc is out of the build; the C++ survives only at tag archive/hip-kernels as the bit-identity reference. Witnessed on b5ca13a: 66/66 launcher rows byte-identical to the tagged hipcc, battery green bar the 30 inherited CodeScene files, determinism 1024/1024 under --arena-refresh, parity-glm 32/32, and GLM decode not slower than the pre-migration build under the pre-registered rule (3.031 vs 3.093 tok/s, identical ids and hit/miss counts). Follow-up (lease on afedb58): with GLM's JOIN 1 device_sync replaced by a zero-cost token, decode is still not slower than the pre-migration build and the attention excess is no longer measurable above the floor (+0.3 against a 0.53 ms same-binary spread, the two pairs without host load); the sync as the cause is post hoc, the attribution lease's pre-registered rule NOT MET. Two pre-existing MoE ordering items owed (§5 Phase 2 follow-up). The body is the per-lane port log: open §1's hazards only when writing a new device kernel, and §5 Phase 2 for the closing evidence.
 ---
 
 # Rust kernels — migration plan
@@ -2351,7 +2351,8 @@ A1 B1 A2 B2 A3 B3, each flock'd and witnessed; nothing built between arms
   arm, would settle it.
 
 **Plan status: COMPLETE** (verdict above). Left open, none blocking: the ATTEND attribution
-above; the `launchers!` annotations (declined, above); L2's `MoeRange` literals, the shared plant-threshold helper and the plants-root layout
+above *(taken up 2026-11-20 by the follow-up below, which also carries two owed ordering
+items)*; the `launchers!` annotations (declined, above); L2's `MoeRange` literals, the shared plant-threshold helper and the plants-root layout
 (integration's owed list); CodeScene's 30 inherited files.
 
 ### Phase 2 follow-up — the ATTEND attribution (2026-11-20, branch `wave/rk-phase2`, base `372efc6`)
@@ -2405,14 +2406,44 @@ mint (`device.rs`, private field), `route_layer` gets it from the gate-logits D2
 it (the token is exactly as strong as the sync: the sync sat before `submit`, waited on no device
 work, and every writer the experts read is on the null stream before the D2H). Taken whatever the
 attribution, because by its own argument the sync bought nothing the readback had not.
-**UNVERIFIED-NEEDS-GPU:** the confirmation lease (B′ = this tree against A, interleaved ×3, the
-Phase 2 AB command, the Phase 2 rule).
 
-**Found by the review, pre-existing, not changed here:** `stage_batch`'s two uploads
-(`descs_buf`, `wexpert_buf`) are synchronous `hipMemcpy` H2D from pageable memory, issued after
-the join. CUDA's rule lets such a copy return before its DMA lands; ROCm's synchronous copy is
-believed to wait for completion, which nothing here cites. The removed sync sat before
-`stage_batch` and never covered them, and V4/K3 sync after theirs. Owed: cite the ROCm behaviour
-or put the uploads behind an event both MoE streams wait on. Likewise the trace-only poison fill
-inside `submit` (`hipMemsetD32Async` on the null stream) is unordered against the fetch write and
-the miss-stream read of the same slot.
+**Confirmation lease (2026-11-20 10:44–11:04 +01:00, rh-anine).** A = the same `rk-phase2-premig`
+binary as above (sha256 `34c58726…`), B′ = the release build of `afedb58` (the token, no sync;
+sha256 `de90bedb…`); A1 B′1 A2 B′2 A3 B′3, the Phase 2 AB command. Logs:
+`/var/cache/rivoli/scratch/rk-phase2/confirm/`. Every arm rc 0, every witness 0 B, GTT 17 MiB
+pre-arm; all six decoded the same 512 ids (md5 `89be6806`, hashed as above) with 236570 hits /
+70030 misses. Columns as in the attribution table; means and spreads are computed from the
+logged decode seconds, not the rounded column. Pre-registered (coordinator, at GO): the Phase 2
+rule (B′ not slower if mean(B′) ≥ mean(A) − max(spread)), and any pair with an arm whose host load
+starts or ends above 10 is reported load-confounded, the verdict given with and without it.
+
+| arm | tok/s | attend | ffn | fetch-wait | wall | host load before → after |
+|---|---|---|---|---|---|---|
+| A1 | 3.040 | 94.606 | 113.407 | 115.191 | 328.895 | 4.16 → 6.00 |
+| B′1 | 3.014 | 94.907 | 113.250 | 118.259 | 331.925 | 6.00 → 7.49 |
+| A2 | 2.862 | 98.808 | 118.220 | 126.424 | 349.359 | 7.49 → 11.50 |
+| B′2 | 3.096 | 94.453 | 111.547 | 111.658 | 323.096 | 11.50 → 5.70 |
+| A3 | 3.066 | 94.075 | 112.128 | 114.350 | 326.183 | 5.70 → 4.80 |
+| B′3 | 3.088 | 94.376 | 111.333 | 112.731 | 323.858 | 4.80 → 4.33 |
+
+- **All pairs:** mean A 2.989 (spread 0.204), B′ 3.066 (spread 0.082); threshold 2.785, so
+  **B′ not slower**. ATTEND B′ − A = −1.25 ms/token, driven by A2's load.
+- **Without pair 2** (load-confounded: A2 ends at 11.50, B′2 starts there): mean A 3.053 (spread 0.025), B′ 3.051 (spread 0.075); threshold 2.979, so
+  **B′ not slower**. ATTEND B′ − A = +0.30 ms/token (94.64 against 94.34), inside this lease's
+  own same-binary spread (A1–A3 and B′1–B′3 both 0.53 ms), so not distinguishable from zero;
+  B had sat +2.04 (attribution lease, pairs 2–3) and +1.6 (Phase 2 AB), and S — the same code,
+  uncommitted — +0.55.
+- **What may be claimed:** decode with the token is not slower than the pre-migration build, and
+  the ATTEND excess is no longer measurable above the floor. That the removed sync was the cause
+  stays the post-hoc reading; the attribution lease's pre-registered rule was NOT MET.
+
+**Owed (found by the review, pre-existing, not changed here):**
+- `stage_batch`'s two uploads (`descs_buf`, `wexpert_buf`) are synchronous `hipMemcpy` H2D from
+  pageable memory, issued after the join, and the engine assumes they have landed before the
+  expert kernels read them. CUDA's rule lets such a copy return before its DMA lands; ROCm's
+  synchronous copy is believed to wait for completion, and nothing here cites it. The removed
+  sync sat before `stage_batch` and never covered them (V4 and K3 sync after theirs). Owed: cite
+  the ROCm behaviour, or put the uploads behind an event both MoE streams wait on.
+- The trace-only poison fill inside `submit` (`hipMemsetD32Async` on the null stream) is
+  unordered against the fetch write and the miss-stream read of the same slot. Owed: order the
+  fill behind the slot's fetch, or argue that the trace's poison may be unordered.
