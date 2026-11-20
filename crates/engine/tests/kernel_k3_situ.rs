@@ -174,7 +174,10 @@ fn situ_glu_matches_the_anchor_at_every_mlp() {
 #[test]
 fn the_situ_sigmoid_takes_the_uncapped_gate() {
     for_each_situ(|salt, layer, tol, betas, s| {
-        let moved = rel(&host_situ(&s.gate, &s.up, betas, true), &s.want);
+        let moved = rel(
+            &host_situ(&s.gate, &s.up, betas, SigmoidOf::CappedGate),
+            &s.want,
+        );
         let bar = SITU_OBSERVED_WORST * 10.0;
         assert!(
             moved > bar * 30.0,
@@ -212,7 +215,7 @@ fn situ_glu_saturates_at_the_product_of_its_betas() {
             situ_launch(&gate, &up, SHIPPED_BETAS, false),
             "situ_glu_f32",
         );
-        let d = rel(&got, &host_situ(&gate, &up, SHIPPED_BETAS, false));
+        let d = rel(&got, &host_situ(&gate, &up, SHIPPED_BETAS, SigmoidOf::Gate));
         // 10x the 1.721e-7 measured over these cases. `tanhf` and `expf` are the device's
         // own against Rust's f64 ones, so this is the one fixture here whose bound is a libm
         // difference rather than a reassociated sum. The `gain = 400` case measures SMALLER

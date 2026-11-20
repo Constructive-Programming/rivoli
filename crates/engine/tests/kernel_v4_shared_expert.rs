@@ -139,13 +139,11 @@ fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
 /// produced, `out` is `n_out` writable f32, none aliasing another, all live until the caller's
 /// next join. `stream` is a live `hipStream_t`.
 unsafe fn fp8_linear(
-    x: *const f32,
+    (x, out): (*const f32, *mut f32),
     w: &(DeviceBuf, DeviceBuf),
-    dims: (usize, usize),
-    out: *mut f32,
+    (n_out, k): (usize, usize),
     stream: *mut std::ffi::c_void,
 ) {
-    let (n_out, k) = dims;
     // SAFETY: the caller's contract above.
     unsafe {
         launch_gemv_fp8_bf16(
@@ -203,8 +201,8 @@ fn gpu_shared_expert(
         )
         .expect("act_quant x");
         let xp = xq.ptr().cast::<f32>();
-        fp8_linear(xp, &w[0], (inter, dim), g.ptr_mut().cast(), st);
-        fp8_linear(xp, &w[2], (inter, dim), u.ptr_mut().cast(), st);
+        fp8_linear((xp, g.ptr_mut().cast()), &w[0], (inter, dim), st);
+        fp8_linear((xp, u.ptr_mut().cast()), &w[2], (inter, dim), st);
         // IN PLACE into `g`: `h` becomes `w2`'s input, which is one fewer allocation. Safe by
         // the kernel's own note — every thread reads both operands, then writes once, and that
         // write depends on both reads.
@@ -228,10 +226,9 @@ fn gpu_shared_expert(
         )
         .expect("act_quant h");
         fp8_linear(
-            g.ptr().cast(),
+            (g.ptr().cast(), out.ptr_mut().cast()),
             &w[1],
             (dim, inter),
-            out.ptr_mut().cast(),
             st,
         );
     }

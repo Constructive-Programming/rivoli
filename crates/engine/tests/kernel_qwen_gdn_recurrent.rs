@@ -257,79 +257,91 @@ fn l2(row: &[f32], eps: f64) -> Vec<f64> {
     row.iter().map(|x| f64::from(*x) * inv).collect()
 }
 
-/// One decode step, in f64, for one `form`. Returns `(o, state)` in the launcher's layouts.
+/// One decode step, in f64, for one `form`. Returns `(o, state)` in the launcher's layouts:
+/// each V head's `dv` outputs and `dk·dv` state block, concatenated in head order.
 fn recurrence(c: &Gdn, form: Form) -> (Vec<f32>, Vec<f32>) {
-    let (dk, dv) = (c.dk, c.dv);
-    let rep = c.v_heads / c.qk_heads;
+    let (g, beta) = gates(c, form);
+    let (out, state): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (0..c.v_heads)
+        .map(|hd| head_step(c, form, hd, (g[hd], beta[hd])))
+        .unzip();
+    (out.concat(), state.concat())
+}
+
+/// The QK head V head `hd` reads: `hd / rep` (`rep = v_heads / qk_heads`) under the reference's
+/// `repeat_interleave`, and `hd % qk_heads` under the `QkTiled` defect.
+fn qk_source(c: &Gdn, form: Form, hd: usize) -> usize {
+    if form == Form::QkTiled {
+        hd % c.qk_heads
+    } else {
+        hd / (c.v_heads / c.qk_heads)
+    }
+}
+
+/// Where `S[i][j]` (key `i`, value `j`) sits in one head's state block. The KERNEL's layout is
+/// `[key][value]`; `StateValueMajor` is the port that took a `[128][128]` buffer at face value,
+/// so it loads and stores transposed — and both directions have to move, or the round trip
+/// cancels the defect.
+fn state_layout(form: Form, dk: usize, dv: usize) -> impl Fn(usize, usize) -> usize {
+    let value_major = form == Form::StateValueMajor;
+    move |i, j| if value_major { j * dk + i } else { i * dv + j }
+}
+
+/// Every `(row, col)` of a `rows × cols` grid, row-major — one loop where a nested pair would
+/// be, visiting in the same order.
+fn grid(rows: usize, cols: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..rows).flat_map(move |r| (0..cols).map(move |c| (r, c)))
+}
+
+/// Head `hd`'s `q` and `k`, L2-normed, with `q` also scaled by `1/sqrt(dk)`.
+fn normed_qk(c: &Gdn, form: Form, hd: usize) -> (Vec<f64>, Vec<f64>) {
+    let dk = c.dk;
+    let src = qk_source(c, form, hd);
     let eps = if form == Form::L2EpsDropped {
         0.0
     } else {
         1e-6
     };
-    let (g, beta) = gates(c, form);
-    let mut out = vec![0.0f32; c.v_heads * dv];
-    let mut state = vec![0.0f32; c.v_heads * dk * dv];
-    for hd in 0..c.v_heads {
-        let src = if form == Form::QkTiled {
-            hd % c.qk_heads
-        } else {
-            hd / rep
-        };
-        let qn: Vec<f64> = {
-            let n = l2(&c.q[src * dk..src * dk + dk], eps);
-            let s = if form == Form::QScaleDropped {
-                1.0
-            } else {
-                1.0 / (dk as f64).sqrt()
-            };
-            n.iter().map(|x| x * s).collect()
-        };
-        let kn = l2(&c.k[src * dk..src * dk + dk], eps);
-        let alpha = g[hd].exp();
-        // The state, in the layout the KERNEL reads: `[key][value]`. `StateValueMajor` is the
-        // port that took a `[128][128]` buffer at face value, so it loads and stores transposed
-        // — and both directions have to move, or the round trip cancels the defect.
-        let load = |i: usize, j: usize| -> f64 {
-            let base = hd * dk * dv;
-            f64::from(if form == Form::StateValueMajor {
-                c.state[base + j * dk + i]
-            } else {
-                c.state[base + i * dv + j]
-            })
-        };
-        let mut decayed = vec![0.0f64; dk * dv];
-        for i in 0..dk {
-            for j in 0..dv {
-                decayed[i * dv + j] = alpha * load(i, j);
-            }
-        }
-        // `u = S^T k` from the ALREADY-DECAYED state, which is the order MOD's loop body has
-        // (decay, then `kv_mem`, then the rank-one update).
-        let mut u = vec![0.0f64; dv];
-        for i in 0..dk {
-            for j in 0..dv {
-                u[j] += kn[i] * decayed[i * dv + j];
-            }
-        }
-        for j in 0..dv {
-            let dvj = beta[hd] * (f64::from(c.v[hd * dv + j]) - u[j]);
-            for i in 0..dk {
-                let updated = decayed[i * dv + j] + kn[i] * dvj;
-                let read = if form == Form::OutputBeforeUpdate {
-                    decayed[i * dv + j]
-                } else {
-                    updated
-                };
-                out[hd * dv + j] += (qn[i] * read) as f32;
-                let base = hd * dk * dv;
-                let at = if form == Form::StateValueMajor {
-                    base + j * dk + i
-                } else {
-                    base + i * dv + j
-                };
-                state[at] = updated as f32;
-            }
-        }
+    let s = if form == Form::QScaleDropped {
+        1.0
+    } else {
+        1.0 / (dk as f64).sqrt()
+    };
+    let qn = l2(&c.q[src * dk..src * dk + dk], eps)
+        .iter()
+        .map(|x| x * s)
+        .collect();
+    (qn, l2(&c.k[src * dk..src * dk + dk], eps))
+}
+
+/// One V head's step: its `dv` outputs and its updated `dk·dv` state block.
+fn head_step(c: &Gdn, form: Form, hd: usize, (g, beta): (f64, f64)) -> (Vec<f32>, Vec<f32>) {
+    let (dk, dv) = (c.dk, c.dv);
+    let (qn, kn) = normed_qk(c, form, hd);
+    let alpha = g.exp();
+    let at = state_layout(form, dk, dv);
+    let prior = &c.state[hd * dk * dv..(hd + 1) * dk * dv];
+    // `decayed[i * dv + j]`, key-major whatever the defect's storage layout.
+    let decayed: Vec<f64> = grid(dk, dv)
+        .map(|(i, j)| alpha * f64::from(prior[at(i, j)]))
+        .collect();
+    // `u = S^T k` from the ALREADY-DECAYED state, which is the order MOD's loop body has
+    // (decay, then `kv_mem`, then the rank-one update).
+    let mut u = vec![0.0f64; dv];
+    for (i, j) in grid(dk, dv) {
+        u[j] += kn[i] * decayed[i * dv + j];
+    }
+    let dvs: Vec<f64> = (0..dv)
+        .map(|j| beta * (f64::from(c.v[hd * dv + j]) - u[j]))
+        .collect();
+    let read_before_update = form == Form::OutputBeforeUpdate;
+    let mut out = vec![0.0f32; dv];
+    let mut state = vec![0.0f32; dk * dv];
+    for (j, i) in grid(dv, dk) {
+        let before = decayed[i * dv + j];
+        let updated = before + kn[i] * dvs[j];
+        let read = if read_before_update { before } else { updated };
+        out[j] += (qn[i] * read) as f32;
+        state[at(i, j)] = updated as f32;
     }
     (out, state)
 }
@@ -408,8 +420,8 @@ fn the_host_recurrence_reproduces_the_anchor_at_every_gdn_layer() {
     for_each_gdn(|salt, layer, c| {
         let (o, state) = recurrence(c, Form::Reference);
         let at = format!("{salt} L{layer}");
-        b.hold(&at, "o", &o, &c.want_o);
-        b.hold(&at, "state", &state, &c.want_state);
+        b.hold((&at, "o"), &o, &c.want_o);
+        b.hold((&at, "state"), &state, &c.want_state);
         sites += 1;
     });
     assert_eq!(sites, 8, "two draws times four GDN layers");
@@ -429,8 +441,8 @@ fn the_fused_decay_and_write_gate_reproduce_the_rules_own_inputs() {
         let at = format!("{salt} L{layer}");
         let g32: Vec<f32> = g.iter().map(|x| *x as f32).collect();
         let beta32: Vec<f32> = beta.iter().map(|x| *x as f32).collect();
-        b.hold(&at, "g", &g32, &c.want_g);
-        b.hold(&at, "beta", &beta32, &c.want_beta);
+        b.hold((&at, "g"), &g32, &c.want_g);
+        b.hold((&at, "beta"), &beta32, &c.want_beta);
     });
 }
 
@@ -447,34 +459,34 @@ fn the_repeated_qk_heads_are_interleaved_and_not_tiled() {
     for d in h::decode_draws() {
         let (v_heads, qk_heads) = (d.w("linear_num_value_heads"), d.w("linear_num_key_heads"));
         let (dk, rep) = (d.w("linear_key_head_dim"), d.w("gdn_repeat"));
-        for layer in GDN_LAYERS {
+        let inputs = GDN_LAYERS
+            .iter()
+            .flat_map(|&layer| ["query", "key"].map(|which| (layer, which)));
+        for (layer, which) in inputs {
             let r = format!("model.layers.{layer}.linear_attn.gated_delta_rule");
-            for which in ["query", "key"] {
-                let x = d.flat(&format!("{r}.in.{which}"), v_heads * dk);
-                let row = |hd: usize| &x[hd * dk..hd * dk + dk];
-                for src in 0..qk_heads {
-                    for copy in 1..rep {
-                        assert_eq!(
-                            row(src * rep),
-                            row(src * rep + copy),
-                            "{} L{layer} {which}: head {} is not a bit-identical copy of {}, so \
-                             the reference did not `repeat_interleave` and this fixture's \
-                             de-repeat is unfounded",
-                            d.salt,
-                            src * rep + copy,
-                            src * rep
-                        );
-                    }
-                }
-                // The tiled reading must DISAGREE somewhere, or the distinction is vacuous.
-                let tiled_agrees = (0..v_heads).all(|hd| row(hd) == row(hd % qk_heads));
-                assert!(
-                    !tiled_agrees,
-                    "{} L{layer} {which}: the tiled reading agrees with the interleaved one on \
-                     this draw, so `QkTiled` prices nothing here and the fixture is degenerate",
-                    d.salt
+            let x = d.flat(&format!("{r}.in.{which}"), v_heads * dk);
+            let row = |hd: usize| &x[hd * dk..hd * dk + dk];
+            let copies = (0..qk_heads).flat_map(|src| (1..rep).map(move |copy| (src, copy)));
+            for (src, copy) in copies {
+                assert_eq!(
+                    row(src * rep),
+                    row(src * rep + copy),
+                    "{} L{layer} {which}: head {} is not a bit-identical copy of {}, so \
+                     the reference did not `repeat_interleave` and this fixture's \
+                     de-repeat is unfounded",
+                    d.salt,
+                    src * rep + copy,
+                    src * rep
                 );
             }
+            // The tiled reading must DISAGREE somewhere, or the distinction is vacuous.
+            let tiled_agrees = (0..v_heads).all(|hd| row(hd) == row(hd % qk_heads));
+            assert!(
+                !tiled_agrees,
+                "{} L{layer} {which}: the tiled reading agrees with the interleaved one on \
+                 this draw, so `QkTiled` prices nothing here and the fixture is degenerate",
+                d.salt
+            );
         }
     }
 }
@@ -621,8 +633,8 @@ fn the_gdn_recurrence_kernel_matches_the_anchor_at_every_gdn_layer() {
         );
         // `back` copies out, which joins — there is no separate sync to forget.
         let at = format!("{salt} L{layer}");
-        b.hold(&at, "o", &f32v(&back(&out)), &c.want_o);
-        b.hold(&at, "state", &f32v(&back(&state)), &c.want_state);
+        b.hold((&at, "o"), &f32v(&back(&out)), &c.want_o);
+        b.hold((&at, "state"), &f32v(&back(&state)), &c.want_state);
     });
 }
 

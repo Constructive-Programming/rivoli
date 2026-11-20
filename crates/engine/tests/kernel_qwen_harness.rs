@@ -256,7 +256,9 @@ pub enum Pairing {
 /// writing `j` overlaps, so an in-place interleaved rotation without it reads values it has already
 /// overwritten — which `activation.hip`'s own kernels (tag `archive/hip-kernels`) solve with a `__syncthreads` between the read
 /// and the write.
-pub fn rope_row(row: &mut [f32], p: Pairing, rd: usize, pos: usize, theta: f64) {
+///
+/// `(rd, theta)` is the rotary convention (rotary width, frequency base); `pos` is the token.
+pub fn rope_row(row: &mut [f32], p: Pairing, (rd, theta): (usize, f64), pos: usize) {
     let half = rd / 2;
     let src = row.to_vec();
     for j in 0..half {
@@ -327,8 +329,9 @@ impl Bar {
         bar
     }
 
-    /// Score one named quantity. Both bars, in the order that makes the tighter one bind.
-    pub fn hold(&self, at: &str, what: &str, got: &[f32], want: &[f32]) {
+    /// Score one named quantity, `(at, what)` naming it in the messages. Both bars, in the order
+    /// that makes the tighter one bind.
+    pub fn hold(&self, (at, what): (&str, &str), got: &[f32], want: &[f32]) {
         let bar = self.enforced();
         let r = rel(got, want);
         assert!(

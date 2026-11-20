@@ -259,6 +259,15 @@ pub fn sums64(n: usize, mut term: impl FnMut(usize) -> f64) -> Vec<f32> {
     (0..n).map(|j| term(j) as f32).collect()
 }
 
+/// What [`situ1`]'s sigmoid is applied to: the raw gate (the reference) or the capped gate
+/// `b1·tanh(g/b1)` (the defect). Named rather than a bare `bool`, whose `true` at a call site
+/// says nothing about which of the two it selects.
+#[derive(Clone, Copy)]
+pub enum SigmoidOf {
+    Gate,
+    CappedGate,
+}
+
 /// `SituAndMul.forward` in f64 — `(b1·tanh(g/b1)·sigmoid(g)) · (b2·tanh(u/b2))`.
 ///
 /// The sigmoid takes `g`, NOT `b1·tanh(g/b1)`: the two factors saturate at different rates
@@ -267,20 +276,23 @@ pub fn sums64(n: usize, mut term: impl FnMut(usize) -> f64) -> Vec<f32> {
 /// second function is how the two drift into differing by something nobody intended
 /// (`k3:tests/k3_kernels.rs:1580`). Here rather than in the SiTU suite because the fp4
 /// expert oracle composes the same arithmetic between its two passes.
-pub fn situ1(g: f32, u: f32, (b1, b2): (f32, f32), capped_sigmoid: bool) -> f32 {
+pub fn situ1(g: f32, u: f32, (b1, b2): (f32, f32), sigmoid_of: SigmoidOf) -> f32 {
     let (b1, b2) = (f64::from(b1), f64::from(b2));
     let (g, u) = (f64::from(g), f64::from(u));
     let t = b1 * (g / b1).tanh();
-    let sig = if capped_sigmoid { t } else { g };
+    let sig = match sigmoid_of {
+        SigmoidOf::Gate => g,
+        SigmoidOf::CappedGate => t,
+    };
     (t * (1.0 / (1.0 + (-sig).exp())) * (b2 * (u / b2).tanh())) as f32
 }
 
 /// The same arithmetic over two slices — the SiTU scoring oracle. Elementwise primitive,
 /// map over it: the arithmetic stays in exactly one place (`k3:tests/k3_kernels.rs:1604`).
-pub fn host_situ(gate: &[f32], up: &[f32], betas: (f32, f32), capped_sigmoid: bool) -> Vec<f32> {
+pub fn host_situ(gate: &[f32], up: &[f32], betas: (f32, f32), sigmoid_of: SigmoidOf) -> Vec<f32> {
     gate.iter()
         .zip(up)
-        .map(|(&g, &u)| situ1(g, u, betas, capped_sigmoid))
+        .map(|(&g, &u)| situ1(g, u, betas, sigmoid_of))
         .collect()
 }
 

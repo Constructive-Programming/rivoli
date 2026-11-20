@@ -156,8 +156,7 @@ impl Shape {
 /// and they exist here to be fed straight into `hc_post`, which is what makes the chain a chain.
 fn gpu_hc_pre(
     cfg: &V4Config,
-    h: &[f32],
-    w: HcW<'_>,
+    (h, w): (&[f32], HcW<'_>),
     g: Shape,
     iters: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
@@ -328,7 +327,7 @@ fn mhc_reproduces_the_layer_goldens() {
         "the driver's h is not what the oracle recorded",
     );
 
-    let (y, post, comb) = gpu_hc_pre(cfg, &h_in, HcW::of(lw, Sub::Attn), g, iters);
+    let (y, post, comb) = gpu_hc_pre(cfg, (&h_in, HcW::of(lw, Sub::Attn)), g, iters);
     assert_rel(
         &golden("L0.pre.attn_norm_out"),
         &norm(&y, &lw.attn_norm, cfg.norm_eps, "attn"),
@@ -346,7 +345,7 @@ fn mhc_reproduces_the_layer_goldens() {
         },
         g,
     );
-    let (y2, post2, comb2) = gpu_hc_pre(cfg, &h1, HcW::of(lw, Sub::Ffn), g, iters);
+    let (y2, post2, comb2) = gpu_hc_pre(cfg, (&h1, HcW::of(lw, Sub::Ffn)), g, iters);
     assert_rel(
         &golden("L0.pre.ffn_norm_out"),
         &norm(&y2, &lw.ffn_norm, cfg.norm_eps, "ffn"),
@@ -380,7 +379,7 @@ fn sinkhorn_iteration_count_is_live() {
     let h = fixed_bf16("sink-h", S * cfg.hc_mult * cfg.dim, 1.0);
     assert!(cfg.hc_sinkhorn_iters >= 2, "this test subtracts one below");
     let g = Shape::of(cfg, S);
-    let run = |iters| gpu_hc_pre(cfg, &h, HcW::of(lw, Sub::Attn), g, iters).2;
+    let run = |iters| gpu_hc_pre(cfg, (&h, HcW::of(lw, Sub::Attn)), g, iters).2;
     let (c20, c2, c19) = (
         run(cfg.hc_sinkhorn_iters),
         run(2),

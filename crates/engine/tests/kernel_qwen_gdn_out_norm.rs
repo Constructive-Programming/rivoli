@@ -403,7 +403,7 @@ fn the_host_norm_gate_predicts_every_other_head() {
             c.head_dim
         );
         let got = gate_norm(c, Form::Reference);
-        b.hold(at, "norm", &c.predicted(&got), &c.predicted(&c.want));
+        b.hold((at, "norm"), &c.predicted(&got), &c.predicted(&c.want));
         seen.push(at.to_string());
     });
     seen.sort();
@@ -490,8 +490,7 @@ fn the_recovered_weight_cannot_choose_the_offset_convention() {
         };
         let got = gate_norm(&alt, Form::Reference);
         b.hold(
-            at,
-            "zero-centred reading",
+            (at, "zero-centred reading"),
             &alt.predicted(&got),
             &alt.predicted(&c.want),
         );
@@ -574,7 +573,7 @@ fn the_norm_gate_launcher_matches_the_anchor_at_the_width_the_guard_refused() {
     let s = stream();
     for_each_gate(|at, c| {
         let got = launch(&s, c, &c.o, &c.z);
-        b.hold(at, "norm", &c.predicted(&got), &c.predicted(&c.want));
+        b.hold((at, "norm"), &c.predicted(&got), &c.predicted(&c.want));
     });
 }
 
@@ -757,8 +756,7 @@ fn the_power_of_two_widths_reproduce_the_host_oracle_and_print_their_bytes() {
              ignores NaN, so an all-NaN pair scores as a perfect match"
         );
         h::Bar::at("gdn_out_norm", HOST_WORST).hold(
-            &format!("synthetic head_dim={head_dim}"),
-            "norm",
+            (&format!("synthetic head_dim={head_dim}"), "norm"),
             &got,
             &want,
         );

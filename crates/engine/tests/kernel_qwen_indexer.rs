@@ -265,19 +265,26 @@ fn rope_blocks(c: &Idx, kbar: &[f32], at: At) -> Vec<f32> {
             At::End => c.starts[b] as usize + c.ratio - 1,
             At::Zero => 0,
         };
-        h::rope_row(
-            &mut out[b * c.hd..(b + 1) * c.hd],
-            h::Pairing::SplitHalf,
-            c.rd,
-            pos,
-            c.theta,
-        );
+        let row = &mut out[b * c.hd..(b + 1) * c.hd];
+        h::rope_row(row, h::Pairing::SplitHalf, (c.rd, c.theta), pos);
     }
     out
 }
 
+/// Which block score: the reference, or it with one of its two operations dropped.
+enum Score {
+    Reference,
+    ReluDropped,
+    Unscaled,
+}
+
 /// `I_ib = sum_h ReLU(<q_i^h, kbar_b>) / sqrt(hd)` for one query row.
-fn block_scores(c: &Idx, q_roped: &[f32], kbar: &[f32], relu: bool, scaled: bool) -> Vec<f32> {
+fn block_scores(c: &Idx, q_roped: &[f32], kbar: &[f32], form: Score) -> Vec<f32> {
+    let (relu, scaled) = match form {
+        Score::Reference => (true, true),
+        Score::ReluDropped => (false, true),
+        Score::Unscaled => (true, false),
+    };
     let scale = if scaled {
         1.0 / (c.hd as f64).sqrt()
     } else {
@@ -303,13 +310,8 @@ fn last_query_roped(c: &Idx) -> Vec<f32> {
     let q = c.seq - 1;
     let mut rows = c.q_normed[q * c.heads * c.hd..(q + 1) * c.heads * c.hd].to_vec();
     for hh in 0..c.heads {
-        h::rope_row(
-            &mut rows[hh * c.hd..(hh + 1) * c.hd],
-            h::Pairing::SplitHalf,
-            c.rd,
-            q,
-            c.theta,
-        );
+        let row = &mut rows[hh * c.hd..(hh + 1) * c.hd];
+        h::rope_row(row, h::Pairing::SplitHalf, (c.rd, c.theta), q);
     }
     rows
 }
@@ -443,7 +445,7 @@ fn the_host_pool_and_norm_reproduces_the_whole_ladder() {
     let b = h::Bar::at("indexer", HOST_WORST);
     for (q, nb, want) in ladder(&c, &d) {
         let got = pool_norm(&c, nb, Pool::Reference);
-        b.hold(&format!("q{q}"), "k_layernorm", &got, &want);
+        b.hold((&format!("q{q}"), "k_layernorm"), &got, &want);
     }
 }
 
@@ -461,12 +463,8 @@ fn the_block_keys_are_roped_at_the_blocks_first_token() {
     let c = window();
     let b = h::Bar::at("indexer", HOST_WORST);
     let kbar = pool_norm(&c, c.n_blocks(), Pool::Reference);
-    b.hold(
-        "prefill",
-        "pooled_keys",
-        &rope_blocks(&c, &kbar, At::Start),
-        &c.want_kbar,
-    );
+    let roped = rope_blocks(&c, &kbar, At::Start);
+    b.hold(("prefill", "pooled_keys"), &roped, &c.want_kbar);
     for (at, name, floor) in [
         (At::End, "block end", ROPE_AT_BLOCK_END),
         (At::Zero, "position zero", ROPE_AT_POSITION_ZERO),
@@ -487,20 +485,13 @@ fn the_host_block_scores_reproduce_the_reference() {
     let c = window();
     let b = h::Bar::at("indexer", HOST_WORST);
     let q = last_query_roped(&c);
-    b.hold(
-        "prefill",
-        "scores",
-        &block_scores(&c, &q, &c.want_kbar, true, true),
-        &c.want_scores,
-    );
-    for (relu, scaled, name, floor) in [
-        (false, true, "ReLU dropped", SCORE_RELU_OFF),
-        (true, false, "1/sqrt(hd) dropped", SCORE_UNSCALED),
+    let scores = block_scores(&c, &q, &c.want_kbar, Score::Reference);
+    b.hold(("prefill", "scores"), &scores, &c.want_scores);
+    for (form, name, floor) in [
+        (Score::ReluDropped, "ReLU dropped", SCORE_RELU_OFF),
+        (Score::Unscaled, "1/sqrt(hd) dropped", SCORE_UNSCALED),
     ] {
-        let moved = h::rel(
-            &block_scores(&c, &q, &c.want_kbar, relu, scaled),
-            &c.want_scores,
-        );
+        let moved = h::rel(&block_scores(&c, &q, &c.want_kbar, form), &c.want_scores);
         b.separates("prefill", name, moved);
         assert!(
             moved >= floor * 0.9,
@@ -645,11 +636,7 @@ fn a_summing_pool_is_cancelled_by_the_norm_that_follows_it() {
 #[test]
 fn the_block_key_pipeline_matches_the_anchor() {
     use common::{DeviceBuf, back, dev, f32b, f32v, ok, stream, zeros};
-    use rivoli_backend::abi::ScoreDims;
-    use rivoli_backend::hip::{
-        ScoreBufs, device_sync, launch_index_pool_norm_f32, launch_index_score_blocks_f32,
-        launch_rope_split_half,
-    };
+    use rivoli_backend::hip::{device_sync, launch_index_pool_norm_f32, launch_rope_split_half};
 
     let c = window();
     let b = h::Bar::at("indexer", HOST_WORST);
@@ -701,7 +688,7 @@ fn the_block_key_pipeline_matches_the_anchor() {
             "rope_split_half on a block key",
         );
     }
-    b.hold("device", "pooled_keys", &f32v(&back(&kbar)), &c.want_kbar);
+    b.hold(("device", "pooled_keys"), &f32v(&back(&kbar)), &c.want_kbar);
 
     // The query side: the reference's own normed rows, RoPE'd at the query's position in ONE
     // launch — `count = heads`, `stride = hd`, so the four head rows are contiguous and share a
@@ -724,6 +711,24 @@ fn the_block_key_pipeline_matches_the_anchor() {
         "join the null-stream RoPE before the score on `s`",
     );
 
+    let scores = device_scores(&c, &s, &qrows, &kbar);
+    b.hold(("device", "scores"), &scores, &c.want_scores);
+}
+
+/// The score stage of [`the_block_key_pipeline_matches_the_anchor`], read back.
+#[cfg(feature = "rocm")]
+fn device_scores(
+    c: &Idx,
+    s: &rivoli_backend::gpustream::HipStream,
+    qrows: &common::DeviceBuf,
+    kbar: &common::DeviceBuf,
+) -> Vec<f32> {
+    use common::{back, dev, f32b, f32v, ok, zeros};
+    use rivoli_backend::abi::ScoreDims;
+    use rivoli_backend::hip::{ScoreBufs, launch_index_score_blocks_f32};
+
+    let nb = c.n_blocks();
+    let cp = |d: &common::DeviceBuf| d.ptr() as *const f32;
     // The score: `w` filled with `1/sqrt(hd)`, which is the scale MOD:693 applies after the sum —
     // a positive uniform factor distributes over it — and NOT a learned per-head weight, of which
     // this model has none (trap T6).
@@ -740,8 +745,8 @@ fn the_block_key_pipeline_matches_the_anchor() {
         unsafe {
             launch_index_score_blocks_f32(
                 ScoreBufs {
-                    q: q_out as *const f32,
-                    kv: kbar_out as *const f32,
+                    q: cp(qrows),
+                    kv: cp(kbar),
                     w: cp(&w),
                     score: score_out,
                 },
@@ -756,7 +761,7 @@ fn the_block_key_pipeline_matches_the_anchor() {
         },
         "index_score_blocks_f32",
     );
-    b.hold("device", "scores", &f32v(&back(&scores)), &c.want_scores);
+    f32v(&back(&scores))
 }
 
 /// The new launcher refuses the four argument shapes that mean the caller misread a config field.

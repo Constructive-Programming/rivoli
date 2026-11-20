@@ -158,21 +158,20 @@ fn turned(s: &Site, turn: Turn) -> Vec<f32> {
     let mut got = s.src.clone();
     for head in got.chunks_mut(s.hd) {
         match turn {
-            Turn::Reference => h::rope_row(head, h::Pairing::SplitHalf, s.rd, s.pos, s.theta),
+            Turn::Reference => h::rope_row(head, h::Pairing::SplitHalf, (s.rd, s.theta), s.pos),
             // The one arm that reads a different pairing — `h::Pairing`'s own note argues why the
             // two conventions share a body in a test and never in a kernel.
-            Turn::Interleaved => h::rope_row(head, h::Pairing::Interleaved, s.rd, s.pos, s.theta),
+            Turn::Interleaved => h::rope_row(head, h::Pairing::Interleaved, (s.rd, s.theta), s.pos),
             Turn::OnePositionEarly => {
-                h::rope_row(head, h::Pairing::SplitHalf, s.rd, s.pos - 1, s.theta)
+                h::rope_row(head, h::Pairing::SplitHalf, (s.rd, s.theta), s.pos - 1)
             }
             Turn::OnTailDims => {
                 let tail = s.hd - s.rd;
                 h::rope_row(
                     &mut head[tail..],
                     h::Pairing::SplitHalf,
-                    s.rd,
+                    (s.rd, s.theta),
                     s.pos,
-                    s.theta,
                 );
             }
         }
@@ -194,7 +193,7 @@ fn the_host_split_half_rotation_is_the_reference_and_the_wrong_doors_are_not() {
     let b = h::Bar::at("indexer", HOST_WORST);
     let all = sites();
     for s in &all {
-        b.hold(&s.at, "rotation", &turned(s, Turn::Reference), &s.want);
+        b.hold((&s.at, "rotation"), &turned(s, Turn::Reference), &s.want);
     }
     for (turn, name, floor) in [
         (Turn::Interleaved, "rope_interleaved_pairs", INTERLEAVED),
@@ -249,7 +248,7 @@ fn the_split_half_rope_launcher_is_qwens_partial_rope() {
             "rope_split_half",
         );
         let got = f32v(&back(&x));
-        b.hold(&s.at, "rotation", &got, &s.want);
+        b.hold((&s.at, "rotation"), &got, &s.want);
         // The dims above `rotary_dim` must be UNTOUCHED. Agreement over the whole row cannot
         // separate a partial rotation from a full one whose tail happened to land close, and at
         // `head_dim` 32 against `rotary_dim` 8 three quarters of every row is that tail.

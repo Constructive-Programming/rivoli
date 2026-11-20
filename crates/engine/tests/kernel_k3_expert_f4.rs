@@ -151,7 +151,7 @@ impl F4Case {
             .map(|j| {
                 let g = dot(&f4_row(&ew.w1, j));
                 let u = dot(&f4_row(&ew.w3, j));
-                let y = situ1(g, u, SHIPPED_BETAS, false);
+                let y = situ1(g, u, SHIPPED_BETAS, SigmoidOf::Gate);
                 // The fold happens BEFORE this bf16 store when it happens at all — V4's
                 // `weights * x` then `x.to(dtype)`. That is the whole difference, and it is
                 // one multiply's worth of position.

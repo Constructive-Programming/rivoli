@@ -93,20 +93,21 @@ use rivoli_engine::seam::GenSpec;
 fn the_kda_recurrence_reproduces_the_anchor() {
     let tol = kda_tol();
     let mut worst = (0.0f32, String::new());
-    for a in &anchors() {
-        for l in KDA_LAYERS {
-            let (o_rel, s_rel) = kda_step(a, l);
-            for (what, r) in [("out.o", o_rel), ("out.state", s_rel)] {
-                assert!(
-                    r < tol,
-                    "{}: L{l} {what} disagrees with the reference by {r:.3e}, past the \
-                     kda_op tolerance {tol:e} (10x its measured chunk-vs-recurrent floor; \
-                     the weakest KDA defect the anchor priced is 1.75e0)",
-                    a.name
-                );
-                if r > worst.0 {
-                    worst = (r, format!("{} L{l} {what}", a.name));
-                }
+    let anchors = anchors();
+    // Anchor-major, then layer, so a tie under the strict `>` below names the earliest site.
+    let sites = anchors.iter().flat_map(|a| KDA_LAYERS.map(|l| (a, l)));
+    for (a, l) in sites {
+        let (o_rel, s_rel) = kda_step(a, l);
+        for (what, r) in [("out.o", o_rel), ("out.state", s_rel)] {
+            assert!(
+                r < tol,
+                "{}: L{l} {what} disagrees with the reference by {r:.3e}, past the \
+                 kda_op tolerance {tol:e} (10x its measured chunk-vs-recurrent floor; \
+                 the weakest KDA defect the anchor priced is 1.75e0)",
+                a.name
+            );
+            if r > worst.0 {
+                worst = (r, format!("{} L{l} {what}", a.name));
             }
         }
     }
