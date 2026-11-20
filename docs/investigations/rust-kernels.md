@@ -1,7 +1,7 @@
 ---
 status: closed-shipped
 scope: engine
-verdict: COMPLETE 2026-11-20 — every HIP C++ kernel (66 launchers) is Rust on amdgcn-amd-amdhsa and hipcc is out of the build; the C++ survives only at tag archive/hip-kernels as the bit-identity reference. Witnessed on b5ca13a: 66/66 launcher rows byte-identical to the tagged hipcc, battery green bar the 30 inherited CodeScene files, determinism 1024/1024 under --arena-refresh, parity-glm 32/32, and GLM decode not slower than the pre-migration build under the pre-registered rule (3.031 vs 3.093 tok/s, identical ids and hit/miss counts). Open, not blocking: the migrated build's attention bucket runs ~1.6 ms/token high, cause unattributed (§5 Phase 2). The body is the per-lane port log: open §1's hazards only when writing a new device kernel, and §5 Phase 2 for the closing evidence.
+verdict: COMPLETE 2026-11-20 — every HIP C++ kernel (66 launchers) is Rust on amdgcn-amd-amdhsa and hipcc is out of the build; the C++ survives only at tag archive/hip-kernels as the bit-identity reference. Witnessed on b5ca13a: 66/66 launcher rows byte-identical to the tagged hipcc, battery green bar the 30 inherited CodeScene files, determinism 1024/1024 under --arena-refresh, parity-glm 32/32, and GLM decode not slower than the pre-migration build under the pre-registered rule (3.031 vs 3.093 tok/s, identical ids and hit/miss counts). Open, not blocking: the migrated build's attention bucket ran ~1.6 ms/token high; ~1.5 of it is attributed post hoc to GLM's JOIN 1 device_sync, now replaced by a zero-cost token, its confirmation lease owed (§5 Phase 2 follow-up). The body is the per-lane port log: open §1's hazards only when writing a new device kernel, and §5 Phase 2 for the closing evidence.
 ---
 
 # Rust kernels — migration plan
@@ -2292,6 +2292,8 @@ every stream is already idle, so it waits on no device work; its cost is priced 
 A/B below.
 > **NOT PRICED 2026-11-20 (the lease, below):** the A/B bounds the whole migration, not the
 > sync; a B vs B-without-the-sync arm would.
+> **SUPERSEDED 2026-11-20 (Phase 2 follow-up):** that arm ran (~1.5 ms/token post hoc, the
+> pre-registered rule not met), and the sync is now the `NullStreamDrained` token.
 
 **Gates (deviceless):** fmt, the dev build (jscpd ran, 0 clones), clippy both arms rc 0;
 `cargo test --workspace --no-default-features --no-fail-fast` 516 passed, 1 failed: CodeScene,
@@ -2352,3 +2354,65 @@ A1 B1 A2 B2 A3 B3, each flock'd and witnessed; nothing built between arms
 above; the `launchers!` annotations (declined, above); L2's `MoeRange` literals, the shared plant-threshold helper and the plants-root layout
 (integration's owed list); CodeScene's 30 inherited files.
 
+### Phase 2 follow-up — the ATTEND attribution (2026-11-20, branch `wave/rk-phase2`, base `372efc6`)
+
+The Phase 2 A/B left B's ATTEND bucket ~1.6 ms/token above A's, unattributed between three
+candidates. Logs: `/var/cache/rivoli/scratch/rk-phase2/attr/`.
+
+**`gemv_fp8` at GLM's `q_a` shape, priced from data already on record.** The bit-identity TIME
+row `gemv_fp8 (2048, 6144, 128, 1)` read 1.025 / 1.025 (integration A / A′), 1.016 / 1.020
+(perf A / A′) and 1.077 (Phase 2 A, one arm, no A′): ~1.02× hipcc, an excess of 0.5–0.8 µs a
+call, so 78 calls cost 0.04–0.06 ms/token (0.2 ms at the lone outlier). Not the main cause.
+`q_b`, `kv_a` and `o_proj` have no TIME row at GLM's shapes and stay unpriced.
+
+**The lease (2026-11-20 10:01–10:28, rh-anine).** Three binaries, built outside the lock:
+A = the pre-migration hipcc build; B = main `372efc6`; S = B with only the JOIN 1
+`device_sync()` (and its import) removed, a diagnostic build from `git archive` in its own
+target dir, never committed. Order A1 B1 S1 B2 S2 B3 S3 A2, the Phase 2 AB command (512 tokens,
+stock flags). Every witness 0 B, GTT 17 MiB before every arm; all eight arms decoded the same
+512 ids (md5 `89be6806` over the id lines, header stripped — the Phase 2 AB's too) with the same
+236570 hits / 70030 misses. tok/s is 512 ÷ the logged decode seconds; bucket columns are
+ms/token from `PROFILE/tok`; host load is the 1-minute loadavg.
+
+| arm | tok/s | attend | ffn | fetch-wait | wall | host load before → after |
+|---|---|---|---|---|---|---|
+| A1 | 3.088 | 93.750 | 114.242 | 110.102 | 323.760 | 6.72 → 8.11 |
+| B1 | 2.754 | 102.509 | 120.313 | 134.587 | 363.166 | 8.11 → 17.06 |
+| S1 | 2.671 | 98.137 | 129.013 | 141.323 | 374.457 | 17.06 → 12.18 |
+| B2 | 3.055 | 95.979 | 111.855 | 114.100 | 327.365 | 12.18 → 7.43 |
+| S2 | 3.035 | 94.373 | 112.623 | 116.947 | 329.453 | 7.43 → 6.09 |
+| B3 | 3.060 | 95.695 | 111.403 | 114.122 | 326.667 | 6.09 → 6.94 |
+| S3 | 3.092 | 94.308 | 111.537 | 112.198 | 323.490 | 6.94 → 6.15 |
+| A2 | 3.097 | 93.838 | 112.873 | 110.453 | 322.821 | 6.15 → 5.40 |
+
+- **Pre-registered verdict: NOT MET.** The rule, fixed by the coordinator before the run: the
+  sync explains the gap if mean ATTEND(S) < mean ATTEND(B) − max(spread B, spread S), spread =
+  max − min over the three arms. Mean ATTEND B 98.061 (spread 6.814), S 95.606 (spread 3.829);
+  Δ 2.455 < 6.814. The spread is pair 1's: host load reached 17 during B1 and S1 (foreign CPU
+  load; the GPU witness was clean), inflating every bucket of both arms.
+- **Post hoc, outside the rule:** S's ATTEND is below B's in all three pairs (−4.4, −1.6,
+  −1.4 ms). In pairs 2 and 3, B averages 95.84 and S 94.34: Δ 1.50 ms/token, ~20 µs a call over
+  75 MoE layers, in line with the 11–20 µs host-join price in `how-to-measure.md`; S sits
+  0.55 ms above the A anchors (93.79), B 2.04 above. Caveats: S always ran after B, while host
+  load fell through pairs 1–2, and only pair 3 is load-matched (−1.39 ms there, against an A1-A2
+  difference of 0.09 and a B2-B3 difference of 0.28). The B-vs-A gap itself reproduced (+2.04
+  ms in pairs 2–3, +1.6 in the Phase 2 AB).
+
+**The change.** The sync is replaced by the join it restated, as a type:
+`DeviceBuf::copy_out_joined` returns a `NullStreamDrained` that only that blocking readback can
+mint (`device.rs`, private field), `route_layer` gets it from the gate-logits D2H, and
+`launch_moe` takes it. The argument is in the type's doc; the correctness reviewer signed off on
+it (the token is exactly as strong as the sync: the sync sat before `submit`, waited on no device
+work, and every writer the experts read is on the null stream before the D2H). Taken whatever the
+attribution, because by its own argument the sync bought nothing the readback had not.
+**UNVERIFIED-NEEDS-GPU:** the confirmation lease (B′ = this tree against A, interleaved ×3, the
+Phase 2 AB command, the Phase 2 rule).
+
+**Found by the review, pre-existing, not changed here:** `stage_batch`'s two uploads
+(`descs_buf`, `wexpert_buf`) are synchronous `hipMemcpy` H2D from pageable memory, issued after
+the join. CUDA's rule lets such a copy return before its DMA lands; ROCm's synchronous copy is
+believed to wait for completion, which nothing here cites. The removed sync sat before
+`stage_batch` and never covered them, and V4/K3 sync after theirs. Owed: cite the ROCm behaviour
+or put the uploads behind an event both MoE streams wait on. Likewise the trace-only poison fill
+inside `submit` (`hipMemsetD32Async` on the null stream) is unordered against the fetch write and
+the miss-stream read of the same slot.

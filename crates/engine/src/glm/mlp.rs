@@ -5,7 +5,7 @@
 
 use super::engine::{GlmEngine, MOE_ACC_ROWS};
 use super::forward::{ResidualBase, Rows};
-use crate::device::as_le_bytes;
+use crate::device::{NullStreamDrained, as_le_bytes};
 use crate::fetch::asyncfetch::Ticket;
 use crate::glm::pin::{Fp8Mlp, Fp8Weight, LayerMlp};
 use crate::routed::{ExpertSlot, Selection};
@@ -16,7 +16,7 @@ use anyhow::Result;
 use anyhow::Context;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_backend::{
-    ExpertDesc, NULL_STREAM, device_sync, launch_gemv_f32, launch_gemv_fp8, launch_moe_acc_drain,
+    ExpertDesc, NULL_STREAM, launch_gemv_f32, launch_gemv_fp8, launch_moe_acc_drain,
     launch_moe_expert_range, launch_moe_expert_range_i4, launch_swiglu, launch_vadd, stream_signal,
 };
 use rivoli_core::routing::{RoutePolicy, RouteScratch, route_into};
@@ -87,8 +87,8 @@ impl GlmEngine<'_> {
         // layer's misses and relocations, not with the run's totals.
         #[cfg(feature = "corruption-probe")]
         let before = (self.pin.routed.misses(), self.pin.routed.relocs());
-        self.route_layer(l, rows)?;
-        self.moe_layer(l, rows).await?;
+        let joined = self.route_layer(l, rows)?;
+        self.moe_layer(l, rows, joined).await?;
         #[cfg(feature = "corruption-probe")]
         self.probe_moe(l, rows, before)?;
         // `ac`: the fixed-point accumulator BEFORE the drain resets it — the consumer-output
@@ -234,7 +234,7 @@ impl GlmEngine<'_> {
     /// `nrow == 1` pass submits exactly what the unbatched engine submitted. Routing
     /// is a pure function of (logits, bias, top_k) — it does NOT consult residency
     /// (INV-1).
-    fn route_layer(&mut self, l: usize, rows: Rows) -> Result<()> {
+    fn route_layer(&mut self, l: usize, rows: Rows) -> Result<NullStreamDrained> {
         let cfg = self.cfg;
         let LayerMlp::Moe { gate_w, .. } = self.pin.layers[l].mlp else {
             anyhow::bail!("route_layer on dense layer {l}")
@@ -261,17 +261,15 @@ impl GlmEngine<'_> {
         // against MLA over a growing KV; the approximation is stated on
         // `telemetry::ProfileSummary`).
         let t = std::time::Instant::now();
-        self.gate_logits.copy_out_into(&mut self.gate_logits_host)?;
-        // JOIN 1 (V4 and K3 make the same join). `xn` and the gate GEMV were written on the
-        // NULL stream, and `launch_moe`'s two MoE streams are `hipStreamNonBlocking`, so only
-        // this sync — not the readback above, which merely happens to drain the null stream —
-        // orders the expert kernels behind those writes. It sits BEFORE `submit`, where every
-        // stream is already idle (the null stream by the D2H, the MoE streams by the previous
-        // layer's awaits, the fetch stream by `run_layer`'s trailing sync), so it waits on no
-        // device work; after `submit` it could wait on miss copies the reaper has already
-        // enqueued. Its span lands in ATTEND with the D2H's; priced by the Phase 2 decode A/B
-        // (`rust-kernels.md` §5).
-        device_sync()?;
+        // JOIN 1. `xn` and the gate GEMV were written on the NULL stream, and `launch_moe`'s
+        // compute and miss streams are `hipStreamNonBlocking`, which the null stream does not
+        // order; this blocking readback is what puts those writes behind the expert kernels,
+        // and the token it returns is what `launch_moe` demands. (It replaced a
+        // `device_sync()` that restated the join at runtime: `rust-kernels.md` §5, Phase 2
+        // follow-up.)
+        let joined = self
+            .gate_logits
+            .copy_out_joined(&mut self.gate_logits_host)?;
         let t = self.prof.lap(crate::telemetry::Phase::Attend, t);
         // Descending, so `scores`/`choice` are left holding ROW 0 for the trace window
         // below — the trace measures the router against the real token, and row 0 is
@@ -299,7 +297,7 @@ impl GlmEngine<'_> {
         // Host routing — sigmoid/bias/top-k over 256 experts per row plus the union
         // build — is FFN-side work.
         self.prof.lap(crate::telemetry::Phase::Ffn, t);
-        Ok(())
+        Ok(joined)
     }
 
     /// Row `r`'s routed weights: the affinity score BEFORE the bias (the bias steers
@@ -340,7 +338,7 @@ impl GlmEngine<'_> {
     /// ADDRESSES are known after submit, so the descriptors are valid pointers), stage
     /// the batch, launch. The UNION, not one row's picks: every expert any row routed
     /// to must be resident before the batch launches.
-    async fn moe_layer(&mut self, l: usize, rows: Rows) -> Result<()> {
+    async fn moe_layer(&mut self, l: usize, rows: Rows, joined: NullStreamDrained) -> Result<()> {
         let t = std::time::Instant::now();
         // The fetch-path fold targets travel WITH the selection, so they are resolved here where
         // the probe is in hand rather than pushed into the pool as state beforehand.
@@ -383,7 +381,7 @@ impl GlmEngine<'_> {
         self.stage_batch(l, rows)?;
         // Pool submit + host staging + the two H2D uploads — FFN-side host work.
         self.prof.lap(crate::telemetry::Phase::Ffn, t);
-        self.launch_moe(rows).await
+        self.launch_moe(rows, joined).await
     }
 
     /// Host staging after submit: the `[descriptor][row]` weight matrix, the
@@ -452,7 +450,7 @@ impl GlmEngine<'_> {
     /// memory, silently); this decides only the ORDER of launches that each enqueue
     /// their wait unconditionally. A wrong bit costs throughput and cannot cost
     /// correctness.
-    async fn launch_moe(&mut self, rows: Rows) -> Result<()> {
+    async fn launch_moe(&mut self, rows: Rows, _joined: NullStreamDrained) -> Result<()> {
         let ndesc = self.descs.len();
         debug_assert_eq!(
             self.tickets.len(),

@@ -118,7 +118,7 @@ mod ffi {
 }
 
 #[cfg(feature = "rocm")]
-pub use tier::{DeviceBuf, DeviceTier, VmmBuf, mem_info};
+pub use tier::{DeviceBuf, DeviceTier, NullStreamDrained, VmmBuf, mem_info};
 
 /// `&[T]` as little-endian bytes, for a device upload.
 ///
@@ -292,6 +292,14 @@ mod tier {
         tier_used_accessor!();
     }
 
+    /// Proof that the null stream has retired every launch enqueued before it. Minted ONLY by
+    /// [`DeviceBuf::copy_out_joined`] (the field is private to this module), so a consumer
+    /// that takes one cannot be reached without a blocking readback first: make that copy
+    /// asynchronous and this is the one place that must change. A kernel enqueued after the
+    /// host holds one — on any stream, `hipStreamNonBlocking` included — reads the null
+    /// stream's earlier writes, because those kernels completed before the copy returned.
+    pub struct NullStreamDrained(());
+
     /// A standalone mutable device buffer — for per-token activations, the
     /// descriptor array, and the MoE accumulator that the kernels write. Unlike
     /// [`DeviceTier`] (append-only resident weights), a `DeviceBuf` is sized once
@@ -402,6 +410,14 @@ mod tier {
         /// D2H allocates nothing once `out` has grown to size).
         pub fn copy_out_into(&self, out: &mut Vec<u8>) -> Result<()> {
             self.copy_out_prefix(out, self.len)
+        }
+
+        /// [`DeviceBuf::copy_out_into`], returning the join it makes: the copy is a blocking
+        /// null-stream `hipMemcpy` into pageable memory, so it returns only after every launch
+        /// enqueued on the null stream before it has retired.
+        pub fn copy_out_joined(&self, out: &mut Vec<u8>) -> Result<NullStreamDrained> {
+            self.copy_out_into(out)?;
+            Ok(NullStreamDrained(()))
         }
 
         pub fn ptr(&self) -> *const u8 {

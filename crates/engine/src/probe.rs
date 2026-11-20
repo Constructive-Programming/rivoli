@@ -611,9 +611,9 @@ impl Probe {
         // exclusion), or one would read 0 and the other a hash (a false positive naming the wrong
         // hop). Either is the instrument lying, which is the one thing it may not do.
         //
-        // It is closed today by accident as well — `route_layer`'s gate-logits D2H is a blocking
-        // null-stream sync and sits between this clear and any later fold — but an instrument must
-        // not rest on a barrier that belongs to someone else's code and could go async.
+        // It is also closed by `route_layer`'s blocking gate-logits D2H (GLM's JOIN 1, the
+        // `NullStreamDrained` it returns), which sits between this clear and any later fold — but
+        // an instrument must not rest on a barrier that belongs to another sublayer.
         //
         // The cost is nil where it stands: `drain` runs at the end of a pass, immediately after
         // its own blocking D2H, at a point `run_layer`'s per-layer `device_sync` has already
