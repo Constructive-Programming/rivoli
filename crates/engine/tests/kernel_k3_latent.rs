@@ -17,7 +17,9 @@
 //!   3.299e-3 against the 6.3e-4 tolerance — and
 //!   [`the_batch_rmsnorm_would_fail_this_fixture`] must go red TOO, since the kernel it
 //!   asserts fails now "passes": the pair flipping together is the proof both are live.
-//! * In `kernels/linalg.hip`'s `gemm_bf16`, read the weight as fp16 instead of bf16.
+//! * In `crates/kernels/src/kvcompress.rs`'s `gemm_bf16` (was `kernels/linalg.hip`), read the
+//!   weight as fp16 instead of bf16 (recipe repointed to the Rust twin 2026-11-20; any red recorded
+//!   against it was on the hipcc kernel).
 //!   [`the_trunk_gemv_matches_an_f64_dot_at_k3_widths`] must go red in the 1e-3 region —
 //!   its own comment says a miss that size means "reading the weights as something other
 //!   than bf16", and this mutation is exactly that.

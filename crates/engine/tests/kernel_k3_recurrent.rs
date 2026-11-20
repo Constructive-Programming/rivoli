@@ -19,7 +19,9 @@
 //!
 //! The k3 tree red-proved this fixture against the DEVICE six ways, six reds
 //! (`k3:tests/k3_kernels.rs:2436`) — that recipe is this plan. Each mutation goes in
-//! `kernels/recurrent.hip`, and for each,
+//! `crates/kernels/src/recurrent.rs` (was `kernels/recurrent.hip`)
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel), and for each,
 //! [`the_gated_delta_recurrence_matches_the_anchor_at_every_kda_layer`] must go RED while
 //! [`the_kda_host_oracle_agrees_with_the_anchor`] stays GREEN (it is device-free — a
 //! mutation that reddens it has broken the tree, not the kernel):

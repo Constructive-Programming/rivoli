@@ -1,5 +1,5 @@
-//! `kernels/fwd.hip`'s glue kernels against host references. Compiles to nothing without
-//! rocm.
+//! The glue kernels (`crates/kernels/src/fwd.rs`; was `kernels/fwd.hip`) against host
+//! references. Compiles to nothing without rocm.
 //!
 //! These four are the small device ops that stitch a resident token together — an
 //! embedding lookup, the KV append, a query gather, and the non-finite localiser. All were

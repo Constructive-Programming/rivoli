@@ -505,7 +505,9 @@ fn the_recovered_weight_cannot_choose_the_offset_convention() {
 ///
 /// # RED-PROOF PLAN — for the integrator's first device run
 ///
-/// Mutations go in `kernels/recurrent.hip`'s `rmsnorm_gate_heads_f32`; each must redden this test
+/// Mutations go in `crates/kernels/src/recurrent.rs`'s `rmsnorm_gate_heads_f32` (was
+/// `kernels/recurrent.hip`) (recipe repointed to the Rust twin 2026-11-20; any red recorded against
+/// it was on the hipcc kernel); each must redden this test
 /// while [`the_host_norm_gate_predicts_every_other_head`] stays green:
 ///
 /// * `t <= head_dim` in the mask — the off-by-one, ~5.6e-4 at its weakest, and the LAST head then

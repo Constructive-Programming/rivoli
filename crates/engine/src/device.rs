@@ -101,7 +101,7 @@ macro_rules! tier_used_accessor {
 mod ffi {
     use std::ffi::c_void;
     // The HIP runtime memory API (libamdhip64, already linked by build.rs).
-    // These are runtime calls, not kernels — no hipcc launcher needed.
+    // These are runtime calls, not kernels — no launcher needed.
     unsafe extern "C" {
         pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
         pub fn hipFree(ptr: *mut c_void) -> i32;

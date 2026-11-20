@@ -129,11 +129,11 @@ fn moe_reference(x: &[f32], w: &[f32], d: Dims, mv: Matvec<'_>) -> Vec<f32> {
         for (o, d) in down.iter().enumerate() {
             // THE FIXTURE'S PRECONDITION, asserted where it can name the expert. The GPU
             // path runs every per-expert contribution through `moe_fixed`, which SATURATES
-            // at +/-MOE_ACC_MAX = 2^(58 - MOE_ACC_SHIFT) = 2^14 (common.hpp; not exported to
-            // Rust, so derived here) — this reference does not, so a fixture whose
-            // magnitudes exceed the clamp makes every comparison against it garbage in a way
-            // that reads as a kernel bug. MEASURED 2026-08-09, the hard way: the first
-            // multi-trip fixture drew weights up to +/-4 at 1280/1024, its reference peaked
+            // at +/-MOE_ACC_MAX = 2^(58 - MOE_ACC_SHIFT) = 2^14 (`prelude/mod.rs`;
+            // the device crate is not a host dependency, so derived here) — this reference does
+            // not, so a fixture whose magnitudes exceed the clamp makes every comparison against it
+            // garbage in a way that reads as a kernel bug. MEASURED 2026-08-09, the hard way: the
+            // first multi-trip fixture drew weights up to +/-4 at 1280/1024, its reference peaked
             // at 1.055e5, the GPU clamped at 1.6384e4, and the device test failed by 845x
             // against a STOCK kernel that three other tests were passing at 1e-6 — err
             // equalled max - 2^14 to three figures. The hazard was already written down in
@@ -676,7 +676,7 @@ fn moe_acc_drain_to_writes_the_latent_aggregate_and_resets() {
     // because an earlier draft claimed "an off-by-one in the block math would show" and it would
     // not; the grid math is covered by the real widths at decode, not here.
     let (n, rows) = (8usize, 2usize);
-    const SCALE: f64 = (1u64 << 44) as f64; // MOE_ACC_SHIFT, mirrored from kernels/moe.hip
+    const SCALE: f64 = (1u64 << 44) as f64; // MOE_ACC_SHIFT, mirrored from prelude/mod.rs
     // Row r contributes (o + 1) · (r + 1) · 2^44, so every output is an exact small integer and
     // the two rows are distinguishable — a drain that read only row 0 returns a THIRD of the
     // answer (1·(o+1) of 3·(o+1)), not half.

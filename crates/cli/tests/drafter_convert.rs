@@ -736,7 +736,7 @@ fn attended(q: i64, kv_len: usize, window: i64, lower_is_strict: bool) -> Vec<i6
 /// **THE BIDIRECTIONAL LOWER EDGE IS INCLUSIVE AND THE CAUSAL ONE IS STRICT, AND THE ANCHOR
 /// FIXTURE CANNOT SEE THE DIFFERENCE.** Measured 2026-08-17.
 ///
-/// The tree already has a Glimmer GQA attend kernel — `attn.hip::gqa_attend` — with the right head
+/// The tree already has a Glimmer GQA attend kernel — `gqa.rs::gqa_attend` — with the right head
 /// grouping, the right layout, a multi-row `tq`, and a `start_pos` that is exactly the `q_offset`
 /// the sibling test above says the drafter needs. So the natural way to build the block-attend
 /// kernel is to copy it and widen the bound. **That produces a defect this anchor scores green.**

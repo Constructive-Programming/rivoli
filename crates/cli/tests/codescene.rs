@@ -299,9 +299,10 @@ fn sweep(root: &Path, files: &[PathBuf], cache: &mut Cache) -> Sweep {
 /// that found almost nothing means the gate is aimed at the wrong tree — not that the
 /// tree is healthy.
 fn walked_rust_files(root: &Path) -> Vec<PathBuf> {
-    // .rs + .hpp + .py since 2026-08-15 (owner extended the mandate; cs scores all
-    // three). .hip is NOT scored by cs — the kernels' gates are the device oracles.
-    let mut files: Vec<PathBuf> = ["rs", "hpp", "py"]
+    // .rs + .py (owner extended the mandate 2026-08-15; .hpp was the third until
+    // 2026-11-20, when Rust-kernel Phase 2 deleted the last C++ header). .hip (now only
+    // the bit-identity probe) is NOT scored by cs.
+    let mut files: Vec<PathBuf> = ["rs", "py"]
         .iter()
         .flat_map(|e| common::walk(&root.join("crates"), e))
         .collect();

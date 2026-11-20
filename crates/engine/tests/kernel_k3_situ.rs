@@ -11,11 +11,13 @@
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
 //! Never executed: no PR-triggered rocm CI arm, no GPU for this port. One mutation in
-//! `kernels/common.hpp::situ_glu`: feed the sigmoid the CAPPED gate — `sigmoid(b1·tanh(g/b1))`
-//! instead of `sigmoid(g)`. That is the one trap this three-line operator has, and at the
-//! shipped `b1 = 4` it agrees to three figures near zero, which is where a spot check looks.
-//! [`situ_glu_matches_the_anchor_at_every_mlp`] must go RED — worst sites in the 1e-2 region
-//! at the dense MLP, 4.1e-3 at the shared experts — and
+//! `crates/kernels/src/prelude/activation.rs::situ_glu` (was `kernels/common.hpp`)
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel): feed the sigmoid the
+//! CAPPED gate — `sigmoid(b1·tanh(g/b1))` instead of `sigmoid(g)`. That is the one trap this
+//! three-line operator has, and at the shipped `b1 = 4` it agrees to three figures near zero, which
+//! is where a spot check looks. [`situ_glu_matches_the_anchor_at_every_mlp`] must go RED — worst
+//! sites in the 1e-2 region at the dense MLP, 4.1e-3 at the shared experts — and
 //! [`the_situ_sigmoid_takes_the_uncapped_gate`] must stay GREEN, because it perturbs the
 //! HOST oracle the same way and the kernel now agrees with its defect arm. Both directions
 //! are the proof; a mutation that reddens both changed something other than the sigmoid's

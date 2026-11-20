@@ -1,5 +1,5 @@
 //! DSA lightning-indexer constants shared by the host selection path (gpu.rs
-//! `dsa_select_layer`) and the device kernels (indexer.hip). The indexer itself
+//! `dsa_select_layer`) and the device kernels (crates/kernels/src/indexer.rs). The indexer itself
 //! runs on device; this module only pins the two magic numbers both sides must
 //! agree on.
 

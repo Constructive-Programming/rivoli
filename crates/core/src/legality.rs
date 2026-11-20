@@ -397,7 +397,7 @@ const V4_SPARSE_ATTN_IS_NOT_A_CHOICE: &str = "--attn names how attention SELECTS
 
 const V4_MTP_NEEDS_A_KERNEL: &str = "speculative decode on this architecture is blocked by a \
      missing KERNEL, not a missing head, and that is which of the two would have to arrive \
-     first. moe.hip instantiates the FP4 expert range at R=1 only and its guard refuses \
+     first. The FP4 expert-range kernel is instantiated at R=1 only and its guard refuses \
      anything else, so a V4 decode is structurally single-row: there is no verify pass to \
      batch whatever a draft head might later offer, and no two-row FP4 kernel could be scored \
      against an oracle that is bsz=1 only";

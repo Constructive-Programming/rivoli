@@ -100,8 +100,8 @@ echo
 #
 # The resolve check FIRST, and it is not a formality: --no-default-features strips only the
 # TOP crate's defaults — an inter-crate dep edge without `default-features = false` re-arms
-# rocm through feature unification, and on this box (hipcc present) every build cell below
-# stays green over it. Found live 2026-08-16: an M9 agent's "deviceless" workspace run
+# rocm through feature unification, and on this box (the rocm toolchain present) every build cell
+# below stays green over it. Found live 2026-08-16: an M9 agent's "deviceless" workspace run
 # executed device binaries unlocked. A compile cell cannot see the leak; the resolve can.
 # The non-empty guard is load-bearing: a failed `cargo tree` (stderr discarded) yields
 # empty stdout, grep exits 1, and the bare negation would turn the cell GREEN on a broken

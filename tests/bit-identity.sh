@@ -6,8 +6,9 @@
 # discipline (flock + contention witness through tests/gpu-witness.sh's run_arm).
 #
 # **The reference is the tagged C, never the tree.** `git archive` extracts
-# crates/backend/kernels at the tag into scratch and hipcc builds REF_SOURCES there with the
-# flags crates/backend/build.rs used for them (`--offload-arch=gfx1151 -O3 -fPIC`), as a
+# crates/backend/kernels at the tag into scratch (the tree has had no C++ since Rust-kernel
+# Phase 2, 2026-11-20) and hipcc builds REF_SOURCES there with the flags
+# crates/backend/build.rs used for them until then (`--offload-arch=gfx1151 -O3 -fPIC`), as a
 # shared object whose `rivoli_*` launchers the harness dlopens. Comparing against anything
 # rebuilt from the working tree would let a port that edited the C beside the Rust compare
 # against its own edit.
@@ -29,6 +30,7 @@
 #        tests/bit-identity.sh --probes [--families=F,…]                  prelude probe rows
 #        tests/bit-identity.sh --plant=FAMILY                             a probe plant's arm
 #        tests/bit-identity.sh --build-probes [--plant=FAMILY]            deviceless build
+#        tests/bit-identity.sh --census                                   deviceless barrier census
 #        --expect-red=ROWS  inverts the verdict, for a recorded red proof: GREEN only if every
 #                           row ran and examined something, EXACTLY the named rows are RED, and
 #                           every other row is BIT-IDENTICAL — a plant must redden the assertion
@@ -48,6 +50,11 @@
 #                           --plant, tests/bit-identity/plants/FAMILY.patch is applied to the
 #                           copy first: the plant is a small diff against the real prelude, so
 #                           no red-proof branch lives in shipped source and nothing is copied.
+#        --census           the per-kernel barrier census, deviceless (no lock): the clean
+#                           probe object's static `s_barrier`/`buffer_gl0_inv` counts against
+#                           hipcc's objects of the tag, each kernel equal or pinned in DIVERGE
+#                           below. `--plant=barrier` is judged by this census, not by a device
+#                           arm (plant_spec's CENSUS rows).
 #        test-binary        a PLANTED binary, only with --expect-red; default: the one the header's
 #                           build line produces, refused unless cargo reports it Fresh.
 #        BITIDENT_CLASSIFY=<stdout-file>  classify an existing arm's stdout and exit, no GPU and
@@ -71,11 +78,18 @@ ARCH=${RIVOLI_OFFLOAD_ARCH:-gfx1151}
 # 0b's CPU defect sets and device arms (rust-kernels.md §"Phase 0b — the prelude"), respelled
 # for this harness's row names (Rust float formatting: `s=NaN`). A patch plants the defect in
 # the real helper, so it reaches EVERY probe calling that helper (formats: `f2e4m3_rne` also
-# sits inside `ex_aq8`). `barrier` has a patch but no row: a missing barrier is a race the
-# bits may not show, and its judge (0b's scratch ISA census, `s_barrier` per kernel) is not
-# in the tree yet — owed.
+# sits inside `ex_aq8`). `barrier` is a CENSUS row: a missing barrier is a race the bits may
+# not show (0b's R-barrier arm: 0 red cells of 512), so it is judged by --census, its rows
+# being kernels. It must redden exactly the kernels that call `block_sum_lds` (the planted
+# helper; each call loses one of its 2 + log2(bd) barriers) and hold kernels whose barriers
+# it cannot reach: the fp8 dots' combine, `mha_attend`, `index_topk`, `gather_attn_shared_kv`.
 plant_spec() {
     case $1 in
+        barrier) CENSUS=1
+            RED_RE='^(k_block_sum2|qk_norm|index_pool_norm_f32|g(ated_delta|dn)_recurrent_f32'
+            RED_RE+='|rmsnorm_(batch|centered_single|weightless_batch|gate_heads_f32)'
+            RED_RE+='|kv_compress_(decode|prefill))$'
+            HOLD_RE='^(k_fp8_|gemv_fp8|mha_attend$|index_topk$|gather_attn_shared_kv$)' ;;
         formats) FAMILIES=codec RED_RE='^ex_f2e4m3$|^ex_aq8 ' HOLD_RE='^ex_(aq4|rbf16|f2bf16)' ;;
         actquant) FAMILIES=codec RED_RE='^ex_aq[48] s=' HOLD_RE='^ex_aq[48] s=NaN$|^ex_f2e4m3$' ;;
         common) FAMILIES=codec RED_RE='^ex_swiglu ' HOLD_RE='^ex_situ_|^ex_moe_fixed$' ;;
@@ -90,7 +104,7 @@ plant_spec() {
     esac
 }
 
-EXPECT_RED= RED_RE= HOLD_RE= PROBES= FAMILIES= PLANT= BUILD=
+EXPECT_RED= RED_RE= HOLD_RE= PROBES= FAMILIES= PLANT= BUILD= CENSUS=
 while [ $# -gt 0 ]; do
     case "$1" in
         --expect-red=?*) EXPECT_RED=${1#--expect-red=} ;;
@@ -98,25 +112,31 @@ while [ $# -gt 0 ]; do
         --families=?*) FAMILIES=${1#--families=} ;;
         --plant=?*) PLANT=${1#--plant=} PROBES=1 ;;
         --build-probes) BUILD=1 ;;
+        --census) CENSUS=1 ;;
         --*) echo "FAIL: unknown option $1" >&2; exit 2 ;;
         *) break ;;
     esac
     shift
 done
 if [ -n "$BUILD" ]; then
-    [ -z "$EXPECT_RED$FAMILIES$*" ] || { echo "FAIL: --build-probes takes only --plant" >&2; exit 2; }
+    [ -z "$EXPECT_RED$FAMILIES$CENSUS$*" ] || { echo "FAIL: --build-probes takes only --plant" >&2; exit 2; }
+elif [ -n "$CENSUS" ]; then
+    [ -z "$EXPECT_RED$FAMILIES$PLANT$PROBES$*" ] ||
+        { echo "FAIL: --census takes no other option (its plant is --plant=barrier)" >&2; exit 2; }
 elif [ -n "$PLANT" ]; then
     [ -z "$EXPECT_RED$FAMILIES" ] || { echo "FAIL: --plant sets its own verdict and families" >&2; exit 2; }
     plant_spec "$PLANT" || { echo "FAIL: no plant_spec row for '$PLANT'" >&2; exit 2; }
+    [ -z "$CENSUS" ] || [ -z "$*" ] || { echo "FAIL: a census plant scores no binary" >&2; exit 2; }
 fi
 
 # The verdict, from an arm's stdout ($1) and its exit code ($2). Counted from the binary's
-# per-row token lines and checked against the binary's own RESULT total — never from rc
+# per-row token lines (a passing row is BIT-IDENTICAL, or SAME in the barrier census, where
+# equal counts are not equal bits) and checked against the binary's own RESULT total — never from rc
 # alone: a row that examined nothing prints VACUOUS and is neither verdict, and an arm that
 # died part-way prints fewer rows than its RESULT line (or none) and is refused too.
 classify() {
     local out=$1 rc=$2 rows total vac reds red_names
-    rows=$(grep -cE '^(BIT-IDENTICAL|RED|VACUOUS) ' "$out")
+    rows=$(grep -cE '^(BIT-IDENTICAL|SAME|RED|VACUOUS) ' "$out")
     total=$(sed -nE 's/^RESULT [0-9]+ of ([0-9]+) rows.*/\1/p' "$out" | tail -1)
     vac=$(grep -cE '^VACUOUS ' "$out")
     reds=$(grep -cE '^RED ' "$out")
@@ -133,7 +153,7 @@ classify() {
     if [ -n "$RED_RE" ]; then
         local stray holds held_red
         stray=$(grep -E '^RED ' "$out" | sed -E 's/^RED ([^:]+):.*/\1/' | grep -vcE "$RED_RE")
-        holds=$(grep -E '^(BIT-IDENTICAL|RED) ' "$out" | sed -E 's/^[A-Z-]+ ([^:]+):.*/\1/' | grep -cE "$HOLD_RE")
+        holds=$(grep -E '^(BIT-IDENTICAL|SAME|RED) ' "$out" | sed -E 's/^[A-Z-]+ ([^:]+):.*/\1/' | grep -cE "$HOLD_RE")
         held_red=$(grep -E '^RED ' "$out" | sed -E 's/^RED ([^:]+):.*/\1/' | grep -cE "$HOLD_RE")
         echo "plant $PLANT: red=$reds outside-RE=$stray must-hold rows=$holds of which red=$held_red"
         if [ "$reds" -gt 0 ] && [ "$stray" -eq 0 ] && [ "$rc" -ne 0 ] &&
@@ -155,7 +175,7 @@ classify() {
         return 1
     fi
     if [ "$reds" -eq 0 ] && [ "$rc" -eq 0 ]; then
-        echo "GREEN: every row BIT-IDENTICAL"
+        echo "GREEN: every row BIT-IDENTICAL (census: SAME)"
         return 0
     fi
     echo "RED: [${red_names}] differ from the tagged hipcc twin (rc=$rc)" >&2
@@ -182,6 +202,36 @@ probe_stamp() {
     (cd "$ROOT" && find crates/kernels crates/abi -type f -print0 | sort -z | xargs -0 sha256sum |
         sha256sum) || return 1
     [ "$1" = clean ] || sha256sum <"$HERE/bit-identity/plants/$1.patch"
+}
+# The probe object for $1 (clean or a plant), refused when absent or stamped from other source.
+current_probe() {
+    local rp
+    rp=$(probe_object "$1")
+    [ -f "$rp" ] && [ "$(cat "$TARGET/probes/$1.stamp" 2>/dev/null)" = "$(probe_stamp "$1")" ] || {
+        echo "FAIL: no current $rp — run --build-probes$([ "$1" = clean ] || echo " --plant=$1") first" >&2
+        return 1
+    }
+    echo "$rp"
+}
+# The tagged C, extracted into $SCRATCH/ref: sets TAG_SHA and KDIR.
+ref_tree() {
+    TAG_SHA=$(git -C "$ROOT" rev-parse "$TAG^{commit}") || { echo "FAIL: tag $TAG missing" >&2; return 1; }
+    mkdir -p "$SCRATCH/ref" || return 1
+    git -C "$ROOT" archive "$TAG" crates/backend/kernels | tar -x -C "$SCRATCH/ref" || return 1
+    KDIR=$SCRATCH/ref/crates/backend/kernels
+    echo "reference: $TAG @ $TAG_SHA, $(hipcc --version 2>/dev/null | grep -m1 -i 'hip version')"
+}
+# hipcc for the reference, every call appending to one log.
+ref_hipcc() {
+    hipcc "--offload-arch=$ARCH" -O3 "$@" >>"$SCRATCH/hipcc.log" 2>&1 ||
+        { echo "FAIL: hipcc (see $SCRATCH/hipcc.log)" >&2; return 1; }
+}
+# The prelude probes' hipcc object ($1): the in-tree probe.hip compiled against the TAG's
+# headers, with 0b's flags (`--offload-device-only --no-gpu-bundle-output`, -O3) — a code
+# object, not a .so.
+hip_probes() {
+    ref_hipcc --offload-device-only --no-gpu-bundle-output -I"$KDIR" \
+        "$ROOT/crates/engine/tests/bit_identity/probes/probe.hip" -o "$1"
 }
 
 # ── Rust probe objects: deviceless, never inside the lock ────────────────────────────────
@@ -230,6 +280,120 @@ if [ -n "$BUILD" ]; then
     exit 0
 fi
 
+# ── the barrier census: deviceless, never inside the lock ────────────────────────────────
+# A missing barrier is a race the bits may not show, so the barrier plant is judged here, from
+# the ISA: per kernel, the static `s_barrier` and `buffer_gl0_inv` counts (`__syncthreads`
+# on gfx11 is `s_barrier; buffer_gl0_inv`, `prelude::reduce::sync_threads` the same) in the
+# probe object — every shipped kernel plus the prelude probes — against hipcc's objects of the
+# tag, one per REF_SOURCES file with build.rs's flags (`-fgpu-rdc`, one object for all, would
+# change the codegen) plus probe.hip. A row is a paired kernel with a barrier on either side;
+# SAME is equal counts, or the exact counts DIVERGE pins. The clean census also holds the
+# EMBEDDED object (the one `src/module.rs` ships) to the probe object, kernel by kernel, so
+# scoring the probe build is not scoring a different binary.
+#
+# DIVERGE: `kernel hipcc_barrier hipcc_inv rust_barrier rust_inv`, one row per line, where the
+# two differ by construction — hipcc loops an LDS tree on blockDim (one barrier in the loop
+# body), Rust unrolls the block-size constant's tree (one per level): L1's `s_barrier 2 → 9`,
+# L4's `20 against 6` (rust-kernels.md §5). Pinned exactly, so a plant that removes one of the
+# unrolled barriers still reddens the row. `hash_rows`' hipcc elides one invalidate after a
+# barrier; `sync_threads` always emits it.
+DIVERGE='argmax_reduce 2 2 9 9
+attn_res 3 3 10 10
+hash_rows 2 1 9 9
+kv_compress_decode 9 9 16 16
+kv_compress_prefill 8 8 15 15
+layernorm 2 2 9 9
+mha_attend 6 6 20 20
+qk_norm 3 3 10 10
+rmsnorm_batch 3 3 10 10
+rmsnorm_centered_single 3 3 10 10
+rmsnorm_single 2 2 9 9
+rmsnorm_weightless_batch 3 3 10 10'
+# Kernels with no twin, each argued: the gate's device compares (hipcc-only by design, probes
+# census), `k_vq_wave_r1` (LTO merges it into the identical `k_vq_wave` on the Rust side),
+# `touch_region` (async.hip is not a REF_SOURCE: no output to compare, kernel_coverage's
+# UNROWED). Each must be one-sided, both ends. Rust's `argmax` is hipcc's `argmax_reduce`.
+ONE_SIDED='cmp_bytes cmp_nan_words k_vq_wave_r1 touch_region'
+if [ -n "$CENSUS" ]; then
+    # `join` pairs on field 1 while `sort` orders whole lines; under a collating locale `_` and
+    # spaces are ignored and the two orders can disagree (review 2026-11-20, reproduced).
+    export LC_ALL=C
+    RP=$(current_probe "${PLANT:-clean}") || exit 2
+    OBJDUMP=$(hipconfig --hipclangpath 2>/dev/null)/llvm-objdump
+    [ -x "$OBJDUMP" ] || { echo "FAIL: no llvm-objdump beside hipcc's clang ($OBJDUMP)" >&2; exit 2; }
+    SCRATCH=/var/cache/rivoli/scratch/bit-identity/census-$(date +%Y%m%dT%H%M%S)-$$
+    mkdir -p "$SCRATCH/obj" || exit 2
+    ref_tree || exit 2
+    for s in "${REF_SOURCES[@]}"; do
+        ref_hipcc -fPIC --offload-device-only --no-gpu-bundle-output "$KDIR/$s.hip" \
+            -o "$SCRATCH/obj/$s.hsaco" || exit 2
+    done
+    hip_probes "$SCRATCH/obj/probes.hsaco" || exit 2
+    sha256sum "$RP" | sed 's/^/rust:      /'
+    counts() { # objects… → sorted `kernel barriers invalidates`, one line per kernel
+        "$OBJDUMP" -d "--mcpu=$ARCH" "$@" | awk '
+            /^[0-9a-f]+ <[^>]+>:$/ { k = substr($2, 2, length($2) - 3); b[k] += 0; g[k] += 0; next }
+            k && /^[ \t]+s_barrier/ { b[k]++ }
+            k && /^[ \t]+buffer_gl0_inv/ { g[k]++ }
+            END { for (k in b) print k, b[k], g[k] }' | sort
+    }
+    counts "$SCRATCH"/obj/*.hsaco >"$SCRATCH/hipcc.txt" || exit 2
+    counts "$RP" >"$SCRATCH/probe.txt" || exit 2
+    if [ -z "$PLANT" ]; then
+        EMB=$(find "$TARGET/debug/build" -path \
+            '*/rivoli-backend-*/out/kernels-target/amdgcn-amd-amdhsa/release/rivoli_kernels.elf' \
+            -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+        [ -n "$EMB" ] || { echo "FAIL: no embedded code object under $TARGET — build the rocm arm first" >&2; exit 2; }
+        counts "$EMB" >"$SCRATCH/embedded.txt" || exit 2
+        # Every embedded kernel, present in the probe object with the same counts.
+        drift=$(join -a1 -e - -o 0,1.2,1.3,2.2,2.3 "$SCRATCH/embedded.txt" "$SCRATCH/probe.txt" |
+            awk '$2 != $4 || $3 != $5') || exit 2
+        [ -z "$drift" ] || {
+            echo "FAIL: the embedded object ($EMB) differs from the probe object:" >&2
+            echo "$drift" >&2
+            exit 2
+        }
+        echo "embedded:  $(wc -l <"$SCRATCH/embedded.txt") kernels, counts equal to the probe object's ($EMB)"
+    fi
+    sed 's/^argmax /argmax_reduce /' "$SCRATCH/probe.txt" | sort >"$SCRATCH/rust.txt" || exit 2
+    join --check-order -a1 -a2 -e - -o 0,1.2,1.3,2.2,2.3 "$SCRATCH/hipcc.txt" "$SCRATCH/rust.txt" \
+        >"$SCRATCH/joined.txt" || { echo "FAIL: join (unsorted input?)" >&2; exit 2; }
+    awk -v one="$ONE_SIDED" -v table="$DIVERGE" '
+        BEGIN {
+            n = split(one, o, " "); for (i = 1; i <= n; i++) side[o[i]] = 0
+            n = split(table, t, "\n")
+            for (i = 1; i <= n; i++) { split(t[i], f, " "); pin[f[1]] = f[2] " " f[3] " " f[4] " " f[5] }
+        }
+        {
+            k = $1; got = $2 " " $3 " " $4 " " $5
+            if ($2 == "-" || $4 == "-") {
+                if (k in side) { side[k] = 1; next }
+                print "RED " k ": no twin (hipcc " $2 "/" $3 ", rust " $4 "/" $5 ")"; rows++; reds++; next
+            }
+            if (k in side) { print "SETUP: " k " is listed one-sided but has both twins"; bad = 1; next }
+            if (k in pin) { want = pin[k]; used[k] = 1 }
+            else if ($2 + $3 + $4 + $5 == 0) next
+            else want = $2 " " $3 " " $2 " " $3
+            rows++
+            split(want, w, " ")
+            line = k ": s_barrier " $2 "/" $4 ", buffer_gl0_inv " $3 "/" $5 " (hipcc/rust)"
+            if (got == want) print "SAME " line
+            else { reds++; print "RED " line "; want " w[1] "/" w[3] ", " w[2] "/" w[4] }
+        }
+        END {
+            for (k in side) if (!side[k]) { print "SETUP: one-sided " k " not found on exactly one side"; bad = 1 }
+            for (k in pin) if (!(k in used)) { print "SETUP: DIVERGE row " k " names no paired kernel"; bad = 1 }
+            print "RESULT " rows - reds " of " rows " rows"
+            exit bad ? 2 : (reds ? 1 : 0)
+        }' "$SCRATCH/joined.txt" >"$SCRATCH/census.stdout"
+    rc=$?
+    cat "$SCRATCH/census.stdout"
+    echo "logs: $SCRATCH"
+    [ "$rc" -eq 2 ] && { echo "FAIL: the census tables disagree with the objects (SETUP lines)" >&2; exit 2; }
+    classify "$SCRATCH/census.stdout" "$rc"
+    exit $?
+fi
+
 LOCK=${GPU_LOCK:-/var/run/sys-gpu.lock}
 [ -e "$LOCK" ] || {
     echo "FAIL: $LOCK does not resolve (gate-red-proofs.md §16, the /var/run bind defect)" >&2
@@ -237,7 +401,7 @@ LOCK=${GPU_LOCK:-/var/run/sys-gpu.lock}
 }
 
 SCRATCH=/var/cache/rivoli/scratch/bit-identity/$(date +%Y%m%dT%H%M%S)-$$
-mkdir -p "$SCRATCH/ref" || exit 2
+mkdir -p "$SCRATCH" || exit 2
 
 # ── the binary: built from THIS tree, by cargo's own fingerprint ────────────────────────
 # Not "the newest by mtime", which is how a binary built before the last edit got scored:
@@ -273,22 +437,13 @@ fi
 [ -x "$BIN" ] || { echo "FAIL: $BIN is not an executable" >&2; exit 2; }
 
 # ── the reference, outside the lock ─────────────────────────────────────────────────────
-TAG_SHA=$(git -C "$ROOT" rev-parse "$TAG^{commit}") || { echo "FAIL: tag $TAG missing" >&2; exit 2; }
-git -C "$ROOT" archive "$TAG" crates/backend/kernels | tar -x -C "$SCRATCH/ref" || exit 2
-KDIR=$SCRATCH/ref/crates/backend/kernels
-echo "reference: $TAG @ $TAG_SHA, $(hipcc --version 2>/dev/null | grep -m1 -i 'hip version')"
+ref_tree || exit 2
 echo "binary:    $BIN"
 ENVS=()
 if [ -n "$PROBES" ]; then
-    # The prelude probes: the in-tree probe.hip compiled against the TAG's headers, with 0b's
-    # flags (`--offload-device-only --no-gpu-bundle-output`, -O3) — a code object, not a .so.
     HP=$SCRATCH/ref/probes.hsaco
-    hipcc "--offload-arch=$ARCH" -O3 --offload-device-only --no-gpu-bundle-output -I"$KDIR" \
-        "$ROOT/crates/engine/tests/bit_identity/probes/probe.hip" -o "$HP" \
-        >"$SCRATCH/hipcc.log" 2>&1 || { echo "FAIL: hipcc (see $SCRATCH/hipcc.log)" >&2; exit 2; }
-    RP=$(probe_object "${PLANT:-clean}")
-    [ -f "$RP" ] && [ "$(cat "$TARGET/probes/${PLANT:-clean}.stamp" 2>/dev/null)" = "$(probe_stamp "${PLANT:-clean}")" ] ||
-        { echo "FAIL: no current $RP — run --build-probes${PLANT:+ --plant=$PLANT} first" >&2; exit 2; }
+    hip_probes "$HP" || exit 2
+    RP=$(current_probe "${PLANT:-clean}") || exit 2
     # The reference source is the working tree's probe.hip (its bodies are thin calls into the
     # tag's headers); its hash and both objects' are printed so an arm names what it compared.
     sha256sum "$ROOT/crates/engine/tests/bit_identity/probes/probe.hip" "$HP" "$RP" |
@@ -300,8 +455,7 @@ else
     SRCS=()
     for s in "${REF_SOURCES[@]}"; do SRCS+=("$KDIR/$s.hip"); done
     SO=$SCRATCH/ref/rivoli_ref.so
-    hipcc "--offload-arch=$ARCH" -O3 -fPIC -shared -Wl,-Bsymbolic "${SRCS[@]}" -o "$SO" \
-        >"$SCRATCH/hipcc.log" 2>&1 || { echo "FAIL: hipcc (see $SCRATCH/hipcc.log)" >&2; exit 2; }
+    ref_hipcc -fPIC -shared -Wl,-Bsymbolic "${SRCS[@]}" -o "$SO" || exit 2
     TEST=every_rust_kernel_is_byte_identical_to_its_tagged_hipcc_twin
     ENVS+=(RIVOLI_BITIDENT_REF="$SO")
 fi

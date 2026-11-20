@@ -24,7 +24,9 @@
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
 //! Never executed: no PR-triggered rocm CI arm, no GPU for this port. Two mutations in
-//! `kernels/moe_f4.hip`:
+//! `crates/kernels/src/moe_f4.rs` (was `kernels/moe_f4.hip`)
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel):
 //!
 //! * In the K3 pass-2 body, move the routing weight INSIDE the bf16 store —
 //!   `rbf16(dv * w)` for `rbf16(dv) * w`, which is V4's arrangement.

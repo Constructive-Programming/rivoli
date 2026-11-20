@@ -64,11 +64,12 @@ pub const F4_LUT: [f32; 16] = [
 /// > but it is weaker evidence, because it names the tensor and not the row or the group.
 /// >
 /// > **And there are THREE decoders with three behaviours, not two.** This one bails,
-/// > `common.hpp::e8m0f` returns a quiet NaN, and `v4oracle::numerics::e8m0_decode` returns
-/// > `f32::NAN` outright. A future decision to adopt 255 → zero has three sites to move.
+/// > the kernels' `e8m0f` (`crates/kernels/src/prelude/dot_nib.rs`) returns a quiet NaN, and
+/// > `v4oracle::numerics::e8m0_decode` returns `f32::NAN` outright. A future decision to adopt 255
+/// > → zero has three sites to move.
 /// >
 /// > Mapping 255 to zero instead would be adopting a rule for values the format forbids and this
-/// > engine's own artifacts cannot contain — and it would have to be adopted in `common.hpp`'s
+/// > engine's own artifacts cannot contain — and it would have to be adopted in the kernels'
 /// > `e8m0f` too, where nothing can report it. `docs/measurement/k3-reference/repack-one-expert.md`
 /// > carries the distribution.
 pub fn e8m0(b: u8) -> anyhow::Result<f32> {

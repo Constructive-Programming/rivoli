@@ -6,10 +6,11 @@
 //! once, and a bucket that reads zero because nothing filled it is this repo's named telemetry
 //! trap. What remains is the loop, and the one stat line every arm prints.
 //!
-//! **Speculative decode is not available on this path and cannot be.** `moe.hip` instantiates
-//! the FP4 expert range at `R = 1` only, so there is no `--mtp` argument here to switch off;
-//! `rivoli_core::legality` says so once, at startup, and says it as a missing KERNEL rather
-//! than a missing head — because that is which of the two would have to arrive first.
+//! **Speculative decode is not available on this path and cannot be.**
+//! `crates/kernels/src/moe_f4.rs` instantiates the FP4 expert range at `R = 1` only, so there is no
+//! `--mtp` argument here to switch off; `rivoli_core::legality` says so once, at startup, and says
+//! it as a missing KERNEL rather than a missing head — because that is which of the two would have
+//! to arrive first.
 
 use super::engine::{ARGMAX_BYTES, V4Engine};
 use crate::seam::{Decoded, Emit, GenSpec, TokenSink};

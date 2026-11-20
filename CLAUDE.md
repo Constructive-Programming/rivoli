@@ -166,7 +166,8 @@ appears that enum dispatch cannot fill.
   kernel with an output (all but `touch_region`, which has none to compare — the one argued
   exemption, `UNROWED` in `kernel_coverage.rs`), through its shipped `launch_*`, against the
   `rivoli_*` C launcher of a shared object hipcc builds from `git archive archive/hip-kernels`
-  (the tag, never the tree) — byte-identical outputs with NaN compared as a class (owner,
+  (the tag, never the tree — the tree holds no C++ since Rust-kernel Phase 2, 2026-11-20) —
+  byte-identical outputs with NaN compared as a class (owner,
   2026-11-18), guard codes and guard order, ≥ 64 seeds, adversarial inputs, the engine's shapes
   and its aliasing (`h == g`, `y == x` where production launches in place), per-kernel µs beside
   hipcc's. A row that examined nothing prints VACUOUS and fails; `--expect-red=ROWS` judges a
@@ -183,7 +184,12 @@ appears that enum dispatch cannot fill.
   PAID 2026-11-18 (222/222 identical, all eight judged plants scripted GREEN, witness clean). A
   plant is a small patch to the real prelude (`tests/bit-identity/plants/<family>.patch`),
   applied with exact context to a scratch copy by `--build-probes --plant=<family>`;
-  `--plant=<family>` judges it by its row in the script's `plant_spec` table. On-demand (GPU;
+  `--plant=<family>` judges it by its row in the script's `plant_spec` table. `--census` is the
+  deviceless barrier census (no lock): per kernel, the static `s_barrier`/`buffer_gl0_inv`
+  counts of the probe object (held equal to the embedded one) against hipcc's objects of the
+  tag, each equal or pinned exactly in the script's `DIVERGE` table (Rust unrolls LDS trees
+  hipcc loops on blockDim); it is the `barrier` plant's judge (`--plant=barrier`), red-proofed
+  2026-11-20 (`docs/measurement/gate-red-proofs.md` §21). On-demand (GPU;
   `--probes` plus the eight plants 281 s, measured 2026-11-18; the launcher-row arm
   unmeasured), not CI.
 - **kernel census** — `crates/cli/tests/kernel_coverage.rs`: every launcher has an oracle
@@ -215,8 +221,11 @@ appears that enum dispatch cannot fill.
 **The build IS the rocm build** (owner rule 2026-08-16): `default = ["rocm"]` at every
 level of the DAG, so a bare `cargo build` is the real engine and a bare
 `cargo test --workspace` is a GPU arm — flock it and serialize it like any device suite.
-The deviceless refusal-stub arm is `--no-default-features`; it is what CI's hipcc-less
-runner builds, and the feature matrix pins every cell's exact set with it.
+The deviceless refusal-stub arm is `--no-default-features`; it is what CI's ROCm-less
+runner builds, and the feature matrix pins every cell's exact set with it. The rocm arm needs
+rustup with the device crate's pinned nightly (`crates/kernels/rust-toolchain.toml`), ROCm's
+device bitcode (`ocml.bc` …) and `libamdhip64`; **hipcc is not a build input** since 2026-11-20
+— only `tests/bit-identity.sh` runs it, on the tagged reference.
 
 Every line below carries its own `CARGO_TARGET_DIR` because on this box that is the only
 thing that isolates a build (`## Build cache and worktrees`); `rivoli` is the PRIMARY
@@ -350,6 +359,9 @@ session's scratch directory is how a stale result gets mistaken for a fresh one.
 
 - Comments explain *why* and carry the measurement that justified the choice; a bare
   restatement of the code is noise here.
+- A citation of `kernels/<file>.hip` or `.hpp` names that file at tag `archive/hip-kernels`
+  (it lived in `crates/backend/kernels/`, deleted 2026-11-20); the live kernels are
+  `crates/kernels/src`.
 - Name code for **behaviour + ABI**, never for the model that introduced it; model
   membership is data in a checked census table.
 - Docs: front matter on every file, corrections **in place with a dated note**, superseded

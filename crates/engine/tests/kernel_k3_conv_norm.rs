@@ -15,7 +15,9 @@
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
 //! Never executed: no PR-triggered rocm CI arm, no GPU for this port. Two mutations, one per
-//! kernel, in `kernels/recurrent.hip`:
+//! kernel, in `crates/kernels/src/recurrent.rs` (was `kernels/recurrent.hip`)
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel):
 //!
 //! * **Reverse the conv's tap order** (read `w[ch*taps + (taps-1-j)]`).
 //!   [`the_short_conv_matches_the_anchor_at_every_kda_layer`]'s `y` sites must go RED in the

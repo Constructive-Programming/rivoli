@@ -2,13 +2,12 @@
 //! the code object to `src/module.rs`. Only reached under the `rocm` feature, so the
 //! deviceless arm never needs nightly, rustup or ROCm's device libraries.
 
-use super::Toolchain;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// ROCm's device-library directory (`ocml.bc` and the `oclc_*` control libraries hipcc
 /// links). Probed like the runtime below; `RIVOLI_DEVICE_LIBS` overrides, for the same
-/// build-script-environment reason `RIVOLI_OFFLOAD_ARCH` gives.
+/// build-script-environment reason `RIVOLI_OFFLOAD_ARCH` gives (`offload_arch`).
 fn device_libs() -> PathBuf {
     println!("cargo:rerun-if-env-changed=RIVOLI_DEVICE_LIBS");
     if let Some(d) = std::env::var_os("RIVOLI_DEVICE_LIBS") {
@@ -23,6 +22,15 @@ fn device_libs() -> PathBuf {
     .find(|d| Path::new(d).join("ocml.bc").exists())
     .expect("ROCm device libraries (ocml.bc) not found; set RIVOLI_DEVICE_LIBS")
     .into()
+}
+
+/// ponytail: default gfx1151 (Strix Halo); override for other ROCm nodes with
+/// RIVOLI_OFFLOAD_ARCH. (An env var — the build-script carve-out argument from the old tree
+/// applies verbatim: cargo already configures this script through the environment, and
+/// rerun-if-env-changed puts the toggle inside cargo's fingerprint.)
+fn offload_arch() -> String {
+    println!("cargo:rerun-if-env-changed=RIVOLI_OFFLOAD_ARCH");
+    std::env::var("RIVOLI_OFFLOAD_ARCH").unwrap_or_else(|_| "gfx1151".into())
 }
 
 /// The pinned channel, read from the file rustup itself would read — one spelling of the pin.
@@ -47,10 +55,10 @@ fn device_toolchain(kdir: &Path) -> String {
 ///   which under linker-plugin LTO does not exist until LTO has run — lld refuses the
 ///   script without this (measured: `version script assignment of 'global' to symbol
 ///   't.kd' failed`).
-fn device_rustflags(tc: &Toolchain, libs: &Path) -> Vec<String> {
-    let isa = tc.arch.trim_start_matches("gfx");
+fn device_rustflags(arch: &str, libs: &Path) -> Vec<String> {
+    let isa = arch.trim_start_matches("gfx");
     let mut f = vec![
-        format!("-Ctarget-cpu={}", tc.arch),
+        format!("-Ctarget-cpu={arch}"),
         "-Clinker-plugin-lto".into(),
         "-Clink-arg=--undefined-version".into(),
     ];
@@ -64,8 +72,8 @@ fn device_rustflags(tc: &Toolchain, libs: &Path) -> Vec<String> {
     let isa_bc = format!("oclc_isa_version_{isa}");
     for bc in bcs.iter().copied().chain([isa_bc.as_str()]) {
         let path = libs.join(format!("{bc}.bc"));
-        // A ROCm upgrade replaces these; the hipcc reference rebuilds against the new OCML,
-        // so the embedded code object must too.
+        // A ROCm upgrade replaces these; the hipcc reference (tests/bit-identity.sh) rebuilds
+        // against the new OCML, so the embedded code object must too.
         println!("cargo:rerun-if-changed={}", path.display());
         f.push(format!("-Clink-arg={}", path.display()));
     }
@@ -78,7 +86,7 @@ fn device_rustflags(tc: &Toolchain, libs: &Path) -> Vec<String> {
 /// — above all `CARGO_TARGET_DIR` (the per-checkout dir this outer build is using; sharing
 /// it is the `gate-red-proofs.md` §7e-bis defect) and the outer `CARGO_ENCODED_RUSTFLAGS`
 /// (host flags), which is REPLACED rather than removed because it outranks `RUSTFLAGS`.
-pub fn rivoli_kernels(tc: &Toolchain) -> PathBuf {
+pub fn rivoli_kernels(out_dir: &Path) -> PathBuf {
     let kdir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels");
     for p in [
         "src",
@@ -92,14 +100,13 @@ pub fn rivoli_kernels(tc: &Toolchain) -> PathBuf {
     ] {
         println!("cargo:rerun-if-changed={}", kdir.join(p).display());
     }
-    let target_dir = Path::new(&tc.out_dir).join("kernels-target");
-    let flags = device_rustflags(tc, &device_libs()).join("\x1f");
+    let target_dir = out_dir.join("kernels-target");
+    let flags = device_rustflags(&offload_arch(), &device_libs()).join("\x1f");
     // The same flags, for `tests/bit-identity.sh --build-probes`: the gate builds the probe
     // object (`--features probes`, from a copy of this crate that may carry a plant patch)
     // outside cargo, and reads the one spelling of the device flags from here rather than
     // restating ROCm's bitcode paths.
-    std::fs::write(Path::new(&tc.out_dir).join("device-rustflags"), &flags)
-        .expect("write device-rustflags");
+    std::fs::write(out_dir.join("device-rustflags"), &flags).expect("write device-rustflags");
     let mut cmd = Command::new("rustup");
     cmd.args([
         "run",

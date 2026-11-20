@@ -16,7 +16,10 @@
 //!
 //! This suite has never executed: no PR-triggered rocm CI arm, and the author of this port
 //! had no GPU. Before trusting a green run, make it go red. One mutation in
-//! `kernels/residual.hip` (at tag `archive/hip-kernels`), expected magnitudes below it:
+//! `crates/kernels/src/residual.rs` (was `kernels/residual.hip`)
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel), expected magnitudes
+//! below it:
 //!
 //! * In `rivoli_attn_res`'s score loop, multiply each source's contribution to the score by
 //!   its RMSNorm scale a SECOND time (i.e. mix the normalised sources — the

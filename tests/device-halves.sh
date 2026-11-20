@@ -68,12 +68,13 @@ binary_for() { # $1 = test stem → newest built executable, skipping cargo's `.
 }
 
 # A binary older than the kernels it launches tests a stale tree — §11's exact warning, that
-# a fast rebuild proves nothing about whether hipcc ran. Warn rather than refuse: the
-# operator may be scoring a branch deliberately, and parity-glm.sh made this a warning too.
+# a fast rebuild proves nothing about whether the kernels were recompiled. Warn rather than
+# refuse: the operator may be scoring a branch deliberately, and parity-glm.sh made this a warning
+# too.
 warn_if_stale() { # $1 = binary
     local st
-    st=$(find "$HERE/../crates/backend" "$HERE/../crates/engine" \( -name '*.hip' -o -name '*.hpp' \
-          -o -name '*.rs' \) -newer "$1" 2>/dev/null | head -5) || true
+    st=$(find "$HERE/../crates/backend" "$HERE/../crates/engine" "$HERE/../crates/kernels" \
+          -name '*.rs' -newer "$1" 2>/dev/null | head -5) || true
     [ -z "$st" ] || echo "WARN: sources newer than $1 — this arm tests an older tree:" >&2
     while IFS= read -r f; do printf '        %s\n' "$f" >&2; done <<<"$st"
 }

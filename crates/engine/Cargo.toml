@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 # THE BUILD IS THE ROCM BUILD (owner rule 2026-08-16): `rocm` is default at every level of
 # the DAG, so a bare `cargo build`/`cargo test` is the real engine on this box. The
-# deviceless refusal-stub arm — what CI's hipcc-less runner builds — is reached with
+# deviceless refusal-stub arm — what CI's ROCm-less runner builds — is reached with
 # `--no-default-features`, and the feature matrix pins every cell to an exact set the same
 # way. This also means a bare `cargo test --workspace` is a GPU arm: flock it and pass
 # `--test-threads=1` like any device suite.

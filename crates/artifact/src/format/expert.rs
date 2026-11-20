@@ -161,7 +161,7 @@ impl F4Expert<'_> {
             );
             // **The e8m0 NaN check, and this is the one place in the engine that can make
             // it.** `0xff` is the format's NaN. The kernel decodes it correctly
-            // (`common.hpp::e8m0f` returns a quiet NaN rather than `2^128`) but cannot
+            // (`prelude::dot_nib::e8m0f` returns a quiet NaN rather than `2^128`) but cannot
             // REFUSE it, and `moe_fixed`'s saturating clamp then launders the NaN into a
             // finite ±2^14 — so one bad byte is 32 weights of plausible garbage with no
             // error anywhere. `docs/investigations/v4-flash-port.md` §S3 requirement 10.
@@ -267,7 +267,7 @@ mod tests {
 
     /// **An e8m0 `0xff` scale byte is refused at repack, and `0x00` is not.**
     ///
-    /// `0xff` is the format's NaN. `common.hpp::e8m0f` decodes it correctly — to a quiet
+    /// `0xff` is the format's NaN. `prelude::dot_nib::e8m0f` decodes it correctly — to a quiet
     /// NaN, which is the right answer — and then `moe_fixed`'s saturating clamp launders it
     /// into a finite ±2^14, so a single bad byte becomes 32 weights of plausible garbage
     /// with no error anywhere downstream. The kernels cannot refuse it; this is the only

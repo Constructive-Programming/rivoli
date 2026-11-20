@@ -35,24 +35,27 @@
 //!   GEMV sweeps: NaN payloads through an FMA chain are not contractual across host and device,
 //!   so a bitwise comparison over them would pin an implementation accident. Their decode stays
 //!   covered by `kernel_v4_moe.rs`'s formula test.
-//! * **What hipcc will emit tomorrow.** [`the_fp8_dot_sums_in_source_order_through_both_loops`]
-//!   pins the compiler's CONTRACTION pattern as well as the source order; if a future hipcc
-//!   contracts differently this goes red and the ISA gets re-read. That is the intended
-//!   outcome, not a fragility to paper over.
+//! * **What the compiler will emit tomorrow.**
+//!   [`the_fp8_dot_sums_in_source_order_through_both_loops`] pins the compiler's CONTRACTION
+//!   pattern as well as the source order; if a future toolchain contracts differently this goes red
+//!   and the ISA gets re-read. That is the intended outcome, not a fragility to paper over.
 //!
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
 //! Never executed: there is no `rocm` CI arm and this port had no GPU. One mutation each, with
-//! the magnitude to expect:
+//! the magnitude to expect (recipe repointed to the Rust twin 2026-11-20; any red recorded against
+//! it was on the hipcc kernel):
 //!
-//! * In `kernels/linalg.hip::f2e4m3_rne`, change the subnormal tie from round-to-nearest-EVEN
-//!   to half-away-from-zero (`+= 0.5` before the truncation instead of the even-bit test).
+//! * In `crates/kernels/src/prelude/formats.rs::f2e4m3_rne` (was `kernels/linalg.hip`), change
+//!   the subnormal tie from round-to-nearest-EVEN to half-away-from-zero (`+= 0.5` before the
+//!   truncation instead of the even-bit test).
 //!   [`act_quant_reaches_e4m3s_subnormal_ties_and_rounds_them_to_even`] must go RED naming an
-//!   element in its first 16, and [`act_quant_f8_is_bit_identical_to_the_oracle`] must go red
-//!   too — the second fixture reaches the same ties by construction. Nothing else moves. If the
-//!   FIRST stays green the fixture has stopped reaching the subnormal band, which its own
-//!   anti-vacuity arm (`sub >= 8`) asserts.
-//! * In `kernels/common.hpp::fp8_dot_strided`, reorder the three fmas of the dword body
+//!   element in its first 16, and [`act_quant_f8_is_bit_identical_to_the_oracle`] must go red too —
+//!   the second fixture reaches the same ties by construction. Nothing else moves. If the FIRST
+//!   stays green the fixture has stopped reaching the subnormal band, which its own anti-vacuity
+//!   arm (`sub >= 8`) asserts.
+//! * In `crates/kernels/src/prelude/dot_fp8.rs::fp8_dot_strided_r` (was
+//!   `kernels/common.hpp::fp8_dot_strided`), reorder the three fmas of the dword body
 //!   (accumulate `i0+2` before `i0`). [`the_fp8_dot_sums_in_source_order_through_both_loops`]
 //!   must go RED at some element — it is a BITWISE gate, so the expected magnitude is "at least
 //!   one bit pattern differs", and `old:` records the sibling reassociation experiment moving
@@ -364,7 +367,7 @@ struct FoldRow<'a> {
 
 impl FoldRow<'_> {
     /// One THREAD's strided share of the fp8 dot, in the kernel's emitted contraction
-    /// (`common.hpp::fp8_dot_strided`: `q = x1·l1` rounded, then three fmas, then
+    /// (`prelude/dot_fp8.rs::fp8_dot_strided_r`: `q = x1·l1` rounded, then three fmas, then
     /// `acc = fma(s, q, acc)`; the scalar tail is `acc = fma(x·l, s, acc)`).
     ///
     /// `start`/`stride` are the kernel's own arguments: `(lane, 32)` under the wave-per-row

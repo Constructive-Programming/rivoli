@@ -31,7 +31,8 @@ use super::{
 // published int4 GLM checkpoint (AWQ/GPTQ, `group_size=128`) actually use.
 //
 // The scale therefore lives INSIDE the dot (each group's partial is scaled before it
-// is accumulated), not outside it — see `dot_i4_wave` in kernels/common.hpp.
+// is accumulated), not outside it — see `dot_nib_wave_r` in crates/kernels/src/prelude/dot_nib.rs
+// (`dot_i4_wave` at tag `archive/hip-kernels`).
 
 /// Weights per f32 int4 group scale, along the input dimension. 128 is the
 /// AWQ/GPTQ/Marlin default; 64 (what `.vq3` uses) is the other point worth sweeping.

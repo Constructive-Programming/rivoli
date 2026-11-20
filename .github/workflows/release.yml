@@ -5,8 +5,10 @@ name: release
 # WHY THIS NEEDS A SELF-HOSTED RUNNER, and is not a GitHub-hosted job with an apt step.
 #
 # The shipped engine is `--features rocm` compiled `--offload-arch=gfx1151`. That needs the
-# ROCm toolchain (hipcc + device libs), which is tens of gigabytes and does not fit in a
-# GitHub-hosted runner's free disk. More importantly, a binary for one GPU architecture is
+# kernels' pinned nightly (`crates/kernels/rust-toolchain.toml`) and ROCm's device bitcode
+# libs (`ocml.bc` etc.) and `libamdhip64` — hipcc is no longer a build input (2026-11-20) —
+# and the ROCm install is tens of gigabytes, which does not fit in a GitHub-hosted runner's
+# free disk. More importantly, a binary for one GPU architecture is
 # only worth shipping if it has been RUN on that architecture, and the 106-test rocm suite
 # needs the device. So the release is built and tested on the target machine itself.
 #
@@ -70,7 +72,7 @@ jobs:
             echo "built:   $(date -uIseconds)"
             echo "arch:    ${RIVOLI_OFFLOAD_ARCH:-gfx1151}"
             echo "rustc:   $(rustc --version)"
-            echo "hipcc:   $(hipcc --version 2>/dev/null | head -1 || echo unknown)"
+            echo "device:  $(cd crates/kernels && rustc --version)"
           } > BUILD-INFO.txt
           cat BUILD-INFO.txt
 

@@ -54,8 +54,8 @@
 //! aims other tooling at these dirs and reads the refusal as a defect. The same shape
 //! applies to `geometry.rs`'s sniff fixtures.
 //!
-//! **Nothing here reaches the split-K kernel.** `linalg.hip` routes `rivoli_gemv_fp8` to its
-//! split-K sibling at `i_dim >= 4096`; the anchor's `hidden` is 72 and `inter` 216, so every
+//! **Nothing here reaches the split-K kernel.** `launch/linalg.rs` routes `rivoli_gemv_fp8` to
+//! its split-K sibling at `i_dim >= 4096`; the anchor's `hidden` is 72 and `inter` 216, so every
 //! projection in this fixture takes the wave-per-row path. On the real checkpoint (hidden
 //! 6656, `o_proj` `i_dim` 4096, `mlp.down_proj` `i_dim` 19968) **all eight take split-K**.
 //! That arithmetic is scored by `kernel.rs::gemv_fp8_matches_oracle`, which runs the long

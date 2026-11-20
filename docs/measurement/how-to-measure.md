@@ -65,7 +65,8 @@ the mean and its interval do not.
 
 **A phase profile localises cost; it does not explain it.** Any mechanism attributed to a
 hot kernel without reading its ISA is a **HYPOTHESIS**. Mark it as one when writing, and
-confirm with `hipcc -S` before implementing — that costs a compile, not a device slot.
+confirm by disassembling the shipped code object before implementing — that costs a compile,
+not a device slot.
 
 This is not a general caution; it is the measured result of the first per-kernel tranche.
 **Four of the five per-kernel items below had the wrong mechanism.** The profile was right
@@ -79,16 +80,31 @@ about *where* the time went in all five cases and wrong about *why* in four:
 | 5 lm_head | split-K, "same shape argument as o_proj" | not grid-starved at all (19,360 blocks); it is load width |
 
 Every one of those corrections came from a compiler that was available the whole time,
-free, while the GPU was the bottleneck. Both invocations are CPU-only and need no device:
+free, while the GPU was the bottleneck. Both invocations are CPU-only and need no device.
+
+> **2026-11-20 (Rust-kernel Phase 2):** the kernels are Rust (`crates/kernels`) and the
+> `.hip` sources these commands first ran on are gone from the tree, so the recipe below now
+> reads the code object the build embeds (the method `docs/investigations/rust-kernels.md`
+> used throughout Phase 1). The table above was measured on the hipcc build; to reproduce
+> it, `git archive archive/hip-kernels` and run hipcc (`--offload-arch=gfx1151 -O3
+> --cuda-device-only -S` for ISA, `-Rpass-analysis=kernel-resource-usage -c` for resources)
+> on the tagged file.
 
 ```sh
-# 1. The gfx1151 ISA for a kernel translation unit.
-hipcc --offload-arch=gfx1151 -O3 --cuda-device-only -S kernels/linalg.hip -o /tmp/k.s
-awk '/^gemv_fp8_splitk:/,/^\.Lfunc_end/' /tmp/k.s > /tmp/kernel.s   # isolate one kernel
-awk '/Inner Loop Header/,/s_cbranch_execnz/' /tmp/kernel.s          # isolate its hot loop
+# The code object rustc builds for gfx1151 (under the backend's build-script OUT_DIR).
+OBJ=amdgcn-amd-amdhsa/release/rivoli_kernels.elf
+ELF=$(ls -t /var/cache/rivoli/target/<name>/debug/build/rivoli-backend-*/out/kernels-target/$OBJ \
+      | head -1)
+LLVM=$(hipconfig --hipclangpath)   # ROCm's LLVM, as tests/bit-identity.sh resolves it
+S=/var/cache/rivoli/scratch/isa
+mkdir -p "$S"
 
-# 2. Registers, scratch, spills, occupancy.
-hipcc --offload-arch=gfx1151 -O3 -Rpass-analysis=kernel-resource-usage -c kernels/attn.hip -o /dev/null
+# 1. The gfx1151 ISA for one kernel, then its loop back-edges.
+"$LLVM/llvm-objdump" -d --mcpu=gfx1151 --disassemble-symbols=gemv_fp8_splitk "$ELF" > "$S/kernel.s"
+grep -n 's_cbranch_' "$S/kernel.s"
+
+# 2. Registers, scratch, spills (the AMDGPU metadata notes).
+"$LLVM/llvm-readelf" --notes "$ELF"
 ```
 
 **Three ways a static instruction count lies.** Each cost an afternoon:
@@ -104,7 +120,8 @@ hipcc --offload-arch=gfx1151 -O3 -Rpass-analysis=kernel-resource-usage -c kernel
 - **Do not conclude "no divide in the loop" by grepping for `v_rcp_iflag_f32`.** LLVM
   strength-reduces a division by a loop-invariant runtime value into a magic multiply, so the
   reciprocal disappears while the cost does not. For a **signed** divide what survives is the
-  quotient correction — that is the signature to grep for. `kernels/common.hpp` cites this.
+  quotient correction — that is the signature to grep for. `kernels/common.hpp` (tag
+  `archive/hip-kernels`) cites this.
 
 Count the cost you may have added, not just the one you removed: one exec-mask sequence
 (`s_and_saveexec_b32`) went 6 → **37** → 4 across a round where only the mask handling

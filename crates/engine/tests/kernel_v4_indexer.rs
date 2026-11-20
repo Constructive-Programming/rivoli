@@ -44,7 +44,9 @@
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
 //! Never executed: no `rocm` CI arm, and no GPU for this port. Two mutations in
-//! `kernels/linalg.hip`:
+//! `crates/kernels/src/blockindex.rs` (was `kernels/linalg.hip`)
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel):
 //!
 //! * In `rivoli_act_quant_f4_rotated`, drop the bf16 store BETWEEN the rotation and the fp4
 //!   quantization. [`indexer_spread_is_bit_identical_to_the_oracle`] must go RED naming a first

@@ -206,7 +206,7 @@ fn warn_if_over_soft_cap(root: &std::path::Path, p: &std::path::Path) {
     const SOFT: usize = 800;
     let source = p
         .extension()
-        .is_some_and(|x| ["rs", "hip", "hpp", "py", "sh"].iter().any(|e| x == *e));
+        .is_some_and(|x| ["rs", "hip", "py", "sh"].iter().any(|e| x == *e));
     if !source {
         return;
     }

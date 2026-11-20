@@ -36,7 +36,7 @@
 //!    that band would be truncated by the ACCUMULATOR and the test would measure the wrong
 //!    thing. [`the_branchless_decodes_match_the_oracle_bitwise`] covers the two decode
 //!    FORMULAS over every code including `0x00` and `0xff`, on the host;
-//!    [`every_byte_pattern_decodes_right_in_both_dot_paths`] is the bridge to what hipcc
+//!    [`every_byte_pattern_decodes_right_in_both_dot_paths`] is the bridge to what the compiler
 //!    emitted; and [`the_fixture_exercises_the_codes_the_decoders_are_credited_with`] measures
 //!    what the end-to-end comparison actually reaches instead of assuming it is broad.
 //! 4. **The shared expert.** It is fp8 e4m3 at 128x128, not FP4, and is a different kernel —
@@ -46,9 +46,12 @@
 //!
 //! This suite has never executed: `--features rocm` has no CI arm in this tree, and the author
 //! of this port had no GPU. Before trusting a green run, make it go red. One mutation, in
-//! `kernels/moe.hip`, and the expected magnitude below it:
+//! `crates/kernels/src/moe_f4.rs` (was `kernels/moe.hip`)
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel), and the expected
+//! magnitude below it:
 //!
-//! * In `moe_gateup_f4_impl`, drop the `swiglu_clamped` call's `limit` to `1e6f`
+//! * In `moe_gateup_f4`, drop the `swiglu_clamped` call's `limit` to `1e6f`
 //!   (or replace `swiglu_clamped(g, u, limit)` with the unclamped `silu(g) * u`).
 //!   [`the_swiglu_clamp_is_live_and_the_fixture_reaches_it`] must go RED and
 //!   [`routed_experts_match_the_oracle`] must stay GREEN — the first runs at activation scale

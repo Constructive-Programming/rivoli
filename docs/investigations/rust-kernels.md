@@ -103,6 +103,8 @@ Spike tree: `/var/cache/rivoli/scratch/rust-amdgpu-spike/` (scratch, not vendore
   crate both sides compile, so host and device share ONE definition — the unification
   payoff. Where that is not possible, a compile-time layout assert on both sides.
 - `hipcc` leaves the build. It remains only in the bit-identity reference (§3).
+  > **DONE 2026-11-20 (Phase 2, §5):** `build.rs` builds only the device crate and links
+  > `libamdhip64`; `crates/backend/kernels/` is deleted, and the C++ lives at the tag alone.
 
 > **AMENDED 2026-11-18 (Phase 0a), three points the build proved:**
 > - **ROCm's device libraries stay a build input.** `tanhf`, `pow`, `sin`, `cos` are OCML
@@ -449,6 +451,8 @@ over the in-tree pair: the same single DIFF as their record (`k_i4_wave_r2`, wav
   15/15), so its hold anchor is the reduce family. `barrier` has a patch but no row: it is a race, and
   its judge, 0b's scratch ISA census (`s_barrier` per kernel), is not in the tree yet. That
   judge is OWED. Five stub arms red-proof the rule (`gate-red-proofs.md` §18).
+  > **PAID 2026-11-20 (Phase 2):** `tests/bit-identity.sh --census` is that judge, in the tree
+  > (§5 Phase 2; `gate-red-proofs.md` §21).
 - **Census:** `every_prelude_probe_has_its_hipcc_twin` — 35 Rust probes, each with a
   same-named `__global__` in `probe.hip` and vice versa (documented one-sided: `cmp_*`,
   `k_vq_wave_r1`, each checked to exist), and every probe name is a string literal some
@@ -526,7 +530,7 @@ each.
   - actquant, common and situ: equal counts per name pattern.
   - formats: the five extra `ex_aq8` rows are new. The patch form predicted them: the
     patched `f2e4m3_rne` sits inside `ex_aq8`.
-- The barrier plant has no arm; its judge is owed (above).
+- The barrier plant has no arm; its judge is owed (above). *(PAID 2026-11-20, §5 Phase 2.)*
 
 ### Phase 0 merge review — the fix list (2026-11-18, deviceless)
 
@@ -2140,9 +2144,10 @@ scorers 0.18×.
 
 **Left owed:**
 - the four slow rows above;
-- the `glm/mlp.rs` join;
+- the `glm/mlp.rs` join; *(done 2026-11-20, Phase 2)*
 - Phase 2: the dead hipcc half of `build.rs`, the 9 headers, the `launchers!` matcher's
-  decorative annotations and the census's `->` arrow;
+  decorative annotations and the census's `->` arrow; *(2026-11-20: all but the annotations
+  done in Phase 2, which records why those stay)*
 - L2's `MoeRange` literals;
 - one shared plant-threshold helper;
 - from Step 1: L2's gdn `rep` computed in the row; the L1/L2 launcher-row plants at the plants
@@ -2202,7 +2207,7 @@ the device had an empty witness, and GTT read 17 MiB before each (17.8 MiB exact
 | launcher plants, one binary (fwd, launch/kvcompress, launch/mla, attn-dense) | GREEN (expect-red): exactly `gather_attn_shared_kv` 187, `mha_attend` 209, `gemm_bf16` 266, `mla_absorb_fp8` 256, `sigmoid_gate` 256 cells red | 0 | 15.4 min |
 | `--probes` | GREEN: 222/222 probe rows identical | 0 | 0.9 min |
 | `--plant=reduce` | GREEN: `k_wave_sum` red 64/64, the must-hold rows held | 0 | 2 s |
-| `--plant=barrier` | **refused at setup** (`no plant_spec row for 'barrier'`): that plant's arm is owed (its judge, a per-kernel `s_barrier` census, is not in the tree). Listing it was a planning error in the READY post. Not rerun. | 2 | 0 s |
+| `--plant=barrier` | **refused at setup** (`no plant_spec row for 'barrier'`): that plant's arm is owed (its judge, a per-kernel `s_barrier` census, is not in the tree). Listing it was a planning error in the READY post. Not rerun. *(Its judge landed 2026-11-20: Phase 2, below.)* | 2 | 0 s |
 | W (full battery, `--test-threads=1`) | 721 passed, 1 failed: CodeScene, the same 30 inherited files as Step 4's W (lists diffed equal) | 101 | 19.2 min |
 | D (`determinism-glm.sh`, `--arena-refresh`, ngen 1024) | GREEN: ids identical to 1024; GTT rise 0; `slot_stalls 0`; 2.73 and 2.82 tok/s | 0 | 13.5 min |
 
@@ -2231,4 +2236,60 @@ the device had an empty witness, and GTT read 17 MiB before each (17.8 MiB exact
     - `hc_post` 0.923 → 0.961 (+0.037; a 2.4 µs row whose spread is 0.024–0.025);
     - `act_quant_f4_rotated` 0.958 → 0.968 (+0.010);
     - `moe_expert_range_f4` single expert 1.018 → 1.020 (+0.002).
+
+### Phase 2 (2026-11-20, branch `wave/rk-phase2`, base `5dd417b`)
+
+Deviceless half; the lease is recorded below it. Logs: `/var/cache/rivoli/scratch/rk-phase2/`
+(`gates/`, `census/`, `deviceless/`).
+
+**1. hipcc out of the build.** `crates/backend/build.rs` keeps the libamdhip64 link and the
+device-crate build (`build/device.rs`, which now reads `RIVOLI_OFFLOAD_ARCH` itself); the
+`KERNELS` list, `headers()`, `Toolchain` and the `librivolikernels.a` archive are gone, and so is
+`crates/backend/kernels/` (the 9 headers). The bit-identity reference never read the tree: the
+launcher arm, the probe arm and the new census all `git archive` the tag (`ref_tree`), and the
+probe build reads only `crates/kernels`, `crates/abi` and the `device-rustflags` file
+`build/device.rs` writes.
+- **The embedded code object did not move:** sha256 `318f0bfb…` in this branch's dev and
+  release builds, in a fresh target dir, and in the `rk-perf` target dir whose object the
+  `fe02120` lease scored 66/66 bit-identical.
+- **The rocm build needs no hipcc, shown:** a `hipcc` that exits 97 first on `PATH`, a freshly
+  deleted target dir, `cargo build -p rivoli-backend`: rc 0, the device crate built.
+- **The deviceless arm needs neither nightly nor ROCm, re-shown** (Phase 0a's recipe): a
+  `RUSTUP_HOME` holding only the stable toolchain, the failing `hipcc` first on `PATH`,
+  `RIVOLI_DEVICE_LIBS=/nonexistent`, a freshly deleted target dir, `cargo test --workspace
+  --no-default-features --no-fail-fast`: 516 passed, 1 failed (CodeScene, below). Red proof that
+  the environment lacks the device toolchain: the same environment building `-p rivoli-backend`
+  (rocm) fails in `build/device.rs` with `toolchain 'nightly-2026-11-18…' is not installed`.
+- **Every census still examines its population:** kernel_coverage 66/66 launchers with oracles,
+  53 called + 13 classified, 35 prelude probes; the scanner lost its `->` arrow (no row has
+  carried one since the integration).
+- **Docs and comments:** about 50 files whose text said the C was in the tree, was a build
+  input, or located live behaviour in a deleted `.hip`, now point at the Rust (red-proof recipes
+  that moved carry a dated note that their recorded red was on the hipcc kernel). A bare
+  `kernels/<file>.hip` citation names the tag, by a CLAUDE.md convention line. The jscpd exempt
+  count stays 10 (no marker moved; `docs.rs` derives it).
+- **Declined:** the `launchers!` rows' `as`/`=>` type annotations, decorative since the `->`
+  arm left. Removing them is 166 one-line edits across the five jscpd-exempt invocation files,
+  where a parameter annotation and a kernarg struct field (`s: d.s as i32,`) look alike to any
+  mechanical rewrite; it changes no behaviour, so it is left for an owner-approved pass.
+
+**2. The barrier census** (`tests/bit-identity.sh --census`, the `barrier` plant's judge). It is
+a script mode, not a cargo test, because its reference needs hipcc and its object the pinned
+nightly, neither of which the deviceless cargo arm may assume. Per kernel, the static
+`s_barrier` and `buffer_gl0_inv` counts of the probe object, held equal to the embedded object's,
+against hipcc's objects of the tag. 12 kernels differ by construction and are pinned exactly
+(`DIVERGE`: hipcc loops an LDS tree on blockDim where Rust unrolls the constant's). Clean: 46/46
+rows SAME. `--plant=barrier`: exactly the 11 `block_sum_lds` callers red, 14 must-hold rows held,
+scripted `GREEN (plant barrier)`. Eight further plants and stubs red or refused as designed
+(`gate-red-proofs.md` §21).
+
+**3. GLM's MoE join.** `glm/mlp.rs::route_layer` calls `device_sync()` right after the
+gate-logits D2H: JOIN 1, as V4 and K3 have it. The null-stream writes (`xn`, the gate GEMV)
+were ordered before the non-blocking MoE streams only by the readback. Placed before `submit`,
+every stream is already idle, so it waits on no device work; its cost is priced by the decode
+A/B below.
+
+**Gates (deviceless):** fmt, the dev build (jscpd ran, 0 clones), clippy both arms rc 0;
+`cargo test --workspace --no-default-features --no-fail-fast` 516 passed, 1 failed: CodeScene,
+the same 30 inherited files as the `rk-perf` lease's W (lists diffed equal).
 

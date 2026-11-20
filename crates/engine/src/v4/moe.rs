@@ -193,7 +193,7 @@ impl V4Engine<'_> {
 
     /// The routed experts for token row `t`, accumulated onto the sublayer buffer's row `t`.
     ///
-    /// One row at a time, and that is structural rather than a simplification: `moe.hip`
+    /// One row at a time, and that is structural rather than a simplification: `launch/moe.rs`
     /// refuses `nrow != 1` (only `R = 1` is instantiated). So a prefill of `s` tokens performs
     /// `s` MoE dispatches per layer while attention runs ONCE over the whole prompt —
     /// attention is the only operation here with a cross-token dependency.

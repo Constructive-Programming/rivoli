@@ -96,9 +96,9 @@ launchers! {
     /// produce. This refuses `limit <= 0`, **NaN and `+/-inf`** (guard 1006, the same code `moe.hip`
     /// returns for the same check on the same argument), so unclamped is not spellable here.
     ///
-    /// The clamp itself is one `kernels/common.hpp::swiglu_clamped`, shared with
-    /// `moe_gateup_f4_impl`: the routed and shared paths must agree bit for bit, and `kernels/`
-    /// is not scanned by `build.rs`'s jscpd gate, so a second copy would have drifted unseen.
+    /// The clamp itself is one `crates/kernels/src/prelude/activation.rs::swiglu_clamped` (was
+    /// `kernels/common.hpp`), shared with `moe_gateup_f4`: the routed and shared paths must
+    /// agree bit for bit.
     ///
     /// # Safety
     /// `g`, `u` and `h` are each `n` f32 and must outlive `stream`'s completion. `h` may alias
@@ -115,7 +115,8 @@ launchers! {
 
     /// **SiTU-GLU over a gate/up pair — Kimi-K3's activation**, `k3-architecture.md` §8:
     /// `y = (b1·tanh(g/b1)·sigmoid(g)) · (b2·tanh(u/b2))`, so `|y| <= b1·b2` (100 at the shipped
-    /// 4 and 25). The arithmetic is `kernels/common.hpp::situ_glu` and is argued there; ported
+    /// 4 and 25). The arithmetic is `crates/kernels/src/prelude/activation.rs::situ_glu`;
+    /// was `kernels/common.hpp::situ_glu`, which argues it (tag `archive/hip-kernels`); ported
     /// from `k3:src/backend/hip.rs` (M9).
     ///
     /// **Not [`launch_swiglu_clamped_bf16`] with different constants.** The sigmoid takes the

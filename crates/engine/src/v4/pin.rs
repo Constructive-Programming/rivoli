@@ -426,7 +426,7 @@ impl V4Pin {
         let unit = f4.expert_slot();
         let units = expert_units(range.len(), cfg.n_experts, unit);
         // `super::ROWS` rows and ZERO shared blocks — both facts about this arm's kernels
-        // rather than preferences. `moe.hip` instantiates the FP4 expert range at `R = 1`
+        // rather than preferences. `moe_f4.rs` instantiates the FP4 expert range at `R = 1`
         // only, so a V4 decode is structurally single-row and there is no union to take; and
         // V4's shared expert is fp8 e4m3 and RESIDENT, so the `.f4` set holds `n_experts`
         // blocks with none folded in (which is also why `launch_moe_expert_range_f4` takes an

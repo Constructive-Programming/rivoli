@@ -1,5 +1,5 @@
-//! `kernels/indexer.hip`'s DSA/MISA launchers against host references. Compiles to nothing
-//! without rocm.
+//! The DSA/MISA indexer launchers (`crates/kernels/src/indexer.rs`; was `kernels/indexer.hip`)
+//! against host references. Compiles to nothing without rocm.
 //!
 //! Five of the six kernels in that file were uncovered until 2026-08-06; `index_topk` was
 //! not, and its oracle stays in `tests/kernel.rs` where it was written. Named by

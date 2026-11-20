@@ -136,7 +136,8 @@ impl ArchConfig for ModelConfig {
         )?;
         // No ceiling on the intermediate widths: the LDS-staging MoE kernel that
         // imposed one (inter ≤ 16384, gfx1151's 64KB budget) is gone. `swiglu`
-        // (linalg.hip) is elementwise with zero dynamic LDS, and moe.hip stages
+        // (`crates/kernels/src/activation.rs`) is elementwise with zero dynamic LDS, and the
+        // MoE kernels (`moe.rs`, `moe.hip` at tag `archive/hip-kernels`) stage
         // nothing on purpose — LDS capped occupancy and measured slower. The old
         // guard would have refused the DeepSeek-V3 family on intermediate_size
         // 18432 for a constraint that no longer exists.

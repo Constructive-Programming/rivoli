@@ -1,11 +1,11 @@
 //! > **2026-11-19 (Phase 1 integration): no hipcc-built launcher remains** — every one is Rust,
-//! > through `launch/` and a `=>` row; the `extern "C"` half described below is the record of the
-//! > hipcc era, and Phase 2's docs rewrite retires that prose.
+//! > through `launch/` and a `=>` row. **2026-11-20 (Phase 2):** hipcc left the build too; the
+//! > notes below that speak of an `extern "C"` half, or of `kernels/*.hip` entry points, are the
+//! > record of the hipcc era and name those files at tag `archive/hip-kernels`.
 //!
-//! Minimal HIP surface: under `rocm` this binds the kernel launchers — the hipcc-built ones
-//! (fp8/int8/f32 linalg, VQ-int3 and int4 MoE, MLA, fwd glue) through `extern "C"`, and the
-//! Rust ones (`crates/kernels`, since 2026-11-18) through `launch/`. Without the
-//! feature the whole module compiles away.
+//! Minimal HIP surface: under `rocm` this binds the kernel launchers — every one a Rust
+//! kernel (`crates/kernels`) launched through `launch/`. Without the feature the whole
+//! module compiles away.
 //!
 //! # The wall is five files, and this one is its shared fifth
 //!
@@ -175,6 +175,11 @@ pub(crate) use launchers;
 
 //
 // EXEMPT FROM THE DUPLICATION GATE, and this is the only kind of thing that is.
+//
+// > **2026-11-20 (Rust-kernel Phase 2):** the C entry points this paragraph names exist only at
+// > tag `archive/hip-kernels`. What the region still exempts (re-measured 2026-11-19: the scorer
+// > rows' parameter lists and `memcpy_dtod_async` against its `hiprt.rs` extern) is argued at
+// > its own marker below.
 //
 // What follows is not code, it is an ABI: the argument lists of the C entry points in
 // `kernels/*.hip`. Every item mirrors one of those entry points, and the mirroring IS the

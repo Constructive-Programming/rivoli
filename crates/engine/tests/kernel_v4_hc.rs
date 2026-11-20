@@ -50,15 +50,18 @@
 //!
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
-//! Never executed: no `rocm` CI arm, and no GPU for this port. One mutation each:
+//! Never executed: no `rocm` CI arm, and no GPU for this port. One mutation each
+//! (recipe repointed to the Rust twin 2026-11-20; any red recorded against it was on the
+//! hipcc kernel):
 //!
-//! * In `kernels/linalg.hip::rivoli_hc_post`, TRANSPOSE the `comb` index (`comb[dest*hc+src]`
-//!   for `comb[src*hc+dest]`). [`mhc_reproduces_the_layer_goldens`] must go RED on its
-//!   `hc_post(ffn)` arm — and note WHY nothing cheaper would catch it: transposing leaves every
-//!   output row a combination of the same vectors, so no magnitude, norm or shape check can see
-//!   it, which is exactly why the golden chain is the instrument. `hc_pre`'s two arms must stay
-//!   green, which is what says the failure is attributed to the right half.
-//! * In `kernels/linalg.hip::rivoli_hc_pre`, replace the `iters` parameter with a literal `2`.
+//! * In `crates/kernels/src/residual.rs::hc_post` (was `rivoli_hc_post`), TRANSPOSE the `comb`
+//!   index (`comb[dest*hc+src]` for `comb[src*hc+dest]`). [`mhc_reproduces_the_layer_goldens`] must
+//!   go RED on its `hc_post(ffn)` arm — and note WHY nothing cheaper would catch it: transposing
+//!   leaves every output row a combination of the same vectors, so no magnitude, norm or shape
+//!   check can see it, which is exactly why the golden chain is the instrument. `hc_pre`'s two arms
+//!   must stay green, which is what says the failure is attributed to the right half.
+//! * In `crates/kernels/src/residual.rs::hc_pre` (was `rivoli_hc_pre`), replace the `iters`
+//!   parameter with a literal `2`.
 //!   [`sinkhorn_iteration_count_is_live`] must go RED on its first assertion
 //!   (`bits(c20) != bits(c2)`) and GREEN on its second (`bits(c20) == bits(c19)`), because at 2
 //!   iterations both arms compute the same thing. The second assertion going red instead is a

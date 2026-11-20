@@ -47,8 +47,10 @@
 //! # RED-PROOF PLAN — for the integrator's first device run
 //!
 //! Never executed: no `rocm` CI arm, no GPU for this port. Two mutations in
-//! `kernels/linalg.hip::rivoli_swiglu_clamped_bf16`, each with the test that must move and the
-//! tests that must not:
+//! `crates/kernels/src/activation.rs::swiglu_clamped_bf16` and the prelude's `swiglu_clamped`
+//! (was `kernels/linalg.hip::rivoli_swiglu_clamped_bf16`) (recipe repointed to the Rust twin
+//! 2026-11-20; any red recorded against it was on the hipcc kernel),
+//! each with the test that must move and the tests that must not:
 //!
 //! * Clamp the gate from BELOW as well (`gt = fmaxf(fminf(g, limit), -limit)`).
 //!   [`the_clamped_combine_is_bit_exact_elementwise`] must go RED, naming a probe pair whose

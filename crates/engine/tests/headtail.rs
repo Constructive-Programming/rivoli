@@ -17,9 +17,10 @@
 //! What each half can promise is different, and the tests say which is which:
 //! - `hc_head_collapse_blend` sums over `hc_mult` copies SEQUENTIALLY, in the oracle's own ORDER,
 //!   so given the same gate vector it is exactly reproducible -- as an FMA reduction, which
-//!   is what hipcc's default `-ffp-contract=fast` makes it. Asserted bitwise against the
+//!   is what the kernel's explicit `fma` makes it (hipcc's default `-ffp-contract=fast` did
+//!   before 2026-11-19). Asserted bitwise against the
 //!   device's own `pre`, and against `mul_add` rather than `+ p * x`; see `kernels/headtail.hip`
-//!   for the measurement.
+//!   (tag `archive/hip-kernels`) for the measurement.
 //! - `hc_head_collapse_gate` reduces 16384 terms with `wave_sum`, so it re-associates and is
 //!   compared under a tolerance.
 //!
@@ -27,7 +28,8 @@
 //! `Defect::HeadHcRsqrtPerCopy` — the mHC denominator taken per copy instead of over the
 //! flattened row — has a signal of the same ORDER as that re-association noise at real
 //! dimensions. **No tolerance here can separate it.** It is settled by reading
-//! `kernels/headtail.hip`, and pinned at small dimensions by
+//! `crates/kernels/src/headtail.rs` (`kernels/headtail.hip` at tag `archive/hip-kernels`), and
+//! pinned at small dimensions by
 //! `tests/v4_oracle_head_tail.rs::the_head_tail_matches_torch_absolutely`, which compares against
 //! PyTorch itself.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
@@ -309,7 +311,7 @@ fn the_head_tail_matches_the_oracle_at_toy_dimensions() {
 
 /// One `(token, d)` element of the blend: the `hc_mult` copies summed SEQUENTIALLY, then
 /// bf16-rounded exactly where the kernel rounds. `fma` picks the contraction form, because
-/// which one hipcc emitted is what the caller is measuring.
+/// which one the compiler emitted is what the caller is measuring.
 fn blend_copies(copies: impl Iterator<Item = (f32, f32)>, fma: bool) -> f32 {
     let mut acc = 0.0f32;
     for (p, x) in copies {
@@ -357,8 +359,8 @@ fn the_blend_is_bit_exact_given_the_gate() {
     );
 
     // The blend alone, on the device's own gate vector, in the reference's order -- computed
-    // BOTH ways, because whether hipcc contracts `acc += p * x` into an FMA decides which one
-    // the kernel is actually doing and the build does not say.
+    // BOTH ways, because whether the kernel contracts `acc += p * x` into an FMA decides which one
+    // it is actually doing (an explicit `fma` in the Rust twin; hipcc's choice before).
     let (plain, fma) = (
         blend_on_host(&f, &pre, false),
         blend_on_host(&f, &pre, true),
@@ -391,7 +393,7 @@ fn the_blend_is_bit_exact_given_the_gate() {
     );
     assert!(
         m_plain > 0,
-        "the blend now matches a NON-contracted sum, so hipcc has stopped contracting (or the \
+        "the blend now matches a NON-contracted sum, so the kernel has stopped contracting (or the \
          fixture stopped reaching a rounding boundary). Re-measure before relying on either \
          form -- this bound is what keeps the assertion above from being a coincidence"
     );

@@ -109,7 +109,8 @@ pub mod pin;
 /// Token rows one routed-expert dispatch carries. **One, and it is the kernel's number
 /// rather than this loop's preference.**
 ///
-/// `moe.hip` instantiates `rivoli_moe_expert_range_f4` at `R = 1` only and its guard 1003
+/// `crates/kernels/src/moe_f4.rs` instantiates `rivoli_moe_expert_range_f4` at `R = 1` only and
+/// its guard 1003 (`launch/moe.rs`)
 /// refuses anything else, so a V4 decode is structurally single-row: there is no verify pass
 /// to batch and no speculative arm to build, whatever a draft head might later offer.
 /// `rivoli_core::legality`'s `--mtp` cell says exactly that to the user, and says it as a

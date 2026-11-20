@@ -548,7 +548,9 @@ fn every_defect_form_prices_the_difference_it_names() {
 ///
 /// # RED-PROOF PLAN — for the integrator's first device run
 ///
-/// Each mutation goes in `kernels/recurrent.hip`'s `gdn_recurrent_f32`, and for each this test
+/// Each mutation goes in `crates/kernels/src/recurrent.rs`'s `gdn_recurrent_f32` (was
+/// `kernels/recurrent.hip`) (recipe repointed to the Rust twin 2026-11-20; any red recorded against
+/// it was on the hipcc kernel), and for each this test
 /// must go RED while [`the_host_recurrence_reproduces_the_anchor_at_every_gdn_layer`] stays
 /// GREEN. The expected magnitudes are the `MEASURE`-style constants above, which the deviceless
 /// [`every_defect_form_prices_the_difference_it_names`] has already established are reachable at

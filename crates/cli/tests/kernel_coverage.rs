@@ -82,24 +82,26 @@ const DEFERRED: &[(&str, &str)] = &[
     // cannot. EMPTY again, for the third time.)
 ];
 
-/// The two arrows a `launchers!` row may carry: `->` (a hipcc launcher, declared `extern`)
-/// and `=>` (a Rust launcher, `src/launch/`, since 2026-11-18).
+/// The arrow a `launchers!` row carries: `=>` (a Rust launcher, `src/launch/`, since
+/// 2026-11-18). A row could carry `->` (a hipcc launcher, declared `extern`) until the Phase 1
+/// integration (2026-11-19), when the macro lost that arm; the scanner kept matching it until
+/// Phase 2 (2026-11-20).
 ///
 /// **The `=>` form was added because the scanner went blind without it, and only half the
 /// census noticed.** With the 13 activation/residual rows moved to `=>` and this list still
 /// `["->"]`, the oracle census PASSED at 53 launchers — thirteen fewer, under a floor of 45 —
 /// and the liveness census reddened only because one of the thirteen
 /// (`gated_residual_collapse_f32`) happens to carry an uncalled-table row (measured
-/// 2026-11-18, `docs/measurement/gate-red-proofs.md` §18). Hence also the floor below.
-const ARROWS: [&str; 2] = [" -> rivoli_", " => rivoli_"];
+/// 2026-11-18, `docs/measurement/gate-red-proofs.md` §18).
+const ARROW: &str = " => rivoli_";
 
 /// The launcher stem every census strips (a `const` here is no scanner hazard: no scanner
 /// matches the bare stem).
 const LAUNCH_STEM: &str = "launch_";
 
-/// Launcher names in the backend's sources, under both declaration forms (hand-written `pub unsafe fn
-/// launch_*` and the `launchers!` DSL's `launch_* -> rivoli_*` / `launch_* => rivoli_*`
-/// rows). The patterns are built at runtime so this file's own text cannot trip its scanner.
+/// Launcher names in the backend's sources, under both declaration forms (hand-written `pub
+/// unsafe fn launch_*` and the `launchers!` DSL's `launch_* => rivoli_*` rows). The patterns
+/// are built at runtime so this file's own text cannot trip its scanner.
 fn launcher_names() -> Vec<String> {
     let decl = format!("pub unsafe fn {}", LAUNCH_STEM);
     corpus(Path::new("crates/backend/src"))
@@ -110,8 +112,7 @@ fn launcher_names() -> Vec<String> {
                 .and_then(|rest| rest.split('(').next())
                 .or_else(|| {
                     let rest = l.strip_prefix(LAUNCH_STEM)?;
-                    let arrow = ARROWS.iter().find(|a| rest.contains(*a))?;
-                    rest.split(*arrow).next()
+                    rest.split_once(ARROW).map(|(name, _)| name)
                 })
         })
         .map(String::from)
@@ -140,7 +141,7 @@ fn backend_launchers() -> Vec<String> {
     // Anti-vacuity, DERIVED (Phase 0 merge review, 2026-11-18): the scanned population must
     // equal `kernel-inventory.md`'s table, both ends. It was a hand-bumped floor — 45 under a
     // population of 53 on 2026-08-15, low enough that losing every Rust launcher at once
-    // passed (see `ARROWS`), then 66 — and a floor is only a check while someone remembers to
+    // passed (see `ARROW`), then 66 — and a floor is only a check while someone remembers to
     // move it. A launcher added without its inventory row, or a row outliving its launcher,
     // is now a deviceless red, and no number lives in this file.
     let table = inventory_table();
@@ -592,7 +593,7 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
         .filter(|l| l.starts_with(LAUNCH_STEM))
         .collect::<Vec<_>>()
         .join("\n");
-    let arrows = Text(decls).names_after(ARROWS[1], '(');
+    let arrows = Text(decls).names_after(ARROW, '(');
     let entries = gate_rows();
     let unbound: Vec<&String> = entries.iter().filter(|(_, b)| !b).map(|(n, _)| n).collect();
     let rows: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();

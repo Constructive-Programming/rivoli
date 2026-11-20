@@ -80,8 +80,8 @@ impl Scoring {
 /// former hand-rolled RNE for every finite value, zero, subnormal, and infinity;
 /// the two differ only on NaN payload bits (never present in the KV/latent/scale
 /// data path), where `half` keeps a NaN as a NaN rather than truncating a
-/// signaling NaN into an Inf. The kernel's f2bf16 (common.hpp) still matches on
-/// this finite domain — the oracle tests never feed NaN.
+/// signaling NaN into an Inf. The kernel's f2bf16 (crates/kernels/src/prelude/formats.rs) still
+/// matches on this finite domain — the oracle tests never feed NaN.
 #[inline]
 pub fn f32_to_bf16(x: f32) -> u16 {
     half::bf16::from_f32(x).to_bits()

@@ -51,8 +51,8 @@ jobs:
           print(f"armed: {scanned} files scanned, 0 clones")
           EOF
       # --no-default-features on every cargo step: the fuse (owner rule 2026-08-16) made
-      # `rocm` the default so the box's bare build is the real engine — this runner has no
-      # hipcc, so CI builds the refusal-stub arm explicitly.
+      # `rocm` the default so the box's bare build is the real engine — this runner has neither
+      # ROCm nor the kernels' pinned nightly, so CI builds the refusal-stub arm explicitly.
       - run: cargo clippy --workspace --release --locked --all-targets --no-default-features
       # The deviceless feature union — the E0609-rot class's only watcher: `mod otlp` sat
       # broken for weeks in the old tree because no prescribed command compiled it.

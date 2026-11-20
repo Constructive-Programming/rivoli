@@ -56,7 +56,8 @@ pub mod forward;
 pub mod pin;
 
 /// Token rows one routed-expert dispatch carries. **One, and it is the kernel's number**:
-/// `moe_f4.hip` instantiates the situ expert range at `R = 1` only and guard 1003 refuses
+/// `crates/kernels/src/moe_f4.rs` instantiates the situ expert range at `R = 1` only and
+/// `launch/moe.rs`'s guard 1003 refuses
 /// anything else. A named constant for the reason `crate::v4::ROWS` is one — the day a
 /// multi-row kernel exists with a measurement behind it, this name is the grep that finds
 /// every affected site. `rivoli_core::legality`'s K3 `--mtp` cell names the OTHER blocker

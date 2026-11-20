@@ -254,7 +254,8 @@ pub struct V4Config {
     ///
     /// Required like every other field here, so the `ensure!` in `validate` reaches exactly
     /// one case: a config that writes `0` explicitly. `rivoli_hc_pre` already refuses that
-    /// (`kernels/linalg.hip:642`, `if (iters < 1) return 1003`), so this is a load-boundary
+    /// (`launch/residual.rs`, `iters >= 1` or 1003; was `kernels/residual.hip:328` at tag
+    /// `archive/hip-kernels`, `if (iters < 1) return 1003`), so this is a load-boundary
     /// restatement of a check the kernel makes — worth the two lines because the load
     /// boundary names the FIELD and the kernel names a code, and because a config is read
     /// once while the launcher fires 43 times a token.
@@ -262,7 +263,8 @@ pub struct V4Config {
     /// **What a zero would cost is smaller than it sounds, and an earlier draft of this
     /// comment overstated it as "the matrix is never normalized at all".** It is not:
     /// `hc_sinkhorn` runs a row softmax and one column divide BEFORE the loop
-    /// (`kernels/linalg.hip:370`, `norm(1, HC_MULT);`, and `kernel.py:401-415` agrees), and
+    /// (`crates/kernels/src/residual.rs::hc_sinkhorn`; was `kernels/residual.hip:110` at tag
+    /// `archive/hip-kernels`, `norm(1, HC_MULT);`, and `kernel.py:401-415` agrees), and
     /// only the remaining `iters - 1` passes are the plain row/column refinements. So zero
     /// loses the refinement, not the normalization.
     ///
@@ -285,8 +287,9 @@ pub struct V4Config {
     /// named. It is the floor added to `hc_head`'s sigmoid gate (`model.py:714`,
     /// `pre = sigmoid(...) + hc_eps`), and inside `hc_split_sinkhorn` it is *also* the
     /// `+ eps` after the comb softmax and in every row and column divide — `2·iters - 1` of
-    /// them per token (`kernel.py:408, :413, :419, :423`; `kernels/linalg.hip:347` and the
-    /// `norm` lambda at :358). So a zero moves `comb` as well as `pre`, in opposite
+    /// them per token (`kernel.py:408, :413, :419, :423`; `crates/kernels/src/residual.rs`'s
+    /// `comb_softmax` and `sinkhorn_norm` — was `kernels/residual.hip:93` and the `norm` lambda
+    /// at :98, tag `archive/hip-kernels`). So a zero moves `comb` as well as `pre`, in opposite
     /// directions, and removes the guard from those divisions — harmless there, since the
     /// sums are strictly positive, but that is a reason rather than an absence.
     ///
@@ -484,7 +487,8 @@ impl V4Config {
         self.validate_quantization()?;
         // Both mHC scalars are checked non-zero here rather than left to the kernels, and
         // the two cases differ. `hc_sinkhorn_iters == 0` IS refused downstream —
-        // `kernels/linalg.hip:642` returns guard 1003 — so this is a restatement at the load
+        // `launch/residual.rs` returns guard 1003 (was `kernels/residual.hip:328` at tag
+        // `archive/hip-kernels`) — so this is a restatement at the load
         // boundary, which names the field where the kernel names a code. `hc_eps == 0` is
         // refused by nothing: it is arithmetic, not a shape, and it perturbs every gate and
         // every Sinkhorn divide by 1e-6 uniformly, which no per-layer tolerance would read
@@ -505,7 +509,9 @@ impl V4Config {
 
     /// The SwiGLU clamp, checked in the f32 domain the KERNELS work in.
     ///
-    /// `kernels/moe.hip:413` guards `!(swiglu_limit > 0.0f)` — spelled that way rather than
+    /// `launch/moe.rs` refuses a limit that is not positive and finite (1006); was
+    /// `kernels/moe_f4.hip:362` at tag `archive/hip-kernels`, which guarded
+    /// `!(swiglu_limit > 0.0f && swiglu_limit < INFINITY)` — negated rather than spelled
     /// `<= 0.0f` because NaN fails every comparison and `fminf(gt, NaN)` returns `gt`, so `<=`
     /// would admit the one value that silently disables the clamp. A bare `> 0.0` here misses
     /// BOTH narrowing failures, and they fail in opposite ways:

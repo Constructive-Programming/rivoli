@@ -16,7 +16,7 @@ use anyhow::Result;
 use anyhow::Context;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_backend::{
-    ExpertDesc, NULL_STREAM, launch_gemv_f32, launch_gemv_fp8, launch_moe_acc_drain,
+    ExpertDesc, NULL_STREAM, device_sync, launch_gemv_f32, launch_gemv_fp8, launch_moe_acc_drain,
     launch_moe_expert_range, launch_moe_expert_range_i4, launch_swiglu, launch_vadd, stream_signal,
 };
 use rivoli_core::routing::{RoutePolicy, RouteScratch, route_into};
@@ -262,6 +262,16 @@ impl GlmEngine<'_> {
         // `telemetry::ProfileSummary`).
         let t = std::time::Instant::now();
         self.gate_logits.copy_out_into(&mut self.gate_logits_host)?;
+        // JOIN 1 (V4 and K3 make the same join). `xn` and the gate GEMV were written on the
+        // NULL stream, and `launch_moe`'s two MoE streams are `hipStreamNonBlocking`, so only
+        // this sync — not the readback above, which merely happens to drain the null stream —
+        // orders the expert kernels behind those writes. It sits BEFORE `submit`, where every
+        // stream is already idle (the null stream by the D2H, the MoE streams by the previous
+        // layer's awaits, the fetch stream by `run_layer`'s trailing sync), so it waits on no
+        // device work; after `submit` it could wait on miss copies the reaper has already
+        // enqueued. Its span lands in ATTEND with the D2H's; priced by the Phase 2 decode A/B
+        // (`rust-kernels.md` §5).
+        device_sync()?;
         let t = self.prof.lap(crate::telemetry::Phase::Attend, t);
         // Descending, so `scores`/`choice` are left holding ROW 0 for the trace window
         // below — the trace measures the router against the real token, and row 0 is

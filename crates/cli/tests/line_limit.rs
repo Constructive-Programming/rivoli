@@ -7,18 +7,19 @@
 //! file should shrink it. CodeScene still binds independently below both caps (Low
 //! Cohesion fires from ~605 non-comment lines at LCOM4 >= 3, measured during the wave).
 //!
-//! Scope: everything the tree AUTHORS under `crates/` — Rust, HIP kernels and headers,
-//! the anchor drivers, the regeneration scripts. Vendored binary fixtures have no lines;
-//! docs are prose with their own registry. The limit is a ceiling on FILES, not on code:
+//! Scope: everything the tree AUTHORS under `crates/` — Rust (the kernels included), the
+//! HIP probe source, the anchor drivers, the regeneration scripts. Vendored binary fixtures have no
+//! lines; docs are prose with their own registry. The limit is a ceiling on FILES, not on code:
 //! the enforced move is a split by cohesion (module out, sibling test binary out), never
-//! deletion of the comments that carry this repo's measurements.
+//! deletion of the comments that carry this repo's measurements. (`hpp` left the list
+//! 2026-11-20, Rust-kernel Phase 2: no C++ header remains in the tree.)
 
 #![allow(clippy::expect_used)] // meta-gate: panic loudly
 
 mod common;
 
 const LIMIT: usize = 1200;
-const EXTS: [&str; 5] = ["rs", "hip", "hpp", "py", "sh"];
+const EXTS: [&str; 4] = ["rs", "hip", "py", "sh"];
 
 #[test]
 fn no_authored_source_file_exceeds_the_line_limit() {

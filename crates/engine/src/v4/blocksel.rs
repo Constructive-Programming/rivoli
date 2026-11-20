@@ -3,7 +3,7 @@
 //!
 //! Every kernel here already existed and was already scored before this file had a caller:
 //! `wq_b` rides `gemv_fp8_bf16` and the finish rides `rope_adjacent` (both on the attention
-//! q path since M8), the spread and the scorer are `blockindex.hip`'s pair, bit-identical
+//! q path since M8), the spread and the scorer are `blockindex.rs`'s pair, bit-identical
 //! against the oracle in `tests/kernel_v4_indexer.rs`, and the nested compressor is
 //! [`LayerCompressor`] under [`Geom::indexer`](super::geometry::Geom::indexer)'s
 //! Hadamard-fp4 finish. What this file adds is the WIRING and the two host steps no kernel

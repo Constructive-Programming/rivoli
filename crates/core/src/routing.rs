@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(topk(&s, 10), vec![1, 3, 2, 0]);
     }
 
-    /// The MLA attention kernel (attn.hip) replaces the reference two-pass
+    /// The MLA attention kernel (crates/kernels/src/attn/mla.rs) replaces the reference two-pass
     /// softmax with a single-pass flash recurrence. The scalar oracle only ever
     /// runs at test-scale context, so this locks — GPU-free, in CI — that the two
     /// forms agree at the 200k regime the kernel actually targets, where the

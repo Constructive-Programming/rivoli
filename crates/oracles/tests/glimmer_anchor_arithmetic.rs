@@ -178,7 +178,8 @@ impl ScaleSweep {
 ///
 /// **And it constrains the reference, not rivoli.** Trap 3 is a port-side defect; nothing here stops
 /// a caller passing 3.87 for K, the anchor has no defect run for that form, and until the layer loop
-/// lands there is no call site to gate. `kernels/linalg.hip` says so at the kernel. The
+/// lands there is no call site to gate. `kernels/linalg.hip` said so at the kernel (tag
+/// `archive/hip-kernels`). The
 /// `qk_scale_on_k` defect that exists scales `k_proj`'s output, upstream of a norm that cancels a
 /// scalar only up to the eps term. Its residue peaks at 6.2e-4 — which this line used to call
 /// "nothing", and which is **7.9x the `qk_norm` row's own tolerance**. See `tolerance.rs` for the

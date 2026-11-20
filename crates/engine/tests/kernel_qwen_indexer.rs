@@ -625,7 +625,9 @@ fn a_summing_pool_is_cancelled_by_the_norm_that_follows_it() {
 ///
 /// # RED-PROOF PLAN — for the integrator's first device run
 ///
-/// Mutations go in `kernels/indexer.hip`'s `index_pool_norm_f32`; each must redden this test while
+/// Mutations go in `crates/kernels/src/indexer.rs`'s `index_pool_norm_f32` (was
+/// `kernels/indexer.hip`) (recipe repointed to the Rust twin 2026-11-20; any red recorded against
+/// it was on the hipcc kernel); each must redden this test while
 /// [`the_host_pool_and_norm_reproduces_the_whole_ladder`] stays green. Magnitudes are the
 /// constants above, already shown reachable deviceless:
 ///

@@ -13,8 +13,9 @@ column is a query, and a query can be wrong.
 
 * **Rows.** The `launchers!` DSL rows in `crates/backend/src/{hip_linalg,hip_activation,hip_blocks,hip_attn}.rs`
   (`hip_activation` split out of `hip_linalg` 2026-11-18)
-  (grammar `rust_fn -> c_symbol, "tag" (args)` for a hipcc launcher, `rust_fn => rivoli_x(..),
-  "tag" (args)` for a Rust one); no launcher is hand-written any more. (CORRECTED 2026-11-19:
+  (grammar `rust_fn => rivoli_x(..), "tag" (args)`; the `rust_fn -> c_symbol, "tag" (args)` form
+  for a hipcc launcher stopped parsing 2026-11-19 with the last C kernel, and hipcc left the
+  build 2026-11-20); no launcher is hand-written any more. (CORRECTED 2026-11-19:
   four were, until `hash_rows` (L1), the two block scorers (L3) and `gdn_recurrent_f32` (L2)
   became `launchers!` rows when their kernels moved to Rust — the scorers' rows live in
   `hip.rs`. The TU column names the Rust file for every launcher, every kernel being Rust after

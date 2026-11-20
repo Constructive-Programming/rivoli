@@ -19,10 +19,10 @@
 // MIRRORING IS THE POINT for the block below, so the duplication gate is off for it. Each
 // function is a statement-for-statement transcription of a `kernel.py` primitive, and the
 // oracle's whole value is that it was written from the reference rather than from rivoli's
-// own idea of what fp8 means. `src/math.rs` and `kernels/common.hpp` contain arithmetic of
-// the same SHAPE (an e4m3 encoder, an e8m0 decoder) for GLM's formats; factoring the two
-// together would leave this file testing rivoli against itself, which is the "check that
-// passes without examining anything" failure this repo has already been bitten by twice
+// own idea of what fp8 means. `src/math.rs` and the device prelude (`crates/kernels/src/prelude`)
+// contain arithmetic of the same SHAPE (an e4m3 encoder, an e8m0 decoder) for GLM's formats;
+// factoring the two together would leave this file testing rivoli against itself, which is the
+// "check that passes without examining anything" failure this repo has already been bitten by twice
 // (docs/reference/architecture.md §8b, tests/glsl_numerics.rs).
 
 /// The four byte formats this file decodes, NAMED. Type aliases, not newtypes, and that
