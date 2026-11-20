@@ -1,10 +1,12 @@
 ---
-status: live
+status: closed-shipped
 scope: engine
-verdict: OPEN 2026-11-18 — migrate every HIP C++ kernel (crates/backend/kernels, 15 .hip + 8 .hpp, 8115 lines, 66 launchers) to Rust on amdgcn-amd-amdhsa, owner decision for a smaller unified codebase. The spike proved bit-identity on two kernels (and Phase 0a/0b proved the whole prelude bit-identical on device, 2026-11-18: 222/222 probe groups, eight plants red where their CPU proofs say) and named three hazards (FMA contraction, missing workgroup-scope fence, a ~1 µs small-launch gap, isolated by Phase 0c 2026-11-18 to the dispatch-packet blockDim read); this plan is a hypothesis, and a measured reason to stop is a valid outcome.
+verdict: COMPLETE 2026-11-20 — every HIP C++ kernel (66 launchers) is Rust on amdgcn-amd-amdhsa and hipcc is out of the build; the C++ survives only at tag archive/hip-kernels as the bit-identity reference. Witnessed on b5ca13a: 66/66 launcher rows byte-identical to the tagged hipcc, battery green bar the 30 inherited CodeScene files, determinism 1024/1024 under --arena-refresh, parity-glm 32/32, and GLM decode not slower than the pre-migration build under the pre-registered rule (3.031 vs 3.093 tok/s, identical ids and hit/miss counts). Open, not blocking: the migrated build's attention bucket runs ~1.6 ms/token high, cause unattributed (§5 Phase 2). The body is the per-lane port log: open §1's hazards only when writing a new device kernel, and §5 Phase 2 for the closing evidence.
 ---
 
 # Rust kernels — migration plan
+
+> **COMPLETE 2026-11-20:** the hypothesis held; §5 Phase 2 is the closing evidence.
 
 **Owner decision 2026-11-18:** the project is experimental, and a single-language tree
 (one type system across the host/device wall, kernels under jscpd and CodeScene for the
@@ -2288,8 +2290,65 @@ gate-logits D2H: JOIN 1, as V4 and K3 have it. The null-stream writes (`xn`, the
 were ordered before the non-blocking MoE streams only by the readback. Placed before `submit`,
 every stream is already idle, so it waits on no device work; its cost is priced by the decode
 A/B below.
+> **NOT PRICED 2026-11-20 (the lease, below):** the A/B bounds the whole migration, not the
+> sync; a B vs B-without-the-sync arm would.
 
 **Gates (deviceless):** fmt, the dev build (jscpd ran, 0 clones), clippy both arms rc 0;
 `cargo test --workspace --no-default-features --no-fail-fast` 516 passed, 1 failed: CodeScene,
 the same 30 inherited files as the `rk-perf` lease's W (lists diffed equal).
+
+**The lease (2026-11-20, commit `b5ca13a`, rh-anine).** One `setsid`-detached driver,
+`scratch/rk-phase2/lease/lease.sh`, 01:35:34–02:44:13 +01:00. Every binary was built outside
+the lock (W's pre-check: 118 units Fresh, 0 compiled inside). No arm was discarded: every
+witness file is 0 B and GTT read 17.8 MiB before every arm.
+
+| arm | verdict | rc | wall |
+|---|---|---|---|
+| A (bit-identity, launcher rows) | GREEN: 66/66 rows BIT-IDENTICAL | 0 | 15.9 min |
+| W (full battery, `--test-threads=1`) | 721 passed, 1 failed: CodeScene, the same 30 inherited files (lists diffed equal) | 101 | 19.5 min |
+| D (`determinism-glm.sh`, `--arena-refresh`, 1024) | GREEN: ids identical to 1024; `slot_stalls 0`; 2.95 and 3.02 tok/s | 0 | 13.0 min |
+| AB (decode A/B, six arms) | B not slower (below); each of the six arms rc 0 (the driver's own rc cannot fail) | — | 19.6 min |
+| P (`tests/parity-glm.sh`, ngen 32, mem 100) | GREEN: 32 generated ids identical to the pinned reference, at its full length | 0 | 0.7 min |
+
+**The decode A/B.** A = the pre-migration engine, tag `archive/hip-kernels` (`abd065f`) built
+`--release` with hipcc in its own target dir (`rk-phase2-premig`); B = this branch, `--release`.
+Same command for every arm: `/var/db/rivoli/glm52-vq3-full --bench 512 --mode int3-vq --attn
+dense --max-mem 115` with determinism-glm's 317-byte prompt (71 tokens), stock flags. Interleaved
+A1 B1 A2 B2 A3 B3, each flock'd and witnessed; nothing built between arms
+(`scratch/rk-phase2/lease/ab/`).
+
+| arm | decode s / 512 | tok/s | attend ms/tok | ffn ms/tok | fetch-wait ms/tok | wall ms/tok | host load before → after |
+|---|---|---|---|---|---|---|---|
+| A1 | 166.1 | 3.082 | 93.816 | 115.121 | 109.878 | 324.453 | 9.23 → 4.37 |
+| B1 | 165.7 | 3.090 | 95.425 | 112.943 | 109.824 | 323.577 | 4.37 → 4.52 |
+| A2 | 165.5 | 3.094 | 93.875 | 113.549 | 110.207 | 323.275 | 4.52 → 5.12 |
+| B2 | 166.9 | 3.068 | 95.523 | 112.810 | 112.202 | 325.966 | 5.12 → 6.22 |
+| A3 | 165.0 | 3.103 | 93.996 | 113.496 | 109.053 | 322.201 | 6.22 → 5.90 |
+| B3 | 174.4 | 2.936 | 97.176 | 115.785 | 121.907 | 340.550 | 5.90 → 11.11 |
+
+- **Every arm decoded the same 512 ids** (one md5 across all six) with the same
+  236570 hits / 70030 misses: the pre-migration and migrated engines are token-identical here,
+  and so is their fetch traffic.
+- **P5, bytes/token (derived, the bench does not print it):** 70030 / 512 = 136.8 misses/token ×
+  15335424 B/slot (the routed pool's slot size, logged at startup) = **2.10 GB/token of
+  slot-bytes**, an upper bound on bytes streamed, identical in A and B; the migration did not
+  move the currency.
+- **Verdict, by the coordinator's pre-registered rule** (B is not slower if mean(B) ≥ mean(A) −
+  max(spread A, spread B)): mean A 3.093 (spread 0.021), mean B 3.031 (spread 0.154); threshold
+  3.093 − 0.154 = 2.939 ≤ 3.031, so **B is not slower**. The gap (−0.062 tok/s) is carried by B3,
+  whose host load climbed to 11.1 by its end; against the B1/B2 mean it moved every bucket
+  (fetch-wait +10.9, attend +1.7, ffn +2.9 ms/token), as host contention would, though there is
+  no host-process witness. Post hoc and outside the verdict: B1 and B2 alone average 3.079.
+- **One difference the floor does not hide:** B's ATTEND bucket is above A's in every pair,
+  ~1.6 ms/token (+1.7%) in the two unloaded ones, where FFN is 0.7–2.2 ms lower and the wall +0.45%, inside
+  A's own 0.7% spread. **Unattributed**, three candidates: GLM's new JOIN 1 `device_sync`
+  (stamped into ATTEND, once per MoE layer; ~20 µs a call would cover it, and a host join was
+  measured at 11–20 µs, `how-to-measure.md`); `gemv_fp8` at GLM's `q_a` shape (2048 × 6144),
+  1.077× hipcc in arm A (about +0.2 ms/token over 78 layers, also in ATTEND); the Rust attention
+  kernels (at parity in arm A). An A/B of B against B-without-the-sync, plus a `gemv_fp8`-only
+  arm, would settle it.
+
+**Plan status: COMPLETE** (verdict above). Left open, none blocking: the ATTEND attribution
+above; the `launchers!` annotations (declined, above); L2's `MoeRange` literals, the shared plant-threshold helper and the plants-root layout
+(integration's owed list); CodeScene's 30 inherited files.
 
