@@ -31,8 +31,8 @@
 use anyhow::{Result, ensure};
 use clap::Parser;
 use rivoli_artifact::format::{
-    ArtifactDirs, F4_NAMING_K3, FormatMeta, RoutedRepack, SafeWriter, Safetensors, f4_source,
-    finish_artifact, require_aux,
+    ArtifactDirs, F4_NAMING_K3, FormatMeta, RoutedRepack, SafeWriter, Safetensors, TensorData,
+    f4_source, finish_artifact, require_aux,
 };
 use rivoli_artifact::k3_config::{K3Config, K3TextConfig};
 use rivoli_artifact::quant::{FP8_BLOCK, K3_TEXT_PREFIX, k3_expert_base};
@@ -228,6 +228,16 @@ fn confront(src: &Safetensors, name: &str, want: &[usize]) -> Result<()> {
     Ok(())
 }
 
+/// The routed experts this run's MoE layers hold — the floor [`write_resident`]'s skip count
+/// is judged against. Named fields rather than two adjacent `usize` parameters: the product
+/// commutes, but the refusal quotes each by name, and a transposed pair would print a wrong
+/// account of the shortfall.
+#[derive(Clone, Copy)]
+struct RoutedScope {
+    moe_layers: usize,
+    n_experts: usize,
+}
+
 /// Step 2: the resident set — everything in scope that is neither routed nor vision,
 /// copied VERBATIM. ALWAYS rewritten, never reused, for `convert_v4::write_resident`'s
 /// reason: it is one file spanning every layer the run covered, and reusing it after a
@@ -245,11 +255,14 @@ fn confront(src: &Safetensors, name: &str, want: &[usize]) -> Result<()> {
 /// BF16 tensor read as f32 is not a length error, it is half the rows at wrong magnitudes.
 fn write_resident(
     src: &Safetensors,
-    n_experts: usize,
+    routed: RoutedScope,
     in_scope: &impl Fn(&str) -> bool,
-    moe_layers: usize,
     out_dir: &str,
 ) -> Result<()> {
+    let RoutedScope {
+        moe_layers,
+        n_experts,
+    } = routed;
     let mut w = SafeWriter::new();
     let (mut kept, mut skipped_routed, mut skipped_vision) = (0usize, 0usize, 0usize);
     for name in src.names() {
@@ -284,7 +297,7 @@ fn write_resident(
              (`vision_tower.`, `mm_projector.`) must never reach the artifact"
         );
         let (bytes, dtype, shape) = src.raw(name)?;
-        w.add(name, dtype, shape.to_vec(), bytes);
+        w.add(name, dtype, TensorData::new(shape.to_vec(), bytes));
         kept += 1;
     }
     // **A guard that can actually fire**, replacing the k3 tree's `kept > 0`-with-a-wrong-
@@ -432,7 +445,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    write_resident(&src, k3.n_experts, &in_scope, layers.len(), &out_dir)?;
+    let routed = RoutedScope {
+        moe_layers: layers.len(),
+        n_experts: k3.n_experts,
+    };
+    write_resident(&src, routed, &in_scope, &out_dir)?;
     // `AUX` again, the same slice `require_aux` checked before any shard was opened — that
     // pairing is the point, so it is spelled at one call site rather than in two functions.
     // `ArtifactDirs` inline and src-first, where `convert_v4` routes its two sites through an

@@ -224,24 +224,47 @@ fn vision_count(src_dir: &str) -> Result<usize> {
 /// so omitted the whole MLP; the loop always covered them, because it iterates the constant
 /// rather than a count. Reconciled against the shipped checkpoint 2026-08-14: 52 x 12 + 3
 /// model-level = 627 text tensors, and 627 + 809 vision = the index's 1436.
-fn ensure_complete(names: &[String], n_layers: usize) -> Result<()> {
+fn ensure_complete(names: &Names<'_>, n_layers: usize) -> Result<()> {
     for required in [
         "lm_head.weight",
         "model.language_model.embed_tokens.weight",
         "model.language_model.norm.weight",
     ] {
         ensure!(
-            names.iter().any(|n| n == required),
+            names.has(required),
             "the checkpoint has no {required} — this is not a complete Glimmer text model"
         );
     }
     for l in 0..n_layers {
         for t in GLIMMER_LAYER_TENSORS {
             let n = format!("{GLIMMER_LAYER_PREFIX}.{l}.{t}.weight");
-            ensure!(names.contains(&n), "the checkpoint has no {n}");
+            ensure!(names.has(&n), "the checkpoint has no {n}");
         }
     }
     Ok(())
+}
+
+/// Every tensor name the opened shards hold, in [`Safetensors::names`]' sorted order — which is
+/// the order [`write_tensors`] adds them in, and so the order of the artifact's data offsets.
+///
+/// One value for the three passes that read it (the pre-pass quantization count, the write,
+/// the completeness sweep), borrowed from the source rather than copied into owned `String`s:
+/// the names live exactly as long as the shards they index.
+struct Names<'a>(Vec<&'a str>);
+
+impl<'a> Names<'a> {
+    /// The only constructor, so the order is always `Safetensors::names`' sort.
+    fn of(src: &'a Safetensors) -> Self {
+        Self(src.names())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.0.iter().copied()
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.0.contains(&name)
+    }
 }
 
 /// What the tensor pass counted — the numbers `main` prints and asserts, travelling as one
@@ -261,12 +284,12 @@ struct Counts {
 /// says the loop actually took the branch.
 ///
 /// Returns the expected count so the post-pass check judges the same number this one did.
-fn refuse_partial_quantization(names: &[String], cfg: &GlimmerConfig, fp8: bool) -> Result<usize> {
+fn refuse_partial_quantization(names: &Names<'_>, cfg: &GlimmerConfig, fp8: bool) -> Result<usize> {
     let want_quantized = expected_quantized(&cfg.text, fp8)?;
+    let projs = names.iter().filter(|n| is_layer_proj(n)).count();
     ensure!(
-        names.iter().filter(|n| is_layer_proj(n)).count() * usize::from(fp8) == want_quantized,
-        "this checkpoint has {} layer projections; its {} layers imply {want_quantized}",
-        names.iter().filter(|n| is_layer_proj(n)).count(),
+        projs * usize::from(fp8) == want_quantized,
+        "this checkpoint has {projs} layer projections; its {} layers imply {want_quantized}",
         cfg.text.n_layers
     );
     Ok(want_quantized)
@@ -277,12 +300,12 @@ fn refuse_partial_quantization(names: &[String], cfg: &GlimmerConfig, fp8: bool)
 /// [`refuse_before_writing`] — this function is exactly "what the artifact's tensors are".
 fn write_tensors<'a>(
     src: &'a Safetensors,
-    names: &[String],
+    names: &Names<'_>,
     fp8: bool,
 ) -> Result<(SafeWriter<'a>, Counts)> {
     let mut w = SafeWriter::new();
     let (mut verbatim, mut widened, mut quantized) = (0usize, 0usize, 0usize);
-    for name in names {
+    for name in names.iter() {
         if is_vision(name) {
             continue; // counted from the index, not from whichever shards were opened
         }
@@ -326,8 +349,7 @@ fn main() -> Result<()> {
     let want = |n: &str| !is_vision(n);
     let src = Safetensors::open_indexed(&args.src_dir, want)?;
 
-    let mut names: Vec<String> = src.names().iter().map(|s| s.to_string()).collect();
-    names.sort();
+    let names = Names::of(&src);
     let want_quantized = refuse_partial_quantization(&names, &cfg, args.fp8)?;
     let (w, counts) = write_tensors(&src, &names, args.fp8)?;
     // **The count is asserted, not printed and trusted.** `is_layer_proj` is two string

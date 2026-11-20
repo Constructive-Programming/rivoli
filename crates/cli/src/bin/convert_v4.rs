@@ -116,7 +116,8 @@ fn write_layer_resident<'a>(
         w.copy_fp8_e8m0(src, &format!("{shared}.{p}"))?;
     }
     w.add_widened(src, &format!("{lb}.ffn.gate.weight"))?;
-    write_router(w, src, cfg, &lb, l)?;
+    let (router, dtype) = router_tensor(src, cfg, l)?;
+    w.copy_verbatim(src, &router, dtype)?;
     for t in ["hc_attn", "hc_ffn"] {
         for s in ["base", "fn", "scale"] {
             w.copy_verbatim(src, &format!("{lb}.{t}_{s}"), Dtype::F32)?;
@@ -194,13 +195,12 @@ fn confront_config_with_tensors(src: &Safetensors, cfg: &V4Config, lb: &str) -> 
 /// bias and no table. Driven off the config rather than off `src.has(…)`, so a layer
 /// whose tensors disagree with `num_hash_layers` fails instead of silently taking
 /// whichever branch the checkpoint happens to satisfy.
-fn write_router<'a>(
-    w: &mut SafeWriter<'a>,
-    src: &'a Safetensors,
-    cfg: &V4Config,
-    lb: &str,
-    l: usize,
-) -> Result<()> {
+///
+/// Answers WHICH tensor and in what dtype; the caller copies it. It used to take the writer and
+/// copy it here, beside both the layer index and its `layers.{l}` base string — one fact passed
+/// twice, which nothing checked named the same layer — so it now takes the index alone.
+fn router_tensor(src: &Safetensors, cfg: &V4Config, l: usize) -> Result<(String, Dtype)> {
+    let lb = format!("layers.{l}");
     if cfg.layer_routes_by_hash(l) {
         let name = format!("{lb}.ffn.gate.tid2eid");
         let got = src.shape(&name)?;
@@ -210,9 +210,9 @@ fn write_router<'a>(
             cfg.vocab,
             cfg.top_k
         );
-        w.copy_verbatim(src, &name, Dtype::I64)
+        Ok((name, Dtype::I64))
     } else {
-        w.copy_verbatim(src, &format!("{lb}.ffn.gate.bias"), Dtype::F32)
+        Ok((format!("{lb}.ffn.gate.bias"), Dtype::F32))
     }
 }
 

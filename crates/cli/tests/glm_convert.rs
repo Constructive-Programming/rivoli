@@ -18,7 +18,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli_artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors};
+use rivoli_artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, TensorData};
 use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_artifact::quant::{FP8_BLOCK, quantize_fp8_block};
 use rivoli_artifact::schema::load_config;
@@ -57,13 +57,16 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 fn add_fp8(w: &mut SafeWriter<'_>, base: &str, o: usize, i: usize) {
     let vals = weights(base, o * i);
     let (packed, scales) = quantize_fp8_block(&vals, [o, i], FP8_BLOCK).unwrap();
-    w.add(format!("{base}.weight"), Dtype::F8E4M3, vec![o, i], packed);
+    w.add(
+        format!("{base}.weight"),
+        Dtype::F8E4M3,
+        TensorData::new(vec![o, i], packed),
+    );
     let sb = [o.div_ceil(FP8_BLOCK), i.div_ceil(FP8_BLOCK)];
     w.add(
         format!("{base}.weight_scale_inv"),
         Dtype::F32,
-        sb.to_vec(),
-        f32_bytes(&scales),
+        TensorData::new(sb.to_vec(), f32_bytes(&scales)),
     );
 }
 
@@ -72,8 +75,7 @@ fn add_bf16(w: &mut SafeWriter<'_>, name: &str, shape: &[usize]) {
     w.add(
         name.to_string(),
         Dtype::Bf16,
-        shape.to_vec(),
-        bf16_bytes(&weights(name, n)),
+        TensorData::new(shape.to_vec(), bf16_bytes(&weights(name, n))),
     );
 }
 
@@ -126,8 +128,7 @@ fn add_moe(w: &mut SafeWriter<'_>, lb: &str) {
     w.add(
         format!("{lb}.mlp.gate.e_score_correction_bias"),
         Dtype::F32,
-        vec![EXPERTS],
-        f32_bytes(&weights("bias", EXPERTS)),
+        TensorData::new(vec![EXPERTS], f32_bytes(&weights("bias", EXPERTS))),
     );
     for e in 0..EXPERTS {
         add_mlp(w, &format!("{lb}.mlp.experts.{e}"), MOE_INTER);

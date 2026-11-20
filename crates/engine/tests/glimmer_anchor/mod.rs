@@ -341,7 +341,11 @@ pub fn write_artifact(a: &Anchor) -> Artifact {
     let mut placed = 0usize;
     for (name, shape, vals) in a.weights.floats.iter().filter(|(n, _, _)| !is_alias(n)) {
         let (dt, bytes) = stored(shape, vals);
-        w.add(name.clone(), dt, shape.clone(), bytes);
+        w.add(
+            name.clone(),
+            dt,
+            rivoli_artifact::format::TensorData::new(shape.clone(), bytes),
+        );
         placed += 1;
     }
     w.write(&format!("{}/resident.safetensors", root.display()))

@@ -26,6 +26,26 @@ use super::Dtype;
 /// conversion is possible at all.
 type Tensor<'a> = (String, Dtype, Vec<usize>, Cow<'a, [u8]>);
 
+/// A tensor's shape and its bytes — what [`SafeWriter::add`] stores under a name and a dtype.
+///
+/// One value rather than two parameters beside the name and dtype, so a payload's shape travels
+/// with it: as `add_fp8_pair`'s four positional arguments (two shapes, two payloads of one type)
+/// the weight's bytes could be paired with the scale's shape in a call that compiled. Swapping
+/// the two whole pairs still compiles; that is what `add_fp8_pair`'s length check is for.
+pub struct TensorData<'a> {
+    shape: Vec<usize>,
+    bytes: Cow<'a, [u8]>,
+}
+
+impl<'a> TensorData<'a> {
+    pub fn new(shape: Vec<usize>, bytes: impl Into<Cow<'a, [u8]>>) -> Self {
+        Self {
+            shape,
+            bytes: bytes.into(),
+        }
+    }
+}
+
 /// Minimal safetensors writer for the resident artifact — collects tensors, then serializes
 /// `u64 header_len ‖ JSON header ‖ concatenated data`.
 ///
@@ -48,14 +68,9 @@ impl<'a> SafeWriter<'a> {
         Self::default()
     }
 
-    pub fn add(
-        &mut self,
-        name: impl Into<String>,
-        dtype: Dtype,
-        shape: Vec<usize>,
-        bytes: impl Into<Cow<'a, [u8]>>,
-    ) {
-        self.tensors.push((name.into(), dtype, shape, bytes.into()));
+    pub fn add(&mut self, name: impl Into<String>, dtype: Dtype, data: TensorData<'a>) {
+        self.tensors
+            .push((name.into(), dtype, data.shape, data.bytes));
     }
 
     /// Add an fp8 weight and its f32 block scale under this engine's two resident names,
@@ -65,18 +80,24 @@ impl<'a> SafeWriter<'a> {
     fn add_fp8_pair(
         &mut self,
         name: &str,
-        weight: Cow<'a, [u8]>,
-        shape: &[usize],
-        scale: Cow<'a, [u8]>,
-        sshape: &[usize],
+        weight: TensorData<'a>,
+        scale: TensorData<'a>,
     ) -> Result<()> {
         // Both payloads are now the same TYPE, where they used to be `&[u8]` and `Vec<u8>` —
         // so transposing them stopped being a compile error. These two checks put the barrier
         // back at add time: an fp8 weight is one byte per element and an f32 scale grid is
         // four, so a swap fails here rather than at load, a whole convert later.
-        for (suffix, dtype, bpe, shape, payload) in [
-            ("weight", Dtype::F8E4M3, 1usize, shape, weight),
-            ("weight_scale_inv", Dtype::F32, 4, sshape, scale),
+        for (
+            suffix,
+            dtype,
+            bpe,
+            TensorData {
+                shape,
+                bytes: payload,
+            },
+        ) in [
+            ("weight", Dtype::F8E4M3, 1usize, weight),
+            ("weight_scale_inv", Dtype::F32, 4, scale),
         ] {
             let want = shape.iter().product::<usize>() * bpe;
             ensure!(
@@ -86,7 +107,7 @@ impl<'a> SafeWriter<'a> {
                 payload.len()
             );
             self.tensors
-                .push((format!("{name}.{suffix}"), dtype, shape.to_vec(), payload));
+                .push((format!("{name}.{suffix}"), dtype, shape, payload));
         }
         Ok(())
     }
@@ -97,7 +118,11 @@ impl<'a> SafeWriter<'a> {
         let (w, shape) = src.typed(&format!("{name}.weight"), Dtype::F8E4M3)?;
         let (sc, ssh) = src.typed(&format!("{name}.weight_scale_inv"), Dtype::F32)?;
         // Both halves are already what the loader wants, so both borrow the mmap.
-        self.add_fp8_pair(name, w.into(), shape, sc.into(), ssh)
+        self.add_fp8_pair(
+            name,
+            TensorData::new(shape.to_vec(), w),
+            TensorData::new(ssh.to_vec(), sc),
+        )
     }
 
     /// Copy a V4 fp8 tensor (`<name>.weight` F8E4M3 + `<name>.scale` **F8_E8M0**) into
@@ -141,7 +166,11 @@ impl<'a> SafeWriter<'a> {
             .with_context(|| format!("{name}.scale"))?
             .concat();
         // The weight borrows; only the widened scale grid materializes.
-        self.add_fp8_pair(name, w.into(), shape, f32b.into(), ssh)
+        self.add_fp8_pair(
+            name,
+            TensorData::new(shape.to_vec(), w),
+            TensorData::new(ssh.to_vec(), f32b),
+        )
     }
 
     /// Quantize a BF16 tensor to fp8-e4m3 at `block` and add it as the `<name>.weight` +
@@ -177,7 +206,11 @@ impl<'a> SafeWriter<'a> {
             .with_context(|| wname.clone())?;
         let sshape: Vec<usize> = shape.iter().map(|d| d.div_ceil(block)).collect();
         let sbytes: Vec<u8> = scale.iter().flat_map(|s| s.to_le_bytes()).collect();
-        self.add_fp8_pair(name, packed.into(), shape, sbytes.into(), &sshape)
+        self.add_fp8_pair(
+            name,
+            TensorData::new(shape.to_vec(), packed),
+            TensorData::new(sshape, sbytes),
+        )
     }
 
     /// Copy a tensor verbatim — same dtype, same shape, same bytes. For the ones that are
@@ -188,7 +221,7 @@ impl<'a> SafeWriter<'a> {
         let (b, shape) = src.typed(name, dtype)?;
         // Borrowed, not copied: this is the path K3's 108.81 GB of bf16 trunk rides, and
         // `.to_vec()` here was what made a K3 conversion impossible on a 128 GB host.
-        self.add(name, dtype, shape.to_vec(), b);
+        self.add(name, dtype, TensorData::new(shape.to_vec(), b));
         Ok(())
     }
 
@@ -202,7 +235,7 @@ impl<'a> SafeWriter<'a> {
                 rivoli_core::num::bf16_to_f32(u16::from_le_bytes([c[0], c[1]])).to_le_bytes()
             })
             .collect();
-        self.add(name, Dtype::F32, shape.to_vec(), f32b);
+        self.add(name, Dtype::F32, TensorData::new(shape.to_vec(), f32b));
         Ok(())
     }
 
@@ -519,8 +552,8 @@ mod tests {
         let mut w = SafeWriter::new();
         let a: Vec<u8> = (0..48u8).collect(); // F32 [2,6]
         let b: Vec<u8> = (100..108u8).collect(); // I8 [2,4]
-        w.add("a", Dtype::F32, vec![2, 6], a.clone());
-        w.add("b", Dtype::I8, vec![2, 4], b.clone());
+        w.add("a", Dtype::F32, TensorData::new(vec![2, 6], a.clone()));
+        w.add("b", Dtype::I8, TensorData::new(vec![2, 4], b.clone()));
         w.write(&path).unwrap();
 
         let st = Safetensors::open_file(&path).unwrap();
@@ -567,12 +600,14 @@ mod tests {
         // One e8m0 byte: `copy_fp8_e8m0` requires the grid to be ceil(shape/128) per dim,
         // so a [2,4] weight at block 128 takes exactly [1,1]. 129 = 2^2, and not the 0xFF NaN.
         let e8: Vec<u8> = vec![129];
+        // A generic fn item fixes its `impl Into` type at first use: every payload here is `Vec<u8>`.
+        let td = TensorData::new;
         let mut s = SafeWriter::new();
-        s.add("t", Dtype::Bf16, vec![3, 4], bf16.clone());
-        s.add("p.weight", Dtype::F8E4M3, vec![2, 4], w8.clone());
-        s.add("p.weight_scale_inv", Dtype::F32, vec![1, 4], sc);
-        s.add("q.weight", Dtype::F8E4M3, vec![2, 4], w8.clone());
-        s.add("q.scale", Dtype::F8E8M0, vec![1, 1], e8.clone());
+        s.add("t", Dtype::Bf16, td(vec![3, 4], bf16.clone()));
+        s.add("p.weight", Dtype::F8E4M3, td(vec![2, 4], w8.clone()));
+        s.add("p.weight_scale_inv", Dtype::F32, td(vec![1, 4], sc));
+        s.add("q.weight", Dtype::F8E4M3, td(vec![2, 4], w8.clone()));
+        s.add("q.scale", Dtype::F8E8M0, td(vec![1, 1], e8.clone()));
         s.write(&src_path).unwrap();
         let src = Safetensors::open_file(&src_path).unwrap();
 
@@ -594,8 +629,8 @@ mod tests {
         let mut o = SafeWriter::new();
         o.copy_verbatim(&src, "t", Dtype::Bf16).unwrap();
         o.copy_fp8(&src, "p").unwrap();
-        o.add("q.weight", Dtype::F8E4M3, vec![2, 4], w8);
-        o.add("q.weight_scale_inv", Dtype::F32, vec![1, 1], widened);
+        o.add("q.weight", Dtype::F8E4M3, td(vec![2, 4], w8));
+        o.add("q.weight_scale_inv", Dtype::F32, td(vec![1, 1], widened));
         o.write(&owned).unwrap();
 
         assert_eq!(
@@ -621,17 +656,21 @@ mod tests {
         w.add(
             "t.weight",
             Dtype::F8E4M3,
-            vec![2, 4],
-            vec![0x38, 0x40, 0x38, 0xB8, 0xB8, 0x00, 0x40, 0x38], // 1,2,1,-1 / -1,0,2,1
+            TensorData::new(
+                vec![2, 4],
+                vec![0x38, 0x40, 0x38, 0xB8, 0xB8, 0x00, 0x40, 0x38], // 1,2,1,-1 / -1,0,2,1
+            ),
         );
         w.add(
             "t.weight_scale_inv",
             Dtype::F32,
-            vec![1, 2],
-            [10.0f32, 100.0]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>(),
+            TensorData::new(
+                vec![1, 2],
+                [10.0f32, 100.0]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            ),
         );
         w.write(&path).unwrap();
         let st = Safetensors::open_file(&path).unwrap();
@@ -656,7 +695,7 @@ mod tests {
         let dir = tmpdir("trunc");
         let path = format!("{dir}/t.safetensors");
         let mut w = SafeWriter::new();
-        w.add("t", Dtype::F32, vec![4], vec![0u8; 16]);
+        w.add("t", Dtype::F32, TensorData::new(vec![4], vec![0u8; 16]));
         w.write(&path).unwrap();
         let whole = std::fs::read(&path).unwrap();
         Safetensors::open_file(&path).expect("the intact file must open");

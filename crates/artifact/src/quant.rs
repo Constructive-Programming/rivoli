@@ -312,9 +312,24 @@ fn worker_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |t| t.get())
 }
 
-/// Fill `n` consecutive expert blocks of `stride` bytes in `buf`, in parallel, calling
-/// `fill(e, &mut block[..bytes])` for each. The padding between `bytes` and `stride` is
-/// left as the caller found it.
+/// `count` consecutive expert blocks, each `stride` bytes apart and carrying `bytes` of payload
+/// at its start — the geometry [`fill_expert_blocks`] and `format::write_expert_layer` both lay
+/// out.
+///
+/// Named fields rather than the three adjacent `usize` parameters both functions took. A
+/// `stride`/`bytes` swap was already refused by `bytes <= stride` whenever it mattered; the
+/// count was not — a block count passed as either width (or the reverse) is a geometry that
+/// type-checks and sizes the file wrong.
+#[derive(Clone, Copy)]
+pub struct ExpertBlocks {
+    pub stride: usize,
+    pub bytes: usize,
+    pub count: usize,
+}
+
+/// Fill `blocks.count` consecutive expert blocks of `blocks.stride` bytes in `buf`, in parallel,
+/// calling `fill(e, &mut block[..blocks.bytes])` for each. The padding between the two is left
+/// as the caller found it.
 ///
 /// **`fill` must write all `bytes` it is given.** Nothing here clears a slot first, and the one
 /// caller reuses its buffer across windows, so a partial write leaves whatever the previous
@@ -329,11 +344,14 @@ fn worker_threads() -> usize {
 /// `e` lands at exactly `e · stride`.
 pub(crate) fn fill_expert_blocks(
     buf: &mut [u8],
-    stride: usize,
-    bytes: usize,
-    n: usize,
+    blocks: ExpertBlocks,
     fill: impl Fn(usize, &mut [u8]) -> anyhow::Result<()> + Sync,
 ) -> anyhow::Result<()> {
+    let ExpertBlocks {
+        stride,
+        bytes,
+        count: n,
+    } = blocks;
     anyhow::ensure!(bytes <= stride, "expert bytes {bytes} > stride {stride}");
     anyhow::ensure!(
         buf.len() >= n * stride,

@@ -71,10 +71,11 @@ mod k3_anchor;
 use common::{Lcg, back, dev, f32b, f32v, ok, rel};
 use k3_anchor::{KDA_LAYERS, anchors, float, kda_tag, kda_tol, to_key_major};
 use rivoli_artifact::format::{
-    Dtype, EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, LAYER_WINDOW, LayerDims, SafeWriter,
-    write_expert_layer,
+    Dtype, EXPERT_HEADER_BYTES, ExpertFile, ExpertHeader, F4_MAGIC, LAYER_WINDOW, LayerDims,
+    SafeWriter, TensorData, write_expert_layer,
 };
 use rivoli_artifact::k3_config::K3Config;
+use rivoli_artifact::quant::ExpertBlocks;
 use rivoli_artifact::quant::f4::{f4_expert_bytes, f4_expert_stride, f4_slot_offsets};
 use rivoli_artifact::schema::parse_config;
 use rivoli_backend::{
@@ -280,22 +281,32 @@ impl Draw {
 
     fn proj(&mut self, name: &str, o: usize, i: usize) {
         let v = self.vals(o * i, -0.08, 0.08);
-        self.w
-            .add(name.to_string(), Dtype::Bf16, vec![o, i], bf16_bytes(&v));
+        self.w.add(
+            name.to_string(),
+            Dtype::Bf16,
+            TensorData::new(vec![o, i], bf16_bytes(&v)),
+        );
     }
 
     fn norm(&mut self, name: &str, shape: Vec<usize>) {
         let n = shape.iter().product();
         let v = self.vals(n, 0.8, 1.2);
-        self.w
-            .add(name.to_string(), Dtype::Bf16, shape, bf16_bytes(&v));
+        self.w.add(
+            name.to_string(),
+            Dtype::Bf16,
+            TensorData::new(shape, bf16_bytes(&v)),
+        );
     }
 
     fn f32t(&mut self, name: &str, shape: Vec<usize>, fam: Fam) {
         let n = shape.iter().product();
         let (lo, hi) = fam.span();
         let v = self.vals(n, lo, hi);
-        self.w.add(name.to_string(), Dtype::F32, shape, f32b(&v));
+        self.w.add(
+            name.to_string(),
+            Dtype::F32,
+            TensorData::new(shape, f32b(&v)),
+        );
     }
 }
 
@@ -392,8 +403,7 @@ fn write_attn_tensors(
             d.w.add(
                 format!("{sa}.A_log"),
                 Dtype::F32,
-                vec![la.num_heads],
-                f32b(&a_log),
+                TensorData::new(vec![la.num_heads], f32b(&a_log)),
             );
             d.f32t(&format!("{sa}.dt_bias"), vec![ch], Fam::DtBias);
             d.f32t(&format!("{sa}.o_norm.weight"), vec![la.head_dim], Fam::Gain);
@@ -475,11 +485,15 @@ fn write_experts(dir: &str, t: &rivoli_artifact::k3_config::K3TextConfig) {
         // One deterministic byte stream per (layer, expert), scales re-drawn into range.
         let seeds: Vec<u64> = (0..ne).map(|e| 0x9e37 + (l * ne + e) as u64).collect();
         write_expert_layer(
-            &format!("{dir}/L{l:02}.f4"),
-            &header,
-            stride,
-            bytes,
-            ne,
+            ExpertFile {
+                path: &format!("{dir}/L{l:02}.f4"),
+                header: &header,
+            },
+            ExpertBlocks {
+                stride,
+                bytes,
+                count: ne,
+            },
             LAYER_WINDOW,
             |e, slot| {
                 let mut r = Lcg(seeds[e]);

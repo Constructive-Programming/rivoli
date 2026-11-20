@@ -177,6 +177,77 @@ impl Family {
             LayerDomain::All
         })
     }
+
+    /// Every index a name carries, bounded by the config — never by the census's own count,
+    /// except for vision blocks, whose depth this port does not bind (see `qwen_config`'s
+    /// header: `vision_config` is deliberately unbound, so its 27 is read from the census row
+    /// that will be excluded anyway).
+    fn check_indices(
+        &self,
+        cfg: &QwenTextConfig,
+        name: &str,
+        indices: &[(char, usize)],
+    ) -> Result<()> {
+        for &(kind, idx) in indices {
+            let (bound, what) = match kind {
+                'L' => (self.layer_bound(cfg, idx)?, "layer"),
+                'E' => (cfg.num_experts, "expert"),
+                'S' => (cfg.split_ngram_parts, "n-gram shard"),
+                'B' => (usize::try_from(self.count).unwrap_or(0), "vision block"),
+                other => bail!("{name}: unknown index placeholder {other:?}"),
+            };
+            ensure!(
+                idx < bound,
+                "{name}: {what} index {idx} is not below {bound} for family {}",
+                self.pattern
+            );
+        }
+        Ok(())
+    }
+
+    /// The layer bound for one observed `{L}`, and — the sharp half — the FAMILY check, which is
+    /// not a bound at all.
+    ///
+    /// A `self_attn` tensor on a GatedDeltaNet layer, or a `ple` tensor on any layer but the
+    /// host, is a name whose pattern and count are both fine. Only the config knows it is wrong.
+    fn layer_bound(&self, cfg: &QwenTextConfig, idx: usize) -> Result<usize> {
+        let domain = self.layer_domain().with_context(|| {
+            format!(
+                "{}: an {{L}} index in a family with no layer domain",
+                self.pattern
+            )
+        })?;
+        let (ok, wanted) = match domain {
+            LayerDomain::All => (idx < cfg.n_layers, "any layer"),
+            LayerDomain::Mtp => (idx < cfg.mtp_num_hidden_layers, "an MTP draft layer"),
+            LayerDomain::LinearAttention => (
+                !cfg.layer_is_sparse_attention(idx)?,
+                "a linear_attention (GatedDeltaNet) layer",
+            ),
+            LayerDomain::SparseAttention => (
+                cfg.layer_is_sparse_attention(idx)?,
+                "a full_attention-spelled (indexer-running) layer",
+            ),
+            LayerDomain::PleHost => (
+                cfg.layer_hosts_ple(idx),
+                "the ONE-INDEXED ple_layer_ids host, i.e. layer_idx = ple_layer_ids[0] - 1",
+            ),
+        };
+        ensure!(
+            ok,
+            "{} at layer {idx}, which is not {wanted}. `layer_types` calls it {:?}; the PLE host \
+             is layer_idx {:?}. This is trap T12's shape: the pattern is a real family and the \
+             count would still balance",
+            self.pattern,
+            cfg.layer_types.get(idx),
+            cfg.ple_host_layer().ok()
+        );
+        Ok(if domain == LayerDomain::Mtp {
+            cfg.mtp_num_hidden_layers
+        } else {
+            cfg.n_layers
+        })
+    }
 }
 
 /// The three dtypes this checkpoint declares, and only those.
@@ -561,7 +632,7 @@ impl Census {
                 .families
                 .get(i)
                 .context("census index is out of step with its rows")?;
-            self.check_indices(cfg, name, f, &indices)?;
+            f.check_indices(cfg, name, &indices)?;
             *seen.get_mut(i).context("tally is out of step")? += 1;
         }
         for (f, &got) in self.families.iter().zip(&seen) {
@@ -575,78 +646,6 @@ impl Census {
         }
         self.confront_scale_grids()?;
         Ok(self.summarise(&seen))
-    }
-
-    /// Every index a name carries, bounded by the config — never by the census's own count,
-    /// except for vision blocks, whose depth this port does not bind (see `qwen_config`'s
-    /// header: `vision_config` is deliberately unbound, so its 27 is read from the census row
-    /// that will be excluded anyway).
-    fn check_indices(
-        &self,
-        cfg: &QwenTextConfig,
-        name: &str,
-        f: &Family,
-        indices: &[(char, usize)],
-    ) -> Result<()> {
-        for &(kind, idx) in indices {
-            let (bound, what) = match kind {
-                'L' => (self.layer_bound(cfg, f, idx)?, "layer"),
-                'E' => (cfg.num_experts, "expert"),
-                'S' => (cfg.split_ngram_parts, "n-gram shard"),
-                'B' => (usize::try_from(f.count).unwrap_or(0), "vision block"),
-                other => bail!("{name}: unknown index placeholder {other:?}"),
-            };
-            ensure!(
-                idx < bound,
-                "{name}: {what} index {idx} is not below {bound} for family {}",
-                f.pattern
-            );
-        }
-        Ok(())
-    }
-
-    /// The layer bound for one observed `{L}`, and — the sharp half — the FAMILY check, which is
-    /// not a bound at all.
-    ///
-    /// A `self_attn` tensor on a GatedDeltaNet layer, or a `ple` tensor on any layer but the
-    /// host, is a name whose pattern and count are both fine. Only the config knows it is wrong.
-    fn layer_bound(&self, cfg: &QwenTextConfig, f: &Family, idx: usize) -> Result<usize> {
-        let domain = f.layer_domain().with_context(|| {
-            format!(
-                "{}: an {{L}} index in a family with no layer domain",
-                f.pattern
-            )
-        })?;
-        let (ok, wanted) = match domain {
-            LayerDomain::All => (idx < cfg.n_layers, "any layer"),
-            LayerDomain::Mtp => (idx < cfg.mtp_num_hidden_layers, "an MTP draft layer"),
-            LayerDomain::LinearAttention => (
-                !cfg.layer_is_sparse_attention(idx)?,
-                "a linear_attention (GatedDeltaNet) layer",
-            ),
-            LayerDomain::SparseAttention => (
-                cfg.layer_is_sparse_attention(idx)?,
-                "a full_attention-spelled (indexer-running) layer",
-            ),
-            LayerDomain::PleHost => (
-                cfg.layer_hosts_ple(idx),
-                "the ONE-INDEXED ple_layer_ids host, i.e. layer_idx = ple_layer_ids[0] - 1",
-            ),
-        };
-        ensure!(
-            ok,
-            "{} at layer {idx}, which is not {wanted}. `layer_types` calls it {:?}; the PLE host \
-             is layer_idx {:?}. This is trap T12's shape: the pattern is a real family and the \
-             count would still balance",
-            f.pattern,
-            cfg.layer_types.get(idx),
-            cfg.ple_host_layer().ok()
-        );
-        Ok(if domain == LayerDomain::Mtp {
-            cfg.mtp_num_hidden_layers
-        } else {
-            cfg.n_layers
-        })
     }
 
     fn summarise(&self, seen: &[u64]) -> Summary {
