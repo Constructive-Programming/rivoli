@@ -360,3 +360,26 @@ pub fn back(d: &rivoli_engine::device::DeviceBuf) -> Vec<u8> {
 pub fn assert_out(want: &[f32], got: &rivoli_engine::device::DeviceBuf, label: &str) {
     super::assert_close(want, &f32v(&got.copy_out().expect("out")), label);
 }
+
+/// One whole-buffer `hash_rows` launch on `stream`: the XOR fold of `x[0..n]` into `*out`.
+///
+/// Shared by `fwd_kernel.rs` (the fold against its host oracle) and `h2d_ordering.rs` (the fold
+/// as a reader on a non-blocking stream). jscpd caught the third copy of this launch block
+/// before it landed.
+///
+/// # Safety
+/// `x` is `n` live device f32 and `out` one live device u64, zeroed before the first fold; both
+/// outlive `stream`'s completion; `stream` is a live `hipStream_t`, or null.
+#[cfg(feature = "rocm")]
+pub unsafe fn hash_fold(x: *const f32, n: usize, out: *mut u64, stream: *mut std::ffi::c_void) {
+    let span = rivoli_backend::HashSpan {
+        n,
+        stride: 1,
+        i_base: 0,
+    };
+    // SAFETY: the caller's contract above.
+    ok(
+        unsafe { rivoli_backend::hip::launch_hash_rows(x, span, out, stream) },
+        "hash_rows",
+    );
+}

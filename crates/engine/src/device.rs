@@ -328,6 +328,18 @@ mod tier {
 
         /// Overwrite `bytes` at byte offset `off` (partial H2D) — grows a KV
         /// slab by one token or fills a cold-expert slot without reallocating.
+        ///
+        /// **When this returns, the bytes are on the device, so a kernel enqueued afterwards
+        /// on any stream reads them, `hipStreamNonBlocking` streams included.** CUDA's pageable
+        /// `cudaMemcpy` may return before its DMA lands. HIP's does not: the HIP guide says
+        /// "hipMemcpy() for data transfers waits for completion before returning control to the
+        /// host" (rocm.docs.amd.com/projects/HIP/en/latest/how-to/hip_runtime_api/asynchronous.html),
+        /// and the CLR this box runs waits on the copy's completion signal before returning.
+        /// The argument covers up to 16 KiB, the shader-copy path that `stage_batch`'s uploads
+        /// take. Larger copies are covered only by the device tripwire
+        /// `crates/engine/tests/h2d_ordering.rs`. Source lines and scope are in
+        /// `docs/investigations/rust-kernels.md` §5 "stage_batch ordering". If this ever
+        /// becomes an async copy, `stage_batch` needs an event.
         pub fn copy_in_at(&mut self, off: usize, bytes: &[u8]) -> Result<()> {
             ensure!(
                 off + bytes.len() <= self.len,

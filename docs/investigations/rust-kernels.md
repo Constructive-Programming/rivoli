@@ -1,7 +1,7 @@
 ---
 status: closed-shipped
 scope: engine
-verdict: COMPLETE 2026-11-20 — every HIP C++ kernel (66 launchers) is Rust on amdgcn-amd-amdhsa and hipcc is out of the build; the C++ survives only at tag archive/hip-kernels as the bit-identity reference. Witnessed on b5ca13a: 66/66 launcher rows byte-identical to the tagged hipcc, battery green bar the 30 inherited CodeScene files, determinism 1024/1024 under --arena-refresh, parity-glm 32/32, and GLM decode not slower than the pre-migration build under the pre-registered rule (3.031 vs 3.093 tok/s, identical ids and hit/miss counts). Follow-up (lease on afedb58): with GLM's JOIN 1 device_sync replaced by a zero-cost token, decode is still not slower than the pre-migration build and the attention excess is no longer measurable above the floor (+0.3 against a 0.53 ms same-binary spread, the two pairs without host load); the sync as the cause is post hoc, the attribution lease's pre-registered rule NOT MET. Two pre-existing MoE ordering items owed (§5 Phase 2 follow-up). The body is the per-lane port log: open §1's hazards only when writing a new device kernel, and §5 Phase 2 for the closing evidence.
+verdict: COMPLETE 2026-11-20 — every HIP C++ kernel (66 launchers) is Rust on amdgcn-amd-amdhsa and hipcc is out of the build; the C++ survives only at tag archive/hip-kernels as the bit-identity reference. Witnessed on b5ca13a: 66/66 launcher rows byte-identical to the tagged hipcc, battery green bar the 30 inherited CodeScene files, determinism 1024/1024 under --arena-refresh, parity-glm 32/32, and GLM decode not slower than the pre-migration build under the pre-registered rule (3.031 vs 3.093 tok/s, identical ids and hit/miss counts). Follow-up (lease on afedb58): with GLM's JOIN 1 device_sync replaced by a zero-cost token, decode is still not slower than the pre-migration build and the attention excess is no longer measurable above the floor (+0.3 against a 0.53 ms same-binary spread, the two pairs without host load); the sync as the cause is post hoc, the attribution lease's pre-registered rule NOT MET. Two pre-existing MoE ordering items were owed (§5 Phase 2 follow-up): stage_batch's uploads closed 2026-11-20 by citation (blocking hipMemcpy waits for completion in HIP's docs and the CLR source; §5 stage_batch ordering, device tripwire h2d_ordering.rs); the trace-only poison fill is still owed. The body is the per-lane port log: open §1's hazards only when writing a new device kernel, and §5 Phase 2 for the closing evidence.
 ---
 
 # Rust kernels — migration plan
@@ -2444,6 +2444,85 @@ starts or ends above 10 is reported load-confounded, the verdict given with and 
   synchronous copy is believed to wait for completion, and nothing here cites it. The removed
   sync sat before `stage_batch` and never covered them (V4 and K3 sync after theirs). Owed: cite
   the ROCm behaviour, or put the uploads behind an event both MoE streams wait on.
+  > **CLOSED 2026-11-20 by citation ("stage_batch ordering" below):** ROCm's synchronous
+  > `hipMemcpy` does wait for completion, which is both documented and visible in the source. No
+  > event was added. The device tripwire is pending its lease.
 - The trace-only poison fill inside `submit` (`hipMemsetD32Async` on the null stream) is
   unordered against the fetch write and the miss-stream read of the same slot. Owed: order the
   fill behind the slot's fetch, or argue that the trace's poison may be unordered.
+
+### stage_batch ordering (2026-11-20, branch `wave/stage-batch`, base `eb801b7`)
+
+**The question.** `stage_batch` (`glm/mlp.rs`) uploads `descs_buf` and `wexpert_buf` with
+`DeviceBuf::copy_in_at`, a blocking `hipMemcpy` H2D from pageable `Vec`s on the null stream.
+The experts that read them launch afterwards on `compute_stream` and `miss_stream`, both
+`hipStreamNonBlocking` (`hiprt::rivoli_stream_create`), which the null stream does not order
+against. Nothing else orders the two: the JOIN 1 token comes from the gate-logits D2H, which
+runs before `stage_batch`. So correctness depends on one thing: has the copy landed by the time
+`hipMemcpy` returns?
+
+**CUDA does not promise it, and CUDA is only context here.** Its API sync behaviour page
+(docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html) says: for pageable H2D, "The
+function will return once the pageable buffer has been copied to the staging memory for DMA
+transfer to device memory, but the DMA to final destination may not have completed."
+
+**HIP does promise it, in its docs and in the code.**
+- Docs: the HIP guide's asynchronous-execution page
+  (rocm.docs.amd.com/projects/HIP/en/latest/how-to/hip_runtime_api/asynchronous.html, fetched
+  2026-11-20, HIP 7.17 docs) says "For example, hipMemcpy() for data transfers waits for
+  completion before returning control to the host," and "When a synchronous function is called,
+  control is not returned to the host thread before the device has completed the requested
+  task." The `hipMemcpy` comment in `hip_runtime_api.h` says nothing either way.
+- Source: the code is the CLR this box runs. `dev-util/hip-10.0.0` builds
+  `libamdhip64.so.7.15.0` from `rocm-clr-10.0.0.tar.gz` (sha256 `07caed9d…`), and none of its
+  four patches touches the copy path. `hipMemcpy` → `hipMemcpy_common` → `ihipMemcpy(…,
+  stream)`, with defaults `isHostAsync = false, isGPUAsync = true`
+  (`hipamd/src/hip_internal.hpp:791`). On the host↔device branch,
+  `isHostAsync &= AMD_DIRECT_DISPATCH` (`hip_memory.cpp:766`) leaves it false, so
+  `if (!isHostAsync) command->queue()->finishCommand(command)` (`hip_memory.cpp:799`) runs.
+  `HostQueue::finishCommand` (`rocclr/platform/commandqueue.cpp:141`) calls
+  `IsHwEventReady(event, kWaitCompletion = true)`, which waits on the command's HSA signal
+  (`rocdevice.cpp:3207–3221`), or falls back to `awaitCompletion()` if the command has no HW
+  event.
+- Which copy runs: `blocking_blit_ = IS_HIP`, but `hipMalloc` memory is not
+  `HostMemoryDirectAccess`, so the CPU-memcpy path is not taken. Two things rule it out:
+  `HSA_ENABLE_DTIF_FAST_COPY` defaults false, and the fine-grain allocation that would also get
+  direct access only applies on a FULL-profile agent (`rocmemory.cpp:898–906`). The paths, from
+  `rocsettings.cpp` and `rocblit.cpp`, are:
+  - up to `GPU_FORCE_BLIT_COPY_SIZE` (16 KiB): a staging buffer and a shader copy that carries a
+    completion signal and a system-scope release (`KernelBlitManager::writeBuffer`,
+    `rocblit.cpp:2255`);
+  - up to `pinnedMinXferSize_` (64 KiB): staged SDMA;
+  - above that: SDMA from the pageable source pinned in place, in 32 MiB chunks
+    (`DmaBlitManager::getBuffer`, `rocblit.cpp:1042`).
+
+  Both real uploads take the first path: 36–136 B for `wexpert` and 432/816 B for `descs` at
+  nrow 1/2. Since `slots = top_k·MAXROW + n_shared`, they stay there for any `top_k ≤ 170`.
+
+**Why that is enough, for the shader-copy path.** The host returns only after the copy has
+completed, and only then enqueues the expert kernels. The copy is a kernel on the same agent,
+so it shares the L2 with the experts, and it releases at system scope. The null stream's lack of
+ordering against non-blocking streams never matters, because nothing is left in flight on it
+when the experts are enqueued. For the SDMA paths (above 16 KiB), the reader's acquire is
+agent-scope (`AMD_OPT_FLUSH`), and the hardware ordering of an SDMA write against it is NOT
+argued here. The tripwire covers those sizes empirically, and `stage_batch` never uses them.
+`copy_in_at`'s doc carries the citation and this scope, and `stage_batch` points to it.
+Correctness review signed off on the argument for `stage_batch`'s sizes and asked for this scope.
+
+**The tripwire.** `crates/engine/tests/h2d_ordering.rs`, rocm arm. Each iteration uploads fresh
+data with `copy_in_at`, then immediately folds it with `hash_rows` on a `HipStream::miss()`
+stream with no other sync. A device fold that differs from `rivoli_core::hash::xor_fold` means a
+stale read. Sizes are 36, 432 and 816 B (the real uploads), then 16 KiB, 64 KiB, each of those
+plus 4, then 1 MiB and 16 MiB, with 16 to 256 iterations per size.
+
+The red proof is a standing fixture that runs every time: `async_upload_without_a_wait_is_seen_stale`.
+It is the same loop with the upload replaced by a 64 MiB `hash_rows` delay kernel and a
+`hipMemcpyAsync` from pinned memory, both on the null stream, and no wait. It must see stale
+reads at EVERY size. The delay is what gives it power at the real sub-KiB sizes, because without
+it a small copy finishes before the reader starts. If a small size reads 0 stale even so (for
+example, if HIP placed both streams on one hardware queue, whose barrier bit would serialise
+them), the fixture fails and says the tripwire has no power at that size. Device arm: **OWED**
+(READY-FOR-GPU).
+
+**Decode cost.** Nothing in the decode path changed, so there is no decode A/B to run.
+

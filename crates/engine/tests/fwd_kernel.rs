@@ -32,13 +32,13 @@
 
 use rivoli_backend::hip::{
     launch_append_kv, launch_embed_i8_row, launch_flag_nonfinite, launch_gather_rope,
-    launch_hash_rows,
 };
 use rivoli_core::num::{E4M3_BLOCK, E4M3_MAX, f32_to_bf16, f32_to_e4m3};
 
 mod common;
 use common::{
-    Lcg, assert_bits, assert_bitwise, back, dev, f32b, f32v, i8_weights, ok, u16v, u32v, zeros,
+    Lcg, assert_bits, assert_bitwise, back, dev, f32b, f32v, hash_fold, i8_weights, ok, u16v, u32v,
+    zeros,
 };
 
 /// `embed_i8_row` — `x[i] = (i8)embed[token][i] · scale[token]`.
@@ -321,15 +321,7 @@ fn hash_rows_matches_the_host_fold() {
     // which the duplication gate reported the moment the `stream` parameter widened them.
     let launch = |x: *const f32, n: usize, out: *mut u64| {
         // SAFETY: the callers pass a live device f32 span of `n` and one live device u64.
-        let span = rivoli_backend::HashSpan {
-            n,
-            stride: 1,
-            i_base: 0,
-        };
-        ok(
-            unsafe { launch_hash_rows(x, span, out, rivoli_backend::NULL_STREAM) },
-            "hash_rows",
-        );
+        unsafe { hash_fold(x, n, out, rivoli_backend::NULL_STREAM) };
     };
     let fold = |v: &[f32]| -> u64 {
         let xb = dev(&f32b(v));
