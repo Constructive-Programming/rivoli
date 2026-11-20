@@ -11,12 +11,12 @@
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use rivoli_artifact::format::{
-    ArtifactDirs, Dtype, ExpertHeader, FormatMeta, LAYER_WINDOW, LayerDims, SafeWriter,
-    Safetensors, VQ3_MAGIC, finish_artifact, load_codebooks, write_expert_layer,
+    ArtifactDirs, Dtype, ExpertFile, ExpertHeader, FormatMeta, LAYER_WINDOW, LayerDims, SafeWriter,
+    Safetensors, TensorData, VQ3_MAGIC, finish_artifact, load_codebooks, write_expert_layer,
 };
 use rivoli_artifact::quant::{
-    ExpertProjs, FP8_BLOCK, PROJ, VQ_DIM, expert_base, expert_projs, learn_codebook, quant_vq,
-    sample_subvectors, vq_expert_bytes, vq_proj_bytes, vq_row_bytes, write_le_scales,
+    ExpertBlocks, ExpertProjs, FP8_BLOCK, PROJ, VQ_DIM, expert_base, expert_projs, learn_codebook,
+    quant_vq, sample_subvectors, vq_expert_bytes, vq_proj_bytes, vq_row_bytes, write_le_scales,
 };
 use rivoli_core::num::bf16_to_f32;
 // Only the tests still take the layout on its own; the encoders go through `expert_projs`,
@@ -379,11 +379,15 @@ impl<'a> Job<'a> {
         )
         .to_bytes();
         write_expert_layer(
-            path,
-            &header,
-            stride,
-            vq_expert_bytes(d.hidden, d.moe_inter),
-            d.n_experts + 1,
+            ExpertFile {
+                path,
+                header: &header,
+            },
+            ExpertBlocks {
+                stride,
+                bytes: vq_expert_bytes(d.hidden, d.moe_inter),
+                count: d.n_experts + 1,
+            },
             LAYER_WINDOW,
             |e, slot| cx.expert(&expert_base(l, e, d.n_experts), slot),
         )
@@ -411,8 +415,12 @@ impl<'a> Job<'a> {
         let (bytes, shape) = self.src.typed(name, Dtype::Bf16)?;
         let (o, i) = (shape[0], shape[1]);
         let (packed, scales) = requant_int8(bytes, o, i);
-        w.add(name, Dtype::I8, vec![o, i], packed);
-        w.add(format!("{name}.scale"), Dtype::F32, vec![o], scales);
+        w.add(name, Dtype::I8, TensorData::new(vec![o, i], packed));
+        w.add(
+            format!("{name}.scale"),
+            Dtype::F32,
+            TensorData::new(vec![o], scales),
+        );
         Ok(())
     }
 
@@ -465,7 +473,11 @@ impl<'a> Job<'a> {
         w.add_widened(self.src, &format!("{lb}.mlp.gate.weight"))?;
         let bias_name = format!("{lb}.mlp.gate.e_score_correction_bias");
         let (bias, bsh) = self.src.typed(&bias_name, Dtype::F32)?;
-        w.add(bias_name, Dtype::F32, bsh.to_vec(), bias.to_vec());
+        w.add(
+            bias_name,
+            Dtype::F32,
+            TensorData::new(bsh.to_vec(), bias.to_vec()),
+        );
         Ok(())
     }
 

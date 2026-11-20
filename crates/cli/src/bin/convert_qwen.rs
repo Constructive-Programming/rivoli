@@ -48,7 +48,8 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use rivoli_artifact::census::qwen::{Census, NgramHash, Role, ngram_hash};
 use rivoli_artifact::format::{
-    ArtifactDirs, Dtype, FormatMeta, SafeWriter, Safetensors, finish_artifact, require_aux,
+    ArtifactDirs, Dtype, FormatMeta, SafeWriter, Safetensors, TensorData, finish_artifact,
+    require_aux,
 };
 use rivoli_artifact::quant::FP8_BLOCK;
 use rivoli_artifact::qwen_config::{QwenConfig, QwenTextConfig};
@@ -227,7 +228,7 @@ fn add_fp8_bf16_scaled<'a>(
     );
     // The weight BORROWS the source mmap (this is the path 112.5 GiB rides); only the grid
     // materializes, at 4 B per tile.
-    w.add(wname, Dtype::F8E4M3, shape.to_vec(), bytes);
+    w.add(wname, Dtype::F8E4M3, TensorData::new(shape.to_vec(), bytes));
     w.add_widened(src, &sname)?;
     Ok(shape.iter().product::<usize>())
 }
@@ -328,8 +329,7 @@ fn write_ngram_shards(src: &Safetensors, job: &NgramJob<'_>, out_dir: &str) -> R
             w.add(
                 format!("ngram.rows.{row}"),
                 Dtype::F8E4M3,
-                shape.to_vec(),
-                bytes,
+                TensorData::new(shape.to_vec(), bytes),
             );
             w.write(&path)?;
         }
@@ -455,7 +455,7 @@ fn write_resident(
         match f.role {
             Role::RoutedWeight | Role::RoutedScale | Role::NgramShard => skipped += 1,
             Role::Resident | Role::HashParam | Role::NgramScale => {
-                w.add(name, dtype, shape.to_vec(), bytes);
+                w.add(name, dtype, TensorData::new(shape.to_vec(), bytes));
                 kept += 1;
             }
             Role::ExcludedMtp | Role::ExcludedVision => bail!(

@@ -20,6 +20,7 @@
 //! snapshots of the same architecture* — each one says so at its declaration.
 
 use crate::arch::Arch;
+use crate::format::RoutedFmt;
 use anyhow::{Context, Result, ensure};
 
 /// Resolve a config document's architecture, from `model_type` and `architectures` BOTH.
@@ -224,9 +225,9 @@ pub(crate) fn ensure_f32_positive(items: &[(&str, f64)]) -> Result<()> {
 pub(crate) fn ensure_group_aligned(
     expert_in: usize,
     moe_inter: usize,
-    group: usize,
-    what: &str,
+    fmt: RoutedFmt,
 ) -> Result<()> {
+    let (group, what) = (fmt.group(), fmt.group_name());
     // Named for the CONFIG KEY, not for the parameter. The reader of this message is holding a
     // `config.json` and needs to know which field to look at; `expert_in 6144 is not a multiple
     // of ...` makes them go find out what feeds `expert_in` first. Which key that is differs by
@@ -250,7 +251,8 @@ pub(crate) fn ensure_group_aligned(
 // > prediction held: it landed at M8, unchanged in shape.
 
 /// [`ensure_group_aligned`] at [`crate::quant::F4_GROUP`] — the routed-expert scheme both
-/// `.f4` models use, so both configs' `validate` want the same four arguments.
+/// `.f4` models use, so both configs' `validate` want the same call (four arguments until
+/// 2026-11-20, when the group and its name became one [`RoutedFmt`]).
 ///
 /// Wrapped rather than restated at each call: the five-line form was a duplication-gate failure
 /// the moment K3 became the second caller in the old tree, and the group is not the interesting
@@ -263,12 +265,7 @@ pub(crate) fn ensure_group_aligned(
 /// [`ensure_f32_positive`] is: the rule is about the FORMAT, which two architectures share,
 /// not about either checkpoint.
 pub(crate) fn ensure_f4_group_aligned(expert_in: usize, moe_inter: usize) -> Result<()> {
-    ensure_group_aligned(
-        expert_in,
-        moe_inter,
-        crate::quant::F4_GROUP,
-        stringify!(F4_GROUP),
-    )
+    ensure_group_aligned(expert_in, moe_inter, RoutedFmt::F4)
 }
 
 #[cfg(test)]

@@ -62,11 +62,11 @@ mod fixtures;
 /// API change, and this block is what keeps the two separate.
 pub use expert::{F4_NAMING_K3, F4_NAMING_V4, F4Expert, F4Naming};
 pub use header::{EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, LayerDims, RoutedFmt, VQ3_MAGIC};
-pub use layer::{LAYER_WINDOW, write_expert_layer};
+pub use layer::{ExpertFile, LAYER_WINDOW, write_expert_layer};
 pub use meta::{ArtifactDirs, FormatMeta, I4Source, finish_artifact, require_aux};
 pub use repack::RoutedRepack;
 pub use set::{ExpertSet, SetDims, f4_layer_range, f4_source, load_codebooks};
-pub use tensors::{SafeWriter, Safetensors};
+pub use tensors::{SafeWriter, Safetensors, TensorData};
 
 /// A tensor's dtype in a safetensors header (only the ones this engine uses).
 ///

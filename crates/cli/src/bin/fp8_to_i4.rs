@@ -292,9 +292,11 @@ fn warn_if_stamp_understates(art: &str, cfg: &ModelConfig, from: usize, to: usiz
     let on_disk: Vec<usize> = (cfg.dense_layers..=cfg.n_layers)
         .filter(|l| std::fs::metadata(format!("{art}/L{l:02}.i4")).is_ok())
         .collect();
-    if let (Some(&lo), Some(&hi)) = (on_disk.first(), on_disk.last())
-        && (lo < from || hi >= to)
-    {
+    // An empty set has nothing on disk for the stamp to understate.
+    let (Some(&lo), Some(&hi)) = (on_disk.first(), on_disk.last()) else {
+        return;
+    };
+    if lo < from || hi >= to {
         eprintln!(
             "fp8_to_i4: WARNING — stamped [{from},{to}) but L{lo:02}.i4..L{hi:02}.i4 are on \
              disk. The stamp now UNDERSTATES the set. If those layers came from this same \

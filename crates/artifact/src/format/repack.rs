@@ -10,9 +10,9 @@ use anyhow::{Context, Result, ensure};
 
 use super::expert::{F4Expert, F4Naming};
 use super::header::{ExpertHeader, F4_MAGIC, LayerDims};
-use super::layer::{LAYER_WINDOW, write_expert_layer};
+use super::layer::{ExpertFile, LAYER_WINDOW, write_expert_layer};
 use super::tensors::Safetensors;
-use crate::quant::{VQ_ALIGN, f4_expert_bytes, f4_expert_stride};
+use crate::quant::{ExpertBlocks, VQ_ALIGN, f4_expert_bytes, f4_expert_stride};
 
 /// One `.f4` layer file's worth of work: write it if absent, then optionally prove it.
 ///
@@ -124,22 +124,27 @@ impl RoutedRepack<'_> {
         // is BF16 at full width), so a block written past `ne` would be the wrong
         // ARITHMETIC, not just the wrong weights. Streamed in `LAYER_WINDOW` windows: a K3
         // layer is 15.72 GB and buffering one would be host RAM the GPU shares.
+        let header = ExpertHeader::new(
+            F4_MAGIC,
+            LayerDims {
+                layer: plan.layer,
+                n_experts: ne,
+                expert_in: self.expert_in,
+                moe_inter: self.moe_inter,
+                stride: plan.stride,
+            },
+        )
+        .to_bytes();
         let n = write_expert_layer(
-            &plan.path,
-            &ExpertHeader::new(
-                F4_MAGIC,
-                LayerDims {
-                    layer: plan.layer,
-                    n_experts: ne,
-                    expert_in: self.expert_in,
-                    moe_inter: self.moe_inter,
-                    stride: plan.stride,
-                },
-            )
-            .to_bytes(),
-            plan.stride,
-            plan.ebytes,
-            ne,
+            ExpertFile {
+                path: &plan.path,
+                header: &header,
+            },
+            ExpertBlocks {
+                stride: plan.stride,
+                bytes: plan.ebytes,
+                count: ne,
+            },
             LAYER_WINDOW,
             |e, slot| self.expert(base, e).pack(slot),
         )

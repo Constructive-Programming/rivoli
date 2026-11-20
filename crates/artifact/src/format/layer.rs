@@ -10,7 +10,17 @@
 use anyhow::{Context, Result, ensure};
 
 use super::header::EXPERT_HEADER_BYTES;
-use crate::quant::VQ_ALIGN;
+use crate::quant::{ExpertBlocks, VQ_ALIGN};
+
+/// The file [`write_expert_layer`] publishes, and the header its block 0 carries.
+///
+/// Bundled because the two always travel together to one call. Not cross-checked: nothing
+/// compares the header's layer index with the path's `L{ll}`, or its stride with the
+/// [`ExpertBlocks`] beside it — the callers build both from the same values.
+pub struct ExpertFile<'a> {
+    pub path: &'a str,
+    pub header: &'a [u8; EXPERT_HEADER_BYTES],
+}
 
 /// Host memory one call to [`write_expert_layer`] may hold, regardless of the layer's size.
 ///
@@ -36,8 +46,8 @@ pub const LAYER_WINDOW: usize = 1 << 30;
 /// [`write_expert_layer`], which is a runtime test of `40 <= 4096` on every layer.
 const _: () = assert!(EXPERT_HEADER_BYTES <= VQ_ALIGN);
 
-/// Write one layer's expert file — header block, then `blocks` expert blocks — in bounded host
-/// memory, published to `path` by a rename from `<path>.<pid>.part`.
+/// Write one layer's expert file — header block, then `blocks.count` expert blocks — in bounded
+/// host memory, published to `file.path` by a rename from `<path>.<pid>.part`.
 ///
 /// **Bounded, because the buffered form does not scale past GLM.** Both converters used to
 /// allocate the whole file (`vec![0u8; VQ_ALIGN + blocks * stride]`), fill it, and write it in
@@ -96,17 +106,21 @@ const _: () = assert!(EXPERT_HEADER_BYTES <= VQ_ALIGN);
 /// `window` is the host-memory ceiling and both converters pass [`LAYER_WINDOW`]. It is a
 /// parameter rather than a constant read from inside so a test can reach the window BOUNDARY
 /// without allocating a gigabyte; a thin wrapper supplying the constant would be a second copy
-/// of this parameter list, which `jscpd` refuses (measured: 6 lines, 45 tokens).
+/// of this parameter list, which `jscpd` refuses (measured: 6 lines, 45 tokens — against the
+/// seven-parameter list this took before 2026-11-20; the four-parameter list is not re-measured).
 pub fn write_expert_layer(
-    path: &str,
-    header: &[u8; EXPERT_HEADER_BYTES],
-    stride: usize,
-    bytes: usize,
-    blocks: usize,
+    file: ExpertFile<'_>,
+    geometry: ExpertBlocks,
     window: usize,
     fill: impl Fn(usize, &mut [u8]) -> Result<()> + Sync,
 ) -> Result<u64> {
     use std::io::Write;
+    let ExpertFile { path, header } = file;
+    let ExpertBlocks {
+        stride,
+        count: blocks,
+        ..
+    } = geometry;
     // A `stride` of 0 would reach `chunks_exact_mut(0)` and PANIC rather than return, and
     // `window / stride` would divide by zero one line further down. Refused, not clamped: the
     // `.max(1)` this replaced turned a caller's bad dimension into a panic in someone else's
@@ -145,9 +159,11 @@ pub fn write_expert_layer(
         // insurance, not a check — it cannot report the short write, only defuse it.
         #[cfg(debug_assertions)]
         span.fill(0);
-        crate::quant::fill_expert_blocks(span, stride, bytes, span.len() / stride, |j, slot| {
-            fill(start + j, slot)
-        })?;
+        let window_blocks = ExpertBlocks {
+            count: span.len() / stride,
+            ..geometry
+        };
+        crate::quant::fill_expert_blocks(span, window_blocks, |j, slot| fill(start + j, slot))?;
         f.write_all(span).with_context(|| format!("write {part}"))?;
     }
     // `File` has no user-space buffer to flush; the bytes are in the kernel by here, which is
@@ -180,6 +196,21 @@ mod tests {
         v
     }
 
+    /// The geometry [`a_windowed_expert_layer_is_byte_identical_to_the_buffered_one`] writes.
+    /// Hoisted out of the test body as data: the struct
+    /// literals are fixtures, not steps.
+    const GEOMETRY: ExpertBlocks = ExpertBlocks {
+        stride: 64,
+        bytes: 40,
+        count: 7,
+    };
+    /// The zero-stride geometry that test must see refused.
+    const ZERO_STRIDE: ExpertBlocks = ExpertBlocks {
+        stride: 0,
+        bytes: 0,
+        count: GEOMETRY.count,
+    };
+
     /// Streaming a layer in windows produces the same file the whole-layer buffer did, and
     /// keeps doing so when the block count is not a multiple of the window.
     ///
@@ -196,7 +227,7 @@ mod tests {
     #[test]
     fn a_windowed_expert_layer_is_byte_identical_to_the_buffered_one() {
         let dir = tmpdir("expert_layer");
-        let (stride, bytes, blocks) = (64usize, 40usize, 7usize);
+        let (stride, bytes, blocks) = (GEOMETRY.stride, GEOMETRY.bytes, GEOMETRY.count);
         let header = ExpertHeader::new(
             F4_MAGIC,
             LayerDims {
@@ -219,19 +250,21 @@ mod tests {
         // Reference: the whole-layer buffer, as both converters wrote it before 2026-08-10.
         let mut buf = vec![0u8; VQ_ALIGN + blocks * stride];
         buf[..EXPERT_HEADER_BYTES].copy_from_slice(&header);
-        crate::quant::fill_expert_blocks(&mut buf[VQ_ALIGN..], stride, bytes, blocks, fill)
-            .unwrap();
+        crate::quant::fill_expert_blocks(&mut buf[VQ_ALIGN..], GEOMETRY, fill).unwrap();
+        let at = |path| ExpertFile {
+            path,
+            header: &header,
+        };
 
         // One window per two blocks: four windows, the last holding one block.
         let path = format!("{dir}/L03.f4");
-        let n =
-            write_expert_layer(&path, &header, stride, bytes, blocks, 2 * stride, fill).unwrap();
+        let n = write_expert_layer(at(&path), GEOMETRY, 2 * stride, fill).unwrap();
 
         // A zero stride is REFUSED, not clamped. It used to be `stride.max(1)`, which turned a
         // caller's bad geometry into a panic inside `chunks_exact_mut(0)` two functions away.
         let zero = format!("{dir}/L04.f4");
         assert!(
-            write_expert_layer(&zero, &header, 0, 0, blocks, 2 * stride, fill).is_err(),
+            write_expert_layer(at(&zero), ZERO_STRIDE, 2 * stride, fill).is_err(),
             "stride 0 accepted"
         );
         assert!(!std::path::Path::new(&zero).exists(), "refused but created");
@@ -245,7 +278,7 @@ mod tests {
         let foreign = format!("{path}.999999.part");
         std::fs::write(&foreign, vec![0xFDu8; buf.len() + 64]).unwrap();
         let again = format!("{dir}/L05.f4");
-        write_expert_layer(&again, &header, stride, bytes, blocks, 2 * stride, fill).unwrap();
+        write_expert_layer(at(&again), GEOMETRY, 2 * stride, fill).unwrap();
         assert_eq!(
             std::fs::read(&again).unwrap().len(),
             buf.len(),

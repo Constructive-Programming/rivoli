@@ -4,6 +4,7 @@
 //! Ported verbatim from the old `artifact/model.rs`'s GLM slice.
 
 use crate::arch::Arch;
+use crate::format::RoutedFmt;
 use crate::schema::{ArchConfig, ensure_group_aligned, load_config};
 use anyhow::Result;
 use serde::Deserialize;
@@ -128,12 +129,7 @@ impl ArchConfig for ModelConfig {
         }
         // VQ_GROUP=64 is a multiple of the 8 the 12-bit packing needs, so this one check
         // covers the indices too. GLM-5.2: 6144, 2048 — both clean.
-        ensure_group_aligned(
-            self.hidden,
-            self.moe_inter,
-            crate::quant::VQ_GROUP,
-            stringify!(VQ_GROUP),
-        )?;
+        ensure_group_aligned(self.hidden, self.moe_inter, RoutedFmt::Vq3)?;
         // No ceiling on the intermediate widths: the LDS-staging MoE kernel that
         // imposed one (inter ≤ 16384, gfx1151's 64KB budget) is gone. `swiglu`
         // (`crates/kernels/src/activation.rs`) is elementwise with zero dynamic LDS, and the

@@ -150,6 +150,28 @@ impl RoutedFmt {
         }
     }
 
+    /// The group-scale span this format's expert rows are quantized in, which both of an
+    /// expert's input widths must divide (`schema::ensure_group_aligned`).
+    ///
+    /// Here rather than as a `(usize, &str)` pair at the check: the size checked and the
+    /// constant named in the refusal were two arguments nothing tied together (2026-11-20).
+    pub(crate) fn group(self) -> usize {
+        match self {
+            RoutedFmt::Vq3 => crate::quant::VQ_GROUP,
+            RoutedFmt::I4 => crate::quant::I4_GROUP,
+            RoutedFmt::F4 => crate::quant::F4_GROUP,
+        }
+    }
+
+    /// The constant [`Self::group`] reads, as the refusal quotes it.
+    pub(crate) fn group_name(self) -> &'static str {
+        match self {
+            RoutedFmt::Vq3 => stringify!(VQ_GROUP),
+            RoutedFmt::I4 => stringify!(I4_GROUP),
+            RoutedFmt::F4 => stringify!(F4_GROUP),
+        }
+    }
+
     /// The magic the file's header must carry, or `None` for the headerless `.i4`.
     /// `.i4` gets away without one only because it is a twin of a `.vq3` that was already
     /// validated against the same dims; `.vq3` and `.f4` are standalone and carry one.

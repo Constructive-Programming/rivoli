@@ -127,7 +127,11 @@ pub type Tensor = (String, rivoli_artifact::format::Dtype, Vec<usize>, Vec<u8>);
 pub fn write_shard(path: &std::path::Path, tensors: &[Tensor]) {
     let mut w = rivoli_artifact::format::SafeWriter::new();
     for (name, dtype, shape, bytes) in tensors {
-        w.add(name.clone(), *dtype, shape.clone(), &bytes[..]);
+        w.add(
+            name.clone(),
+            *dtype,
+            rivoli_artifact::format::TensorData::new(shape.clone(), &bytes[..]),
+        );
     }
     // `to_string_lossy` rather than `to_str().unwrap()`: this module is compiled into the
     // META-GATES too, which carry no file-level `unwrap` allow, and a scratch path is ASCII by

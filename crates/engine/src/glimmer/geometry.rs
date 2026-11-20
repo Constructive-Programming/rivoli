@@ -537,7 +537,7 @@ mod geometry_tests {
     #[test]
     fn sniff_reads_the_dtype_and_consults_the_manifest_only_for_fp8() -> Result<()> {
         use anyhow::Context;
-        use rivoli_artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors};
+        use rivoli_artifact::format::{Dtype, FormatMeta, SafeWriter, Safetensors, TensorData};
 
         /// A one-tensor artifact directory: layer 0's `q_proj` at `dtype`, and optionally the
         /// `manifest.json` format stamp. Returns `(dir-as-string, opened reader)`.
@@ -558,8 +558,7 @@ mod geometry_tests {
                     rivoli_artifact::glimmer::GLIMMER_LAYER_PREFIX
                 ),
                 dtype,
-                vec![2, 2],
-                vec![0u8; 4 * elem],
+                TensorData::new(vec![2, 2], vec![0u8; 4 * elem]),
             );
             let st_path = dir.join("resident.safetensors");
             let st_path = st_path.to_str().context("utf-8 path")?;

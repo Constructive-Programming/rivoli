@@ -9,7 +9,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // fixtures: a panic here IS the report
 
 use super::expert::{F4_NAMING_V4, F4Expert, F4Naming};
-use super::tensors::{SafeWriter, Safetensors};
+use super::tensors::{SafeWriter, Safetensors, TensorData};
 
 /// A fresh, empty scratch directory for one test. Every test here needs one and each
 /// had spelled out the same four lines; a shared helper also guarantees the
@@ -88,14 +88,12 @@ impl F4Fixture {
             w.add(
                 format!("e.{proj}.{}", nm.packed),
                 nm.packed_dtype,
-                vec![o_dim, i_dim / 2],
-                weight,
+                TensorData::new(vec![o_dim, i_dim / 2], weight),
             );
             w.add(
                 format!("e.{proj}.{}", nm.scale),
                 nm.scale_dtype,
-                vec![o_dim, i_dim / F4_GROUP],
-                scale,
+                TensorData::new(vec![o_dim, i_dim / F4_GROUP], scale),
             );
         }
         w.write(&format!("{dir}/e.safetensors")).unwrap();
