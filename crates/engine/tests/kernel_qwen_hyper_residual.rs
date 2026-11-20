@@ -234,12 +234,9 @@ fn the_host_gated_residual_reproduces_the_anchor_everywhere() {
     let b = h::Bar::at("hc_attn", HOST_WORST);
     let mut sites = 0;
     for_each_wrapper(|at, c| {
-        b.hold((at, "x"), &collapse(c, Form::Reference), &c.want_x);
-        b.hold(
-            (at, "scale"),
-            &inject_scale(c, Form::Reference),
-            &c.want_scale,
-        );
+        let site = b.site(at);
+        site.hold("x", &collapse(c, Form::Reference), &c.want_x);
+        site.hold("scale", &inject_scale(c, Form::Reference), &c.want_scale);
         sites += 1;
     });
     assert_eq!(
@@ -365,8 +362,9 @@ fn the_gated_residual_kernel_matches_the_anchor_everywhere() {
             },
             "gated_residual_collapse_f32",
         );
-        b.hold((at, "x"), &f32v(&back(&x)), &c.want_x);
-        b.hold((at, "scale"), &f32v(&back(&scale)), &c.want_scale);
+        let site = b.site(at);
+        site.hold("x", &f32v(&back(&x)), &c.want_x);
+        site.hold("scale", &f32v(&back(&scale)), &c.want_scale);
     });
 }
 

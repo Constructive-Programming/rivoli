@@ -127,6 +127,14 @@ fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
         .collect()
 }
 
+/// One uploaded fp8 weight with its `[n_out, k]` shape — named fields, because `n_out` and `k` are
+/// both `usize` and the up/down projections differ only by swapping them.
+struct Fp8Mat<'a> {
+    pair: &'a (DeviceBuf, DeviceBuf),
+    n_out: usize,
+    k: usize,
+}
+
 /// One fp8 `Linear` of the shared expert: `out[0..n_out] = bf16(w · x)`, `x` already quantized.
 ///
 /// A helper rather than three spelled-out launches, and the reason is the argument list: ten
@@ -135,21 +143,21 @@ fn upload_fp8_shared(e: &ExpertW) -> Vec<(DeviceBuf, DeviceBuf)> {
 /// k, destination)`.
 ///
 /// # Safety
-/// `x` is `k` live quantized f32, `w` is the `[n_out, k]` e4m3 pair `upload_fp8_shared`
+/// `x` is `k` live quantized f32, `pair` is the `[n_out, k]` e4m3 pair `upload_fp8_shared`
 /// produced, `out` is `n_out` writable f32, none aliasing another, all live until the caller's
 /// next join. `stream` is a live `hipStream_t`.
 unsafe fn fp8_linear(
-    (x, out): (*const f32, *mut f32),
-    w: &(DeviceBuf, DeviceBuf),
-    (n_out, k): (usize, usize),
+    x: *const f32,
+    Fp8Mat { pair, n_out, k }: Fp8Mat<'_>,
+    out: *mut f32,
     stream: *mut std::ffi::c_void,
 ) {
     // SAFETY: the caller's contract above.
     unsafe {
         launch_gemv_fp8_bf16(
             x,
-            w.0.ptr(),
-            w.1.ptr().cast(),
+            pair.0.ptr(),
+            pair.1.ptr().cast(),
             1,
             n_out,
             k,
@@ -186,6 +194,18 @@ fn gpu_shared_expert(
     let mut g = zeros(inter * 4);
     let mut u = zeros(inter * 4);
     let mut out = zeros(dim * 4);
+    // `w1`/`w3` take `dim` to `inter`, `w2` takes it back.
+    let w1 = Fp8Mat {
+        pair: &w[0],
+        n_out: inter,
+        k: dim,
+    };
+    let w3 = Fp8Mat { pair: &w[2], ..w1 };
+    let w2 = Fp8Mat {
+        pair: &w[1],
+        n_out: dim,
+        k: inter,
+    };
     // SAFETY: `xq` is one row of `dim` f32; `g`/`u` are `inter`; `out` is `dim`; each weight is
     // `[o_dim, i_dim]` e4m3 with a 128x128 f32 scale grid by `upload_fp8_shared`'s contract. All
     // five outlive the join inside `back`.
@@ -201,8 +221,8 @@ fn gpu_shared_expert(
         )
         .expect("act_quant x");
         let xp = xq.ptr().cast::<f32>();
-        fp8_linear((xp, g.ptr_mut().cast()), &w[0], (inter, dim), st);
-        fp8_linear((xp, u.ptr_mut().cast()), &w[2], (inter, dim), st);
+        fp8_linear(xp, w1, g.ptr_mut().cast(), st);
+        fp8_linear(xp, w3, u.ptr_mut().cast(), st);
         // IN PLACE into `g`: `h` becomes `w2`'s input, which is one fewer allocation. Safe by
         // the kernel's own note — every thread reads both operands, then writes once, and that
         // write depends on both reads.
@@ -225,12 +245,7 @@ fn gpu_shared_expert(
             st,
         )
         .expect("act_quant h");
-        fp8_linear(
-            (g.ptr().cast(), out.ptr_mut().cast()),
-            &w[1],
-            (dim, inter),
-            st,
-        );
+        fp8_linear(g.ptr().cast(), w2, out.ptr_mut().cast(), st);
     }
     f32v(&back(&out))
 }

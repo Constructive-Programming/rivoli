@@ -109,6 +109,8 @@ use kernel_qwen_harness as h;
 #[cfg(feature = "rocm")]
 #[allow(clippy::duplicate_mod)]
 mod common;
+#[cfg(feature = "rocm")]
+use {common::DeviceBuf, rivoli_backend::gpustream::HipStream};
 
 /// The QSA layer the prefill window captures. Index 3 is the first `full_attention` entry in the
 /// checkpoint's own `layer_types`, which the reference ALIASES to `qwen_sparse_attention` before
@@ -162,9 +164,8 @@ struct Idx {
     hd: usize,
     /// `indexer_compress_ratio` — TOKENS per block, not blocks per anything (trap T8).
     ratio: usize,
-    /// `rotary_dim`, the partial-RoPE width inside `hd`.
-    rd: usize,
-    theta: f64,
+    /// `rotary_dim` (the partial-RoPE width inside `hd`) and `rope_theta`.
+    rot: h::Rotary,
     seq: usize,
     /// `[seq][hd]` — the ONE shared indexer key head, raw and un-normed, as the cache holds it.
     keys: Vec<f32>,
@@ -266,7 +267,7 @@ fn rope_blocks(c: &Idx, kbar: &[f32], at: At) -> Vec<f32> {
             At::Zero => 0,
         };
         let row = &mut out[b * c.hd..(b + 1) * c.hd];
-        h::rope_row(row, h::Pairing::SplitHalf, (c.rd, c.theta), pos);
+        h::rope_row(row, h::Pairing::SplitHalf, c.rot, pos);
     }
     out
 }
@@ -309,9 +310,8 @@ fn block_scores(c: &Idx, q_roped: &[f32], kbar: &[f32], form: Score) -> Vec<f32>
 fn last_query_roped(c: &Idx) -> Vec<f32> {
     let q = c.seq - 1;
     let mut rows = c.q_normed[q * c.heads * c.hd..(q + 1) * c.heads * c.hd].to_vec();
-    for hh in 0..c.heads {
-        let row = &mut rows[hh * c.hd..(hh + 1) * c.hd];
-        h::rope_row(row, h::Pairing::SplitHalf, (c.rd, c.theta), q);
+    for row in rows.chunks_mut(c.hd) {
+        h::rope_row(row, h::Pairing::SplitHalf, c.rot, q);
     }
     rows
 }
@@ -355,8 +355,10 @@ fn window() -> Idx {
         heads,
         hd,
         ratio,
-        rd,
-        theta: d.rope_theta(),
+        rot: h::Rotary {
+            rd,
+            theta: d.rope_theta(),
+        },
         seq,
         keys,
         q_normed: d.flat(&format!("{a}.q_layernorm"), seq * heads * hd),
@@ -445,7 +447,7 @@ fn the_host_pool_and_norm_reproduces_the_whole_ladder() {
     let b = h::Bar::at("indexer", HOST_WORST);
     for (q, nb, want) in ladder(&c, &d) {
         let got = pool_norm(&c, nb, Pool::Reference);
-        b.hold((&format!("q{q}"), "k_layernorm"), &got, &want);
+        b.site(&format!("q{q}")).hold("k_layernorm", &got, &want);
     }
 }
 
@@ -464,13 +466,14 @@ fn the_block_keys_are_roped_at_the_blocks_first_token() {
     let b = h::Bar::at("indexer", HOST_WORST);
     let kbar = pool_norm(&c, c.n_blocks(), Pool::Reference);
     let roped = rope_blocks(&c, &kbar, At::Start);
-    b.hold(("prefill", "pooled_keys"), &roped, &c.want_kbar);
+    let prefill = b.site("prefill");
+    prefill.hold("pooled_keys", &roped, &c.want_kbar);
     for (at, name, floor) in [
         (At::End, "block end", ROPE_AT_BLOCK_END),
         (At::Zero, "position zero", ROPE_AT_POSITION_ZERO),
     ] {
         let moved = h::rel(&rope_blocks(&c, &kbar, at), &c.want_kbar);
-        b.separates("prefill", name, moved);
+        prefill.separates(name, moved);
         assert!(
             moved >= floor * 0.9,
             "{name}: {moved:e} against the {floor:e} recorded — the variant is not moving what \
@@ -486,13 +489,14 @@ fn the_host_block_scores_reproduce_the_reference() {
     let b = h::Bar::at("indexer", HOST_WORST);
     let q = last_query_roped(&c);
     let scores = block_scores(&c, &q, &c.want_kbar, Score::Reference);
-    b.hold(("prefill", "scores"), &scores, &c.want_scores);
+    let prefill = b.site("prefill");
+    prefill.hold("scores", &scores, &c.want_scores);
     for (form, name, floor) in [
         (Score::ReluDropped, "ReLU dropped", SCORE_RELU_OFF),
         (Score::Unscaled, "1/sqrt(hd) dropped", SCORE_UNSCALED),
     ] {
         let moved = h::rel(&block_scores(&c, &q, &c.want_kbar, form), &c.want_scores);
-        b.separates("prefill", name, moved);
+        prefill.separates(name, moved);
         assert!(
             moved >= floor * 0.9,
             "{name}: {moved:e} against the {floor:e} recorded"
@@ -635,7 +639,7 @@ fn a_summing_pool_is_cancelled_by_the_norm_that_follows_it() {
 #[cfg(feature = "rocm")]
 #[test]
 fn the_block_key_pipeline_matches_the_anchor() {
-    use common::{DeviceBuf, back, dev, f32b, f32v, ok, stream, zeros};
+    use common::{back, dev, f32b, f32v, ok, stream, zeros};
     use rivoli_backend::hip::{device_sync, launch_index_pool_norm_f32, launch_rope_split_half};
 
     let c = window();
@@ -643,6 +647,7 @@ fn the_block_key_pipeline_matches_the_anchor() {
     let s = stream();
     let nb = c.n_blocks();
     let cp = |d: &DeviceBuf| d.ptr() as *const f32;
+    let h::Rotary { rd, theta } = c.rot;
 
     let keys = dev(&f32b(&c.keys));
     let weight = dev(&f32b(&c.weight));
@@ -684,12 +689,26 @@ fn the_block_key_pipeline_matches_the_anchor() {
         // SAFETY: `row` is inside the `n_blocks · hd` buffer above, and the kernel rewrites the
         // first `seg` of the `hd` it is handed, in place.
         ok(
-            unsafe { launch_rope_split_half(row, 1, c.hd, c.rd, c.starts[blk] as usize, c.theta) },
+            unsafe { launch_rope_split_half(row, 1, c.hd, rd, c.starts[blk] as usize, theta) },
             "rope_split_half on a block key",
         );
     }
-    b.hold(("device", "pooled_keys"), &f32v(&back(&kbar)), &c.want_kbar);
+    let device = b.site("device");
+    device.hold("pooled_keys", &f32v(&back(&kbar)), &c.want_kbar);
+    device.hold("scores", &query_scores(&c, &s, &kbar), &c.want_scores);
+}
 
+/// The query side and the score stage of [`the_block_key_pipeline_matches_the_anchor`], against
+/// the caller's RoPE'd block keys `kbar`, read back. "The same race" below is the one the caller's
+/// pool-norm join documents.
+#[cfg(feature = "rocm")]
+fn query_scores(c: &Idx, s: &HipStream, kbar: &DeviceBuf) -> Vec<f32> {
+    use common::{back, dev, f32b, f32v, ok, zeros};
+    use rivoli_backend::abi::ScoreDims;
+    use rivoli_backend::hip::{
+        ScoreBufs, device_sync, launch_index_score_blocks_f32, launch_rope_split_half,
+    };
+    let h::Rotary { rd, theta } = c.rot;
     // The query side: the reference's own normed rows, RoPE'd at the query's position in ONE
     // launch — `count = heads`, `stride = hd`, so the four head rows are contiguous and share a
     // position, which is what a decode step has.
@@ -700,7 +719,7 @@ fn the_block_key_pipeline_matches_the_anchor() {
     let q_out = qrows.ptr_mut() as *mut f32;
     // SAFETY: `qrows` holds `heads · hd` f32 and the kernel rotates in place.
     ok(
-        unsafe { launch_rope_split_half(q_out, c.heads, c.hd, c.rd, q, c.theta) },
+        unsafe { launch_rope_split_half(q_out, c.heads, c.hd, rd, q, theta) },
         "rope_split_half on the indexer query",
     );
     // The same race in reverse, joined for the same reason: this RoPE ran on the null stream and
@@ -710,25 +729,8 @@ fn the_block_key_pipeline_matches_the_anchor() {
         device_sync(),
         "join the null-stream RoPE before the score on `s`",
     );
-
-    let scores = device_scores(&c, &s, &qrows, &kbar);
-    b.hold(("device", "scores"), &scores, &c.want_scores);
-}
-
-/// The score stage of [`the_block_key_pipeline_matches_the_anchor`], read back.
-#[cfg(feature = "rocm")]
-fn device_scores(
-    c: &Idx,
-    s: &rivoli_backend::gpustream::HipStream,
-    qrows: &common::DeviceBuf,
-    kbar: &common::DeviceBuf,
-) -> Vec<f32> {
-    use common::{back, dev, f32b, f32v, ok, zeros};
-    use rivoli_backend::abi::ScoreDims;
-    use rivoli_backend::hip::{ScoreBufs, launch_index_score_blocks_f32};
-
     let nb = c.n_blocks();
-    let cp = |d: &common::DeviceBuf| d.ptr() as *const f32;
+    let cp = |d: &DeviceBuf| d.ptr() as *const f32;
     // The score: `w` filled with `1/sqrt(hd)`, which is the scale MOD:693 applies after the sum —
     // a positive uniform factor distributes over it — and NOT a learned per-head weight, of which
     // this model has none (trap T6).
@@ -745,7 +747,7 @@ fn device_scores(
         unsafe {
             launch_index_score_blocks_f32(
                 ScoreBufs {
-                    q: cp(qrows),
+                    q: cp(&qrows),
                     kv: cp(kbar),
                     w: cp(&w),
                     score: score_out,

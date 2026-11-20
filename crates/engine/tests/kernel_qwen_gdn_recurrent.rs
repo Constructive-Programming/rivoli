@@ -261,8 +261,11 @@ fn l2(row: &[f32], eps: f64) -> Vec<f64> {
 /// each V head's `dv` outputs and `dk·dv` state block, concatenated in head order.
 fn recurrence(c: &Gdn, form: Form) -> (Vec<f32>, Vec<f32>) {
     let (g, beta) = gates(c, form);
-    let (out, state): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (0..c.v_heads)
-        .map(|hd| head_step(c, form, hd, (g[hd], beta[hd])))
+    let (out, state): (Vec<Vec<f32>>, Vec<Vec<f32>>) = g
+        .iter()
+        .zip(&beta)
+        .enumerate()
+        .map(|(hd, (&g, &beta))| head_step(c, form, hd, HeadGate { g, beta }))
         .unzip();
     (out.concat(), state.concat())
 }
@@ -281,7 +284,8 @@ fn qk_source(c: &Gdn, form: Form, hd: usize) -> usize {
 /// `[key][value]`; `StateValueMajor` is the port that took a `[128][128]` buffer at face value,
 /// so it loads and stores transposed — and both directions have to move, or the round trip
 /// cancels the defect.
-fn state_layout(form: Form, dk: usize, dv: usize) -> impl Fn(usize, usize) -> usize {
+fn state_layout(c: &Gdn, form: Form) -> impl Fn(usize, usize) -> usize {
+    let (dk, dv) = (c.dk, c.dv);
     let value_major = form == Form::StateValueMajor;
     move |i, j| if value_major { j * dk + i } else { i * dv + j }
 }
@@ -313,12 +317,24 @@ fn normed_qk(c: &Gdn, form: Form, hd: usize) -> (Vec<f64>, Vec<f64>) {
     (qn, l2(&c.k[src * dk..src * dk + dk], eps))
 }
 
+/// One V head's `(g, beta)` from [`gates`] — named, because the two are both `f64` and a swap
+/// would compile.
+struct HeadGate {
+    g: f64,
+    beta: f64,
+}
+
 /// One V head's step: its `dv` outputs and its updated `dk·dv` state block.
-fn head_step(c: &Gdn, form: Form, hd: usize, (g, beta): (f64, f64)) -> (Vec<f32>, Vec<f32>) {
+fn head_step(
+    c: &Gdn,
+    form: Form,
+    hd: usize,
+    HeadGate { g, beta }: HeadGate,
+) -> (Vec<f32>, Vec<f32>) {
     let (dk, dv) = (c.dk, c.dv);
     let (qn, kn) = normed_qk(c, form, hd);
     let alpha = g.exp();
-    let at = state_layout(form, dk, dv);
+    let at = state_layout(c, form);
     let prior = &c.state[hd * dk * dv..(hd + 1) * dk * dv];
     // `decayed[i * dv + j]`, key-major whatever the defect's storage layout.
     let decayed: Vec<f64> = grid(dk, dv)
@@ -420,8 +436,9 @@ fn the_host_recurrence_reproduces_the_anchor_at_every_gdn_layer() {
     for_each_gdn(|salt, layer, c| {
         let (o, state) = recurrence(c, Form::Reference);
         let at = format!("{salt} L{layer}");
-        b.hold((&at, "o"), &o, &c.want_o);
-        b.hold((&at, "state"), &state, &c.want_state);
+        let site = b.site(&at);
+        site.hold("o", &o, &c.want_o);
+        site.hold("state", &state, &c.want_state);
         sites += 1;
     });
     assert_eq!(sites, 8, "two draws times four GDN layers");
@@ -441,8 +458,9 @@ fn the_fused_decay_and_write_gate_reproduce_the_rules_own_inputs() {
         let at = format!("{salt} L{layer}");
         let g32: Vec<f32> = g.iter().map(|x| *x as f32).collect();
         let beta32: Vec<f32> = beta.iter().map(|x| *x as f32).collect();
-        b.hold((&at, "g"), &g32, &c.want_g);
-        b.hold((&at, "beta"), &beta32, &c.want_beta);
+        let site = b.site(&at);
+        site.hold("g", &g32, &c.want_g);
+        site.hold("beta", &beta32, &c.want_beta);
     });
 }
 
@@ -633,8 +651,9 @@ fn the_gdn_recurrence_kernel_matches_the_anchor_at_every_gdn_layer() {
         );
         // `back` copies out, which joins — there is no separate sync to forget.
         let at = format!("{salt} L{layer}");
-        b.hold((&at, "o"), &f32v(&back(&out)), &c.want_o);
-        b.hold((&at, "state"), &f32v(&back(&state)), &c.want_state);
+        let site = b.site(&at);
+        site.hold("o", &f32v(&back(&out)), &c.want_o);
+        site.hold("state", &f32v(&back(&state)), &c.want_state);
     });
 }
 

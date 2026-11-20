@@ -257,8 +257,8 @@ pub enum Pairing {
 /// overwritten — which `activation.hip`'s own kernels (tag `archive/hip-kernels`) solve with a `__syncthreads` between the read
 /// and the write.
 ///
-/// `(rd, theta)` is the rotary convention (rotary width, frequency base); `pos` is the token.
-pub fn rope_row(row: &mut [f32], p: Pairing, (rd, theta): (usize, f64), pos: usize) {
+/// `pos` is the token position the row is rotated to.
+pub fn rope_row(row: &mut [f32], p: Pairing, Rotary { rd, theta }: Rotary, pos: usize) {
     let half = rd / 2;
     let src = row.to_vec();
     for j in 0..half {
@@ -272,6 +272,14 @@ pub fn rope_row(row: &mut [f32], p: Pairing, (rd, theta): (usize, f64), pos: usi
         row[j] = (a * cs - b * sn) as f32;
         row[half + j] = (b * cs + a * sn) as f32;
     }
+}
+
+/// The rotary convention [`rope_row`] applies: how many leading dims rotate (`rd`) and the
+/// frequency base (`theta`).
+#[derive(Clone, Copy)]
+pub struct Rotary {
+    pub rd: usize,
+    pub theta: f64,
 }
 
 /// The relative metric every site scores with: `max |got - want| / max |want|`, over the whole
@@ -329,24 +337,38 @@ impl Bar {
         bar
     }
 
-    /// Score one named quantity, `(at, what)` naming it in the messages. Both bars, in the order
-    /// that makes the tighter one bind.
-    pub fn hold(&self, (at, what): (&str, &str), got: &[f32], want: &[f32]) {
-        let bar = self.enforced();
+    /// This bar at one site, `at` naming it in every message [`SiteBar::hold`] prints — most
+    /// sites hold two or more quantities, so a site can be bound once and each quantity named.
+    pub fn site<'a>(&'a self, at: &'a str) -> SiteBar<'a> {
+        SiteBar { bar: self, at }
+    }
+}
+
+/// A [`Bar`] bound to one site by [`Bar::site`].
+pub struct SiteBar<'a> {
+    bar: &'a Bar,
+    at: &'a str,
+}
+
+impl SiteBar<'_> {
+    /// Score one named quantity. Both bars, in the order that makes the tighter one bind.
+    pub fn hold(&self, what: &str, got: &[f32], want: &[f32]) {
+        let SiteBar { bar: b, at } = self;
+        let enforced = b.enforced();
         let r = rel(got, want);
         assert!(
-            r <= self.tol,
+            r <= b.tol,
             "{at} {what}: {r:e} is outside the {:e} operator tolerance — this is a wrong \
              result, not a regression",
-            self.tol
+            b.tol
         );
         assert!(
-            r <= bar,
+            r <= enforced,
             "{at} {what}: {r:e} is far above the {:e} this operator achieves on these fixtures. \
              It is still inside the {:e} tolerance, so this is a REGRESSION tripwire: find what \
              moved, and move the constant only when the new value is defensible.",
-            self.worst,
-            self.tol
+            b.worst,
+            b.tol
         );
     }
 
@@ -356,8 +378,9 @@ impl Bar {
     /// Applied to the bar this fixture ENFORCES and not to the operator tolerance: the
     /// tolerance is the loose envelope, so a defect that cleared only it could still be
     /// invisible to the site that is actually scoring.
-    pub fn separates(&self, at: &str, what: &str, moved: f32) {
-        let need = self.enforced() * 30.0;
+    pub fn separates(&self, what: &str, moved: f32) {
+        let SiteBar { bar: b, at } = self;
+        let need = b.enforced() * 30.0;
         assert!(
             moved > need,
             "{at} {what}: this variant moved the operator by {moved:e}, under the {need:e} that \
@@ -398,7 +421,7 @@ pub fn separations(b: Bar, name: &str, floor: f32, sites: &[(String, f32)]) {
          examined-count-reaches-zero hole, not a pass"
     );
     for (at, moved) in sites {
-        b.separates(at, name, *moved);
+        b.site(at).separates(name, *moved);
     }
     let weakest = sites.iter().map(|(_, m)| *m).fold(f32::INFINITY, f32::min);
     assert!(
