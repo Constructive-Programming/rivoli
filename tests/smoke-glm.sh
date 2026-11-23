@@ -18,7 +18,8 @@ BIN=${SMOKE_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/debug/rivoli}
 ARTIFACT=${1:?usage: smoke-glm.sh <artifact-dir> [max-mem-GiB]}
 MEM=${2:-100}
 LOCK=/var/run/sys-gpu.lock
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/smoke-glm.XXXXXX")
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+SCRATCH=$(scratch_dir smoke-glm)
 PORT=${SMOKE_PORT:-18173}
 
 [ -x "$BIN" ] || { echo "FAIL: rivoli binary missing: $BIN (cargo build first — rocm is default since the 2026-08-16 fuse)" >&2; exit 1; }

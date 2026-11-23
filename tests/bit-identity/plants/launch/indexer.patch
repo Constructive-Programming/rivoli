@@ -1,5 +1,5 @@
---- a/src/indexer.rs
-+++ b/src/indexer.rs
+--- a/crates/kernels/src/indexer.rs
++++ b/crates/kernels/src/indexer.rs
 @@ -151,7 +151,7 @@
  /// The C's order-preserving key: `-0.0` canonicalised to `+0.0`, then the sign-flip map.
  #[inline(always)]

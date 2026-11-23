@@ -1,5 +1,5 @@
---- a/src/activation.rs
-+++ b/src/activation.rs
+--- a/crates/kernels/src/activation.rs
++++ b/crates/kernels/src/activation.rs
 @@ -138,7 +138,7 @@
      let inv = ocml::pow(a.theta, -2.0 * f64::from(j) / f64::from(a.seg));
      let ang = f64::from(a.pos) * inv;

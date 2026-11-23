@@ -118,5 +118,13 @@ pub(crate) unsafe fn rivoli_gdn_recurrent_f32(
     stream: *mut c_void,
 ) -> i32 {
     let checked = gdn_checked(v_heads, qk_heads, &a);
+    // `rep` is derived here, AFTER the guard: `gdn_checked` refuses `qk_heads <= 0` and a ragged
+    // ratio (1003), so this division never meets a zero divisor and the kernel never receives a
+    // ratio the guard did not admit. Until 2026-11-23 the `launchers!` row computed it, before
+    // any guard, as `v_heads / qk_heads.max(1)` — the `.max(1)` hid the zero instead of refusing it.
+    let a = Gdn {
+        rep: checked.map_or(0, |_| v_heads.0 / qk_heads),
+        ..a
+    };
     unsafe { run(&GDN_RECURRENT_F32, checked, stream, &a) }
 }

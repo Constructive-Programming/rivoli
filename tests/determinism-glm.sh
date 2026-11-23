@@ -189,7 +189,8 @@ if [ "${1:-}" = "--self-test" ]; then
     # (the 512-token arm does that, and did); it proves that when two id streams differ this
     # gate SAYS SO and exits non-zero — the half a green run can never demonstrate about
     # itself, and the half that silently breaks when someone "simplifies" the diff.
-    d=$(mktemp -d "${TMPDIR:-/tmp}/determinism-selftest.XXXXXX")
+    source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+    d=$(scratch_dir determinism-selftest)
     trap 'rm -rf "$d"' EXIT
     printf '10\n20\n30\n40\n' >"$d/a"
     printf '10\n20\n30\n40\n' >"$d/b"
@@ -254,7 +255,9 @@ EOF
 # rule stays written down instead: **do not run this gate on a `--features trace` binary.** If
 # it ever needs enforcing, `--version` should print its feature set.
 
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/determinism-glm.XXXXXX")
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+
+SCRATCH=$(scratch_dir determinism-glm)
 echo "== determinism-glm | ngen=$NGEN mem=${MEM}GiB${FIX_FLAGS:+ fix-flags='$FIX_FLAGS'} scratch=$SCRATCH"
 echo "   bin: $(stat -c '%y' "$BIN") $BIN"
 

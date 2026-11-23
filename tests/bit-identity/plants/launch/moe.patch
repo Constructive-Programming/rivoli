@@ -1,5 +1,5 @@
---- a/src/moe.rs
-+++ b/src/moe.rs
+--- a/crates/kernels/src/moe.rs
++++ b/crates/kernels/src/moe.rs
 @@ -27,7 +27,7 @@
  /// `x / (1 + e^-x)` — `moe.hip::siluf`, the division form.
  #[inline(always)]

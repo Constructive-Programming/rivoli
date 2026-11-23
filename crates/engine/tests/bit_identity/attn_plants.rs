@@ -9,10 +9,11 @@
 
 use super::attn_inputs::{Mla, ROPE, mla, mla_inputs, nasty, plant_nonfinite};
 use super::inputs::{SEEDS, draw};
+use super::plant_bar::{MOST, Rate, demand};
 use rivoli_core::num::{bf16_to_f32, e4m3_to_f32};
 
 /// Run `pairs(seed)` — every `[unplanted, planted]` value the plant reaches for that seed —
-/// over `seeds`, print the rate, and demand the plant move ≥ 90% of them.
+/// over `seeds`, print the rate, and hold the seed rate to `plant_bar::MOST`.
 fn rate(what: &str, seeds: &[u64], pairs: impl Fn(u64) -> Vec<[f32; 2]>) {
     let (mut moved, mut diff, mut total) = (0usize, 0usize, 0usize);
     for &seed in seeds {
@@ -21,10 +22,14 @@ fn rate(what: &str, seeds: &[u64], pairs: impl Fn(u64) -> Vec<[f32; 2]>) {
         (moved, diff, total) = (moved + usize::from(d > 0), diff + d, total + p.len());
     }
     let n = seeds.len();
-    println!("{what}: {diff}/{total} values differ; {moved}/{n} eligible seeds affected");
-    assert!(
-        moved * 10 >= n * 9,
-        "plant moved only {moved}/{n} seeds — sub-threshold"
+    println!("{what}: {diff}/{total} values differ over the eligible seeds");
+    demand(
+        what,
+        Rate {
+            moved: moved as u64,
+            of: n as u64,
+        },
+        MOST,
     );
 }
 

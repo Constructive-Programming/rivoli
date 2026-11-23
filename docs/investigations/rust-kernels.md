@@ -2154,6 +2154,30 @@ scorers 0.18×.
 - one shared plant-threshold helper;
 - from Step 1: L2's gdn `rep` computed in the row; the L1/L2 launcher-row plants at the plants
   root rather than `plants/launch/`;
+  > **Closed 2026-11-23 (`wave/open-items`):**
+  > - **`MoeRange` literals — declined, with the reason.** The four literals spell every field by
+  >   name inside `hip_blocks.rs`'s `launchers!` rows (a jscpd-exempt invocation region by
+  >   design). The only shorter form is a positional `MoeSpan::of(hidden, inter, e_start,
+  >   e_count)`: four same-typed integers whose transposition would compile — the class the Phase 0
+  >   merge review refused (`Geometry = (u32, u32, u32)`). Named fields are the safer spelling.
+  > - **One shared plant-threshold helper:** `crates/engine/tests/bit_identity/plant_bar.rs`
+  >   (`Rate`, `Bar`, `MOST` = 9/10, `demand`) replaces the four copies in `plants.rs`,
+  >   `linalg_plants.rs`, `attn_plants.rs` and `plant_models.rs`; models that argue a lower bar pass
+  >   their own `Bar`. Red proof: `MOST` raised to 11/10 reddened exactly the 11 models that use it,
+  >   the four with their own bar or assert held.
+  > - **The gdn `rep`:** derived in `launch::recurrent::rivoli_gdn_recurrent_f32` after
+  >   `gdn_checked` has refused `qk_heads <= 0` (1001) and a ragged ratio (1003); the row passes 0.
+  >   It had been computed in the row, before any guard, as `v_heads / qk_heads.max(1)` — the
+  >   `.max(1)` hid a zero, and the kernarg doc claimed the launcher derived it after the guard.
+  >   Same value whenever the guard passes; device check is the bit-identity `gdn_recurrent_f32` row.
+  > - **Plants layout:** the 15 launcher-row plants (L1, L2, L3, L4, rope) all live in
+  >   `tests/bit-identity/plants/launch/` with repo-root paths; the root holds only the 9 probe
+  >   plants. `tests/bit-identity/build-launch-plants.sh` (in-tree port of the integration's
+  >   scratch script) builds the planted binaries from `git archive HEAD`, and
+  >   `crates/cli/tests/plants.rs` holds both tables equal to the patch files at both ends and
+  >   dry-runs every patch (red-proofed: an unlisted patch, a probe plant with no `plant_spec` row,
+  >   and a drifted context each reddened exactly their own test). The rope plant built through the
+  >   script (`e791d0c0…`).
 - CodeScene: the 30 inherited files below 10/10, unchanged by this branch.
 
 ### Perf follow-up (2026-11-19, branch `wave/rk-perf`, base `51ab275`)
@@ -2450,6 +2474,13 @@ starts or ends above 10 is reported load-confounded, the verdict given with and 
 - The trace-only poison fill inside `submit` (`hipMemsetD32Async` on the null stream) is
   unordered against the fetch write and the miss-stream read of the same slot. Owed: order the
   fill behind the slot's fetch, or argue that the trace's poison may be unordered.
+  > **CLOSED 2026-11-23 by citation — it was already ordered.** `routed.rs::admit_misses`
+  > (lines 670–684) runs `rivoli_backend::device_sync()` under `trace` after a layer's misses are
+  > allocated, i.e. after every poison fill, and before `resolve` hands the reads to the reaper:
+  > `alloc` (the only fill site) is called only from `admit_misses`, and `submit` runs
+  > `admit_misses` then `resolve`. The review that raised this read `alloc` without its caller.
+  > Device evidence: the Phase 0 merge-review lease's trace arm (T) read
+  > `read-before-write=0` over 4612 misses.
 
 ### stage_batch ordering (2026-11-20, branch `wave/stage-batch`, base `eb801b7`)
 
@@ -2552,3 +2583,53 @@ after D and P, nothing compiled inside the lock):
 
 GLM MoE is correct after the refactors and the stage_batch citation: parity, determinism and
 the battery's GLM suites all green on the integrated tree.
+
+### Open items closed (2026-11-23, branch `wave/open-items`)
+
+- **The trace poison fill** — closed by citation; see its owed bullet above.
+- **The `/tmp` scratch defaults.** Eight gate scripts (`determinism-glm`, `device-halves`,
+  `feature-matrix`, `nll-divergence`, `parity-glm`, `ppl-gates`, `smoke-glm`, `smoke-v4`) spelled
+  `mktemp -d "${TMPDIR:-/tmp}/…"`, so an unset `TMPDIR` put id dumps and witness files in the RAM
+  tmpfs CLAUDE.md forbids. `tests/scratch.sh` (`scratch_root`, `scratch_dir`) now chooses: an
+  explicit `TMPDIR`, else `/var/cache/rivoli/scratch` when it exists, else `/tmp` (CI's hosted
+  runner only). `determinism-glm.sh --self-test` passes through it.
+- **The integration owed list** — `MoeRange`, the shared plant bar, the gdn `rep`, the plants
+  layout: see the dated block under that list.
+- **The ATTEND attribution** — re-run with a counterbalanced order and a load gate, pre-registered
+  in `scratch/open-items/attr/attr.sh`; result below.
+
+**ATTEND attribution, second attempt: INCONCLUSIVE (2026-11-23).** Pre-registered in
+`scratch/open-items/attr/attr.sh` before any arm ran: B = main `995ceb3` (JOIN 1 as the token),
+S = B with the pre-`afedb58` `device_sync()` restored inside the ATTEND lap; counterbalanced order
+B1 S1 S2 B2 B3 S3 S4 B4 B5 S5 (the first attempt ran S always after B on falling load); an arm is
+VALID only with rc 0, an empty witness and host 1-min loadavg ≤ 8.0 before and after; a verdict
+needs ≥ 3 valid arms of each binary. Every witness was 0 B, GTT 17.8 MiB before the lease (after
+llama-swap's embedding model was unloaded).
+
+| arm | load before → after | attend ms/tok | wall ms/tok | valid |
+|---|---|---|---|---|
+| B1 | 6.35 → 7.70 | 97.624 | 356.6 | yes |
+| S1 | 7.70 → 7.75 | 96.864 | 354.6 | yes |
+| S2 | 7.75 → 8.87 | 96.273 | 351.2 | no |
+| B2 | 8.87 → 9.11 | 101.426 | 393.1 | no |
+| B3 | 9.11 → 7.60 | 97.683 | 349.3 | no |
+| S3 | 7.60 → 6.14 | 97.359 | 337.7 | yes |
+| S4 | 6.14 → 12.53 | 99.757 | 354.2 | no |
+| B4 | 12.53 → 8.39 | 96.913 | 362.2 | no |
+| B5 | 8.39 → 8.84 | 159.746 | 674.5 | no |
+| S5 | 8.84 → 7.30 | 115.941 | 442.9 | no |
+
+Valid: B 1 arm, S 2 arms — below the pre-registered 3, so **INCONCLUSIVE**, and no arm is rerun.
+The host was not quiet: a user `valgrind` memcheck job (one core, ~3 days) and periodic root
+`nuq-worker` node processes pushed the 1-min load from 6 to 12.5 during the lease. Descriptively,
+on the three valid arms S's ATTEND (96.9, 97.4) sits at or below B's (97.6), the opposite sign
+from the post-hoc reading — but three arms establish nothing, and it is recorded as data, not a
+verdict. **The standing claim is unchanged:** decode with the token is not slower than the
+pre-migration build (two leases), and the ATTEND excess is no longer measurable above the floor;
+the sync-as-cause reading stays post-hoc. A third attempt needs a quiet host (no co-tenant CPU
+load) — the method in `attr.sh` is ready to re-run as is.
+
+*Observation, not a finding:* S2 and S5 (both S) decoded different ids from the other eight arms,
+first diverging at tokens 176 and 325; all five B arms were identical. That is GLM's known
+stock-flags nondeterminism (`glm-nondeterminism-closeout.md`; no `--arena-refresh` here, and its
+rate rises with load). 2/5 against 0/5 is not significant (Fisher exact p ≈ 0.44).

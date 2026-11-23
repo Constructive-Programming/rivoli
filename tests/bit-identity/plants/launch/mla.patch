@@ -1,5 +1,5 @@
---- a/src/mla.rs
-+++ b/src/mla.rs
+--- a/crates/kernels/src/mla.rs
++++ b/crates/kernels/src/mla.rs
 @@ -122,11 +122,11 @@
      for d in 0..k.nope as usize {
          let p = *w4;

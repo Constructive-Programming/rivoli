@@ -134,7 +134,8 @@ for f in "$@"; do [ -r "$f" ] || { echo "FAIL: cannot read $f" >&2; exit 2; }; d
 
 # `${TMPDIR:-/tmp}` and a trap, like every sibling script: /tmp here is a 63 GiB RAM tmpfs that
 # has hit 100%, and an early exit used to leak two files per pair.
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/nll-divergence.XXXXXX")
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+WORK=$(scratch_dir nll-divergence)
 trap 'rm -rf "$WORK"' EXIT
 
 # strip() keeps the value TEXT; see the header for why the comparison is textual.

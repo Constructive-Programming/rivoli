@@ -34,6 +34,7 @@ mod cells;
 mod common;
 mod inputs;
 mod linalg_plants;
+mod plant_bar;
 mod plant_models;
 mod plants;
 mod ranges;

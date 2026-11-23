@@ -1,5 +1,5 @@
---- a/src/fwd.rs
-+++ b/src/fwd.rs
+--- a/crates/kernels/src/fwd.rs
++++ b/crates/kernels/src/fwd.rs
 @@ -127,7 +127,7 @@
  /// `1/(1+exp(-g))`, the division form `torch.sigmoid` computes (the C's note).
  #[unsafe(no_mangle)]

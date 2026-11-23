@@ -59,7 +59,8 @@ pub struct GateHeads {
 const _: () = assert!(size_of::<GateHeads>() == 40);
 
 /// `gdn_recurrent_f32` — one block per V head of `reduce_block(max(dk, dv))` threads; `rep`
-/// is `v_heads / qk_heads`, which the launcher derives after refusing a ragged ratio (1003).
+/// is `v_heads / qk_heads`, which `launch::recurrent::rivoli_gdn_recurrent_f32` derives after
+/// its guard has refused `qk_heads <= 0` and a ragged ratio (1003); callers pass 0.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Gdn {

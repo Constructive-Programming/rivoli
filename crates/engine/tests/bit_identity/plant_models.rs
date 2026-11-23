@@ -9,18 +9,9 @@ use super::cells::{
     mla_ins, prefill_ins, score_blocks_ins,
 };
 use super::inputs::{SEEDS, TOPK_SHAPES, topk_scores};
+use super::plant_bar::{Bar, MOST, Rate, demand};
 use rivoli_backend::abi::CompGeom;
 use rivoli_core::num::{bf16_to_f32, e4m3_to_f32, f32_to_bf16};
-
-/// A plant's verdict: print its rate, and refuse it below `num/den` of the cells — the demand each
-/// test argues for its own plant, never a round number that merely passes.
-fn demand(plant: &str, (moved, cells): (usize, usize), (num, den): (usize, usize)) {
-    println!("{plant} plant: {moved}/{cells} cells move");
-    assert!(
-        moved * den >= cells * num,
-        "{plant} plant moved only {moved}/{cells} cells — sub-threshold"
-    );
-}
 
 /// Over `shapes` × every seed, how many cells `moves(shape, seed)` says the plant moves, printing
 /// each shape's count: `(moved, cells)`.
@@ -28,12 +19,17 @@ fn rate<S: Copy + std::fmt::Debug>(
     plant: &str,
     shapes: impl IntoIterator<Item = S>,
     moves: impl Fn(S, u64) -> bool,
-) -> (usize, usize) {
-    shapes.into_iter().fold((0, 0), |(moved, cells), shape| {
-        let m = (1..=SEEDS).filter(|&seed| moves(shape, seed)).count();
-        println!("{plant} at {shape:?}: {m}/{SEEDS} seeds move");
-        (moved + m, cells + SEEDS as usize)
-    })
+) -> Rate {
+    shapes
+        .into_iter()
+        .fold(Rate { moved: 0, of: 0 }, |r, shape| {
+            let m = (1..=SEEDS).filter(|&seed| moves(shape, seed)).count() as u64;
+            println!("{plant} at {shape:?}: {m}/{SEEDS} seeds move");
+            Rate {
+                moved: r.moved + m,
+                of: r.of + SEEDS,
+            }
+        })
 }
 
 /// Whether the clean arm (`arm(true)`) and the planted one (`arm(false)`) part, bit for bit.
@@ -77,7 +73,7 @@ fn topk_signed_zero_plant_is_adversarial_on_cpu() {
         let s = topk_scores(nt, seed);
         select(&s, k, true) != select(&s, k, false)
     });
-    demand(plant, r, (1, 3));
+    demand(plant, r, Bar { num: 1, den: 3 });
 }
 
 /// A float through bf16 and back (round to nearest even) — shared with `plants.rs`.
@@ -120,7 +116,7 @@ fn score_blocks_per_term_plant_is_adversarial_on_cpu() {
             splits(|clean| score_cell(&ins, dims, tc, clean))
         })
     });
-    demand(plant, r, (3, 4));
+    demand(plant, r, Bar { num: 3, den: 4 });
 }
 
 /// One `kv_compress_prefill` output row on the CPU up to the RoPE — the pool, the bf16 store and
@@ -174,7 +170,7 @@ fn prefill_pairs(ins: &[Vec<f32>], p: &CompGeom, b: usize) -> Vec<[f32; 4]> {
 /// `kvcompress` plant is `gemm_bf16`'s, and why the RoPE sites rest on the ISA reading.
 #[test]
 fn compress_rope_fusion_is_visible_to_the_prefill_rows() {
-    let (moved, cells) = rate(
+    let Rate { moved, of: cells } = rate(
         "kv_compress_prefill rope mis-fusion",
         PREFILL_SHAPES,
         |(gi, nblk), seed| {
@@ -239,7 +235,7 @@ fn gemm_unfused_plant_is_adversarial_on_cpu() {
     demand(
         "gemm_bf16 unfused",
         rate("gemm_bf16 unfused", GEMM_SHAPES, unfused),
-        (3, 4),
+        Bar { num: 3, den: 4 },
     );
 }
 
@@ -284,5 +280,5 @@ fn absorb_reassociation_plant_is_adversarial_on_cpu() {
             splits(|clean| absorb_out(&ins, shape, at, clean))
         })
     });
-    demand(plant, r, (9, 10));
+    demand(plant, r, MOST);
 }

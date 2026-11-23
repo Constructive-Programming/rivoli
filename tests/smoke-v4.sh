@@ -23,7 +23,8 @@ BIN=${SMOKE_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/debug/rivoli}
 ARTIFACT=${1:?usage: smoke-v4.sh <artifact-dir> [max-mem-GiB]}
 MEM=${2:-100}
 LOCK=/var/run/sys-gpu.lock
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/smoke-v4.XXXXXX")
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+SCRATCH=$(scratch_dir smoke-v4)
 # The recorded reference decode: captured at the PRE-M15 pin (264758c) with the same
 # command cell 2 runs, then re-verified against the M15 tree before being committed —
 # below the cap the scored arm is byte-identical by construction, so a drift here is a

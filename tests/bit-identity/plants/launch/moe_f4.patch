@@ -1,5 +1,5 @@
---- a/src/moe_f4.rs
-+++ b/src/moe_f4.rs
+--- a/crates/kernels/src/moe_f4.rs
++++ b/crates/kernels/src/moe_f4.rs
 @@ -83,5 +83,5 @@
      // `routed` multiplies `w · y` where the C wrote `y · w`: IEEE multiplication commutes, so
      // only a NaN's payload could differ, and `moe_fixed` clamps every NaN to the same bound.

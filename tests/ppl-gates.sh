@@ -81,7 +81,8 @@ read -ra MODE_FLAGS <<<"${PPL_MODE_FLAGS:---mode int3-vq --attn dense}"
 # needs saying so, not silently ranking against the old row.
 PROMPT=${PPL_PROMPT:-"Write a long, detailed technical essay explaining how virtual memory works in a modern operating system: page tables, the TLB, demand paging, and what happens on a page fault. Then compare that machinery to how a GPU manages its own memory, and explain which ideas carry over and which do not."}
 LOCK=/var/run/sys-gpu.lock
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/ppl-gates.XXXXXX")
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+SCRATCH=$(scratch_dir ppl-gates)
 # FORCED, not defaulted. Every subject this gate reads — `PROFILE/tok:`, `TF row-coherence
 # held` — is a `tracing::info!`, and an inherited `RUST_LOG=warn` deletes both: the profile
 # cell would go RED on a missing line and, under --expect-red, an environment variable

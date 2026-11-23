@@ -1,5 +1,5 @@
---- a/src/linalg.rs
-+++ b/src/linalg.rs
+--- a/crates/kernels/src/linalg.rs
++++ b/crates/kernels/src/linalg.rs
 @@ -11,7 +11,7 @@
  //! `R` (token rows through one read of the weights) is a const generic, so each `_r2` kernel
  //! is its own instantiation exactly as each C template instance was.

@@ -1,5 +1,5 @@
---- a/src/recurrent.rs
-+++ b/src/recurrent.rs
+--- a/crates/kernels/src/recurrent.rs
++++ b/crates/kernels/src/recurrent.rs
 @@ -87,7 +87,7 @@
      let dv = delta(u);
      let mut o = 0.0f32;

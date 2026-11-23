@@ -1,5 +1,5 @@
---- a/src/kvcompress.rs
-+++ b/src/kvcompress.rs
+--- a/crates/kernels/src/kvcompress.rs
++++ b/crates/kernels/src/kvcompress.rs
 @@ -38,7 +38,7 @@
      let wr = a.w.add(c as usize * a.k as usize);
      let mut acc = 0.0f32;

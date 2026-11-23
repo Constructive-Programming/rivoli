@@ -8,6 +8,7 @@
 //! shapes are a subset of each row's sweep, drawn on the row's own streams.
 
 use super::inputs::{SEEDS, bytes, draw, uniform};
+use super::plant_bar::{MOST, Rate, demand};
 
 /// `wave_sum`'s shuffle-down tree on lane 0: each step every lane adds the lane `o` above it
 /// (or itself, past the wave's end), `o = 16, 8, 4, 2, 1`.
@@ -33,17 +34,9 @@ fn lane_dot(x: &[f32], w: impl Fn(usize) -> f32, fused: bool) -> f32 {
 }
 
 /// `(cells moved, cells)` over the seeds, a cell moving when `differs(seed)`.
-fn rate(differs: impl Fn(u64) -> bool) -> (u64, u64) {
-    ((1..=SEEDS).filter(|&s| differs(s)).count() as u64, SEEDS)
-}
-
-/// §1's bar: the gate reddens on one word, so demand most cells move.
-fn assert_adversarial(what: &str, (moved, cells): (u64, u64)) {
-    println!("{what}: {moved}/{cells} cells moved");
-    assert!(
-        moved * 10 >= cells * 9,
-        "{what}: plant moved only {moved}/{cells} cells — sub-threshold"
-    );
+fn rate(differs: impl Fn(u64) -> bool) -> Rate {
+    let moved = (1..=SEEDS).filter(|&s| differs(s)).count() as u64;
+    Rate { moved, of: SEEDS }
 }
 
 /// `linalg.patch`: `lane_cols` without its fma, on `gemv_f32`'s (160, 6144) and `gemv_i8`'s
@@ -51,7 +44,7 @@ fn assert_adversarial(what: &str, (moved, cells): (u64, u64)) {
 #[test]
 fn linalg_lane_column_plant_is_adversarial_on_cpu() {
     let (o, i) = (160, 6144);
-    assert_adversarial(
+    demand(
         "gemv_f32 (160, 6144) rows 0..8",
         rate(|seed| {
             let x = draw(i, (seed, 1), 1.0, true);
@@ -62,16 +55,18 @@ fn linalg_lane_column_plant_is_adversarial_on_cpu() {
                 dot(true) != dot(false)
             })
         }),
+        MOST,
     );
     // `gemv_i8`'s scalar-tail work in its sweep: rows that start off a dword boundary, and
     // every row at R = 2 with `i_dim % 4 != 0` (the quads need each `x` row float4-aligned).
-    assert_adversarial(
+    demand(
         "gemv_i8 scalar-tail rows",
         rate(|seed| {
             [(9, 1001, 1), (9, 1001, 2), (5, 130, 2), (3, 127, 1)]
                 .iter()
                 .any(|&(o, i, n)| i8_tail_moves(seed, (o, i, n)))
         }),
+        MOST,
     );
 }
 
@@ -92,7 +87,7 @@ fn i8_tail_moves(seed: u64, (o, i, n): (usize, usize, usize)) -> bool {
 #[test]
 fn fwd_sigmoid_division_plant_is_adversarial_on_cpu() {
     for n in [257, 2048, 6144] {
-        assert_adversarial(
+        demand(
             &format!("sigmoid_gate n={n}"),
             rate(|seed| {
                 let x = draw(n, (seed, 1), 1.0, true);
@@ -102,6 +97,7 @@ fn fwd_sigmoid_division_plant_is_adversarial_on_cpu() {
                     (x * (1.0 / d)).to_bits() != (x / d).to_bits()
                 })
             }),
+            MOST,
         );
     }
 }
@@ -112,9 +108,10 @@ fn fwd_sigmoid_division_plant_is_adversarial_on_cpu() {
 /// at a time it moves ~3 cells in 4), so a cell is a seed over the row's two V4 shapes.
 #[test]
 fn headtail_gate_dot_plant_is_adversarial_on_cpu() {
-    assert_adversarial(
+    demand(
         "hc_head_collapse (1|3, 4, 4096)",
         rate(|seed| [1, 3].iter().any(|&s| gate_moves(seed, (s, 4, 4096)))),
+        MOST,
     );
 }
 

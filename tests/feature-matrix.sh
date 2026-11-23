@@ -66,17 +66,18 @@ combos() { # combos -> one space-separated feature subset per line ("" = none)
   done
 }
 
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+FM_LOG=$(scratch_dir feature-matrix)/cargo.log
 PASS=0; FAIL=0; FAILED=()
 run() { # run <label> <cargo args...>
   local label=$1; shift
-  if "$@" >/tmp/fm.$$ 2>&1; then
+  if "$@" >"$FM_LOG" 2>&1; then
     PASS=$((PASS + 1)); printf 'ok    %s\n' "$label"
   else
     FAIL=$((FAIL + 1)); FAILED+=("$label"); printf 'FAIL  %s\n' "$label"
     # The first error only: a feature-gated break is usually one type error repeated.
-    grep -m3 -E "^error" /tmp/fm.$$ | sed 's/^/        /'
+    grep -m3 -E "^error" "$FM_LOG" | sed 's/^/        /'
   fi
-  rm -f /tmp/fm.$$
 }
 
 echo "feature matrix ($MODE): backends=${BACKENDS[*]} optional=${OPTIONAL[*]}"

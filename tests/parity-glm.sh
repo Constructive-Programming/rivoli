@@ -26,8 +26,8 @@ REF_BIN=${PARITY_REF_BIN:-/var/cache/users/rhansen/ref-pin-target/release/rivoli
 NEW_BIN=${PARITY_NEW_BIN:-${CARGO_TARGET_DIR:-$(dirname "$0")/../target}/debug/examples/glm_smoke}
 PROMPT=${PARITY_PROMPT:-"The sky is blue"}
 LOCK=/var/run/sys-gpu.lock
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/parity-glm.XXXXXX")
-
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+SCRATCH=$(scratch_dir parity-glm)
 RED_PROOF=""
 if [ "${1:-}" = "--red-proof" ]; then
     RED_PROOF=${2:?red-proof needs a green-run ref-ids file}

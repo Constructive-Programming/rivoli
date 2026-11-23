@@ -1,5 +1,5 @@
---- a/src/blockindex.rs
-+++ b/src/blockindex.rs
+--- a/crates/kernels/src/blockindex.rs
++++ b/crates/kernels/src/blockindex.rs
 @@ -68,5 +68,5 @@
  /// the f32 accumulator, and the one rounding `.sum` performs on the way out.
  #[unsafe(no_mangle)]

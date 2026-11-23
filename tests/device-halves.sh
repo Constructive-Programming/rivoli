@@ -37,7 +37,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/gpu-witness.sh"
 
 LOCK=${GPU_LOCK:-/var/run/sys-gpu.lock}
-SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/device-halves.XXXXXX")
+source "$(dirname "$0")/scratch.sh"  # never /tmp: tests/scratch.sh
+SCRATCH=$(scratch_dir device-halves)
 CELL=${1:-all}
 
 # The canonical lock path, not /run/sys-gpu.lock: gate-red-proofs.md §16 records the 2026-09-02 window when a

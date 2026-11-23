@@ -7,6 +7,7 @@
 //! exact cells; the device arm is the measurement.
 
 use super::inputs::{SEEDS, draw, rope_at, uniform, weight_bytes};
+use super::plant_bar::{MOST, Rate, demand};
 use super::plant_models::rbf16;
 
 /// One modelled output row: its seed, its reduction dim, and its index.
@@ -36,16 +37,7 @@ fn row_plant(what: &str, dim: usize, moves: impl Fn(RowAt) -> bool) {
         moved += u64::from(d > 0);
     }
     println!("{what}: {rows}/{} rows differ", 64 * SEEDS);
-    assert_adversarial(what, moved, SEEDS);
-}
-
-/// The gate demands a plant move at least 90% of seeds, so it cannot hide in a lucky draw.
-fn assert_adversarial(what: &str, moved: u64, cells: u64) {
-    println!("{what}: {moved}/{cells} seeds affected");
-    assert!(
-        moved * 10 >= cells * 9,
-        "{what} moved only {moved}/{cells} seeds — sub-threshold"
-    );
+    demand(what, Rate { moved, of: SEEDS }, MOST);
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -134,7 +126,11 @@ fn recurrent_unfused_update_plant_is_adversarial_on_cpu() {
             gated_delta_model(seed, Update::Fused) != gated_delta_model(seed, Update::Split)
         })
         .count() as u64;
-    assert_adversarial("recurrent unfused-update plant", moved, SEEDS);
+    demand(
+        "recurrent unfused-update plant",
+        Rate { moved, of: SEEDS },
+        MOST,
+    );
 }
 
 /// The CPU half of the recorded red proof (`docs/measurement/gate-red-proofs.md` §18): the
@@ -170,7 +166,7 @@ fn rope_unfused_plant_is_adversarial_on_cpu() {
         moved += u64::from(diff > before);
     }
     println!("rope unfused plant: {diff}/{elems} lo outputs differ");
-    assert_adversarial("rope unfused plant", moved, cells);
+    demand("rope unfused plant", Rate { moved, of: cells }, MOST);
 }
 
 /// fp16 bits → f32 (the codebook's storage), every class.
@@ -387,10 +383,13 @@ fn moe_f4_late_bf16_plant_reaches_k3_production_shapes() {
             .iter()
             .filter(|&&s| K3Cell::new(CellAt { range, seed: s }).plant_moves())
             .count() as u64;
-        assert_adversarial(
+        demand(
             &format!("moe_f4 late-bf16 plant at {range:?}"),
-            moved,
-            finite.len() as u64,
+            Rate {
+                moved,
+                of: finite.len() as u64,
+            },
+            MOST,
         );
     }
 }

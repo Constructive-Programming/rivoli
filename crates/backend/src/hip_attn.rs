@@ -497,7 +497,7 @@ launchers! {
     /// Every pointer is a device buffer of the size above and must outlive `stream`'s completion.
     /// **Every one is `__restrict__` in the kernel, so none may alias another** — including `state`
     /// against `out`, the two written.
-    launch_gdn_recurrent_f32 => rivoli_gdn_recurrent_f32(Rows(v_heads.0 as i32), qk_heads.0 as i32, Gdn { inp: bufs.into(), state, out, rep: (v_heads.0 / qk_heads.0.max(1)) as i32, dk: dk.0 as i32, dv: dv.0 as i32 }, stream),
+    launch_gdn_recurrent_f32 => rivoli_gdn_recurrent_f32(Rows(v_heads.0 as i32), qk_heads.0 as i32, Gdn { inp: bufs.into(), state, out, rep: 0, dk: dk.0 as i32, dv: dv.0 as i32 }, stream),
     "gdn_recurrent_f32" (
         bufs: GdnBufs,
         qk_heads: HeadCount => i32,
