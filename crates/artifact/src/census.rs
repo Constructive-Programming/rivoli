@@ -26,9 +26,23 @@
 //! are a converter (which must refuse, not panic) as well as three gates (which may `expect`
 //! under their own file allow).
 
+pub mod inkling;
 pub mod qwen;
 
 use anyhow::{Context, Result, ensure};
+
+/// The 8-column contract shared by the qwen and inkling censuses: status, family, example, shape,
+/// dtype, count, bytes-per-tensor, total-bytes. K3's 4-column contract is its own. Shared here
+/// because the two 8-column readers spelled the same indices twice (jscpd's 5-line floor).
+pub const COLS: usize = 8;
+pub const COL_STATUS: usize = 0;
+pub const COL_PATTERN: usize = 1;
+pub const COL_EXAMPLE: usize = 2;
+pub const COL_SHAPE: usize = 3;
+pub const COL_DTYPE: usize = 4;
+pub const COL_COUNT: usize = 5;
+pub const COL_BYTES_PER: usize = 6;
+pub const COL_TOTAL: usize = 7;
 
 /// One vendored census TSV: its repo-relative path, for messages, and its bytes.
 ///

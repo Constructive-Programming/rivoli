@@ -217,10 +217,17 @@ enum Health {
 /// Complex Method cc=12 at 9.66, strictly worse. A conversion module's vocabulary IS one
 /// primitive in, one out; a newtype added to move the counter would be laundering. Floor
 /// 9.6 so real decay still reddens.
+/// `inkling.rs` joined 2026-11-24 on the num.rs/numerics.rs argument: it is the CPU oracle
+/// transliteration of the first-party `inkling2_loop` operator bodies (softcap, SwiGLU, the L2
+/// clips, LogScale, RMSNorm), and a conversion oracle's vocabulary IS one primitive in, one out
+/// (f32 vectors + scalar caps/thresholds). The Primitive Obsession finding is the reference's
+/// shape; a newtype added to move the counter would be laundering. Floor 9.6 against a measured
+/// 9.68, so real decay still reddens.
 const EXEMPT: &[(&str, f64)] = &[
     ("crates/oracles/src/v4oracle/numerics.rs", 9.6),
     ("crates/oracles/src/dflash.rs", 8.4),
     ("crates/core/src/num.rs", 9.6),
+    ("crates/oracles/src/inkling.rs", 9.6),
 ];
 
 /// The verdict for a scored file, exemption triple included: an exempt file is green in

@@ -69,7 +69,7 @@ mod oai;
 
 use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::tokenizer::{ChatOpts, Tokenizer};
-use rivoli_core::legality::{Arch, QWEN_ARM_NOT_BUILT};
+use rivoli_core::legality::{Arch, INKLING_ARM_NOT_BUILT, QWEN_ARM_NOT_BUILT};
 use rivoli_engine::{Decoded, Engine, GenSpec};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
@@ -312,6 +312,9 @@ fn frame_prompt(
         // checkpoint whose own template ships with a `reasoning_effort` axis nothing here
         // renders yet (S5 owns it).
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
+        // Inkling 2, both members (S1, 2026-11-23): the second door, quoting the table's const.
+        // `main` bails first; this holds if that door ever moves. S5 owns Mini's template.
+        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 
@@ -363,6 +366,9 @@ fn split_channels(text: &str, ask: &Ask, complete: bool) -> Result<(String, Stri
         // > is S6's, in the commit that gives this architecture a real arm and rewrites both
         // > matches anyway.
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
+        // Inkling 2, both members: a refusal and not a panic, on the qwen arm's argument above
+        // — silently reading a reply with another model's channel markers is the M11b failure.
+        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 
@@ -692,6 +698,18 @@ mod tests {
             e.contains("no decode path for this architecture yet"),
             "the refusal must be the table's own wording, not a second one invented here: {e}"
         );
+        // Inkling 2's two members refuse on the same wording (S1, 2026-11-23) — one port, one
+        // const, both doors. Same claim as the qwen arm above, for both variants.
+        for arch in [Arch::Inkling2Loop, Arch::Inkling2] {
+            let e = format!(
+                "{:#}",
+                split(arch).expect_err("the armless inkling members must refuse")
+            );
+            assert!(
+                e.contains("no decode path for this architecture yet"),
+                "inkling's refusal must be the table's own wording: {e}"
+            );
+        }
     }
 
     /// The ceiling contract, stated on the arithmetic rather than on a socket: one slot is

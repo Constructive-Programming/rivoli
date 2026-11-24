@@ -20,6 +20,12 @@ pub mod glimmer_config;
 /// pair that "the two must not converge", so they do not share a module.
 pub mod glimmer_encoding;
 pub mod glm_config;
+/// Inkling 2's config schema — two members (Mini `inkling2_loop`, Small `inkling2`) over one
+/// shared text stack. A sibling of [`qwen_config`] rather than a member of it: the nesting and
+/// the member differences are this checkpoint's own, per the rule that per-model config types
+/// stay separate.
+pub mod inkling_config;
+pub mod inkling_dequant;
 pub mod k3_config;
 pub mod quant;
 pub mod qwen_config;

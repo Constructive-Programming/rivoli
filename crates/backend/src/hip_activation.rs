@@ -10,15 +10,20 @@
 use crate::hip::{ensure_hip_status, launchers};
 use crate::launch::{
     Rows, rivoli_act_quant_f4_rotated, rivoli_act_quant_f8, rivoli_act_quant_f8_prefix,
-    rivoli_layernorm, rivoli_logit_softcap, rivoli_qk_norm, rivoli_rmsnorm_batch,
-    rivoli_rmsnorm_centered_single, rivoli_rmsnorm_single, rivoli_rmsnorm_weightless_batch,
-    rivoli_rope_adjacent, rivoli_rope_interleave, rivoli_rope_split_half, rivoli_sigmoid_gate,
-    rivoli_situ_glu_f32, rivoli_swiglu, rivoli_swiglu_clamped_bf16,
+    rivoli_kv_scatter, rivoli_l2_clip, rivoli_layernorm, rivoli_log_scaled_l2_clip,
+    rivoli_logit_softcap, rivoli_message_gate, rivoli_mxfp8_dequant, rivoli_nvfp4_dequant,
+    rivoli_qk_norm, rivoli_rel_bias_gather, rivoli_rmsnorm_batch, rivoli_rmsnorm_centered_single,
+    rivoli_rmsnorm_single, rivoli_rmsnorm_weightless_batch, rivoli_rope_adjacent,
+    rivoli_rope_interleave, rivoli_rope_split_half, rivoli_scaled_l2_clip, rivoli_sconv,
+    rivoli_sigmoid_gate, rivoli_sink_attend, rivoli_situ_glu_f32, rivoli_swiglu,
+    rivoli_swiglu_clamped_bf16,
 };
 use anyhow::Result;
 use rivoli_abi::kernarg::{
-    ActQuantPrefix, F4Rotate, Gate, GateClamped, GateSitu, InPlaceBinary, LayerNorm, QkNorm,
-    RmsNormRows, Rope, RopeAdjacent, RowNorm, Softcap, WeightlessNorm,
+    ActQuantPrefix, F4Rotate, Gate, GateClamped, GateSitu, InPlaceBinary, KvScatter, L2Clip,
+    LayerNorm, LogScaledL2Clip, MessageGate, Mxfp8Dequant, Nvfp4Dequant, QkNorm, RelBiasGather,
+    RmsNormRows, Rope, RopeAdjacent, RowNorm, ScaledL2Clip, Sconv, SinkAttend, Softcap,
+    WeightlessNorm,
 };
 use std::ffi::c_void;
 
@@ -55,6 +60,203 @@ launchers! {
         u: *const f32,
         n: usize,
         h: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's per-head L2 clip `y = x·min(threshold/(‖x‖+1e-6), 1)` (the q/k/rel norm clips).
+    /// No C twin — oracle-validated against `rivoli_oracles::inkling` (owner direction 2026-11-24).
+    /// BATCHED: one block per row, `rows` rows of `n` — `x`/`y` are `rows·n` f32. Safe in place
+    /// (`y` may alias `x`); `threshold` positive and finite (1006).
+    ///
+    /// # Safety
+    /// Device pointers (`x`, `y` each `rows·n` f32) live until the next [`device_sync`]; `stream`
+    /// is null or a live stream ordering every producer of `x`.
+    launch_l2_clip => rivoli_l2_clip(Rows(rows as i32), L2Clip { x, y, n: n as i32, threshold }, stream), "l2_clip" (
+        x: *const f32,
+        rows: usize,
+        n: usize,
+        threshold: f32,
+        y: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's sliding-layer q/k norm: a learned per-head `scale` first, then the L2 clip.
+    /// No C twin — oracle-validated (owner direction 2026-11-24). BATCHED: one block per row,
+    /// `x`/`scale`/`y` each `rows·n` f32 (row `r` reads `scale + r·n`). Safe in place (`y` may
+    /// alias `x`); `threshold` positive and finite (1006).
+    ///
+    /// # Safety
+    /// Device pointers (`x`, `scale`, `y` each `rows·n` f32) live until the next [`device_sync`];
+    /// `stream` is null or a live stream ordering every producer of `x`/`scale`.
+    launch_scaled_l2_clip => rivoli_scaled_l2_clip(Rows(rows as i32), ScaledL2Clip { clip: L2Clip { x, y, n: n as i32, threshold }, scale }, stream), "scaled_l2_clip" (
+        x: *const f32,
+        scale: *const f32,
+        rows: usize,
+        n: usize,
+        threshold: f32,
+        y: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's full-layer q/k norm: the scaled clip then the position-dependent LogScale `tau`
+    /// (T11: sliding layers omit it). No C twin — oracle-validated. BATCHED like
+    /// [`launch_scaled_l2_clip`]. Safe in place; `threshold` AND `tau` positive and finite (1006).
+    ///
+    /// # Safety
+    /// Device pointers (`x`, `scale`, `y` each `rows·n` f32) live until the next [`device_sync`];
+    /// `stream` is null or a live stream ordering every producer of `x`/`scale`.
+    launch_log_scaled_l2_clip => rivoli_log_scaled_l2_clip(Rows(rows as i32), LogScaledL2Clip { scaled: ScaledL2Clip { clip: L2Clip { x, y, n: n as i32, threshold }, scale }, tau }, stream), "log_scaled_l2_clip" (
+        x: *const f32,
+        scale: *const f32,
+        rows: usize,
+        n: usize,
+        threshold: f32,
+        tau: f32,
+        y: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's MXFP8 expert decode: one e4m3 value per byte, one power-of-two scale per 32
+    /// values along the input dim, ROW-WISE `[1,32]` (T1: the scale is a raw U8 exponent, not
+    /// e4m3). No C twin — oracle-validated. `cols` a positive multiple of 32 that DIVIDES `n`
+    /// (1001 otherwise); `n` is carried 64-bit into the kernarg for an expert layer past `i32`.
+    ///
+    /// # Safety
+    /// Device pointers (`weight` `n` bytes, `scale` `n/32` bytes, `out` `n` f32) live until the
+    /// next [`device_sync`]; `stream` is null or a live stream ordering every producer.
+    launch_mxfp8_dequant => rivoli_mxfp8_dequant(Mxfp8Dequant { weight, scale, out, n: n as u64, cols: cols as i32 }, stream), "mxfp8_dequant" (
+        weight: *const u8,
+        scale: *const u8,
+        n: usize,
+        cols: usize,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's NVFP4 expert decode: two E2M1 codes per byte (low nibble even), one e4m3 scale
+    /// per 16 values along the input dim, and a per-expert factor `amax[e]/denom`. No C twin —
+    /// oracle-validated. `cols_packed` a positive multiple of 8 (1001), `n` a whole number of
+    /// `rows·cols_packed·2` expert planes (1001 — `row / rows` is the expert index), `denom`
+    /// positive finite (1006); `n` is carried 64-bit into the kernarg.
+    ///
+    /// # Safety
+    /// Device pointers (`weight` `n/2` bytes, `scale` `n/16` bytes, `amax` `E` f32, `out` `n` f32)
+    /// live until the next [`device_sync`]; `stream` is null or a live stream ordering every producer.
+    launch_nvfp4_dequant => rivoli_nvfp4_dequant(Nvfp4Dequant { weight, scale, amax, out, denom, n: n as u64, rows: rows as i32, cols_packed: cols_packed as i32 }, stream), "nvfp4_dequant" (
+        weight: *const u8,
+        scale: *const u8,
+        amax: *const f32,
+        denom: f32,
+        n: usize,
+        rows: usize,
+        cols_packed: usize,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's static short-convolution decode step, state included: a depthwise causal k-tap
+    /// cross-correlation of the window `[state (past k−1), current]` plus the residual (the current
+    /// token), divided by `divisor = √(k+1)` (T15); advances `state` in place. No C twin —
+    /// oracle-validated. `channels > 0`, `k > 0` (1001), `divisor` positive finite (1006).
+    ///
+    /// # Safety
+    /// Device pointers (`weight` `channels·k` f32, `state` `channels·(k−1)` f32, `current`/`out`
+    /// `channels` f32) live until the next [`device_sync`]; `stream` is null or a live stream
+    /// ordering every producer.
+    launch_sconv => rivoli_sconv(Sconv { weight, state, current, out, channels: channels as i32, k: k as i32, divisor }, stream), "sconv" (
+        weight: *const f32,
+        state: *mut f32,
+        current: *const f32,
+        channels: usize,
+        k: usize,
+        divisor: f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's single-query attention decode step with a sink: the softmax joins one extra sink
+    /// logit then drops its column (T10), so the real weights sum to < 1. No C twin —
+    /// oracle-validated. BATCHED over `heads` query heads in one launch (one block each), with
+    /// the per-head sink logits already on the device (`sink` is `heads` f32) so the caller
+    /// needs no sync-and-copy per layer.
+    ///
+    /// `n`, `d`, `heads`, `kv_heads` > 0 with `heads % kv_heads == 0` (the GQA map), `kv_stride >=
+    /// n` (a head's window inside its stride) → 1001; `scaling` positive finite → 1006; the LDS
+    /// total `(n + ROW_BLOCK)·4` within the gfx1151 budget → 1001.
+    ///
+    /// # Safety
+    /// Device pointers (`q`/`out` `heads·d` f32, `bias` `heads·n` f32, `sink` `heads` f32,
+    /// `k`/`v` `kv_heads·kv_stride·d` f32) live until the next [`device_sync`]; `stream` is null
+    /// or a live stream ordering every producer.
+    launch_sink_attend => rivoli_sink_attend(SinkAttend { sink, bias, out, q, k, v, scaling, n: n as i32, d: d as i32, heads: heads as i32, kv_heads: kv_heads as i32, kv_stride: kv_stride as i32 }, stream), "sink_attend" (
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        bias: *const f32,
+        sink: *const f32,
+        scaling: f32,
+        n: usize,
+        d: usize,
+        heads: usize,
+        kv_heads: usize,
+        kv_stride: usize,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's loop MessageGate pointwise combine: `(1−tanh(forget_logit))·hidden +
+    /// tanh(gain_logit)·message`, fp32. No C twin — oracle-validated. The down/forget/gain
+    /// projections are the engine's GEMVs; `n > 0` (1001).
+    ///
+    /// # Safety
+    /// Device pointers (the four inputs and `out`, each `n` f32) live until the next [`device_sync`];
+    /// `stream` is null or a live stream ordering every producer.
+    launch_message_gate => rivoli_message_gate(MessageGate { forget_logit, gain_logit, hidden, message, out, n: n as i32 }, stream), "message_gate" (
+        forget_logit: *const f32,
+        gain_logit: *const f32,
+        hidden: *const f32,
+        message: *const f32,
+        n: usize,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's KV-cache append: scatter one token's projected `src` (`n = kv_heads·head_dim`) into
+    /// the per-head-deinterleaved cache `dst` (`[kv_heads, ctx, head_dim]`) at `pos`, so each head's
+    /// vectors are contiguous for `sink_attend`. No C twin — oracle-validated. `n > 0`,
+    /// `head_dim > 0`, `ctx > 0`, `n % head_dim == 0`, `0 <= pos < ctx` (1001).
+    ///
+    /// # Safety
+    /// Device pointers (`src` `n` f32, `dst` `kv_heads·ctx·head_dim` f32) live until the next
+    /// [`device_sync`]; `stream` is null or a live stream ordering every producer.
+    launch_kv_scatter => rivoli_kv_scatter(KvScatter { src, dst, pos: pos as i32, head_dim: head_dim as i32, ctx: ctx as i32, n: n as i32 }, stream), "kv_scatter" (
+        src: *const f32,
+        dst: *mut f32,
+        pos: usize,
+        head_dim: usize,
+        ctx: usize,
+        n: usize,
+        stream: *mut c_void,
+    );
+
+    /// inkling's rel-bias distance gather: for one decode query at `pos` over the key window
+    /// `start..start+n`, key slot `t` sits at absolute position `start + t` and
+    /// `bias[h·n+t] = rel_logits[h·rel_extent + pos−(start+t)]` when that distance is in
+    /// `[0, rel_extent)`, else 0 (MOD:224–227). `rel_logits` `[heads, rel_extent]`, `bias`
+    /// `[heads, n]`. No C twin — oracle-validated. `heads > 0`, `n > 0`, `rel_extent > 0`,
+    /// `pos >= 0`, `start >= 0`, `heads·n <= i32::MAX` (1001).
+    ///
+    /// # Safety
+    /// Device pointers (`rel_logits` `heads·rel_extent` f32, `bias` `heads·n` f32) live until the
+    /// next [`device_sync`]; `stream` is null or a live stream ordering every producer.
+    launch_rel_bias_gather => rivoli_rel_bias_gather(RelBiasGather { rel_logits, bias, pos: pos as i32, start: start as i32, n: n as i32, heads: heads as i32, rel_extent: rel_extent as i32 }, stream), "rel_bias_gather" (
+        rel_logits: *const f32,
+        bias: *mut f32,
+        pos: usize,
+        start: usize,
+        n: usize,
+        heads: usize,
+        rel_extent: usize,
         stream: *mut c_void,
     );
 

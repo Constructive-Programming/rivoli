@@ -15,6 +15,7 @@ pub mod glimmer;
 #[cfg(feature = "rocm")]
 pub mod glm;
 pub mod indexer;
+pub mod inkling;
 /// `--divergence-log`: the (position, layer, quantity) localiser for a run-to-run divergence,
 /// behind its own feature rather than `trace`'s because `trace` adds the class of
 /// `device_sync` that is recorded to MASK this fault. The pure host fold it is scored against

@@ -347,6 +347,23 @@ pub fn back(d: &rivoli_engine::device::DeviceBuf) -> Vec<u8> {
     d.copy_out().expect("copy_out")
 }
 
+/// The device destination a single-launch oracle shares: a zeroed `n`-f32 buffer, the launch onto
+/// a real stream, and the synced readback as f32. The caller supplies only the launch (its uploads
+/// and kernarg), so the stream/`zeros`/`back` spelling lives here once rather than in each suite's
+/// helper — the duplication gate's signal that the inkling oracle suites share this trip.
+#[cfg(feature = "rocm")]
+pub fn launch_to_f32(
+    n: usize,
+    launch: impl FnOnce(*mut f32, *mut std::ffi::c_void) -> anyhow::Result<()>,
+) -> anyhow::Result<Vec<f32>> {
+    let s = stream();
+    let mut out = zeros(n * 4);
+    let op = out.ptr_mut() as *mut f32;
+    launch(op, s.raw())?;
+    let raw = back(&out);
+    Ok(f32v(&raw))
+}
+
 // **MOVED HERE from `kernel.rs` 2026-08-16**, when the MLA/attend suites left it for
 // `kernel_attend.rs`: both that file and `kernel.rs` (GEMV) read a device destination back
 // against a CPU oracle, and a second copy of the join is what `build.rs`'s duplication gate is

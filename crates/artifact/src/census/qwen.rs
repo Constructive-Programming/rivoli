@@ -41,16 +41,11 @@ pub const FAMILIES: Tsv = Tsv::new(
     include_str!("../../../../docs/measurement/qwen-reference/tensor-families.tsv"),
 );
 
-/// The TSV's column contract, from its own COLUMNS block.
-const COLS: usize = 8;
-const COL_STATUS: usize = 0;
-const COL_PATTERN: usize = 1;
-const COL_EXAMPLE: usize = 2;
-const COL_SHAPE: usize = 3;
-const COL_DTYPE: usize = 4;
-const COL_COUNT: usize = 5;
-const COL_BYTES_PER: usize = 6;
-const COL_TOTAL: usize = 7;
+/// The 8-column contract, shared with the inkling census via the parent module.
+use super::{
+    COL_BYTES_PER, COL_COUNT, COL_DTYPE, COL_EXAMPLE, COL_PATTERN, COL_SHAPE, COL_STATUS,
+    COL_TOTAL, COLS,
+};
 
 /// The three legal `v1-status` values, as the TSV's COLUMNS block spells them.
 const STATUS_V1: &str = "v1";

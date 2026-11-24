@@ -8,5 +8,6 @@
 
 pub mod dflash;
 pub mod golden;
+pub mod inkling;
 pub mod torchdraw;
 pub mod v4oracle;

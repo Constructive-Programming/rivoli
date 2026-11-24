@@ -2261,3 +2261,131 @@ restored from a scratch copy (`cmp` rc 0), after the review round's changes to t
 present and held) is `classify`, whose plant rule the §18 stub arms red-proofed; it now also
 counts `SAME` as a passing row, which the two stubs above exercise.
 
+
+## 22. Inkling 2 ORACLE_VALIDATED kernels — the census waiver and the device oracles (added 2026-11-24)
+
+Owner direction 2026-11-24: inkling's new kernels have **no C twin**; they are validated against
+the first-party CPU oracle and the S3 anchor through an oracle suite, via the census's
+`ORACLE_VALIDATED` category (`kernel_coverage.rs`), not the C→Rust bit-identity harness. The
+waiver still owes a `=>` launchers row and an oracle suite that cites it, checked both ends
+(`assert_oracle_validated`). The clip family's proofs (i, j) are recorded in the port plan's S4
+section (`docs/investigations/inkling2-port.md`); the MXFP8 decode's is paid here.
+
+### 22a. The MXFP8 decode device oracle (`kernel_inkling_dequant.rs`) — PAID 2026-11-24
+
+The decode is elementwise, so the oracle comparison is BITWISE: the shared fp8 LUT equals
+`num::e4m3_to_f32` and `ldexp(1.0, e)` equals the oracle's `2f32.powi(e)` for the integer
+exponent. The plant is the T1 trap's neighbour — the scale bias `−127` → `−128` (a wrong
+power-of-two grid, the defect class T1 exists to catch).
+
+| arm | observed | exit |
+|---|---|---|
+| clean | 3/3 tests pass (oracle bitwise over 4 expert/row/width grids, the T1 raw-exponent trap, the 1001 geometry guards); witness empty | 0 |
+| scale bias `−128` | `mxfp8_dequant_matches_the_cpu_oracle` FAILED (32/32 elements differ at e=1 rows=1 cols=32) AND `mxfp8_scale_is_a_raw_exponent_not_e4m3` FAILED (scale 128 gives 1.0, want 2.0); the guard test held (1 passed) | 101 |
+
+Logs: `/var/cache/rivoli/scratch/inkling-s4-red-gpu.log` (red), `inkling-s4n-gpu.log` (reverted
+green). The first plant attempt — decode the scale as e4m3 (`lut[s]`) — refused to BUILD:
+`ldexp` became an unused import under `warnings = deny`, so the GPU ran the stale binary and
+showed a false green. The bias plant is the one that compiles and reddens; a plant that will
+not compile is not evidence, the same lesson §14's review round taught.
+
+### 22b. The NVFP4 decode device oracle (`kernel_inkling_dequant.rs`) — PAID 2026-11-24
+
+The plant is the T2 trap itself — swap the nibbles so the even element reads the HIGH nibble
+(`byte >> 4`) instead of the LOW (`byte & 0xF`). The decode stays elementwise and bitwise.
+
+| arm | observed | exit |
+|---|---|---|
+| clean | 6/6 tests pass (MXFP8 + NVFP4 oracles bitwise, the T1/T2 traps, both geometry guards); witness empty | 0 |
+| nibbles swapped | `nvfp4_dequant_matches_the_cpu_oracle` FAILED (16/16 elements differ at e=1 rows=1 cp=8) AND `nvfp4_even_element_is_the_low_nibble` FAILED (even element 0.5, want 1.0); the three MXFP8 tests and the NVFP4 guard held (4 passed) | 101 |
+
+Logs: `/var/cache/rivoli/scratch/inkling-s4-red2-gpu.log` (red), `inkling-s4r-gpu.log` (reverted
+green). The NVFP4 oracle also pins the `(code·scale)·factor` association (LOAD:813): a kernel
+that reassociated to `code·(scale·factor)` would redden the bitwise comparison at the grids
+where f32 rounding differs, the same way the bias plant reddens MXFP8.
+
+### 22c. The sconv decode device oracle (`kernel_inkling_sconv.rs`) — PAID 2026-11-24, RE-RECORDED 2026-11-24
+
+The kernel was redesigned 2026-11-24 (S5) to be self-contained: it takes the running `state`
+`[channels, k−1]` + `current` and ADVANCES the state in place (shift left one, append current —
+MOD:254), so the engine keeps no separate window copy. The oracle returns `(out, advanced_state)`;
+the suite checks the output RELATIVE (the k-tap dot is a short reduction) and the state advance
+BITWISE (a pure shift+append, no arithmetic). Two plants, each reddening only its own half:
+
+| arm | observed | exit |
+|---|---|---|
+| clean | 3/3 tests pass (oracle relative over 5 channel/tap grids + bitwise state advance, the T15 √5 divisor trap, the 1001/1006 guards); witness empty | 0 |
+| residual dropped | `sconv_matches_the_cpu_oracle` FAILED on the output relative error (8.8e-1 past 1e-5) AND `sconv_static_divisor_is_sqrt5` FAILED (got 0.8944272 = 2/√5, want 1.7888544 = 4/√5); the guard test held (1 passed) | 101 |
+| state advance no-op | `sconv_matches_the_cpu_oracle` FAILED on the BITWISE state check ("sconv state c=1 k=4: 3 of 3 elements differ") AND `sconv_static_divisor_is_sqrt5` FAILED on `next` ([0,0,0] not [0,0,2]); the output comparison passed first, the guard test held | 101 |
+
+Logs: `/var/cache/rivoli/scratch/inkling-sconv-red2-gpu.log` (residual red), `inkling-sconv-red-gpu.log`
+(state red), `inkling-sconv-rev2-gpu.log` / `inkling-sconv-gpu.log` (reverted green). The CPU oracle is
+`rivoli_oracles::inkling::sconv` (tap-order sum + state shift, MOD:254/255/349); the S3 anchor validates
+the model-level path against the first-party `F.conv1d`. Both arms ran under `flock -s` (the stale
+shared-lock deviation, §22d) with the witness empty before/after.
+
+### 22d. The sink-attend device oracle (`kernel_inkling_sink_attend.rs`) — PAID 2026-11-24
+
+The plant removes the sink from the softmax denominator (`z = 0` instead of `z = exp(sink−m)`),
+so the softmax is sink-less and the kept weights sum to 1 — the T10 trap. The QK dots and the
+weight·V sum are reductions, so the oracle comparison is RELATIVE.
+
+| arm | observed | exit |
+|---|---|---|
+| clean | 3/3 tests pass (oracle relative over 5 key/head grids, the T10 sink-absorbs-mass trap, the 1001/1006 guards incl. the LDS budget); witness empty | 0 |
+| sink dropped from denominator | `sink_attend_matches_the_cpu_oracle` FAILED AND `sink_attend_sink_absorbs_probability_mass` FAILED (got 1.0, want 0.7310586 — the sink no longer absorbs mass); the guard test held (1 passed) | 101 |
+
+Logs: `/var/cache/rivoli/scratch/inkling-s4-red4-gpu.log` (red), `inkling-s4z-gpu.log` (reverted
+green). The CPU oracle is `rivoli_oracles::inkling::sink_attend` (MOD:530–543); the S3 anchor
+validates the model-level path. **Device-arm note:** a stale shared `flock` on
+`/var/run/sys-gpu.lock` (a dead PID's inherited fd, `/proc/locks` row 11) blocked the exclusive
+`flock -c` the canonical arms use; the device itself was sole-tenant (`/dev/kfd` empty before and
+after every arm), so these arms ran under `flock -s` with the contention witness sampled per arm.
+
+### 22e. The message-gate device oracle (`kernel_inkling_message_gate.rs`) — PAID 2026-11-24
+
+The plant uses the forget gate directly (`f·hidden`) instead of its complement (`(1−f)·hidden`),
+so a large forget logit KEEPS hidden rather than suppressing it. The device tanh is ocml's, ~1 ulp
+from the host's, so the oracle comparison is RELATIVE.
+
+| arm | observed | exit |
+|---|---|---|
+| clean | 3/3 tests pass (oracle relative over 5 hidden widths, the forget-suppresses/gain-keeps trap, the 1001 guard); witness empty | 0 |
+| forget not complemented | `message_gate_matches_the_cpu_oracle` FAILED AND `message_gate_forget_suppresses_hidden_gain_keeps_message` FAILED (got 12 = hidden+message, want ≈7); the guard test held (1 passed) | 101 |
+
+Logs: `/var/cache/rivoli/scratch/inkling-s4-red5-gpu.log` (red), `inkling-s4af-gpu.log` (reverted
+green). The CPU oracle is `rivoli_oracles::inkling::message_gate` (MOD:196–200); the down/forget/
+gain projections are GEMVs the S5 engine runs separately, and the S3 anchor validates the model path.
+
+### 22f. The KV-cache scatter device oracle (`kernel_inkling_kv_scatter.rs`) — PAID 2026-11-24
+
+The plant transposes head and lane (`(e % hd, e / hd)` instead of `(e / hd, e % hd)`), so each
+element lands in the wrong head block — the deinterleave inverted. The scatter is a pure data
+movement, so the oracle comparison is BITWISE and the plant reddens exact elements.
+
+| arm | observed | exit |
+|---|---|---|
+| clean | 3/3 tests pass (oracle bitwise over 4 head/width/ctx/pos grids, the per-head-block trap, the 1001 guards); witness empty | 0 |
+| head/lane transposed | `kv_scatter_matches_the_cpu_oracle` FAILED ("3 of 12 elements differ") AND `kv_scatter_keeps_heads_in_their_own_blocks` FAILED; the guard test held (1 passed) | 101 |
+
+Logs: `/var/cache/rivoli/scratch/inkling-kvs-red-gpu.log` (red), `inkling-kvs-rev-gpu.log` (reverted
+green). The CPU oracle is `rivoli_oracles::inkling::kv_scatter`; the scatter is what lets
+`sink_attend` (§22d) read each KV head's `n` vectors contiguous from the deinterleaved cache. The
+arm ran under `flock -s` (the stale shared-lock deviation, §22d) with the witness empty before/after.
+
+### 22g. The rel-bias distance-gather device oracle (`kernel_inkling_rel_bias.rs`) — PAID 2026-11-24
+
+The plant removes the distance mask — an unconditional clamped `|pos−t|` read instead of zeroing
+out-of-range distances — so both negative distances (keys ahead of the query) and distances past
+`rel_extent` leak nonzero bias. The gather is a pure data movement + mask, so the oracle comparison
+is BITWISE.
+
+| arm | observed | exit |
+|---|---|---|
+| clean | 3/3 tests pass (oracle bitwise over 4 head/extent/pos/n grids, the out-of-range mask trap, the 1001 guards); witness empty | 0 |
+| mask removed | `rel_bias_gather_matches_the_cpu_oracle` FAILED ("24 of 48 elements differ", want 0 got nonzero) AND `rel_bias_gather_masks_out_of_range_distances` FAILED; the guard test held (1 passed) | 101 |
+
+Logs: `/var/cache/rivoli/scratch/inkling-rbg-red-gpu.log` (red), `inkling-rbg-rev-gpu.log` (reverted
+green). The CPU oracle is `rivoli_oracles::inkling::rel_bias_gather` (MOD:224–227); the gather feeds
+the per-head `bias` that `sink_attend` (§22d) adds to the QK dots. The arm ran under `flock -s` (the
+stale shared-lock deviation, §22d) with the witness empty before/after.

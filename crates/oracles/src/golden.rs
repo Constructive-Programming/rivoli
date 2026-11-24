@@ -50,6 +50,15 @@ const MAGIC_GLM: &[u8; 8] = b"RIVGMGLD";
 // spelling is fixed by the port plan's identity table, so it is not track B's to choose later.
 const MAGIC_QWEN: &[u8; 8] = b"RIVQWGLD";
 
+// Inkling 2's anchors — the sixth and seventh magics, two members of ONE port. Mini (the looped
+// member) and Small (the streaming case) get distinct bytes because a gate reaching for the
+// wrong member's fixture is the mistake these eight bytes exist to catch, even within one port.
+// Landed at S1 before the drivers, on MAGIC_QWEN's argument: the anchor track adds fixtures, not
+// an edit to a file six other models read. The spellings are fixed by the port plan's identity
+// table (docs/investigations/inkling2-port.md).
+const MAGIC_INKLING_LOOP: &[u8; 8] = b"RIVILGLD";
+const MAGIC_INKLING: &[u8; 8] = b"RIVISGLD";
+
 /// The metadata key `v4-oracle emit` records its `--defect` under -- one constant, because
 /// the writer (the bin) and the readers below must agree on the spelling or the check
 /// silently degrades to "every file is legacy".
@@ -109,6 +118,8 @@ impl GoldenSet {
             Arch::MuseGlimmer => MAGIC_GLIMMER,
             Arch::GlmMoeDsa => MAGIC_GLM,
             Arch::QwenFlashNext => MAGIC_QWEN,
+            Arch::Inkling2Loop => MAGIC_INKLING_LOOP,
+            Arch::Inkling2 => MAGIC_INKLING,
         }
     }
 

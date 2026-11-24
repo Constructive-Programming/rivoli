@@ -370,4 +370,71 @@ mod tests {
             }
         }
     }
+
+    /// Inkling 2's two wrappers, against BOTH shipped documents — the same root-only claim as
+    /// the qwen test above, for two members of one port. The promoted-block refusals are the
+    /// ones that matter: Mini's `text_config` carries `inkling2_loop_text` and its
+    /// `vision_config` carries `inkling2_vision`; Small's `text_config` carries NO `model_type`
+    /// and its `vision_config` carries none either, so a promoted Small block has no identity at
+    /// all. The cross-member parse is refused by `parse_config`'s arch check, not by serde — and
+    /// the full `parse_config` run exercises `validate`, including the DERIVED `local_layer_ids`
+    /// complement (20 sliding layers on Mini, 40 on Small).
+    #[test]
+    fn the_shipped_inkling_wrappers_resolve_from_their_roots_and_promoted_blocks_do_not() {
+        use crate::inkling_config::{Inkling2Config, Inkling2LoopConfig};
+        let mini = include_str!("../../../docs/measurement/inkling2-reference/mini/config.json");
+        let small =
+            include_str!("../../../docs/measurement/inkling2-reference/small-mxfp8/config.json");
+        let mini_cfg = parse_config::<Inkling2LoopConfig>(mini)
+            .expect("Mini's shipped wrapper must parse and validate");
+        let small_cfg =
+            parse_config::<Inkling2Config>(small).expect("Small's shipped wrapper must parse");
+        assert_eq!(mini_cfg.text.num_hidden_layers, 24);
+        assert_eq!(small_cfg.text.num_hidden_layers, 48);
+        for (text, want_arch, want_mt) in [
+            (mini, Arch::Inkling2Loop, "inkling2_loop"),
+            (small, Arch::Inkling2, "inkling2"),
+        ] {
+            let doc: serde_json::Value = serde_json::from_str(text).unwrap();
+            let (arch, spelling) = arch_of_named(&doc).expect("the shipped wrapper must resolve");
+            assert_eq!(arch, want_arch);
+            assert_eq!(
+                spelling, want_mt,
+                "the ROOT model_type is what resolved — not a nested text/vision spelling"
+            );
+        }
+        assert!(
+            parse_config::<Inkling2Config>(mini).is_err(),
+            "Mini's document is not the Small schema — the arch check must refuse it"
+        );
+        assert!(
+            parse_config::<Inkling2LoopConfig>(small).is_err(),
+            "Small's document is not the Mini schema"
+        );
+        let mini_doc: serde_json::Value = serde_json::from_str(mini).unwrap();
+        let small_doc: serde_json::Value = serde_json::from_str(small).unwrap();
+        for (why, promoted) in [
+            (
+                "Mini's text_config promoted: one nested spelling, no architectures",
+                mini_doc["text_config"].clone(),
+            ),
+            (
+                "Mini's vision_config promoted: inkling2_vision, no architectures",
+                mini_doc["vision_config"].clone(),
+            ),
+            (
+                "Small's text_config promoted: NO model_type at all",
+                small_doc["text_config"].clone(),
+            ),
+            (
+                "Small's vision_config promoted: NO model_type at all",
+                small_doc["vision_config"].clone(),
+            ),
+        ] {
+            assert!(
+                arch_of_named(&promoted).is_err(),
+                "{why}: a promoted block must not resolve to a decode path"
+            );
+        }
+    }
 }

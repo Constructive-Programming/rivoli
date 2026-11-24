@@ -73,8 +73,8 @@ appears that enum dispatch cannot fill.
   `backend/hip_attn.rs` (the third invocation file split out 2026-08-16 with M9's launchers;
   the fourth, `hip_activation.rs`, 2026-11-18, when the Phase 0 merge review split the
   799-line `hip_linalg.rs` by kernel family so no Phase 1 lane's first edit crosses the cap),
-  since a marker pair cannot span files; one in `core/routing.rs`, the frozen `route_into_pre` photograph — each argues
-  in place;
+  since a marker pair cannot span files; and one in `core/routing.rs`, the frozen
+  `route_into_pre` photograph — each argues in place;
   `quant.rs`'s parameter-list exemption died 2026-08-15 when the `Fp8W`/`VqW`/
   `RowScaledW` views paid the hop its note had priced; and one in
   `engine/examples/arena_repro.rs`, added 2026-08-18, where two examples sharing a module

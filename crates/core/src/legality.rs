@@ -58,12 +58,21 @@ pub enum Arch {
     /// it is the point — a surface that would have to refuse cannot be added quietly later,
     /// so it is added, refusing, first (stage S1).
     QwenFlashNext,
+    /// Inkling 2 Mini — Thinking Machines Lab, `inkling2_loop`: the looped member. 24 layers
+    /// whose middle 12 run three passes over a block-residual stream, MoE every layer, NVFP4
+    /// experts on layers 0–19 and MXFP8 on 20–23. Armless as of S1 (2026-11-23): the port plan
+    /// is `docs/investigations/inkling2-port.md`, the math `docs/reference/inkling2-architecture.md`.
+    Inkling2Loop,
+    /// Inkling 2 Small — the `inkling2` member: 48 layers, no loop, MXFP8 experts throughout.
+    /// The P1 bigger-than-memory streaming case; shares Mini's text stack and its port plan.
+    /// Armless as of S1 (2026-11-23).
+    Inkling2,
 }
 
 /// How many architectures [`Arch::ALL`] must carry. Hand-written on purpose: it is what
 /// turns "someone added a variant and forgot the list" from a silent hole into a length
 /// mismatch on `ALL`'s array type. See [`Arch::ordinal`].
-const ARCH_COUNT: usize = 5;
+const ARCH_COUNT: usize = 7;
 
 impl Arch {
     /// Every architecture, exactly once — the legality product test's first axis.
@@ -73,6 +82,8 @@ impl Arch {
         Arch::KimiK3,
         Arch::MuseGlimmer,
         Arch::QwenFlashNext,
+        Arch::Inkling2Loop,
+        Arch::Inkling2,
     ];
 
     /// Dense index, written out arm by arm rather than as `self as usize`, because the
@@ -92,6 +103,8 @@ impl Arch {
             Arch::KimiK3 => 2,
             Arch::MuseGlimmer => 3,
             Arch::QwenFlashNext => 4,
+            Arch::Inkling2Loop => 5,
+            Arch::Inkling2 => 6,
         }
     }
 
@@ -106,6 +119,12 @@ impl Arch {
             // `crates/cli/tests/docs.rs`), so a refusal and the doc it sends the reader to
             // are searchable by one word.
             Arch::QwenFlashNext => "qwen",
+            // Both members return the SCOPE string, generalising the convention above: the
+            // docs scope is the search unit, and one port plan covers both members. `name()`
+            // is presentation-only (main's refusal and tracing lines, test messages) — nothing
+            // parses it back and no gate asks for injectivity — so two variants may share it;
+            // `summary()` is what tells the members apart in a log line (2026-11-23).
+            Arch::Inkling2Loop | Arch::Inkling2 => "inkling",
         }
     }
 
@@ -119,6 +138,12 @@ impl Arch {
             Arch::MuseGlimmer => "dense GQA 32Q/2KV, gated, 3 sliding (2048) per full layer",
             Arch::QwenFlashNext => {
                 "36 gated-delta linear + 12 indexed sparse, MoE every layer, 4-wide residual"
+            }
+            Arch::Inkling2Loop => {
+                "24 layers, middle 12 looped ×3, block-residual queries, sconv + sinks, MoE 128 top-8"
+            }
+            Arch::Inkling2 => {
+                "48 layers, block-residual queries, sconv + sinks, MoE 384 top-8, MXFP8 experts"
             }
         }
     }
@@ -432,19 +457,23 @@ const K3_MTP_NEEDS_TWO_KERNELS: &str = "speculative decode on this architecture 
      fixtures. There is no draft head loaded either, but the kernels are what would have to \
      arrive first";
 
-/// **The only refusal text in this table that is `pub`**, and the exception is argued rather
-/// than convenient: every other row's wording is consumed exclusively by [`decide`], so
-/// publishing it would invent API nobody imports. This one has three consumers OUTSIDE the
+/// **Pub, and the exception is argued rather than convenient**: most rows' wording is consumed
+/// exclusively by [`decide`], so publishing it would invent API nobody imports. This one has
+/// three consumers OUTSIDE the
 /// table — `main`'s dispatch bail, `bench::frame_prompt` and `serve`'s two arch matches — each
 /// of which is a door a qwen artifact reaches only if the door in front of it moved. The
 /// alternative is one hand-written wording per door, which is precisely the "two authorities
 /// that can independently judge one configuration" hazard this module's header opens with; four
 /// wordings would be four. It stops being `pub` at S6, when the arm lands and the doors close.
+///
+/// > **CORRECTED 2026-11-23 (inkling S1).** This opened "the only refusal text in this table
+/// > that is `pub`". [`INKLING_ARM_NOT_BUILT`] is the second, for the same reason.
 pub const QWEN_ARM_NOT_BUILT: &str = "there is no decode path for this architecture yet, so \
      there is nothing for a flag to be legal ABOUT: the sniff recognises the artifact and \
-     everything behind it is owed — no config type, no converter, no kernel, no arm. This is \
-     the only row here that refuses every cell, and it refuses them for ONE reason rather \
-     than twelve: a knob cannot be honoured, degraded, or even honestly ignored by a run that \
+     everything behind it is owed — no config type, no converter, no kernel, no arm. This was \
+     the only row here that refuses every cell until Inkling 2's two members landed armless the \
+     same way (2026-11-23), and it refuses them for ONE reason rather than twelve: a knob cannot \
+     be honoured, degraded, or even honestly ignored by a run that \
      cannot start, and a loud fallback would promise a run that main then bails on a few \
      lines later. The stages are docs/investigations/qwen-flash-next-port.md — S2 anchors, \
      S3 kernels, S4 artifact and converter, S5 chat encoding, S6 the arm, where this row \
@@ -477,6 +506,39 @@ const QWEN_MTP_NOT_LOADED: &str = "speculative decode on this architecture is bl
      routed-expert range would be instantiated at one row only, as on every arm here. And in \
      front of all three, this architecture has no decode arm at all — see its other refusals";
 
+/// Inkling 2's arm-not-built refusal — BOTH members, one wording, because the port is one
+/// shared text stack and the plan names the order (Mini first, Small the streaming case).
+///
+/// `pub` for the same reason as [`QWEN_ARM_NOT_BUILT`]: `main.rs`, `bench.rs` and `serve/mod.rs`
+/// quote it at their doors. Unlike the qwen const it does NOT stop being `pub` when the first
+/// arm lands: Mini's arm (S5) flips Mini's cells while Small's door keeps quoting this text
+/// until S6, so the const outlives the Mini flip.
+pub const INKLING_ARM_NOT_BUILT: &str = "no decode path for this architecture yet — Inkling 2's text stack is not built. The \
+     block-residual attention (learned query mixing, per-head sinks, relative bias, short \
+     convolutions), the softcapped MoE and, on Mini, the 12-layer ×3-pass loop are the port, \
+     not the existing decode loop with a new batch shape. Planned order: Mini first on the \
+     shared stack, then Small-MXFP8 as the bigger-than-memory streaming case. The pinned \
+     checkpoint, tokenizer and config are vendored under docs/measurement/inkling2-reference/; \
+     the plan is docs/investigations/inkling2-port.md.";
+
+/// `--mtp` on Inkling 2: refused for TWO facts, and the wording carries both.
+///
+/// 1. The draft stack is not in the artifact: `mtp.safetensors` (635,801,416 B, sha256-verified
+///    beside the Mini shard) is EXCLUDED BY NAME from the text conversion, and Small's MTP
+///    weights are likewise unconverted.
+/// 2. Mini's loop is not a batch shape a verify pass can step: each pass re-reads the previous
+///    pass's block states, so verifying several drafted tokens would have to replay the loop
+///    per token, not widen a batch.
+///
+/// Deferred by owner scope (2026-11-23), not planned for v1. Unreachable from the CLI until the
+/// arm row flips, on the same ordering [`QWEN_MTP_NOT_LOADED`] documents: `Flag::Mode` is judged
+/// first and bails.
+const INKLING_MTP_NOT_LOADED: &str = "--mtp refused: the DRAFT STACK IS NOT IN THE ARTIFACT. mtp.safetensors is downloaded and \
+     hash-verified beside the checkpoint but EXCLUDED BY NAME from the text conversion. And \
+     Mini's looped recurrence is not a batch shape a verify pass can step — each pass re-reads \
+     the previous pass's block states, so a multi-token verify would replay the loop, not widen \
+     a batch. Deferred, not planned for v1.";
+
 /// **The** legality decider. Total over `Arch × Flag` by the compiler: adding an
 /// architecture breaks this match, adding a flag breaks [`glm`], and either way the build
 /// stops until the new cell has an argued answer.
@@ -487,6 +549,7 @@ pub fn decide(arch: Arch, flag: Flag) -> Outcome {
         Arch::DeepseekV4 => deepseek_v4(flag),
         Arch::KimiK3 => kimi_k3(flag),
         Arch::QwenFlashNext => qwen_flash_next(flag),
+        Arch::Inkling2Loop | Arch::Inkling2 => inkling2(flag),
     }
 }
 
@@ -683,19 +746,42 @@ fn deepseek_v4(flag: Flag) -> Outcome {
 ///
 /// The row flips at S6 (`docs/investigations/qwen-flash-next-port.md`), in one commit with the
 /// arm and `tests/smoke-qwen.sh`, whose legality cells quote these two consts' own fragments.
+///
+/// > **FACTORED 2026-11-23 (inkling S1).** The by-value match moved to [`armless_row`] when
+/// > inkling became the second armless architecture: a second copy of the seven-line pattern
+/// > list is a jscpd clone at the gate's 5-line floor, the same forced factoring
+/// > `schema::ensure_f32_positive` records. Every cell is still spelled BY VALUE there, so a
+/// > new `Mode`, `AttnKind` or valueless flag is a compile error, not a wildcard that silently
+/// > answers `Support`.
 fn qwen_flash_next(flag: Flag) -> Outcome {
+    armless_row(flag, QWEN_ARM_NOT_BUILT, QWEN_MTP_NOT_LOADED)
+}
+
+/// Inkling 2's row, as of S1: refuses EVERY cell, on BOTH members — the reddening commit's own
+/// gate, on [`qwen_flash_next`]'s precedent. One function for two variants because the row IS
+/// one row: the members share the port plan and the refusal wording, and two copies of the
+/// match would be a jscpd clone. The pinned test is `inkling2_rows_refuse_every_flag_as_of_s1`.
+fn inkling2(flag: Flag) -> Outcome {
+    armless_row(flag, INKLING_ARM_NOT_BUILT, INKLING_MTP_NOT_LOADED)
+}
+
+/// The shape every ARMLESS row shares: `--mtp` refuses with the draft-stack reason, every other
+/// cell with the arm-not-built reason. Two callers ([`qwen_flash_next`], [`inkling2`]); the
+/// factoring argument is on the first one's dated note.
+///
+/// The pattern is spelled BY VALUE so a new `Mode`, `AttnKind` or valueless flag is a compile
+/// error here, not a wildcard that silently accepts it.
+fn armless_row(flag: Flag, arm_not_built: &'static str, mtp_not_loaded: &'static str) -> Outcome {
     match flag {
-        // Its OWN wording, not the shared `MTP_DEFERRED`: that one says the draft head is not
-        // loaded, and here the draft layer is not even converted.
-        Flag::Mtp => Outcome::Refuse(QWEN_MTP_NOT_LOADED),
-        // Every other cell together, spelled by VALUE rather than with a wildcard, so a new
-        // `Mode` or `AttnKind` lands here as a compile error like everywhere else in this table.
+        // Each caller's OWN wording, not the shared `MTP_DEFERRED`: that one says the draft
+        // head is not loaded, while an armless architecture's draft stack is not even converted.
+        Flag::Mtp => Outcome::Refuse(mtp_not_loaded),
         Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid)
         | Flag::Attn(AttnKind::Dense | AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa)
         | Flag::CachePolicy
         | Flag::MaxMem
         | Flag::Ctx
-        | Flag::Trace => Outcome::Refuse(QWEN_ARM_NOT_BUILT),
+        | Flag::Trace => Outcome::Refuse(arm_not_built),
     }
 }
 

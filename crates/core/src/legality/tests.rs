@@ -196,6 +196,12 @@ fn muse_glimmer_row_is_the_m7_truth() {
 /// > 35-token jscpd clone of `Arch::ALL` (caught on this change's first full build), and it
 /// > would have failed OPEN — a sixth architecture would have gone unchecked here instead of
 /// > reddening until someone said which side of the line it is on.
+///
+/// > **GREW 2026-11-23 (inkling S1).** The armless list is now THREE — qwen plus Inkling 2's two
+/// > members — and the excluded ones are asserted from the other side by
+/// > [`qwen_flash_next_row_refuses_every_flag_as_of_s1`] and
+/// > [`inkling2_rows_refuse_every_flag_as_of_s1`]. The fail-closed argument is unchanged: a new
+/// > variant reddens here until someone says which side of the line it is on.
 #[test]
 fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
     let default_mode = parse_in(&MODES, "--mode", "int3-vq").expect("int3-vq parses");
@@ -204,7 +210,7 @@ fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
     // the statement. `main`'s `the_arms_and_the_legality_table_agree_about_who_can_start` is
     // the cross-check that this exclusion and the arms `main` dispatches to are the same
     // set — including, since S1, its previously unexercised no-arm branch.
-    const ARMLESS: [Arch; 1] = [Arch::QwenFlashNext];
+    const ARMLESS: [Arch; 3] = [Arch::QwenFlashNext, Arch::Inkling2Loop, Arch::Inkling2];
     for arch in Arch::ALL.into_iter().filter(|a| !ARMLESS.contains(a)) {
         for flag in [Flag::Mode(default_mode), Flag::Attn(default_attn)] {
             assert!(
@@ -326,22 +332,7 @@ fn kimi_k3_row_is_the_m9_truth() {
 /// > `a_qwen_mtp_invocation_is_refused_by_the_mode_cell_first`.
 #[test]
 fn qwen_flash_next_row_refuses_every_flag_as_of_s1() {
-    for flag in Flag::ALL {
-        let want = if flag == Flag::Mtp {
-            QWEN_MTP_NOT_LOADED
-        } else {
-            QWEN_ARM_NOT_BUILT
-        };
-        assert_eq!(
-            decide(Arch::QwenFlashNext, flag),
-            Outcome::Refuse(want),
-            "{} must REFUSE on {} while the arm does not exist — a Support cell would let a \
-             run start into a dispatch that bails, and a FallbackLoudly cell would promise a \
-             run that never happens",
-            flag.spelling(),
-            Arch::QwenFlashNext.name()
-        );
-    }
+    assert_row_refuses_everywhere(Arch::QwenFlashNext, QWEN_ARM_NOT_BUILT, QWEN_MTP_NOT_LOADED);
     // The two fragments the smoke script quotes. `--mtp` is the cell that stays refused after
     // the arm lands, so its reason must name the DRAFT LAYER's absence from the artifact and
     // the recurrence, not a decode-loop increment on a batch shape that already exists.
@@ -355,6 +346,51 @@ fn qwen_flash_next_row_refuses_every_flag_as_of_s1() {
         "qwen's --mtp reason must name the unconverted draft layer AND the recurrence a \
          verify pass would have to step: quoting another arm's wording tells the user to \
          wait for the wrong thing"
+    );
+}
+
+/// The cell-by-cell claim every ARMLESS row's test makes: refuse EVERY flag, with the row's own
+/// two consts. Hoisted when inkling's two members became the second and third armless rows
+/// (2026-11-23): the per-cell assert is nine lines carrying one long message, and a second copy
+/// is a jscpd clone at the gate's 5-line floor — the same forced factoring `armless_row` records
+/// on the production side. The fragment pins stay per-test: they are what differs between rows.
+fn assert_row_refuses_everywhere(arch: Arch, arm: &'static str, mtp: &'static str) {
+    for flag in Flag::ALL {
+        let want = if flag == Flag::Mtp { mtp } else { arm };
+        assert_eq!(
+            decide(arch, flag),
+            Outcome::Refuse(want),
+            "{} must REFUSE on {} while the arm does not exist — a Support cell would let a \
+             run start into a dispatch that bails, and a FallbackLoudly cell would promise a \
+             run that never happens",
+            flag.spelling(),
+            arch.name()
+        );
+    }
+}
+
+/// Inkling 2's rows, cell by cell, as of S1 — the same reddening-commit gate as
+/// [`qwen_flash_next_row_refuses_every_flag_as_of_s1`], for BOTH members: one port plan, one
+/// shared refusal, two variants. Pinned to the consts and their fragments for the same reason;
+/// `tests/smoke-inkling.sh` (S5) will quote the ARM fragment, and the MTP const stays test-only
+/// until the Mini row flips, on the ordering [`QWEN_MTP_NOT_LOADED`] documents.
+#[test]
+fn inkling2_rows_refuse_every_flag_as_of_s1() {
+    for arch in [Arch::Inkling2Loop, Arch::Inkling2] {
+        assert_row_refuses_everywhere(arch, INKLING_ARM_NOT_BUILT, INKLING_MTP_NOT_LOADED);
+    }
+    assert!(
+        INKLING_ARM_NOT_BUILT.contains("no decode path for this architecture yet")
+            && INKLING_ARM_NOT_BUILT.contains("Inkling 2's text stack is not built"),
+        "the arm-not-built refusal must say there is no decode path AND name the stack that is \
+         owed, so a reader can tell the two armless architectures' refusals apart"
+    );
+    assert!(
+        INKLING_MTP_NOT_LOADED.contains("DRAFT STACK IS NOT IN THE ARTIFACT")
+            && INKLING_MTP_NOT_LOADED.contains("loop"),
+        "inkling's --mtp reason must name the excluded draft file AND the looped recurrence a \
+         verify pass would have to replay: quoting another arm's wording tells the user to wait \
+         for the wrong thing"
     );
 }
 

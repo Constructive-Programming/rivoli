@@ -54,6 +54,15 @@ pub use rivoli_core::legality::Arch;
 /// > the nesting is mandatory and present, and every architecture dimension lives under
 /// > `text_config` (S0, 2026-08-31). The rule it states is unchanged and now load-bearing.
 ///
+/// **Inkling 2 is the fourth wrapper shape, and BOTH members are recognised at the root only.**
+/// Mini's root pair is `Inkling2LoopForConditionalGeneration` / `inkling2_loop`; its
+/// `text_config.model_type` is `inkling2_loop_text` and its `vision_config.model_type` is
+/// `inkling2_vision`. Small's root pair is `Inkling2ForConditionalGeneration` / `inkling2`, and
+/// its shipped `text_config` declares NO `model_type` at all. No nested spelling is accepted
+/// here — `inkling2_loop_text` and `inkling2_text` name the text half, `inkling2_vision` the
+/// tower — and [`crate::inkling_config`]'s `validate` asserts the nested shape where it can
+/// quote the key it descended through.
+///
 /// A free function rather than an inherent `Arch::from_manifest_str`, because the type is
 /// core's now and an inherent impl has to live with its type. Nothing else changed: this
 /// is the same match, in the same crate as the manifests it knows about.
@@ -64,6 +73,8 @@ pub fn from_manifest_str(s: &str) -> Option<Arch> {
         "KimiK3ForConditionalGeneration" | "kimi_k3" => Some(Arch::KimiK3),
         "MuseGlimmerForConditionalGeneration" | "muse_glimmer" => Some(Arch::MuseGlimmer),
         "Qwen4ExpForConditionalGeneration" | "qwen4_exp" => Some(Arch::QwenFlashNext),
+        "Inkling2LoopForConditionalGeneration" | "inkling2_loop" => Some(Arch::Inkling2Loop),
+        "Inkling2ForConditionalGeneration" | "inkling2" => Some(Arch::Inkling2),
         _ => None,
     }
 }
@@ -100,6 +111,31 @@ mod tests {
                 None,
                 "{s:?} must not resolve: it names the text half or another family member, and \
                  admitting it would let a trimmed or foreign config choose a decode path"
+            );
+        }
+    }
+
+    /// Inkling 2's four accepted spellings (two per member) and the three nested spellings that
+    /// must not resolve — the same claim as the qwen test above, for both members of one port.
+    /// `inkling2_text` is the reference class's spelling for Small's text half even though the
+    /// shipped Small `text_config` omits `model_type` entirely; a document declaring it is a
+    /// promoted sub-config, which is the shape this refusal exists for.
+    #[test]
+    fn inkling_accepts_its_root_spellings_and_refuses_the_nested_ones() {
+        for (s, want) in [
+            ("Inkling2LoopForConditionalGeneration", Arch::Inkling2Loop),
+            ("inkling2_loop", Arch::Inkling2Loop),
+            ("Inkling2ForConditionalGeneration", Arch::Inkling2),
+            ("inkling2", Arch::Inkling2),
+        ] {
+            assert_eq!(from_manifest_str(s), Some(want), "{s:?}");
+        }
+        for s in ["inkling2_loop_text", "inkling2_text", "inkling2_vision"] {
+            assert_eq!(
+                from_manifest_str(s),
+                None,
+                "{s:?} must not resolve: it names the text half or the vision tower, and \
+                 admitting it would let a trimmed config choose a decode path"
             );
         }
     }

@@ -1,0 +1,441 @@
+---
+status: live
+scope: inkling
+verdict: S0 THROUGH S4 ARE BUILT and S5-S8 are not -- the Inkling 2 port (owner scope 2026-11-23 both members, Mini first, text-only v1, MTP refused) has its identity pinned Mini @ 7a67ae23 and Small-MXFP8 @ 14f2cb29 vendored and hash-gated, the shared tiktoken rank file vendored once byte-identical between members, the Mini checkpoint downloaded and sha256-verified at 19.5 GB, the text-stack and loop math extracted with citations in reference/inkling2-architecture.md, and the checkpoint name mapping RESOLVED from transformers' on-load conversion ops. S1 lands the refusing-first surface (two Arch variants sharing scope inkling, root-only sniff, one shared text config behind two wrappers, a legality row refusing every cell, every door quoting INKLING_ARM_NOT_BUILT, two golden magics, a config-pin byte-compare gate), all red-proofed. S2 lands the Mini converter: a census::inkling classification module, an NVFP4/MXFP8 dequant oracle bit-compared against the first-party transformers ops (dequant-golden.json), and convert_inkling which consumed 822 TEXT tensors and excluded 422 vision tensors by name on the real shard, emitting 693 tensors whose names and shapes equal the first-party text model's state dict (text-model-names.tsv); mtp.safetensors never opened. S3 lands the first-party anchor: tiny-config CPU fp32 goldens from transformers' own inkling2_loop text model, three vendored byte-pinned goldens reproduced 3 of 3 (the decode pair is the model's CACHED step -- a 16-token prefill whose cache is not captured, then ONE token stepped against it, with every loop pass stored), a five-trap defect matrix reddening on both draws with declared first-touched buckets, and carved fp32-vs-fp64 tolerance floors (the reference is fp32-locked); see measurement/inkling2-reference/anchor.md. S4 lands ten ORACLE_VALIDATED Rust kernels (no C twin, owner direction 2026-11-24) -- l2_clip/scaled_l2_clip/log_scaled_l2_clip, mxfp8_dequant/nvfp4_dequant, sconv, sink_attend, message_gate, kv_scatter, rel_bias_gather -- each GPU-verified against a first-party CPU oracle with a recorded red proof (gate-red-proofs.md §22a-g), the census holding both ends (76 launchers, 10 oracle-validated, 16 classified uncalled); the MoE activation reuses situ_glu_f32 and RMSNorm reuses rmsnorm_single (measured bit-identical), and the block-residual/dynamic-sconv/rel-bias are reuse + S5 integration (the sink=-inf sink-less identity witnessed). S5 (the Mini engine arm) is next; Small-MXFP8 is the Small source because transformers supports no NVFP4 Small checkpoint.
+---
+
+# Inkling 2: port plan of record
+
+## Why this file exists
+
+Inkling 2 (Thinking Machines Lab, 2026-11) is the fifth model family in scope. Its text
+stack is unlike the four on record: looped decoder layers (Mini applies 12 stored layers
+three times), block-attention-residual query banks instead of plain residuals, short
+convolutions on every k/v path, attention sinks, softcapped SwiGLU, and TWO expert quant
+ABIs in one checkpoint (NVFP4 layers 0–19, MXFP8 layers 20–23). The math extraction and
+the checkpoint→HF name mapping live in
+[`docs/reference/inkling2-architecture.md`](../reference/inkling2-architecture.md); this
+file carries the plan, the pins, and the census answers. The Qwen port
+([qwen-flash-next-port.md](qwen-flash-next-port.md)) is the refusing-first precedent:
+recognition + legality + doors land RED before any engine code exists.
+
+## Owner scope decisions (2026-11-23)
+
+1. **Both members, Mini first.** One port plan for the shared `inkling2` text stack;
+   Mini is the iteration vehicle (19.5 GB, fits), Small becomes the P1
+   bigger-than-memory streaming case (~600 GB MXFP8 source).
+2. **Text-only v1.** The vision tower's weights are pinned and counted but EXCLUDED by
+   name from the converter; image input is refused loudly at the door.
+3. **MTP/DSpark deferred.** `mtp.safetensors` is downloaded and hash-verified but never
+   opened by the converter; `Flag::Mtp` refuses with its own const.
+4. **Small source = `Inkling-2-Small-MXFP8`**, not an NVFP4 Small: transformers' Small
+   path keeps MXFP8 experts quantized and its quant config declares MXFP8 for all 48
+   layers, zero NVFP4. The first-party-anchor rule selects this checkpoint. NVFP4
+   machinery is still built for Mini.
+
+## Stage legend
+
+| stage | what | state |
+|---|---|---|
+| S0 | identity: tokenizer TYPE, pins vendored, Mini weights verified, math + name mapping extracted, this plan registered | **built 2026-11-23** |
+| S1 | refusing-first landing: Arch variants + sniff + config types + legality rows + doors + golden magics + pin gate, each refusal red-proofed, deviceless battery green | **built 2026-11-23** |
+| S2 | Mini artifact converter: exact consumed/emitted counts, exclusions BY NAME (vision families, `mtp.*`), NVFP4/MXFP8 dequant per the first-party oracle, w13 de-interleave | **built 2026-11-24** |
+| S3 | anchors: transformers `main` @ `d8f10a82` + torch CPU venv; tiny-config fp32 goldens from the first-party text model, the decode pair being the model's own CACHED step with every loop pass captured; defect matrix off the traps table; carved fp32 tolerance floors on ≥2 draws (anchor.md) | **built 2026-11-24** |
+| S4 | kernels: ten ORACLE_VALIDATED Rust kernels (clips ×3, dequants ×2, sconv, sink_attend, message_gate, kv_scatter, rel_bias_gather), no C twin (owner 2026-11-24); MoE = `situ_glu_f32` reuse, RMSNorm = `rmsnorm_single` reuse; block-residual/dynamic-sconv/rel-bias = reuse + S5; census both ends; red proofs §22a–g | **built 2026-11-24** |
+| S5 | Mini engine arm (looped decode, per-pass cache residency) + parity/ppl gates + thin `tests/smoke-inkling.sh` WITH the exit gate | open |
+| S6 | Small streaming arm (Small-MXFP8 source download, residency plan) + its gates | open |
+| S7 | first measured decode + the gate battery on the box | open |
+| S8 | closeout: verdicts corrected in place, census answered out loud | open |
+
+S2-before-S3 is deliberate and does NOT violate the TDD ordering: the converter is
+scored by the census (exact counts from the derived TSV) and by the FIRST-PARTY dequant
+oracle (`core_model_loading.py:772–820`, already extracted), both of which exist before
+the converter is written. The model goldens (S3) score the KERNELS (S4), not the
+converter's byte layout — and because transformers converts the original checkpoint on
+load, S3 needs no rivoli converter at all. The two orderings are decoupled; the converter
+additionally gets a byte-level cross-check against the loader's dequanted experts.
+
+## Identity and pins
+
+Vendored under `docs/measurement/inkling2-reference/` (bytes + sha256 + FNV-1a64 in the
+TSV header and the pin gate; FNV-1a is `crates/core/src/hash.rs::fnv1a`, no sha256
+dependency in the gate):
+
+| pin | revision | note |
+|---|---|---|
+| `thinkingmachines/Inkling-2-Mini` | `7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6` | lastModified 2026-11-23T08:08:49Z |
+| `thinkingmachines/Inkling-2-Small-MXFP8` | `14f2cb29a5d0f4c1fda8f645fa339e936c2147a2` | lastModified 2026-11-20T14:10:39Z |
+| `huggingface/transformers` | `d8f10a82213a3a9db48385aba3a4b57ab535de50` (`main`) | inkling2 merged via PR #51050, `046bdb8cc2ce` 2026-11-21 |
+| `tiktoken.model` | 3,386,494 B, sha256 `f170372d…6ec0d8` | ONE copy; byte-identical between members |
+| Mini shard | `model-00001-of-00001.safetensors` 19,526,019,168 B, sha256 `65e60f51…3539d1` | on `/swarm/storage/ai/rivoli/inkling-2-mini-src/`, recomputed and matched to the HF LFS oid |
+| Mini MTP | `mtp.safetensors` 635,801,416 B, sha256 `7c3b6513…10a1d2` | verified, DEFERRED, never opened |
+
+`docs/measurement/inkling2-reference/mini/tensor-families.tsv` is DERIVED from the live
+shard header by script: 85 homogeneous (family, dtype, shape) rows; **1244 tensors** =
+822 TEXT (18,889,358,496 B) + 422 EXCLUDED-VISION (636,512,256 B); closure asserts
+header+payload = file size exactly. The converter's S2 counts come from this table, not
+from memory.
+
+**Name-mapping resolution (2026-11-23):** the blog's literal
+`convert_inkling2_weights_to_hf.py` link 404s at every ref — no standalone script was
+ever merged. What merged is the on-load conversion: `conversion_mapping.py`
+(`inkling2` :301, `inkling2_text` :353, loop built programmatically :2654–2707) +
+`core_model_loading.py` (`Interleave` :232, `Inkling2LoopDequantizeExperts` :772,
+`Inkling2LoopMergeMessageQueries` :823, `Inkling2UnpadVocab` :856,
+`Inkling2IndexOffsetWeightRename` :1266). The full rename table and dequant semantics
+are in the math doc §5–6.
+
+## S0 registration red proof (2026-11-23)
+
+The docs gate was run with both docs written but SCOPES/INDEX unregistered:
+`every_doc_declares_a_status_and_a_verdict` reddened on `scope 'inkling' is not one of
+[glm, v4, k3, engine, glimmer, qwen]` for BOTH docs, and
+`the_index_lists_every_doc_with_a_matching_verdict` reddened on both docs missing from
+the INDEX (exit 101; log `/var/cache/rivoli/scratch/inkling-docs-red.log`). Adding
+`"inkling"` to SCOPES and the two INDEX rows turned it green, 4/4
+(`inkling-docs-green.log`). The gate demonstrably refuses an unregistered port.
+
+## S1 landing and red proofs (2026-11-23)
+
+The refusing-first surface is built and the deviceless battery is green:
+`cargo test --workspace --no-default-features`, `cargo build -p rivoli --no-default-features`
+(the jscpd unit) and `cargo clippy --workspace --all-targets --no-default-features` all exit 0
+(`inkling-s1-test.log`, `inkling-s1-build.log`, `inkling-s1-clippy.log` under
+`/var/cache/rivoli/scratch/`). `inkling_config.rs` scores CodeScene 10.0. The new gates ran
+non-vacuously: the sniff test, the schema test, all four pin-gate cells (including the live
+shard-header cell, which read the 19.5 GB shard's header on `/swarm`), and the legality
+refusal test.
+
+Two jscpd/CodeScene falls forced structure rather than exemptions, both argued in place:
+the two wrapper `validate` bodies share one `validate_member` helper (a cloned
+`validate_root`-call pair would be a 5-line clone), and that helper takes FOUR arguments —
+the root pair bundled as one tuple, the expected spelling derived from `arch` inside — because
+the six-argument form scored 9.68 ("Excess Number of Function Arguments", Rust threshold 4).
+Mini's root-dtype `ensure!` is one line, not the five-line block `glimmer_config.rs:227` writes
+for the same bfloat16 rule: jscpd normalizes the message literal, so the block form clones it.
+
+Each S1 gate was shown red, then reverted (logs `inkling-red-{a,b,c,d}-*.log`):
+
+| gate | plant | observed red |
+|---|---|---|
+| (a) legality | `inkling2`'s `--ctx` cell flipped to `Outcome::Support` | `inkling2_rows_refuse_every_flag_as_of_s1` exit 101: `--ctx` left `Support`, right `Refuse(INKLING_ARM_NOT_BUILT)` |
+| (b) sniff | `inkling2_loop_text` admitted in `from_manifest_str` | `inkling_accepts_its_root_spellings_and_refuses_the_nested_ones` exit 101: left `Some(Inkling2Loop)`, right `None` |
+| (c) config | block-end complement predicate inverted (`!= 0` → `== 0`) | schema test exit 101: Mini `local_layer_ids` 20 entries vs derived 4 |
+| (d) pin gate | recorded `mini/config.json` fnv1a64 last digit `f`→`0` | `the_vendored_files_hash_as_the_header_records` exit 101: live `5279eda68ce19c6f` ≠ header `…60` |
+
+The docs-registration red proof is S0's (above); SCOPES already carries `inkling` and the
+INDEX row tracks this verdict.
+
+## S2 landing and red proofs (2026-11-24)
+
+The Mini converter is built and the deviceless battery is green (test/build/clippy exit 0,
+CodeScene 10.0 on every new file). Three pieces, each gated:
+
+- **`census::inkling`** (`crates/artifact/src/census/inkling.rs`): classifies every shard name by
+  (pattern, dtype, shape) — the key is NOT the pattern alone, because `attn_queries.{I}` and the
+  expert weights split into two rows by storage format. `confront` checks every family's count
+  both ends and each tensor's byte length; `tests/inkling_census.rs` scores it on the live shard
+  (1244 names → 822 TEXT / 422 vision) and deviceless (a full synthetic expansion passes; a dropped
+  tensor and an unknown name both redden).
+- **`inkling_dequant`** (`crates/artifact/src/inkling_dequant.rs`): the NVFP4 (e2m1 low-nibble-first,
+  e4m3 block-16 scale, per-expert amax/denominator) and MXFP8 (e4m3 × 2^(u8−127), row-wise [1,32])
+  dequant, w13 de-interleave, and (q,k,v,mlp) query merge — transcribed from LOAD:772–853.
+  `tests/inkling_dequant.rs` bit-compares the bf16 output (fnv1a64 + 64 spot values) against
+  `dequant-golden.json`, vendored from the ACTUAL transformers ops run on real experts (torch
+  2.15.0+cpu, transformers @ d8f10a82, venv at `/var/cache/rivoli/scratch/inkling-venv`). The
+  multiply association matches LOAD:813–814 exactly so the bf16 rounding agrees bit-for-bit.
+- **`convert_inkling`** (`crates/cli/src/bin/convert_inkling.rs`): consumed 822 TEXT tensors,
+  excluded 422 vision by name, never opened `mtp.safetensors`, and emitted 693 tensors (176 expert
+  tensors fused to 48 projections, 50 query tensors to 49, unembed unpadded to 200058 rows). The
+  run (`inkling-s2-convert.log`, ~19 min dev profile) wrote a 52.1 GB bf16 artifact to
+  `/var/cache/rivoli/scratch/inkling-mini-artifact`. `tests/inkling_convert.rs` compares the
+  artifact's names+shapes to `text-model-names.tsv` — the first-party `Inkling2LoopForCausalLM`
+  state dict (meta device), 693 params / 47 patterns — both ends.
+
+The 8-column census contract is now shared between qwen and inkling via `census.rs` (jscpd).
+
+| gate | plant | observed red |
+|---|---|---|
+| (e) census | `embed.weight` row count 1→2 (total kept consistent so load passes) | live confront exit 101: observed 1, census records 2 |
+| (f) dequant | NVFP4 nibble order swapped (high first, trap T2) | deviceless cells red (1.0≠0.5) AND first-party cross-check red (nvfp4_w13 bf16 fnv) |
+| (g) convert | `text-model-names.tsv` lm_head rows 200058→200059 | both cells exit 101: census shape and artifact mismatch |
+
+## S3 landing and red proofs (2026-11-24)
+
+The first-party anchor is built; the full record (stack pins, tiny config, goldens, defect
+matrix, tolerance floors, vacuous plants) is `docs/measurement/inkling2-reference/anchor.md`.
+`crates/oracles/tests/inkling-anchor.sh` regenerates it (venv torch 2.15.0+cpu + transformers @
+`d8f10a82`); `inkling_anchor_driver.py` runs the reference; `inkling_anchor.rs` is the deviceless
+gate (7 cells). Three goldens vendored byte-pinned and reproduced 3 of 3; a five-trap defect
+matrix reddens on both salts with declared first-touched buckets; tolerance floors carved
+fp32-vs-fp64 (the reference is fp32-locked, so a whole-model fp64 run shows zero diff).
+**Correction 2026-11-24 (review):** `--mode decode` was a plain 17-token forward wearing the name —
+it is now the model's own CACHED step (prefill `0..16` with `use_cache=True` and NO hooks, then ONE
+token stepped against that cache, so the conv-state shift, the KV append and the passes'
+`cache_offset` all execute), the loop layers `6`/`11`/`17` store all three of their passes, and
+both clip floors — previously `0`, because no captured vector reached `threshold` — are carved on
+an input scaled into the clamp branch. A golden now holds 16 float tensors, regenerated and
+reproduced 3 of 3 by `inkling-anchor.sh` (pins and 7-operator floors in `anchor.md`).
+
+| gate | plant | observed red |
+|---|---|---|
+| (h) anchor byte pin | last byte of `inkling-anchor-decode-inkling-1.bin` XOR 0xFF | `the_vendored_goldens_match_their_byte_pins` exit 101: FNV-1a mismatch |
+
+The defect matrix's own red is every row's `--compare`; two plants (L2Clip epsilon, router
+bias-in-weights) were measured vacuous at tiny widths / random init and replaced — recorded in
+anchor.md.
+
+## S4 kernel plan (reuse measured, 2026-11-24)
+
+The CPU operator references are `crates/oracles/src/inkling.rs` (6 tests, each encoding its
+trap). **Owner direction 2026-11-24: no C versions of the kernels.** Inkling's new kernels are
+Rust-only, validated against the first-party CPU oracle and the S3 anchor through an oracle
+suite — NOT the C→Rust bit-identity harness (which scores the legacy ports against tag
+`archive/hip-kernels`). The census gained an `ORACLE_VALIDATED` category (`kernel_coverage.rs`):
+a waived kernel still owes a `=>` launchers row and an oracle suite that cites it, checked both
+ends; it is waived only the C-twin gate row.
+
+**Measured reuses (no new kernel):**
+- MoE activation = `situ_glu_f32` (SoftcappedSwiGLU is SiTU-GLU; bit-identical, math doc §MoE).
+- RMSNorm = `rmsnorm_single` (T5-style weight-after-rsqrt; `weight·(x·inv)` commutes to the
+  kernel's `(x·inv)·weight`).
+
+**Genuinely new kernels (Rust + oracle suite, no C twin):**
+- L2Clip / ScaledL2Clip / LogScaledL2Clip (the q/k/rel norm clips; T4/T9).
+- Sink attention (softmax joins a sink logit then DROPS it; T10) — **single-query decode step
+  BUILT, then BATCHED** (below): one launch over `heads` blocks with the GQA head→kv-head map, an
+  on-device sink logit and a parallel block softmax; the rel-bias fold still arrives as the `bias`
+  array `rel_bias_gather` fills.
+- Relative-position bias (`rel_logits_proj` + the rel L2Clip).
+- Short convolution (inkling's `(conv+residual)/√(k+1)`, no SiLU — distinct from K3's
+  `short_conv_silu_f32`; T15). **Static decode step BUILT** (below); the dynamic variant follows.
+- Loop message gates (MessageGate down/gain/forget; the per-pass recurrence; T8/T16). **Pointwise
+  combine BUILT** (below); the down/forget/gain GEMVs and the per-pass recurrence are S5.
+- Block attention residual (query-bank attend; cf. K3 `attn_res`). **Reuse, not a new kernel** (below).
+- NVFP4 / MXFP8 expert dequant (the S2 `inkling_dequant` oracle is the CPU reference). **BOTH
+  BUILT** (below).
+
+Each lands as a complete Rust unit (kernel + kernarg + handle + launcher + oracle suite); the
+census refuses a kernel missing any of handle / launcher / oracle. **The clip family is BUILT
+and GPU-verified (all three)**: `l2_clip`, `scaled_l2_clip` (sliding-layer q/k norm, learned
+scale first), and `log_scaled_l2_clip` (full-layer q/k norm, scaled clip + LogScale τ),
+`kernel_inkling_l2clip.rs`, 8 tests against `rivoli_oracles::inkling::{l2_clip, scaled_l2_clip,
+log_scaled_l2_clip}`, flock + clean witness — the oracle match (one loop over both τ arms),
+clip-down-only, aliasing (its own in-place launch), unit-scale and unit-τ reductions, and the
+1001/1006 guards. The host launchers share a `ClipGuard` trait so each wrapper is one line
+(CodeScene 10.0); the suite's `clip_launch` dispatches all three through one four-arg helper.
+Red proofs: a bogus `ORACLE_VALIDATED` row reddens the census (i); removing the clip clamp
+reddens the GPU oracle (j). The attention/conv/loop/dequant kernels follow on the same path.
+**Correction 2026-11-24 (S5 wiring):** the clips are BATCHED — each kernel takes `rows` blocks,
+one block per row/head, and block `bid()` selects its row at offset `r·n`, so a prefill's q/k/rel
+norms are ONE launch rather than one per token; the kernargs and their sizes are unchanged
+(`L2Clip` 24 B, `ScaledL2Clip` 32 B with its `[rows, n]` scale, `LogScaledL2Clip` 40 B), and each
+launcher gained a leading `rows: Rows`.
+
+**The MXFP8 decode is BUILT and GPU-verified**: `mxfp8_dequant` (one e4m3 value per byte, one
+power-of-two scale per 32 values along the input dim, ROW-WISE `[1,32]`, T1),
+`kernel_inkling_dequant.rs`, 3 tests BIT-FOR-BIT against `rivoli_artifact::inkling_dequant::Mxfp8`
+(the decode is elementwise, so the fp8 LUT + `ldexp(1,e)` match `e4m3_to_f32` + `powi` exactly),
+flock + clean witness — the bitwise oracle over four expert/row/width grids, the T1 raw-exponent
+trap, and the 1001 geometry guards. Red proof (k, `gate-red-proofs.md` §22a): the scale bias
+`−127`→`−128` reddens the oracle and the T1 trap while the guard holds. The host geometry carries
+the fp8 LUT's LDS (`GEMV_FP8_LDS_BYTES`); the kernel reuses `gpu::fp8_lut`.
+
+**The NVFP4 decode is BUILT and GPU-verified**: `nvfp4_dequant` (two E2M1 codes per byte, the LOW
+nibble the even element, one e4m3 scale per 16 values, per-expert factor `amax[e]/denom`; T2/T3),
+3 tests BIT-FOR-BIT against `rivoli_artifact::inkling_dequant::Nvfp4` — the bitwise oracle over
+four grids (pinning the `(code·scale)·factor` association, LOAD:813), the T2 low-nibble-first trap,
+and the 1001/1006 geometry+denom guards. Red proof (`gate-red-proofs.md` §22b): swapping the
+nibbles reddens the oracle and the T2 trap while MXFP8 and the guards hold. The suite builds
+every case through `Nvfp4Case::new` (denom fixed at the shipped 448) and maps the case's fields
+into the CPU `Nvfp4` oracle so the device case and the reference cannot drift; the host geometry
+shares `elementwise_fp8_lds` with MXFP8.
+
+**The static sconv decode step is BUILT and GPU-verified**: `sconv` (a depthwise causal k-tap
+cross-correlation of the window `[past k−1, current]` plus the residual, divided by `√(k+1)`; T15),
+`kernel_inkling_sconv.rs`, 3 tests against `rivoli_oracles::inkling::sconv` — the oracle over five
+channel/tap grids (RELATIVE, the k-tap dot is a short reduction that may contract to FMA), the T15
+`√5` divisor trap, and the 1001/1006 geometry+divisor guards. Red proof (`gate-red-proofs.md`
+§22c): dropping the residual reddens the oracle and the T15 trap while the guard holds. The kernel
+is one thread per channel, no LDS. **Correction 2026-11-24:** the state SHIFT moved into the kernel
+(it takes the running `state [channels, k−1]` plus `current` and advances the state in place, so the
+layer loop keeps no window copy), and the dynamic variant is resolved in engine `pin.rs`'s
+`LayerSconv::Dynamic` (a static tap bank plus a `weight_proj` per side, divisor `√(2k+1)`) rather
+than left to S5.
+
+**The single-query sink attention is BUILT and GPU-verified**: `sink_attend` (one block stripes the
+`n` QK dots into LDS logits, thread 0 runs the max-subtracted softmax over `[logits, sink]` and
+drops the sink column, then the threads stripe the `d` weight·V outputs; T10),
+`kernel_inkling_sink_attend.rs`, 3 tests against `rivoli_oracles::inkling::sink_attend` — the oracle
+over five key/head grids (RELATIVE, the dots and the AV sum are reductions), the T10
+sink-absorbs-mass trap, and the 1001/1006 guards including the LDS budget — now
+`(n + one reduction block)·4 ≤ 65536`, because the parallel block softmax keeps a reduction scratch
+beside the logits. Red proof
+(`gate-red-proofs.md` §22d): dropping the sink from the denominator reddens the oracle and the T10
+trap while the guard holds. **Correction 2026-11-24 (S5 wiring):** the GQA repeat and the
+multi-query batch are INSIDE the kernel now — one launch covers `heads` blocks, each block maps its
+head to a kv head and computes one query row's sink softmax over a shared LDS logit block, and the
+per-head sink logit arrives as a `*const f32` read ON DEVICE, so the engine never reads it back and
+the layer loop carries no `device_sync`. The rel-bias fold still arrives as the `bias` array, which
+the engine gathers with `rel_bias_gather`.
+
+**The MessageGate pointwise combine is BUILT and GPU-verified**: `message_gate`
+(`out = (1−tanh(forget_logit))·hidden + tanh(gain_logit)·message`, fp32; MOD:196–200),
+`kernel_inkling_message_gate.rs`, 3 tests against `rivoli_oracles::inkling::message_gate` — the
+oracle over five hidden widths (RELATIVE, ocml's tanh is ~1 ulp from the host's), the
+forget-suppresses/gain-keeps trap, and the 1001 guard. Red proof (`gate-red-proofs.md` §22e):
+using `f` instead of `1−f` reddens the oracle and the trap while the guard holds. The down/forget/
+gain projections are GEMVs (the engine's linalg) and the per-pass recurrence (T8/T16) is S5.
+
+**The remaining S4 items are reuse + S5 integration, not new kernels** (analysis 2026-11-24, to be
+witnessed in S5):
+- *Block attention residual* (MOD:843–858): `norm(cat[block_states, partial])` then a sink-less
+  attend (`sinks=None`, scaling H^−0.5, no mask, groups=1). The norm is `rmsnorm_weightless_batch`
+  (UnweightedRMSNorm); the attend is `sink_attend` with `sink = −∞` — `exp(−∞−m)=0` removes the
+  sink column's mass, leaving the ordinary softmax. **Kernel half witnessed**:
+  `sink_attend_negative_infinity_sink_is_sinkless` (GPU == CPU oracle at sink=−∞, 2026-11-24). The
+  1/3-query bank and the block-bank norm are per-query calls + `rmsnorm_weightless_batch` (S5).
+- *Dynamic short convolution* (MOD:353–412): the static `sconv` kernel at `divisor = √(2k+1) = 3`
+  with the weight formed as `static_w + weight_proj(hidden)` (a GEMV); the conv-state shift is
+  engine bookkeeping.
+- *Relative-position bias* (MOD:196–227): the rel norm is the clip family (`scaled_l2_clip` /
+  `log_scaled_l2_clip`, threshold rel_l2_clip 8.0); `wr_du` and `rel_logits_proj` are GEMVs; the
+  `clamp(distance, 0, extent−1)` gather + `masked_fill` is engine indexing folded into `sink_attend`'s
+  `bias`. T17 (the extent's SOURCE differs sliding vs full) is an S5 config trap.
+
+So S4's new-kernel work is **ten ORACLE_VALIDATED kernels** (three clips, two dequants, sconv,
+sink_attend, message_gate, and the pair the S5 wiring forced into existence — `kv_scatter`, which
+appends one token's projected k/v into the per-head cache, and `rel_bias_gather`, which gathers a
+window's distances), each with a recorded red proof (§22a–g plus the clip i/j), plus the measured
+reuses (`situ_glu_f32`, `rmsnorm_single`). The census holds both ends (76 launchers, 10
+oracle-validated, 16 classified uncalled). The attention/conv/gate families are covered; what
+remains is the S5 engine arm that wires them with the position/cache/block-bank/loop logic.
+
+## S5 landing (begun 2026-11-24)
+
+The engine arm's deviceless foundation is landed: `crates/engine/src/inkling/geometry.rs` (the
+`inkling` module registered in `engine/lib.rs`) carries the loop's trap-carrying arithmetic as pure
+functions over plain data — `application_schedule` (Mini's 6 + 12·3 + 6 = 48 applications of 24
+stored layers; Small's plain 0..48), `is_block_boundary`/`is_block_end` (layer 0 IS a boundary, T7),
+`sconv_static_divisor`/`sconv_dynamic_divisor` (√5 vs 3, T15), `qk_scale`, and `loop_cache_offset`
+(T16: pass 2 → 18, pass 3 → 30, LOOP:542), `cache_layer_count` (48 cache layers for Mini), and the
+f32 scratch byte counts (residual/KV/sconv-state), the streamed-unit `expert_layer_bytes`, and
+`dense_layer_elements` (the resident per-layer footprint; full vs sliding differ by T11's norms).
+Twelve deviceless tests score these rules. The `rocm`-gated `engine.rs` allocates the decode scratch
+(`InklingScratch`: the residual stream plus the pre-loop and previous-pass copies the recurrence
+restarts from, the block bank, the four short-convolution states of EACH cache layer, a
+`ctx`-long K and V per cache layer, and the attention/logit buffers) from those byte counts; the
+rocm build is green. The 2026-11-24 review caught both sizings: ONE shared sconv state let a loop
+pass continue the window a previous pass left behind and let two layers of one pass share it, so the
+state is now indexed by cache layer; and the K/V pair had been allocated from the K+V layer total
+into each buffer, a 2× over-allocation.
+`names.rs` carries the artifact weight-name layout (the converter's rename-target census): the
+per-layer attention/MoE/norm suffixes, the full layers' three q/k/v input norms (T11), the
+block-residual query, and the globals (`lm_head.weight`, the final/message query banks). `pin.rs`
+carries `InklingLayerPin` (the resolved per-layer dense weights — bf16 projections, f32
+norms/sconv/queries) and `place_layer`, which resolves them from the artifact by name; the routed
+experts are the streamed unit, placed separately. A review correction gave the FULL layers their
+DYNAMIC k/v convolution (`static_weight` plus a `weight_proj` per side, divisor √(2k+1) = 3) instead
+of the static one — the two forms are a `LayerSconv` enum so a mis-classified layer cannot run the
+wrong conv — and made `attention_input.query` a field of every layer with `i > 0` (`[hidden]` on a
+sliding layer, `[3, hidden]` on a full one), which is where the block-residual bank's three queries
+live. `forward.rs` carries `proj` (the bf16 GEMM-at-m=1 projection), `logit_tail` (final norm +
+lm_head + softcap), the per-head `q_norm_sliding`/`k_norm`/`v_norm` (T4/T18), `gated_output` (the
+sigmoid output gate + o_proj), and `attend_gqa` (the batched sink softmax, T10). The same review
+reshaped the last two: `sink_attend` is launched ONCE over `heads` blocks with the GQA head→kv-head
+map and a parallel block softmax inside the kernel, and it reads the per-head sink logit from DEVICE
+memory — the `[heads]` vector `sink_proj` wrote stays a device pointer, so the layer loop has no
+per-layer readback and no `device_sync`. The clip family was batched at the same time (each kernel
+takes `rows` blocks, one per row/head, so a prefill's q/k norms are one launch rather than one per
+token), and `rel_bias_gather` gained the window's `start` (`key_pos = start + t`), which is what
+makes a window at `pos >= sliding_window_size` gather the right distances instead of reading from
+the cache's origin. The `SinkAttend` jscpd ABI exemption the unbatched field order needed is GONE —
+its q/k/v fields no longer collide with the test `AttendIo` helper — so the exemption ledger is back
+at 10. `l2_clip`, `scaled_l2_clip`, `log_scaled_l2_clip` and `sink_attend` now have production
+callers (the inventory's uncalled table shrank to 16).
+The `sconv` kernel was redesigned self-contained (2026-11-24): it takes the running `state`
+`[channels, k−1]` + `current` and advances the state in place (shift left one, append current), so
+the layer loop keeps no separate window copy; the oracle returns `(out, advanced_state)` and the
+suite checks the advance bitwise (§22c re-recorded with a residual plant and a state-advance plant).
+The KV cache is per-head-deinterleaved `[kv_heads, ctx, head_dim]` so `sink_attend` reads each head's
+`n` vectors contiguous (no gather); the append is the new `kv_scatter` kernel (2026-11-24, §22f),
+which scatters one token's projected k/v into the head blocks at `pos`; the rel-bias distance gather
+is the new `rel_bias_gather` kernel (2026-11-24, §22g). The attention scratch (k/v, rel_states,
+rel_logits, bias, sink, gate) and the static `kv_path` helper (proj → sconv → norm → kv_scatter) are
+landed; `sconv`/`kv_scatter` now have production callers. An S2 converter correction (2026-11-24):
+the f32-consumed norms/clip-scales/sconv weights are widened bf16→f32 (the launchers take f32 and
+`place_f32` requires F32), and rel_proj is transposed to `[rel_extent, d_rel]` for the m=heads GEMM
+(`gemm_bf16` computes x·wᵀ); the target-census TSV carries the transposed shape. The expert path is
+zero-copy and fused: the source bytes are the mmap'd slices, and the dequant writes bf16 DIRECTLY
+with the `w13` de-interleave folded in, so no f32 plane of a 128-expert layer is ever allocated. The
+attention sub-block is wired (`attention`: input norm(s) → q/kv/rel-bias/sink → GQA sink attend →
+gated output, the sink read ON DEVICE); the decoder layer (block-residual queries,
+post-attn/post-mlp sconv, MoE, residual) is the next piece.
+The layer-loop assembly (`forward`/`decode`), the residency partition, the parity/ppl gates, and
+`tests/smoke-inkling.sh` with its exit gate are the remaining S5 work.
+
+## Integration surface (S1's edit list)
+
+- `crates/core/src/legality.rs`: Arch variants (proposed `Inkling2Loop` for Mini,
+  `Inkling2` for Small; `name()`'s docs-scope contract must be checked first — two
+  arches share ONE scope `inkling`), `ARCH_COUNT` 5→7, `ALL`, ordinal/name/summary;
+  shared `INKLING_ARM_NOT_BUILT` + `INKLING_MTP_NOT_LOADED` consts, ONE row fn called by
+  both `decide` arms (jscpd); dated correction of `QWEN_ARM_NOT_BUILT`'s "only row that
+  refuses every cell" sentence; ARMLESS grows to 3.
+- `crates/artifact/src/arch.rs`: root-only sniff (`Inkling2LoopForConditionalGeneration`
+  | `inkling2_loop`, `Inkling2ForConditionalGeneration` | `inkling2`); nested
+  `inkling2_loop_text`/`inkling2_text` refused at the sniff, asserted in config validate.
+- `crates/artifact/src/inkling_config.rs` (new, qwen_config.rs template): two wrapper
+  types over ONE shared text config; `validate` asserts root+nested spellings, the
+  attribute_map JSON spellings, loop validate rules, and the behavior-pinned extra
+  fields (math doc §7).
+- `crates/artifact/src/schema.rs` tests against the vendored configs; pin gate mirroring
+  `tests/qwen_names.rs:456–480` over the TSV header (`include_bytes!`, length + FNV-1a).
+- Doors: `crates/cli/src/main.rs:179`, `bench.rs:112`, `serve/mod.rs:314`/`:365`, each
+  with fragment tests; `crates/oracles/src/golden.rs` `magic_of` exhaustive match forces
+  two new 8-byte MAGIC consts.
+- `crates/cli/tests/docs.rs` SCOPES gains `"inkling"`; INDEX gains exactly one row per
+  doc — landed in THIS change (S0), not "next commit".
+- Engine seam: NO qwen arm exists in `seam.rs` ArchCfg/Engine; likewise no inkling arm
+  at S1. Engine work starts S5.
+
+Naming exception (argued as in the qwen plan): arch-scoped modules
+(`inkling_config.rs`, `convert_inkling.rs`, `inkling_encoding.rs`, `engine/src/inkling/`)
+name a PORT BOUNDARY; kernels, traits and structs are behaviour+ABI named (skill §8).
+Model membership is data in the checked census tables.
+
+## Skill census (model-port §1–8), current answers
+
+1. **Vendored pins, recomputed**: S0 vendored both members' config/tokenizer/generation/
+   quant pins + the shared tiktoken file; the pin GATE (`crates/artifact/tests/inkling_pins.rs`,
+   recompute FNV-1a from the live vendored bytes, compare to the TSV header) landed S1 and is
+   red-proofed (d, above). CLOSED (S1).
+2. **Tokenizer TYPE first**: settled BEFORE weights moved — tiktoken BPE rank file,
+   200,055 lines, byte-identical between members; chat template pinned per member.
+   CLOSED (S0).
+3. **Converter exact counts, exclusions by name**: CLOSED (S2). `convert_inkling` consumed
+   822 TEXT tensors and excluded 422 EXCLUDED-VISION by name on the real shard (census confront,
+   `consumed == 822` guard); `mtp.safetensors` never opened. The output's 693 names+shapes equal
+   the first-party text model's state dict (`tests/inkling_convert.rs`).
+4. **First-party anchors + defect matrix**: CLOSED (S3). The DEQUANT oracle is first-party-
+   verified (S2, `dequant-golden.json`); the MODEL anchor (S3) runs transformers' own
+   `Inkling2LoopForCausalLM` over a tiny config, vendors three byte-pinned goldens reproduced
+   3 of 3, a five-trap defect matrix reddening on both draws with declared first-touched buckets,
+   and carved fp32-vs-fp64 tolerance floors (the reference is fp32-locked). Record:
+   `docs/measurement/inkling2-reference/anchor.md`; gate `crates/oracles/tests/inkling_anchor.rs`.
+5. **Kernel census both ends**: OPEN (S4); every new launcher gets a bit-identity ROWS
+   entry + `=>` row or a live DEFERRED row, never parked.
+6. **Registration in the SAME change**: this change adds `"inkling"` to SCOPES, both
+   docs, and their INDEX rows. CLOSED with S0.
+7. **Thin smoke WITH the exit gate**: OPEN (S5); `tests/smoke-inkling.sh` lands with the
+   Mini arm's exit gate, red-proofed.
+8. **Behaviour+ABI names**: OPEN until S4's kernels exist; the naming exception for
+   port-boundary modules is argued above.
+
+## Measurement posture
+
+Mini fits in memory; its gates are correctness gates (parity, ppl, bit-identity), not
+streaming measurements. Small is the P1 case: its S6 residency plan and bytes/token
+measurements follow `docs/measurement/how-to-measure.md` (flock, contention witness,
+no builds between arms, paired dNLL with the A-vs-A control). No number in this file or
+the math doc is a measurement of this box yet.

@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: Every GPU kernel launcher in the tree as a row — 66 of them, the same population `crates/cli/tests/kernel_coverage.rs` censuses at 66/66/0 — with the models that call it, the production site that calls it, and the mode that reaches it, all derived from the `launchers!` DSL and from the engine's own call sites rather than from memory. It also carries the 13 launchers that NO production code calls, each classified with the evidence that puts it in a category: superseded by a shipped sibling, implemented ahead of the arm that will call it (qwen S3 vs S6), or pending a deferred milestone (M13's GLM DSA). Reuse is measured, not hoped for: V4 is the most-shared kernel consumer (22 launchers) and `gemv_fp8`, `argmax`, `vadd` and `sigmoid_gate` each serve three or four architectures through one implementation. The uncalled table is enforced, not remembered — `kernel_coverage.rs`'s liveness census refuses an uncalled launcher absent from it, a stale row, and a row naming a launcher that no longer exists.
+verdict: Every GPU kernel launcher in the tree as a row — 76 of them, the same population `crates/cli/tests/kernel_coverage.rs` censuses at 76/76/0 (76 launchers, 76 with oracles, 0 deferred; its liveness census reads 60 with production callers, 16 classified uncalled, 10 oracle-validated) — with the models that call it, the production site that calls it, and the mode that reaches it, all derived from the `launchers!` DSL and from the engine's own call sites rather than from memory. It also carries the 16 launchers that NO production code calls, each classified with the evidence that puts it in a category: superseded by a shipped sibling, implemented ahead of the arm that will call it (qwen S3 vs S6), or pending a deferred milestone (M13's GLM DSA). Reuse is measured, not hoped for: V4 is the most-shared kernel consumer (22 launchers) and `gemv_fp8`, `argmax`, `vadd` and `sigmoid_gate` each serve three or four architectures through one implementation. The uncalled table is enforced, not remembered — `kernel_coverage.rs`'s liveness census refuses an uncalled launcher absent from it, a stale row, and a row naming a launcher that no longer exists.
 ---
 
 # The kernel inventory
@@ -80,6 +80,16 @@ column is a query, and a query can be wrong.
 | `rmsnorm_centered_single` | `rmsnorm_centered_single` | activation.rs | · | · | · | **✓** | · | glimmer/forward :: branch_add, pre_norm |
 | `rmsnorm_single` | `rmsnorm_single` | activation.rs | **✓** | · | **✓** | **✓** | · | glimmer/forward; glm/attn; glm/forward; k3/forward :: cache_and_absorb, embed_rows, qkv_project, rms_vec |
 | `rmsnorm_weightless_batch` | `rmsnorm_weightless_batch` | activation.rs | · | · | · | **✓** | · | glimmer/forward :: attention, embed |
+| `l2_clip` | *(no C twin)* | activation.rs | · | · | · | · | · | inkling/forward :: k_norm |
+| `scaled_l2_clip` | *(no C twin)* | activation.rs | · | · | · | · | · | inkling/forward :: q_norm |
+| `log_scaled_l2_clip` | *(no C twin)* | activation.rs | · | · | · | · | · | inkling/forward :: q_norm / rel_bias_path |
+| `mxfp8_dequant` | *(no C twin)* | activation.rs | · | · | · | · | · | *(inkling S6; oracle-validated, no C twin)* |
+| `nvfp4_dequant` | *(no C twin)* | activation.rs | · | · | · | · | · | *(inkling on-device NVFP4 decode, ahead of its arm; oracle-validated, no C twin)* |
+| `sconv` | *(no C twin)* | activation.rs | · | · | · | · | · | inkling/forward :: kv_path |
+| `sink_attend` | *(no C twin)* | activation.rs | · | · | · | · | · | inkling/forward :: attend_gqa |
+| `message_gate` | *(no C twin)* | activation.rs | · | · | · | · | · | *(inkling S5; oracle-validated, no C twin)* |
+| `kv_scatter` | *(no C twin)* | activation.rs | · | · | · | · | · | inkling/forward :: kv_path |
+| `rel_bias_gather` | *(no C twin)* | activation.rs | · | · | · | · | · | inkling/forward :: rel_bias_path |
 | `rope_interleave` | `rope_interleave` | activation.rs | **✓** | · | · | · | · | glm/attn :: cache_and_absorb |
 | `rope_split_half` | `rope_split_half` | activation.rs | · | · | · | **✓** | · | glimmer/forward :: attention |
 | `situ_glu_f32` | `situ_glu_f32` | activation.rs | · | · | **✓** | · | · | k3/forward :: situ_mlp |
@@ -144,7 +154,7 @@ column is a query, and a query can be wrong.
 | `index_score_blocks` | `index_score_blocks` | blockindex.rs | · | **✓** | · | · | · | v4/blocksel :: raw_scores |
 | `index_score_blocks_f32` | `index_score_blocks_f32` | indexer.rs | · | · | · | · | · | *(no production reference)* |
 
-## The 13 that no production code calls
+## The 16 that no production code calls
 
 Classified with primary evidence. A launcher here is either **wired** (name the milestone),
 **superseded** (delete it and its kernel body), or **pending a deferred chain** — the fourth
@@ -175,6 +185,9 @@ in `gate-red-proofs.md` §17 (2026-09-10).
 | `index_pool_norm_f32` | indexer.rs | **qwen S3 ahead of S6** | same |
 | `gated_residual_collapse_f32` | residual.rs | **qwen S3 ahead of S6** | same |
 | `index_score_blocks_f32` | indexer.rs | **qwen S3 ahead of S6** | the f32 sibling of V4's live `index_score_blocks`; `v4/blocksel.rs` calls the f4 pair, not this one |
+| `mxfp8_dequant` | activation.rs | **inkling S4, ahead of an arm that has not chosen on-device decode** | MXFP8 expert decode (row-wise `[1,32]` raw-exponent scale, T1); oracle-validated via `kernel_inkling_dequant.rs` against `rivoli_artifact::inkling_dequant::Mxfp8`. The same offline route covers it: `convert_inkling` dequantizes MXFP8 experts to bf16 with the NVFP4 ones, so a bf16 Small artifact would never call this kernel either — it stays oracle-validated for an on-device MXFP8 decode (S6) rather than being the one S6 is assumed to take |
+| `nvfp4_dequant` | activation.rs | **inkling S4, ahead of an arm that is not S5** | NVFP4 expert decode (two E2M1 codes/byte, low nibble first, e4m3 block-16 scale + per-expert amax/denominator, T2/T3); oracle-validated via `kernel_inkling_dequant.rs` against `rivoli_artifact::inkling_dequant::Nvfp4`. It is NOT on Mini's S5 path: `cli/src/bin/convert_inkling.rs` DEQUANTIZES the NVFP4 experts offline to bf16 (the reference's own `Inkling2LoopDequantizeExperts` on-load op, LOAD:772), so the artifact the Mini engine streams carries no NVFP4 and the decode path never calls this kernel. It is kept oracle-validated for a future ON-DEVICE NVFP4 decode, where the packed experts would ship instead of the widened ones |
+| `message_gate` | activation.rs | **inkling S4 ahead of S5** | loop MessageGate pointwise combine ((1−tanh(forget))·hidden + tanh(gain)·message; the down/forget/gain projections are GEMVs); oracle-validated via `kernel_inkling_message_gate.rs` against `rivoli_oracles::inkling::message_gate`; the inkling engine arm (S5) is its first production caller |
 
 **Two near-misses worth recording, because they were classified wrong before being checked.**
 `hash_rows` and `vq_encode` both look uncalled to a scan that only looks at `crates/engine/src`:

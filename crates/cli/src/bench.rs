@@ -16,7 +16,9 @@
 use crate::{BENCH_PROMPT, args::Args};
 use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::tokenizer::Tokenizer;
-use rivoli_core::legality::{ATTNS, Arch, MODES, QWEN_ARM_NOT_BUILT, name_in};
+use rivoli_core::legality::{
+    ATTNS, Arch, INKLING_ARM_NOT_BUILT, MODES, QWEN_ARM_NOT_BUILT, name_in,
+};
 use rivoli_engine::{Engine, GenSpec};
 use std::io::Write as _;
 
@@ -110,6 +112,10 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
         // hide is the worst-shaped one available: a prompt framed in SOME model's markers,
         // encoded, counted against `--ctx`, and reported as a bench that ran.
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
+        // The THIRD door quoting the table's const (inkling S1, 2026-11-23): same reachability
+        // argument as qwen above — a bench framed in some model's markers, counted against
+        // `--ctx` and reported as run, is the failure this bail hides. Both members, one wording.
+        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 

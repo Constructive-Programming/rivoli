@@ -1,0 +1,149 @@
+# rivoli / docs/measurement/inkling2-reference/mini/tensor-families.tsv
+# Inkling 2 Mini (`inkling2_loop`) tensor census — model-port census item 4.
+# Plan of record: docs/investigations/inkling2-port.md   House rules: CLAUDE.md
+#
+# THIS FILE IS DERIVED, NOT TRANSCRIBED. Every row was computed 2026-11-23 from the
+# safetensors HEADER of the single shard (first 8 bytes = LE u64 header length 148408,
+# then that many bytes of JSON) of the LOCAL copy at
+# /swarm/storage/ai/rivoli/inkling-2-mini-src/model-00001-of-00001.safetensors,
+# downloaded at resolve/<sha>/ and sha256-verified against the HF LFS oid. No payload
+# was read for this census. Family = tensor name with layers.<N> -> layers.{L} and
+# attn_res query indices -> {I}; rows split by (dtype, shape) so every row is homogeneous.
+# Columns: status  family  example  shape  dtype  count  bytes-per-tensor  total-bytes.
+#
+# ---- REVISION PIN (census item 1) --------------------------------------------------------
+# repo          thinkingmachines/Inkling-2-Mini   (HF, public)
+# revision sha  7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6
+# lastModified  2026-11-23T08:08:49.000Z
+# fetched at    2026-11-23T20:15:56Z  (all fetches used resolve/<sha>/<file>, never /main/)
+# sibling       thinkingmachines/Inkling-2-Small-MXFP8 @ 14f2cb29a5d0f4c1fda8f645fa339e936c2147a2
+#               lastModified 2026-11-20T14:10:39.000Z; pins vendored under ../small-mxfp8/
+# reference     huggingface/transformers main @ d8f10a82213a3a9db48385aba3a4b57ab535de50
+#               (models/inkling2, models/inkling2_loop, conversion_mapping.py, core_model_loading.py)
+#
+# ---- SHARD PIN (not vendored: 19.5 GB; re-fetchable at resolve/<sha>/) -------------------
+# model-00001-of-00001.safetensors  bytes 19526019168  sha256 65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1
+# mtp.safetensors                   bytes 635801416    sha256 7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2
+#   (both sha256s recomputed from the live local files and matched to the HF tree API LFS oids)
+#
+# ---- VENDORED BYTES (this directory and its parent; gate recomputes fnv1a64) -------------
+# mini/config.json                 bytes 2722  sha256 a7a349601f0984c4abf999c480ef775d8567d21f5f84b4e8a3e035b44f288dc2  fnv1a64 5279eda68ce19c6f
+# mini/generation_config.json      bytes 98  sha256 a08737c07a65a8fdf69f7cf086576210e5aad4b241437090b26d7b0c4f7905f7  fnv1a64 62f601d2f9968b18
+# mini/hf_quant_config.json        bytes 67924  sha256 7c656207d3ce37879c7be209a036b0dde43bf01f78159bff06880b868ed57143  fnv1a64 d9da81307f3dc091
+# mini/tokenizer_config.json       bytes 13235  sha256 bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636  fnv1a64 a2a8a6977f54752e
+# mini/special_tokens_map.json     bytes 529  sha256 c16f44b3594563d82743ddb0417a2be1bfe3e2000dfad2da4b8f32554593e1a0  fnv1a64 c3841277d2edfd61
+# mini/processor_config.json       bytes 461  sha256 d7350adce18c8be4b607f261c8f0f7eabbf720bb7aaf648a43d4f8372bbacc2d  fnv1a64 edd3e5fe785d18d2
+# mini/chat_template.jinja         bytes 6868  sha256 53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc  fnv1a64 73916286448643c8
+# tiktoken.model                   bytes 3386494  sha256 f170372dd655728909228220d77cf6b8104a59f38a91262a7d2c4027906ec0d8  fnv1a64 0f2429f7c3f00f68
+# small-mxfp8/config.json            bytes 2929  sha256 4e8ce9c2be0af55f5c13d8555b5cc52a0e9c74f6dc908b0933bd21e05a09d4c7  fnv1a64 c1f1ef689ea85732
+# small-mxfp8/generation_config.json bytes 55  sha256 16943d85e6306546d8b0844a67f9f198e6a157b8310374c1bdfe1b39a2d73e79  fnv1a64 801a6f9d2065dae5
+# small-mxfp8/hf_quant_config.json   bytes 88356  sha256 778af00cedf00beb3f5b038abf75c992933d4639e07bba986ffa87efbb1eaf85  fnv1a64 3c1836695ae2741a
+# small-mxfp8/processor_config.json  bytes 394  sha256 b326f9a5d49c037c463045bec4d80229f5463048df7d6de95b597667888228ae  fnv1a64 df0cea62193e0614
+# small-mxfp8/chat_template.jinja    bytes 6868  sha256 53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc  fnv1a64 73916286448643c8
+# small-mxfp8/special_tokens_map.json bytes 529  sha256 c16f44b3594563d82743ddb0417a2be1bfe3e2000dfad2da4b8f32554593e1a0  fnv1a64 c3841277d2edfd61
+# small-mxfp8/tokenizer_config.json  bytes 13235  sha256 bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636  fnv1a64 a2a8a6977f54752e
+#   small-mxfp8's chat_template / special_tokens_map / tokenizer_config are byte-identical to
+#   mini's (sha256 and fnv1a64 equal); the gate asserts that identity rather than trusting it.
+#   tiktoken.model is the BPE rank file (200055 lines), byte-identical between Mini and
+#   Small-MXFP8 (sha256 equal); vendored ONCE at the parent level. The members' 26 MB
+#   tokenizer.json files are derived fast-tokenizer serializations — NOT vendored, NOT
+#   read by the runtime (the tiktoken path is, crates/artifact/src/tiktoken.rs).
+#
+# ---- CENSUS CLOSURE (the assert this file exists to make checkable) ---------------------
+# tensors in the shard header            1244
+# sum of `count` over all family rows    1244
+# EQUAL: True   -- every tensor lands in exactly one family row
+# family rows                            85
+# payload bytes (header data_offsets)    19525870752
+# 8 + 148408 + 19525870752 = 19526019168 = file size 19526019168: True
+# STATUS TEXT             tensors 822  params 17279653416  bytes 18889358496
+# STATUS EXCLUDED-VISION  tensors 422  bytes 636512256
+#   EXCLUDED-VISION = every model.visual.* family: the text-only v1 refusal scope. The
+#   converter must exclude them BY NAME and count them; mtp.safetensors is a separate
+#   file, refused by Flag::Mtp, never opened by the text converter.
+#
+TEXT	model.llm.attn_res.attn_queries.{I}	model.llm.attn_res.attn_queries.0	2304	F32	19	9216	175104
+TEXT	model.llm.attn_res.attn_queries.{I}	model.llm.attn_res.attn_queries.10	3x2304	F32	4	27648	110592
+TEXT	model.llm.attn_res.mlp_queries.{I}	model.llm.attn_res.mlp_queries.0	2304	F32	24	9216	221184
+TEXT	model.llm.attn_res.output_query	model.llm.attn_res.output_query	2304	F32	1	9216	9216
+TEXT	model.llm.embed.weight	model.llm.embed.weight	201024x2304	BF16	1	926318592	926318592
+TEXT	model.llm.embed_norm.weight	model.llm.embed_norm.weight	2304	BF16	1	4608	4608
+TEXT	model.llm.layers.{L}.attn.attn_sink_proj.weight	model.llm.layers.0.attn.attn_sink_proj.weight	24x2304	BF16	24	110592	2654208
+TEXT	model.llm.layers.{L}.attn.gate_attn.weight	model.llm.layers.0.attn.gate_attn.weight	3072x2304	BF16	24	14155776	339738624
+TEXT	model.llm.layers.{L}.attn.k_sconv.static_w	model.llm.layers.11.attn.k_sconv.static_w	4x1024	BF16	4	8192	32768
+TEXT	model.llm.layers.{L}.attn.k_sconv.weight	model.llm.layers.0.attn.k_sconv.weight	1024x1x4	BF16	20	8192	163840
+TEXT	model.llm.layers.{L}.attn.k_sconv.weight_proj	model.llm.layers.11.attn.k_sconv.weight_proj	32x2304	BF16	4	147456	589824
+TEXT	model.llm.layers.{L}.attn.q_l2_clip.scale	model.llm.layers.0.attn.q_l2_clip.scale	24x128	BF16	24	6144	147456
+TEXT	model.llm.layers.{L}.attn.rel_l2_clip.scale	model.llm.layers.0.attn.rel_l2_clip.scale	24x16	BF16	24	768	18432
+TEXT	model.llm.layers.{L}.attn.rel_logits_proj.proj	model.llm.layers.0.attn.rel_logits_proj.proj	16x1024	BF16	24	32768	786432
+TEXT	model.llm.layers.{L}.attn.v_sconv.static_w	model.llm.layers.11.attn.v_sconv.static_w	4x1024	BF16	4	8192	32768
+TEXT	model.llm.layers.{L}.attn.v_sconv.weight	model.llm.layers.0.attn.v_sconv.weight	1024x1x4	BF16	20	8192	163840
+TEXT	model.llm.layers.{L}.attn.v_sconv.weight_proj	model.llm.layers.11.attn.v_sconv.weight_proj	32x2304	BF16	4	147456	589824
+TEXT	model.llm.layers.{L}.attn.wk_dv.weight	model.llm.layers.0.attn.wk_dv.weight	1024x2304	BF16	24	4718592	113246208
+TEXT	model.llm.layers.{L}.attn.wo_ud.weight	model.llm.layers.0.attn.wo_ud.weight	2304x3072	BF16	24	14155776	339738624
+TEXT	model.llm.layers.{L}.attn.wq_du.weight	model.llm.layers.0.attn.wq_du.weight	3072x2304	BF16	24	14155776	339738624
+TEXT	model.llm.layers.{L}.attn.wr_du.weight	model.llm.layers.0.attn.wr_du.weight	384x2304	BF16	24	1769472	42467328
+TEXT	model.llm.layers.{L}.attn.wv_dv.weight	model.llm.layers.0.attn.wv_dv.weight	1024x2304	BF16	24	4718592	113246208
+TEXT	model.llm.layers.{L}.attn_norm.weight	model.llm.layers.0.attn_norm.weight	2304	BF16	20	4608	92160
+TEXT	model.llm.layers.{L}.attn_sconv.weight	model.llm.layers.0.attn_sconv.weight	2304x1x4	BF16	24	18432	442368
+TEXT	model.llm.layers.{L}.controllers.attn.down_weight	model.llm.layers.10.controllers.attn.down_weight	64x4608	BF16	12	589824	7077888
+TEXT	model.llm.layers.{L}.controllers.attn.forget_weight	model.llm.layers.10.controllers.attn.forget_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.controllers.attn.gain_weight	model.llm.layers.10.controllers.attn.gain_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.controllers.k.down_weight	model.llm.layers.10.controllers.k.down_weight	64x4608	BF16	12	589824	7077888
+TEXT	model.llm.layers.{L}.controllers.k.forget_weight	model.llm.layers.10.controllers.k.forget_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.controllers.k.gain_weight	model.llm.layers.10.controllers.k.gain_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.controllers.mlp.down_weight	model.llm.layers.10.controllers.mlp.down_weight	64x4608	BF16	12	589824	7077888
+TEXT	model.llm.layers.{L}.controllers.mlp.forget_weight	model.llm.layers.10.controllers.mlp.forget_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.controllers.mlp.gain_weight	model.llm.layers.10.controllers.mlp.gain_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.controllers.v.down_weight	model.llm.layers.10.controllers.v.down_weight	64x4608	BF16	12	589824	7077888
+TEXT	model.llm.layers.{L}.controllers.v.forget_weight	model.llm.layers.10.controllers.v.forget_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.controllers.v.gain_weight	model.llm.layers.10.controllers.v.gain_weight	2304x64	BF16	12	294912	3538944
+TEXT	model.llm.layers.{L}.k_input_norm.weight	model.llm.layers.11.k_input_norm.weight	2304	BF16	4	4608	18432
+TEXT	model.llm.layers.{L}.mlp.experts.w13_weight	model.llm.layers.20.mlp.experts.w13_weight	128x2304x2304	F8_E4M3	4	679477248	2717908992
+TEXT	model.llm.layers.{L}.mlp.experts.w13_weight	model.llm.layers.0.mlp.experts.w13_weight	128x2304x1152	U8	20	339738624	6794772480
+TEXT	model.llm.layers.{L}.mlp.experts.w13_weight_amax	model.llm.layers.0.mlp.experts.w13_weight_amax	128	F32	20	512	10240
+TEXT	model.llm.layers.{L}.mlp.experts.w13_weight_outer_scale_denominator	model.llm.layers.0.mlp.experts.w13_weight_outer_scale_denominator	1	F32	20	4	80
+TEXT	model.llm.layers.{L}.mlp.experts.w13_weight_scale	model.llm.layers.0.mlp.experts.w13_weight_scale	128x2304x144	F8_E4M3	20	42467328	849346560
+TEXT	model.llm.layers.{L}.mlp.experts.w13_weight_scale	model.llm.layers.20.mlp.experts.w13_weight_scale	128x2304x72	U8	4	21233664	84934656
+TEXT	model.llm.layers.{L}.mlp.experts.w2_weight	model.llm.layers.20.mlp.experts.w2_weight	128x2304x1152	F8_E4M3	4	339738624	1358954496
+TEXT	model.llm.layers.{L}.mlp.experts.w2_weight	model.llm.layers.0.mlp.experts.w2_weight	128x2304x576	U8	20	169869312	3397386240
+TEXT	model.llm.layers.{L}.mlp.experts.w2_weight_amax	model.llm.layers.0.mlp.experts.w2_weight_amax	128	F32	20	512	10240
+TEXT	model.llm.layers.{L}.mlp.experts.w2_weight_outer_scale_denominator	model.llm.layers.0.mlp.experts.w2_weight_outer_scale_denominator	1	F32	20	4	80
+TEXT	model.llm.layers.{L}.mlp.experts.w2_weight_scale	model.llm.layers.0.mlp.experts.w2_weight_scale	128x2304x72	F8_E4M3	20	21233664	424673280
+TEXT	model.llm.layers.{L}.mlp.experts.w2_weight_scale	model.llm.layers.20.mlp.experts.w2_weight_scale	128x2304x36	U8	4	10616832	42467328
+TEXT	model.llm.layers.{L}.mlp.gate.bias	model.llm.layers.0.mlp.gate.bias	128	F32	24	512	12288
+TEXT	model.llm.layers.{L}.mlp.gate.weight	model.llm.layers.0.mlp.gate.weight	128x2304	BF16	24	589824	14155776
+TEXT	model.llm.layers.{L}.mlp_norm.weight	model.llm.layers.0.mlp_norm.weight	2304	BF16	24	4608	110592
+TEXT	model.llm.layers.{L}.mlp_sconv.weight	model.llm.layers.0.mlp_sconv.weight	2304x1x4	BF16	24	18432	442368
+TEXT	model.llm.layers.{L}.q_input_norm.weight	model.llm.layers.11.q_input_norm.weight	2304	BF16	4	4608	18432
+TEXT	model.llm.layers.{L}.v_input_norm.weight	model.llm.layers.11.v_input_norm.weight	2304	BF16	4	4608	18432
+TEXT	model.llm.middle_cycle_cross_pass_kv_queries	model.llm.middle_cycle_cross_pass_kv_queries	24x2304	F32	1	221184	221184
+TEXT	model.llm.middle_cycle_cross_pass_queries	model.llm.middle_cycle_cross_pass_queries	24x2304	F32	1	221184	221184
+TEXT	model.llm.norm.weight	model.llm.norm.weight	2304	BF16	1	4608	4608
+TEXT	model.llm.unembed.weight	model.llm.unembed.weight	201024x2304	BF16	1	926318592	926318592
+EXCLUDED-VISION	model.visual.backbone.embeddings.class_embedding	model.visual.backbone.embeddings.class_embedding	1024	BF16	1	2048	2048
+EXCLUDED-VISION	model.visual.backbone.embeddings.cls_position_embedding	model.visual.backbone.embeddings.cls_position_embedding	1024	BF16	1	2048	2048
+EXCLUDED-VISION	model.visual.backbone.embeddings.patch_embedding.weight	model.visual.backbone.embeddings.patch_embedding.weight	1024x1200	BF16	1	2457600	2457600
+EXCLUDED-VISION	model.visual.backbone.embeddings.position_embedding	model.visual.backbone.embeddings.position_embedding	1024x1024	BF16	1	2097152	2097152
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.ln_1.bias	model.visual.backbone.layers.0.ln_1.bias	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.ln_1.weight	model.visual.backbone.layers.0.ln_1.weight	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.ln_2.bias	model.visual.backbone.layers.0.ln_2.bias	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.ln_2.weight	model.visual.backbone.layers.0.ln_2.weight	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.ls_1.gamma	model.visual.backbone.layers.0.ls_1.gamma	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.ls_2.gamma	model.visual.backbone.layers.0.ls_2.gamma	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.mlp.c_fc.bias	model.visual.backbone.layers.0.mlp.c_fc.bias	4096	BF16	23	8192	188416
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.mlp.c_fc.weight	model.visual.backbone.layers.0.mlp.c_fc.weight	4096x1024	BF16	23	8388608	192937984
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.mlp.c_proj.bias	model.visual.backbone.layers.0.mlp.c_proj.bias	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.mlp.c_proj.weight	model.visual.backbone.layers.0.mlp.c_proj.weight	1024x4096	BF16	23	8388608	192937984
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.k_proj.bias	model.visual.backbone.layers.0.self_attn.k_proj.bias	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.k_proj.weight	model.visual.backbone.layers.0.self_attn.k_proj.weight	1024x1024	BF16	23	2097152	48234496
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.out_proj.bias	model.visual.backbone.layers.0.self_attn.out_proj.bias	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.out_proj.weight	model.visual.backbone.layers.0.self_attn.out_proj.weight	1024x1024	BF16	23	2097152	48234496
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.q_proj.bias	model.visual.backbone.layers.0.self_attn.q_proj.bias	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.q_proj.weight	model.visual.backbone.layers.0.self_attn.q_proj.weight	1024x1024	BF16	23	2097152	48234496
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.v_proj.bias	model.visual.backbone.layers.0.self_attn.v_proj.bias	1024	BF16	23	2048	47104
+EXCLUDED-VISION	model.visual.backbone.layers.{L}.self_attn.v_proj.weight	model.visual.backbone.layers.0.self_attn.v_proj.weight	1024x1024	BF16	23	2097152	48234496
+EXCLUDED-VISION	model.visual.backbone.ln_pre.bias	model.visual.backbone.ln_pre.bias	1024	BF16	1	2048	2048
+EXCLUDED-VISION	model.visual.backbone.ln_pre.weight	model.visual.backbone.ln_pre.weight	1024	BF16	1	2048	2048
+EXCLUDED-VISION	model.visual.proj_in.weight	model.visual.proj_in.weight	4096x4096	BF16	1	33554432	33554432
+EXCLUDED-VISION	model.visual.proj_out.weight	model.visual.proj_out.weight	2304x4096	BF16	1	18874368	18874368

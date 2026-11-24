@@ -36,7 +36,8 @@ const STATUSES: [&str; 5] = [
 // scope: in the old tree, npu-offload.md's closed-negative was measured on GLM-5.2 and
 // says nothing about the V4 port (2026-08-07, the correction that motivated this field).
 // `qwen` joined 2026-08-31 for the Qwen3.8-Flash-Next port, family-short like glm/glimmer.
-const SCOPES: [&str; 6] = ["glm", "v4", "k3", "engine", "glimmer", "qwen"];
+// `inkling` joined 2026-11-23 for the Inkling 2 port (both members, one scope).
+const SCOPES: [&str; 7] = ["glm", "v4", "k3", "engine", "glimmer", "qwen", "inkling"];
 
 /// A doc's front matter. Named fields rather than a tuple because all three travel together
 /// through both tests below, and position stopped being readable at the third one.

@@ -24,7 +24,9 @@ use rivoli_artifact::{
     tokenizer::Tokenizer, v4_config::V4Config,
 };
 use rivoli_core::cache::TwoQSplit;
-use rivoli_core::legality::{Arch, Flag, Mode, Outcome, QWEN_ARM_NOT_BUILT, decide};
+use rivoli_core::legality::{
+    Arch, Flag, INKLING_ARM_NOT_BUILT, Mode, Outcome, QWEN_ARM_NOT_BUILT, decide,
+};
 use rivoli_engine::{ArchCfg, Engine, OpenSpec, PoolKnobs};
 
 // Private to the binary rather than `pub` in `lib.rs`: these have exactly one consumer,
@@ -177,6 +179,11 @@ fn main() -> Result<()> {
         // refuses `--mode` and `--attn`, which every invocation asks for — and the ARMS test
         // below ties those two halves together. S6 replaces this arm with a real one.
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
+        // Inkling 2's two members, armless as of S1 (2026-11-23) on the same shape as qwen:
+        // `check_legality` refuses every flag they ask for, so this bail is unreachable while
+        // the row holds, and the ARMS test below ties the two halves together. One const for
+        // both members — the port is one shared text stack. S5 gives Mini a real arm; S6 Small.
+        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 
@@ -454,16 +461,22 @@ mod tests {
         }
     }
 
-    /// **Which refusal a `--mtp` invocation on the armless architecture actually PRINTS.**
+    /// **Which refusal a `--mtp` invocation on an ARMLESS architecture actually PRINTS.**
     ///
-    /// `rivoli_core::legality`'s qwen row answers `--mtp` with its own 964-character wording,
-    /// and a reader — including whoever writes `tests/smoke-qwen.sh`'s `--mtp` cell at S6 —
-    /// will assume a user sees it. They do not: [`requested_flags`] puts `Flag::Mode` first
-    /// and [`check_legality`] bails on the FIRST `Refuse`, so the `--mode` cell answers and
-    /// the run stops. The consequence is a smoke expectation, which is why it is gated here
-    /// rather than left as a comment: until the arm row flips, that cell must quote
-    /// `QWEN_ARM_NOT_BUILT`'s fragment, and after it flips this test's `Refuse` becomes a
-    /// `Support` and reddens exactly where the expectation has to change.
+    /// `rivoli_core::legality`'s qwen and inkling rows each answer `--mtp` with their own
+    /// wording (qwen's is 964 characters), and a reader — including whoever writes
+    /// `tests/smoke-qwen.sh`'s `--mtp` cell at S6 — will assume a user sees it. They do not:
+    /// [`requested_flags`] puts `Flag::Mode` first and [`check_legality`] bails on the FIRST
+    /// `Refuse`, so the `--mode` cell answers and the run stops. The consequence is a smoke
+    /// expectation, which is why it is gated here rather than left as a comment: until an arm
+    /// row flips, that cell must quote the architecture's ARM_NOT_BUILT fragment, and after it
+    /// flips this test's `Refuse` becomes a `Support` and reddens exactly where the expectation
+    /// has to change.
+    ///
+    /// **All three armless architectures**, each against its OWN const: `Arch::Inkling2Loop`
+    /// and `Arch::Inkling2` share a legality row, so a future split that gives one of them an
+    /// arm is the change this loop is positioned to catch — and the Inkling `--mtp` ordering is
+    /// gated without a second copy of this body.
     ///
     /// Asserted on the ORDER and on the outcome of the first flag, not on a formatted string:
     /// the wording belongs to the table, and re-asserting it here would be the second
@@ -486,11 +499,21 @@ mod tests {
             "--mtp was typed and must be among the requested flags: {flags:?}"
         );
         let first = *flags.first().expect("at least --mode");
-        assert_eq!(
-            decide(Arch::QwenFlashNext, first),
-            Outcome::Refuse(QWEN_ARM_NOT_BUILT),
-            "the FIRST cell judged on the armless architecture is what the user reads"
-        );
+        // One row per architecture with no decode arm, each with the const its table row
+        // answers `--mode` with. The array is the population: a fourth armless architecture
+        // added without a row here leaves its `--mtp` ordering unchecked.
+        const ARMLESS: [(Arch, &str); 3] = [
+            (Arch::QwenFlashNext, QWEN_ARM_NOT_BUILT),
+            (Arch::Inkling2Loop, INKLING_ARM_NOT_BUILT),
+            (Arch::Inkling2, INKLING_ARM_NOT_BUILT),
+        ];
+        for (arch, want) in ARMLESS {
+            assert_eq!(
+                decide(arch, first),
+                Outcome::Refuse(want),
+                "the FIRST cell judged on {arch:?} is what the user reads"
+            );
+        }
     }
 
     /// **The arms `main` dispatches to and the table's refusals must name the same set.**

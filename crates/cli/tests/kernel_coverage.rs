@@ -540,6 +540,27 @@ fn every_rust_kernel_has_exactly_one_host_handle() {
 /// `tests/determinism-glm.sh` on the `--arena-refresh` arm, which is what the read exists for.
 const UNROWED: [&str; 1] = ["touch_region"];
 
+/// New-model kernels with no legacy C twin — owner direction 2026-11-24: inkling needs no C
+/// versions. Each is validated against the first-party CPU oracle (`rivoli_oracles`) and the S3
+/// anchor through its oracle suite, NOT the C→Rust bit-identity harness, so it is waived the
+/// C-twin gate row. It still owes a `=>` launchers row (the arrows census) and an oracle suite
+/// (the oracle census). `(kernel, suite)` is checked at both ends in
+/// [`every_rust_kernel_has_a_gate_row_and_a_launchers_row`]: the kernel is shipped and the suite
+/// exists and cites its launcher. A row dies loudly when its kernel stops being shipped or its
+/// suite stops covering it — the same both-ends discipline as [`DEFERRED`], not an exemption list.
+const ORACLE_VALIDATED: &[(&str, &str)] = &[
+    ("l2_clip", "kernel_inkling_l2clip.rs"),
+    ("scaled_l2_clip", "kernel_inkling_l2clip.rs"),
+    ("log_scaled_l2_clip", "kernel_inkling_l2clip.rs"),
+    ("mxfp8_dequant", "kernel_inkling_dequant.rs"),
+    ("nvfp4_dequant", "kernel_inkling_dequant.rs"),
+    ("sconv", "kernel_inkling_sconv.rs"),
+    ("sink_attend", "kernel_inkling_sink_attend.rs"),
+    ("message_gate", "kernel_inkling_message_gate.rs"),
+    ("kv_scatter", "kernel_inkling_kv_scatter.rs"),
+    ("rel_bias_gather", "kernel_inkling_rel_bias.rs"),
+];
+
 /// The bit-identity gate's `ROWS` table: each entry's kernel name, and whether its row
 /// function binds that kernel's tagged C launcher (`c"rivoli_<name>"`, the symbol it scores
 /// against) — so an entry pointing at another kernel's row cannot stand in for this one.
@@ -583,6 +604,7 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
             "UNROWED names `{u}`, which is not a shipped gpu-kernel — delete the exemption"
         );
     }
+    assert_oracle_validated(&device);
     let (rowed, stale) = (rowed_names(), stale_launched_by());
     // A `=>` row names its Rust host launcher `rivoli_<kernel>`; that launcher's own
     // `Kernel::new(c"<kernel>")` is held by the host-handle census above.
@@ -599,13 +621,18 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
     let rows: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
     // Every finding from both populations, gathered before one assert, so a defect that
     // breaks both shows both (a first assert would mask the second).
+    let rowed_gate: Vec<String> = rowed
+        .iter()
+        .filter(|n| !ORACLE_VALIDATED.iter().any(|(k, _)| *k == n.as_str()))
+        .cloned()
+        .collect();
     let report: Vec<String> = [
-        ("the bit-identity ROWS table", &rows),
-        ("the `=>` launchers! rows", &arrows),
+        ("the bit-identity ROWS table", &rows, &rowed_gate),
+        ("the `=>` launchers! rows", &arrows, &rowed),
     ]
     .iter()
-    .flat_map(|(what, population)| {
-        let (missing, extra) = one_sided(&rowed, population);
+    .flat_map(|(what, population, rowed_pop)| {
+        let (missing, extra) = one_sided(rowed_pop, population);
         [
             (
                 format!("row names (a kernel, or its LAUNCHED_BY launcher) missing from {what}"),
@@ -634,13 +661,39 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
     .collect();
     assert!(report.is_empty(), "\n\n{}", report.join("\n\n"));
     println!(
-        "{} Rust kernels: {} rows (a gate row and a `=>` row each; {} kernels rowed via \
-         LAUNCHED_BY), {} argued exemption",
+        "{} Rust kernels: {} C-twin rows ({} kernels rowed via LAUNCHED_BY), {} oracle-validated \
+         (no C twin), {} argued exemption",
         device.len(),
         rows.len(),
         launched_by::LAUNCHED_BY.len(),
+        ORACLE_VALIDATED.len(),
         UNROWED.len()
     );
+}
+
+/// The [`ORACLE_VALIDATED`] both-ends check: each waived kernel is shipped, and its oracle suite
+/// exists and cites its launcher. A waiver covering a kernel nothing checks is refused — the
+/// same discipline as [`DEFERRED`], split out to keep the census under the code-health length cap.
+fn assert_oracle_validated(device: &[String]) {
+    let cited = Cited::of(&[Path::new("crates/engine/tests")]);
+    for (kernel, suite) in ORACLE_VALIDATED {
+        assert!(
+            device.iter().any(|k| k == kernel),
+            "ORACLE_VALIDATED names `{kernel}`, which is not a shipped gpu-kernel — delete the row"
+        );
+        assert!(
+            common::repo_root()
+                .join("crates/engine/tests")
+                .join(suite)
+                .exists(),
+            "ORACLE_VALIDATED `{kernel}`: oracle suite {suite} does not exist"
+        );
+        assert!(
+            cited.cites(kernel),
+            "ORACLE_VALIDATED `{kernel}`: no oracle cites launch_{kernel} — the waiver covers a \
+             kernel nothing checks"
+        );
+    }
 }
 
 /// `__global__` kernel names in the bit-identity gate's hipcc probe source.
