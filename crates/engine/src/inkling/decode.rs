@@ -40,16 +40,25 @@ struct LoopCtx {
     n_bank: usize,
 }
 
-/// One decoder layer: attention half, then MLP half, a phase stamp on each.
+/// One decoder layer: the attention half, then the MLP half.
+///
+/// **Only the attention half is stamped here.** The MLP half stamps itself — `Ffn` around
+/// everything that is not the routed MoE, and the MoE's own dispatch stamps `Ffn`/`FetchWait` at
+/// its awaits. Wrapping the whole half in one `Ffn` span (what this loop did before the `.mxfp8`
+/// miss path grew a fetch-wait stamp) would put the fetch wait INSIDE ffn and drive
+/// `PROFILE/tok`'s `other` remainder negative — the double-count its bucket-sum gate reads as a
+/// broken instrument.
 impl InklingEngine<'_> {
+    pub(super) fn lap_ffn<T>(&mut self, t: std::time::Instant, res: Result<T>) -> Result<T> {
+        self.prof.lap(crate::telemetry::Phase::Ffn, t);
+        res
+    }
+
     fn layer(&mut self, s: LayerStep, c: &mut LoopCtx, msg: Option<*const f32>) -> Result<()> {
         let t = std::time::Instant::now();
         self.attn_phase(s, c, msg)?;
         self.prof.lap(crate::telemetry::Phase::Attend, t);
-        let t = std::time::Instant::now();
-        self.mlp_phase(s, (c.n_bank, msg))?;
-        self.prof.lap(crate::telemetry::Phase::Ffn, t);
-        Ok(())
+        self.mlp_phase(s, (c.n_bank, msg))
     }
 }
 
@@ -284,12 +293,18 @@ impl InklingEngine<'_> {
 
 /// The MLP half: block-residual query, optional message gate, pre-MLP norm, the routed MoE, the
 /// post-MLP convolution, and the residual add.
+///
+/// **Two `Ffn` spans with the MoE's own stamps between them**, so every millisecond of the half
+/// lands in exactly one bucket: the MoE reports its launches as `Ffn` and, on the miss path, the
+/// residual miss-stream wait as `FetchWait` (see `moe_mxfp8`). The dispatch call itself is the
+/// only unstamped gap, and it is a call.
 impl InklingEngine<'_> {
     fn mlp_phase(
         &mut self,
         s: LayerStep,
         (n_bank, msg): (usize, Option<*const f32>),
     ) -> Result<()> {
+        let t = std::time::Instant::now();
         let cfg = self.cfg;
         let (hidden, eps) = (cfg.hidden_size, cfg.rms_norm_eps as f32);
         let lp = &self.pin.layers[s.layer];
@@ -320,11 +335,14 @@ impl InklingEngine<'_> {
         // SAFETY: `mlp_in` is `hidden` f32 into the `hidden`-f32 `xn`.
         unsafe { launch_rmsnorm_single(mlp_in, post_ln, hidden, eps, p(&self.sc.xn))? };
         let scale = self.route(s.layer)?;
+        self.prof.lap(crate::telemetry::Phase::Ffn, t);
         self.moe(s.layer, scale)?;
+        let t = std::time::Instant::now();
         // The post-MLP conv reads `moe_acc` and writes `branch` (distinct).
         self.post_sconv(post_conv, sconv3, pc(&self.sc.moe_acc))?;
         // SAFETY: `x` and `branch` are distinct `hidden`-f32 buffers.
-        unsafe { launch_vadd(p(&self.sc.x), pc(&self.sc.branch), hidden) }
+        let r = unsafe { launch_vadd(p(&self.sc.x), pc(&self.sc.branch), hidden) };
+        self.lap_ffn(t, r)
     }
 
     /// The router: a bf16 gate GEMV on the normed input, one blocking D2H, then host top-k.
@@ -363,7 +381,8 @@ impl InklingEngine<'_> {
     /// The routed MoE — the ONE branch the two members take differently.
     ///
     /// Mini's whole-layer slabs are sliced on the host ([`Self::moe_bf16`]); Small's `.mxfp8`
-    /// experts come from the pool's slots with their fills overlapped on two streams
+    /// experts come from the pool's slots, their fills overlapped on two streams when the layer
+    /// misses at least one expert and on the null stream alone when it misses none
     /// ([`Self::moe_mxfp8`]). Everything before and after this call — the router, the norms, the
     /// post-MLP convolution, the residual — is the same code for both.
     fn moe(&mut self, layer: usize, scale: f32) -> Result<()> {
@@ -377,6 +396,7 @@ impl InklingEngine<'_> {
     /// `scores[e] · scale`. The softcaps are K3's SiTU-GLU at b1=4, b2=25 — the sigmoid sees the
     /// RAW gate (T6).
     fn moe_bf16(&mut self, layer: usize, scale: f32) -> Result<()> {
+        let t = std::time::Instant::now();
         let (hidden, inter) = (self.cfg.hidden_size, self.cfg.intermediate_size);
         let (b1, b2) = (
             self.cfg.mlp_gate_softcap as f32,
@@ -415,7 +435,11 @@ impl InklingEngine<'_> {
                 launch_vaxpy(acc, pc(&self.sc.moe_out), w, hidden, NULL_STREAM)
             }?;
         }
-        Ok(())
+        // Launch time, not execution: nothing on this arm joins before the next router
+        // readback, so the span is the enqueue cost — the same semantics GLM's resident half
+        // carries, and the reason Mini's `fetch-wait` stays 0 (its experts are pinned weights,
+        // not pooled fills).
+        self.lap_ffn(t, Ok(()))
     }
 }
 

@@ -4,7 +4,7 @@
 
 use super::{Checked, elementwise, not_positive_finite, rivoli_act_quant_f8, run};
 use crate::module::{Geometry, Kernel, LdsBytes};
-use rivoli_abi::geom::{ACT_QUANT_BLOCK, F4_GROUP, GEMV_FP8_LDS_BYTES, ROWS_PER_BLOCK, WAVE};
+use rivoli_abi::geom::{ACT_QUANT_BLOCK, F4_GROUP, ROWS_PER_BLOCK, WAVE};
 use rivoli_abi::kernarg::{AccDrain, AccDrainTo, MoeF4, MoeF4Situ, MoeI4, MoeSpan, MoeVq};
 use std::ffi::c_void;
 
@@ -31,14 +31,12 @@ fn span_checked(s: &MoeSpan) -> Result<(), i32> {
 /// blocks of `ROWS_PER_BLOCK` waves — the constants the kernels' row mapping strides by.
 /// `dim3` takes `unsigned`: the C narrowed the same way.
 ///
-/// `lds` is the pass's own dynamic-LDS request and not a default: nibble and VQ kernels
-/// take none, while every fp8 or MXFP8 body builds the block's 256-float e4m3 table at the
-/// base of it (`kernels::gpu::fp8_lut`), which the launch must actually grant or the table
-/// writes land on whatever the previous launch left there. The block is `ROWS_PER_BLOCK ·
-/// WAVE = 256` threads, and `rivoli_abi::geom::linalg` already asserts
-/// `FP8_LUT_ENTRIES <= GEMV_BLOCK` on exactly that product — so the builder fills the table
-/// whole, and a moved `ROWS_PER_BLOCK` is a compile error there rather than a half-built LUT
-/// here.
+/// `lds` is the pass's own dynamic-LDS request and not a default: a kernel that builds a
+/// decode table in shared memory must be GRANTED it, or its writes land on whatever the
+/// previous launch left there. Every kernel this module launches decodes its weights in
+/// registers instead — the nibble, fp4 and VQ planes arithmetically, MXFP8's e4m3 bytes by
+/// bit arithmetic — so every caller here passes `LdsBytes(0)`; the knob stays on the grid
+/// builder because the request belongs to a kernel's own body, not to this host code.
 fn wave_rows(e_count: i32, len: i32, lds: LdsBytes) -> Geometry {
     let rows = e_count as u64 * len as u64;
     Geometry {
@@ -54,8 +52,9 @@ fn wave_rows(e_count: i32, len: i32, lds: LdsBytes) -> Geometry {
 /// each launcher names, and launches, its own kernels' statics (`kernel_coverage`'s
 /// `LAUNCHED_BY` rule).
 ///
-/// `lds` is handed to BOTH grids ([`wave_rows`]): a format whose kernels build the block's
-/// e4m3 table in dynamic LDS names `GEMV_FP8_LDS_BYTES` and the others `0`.
+/// `lds` is handed to BOTH grids ([`wave_rows`]): each pass is its own dispatch, so a format
+/// that built a shared table would have to grant it twice, and one that does not grants `0`
+/// twice. No format here builds one.
 fn passes(
     (span, checked): (MoeSpan, Result<(), i32>),
     (up, down): (impl FnOnce(Geometry) -> i32, impl FnOnce(Geometry) -> i32),
@@ -273,22 +272,23 @@ static MOE_DOWN_MXFP8_WEIGHTED: Kernel<MoeF4Situ> = Kernel::new(c"moe_down_mxfp8
 ///
 /// Guards, order and codes are `rivoli_moe_expert_range_f4_situ`'s exactly — MXFP8's group is
 /// 32 columns like fp4's, so `F4_GROUP` is the reduction-dim unit here too and 1002 is the
-/// same refusal. What differs is the LDS: both passes build the block's e4m3 decode table, so
-/// both grids request [`GEMV_FP8_LDS_BYTES`].
+/// same refusal. The one difference is inside the kernels rather than in this guard: MXFP8's
+/// e4m3 weights decode arithmetically in registers, so neither pass builds a shared decode
+/// table and both grids request no dynamic LDS — `LdsBytes(0)`, as the fp4 pair does.
 pub(crate) unsafe fn rivoli_moe_expert_range_mxfp8_situ(
     a: MoeF4Situ,
     c: DescRows,
     s: *mut c_void,
 ) -> i32 {
-    // SAFETY: the launcher contract covers both passes' buffers, and the grid grants both
-    // kernels' `fp8_lut` its `GEMV_FP8_LDS_BYTES` of dynamic LDS.
+    // SAFETY: the launcher contract covers both passes' buffers, and neither kernel touches
+    // shared memory, so the grid's LDS request is zero.
     unsafe {
         situ_range(
             &a,
             c,
             (
                 (&MOE_GATEUP_MXFP8_SITU, &MOE_DOWN_MXFP8_WEIGHTED),
-                LdsBytes(GEMV_FP8_LDS_BYTES),
+                LdsBytes(0),
             ),
             |k, g| k.launch(g, s, &a),
         )

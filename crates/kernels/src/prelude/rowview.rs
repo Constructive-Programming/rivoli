@@ -61,18 +61,23 @@ pub fn aligned_base(w: *const u8, dim: usize, step: usize) -> usize {
     if w as usize & 3 == 0 { floored } else { 0 }
 }
 
-/// Sixteen bytes of activation, the `float4` the dword paths load.
+/// Sixteen-byte aligned 4-lane vector (`float4` / `uint4`) for 128-bit global loads.
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
-pub struct F32x4(pub [f32; 4]);
+pub struct Align16<T>(pub [T; 4]);
 
-impl F32x4 {
+/// Sixteen bytes of activation, the `float4` the dword paths load.
+pub type F32x4 = Align16<f32>;
+/// Sixteen bytes of packed weights, the `uint4` the 128-bit weight passes load.
+pub type U32x4 = Align16<u32>;
+
+impl<T: Copy> Align16<T> {
     /// # Safety
-    /// `p` must be 16-byte aligned and point at 4 readable floats. A misaligned `p` is
+    /// `p` must be 16-byte aligned and point at 16 readable bytes. A misaligned `p` is
     /// undefined behaviour, as the C++ `*(const float4*)` cast is — an unchecked caller
     /// obligation the launchers carry.
     #[inline(always)]
-    pub unsafe fn load(p: *const f32) -> Self {
+    pub unsafe fn load<U>(p: *const U) -> Self {
         // SAFETY: the caller's obligation above.
         unsafe { *p.cast::<Self>() }
     }

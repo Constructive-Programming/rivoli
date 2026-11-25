@@ -267,8 +267,8 @@ launchers! {
     /// **Inkling-2 Small's routed expert range** — the K3 pair's SiTU-GLU arithmetic at
     /// MXFP8's weight format: one e4m3 value per byte with ONE raw ue8m0 exponent per 32
     /// values along the reduction dim, ROW-wise `[1, 32]` (`inkling_dequant::Mxfp8`, trap T1:
-    /// the scale byte is an exponent, not an e4m3 code — reading it through the fp8 LUT would
-    /// decode `0x80` as `-0`).
+    /// the scale byte is an exponent, not an e4m3 code — decoded as e4m3, `0x80` would be
+    /// `-0` and `0x70` would be `224`).
     ///
     /// Everything else is [`launch_moe_expert_range_f4_situ`]'s contract, because MXFP8's
     /// group is 32 columns like fp4's: the same 1001/1002/1003/1004/1006 refusals, the same

@@ -398,8 +398,11 @@ top-8, hidden 4608, inter 2304) is built and verified:
   ue8m0 wave dot using LDS `fp8_lut` + `e8m0f`) and `crates/kernels/src/moe_mxfp8.rs`
   (`moe_gateup_mxfp8_situ` + `moe_down_mxfp8_weighted`, `fp8_lut()` before any early return, f32
   intermediate and pass-2 weight multiply), launched via `launch_moe_expert_range_mxfp8_situ`
-  (dynamic LDS `GEMV_FP8_LDS_BYTES`). Kernel census updated to **79/79/0** (98 shipped Rust
-  kernels, 64 production callers, 15 classified uncalled, 13 `ORACLE_VALIDATED`); GPU oracle
+  (dynamic LDS `GEMV_FP8_LDS_BYTES`). **Corrected 2026-11-25 (Wave 2 perf):** the e4m3 weights
+  now decode arithmetically in registers (`E4M3_REBIAS`), so neither kernel builds the LDS
+  `fp8_lut`, `MxFp8Row` carries no `lut`, and the launcher passes `LdsBytes(0)` — the S6 record
+  above is what shipped, not what the tree does now. Kernel census updated to **79/79/0** (98
+  shipped Rust kernels, 64 production callers, 15 classified uncalled, 13 `ORACLE_VALIDATED`); GPU oracle
   `crates/engine/tests/kernel_inkling_moe_mxfp8.rs` 6/6 green under flock (including T1 raw
   exponent trap, gate/up swap separation, offset window with `w == 0` skip, and guard codes
   1001–1006).

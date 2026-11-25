@@ -239,7 +239,7 @@ impl RoutedGeom {
     /// can run it BEFORE it mutates anything — see the range check at the top of `submit`
     /// for why that ordering is not a style preference.
     fn row(&self, layer: usize) -> Result<usize> {
-        let rows = self.table.len() / self.n_experts;
+        let rows = self.rows();
         let row = layer.checked_sub(self.first_layer).filter(|&r| r < rows);
         row.with_context(|| {
             format!(
@@ -260,5 +260,30 @@ impl RoutedGeom {
             self.fmt.ext(),
         );
         Ok(())
+    }
+
+    /// How many layer rows the table holds — the row basis [`Self::row`] bounds against.
+    fn rows(&self) -> usize {
+        self.table.len() / self.n_experts
+    }
+
+    /// The stored layer ids this set covers, in table order.
+    ///
+    /// The population walk's outer axis: the set's own range, never a config's, so a walk
+    /// over it cannot address a layer the table has no row for. Read-only, like everything
+    /// else here — the preload places slots, it does not move rows.
+    pub(super) fn layer_range(&self) -> std::ops::Range<usize> {
+        self.first_layer..self.first_layer + self.rows()
+    }
+
+    /// Routed experts per layer — the population walk's inner axis.
+    pub(super) fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    /// Every `(layer, expert)` this set can hold, `rows · n_experts` — the population a
+    /// preload must place to call itself complete.
+    pub(super) fn total_experts(&self) -> usize {
+        self.table.len()
     }
 }

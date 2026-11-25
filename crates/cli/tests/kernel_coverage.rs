@@ -568,6 +568,10 @@ const ORACLE_VALIDATED: &[(&str, &str)] = &[
     // asks whether the name is in `rowed` — the launcher names plus the ungrouped kernels —
     // rather than in the shipped-kernel list, which holds only the two phases.
     ("moe_expert_range_mxfp8_situ", "kernel_inkling_moe_mxfp8.rs"),
+    // The decode projections' bf16 GEMV: NEW in the rewrite, so there is no C twin to score
+    // bit-for-bit — its suite's f64 reference is the oracle (the kernel's own note says why
+    // `gemm_bf16` could not simply be widened instead).
+    ("gemv_bf16", "kernel_gemv_bf16.rs"),
 ];
 
 /// The bit-identity gate's `ROWS` table: each entry's kernel name, and whether its row

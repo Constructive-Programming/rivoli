@@ -23,10 +23,10 @@ use crate::resident::Bf16Weight;
 use anyhow::{Result, ensure};
 use rivoli_artifact::inkling_config::InklingTextConfig;
 use rivoli_backend::{
-    NULL_STREAM, launch_gemm_bf16, launch_kv_scatter, launch_l2_clip, launch_log_scaled_l2_clip,
-    launch_logit_softcap, launch_message_gate, launch_rel_bias_gather, launch_rmsnorm_single,
-    launch_rmsnorm_weightless_batch, launch_scaled_l2_clip, launch_sconv, launch_sconv_dynamic,
-    launch_sigmoid_gate, launch_sink_attend, memcpy_dtod_async,
+    NULL_STREAM, launch_gemm_bf16, launch_gemv_bf16, launch_kv_scatter, launch_l2_clip,
+    launch_log_scaled_l2_clip, launch_logit_softcap, launch_message_gate, launch_rel_bias_gather,
+    launch_rmsnorm_single, launch_rmsnorm_weightless_batch, launch_scaled_l2_clip, launch_sconv,
+    launch_sconv_dynamic, launch_sigmoid_gate, launch_sink_attend, memcpy_dtod_async,
 };
 
 /// A buffer's device address as an f32 pointer. `DeviceBuf::ptr` takes `&self`, so the pointer is
@@ -50,9 +50,11 @@ pub(super) unsafe fn copy_dev(dst: *mut f32, src: *const f32, n: usize) -> Resul
     unsafe { memcpy_dtod_async(dst as *mut u8, src as *const u8, n * 4, NULL_STREAM) }
 }
 
-/// One projection on a single row: `out = w · x`, `w` being `[o_dim, i_dim]` bf16. A GEMM at
-/// `m = 1` because the tree has no bf16 GEMV. The `i_dim` agreement is checked here: a mismatch
-/// reads past a live buffer and produces fluent wrong text.
+/// One projection on a single row: `out = w · x`, `w` being `[o_dim, i_dim]` bf16. `m = 1` is
+/// the GEMV's shape, so this is [`launch_gemv_bf16`] — the wide-load kernel — and not the
+/// scalar [`launch_gemm_bf16`] that `rel_logits` still needs at `m = num_heads`. The `i_dim`
+/// agreement is checked here: a mismatch reads past a live buffer and produces fluent wrong
+/// text.
 ///
 /// # Safety
 /// `x` is `i_dim` live f32, `out` is `w.o_dim` live f32, `w.packed` is `w.o_dim·w.i_dim` live
@@ -65,7 +67,7 @@ pub unsafe fn proj(x: *const f32, w: &Bf16Weight, out: *mut f32, i_dim: usize) -
         w.i_dim
     );
     // SAFETY: the caller's contract, plus the `i_dim` agreement checked above.
-    unsafe { launch_gemm_bf16(x, w.packed, out, 1, w.o_dim, w.i_dim, NULL_STREAM) }
+    unsafe { launch_gemv_bf16(x, w.packed, w.o_dim, w.i_dim, out, NULL_STREAM) }
 }
 
 /// The logit tail's weights and dims: the final norm, the lm_head (live rows only, T14), the

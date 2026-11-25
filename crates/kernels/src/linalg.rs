@@ -15,8 +15,9 @@ use crate::gpu::{bid, elementwise, fma, for_i32, fp8_lut, tid};
 use crate::prelude::dot_fp8::{Fp8Row, dot_fp8_wave_r, fp8_dot_strided_r};
 use crate::prelude::dot_nib::{I4_GROUP, I4Row, NibRow, dot_nib_wave_r};
 use crate::prelude::dot_vq::{VQ_DIM, VQ_GROUP, VQ_INDEX_BITS, VQ_K, VqRow, dot_vq_wave_r};
+use crate::prelude::formats::bf16f;
 use crate::prelude::reduce::{ROWS_PER_BLOCK, WAVE, sync_threads, wave_sum};
-use crate::prelude::rowview::{F32x4, LaneSpan, RowsView, blk_shift, quad};
+use crate::prelude::rowview::{F32x4, LaneSpan, RowsView, U32x4, blk_shift, for_strided, quad};
 use core::intrinsics::unchecked_div;
 use rivoli_abi::geom::{FP8_LUT_ENTRIES, GEMV_BLOCK};
 use rivoli_abi::kernarg::{Gemv, GemvFp8, Scaled, Vq, VqEncode};
@@ -194,6 +195,81 @@ pub unsafe extern "gpu-kernel" fn gemv_f32(a: Gemv<*const f32>) {
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn gemv_f32_r2(a: Gemv<*const f32>) {
     gemv_f32_rows::<2>(a);
+}
+
+/// The two bf16 weights packed in one dword, in ascending column order.
+///
+/// `bf16f` of the low half is `p << 16` and of the high half `p & 0xffff_0000` — the shift
+/// drops the bits it would have masked, so this is one `v_lshlrev_b32` and one `v_and_b32`
+/// beside the loads rather than two 16-bit extracts, and it is the same value either way.
+#[inline(always)]
+fn bf16_pair(p: u32) -> [f32; 2] {
+    [f32::from_bits(p << 16), f32::from_bits(p & 0xffff_0000)]
+}
+
+fn fma_pair(x: [f32; 2], p: u32, acc: f32) -> f32 {
+    let [w0, w1] = bf16_pair(p);
+    crate::gpu::fma(x[1], w1, crate::gpu::fma(x[0], w0, acc))
+}
+
+/// One output row's dot, wave-cooperative: `Σ_i x[i]·bf16(w[i])` over this row's `i_dim`
+/// codes.
+///
+/// **Eight columns per lane per step while BOTH spans are 16-byte aligned** — one 16 B weight
+/// load against two 16 B activation loads, `WAVE·8 = 256` columns per wave step, four steps in
+/// flight (`for_strided::<4>`: 2 KB of weights in flight per wave, no LDS). The trunk's widths
+/// are all multiples of 256 — Mini's 2304/3072/1024 and Small's 4608/6144/1024 — so they run
+/// the vector path end to end with no tail; the MessageGate rank (64) and `d_rel` (16) are the
+/// widths that are tail only.
+///
+/// Two accumulators, the low and high four columns of each step, so the two `v_fmac` chains
+/// cannot serialise on one another. The combine (`lo + hi`) and then the ascending scalar tail
+/// leave the columns in order, and `wave_sum` reduces across lanes in its fixed ladder.
+///
+/// The alignment test is on BOTH spans and decides the whole row rather than a prefix: a
+/// `global_load_b128` on a misaligned address faults, and `F32x4::load` is UB there, so a row
+/// that is not aligned takes the scalar path for every column.
+#[inline(always)]
+unsafe fn dot_bf16_wave(x: *const f32, w: *const u16, i_dim: usize, lane: usize) -> f32 {
+    // Columns per wave step: one lane's eight, across the wave.
+    const STEP: usize = WAVE * 8;
+    let vector = if w as usize & 15 == 0 && x as usize & 15 == 0 {
+        i_dim / STEP * STEP
+    } else {
+        0
+    };
+    let (mut lo, mut hi) = (0.0f32, 0.0f32);
+    for_strided::<4>(lane * 8, vector, STEP, |c| {
+        // SAFETY: `c` is a multiple of 8 and both spans are 16-byte aligned, so the 16 B load
+        // and the two `float4`s it is paired with are aligned and inside the row.
+        let wp = U32x4::load(w.add(c)).0;
+        let xl = F32x4::load(x.add(c)).0;
+        let xh = F32x4::load(x.add(c + 4)).0;
+        lo = fma_pair([xl[0], xl[1]], wp[0], fma_pair([xl[2], xl[3]], wp[1], lo));
+        hi = fma_pair([xh[0], xh[1]], wp[2], fma_pair([xh[2], xh[3]], wp[3], hi));
+    });
+    let mut acc = lo + hi;
+    // SAFETY: the tail columns are the ones the vector pass did not take, each inside `x` and
+    // the weight row.
+    for_strided::<1>(vector + lane, i_dim, WAVE, |i| {
+        acc = crate::gpu::fma(*x.add(i), bf16f(*w.add(i)), acc);
+    });
+    wave_sum(acc)
+}
+
+/// `y[o] = Σ_i x[i]·bf16(w[o, i])` — one token row through a row-major `[o_dim, i_dim]` bf16
+/// weight, the decode projections' shape (no C twin: `gemm_bf16` stays scalar for bit-identity;
+/// scored by `kernel_gemv_bf16.rs`). See [`dot_bf16_wave`] for the wide path.
+///
+/// The grid is the GEMV family's row grid (`ceil(o_dim / ROWS_PER_BLOCK)` blocks of
+/// `GEMV_BLOCK`), and `w` must be `o_dim · i_dim` codes: the launcher's extents are the only
+/// bound the kernel has.
+#[unsafe(no_mangle)]
+pub unsafe extern "gpu-kernel" fn gemv_bf16(a: Gemv<*const u16>) {
+    let i_dim = ext(a.i_dim);
+    wave_per_row::<*const u16, 1>(&a, |o, lane| {
+        [dot_bf16_wave(a.x, a.w.add(o * i_dim), i_dim, lane)]
+    });
 }
 
 /// `gemv_i8_impl<R>`: four columns per lane (one dword of int8 against one `float4` of `x`)

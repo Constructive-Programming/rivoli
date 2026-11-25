@@ -12,7 +12,7 @@
 //!   transliteration of `LOAD:808–810` whose raw-exponent scale trap (T1: the byte is an
 //!   exponent, NOT an e4m3 code) `kernel_inkling_dequant.rs` scores bit-for-bit on the
 //!   device. This fixture hands its `dequant` the same bytes the kernel reads, so a wrong
-//!   LUT, a wrong group stride or a scale read through the fp8 table has to already be
+//!   e4m3 decode, a wrong group stride or a scale byte read as a value has to already be
 //!   inside that crate to survive here;
 //! * the **activation** — `rivoli_oracles::inkling::softcap_swiglu`, `MOD:768–771`, which
 //!   `crates/oracles/src/inkling.rs` pins equal to the device's `situ_glu` (the sigmoid
@@ -31,7 +31,7 @@
 //! Never executed: this lane has no device. Three plants, each in one line of
 //! `crates/kernels/src/moe_mxfp8.rs` or `crates/kernels/src/prelude/dot_mxfp8.rs`:
 //!
-//! * **Scale read through the fp8 LUT** (`*w.lut.add(*w.scale.add(..) as usize)` for
+//! * **Scale read as an e4m3 code** (`e4m3_byte(u32::from(*w.scale.add(..)))` for
 //!   `e8m0f(*w.scale.add(..))`) in `dot_mxfp8_wave` — [`the_mxfp8_scale_byte_is_a_raw_exponent`]
 //!   must go RED on the accumulator's magnitude (the fixture's scale byte `0x70` is `2^-15`
 //!   as an exponent and `224.0` as an e4m3 code, a factor of 7.34e6), and

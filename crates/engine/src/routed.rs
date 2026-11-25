@@ -20,14 +20,17 @@
 //! What this does NOT own: which experts to fetch. Routing never consults residency
 //! (INV-1), so the pool is told a selection and reports where the bytes are.
 //!
-//! Two siblings carry the halves that have no interaction with residency, moved out when
-//! this file crossed the 800-line soft cap (`crates/cli/build.rs`) — a split by cohesion,
-//! and both are re-exported here so every `crate::routed::X` path is unchanged:
+//! Three siblings carry the parts that have no interaction with residency, moved out when
+//! this file crossed the 800-line soft cap (`crates/cli/build.rs`) — a split by cohesion:
 //! [`mod geom`](geom) is the static layout read once from the artifact (key packing, slot
-//! pointers, read-spec table) and [`mod trace`](trace) is the whole `--trace` v2 capture.
-//! What is left in this file is the mutable part: the arena, the policy, the fetch ring.
+//! pointers, read-spec table), re-exported below so every `crate::routed::X` path is
+//! unchanged; [`mod trace`](trace) is the whole `--trace` v2 capture; [`mod preload`](preload)
+//! is the startup fill of a set that fits the pool entirely — the one path that places bytes
+//! without a demand miss. What is left here is the mutable part: the arena, the policy, the
+//! fetch ring.
 
 mod geom;
+mod preload;
 mod trace;
 
 pub use geom::{ExpertSlot, ProjSlot, RoutedGeom, expert_key, slot_at};

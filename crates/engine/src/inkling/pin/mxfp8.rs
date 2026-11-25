@@ -101,9 +101,18 @@ impl InklingPin {
             tier_bytes: resident,
         };
         Self::assemble(parts, move |_, _| {
+            let mut routed = RoutedPool::new(pool, geom)?;
+            // A pool the placement already filled has nothing to stream: load the set now
+            // and decode starts at 0 misses / 0 fetch-wait, instead of pulling every
+            // expert no prefill layer touched through the demand path at NVMe latency.
+            // `preload_all` restates this condition at the byte level and owns the `--trace`
+            // opt-out, so the two cannot disagree about what "fully resident" means.
+            if pinned_experts == total_experts {
+                routed.preload_all()?;
+            }
             Ok(ExpertBackend::MxFp8 {
                 _set: set,
-                routed: Box::new(RoutedPool::new(pool, geom)?),
+                routed: Box::new(routed),
                 pinned_experts,
                 total_experts,
             })
