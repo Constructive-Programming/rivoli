@@ -2389,3 +2389,19 @@ Logs: `/var/cache/rivoli/scratch/inkling-rbg-red-gpu.log` (red), `inkling-rbg-re
 green). The CPU oracle is `rivoli_oracles::inkling::rel_bias_gather` (MOD:224–227); the gather feeds
 the per-head `bias` that `sink_attend` (§22d) adds to the QK dots. The arm ran under `flock -s` (the
 stale shared-lock deviation, §22d) with the witness empty before/after.
+
+### 22h. The MXFP8 routed-expert kernel & Small composition gate (`kernel_inkling_moe_mxfp8.rs`, `inkling_small_mxfp8.rs`) — PAID 2026-11-25
+
+The plant decrements every ue8m0 scale exponent by 1 (`scale.wrapping_sub(1)`) in both the dword
+fast path and scalar tail of `crates/kernels/src/prelude/dot_mxfp8.rs::dot_mxfp8_wave` — halving
+every expert weight (`2^(s−1−127)` vs `2^(s−127)`). Verified changed against a saved copy
+(`cmp -s` exit 1) before running both GPU suites under `flock /var/run/sys-gpu.lock`, then
+restored byte-identical (`cmp -s` exit 0) and re-verified green.
+
+| arm | observed | exit |
+|---|---|---|
+| clean (`kernel_inkling_moe_mxfp8`) | 6/6 tests pass (3 shape pairs, offset window with `w == 0` skip, gate/up swap separation, T1 raw-exponent trap `err=0.000e0`, shape guards 1001–1004, beta guards 1006) | 0 |
+| clean (`inkling_small_mxfp8`, `--features teacher-forcing`) | 4/4 tests pass (door check, TF finite NLL, P4 bit-identical 4 ids + 60 logits across pinned 0 warm fills vs streaming 36 fills, bf16 vs MXFP8 max rel logit diff `1.480e-5`) | 0 |
+| scale exponent `s−1` (`kernel_inkling_moe_mxfp8`) | 3/6 FAILED: `the_mxfp8_expert_pair_matches_the_host_oracle` (`err=3.678e-2 > tol=3.828e-6`), `the_expert_range_is_a_window_and_not_the_whole_set` (`err=9.627e-4 > tol=2.517e-8`), `the_mxfp8_scale_byte_is_a_raw_exponent` (`err=1.948e-5 > tol=1.667e-10`); guard & swap tests held (3 passed) | 101 |
+| scale exponent `s−1` (`inkling_small_mxfp8`) | 1/3 FAILED: `bf16_resident_experts_match_the_streamed_mxfp8_ones` (`mxfp8 [43, 1, 35, 24] vs bf16 [15, 35, 55, 53]`); door & P4 self-consistency held (2 passed) | 101 |
+| reverted | both suites back to 6/6 and 3/3 (4/4 with TF) green | 0 |

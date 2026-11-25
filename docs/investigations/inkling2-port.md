@@ -1,7 +1,7 @@
 ---
 status: live
 scope: inkling
-verdict: S0 THROUGH S6 ARE BUILT and S7-S8 are in progress -- the Inkling 2 port (owner scope 2026-11-23 both members, Mini first, text-only v1, MTP refused) has its identity pinned Mini @ 7a67ae23 and Small-MXFP8 @ 14f2cb29 vendored and hash-gated, the shared tiktoken rank file vendored once byte-identical between members, the Mini checkpoint downloaded and sha256-verified at 19.5 GB, the text-stack and loop math extracted with citations in reference/inkling2-architecture.md, and the checkpoint name mapping RESOLVED from transformers' on-load conversion ops. S1 lands the refusing-first surface; S2 lands the Mini converter (822 TEXT consumed, 422 EXCLUDED-VISION by name, 693 output names+shapes equal to text-model-names.tsv, mtp.safetensors never opened); S3 lands the first-party cached-decode anchor (3 goldens reproduced 3 of 3, 16 tensors/golden incl. all 3 loop passes, 5-trap defect matrix, 7 non-vacuous fp32-vs-fp64 floors); S4+S5 land twelve ORACLE_VALIDATED Rust kernels, Inkling tiktoken + chat template + serve channel split, and the full Mini (`inkling2_loop`) decode/serve/TF-scoring arm — verified 3/3 against the S3 anchor, 8/8 token-identical to first-party transformers on "Hi", P4 residency-invariant (16/16 identical ids), TF `--ppl` coherent on 830/830 tokens of TOUR.md (PPL 9.617), release 11.95 tok/s pinned, and `tests/smoke-inkling.sh` 16/16 green + red-proofed. S6 lands the Small (`inkling2`, 48-layer MXFP8 streaming) arm: `RoutedFmt::MxFp8` O_DIRECT container (`MX8\0`, row-wise `[1,32]` ue8m0, de-interleaved gate/up), `convert_inkling_small` (verified byte-exact on real 12.61 GB Small layer 0: 384 experts, 0 bytes differ), fused `moe_gateup_mxfp8_situ` + `moe_down_mxfp8_weighted` kernels behind `launch_moe_expert_range_mxfp8_situ` (79/79/0 census, 64 callers, 15 uncalled, 13 oracle-validated; 6/6 GPU oracle green), two-stream `RoutedPool` integration in `InklingEngine::open_mxfp8`, legality/CLI/serve cutover (`INKLING_ARM_NOT_BUILT` retired), `inkling_small_mxfp8.rs` (4/4 GPU green: P4 bit-identical ids+logits across pinned vs O_DIRECT streaming, bf16 vs MXFP8 max rel logit diff 1.48e-5, TF scoring finite, door check), and `tests/smoke-inkling-small.sh`.
+verdict: S0 THROUGH S6 COMPLETE, S7 MINI COMPLETE + SMALL ARTIFACT CONVERTED/VERIFIED (SMALL LIVE GPU DECODE BLOCKED BY EXTERNAL 7.0 GiB GTT TENANT) -- the Inkling 2 port (owner scope 2026-11-23 both members, Mini first, text-only v1, MTP refused) has both members built, audited, and gated. Mini (`inkling2_loop`): 8/8 greedy token-identical to first-party transformers on "Hi"; witnessed release 64-token decode on "The sky is blue because" (GTT 17-18 MiB pre-arm, empty KFD witness) 11.69 / 11.59 tok/s pinned (90 GiB, 24/24 layers, 85.6 ms/tok = attend 1.96 + ffn 77.45 + head 5.99 + other 0.16) and 2.25 tok/s streaming (20 GiB, 8/24 pinned, 18144 misses), 64/64 ids identical A-vs-A' and P4 A-vs-B; witnessed TF `--ppl` on TOUR.md (830 tokens, PPL 9.617) byte-identical A-vs-A' (100% hits) and P4 A-vs-B (25% hits); `tests/smoke-inkling.sh` 16/16 green + red-proofed. Small (`inkling2`, MXFP8 streaming): `RoutedFmt::MxFp8` (`MX8\0`), fused `moe_gateup_mxfp8_situ` + `moe_down_mxfp8_weighted` kernels (79/79/0 census, 64 callers, 15 uncalled, 13 oracle-validated; 6/6 GPU oracle green + §22h red-proofed), two-stream `RoutedPool` in `InklingEngine::open_mxfp8`, `inkling_small_mxfp8.rs` 4/4 GPU green + §22h red-proofed (P4 bit-identical ids+logits, bf16 vs MXFP8 max rel logit diff 1.480e-5), `tests/smoke-inkling-small.sh` 6/6 deviceless refusals green + red-proofed. All 48 Small-MXFP8 shards (619.38 GB) downloaded to `/swarm/storage/ai/rivoli/inkling-2-small-mxfp8-src` and converted to `/swarm/storage/ai/rivoli/inkling-2-small-mxfp8-art` (996/996 resident tensors exact match to first-party `Inkling2ForCausalLM` meta state_dict; 48 × 12,612,800,512 B `.mxfp8` layer files, L00 and L47 verified 384/384 experts 0 bytes differ). Remaining S7 gate: live Small GPU decode & `tests/smoke-inkling-small.sh` once external root `llama-server` (qwen3-embedding-4b holding 7.0 GiB GTT, refused by sole-tenant guard) is unloaded.
 ---
 
 # Inkling 2: port plan of record
@@ -44,8 +44,8 @@ recognition + legality + doors land RED before any engine code exists.
 | S4 | kernels: twelve ORACLE_VALIDATED Rust kernels (clips ×3, dequants ×2, sconv, sconv_dynamic, sink_attend, message_gate, vaxpy, kv_scatter, rel_bias_gather), no C twin (owner 2026-11-24); MoE = `situ_glu_f32` reuse, RMSNorm = `rmsnorm_single` reuse; census both ends (78/63/15/12); red proofs §22a–g | **built 2026-11-24** |
 | S5 | Mini engine arm (looped decode, dynamic sconv, block residual, MessageGate, MoE, P6 residency partition, tiktoken/chat/serve, TF `--ppl`, `inkling_engine_anchor.rs`, `tests/smoke-inkling.sh` green + red-proofed, 8/8 first-party parity, P4 16/16 invariance, S5 ponytail+correctness audit closed) | **built 2026-11-25** |
 | S6 | Small streaming arm (`RoutedFmt::MxFp8`, `convert_inkling_small` verified 0 bytes differ on real 12.61 GB L00, fused `moe_expert_range_mxfp8_situ` kernels 6/6 GPU green, two-stream `RoutedPool` in `InklingEngine::open_mxfp8`, legality/CLI/serve cutover, `inkling_small_mxfp8.rs` 4/4 GPU green, `tests/smoke-inkling-small.sh`, S6 audit closed) | **built 2026-11-25** |
-| S7 | first measured decode + the gate battery on the box | open |
-| S8 | closeout: verdicts corrected in place, census answered out loud | open |
+| S7 | witnessed Mini release decode + P4 NLL (all byte-identical, clean witness), all 11 Inkling GPU suites (56/56 green) + §22h red-proof, full 48-shard Small download (619.38 GB) + conversion (996/996 resident match, 48 × 12.61 GB `.mxfp8`, L00/L47 verified 0 bytes differ), Small refusals + smoke red-proof; **live Small GPU decode + smoke GPU cells owed** (blocked by external root `llama-server` holding 7.0 GiB GTT) | **partial 2026-11-25** |
+| S8 | closeout: verdicts corrected in place, §22h red proofs recorded, census 1–8 answered, deviceless + CodeScene 10/10 + jscpd 0-clone battery green; flips to `closed-shipped` once Small live GPU smoke lands | **in progress 2026-11-25** |
 
 S2-before-S3 is deliberate and does NOT violate the TDD ordering: the converter is
 scored by the census (exact counts from the derived TSV) and by the FIRST-PARTY dequant
@@ -413,6 +413,29 @@ top-8, hidden 4608, inter 2304) is built and verified:
   teacher-forcing`): door check, TF finite NLL, P4 bit-identical ids + logits across pinned (0
   warm fills) vs O_DIRECT streaming (36 fills), and bf16 vs MXFP8 cross-check (worst rel logit
   diff `1.48e-5`). `tests/smoke-inkling-small.sh` landed.
+
+## S7 witnessed measurements & full Small artifact (2026-11-25)
+
+All Mini device measurements ran under `tests/gpu-witness.sh` (`flock /var/run/sys-gpu.lock`,
+empty KFD witness, pre-arm GTT 17–18 MiB) on the release+`teacher-forcing` binary (`225ff6f`,
+zero builds between arms):
+
+| arm | budget | residency | throughput / NLL | wall breakdown (ms/tok) | comparison |
+|---|---|---|---|---|---|
+| Mini bench A (`"The sky is blue because"`, 64 tok) | 90 GiB | 24/24 layers pinned (48.6 GiB tier, 3.2 GiB floor) | **11.69 tok/s** (24192 hits, 0 misses) | 85.559 = attend 1.964 + ffn 77.451 + head 5.988 + other 0.155 (0.18%) | baseline |
+| Mini bench A' (control, identical flags) | 90 GiB | 24/24 layers pinned | **11.59 tok/s** (24192 hits, 0 misses) | 86.261 = attend 1.949 + ffn 78.214 + head 5.944 + other 0.154 (0.18%) | **64/64 ids identical** to A |
+| Mini bench B (P4 streaming) | 20 GiB | 8/24 pinned, 16/24 streamed (18.2 GiB tier) | **2.25 tok/s** (6048 hits, 18144 misses) | 444.413 = attend 2.344 + ffn 436.625 + head 5.050 + other 0.394 (0.09%) | **64/64 ids identical** to A |
+| Mini TF `--ppl` (`TOUR.md`, 830 tok) A / A' / B | 90 / 90 / 20 GiB | 100% / 100% / 25% hits | **PPL 9.617419** (mean NLL 2.263576) | — | **830/830 NLL bytes identical** A=A'=B |
+
+- **All 11 Inkling GPU test binaries** (`kernel_inkling_{l2clip,dequant,sconv,sink_attend,message_gate,vaxpy,kv_scatter,rel_bias,moe_mxfp8}`, `inkling_engine_anchor`, `inkling_small_mxfp8` with `--features teacher-forcing`): **56/56 tests pass** under `flock`.
+- **P7 red proofs paid (§22h in `docs/measurement/gate-red-proofs.md`)**: planting `scale.wrapping_sub(1)` in `dot_mxfp8_wave` reddened `kernel_inkling_moe_mxfp8` (3/6 failed, guards+swap held) AND `inkling_small_mxfp8` (`bf16_resident_experts_match_the_streamed_mxfp8_ones` failed on argmax `[43, 1, 35, 24]` vs `[15, 35, 55, 53]`); restored byte-identical and re-verified green. Planting a wrong refusal fragment in `tests/smoke-inkling-small.sh` exited 0 under `--expect-red='without the expected message'`, then restored byte-identical.
+- **Full Small-MXFP8 checkpoint & artifact**: all 48 shards (`619,380,084,424 B`, rev `14f2cb29`) downloaded to `/swarm/storage/ai/rivoli/inkling-2-small-mxfp8-src` and converted by release `convert_inkling_small` to `/swarm/storage/ai/rivoli/inkling-2-small-mxfp8-art`:
+  - `resident.safetensors` (~13 GB): **996/996** tensor names and shapes match first-party `Inkling2ForCausalLM` meta `state_dict` (0 missing, 0 extra, 0 shape mismatches; 422 vision and 192 expert tensors excluded by name).
+  - `L00.mxfp8`–`L47.mxfp8`: 48 files × `12,612,800,512 B` each (`~564 GiB` routed set); `L00.mxfp8` and `L47.mxfp8` verified byte-for-byte against source shards (`384 experts, 0 bytes differ`).
+  - Dry-run partition log at `--max-mem 88 --ctx 512`: `12.4 GiB resident (globals + dense), 0.2 GiB activation scratch, 2457 of 18432 experts pinned (13.3% of the 564 GiB routed set), 75.4 GiB pool`.
+  - All 6 deviceless CLI legality refusals (`dsa`, `streaming`, `misa`, `mtp`, `bench-vs-port`, `think-needs-port`) verified green on the real artifact.
+- **Blocker for live Small GPU decode + `tests/smoke-inkling-small.sh` GPU cells**: an external root-owned `llama-server` (`qwen3-embedding-4b`, started by `llama-swap` at 04:35) holds `7565582336 B` (~7.0 GiB) of GTT, so both `tests/gpu-witness.sh` (1 GiB pre-arm threshold) and `DeviceTier`'s sole-tenant guard refuse to start Small's GPU arms. Once that tenant is unloaded, run `tests/smoke-inkling-small.sh /swarm/storage/ai/rivoli/inkling-2-small-mxfp8-art 96` and witnessed Small bench/P4 arms to close S7/S8 completely.
+
 ## Integration surface (S1's edit list)
 
 - `crates/core/src/legality.rs`: Arch variants (proposed `Inkling2Loop` for Mini,
@@ -473,8 +496,8 @@ Model membership is data in the checked census tables.
 
 ## Measurement posture
 
-Mini fits in memory; its gates are correctness gates (parity, ppl, bit-identity), not
-streaming measurements. Small is the P1 case: its S6 residency plan and bytes/token
-measurements follow `docs/measurement/how-to-measure.md` (flock, contention witness,
-no builds between arms, paired dNLL with the A-vs-A control). No number in this file or
-the math doc is a measurement of this box yet.
+Mini's witnessed measurements on this box are recorded in the S7 section above (64-token release
+decode + 830-token TF NLL, both A-vs-A' and P4 A-vs-B byte-identical, clean KFD witness, 17–18 MiB
+pre-arm GTT). Small's real-artifact partition and byte-exact `.mxfp8` conversion are recorded above;
+Small's live witnessed streaming decode and bytes/token numbers are owed once the external 7.0 GiB
+GTT tenant (`llama-server` / `qwen3-embedding-4b`) is unloaded.
