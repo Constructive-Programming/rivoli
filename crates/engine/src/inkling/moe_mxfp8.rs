@@ -1,5 +1,12 @@
-//! Inkling 2 Small's routed MoE dispatch: the `.mxfp8` experts out of the routed pool, the
-//! compute and miss streams their fills overlap on, and the fixed-point accumulator they land in.
+//! Inkling 2 Small's routed MoE dispatch: the pool's experts — `.mxfp8` or `.f4`, whichever the
+//! artifact holds — the compute and miss streams their fills overlap on, and the fixed-point
+//! accumulator they land in.
+//!
+//! **The container is a value, not a code path.** `moe_expert_range_f4_situ` and
+//! `moe_expert_range_mxfp8_situ` are emitted from one ABI (`hip_blocks.rs`'s `launchers!` rows
+//! differ only in the kernel), so [`RangeLaunch`] names that ABI, the format picks the function,
+//! and the 14-argument call below exists once. Everything else here — the tickets, the descriptor
+//! table, the launch order, the two accumulator rows — is already format-agnostic.
 //!
 //! Split from `decode.rs` when the two-stream dispatch crossed the workspace's 800-line soft
 //! cap — a split by cohesion, not convenience: `decode.rs` owns the ORDER the blocks run in,
@@ -23,21 +30,49 @@ use super::pin::InklingPin;
 use crate::device::as_le_bytes;
 use crate::fetch::asyncfetch::FetchFolds;
 use crate::routed::{RoutedPool, Selection};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::inkling_config::InklingTextConfig;
 use rivoli_backend::{
-    ExpertDescF4, NULL_STREAM, block_on, launch_moe_acc_drain_to,
+    ExpertDescF4, NULL_STREAM, block_on, launch_moe_acc_drain_to, launch_moe_expert_range_f4_situ,
     launch_moe_expert_range_mxfp8_situ, stream_signal,
 };
 use std::ffi::c_void;
 
-/// The activation one range reads and the config its extents come from — bundled because they
-/// travel together and unbundled they would push the range call past the argument budget.
+/// The activation one range reads, the config its extents come from, and the container its
+/// descriptor table names — bundled because they travel together and unbundled they would push
+/// the range call past the argument budget.
 #[derive(Clone, Copy)]
 struct MoeX<'a> {
     x: *const f32,
     cfg: &'a InklingTextConfig,
+    /// `.mxfp8` or `.f4`, read once from the pool's own set ([`InklingPin::routed_fmt`]).
+    fmt: RoutedFmt,
 }
+
+/// The routed-expert range launcher's ABI.
+///
+/// **Both containers' launchers are emitted from ONE signature** — `hip_blocks.rs`'s `launchers!`
+/// rows for `moe_expert_range_f4_situ` and `moe_expert_range_mxfp8_situ` differ only in the kernel
+/// they call, because the storage format lives inside the kernel and not in the call. That is what
+/// lets the container be a VALUE here: one call site, one argument list, and the format chosen by
+/// a single `match` — where two 14-argument calls would have been a 14-line clone.
+type RangeLaunch = unsafe fn(
+    *const f32,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    *const ExpertDescF4,
+    *const f32,
+    f32,
+    f32,
+    *mut f32,
+    *mut u64,
+    usize,
+    *mut c_void,
+) -> Result<()>;
 
 /// One dispatch's per-stream operands: the accumulator ROW this stream owns and the stream.
 #[derive(Clone, Copy)]
@@ -57,7 +92,8 @@ struct MoeLaunch {
 }
 
 impl InklingEngine<'_> {
-    /// Small's MoE: the pool's `.mxfp8` slots, one range of residents overlapping the misses.
+    /// Small's MoE: the pool's slots (`.mxfp8` or `.f4`), one range of residents overlapping the
+    /// misses.
     ///
     /// **The shape is `crate::v4::moe`'s measured order**, not an invention: residents first as
     /// ONE contiguous range on the compute stream, then each miss alone behind its own ticket on
@@ -74,9 +110,16 @@ impl InklingEngine<'_> {
         let n_res = self.stage_moe8(layer, scale)?;
         self.prof.lap(crate::telemetry::Phase::Ffn, t);
         let k = self.route_sel.len();
+        // Read once per dispatch off the pool's own set: the launcher choice is the ARTIFACT's
+        // fact, and a second source of it here could name a container the pool does not hold.
+        let fmt = self
+            .pin
+            .routed_fmt()
+            .context("the routed backend has no pool to name a container")?;
         let x_in = MoeX {
             x: pc(&self.sc.xn),
             cfg: self.cfg,
+            fmt,
         };
         let acc = self
             .moe8
@@ -277,11 +320,39 @@ impl MxFp8MoeScratch {
         (e_start, e_count): (usize, usize),
         lane: MoeLane,
     ) -> Result<()> {
+        match x_in.fmt {
+            RoutedFmt::MxFp8 => unsafe {
+                self.invoke_range(
+                    launch_moe_expert_range_mxfp8_situ,
+                    (x_in, (e_start, e_count), lane),
+                )
+            },
+            RoutedFmt::F4 => unsafe {
+                self.invoke_range(
+                    launch_moe_expert_range_f4_situ,
+                    (x_in, (e_start, e_count), lane),
+                )
+            },
+            other => bail!(
+                "unexpected Inkling routed format .{}: the pool streams .mxfp8 or .f4",
+                other.ext()
+            ),
+        }
+    }
+
+    /// Shared 14-argument launch body for both `.mxfp8` and `.f4` SiTU range kernels.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::range`].
+    unsafe fn invoke_range(
+        &self,
+        launch: RangeLaunch,
+        (x_in, (e_start, e_count), lane): (MoeX<'_>, (usize, usize), MoeLane),
+    ) -> Result<()> {
         let cfg = x_in.cfg;
-        // SAFETY: forwarded from this method's contract; `x` is the normed hidden the router
-        // read, `hidden` wide and 256-byte aligned by construction.
+        // SAFETY: forwarded from `range`'s contract.
         unsafe {
-            launch_moe_expert_range_mxfp8_situ(
+            launch(
                 x_in.x,
                 cfg.hidden_size,
                 cfg.intermediate_size,

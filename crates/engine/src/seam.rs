@@ -491,26 +491,26 @@ impl<'a> Engine<'a> {
             // the block state and the activation scratch, so the bytes the partition may use
             // are decided once by the constructor rather than split across a pin and a new.
             //
-            // **Which pin is the ARTIFACT's answer**, so the two-branch choice lives in
-            // [`open_inkling`] rather than here: this arm is one statement, and the body it
-            // shares with nothing keeps `build.rs`'s duplication gate out of the argument.
+            // **Which pin is the ARTIFACT's answer** (bf16 slabs, `.mxfp8` pool, `.f4` pool), so
+            // the container choice lives in [`open_inkling`] rather than here: this arm is one
+            // statement, and the body it shares with nothing keeps `build.rs`'s duplication gate
+            // out of the argument. Small's arm below spends the same statement for the same
+            // reason.
             ArchCfg::InklingLoop(cfg, knobs) => {
                 let e = open_inkling(dir, &cfg.text, (capacity, knobs), spec.max_ctx)?;
                 Ok(Engine::Inkling(e))
             }
-            // Small's floor charges KV and activation scratch before the pool is sized, and
-            // its experts stream through a pool, so it takes the same `pin_cfg` every routed
-            // arm builds — one construction site for the budget and the four pool knobs.
-            ArchCfg::Inkling(cfg, knobs) => {
-                let pin = pin_cfg(capacity, knobs);
-                let e = crate::inkling::engine::InklingEngine::open_mxfp8(
-                    dir,
-                    &cfg.text,
-                    pin,
-                    spec.max_ctx,
-                )?;
-                Ok(Engine::Inkling(e))
-            }
+            // Small's floor charges KV and activation scratch before the pool is sized, and its
+            // experts stream through a pool — so it takes the SAME container sniff Mini's arm
+            // does: `.mxfp8` and `.f4` are both pools, and which one an artifact holds is its
+            // manifest's statement. Naming `open_mxfp8` here (as this arm did until the `.f4`
+            // container existed) made an `.f4` Small artifact a load error.
+            ArchCfg::Inkling(cfg, knobs) => Ok(Engine::Inkling(open_inkling(
+                dir,
+                &cfg.text,
+                (capacity, knobs),
+                spec.max_ctx,
+            )?)),
         }
     }
 
@@ -712,16 +712,21 @@ impl<'a> Engine<'a> {
 
 /// Open the Inkling 2 member `dir` holds, on the pin its CONTAINER implies.
 ///
-/// **Sniffed from the artifact, never from a flag.** `manifest.json`'s `mxfp8_source` is the
-/// converter's own statement that the experts are routed slots, so the two containers are told
-/// apart exactly as Glimmer's bf16 and fp8 ones are (`ProjFmt::sniff`'s argument): a flag could
-/// disagree with the weights it describes, and disagreeing here is not a crash but a wrong pin
-/// — the bf16 one reads expert slabs an `.mxfp8` artifact does not carry, and fails at load.
+/// **Sniffed from the artifact, never from a flag.** `manifest.json`'s `f4_source` and
+/// `mxfp8_source` are the converters' own statements that the experts are routed slots, so the
+/// containers are told apart exactly as Glimmer's bf16 and fp8 ones are (`ProjFmt::sniff`'s
+/// argument): a flag could disagree with the weights it describes, and disagreeing here is not a
+/// crash but a wrong pin — the bf16 one reads expert slabs an `.mxfp8`/`.f4` artifact does not
+/// carry, and fails at load.
 ///
 /// The branches differ in ONE thing, residency: both members run the same text stack and the
 /// same decode loop, so Mini's `.mxfp8` artifact is its own loop schedule over Small's pin
-/// (`InklingPin::build_mxfp8`). A bf16 artifact keeps the fixed layer-prefix partition and
-/// spends no knob — there is no pool for one to describe.
+/// (`InklingPin::build_pooled`), and its `.f4` artifact is the same pin over the smaller
+/// container. A bf16 artifact keeps the fixed layer-prefix partition and spends no knob — there
+/// is no pool for one to describe. **Both members take this path** (Mini through
+/// [`ArchCfg::InklingLoop`], Small through [`ArchCfg::Inkling`]), which is what makes an `.f4`
+/// Small artifact open: before the `.f4` container existed, Small's arm named its pin directly
+/// and a container it did not expect was a load error rather than a branch.
 #[cfg(feature = "rocm")]
 fn open_inkling<'a>(
     dir: &str,
@@ -730,10 +735,19 @@ fn open_inkling<'a>(
     n_ctx: usize,
 ) -> Result<crate::inkling::engine::InklingEngine<'a>> {
     use crate::inkling::engine::InklingEngine;
+    use rivoli_artifact::format::{has_f4_source, has_mxfp8_source};
+
     let (capacity, knobs) = budget;
-    match rivoli_artifact::format::has_mxfp8_source(dir) {
-        true => InklingEngine::open_mxfp8(dir, text, pin_cfg(capacity, knobs), n_ctx),
-        false => InklingEngine::open(dir, text, capacity, n_ctx),
+    // `.f4` is asked FIRST and the two are mutually exclusive by construction: no converter
+    // writes both provenance keys, and a directory carrying both would be an artifact two runs
+    // half-built — refused by `ExpertSet::open_routed`'s own dims check rather than guessed at
+    // here, because `.f4` is the smaller container and the one a re-quantization produces.
+    if has_f4_source(dir) {
+        InklingEngine::open_f4(dir, text, pin_cfg(capacity, knobs), n_ctx)
+    } else if has_mxfp8_source(dir) {
+        InklingEngine::open_mxfp8(dir, text, pin_cfg(capacity, knobs), n_ctx)
+    } else {
+        InklingEngine::open(dir, text, capacity, n_ctx)
     }
 }
 

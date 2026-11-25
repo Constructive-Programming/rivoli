@@ -3,16 +3,17 @@
 //! input/post-attention norms, the two post convolutions, the query banks, the router, and (on a
 //! looped layer) the four MessageGates — to device addresses.
 //!
-//! Every dense projection is a bf16 [`Bf16Weight`] on both members. The routed experts are the
-//! STREAMED unit, and WHO streams them is the one thing the backends differ in
+//! The five large attention projections (`q`, `k`, `v`, the output gate and `o`) are
+//! [`DenseWeight`]s — bf16, or fp8-e4m3 with a per-tile scale grid when the artifact was
+//! converted that way (the `dense` child module); every other dense tensor is a [`Bf16Weight`] on
+//! every artifact. The routed experts are the STREAMED unit, and WHO streams them is the one
+//! thing the backends differ in
 //! ([`ExpertBackend`]): Mini's converted artifact holds them dequantized bf16, so
 //! [`InklingPin::build`] asks [`rivoli_core::residency::partition`] how many whole layers fit
 //! (P6, INV-8) and reads ONE expert per routing decision into a single-expert staging slot;
 //! Small's are native `.mxfp8` and stream through [`RoutedPool`] (the `mxfp8` child module).
 
-use super::geometry::{
-    ScratchSizes, expert_layer_bytes, global_weight_bytes, is_block_end, single_expert_bytes,
-};
+use super::geometry::{ScratchSizes, expert_layer_bytes, is_block_end, single_expert_bytes};
 use super::names;
 use crate::device::{DeviceBuf, DeviceTier};
 use crate::resident::{Bf16Weight, place_bf16, place_f32};
@@ -20,7 +21,7 @@ use crate::routed::RoutedPool;
 use crate::seam::Fetched;
 use anyhow::{Context, Result, bail, ensure};
 use core::ptr;
-use rivoli_artifact::format::{Dtype, ExpertSet, Safetensors};
+use rivoli_artifact::format::{Dtype, ExpertSet, RoutedFmt, Safetensors};
 use rivoli_artifact::inkling_config::InklingTextConfig;
 use rivoli_core::residency::{Bytes, Floor, Refusal, Unit, UnitId, partition};
 use std::num::NonZeroU64;
@@ -32,10 +33,20 @@ use std::num::NonZeroU64;
 /// for 64 MiB no placement could ever consume.
 const PIN_SLACK: usize = 4 << 20;
 
+/// The dense trunk's storage width — bf16 or fp8-e4m3 — and the artifact's byte census. A child
+/// module for the 800-line soft cap, split along "what the dense weights are stored in and what
+/// that costs" (see its own doc).
+mod dense;
+/// One layer's dense placement — the walk that reads `dense`'s widths against this file's pin.
+mod layer;
 /// Small's `.mxfp8` construction — the pool-backed half of this pin, split out when the file
 /// crossed the workspace's 800-line soft cap. It is a child module so it can read this file's
 /// private placers and its [`PIN_SLACK`] without widening one visibility.
 mod mxfp8;
+
+pub use dense::DenseWeight;
+use dense::{measure_resident, sniff};
+pub use layer::{LayerSpec, place_layer};
 
 /// One decoder layer's short-convolution form. The SLIDING layers carry a self-contained static
 /// `conv1d` per k/v side; the FULL layers carry the dynamic pair — a static tap bank plus an input
@@ -74,19 +85,19 @@ pub struct InklingLayerPin {
     /// `post_attention_layernorm` — the pre-MLP norm.
     pub post_attn_ln: *const f32,
     /// `q_proj.linear` `[num_heads·head_dim, hidden]`.
-    pub q: Bf16Weight,
+    pub q: DenseWeight,
     /// `q_proj.norm.scale` `[num_heads·head_dim]` — the learned L2Clip scale.
     pub q_norm_scale: *const f32,
     /// `k_proj.linear` `[kv_heads·head_dim, hidden]`.
-    pub k: Bf16Weight,
+    pub k: DenseWeight,
     /// `v_proj.linear`, same shape as [`Self::k`], separable only by name.
-    pub v: Bf16Weight,
+    pub v: DenseWeight,
     /// The k/v short convolution in this layer's form — static on sliding, dynamic on full.
     pub sconv: LayerSconv,
     /// `o_proj.gate_proj` `[num_heads·head_dim, hidden]` — the sigmoid output gate.
-    pub attn_gate: Bf16Weight,
+    pub attn_gate: DenseWeight,
     /// `o_proj.linear` `[hidden, num_heads·head_dim]`.
-    pub o: Bf16Weight,
+    pub o: DenseWeight,
     /// `sink_proj` `[num_heads, hidden]` — one sink logit per head, read on-device by
     /// `sink_attend`.
     pub sink: Bf16Weight,
@@ -113,107 +124,6 @@ pub struct InklingLayerPin {
     pub router: Bf16Weight,
     /// The four MessageGates — `Some` exactly on a looped layer (`core_start <= i < core_end`).
     pub message_gates: Option<[MessageGatePin; 4]>,
-}
-
-/// One MessageGate's three projections, resolved from `<prefix>.{down,forget,message}_proj`.
-fn place_message_gate(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
-    prefix: &str,
-) -> Result<MessageGatePin> {
-    let n = |suffix: &str| format!("{prefix}.{suffix}");
-    Ok(MessageGatePin {
-        down: place_bf16(tier, st, &n(names::MESSAGE_GATE_SUFFIXES[0]))?,
-        forget: place_bf16(tier, st, &n(names::MESSAGE_GATE_SUFFIXES[1]))?,
-        gain: place_bf16(tier, st, &n(names::MESSAGE_GATE_SUFFIXES[2]))?,
-    })
-}
-
-/// Place one layer's input norms (three on full layers, one on sliding) and k/v sconv weights.
-fn place_layer_norms_and_sconv(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
-    p: &str,
-    full: bool,
-) -> Result<([*const f32; 3], LayerSconv)> {
-    let n = |suffix: &str| format!("{p}.{suffix}");
-    if full {
-        let input_ln = [
-            place_f32(tier, st, &n(names::FULL_INPUT_NORMS[0]))?,
-            place_f32(tier, st, &n(names::FULL_INPUT_NORMS[1]))?,
-            place_f32(tier, st, &n(names::FULL_INPUT_NORMS[2]))?,
-        ];
-        let sconv = LayerSconv::Dynamic {
-            k_static: place_f32(tier, st, &n(names::K_SCONV_TAPS))?,
-            k_proj: place_bf16(tier, st, &n(names::K_SCONV_PROJ))?,
-            v_static: place_f32(tier, st, &n(names::V_SCONV_TAPS))?,
-            v_proj: place_bf16(tier, st, &n(names::V_SCONV_PROJ))?,
-        };
-        return Ok((input_ln, sconv));
-    }
-    let input_ln = [
-        place_f32(tier, st, &n(names::SLIDING_INPUT_NORM))?,
-        ptr::null(),
-        ptr::null(),
-    ];
-    let sconv = LayerSconv::Static {
-        k: place_f32(tier, st, &n(names::K_SCONV_STATIC))?,
-        v: place_f32(tier, st, &n(names::V_SCONV_STATIC))?,
-    };
-    Ok((input_ln, sconv))
-}
-
-/// Resolve one layer's dense weights from the artifact. `flags` is `(full, looped)` — both derived
-/// by the caller from `geometry`'s rules (`is_block_end` and the loop core), never guessed here;
-/// `full` selects the three q/k/v input norms (T11) and the dynamic sconv, `looped` the four
-/// MessageGates. The unused slots are null. Each projection's dims ride the [`Bf16Weight`] from the
-/// tensor's own shape, so a mis-shaped artifact fails at load (`place_bf16`'s `dims2`), not at
-/// launch.
-pub fn place_layer(
-    tier: &mut DeviceTier,
-    st: &Safetensors,
-    i: usize,
-    flags: (bool, bool),
-) -> Result<InklingLayerPin> {
-    let (full, looped) = flags;
-    let p = names::layer_prefix(i);
-    let n = |suffix: &str| format!("{p}.{suffix}");
-    let (input_ln, sconv) = place_layer_norms_and_sconv(tier, st, &p, full)?;
-    let message_gates = if looped {
-        Some([
-            place_message_gate(tier, st, &n(names::MESSAGE_GATE_PREFIXES[0]))?,
-            place_message_gate(tier, st, &n(names::MESSAGE_GATE_PREFIXES[1]))?,
-            place_message_gate(tier, st, &n(names::MESSAGE_GATE_PREFIXES[2]))?,
-            place_message_gate(tier, st, &n(names::MESSAGE_GATE_PREFIXES[3]))?,
-        ])
-    } else {
-        None
-    };
-    Ok(InklingLayerPin {
-        input_ln,
-        post_attn_ln: place_f32(tier, st, &n(names::POST_ATTN_NORM))?,
-        q: place_bf16(tier, st, &n(names::Q_LINEAR))?,
-        q_norm_scale: place_f32(tier, st, &n(names::Q_NORM))?,
-        k: place_bf16(tier, st, &n(names::K_LINEAR))?,
-        v: place_bf16(tier, st, &n(names::V_LINEAR))?,
-        sconv,
-        attn_gate: place_bf16(tier, st, &n(names::O_GATE))?,
-        o: place_bf16(tier, st, &n(names::O_LINEAR))?,
-        sink: place_bf16(tier, st, &n(names::SINK))?,
-        rel_linear: place_bf16(tier, st, &n(names::REL_LINEAR))?,
-        rel_proj: place_bf16(tier, st, &n(names::REL_PROJ))?,
-        rel_norm_scale: place_f32(tier, st, &n(names::REL_NORM))?,
-        post_attn_conv: place_f32(tier, st, &n(names::POST_ATTN_CONV))?,
-        post_mlp_conv: place_f32(tier, st, &n(names::POST_MLP_CONV))?,
-        mlp_query: place_f32(tier, st, &n(names::MLP_INPUT_QUERY))?,
-        attn_query: if i > 0 {
-            place_f32(tier, st, &n(names::ATTENTION_INPUT_QUERY))?
-        } else {
-            ptr::null()
-        },
-        router: place_bf16(tier, st, &n(names::ROUTER))?,
-        message_gates,
-    })
 }
 
 // ── the whole pin: globals, dense layers, and the routed experts' placement ─────────────────
@@ -264,18 +174,21 @@ pub enum ExpertBackend {
         /// Expert-slot hits and fills, at this backend's granularity (one expert).
         fetched: Fetched,
     },
-    /// Small: the `.mxfp8` set behind the shared routed pool. The pool's own counters are the
-    /// authority for [`InklingPin::fetched`] — a second tally here could disagree with it.
+    /// The pool-backed backend: the routed set's slots behind [`RoutedPool`]. Named for the
+    /// container it was introduced with, but the pool is format-agnostic — `.mxfp8` and `.f4`
+    /// both land here, and which one is [`InklingPin::routed_fmt`]'s answer. The pool's own
+    /// counters are the authority for [`InklingPin::fetched`] — a second tally here could
+    /// disagree with it.
     MxFp8 {
-        /// Keeps the read table's fds open for the pool's lifetime.
-        _set: ExpertSet,
+        /// Keeps the read table's fds open for the pool's lifetime, and names the container.
+        set: ExpertSet,
         routed: Box<RoutedPool>,
         pinned_experts: usize,
         total_experts: usize,
     },
 }
 
-/// What [`InklingPin::assemble`] needs to place the resident set — bundled because it is four
+/// What [`InklingPin::assemble`] needs to place the resident set — bundled because it is five
 /// values travelling together into one call and two of them are byte counts a positional list
 /// would let transpose.
 pub(super) struct Parts<'a> {
@@ -283,6 +196,8 @@ pub(super) struct Parts<'a> {
     pub st: Safetensors,
     pub flags: &'a [(bool, bool)],
     pub tier_bytes: usize,
+    /// The dense trunk's fp8 block, sniffed once per artifact (`None` on a bf16 trunk).
+    pub fp8_block: Option<usize>,
 }
 
 /// One Inkling 2 member's weight set: the placed globals and dense layers, and the routed
@@ -317,38 +232,6 @@ fn expert_names(l: usize) -> (String, String) {
         format!("{p}.{}", names::EXPERTS_GATE_UP),
         format!("{p}.{}", names::EXPERTS_DOWN),
     )
-}
-
-/// The dense (non-expert) byte total over every layer, read off the artifact's own headers.
-///
-/// **The artifact's lengths, not `dense_layer_elements` × a dtype.** The per-layer census formula
-/// counts ELEMENTS across two storage widths (bf16 projections, f32 norms), so multiplying it by
-/// either width is wrong by the other one's share; the header is exact by construction and is the
-/// same tensor list [`place_layer`] places.
-fn dense_total(st: &Safetensors, flags: &[(bool, bool)]) -> Result<usize> {
-    let mut n = 0;
-    for (l, &(full, looped)) in flags.iter().enumerate() {
-        for name in names::layer_tensor_names(l, full, looped) {
-            if name.contains(".mlp.experts.") {
-                continue; // the routed unit: `expert_layer_bytes`
-            }
-            n += st.raw(&name)?.0.len();
-        }
-    }
-    Ok(n)
-}
-
-/// The global tensors' byte total, read off the artifact — equal to
-/// [`global_weight_bytes`]'s derived figure, which is what the floor uses.
-fn globals_bytes(st: &Safetensors, text: &InklingTextConfig) -> Result<usize> {
-    let mut n = 0;
-    for (i, name) in names::GLOBAL_SUFFIXES.iter().enumerate() {
-        if i == 4 && text.loop_config.is_none() {
-            continue; // message_input.query is the looped member's alone
-        }
-        n += st.raw(name)?.0.len();
-    }
-    Ok(n)
 }
 
 /// The residency units: one whole layer's expert slabs, in layer order. Layer order is the
@@ -429,6 +312,11 @@ fn place_experts(
 impl InklingPin {
     /// Whether this pin streamed its experts through [`RoutedPool`] — Small's backend.
     ///
+    /// **It answers "pool-backed", not "e4m3":** an `.f4` artifact takes the same pool, streams
+    /// and descriptor table, and [`Self::routed_fmt`] is what tells the two containers apart. The
+    /// name is the one its caller (`decode.rs`'s `moe`) has used since the pool was the `.mxfp8`
+    /// arm alone; renaming it would have moved a token in a file this change does not own.
+    ///
     /// The engine asks this ONCE, at construction, to decide whether to allocate the two
     /// streams and the descriptor table the pool's dispatch needs: Mini's loop must pay no
     /// byte and no accounting for a path it never takes.
@@ -441,6 +329,15 @@ impl InklingPin {
     pub fn routed_mut(&mut self) -> Option<&mut RoutedPool> {
         match &mut self.backend {
             ExpertBackend::MxFp8 { routed, .. } => Some(routed),
+            ExpertBackend::Bf16 { .. } => None,
+        }
+    }
+
+    /// Which container the pool streams — `.mxfp8` or `.f4` — read off the set the pool was built
+    /// from, so the MoE dispatch's launcher choice and the artifact cannot disagree.
+    pub fn routed_fmt(&self) -> Option<RoutedFmt> {
+        match &self.backend {
+            ExpertBackend::MxFp8 { set, .. } => Some(set.fmt()),
             ExpertBackend::Bf16 { .. } => None,
         }
     }
@@ -492,6 +389,7 @@ impl InklingPin {
         let (hidden, inter) = (text.hidden_size, text.intermediate_size);
         let n_layers = text.num_hidden_layers;
         let flags = layer_flags(text);
+        let fp8_block = sniff(dir, &st)?;
         let (globals, dense) = measure_resident(&st, text, &flags)?;
         let (n_pinned, tier_bytes) = plan_partition(text, (capacity, n_ctx), (globals, dense))?;
         let n_streamed = n_layers - n_pinned;
@@ -502,6 +400,7 @@ impl InklingPin {
             st,
             flags: &flags,
             tier_bytes,
+            fp8_block,
         };
         Self::assemble(parts, move |tier, st| {
             let experts = place_expert_sources(tier, st, counts, dims)?;
@@ -539,10 +438,11 @@ impl InklingPin {
             st,
             flags,
             tier_bytes,
+            fp8_block,
         } = parts;
         let mut tier = DeviceTier::new(tier_bytes)?;
         let globals = place_globals(&mut tier, &st, text)?;
-        let (layers, router_bias_host) = place_dense(&mut tier, &st, flags)?;
+        let (layers, router_bias_host) = place_dense(&mut tier, &st, flags, fp8_block)?;
         let backend = make_backend(&mut tier, &st)?;
         Ok(Self {
             _tier: tier,
@@ -676,11 +576,18 @@ fn place_dense(
     tier: &mut DeviceTier,
     st: &Safetensors,
     flags: &[(bool, bool)],
+    fp8_block: Option<usize>,
 ) -> Result<(Vec<InklingLayerPin>, Vec<Vec<f32>>)> {
     let mut layers = Vec::with_capacity(flags.len());
     let mut biases = Vec::with_capacity(flags.len());
-    for (l, &f) in flags.iter().enumerate() {
-        layers.push(place_layer(tier, st, l, f)?);
+    for (l, &(full, looped)) in flags.iter().enumerate() {
+        let spec = LayerSpec {
+            layer: l,
+            full,
+            looped,
+            fp8_block,
+        };
+        layers.push(place_layer(tier, st, spec)?);
         let name = format!("{}.{}", names::layer_prefix(l), names::ROUTER_BIAS);
         let (bytes, _) = st.typed(&name, Dtype::F32)?;
         biases.push(rivoli_artifact::quant::read_f32(bytes));
@@ -735,23 +642,6 @@ fn below_floor(r: Refusal) -> anyhow::Error {
         need.0 as f64 / (1u64 << 30) as f64,
         have.0 as f64 / (1u64 << 30) as f64
     )
-}
-
-/// Measure the artifact's global + dense bytes and verify the globals agree with geometry.
-fn measure_resident(
-    st: &Safetensors,
-    text: &InklingTextConfig,
-    flags: &[(bool, bool)],
-) -> Result<(usize, usize)> {
-    let dense = dense_total(st, flags)?;
-    let globals = global_weight_bytes(text);
-    let carried = globals_bytes(st, text)?;
-    ensure!(
-        carried == globals,
-        "the artifact's global tensors total {carried} bytes against geometry's {globals} — \
-         the floor is stated from a derivation that no longer matches the artifact"
-    );
-    Ok((globals, dense))
 }
 
 /// Run `residency::partition` over the expert layers and return `(n_pinned, tier_bytes)`.

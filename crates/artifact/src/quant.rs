@@ -40,7 +40,7 @@ pub mod vq;
 /// keeps the two separate.
 pub use f4::{
     F4_GROUP, F4_LUT, e8m0, f4_expert_bytes, f4_expert_stride, f4_groups, f4_proj_bytes,
-    f4_row_bytes, f4_slot_offsets,
+    f4_row_bytes, f4_slot_offsets, quantize_f4_row,
 };
 pub use fp8::{FP8_BLOCK, dequant_fp8_block, matvec_fp8, quantize_fp8_block};
 pub use int4::{
