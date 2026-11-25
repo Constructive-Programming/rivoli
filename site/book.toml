@@ -1,0 +1,19 @@
+# rivoli.constructive.dev: built with mdBook (`mdbook build site`, output in site/book/),
+# deployed to Cloudflare Pages by .github/workflows/deploy-site.yml. The constructive.dev
+# brand (indigo, Inter + JetBrains Mono, OS-driven dark mode) comes from theme/rivoli.css,
+# which overrides mdBook's own Light and Navy themes rather than vendoring its templates.
+[book]
+title = "rivoli"
+description = "Decode LLMs bigger than memory: weights streamed from NVMe, overlapped with compute, on ROCm unified memory systems."
+authors = ["Constructive Programming"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/Constructive-Programming/rivoli"
+site-url = "/"
+additional-css = ["theme/rivoli.css"]
+additional-js = ["theme/rivoli.js"]
+no-section-label = true

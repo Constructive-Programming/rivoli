@@ -29,3 +29,6 @@ __pycache__/
 **/.claude/scheduled_tasks.lock
 **/.claude/assistant-daemon-state.json
 **/.claude/first-run
+
+# mdBook output (mdbook build site)
+/site/book/
