@@ -1,0 +1,161 @@
+/* =====================================================================
+ * rivoli.css: the constructive.dev brand on mdBook, plus rivoli's accent.
+ *
+ * Structure (nav, links, headings, sidebar) uses the shared constructive.dev
+ * indigo: #3b3b8c light / #7878d6 dark, the same values as eo/fixed's
+ * Helium ThemeColors. rivoli adds ONE warm accent, ember, which stands for
+ * Rust and for the NVMe stream in diagrams. Indigo is compute and ember is
+ * the stream, so the palette tells the overlap story.
+ *
+ * Sizes are in em: mdBook sets html font-size to 62.5%, so 1rem is 10px.
+ *
+ * Ember has two shades: #c2410c is for text on white (5.2:1, passes AA) and
+ * #e8590c is for fills. On the dark background, #ff8a3d does both.
+ *
+ * Only mdBook's Light and Navy themes are restyled (book.toml picks them as
+ * the light and dark defaults). The picker hides Rust, Coal and Ayu, so a
+ * visitor gets Auto, Light or Dark.
+ * ===================================================================== */
+
+:root {
+  --mono-font: "JetBrains Mono", "Cascadia Code", "Fira Code", "SF Mono", Menlo,
+    Consolas, "Liberation Mono", monospace;
+  --rv-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+html { font-family: var(--rv-sans); }
+
+/* ---- Light ---------------------------------------------------------- */
+.light, html:not(.js) {
+  --rv-indigo: #3b3b8c;
+  --rv-indigo-mid: #8585c5;
+  --rv-indigo-soft: #eaeaf5;
+  --rv-ember: #c2410c;
+  --rv-ember-fill: #e8590c;
+  --rv-ember-soft: #fdeee4;
+
+  --bg: #ffffff;
+  --fg: #23272e;
+  --sidebar-bg: #f6f6fb;
+  --sidebar-fg: #23272e;
+  --sidebar-active: var(--rv-indigo);
+  --sidebar-spacer: #e6e6f0;
+  --sidebar-header-border-color: var(--rv-indigo-mid);
+  --icons: #6b6f80;
+  --icons-hover: var(--rv-indigo);
+  --links: var(--rv-indigo);
+  --inline-code-color: var(--rv-ember);
+  --theme-popup-bg: #f6f6fb;
+  --theme-hover: var(--rv-indigo-soft);
+  --quote-bg: var(--rv-indigo-soft);
+  --quote-border: var(--rv-indigo-mid);
+  --warning-border: var(--rv-ember-fill);
+  --table-border-color: #e6e6f0;
+  --table-header-bg: var(--rv-indigo-soft);
+  --table-alternate-bg: #fafafd;
+  --searchresults-li-bg: var(--rv-indigo-soft);
+  --search-mark-bg: #ffd8bf;
+  --footnote-highlight: var(--rv-indigo-mid);
+  --blockquote-note-color: var(--rv-indigo);
+  --blockquote-important-color: var(--rv-ember);
+}
+
+/* ---- Dark (mdBook's "navy" slot) ------------------------------------ */
+.navy {
+  --rv-indigo: #7878d6;
+  --rv-indigo-mid: #5e5eb8;
+  --rv-indigo-soft: #2d333b;
+  --rv-ember: #ff8a3d;
+  --rv-ember-fill: #ff8a3d;
+  --rv-ember-soft: #3a2a22;
+
+  --bg: #1f242b;
+  --fg: #e6edf3;
+  --sidebar-bg: #23272e;
+  --sidebar-fg: #c9d1d9;
+  --sidebar-active: #a3a3e6;
+  --sidebar-spacer: #2d333b;
+  --sidebar-header-border-color: var(--rv-indigo-mid);
+  --icons: #8b949e;
+  --icons-hover: #a3a3e6;
+  --links: #a3a3e6;
+  --inline-code-color: var(--rv-ember);
+  --theme-popup-bg: #23272e;
+  --theme-hover: #2d333b;
+  --quote-bg: #262b33;
+  --quote-border: var(--rv-indigo-mid);
+  --warning-border: var(--rv-ember);
+  --table-border-color: #2d333b;
+  --table-header-bg: #2d333b;
+  --table-alternate-bg: #23272e;
+  --searchbar-bg: #2d333b;
+  --searchbar-fg: #e6edf3;
+  --searchresults-li-bg: #2d333b;
+  --search-mark-bg: #7a4a2a;
+  --footnote-highlight: var(--rv-indigo-mid);
+  --blockquote-note-color: var(--rv-indigo);
+  --blockquote-important-color: var(--rv-ember);
+}
+
+/* Three choices only: Auto, Light, Dark. */
+#mdbook-theme-rust, #mdbook-theme-coal, #mdbook-theme-ayu { display: none; }
+
+/* ---- Typography ------------------------------------------------------ */
+/* mdBook wraps each heading in a.header coloured --fg; recolour the link, not the h*. */
+.content h1, .content h2, .content h3 { letter-spacing: -0.01em; }
+.content :is(h1, h2, h3) a.header:is(:link, :visited) { color: var(--rv-indigo); }
+.content h2 { border-bottom: 2px solid var(--rv-indigo-soft); padding-bottom: .2em; }
+.menu-title { color: var(--rv-indigo); font-weight: 700; }
+.chapter li a.active { font-weight: 600; }
+.content a:hover { color: var(--rv-ember); }
+
+/* ---- Brand icon in the top bar (rivoli.js) ---------------------------- */
+.rv-brand-link { display: inline-flex; align-items: center; padding: 0 .5em; }
+.rv-brand-link img { width: 1.3em; height: 1.3em; }
+
+/* ---- Landing hero ---------------------------------------------------- */
+.rv-hero {
+  margin: 1em 0 2em;
+  padding: 2em 1.5em;
+  border-radius: 12px;
+  background:
+    radial-gradient(120% 140% at 100% 0%, var(--rv-ember-soft) 0%, transparent 55%),
+    linear-gradient(135deg, var(--rv-indigo-soft) 0%, var(--bg) 70%);
+  border: 1px solid var(--rv-indigo-soft);
+}
+.rv-hero h1 { margin: 0; font-size: 3em; line-height: 1; }
+.rv-hero h1 span { color: var(--rv-ember); }
+.rv-hero .rv-tagline { font-size: 1.25em; margin: .75em 0 1.25em; }
+.rv-pill {
+  display: inline-block;
+  margin: 0 .35em .35em 0;
+  padding: .15em .65em;
+  border-radius: 999px;
+  font-family: var(--mono-font);
+  font-size: .8em;
+  border: 1px solid var(--rv-indigo-mid);
+  color: var(--rv-indigo);
+}
+.rv-pill.ember { border-color: var(--rv-ember-fill); color: var(--rv-ember); }
+
+/* ---- Overlap diagram (inline SVG, so it follows the theme) ----------- */
+.rv-overlap { width: 100%; height: auto; margin: 1em 0; }
+.rv-overlap text { font-family: var(--mono-font); font-size: 12px; fill: var(--fg); }
+.rv-overlap .lane { fill: var(--rv-indigo-soft); }
+.rv-overlap .compute { fill: var(--rv-indigo); }
+.rv-overlap .stream { fill: var(--rv-ember-fill); }
+.rv-overlap .on-compute { fill: var(--bg); font-size: 11px; }
+.rv-overlap .on-stream { fill: #1f242b; font-size: 11px; }
+.rv-overlap .axis { stroke: var(--icons); stroke-width: 1; }
+
+/* ---- Principle cards ------------------------------------------------- */
+.rv-card {
+  border-left: 4px solid var(--rv-indigo);
+  background: var(--rv-indigo-soft);
+  padding: .6em 1em;
+  margin: 1em 0;
+  border-radius: 0 8px 8px 0;
+}
+.rv-card.ember { border-left-color: var(--rv-ember-fill); background: var(--rv-ember-soft); }
+.rv-card > :first-child { margin-top: 0; }
+.rv-card > :last-child { margin-bottom: 0; }
