@@ -3,8 +3,9 @@ name: Deploy site
 # Builds the mdBook site in site/ and publishes it to Cloudflare Pages. This is the same
 # flow as the other constructive.dev sites (eo's deploy-site.yml), minus the JVM:
 #   - Pull request   -> preview deployment named after the head branch, URL posted on the PR
-#   - Push to main   -> preview deployment for main
-#   - Tag push v*    -> production deployment
+#   - Push to main   -> production deployment (main is the Pages project's production branch)
+# Unlike eo, production does NOT wait for a v* tag: rivoli's tags are engine releases, and
+# the site should not lag the docs it describes until the next engine cut.
 # Needs secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID; the Pages project name
 # comes from the CLOUDFLARE_PAGES_PROJECT variable (default rivoli-site). Fork PRs are
 # skipped because they cannot read the secrets.
@@ -15,7 +16,6 @@ on:
     paths: [site/**, .github/workflows/deploy-site.yml]
   push:
     branches: [main]
-    tags: [v*]
     paths: [site/**, .github/workflows/deploy-site.yml]
   workflow_dispatch:
 
