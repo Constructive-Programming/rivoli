@@ -332,6 +332,16 @@ in RAM** that competes with the GPU's unified-memory budget, and it is session-s
 sweep script written there is gone next session, and reading a census from a *previous*
 session's scratch directory is how a stale result gets mistaken for a fresh one.
 
+## Model storage tiers
+
+- **Hot storage (`/var/db/rivoli`)**: local NVMe for models currently being worked on or benchmarked.
+- **Cold storage (`/swarm/storage/ai/rivoli`)**: NFS archive that must hold a copy of every rivoli model.
+- **`/swarm/storage/ai/models`** is shared common storage; it holds GGUF models shared with other tools.
+- **Performance tests**: require the model artifact to be in hot storage (`/var/db/rivoli`).
+- **Promoting a model**: copy from cold to hot with `rsync -a --info=progress2 /swarm/storage/ai/rivoli/<model>/ /var/db/rivoli/<model>/`.
+- **Archiving a model**: copy to cold with `rsync -a --info=progress2 <src>/ /swarm/storage/ai/rivoli/<model>/` before deleting any hot copy.
+- **Freeing hot space**: confirm the model is already present and complete in cold storage (`/swarm/storage/ai/rivoli`) before deleting `/var/db/rivoli/<model>`.
+
 ## Measurement discipline (all of these drew blood in the old tree)
 
 - **The GPU is sole-tenant.** Wrap every GPU command in `flock /var/run/sys-gpu.lock -c`,

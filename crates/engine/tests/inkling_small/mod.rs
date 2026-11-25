@@ -1,28 +1,38 @@
-//! The synthetic Inkling-2-Small artifact `inkling_small_mxfp8.rs` scores: a TINY, VALID Small
-//! wrapper whose dense tensors are deterministic LCG draws and whose routed experts are real
-//! `.mxfp8` files produced by [`Mxfp8Layer`] from a source in the checkpoint's own interleaved
-//! `w13` spelling.
+//! The synthetic Inkling 2 artifacts the two gate files beside this module score: a TINY, VALID
+//! wrapper for EITHER member, whose dense tensors are deterministic LCG draws and whose routed
+//! experts are real `.mxfp8` files produced by [`Mxfp8Layer`] from a source in the checkpoint's
+//! own interleaved `w13` spelling.
 //!
-//! **The dimensions are Small's SHAPE, not its sizes** — 6 layers (5 sliding + 1 block end),
-//! hidden 64, inter 64, 8 experts top-2 — so every code path the 48-layer model takes (static
-//! and dynamic short convolutions, block residual, host router, O_DIRECT `.mxfp8` fill, the fused
-//! SiTU-GLU MoE, `logit_tail`) runs at a size a gate can afford on every invocation. The fixture
-//! is ~2 MB and builds in milliseconds, which is what lets this gate exist on a box that has
-//! never seen the 619 GB checkpoint.
+//! **The dimensions are the members' SHAPES, not their sizes.** The non-looped fixture is 6
+//! layers (5 sliding + 1 block end), hidden 64, inter 64, 8 experts top-2 — every code path the
+//! 48-layer model takes (static and dynamic short convolutions, block residual, host router,
+//! O_DIRECT `.mxfp8` fill, the fused SiTU-GLU MoE, `logit_tail`) at a size a gate can afford on
+//! every invocation. The LOOPED fixture is Mini's own 24-layer schedule with the core `6..18`
+//! run twice, so the same writer also produces the pre-loop prefix, the core, the post-loop
+//! suffix, the message query bank and the four MessageGates per core layer. Both are a few MB
+//! and build in milliseconds, which is what lets these gates exist on a box that has never seen
+//! the 619 GB checkpoint.
 //!
-//! **Everything here is `pub` and used once**, from the gate file beside it: this module exists
-//! so the assertions fit under the 450-line cap, not so a second consumer can share it. It is
-//! compiled into that ONE test binary (cargo does not treat a `tests/` subdirectory as a target).
+//! **`pub` because TWO test binaries compile this module** — `inkling_small_mxfp8.rs` (the
+//! non-looped member) and `inkling_mini_mxfp8.rs` (the looped one) — each with its own
+//! `mod inkling_small;`. Cargo does not treat a `tests/` subdirectory as a target, so there is no
+//! third copy and no separate build.
 
 // Tests: panic-on-failure is the idiom, and every fixture value is generated rather than threaded
 // out as a `Result`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// `dead_code` for `tests/common/mod.rs`'s reason: this module is compiled into TWO test binaries
+// and each uses a subset — the non-looped gate never calls `build_mini`, the looped one never
+// calls `build` — so an unused item is dead in that binary by construction, not by neglect. The
+// alternative is per-consumer cfg gates on a test fixture, which is the same helper under two
+// names and a drift waiting to happen.
+#![allow(dead_code)]
 
 use rivoli_artifact::format::{
     Dtype, FormatMeta, Mxfp8Layer, SafeWriter, Safetensors, TensorData, mxfp8_expert_prefix,
     mxfp8_source,
 };
-use rivoli_artifact::inkling_config::{Inkling2Config, InklingTextConfig};
+use rivoli_artifact::inkling_config::{Inkling2Config, Inkling2LoopConfig, InklingTextConfig};
 use rivoli_artifact::quant::{mxfp8_expert_bytes, mxfp8_groups, mxfp8_slot_offsets};
 use rivoli_core::hash::splitmix_finalize;
 use rivoli_core::num::f32_to_bf16;
@@ -37,6 +47,21 @@ const INTER: usize = 64;
 const LAYERS: usize = 6;
 const BLOCK: usize = 6;
 const N_EXPERTS: usize = 8;
+
+/// The LOOPED member's shape: Mini's OWN schedule — 24 stored layers, the core `6..18` run once
+/// more than the prefix does, a post-loop suffix — with only the widths narrowed.
+///
+/// **The layer count is not free.** `replay_pass` refuses a pass whose bank never grew past the
+/// pre-loop boundary (`n_bank > pre_blocks + 1`), so a shorter model would not exercise the loop
+/// at all: the core pass has to close at least two block boundaries of its own, and layer 12 is
+/// the second one.
+const MINI_LAYERS: usize = 24;
+const MINI_CORE: (usize, usize) = (6, 18);
+const MINI_PASSES: usize = 2;
+/// The MessageGate down-projection rank. Mini's shipped file says 64 against hidden 2304; 8
+/// against this fixture's hidden 64 keeps the gate's two projection shapes (`2H → rank` and
+/// `rank → H`) distinct from each other and from `H`, which is all a shape check needs.
+const GATE_RANK: usize = 8;
 
 /// Every dimension the fixture's tensor shapes need, read ONCE from the config so the writer and
 /// the byte layout cannot disagree.
@@ -55,6 +80,18 @@ struct Dims {
     block: usize,
     vocab: usize,
     unpadded: usize,
+    /// The loop core `[start, end)` on the LOOPED member; `None` on the non-looped one. Read off
+    /// the config rather than a constant so the writer and the loop schedule cannot disagree.
+    core: Option<(usize, usize)>,
+    /// The MessageGate rank — 1 when there is no loop, which is never read on that member.
+    gate_rank: usize,
+}
+
+impl Dims {
+    /// Whether layer `l` carries the four MessageGates — `core_start <= l < core_end`.
+    fn looped(&self, layer: usize) -> bool {
+        self.core.is_some_and(|(s, e)| (s..e).contains(&layer))
+    }
 }
 
 fn dims(t: &InklingTextConfig) -> Dims {
@@ -72,6 +109,11 @@ fn dims(t: &InklingTextConfig) -> Dims {
         block: t.n_layers_per_attn_res_block,
         vocab: t.vocab_size,
         unpadded: t.unpadded_vocab_size,
+        core: t
+            .loop_config
+            .as_ref()
+            .map(|lc| (lc.core_start, lc.core_end)),
+        gate_rank: t.loop_config.as_ref().map_or(1, |lc| lc.gate_rank),
     }
 }
 
@@ -174,78 +216,153 @@ impl Drop for Scratch {
 // the config
 // ---------------------------------------------------------------------------------------
 
-/// A tiny, VALID Small wrapper: the shipped member's root pair and quant header, with the
-/// dimensions narrowed to what a gate can afford. [`write_config`] loads it through
-/// `Inkling2Config`, whose validator runs the member split, the GQA divisibility, the DERIVED
-/// `local_layer_ids` complement and the MXFP8 block alignment — so a fixture that drifted out of
-/// shape fails here rather than mid-decode.
-fn config_json() -> serde_json::Value {
-    serde_json::json!({
-        "model_type": "inkling2",
-        "architectures": ["Inkling2ForConditionalGeneration"],
-        "text_config": {
-            "model_max_length": 128,
-            "torch_dtype": "bfloat16",
-            "hidden_size": HIDDEN,
-            "num_hidden_layers": LAYERS,
-            "vocab_size": 64,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 32,
-            "d_rel": 16,
-            "rel_extent": 32,
-            "q_bias": false,
-            "o_bias": false,
-            "log_scaling_n_floor": 128,
-            "log_scaling_alpha": 0.1,
-            "rms_norm_eps": 0.000001,
-            "pre_norm_pre_affine": false,
-            "final_norm_pre_affine": false,
-            "use_value_norm_no_gamma": true,
-            "qk_l2_clip_threshold": 22.627416997969522,
-            "rel_l2_clip_threshold": 8.0,
-            "local_layer_ids": [0, 1, 2, 3, 4],
-            "sconv_kernel_size": 4,
-            "unpadded_vocab_size": 60,
-            "final_logit_softcapping": 30.0,
-            "swa_head_dim": 32,
-            "swa_num_attention_heads": 4,
-            "swa_num_key_value_heads": 2,
-            "sliding_window_size": 32,
-            "n_layers_per_attn_res_block": BLOCK,
-            "attn_res_normalize_values": true,
-            "n_routed_experts": N_EXPERTS,
-            "num_experts_per_tok": 2,
-            "n_shared_experts": 0,
-            "intermediate_size": INTER,
-            "mlp_gate_softcap": 4.0,
-            "mlp_up_softcap": 25.0,
-            "route_scale": 8.0,
-            "use_gate_bias": true
-        },
-        "quantization_config": {
-            "quant_method": "fp8",
-            "activation_scheme": "dynamic",
-            "weight_block_size": [1, 32],
-            "scale_fmt": "ue8m0",
-            "modules_to_not_convert": [
-                "model.llm.unembed",
-                "model.visual",
-                "model.llm.layers.*.attn.*"
-            ]
-        }
-    })
+/// Which member a fixture builds.
+///
+/// The two wrappers differ in the ROOT pair, the quant header and the presence of `loop_config`
+/// — exactly what the config door asserts per member — while the text stack's dimensions are one
+/// object. A `Member` rather than two fixture builders, because a second hand-written text block
+/// is a fixture that drifts from this one.
+#[derive(Clone, Copy)]
+pub enum Member {
+    Small,
+    Mini,
 }
 
-/// Write `config.json` into `dir` and load it back — the same door the CLI walks.
-pub fn write_config(dir: &str) -> Inkling2Config {
-    let doc = config_json();
+/// The text stack, member-specific keys included. Every dimension is the fixture's, so the
+/// writer and the shapes cannot disagree; `local_layer_ids` is DERIVED from the block rule
+/// because `InklingTextConfig::validate` compares it against its own complement.
+fn text_json(member: Member) -> serde_json::Value {
+    let layers = match member {
+        Member::Small => LAYERS,
+        Member::Mini => MINI_LAYERS,
+    };
+    let local: Vec<usize> = (0..layers).filter(|l| !is_block_end(*l, BLOCK)).collect();
+    let mut t = serde_json::json!({
+        "model_max_length": 128,
+        "torch_dtype": "bfloat16",
+        "hidden_size": HIDDEN,
+        "num_hidden_layers": layers,
+        "vocab_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "d_rel": 16,
+        "rel_extent": 32,
+        "q_bias": false,
+        "o_bias": false,
+        "log_scaling_n_floor": 128,
+        "log_scaling_alpha": 0.1,
+        "rms_norm_eps": 0.000001,
+        "use_value_norm_no_gamma": true,
+        "qk_l2_clip_threshold": 22.627416997969522,
+        "rel_l2_clip_threshold": 8.0,
+        "local_layer_ids": local,
+        "sconv_kernel_size": 4,
+        "unpadded_vocab_size": 60,
+        "final_logit_softcapping": 30.0,
+        "swa_head_dim": 32,
+        "swa_num_attention_heads": 4,
+        "swa_num_key_value_heads": 2,
+        "sliding_window_size": 32,
+        "n_layers_per_attn_res_block": BLOCK,
+        "attn_res_normalize_values": true,
+        "n_routed_experts": N_EXPERTS,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 0,
+        "intermediate_size": INTER,
+        "mlp_gate_softcap": 4.0,
+        "mlp_up_softcap": 25.0,
+        "route_scale": 8.0,
+        "use_gate_bias": true
+    });
+    match member {
+        // The shipped Small file disables both pre-affines and carries no loop — the validator
+        // asserts `Some(false)`/`Some(false)` and `loop_config: None`, so the keys are PRESENT
+        // here rather than defaulted.
+        Member::Small => {
+            t["pre_norm_pre_affine"] = false.into();
+            t["final_norm_pre_affine"] = false.into();
+        }
+        // Mini's file carries the text half's spelling and the loop; the two pre-affine keys are
+        // Small's and the validator refuses them here, so they are simply absent.
+        Member::Mini => {
+            t["model_type"] = "inkling2_loop_text".into();
+            t["loop_config"] = serde_json::json!({
+                "core_start": MINI_CORE.0,
+                "core_end": MINI_CORE.1,
+                "num_passes": MINI_PASSES,
+                "gate_rank": GATE_RANK,
+                "is_varloop": false,
+            });
+        }
+    }
+    t
+}
+
+/// A tiny, VALID wrapper for `member`: the shipped root pair and quant header, with the
+/// dimensions narrowed to what a gate can afford. The loaders below run it through
+/// `Inkling2Config`/`Inkling2LoopConfig`, whose validators run the member split, the GQA
+/// divisibility, the DERIVED `local_layer_ids` complement and the MXFP8 block alignment — so a
+/// fixture that drifted out of shape fails here rather than mid-decode.
+fn config_json(member: Member) -> serde_json::Value {
+    let (model_type, architectures, quant) = match member {
+        Member::Small => (
+            "inkling2",
+            serde_json::json!(["Inkling2ForConditionalGeneration"]),
+            serde_json::json!({
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [1, 32],
+                "scale_fmt": "ue8m0",
+                "modules_to_not_convert": [
+                    "model.llm.unembed",
+                    "model.visual",
+                    "model.llm.layers.*.attn.*"
+                ]
+            }),
+        ),
+        // Mini's root header names the checkpoint's NVFP4 quantization; the per-layer NVFP4 /
+        // MXFP8 split lives in `hf_quant_config.json`, which this fixture does not carry.
+        Member::Mini => (
+            "inkling2_loop",
+            serde_json::json!(["Inkling2LoopForConditionalGeneration"]),
+            serde_json::json!({ "quant_method": "modelopt", "quant_algo": "NVFP4" }),
+        ),
+    };
+    let mut doc = serde_json::json!({
+        "model_type": model_type,
+        "architectures": architectures,
+        "text_config": text_json(member),
+        "quantization_config": quant,
+    });
+    if matches!(member, Member::Mini) {
+        // Mini's ROOT carries the dtype; `Inkling2Config` has no field for it, so it is added
+        // only here rather than written as a key the other member's schema would ignore.
+        doc["dtype"] = "bfloat16".into();
+    }
+    doc
+}
+
+fn write_json(dir: &str, member: Member) {
+    let doc = config_json(member);
     std::fs::write(
         format!("{dir}/config.json"),
         serde_json::to_vec_pretty(&doc).expect("the fixture config is JSON"),
     )
     .expect("write config.json");
+}
+
+/// Write `config.json` into `dir` and load it back as the NON-looped wrapper — the same door the
+/// CLI walks.
+pub fn write_config(dir: &str) -> Inkling2Config {
+    write_json(dir, Member::Small);
     Inkling2Config::load(dir).expect("the fixture config must pass the Small validator")
+}
+
+/// The LOOPED member's wrapper, loaded through its own door.
+pub fn write_mini_config(dir: &str) -> Inkling2LoopConfig {
+    write_json(dir, Member::Mini);
+    Inkling2LoopConfig::load(dir).expect("the fixture config must pass the Mini validator")
 }
 
 // ---------------------------------------------------------------------------------------
@@ -294,6 +411,17 @@ fn shape_of(suffix: &str, d: &Dims, full: bool) -> Option<(Dtype, Vec<usize>)> {
         names::ATTENTION_INPUT_QUERY => (Dtype::F32, vec![d.h]),
         names::ROUTER => (Dtype::Bf16, vec![d.e, d.h]),
         names::ROUTER_BIAS => (Dtype::F32, vec![d.e]),
+        // The looped layers' four MessageGates: `down` maps the two residual streams into the
+        // rank, `forget` and `message` map it back out (`Inkling2MessageGate`, MOD:196). Matched
+        // by SUFFIX because the four gates differ only in the prefix.
+        _ if suffix.ends_with(names::MESSAGE_GATE_SUFFIXES[0]) => {
+            (Dtype::Bf16, vec![d.gate_rank, 2 * d.h])
+        }
+        _ if suffix.ends_with(names::MESSAGE_GATE_SUFFIXES[1])
+            || suffix.ends_with(names::MESSAGE_GATE_SUFFIXES[2]) =>
+        {
+            (Dtype::Bf16, vec![d.h, d.gate_rank])
+        }
         _ if names::FULL_INPUT_NORMS.contains(&suffix) => (Dtype::F32, vec![d.h]),
         _ => return None,
     })
@@ -313,6 +441,23 @@ fn values(suffix: &str, n: usize, rng: &mut Lcg) -> Vec<f32> {
 fn globals(w: &mut SafeWriter<'_>, d: &Dims) {
     let mut rng = Lcg::new(0x600D);
     let g = names::GLOBAL_SUFFIXES;
+    // The looped member's MessageGate query bank: four rows per looped layer. `globals_bytes`
+    // reads this tensor's own length and confronts the total with `global_weight_bytes`, so the
+    // SHAPE is load-bearing rather than decorative.
+    if let Some((start, end)) = d.core {
+        let shape = vec![(end - start) * 4, d.h];
+        let n = shape.iter().product();
+        let vals = values(g[4], n, &mut rng);
+        add_tensor(
+            w,
+            Tensor {
+                name: g[4].to_owned(),
+                dtype: Dtype::F32,
+                shape,
+            },
+            &vals,
+        );
+    }
     for (name, shape, dtype) in [
         (g[0], vec![d.vocab, d.h], Dtype::Bf16),
         (g[1], vec![d.h], Dtype::F32),
@@ -338,7 +483,7 @@ fn layer_dense(w: &mut SafeWriter<'_>, d: &Dims, layer: usize) {
     let full = is_block_end(layer, d.block);
     let prefix = names::layer_prefix(layer);
     let mut rng = Lcg::new(layer as u64 + 1);
-    for name in names::layer_tensor_names(layer, full, false) {
+    for name in names::layer_tensor_names(layer, full, d.looped(layer)) {
         let Some(suffix) = name.strip_prefix(&prefix).and_then(|s| s.strip_prefix('.')) else {
             continue;
         };
@@ -530,14 +675,28 @@ pub enum Storage {
     Bf16,
 }
 
-/// Build `dir` as a complete artifact. `MxFp8` writes a source file in the checkpoint's spelling,
-/// runs the real repack over it (with `verify`, so each file is read back and byte-compared), and
-/// stamps the manifest's `mxfp8_source`; `Bf16` is resident-only (Mini's container, Small's
-/// values).
+/// Build `dir` as a complete NON-looped artifact. `MxFp8` writes a source file in the
+/// checkpoint's spelling, runs the real repack over it (with `verify`, so each file is read back
+/// and byte-compared), and stamps the manifest's `mxfp8_source`; `Bf16` is resident-only.
 pub fn build(scratch: &Scratch, storage: Storage) -> (String, Inkling2Config) {
+    let cfg = write_config(&scratch.path());
+    (write_artifact(scratch, &cfg.text, storage), cfg)
+}
+
+/// The LOOPED member's artifact — the same writer over `write_mini_config`, so the loop's extra
+/// resident tensors (the message query bank and the four MessageGates per core layer) are written
+/// by the same names expansion the pin places from.
+pub fn build_mini(scratch: &Scratch, storage: Storage) -> (String, Inkling2LoopConfig) {
+    let cfg = write_mini_config(&scratch.path());
+    (write_artifact(scratch, &cfg.text, storage), cfg)
+}
+
+/// Write the resident set, and for `MxFp8` the repacked layer files too, and hand back the
+/// directory it wrote into. Member-agnostic: every difference between the two members is already
+/// in the `Dims` read off `text`, so the two builders differ only in the config DOOR they walk.
+fn write_artifact(scratch: &Scratch, text: &InklingTextConfig, storage: Storage) -> String {
     let dir = scratch.path();
-    let cfg = write_config(&dir);
-    let d = dims(&cfg.text);
+    let d = dims(text);
     let mut resident = SafeWriter::new();
     globals(&mut resident, &d);
     for layer in 0..d.layers {
@@ -552,7 +711,7 @@ pub fn build(scratch: &Scratch, storage: Storage) -> (String, Inkling2Config) {
     if matches!(storage, Storage::MxFp8) {
         repack(&dir, &d);
     }
-    (dir, cfg)
+    dir
 }
 
 /// Write the source tensors, then let [`Mxfp8Layer`] produce `L{ll}.mxfp8` for each layer and

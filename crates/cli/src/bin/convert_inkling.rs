@@ -6,13 +6,17 @@
 //! census closure (`census::inkling::Census::confront`) classifies every one of the 1244 names
 //! before a byte is converted; a name matching no family is a hard error.
 //!
-//! **The experts are DEQUANTIZED to bf16, not requantized.** Mini's first-party loop path
-//! (`Inkling2LoopDequantizeExperts`, LOAD:772) dequantizes on load; the artifact stores that
-//! result. NVFP4 (layers 0–19) and MXFP8 (20–23) are decoded by `inkling_dequant`, whose oracle is
-//! bit-compared against the transformers op (`tests/inkling_dequant.rs`). `w13` is de-interleaved
-//! into `[gate_all; up_all]`; the two message-query banks merge to `(q,k,v,mlp)`; `unembed` keeps
-//! the first 200058 rows. The output names are the first-party text model's state-dict names
-//! (`text-model-names.tsv`, 693 params), gated by `tests/inkling_convert.rs`.
+//! **The experts are DEQUANTIZED to bf16 by default, and streamed as `.mxfp8` under `--mxfp8`.**
+//! Mini's first-party loop path (`Inkling2LoopDequantizeExperts`, LOAD:772) dequantizes on load,
+//! and the default artifact stores that result: NVFP4 (layers 0–19) and MXFP8 (20–23) decoded by
+//! `inkling_dequant`, whose oracle is bit-compared against the transformers op
+//! (`tests/inkling_dequant.rs`). `--mxfp8` instead writes one `L{ll}.mxfp8` per layer for the
+//! streaming engine: the four native-MXFP8 layers are REPACKED bit-for-bit (and verified), and
+//! the twenty NVFP4 ones are decoded and re-quantized row-wise by `quantize_mxfp8_row`, which
+//! costs a re-rounding those layers do not otherwise pay. `w13` is de-interleaved into
+//! `[gate_all; up_all]` in both modes; the two message-query banks merge to `(q,k,v,mlp)`;
+//! `unembed` keeps the first 200058 rows. The output names are the first-party text model's
+//! state-dict names (`text-model-names.tsv`, 693 params), gated by `tests/inkling_convert.rs`.
 //!
 //! Plan of record: `docs/investigations/inkling2-port.md` (stage S2).
 
@@ -20,15 +24,20 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use rivoli_artifact::census::inkling::Census;
 use rivoli_artifact::format::{
-    Dtype, FormatMeta, SafeWriter, Safetensors, TensorData, finish_artifact,
+    Dtype, ExpertFile, ExpertHeader, FormatMeta, LAYER_WINDOW, LayerDims, LayerInputs, LayerShape,
+    MXFP8_MAGIC, Mxfp8Layer, SafeWriter, Safetensors, TensorData, finish_artifact, mxfp8_source,
+    write_expert_layer,
 };
-use rivoli_artifact::inkling_config::Inkling2LoopConfig;
+use rivoli_artifact::inkling_config::{Inkling2LoopConfig, InklingTextConfig};
 use rivoli_artifact::inkling_convert::{
     INKLING_AUX, VocabRows, copy_tiktoken, emit_lm_head, emit_verbatim, preflight, query_target,
     rename_verbatim,
 };
 use rivoli_artifact::inkling_dequant::{Mxfp8, Nvfp4, merge_message_queries};
-use rivoli_artifact::quant::{FP8_BLOCK, read_f32};
+use rivoli_artifact::quant::{
+    ExpertBlocks, FP8_BLOCK, mxfp8_expert_bytes, mxfp8_expert_stride, mxfp8_groups,
+    mxfp8_slot_offsets, quantize_mxfp8_row, read_f32,
+};
 use std::collections::HashSet;
 
 /// The single text shard. `mtp.safetensors` is NEVER named here — it is a separate file the text
@@ -46,8 +55,9 @@ const MIDDLE_CYCLE_KV: &str = "model.llm.middle_cycle_cross_pass_kv_queries";
 #[derive(Parser)]
 #[command(
     name = "convert_inkling",
-    about = "Inkling 2 Mini checkpoint → a rivoli text artifact (NVFP4/MXFP8 experts dequantized \
-             to bf16, vision excluded by name, MTP never opened)"
+    about = "Inkling 2 Mini checkpoint → a rivoli text artifact (routed experts either \
+             dequantized to bf16 or streamed as per-layer .mxfp8 files, vision excluded by \
+             name, MTP never opened)"
 )]
 struct Args {
     /// The checkpoint directory: config.json, model-00001-of-00001.safetensors, tiktoken/, and the
@@ -56,6 +66,13 @@ struct Args {
 
     /// Artifact directory to write. Created if absent.
     out_dir: String,
+
+    /// Emit `L{ll}.mxfp8` per-layer expert files instead of bf16 expert slabs in
+    /// `resident.safetensors` — the layout the streaming engine opens. The four layers already at
+    /// MXFP8 are repacked bit-for-bit and verified; the twenty NVFP4 layers are decoded and
+    /// re-quantized row-wise (a re-rounding this flag is the only thing that pays for).
+    #[arg(long)]
+    mxfp8: bool,
 }
 
 /// One expert projection: the source suffix, the target suffix, and whether `w13`'s gate/up rows
@@ -82,12 +99,15 @@ const W2: ExpertProj = ExpertProj {
 /// writer's payloads still mmap.
 struct Conv<'a> {
     src: &'a Safetensors,
-    t: &'a rivoli_artifact::inkling_config::InklingTextConfig,
+    t: &'a InklingTextConfig,
     w: SafeWriter<'a>,
 }
 
 impl<'a> Conv<'a> {
-    /// Every layer's two expert projections, dequantized to bf16 and (for w13) de-interleaved.
+    /// Every layer's two expert projections, dequantized to bf16 and (for w13) de-interleaved —
+    /// the DEFAULT mode. `--mxfp8` takes [`Mxfp8Layers`] instead, and the two modes are
+    /// exclusive: writing both would either duplicate the routed experts or leave one of the two
+    /// containers half-populated.
     fn experts(&mut self, consumed: &mut HashSet<String>) -> Result<()> {
         for l in 0..self.t.num_hidden_layers {
             self.expert_proj(consumed, l, &W13)?;
@@ -262,21 +282,339 @@ impl<'a> Conv<'a> {
     }
 }
 
+// ── `--mxfp8`: the routed experts as per-layer files ──────────────────────
+//
+// The default mode above writes bf16 slabs into `resident.safetensors`. This one writes the
+// same 24 layers as `L{ll}.mxfp8`, which is the container the streaming engine opens, and the
+// source decides which of its two paths a layer takes: 20..24 arrive at MXFP8 already and are
+// repacked bit-for-bit, 0..20 arrive at NVFP4 and are re-quantized row-wise.
+
+/// The `--mxfp8` expert pass: read the single text shard, write one layer file per layer.
+struct Mxfp8Layers<'a> {
+    src: &'a Safetensors,
+    t: &'a InklingTextConfig,
+    out_dir: &'a str,
+}
+
+impl<'a> Mxfp8Layers<'a> {
+    /// Every layer's file, marking each layer's source tensors consumed as it goes — the same
+    /// eight-or-four per layer the default mode spends, so the census closure is mode-agnostic.
+    fn layers(&self, consumed: &mut HashSet<String>) -> Result<()> {
+        for l in 0..self.t.num_hidden_layers {
+            self.layer(consumed, l)?;
+        }
+        Ok(())
+    }
+
+    /// One layer, dispatched on the SOURCE dtype of its `w13_weight`: U8 is NVFP4 (an `amax`
+    /// rides beside it) and F8_E4M3 is MXFP8. Anything else is refused by name rather than
+    /// guessed at — the default mode makes the same match for the same reason.
+    fn layer(&self, consumed: &mut HashSet<String>, l: usize) -> Result<()> {
+        let w13 = format!("{}w13_weight", expert_prefix(l));
+        let (_, dt, _) = self.src.raw(&w13)?;
+        match dt {
+            Dtype::F8E4M3 => self.repack_native(consumed, l),
+            Dtype::U8 => self.requantize_nvfp4(consumed, l),
+            other => bail!(
+                "{w13}: expert weight dtype {other:?} is neither NVFP4 (U8) nor MXFP8 \
+                 (F8_E4M3) — --mxfp8 has no path for it"
+            ),
+        }
+    }
+
+    /// A layer the checkpoint already holds at MXFP8: mark its four tensors and let
+    /// [`Mxfp8Layer`] write AND verify it. Byte identity is the claim `--verify` there demands,
+    /// which is exactly right for a repack that fits nothing and re-rounds nothing.
+    fn repack_native(&self, consumed: &mut HashSet<String>, l: usize) -> Result<()> {
+        for suffix in [
+            "w13_weight",
+            "w13_weight_scale",
+            "w2_weight",
+            "w2_weight_scale",
+        ] {
+            consumed.insert(format!("{}{suffix}", expert_prefix(l)));
+        }
+        let inputs = LayerInputs {
+            tool: "convert_inkling",
+            out_dir: self.out_dir,
+            src: self.src,
+        };
+        let shape = LayerShape {
+            n_experts: self.t.n_routed_experts,
+            expert_in: self.t.hidden_size,
+            moe_inter: self.t.intermediate_size,
+        };
+        Mxfp8Layer::new(inputs, l, shape).mode(true, true).run()
+    }
+
+    /// A layer the checkpoint holds at NVFP4: decode one row at a time and re-quantize it into
+    /// the `.mxfp8` block layout, streamed in windows by [`write_expert_layer`] — the same
+    /// bounded-memory, atomic writer every other converter reaches.
+    fn requantize_nvfp4(&self, consumed: &mut HashSet<String>, l: usize) -> Result<()> {
+        let plane = Nvfp4Layer::load(self.src, self.t, l)?;
+        plane.mark_consumed(consumed);
+        let (h, i, n) = (
+            self.t.hidden_size,
+            self.t.intermediate_size,
+            self.t.n_routed_experts,
+        );
+        let path = format!("{}/L{l:02}.mxfp8", self.out_dir);
+        let stride = mxfp8_expert_stride(h, i);
+        let header = ExpertHeader::new(
+            MXFP8_MAGIC,
+            LayerDims {
+                layer: l,
+                n_experts: n,
+                expert_in: h,
+                moe_inter: i,
+                stride,
+            },
+        )
+        .to_bytes();
+        let file = ExpertFile {
+            path: &path,
+            header: &header,
+        };
+        write_expert_layer(
+            file,
+            ExpertBlocks {
+                stride,
+                bytes: mxfp8_expert_bytes(h, i),
+                count: n,
+            },
+            LAYER_WINDOW,
+            |e, slot| plane.pack_expert(e, slot),
+        )
+        .with_context(|| format!("write layer {l} (NVFP4 → MXFP8 re-quantization)"))?;
+        eprintln!("convert_inkling: wrote {path} ({n} experts re-quantized from NVFP4)");
+        Ok(())
+    }
+}
+
+/// The checkpoint's tensor-name prefix for one layer's routed experts — one spelling, shared by
+/// the dtype sniff, the consumption marks and the per-projection reads, so a rename cannot make
+/// the three disagree about which tensors a layer owns.
+fn expert_prefix(layer: usize) -> String {
+    format!("model.llm.layers.{layer}.mlp.experts.")
+}
+
+/// One projection's NVFP4 source: the packed weight plane, its e4m3 block-scale grid, and the
+/// per-expert `amax` / `outer_scale_denominator` pair that is that projection's factor.
+struct Nvfp4Plane<'a> {
+    weight: &'a [u8],
+    scale: &'a [u8],
+    amax: Vec<f32>,
+    denom: f32,
+    /// The `[E, rows, cols_packed]` tail of this projection's shape, kept so a row decode
+    /// cannot be handed another projection's width.
+    rows: usize,
+    cols_packed: usize,
+}
+
+impl<'a> Nvfp4Plane<'a> {
+    /// Read one projection's four tensors — `<base>weight`, `scale`, `amax`,
+    /// `outer_scale_denominator` — and CHECK them against `[E, rows, cols_packed]`.
+    ///
+    /// Checked once per layer, not per row: the shapes decide every row offset below, and a
+    /// transposed or mis-blocked source would copy the right number of bytes in the wrong order
+    /// and fail no length check anywhere downstream.
+    fn load(src: &'a Safetensors, base: &str, want: [usize; 3]) -> Result<Self> {
+        let (weight, wsh) = src.typed(base, Dtype::U8)?;
+        let (scale, ssh) = src.typed(&format!("{base}_scale"), Dtype::F8E4M3)?;
+        let (ab, ash) = src.typed(&format!("{base}_amax"), Dtype::F32)?;
+        let (db, _) = src.typed(&format!("{base}_outer_scale_denominator"), Dtype::F32)?;
+        let [n, rows, cols_packed] = want;
+        ensure!(
+            wsh == want,
+            "{base}: {wsh:?} != {want:?} (U8, two e2m1 codes per byte)"
+        );
+        ensure!(
+            ssh == [n, rows, cols_packed / 8],
+            "{base}_scale: {ssh:?} != [{n}, {rows}, {}] (one e4m3 scale per 16 values)",
+            cols_packed / 8
+        );
+        ensure!(
+            ash == [n] && ab.len() == 4 * n,
+            "{base}_amax: {ash:?} / {} bytes for {n} experts",
+            ab.len()
+        );
+        let denom = read_f32(db)
+            .first()
+            .copied()
+            .with_context(|| format!("{base}_outer_scale_denominator is empty"))?;
+        ensure!(
+            denom > 0.0 && denom.is_finite(),
+            "{base}_outer_scale_denominator: {denom} must be positive and finite"
+        );
+        Ok(Self {
+            weight,
+            scale,
+            amax: read_f32(ab),
+            denom,
+            rows,
+            cols_packed,
+        })
+    }
+
+    /// The [`Nvfp4`] view of this plane — the row walk itself stays in `inkling_dequant`, so the
+    /// `(code · block_scale) · factor` association exists once.
+    ///
+    /// Written spans-then-factor rather than in `Nvfp4`'s declaration order: the two spans and the
+    /// row geometry are what the SOURCE shard fixes, while `amax`/`denom` are what this plane
+    /// derived from that shard, and the literal reads in that order.
+    fn view(&self) -> Nvfp4<'_> {
+        Nvfp4 {
+            weight: self.weight,
+            scale: self.scale,
+            rows: self.rows,
+            cols_packed: self.cols_packed,
+            amax: &self.amax,
+            denom: self.denom,
+        }
+    }
+
+    /// Decode `row` of `expert` into `out`, exactly `cols_packed * 2` values long.
+    fn decode_into(&self, (expert, row): (usize, usize), out: &mut [f32]) -> Result<()> {
+        self.view().decode_expert_row(expert, row, out)
+    }
+}
+
+/// One layer's NVFP4 routed experts: `w13` (gate/up interleaved) and `w2` (down), each with its
+/// own scale grid and its own per-expert factor.
+struct Nvfp4Layer<'a> {
+    /// [`expert_prefix`]'s value for this layer — the sole spelling of its tensor names.
+    prefix: String,
+    w13: Nvfp4Plane<'a>,
+    w2: Nvfp4Plane<'a>,
+    n_experts: usize,
+    hidden: usize,
+    inter: usize,
+}
+
+/// The eight tensors one NVFP4 layer spends, in the order its projections consume them.
+const NVFP4_TENSORS: [&str; 8] = [
+    "w13_weight",
+    "w13_weight_scale",
+    "w13_weight_amax",
+    "w13_weight_outer_scale_denominator",
+    "w2_weight",
+    "w2_weight_scale",
+    "w2_weight_amax",
+    "w2_weight_outer_scale_denominator",
+];
+
+impl<'a> Nvfp4Layer<'a> {
+    /// Read and check both projections of one layer.
+    ///
+    /// `w13` is `[E, 2·inter, hidden/2]` packed and `w2` is `[E, hidden, inter/2]`, because the
+    /// block is ENTERED at `hidden` — the same `(expert_in, moe_inter)` the `.mxfp8` offsets and
+    /// the O_DIRECT stride are built from.
+    fn load(src: &'a Safetensors, t: &InklingTextConfig, layer: usize) -> Result<Self> {
+        let prefix = expert_prefix(layer);
+        let (e, h, i) = (t.n_routed_experts, t.hidden_size, t.intermediate_size);
+        let w13 = Nvfp4Plane::load(src, &format!("{prefix}w13_weight"), [e, 2 * i, h / 2])?;
+        let w2 = Nvfp4Plane::load(src, &format!("{prefix}w2_weight"), [e, h, i / 2])?;
+        Ok(Self {
+            prefix,
+            w13,
+            w2,
+            n_experts: e,
+            hidden: h,
+            inter: i,
+        })
+    }
+
+    /// Mark this layer's eight source tensors consumed. The count is the default mode's, which
+    /// is what keeps `consumed.len() == sum.text_tensors` true in both modes.
+    fn mark_consumed(&self, consumed: &mut HashSet<String>) {
+        for suffix in NVFP4_TENSORS {
+            consumed.insert(format!("{}{suffix}", self.prefix));
+        }
+    }
+
+    /// Re-quantize expert `e` into one MXFP8 block of `mxfp8_expert_bytes` when called by
+    /// [`write_expert_layer`], writing every byte of it.
+    ///
+    /// The row order is the DE-INTERLEAVE, exactly as the native repack applies it: `w13`'s even
+    /// rows are gate and its odd rows up (CONV:365–372), and `w2`'s rows are down in place.
+    /// Treating `w13` as a `[gate; up]` concatenation is trap T2 — a file that opens, streams and
+    /// decodes the gate against the up weights, which no length check can see.
+    fn pack_expert(&self, e: usize, slot: &mut [u8]) -> Result<()> {
+        let (h, i) = (self.hidden, self.inter);
+        let bytes = mxfp8_expert_bytes(h, i);
+        ensure!(
+            e < self.n_experts && slot.len() == bytes,
+            "{}expert {e}: {}-byte slot for {} experts of an {bytes}-byte MXFP8 block",
+            self.prefix,
+            slot.len(),
+            self.n_experts
+        );
+        let off = mxfp8_slot_offsets(h, i);
+        let (g_in, g_out) = (mxfp8_groups(h), mxfp8_groups(i));
+        let mut row = vec![0f32; h.max(i)];
+        for j in 0..i {
+            self.w13.decode_into((e, 2 * j), &mut row[..h])?;
+            put_mxfp8_row(slot, (off[0] + j * h, off[1] + j * g_in), &row[..h])?;
+            self.w13.decode_into((e, 2 * j + 1), &mut row[..h])?;
+            put_mxfp8_row(slot, (off[2] + j * h, off[3] + j * g_in), &row[..h])?;
+        }
+        for r in 0..h {
+            self.w2.decode_into((e, r), &mut row[..i])?;
+            put_mxfp8_row(slot, (off[4] + r * i, off[5] + r * g_out), &row[..i])?;
+        }
+        Ok(())
+    }
+}
+
+/// Quantize one row into its slot: `at.0` is the packed span's start, `at.1` the ue8m0 grid's.
+/// The two offsets come from [`mxfp8_slot_offsets`], the same function the streaming pool points
+/// its descriptor at, so a row written here is a row the kernel reads.
+///
+/// The split is `split_at_mut` rather than two index borrows of `slot`, because a projection's
+/// scale grid FOLLOWS its packed rows (`off[1] = off[0] + rows × cols`) and the two spans are
+/// therefore disjoint with the packed one first — the one fact `split_at_mut(at.1)` relies on.
+fn put_mxfp8_row(slot: &mut [u8], at: (usize, usize), row: &[f32]) -> Result<()> {
+    let (packed, scales) = at;
+    let n = row.len();
+    let (head, tail) = slot.split_at_mut(scales);
+    quantize_mxfp8_row(
+        row,
+        &mut head[packed..packed + n],
+        &mut tail[..mxfp8_groups(n)],
+    )
+}
+
 /// `manifest.json` = the source config VERBATIM (wrapper and all) + the `format` section +
-/// `inkling_source` provenance. `fp8_block` is inert on this bf16 artifact (Glimmer's precedent).
-fn build_manifest(src_dir: &str) -> Result<serde_json::Value> {
+/// `inkling_source` provenance, plus `mxfp8_source` under `--mxfp8` (the streaming loader's sole
+/// source for which layers exist). `fp8_block` is inert in both modes (Glimmer's precedent).
+fn build_manifest(src_dir: &str, (mxfp8, n_layers): (bool, usize)) -> Result<serde_json::Value> {
     let mut manifest = FormatMeta::manifest_from_config(src_dir, FP8_BLOCK)?;
+    let experts = if mxfp8 {
+        "mxfp8-streamed"
+    } else {
+        "dequantized-to-bf16"
+    };
     manifest["inkling_source"] = serde_json::json!({
         "tool": "convert_inkling",
         "src": src_dir,
         "member": "inkling2_loop",
-        "experts": "dequantized-to-bf16",
+        "experts": experts,
     });
+    if mxfp8 {
+        manifest["mxfp8_source"] = mxfp8_source("convert_inkling", src_dir, 0..n_layers);
+        // The shared producer's chain names ONE source encoding; Mini is mixed (0..20 NVFP4
+        // re-quantized, 20..24 repacked), so the truthful string is stamped here.
+        manifest["mxfp8_source"]["chain"] = serde_json::json!("nvfp4+fp8 -> fp8 (quantize/repack)");
+    }
     Ok(manifest)
 }
 
 fn main() -> Result<()> {
-    let Args { src_dir, out_dir } = Args::parse();
+    let Args {
+        src_dir,
+        out_dir,
+        mxfp8,
+    } = Args::parse();
     // The aux, write-into-source and tiktoken refusals, shared with the Small converter: all
     // three must land before the weight pass, not after it.
     let dirs = preflight(rivoli_artifact::format::ArtifactDirs {
@@ -304,7 +642,16 @@ fn main() -> Result<()> {
         t: &cfg.text,
         w: SafeWriter::new(),
     };
-    conv.experts(&mut consumed)?;
+    if mxfp8 {
+        Mxfp8Layers {
+            src: &src,
+            t: &cfg.text,
+            out_dir: &out_dir,
+        }
+        .layers(&mut consumed)?;
+    } else {
+        conv.experts(&mut consumed)?;
+    }
     conv.queries(&mut consumed)?;
     conv.unembed(&mut consumed)?;
     conv.verbatim(&census, &mut consumed)?;
@@ -321,12 +668,13 @@ fn main() -> Result<()> {
     finish_artifact(
         "convert_inkling",
         dirs,
-        &build_manifest(&src_dir)?,
+        &build_manifest(&src_dir, (mxfp8, cfg.text.num_hidden_layers))?,
         INKLING_AUX,
     )?;
     eprintln!(
-        "convert_inkling: done — {src_dir} → {out_dir} ({} TEXT tensors consumed)",
-        consumed.len()
+        "convert_inkling: done — {src_dir} → {out_dir} ({} TEXT tensors consumed, experts {})",
+        consumed.len(),
+        if mxfp8 { "streamed" } else { "bf16" }
     );
     Ok(())
 }

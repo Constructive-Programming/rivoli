@@ -25,6 +25,10 @@ use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
 use rivoli_artifact::inkling_config::{Inkling2Config, Inkling2LoopConfig};
+// `rocm`-gated with its only user, `open_inkling`: a deviceless build has no arm that opens an
+// Inkling pin, and `warnings = deny` makes an unused import a build error.
+#[cfg(feature = "rocm")]
+use rivoli_artifact::inkling_config::InklingTextConfig;
 use rivoli_artifact::k3_config::K3Config;
 use rivoli_artifact::v4_config::V4Config;
 use rivoli_core::cache::TwoQSplit;
@@ -247,8 +251,9 @@ pub struct OpenSpec {
     pub max_ctx: usize,
 }
 
-/// The routed-expert pool's startup knobs — the ones that describe a POOL, which both routed
-/// arms have and a dense architecture has none of.
+/// The routed-expert pool's startup knobs — the ones that describe a POOL, which every routed
+/// arm has and a dense architecture has none of. An arm may carry them and spend them on only
+/// one of its artifacts (Mini's `.mxfp8` container has a pool; its bf16 one does not).
 ///
 /// **The routed FORMAT is deliberately not here**, and its absence is what makes this one type
 /// rather than two. GLM chooses between `.vq3` and `.i4` with `--mode`; V4's experts are `.f4`
@@ -277,6 +282,31 @@ pub struct PoolKnobs<'a> {
     /// arena (the CQE's own guarantee) and writes the slot (the CPU→GPU coherence the resident
     /// tier's startup load already spends). See `fetch::stream::FetchKnobs::cpu_copy`.
     pub copy_via_cpu: bool,
+}
+
+impl PoolKnobs<'static> {
+    /// The STOCK knobs — [`PinCfg::stock`](crate::resident::PinCfg::stock)'s values, for a
+    /// caller with no command line to read them from (a gate, or `serve`'s default).
+    ///
+    /// **Delegated rather than spelled out**, which is the whole point: a second five-field
+    /// literal is how `arena_refresh` got updated in one place and not the other (see that
+    /// function's own note), and it would also be a five-line copy `build.rs`'s duplication
+    /// gate reports.
+    ///
+    /// `rocm`-gated because its ONE source of truth is [`crate::resident::PinCfg`], and
+    /// `lib.rs` gates that module on the backend (every item there takes a `DeviceTier`). A
+    /// deviceless build has no pin to take stock values from, and no engine to hand them to.
+    #[cfg(feature = "rocm")]
+    pub fn stock() -> PoolKnobs<'static> {
+        let p = crate::resident::PinCfg::stock(0);
+        PoolKnobs {
+            cache_policy: p.cache_policy,
+            two_q: p.two_q,
+            trace_path: p.trace_path,
+            arena_refresh: p.arena_refresh,
+            copy_via_cpu: p.copy_via_cpu,
+        }
+    }
 }
 
 /// A caller's token sink: called with each token the moment it lands, BEFORE the next forward.
@@ -316,12 +346,16 @@ pub enum ArchCfg<'a> {
     /// Routed like V4 — a pool, no format choice (the checkpoint ships MXFP4) — so the
     /// same `PoolKnobs` and the same absence of a `RoutedFmt`.
     K3(&'a K3Config, PoolKnobs<'a>),
-    /// Inkling 2 Mini. **No `PoolKnobs`**: its 24 expert blocks are streamed bf16 with a
-    /// fixed layer-prefix partition, so there is no policy, two-Q split or trace to carry —
-    /// `rivoli_core::legality`'s Mini row refuses `--cache-policy` and `--trace` for exactly
-    /// that reason, and `--mode` falls back loudly. The budget and the context ride in
-    /// [`OpenSpec`], which is what this arm actually spends.
-    InklingLoop(&'a Inkling2LoopConfig),
+    /// Inkling 2 Mini — the LOOPED member, and **the container is the artifact's fact, not a
+    /// flag**. Its converted artifact holds the 24 expert blocks as dequantized bf16 (a fixed
+    /// layer-prefix partition: no pool, nothing for [`PoolKnobs`] to describe), and its native
+    /// `.mxfp8` artifact holds them as routed slots behind a pool — so the arm carries the
+    /// knobs and [`open_inkling`] spends them only on the branch that has a pool.
+    /// `rivoli_core::legality`'s Mini row still refuses `--cache-policy` and `--trace` (the
+    /// bf16 artifact is what S5 shipped, and a knob is legal only where every artifact the
+    /// architecture opens can spend it); `--mode` falls back loudly. The budget and the context
+    /// ride in [`OpenSpec`].
+    InklingLoop(&'a Inkling2LoopConfig, PoolKnobs<'a>),
     /// Inkling 2 Small — the same text stack with ~600 GB of native `.mxfp8` experts, so it
     /// takes [`PoolKnobs`] like every routed arm: the policy, the 2Q split and the trace path
     /// all describe a pool, and Small has one. Its format is NOT a knob — the checkpoint ships
@@ -363,9 +397,10 @@ impl ArchCfg<'_> {
 ///
 /// GLM-5.2 (MoE, streamed experts), Muse Glimmer-30B (dense, streamed whole layers),
 /// DeepSeek-V4-Flash, Kimi-K3, and BOTH Inkling 2 members behind ONE variant: a 24-layer looped
-/// bf16 stack and a 48-layer `.mxfp8` pool differ in the pin, not in the input, the decode loop
-/// or the output. `rivoli_core::legality::decide` is what tells a user of the one artifact with
-/// no arm (Qwen) that there is none, in the same breath as it tells them why.
+/// stack (bf16 slabs or `.mxfp8` slots) and a 48-layer `.mxfp8` pool differ in the pin, not in
+/// the input, the decode loop or the output. `rivoli_core::legality::decide` is what tells a
+/// user of the one artifact with no arm (Qwen) that there is none, in the same breath as it
+/// tells them why.
 ///
 /// **`large_enum_variant` is allowed, and boxing would be the wrong fix here.** The arms are
 /// 1792 and 632 bytes (clippy, 2026-08-16), so the enum is the larger of the two — and that
@@ -456,15 +491,11 @@ impl<'a> Engine<'a> {
             // the block state and the activation scratch, so the bytes the partition may use
             // are decided once by the constructor rather than split across a pin and a new.
             //
-            // **Deliberately NOT the multi-line argument form the other arms use.** Written
-            // that way this block is nine lines that differ from Glimmer's only in two type
-            // names — five-plus identical lines, which is what `build.rs`'s jscpd gate calls a
-            // clone. The in-arm `use` and the named ceiling are what keep both the block and
-            // the argument list textually distinct from Glimmer's.
-            ArchCfg::InklingLoop(cfg) => {
-                use crate::inkling::engine::InklingEngine;
-                let n_ctx = spec.max_ctx;
-                let e = InklingEngine::open(dir, &cfg.text, capacity, n_ctx)?;
+            // **Which pin is the ARTIFACT's answer**, so the two-branch choice lives in
+            // [`open_inkling`] rather than here: this arm is one statement, and the body it
+            // shares with nothing keeps `build.rs`'s duplication gate out of the argument.
+            ArchCfg::InklingLoop(cfg, knobs) => {
+                let e = open_inkling(dir, &cfg.text, (capacity, knobs), spec.max_ctx)?;
                 Ok(Engine::Inkling(e))
             }
             // Small's floor charges KV and activation scratch before the pool is sized, and
@@ -679,10 +710,38 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// Open the Inkling 2 member `dir` holds, on the pin its CONTAINER implies.
+///
+/// **Sniffed from the artifact, never from a flag.** `manifest.json`'s `mxfp8_source` is the
+/// converter's own statement that the experts are routed slots, so the two containers are told
+/// apart exactly as Glimmer's bf16 and fp8 ones are (`ProjFmt::sniff`'s argument): a flag could
+/// disagree with the weights it describes, and disagreeing here is not a crash but a wrong pin
+/// — the bf16 one reads expert slabs an `.mxfp8` artifact does not carry, and fails at load.
+///
+/// The branches differ in ONE thing, residency: both members run the same text stack and the
+/// same decode loop, so Mini's `.mxfp8` artifact is its own loop schedule over Small's pin
+/// (`InklingPin::build_mxfp8`). A bf16 artifact keeps the fixed layer-prefix partition and
+/// spends no knob — there is no pool for one to describe.
+#[cfg(feature = "rocm")]
+fn open_inkling<'a>(
+    dir: &str,
+    text: &'a InklingTextConfig,
+    budget: (usize, PoolKnobs<'_>),
+    n_ctx: usize,
+) -> Result<crate::inkling::engine::InklingEngine<'a>> {
+    use crate::inkling::engine::InklingEngine;
+    let (capacity, knobs) = budget;
+    match rivoli_artifact::format::has_mxfp8_source(dir) {
+        true => InklingEngine::open_mxfp8(dir, text, pin_cfg(capacity, knobs), n_ctx),
+        false => InklingEngine::open(dir, text, capacity, n_ctx),
+    }
+}
+
 /// The run's budget joined to the pool knobs — what a routed pin takes.
 ///
-/// One function because both routed arms build the identical four-field value out of the same
-/// two inputs, and the literal is five lines under rustfmt's `struct_lit_width`.
+/// One function because every routed arm builds the identical value out of the same two inputs,
+/// and the literal is five lines under rustfmt's `struct_lit_width` — enough for `build.rs`'s
+/// duplication gate to match a second copy.
 #[cfg(feature = "rocm")]
 fn pin_cfg(capacity: usize, knobs: PoolKnobs<'_>) -> crate::resident::PinCfg<'_> {
     crate::resident::PinCfg {

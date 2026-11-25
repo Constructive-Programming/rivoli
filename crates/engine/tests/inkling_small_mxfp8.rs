@@ -23,7 +23,7 @@
 //!
 //! **RED-PROOF RECIPE (P7 — owed for the device half).**
 //! * P4: make the tight arm's pool hand back a stale slot (or skip the `wait` before reuse) and
-//!   [`residency_moves_no_bit`] must redden on the token.
+//!   [`residency_moves_no_bit`] reddens inside the shared `inkling_gate::p4` on the token.
 //! * cross-check: write the source's scale grid one exponent off and
 //!   [`bf16_resident_experts_match_the_streamed_mxfp8_ones`] must redden on the argmax.
 //! * door: delete `validate_scratch_cfg` from `open_mxfp8` and
@@ -34,27 +34,18 @@
 // as a `Result`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod inkling_gate;
 mod inkling_small;
 
-use inkling_small::{Scratch, Storage, build, expert_total, write_config};
-use rivoli_artifact::inkling_config::InklingTextConfig;
+use inkling_gate::{N_CTX, decode, p4};
+// `teacher-forcing`-gated with its only user, the scoring cell below: the default rocm arm
+// compiles that test out, and `warnings = deny` makes an unused import a build error.
+#[cfg(feature = "teacher-forcing")]
+use inkling_gate::PROMPT;
+use inkling_small::{Scratch, Storage, build, write_config};
 use rivoli_backend::abi::SINK_ATTEND_MAX_N;
 use rivoli_engine::inkling::engine::InklingEngine;
 use rivoli_engine::resident::PinCfg;
-use rivoli_engine::seam::GenSpec;
-
-const N_CTX: usize = 32;
-const NGEN: usize = 4;
-static PROMPT: [u32; 4] = [1, 7, 13, 29];
-
-/// The one greedy request this file makes: the fixture prompt, `NGEN` new tokens, and no stop
-/// token — the ids are compared bit-for-bit across budgets, so an EOS the fixture happened to
-/// emit would make the comparison's width depend on which arm ran.
-const SPEC: GenSpec<'static> = GenSpec {
-    prompt: &PROMPT,
-    ngen: NGEN,
-    eos: &[],
-};
 
 /// The bf16-vs-MXFP8 tolerance, and where it comes from. Both artifacts hold the SAME values:
 /// e4m3 (3 mantissa bits) widened to bf16 is exact, so the difference is not representation but
@@ -63,51 +54,6 @@ const SPEC: GenSpec<'static> = GenSpec {
 /// `64 · 2^-24 ≈ 4e-6` relative; the two paths' different reduction orders are what the remaining
 /// factor covers. Measured evidence is owed with the device arm (see the header's recipe).
 const MX_VS_BF16_TOL: f32 = 1e-3;
-
-fn decode(engine: &mut InklingEngine<'_>) -> (Vec<u32>, Vec<f32>, u64) {
-    let decoded = engine
-        .decode(SPEC, &mut |_| true)
-        .expect("the synthetic Small artifact must decode");
-    let logits = engine.logits().expect("a sampled row is available");
-    assert!(
-        logits.iter().all(|v| v.is_finite()),
-        "a decode row must be finite — an infinite or NaN logit is a broken composition, not a \
-         tolerance question"
-    );
-    (decoded.ids, logits, decoded.stats.misses)
-}
-
-fn bits(row: &[f32]) -> Vec<u32> {
-    row.iter().map(|v| v.to_bits()).collect()
-}
-
-/// The smallest capacity that opens at all: every routed expert must stream from it. Found by
-/// BISECTION on observed behaviour rather than by re-deriving the pin's floor in this file — the
-/// pin's slack, the tier's 256-byte rounding and the pool's staging arena are the pin's
-/// arithmetic, and a copy here would be a second author to drift.
-fn open_tight<'a>(dir: &str, text: &'a InklingTextConfig) -> InklingEngine<'a> {
-    let (mut lo, mut hi) = (0usize, 64 << 20);
-    let opens =
-        |cap: usize| InklingEngine::open_mxfp8(dir, text, PinCfg::stock(cap), N_CTX).is_ok();
-    assert!(opens(hi), "a 64 MiB budget must open the ~2 MB fixture");
-    // `PinCfg::stock(0)` is a LITERAL zero-byte budget, not "auto-size": the pin's floor must
-    // refuse it. That is the invariant the bisection rests on, and it is asserted rather than
-    // assumed because an auto-sizing capacity would silently make every later arm "pinned".
-    assert!(
-        !opens(0),
-        "a zero-byte capacity must be refused by the pin's floor"
-    );
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if opens(mid) {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    InklingEngine::open_mxfp8(dir, text, PinCfg::stock(hi), N_CTX)
-        .expect("the minimal successful capacity opens by construction")
-}
 
 /// The door: a `--ctx` past the LDS ceiling is refused BEFORE anything is placed, so this runs
 /// against a directory that holds a config and no weights at all.
@@ -163,68 +109,16 @@ fn teacher_forced_scoring_is_finite_over_the_streamed_experts() {
     );
 }
 
-/// **P4, at the seam.** One prompt, two budgets: everything pinned, and the smallest capacity
-/// that opens (so the routed set streams through `RoutedPool`'s O_DIRECT fill). The ids and the
-/// logits must be BIT-identical — a token that moves when only residency changed is a pool
-/// defect. The A-vs-A rerun is the floor: it separates "the pool is not state-free" from "this
-/// arm does not repeat itself", which is the question a mismatch would raise.
+/// **P4, at the seam**, through the protocol both members share ([`inkling_gate::p4`]): one
+/// prompt, two budgets — everything pinned, and the smallest capacity that opens — with ids AND
+/// logits bit-identical, plus the pinned arm's A-vs-A rerun as the floor. A token that moves when
+/// only residency changed is a pool defect, and the helper carries the assertions (and the
+/// bisection that finds the boundary) for the looped member too.
 #[test]
 fn residency_moves_no_bit() {
     let scratch = Scratch::new("p4");
     let (dir, cfg) = build(&scratch, Storage::MxFp8);
-    let total = expert_total(&cfg.text);
-
-    let mut pinned = InklingEngine::open_mxfp8(&dir, &cfg.text, PinCfg::stock(64 << 20), N_CTX)
-        .expect("the fixture opens with room for every expert");
-    assert_eq!(
-        pinned.residency(),
-        (total, 0),
-        "64 MiB must pin every one of the {total} experts and stream none"
-    );
-    let (ids, logits, first_misses) = decode(&mut pinned);
-    let (ids_again, logits_again, warm_misses) = decode(&mut pinned);
-    assert_eq!(
-        warm_misses, 0,
-        "the pinned arm must not miss once warmed (first decode had {first_misses} cold-start \
-         fills, repeat had {warm_misses} — a budget that can hold every expert must never evict)"
-    );
-    assert_eq!(ids, ids_again, "the pinned arm must repeat its own ids");
-    assert_eq!(
-        bits(&logits),
-        bits(&logits_again),
-        "the pinned arm must repeat its own logits bit-for-bit"
-    );
-
-    let mut streamed = open_tight(&dir, &cfg.text);
-    let (pinned_experts, streamed_experts) = streamed.residency();
-    assert!(
-        streamed_experts > 0,
-        "the tight arm pinned all {pinned_experts} experts — a budget at the open boundary must \
-         force the routed set through the pool"
-    );
-    let (ids_streamed, logits_streamed, streamed_misses) = decode(&mut streamed);
-    assert!(
-        streamed_misses > 0,
-        "the tight arm recorded no miss — it never left the resident tier, so this run is not \
-         the streaming arm it claims to be"
-    );
-    assert_eq!(
-        ids, ids_streamed,
-        "ids moved when only residency changed: pinned {ids:?} vs streamed {ids_streamed:?} — P4 \
-         lets bytes/token move and forbids text from moving"
-    );
-    assert_eq!(
-        bits(&logits),
-        bits(&logits_streamed),
-        "logits are not bit-identical across budgets — the pool is not state-free (a slot reused \
-         under a live launch, or decoded from a stale block)"
-    );
-    eprintln!(
-        "P4: {total} experts, pinned arm 0 fills, streaming arm {streamed_misses} fills, {} ids \
-         and {} logits bit-identical",
-        ids.len(),
-        logits.len()
-    );
+    p4(&dir, &cfg.text);
 }
 
 /// **The representation cross-check.** The same experts, dequantized exactly (e4m3 → bf16 is

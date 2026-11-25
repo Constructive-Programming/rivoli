@@ -50,7 +50,7 @@ pub use int4::{
 pub use kmeans::{codebook_norms, learn_codebook, learn_codebook_k, sample_subvectors};
 pub use mxfp8::{
     MXFP8_GROUP, MXFP8_NAN_SCALE, mxfp8_expert_bytes, mxfp8_expert_stride, mxfp8_groups,
-    mxfp8_proj_bytes, mxfp8_row_bytes, mxfp8_slot_offsets,
+    mxfp8_proj_bytes, mxfp8_row_bytes, mxfp8_slot_offsets, quantize_mxfp8_row,
 };
 pub use naming::{
     ExpertProjs, K3_PACKED, K3_PROJ, K3_SCALE, K3_TEXT_PREFIX, PROJ, V4_PROJ, expert_base,

@@ -391,6 +391,12 @@ pub fn f4_source(tool: &str, src_dir: &str, layers: std::ops::Range<usize>) -> s
 /// ARE MXFP8 (one e4m3 value per weight, one ue8m0 byte per 32 along the input dim — the
 /// header shapes agree with the root config's `[1, 32]`, not with the `hf_quant_config`
 /// group's declared `[32, 32]`), so nothing is fit or re-rounded on the way in.
+///
+/// **`convert_inkling --mxfp8` is the second producer and it OVERWRITES `chain`.** Inkling 2
+/// Mini is mixed: layers 20..24 are already MXFP8 (the literal above is true for them) while
+/// layers 0..20 are NVFP4 and are re-encoded — a per-artifact fact the one-string-per-format
+/// literal cannot carry, so the converter stamps its own chain beside this block rather than
+/// widening this function's signature for a distinction only one caller needs.
 pub fn mxfp8_source(
     tool: &str,
     src_dir: &str,
@@ -449,6 +455,28 @@ pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usiz
     )
 }
 
+/// Whether `dir` is an `.mxfp8` artifact at all — a cheap sniff the loader makes BEFORE it
+/// commits to a backend, not a validation.
+///
+/// The question asked is exactly one: does `<dir>/manifest.json` parse and carry a top-level
+/// `mxfp8_source` key? An absent manifest, an unreadable one and malformed JSON all answer
+/// `false`, and the two wrong answers are deliberately not symmetric. A `false` sends the
+/// loader down the bf16 container, which either loads (a Mini artifact built without
+/// `--mxfp8`) or fails naming the tensor that is missing; a `true` on a directory that is
+/// something else would commit the loader to layer files that are not there. Every real check
+/// — the key's `layers`, the dims, each layer file's length and header — stays with
+/// [`mxfp8_layer_range`] and [`ExpertSet::open_routed`], where a wrong answer is worth its cost.
+///
+/// One file read, once per engine open — `manifest.json` and nothing else.
+pub fn has_mxfp8_source(dir: &str) -> bool {
+    let path = std::path::Path::new(dir).join("manifest.json");
+    let Ok(raw) = std::fs::read(&path) else {
+        return false;
+    };
+    let parsed = serde_json::from_slice::<serde_json::Value>(&raw);
+    parsed.is_ok_and(|v| v.get("mxfp8_source").is_some())
+}
+
 /// The layer range an `.mxfp8` artifact holds, from `manifest.json`'s `mxfp8_source`.
 ///
 /// [`f4_layer_range`]'s doc is the whole argument and it applies verbatim: read, never
@@ -457,10 +485,17 @@ pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usiz
 /// them into layers as they land. Absent or malformed is an ERROR: this is the loader's only
 /// source for which layers exist, and `0..48` is precisely the wrong guess for the artifact
 /// the field describes.
+///
+/// Two producers are named, because [`mxfp8_source`] has two callers since 2026-11-25:
+/// `convert_inkling_small` (every layer repacked) and `convert_inkling --mxfp8` (Mini's 20
+/// NVFP4 layers quantized, its four native layers repacked).
 pub fn mxfp8_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usize>> {
     source_layer_range(
         std::path::Path::new(dir),
-        ("mxfp8_source", "convert_inkling_small"),
+        (
+            "mxfp8_source",
+            "convert_inkling_small or convert_inkling --mxfp8",
+        ),
         n_layers,
     )
 }

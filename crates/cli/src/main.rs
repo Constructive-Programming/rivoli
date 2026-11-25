@@ -182,19 +182,22 @@ fn main() -> Result<()> {
         // refuses `--mode` and `--attn`, which every invocation asks for — and the ARMS test
         // below ties those two halves together. S6 replaces this arm with a real one.
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
-        // **The Mini arm (S5, 2026-11-24), and the first architecture here with no
-        // `PoolKnobs` at all** — its bf16 blocks are partitioned by a fixed layer prefix, so
-        // there is no policy, two-Q split or trace to gather, and the legality table refuses
-        // the flags that would have filled one in. The config is held on this stack for the
-        // whole run because the engine borrows it.
+        // **The Mini arm (S5, 2026-11-24), now carrying `PoolKnobs` (2026-11-25)** — the
+        // container is the ARTIFACT's fact: its converted bf16 artifact partitions the experts
+        // by a fixed layer prefix and has no pool, its native `.mxfp8` artifact streams them
+        // through one, and `Engine::open` sniffs which from the manifest. So the knobs are
+        // gathered here exactly as every other routed arm gathers them; the legality table
+        // still refuses `--cache-policy`/`--trace` on this row, which is why the gathered value
+        // is the stock one on every run a user can currently make. The config is held on this
+        // stack for the whole run because the engine borrows it.
         Arch::Inkling2Loop => {
             let cfg = Inkling2LoopConfig::load(&a.model)?;
-            open_and_run(&a, &tok, inv, ArchCfg::InklingLoop(&cfg))
+            open_and_run(&a, &tok, inv, ArchCfg::InklingLoop(&cfg, pool_knobs(&a)))
         }
-        // **Small (S6, 2026-11-25): the same stack, a routed pool.** It takes `PoolKnobs`
-        // where Mini takes none, because ~600 GB of `.mxfp8` experts cannot be partitioned by
-        // a fixed layer prefix — the policy, the 2Q split and the trace path all describe the
-        // pool this member streams through.
+        // **Small (S6, 2026-11-25): the same stack, ALWAYS a routed pool.** It carries the
+        // same knobs as every routed arm, and here every artifact spends them: ~600 GB of
+        // `.mxfp8` experts cannot be partitioned by a fixed layer prefix, so the policy, the
+        // 2Q split and the trace path all describe the pool this member streams through.
         Arch::Inkling2 => {
             let cfg = Inkling2Config::load(&a.model)?;
             open_and_run(&a, &tok, inv, ArchCfg::Inkling(&cfg, pool_knobs(&a)))
@@ -251,9 +254,10 @@ fn glm_fmt(a: &Args) -> Result<RoutedFmt> {
 
 /// The routed pool's knobs, gathered in the one place they are legal.
 ///
-/// Shared by both routed arms because they describe a POOL and both have one — see
+/// Shared by every routed arm because they describe a POOL and each has one — see
 /// [`PoolKnobs`]. Whether the flags that fill it are legal on this architecture is the
-/// legality table's question and has already been asked by the time this runs.
+/// legality table's question and has already been asked by the time this runs; an arm may carry
+/// the knobs and spend them on only one of its containers (Mini's `.mxfp8` artifact).
 fn pool_knobs(a: &Args) -> PoolKnobs<'_> {
     PoolKnobs {
         cache_policy: &a.cache_policy,

@@ -244,9 +244,8 @@ impl Nvfp4<'_> {
     /// artifact stores. `value[e,r,c] = E2M1[code] · e4m3(scale[e,r,c/16]) · (amax[e]/denom)`,
     /// the code being the low nibble of `weight[e,r,c/2]` for even `c`, the high for odd.
     pub fn dequant(&self) -> Result<Vec<f32>> {
-        self.plane(false)?.emit_f32(|ei, wrow, srow, emit| {
-            self.decode_row((wrow, srow), self.amax[ei] / self.denom, emit);
-        })
+        let plane = self.plane(false)?;
+        plane.emit_f32(|ei, wrow, srow, emit| self.decode_with_factor(ei, (wrow, srow), emit))
     }
 
     /// The artifact's stored bytes: dequant, the optional `w13` row de-interleave and the bf16
@@ -255,9 +254,51 @@ impl Nvfp4<'_> {
     /// asserts both ways.
     pub fn dequant_to_bf16_le(&self, deinterleave: bool) -> Result<Vec<u8>> {
         self.plane(deinterleave)?
-            .emit_bf16_le(|ei, wrow, srow, emit| {
-                self.decode_row((wrow, srow), self.amax[ei] / self.denom, emit);
-            })
+            .emit_bf16_le(|ei, wrow, srow, emit| self.decode_with_factor(ei, (wrow, srow), emit))
+    }
+
+    /// One row's block walk WITH this projection's per-expert factor: `(code · block_scale) ·
+    /// (amax[e] / denom)`, the association LOAD:813–814 uses. ONE body for the f32 oracle, the
+    /// bf16 plane and [`Self::decode_expert_row`], because a second spelling could re-associate
+    /// it into `code · (block_scale · factor)` — a different f32 with no error anywhere, which
+    /// the bf16 golden would then be compared against.
+    fn decode_with_factor(
+        &self,
+        ei: usize,
+        (wrow, srow): (usize, usize),
+        emit: &mut dyn FnMut(usize, f32),
+    ) {
+        self.decode_row((wrow, srow), self.amax[ei] / self.denom, emit);
+    }
+
+    /// Decode ONE row of ONE expert into `out`, which must be exactly the logical row width
+    /// (`cols_packed * 2`).
+    ///
+    /// For a caller that re-encodes a row at a time and must not allocate the whole
+    /// `[E, rows, cols]` f32 plane: `convert_inkling --mxfp8` walks Mini's 20 NVFP4 layers this
+    /// way, one 2304-value row per call, straight into its MXFP8 quantizer. The values are
+    /// `decode_row`'s, at the same `(code · block_scale) · factor` association, so a row read
+    /// here is the f32 oracle's row — not a second decode that could drift from it.
+    ///
+    /// Geometry is re-validated per call — a handful of comparisons against the 32-value block
+    /// walk this hands back — and that is deliberately the cheap side of the trade: it keeps a
+    /// plane built for one projection from being decoded at another's width, which is otherwise
+    /// a wrong-by-a-stride read with no length check in its way.
+    pub fn decode_expert_row(&self, expert: usize, row: usize, out: &mut [f32]) -> Result<()> {
+        let (e, rows, cols) = self.validate()?;
+        ensure!(
+            expert < e && row < rows,
+            "NVFP4: expert {expert} row {row} outside [{e}, {rows})"
+        );
+        ensure!(
+            out.len() == cols,
+            "NVFP4: {}-value buffer for a {cols}-wide row",
+            out.len()
+        );
+        let base = expert * rows + row;
+        let spans = (base * self.cols_packed, base * self.scale_cols());
+        self.decode_with_factor(expert, spans, &mut |i, v| out[i] = v);
+        Ok(())
     }
 }
 
@@ -403,7 +444,53 @@ pub fn merge_message_queries(
 
 #[cfg(test)]
 mod tests {
-    use super::exp2_u8;
+    // The subject is arithmetic over in-memory planes, so nothing here touches a file. Crate-wide
+    // `unwrap`/`expect` are `deny`; a firing one IS the report.
+    #![allow(clippy::unwrap_used)]
+    use super::{Nvfp4, exp2_u8};
+
+    /// One expert, two 16-value rows of distinct weights, one e4m3 scale each, and a factor that
+    /// is not 1 so the per-expert multiply is exercised.
+    fn two_row_plane() -> Nvfp4<'static> {
+        // Two packed bytes per 16-value block: 8 bytes a row, so `scale_cols` is 1.
+        static WEIGHT: [u8; 16] = [
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, // row 0
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, // row 1
+        ];
+        static SCALE: [u8; 2] = [0x3c, 0x40]; // 1.5 and 2.0 in e4m3
+        static AMAX: [f32; 1] = [3.5];
+        Nvfp4 {
+            weight: &WEIGHT,
+            scale: &SCALE,
+            amax: &AMAX,
+            denom: 7.0,
+            rows: 2,
+            cols_packed: 8,
+        }
+    }
+
+    /// **The per-row decode is the plane decode's own row**, bit for bit — the claim
+    /// `convert_inkling --mxfp8` rests on when it re-encodes Mini's NVFP4 experts one row at a
+    /// time instead of materialising `[E, rows, cols]`. A second decode written for the row path
+    /// could re-associate `(code · block_scale) · factor` into `code · (block_scale · factor)`
+    /// and produce a plausible, different f32; an equality here is what rules that out.
+    #[test]
+    fn decode_expert_row_matches_the_plane_oracle() {
+        let plane = two_row_plane();
+        let all = plane.dequant().unwrap();
+        assert_eq!(all.len(), 32);
+        let mut row = vec![0f32; 16];
+        plane.decode_expert_row(0, 1, &mut row).unwrap();
+        assert_eq!(row, all[16..32].to_vec());
+        // And it is not a constant: row 0 must differ from row 1, both having decoded.
+        plane.decode_expert_row(0, 0, &mut row).unwrap();
+        assert_ne!(row, all[16..32].to_vec());
+        assert_eq!(row, all[..16].to_vec());
+        // A buffer of the wrong width, or an expert/row outside the plane, is refused.
+        assert!(plane.decode_expert_row(0, 0, &mut [0f32; 8]).is_err());
+        assert!(plane.decode_expert_row(0, 2, &mut [0f32; 16]).is_err());
+        assert!(plane.decode_expert_row(1, 0, &mut [0f32; 16]).is_err());
+    }
 
     /// The bit-exactness claim `exp2_u8` is written against, over the WHOLE scale-byte domain —
     /// every ue8m0 value a checkpoint can carry, not a sample. Hoisting the block scale out of
