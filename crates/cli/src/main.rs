@@ -20,8 +20,9 @@ use anyhow::{Context, Result, bail};
 // another file's token for token the moment the K3 import landed, and the jscpd gate
 // reported the pair — an import list being the one duplication Rust cannot factor.
 use rivoli_artifact::{
-    format::RoutedFmt, glimmer_config::GlimmerConfig, glm_config::ModelConfig, k3_config::K3Config,
-    tokenizer::Tokenizer, v4_config::V4Config,
+    format::RoutedFmt, glimmer_config::GlimmerConfig, glm_config::ModelConfig,
+    inkling_config::Inkling2LoopConfig, k3_config::K3Config, tokenizer::Tokenizer,
+    v4_config::V4Config,
 };
 use rivoli_core::cache::TwoQSplit;
 use rivoli_core::legality::{
@@ -179,11 +180,20 @@ fn main() -> Result<()> {
         // refuses `--mode` and `--attn`, which every invocation asks for — and the ARMS test
         // below ties those two halves together. S6 replaces this arm with a real one.
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
-        // Inkling 2's two members, armless as of S1 (2026-11-23) on the same shape as qwen:
-        // `check_legality` refuses every flag they ask for, so this bail is unreachable while
-        // the row holds, and the ARMS test below ties the two halves together. One const for
-        // both members — the port is one shared text stack. S5 gives Mini a real arm; S6 Small.
-        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
+        // **The Mini arm (S5, 2026-11-24), and the first architecture here with no
+        // `PoolKnobs` at all** — its bf16 blocks are partitioned by a fixed layer prefix, so
+        // there is no policy, two-Q split or trace to gather, and the legality table refuses
+        // the flags that would have filled one in. The config is held on this stack for the
+        // whole run because the engine borrows it.
+        Arch::Inkling2Loop => {
+            let cfg = Inkling2LoopConfig::load(&a.model)?;
+            open_and_run(&a, &tok, inv, ArchCfg::InklingLoop(&cfg))
+        }
+        // Small stays ARMLESS until S6 (the bigger-than-memory streaming case): its row of the
+        // table refuses `--mode` and `--attn`, so this bail is unreachable while the row holds,
+        // and the ARMS test below ties the two halves together. Same const as before — the
+        // port is one shared text stack, and Mini's arm landing does not reword Small's door.
+        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 
@@ -473,10 +483,13 @@ mod tests {
     /// flips this test's `Refuse` becomes a `Support` and reddens exactly where the expectation
     /// has to change.
     ///
-    /// **All three armless architectures**, each against its OWN const: `Arch::Inkling2Loop`
-    /// and `Arch::Inkling2` share a legality row, so a future split that gives one of them an
-    /// arm is the change this loop is positioned to catch — and the Inkling `--mtp` ordering is
-    /// gated without a second copy of this body.
+    /// **Both shapes of the answer, since S5 (2026-11-24).** The ARMLESS rows are asserted as
+    /// before. Inkling 2 MINI is the counter-example the first half exists to make visible: it
+    /// HAS an arm now, and its `--mode` cell is a loud fallback rather than a refusal, so the
+    /// `--mtp` cell IS reached and a Mini user reads Inkling's own draft-stack text. That is
+    /// what `tests/smoke-inkling.sh`'s `mtp` cell asserts, and it is gated here so the two
+    /// cannot drift — asserted as "a refusal that is NOT the arm-not-built const", not against
+    /// the wording, which stays the table's.
     ///
     /// Asserted on the ORDER and on the outcome of the first flag, not on a formatted string:
     /// the wording belongs to the table, and re-asserting it here would be the second
@@ -500,11 +513,11 @@ mod tests {
         );
         let first = *flags.first().expect("at least --mode");
         // One row per architecture with no decode arm, each with the const its table row
-        // answers `--mode` with. The array is the population: a fourth armless architecture
-        // added without a row here leaves its `--mtp` ordering unchecked.
-        const ARMLESS: [(Arch, &str); 3] = [
+        // answers `--mode` with. The array is the population: a third armless architecture
+        // added without a row here leaves its `--mtp` ordering unchecked. Mini left this list
+        // at S5 when its row flipped.
+        const ARMLESS: [(Arch, &str); 2] = [
             (Arch::QwenFlashNext, QWEN_ARM_NOT_BUILT),
-            (Arch::Inkling2Loop, INKLING_ARM_NOT_BUILT),
             (Arch::Inkling2, INKLING_ARM_NOT_BUILT),
         ];
         for (arch, want) in ARMLESS {
@@ -513,6 +526,25 @@ mod tests {
                 Outcome::Refuse(want),
                 "the FIRST cell judged on {arch:?} is what the user reads"
             );
+        }
+        // Mini's `--mode` cell must NOT refuse, which is what makes its `--mtp` cell reachable
+        // — and the cell must then answer with a refusal that is not the arm-not-built text,
+        // or a Mini user is told to wait for an arm that is already there.
+        assert!(
+            matches!(
+                decide(Arch::Inkling2Loop, first),
+                Outcome::FallbackLoudly(_)
+            ),
+            "Mini's --mode cell must fall back loudly: a refusal here would make the \
+             smoke script's mtp cell quote the wrong text"
+        );
+        match decide(Arch::Inkling2Loop, Flag::Mtp) {
+            Outcome::Refuse(why) => assert_ne!(
+                why, INKLING_ARM_NOT_BUILT,
+                "Mini's --mtp cell must answer with its draft-stack reason, not the \
+                 arm-not-built text — the arm exists"
+            ),
+            other => panic!("Mini's --mtp cell must refuse; got {other:?}"),
         }
     }
 
@@ -540,11 +572,14 @@ mod tests {
         // Hand-written, on the same argument as `legality::ARCH_COUNT`: no test can observe
         // a `match`'s arms, so the list is stated and the assertion is what binds it. Adding
         // an arm to `main` without a row here leaves that architecture unchecked.
-        const ARMS: [Arch; 4] = [
+        const ARMS: [Arch; 5] = [
             Arch::GlmMoeDsa,
             Arch::MuseGlimmer,
             Arch::DeepseekV4,
             Arch::KimiK3,
+            // Added at S5 with the Mini arm: this list is what binds `main`'s dispatch to the
+            // table, so an arm landing without a row here leaves it unchecked.
+            Arch::Inkling2Loop,
         ];
         let Ok(a) = <Args as clap::Parser>::try_parse_from(["rivoli", "DIR", "--bench", "1"])
         else {

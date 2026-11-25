@@ -8,7 +8,7 @@
 
 // The two `repr(C)` structs moved to `rivoli-abi` 2026-11-18 — the `no_std` crate the Rust
 // device crate compiles too — with their notes; re-exported so no path changed.
-pub use rivoli_abi::{CompFinish, CompGeom};
+pub use rivoli_abi::{CompFinish, CompGeom, geom::SINK_ATTEND_MAX_N};
 
 /// The four extents the sparse indexer's scoring contracts over.
 ///

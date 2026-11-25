@@ -15,15 +15,15 @@ use crate::launch::{
     rivoli_qk_norm, rivoli_rel_bias_gather, rivoli_rmsnorm_batch, rivoli_rmsnorm_centered_single,
     rivoli_rmsnorm_single, rivoli_rmsnorm_weightless_batch, rivoli_rope_adjacent,
     rivoli_rope_interleave, rivoli_rope_split_half, rivoli_scaled_l2_clip, rivoli_sconv,
-    rivoli_sigmoid_gate, rivoli_sink_attend, rivoli_situ_glu_f32, rivoli_swiglu,
-    rivoli_swiglu_clamped_bf16,
+    rivoli_sconv_dynamic, rivoli_sigmoid_gate, rivoli_sink_attend, rivoli_situ_glu_f32,
+    rivoli_swiglu, rivoli_swiglu_clamped_bf16, rivoli_vaxpy,
 };
 use anyhow::Result;
 use rivoli_abi::kernarg::{
-    ActQuantPrefix, F4Rotate, Gate, GateClamped, GateSitu, InPlaceBinary, KvScatter, L2Clip,
+    ActQuantPrefix, Axpy, F4Rotate, Gate, GateClamped, GateSitu, InPlaceBinary, KvScatter, L2Clip,
     LayerNorm, LogScaledL2Clip, MessageGate, Mxfp8Dequant, Nvfp4Dequant, QkNorm, RelBiasGather,
-    RmsNormRows, Rope, RopeAdjacent, RowNorm, ScaledL2Clip, Sconv, SinkAttend, Softcap,
-    WeightlessNorm,
+    RmsNormRows, Rope, RopeAdjacent, RowNorm, ScaledL2Clip, Sconv, SconvDynamic, SinkAttend,
+    Softcap, WeightlessNorm,
 };
 use std::ffi::c_void;
 
@@ -171,6 +171,45 @@ launchers! {
         k: usize,
         divisor: f32,
         out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// inkling's DYNAMIC short-convolution decode step: the static k-tap window with a per-HEAD
+    /// learned tap vector added to every static weight, residual and divisor as the static form.
+    /// `static_w` is `[k, channels]` row-major (`lag 0` = current … `lag k−1` = oldest), `dyn_w`
+    /// `[kv_heads, k]` at head `c/head_dim`; advances `state` (`[channels, k−1]`) in place and may
+    /// write `out` over `current`. No C twin — oracle-validated. `channels`/`head_dim`/`k` > 0 with
+    /// `channels % head_dim == 0` (1001); `divisor` positive finite (1006).
+    ///
+    /// # Safety
+    /// Device pointers (`static_w` `k·channels` f32, `dyn_w` `kv_heads·k` f32, `state`
+    /// `channels·(k−1)` f32, `current`/`out` `channels` f32) live until the next [`device_sync`];
+    /// `stream` is null or a live stream ordering every producer.
+    launch_sconv_dynamic => rivoli_sconv_dynamic(SconvDynamic { static_w, dyn_w, state, current, out, channels: channels as i32, head_dim: head_dim as i32, k: k as i32, divisor }, stream), "sconv_dynamic" (
+        static_w: *const f32,
+        dyn_w: *const f32,
+        state: *mut f32,
+        current: *const f32,
+        channels: usize,
+        head_dim: usize,
+        k: usize,
+        divisor: f32,
+        out: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// `x[i] += alpha·y[i]` over `n`, `x` in place — inkling's decode vector update. No C twin —
+    /// oracle-validated. `n > 0` (1001); `alpha` finite (1006), so `0.0` and a negative scale are
+    /// arithmetic rather than refusals.
+    ///
+    /// # Safety
+    /// Device pointers (`x`/`y` `n` f32 each) live until the next [`device_sync`]; `stream` is null
+    /// or a live stream ordering every producer.
+    launch_vaxpy => rivoli_vaxpy(Axpy { x, y, alpha, n: n as i32 }, stream), "vaxpy" (
+        x: *mut f32,
+        y: *const f32,
+        alpha: f32,
+        n: usize,
         stream: *mut c_void,
     );
 

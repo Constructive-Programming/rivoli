@@ -50,6 +50,7 @@ pub(crate) struct Bench<'a> {
 /// > is its own commit and why no fp8 A/B may straddle it.
 fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
     use rivoli_artifact::glimmer_encoding;
+    use rivoli_artifact::inkling_encoding;
     use rivoli_artifact::v4_encoding::{EncodeOpts, Message, ThinkingMode};
     match arch {
         // `ThinkingMode::Chat` — the same default `ChatOpts::thinking` takes and for the same
@@ -112,10 +113,25 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
         // hide is the worst-shaped one available: a prompt framed in SOME model's markers,
         // encoded, counted against `--ctx`, and reported as a bench that ran.
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
+        // Inkling 2 Mini (S5, 2026-11-24): its own chat template, rendered as a STRING and
+        // then tokenized — Glimmer's shape, not GLM's id list, and not V4's encoder. That the
+        // markers become single ids is the shipped tokenizer's doing; feeding this checkpoint
+        // any other model's turn markers is the failure `frame_prompt`'s header describes.
+        //
+        // `reasoning_effort: Some("none")` on the Glimmer arm's argument above, not the
+        // template's default `0.9`: `--bench N` is timing the decode, and a reasoning block
+        // would spend the whole budget in the thinking channel.
+        Arch::Inkling2Loop => tok.encode(&inkling_encoding::render(
+            &[serde_json::json!({"role": "user", "content": text})],
+            &inkling_encoding::InklingChatOpts {
+                reasoning_effort: Some("none"),
+            },
+        )?),
         // The THIRD door quoting the table's const (inkling S1, 2026-11-23): same reachability
         // argument as qwen above — a bench framed in some model's markers, counted against
-        // `--ctx` and reported as run, is the failure this bail hides. Both members, one wording.
-        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
+        // `--ctx` and reported as run, is the failure this bail hides. Small only since S5:
+        // Mini's arm is the match arm above, and this one stays until S6.
+        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 

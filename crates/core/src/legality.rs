@@ -1,28 +1,24 @@
 //! The (architecture × flag) legality table — **one** decider for "may this run ask for
 //! that", and the refusal text lives in the table beside the verdict.
 //!
-//! The old tree answered this question in two places: `arch.rs` carried presentation
-//! policy (which flags `--help` shows per architecture) while `main.rs` carried nine
-//! hand-written refusals. Two authorities that can independently judge one configuration
-//! is the silent-wrong hazard — a flag hidden from help but still accepted, or accepted
-//! and then dropped, and a recorded command line that carries a knob nothing spent. Here
-//! [`decide`] is the only judge, [`Outcome`] is its only vocabulary, and a refusal's
-//! wording is data rather than prose scattered through the CLI.
+//! The old tree answered this in two places: `arch.rs` carried presentation policy (which flags
+//! `--help` shows per architecture) while `main.rs` carried nine hand-written refusals. Two
+//! authorities that can independently judge one configuration is the silent-wrong hazard — a
+//! flag hidden from help but still accepted, or accepted and then dropped, and a recorded command
+//! line carrying a knob nothing spent. Here [`decide`] is the only judge, [`Outcome`] is its only
+//! vocabulary, and a refusal's wording is data rather than prose scattered through the CLI.
 //!
-//! **Why the identity enums live in `rivoli-core` and not in `rivoli-artifact`.** The DAG
-//! runs core ← artifact ← engine ← cli, so core cannot name an artifact type. The table
-//! has to key on the architecture, therefore the architecture *identity* is core's and
-//! the *recognition* — which manifest spellings name it — stays with the manifest reader
-//! (`rivoli_artifact::arch::from_manifest_str`, which re-exports [`Arch`]). That is the
-//! shape `ModelConfig::scoring` already uses: core owns the vocabulary, artifact maps its
-//! raw input into it.
+//! **Why the identity enums live in `rivoli-core`.** The DAG runs core ← artifact ← engine ←
+//! cli, so core cannot name an artifact type. The table keys on the architecture, so the
+//! architecture *identity* is core's and the *recognition* — which manifest spellings name it —
+//! stays with the manifest reader (`rivoli_artifact::arch::from_manifest_str`, which re-exports
+//! [`Arch`]), the shape `ModelConfig::scoring` already uses.
 //!
-//! **[`Mode`] is not a weight format, deliberately.** `RoutedFmt` lives in
-//! `rivoli-artifact` precisely so core cannot express "residency selects arithmetic" (the
-//! old tree's hybrid defect, where `--max-mem` changed the output text). `Mode` is what
-//! the user typed; `RoutedFmt` is what the pool stores; the CLI is the one place where one
-//! becomes the other, and `Mode::Hybrid` has no `RoutedFmt` at all — which is exactly why
-//! it refuses here rather than silently resolving to one of the two real formats.
+//! **[`Mode`] is not a weight format, deliberately.** `RoutedFmt` lives in `rivoli-artifact` so
+//! core cannot express "residency selects arithmetic" (the old tree's hybrid defect, where
+//! `--max-mem` changed the output text). `Mode` is what the user typed; `RoutedFmt` is what the
+//! pool stores; the CLI is the one place one becomes the other, and `Mode::Hybrid` has no
+//! `RoutedFmt` at all — which is why it refuses here rather than resolving to a real format.
 
 /// The architectures the engine has, or will have, a decode path for. Parsed from the
 /// artifact manifest's `architectures` / `model_type` by
@@ -51,17 +47,17 @@ pub enum Arch {
     /// indexed sparse-attention layers, MoE on EVERY layer, a 4-wide hyper-connected residual
     /// stream in place of pre-norms, and a hashed n-gram table injected at one layer.
     ///
-    /// **The first variant here with no engine arm behind it**, and the only one whose whole
-    /// legality row refuses: the sniff recognises such an artifact, and everything past the
-    /// sniff is owed. `docs/investigations/qwen-flash-next-port.md` is the plan of record and
-    /// `docs/reference/qwen-architecture.md` is the math; this variant landing before any of
-    /// it is the point — a surface that would have to refuse cannot be added quietly later,
-    /// so it is added, refusing, first (stage S1).
+    /// **The first variant here with no engine arm behind it**: the sniff recognises the
+    /// artifact and everything past it is owed. `docs/investigations/qwen-flash-next-port.md` is
+    /// the plan of record and `docs/reference/qwen-architecture.md` the math; landing before any
+    /// of it is the point — a surface that would have to refuse cannot be added quietly later.
     QwenFlashNext,
     /// Inkling 2 Mini — Thinking Machines Lab, `inkling2_loop`: the looped member. 24 layers
     /// whose middle 12 run three passes over a block-residual stream, MoE every layer, NVFP4
-    /// experts on layers 0–19 and MXFP8 on 20–23. Armless as of S1 (2026-11-23): the port plan
-    /// is `docs/investigations/inkling2-port.md`, the math `docs/reference/inkling2-architecture.md`.
+    /// experts on layers 0–19 and MXFP8 on 20–23 in the CHECKPOINT — the converted artifact
+    /// stores them dequantized bf16, which is why `--mode` falls back loudly here. **Armed
+    /// since S5 (2026-11-24)**; the port plan is `docs/investigations/inkling2-port.md` and the
+    /// math `docs/reference/inkling2-architecture.md`.
     Inkling2Loop,
     /// Inkling 2 Small — the `inkling2` member: 48 layers, no loop, MXFP8 experts throughout.
     /// The P1 bigger-than-memory streaming case; shares Mini's text stack and its port plan.
@@ -197,10 +193,9 @@ pub const ATTNS: [(&str, AttnKind); 4] = [
 
 /// Resolve one spelling against a vocabulary table, or say what was accepted.
 ///
-/// Generic over the vocabulary rather than written once per enum: two copies of
-/// `match s { "..." => Ok(..) }` share a ~20-token prefix and are exactly the duplication
-/// `build.rs`'s jscpd gate forbids. The error is a `String` because that is what clap's
-/// `value_parser` takes — which costs `rivoli-core` no dependency on clap.
+/// Generic rather than written per enum: two copies of `match s { "..." => Ok(..) }` share a
+/// ~20-token prefix, the duplication `build.rs`'s jscpd gate forbids. The error is a `String`
+/// because that is what clap's `value_parser` takes — which costs core no clap dependency.
 pub fn parse_in<T: Copy>(table: &[(&'static str, T)], flag: &str, s: &str) -> Result<T, String> {
     table
         .iter()
@@ -217,9 +212,9 @@ pub fn parse_in<T: Copy>(table: &[(&'static str, T)], flag: &str, s: &str) -> Re
 
 /// The spelling of a value, from the same table its parser reads.
 ///
-/// The `"?"` fallback is unreachable: `vocabularies_round_trip` asserts every variant
-/// reachable through [`Flag::ALL`] is in its table. It exists because a total function is
-/// cheaper than a `Result` no caller could act on.
+/// The `"?"` fallback is unreachable (`vocabularies_round_trip` asserts every variant reachable
+/// through [`Flag::ALL`] is in its table); it exists because a total function is cheaper than a
+/// `Result` no caller could act on.
 pub fn name_in<T: Copy + PartialEq>(table: &[(&'static str, T)], v: T) -> &'static str {
     table
         .iter()
@@ -234,18 +229,15 @@ pub fn name_in<T: Copy + PartialEq>(table: &[(&'static str, T)], v: T) -> &'stat
 /// Two kinds of flag are deliberately absent, and the distinction is the table's scope:
 /// - `--bench` and `--port`, plus the positional artifact path, are the INVOCATION — which
 ///   of the two things this process is — not knobs on it. Their exclusivity is clap's.
-/// - `--think` is a knob, but an architecture-independent one: it selects a framing the
-///   tokenizer either renders or does not, and no architecture here answers it differently.
-///   A row that reads `Support` for every arch is a row that can only ever be noise, and
-///   the cost of adding it is real — [`Flag::ALL`], the ordinal permutation and the product
-///   test all widen. **The rule: a flag earns a row when some architecture would answer it
-///   differently, and not before.** A flag that later grows per-arch variance gets its row
-///   then, which is also when there is something true to write in the cell.
+/// - `--think` is a knob, but an architecture-independent one: no architecture here answers it
+///   differently, and a row that reads `Support` everywhere is noise whose cost is real
+///   ([`Flag::ALL`], the ordinal permutation and the product test all widen). **The rule: a flag
+///   earns a row when some architecture would answer it differently, and not before.** A flag
+///   that later grows per-arch variance gets its row then.
 /// - `--prompt` and `--dump-ids` had rows at first and lost them to the same rule
-///   (review 2026-08-16): a prompt and an id dump are IO facts of the invocation, and no
-///   architecture that decodes at all could answer either differently. `--ctx` stays: the
-///   KV ceiling is answered per-architecture in principle — K3's recurrent KDA state has
-///   no per-token KV growth at all, so its cell would not read like GLM's.
+///   (review 2026-08-16): both are IO facts of the invocation. `--ctx` stays — the KV ceiling is
+///   answered per-architecture in principle, since K3's recurrent KDA state has no per-token KV
+///   growth at all.
 ///
 /// Note the asymmetry among the rows that do exist: `Mode` and `Attn` carry their value
 /// because the answer differs per value (int4 decodes, hybrid does not), while
@@ -267,14 +259,11 @@ const VALUELESS: usize = MODES.len() + ATTNS.len();
 
 /// How many (arch, flag) columns exist. Same contract as [`ARCH_COUNT`]: the `5` is the
 /// count of valueless [`Flag`] variants — `CachePolicy`, `MaxMem`, `Ctx`, `Trace`, `Mtp` —
-/// and is hand-written so that adding one cannot quietly skip [`Flag::ALL`].
+/// hand-written so adding one cannot quietly skip [`Flag::ALL`].
 ///
-/// > **CORRECTED 2026-08-31 (S1 review).** This said `the 7 is the count of valueless
-/// > variants` while the expression below has always been `VALUELESS + 5` and there have
-/// > always been five. A comment restating a wrong number for the constant it documents is
-/// > worse than no comment: the reader who trusts it goes looking for two variants that do
-/// > not exist. The five are now named, so the next drift is a visible disagreement rather
-/// > than an arithmetic one.
+/// > **CORRECTED 2026-08-31 (S1 review).** This once said `the 7 is the count of valueless
+/// > variants` while the expression has always been `VALUELESS + 5`. The five are now named,
+/// > so the next drift is a visible disagreement rather than an arithmetic one.
 const FLAG_COUNT: usize = VALUELESS + 5;
 
 impl Flag {
@@ -457,17 +446,15 @@ const K3_MTP_NEEDS_TWO_KERNELS: &str = "speculative decode on this architecture 
      fixtures. There is no draft head loaded either, but the kernels are what would have to \
      arrive first";
 
-/// **Pub, and the exception is argued rather than convenient**: most rows' wording is consumed
-/// exclusively by [`decide`], so publishing it would invent API nobody imports. This one has
-/// three consumers OUTSIDE the
-/// table — `main`'s dispatch bail, `bench::frame_prompt` and `serve`'s two arch matches — each
-/// of which is a door a qwen artifact reaches only if the door in front of it moved. The
-/// alternative is one hand-written wording per door, which is precisely the "two authorities
-/// that can independently judge one configuration" hazard this module's header opens with; four
-/// wordings would be four. It stops being `pub` at S6, when the arm lands and the doors close.
+/// **Pub, and the exception is argued rather than convenient**: most wording here is consumed
+/// only by [`decide`], so publishing it would invent API nobody imports. This one has three
+/// consumers OUTSIDE the table — `main`'s dispatch bail, `bench::frame_prompt` and `serve`'s two
+/// arch matches — and one hand-written wording per door is precisely the "two authorities that
+/// can independently judge one configuration" hazard the header opens with. It stops being
+/// `pub` at S6, when the arm lands and the doors close.
 ///
 /// > **CORRECTED 2026-11-23 (inkling S1).** This opened "the only refusal text in this table
-/// > that is `pub`". [`INKLING_ARM_NOT_BUILT`] is the second, for the same reason.
+/// > that is `pub`"; [`INKLING_ARM_NOT_BUILT`] is the second, for the same reason.
 pub const QWEN_ARM_NOT_BUILT: &str = "there is no decode path for this architecture yet, so \
      there is nothing for a flag to be legal ABOUT: the sniff recognises the artifact and \
      everything behind it is owed — no config type, no converter, no kernel, no arm. This was \
@@ -480,18 +467,15 @@ pub const QWEN_ARM_NOT_BUILT: &str = "there is no decode path for this architect
      flips in one commit together with tests/smoke-qwen.sh";
 
 /// Qwen's `--mtp` wording. **Not reachable from the CLI yet, and that is a property of the
-/// dispatch rather than of this row** — worth stating here because the text is the longest in
-/// the table and a reader will reasonably assume a user has seen it.
-///
-/// `main`'s `requested_flags` puts [`Flag::Mode`] first and `check_legality` bails on the
-/// FIRST `Refuse`, so `rivoli DIR --mtp …` prints [`QWEN_ARM_NOT_BUILT`] — the `--mode` cell's
-/// refusal — and stops before reaching this cell. Until the arm row flips at S6 this const is
-/// therefore reachable only from a unit test, and `tests/smoke-qwen.sh`'s `--mtp` cell must
-/// expect the ARM_NOT_BUILT fragment; afterwards `--mode` becomes `Support` and this text is
-/// what a user sees. Collecting every refusal and reporting the most specific one was
-/// CONSIDERED and declined in the same review: it changes the refusal contract for four
-/// shipped architectures to improve a message on a fifth that cannot start, and the ordering
-/// is honest — the run is blocked by the missing arm first, which is what it says.
+/// dispatch rather than of this row**: `main`'s `requested_flags` puts [`Flag::Mode`] first and
+/// `check_legality` bails on the FIRST `Refuse`, so `rivoli DIR --mtp …` prints
+/// [`QWEN_ARM_NOT_BUILT`] and stops before this cell. Until the row flips at S6 this const is
+/// reachable only from a unit test, and `tests/smoke-qwen.sh`'s `--mtp` cell must expect the
+/// ARM_NOT_BUILT fragment; afterwards `--mode` becomes `Support` and this is what a user sees.
+/// Collecting every refusal and reporting the most specific one was CONSIDERED and declined:
+/// it changes the refusal contract for four shipped architectures to improve a message on a
+/// fifth that cannot start, and the ordering is honest — the run is blocked by the missing arm
+/// first, which is what it says.
 const QWEN_MTP_NOT_LOADED: &str = "speculative decode on this architecture is blocked THREE \
      deep, and which blocker arrives first is the useful half: the DRAFT LAYER IS NOT IN THE \
      ARTIFACT at all — the `mtp.*` tensors (a draft layer carrying its own full 512-expert MoE \
@@ -506,42 +490,76 @@ const QWEN_MTP_NOT_LOADED: &str = "speculative decode on this architecture is bl
      routed-expert range would be instantiated at one row only, as on every arm here. And in \
      front of all three, this architecture has no decode arm at all — see its other refusals";
 
-/// Inkling 2's arm-not-built refusal — BOTH members, one wording, because the port is one
-/// shared text stack and the plan names the order (Mini first, Small the streaming case).
+/// Inkling 2 SMALL's arm-not-built refusal — **Small's door since S5 (2026-11-24)**. Mini's
+/// looped bf16 arm IS built; this text quotes only the member still owed, the MXFP8 streaming
+/// case, so a Small refusal no longer claims a text stack that exists.
 ///
 /// `pub` for the same reason as [`QWEN_ARM_NOT_BUILT`]: `main.rs`, `bench.rs` and `serve/mod.rs`
-/// quote it at their doors. Unlike the qwen const it does NOT stop being `pub` when the first
-/// arm lands: Mini's arm (S5) flips Mini's cells while Small's door keeps quoting this text
-/// until S6, so the const outlives the Mini flip.
-pub const INKLING_ARM_NOT_BUILT: &str = "no decode path for this architecture yet — Inkling 2's text stack is not built. The \
-     block-residual attention (learned query mixing, per-head sinks, relative bias, short \
-     convolutions), the softcapped MoE and, on Mini, the 12-layer ×3-pass loop are the port, \
-     not the existing decode loop with a new batch shape. Planned order: Mini first on the \
-     shared stack, then Small-MXFP8 as the bigger-than-memory streaming case. The pinned \
-     checkpoint, tokenizer and config are vendored under docs/measurement/inkling2-reference/; \
-     the plan is docs/investigations/inkling2-port.md.";
+/// quote it at their doors, and Small's door keeps quoting it until S6.
+pub const INKLING_ARM_NOT_BUILT: &str = "no decode path for this architecture yet — Inkling 2 SMALL's MXFP8 \
+     streaming arm is not built. Mini's looped bf16 arm IS built (S5); Small is the \
+     bigger-than-memory case: 48 layers of MXFP8 experts (~600 GB) whose blocks must stream from \
+     NVMe overlapped with compute, which is S6. The block-residual attention (learned query \
+     mixing, per-head sinks, relative bias, short convolutions) and the softcapped MoE come \
+     with it. The pinned checkpoint, tokenizer and config are vendored under \
+     docs/measurement/inkling2-reference/; the plan is docs/investigations/inkling2-port.md.";
 
-/// `--mtp` on Inkling 2: refused for TWO facts, and the wording carries both.
+/// `--mtp` on Inkling 2: refused for TWO facts, and the wording carries both. (1) The draft
+/// stack is not in the artifact: `mtp.safetensors` (635,801,416 B, sha256-verified beside the Mini
+/// shard) is EXCLUDED BY NAME from the text conversion, and Small's MTP weights are likewise
+/// unconverted. (2) Mini's loop is not a batch shape a verify pass can step: each pass re-reads
+/// the previous pass's block states, so verifying several drafted tokens would replay the loop
+/// per token, not widen a batch. Deferred by owner scope (2026-11-23), not planned for v1.
 ///
-/// 1. The draft stack is not in the artifact: `mtp.safetensors` (635,801,416 B, sha256-verified
-///    beside the Mini shard) is EXCLUDED BY NAME from the text conversion, and Small's MTP
-///    weights are likewise unconverted.
-/// 2. Mini's loop is not a batch shape a verify pass can step: each pass re-reads the previous
-///    pass's block states, so verifying several drafted tokens would have to replay the loop
-///    per token, not widen a batch.
-///
-/// Deferred by owner scope (2026-11-23), not planned for v1. Unreachable from the CLI until the
-/// arm row flips, on the same ordering [`QWEN_MTP_NOT_LOADED`] documents: `Flag::Mode` is judged
-/// first and bails.
+/// > **REACHABLE FROM THE CLI SINCE S5 (2026-11-24).** Test-only until Mini's arm landed: Mini's
+/// > row answers `--mode` with [`Outcome::FallbackLoudly`] and `--attn` with `Support`, so this
+/// > cell IS the first refusal `check_legality` meets and `rivoli MINI_DIR --mtp --bench 1`
+/// > prints this text.
 const INKLING_MTP_NOT_LOADED: &str = "--mtp refused: the DRAFT STACK IS NOT IN THE ARTIFACT. mtp.safetensors is downloaded and \
      hash-verified beside the checkpoint but EXCLUDED BY NAME from the text conversion. And \
      Mini's looped recurrence is not a batch shape a verify pass can step — each pass re-reads \
      the previous pass's block states, so a multi-token verify would replay the loop, not widen \
      a batch. Deferred, not planned for v1.";
 
-/// **The** legality decider. Total over `Arch × Flag` by the compiler: adding an
-/// architecture breaks this match, adding a flag breaks [`glm`], and either way the build
-/// stops until the new cell has an argued answer.
+/// `--mode` on Inkling 2 Mini: a loud fallback, not a refusal, because the ARTIFACT has no
+/// format to choose — Mini's expert blocks are converted DEQUANTIZED to bf16, one container and
+/// no second one, so `int3-vq`, `int4` and `hybrid` all name something the run does not store.
+/// `Refuse` would kill `rivoli MINI_DIR --bench 4`, the no-flags invocation, on a flag carrying a
+/// clap default ([`muse_glimmer`]'s doc carries the argument). `--max-mem` moves residency.
+const INKLING_MINI_FORMAT_IS_BF16: &str = "--mode names how ROUTED EXPERTS are stored, and this \
+     artifact has no such container to choose: Mini's 24 expert blocks are converted \
+     DEQUANTIZED to bf16, so every mode names a format the run does not store. The flag is \
+     ignored, and nothing in the run is stored in the format you named. What moves residency \
+     here is --max-mem, which decides how many of the 24 blocks are pinned";
+
+/// The three sparse selections on Mini: its attention is a HYBRID of sliding-window and full
+/// layers with relative bias and per-head sinks — a mask over the causal prefix, not a row
+/// selection — so none of `streaming`, `dsa` or `misa` names what any layer does. `dense` is
+/// `Support` because the full layers genuinely are (K3's MLA cell sets the precedent).
+const INKLING_SPARSE_ATTN_UNSUPPORTED: &str = "--attn names how attention SELECTS the rows it \
+     reads, and Inkling 2 Mini does not offer the choice: its attention is a HYBRID of \
+     sliding-window layers and full layers, with relative bias and per-head sinks — a mask over \
+     the causal prefix, not a row selection. streaming, dsa and misa all name selections this \
+     model does not perform. --attn dense is what the full layers genuinely do";
+
+/// `--cache-policy` on Mini: the 24 expert blocks are partitioned by a FIXED LAYER PREFIX, so
+/// all three policies name the same static subset — Glimmer's dense-scan argument, one level up:
+/// at any deficit LRU evicts exactly the block needed next. `--max-mem` moves the partition.
+const INKLING_MINI_CACHE_POLICY_IS_PREFIX: &str = "--cache-policy has one answer here: Mini \
+     partitions its 24 expert blocks into a fixed LAYER PREFIX, the same static subset every \
+     token, so lru, 2q and arc all name it. Accepting the flag as a choice would record a knob \
+     nothing spends. Use --max-mem, which decides how many of the 24 blocks are pinned";
+
+/// `--trace` on Mini: its bf16 arm has no v2 expert-fetch trace — the instrument captures the
+/// ROUTED-EXPERT access stream at GLM's granularity, and nothing on this arm writes it.
+const INKLING_MINI_HAS_NO_EXPERT_TRACE: &str = "--trace is not available on this arm: the v2 \
+     trace captures the routed-expert access stream, and Inkling 2 Mini's bf16 arm has no such \
+     instrument — there is no expert-fetch trace to write and this run would produce an empty \
+     file whose emptiness reads as a measurement. Accepting it would be a knob nothing spends";
+
+/// **The** legality decider. Total over `Arch × Flag` by the compiler: adding an architecture
+/// breaks this match, adding a flag breaks [`glm`], and either way the build stops until the new
+/// cell has an argued answer.
 pub fn decide(arch: Arch, flag: Flag) -> Outcome {
     match arch {
         Arch::GlmMoeDsa => glm(flag),
@@ -549,39 +567,29 @@ pub fn decide(arch: Arch, flag: Flag) -> Outcome {
         Arch::DeepseekV4 => deepseek_v4(flag),
         Arch::KimiK3 => kimi_k3(flag),
         Arch::QwenFlashNext => qwen_flash_next(flag),
-        Arch::Inkling2Loop | Arch::Inkling2 => inkling2(flag),
+        Arch::Inkling2Loop => inkling2_loop(flag),
+        Arch::Inkling2 => inkling2(flag),
     }
 }
 
-/// Kimi-K3's row of the table — M9's arm, and most of it is two facts worked out flag by
-/// flag: **the checkpoint chose the expert format**, and **69 of 93 layers are a recurrence,
-/// not an attention with rows to select.**
+/// Kimi-K3's row — M9's arm, and most of it is two facts worked out flag by flag: **the
+/// checkpoint chose the expert format**, and **69 of 93 layers are a recurrence, not an
+/// attention with rows to select.**
 ///
-/// # `--mode` falls back loudly, forced the same way V4's was
+/// `--mode` falls back loudly, forced the same way V4's was (`Refuse` would kill the no-flags
+/// invocation on a clap default; [`muse_glimmer`]'s doc carries the argument). `--attn dense` is
+/// `Support` on Glimmer's precedent and not V4's: K3's 24 MLA layers genuinely attend the whole
+/// causal prefix — NoPE, unconditionally causal — and the KDA layers are no row selection at
+/// all, so the flag contradicts nothing; on V4 EVERY layer attends a window plus pooled blocks,
+/// so `dense` describes no layer and that cell falls back.
 ///
-/// `Support` would record a knob nothing spent and `Refuse` would kill the no-flags
-/// invocation — [`muse_glimmer`]'s doc carries the argument in full.
-///
-/// # `--attn dense` is `Support`, on Muse Glimmer's precedent and not V4's
-///
-/// Glimmer's cell is `Support` although 39 of its 52 layers slide, because `dense` names
-/// what its full layers genuinely do. K3's 24 MLA layers attend the whole causal prefix the
-/// same way — NoPE, unconditionally causal — and the KDA layers are not an attention row
-/// selection at all, so the flag contradicts nothing. V4's `FallbackLoudly` is the different
-/// case: there EVERY layer attends a window plus pooled blocks, so `dense` described no
-/// layer in the run.
-///
-/// # The rest
-///
-/// `--cache-policy` and `--max-mem` govern every token here even harder than on V4: the
-/// routed set is ~1.3 TiB against ~115 GiB of budget, so residency is never the tail of a
-/// working set. `--ctx` sizes the 24 MLA caches ONLY — the KDA state is context-free, which
-/// is this row's contribution to the header's "a flag earns a row when some architecture
-/// answers it differently". `--trace` is the one cell BETTER here than on GLM: this arm's
-/// prefill is already token-sequential (the recurrence forces it), so the v2 trace's
-/// token-major recovery is exact and nothing falls back. `--mtp` refuses with K3's OWN two
-/// blockers, because quoting GLM's or V4's wording would tell a user to wait for the wrong
-/// thing.
+/// `--cache-policy` and `--max-mem` govern every token: the routed set is ~1.3 TiB against
+/// ~115 GiB of budget, so residency is never the tail of a working set. `--ctx` sizes the 24 MLA
+/// caches ONLY (the KDA state is context-free — this row's answer to the header's "a flag earns
+/// a row when some architecture answers it differently"). `--trace` is the one cell BETTER than
+/// on GLM: prefill is already token-sequential, so the v2 trace's token-major recovery is exact.
+/// `--mtp` refuses with K3's OWN two blockers, because a sibling's wording would tell a user to
+/// wait for the wrong thing.
 fn kimi_k3(flag: Flag) -> Outcome {
     match flag {
         // Every value together: the checkpoint's format is the same whichever was typed.
@@ -618,33 +626,22 @@ fn glm(flag: Flag) -> Outcome {
     }
 }
 
-/// Muse Glimmer-30B's row of the table — the first DENSE architecture here, and most of
-/// this row is that one fact worked out flag by flag.
+/// Muse Glimmer-30B's row — the first DENSE architecture here, and most of this row is that
+/// one fact worked out flag by flag.
 ///
-/// # `--mode` falls back loudly rather than refusing, and the choice is forced
+/// `--mode` falls back loudly rather than refusing, and the choice is forced twice. `Support` is
+/// out: it would accept `--mode int4` on a run that stores nothing in int4 — the "recorded
+/// command line carrying a knob nothing spent" this table exists to prevent. `Refuse` is out for
+/// a reason in the CALLER: `--mode` carries a clap default and `main::requested_flags` submits
+/// value-carrying flags on their RESOLVED value, so a refusal would kill `rivoli GLIMMER_DIR
+/// --bench 4` on a flag the user never typed; presence-judging instead is the two-authority shape
+/// this module ends. [`Outcome::FallbackLoudly`] is "the run proceeds, but not as asked, and the
+/// caller must SAY it" — one warn line beats a silent drop.
 ///
-/// A dense model has no routed format, so `Support` is out: it would accept `--mode int4`
-/// on a run that stores nothing in int4, which is precisely the "recorded command line
-/// carrying a knob nothing spent" this table exists to prevent.
-///
-/// `Refuse` is out too, and for a reason that lives in the CALLER rather than here.
-/// `--mode` carries a clap default, and `main::requested_flags` submits the value-carrying
-/// flags on their RESOLVED value by design — so that a default which ever became illegal is
-/// caught rather than exempted by never having been typed. A refusal here would therefore
-/// kill `rivoli GLIMMER_DIR --bench 4`, an invocation with no `--mode` in it at all, on a
-/// flag the user never typed. Making it presence-judged instead would mean two authorities
-/// deciding when a value matters, which is the shape this module was written to end.
-///
-/// [`Outcome::FallbackLoudly`] is exactly "the run proceeds, but not as asked, and the
-/// caller must SAY it". The cost is one warn line per Glimmer run; the alternative is a
-/// silent drop, and this table's whole premise is that a silent drop is worse than noise.
-///
-/// # The rest
-///
-/// `--cache-policy` and `--trace` are presence-judged (`main::PRESENCE`), so refusing them
-/// costs an untyped run nothing and tells a typed one why. `--attn dense` is genuinely what
-/// this model does — GQA 32Q/2KV over the whole causal prefix on its full layers — so it is
-/// the one attention cell here that is `Support` on its own merits rather than by default.
+/// `--cache-policy` and `--trace` are presence-judged (`main::PRESENCE`), so refusing them costs
+/// an untyped run nothing and tells a typed one why. `--attn dense` is genuinely what this model
+/// does — GQA 32Q/2KV over the whole causal prefix on its full layers — so it is `Support` on
+/// its own merits rather than by default.
 fn muse_glimmer(flag: Flag) -> Outcome {
     match flag {
         // Every value, together: on a dense model they do not differ, which is the same
@@ -670,30 +667,23 @@ fn muse_glimmer(flag: Flag) -> Outcome {
     }
 }
 
-/// DeepSeek-V4-Flash's row of the table — and most of it is one fact worked out flag by flag:
-/// **this architecture chooses neither its expert format nor its attention selection.**
+/// DeepSeek-V4-Flash's row — most of it is one fact worked out flag by flag: **this
+/// architecture chooses neither its expert format nor its attention selection.**
 ///
-/// # EVERY value-carrying flag falls back loudly, and the choice is forced the same way
-/// Glimmer's `--mode` was
+/// EVERY value-carrying flag falls back loudly, forced the same way Glimmer's `--mode` was.
+/// `--mode` because the checkpoint owns the format; every `--attn` value because it owns the
+/// attention too — a ring plus pooled blocks, with the trained-in block indexer ranking blocks on
+/// the 21 indexed layers natively and always since M15 placed its weights and wired its kernels.
+/// `Support` would record a knob nothing spent and `Refuse` would kill runs on a flag that
+/// contradicts nothing the user can change ([`muse_glimmer`]'s doc carries the no-flags half).
+/// The sparse three were `Refuse` while the indexer was unplaced and a positional stand-in
+/// imposed a context ceiling; with the ceiling gone, refusing `--attn dsa` on the one arm whose
+/// attention IS natively block-sparse would kill exactly the runs the flag describes.
 ///
-/// `--mode` because the checkpoint owns the format, and every `--attn` value because the
-/// checkpoint owns the attention too: a run here attends a ring plus pooled blocks, with
-/// the trained-in block indexer ranking the blocks on the 21 indexed layers — natively and
-/// always, since M15 placed its weights and wired its kernels. `Support` on any of the four
-/// would record a knob nothing spent, and `Refuse` would kill runs on a flag that
-/// contradicts nothing the user can change — [`muse_glimmer`]'s doc carries the
-/// no-flags half of the argument. The sparse three were `Refuse` while the indexer was
-/// unplaced and the positional stand-in imposed a context ceiling; with the ceiling gone,
-/// refusing `--attn dsa` on the one arm whose attention IS natively block-sparse would
-/// kill exactly the runs the flag's intent describes.
-///
-/// # The rest
-///
-/// `--cache-policy` and `--max-mem` are real here and for a sharper reason than on GLM: the
-/// `.f4` set is 137 GiB against ~115 GiB of budget, so this arm CANNOT be fully resident on
-/// any configuration this machine has and the policy governs every token. `--ctx` sizes the
-/// KV ring, the compressed regions and the indexer's score scratch — and nothing refuses it
-/// since M15: memory is its only bound.
+/// `--cache-policy` and `--max-mem` are real here for a sharper reason than on GLM: the `.f4`
+/// set is 137 GiB against ~115 GiB of budget, so this arm CANNOT be fully resident on any
+/// configuration this machine has and the policy governs every token. `--ctx` sizes the KV ring,
+/// the compressed regions and the indexer's score scratch; memory is its only bound.
 fn deepseek_v4(flag: Flag) -> Outcome {
     match flag {
         // Every value together: the checkpoint's format is the same whichever was typed.
@@ -720,57 +710,73 @@ fn deepseek_v4(flag: Flag) -> Outcome {
     }
 }
 
-/// Qwen3.8-Flash-Next's row of the table — **the interim row, and the whole of stage S1**:
-/// every cell refuses, because the arm behind them does not exist.
+/// Qwen3.8-Flash-Next's row — **the interim row, and the whole of stage S1**: every cell
+/// refuses, because the arm behind them does not exist.
 ///
-/// # Why one const answers eleven of the twelve cells
+/// One const answers eleven of the twelve cells because exactly one fact sits upstream of every
+/// cell: **nothing decodes.** The other rows argue cell by cell only because each cell has its
+/// own architectural answer; eleven distinct refusals here would invent distinctions this
+/// architecture does not have, each owed a re-argument when the arm lands. `--mtp` is the
+/// exception on merit: it stays refused AFTER the arm lands (the draft layer is excluded from
+/// the artifact by name — not a decode-loop increment), so it is true now and stays true.
 ///
-/// The other four rows argue cell by cell because each cell has its own architectural
-/// answer — the checkpoint owns the format, the cache is a ring plus pooled blocks, 69 of 93
-/// layers keep no rows at all. Here there is exactly one fact and it sits upstream of every
-/// cell: **nothing decodes.** Writing eleven distinct refusals would be inventing eleven
-/// distinctions this architecture does not yet have, each of them owed a re-argument when
-/// the arm lands. `--mtp` is the exception on merit rather than for variety: it stays refused
-/// AFTER the arm lands (the draft layer is excluded from the artifact by name — not a
-/// decode-loop increment), so its own wording is true now and stays true.
-///
-/// # Why `Refuse` and never `FallbackLoudly`
-///
-/// [`Outcome::FallbackLoudly`] means "the run proceeds, but not as asked". No run proceeds
-/// here, so a fallback cell would promise what `main`'s dispatch then bails on — and the
-/// refusal at the door is precisely what keeps that bail unreachable. Refusing `--mode` and
-/// `--attn` is also what makes this architecture ARMLESS in the sense `main`'s
-/// `the_arms_and_the_legality_table_agree_about_who_can_start` checks: that test's
-/// no-arm branch had never once been exercised, because since M9 every architecture had an
-/// arm. **This is the pre-M9 shape restored deliberately**, for exactly as long as it is true.
-///
-/// The row flips at S6 (`docs/investigations/qwen-flash-next-port.md`), in one commit with the
-/// arm and `tests/smoke-qwen.sh`, whose legality cells quote these two consts' own fragments.
+/// `Refuse` and never `FallbackLoudly`: no run proceeds here, so a fallback would promise what
+/// `main`'s dispatch then bails on, and the refusal at the door keeps that bail unreachable.
+/// Refusing `--mode` and `--attn` is also what makes this architecture ARMLESS in the sense
+/// `main`'s `the_arms_and_the_legality_table_agree_about_who_can_start` checks — the pre-M9
+/// shape restored deliberately, and its no-arm branch had never once been exercised. The row
+/// flips at S6 (`docs/investigations/qwen-flash-next-port.md`), in one commit with the arm and
+/// `tests/smoke-qwen.sh`.
 ///
 /// > **FACTORED 2026-11-23 (inkling S1).** The by-value match moved to [`armless_row`] when
-/// > inkling became the second armless architecture: a second copy of the seven-line pattern
-/// > list is a jscpd clone at the gate's 5-line floor, the same forced factoring
-/// > `schema::ensure_f32_positive` records. Every cell is still spelled BY VALUE there, so a
-/// > new `Mode`, `AttnKind` or valueless flag is a compile error, not a wildcard that silently
-/// > answers `Support`.
+/// > inkling became the second armless architecture: a second copy of the seven-line pattern is
+/// > a jscpd clone at the gate's 5-line floor. Every cell is still spelled BY VALUE there, so a
+/// > new `Mode`, `AttnKind` or valueless flag is a compile error, not a wildcard.
 fn qwen_flash_next(flag: Flag) -> Outcome {
     armless_row(flag, QWEN_ARM_NOT_BUILT, QWEN_MTP_NOT_LOADED)
 }
 
-/// Inkling 2's row, as of S1: refuses EVERY cell, on BOTH members — the reddening commit's own
-/// gate, on [`qwen_flash_next`]'s precedent. One function for two variants because the row IS
-/// one row: the members share the port plan and the refusal wording, and two copies of the
-/// match would be a jscpd clone. The pinned test is `inkling2_rows_refuse_every_flag_as_of_s1`.
+/// **Inkling 2 Mini's row, as of S5 (2026-11-24)** — the arm that decodes, and the whole row is
+/// two facts worked out flag by flag: **the artifact stores dequantized bf16 experts**, and **the
+/// attention is a hybrid sliding/full mask, not a row selection.**
+///
+/// `--mode` falls back loudly (`Refuse` would kill the no-flags invocation on a clap default and
+/// `Support` would record a knob nothing spent — [`muse_glimmer`]'s doc carries the argument);
+/// `--attn dense` is honest on its own merits and the three sparse values refuse with Mini's OWN
+/// reason. `--cache-policy` refuses because the block partition is a fixed layer prefix
+/// (Glimmer's cyclic-scan argument), `--trace` because the bf16 arm has no v2 trace, and `--mtp`
+/// with [`INKLING_MTP_NOT_LOADED`] — the ONE cell that would refuse even if a draft head were
+/// loaded. `--max-mem` and `--ctx` are `Support`: every one of the 24 expert blocks streams from
+/// NVMe, so residency and the KV ceiling govern every token. Pinned by
+/// `inkling2_loop_row_is_the_s5_truth`.
+fn inkling2_loop(flag: Flag) -> Outcome {
+    match flag {
+        Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid) => {
+            Outcome::FallbackLoudly(INKLING_MINI_FORMAT_IS_BF16)
+        }
+        Flag::Attn(AttnKind::Dense) => Outcome::Support,
+        Flag::Attn(AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa) => {
+            Outcome::Refuse(INKLING_SPARSE_ATTN_UNSUPPORTED)
+        }
+        Flag::CachePolicy => Outcome::Refuse(INKLING_MINI_CACHE_POLICY_IS_PREFIX),
+        Flag::MaxMem | Flag::Ctx => Outcome::Support,
+        Flag::Trace => Outcome::Refuse(INKLING_MINI_HAS_NO_EXPERT_TRACE),
+        Flag::Mtp => Outcome::Refuse(INKLING_MTP_NOT_LOADED),
+    }
+}
+
+/// Inkling 2 SMALL's row, which is still ARMLESS — the reddening gate S1 put here, now covering
+/// one member: Mini's row above flipped at S5, and Small stays on the shared refusal until S6
+/// gives it the bigger-than-memory streaming arm. The pinned test is
+/// `inkling2_row_refuses_every_flag_as_of_s5`.
 fn inkling2(flag: Flag) -> Outcome {
     armless_row(flag, INKLING_ARM_NOT_BUILT, INKLING_MTP_NOT_LOADED)
 }
 
 /// The shape every ARMLESS row shares: `--mtp` refuses with the draft-stack reason, every other
-/// cell with the arm-not-built reason. Two callers ([`qwen_flash_next`], [`inkling2`]); the
-/// factoring argument is on the first one's dated note.
-///
-/// The pattern is spelled BY VALUE so a new `Mode`, `AttnKind` or valueless flag is a compile
-/// error here, not a wildcard that silently accepts it.
+/// cell with the arm-not-built reason (two callers: [`qwen_flash_next`], [`inkling2`]; the
+/// factoring argument is on the first one's dated note). Spelled BY VALUE, so a new `Mode`,
+/// `AttnKind` or valueless flag is a compile error here, not a wildcard.
 fn armless_row(flag: Flag, arm_not_built: &'static str, mtp_not_loaded: &'static str) -> Outcome {
     match flag {
         // Each caller's OWN wording, not the shared `MTP_DEFERRED`: that one says the draft

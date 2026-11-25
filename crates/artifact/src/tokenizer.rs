@@ -382,8 +382,8 @@ impl Tokenizer {
             // holding the artifact needs to know which they should have.
             bail!(
                 "{snapshot_dir} has neither tokenizer.json (HuggingFace: GLM, DeepSeek-V4, \
-                 Muse Glimmer) nor tiktoken.model (Kimi-K3) — an artifact carries its own \
-                 tokenizer, so one of the two must be there"
+                 Muse Glimmer) nor tiktoken.model (Kimi-K3, Inkling 2) — an artifact carries \
+                 its own tokenizer, so one of the two must be there"
             );
         };
         // An empty eos means decode can never stop on an end token (runaway

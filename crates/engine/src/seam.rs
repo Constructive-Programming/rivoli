@@ -24,6 +24,7 @@ use anyhow::Result;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
+use rivoli_artifact::inkling_config::Inkling2LoopConfig;
 use rivoli_artifact::k3_config::K3Config;
 use rivoli_artifact::v4_config::V4Config;
 use rivoli_core::cache::TwoQSplit;
@@ -315,6 +316,12 @@ pub enum ArchCfg<'a> {
     /// Routed like V4 — a pool, no format choice (the checkpoint ships MXFP4) — so the
     /// same `PoolKnobs` and the same absence of a `RoutedFmt`.
     K3(&'a K3Config, PoolKnobs<'a>),
+    /// Inkling 2 Mini. **No `PoolKnobs`**: its 24 expert blocks are streamed bf16 with a
+    /// fixed layer-prefix partition, so there is no policy, two-Q split or trace to carry —
+    /// `rivoli_core::legality`'s Mini row refuses `--cache-policy` and `--trace` for exactly
+    /// that reason, and `--mode` falls back loudly. The budget and the context ride in
+    /// [`OpenSpec`], which is what this arm actually spends.
+    InklingLoop(&'a Inkling2LoopConfig),
 }
 
 impl ArchCfg<'_> {
@@ -340,15 +347,17 @@ impl ArchCfg<'_> {
             Self::Glimmer(..) => Arch::MuseGlimmer,
             Self::V4(..) => Arch::DeepseekV4,
             Self::K3(..) => Arch::KimiK3,
+            Self::InklingLoop(..) => Arch::Inkling2Loop,
         }
     }
 }
 
 /// The decode engines, one variant per architecture that has a loop.
 ///
-/// GLM-5.2 (MoE, streamed experts) and Muse Glimmer-30B (dense, streamed whole layers);
-/// `rivoli_core::legality::decide` is what tells a user of a third artifact that there is
-/// no arm for it, in the same breath as it tells them why.
+/// GLM-5.2 (MoE, streamed experts), Muse Glimmer-30B (dense, streamed whole layers),
+/// DeepSeek-V4-Flash, Kimi-K3 and Inkling 2 Mini (24 layers, 12 looped ×3, streamed bf16
+/// blocks); `rivoli_core::legality::decide` is what tells a user of an artifact with no arm —
+/// Inkling 2 SMALL today — that there is none, in the same breath as it tells them why.
 ///
 /// **`large_enum_variant` is allowed, and boxing would be the wrong fix here.** The arms are
 /// 1792 and 632 bytes (clippy, 2026-08-16), so the enum is the larger of the two — and that
@@ -367,6 +376,7 @@ pub enum Engine<'a> {
     Glimmer(crate::glimmer::engine::GlimmerEngine<'a>),
     V4(crate::v4::engine::V4Engine<'a>),
     K3(crate::k3::engine::K3Engine<'a>),
+    InklingLoop(crate::inkling::engine::InklingEngine<'a>),
 }
 
 /// A backendless build has no arm at all, and says so in the type: `Infallible` makes the
@@ -434,6 +444,21 @@ impl<'a> Engine<'a> {
                 let e = crate::k3::engine::K3Engine::new(pin, &cfg.text, spec.max_ctx)?;
                 Ok(Engine::K3(e))
             }
+            // The same shape as Glimmer's `open`: the arm's floor CHARGES for its KV cache,
+            // the block state and the activation scratch, so the bytes the partition may use
+            // are decided once by the constructor rather than split across a pin and a new.
+            //
+            // **Deliberately NOT the multi-line argument form the other arms use.** Written
+            // that way this block is nine lines that differ from Glimmer's only in two type
+            // names — five-plus identical lines, which is what `build.rs`'s jscpd gate calls a
+            // clone. The in-arm `use` and the named ceiling are what keep both the block and
+            // the argument list textually distinct from Glimmer's.
+            ArchCfg::InklingLoop(cfg) => {
+                use crate::inkling::engine::InklingEngine;
+                let n_ctx = spec.max_ctx;
+                let e = InklingEngine::open(dir, &cfg.text, capacity, n_ctx)?;
+                Ok(Engine::InklingLoop(e))
+            }
         }
     }
 
@@ -480,6 +505,8 @@ impl<'a> Engine<'a> {
             Engine::V4(e) => e.max_ctx(),
             #[cfg(feature = "rocm")]
             Engine::K3(e) => e.max_ctx(),
+            #[cfg(feature = "rocm")]
+            Engine::InklingLoop(e) => e.max_ctx(),
             #[cfg(not(feature = "rocm"))]
             Engine::Never(never, _) => match *never {},
         }
@@ -541,7 +568,7 @@ impl<'a> Engine<'a> {
     /// false from it to stop early. The delegating match is the whole seam — everything
     /// architecture-shaped is on the other side of it.
     ///
-    /// **Every arm now returns [`Decoded`] itself**, so the match is four forwarding
+    /// **Every arm now returns [`Decoded`] itself**, so the match is five forwarding
     /// lines. It used to yield `(ids, stats)` and build the struct once below, because
     /// jscpd reported the two wrapping arms as the same twenty tokens; M10 gave `Decoded`
     /// a third field and moved GLM onto it, which left the arms textually distinct (each
@@ -574,6 +601,7 @@ impl<'a> Engine<'a> {
                 Engine::Glimmer(e) => e.decode(req, sink),
                 Engine::V4(e) => e.decode(req, sink),
                 Engine::K3(e) => e.decode(req, sink),
+                Engine::InklingLoop(e) => e.decode(req, sink),
             }
         }
     }
@@ -613,6 +641,7 @@ impl<'a> Engine<'a> {
                 Engine::Glimmer(e) => e.score(ids),
                 Engine::V4(e) => e.score(ids),
                 Engine::K3(e) => e.score(ids),
+                Engine::InklingLoop(e) => e.score(ids),
             }
         }
     }

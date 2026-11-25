@@ -168,10 +168,7 @@ pub(super) struct At {
 fn read_f32(b: &crate::device::DeviceBuf, n: usize) -> Result<Vec<f32>> {
     let mut raw = Vec::new();
     b.copy_out_prefix(&mut raw, n * 4)?;
-    Ok(raw
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
+    Ok(rivoli_artifact::quant::read_f32(&raw))
 }
 
 impl GlimmerEngine<'_> {

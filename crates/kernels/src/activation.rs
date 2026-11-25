@@ -20,7 +20,7 @@ use crate::prelude::activation::tanh_ocml;
 use crate::prelude::{situ_glu, swiglu_clamped};
 use core::intrinsics::{exp, sqrt, unchecked_div, unchecked_rem};
 use rivoli_abi::geom::{ACT_QUANT_BLOCK, ACT_QUANT_THREADS, ELEMENTWISE_BLOCK, ROW_BLOCK, WAVE};
-use rivoli_abi::kernarg::{ActQuant, Gate, GateClamped, GateSitu, KvScatter, L2Clip, LogScaledL2Clip, MessageGate, Mxfp8Dequant, Nvfp4Dequant, RelBiasGather, Rope, RowNorm, ScaledL2Clip, Sconv, SinkAttend, WeightlessNorm};
+use rivoli_abi::kernarg::{ActQuant, Axpy, Gate, GateClamped, GateSitu, KvScatter, L2Clip, LogScaledL2Clip, MessageGate, Mxfp8Dequant, Nvfp4Dequant, RelBiasGather, Rope, RowNorm, ScaledL2Clip, Sconv, SconvDynamic, SinkAttend, WeightlessNorm};
 
 /// The gated combines' shared shape: `h[i] = f(g[i], u[i])` for the thread's one `i < n`.
 #[inline(always)]
@@ -281,6 +281,35 @@ pub unsafe extern "gpu-kernel" fn nvfp4_dequant(a: Nvfp4Dequant) {
     *a.out.add(i as usize) = (e2m1f(u32::from(code)) * bs) * factor;
 }
 
+/// The short-convolution state advance both variants share: shift channel `sb`'s history left one
+/// and append `cur` (MOD:254). Increasing `j` reads `state[j+1]` before overwriting it at step
+/// `j+1`, so the in-place shift is safe; each channel's slice is thread-private.
+#[inline(always)]
+unsafe fn shift_sconv_state(state: *mut f32, sb: usize, hist: usize, cur: f32) {
+    for j in 0..hist {
+        let nxt = if j + 1 < hist { *state.add(sb + j + 1) } else { cur };
+        *state.add(sb + j) = nxt;
+    }
+}
+
+/// Shared per-channel driver for `sconv` and `sconv_dynamic`: reads `current[c]`, evaluates the
+/// variant's k-tap dot via `dot(c, cur, hist)`, writes `(acc + cur) / divisor`, and shifts state.
+#[inline(always)]
+unsafe fn sconv_step(
+    (out, state, current): (*mut f32, *mut f32, *const f32),
+    (channels, k): (i32, i32),
+    divisor: f32,
+    dot: impl Fn(usize, f32, usize) -> f32,
+) {
+    elementwise(channels, |c| {
+        let hist = k as usize - 1;
+        let cur = *current.add(c);
+        let acc = dot(c, cur, hist);
+        *out.add(c) = (acc + cur) / divisor;
+        shift_sconv_state(state, c * hist, hist, cur);
+    });
+}
+
 /// `sconv` — inkling's static short-convolution decode step, state included (no C twin;
 /// oracle-validated): one thread per channel accumulates the k-tap cross-correlation over the
 /// window `[state (past k−1), current]` in tap order, adds the residual (the current token), and
@@ -290,24 +319,44 @@ pub unsafe extern "gpu-kernel" fn nvfp4_dequant(a: Nvfp4Dequant) {
 /// to FMA on the device.
 #[unsafe(no_mangle)]
 pub unsafe extern "gpu-kernel" fn sconv(a: Sconv) {
-    elementwise(a.channels, |c| {
-        let k = a.k as usize;
-        let hist = k - 1;
-        let (wb, sb) = (c * k, c * hist);
-        let cur = *a.current.add(c);
+    sconv_step((a.out, a.state, a.current), (a.channels, a.k), a.divisor, |c, cur, hist| {
+        let (wb, sb) = (c * a.k as usize, c * hist);
         let mut acc = 0.0f32;
         for j in 0..hist {
             acc += *a.weight.add(wb + j) * *a.state.add(sb + j);
         }
-        acc += *a.weight.add(wb + hist) * cur;
-        *a.out.add(c) = (acc + cur) / a.divisor;
-        // Shift left one, append current. Increasing j reads state[j+1] before overwriting it at
-        // step j+1, so the in-place shift is safe; each channel's slice is thread-private.
-        for j in 0..hist {
-            let nxt = if j + 1 < hist { *a.state.add(sb + j + 1) } else { cur };
-            *a.state.add(sb + j) = nxt;
-        }
+        acc + *a.weight.add(wb + hist) * cur
     });
+}
+
+/// `sconv_dynamic` — inkling's dynamic short-convolution decode step, state included (no C twin;
+/// oracle-validated): the static kernel's k-tap cross-correlation, but every static tap gains a
+/// per-HEAD learned weight — `w_lag = static_w[lag][c] + dyn_w[c/head_dim][lag]` — so one SHARED
+/// `[channels, k]` filter is modulated by `kv_heads` tap vectors. Lag 0 is the current token;
+/// lag `j` the state slot `hist − j` (chronological state, so `[0]` is the oldest). The residual
+/// and the divisor are the static kernel's; the state advances through the same helper.
+/// Safe in place (`out == current`): the current tap is read before any write.
+#[unsafe(no_mangle)]
+pub unsafe extern "gpu-kernel" fn sconv_dynamic(a: SconvDynamic) {
+    sconv_step((a.out, a.state, a.current), (a.channels, a.k), a.divisor, |c, cur, hist| {
+        let (k, ch) = (a.k as usize, a.channels as usize);
+        let head = unchecked_div(c as i32, a.head_dim) as usize;
+        let mut acc = (*a.static_w.add(c) + *a.dyn_w.add(head * k)) * cur;
+        let sb = c * hist;
+        for lag in 1..k {
+            let w = *a.static_w.add(lag * ch + c) + *a.dyn_w.add(head * k + lag);
+            acc += w * *a.state.add(sb + (hist - lag));
+        }
+        acc
+    });
+}
+
+/// `vaxpy` — `x[i] += alpha·y[i]` (no C twin; oracle-validated): inkling's decode folds this
+/// vector update into a scaled accumulation. One thread per element; `x` may be the caller's
+/// running output, so it is written in place and `y` is read once.
+#[unsafe(no_mangle)]
+pub unsafe extern "gpu-kernel" fn vaxpy(a: Axpy) {
+    elementwise(a.n, |i| *a.x.add(i) += a.alpha * *a.y.add(i));
 }
 
 /// `sink_attend` — inkling's single-query attention decode step with a sink (no C twin;

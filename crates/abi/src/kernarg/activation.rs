@@ -176,6 +176,44 @@ pub struct Sconv {
 }
 const _: () = assert!(size_of::<Sconv>() == 48);
 
+/// `sconv_dynamic` — inkling's dynamic short-convolution decode step: the static kernel's
+/// k-tap window with a per-HEAD learned tap vector added to every static weight (no C twin;
+/// oracle-validated). `static_w` is `[k, channels]` row-major (`lag 0` = current … `lag k−1` =
+/// oldest) and `dyn_w` `[kv_heads, k]` row-major, head `c / head_dim`, same lag order.
+/// `state` `[channels, k−1]` is chronological (`[0]` = oldest) and ADVANCED in place;
+/// `current`/`out` `[channels]`, `out` may alias `current`. `channels % head_dim == 0`,
+/// each of `channels`/`head_dim`/`k` positive; `divisor` positive finite.
+///
+/// Field order is scalars FIRST (4·4 B) then pointers (5·8 B): 56 bytes, zero padding. Callers
+/// name their fields, so the order is free to be the one that packs.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SconvDynamic {
+    pub divisor: f32,
+    pub channels: i32,
+    pub head_dim: i32,
+    pub k: i32,
+    pub static_w: *const f32,
+    pub dyn_w: *const f32,
+    pub state: *mut f32,
+    pub current: *const f32,
+    pub out: *mut f32,
+}
+const _: () = assert!(size_of::<SconvDynamic>() == 56);
+
+/// `vaxpy` — `x[i] += alpha·y[i]` over `n`, the loop inkling's decode folds into a vector
+/// update (no C twin; oracle-validated). `x`/`y` are `n` f32; `n > 0` and `alpha` finite are
+/// the launcher's guards, so `alpha = 0.0` and a negative scale are accepted.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Axpy {
+    pub x: *mut f32,
+    pub y: *const f32,
+    pub alpha: f32,
+    pub n: i32,
+}
+const _: () = assert!(size_of::<Axpy>() == 24);
+
 /// `sink_attend` — inkling's single-query attention decode step with a sink (no C twin;
 /// oracle-validated). Batched over the query heads: `bid()` is the head, `q`/`out` are
 /// `[heads, d]`, `bias` is `[heads, n]` (rel-bias + mask folded), and `sink` is a DEVICE pointer

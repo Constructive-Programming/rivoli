@@ -26,6 +26,15 @@ Usage:
     python3 inkling_anchor_driver.py --mode decode --defect None --salt inkling-1 --out gold.bin
     python3 inkling_anchor_driver.py --compare A.bin B.bin --defect l2clip_no_clamp
     python3 inkling_anchor_driver.py --tolerance --salt inkling-1
+    python3 inkling_anchor_driver.py --dump-artifact /var/cache/rivoli/scratch/inkling-tiny-anchor \
+        --salt inkling-1
+
+`--dump-artifact` materializes the same seeded tiny model as a rivoli Mini artifact: a
+`manifest.json` (the vendored text config wrapped in a valid `Inkling2LoopConfig`, plus the
+`format` block) and a `resident.safetensors` holding all 693 tensors in the converter's layout
+(bf16 projections/embeddings/experts, f32 norms/clip scales/sconv/query banks/router bias,
+`relative_position_bias.proj` transposed). That directory is what
+`crates/engine/tests/inkling_engine_anchor.rs` opens; it is generated, never vendored.
 """
 import argparse
 import hashlib
@@ -292,6 +301,79 @@ DEFECTS = {
     # captured bucket this defect touches is layer 5 (the first full / block-end layer).
     "logscale_wrong_floor": ("model.layers.5.hidden", defect_logscale_wrong_floor),
 }
+
+
+# ── the rivoli artifact `inkling_engine_anchor.rs` opens ────────────────────────────────────
+# The SAME seeded tiny model, materialized in the converter's layout. This is what makes the
+# engine gate a composition check rather than a second reference implementation: the weights
+# the engine places came from the draw that produced the golden it is scored against.
+
+# `FormatMeta::current(FP8_BLOCK)` as `rivoli-artifact` stamps it; a mismatch is a load refusal.
+FORMAT_META = {
+    "version": 1, "vq_dim": 4, "vq_k": 4096, "vq_index_bits": 12, "vq_group": 64, "fp8_block": 128,
+}
+# `convert_inkling.rs`'s `wants_f32` suffixes, in the artifact's own spellings, plus the two
+# families it copies at source dtype because the engine's operand is f32: the block-residual
+# query banks and the router's selection-only bias.
+F32_SUFFIXES = (
+    "layernorm.weight", "norm.scale", "conv1d.weight", "sconv.static_weight",
+    "model.norm.weight", "embed_norm.weight", "input.query", "e_score_correction_bias",
+)
+
+
+def artifact_dtype(name):
+    """F32 where the engine's operand is f32, BF16 for every projection and expert slab."""
+    return torch.float32 if name.endswith(F32_SUFFIXES) else torch.bfloat16
+
+
+def artifact_tensors(model):
+    """The reference state dict in the artifact's layout: dtype per consumer, rel_proj transposed.
+
+    `relative_position_bias.proj` is stored `[rel_extent, d_rel]` (the converter's transpose) so
+    the m=heads rel-logits GEMM reads it without a runtime transpose; every other tensor keeps
+    the reference's own shape, which is the census's.
+    """
+    out = {}
+    for name, tensor in model.state_dict().items():
+        weight = tensor.detach().to(artifact_dtype(name))
+        if name.endswith("relative_position_bias.proj"):
+            weight = weight.transpose(0, 1)
+        out[name] = weight.contiguous()
+    return out
+
+
+def artifact_manifest(salt):
+    """`manifest.json`: the tiny text config wrapped in a valid Mini root, plus `format`."""
+    text = json.loads(CONFIG.read_text())
+    text["torch_dtype"] = "bfloat16"
+    return {
+        "model_type": "inkling2_loop",
+        "architectures": ["Inkling2LoopForConditionalGeneration"],
+        "dtype": "bfloat16",
+        "text_config": text,
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        "format": FORMAT_META,
+        "inkling_source": {
+            "tool": "inkling_anchor_driver.py",
+            "src": str(CONFIG),
+            "member": "inkling2_loop",
+            "experts": f"anchor weights, salt {salt}",
+        },
+    }
+
+
+def dump_artifact(salt, out):
+    """Write the tiny anchor model as the rivoli Mini artifact the engine gate opens."""
+    from safetensors.torch import save_file
+
+    model, _, seed = build_model(salt, torch.float32)
+    directory = pathlib.Path(out)
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = artifact_manifest(salt)
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    tensors = artifact_tensors(model)
+    save_file(tensors, str(directory / "resident.safetensors"))
+    print(f"wrote {directory}: {len(tensors)} tensors, salt={salt} seed={seed}")
 
 
 # ── modes ───────────────────────────────────────────────────────────────────────────────────
@@ -561,11 +643,16 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
     ap.add_argument("--tolerance", action="store_true")
+    ap.add_argument(
+        "--dump-artifact", metavar="DIR",
+        help="write the tiny model as a rivoli Mini artifact (manifest + resident.safetensors)")
     args = ap.parse_args()
     if args.compare:
         compare(args.compare[0], args.compare[1], args.defect)
     elif args.tolerance:
         tolerance(args.salt)
+    elif args.dump_artifact:
+        dump_artifact(args.salt, args.dump_artifact)
     else:
         assert args.out, "--out required for capture"
         run_capture(args.mode, args.defect, args.salt, args.out)

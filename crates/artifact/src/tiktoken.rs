@@ -1,8 +1,20 @@
-//! A tiktoken byte-pair vocabulary: `tiktoken.model` ranks plus a positional special block.
+//! A tiktoken byte-pair vocabulary: `tiktoken.model` ranks plus a special block.
 //!
-//! Named for the FORMAT, not the model that brought it — Kimi-K3 is the only checkpoint here
-//! that ships one today, and the census of which models use it belongs in
-//! [`crate::arch`]-adjacent data rather than in this file's name.
+//! Named for the FORMAT, not the model that brought it, and **two checkpoints ship it in two
+//! different SHAPES**, which is the second half of this module:
+//!
+//! * **Kimi-K3 — a positional block.** 163,584 base lines, and [`SPECIAL_SLOTS`] ids above them
+//!   named from `tokenizer_config.json`'s `added_tokens_decoder` (unnamed slots are
+//!   `<|reserved_token_N|>`); the base vocabulary holds no special spelling at all.
+//! * **Inkling 2 (Mini `inkling2_loop`, Small `inkling2`) — INLINE specials.** All 200,058 lines
+//!   of `tiktoken.model` carry the 60 special spellings (ids 199,998..=200,057), which
+//!   `added_tokens_decoder` names; there are no reserved slots above them.
+//!
+//! **The shape is DETECTED from the config, never from an architecture name** (this module may
+//! not depend on one). A non-empty `added_tokens_decoder` whose every id is BELOW the base
+//! vocabulary's length is inline-specials mode; anything else is the positional block. The
+//! inline arm also cross-checks every name against the base bytes, so a config and a model file
+//! that disagree about a spelling are a refusal, not a vocabulary with two answers for one id.
 //!
 //! **Why this exists at all.** [`crate::tokenizer::Tokenizer`] reads HuggingFace
 //! `tokenizer.json` through the `tokenizers` crate, and **Kimi-K3 ships no such file**: its
@@ -132,6 +144,28 @@ pub const PAT_STR: &str = concat!(
     r"\s+",
 );
 
+/// The Inkling 2 pre-tokenizer, alternative for alternative from the checkpoint's
+/// `tokenizer.json` `Split` pre-tokenizer.
+///
+/// **A second pattern rather than a parameter**, because the two are not variations: `PAT_STR`
+/// opens with a `\p{Han}` run and intersects every script class against it, while this one has
+/// no Han alternative and lets the generic letter classes carry CJK. It carries the same
+/// `\s+(?!\S)` lookahead, so `fancy-regex` is required here too — **pinned behaviourally** by
+/// `tests/inkling_tokenizer.rs`: measured ids for `"a    b"` are `[64, 149862, 149963]`
+/// (`["a", "   ", " b"]`), which no whole-run split reproduces.
+pub const PAT_STR_INKLING: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*",
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    "|",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+",
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    "|",
+    // The tail is `PAT_STR`'s, one literal instead of seven alternatives: spelled out, those
+    // seven lines ARE a clone of the pattern above and jscpd refuses it (measured 2026-11-24).
+    // `concat!` takes only literals, so the shared text cannot be hoisted into a `const`.
+    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+);
+
 /// A loaded tiktoken vocabulary: byte-pair ranks, the special block, and the pre-tokenizer.
 pub struct Vocab {
     /// Token bytes → rank. Lookups are by `&[u8]` slice, which `Vec<u8>: Borrow<[u8]>` allows
@@ -143,6 +177,9 @@ pub struct Vocab {
     bytes_of: Vec<Vec<u8>>,
     special_id: HashMap<String, u32>,
     special_name: HashMap<u32, String>,
+    /// Ids reserved ABOVE the base vocabulary: [`SPECIAL_SLOTS`] for the positional block, `0`
+    /// when the spellings are inline in `tiktoken.model` (see the module header).
+    extra_specials: usize,
     /// First bytes and lengths of every special spelling, so [`Self::encode`] only attempts a
     /// special match where one could start. Derived from the names, never hardcoded to `<`/`[`:
     /// a checkpoint that spells a special differently would silently stop being scanned for.
@@ -154,105 +191,63 @@ pub struct Vocab {
 }
 
 impl Vocab {
-    /// Load `<dir>/tiktoken.model` and name the special block from
+    /// Load `<dir>/tiktoken.model` and name the specials from
     /// `<dir>/tokenizer_config.json`'s `added_tokens_decoder`.
     ///
-    /// Both files are needed and neither substitutes for the other: the vocabulary stops at
-    /// `num_base - 1`, so every special id — including `<|end_of_msg|>`, the actual stop token
-    /// — exists only in the config. That is why `convert_k3` copies both.
+    /// Both files are needed in both shapes: in the positional block every special id —
+    /// including `<|end_of_msg|>`, the actual stop token — exists only in the config, and in the
+    /// inline shape the config is what says which ids ARE specials, cross-checked against the
+    /// model's bytes.
     pub fn load(dir: &str) -> Result<Self> {
         let vpath = format!("{dir}/tiktoken.model");
         let text = std::fs::read_to_string(&vpath).with_context(|| format!("read {vpath}"))?;
-        let bytes_of = parse_ranks(&text).with_context(|| format!("parse {vpath}"))?;
+        let cpath = format!("{dir}/tokenizer_config.json");
+        let config = std::fs::read_to_string(&cpath).with_context(|| format!("read {cpath}"))?;
+        Self::load_parts(&text, &config).with_context(|| format!("assemble {dir}'s vocabulary"))
+    }
+
+    /// Build from the two files' CONTENTS, so a gate can construct a vocabulary with no
+    /// checkpoint on disk — `crates/artifact/tests/inkling_tokenizer.rs` `include_str!`-s the
+    /// vendored pair, so the Inkling id pin asserts in CI rather than skipping for want of an
+    /// artifact.
+    pub fn load_parts(ranks_text: &str, config_json: &str) -> Result<Self> {
+        let bytes_of = parse_ranks(ranks_text)?;
         let ranks = ranks_from(&bytes_of);
-        let named = named_specials(dir)?;
+        let named = named_from_json(config_json)?;
         Self::assemble(ranks, bytes_of, named)
     }
 
-    /// Build from parts. Separate from [`Self::load`] so the gate can construct a vocabulary
-    /// without a checkpoint on disk, and so `load` stays a file-reading function only.
+    /// Build from parts: the rank map, its dense inverse, and the config's id → spelling.
     fn assemble(
         ranks: HashMap<Vec<u8>, u32>,
         bytes_of: Vec<Vec<u8>>,
         named: HashMap<u32, String>,
     ) -> Result<Self> {
-        let num_base = bytes_of.len();
-        // **Every single byte must be a token, and this is a real precondition rather than a
-        // sanity check.** `bpe` starts from one part per byte and only ever merges a pair whose
-        // concatenation is in `ranks`, so every surviving part is either a merged pair (in
-        // ranks by construction) or a lone byte. If some byte were absent, a piece containing
-        // it would have no rank and encoding would fail on ordinary input. Measured on the
-        // shipped file 2026-08-17: 256 of 256 present.
-        let singles = (0..=u8::MAX)
-            .filter(|b| ranks.contains_key(&vec![*b]))
-            .count();
-        ensure!(
-            singles == 256,
-            "the vocabulary has only {singles} of 256 single-byte tokens; byte-pair encoding \
-             cannot represent arbitrary input without them"
-        );
-        let mut special_id = HashMap::with_capacity(SPECIAL_SLOTS);
-        let mut special_name = HashMap::with_capacity(SPECIAL_SLOTS);
-        for slot in 0..SPECIAL_SLOTS {
-            let id = u32::try_from(num_base + slot).context("special id overflows u32")?;
-            // The positional rule, and the `unwrap_or_else` IS the rule — not a fallback for a
-            // missing entry. See `SPECIAL_SLOTS`.
-            let name = named
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| format!("<|reserved_token_{id}|>"));
-            special_id.insert(name.clone(), id);
-            special_name.insert(id, name);
-        }
-        // **Distinct, and last-write-wins would hide it.** `special_id` is a name→id map, so a
-        // config whose `added_tokens_decoder` content collides with another entry — or with a
-        // `<|reserved_token_N|>` spelling — silently yields fewer than 256 entries: one id becomes
-        // unencodable while `special_name` still decodes to a spelling that re-encodes to a
-        // DIFFERENT id. 256/256 distinct on the shipped config (2026-08-17); asserted because the
-        // failure is a silent id substitution, not an error.
-        ensure!(
-            special_id.len() == SPECIAL_SLOTS,
-            "the special block has {} distinct spellings for {SPECIAL_SLOTS} ids — two entries \
-             collide, so one id cannot be encoded and decode/encode are no longer inverse",
-            special_id.len()
-        );
-        let named_outside: Vec<&u32> = named
-            .keys()
-            .filter(|id| (**id as usize) < num_base || (**id as usize) >= num_base + SPECIAL_SLOTS)
-            .collect();
-        ensure!(
-            named_outside.is_empty(),
-            "added_tokens_decoder names ids outside the special block \
-             {num_base}..{}: {named_outside:?} — the block is positional, so a name outside it \
-             would be silently unreachable",
-            num_base + SPECIAL_SLOTS
-        );
-        let special_heads = special_id
-            .keys()
-            .filter_map(|n| n.as_bytes().first().copied())
-            .collect();
-        let mut special_lens: Vec<usize> = special_id.keys().map(|n| n.len()).collect();
-        special_lens.sort_unstable();
-        special_lens.dedup();
-        special_lens.reverse();
+        ensure_single_bytes(&ranks)?;
+        let specials = Specials::build(named, &bytes_of)?;
+        let (special_heads, special_lens) = scan_sets(&specials.id);
         Ok(Self {
             ranks,
             bytes_of,
-            special_id,
-            special_name,
+            special_id: specials.id,
+            special_name: specials.name,
+            extra_specials: specials.extra,
             special_heads,
             special_lens,
-            splitter: fancy_regex::Regex::new(PAT_STR).context("compile the K3 pat_str")?,
+            splitter: fancy_regex::Regex::new(specials.pat)
+                .context("compile the pre-tokenizer pattern")?,
         })
     }
 
-    /// Base tokens plus the special block — `n_vocab`, which must equal the config's
-    /// `vocab_size`. The caller asserts that; this only reports it.
+    /// Base tokens plus the reserved block — `n_vocab`, which must equal the config's
+    /// `vocab_size`. **Zero extra for the inline shape**, so an Inkling vocabulary reports
+    /// 200,058 rather than 200,314: its 60 specials are base tokens.
     pub fn n_vocab(&self) -> usize {
-        self.bytes_of.len() + SPECIAL_SLOTS
+        self.bytes_of.len() + self.extra_specials
     }
 
-    /// Where the special block starts.
+    /// Where the reserved block starts — the base vocabulary's length, which in the inline shape
+    /// is the END of the vocabulary.
     pub fn num_base(&self) -> usize {
         self.bytes_of.len()
     }
@@ -316,21 +311,21 @@ impl Vocab {
     /// Encode, with special spellings recognised — the reference's `encode` default
     /// (`allow_special_tokens=True` → `allowed_special="all"`).
     ///
-    /// **Two declared deviations from `_encode_text_piece`, both stated because the driver's
-    /// golden pins the constants and something has to say what happens to them here:**
+    /// **One declared deviation from `_encode_text_piece`**, stated because the driver's golden
+    /// pins the constants and something has to say what happens to them here.
     ///
-    /// * `TIKTOKEN_MAX_ENCODE_CHARS = 400_000`, the reference's OUTER chunk, is **not ported**.
-    ///   It exists to dodge a `pyo3_runtime.PanicException` in tiktoken's Rust core, which this
-    ///   implementation is not, and 400,000 characters is ~50x the whole `ATTEND_MAX_KV` 8192
-    ///   context this engine can decode — so no reachable prompt crosses it. If a caller ever
-    ///   encodes text that long for some non-decode purpose, the ids would diverge from the
-    ///   reference at that boundary and this is the note that says so.
-    /// * `allow_special_tokens=False` is **not ported** either. The reference offers it for
-    ///   *user* text, where `<|end_of_msg|>` in a prompt must become ordinary bytes rather than
-    ///   a control token; this arm only ever encodes raw bench prompts, where the distinction
+    /// Both encode caps ARE ported (see [`EncodeCaps`]; the paragraph that used to say the outer
+    /// one was not is corrected 2026-11-24 against the landed constants).
+    ///
+    /// * `allow_special_tokens=False` is **not ported**. The reference offers it for *user*
+    ///   text, where `<|end_of_msg|>` in a prompt must become ordinary bytes rather than a
+    ///   control token; this arm only ever encodes raw bench prompts, where the distinction
     ///   cannot arise because nothing frames turns. **A chat port must add it before the first
     ///   user-supplied string reaches here** — otherwise a prompt containing that spelling
-    ///   injects the model's stop token and the decode ends early on the user's own text.
+    ///   injects the model's stop token and the decode ends early on the user's own text. The
+    ///   Inkling 2 port does NOT add it: its template and HuggingFace's own tokenizer both
+    ///   recognise added tokens inside message content, so escaping here would diverge from the
+    ///   reference ids. Recorded, not fixed.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         self.encode_capped(text, EncodeCaps::default())
     }
@@ -396,7 +391,7 @@ impl Vocab {
         None
     }
 
-    /// Pre-tokenize with [`PAT_STR`] and byte-pair each piece.
+    /// Pre-tokenize with this vocabulary's pattern and byte-pair each piece.
     fn encode_text(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
         for m in self.splitter.find_iter(text) {
             let m = m.context("pat_str match failed")?;
@@ -512,6 +507,141 @@ impl Vocab {
     }
 }
 
+/// Which shape the special block takes, resolved once at load and then spent by [`Vocab`].
+struct Specials {
+    id: HashMap<String, u32>,
+    name: HashMap<u32, String>,
+    /// Ids reserved above the base vocabulary — see [`Vocab::extra_specials`].
+    extra: usize,
+    /// The pre-tokenizer that belongs to this shape.
+    pat: &'static str,
+}
+
+impl Specials {
+    /// The positional block or the inline one, decided by the CONFIG alone.
+    ///
+    /// An EMPTY decoder is read as positional — that is the K3 behaviour, and the only shape
+    /// whose unnamed slots are still spellable (see the module header for the rule).
+    fn build(named: HashMap<u32, String>, bytes_of: &[Vec<u8>]) -> Result<Self> {
+        let inline = !named.is_empty() && named.keys().all(|&id| (id as usize) < bytes_of.len());
+        if inline {
+            Self::inline(named, bytes_of)
+        } else {
+            Self::positional(&named, bytes_of.len())
+        }
+    }
+
+    /// The inline shape: every id is a base token, and its bytes must BE the spelling.
+    ///
+    /// **The byte comparison is the cross-check the whole mode needs.** Without it a config
+    /// naming 199,998 `<|endoftext|>` beside a model whose line 199,998 says something else
+    /// would load with two answers for one id — `decode` reads the bytes, `encode` reads the
+    /// name. Measured on the vendored Inkling files 2026-11-24: 60 of 60 identical.
+    fn inline(named: HashMap<u32, String>, bytes_of: &[Vec<u8>]) -> Result<Self> {
+        let mut name = HashMap::with_capacity(named.len());
+        for (&id, spelling) in &named {
+            let bytes = bytes_of.get(id as usize).with_context(|| {
+                format!("added_tokens_decoder names id {id}, past the base vocabulary")
+            })?;
+            ensure!(
+                bytes.as_slice() == spelling.as_bytes(),
+                "added_tokens_decoder says id {id} is {spelling:?} but tiktoken.model's line is \
+                 {:?} — the two files disagree, so encode and decode would not be inverse",
+                String::from_utf8_lossy(bytes)
+            );
+            name.insert(id, spelling.clone());
+        }
+        let id: HashMap<String, u32> = name.iter().map(|(&i, n)| (n.clone(), i)).collect();
+        ensure!(
+            id.len() == named.len(),
+            "added_tokens_decoder has {} distinct spellings for {} ids — two entries collide, so \
+             one id cannot be encoded",
+            id.len(),
+            named.len()
+        );
+        Ok(Self {
+            id,
+            name,
+            extra: 0,
+            pat: PAT_STR_INKLING,
+        })
+    }
+
+    /// The positional block: [`SPECIAL_SLOTS`] ids above the base, named where the config names
+    /// them and `<|reserved_token_N|>` otherwise.
+    fn positional(named: &HashMap<u32, String>, num_base: usize) -> Result<Self> {
+        let mut id = HashMap::with_capacity(SPECIAL_SLOTS);
+        let mut name = HashMap::with_capacity(SPECIAL_SLOTS);
+        for slot in 0..SPECIAL_SLOTS {
+            let special = u32::try_from(num_base + slot).context("special id overflows u32")?;
+            // The positional rule, and the `unwrap_or_else` IS the rule — not a fallback for a
+            // missing entry. See `SPECIAL_SLOTS`.
+            let spelling = named
+                .get(&special)
+                .cloned()
+                .unwrap_or_else(|| format!("<|reserved_token_{special}|>"));
+            id.insert(spelling.clone(), special);
+            name.insert(special, spelling);
+        }
+        // **Distinct, and last-write-wins would hide it.** `id` is a name→id map, so a colliding
+        // spelling yields fewer than 256 entries: one id becomes unencodable while `name` still
+        // decodes to a spelling that re-encodes to a DIFFERENT id. 256/256 distinct on the
+        // shipped config (2026-08-17); the failure is a silent id substitution, not an error.
+        ensure!(
+            id.len() == SPECIAL_SLOTS,
+            "the special block has {} distinct spellings for {SPECIAL_SLOTS} ids — two entries \
+             collide, so one id cannot be encoded and decode/encode are no longer inverse",
+            id.len()
+        );
+        let outside: Vec<&u32> = named
+            .keys()
+            .filter(|id| (**id as usize) < num_base || (**id as usize) >= num_base + SPECIAL_SLOTS)
+            .collect();
+        ensure!(
+            outside.is_empty(),
+            "added_tokens_decoder names ids outside the special block \
+             {num_base}..{}: {outside:?} — the block is positional, so a name outside it \
+             would be silently unreachable",
+            num_base + SPECIAL_SLOTS
+        );
+        Ok(Self {
+            id,
+            name,
+            extra: SPECIAL_SLOTS,
+            pat: PAT_STR,
+        })
+    }
+}
+
+/// First bytes and DESCENDING lengths of every special spelling, for [`Vocab`]'s scan.
+fn scan_sets(special_id: &HashMap<String, u32>) -> (HashSet<u8>, Vec<usize>) {
+    let heads = special_id
+        .keys()
+        .filter_map(|n| n.as_bytes().first().copied())
+        .collect();
+    let mut lens: Vec<usize> = special_id.keys().map(|n| n.len()).collect();
+    lens.sort_unstable();
+    lens.dedup();
+    lens.reverse();
+    (heads, lens)
+}
+
+/// **Every single byte must be a token, and this is a real precondition.** `bpe` starts from one
+/// part per byte and only merges a pair whose concatenation is in `ranks`, so every surviving
+/// part is a merged pair or a lone byte; a missing byte would make ordinary input unencodable.
+/// Measured on the K3 file 2026-08-17 and the Inkling file 2026-11-24: 256 of 256 in both.
+fn ensure_single_bytes(ranks: &HashMap<Vec<u8>, u32>) -> Result<()> {
+    let singles = (0..=u8::MAX)
+        .filter(|b| ranks.contains_key(&vec![*b]))
+        .count();
+    ensure!(
+        singles == 256,
+        "the vocabulary has only {singles} of 256 single-byte tokens; byte-pair encoding \
+         cannot represent arbitrary input without them"
+    );
+    Ok(())
+}
+
 /// Index of the leftmost lowest-rank mergeable pair, or `None` when none is a token.
 ///
 /// Free rather than a method because it reads only the threaded rank column. The final entry is a
@@ -581,15 +711,14 @@ fn ranks_from(bytes_of: &[Vec<u8>]) -> HashMap<Vec<u8>, u32> {
         .collect()
 }
 
-/// `added_tokens_decoder` as id → spelling.
-fn named_specials(dir: &str) -> Result<HashMap<u32, String>> {
-    let path = format!("{dir}/tokenizer_config.json");
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+/// `added_tokens_decoder` as id → spelling, from the config's TEXT.
+///
+/// Absent is not an error: a config naming nothing yields the positional block's 256 reserved
+/// spellings and a vocabulary that still encodes text correctly. It would have no stop token,
+/// which is `Tokenizer::load`'s business and not this function's.
+fn named_from_json(raw: &str) -> Result<HashMap<u32, String>> {
     let doc: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("{path} is not JSON"))?;
-    // Absent is not an error: the block is positional, so a config naming nothing yields 256
-    // reserved spellings and a vocabulary that still encodes text correctly. It would have no
-    // stop token, which is `Tokenizer::load`'s business and not this function's.
+        serde_json::from_str(raw).context("tokenizer_config is not JSON")?;
     let Some(map) = doc.get("added_tokens_decoder").and_then(|v| v.as_object()) else {
         return Ok(HashMap::new());
     };
@@ -597,11 +726,11 @@ fn named_specials(dir: &str) -> Result<HashMap<u32, String>> {
     for (id, entry) in map {
         let id: u32 = id
             .parse()
-            .with_context(|| format!("{path}: added_tokens_decoder key {id:?} is not an id"))?;
+            .with_context(|| format!("added_tokens_decoder key {id:?} is not an id"))?;
         let content = entry
             .get("content")
             .and_then(|v| v.as_str())
-            .with_context(|| format!("{path}: added_tokens_decoder[{id}] has no `content`"))?;
+            .with_context(|| format!("added_tokens_decoder[{id}] has no `content`"))?;
         out.insert(id, content.to_string());
     }
     Ok(out)

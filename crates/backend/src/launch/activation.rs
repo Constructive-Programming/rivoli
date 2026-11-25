@@ -5,12 +5,12 @@ use super::{Checked, Rows, any_nonpositive, elementwise, not_positive_finite, ru
 use crate::module::{Geometry, Kernel, LdsBytes};
 use rivoli_abi::geom::{
     ACT_QUANT_BLOCK, ACT_QUANT_THREADS, ELEMENTWISE_BLOCK, GEMV_FP8_LDS_BYTES, ROW_BLOCK,
-    ROW_LDS_BYTES, WAVE,
+    ROW_LDS_BYTES, SINK_ATTEND_MAX_N, WAVE,
 };
 use rivoli_abi::kernarg::{
-    ActQuant, Gate, GateClamped, GateSitu, KvScatter, L2Clip, LogScaledL2Clip, MessageGate,
-    Mxfp8Dequant, Nvfp4Dequant, RelBiasGather, Rope, RowNorm, ScaledL2Clip, Sconv, SinkAttend,
-    WeightlessNorm,
+    ActQuant, Axpy, Gate, GateClamped, GateSitu, KvScatter, L2Clip, LogScaledL2Clip, MessageGate,
+    Mxfp8Dequant, Nvfp4Dequant, RelBiasGather, Rope, RowNorm, ScaledL2Clip, Sconv, SconvDynamic,
+    SinkAttend, WeightlessNorm,
 };
 use std::{ffi::c_void, ptr::null_mut};
 
@@ -23,6 +23,8 @@ static LOG_SCALED_L2_CLIP: Kernel<LogScaledL2Clip> = Kernel::new(c"log_scaled_l2
 static MXFP8_DEQUANT: Kernel<Mxfp8Dequant> = Kernel::new(c"mxfp8_dequant");
 static NVFP4_DEQUANT: Kernel<Nvfp4Dequant> = Kernel::new(c"nvfp4_dequant");
 static SCONV: Kernel<Sconv> = Kernel::new(c"sconv");
+static SCONV_DYNAMIC: Kernel<SconvDynamic> = Kernel::new(c"sconv_dynamic");
+static VAXPY: Kernel<Axpy> = Kernel::new(c"vaxpy");
 static SINK_ATTEND: Kernel<SinkAttend> = Kernel::new(c"sink_attend");
 static MESSAGE_GATE: Kernel<MessageGate> = Kernel::new(c"message_gate");
 static KV_SCATTER: Kernel<KvScatter> = Kernel::new(c"kv_scatter");
@@ -206,30 +208,62 @@ pub(crate) unsafe fn rivoli_nvfp4_dequant(a: Nvfp4Dequant, stream: *mut c_void) 
     unsafe { run(&NVFP4_DEQUANT, nvfp4_checked(&a), stream, &a) }
 }
 
-/// The sconv geometry: elementwise over `channels` (no LDS — a short per-channel dot, no fp8 LUT),
-/// `channels > 0` and `k > 0` (1001), `divisor` positive finite (1006).
-fn sconv_checked(a: &Sconv) -> Checked {
-    if a.channels <= 0 || a.k <= 0 {
+/// The short-convolution geometry both launchers share: the variant's own `geometry` predicate
+/// (1001 when it fails), then `divisor` positive finite (1006), then an elementwise grid over
+/// `channels` — no LDS, since a k-tap dot is per-channel work with no fp8 LUT. The variants differ
+/// ONLY in that predicate, which each call site states beside its own kernarg.
+fn sconv_checked(geometry: bool, channels: i32, divisor: f32) -> Checked {
+    if !geometry {
         return Err(1001);
     }
-    if not_positive_finite(a.divisor) {
+    if not_positive_finite(divisor) {
         return Err(1006);
     }
-    let n = i64::from(a.channels);
-    elementwise(n)
+    elementwise(i64::from(channels))
 }
 
 /// # Safety
 /// The `launch_sconv` contract. inkling's static short-conv decode step; no C twin (oracle-validated).
 pub(crate) unsafe fn rivoli_sconv(a: Sconv, stream: *mut c_void) -> i32 {
-    unsafe { run(&SCONV, sconv_checked(&a), stream, &a) }
+    let geometry = a.channels > 0 && a.k > 0;
+    let checked = sconv_checked(geometry, a.channels, a.divisor);
+    unsafe { run(&SCONV, checked, stream, &a) }
+}
+
+/// # Safety
+/// The `launch_sconv_dynamic` contract. inkling's dynamic short-conv decode step: the static
+/// kernel's grid over `channels` (the per-head dynamic weight is an index, not extra work), with
+/// `channels % head_dim == 0` required by the head map; no C twin (oracle-validated).
+pub(crate) unsafe fn rivoli_sconv_dynamic(a: SconvDynamic, stream: *mut c_void) -> i32 {
+    // `head_dim > 0` is tested BEFORE the modulus: `%` by zero panics and both refusals are 1001.
+    let geometry = a.channels > 0 && a.head_dim > 0 && a.k > 0 && a.channels % a.head_dim == 0;
+    let checked = sconv_checked(geometry, a.channels, a.divisor);
+    unsafe { run(&SCONV_DYNAMIC, checked, stream, &a) }
+}
+
+/// The vaxpy geometry, kept in its launcher: elementwise over `n` (`n > 0` → 1001), `alpha` finite
+/// → 1006. A zero or negative scale is arithmetic, not a refusal. Two independent refusals, so the
+/// pair is matched rather than chained — a body of `if … return` here collides with the drain and
+/// short-conv guards elsewhere in this module, and the gate cannot tell a refusal from a refusal.
+///
+/// # Safety
+/// The `launch_vaxpy` contract: `x` and `y` are `n` f32 each, `x` updated in place; no C
+/// twin (oracle-validated).
+pub(crate) unsafe fn rivoli_vaxpy(a: Axpy, stream: *mut c_void) -> i32 {
+    let checked = match (a.n <= 0, a.alpha.is_finite()) {
+        (true, _) => Err(1001),
+        (false, false) => Err(1006),
+        (false, true) => elementwise(i64::from(a.n)),
+    };
+    unsafe { run(&VAXPY, checked, stream, &a) }
 }
 
 /// The sink-attend geometry: one block of `ROW_BLOCK` threads per query head, and
 /// `(n + ROW_BLOCK)` f32 of LDS — the `n` logits plus the max/sum tree. `n`, `d`, `heads`,
 /// `kv_heads` > 0 and `heads % kv_heads == 0` (the GQA mapping divides by it), `kv_stride >= n`
 /// (a head's window lies inside its stride) → 1001; `scaling` positive finite → 1006; the LDS
-/// total within the gfx1151 budget of 65536 bytes → 1001 (the engine chunks a longer context).
+/// total within `SINK_ATTEND_LDS_CAP` → 1001, i.e. `n <= SINK_ATTEND_MAX_N` (the engine refuses
+/// a longer `--ctx` at open time).
 fn sink_attend_checked(a: &SinkAttend) -> Checked {
     if any_nonpositive(&[a.n, a.d, a.heads, a.kv_heads]) {
         return Err(1001);
@@ -240,14 +274,16 @@ fn sink_attend_checked(a: &SinkAttend) -> Checked {
     if not_positive_finite(a.scaling) {
         return Err(1006);
     }
-    let lds = (a.n as u64 + u64::from(ROW_BLOCK)) * 4;
-    if lds > 65536 {
+    // The ceiling is `geom`'s one fact, not a second `65536` here: the engine's `--ctx` gate and
+    // this refusal must agree, and a copy of the number is how they stop.
+    if a.n as u32 > SINK_ATTEND_MAX_N {
         return Err(1001);
     }
+    let lds = LdsBytes((a.n as u32 + ROW_BLOCK) * 4);
     Ok(Geometry {
         blocks: a.heads as u32,
         threads: ROW_BLOCK,
-        lds: LdsBytes(lds as u32),
+        lds,
     })
 }
 

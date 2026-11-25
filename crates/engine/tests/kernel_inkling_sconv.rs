@@ -1,5 +1,6 @@
-//! inkling's static short-convolution decode step on the device, scored against the CPU oracle
-//! `rivoli_oracles::inkling::sconv` — **no C twin** (owner direction 2026-11-24): a new-model
+//! inkling's short-convolution decode steps on the device — the static form and the DYNAMIC one
+//! (a per-head learned tap vector added to every static weight) — scored against the CPU oracles
+//! `rivoli_oracles::inkling::{sconv, sconv_dynamic}` — **no C twin** (owner direction 2026-11-24): a new-model
 //! kernel validated against the first-party reference, not the C→Rust bit-identity harness. The
 //! k-tap dot is a short reduction whose accumulation may contract to FMA on the device, so the
 //! comparison of the OUTPUT is RELATIVE (the clip family's convention for a sum); the state
@@ -16,8 +17,10 @@
 #![cfg(feature = "rocm")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // tests: panic-on-failure is the idiom
 
-use rivoli_backend::hip::launch_sconv;
-use rivoli_oracles::inkling::sconv as cpu_sconv;
+use rivoli_backend::hip::{launch_sconv, launch_sconv_dynamic};
+use rivoli_oracles::inkling::{
+    DynamicSconv, sconv as cpu_sconv, sconv_dynamic as cpu_sconv_dynamic,
+};
 
 mod common;
 use common::*;
@@ -95,6 +98,117 @@ fn state_bytes(state: &[f32]) -> Vec<u8> {
         return f32b(&[0.0f32]);
     }
     f32b(state)
+}
+
+/// The dynamic variant's four operand vectors, grouped so [`DynCase::new`] stays inside CodeScene's
+/// argument cap; the geometry travels separately as `(head_dim, k)`.
+#[derive(Clone, Copy)]
+struct DynIo<'a> {
+    static_w: &'a [f32],
+    dyn_w: &'a [f32],
+    state: &'a [f32],
+    current: &'a [f32],
+}
+
+/// The four operand vectors in the dynamic contract's order, so a call site reads as one line
+/// rather than a struct literal repeated at every geometry.
+fn dyn_io<'a>(
+    static_w: &'a [f32],
+    dyn_w: &'a [f32],
+    state: &'a [f32],
+    current: &'a [f32],
+) -> DynIo<'a> {
+    DynIo {
+        static_w,
+        dyn_w,
+        state,
+        current,
+    }
+}
+
+/// One dynamic geometry: the operand group, `(head_dim, k)`, and the divisor. `Copy` so the guard
+/// test can vary one field with struct-update syntax without consuming the base; the geometry is a
+/// pair for [`SconvCase`]'s reason (a transposition would be a wrong answer, not a compile error).
+#[derive(Clone, Copy)]
+struct DynCase<'a> {
+    operands: DynIo<'a>,
+    geom: (usize, usize),
+    divisor: f32,
+}
+
+impl<'a> DynCase<'a> {
+    /// `divisor = √(2k+1)` (T15: 3 at k=4) is derived from the geometry, so the constructor takes
+    /// no extra argument; the guard tests override it with struct-update syntax.
+    fn new(operands: DynIo<'a>, geom: (usize, usize)) -> Self {
+        Self {
+            operands,
+            geom,
+            divisor: ((2 * geom.1 + 1) as f32).sqrt(),
+        }
+    }
+
+    /// The same operands as the CPU reference's struct, so the oracle call cannot transpose a
+    /// field here that the case holds correctly.
+    fn oracle(&self) -> DynamicSconv<'a> {
+        let (head_dim, k) = self.geom;
+        DynamicSconv {
+            static_w: self.operands.static_w,
+            dyn_w: self.operands.dyn_w,
+            state: self.operands.state,
+            current: self.operands.current,
+            head_dim,
+            k,
+            divisor: self.divisor,
+        }
+    }
+}
+
+/// The dynamic variant's device launch: `static_w` `[k, channels]`, `dyn_w` `[heads, k]`, `state`
+/// `[channels, k−1]`, `current`/`out` `[channels]` — `channels` from `current`'s length, the head
+/// count implied by `head_dim`. `alias` points `out` at `current` (the engine's in-place shape).
+fn dyn_launch(c: &DynCase, alias: bool) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+    let sw = dev(&f32b(c.operands.static_w));
+    let dw = dev(&f32b(c.operands.dyn_w));
+    let st = dev(&state_bytes(c.operands.state));
+    let mut cur = dev(&f32b(c.operands.current));
+    // `.max(1)` for the `channels = 0` guard arm: the launcher refuses before any device access,
+    // and a zero-byte buffer is not a test of that.
+    let mut spare = zeros(c.operands.current.len().max(1) * 4);
+    let s = stream();
+    let dst = if alias {
+        cur.ptr_mut()
+    } else {
+        spare.ptr_mut()
+    };
+    // SAFETY: the buffers match the contract above and outlive the stream `back` syncs on; the
+    // launcher guards geometry and divisor first.
+    unsafe {
+        launch_sconv_dynamic(
+            sw.ptr() as *const f32,
+            dw.ptr() as *const f32,
+            st.ptr() as *mut f32,
+            cur.ptr() as *const f32,
+            c.operands.current.len(),
+            c.geom.0,
+            c.geom.1,
+            c.divisor,
+            dst as *mut f32,
+            s.raw(),
+        )?;
+    }
+    let written = if alias { &cur } else { &spare };
+    let produced = f32v(&back(written));
+    let advanced = f32v(&back(&st));
+    Ok((produced, advanced))
+}
+
+/// Every refused divisor, on either variant: zero, NaN, negative and infinite are all 1006 (a zero
+/// or negative *scale* is vaxpy's exception, not sconv's). Shared because a variant that guarded
+/// the divisor on one code path only would otherwise pass on its own bespoke list.
+fn assert_divisor_guards(launch: impl Fn(f32) -> anyhow::Result<(Vec<f32>, Vec<f32>)>) {
+    for bad in [0.0, f32::NAN, -1.0, f32::INFINITY] {
+        assert_guard(launch(bad), Some(1006), &format!("divisor = {bad}"));
+    }
 }
 
 /// The static decode matches the CPU oracle over ragged channel counts and tap widths.
@@ -242,18 +356,111 @@ fn sconv_geometry_is_guarded() {
         Some(1001),
         "k = 0",
     );
-    for bad in [0.0, f32::NAN, -1.0, f32::INFINITY] {
+    assert_divisor_guards(|divisor| sconv_launch(&SconvCase { divisor, ..base }, false));
+    assert_guard(sconv_launch(&base, false), None, "valid geometry");
+}
+
+/// The dynamic decode matches the CPU oracle over ragged head grids, including a realistic
+/// `(heads 8, head_dim 128, k 4)`. The output is compared RELATIVE (the short dot may contract to
+/// FMA); the state advance is a pure shift+append and is compared bitwise.
+#[test]
+fn sconv_dynamic_matches_the_cpu_oracle() {
+    for &(heads, head_dim, k) in &[(1usize, 1usize, 2usize), (2, 16, 4), (8, 128, 4), (4, 7, 3)] {
+        let channels = heads * head_dim;
+        let static_w = fill(k * channels, 0x1a2b + channels as u64, 2.0);
+        let dyn_w = fill(heads * k, 0x3c4d + heads as u64, 1.0);
+        let state = fill(channels * (k - 1), 0x5e6f + k as u64, 2.0);
+        let current = fill(channels, 0x7a8b, 2.0);
+        let io = dyn_io(&static_w, &dyn_w, &state, &current);
+        let c = DynCase::new(io, (head_dim, k));
+        let (want, want_state) = cpu_sconv_dynamic(&c.oracle());
+        let (got, got_state) = ok(dyn_launch(&c, false), "gpu sconv_dynamic");
+        let label = format!("sconv_dynamic heads={heads} head_dim={head_dim} k={k}");
+        assert_rel(&want, &got, &label, 1e-5);
+        assert_bits(&want_state, &got_state, &format!("{label} state"));
+    }
+}
+
+/// T15: the dynamic divisor is `√(2k+1) = 3` at k=4, and the taps are read in lag order — lag 0
+/// the current token, lag `j` the state slot `hist − j`. Static and dynamic weights both vary by
+/// lag, so a reversed window cannot produce this answer.
+#[test]
+fn sconv_dynamic_divisor_is_three_and_lag_order_matters() {
+    let static_w = [1.0, 2.0, 3.0, 4.0]; // [k = 4, channels = 1]
+    let dyn_w = [0.5, 0.25, 0.125, 0.0625]; // [heads = 1, k = 4]
+    let state = [1.0, 2.0, 3.0]; // chronological: lag 3, lag 2, lag 1
+    let current = [4.0];
+    let io = dyn_io(&static_w, &dyn_w, &state, &current);
+    let c = DynCase::new(io, (1, 4));
+    assert_eq!(c.divisor, 3.0, "T15: dynamic divisor is √(2k+1) at k=4");
+    let (want, want_state) = cpu_sconv_dynamic(&c.oracle());
+    let (got, got_state) = ok(dyn_launch(&c, false), "sconv_dynamic T15");
+    // (1.5·4 + 2.25·3 + 3.125·2 + 4.0625·1 + 4)/3 = 27.0625/3.
+    assert!((got[0] - 27.0625 / 3.0).abs() < 1e-5, "got {}", got[0]);
+    assert!((got[0] - want[0]).abs() < 1e-5, "the oracle disagrees");
+    // Reversing the window gives (4.0625·4 + 3.125·3 + 2.25·2 + 1.5·1 + 4)/3 ≈ 11.875.
+    assert!(
+        (got[0] - 35.625 / 3.0).abs() > 1.0,
+        "the lag order is untested"
+    );
+    assert_bits(&want_state, &got_state, "sconv_dynamic T15 state");
+    assert_eq!(got_state, vec![2.0, 3.0, 4.0]);
+}
+
+/// `out` may alias `current` (the engine's in-place call shape): the aliased launch is
+/// bit-identical to the separate-buffer one in both the output and the advanced state.
+#[test]
+fn sconv_dynamic_output_may_alias_the_current_tap() {
+    let (heads, head_dim, k) = (2usize, 8usize, 3usize);
+    let channels = heads * head_dim;
+    let static_w = fill(k * channels, 0xa1b2, 2.0);
+    let dyn_w = fill(heads * k, 0xc3d4, 1.0);
+    let state = fill(channels * (k - 1), 0xe5f6, 2.0);
+    let current = fill(channels, 0x1357, 2.0);
+    let io = dyn_io(&static_w, &dyn_w, &state, &current);
+    let c = DynCase::new(io, (head_dim, k));
+    let (separate, separate_state) = ok(dyn_launch(&c, false), "separate");
+    let (aliased, aliased_state) = ok(dyn_launch(&c, true), "alias");
+    assert_bits(&separate, &aliased, "sconv_dynamic alias out == separate");
+    assert_bits(
+        &separate_state,
+        &aliased_state,
+        "sconv_dynamic alias advances the same state",
+    );
+}
+
+/// `channels`/`head_dim`/`k` > 0 with `channels % head_dim == 0` (1001), and `divisor` positive
+/// finite (1006), are guarded before launch.
+#[test]
+fn sconv_dynamic_geometry_is_guarded() {
+    let static_w = fill(8, 0x11, 2.0);
+    let dyn_w = fill(4, 0x22, 1.0);
+    let state = fill(4, 0x33, 2.0);
+    let current = fill(4, 0x44, 2.0);
+    let io = dyn_io(&static_w, &dyn_w, &state, &current);
+    let base = DynCase::new(io, (2, 2));
+    let empty = DynCase::new(
+        DynIo {
+            static_w: &[],
+            dyn_w: &[],
+            state: &[],
+            current: &[],
+        },
+        (1, 2),
+    );
+    assert_guard(dyn_launch(&empty, false), Some(1001), "channels = 0");
+    let bad_geoms = [
+        ("head_dim = 0", (0usize, 2usize)),
+        ("k = 0", (2, 0)),
+        ("channels % head_dim != 0", (3, 2)),
+    ];
+    for (why, geom) in bad_geoms {
         assert_guard(
-            sconv_launch(
-                &SconvCase {
-                    divisor: bad,
-                    ..base
-                },
-                false,
-            ),
-            Some(1006),
-            &format!("divisor = {bad}"),
+            dyn_launch(&DynCase { geom, ..base }, false),
+            Some(1001),
+            why,
         );
     }
-    assert_guard(sconv_launch(&base, false), None, "valid geometry");
+    assert_divisor_guards(|divisor| dyn_launch(&DynCase { divisor, ..base }, false));
+    assert_guard(dyn_launch(&base, false), None, "valid geometry");
 }

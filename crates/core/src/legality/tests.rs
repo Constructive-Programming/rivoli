@@ -197,10 +197,11 @@ fn muse_glimmer_row_is_the_m7_truth() {
 /// > would have failed OPEN — a sixth architecture would have gone unchecked here instead of
 /// > reddening until someone said which side of the line it is on.
 ///
-/// > **GREW 2026-11-23 (inkling S1).** The armless list is now THREE — qwen plus Inkling 2's two
-/// > members — and the excluded ones are asserted from the other side by
-/// > [`qwen_flash_next_row_refuses_every_flag_as_of_s1`] and
-/// > [`inkling2_rows_refuse_every_flag_as_of_s1`]. The fail-closed argument is unchanged: a new
+/// > **GREW 2026-11-23 (inkling S1), SHRANK 2026-11-24 (inkling S5).** The armless list went to
+/// > THREE when Inkling 2's two members landed armless, and back to TWO when Mini's row flipped
+/// > and `rivoli_engine::seam::Engine` gained its `InklingLoop` arm. The excluded ones are
+/// > asserted from the other side by [`qwen_flash_next_row_refuses_every_flag_as_of_s1`] and
+/// > [`inkling2_row_refuses_every_flag_as_of_s5`]. The fail-closed argument is unchanged: a new
 /// > variant reddens here until someone says which side of the line it is on.
 #[test]
 fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
@@ -210,7 +211,7 @@ fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
     // the statement. `main`'s `the_arms_and_the_legality_table_agree_about_who_can_start` is
     // the cross-check that this exclusion and the arms `main` dispatches to are the same
     // set — including, since S1, its previously unexercised no-arm branch.
-    const ARMLESS: [Arch; 3] = [Arch::QwenFlashNext, Arch::Inkling2Loop, Arch::Inkling2];
+    const ARMLESS: [Arch; 2] = [Arch::QwenFlashNext, Arch::Inkling2];
     for arch in Arch::ALL.into_iter().filter(|a| !ARMLESS.contains(a)) {
         for flag in [Flag::Mode(default_mode), Flag::Attn(default_attn)] {
             assert!(
@@ -369,21 +370,64 @@ fn assert_row_refuses_everywhere(arch: Arch, arm: &'static str, mtp: &'static st
     }
 }
 
-/// Inkling 2's rows, cell by cell, as of S1 — the same reddening-commit gate as
-/// [`qwen_flash_next_row_refuses_every_flag_as_of_s1`], for BOTH members: one port plan, one
-/// shared refusal, two variants. Pinned to the consts and their fragments for the same reason;
-/// `tests/smoke-inkling.sh` (S5) will quote the ARM fragment, and the MTP const stays test-only
-/// until the Mini row flips, on the ordering [`QWEN_MTP_NOT_LOADED`] documents.
+/// **Inkling 2 Mini's row, cell by cell, as of S5** — the change-detector for the arm that
+/// landed, on the four rows' precedent: the total and anti-vacuity checks above would not
+/// notice a cell being flipped, which is the one edit that changes what the engine accepts.
+///
+/// Every cell is asserted, including the two `Support` ones, because this row's value is
+/// exactly the DISTINCTION — Mini decodes under `--attn dense`, `--max-mem` and `--ctx`, falls
+/// back loudly on `--mode`, and refuses the three sparse selections, `--cache-policy`,
+/// `--trace` and `--mtp`. The fragment pins at the end are what `tests/smoke-inkling.sh`
+/// asserts the CLI's own stderr against, so a reworded const in `legality.rs` reddens here
+/// before it can silently stop matching there.
 #[test]
-fn inkling2_rows_refuse_every_flag_as_of_s1() {
-    for arch in [Arch::Inkling2Loop, Arch::Inkling2] {
-        assert_row_refuses_everywhere(arch, INKLING_ARM_NOT_BUILT, INKLING_MTP_NOT_LOADED);
+fn inkling2_loop_row_is_the_s5_truth() {
+    let mini = |f| decide(Arch::Inkling2Loop, f);
+    every_mode_falls_back_loudly(Arch::Inkling2Loop);
+    sparse_selections_refuse(Arch::Inkling2Loop);
+    for f in [Flag::Attn(AttnKind::Dense), Flag::MaxMem, Flag::Ctx] {
+        assert_eq!(mini(f), Outcome::Support, "{} must decode", f.spelling());
     }
+    for (flag, want) in [
+        (Flag::Attn(AttnKind::Dsa), INKLING_SPARSE_ATTN_UNSUPPORTED),
+        (Flag::CachePolicy, INKLING_MINI_CACHE_POLICY_IS_PREFIX),
+        (Flag::Trace, INKLING_MINI_HAS_NO_EXPERT_TRACE),
+        (Flag::Mtp, INKLING_MTP_NOT_LOADED),
+    ] {
+        assert_eq!(mini(flag), Outcome::Refuse(want), "{}", flag.spelling());
+    }
+    for (text, frag) in [
+        (INKLING_MINI_FORMAT_IS_BF16, "bf16"),
+        (INKLING_MINI_FORMAT_IS_BF16, "DEQUANTIZED"),
+        (INKLING_SPARSE_ATTN_UNSUPPORTED, "HYBRID"),
+        (INKLING_MINI_CACHE_POLICY_IS_PREFIX, "LAYER PREFIX"),
+        (INKLING_MINI_HAS_NO_EXPERT_TRACE, "expert-fetch trace"),
+    ] {
+        assert!(text.contains(frag), "missing fragment {frag:?} in {text:?}");
+    }
+}
+
+/// Inkling 2 SMALL's row, cell by cell, as of S5 — the armless gate S1 wrote, reduced to the
+/// member that is still armless when Mini's row flipped (`docs/investigations/inkling2-port.md`:
+/// Mini first, Small as the bigger-than-memory streaming case at S6).
+///
+/// Pinned to the consts and their fragments for the same reason as qwen's row:
+/// `tests/smoke-inkling.sh` runs against a MINI artifact, so Small has no smoke cells — this
+/// test is the whole gate until S6 gives it an arm and a script.
+#[test]
+fn inkling2_row_refuses_every_flag_as_of_s5() {
+    assert_row_refuses_everywhere(
+        Arch::Inkling2,
+        INKLING_ARM_NOT_BUILT,
+        INKLING_MTP_NOT_LOADED,
+    );
     assert!(
         INKLING_ARM_NOT_BUILT.contains("no decode path for this architecture yet")
-            && INKLING_ARM_NOT_BUILT.contains("Inkling 2's text stack is not built"),
-        "the arm-not-built refusal must say there is no decode path AND name the stack that is \
-         owed, so a reader can tell the two armless architectures' refusals apart"
+            && INKLING_ARM_NOT_BUILT.contains("SMALL's MXFP8 streaming arm is not built")
+            && INKLING_ARM_NOT_BUILT.contains("Mini's looped bf16 arm IS built"),
+        "the arm-not-built refusal must say there is no decode path, name the MXFP8 streaming arm \
+         that is owed, and record that Mini's bf16 arm exists — the one fact that tells the two \
+         Inkling members' refusals apart"
     );
     assert!(
         INKLING_MTP_NOT_LOADED.contains("DRAFT STACK IS NOT IN THE ARTIFACT")

@@ -22,39 +22,32 @@
 //! is a type in the featureless build too (an uninhabited one), so this whole subtree
 //! compiles, lints and runs its tests under a plain `cargo test --workspace`. All still true.
 //!
-//! > **AMENDED 2026-08-17 (M11b).** This said "Nothing here is model-shaped", full stop, and
-//! > that had stopped being true in the worst way: with no architecture here, **every** request
-//! > was framed with GLM's chat template and read back with GLM's markers, Muse Glimmer's
-//! > included. Framing cannot go behind the seam — a template is a property of the CHECKPOINT,
-//! > and `Tokenizer` holds one vocabulary and no opinion about turns — so [`Opts::arch`]
-//! > carries it. **Two matches, both exhaustive, both one function**: [`frame_prompt`] on the
-//! > way in and [`split_channels`] on the way out. Feeding an instruct model another model's turn
-//! > markers puts it outside its turn structure, where its stop ids are unreachable and decode
-//! > runs to the limit every time — the failure behind the old tree's 56-run retraction.
+//! > **AMENDED 2026-08-17 (M11b).** This said "Nothing here is model-shaped", and that had
+//! > stopped being true in the worst way: with no architecture here, **every** request was
+//! > framed with GLM's template and read back with GLM's markers, Glimmer's included. Framing
+//! > cannot go behind the seam (a template is a property of the CHECKPOINT), so [`Opts::arch`]
+//! > carries it and **two exhaustive matches, one function each** decide it: [`frame_prompt`] in
+//! > and [`split_channels`] out. Another model's turn markers put it outside its turn structure,
+//! > where its stop ids are unreachable — the failure behind the old tree's 56-run retraction.
 //!
-//! Split by cohesion, four files:
+//! Split by cohesion, five files:
 //! - [`http`] — the HTTP/1.1 and SSE wire format, generic over `BufRead`/`Write`.
-//! - [`glimmer`] — Muse Glimmer's request framing and reply channels, split out at M11b
-//!   when the two halves pushed `oai` past the 800-line soft cap; the cut is by MODEL, since
-//!   `oai` is GLM-shaped end to end.
+//! - [`glimmer`] / [`inkling`] — each model's own request framing and reply channels (the Glimmer
+//!   pair split out at M11b when it pushed `oai` past the 800-line soft cap; the cut is by MODEL).
 //! - [`oai`] — the OpenAI chat-completion semantics: `messages` → template turns, tool-call
 //!   parsing, think splitting, streaming deltas. Pure functions, and where the tests are.
-//! - this file — the socket loop and one request's lifecycle, the only part that needs an
-//!   engine and therefore the only part a host test cannot reach.
+//! - this file — the socket loop and one request's lifecycle, the only part needing an engine.
 //!
 //! Deliberately absent, so nobody goes looking:
-//! - **Sampling.** The engine is greedy argmax and every number in `docs/measurement/`
-//!   is measured that way. `temperature`/`top_p` are accepted and IGNORED, with one warning
-//!   per process — honouring them is not a server-side change, and dropping them silently
-//!   would leave a client believing its own determinism story.
+//! - **Sampling.** The engine is greedy argmax and every number in `docs/measurement/` is
+//!   measured that way. `temperature`/`top_p` are accepted and IGNORED with one warning per
+//!   process — dropping them silently would leave a client believing its own determinism story.
 //! - **Forcing a call.** `tool_choice` accepts `"auto"` and `"none"` (which drops the
-//!   declarations, genuinely preventing calls) and REFUSES `"required"` or a named
-//!   function: nothing here can constrain decoding, and answering prose to a client that
-//!   demanded a call would look like compliance.
-//! - **`/v1/completions`.** A raw (unframed) prompt leaves the model outside an assistant
-//!   turn, where its EOS ids are unreachable and decode runs to the token limit every
-//!   time — see `Tokenizer::encode_chat`. That endpoint would serve the failure mode by
-//!   construction.
+//!   declarations, genuinely preventing calls) and REFUSES `"required"` or a named function:
+//!   answering prose to a client that demanded a call would look like compliance.
+//! - **`/v1/completions`.** A raw prompt leaves the model outside an assistant turn, where its
+//!   EOS ids are unreachable — see `Tokenizer::encode_chat`. That endpoint would serve the
+//!   failure mode by construction.
 //! - **Auth, TLS, batching, multi-model.** llama-swap owns model swapping and fronting;
 //!   the bind is loopback-only.
 //!
@@ -65,6 +58,7 @@
 
 mod glimmer;
 mod http;
+mod inkling;
 mod oai;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -94,25 +88,22 @@ pub struct Opts {
     pub arch: Arch,
 }
 
-// NOTE on what `Opts` does NOT carry. The reference server passed `mtp`/`mtp_min_conf`
-// through to every decode; here `GenSpec` has no speculative knob and
-// `rivoli_core::legality` refuses `--mtp` on the only architecture with a decode path. A
-// field kept against the day it returns would be a second authority on whether speculative
-// decode exists, and the seam is the first.
+// NOTE on what `Opts` does NOT carry: the reference server passed `mtp`/`mtp_min_conf` to every
+// decode, but `GenSpec` has no speculative knob and `rivoli_core::legality` refuses `--mtp`
+// everywhere it could matter. A field kept against the day it returns would be a second
+// authority on whether speculative decode exists, and the seam is the first.
 
-/// Token budget for a request that does not name one. OpenAI's own default is "until
-/// the context runs out", which at this engine's speed is a ~45-minute answer to a
-/// client that only meant to ask a question.
+/// Token budget when a request names none. OpenAI's own default is "until the context runs
+/// out", which at this engine's speed is a ~45-minute answer to a client asking a question.
 const DEFAULT_MAX_TOKENS: usize = 512;
 
 /// A client that connects and then says nothing — or stops reading mid-stream — must
 /// not be able to wedge a single-threaded server.
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Everything a request handler needs from the process. The three always travel
-/// together — `handle`, `chat` and `parse_ask` had spelled the same list out
-/// separately — and bundling them keeps `&mut Engine` where it belongs: threaded
-/// through, never cloned, exactly one live borrow at a time.
+/// Everything a request handler needs from the process. The three travel together (`handle`,
+/// `chat` and `parse_ask` had spelled the same list out separately), which keeps `&mut Engine`
+/// where it belongs: threaded through, never cloned, exactly one live borrow at a time.
 struct Ctx<'a, 'e> {
     engine: &'a mut Engine<'e>,
     tok: &'a Tokenizer,
@@ -122,11 +113,9 @@ struct Ctx<'a, 'e> {
 /// Serve until killed. llama-swap owns the process lifetime — it spawns on demand and
 /// kills on TTL — so there is no shutdown endpoint and no graceful drain to write.
 ///
-/// The accept is BLOCKING. The reference server polled with a 100 ms nap for exactly one
-/// reason: it beat a wedge watchdog from the idle loop, since an idle server generates no
-/// tokens and would otherwise be aborted as hung. This tree has no watchdog, so the poll
-/// would be a spin with nothing to feed — if a watchdog lands, the poll comes back with
-/// it, and not before.
+/// The accept is BLOCKING. The reference server polled with a 100 ms nap only to beat a wedge
+/// watchdog from the idle loop (an idle server generates no tokens and would read as hung). This
+/// tree has no watchdog, so the poll would be a spin with nothing to feed.
 pub fn serve(engine: &mut Engine<'_>, tok: &Tokenizer, opts: &Opts) -> Result<()> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", opts.port))
         .with_context(|| format!("bind 127.0.0.1:{}", opts.port))?;
@@ -312,9 +301,13 @@ fn frame_prompt(
         // checkpoint whose own template ships with a `reasoning_effort` axis nothing here
         // renders yet (S5 owns it).
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
-        // Inkling 2, both members (S1, 2026-11-23): the second door, quoting the table's const.
-        // `main` bails first; this holds if that door ever moves. S5 owns Mini's template.
-        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
+        // Inkling 2 Mini (S5, 2026-11-24): its own OpenAI-body renderer, which quotes the
+        // checkpoint's `reasoning_effort` axis rather than collapsing it into a boolean — the
+        // provider field `reasoning_effort` is passed through verbatim by `thinking_mode`.
+        Arch::Inkling2Loop => tok.encode(&inkling::inkling_prompt(body, (think, effort))?),
+        // Small is still ARMLESS (S6): the second door, quoting the table's const. `main`
+        // bails first; this holds if that door ever moves.
+        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 
@@ -335,10 +328,9 @@ fn frame_prompt(
 /// — it streamed the raw turn header and then wedged the channel for the rest of the request.
 ///
 /// Owned `String`s rather than `&str` slices, because Glimmer's channels are interleaved turns
-/// that have to be concatenated while GLM's are one span each. That is an allocation per token
-/// in the streaming arm, not per reply — on a path that already re-decodes the whole prefix
-/// every token at a few tok/s, which is the measurement that makes it not worth thinking
-/// about.
+/// that must be concatenated while GLM's are one span each. That is an allocation per token in
+/// the streaming arm — on a path that already re-decodes the whole prefix at a few tok/s, which
+/// is the measurement that makes it not worth avoiding.
 fn split_channels(text: &str, ask: &Ask, complete: bool) -> Result<(String, String)> {
     match ask.arch {
         Arch::MuseGlimmer => Ok(glimmer::split_glimmer(text, complete)),
@@ -366,9 +358,14 @@ fn split_channels(text: &str, ask: &Ask, complete: bool) -> Result<(String, Stri
         // > is S6's, in the commit that gives this architecture a real arm and rewrites both
         // > matches anyway.
         Arch::QwenFlashNext => bail!("{QWEN_ARM_NOT_BUILT}"),
-        // Inkling 2, both members: a refusal and not a panic, on the qwen arm's argument above
-        // — silently reading a reply with another model's channel markers is the M11b failure.
-        Arch::Inkling2Loop | Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
+        // Inkling 2 Mini (S5, 2026-11-24): the OTHER half of the framing pair, landed with it
+        // — `inkling_prompt` renders `<|message_model|><|content_thinking|>…` and
+        // `split_inkling` reads exactly those markers back. Wiring one without the other is
+        // the M11b revert this pair exists to prevent.
+        Arch::Inkling2Loop => Ok(inkling::split_inkling(text, complete)),
+        // Small, still armless: a refusal and not a panic, on the qwen arm's argument above —
+        // silently reading a reply with another model's channel markers is the M11b failure.
+        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 
@@ -698,16 +695,42 @@ mod tests {
             e.contains("no decode path for this architecture yet"),
             "the refusal must be the table's own wording, not a second one invented here: {e}"
         );
-        // Inkling 2's two members refuse on the same wording (S1, 2026-11-23) — one port, one
-        // const, both doors. Same claim as the qwen arm above, for both variants.
-        for arch in [Arch::Inkling2Loop, Arch::Inkling2] {
-            let e = format!(
-                "{:#}",
-                split(arch).expect_err("the armless inkling members must refuse")
-            );
+        // Inkling 2 SMALL still refuses on the table's wording (S6 owns its arm). Mini left
+        // this loop at S5 and is asserted below, from the other side.
+        let e = format!(
+            "{:#}",
+            split(Arch::Inkling2).expect_err("the armless inkling member must refuse")
+        );
+        assert!(
+            e.contains("no decode path for this architecture yet"),
+            "inkling's refusal must be the table's own wording: {e}"
+        );
+        // **The Mini round trip (S5, 2026-11-24).** A reply in Inkling's own channel markers —
+        // the pair `inkling_prompt` frames and `split_inkling` reads — must come back as
+        // (thinking, content), with no marker text in either. A dispatch wired to GLM's
+        // `</think>` reader would put the whole string in `reasoning` and leave `content`
+        // empty, which is the same visible signature the Glimmer half above pins; a MIXED pair
+        // (Mini's frames, GLM's reader) must therefore redden here.
+        let mini_reply = "<|message_model|><|content_thinking|>plan<|end_message|>\
+                          <|message_model|><|content_text|>hi<|end_message|>";
+        let (reasoning, content) =
+            split_channels(mini_reply, &ask(Arch::Inkling2Loop), true).expect("mini split");
+        // Trimmed: which channel a span lands in is the dispatch claim; the renderer's own
+        // whitespace around the markers is `inkling_encoding`'s business and is pinned there.
+        assert_eq!(
+            content.trim(),
+            "hi",
+            "the Mini arm must read its content channel"
+        );
+        assert_eq!(
+            reasoning.trim(),
+            "plan",
+            "the Mini arm must read its thinking channel"
+        );
+        for part in [&reasoning, &content] {
             assert!(
-                e.contains("no decode path for this architecture yet"),
-                "inkling's refusal must be the table's own wording: {e}"
+                !part.contains("<|"),
+                "a marker leaked into a channel: {part:?} — the reader is not Mini's"
             );
         }
     }

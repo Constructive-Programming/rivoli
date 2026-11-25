@@ -69,9 +69,174 @@ pub fn loop_cache_offset(
     num_layers + (loop_idx - 1) * (core_end - core_start) - core_start
 }
 
+/// The LogScale factor at `pos` (T9): `τ = 1 + α·ln(max((pos+1)/n_floor, 1))`. Full layers
+/// multiply their q/k normalisation by it; sliding layers never do. `n_floor` is 8192 in BOTH
+/// shipped configs — the class default (128000) is the trap. The ratio is clamped at 1.0, so
+/// `pos < n_floor` is exactly `τ = 1.0`.
+pub fn log_scale_tau(pos: usize, alpha: f32, n_floor: usize) -> f32 {
+    let floor = n_floor.max(1) as f32;
+    1.0 + alpha * (((pos + 1) as f32 / floor).max(1.0)).ln()
+}
+
+/// One streamed expert's staging-slot bytes: the w13 `[2I, H]` plus the down `[H, I]` bf16
+/// pair at `bytes_per` storage. This is the charge the floor reserves for the streaming path
+/// itself — `InklingScratch` does not hold it; [`super::pin`] does.
+pub fn single_expert_bytes(hidden: usize, inter: usize, bytes_per: usize) -> usize {
+    (2 * inter * hidden + hidden * inter) * bytes_per
+}
+
 /// Bytes per f32 — the engine's activations and caches are f32 (the residual stream and KV
 /// allocate `DeviceBuf::new(n*4)`; the glimmer drafter verdict records the same f32-cache rule).
 const F32: usize = 4;
+
+/// Bytes per bf16 — every dense projection and both expert slabs are stored bf16.
+const BF16: usize = 2;
+
+/// The bytes the six GLOBAL tensors occupy in the tier: `embed_tokens` bf16 (all
+/// `vocab_size` rows — T14, the embed is NOT unpadded), `embed_norm`/`norm`/`final_input.query`
+/// f32 (`hidden` each), `message_input.query` f32 (`core_size·4·hidden`, present exactly when
+/// the member loops), and `lm_head` bf16 (the live `unpadded_vocab_size` rows, T14).
+///
+/// The pin PLACES each of these from the artifact, which carries its own byte length; this is
+/// the deviceless restatement of that length, and the two are checked against each other by
+/// the pin's own floor listing rather than compared by eye.
+pub fn global_weight_bytes(text: &InklingTextConfig) -> usize {
+    let h = text.hidden_size;
+    let mut bytes = text.vocab_size * h * BF16; // embed_tokens
+    bytes += 3 * h * F32; // embed_norm, norm, final_input.query
+    bytes += text.unpadded_vocab_size * h * BF16; // lm_head
+    if let Some(lc) = &text.loop_config {
+        bytes += (lc.core_end - lc.core_start) * 4 * h * F32; // message_input.query
+    }
+    bytes
+}
+
+/// Every byte [`super::engine::InklingScratch`] allocates, named once.
+///
+/// **One author for the scratch's size.** The pin's [`rivoli_core::residency::Floor`] charges
+/// for what the engine will allocate, and [`super::engine::InklingScratch::new`] allocates
+/// exactly these fields — so a buffer added to the scratch without a field here is a floor the
+/// partition never saw, and the pin OOMs on `DeviceBuf::new` after the placement decision has
+/// already been made. `total` is the sum of the same numbers `new` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchSizes {
+    /// One position's residual stream (`hidden`).
+    pub residual: usize,
+    /// The block-residual bank: one residual vector per boundary slot, plus the partial.
+    pub bank: usize,
+    pub bank_slots: usize,
+    /// One query projection (`heads·head_dim`).
+    pub qd: usize,
+    /// One KV projection (`kv_heads·head_dim`).
+    pub kv_vec: usize,
+    /// One dynamic short-convolution's per-KV-head taps (`kv_heads·k`). NOT `kv_vec`: the tap
+    /// vectors are `k` wide, so charging the projection's width over-reserved the buffer 32×.
+    pub dyn_w: usize,
+    /// Cache layers, each with its own KV pair and its own four sconv states (T16).
+    pub n_cache: usize,
+    /// One KV cache tensor over `n_ctx` positions.
+    pub kv_tensor: usize,
+    /// One k/v short-convolution state.
+    pub sconv_kv: usize,
+    /// One post-attention/post-mlp short-convolution state.
+    pub sconv_h: usize,
+    pub rel_states: usize,
+    pub rel_logits: usize,
+    pub bias: usize,
+    /// One sink logit per query head.
+    pub sink: usize,
+    /// The live logit row (T14: `unpadded_vocab_size`).
+    pub logits: usize,
+    /// The MessageGate's rank-width scratch, at least one element wide.
+    pub gate_low: usize,
+    pub router: usize,
+    pub moe_gu: usize,
+    pub moe_h: usize,
+}
+
+impl ScratchSizes {
+    /// The sizes for `n_ctx` positions.
+    pub fn of(text: &InklingTextConfig, n_ctx: usize) -> Self {
+        let hidden = text.hidden_size;
+        let heads = text.num_attention_heads;
+        let kv_heads = text.num_key_value_heads;
+        let hd = text.head_dim;
+        let block = text.n_layers_per_attn_res_block.max(1);
+        let core = text
+            .loop_config
+            .as_ref()
+            .map(|lc| (lc.core_start, lc.core_end, lc.num_passes));
+        let gate_rank = text
+            .loop_config
+            .as_ref()
+            .map_or(1, |lc| lc.gate_rank)
+            .max(1);
+        // ONE computation, and `div_ceil`: floor division loses a partial block
+        // (`num_hidden_layers % block != 0`), which leaves the LAST boundary — plus the partial
+        // row — past a bank sized on the quotient, so `block_res_attend` writes out of bounds.
+        let bank_slots = text.num_hidden_layers.div_ceil(block) + 1;
+        Self {
+            residual: residual_bytes(hidden),
+            bank_slots,
+            bank: bank_slots * residual_bytes(hidden),
+            qd: heads * hd * F32,
+            kv_vec: kv_heads * hd * F32,
+            dyn_w: kv_heads * text.sconv_kernel_size * F32,
+            n_cache: cache_layer_count(text.num_hidden_layers, core),
+            kv_tensor: kv_tensor_bytes(kv_heads, hd, n_ctx),
+            sconv_kv: sconv_state_bytes(kv_heads * hd, text.sconv_kernel_size),
+            sconv_h: sconv_state_bytes(hidden, text.sconv_kernel_size),
+            rel_states: heads * text.d_rel * F32,
+            // The full layers' extent is `rel_extent`, the sliding layers' the window (T17):
+            // one scratch serves both, so it holds the larger.
+            rel_logits: heads * text.rel_extent.max(text.sliding_window_size) * F32,
+            bias: heads * n_ctx * F32,
+            sink: heads * F32,
+            logits: text.unpadded_vocab_size * F32,
+            gate_low: gate_rank * F32,
+            router: text.n_routed_experts * F32,
+            moe_gu: 2 * text.intermediate_size * F32,
+            moe_h: text.intermediate_size * F32,
+        }
+    }
+
+    /// The total bytes [`super::engine::InklingScratch::new`] allocates — ONE term per buffer,
+    /// in the order `new` allocates them, so a missing term is a visible line rather than a
+    /// rounding difference.
+    pub fn total(&self) -> usize {
+        let r = self.residual;
+        let mut n = 0;
+        n += 4 * r; // x, xn, xn_k, xn_v
+        n += self.bank; // block_bank
+        n += self.n_cache * (2 * self.sconv_kv + 2 * self.sconv_h); // sconv states
+        n += 2 * self.n_cache * self.kv_tensor; // kc, vc
+        n += 2 * r + 2 * self.bank; // pre_loop_x, pre_loop_bank, prev_pass_x, prev_pass_bank
+        n += 3 * self.qd; // q, attn, gate
+        n += 2 * self.kv_vec; // k, v
+        n += self.rel_states + self.rel_logits + self.bias + self.sink;
+        n += self.logits;
+        n += self.bank; // stacked
+        n += 4 * r; // res_out
+        n += 4 * self.bank_slots * F32; // res_bias
+        n += 4 * F32; // res_sink
+        n += 4 * r; // msg_buf
+        n += self.dyn_w; // dyn_w
+        n += r; // branch
+        n += 4 * r; // gate_cat, gate_f, gate_g
+        n += self.gate_low;
+        n += 3 * r; // xn_q_tmp, xn_k_tmp, xn_v_tmp
+        n += self.router;
+        n += self.moe_gu + self.moe_h;
+        n += 2 * r; // moe_out, moe_acc
+        n += 8; // pick: one i32 index and one f32 value
+        n
+    }
+
+    /// The KV caches' share of [`Self::total`] — the floor's `kv_at_max_ctx` bucket.
+    pub fn kv_total(&self) -> usize {
+        2 * self.n_cache * self.kv_tensor
+    }
+}
 
 /// One position's residual stream: `hidden` f32.
 pub fn residual_bytes(hidden: usize) -> usize {
@@ -183,6 +348,16 @@ pub fn dense_layer_elements(text: &InklingTextConfig, layer: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// The vendored Mini member's config — the ONE reader of the pinned fixture, so a test that
+    /// needs it cannot spell the path (or the parse) a second way.
+    #[allow(clippy::unwrap_used)] // test: the vendored config is a pinned fixture
+    fn mini_cfg() -> rivoli_artifact::inkling_config::Inkling2LoopConfig {
+        serde_json::from_str(include_str!(
+            "../../../../docs/measurement/inkling2-reference/mini/config.json"
+        ))
+        .unwrap()
+    }
+
     #[test]
     fn mini_schedule_runs_the_core_three_times() {
         // 24 stored layers, core [6,18), 3 passes → 6 + 36 + 6 = 48 applications.
@@ -233,6 +408,55 @@ mod tests {
     }
 
     #[test]
+    fn log_scale_tau_is_flat_inside_the_floor() {
+        // T9: 8192 is BOTH shipped members' floor; the class default (128000) is the trap.
+        let alpha = 0.1f32;
+        for pos in [0, 1, 100, 8190, 8191] {
+            assert_eq!(log_scale_tau(pos, alpha, 8192), 1.0, "pos {pos}");
+        }
+        let scaled = log_scale_tau(8192, alpha, 8192);
+        assert!(
+            scaled > 1.0,
+            "the first position past the floor scales: {scaled}"
+        );
+        assert!((scaled - (1.0 + 0.1 * (8193.0f32 / 8192.0).ln())).abs() < 1e-6);
+        // alpha = 0 is the identity everywhere (the knob-off arm).
+        assert_eq!(log_scale_tau(1 << 20, 0.0, 8192), 1.0);
+    }
+
+    /// The pin's floor charges [`ScratchSizes::total`], and `InklingScratch::new` allocates
+    /// `ScratchSizes`' fields — the two are ONE type, so this asserts the shape a reader can check
+    /// deviceless: the KV is a proper subset, and the loop needs 48 cache layers (T16).
+    #[test]
+    fn scratch_total_is_the_scratch_allocation_and_exceeds_its_kv() {
+        let cfg = mini_cfg();
+        let text = &cfg.text;
+        let s = ScratchSizes::of(text, 129);
+        assert_eq!(
+            s.n_cache, 48,
+            "T16: 24 stored layers + 2 extra passes of 12"
+        );
+        assert!(s.kv_total() > 0);
+        assert!(
+            s.total() > s.kv_total(),
+            "the activations ride on top of the KV cache"
+        );
+        assert!(single_expert_bytes(2304, 1152, 2) > 0);
+        assert!(global_weight_bytes(text) > 0);
+    }
+
+    /// A PARTIAL final block must still buy its own bank slot. `num_hidden_layers % block != 0`
+    /// is the shape floor division under-counts, and the last boundary plus the partial row then
+    /// writes past a bank sized on the quotient. 25 layers over 6 → ⌈25/6⌉ + 1 = 6, not 5.
+    #[test]
+    fn bank_slots_count_the_partial_final_block() {
+        let mut text = mini_cfg().text;
+        text.num_hidden_layers = 25;
+        text.n_layers_per_attn_res_block = 6;
+        assert_eq!(ScratchSizes::of(&text, 129).bank_slots, 6);
+    }
+
+    #[test]
     fn loop_cache_offset_matches_t16() {
         // Mini: 24 layers, core [6,18). pass2 (loop_idx 1) → 18, pass3 (loop_idx 2) → 30.
         assert_eq!(loop_cache_offset(24, 6, 18, 1), 18);
@@ -272,12 +496,9 @@ mod tests {
     /// are the streamed unit ([`expert_layer_bytes`]) and are excluded here BY NAME, so an
     /// accidental extra tensor in either list reddens one side.
     #[test]
-    #[allow(clippy::unwrap_used)] // test: the vendored config and census are pinned fixtures; a parse failure is a test failure
+    #[allow(clippy::unwrap_used)] // test: the vendored census is a pinned fixture; a parse failure is a test failure
     fn dense_layer_elements_matches_the_mini_census_for_every_layer() {
-        let cfg: rivoli_artifact::inkling_config::Inkling2LoopConfig = serde_json::from_str(
-            include_str!("../../../../docs/measurement/inkling2-reference/mini/config.json"),
-        )
-        .unwrap();
+        let cfg = mini_cfg();
         let text = &cfg.text;
         let tsv = include_str!(
             "../../../../docs/measurement/inkling2-reference/mini/text-model-names.tsv"

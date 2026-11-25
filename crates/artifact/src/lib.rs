@@ -26,6 +26,12 @@ pub mod glm_config;
 /// stay separate.
 pub mod inkling_config;
 pub mod inkling_dequant;
+/// Inkling 2's chat framing — a hand-port of the checkpoint's `chat_template.jinja`. A sibling
+/// of [`glimmer_encoding`] and [`qwen_encoding`] for their reason: it builds a **string** that
+/// is tokenized afterwards, and unlike GLM's ID-list encoder it returns a `Result` because the
+/// template calls `raise_exception` on several reachable inputs (unknown role, audio content,
+/// out-of-range effort).
+pub mod inkling_encoding;
 pub mod k3_config;
 pub mod quant;
 pub mod qwen_config;

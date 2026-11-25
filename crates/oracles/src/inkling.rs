@@ -79,23 +79,88 @@ pub fn rmsnorm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 pub fn sconv(weight: &[f32], state: &[f32], current: &[f32], divisor: f32) -> (Vec<f32>, Vec<f32>) {
     let channels = current.len();
     let k = weight.len() / channels;
-    let hist = k - 1;
-    let mut out = Vec::with_capacity(channels);
-    let mut next = Vec::with_capacity(channels * hist);
-    for (c, &cur) in current.iter().enumerate() {
+    sconv_pass((current, state), (k, divisor), |c, cur, st, hist| {
         let (wb, sb) = (c * k, c * hist);
         let mut acc = 0.0f32;
         for j in 0..hist {
-            acc += weight[wb + j] * state[sb + j];
+            acc += weight[wb + j] * st[sb + j];
         }
-        acc += weight[wb + hist] * cur;
-        out.push((acc + cur) / divisor);
-        if hist > 0 {
-            next.extend_from_slice(&state[sb + 1..sb + hist]);
-            next.push(cur);
-        }
+        acc + weight[wb + hist] * cur
+    })
+}
+
+/// The state advance both short-convolution variants share: shift channel `sb`'s `hist`-long
+/// history left one and append `cur` (MOD:254). `(sb, hist)` travel as one pair so the helper
+/// stays at four arguments.
+fn shift_state(state: &[f32], (sb, hist): (usize, usize), cur: f32, next: &mut Vec<f32>) {
+    if hist > 0 {
+        next.extend_from_slice(&state[sb + 1..sb + hist]);
+        next.push(cur);
+    }
+}
+
+/// The per-channel decode pass both short-convolution variants share: it walks `current`, asks
+/// `taps` for that channel's accumulated k-tap dot, writes the dot plus the residual over
+/// `divisor`, and advances the channel's history through [`shift_state`] (MOD:254).
+///
+/// `taps` receives `(channel, current, state, hist)` and returns the dot in its OWN association
+/// order, so neither variant's arithmetic — nor its summation order — moves in here: the static
+/// variant folds from zero in tap order and adds the current tap last, the dynamic one starts from
+/// its modulated current tap. That is also why the two weight layouts never reach this function.
+fn sconv_pass(
+    (current, state): (&[f32], &[f32]),
+    (k, divisor): (usize, f32),
+    taps: impl Fn(usize, f32, &[f32], usize) -> f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let hist = k - 1;
+    let mut out = Vec::with_capacity(current.len());
+    let mut next = Vec::with_capacity(current.len() * hist);
+    for (c, &cur) in current.iter().enumerate() {
+        let sb = c * hist;
+        out.push((taps(c, cur, state, hist) + cur) / divisor);
+        shift_state(state, (sb, hist), cur, &mut next);
     }
     (out, next)
+}
+
+/// The dynamic short-convolution's operands, as its kernel takes them: a SHARED static filter
+/// `[k, channels]` row-major modulated by a per-head dynamic tap vector `[heads, k]`, the
+/// chronological `[channels, k−1]` state, and the current token. Named fields rather than seven
+/// positional arguments, where `k`/`head_dim` transposed is a wrong answer, not a type error.
+pub struct DynamicSconv<'a> {
+    pub static_w: &'a [f32],
+    pub dyn_w: &'a [f32],
+    pub state: &'a [f32],
+    pub current: &'a [f32],
+    pub head_dim: usize,
+    pub k: usize,
+    pub divisor: f32,
+}
+
+/// `Inkling2ShortConvolution.forward` (MOD:349) DYNAMIC decode step, otherwise the [`sconv`]
+/// body: `w_lag(c) = static_w[lag][c] + dyn_w[c/head_dim][lag]`, lag 0 the current token and lag
+/// `j` the state slot `hist − j`. The divisor is the caller's (T15: `√(2k+1) = 3` at k=4). Returns
+/// the output and the ADVANCED state, same shift+append as the static variant.
+pub fn sconv_dynamic(d: &DynamicSconv<'_>) -> (Vec<f32>, Vec<f32>) {
+    let channels = d.current.len();
+    sconv_pass(
+        (d.current, d.state),
+        (d.k, d.divisor),
+        |c, cur, st, hist| {
+            let head = c / d.head_dim;
+            let mut acc = (d.static_w[c] + d.dyn_w[head * d.k]) * cur;
+            for lag in 1..d.k {
+                let w = d.static_w[lag * channels + c] + d.dyn_w[head * d.k + lag];
+                acc += w * st[c * hist + (hist - lag)];
+            }
+            acc
+        },
+    )
+}
+
+/// The vector update inkling's decode folds into a scaled accumulation: `x[i] + alpha·y[i]`.
+pub fn vaxpy(x: &[f32], y: &[f32], alpha: f32) -> Vec<f32> {
+    x.iter().zip(y).map(|(&a, &b)| a + alpha * b).collect()
 }
 
 /// `eager_attention_forward` (MOD:530–543) single-query decode step with an attention sink: the
@@ -382,5 +447,45 @@ mod tests {
         assert_eq!(bias, vec![2.0, 1.0, 0.0]);
         // A window that starts past the query masks everything (no key is at or before `pos`).
         assert_eq!(rel_bias_gather(&row, 4, 10, (11, 2)), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn sconv_dynamic_adds_the_per_head_taps_and_shifts_state() {
+        // 2 heads of head_dim 2, k = 2, T15's dynamic divisor /3. Static lag 0 is the current
+        // token's tap, lag 1 the previous one; each head's dynamic vector modulates both.
+        let static_w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let dyn_w = [0.5, 0.25, 1.5, 0.75];
+        let state = [10.0, 20.0, 30.0, 40.0];
+        let current = [2.0, 4.0, 6.0, 8.0];
+        let d = DynamicSconv {
+            static_w: &static_w,
+            dyn_w: &dyn_w,
+            state: &state,
+            current: &current,
+            head_dim: 2,
+            k: 2,
+            divisor: 3.0,
+        };
+        let (out, next) = sconv_dynamic(&d);
+        // c=0: (1+0.5)·2 + (5+0.25)·10 = 55.5 → (55.5+2)/3; c=1: 10+125 → 139/3.
+        // c=2 (head 1): 27+232.5 → 265.5/3; c=3: 44+350 → 402/3.
+        let want = [57.5 / 3.0, 139.0 / 3.0, 265.5 / 3.0, 402.0 / 3.0];
+        for (i, (want, got)) in want.iter().zip(&out).enumerate() {
+            assert!((got - want).abs() < 1e-5, "c={i}: {want} vs {got}");
+        }
+        // The lag order is load-bearing: swapping lag 0 and lag 1 would give
+        // ((5+0.25)·2 + (1+0.5)·10 + 2)/3, which is not this answer.
+        assert!((out[0] - 27.5 / 3.0).abs() > 1e-3);
+        // Hist 1: the state shifts left and appends the current token.
+        assert_eq!(next, current.to_vec());
+    }
+
+    #[test]
+    fn vaxpy_accumulates_the_scaled_second_vector() {
+        let x = [1.0, -2.0, 0.0];
+        let y = [2.0, 3.0, -4.0];
+        assert_eq!(vaxpy(&x, &y, -2.5), vec![-4.0, -9.5, 10.0]);
+        // alpha = 0 is the identity, not a refusal: the update still writes x back unchanged.
+        assert_eq!(vaxpy(&x, &y, 0.0), x.to_vec());
     }
 }

@@ -1,7 +1,7 @@
 ---
 status: live
 scope: inkling
-verdict: S0 THROUGH S4 ARE BUILT and S5-S8 are not -- the Inkling 2 port (owner scope 2026-11-23 both members, Mini first, text-only v1, MTP refused) has its identity pinned Mini @ 7a67ae23 and Small-MXFP8 @ 14f2cb29 vendored and hash-gated, the shared tiktoken rank file vendored once byte-identical between members, the Mini checkpoint downloaded and sha256-verified at 19.5 GB, the text-stack and loop math extracted with citations in reference/inkling2-architecture.md, and the checkpoint name mapping RESOLVED from transformers' on-load conversion ops. S1 lands the refusing-first surface (two Arch variants sharing scope inkling, root-only sniff, one shared text config behind two wrappers, a legality row refusing every cell, every door quoting INKLING_ARM_NOT_BUILT, two golden magics, a config-pin byte-compare gate), all red-proofed. S2 lands the Mini converter: a census::inkling classification module, an NVFP4/MXFP8 dequant oracle bit-compared against the first-party transformers ops (dequant-golden.json), and convert_inkling which consumed 822 TEXT tensors and excluded 422 vision tensors by name on the real shard, emitting 693 tensors whose names and shapes equal the first-party text model's state dict (text-model-names.tsv); mtp.safetensors never opened. S3 lands the first-party anchor: tiny-config CPU fp32 goldens from transformers' own inkling2_loop text model, three vendored byte-pinned goldens reproduced 3 of 3 (the decode pair is the model's CACHED step -- a 16-token prefill whose cache is not captured, then ONE token stepped against it, with every loop pass stored), a five-trap defect matrix reddening on both draws with declared first-touched buckets, and carved fp32-vs-fp64 tolerance floors (the reference is fp32-locked); see measurement/inkling2-reference/anchor.md. S4 lands ten ORACLE_VALIDATED Rust kernels (no C twin, owner direction 2026-11-24) -- l2_clip/scaled_l2_clip/log_scaled_l2_clip, mxfp8_dequant/nvfp4_dequant, sconv, sink_attend, message_gate, kv_scatter, rel_bias_gather -- each GPU-verified against a first-party CPU oracle with a recorded red proof (gate-red-proofs.md §22a-g), the census holding both ends (76 launchers, 10 oracle-validated, 16 classified uncalled); the MoE activation reuses situ_glu_f32 and RMSNorm reuses rmsnorm_single (measured bit-identical), and the block-residual/dynamic-sconv/rel-bias are reuse + S5 integration (the sink=-inf sink-less identity witnessed). S5 (the Mini engine arm) is next; Small-MXFP8 is the Small source because transformers supports no NVFP4 Small checkpoint.
+verdict: S0 THROUGH S5 ARE BUILT and S6-S8 are not -- the Inkling 2 port (owner scope 2026-11-23 both members, Mini first, text-only v1, MTP refused) has its identity pinned Mini @ 7a67ae23 and Small-MXFP8 @ 14f2cb29 vendored and hash-gated, the shared tiktoken rank file vendored once byte-identical between members, the Mini checkpoint downloaded and sha256-verified at 19.5 GB, the text-stack and loop math extracted with citations in reference/inkling2-architecture.md, and the checkpoint name mapping RESOLVED from transformers' on-load conversion ops. S1 lands the refusing-first surface; S2 lands the Mini converter (822 TEXT consumed, 422 EXCLUDED-VISION by name, 693 output names+shapes equal to text-model-names.tsv, mtp.safetensors never opened); S3 lands the first-party cached-decode anchor (3 goldens reproduced 3 of 3, 16 tensors/golden incl. all 3 loop passes, 5-trap defect matrix, 7 non-vacuous fp32-vs-fp64 floors); S4+S5 land twelve ORACLE_VALIDATED Rust kernels (78 launchers, 63 production callers, 15 classified uncalled, 12 oracle-validated), Inkling tiktoken + chat template + serve channel split, and the full Mini (`inkling2_loop`) decode/serve/TF-scoring arm wired through seam.rs and legality.rs — verified against the S3 tiny-anchor golden (`inkling_engine_anchor.rs` 3/3 GPU), 8/8 token-identical to first-party transformers `Inkling2LoopForConditionalGeneration.from_pretrained` on "Hi", P4 residency-invariant (90 GiB pinned vs 20 GiB 8/24 streamed: 16/16 identical ids), TF `--ppl` coherent on all 830/830 tokens of TOUR.md (PPL 9.617), release 11.95 tok/s pinned, and `tests/smoke-inkling.sh` 16/16 green + red-proofed. S6 (Small-MXFP8 ~619 GB streaming arm, weights not yet downloaded) is next.
 ---
 
 # Inkling 2: port plan of record
@@ -41,9 +41,9 @@ recognition + legality + doors land RED before any engine code exists.
 | S1 | refusing-first landing: Arch variants + sniff + config types + legality rows + doors + golden magics + pin gate, each refusal red-proofed, deviceless battery green | **built 2026-11-23** |
 | S2 | Mini artifact converter: exact consumed/emitted counts, exclusions BY NAME (vision families, `mtp.*`), NVFP4/MXFP8 dequant per the first-party oracle, w13 de-interleave | **built 2026-11-24** |
 | S3 | anchors: transformers `main` @ `d8f10a82` + torch CPU venv; tiny-config fp32 goldens from the first-party text model, the decode pair being the model's own CACHED step with every loop pass captured; defect matrix off the traps table; carved fp32 tolerance floors on ≥2 draws (anchor.md) | **built 2026-11-24** |
-| S4 | kernels: ten ORACLE_VALIDATED Rust kernels (clips ×3, dequants ×2, sconv, sink_attend, message_gate, kv_scatter, rel_bias_gather), no C twin (owner 2026-11-24); MoE = `situ_glu_f32` reuse, RMSNorm = `rmsnorm_single` reuse; block-residual/dynamic-sconv/rel-bias = reuse + S5; census both ends; red proofs §22a–g | **built 2026-11-24** |
-| S5 | Mini engine arm (looped decode, per-pass cache residency) + parity/ppl gates + thin `tests/smoke-inkling.sh` WITH the exit gate | open |
-| S6 | Small streaming arm (Small-MXFP8 source download, residency plan) + its gates | open |
+| S4 | kernels: twelve ORACLE_VALIDATED Rust kernels (clips ×3, dequants ×2, sconv, sconv_dynamic, sink_attend, message_gate, vaxpy, kv_scatter, rel_bias_gather), no C twin (owner 2026-11-24); MoE = `situ_glu_f32` reuse, RMSNorm = `rmsnorm_single` reuse; census both ends (78/63/15/12); red proofs §22a–g | **built 2026-11-24** |
+| S5 | Mini engine arm (looped decode, dynamic sconv, block residual, MessageGate, MoE, P6 residency partition, tiktoken/chat/serve, TF `--ppl`, `inkling_engine_anchor.rs`, `tests/smoke-inkling.sh` green + red-proofed, 8/8 first-party parity, P4 16/16 invariance, S5 ponytail+correctness audit closed) | **built 2026-11-25** |
+| S6 | Small streaming arm (Small-MXFP8 48-shard ~619 GB download, census, MXFP8 streaming converter/residency plan) + its gates | open |
 | S7 | first measured decode + the gate battery on the box | open |
 | S8 | closeout: verdicts corrected in place, census answered out loud | open |
 
@@ -369,10 +369,16 @@ the f32-consumed norms/clip-scales/sconv weights are widened bf16→f32 (the lau
 zero-copy and fused: the source bytes are the mmap'd slices, and the dequant writes bf16 DIRECTLY
 with the `w13` de-interleave folded in, so no f32 plane of a 128-expert layer is ever allocated. The
 attention sub-block is wired (`attention`: input norm(s) → q/kv/rel-bias/sink → GQA sink attend →
-gated output, the sink read ON DEVICE); the decoder layer (block-residual queries,
-post-attn/post-mlp sconv, MoE, residual) is the next piece.
-The layer-loop assembly (`forward`/`decode`), the residency partition, the parity/ppl gates, and
-`tests/smoke-inkling.sh` with its exit gate are the remaining S5 work.
+gated output, the sink read ON DEVICE). On 2026-11-25 the remaining S5 pieces landed and were audited:
+`sconv_dynamic` and `vaxpy` kernels (12 ORACLE_VALIDATED, 78/63/15/12 census), Inkling inline-specials
+`tiktoken.rs` + `inkling_encoding.rs` + `serve/inkling.rs`, the full `InklingPin` (`residency::partition`),
+`InklingEngine`, `decode.rs` (loop passes, MessageGates, block-res, MoE, TF `--ppl`), `seam.rs` /
+`legality.rs` / CLI / serve wiring, `inkling_engine_anchor.rs` (3/3 GPU green against S3 golden),
+8/8 greedy token parity with `Inkling2LoopForConditionalGeneration.from_pretrained` on `"Hi"`
+(`[200001, 200008, 371, 150409, 150239, 150330, 196980, 4896]`), P4 residency invariance (90 GiB 24/24
+pinned vs 20 GiB 8/24 streamed: 16/16 identical ids), TF `--ppl` row-coherent on 830/830 tokens of
+`TOUR.md` (PPL 9.617419, mean NLL 2.263576), release 11.95 tok/s pinned, and `tests/smoke-inkling.sh`
+(16/16 green + `--expect-red` red-proofed).
 
 ## Integration surface (S1's edit list)
 
@@ -423,14 +429,14 @@ Model membership is data in the checked census tables.
    3 of 3, a five-trap defect matrix reddening on both draws with declared first-touched buckets,
    and carved fp32-vs-fp64 tolerance floors (the reference is fp32-locked). Record:
    `docs/measurement/inkling2-reference/anchor.md`; gate `crates/oracles/tests/inkling_anchor.rs`.
-5. **Kernel census both ends**: OPEN (S4); every new launcher gets a bit-identity ROWS
-   entry + `=>` row or a live DEFERRED row, never parked.
+5. **Kernel census both ends**: CLOSED (S4+S5). `kernel_coverage.rs` checks all 78 launchers (63 callers,
+   15 classified uncalled, 12 `ORACLE_VALIDATED`) both ends against `docs/reference/kernel-inventory.md`.
 6. **Registration in the SAME change**: this change adds `"inkling"` to SCOPES, both
    docs, and their INDEX rows. CLOSED with S0.
-7. **Thin smoke WITH the exit gate**: OPEN (S5); `tests/smoke-inkling.sh` lands with the
-   Mini arm's exit gate, red-proofed.
-8. **Behaviour+ABI names**: OPEN until S4's kernels exist; the naming exception for
-   port-boundary modules is argued above.
+7. **Thin smoke WITH the exit gate**: CLOSED (S5). `tests/smoke-inkling.sh` landed with Mini's exit gate
+   (16/16 green + `--expect-red` red-proofed 2026-11-25).
+8. **Behaviour+ABI names**: CLOSED (S4+S5); every kernel and ABI struct is behaviour+ABI named; port-boundary
+   modules argued above.
 
 ## Measurement posture
 

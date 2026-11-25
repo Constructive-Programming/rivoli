@@ -555,6 +555,8 @@ const ORACLE_VALIDATED: &[(&str, &str)] = &[
     ("mxfp8_dequant", "kernel_inkling_dequant.rs"),
     ("nvfp4_dequant", "kernel_inkling_dequant.rs"),
     ("sconv", "kernel_inkling_sconv.rs"),
+    ("sconv_dynamic", "kernel_inkling_sconv.rs"),
+    ("vaxpy", "kernel_inkling_vaxpy.rs"),
     ("sink_attend", "kernel_inkling_sink_attend.rs"),
     ("message_gate", "kernel_inkling_message_gate.rs"),
     ("kv_scatter", "kernel_inkling_kv_scatter.rs"),

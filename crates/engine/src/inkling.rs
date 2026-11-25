@@ -4,11 +4,14 @@
 //! on record (glm/glimmer/k3/v4), so it lives in its own files rather than behind an arch flag.
 //!
 //! `geometry` is NOT gated on the backend (arithmetic over a config, touching no device, built
-//! and tested by the deviceless CI arm); the loop body, pin, and decode are `rocm`-gated.
+//! and tested by the deviceless CI arm); the pin, the launch composition (`forward`), and the
+//! decode driver (`decode`) are `rocm`-gated.
 
 pub mod geometry;
 pub mod names;
 
+#[cfg(feature = "rocm")]
+pub mod decode;
 #[cfg(feature = "rocm")]
 pub mod engine;
 #[cfg(feature = "rocm")]
