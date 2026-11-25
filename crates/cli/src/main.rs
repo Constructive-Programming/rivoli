@@ -20,14 +20,16 @@ use anyhow::{Context, Result, bail};
 // another file's token for token the moment the K3 import landed, and the jscpd gate
 // reported the pair — an import list being the one duplication Rust cannot factor.
 use rivoli_artifact::{
-    format::RoutedFmt, glimmer_config::GlimmerConfig, glm_config::ModelConfig,
-    inkling_config::Inkling2LoopConfig, k3_config::K3Config, tokenizer::Tokenizer,
+    format::RoutedFmt,
+    glimmer_config::GlimmerConfig,
+    glm_config::ModelConfig,
+    inkling_config::{Inkling2Config, Inkling2LoopConfig},
+    k3_config::K3Config,
+    tokenizer::Tokenizer,
     v4_config::V4Config,
 };
 use rivoli_core::cache::TwoQSplit;
-use rivoli_core::legality::{
-    Arch, Flag, INKLING_ARM_NOT_BUILT, Mode, Outcome, QWEN_ARM_NOT_BUILT, decide,
-};
+use rivoli_core::legality::{Arch, Flag, Mode, Outcome, QWEN_ARM_NOT_BUILT, decide};
 use rivoli_engine::{ArchCfg, Engine, OpenSpec, PoolKnobs};
 
 // Private to the binary rather than `pub` in `lib.rs`: these have exactly one consumer,
@@ -189,11 +191,14 @@ fn main() -> Result<()> {
             let cfg = Inkling2LoopConfig::load(&a.model)?;
             open_and_run(&a, &tok, inv, ArchCfg::InklingLoop(&cfg))
         }
-        // Small stays ARMLESS until S6 (the bigger-than-memory streaming case): its row of the
-        // table refuses `--mode` and `--attn`, so this bail is unreachable while the row holds,
-        // and the ARMS test below ties the two halves together. Same const as before — the
-        // port is one shared text stack, and Mini's arm landing does not reword Small's door.
-        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
+        // **Small (S6, 2026-11-25): the same stack, a routed pool.** It takes `PoolKnobs`
+        // where Mini takes none, because ~600 GB of `.mxfp8` experts cannot be partitioned by
+        // a fixed layer prefix — the policy, the 2Q split and the trace path all describe the
+        // pool this member streams through.
+        Arch::Inkling2 => {
+            let cfg = Inkling2Config::load(&a.model)?;
+            open_and_run(&a, &tok, inv, ArchCfg::Inkling(&cfg, pool_knobs(&a)))
+        }
     }
 }
 
@@ -513,13 +518,10 @@ mod tests {
         );
         let first = *flags.first().expect("at least --mode");
         // One row per architecture with no decode arm, each with the const its table row
-        // answers `--mode` with. The array is the population: a third armless architecture
-        // added without a row here leaves its `--mtp` ordering unchecked. Mini left this list
-        // at S5 when its row flipped.
-        const ARMLESS: [(Arch, &str); 2] = [
-            (Arch::QwenFlashNext, QWEN_ARM_NOT_BUILT),
-            (Arch::Inkling2, INKLING_ARM_NOT_BUILT),
-        ];
+        // answers `--mode` with. The array is the population: an armless architecture added
+        // without a row here leaves its `--mtp` ordering unchecked. Mini left this list at S5
+        // and Small at S6, so exactly one row is left.
+        const ARMLESS: [(Arch, &str); 1] = [(Arch::QwenFlashNext, QWEN_ARM_NOT_BUILT)];
         for (arch, want) in ARMLESS {
             assert_eq!(
                 decide(arch, first),
@@ -527,24 +529,23 @@ mod tests {
                 "the FIRST cell judged on {arch:?} is what the user reads"
             );
         }
-        // Mini's `--mode` cell must NOT refuse, which is what makes its `--mtp` cell reachable
-        // — and the cell must then answer with a refusal that is not the arm-not-built text,
-        // or a Mini user is told to wait for an arm that is already there.
-        assert!(
-            matches!(
-                decide(Arch::Inkling2Loop, first),
-                Outcome::FallbackLoudly(_)
-            ),
-            "Mini's --mode cell must fall back loudly: a refusal here would make the \
-             smoke script's mtp cell quote the wrong text"
-        );
-        match decide(Arch::Inkling2Loop, Flag::Mtp) {
-            Outcome::Refuse(why) => assert_ne!(
-                why, INKLING_ARM_NOT_BUILT,
-                "Mini's --mtp cell must answer with its draft-stack reason, not the \
-                 arm-not-built text — the arm exists"
-            ),
-            other => panic!("Mini's --mtp cell must refuse; got {other:?}"),
+        // BOTH Inkling members: `--mode` must NOT refuse on either, which is what makes the
+        // `--mtp` cell reachable — and that cell must then refuse, or the smoke scripts' `mtp`
+        // expectations quote a text the CLI never prints. The wording itself is the table's
+        // and is pinned there (`inkling2_loop_row_is_the_s5_truth`,
+        // `inkling2_row_is_the_s6_truth`); re-stating it here would be the second authority.
+        for arch in [Arch::Inkling2Loop, Arch::Inkling2] {
+            assert!(
+                matches!(decide(arch, first), Outcome::FallbackLoudly(_)),
+                "{}'s --mode cell must fall back loudly: a refusal here would make the \
+                 smoke script's mtp cell quote the wrong text",
+                arch.name()
+            );
+            assert!(
+                matches!(decide(arch, Flag::Mtp), Outcome::Refuse(_)),
+                "{}'s --mtp cell must refuse",
+                arch.name()
+            );
         }
     }
 
@@ -572,7 +573,7 @@ mod tests {
         // Hand-written, on the same argument as `legality::ARCH_COUNT`: no test can observe
         // a `match`'s arms, so the list is stated and the assertion is what binds it. Adding
         // an arm to `main` without a row here leaves that architecture unchecked.
-        const ARMS: [Arch; 5] = [
+        const ARMS: [Arch; 6] = [
             Arch::GlmMoeDsa,
             Arch::MuseGlimmer,
             Arch::DeepseekV4,
@@ -580,6 +581,8 @@ mod tests {
             // Added at S5 with the Mini arm: this list is what binds `main`'s dispatch to the
             // table, so an arm landing without a row here leaves it unchecked.
             Arch::Inkling2Loop,
+            // S6's Small-MXFP8 arm, same contract.
+            Arch::Inkling2,
         ];
         let Ok(a) = <Args as clap::Parser>::try_parse_from(["rivoli", "DIR", "--bench", "1"])
         else {

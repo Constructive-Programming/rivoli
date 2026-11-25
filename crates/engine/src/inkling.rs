@@ -16,5 +16,9 @@ pub mod decode;
 pub mod engine;
 #[cfg(feature = "rocm")]
 pub mod forward;
+/// Small's routed `.mxfp8` dispatch — the two-stream MoE block, split out of `decode` by the
+/// 800-line soft cap.
+#[cfg(feature = "rocm")]
+pub mod moe_mxfp8;
 #[cfg(feature = "rocm")]
 pub mod pin;

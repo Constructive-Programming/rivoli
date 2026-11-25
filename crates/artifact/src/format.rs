@@ -12,6 +12,10 @@
 //! L{00..NN}.f4           # DeepSeek-V4-Flash (bin/convert_v4): header + exactly n_experts
 //!                        #   FP4 blocks and NO shared block — V4's shared expert is fp8
 //!                        #   e4m3 and rides `resident.safetensors`. See [`RoutedFmt`].
+//! L{00..47}.mxfp8        # Inkling-2-Small (bin/convert_inkling_small): header + exactly
+//!                        #   n_experts MXFP8 blocks (one e4m3 byte per weight, one ue8m0
+//!                        #   byte per 32 along the input dim), NO shared block — Small ships
+//!                        #   `n_shared_experts 0`. See [`RoutedFmt`] and [`mxfp8_repack`].
 //! ```
 //!
 //! **This file is now the SHARED VOCABULARY; one job per submodule.** Split 2026-08-15 under
@@ -46,6 +50,8 @@ pub mod expert;
 pub mod header;
 pub mod layer;
 pub mod meta;
+/// The `.mxfp8` per-layer repack — Inkling-2-Small's interleaved `w13` pair into one file.
+pub mod mxfp8_repack;
 pub mod repack;
 pub mod set;
 pub mod tensors;
@@ -61,11 +67,16 @@ mod fixtures;
 /// justifies making them move. Adding a submodule is a file-layout decision; it is not an
 /// API change, and this block is what keeps the two separate.
 pub use expert::{F4_NAMING_K3, F4_NAMING_V4, F4Expert, F4Naming};
-pub use header::{EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, LayerDims, RoutedFmt, VQ3_MAGIC};
+pub use header::{
+    EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, LayerDims, MXFP8_MAGIC, RoutedFmt, VQ3_MAGIC,
+};
 pub use layer::{ExpertFile, LAYER_WINDOW, write_expert_layer};
 pub use meta::{ArtifactDirs, FormatMeta, I4Source, finish_artifact, require_aux};
+pub use mxfp8_repack::{LayerInputs, LayerShape, Mxfp8Expert, Mxfp8Layer, mxfp8_expert_prefix};
 pub use repack::RoutedRepack;
-pub use set::{ExpertSet, SetDims, f4_layer_range, f4_source, load_codebooks};
+pub use set::{
+    ExpertSet, SetDims, f4_layer_range, f4_source, load_codebooks, mxfp8_layer_range, mxfp8_source,
+};
 pub use tensors::{SafeWriter, Safetensors, TensorData};
 
 /// A tensor's dtype in a safetensors header (only the ones this engine uses).

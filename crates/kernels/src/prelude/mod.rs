@@ -10,6 +10,7 @@
 //! | `reduce`       | reduce.hpp                | geometry, barrier, wave/block reductions   |
 //! | `rowview`      | rowview.hpp               | by-value views, the shared quad, unrolling |
 //! | `dot_fp8`      | dot_fp8.hpp               | fp8 tile-scaled dot + LUT                  |
+//! | `dot_mxfp8`    | (no C twin)               | fp8 row-wise ue8m0 dot (Inkling-2)         |
 //! | `dot_nib`      | dot_i4.hpp + dot_f4.hpp   | int4 / fp4 dots (one loop), e8m0 decode    |
 //! | `dot_vq`       | dot_vq.hpp                | VQ-int3 codebook dot                       |
 //! | `llvm`         | (hipcc's IR)              | intrinsics `core` has only lookalikes of   |
@@ -23,6 +24,7 @@
 pub mod activation;
 pub mod actquant;
 pub mod dot_fp8;
+pub mod dot_mxfp8;
 pub mod dot_nib;
 pub mod dot_vq;
 pub mod formats;

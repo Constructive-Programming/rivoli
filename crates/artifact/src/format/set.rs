@@ -79,8 +79,11 @@ impl SetDims {
 /// ([`RoutedFmt`]). Routed experts (`0..n_experts`) stream via [`ExpertSet::read_spec`];
 /// where the format carries a shared block (`.vq3`/`.i4`, block `n_experts`) it is read
 /// once for resident placement via [`ExpertSet::shared_block`]. An `.i4` block is
-/// gate‖gate_scale‖up‖up_scale‖down‖down_scale; an `.f4` block is w1‖w1_scale‖w3‖w3_scale‖
-/// w2‖w2_scale, the same gate/up/down slot order (see [`super::expert::F4Expert::spans`]).
+/// gate‖gate_scale‖up‖up_scale‖down‖down_scale; an `.f4` or `.mxfp8` block is w1‖w1_scale‖
+/// w3‖w3_scale‖w2‖w2_scale, the same gate/up/down slot order (see
+/// [`super::expert::F4Expert::spans`]). The two one-byte-scale formats differ only in the
+/// packed span (`o·i/2` nibbles against `o·i` e4m3 bytes), which is why one descriptor type
+/// (`MoeF4Situ`, six `*const u8`) serves both and the MAGIC says which.
 pub struct ExpertSet {
     files: Vec<std::fs::File>, // O_DIRECT, index = layer - first_layer
     first_layer: usize,
@@ -227,9 +230,10 @@ impl ExpertSet {
         ensure!(
             self.has_shared,
             "this expert set has no shared block: it holds {} routed experts and stops \
-             there. V4's shared expert is fp8 e4m3 at 128x128, not FP4 — it is in \
-             `resident.safetensors`, not in the `.f4`",
-            self.n_experts
+             there. The `.{}` format's shared expert, where the model has one at all, is a \
+             resident tensor — in `resident.safetensors`, not in the layer file",
+            self.n_experts,
+            self.fmt.ext()
         );
         ensure!(
             (self.first_layer..self.n_layers).contains(&layer),
@@ -366,13 +370,47 @@ pub fn load_codebooks(dir: &str) -> Result<[Vec<f32>; 3]> {
 /// `tool` and `chain` are for a human reading a manifest six months later — two `.f4` sets built
 /// from different checkpoints are byte-indistinguishable on disk. `src` is the checkpoint path.
 ///
-/// `chain` is a literal rather than a parameter because both producers' sources are the SAME
-/// encoding — OCP MX e2m1 nibbles with e8m0 group scales — so both really are `fp4 -> fp4`, and
-/// `tool` already says which converter ran.
+/// `chain` is a literal at each producer rather than something a converter passes, because both
+/// `.f4` producers' sources are the SAME encoding — OCP MX e2m1 nibbles with e8m0 group scales —
+/// so both really are `fp4 -> fp4`, and `tool` already says which converter ran. (It became a
+/// parameter of [`source_block`] only when `.mxfp8` joined, whose chain is `fp8->fp8`; the
+/// per-format literal stayed.)
 pub fn f4_source(tool: &str, src_dir: &str, layers: std::ops::Range<usize>) -> serde_json::Value {
+    source_block((tool, "fp4->fp4 (repack)"), src_dir.as_ref(), layers)
+}
+
+/// The `mxfp8_source` block — Inkling-2-Small's counterpart of [`f4_source`], written by
+/// `convert_inkling_small` and read by [`mxfp8_layer_range`].
+///
+/// Same shape, same reasoning, same adjacency to its reader: `layers` is the loader's sole
+/// source for which layers the artifact holds, and a Small convert is routinely PARTIAL —
+/// the 619 GB checkpoint arrives 48 shards at a time and `--from`/`--to` exists precisely so
+/// layer files can be built while the rest is still downloading.
+///
+/// `chain` is `fp8->fp8 (repack)` and a literal for [`f4_source`]'s reason: the source bytes
+/// ARE MXFP8 (one e4m3 value per weight, one ue8m0 byte per 32 along the input dim — the
+/// header shapes agree with the root config's `[1, 32]`, not with the `hf_quant_config`
+/// group's declared `[32, 32]`), so nothing is fit or re-rounded on the way in.
+pub fn mxfp8_source(
+    tool: &str,
+    src_dir: &str,
+    layers: std::ops::Range<usize>,
+) -> serde_json::Value {
+    source_block((tool, "fp8->fp8 (repack)"), src_dir.as_ref(), layers)
+}
+
+/// One `<fmt>_source` provenance block. The PRODUCER half of the shape [`source_layer_range`]
+/// consumes, one function between them so the two cannot disagree — the property that made
+/// [`f4_source`] worth factoring when `convert_k3` became the second `.f4` producer
+/// (2026-08-11), and that paid for itself again when `.mxfp8` became the third format.
+fn source_block(
+    (tool, chain): (&str, &str),
+    src_dir: &std::path::Path,
+    layers: std::ops::Range<usize>,
+) -> serde_json::Value {
     serde_json::json!({
         "tool": tool,
-        "chain": "fp4->fp4 (repack)",
+        "chain": chain,
         "src": src_dir,
         "layers": [layers.start, layers.end],
     })
@@ -400,33 +438,68 @@ pub fn f4_source(tool: &str, src_dir: &str, layers: std::ops::Range<usize>) -> s
 /// One function rather than a type with a `load` and a `range`: the two were only ever
 /// called together, in that order, and the pair's only other caller was a test.
 pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usize>> {
+    // Both converters that produce `.f4` are named, because the message is the first thing a
+    // reader sees and "not a convert_v4 artifact" in front of a Kimi-K3 directory sends them
+    // looking for the wrong bug. `convert_k3` shipped without this stamp for exactly one
+    // commit, and this is the error it produced.
+    source_layer_range(
+        std::path::Path::new(dir),
+        ("f4_source", "convert_v4 or convert_k3"),
+        n_layers,
+    )
+}
+
+/// The layer range an `.mxfp8` artifact holds, from `manifest.json`'s `mxfp8_source`.
+///
+/// [`f4_layer_range`]'s doc is the whole argument and it applies verbatim: read, never
+/// inferred from `num_hidden_layers`, because a partial artifact of a 48-layer model is
+/// normal — the Small checkpoint arrives 48 shards at a time and the converter exists to turn
+/// them into layers as they land. Absent or malformed is an ERROR: this is the loader's only
+/// source for which layers exist, and `0..48` is precisely the wrong guess for the artifact
+/// the field describes.
+pub fn mxfp8_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usize>> {
+    source_layer_range(
+        std::path::Path::new(dir),
+        ("mxfp8_source", "convert_inkling_small"),
+        n_layers,
+    )
+}
+
+/// Read `<key>.layers` out of `dir`'s `manifest.json` and confront it with the model's own
+/// layer count.
+///
+/// The `<key>` and the producer names are parameters rather than two hand-written copies of
+/// this walk, which is what the second format would have cost: the READ side of a provenance
+/// block and its WRITE side ([`source_block`]) are one shape, and a copy is how one of them
+/// gets a fix the other does not. Every `.f4`/`.mxfp8` artifact in existence was opened
+/// through this function.
+fn source_layer_range(
+    dir: &std::path::Path,
+    (key, producers): (&str, &str),
+    n_layers: usize,
+) -> Result<std::ops::Range<usize>> {
     /// Just the field the loader needs. `tool`/`chain`/`src` are provenance for a human;
     /// a field with no reader is how [`I4Source::group`] nearly became decoration.
     #[derive(Deserialize)]
-    struct F4Source {
+    struct Source {
         layers: [usize; 2],
     }
 
-    let path = format!("{dir}/manifest.json");
+    let path = dir.join("manifest.json");
+    let path = path.display();
+    let raw = std::fs::read(dir.join("manifest.json")).with_context(|| format!("read {path}"))?;
     let mut v: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)
-            .with_context(|| format!("parse {path}"))?;
+        serde_json::from_slice(&raw).with_context(|| format!("parse {path}"))?;
     let f = v
-        .get_mut("f4_source")
+        .get_mut(key)
         .map(serde_json::Value::take)
-        // Both converters that produce `.f4` are named, because the message is the first thing a
-        // reader sees and "not a convert_v4 artifact" in front of a Kimi-K3 directory sends them
-        // looking for the wrong bug. `convert_k3` shipped without this stamp for exactly one
-        // commit, and this is the error it produced.
-        .with_context(|| {
-            format!("{path} has no `f4_source` — not a convert_v4 or convert_k3 artifact")
-        })?;
-    let [from, to] = serde_json::from_value::<F4Source>(f)
-        .with_context(|| format!("{path}: f4_source malformed"))?
+        .with_context(|| format!("{path} has no `{key}` — not a {producers} artifact"))?;
+    let [from, to] = serde_json::from_value::<Source>(f)
+        .with_context(|| format!("{path}: {key} malformed"))?
         .layers;
     ensure!(
         from < to && to <= n_layers,
-        "{path}: f4_source.layers [{from}, {to}) is not a non-empty range inside \
+        "{path}: {key}.layers [{from}, {to}) is not a non-empty range inside \
          [0, num_hidden_layers={n_layers})"
     );
     Ok(from..to)

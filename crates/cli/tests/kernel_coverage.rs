@@ -545,7 +545,8 @@ const UNROWED: [&str; 1] = ["touch_region"];
 /// anchor through its oracle suite, NOT the C→Rust bit-identity harness, so it is waived the
 /// C-twin gate row. It still owes a `=>` launchers row (the arrows census) and an oracle suite
 /// (the oracle census). `(kernel, suite)` is checked at both ends in
-/// [`every_rust_kernel_has_a_gate_row_and_a_launchers_row`]: the kernel is shipped and the suite
+/// [`every_rust_kernel_has_a_gate_row_and_a_launchers_row`]: the name is in `rowed` — a shipped
+/// kernel's own row name, or the `LAUNCHED_BY` launcher of a multi-kernel pair — and the suite
 /// exists and cites its launcher. A row dies loudly when its kernel stops being shipped or its
 /// suite stops covering it — the same both-ends discipline as [`DEFERRED`], not an exemption list.
 const ORACLE_VALIDATED: &[(&str, &str)] = &[
@@ -561,6 +562,12 @@ const ORACLE_VALIDATED: &[(&str, &str)] = &[
     ("message_gate", "kernel_inkling_message_gate.rs"),
     ("kv_scatter", "kernel_inkling_kv_scatter.rs"),
     ("rel_bias_gather", "kernel_inkling_rel_bias.rs"),
+    // Inkling-2 Small's MXFP8 routed-expert pair rides its RANGE LAUNCHER's name, not either
+    // kernel's: the two phases are one `launch_moe_expert_range_mxfp8_situ` call, which is
+    // what the suite cites and what `LAUNCHED_BY` rows them under. The check below therefore
+    // asks whether the name is in `rowed` — the launcher names plus the ungrouped kernels —
+    // rather than in the shipped-kernel list, which holds only the two phases.
+    ("moe_expert_range_mxfp8_situ", "kernel_inkling_moe_mxfp8.rs"),
 ];
 
 /// The bit-identity gate's `ROWS` table: each entry's kernel name, and whether its row
@@ -606,8 +613,10 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
             "UNROWED names `{u}`, which is not a shipped gpu-kernel — delete the exemption"
         );
     }
-    assert_oracle_validated(&device);
+    // `rowed` first: the oracle waiver's shipped-ness check asks it, not `device` — see
+    // `assert_oracle_validated`.
     let (rowed, stale) = (rowed_names(), stale_launched_by());
+    assert_oracle_validated(&rowed);
     // A `=>` row names its Rust host launcher `rivoli_<kernel>`; that launcher's own
     // `Kernel::new(c"<kernel>")` is held by the host-handle census above.
     // Only declaration lines (they start with the stem): the DSL's own docs spell the form.
@@ -673,15 +682,21 @@ fn every_rust_kernel_has_a_gate_row_and_a_launchers_row() {
     );
 }
 
-/// The [`ORACLE_VALIDATED`] both-ends check: each waived kernel is shipped, and its oracle suite
-/// exists and cites its launcher. A waiver covering a kernel nothing checks is refused — the
-/// same discipline as [`DEFERRED`], split out to keep the census under the code-health length cap.
-fn assert_oracle_validated(device: &[String]) {
+/// The [`ORACLE_VALIDATED`] both-ends check: each waived name is a row name (`rowed`), and its
+/// oracle suite exists and cites its launcher. A waiver covering a kernel nothing checks is
+/// refused — the same discipline as [`DEFERRED`], split out to keep the census under the
+/// code-health length cap.
+fn assert_oracle_validated(rowed: &[String]) {
     let cited = Cited::of(&[Path::new("crates/engine/tests")]);
     for (kernel, suite) in ORACLE_VALIDATED {
+        // `rowed`, not the shipped-kernel list: an ungrouped kernel's rowed name IS its own
+        // name, and a `LAUNCHED_BY` phase's is its launcher's — which `stale_launched_by`
+        // separately holds to a shipped kernel, a named static and a launch. So a row here
+        // still dies loudly when its kernel or its launcher leaves the tree.
         assert!(
-            device.iter().any(|k| k == kernel),
-            "ORACLE_VALIDATED names `{kernel}`, which is not a shipped gpu-kernel — delete the row"
+            rowed.iter().any(|k| k == kernel),
+            "ORACLE_VALIDATED names `{kernel}`, which is neither a shipped gpu-kernel nor the \
+             launcher of one — delete the row"
         );
         assert!(
             common::repo_root()

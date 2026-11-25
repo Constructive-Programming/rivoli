@@ -25,6 +25,10 @@ pub mod glm_config;
 /// the member differences are this checkpoint's own, per the rule that per-model config types
 /// stay separate.
 pub mod inkling_config;
+/// The Inkling 2 rename/transform rules BOTH member converters read — one table, two binaries,
+/// because the two members share one text stack and a second copy is how one of them gets a
+/// rename fix the other does not.
+pub mod inkling_convert;
 pub mod inkling_dequant;
 /// Inkling 2's chat framing — a hand-port of the checkpoint's `chat_template.jinja`. A sibling
 /// of [`glimmer_encoding`] and [`qwen_encoding`] for their reason: it builds a **string** that

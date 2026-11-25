@@ -360,10 +360,23 @@ impl InklingEngine<'_> {
         Ok(self.cfg.route_scale as f32 / (sum + 1e-20))
     }
 
-    /// The routed MoE: per expert `situ_glu(gate_up · x)`, then `down`, accumulated in fp32 with
+    /// The routed MoE — the ONE branch the two members take differently.
+    ///
+    /// Mini's whole-layer slabs are sliced on the host ([`Self::moe_bf16`]); Small's `.mxfp8`
+    /// experts come from the pool's slots with their fills overlapped on two streams
+    /// ([`Self::moe_mxfp8`]). Everything before and after this call — the router, the norms, the
+    /// post-MLP convolution, the residual — is the same code for both.
+    fn moe(&mut self, layer: usize, scale: f32) -> Result<()> {
+        if self.pin.is_mxfp8() {
+            return self.moe_mxfp8(layer, scale);
+        }
+        self.moe_bf16(layer, scale)
+    }
+
+    /// Mini's MoE: per expert `situ_glu(gate_up · x)`, then `down`, accumulated in fp32 with
     /// `scores[e] · scale`. The softcaps are K3's SiTU-GLU at b1=4, b2=25 — the sigmoid sees the
     /// RAW gate (T6).
-    fn moe(&mut self, layer: usize, scale: f32) -> Result<()> {
+    fn moe_bf16(&mut self, layer: usize, scale: f32) -> Result<()> {
         let (hidden, inter) = (self.cfg.hidden_size, self.cfg.intermediate_size);
         let (b1, b2) = (
             self.cfg.mlp_gate_softcap as f32,
@@ -682,6 +695,7 @@ impl InklingEngine<'_> {
         self.reset_state()?;
         let prefill_wall = std::time::Instant::now();
         let mut cur = self.prefill_and_sample(spec.prompt)?;
+        self.flush_trace()?;
         let f0 = self.fetched();
         let (pinned, streamed) = self.residency();
         let prefill_s = prefill_wall.elapsed().as_secs_f64();
@@ -712,7 +726,11 @@ impl InklingEngine<'_> {
     /// decode loop and the teacher-forced walk are built from.
     fn advance(&mut self, cur: u32, pos: usize) -> Result<u32> {
         self.hidden_state(cur, pos)?;
-        self.sample_x()
+        let decided = self.sample_x()?;
+        // The trace is flushed at the ONE step both the decode loop and the teacher-forced walk
+        // go through, so neither can capture a run whose sink silently stopped writing.
+        self.flush_trace()?;
+        Ok(decided)
     }
 }
 

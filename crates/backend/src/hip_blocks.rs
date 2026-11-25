@@ -26,7 +26,7 @@ use crate::launch::{
     DescRows, Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_head_collapse,
     rivoli_hc_post, rivoli_hc_pre, rivoli_moe_acc_drain_s, rivoli_moe_acc_drain_to_s,
     rivoli_moe_expert_range, rivoli_moe_expert_range_f4, rivoli_moe_expert_range_f4_situ,
-    rivoli_moe_expert_range_i4,
+    rivoli_moe_expert_range_i4, rivoli_moe_expert_range_mxfp8_situ,
 };
 use anyhow::Result;
 use rivoli_abi::kernarg::{
@@ -248,6 +248,55 @@ launchers! {
     /// 0), and pass 1 is the one kernel of the pair that is NOT row-templated, so `nrow > 1` is a
     /// two-kernel change rather than a parameter.
     launch_moe_expert_range_f4_situ => rivoli_moe_expert_range_f4_situ(MoeF4Situ { range: MoeRange { x, descs, h, wexpert, acc, span: MoeSpan { hidden: expert_in as i32, inter: inter as i32, e_start: e_start as i32, e_count: e_count as i32 } }, b1, b2 }, DescRows { n_desc: n_desc as i32, nrow: nrow as i32 }, stream), "moe_expert_range_f4_situ" (
+        x: *const f32,
+        expert_in: usize as i32,
+        inter: usize as i32,
+        e_start: usize as i32,
+        e_count: usize as i32,
+        n_desc: usize as i32,
+        descs: *const ExpertDescF4,
+        wexpert: *const f32,
+        b1: f32,
+        b2: f32,
+        h: *mut f32,
+        acc: *mut u64,
+        nrow: usize as i32,
+        stream: *mut c_void,
+    );
+
+    /// **Inkling-2 Small's routed expert range** — the K3 pair's SiTU-GLU arithmetic at
+    /// MXFP8's weight format: one e4m3 value per byte with ONE raw ue8m0 exponent per 32
+    /// values along the reduction dim, ROW-wise `[1, 32]` (`inkling_dequant::Mxfp8`, trap T1:
+    /// the scale byte is an exponent, not an e4m3 code — reading it through the fp8 LUT would
+    /// decode `0x80` as `-0`).
+    ///
+    /// Everything else is [`launch_moe_expert_range_f4_situ`]'s contract, because MXFP8's
+    /// group is 32 columns like fp4's: the same 1001/1002/1003/1004/1006 refusals, the same
+    /// ABSOLUTE-index `wexpert`/`h` layout — indexed by descriptor id, never by position
+    /// within the range, so a caller that sized either by `e_count` runs off the end the first
+    /// time it passes `e_start > 0` — the same 16-byte alignment of `x` and `h` on `dot_mxfp8_wave`'s
+    /// dword loads — and the same ban on `x`/`h` aliasing.
+    ///
+    /// Two differences, both at the kernel:
+    ///
+    /// 1. **`h` stays f32 between the passes.** The fp4 pair rounds it through `rbf16`
+    ///    because K3's `w2` takes a bf16 latent; Inkling-2's experts run fp32, so the
+    ///    truncation would be an error the reference does not have.
+    /// 2. **The routing weight lands on pass 2's f32 output**, `fixed(dv·w)`, skipping
+    ///    `w == 0` — K3's placement without the bf16 store in front of it.
+    ///
+    /// The experts run in the model's own width, so `expert_in` here IS the hidden width
+    /// (Small: 4608) — unlike the K3 twin's 3584-wide latent. Binding `inter` positionally
+    /// swaps two numbers nothing type-checks.
+    ///
+    /// `nrow` must be 1 (guard 1003): pass 1 is not row-templated.
+    ///
+    /// # Safety
+    /// `x` is `expert_in` live f32, **16-byte aligned**; `descs` is `n_desc` `ExpertDescF4`
+    /// whose spans cover `inter × expert_in` e4m3 weights and their group-32 ue8m0 scales;
+    /// `wexpert` is `>= e_start + e_count` f32; `h` is `>= (e_start + e_count) · inter` f32,
+    /// **also 16-byte aligned**; `acc` is `expert_in` u64. All outlive `stream`'s completion.
+    launch_moe_expert_range_mxfp8_situ => rivoli_moe_expert_range_mxfp8_situ(MoeF4Situ { range: MoeRange { x, descs, h, wexpert, acc, span: MoeSpan { hidden: expert_in as i32, inter: inter as i32, e_start: e_start as i32, e_count: e_count as i32 } }, b1, b2 }, DescRows { n_desc: n_desc as i32, nrow: nrow as i32 }, stream), "moe_expert_range_mxfp8_situ" (
         x: *const f32,
         expert_in: usize as i32,
         inter: usize as i32,

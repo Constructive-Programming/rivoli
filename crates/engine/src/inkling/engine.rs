@@ -16,8 +16,15 @@
 use super::geometry::ScratchSizes;
 use super::pin::InklingPin;
 use crate::device::DeviceBuf;
+use crate::resident::PinCfg;
+use crate::routed::ResolvedBatch;
 use anyhow::{Result, ensure};
 use rivoli_artifact::inkling_config::InklingTextConfig;
+use rivoli_backend::{ExpertDescF4, fill_u32, gpustream::HipStream};
+
+/// One accumulator row per STREAM, not per expert: every expert a stream runs adds into its
+/// stream's row, and [`rivoli_backend::launch_moe_acc_drain_to`] sums the rows once.
+pub(super) const MOE_ACC_ROWS: usize = 2;
 
 /// The Inkling decode path's activation scratch and caches. Weights live in the pin.
 pub struct InklingScratch {
@@ -256,6 +263,61 @@ impl InklingScratch {
     }
 }
 
+/// Inkling 2 Small's routed-MoE dispatch state — allocated ONLY on the `.mxfp8` backend, so
+/// Mini pays neither the bytes nor an entry in any accounting.
+///
+/// **Sized for ONE row's `top_k` picks, not for `n_experts`.** The launcher indexes `descs`,
+/// `wexpert` and `h` by DESCRIPTOR index in `0..n_desc`, and this arm passes `n_desc = top_k`;
+/// sizing them for 384 experts would be 48× the bytes for rows no launch can read. The pool's
+/// `top_k` bound is checked at startup by [`Batch::union`](crate::resident::Batch::union).
+pub(super) struct MxFp8MoeScratch {
+    /// Resident experts' partials run here, overlapping the fetch stream's loads; misses
+    /// launch on their own stream behind their tickets.
+    pub compute_stream: HipStream,
+    pub miss_stream: HipStream,
+    /// The pool's answer for the current layer: slots + tickets, in selection order.
+    pub resolved: ResolvedBatch,
+    /// Selection indices in LAUNCH order — residents first, misses after — so the residents
+    /// form the one contiguous range the launcher's `[e_start, e_count)` form exists for.
+    pub launch_idx: Vec<usize>,
+    /// The descriptor table and the routing weights, in launch order.
+    pub descs_host: Vec<ExpertDescF4>,
+    pub wexpert_launch: Vec<f32>,
+    pub descs: DeviceBuf,
+    pub wexpert: DeviceBuf,
+    /// One expert's SiTU-GLU output, `[n_desc, inter]` f32 — indexed by descriptor.
+    pub moe_h: DeviceBuf,
+    /// [`MOE_ACC_ROWS`] rows of the hidden width, u64 fixed point.
+    pub acc: DeviceBuf,
+}
+
+impl MxFp8MoeScratch {
+    fn new(text: &InklingTextConfig) -> Result<Self> {
+        let k = text.num_experts_per_tok;
+        let (hidden, inter) = (text.hidden_size, text.intermediate_size);
+        let acc_bytes = MOE_ACC_ROWS * hidden * size_of::<u64>();
+        let mut acc = DeviceBuf::new(acc_bytes)?;
+        // The drain RESETS the rows it drains, but the first layer reads rows nothing has ever
+        // written — an `hipMalloc` slab is uninitialised, and a garbage accumulator is a
+        // plausible wrong number rather than a fault.
+        // SAFETY: `acc` owns exactly `acc_bytes` (a multiple of 4), and every reader is
+        // enqueued after this async memset on the null stream.
+        unsafe { fill_u32(acc.ptr_mut(), 0, acc_bytes)? };
+        Ok(Self {
+            compute_stream: HipStream::compute()?,
+            miss_stream: HipStream::miss()?,
+            resolved: ResolvedBatch::default(),
+            launch_idx: Vec::with_capacity(k),
+            descs_host: vec![ExpertDescF4::null(); k],
+            wexpert_launch: vec![0.0; k],
+            descs: DeviceBuf::new(k * size_of::<ExpertDescF4>())?,
+            wexpert: DeviceBuf::new(k * size_of::<f32>())?,
+            moe_h: DeviceBuf::new(k * inter * size_of::<f32>())?,
+            acc,
+        })
+    }
+}
+
 /// The Inkling 2 text engine: the placed weights, the activation scratch, and the loop's host-side
 /// routing workspace.
 pub struct InklingEngine<'a> {
@@ -280,6 +342,9 @@ pub struct InklingEngine<'a> {
     pub(super) row_host: Vec<u8>,
     /// `argmax`'s two outputs, read back together.
     pub(super) pick_host: Vec<u8>,
+    /// Small's routed dispatch state and streams; `None` on Mini's bf16 backend, so the loop
+    /// Mini runs is exactly what it ran before this field existed.
+    pub(super) moe8: Option<MxFp8MoeScratch>,
 }
 
 impl<'a> InklingEngine<'a> {
@@ -299,14 +364,43 @@ impl<'a> InklingEngine<'a> {
         capacity: usize,
         n_ctx: usize,
     ) -> Result<Self> {
+        Self::open_with(cfg, n_ctx, || InklingPin::build(dir, cfg, capacity, n_ctx))
+    }
+
+    /// Open Inkling 2 Small: the same text stack and the same floor discipline as [`Self::open`],
+    /// with the routed experts behind [`crate::routed::RoutedPool`].
+    ///
+    /// The door check runs first, for [`Self::open`]'s reason: a `--ctx` past the attend
+    /// kernel's ceiling is unservable, and it must cost a message rather than a placement.
+    pub fn open_mxfp8(
+        dir: &str,
+        cfg: &'a InklingTextConfig,
+        pin: PinCfg<'_>,
+        n_ctx: usize,
+    ) -> Result<Self> {
+        Self::open_with(cfg, n_ctx, || InklingPin::build_mxfp8(dir, cfg, pin, n_ctx))
+    }
+
+    /// Shared door-first open: validate the scratch ceiling BEFORE placing a byte, then build the
+    /// pin and allocate scratch.
+    fn open_with(
+        cfg: &'a InklingTextConfig,
+        n_ctx: usize,
+        build: impl FnOnce() -> Result<InklingPin>,
+    ) -> Result<Self> {
         validate_scratch_cfg(cfg, n_ctx)?;
-        let pin = InklingPin::build(dir, cfg, capacity, n_ctx)?;
-        Self::new(pin, cfg, n_ctx)
+        Self::new(build()?, cfg, n_ctx)
     }
 
     /// Build the engine over an already-placed `pin`.
     pub fn new(pin: InklingPin, cfg: &'a InklingTextConfig, n_ctx: usize) -> Result<Self> {
         let n_experts = cfg.n_routed_experts;
+        // The pool's streams and descriptor table exist only where the pool does. `is_mxfp8`
+        // is read off the pin the caller just built, so there is no second source of truth.
+        let moe8 = match pin.is_mxfp8() {
+            true => Some(MxFp8MoeScratch::new(cfg)?),
+            false => None,
+        };
         Ok(Self {
             pin,
             cfg,
@@ -320,6 +414,7 @@ impl<'a> InklingEngine<'a> {
             router_host: vec![0u8; n_experts * 4],
             row_host: vec![0u8; cfg.unpadded_vocab_size * 4],
             pick_host: vec![0u8; 8],
+            moe8,
         })
     }
 
@@ -328,8 +423,9 @@ impl<'a> InklingEngine<'a> {
         self.n_ctx
     }
 
-    /// How many layers the budget pinned, and how many stream — the pin's own answer, never a
-    /// second count of the same placement.
+    /// How many units the budget pinned, and how many stream — the pin's own answer, never a
+    /// second count of the same placement. The granularity is the BACKEND's: whole layers on
+    /// Mini, single experts on Small, so the two are not comparable across members.
     pub fn residency(&self) -> (usize, usize) {
         self.pin.residency()
     }
@@ -340,9 +436,30 @@ impl<'a> InklingEngine<'a> {
         self.pin.fetched()
     }
 
-    /// Zero every short-convolution state before a request's first position.
+    /// Flush the `--trace` sink when this pin owns a pool (Small). Mini's row refuses
+    /// `--trace` and its pin carries no pool, so this is one branch and no work there.
+    ///
+    /// **Per token, never on `Drop`**: `BufWriter`'s `Drop` discards flush errors, so a wedged
+    /// or ENOSPC sink would leave a silently short capture with a clean exit code — and a trace
+    /// is tens of minutes of sole-tenant GPU time (`RoutedPool::flush_trace` carries the
+    /// argument, and GLM/K3/V4 all call it the same way).
+    pub(super) fn flush_trace(&mut self) -> Result<()> {
+        match self.pin.routed_mut() {
+            Some(routed) => routed.flush_trace(),
+            None => Ok(()),
+        }
+    }
+
+    /// Zero every per-request state (short-convolution windows and MXFP8 accumulator rows) before
+    /// a request's first position so a failed earlier request cannot leave stale partials behind.
     pub(super) fn reset_state(&mut self) -> Result<()> {
         self.sampled = false;
+        if let Some(m) = &mut self.moe8 {
+            let acc_bytes = MOE_ACC_ROWS * self.cfg.hidden_size * size_of::<u64>();
+            // SAFETY: `m.acc` was allocated with `acc_bytes` (multiple of 4), zeroed on the null
+            // stream before any MoE dispatch runs.
+            unsafe { fill_u32(m.acc.ptr_mut(), 0, acc_bytes)? };
+        }
         self.sc.zero_sconv()
     }
 }

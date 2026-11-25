@@ -3,12 +3,12 @@
 //! input/post-attention norms, the two post convolutions, the query banks, the router, and (on a
 //! looped layer) the four MessageGates — to device addresses.
 //!
-//! The Mini artifact stores the text stack bf16 (the converter dequantized the NVFP4/MXFP8
-//! experts), so every dense projection and both expert slabs are a bf16 [`Bf16Weight`]. The routed
-//! experts (`gate_up_proj`, `down_proj`) are the STREAMED unit: [`InklingPin::build`] asks
-//! [`rivoli_core::residency::partition`] how many whole layers fit (P6, INV-8) and executes the
-//! answer — pinned layers keep their `[E, 2I, H]`/`[E, H, I]` slabs in the tier, streamed layers
-//! read ONE expert per routing decision into a single-expert staging slot.
+//! Every dense projection is a bf16 [`Bf16Weight`] on both members. The routed experts are the
+//! STREAMED unit, and WHO streams them is the one thing the backends differ in
+//! ([`ExpertBackend`]): Mini's converted artifact holds them dequantized bf16, so
+//! [`InklingPin::build`] asks [`rivoli_core::residency::partition`] how many whole layers fit
+//! (P6, INV-8) and reads ONE expert per routing decision into a single-expert staging slot;
+//! Small's are native `.mxfp8` and stream through [`RoutedPool`] (the `mxfp8` child module).
 
 use super::geometry::{
     ScratchSizes, expert_layer_bytes, global_weight_bytes, is_block_end, single_expert_bytes,
@@ -16,10 +16,11 @@ use super::geometry::{
 use super::names;
 use crate::device::{DeviceBuf, DeviceTier};
 use crate::resident::{Bf16Weight, place_bf16, place_f32};
+use crate::routed::RoutedPool;
 use crate::seam::Fetched;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use core::ptr;
-use rivoli_artifact::format::{Dtype, Safetensors};
+use rivoli_artifact::format::{Dtype, ExpertSet, Safetensors};
 use rivoli_artifact::inkling_config::InklingTextConfig;
 use rivoli_core::residency::{Bytes, Floor, Refusal, Unit, UnitId, partition};
 use std::num::NonZeroU64;
@@ -30,6 +31,11 @@ use std::num::NonZeroU64;
 /// `822 · 255 B ≈ 205 KB`; 4 MiB is ~20× that, and the 64 MiB this replaced charged the floor
 /// for 64 MiB no placement could ever consume.
 const PIN_SLACK: usize = 4 << 20;
+
+/// Small's `.mxfp8` construction — the pool-backed half of this pin, split out when the file
+/// crossed the workspace's 800-line soft cap. It is a child module so it can read this file's
+/// private placers and its [`PIN_SLACK`] without widening one visibility.
+mod mxfp8;
 
 /// One decoder layer's short-convolution form. The SLIDING layers carry a self-contained static
 /// `conv1d` per k/v side; the FULL layers carry the dynamic pair — a static tap bank plus an input
@@ -238,30 +244,67 @@ pub enum ExpertSource {
     },
 }
 
-/// The Inkling 2 Mini weight set: the placed globals and dense layers, and the routed experts'
-/// per-layer residency.
+/// Where a member's routed experts live — the ONE thing the two members do not share.
 ///
-/// **The placement is [`partition`]'s, never this file's.** The units are whole layers (the dense
-/// weights are always resident; the expert slabs are the streamable mass), the floor is stated
-/// from `geometry`, and the returned prefix is executed verbatim (P6, INV-8).
+/// **Mini and Small run the same text stack** (attention, short convolutions, block-residual
+/// quarries, router, decode and score loops); they differ in the container the experts are
+/// stored in, and therefore in who owns residency. Mini's converted artifact holds them
+/// DEQUANTIZED to bf16, so the pin slices one expert out of an mmap'd slab on every routing
+/// decision. Small's artifact holds ~600 GB of native `.mxfp8` slots, far past this box's
+/// memory, so residency is [`RoutedPool`]'s: O_DIRECT fills behind per-expert tickets,
+/// overlapped with the resident experts' compute on two streams.
+pub enum ExpertBackend {
+    /// Mini: whole-layer slabs placed by [`partition`]'s prefix, streamed by host slice.
+    Bf16 {
+        experts: Vec<ExpertSource>,
+        /// The one-expert staging slots, allocated only when some layer streams.
+        w13_slot: Option<DeviceBuf>,
+        w2_slot: Option<DeviceBuf>,
+        pinned_layers: usize,
+        /// Expert-slot hits and fills, at this backend's granularity (one expert).
+        fetched: Fetched,
+    },
+    /// Small: the `.mxfp8` set behind the shared routed pool. The pool's own counters are the
+    /// authority for [`InklingPin::fetched`] — a second tally here could disagree with it.
+    MxFp8 {
+        /// Keeps the read table's fds open for the pool's lifetime.
+        _set: ExpertSet,
+        routed: Box<RoutedPool>,
+        pinned_experts: usize,
+        total_experts: usize,
+    },
+}
+
+/// What [`InklingPin::assemble`] needs to place the resident set — bundled because it is four
+/// values travelling together into one call and two of them are byte counts a positional list
+/// would let transpose.
+pub(super) struct Parts<'a> {
+    pub text: &'a InklingTextConfig,
+    pub st: Safetensors,
+    pub flags: &'a [(bool, bool)],
+    pub tier_bytes: usize,
+}
+
+/// One Inkling 2 member's weight set: the placed globals and dense layers, and the routed
+/// experts' residency — Mini's layer prefix or Small's routed pool.
+///
+/// **The placement is [`partition`]`/`PoolPlan`'s, never this file's.** The units are whole
+/// layers for Mini (the dense weights are always resident; the expert slabs are the streamable
+/// mass) and single experts for Small (the unit the `.mxfp8` container streams), the floor is
+/// stated from `geometry`, and the returned prefix is executed verbatim (P6, INV-8).
 pub struct InklingPin {
-    /// RAII owner of the slab every pointer below points into.
+    /// RAII owner of the slab every pointer below points into. Small's tier holds the globals
+    /// and dense weights only; its experts live in the pool's arena.
     _tier: DeviceTier,
-    /// The mmap'd artifact, kept because a streamed expert is read from it on every routing
-    /// decision. An all-resident pin holds it too and never reads it again.
+    /// The mmap'd resident artifact. Mini's streamed layers read their expert slices from it;
+    /// Small's dense placement does too at load, and never again.
     st: Safetensors,
     pub globals: InklingGlobalPin,
     pub layers: Vec<InklingLayerPin>,
     /// Each layer's `mlp.gate.e_score_correction_bias`, host-side — `route_into` takes `&[f32]`,
     /// and the bias shifts SELECTION only (T5).
     pub router_bias_host: Vec<Vec<f32>>,
-    experts: Vec<ExpertSource>,
-    /// The one-expert staging slot, allocated only when some layer streams.
-    w13_slot: Option<DeviceBuf>,
-    w2_slot: Option<DeviceBuf>,
-    pub pinned_layers: usize,
-    /// Expert-slot hits and fills, at this arm's granularity (one expert).
-    fetched: Fetched,
+    backend: ExpertBackend,
     pub hidden: usize,
     pub inter: usize,
     n_experts: usize,
@@ -384,32 +427,50 @@ fn place_experts(
 }
 
 impl InklingPin {
-    /// How many layers the budget pinned, and how many stream.
+    /// Whether this pin streamed its experts through [`RoutedPool`] — Small's backend.
+    ///
+    /// The engine asks this ONCE, at construction, to decide whether to allocate the two
+    /// streams and the descriptor table the pool's dispatch needs: Mini's loop must pay no
+    /// byte and no accounting for a path it never takes.
+    pub fn is_mxfp8(&self) -> bool {
+        matches!(self.backend, ExpertBackend::MxFp8 { .. })
+    }
+
+    /// The routed pool, on Small's backend only. `None` on Mini, whose experts are placed
+    /// slabs rather than pool slots.
+    pub fn routed_mut(&mut self) -> Option<&mut RoutedPool> {
+        match &mut self.backend {
+            ExpertBackend::MxFp8 { routed, .. } => Some(routed),
+            ExpertBackend::Bf16 { .. } => None,
+        }
+    }
+
+    /// How many units the budget pinned, and how many stream — in THIS backend's granularity:
+    /// whole layers on Mini, single experts on Small.
     pub fn residency(&self) -> (usize, usize) {
-        (self.pinned_layers, self.layers.len() - self.pinned_layers)
+        match &self.backend {
+            ExpertBackend::Bf16 { pinned_layers, .. } => {
+                (*pinned_layers, self.layers.len() - *pinned_layers)
+            }
+            ExpertBackend::MxFp8 {
+                pinned_experts,
+                total_experts,
+                ..
+            } => (*pinned_experts, *total_experts - *pinned_experts),
+        }
     }
 
-    /// Expert-slot hits and fills.
+    /// Expert-slot hits and fills, at this backend's granularity. Small's are the pool's own
+    /// counters, read at this instant — a copy kept here could disagree with the pool it
+    /// describes, and the run's closing rebase ([`Fetched::since`]) reads the same numbers.
     pub fn fetched(&self) -> Fetched {
-        self.fetched
-    }
-
-    /// An expert's `(w13, w2)` pair from its two base addresses — the shapes are this pin's, so
-    /// both residency arms construct the pair the same way and only the addresses differ.
-    fn expert_pair(&self, w13: *const u16, w2: *const u16) -> (Bf16Weight, Bf16Weight) {
-        let (hidden, inter) = (self.hidden, self.inter);
-        (
-            Bf16Weight {
-                packed: w13,
-                o_dim: 2 * inter,
-                i_dim: hidden,
+        match &self.backend {
+            ExpertBackend::Bf16 { fetched, .. } => *fetched,
+            ExpertBackend::MxFp8 { routed, .. } => Fetched {
+                hits: routed.hits(),
+                misses: routed.misses(),
             },
-            Bf16Weight {
-                packed: w2,
-                o_dim: hidden,
-                i_dim: inter,
-            },
-        )
+        }
     }
 
     /// Open the resident artifact, state the floor, ask [`partition`] for the placement, and place
@@ -434,36 +495,64 @@ impl InklingPin {
         let (globals, dense) = measure_resident(&st, text, &flags)?;
         let (n_pinned, tier_bytes) = plan_partition(text, (capacity, n_ctx), (globals, dense))?;
         let n_streamed = n_layers - n_pinned;
+        let counts = (n_layers, n_pinned);
+        let dims = (text.n_routed_experts, inter, hidden);
+        let parts = Parts {
+            text,
+            st,
+            flags: &flags,
+            tier_bytes,
+        };
+        Self::assemble(parts, move |tier, st| {
+            let experts = place_expert_sources(tier, st, counts, dims)?;
+            let (w13_slot, w2_slot) = match n_streamed {
+                0 => (None, None),
+                _ => (
+                    Some(DeviceBuf::new(2 * inter * hidden * 2)?),
+                    Some(DeviceBuf::new(hidden * inter * 2)?),
+                ),
+            };
+            Ok(ExpertBackend::Bf16 {
+                experts,
+                w13_slot,
+                w2_slot,
+                pinned_layers: n_pinned,
+                fetched: Fetched { hits: 0, misses: 0 },
+            })
+        })
+    }
+
+    /// Allocate the resident tier, place the globals and every dense layer, then build the pin
+    /// around the backend `make_backend` returns.
+    ///
+    /// **One author for the tail both members' constructors end with.** What differs is only the
+    /// tier's SIZE (Mini adds its pinned slabs and staging slot, Small only the scratch charge
+    /// the pool's budget excludes) and which [`ExpertBackend`] rides out — never the placement.
+    /// The closure runs with the fresh tier so Mini can place its expert slabs into the same
+    /// slab as the dense weights, and ignores it on Small, whose experts live in the pool.
+    pub(super) fn assemble<F>(parts: Parts<'_>, make_backend: F) -> Result<Self>
+    where
+        F: FnOnce(&mut DeviceTier, &Safetensors) -> Result<ExpertBackend>,
+    {
+        let Parts {
+            text,
+            st,
+            flags,
+            tier_bytes,
+        } = parts;
         let mut tier = DeviceTier::new(tier_bytes)?;
         let globals = place_globals(&mut tier, &st, text)?;
-        let (layers, router_bias_host) = place_dense(&mut tier, &st, &flags)?;
-        let counts = (n_layers, n_pinned);
-        let experts = place_expert_sources(
-            &mut tier,
-            &st,
-            counts,
-            (text.n_routed_experts, inter, hidden),
-        )?;
-        let (w13_slot, w2_slot) = match n_streamed {
-            0 => (None, None),
-            _ => (
-                Some(DeviceBuf::new(2 * inter * hidden * 2)?),
-                Some(DeviceBuf::new(hidden * inter * 2)?),
-            ),
-        };
+        let (layers, router_bias_host) = place_dense(&mut tier, &st, flags)?;
+        let backend = make_backend(&mut tier, &st)?;
         Ok(Self {
             _tier: tier,
             st,
             globals,
             layers,
             router_bias_host,
-            experts,
-            w13_slot,
-            w2_slot,
-            pinned_layers: n_pinned,
-            fetched: Fetched { hits: 0, misses: 0 },
-            hidden,
-            inter,
+            backend,
+            hidden: text.hidden_size,
+            inter: text.intermediate_size,
             n_experts: text.n_routed_experts,
         })
     }
@@ -480,32 +569,44 @@ impl InklingPin {
         layer: usize,
         expert: usize,
     ) -> Result<(Bf16Weight, Bf16Weight)> {
+        let (hidden, inter, n_experts) = (self.hidden, self.inter, self.n_experts);
+        let ExpertBackend::Bf16 {
+            experts,
+            w13_slot,
+            w2_slot,
+            fetched,
+            ..
+        } = &mut self.backend
+        else {
+            bail!(
+                "this pin streams .mxfp8 experts through the routed pool — there is no bf16 \
+                 slab to slice"
+            );
+        };
         ensure!(
-            layer < self.experts.len(),
+            layer < experts.len(),
             "layer {layer} is past the {} the pin placed",
-            self.experts.len()
+            experts.len()
         );
         ensure!(
-            expert < self.n_experts,
-            "expert {expert} is past the config's {} routed experts",
-            self.n_experts
+            expert < n_experts,
+            "expert {expert} is past the config's {n_experts} routed experts"
         );
-        let (hidden, inter) = (self.hidden, self.inter);
         let gu_plane = 2 * inter * hidden;
-        match &self.experts[layer] {
+        match &experts[layer] {
             ExpertSource::Resident { gate_up, down } => {
-                self.fetched.hits += 1;
+                fetched.hits += 1;
                 // SAFETY: the slabs are `[E, 2I, H]` / `[E, H, I]` bf16 (checked at placement)
                 // and `expert < E` above; both pointers outlive every kernel the caller launches.
                 let gu = unsafe { gate_up.add(expert * gu_plane) };
                 let dn = unsafe { down.add(expert * hidden * inter) };
-                Ok(self.expert_pair(gu, dn))
+                Ok(expert_pair(hidden, inter, gu, dn))
             }
             ExpertSource::Streamed {
                 gate_up_name,
                 down_name,
             } => {
-                self.fetched.misses += 1;
+                fetched.misses += 1;
                 // No `device_sync` here: the `copy_in_at` calls below are blocking null-stream
                 // H2D `hipMemcpy`s ("waits for completion before returning control", documented
                 // in `crate::device::DeviceBuf::copy_in_at`), so each one already joins every
@@ -515,23 +616,44 @@ impl InklingPin {
                 let (dn, _) = self.st.typed(down_name, Dtype::Bf16)?;
                 let (gw, dw) = (gu_plane * 2, hidden * inter * 2);
                 let span = (expert * gw)..((expert + 1) * gw);
-                let slot = self
-                    .w13_slot
+                let slot = w13_slot
                     .as_mut()
                     .context("no w13 staging slot was allocated")?;
                 slot.copy_in_at(0, &gu[span])?;
                 let w13 = slot.ptr() as *const u16;
                 let span = (expert * dw)..((expert + 1) * dw);
-                let slot = self
-                    .w2_slot
+                let slot = w2_slot
                     .as_mut()
                     .context("no w2 staging slot was allocated")?;
                 slot.copy_in_at(0, &dn[span])?;
                 let w2 = slot.ptr() as *const u16;
-                Ok(self.expert_pair(w13, w2))
+                Ok(expert_pair(hidden, inter, w13, w2))
             }
         }
     }
+}
+
+/// One expert's `(w13, w2)` pair: `[2I, H]` and `[H, I]` bf16 at the given addresses. Free
+/// rather than a method because the streaming arm holds `&mut` on the backend while it builds
+/// the pair, and a `&self` receiver would borrow the whole pin against it.
+fn expert_pair(
+    hidden: usize,
+    inter: usize,
+    w13: *const u16,
+    w2: *const u16,
+) -> (Bf16Weight, Bf16Weight) {
+    (
+        Bf16Weight {
+            packed: w13,
+            o_dim: 2 * inter,
+            i_dim: hidden,
+        },
+        Bf16Weight {
+            packed: w2,
+            o_dim: hidden,
+            i_dim: inter,
+        },
+    )
 }
 
 /// The floor: the always-resident tensors, the KV cache, the activation scratch, and the

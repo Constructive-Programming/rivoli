@@ -11,11 +11,11 @@ use anyhow::{Result, ensure};
 
 use super::meta::FormatMeta;
 use crate::quant::{
-    f4_expert_bytes, f4_expert_stride, i4_expert_bytes, i4_expert_stride, vq_expert_bytes,
-    vq_expert_stride,
+    f4_expert_bytes, f4_expert_stride, i4_expert_bytes, i4_expert_stride, mxfp8_expert_bytes,
+    mxfp8_expert_stride, vq_expert_bytes, vq_expert_stride,
 };
 
-// ── .vq3 / .i4 / .f4 expert files (streamed routed experts + resident shared) ────
+// ── .vq3 / .i4 / .f4 / .mxfp8 expert files (streamed routed experts + resident shared) ──
 
 /// Per-file header for a routed-expert layer file. Little-endian, 40 bytes, at the start
 /// of the file. Self-describing: a dim/version mismatch or truncation fails loud on open.
@@ -28,13 +28,14 @@ use crate::quant::{
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ExpertHeader {
-    /// [`VQ3_MAGIC`] or [`F4_MAGIC`] — which format's blocks follow.
+    /// [`VQ3_MAGIC`], [`F4_MAGIC`] or [`MXFP8_MAGIC`] — which format's blocks follow.
     pub magic: [u8; 4],
     pub version: u32,
     pub layer: u32,
     /// ROUTED experts. `.vq3` holds `n_experts + 1` blocks (the last is the shared
-    /// expert); `.f4` holds exactly `n_experts`, because V4's shared expert is fp8 e4m3
-    /// and cannot share a file with FP4 blocks (see `quant::v4_expert_base`).
+    /// expert); `.f4` and `.mxfp8` hold exactly `n_experts`, because V4's shared expert is
+    /// fp8 e4m3 (not FP4) and Inkling-2-Small has none at all (see
+    /// `quant::v4_expert_base`, and `RoutedFmt::has_shared`).
     pub n_experts: u32,
     pub expert_in: u32,
     pub moe_inter: u32,
@@ -44,6 +45,11 @@ pub struct ExpertHeader {
 
 pub const VQ3_MAGIC: [u8; 4] = *b"VQ3\0";
 pub const F4_MAGIC: [u8; 4] = *b"FP4\0";
+/// One e4m3 byte per weight under ue8m0 block scales — Inkling-2-Small's native routed
+/// format ([`crate::quant::mxfp8`]). Distinct from [`F4_MAGIC`] although both spend one
+/// scale byte per 32 weights: the packed span is twice as long, so the two files differ in
+/// LENGTH too and the magic is the check that says which one this is.
+pub const MXFP8_MAGIC: [u8; 4] = *b"MX8\0";
 pub const EXPERT_HEADER_BYTES: usize = 40;
 
 impl ExpertHeader {
@@ -137,6 +143,10 @@ pub enum RoutedFmt {
     Vq3,
     I4,
     F4,
+    /// Inkling-2-Small's MXFP8 blocks: one e4m3 byte per weight, one ue8m0 byte per 32 along
+    /// the input dim. Like [`Self::F4`] it carries `n_experts` blocks and NO shared one —
+    /// Small ships `n_shared_experts 0`, so there is no block to place.
+    MxFp8,
 }
 
 impl RoutedFmt {
@@ -147,6 +157,7 @@ impl RoutedFmt {
             RoutedFmt::Vq3 => "vq3",
             RoutedFmt::I4 => "i4",
             RoutedFmt::F4 => "f4",
+            RoutedFmt::MxFp8 => "mxfp8",
         }
     }
 
@@ -160,6 +171,7 @@ impl RoutedFmt {
             RoutedFmt::Vq3 => crate::quant::VQ_GROUP,
             RoutedFmt::I4 => crate::quant::I4_GROUP,
             RoutedFmt::F4 => crate::quant::F4_GROUP,
+            RoutedFmt::MxFp8 => crate::quant::MXFP8_GROUP,
         }
     }
 
@@ -169,6 +181,7 @@ impl RoutedFmt {
             RoutedFmt::Vq3 => stringify!(VQ_GROUP),
             RoutedFmt::I4 => stringify!(I4_GROUP),
             RoutedFmt::F4 => stringify!(F4_GROUP),
+            RoutedFmt::MxFp8 => stringify!(MXFP8_GROUP),
         }
     }
 
@@ -180,6 +193,7 @@ impl RoutedFmt {
             RoutedFmt::Vq3 => Some(VQ3_MAGIC),
             RoutedFmt::I4 => None,
             RoutedFmt::F4 => Some(F4_MAGIC),
+            RoutedFmt::MxFp8 => Some(MXFP8_MAGIC),
         }
     }
 
@@ -202,7 +216,9 @@ impl RoutedFmt {
     pub(super) fn has_shared(self) -> bool {
         match self {
             RoutedFmt::Vq3 | RoutedFmt::I4 => true,
-            RoutedFmt::F4 => false,
+            // `.f4` and `.mxfp8` both hold `n_experts` blocks and stop: V4's shared expert is
+            // fp8 e4m3 at full width, and Small ships `n_shared_experts 0` outright.
+            RoutedFmt::F4 | RoutedFmt::MxFp8 => false,
         }
     }
 
@@ -214,11 +230,12 @@ impl RoutedFmt {
     /// models' dimensions included; `quant::f4_slot_offsets` has the arithmetic. Derived here,
     /// so the pairing is unrepresentable rather than merely warned about.
     pub(super) fn slot_offsets(self, expert_in: usize, moe_inter: usize) -> [usize; 6] {
-        use crate::quant::{f4_slot_offsets, i4_slot_offsets, vq_slot_offsets};
+        use crate::quant::{f4_slot_offsets, i4_slot_offsets, mxfp8_slot_offsets, vq_slot_offsets};
         match self {
             RoutedFmt::Vq3 => vq_slot_offsets(expert_in, moe_inter),
             RoutedFmt::I4 => i4_slot_offsets(expert_in, moe_inter),
             RoutedFmt::F4 => f4_slot_offsets(expert_in, moe_inter),
+            RoutedFmt::MxFp8 => mxfp8_slot_offsets(expert_in, moe_inter),
         }
     }
 
@@ -236,6 +253,10 @@ impl RoutedFmt {
             RoutedFmt::F4 => (
                 f4_expert_stride(expert_in, moe_inter),
                 f4_expert_bytes(expert_in, moe_inter),
+            ),
+            RoutedFmt::MxFp8 => (
+                mxfp8_expert_stride(expert_in, moe_inter),
+                mxfp8_expert_bytes(expert_in, moe_inter),
             ),
         }
     }
@@ -278,6 +299,44 @@ mod tests {
             moe_inter: 2048,
             stride,
         }
+    }
+
+    /// **The MXFP8 header's own round trip, and the magic as the ONLY discriminator against
+    /// its two one-byte-scale siblings.** An `.f4` and an `.mxfp8` taken as each other put
+    /// every projection but the first at the wrong address; a `.vq3` block is 15 MB against a
+    /// 32.8 MB MXFP8 one. Each pairing below is a WELL-FORMED header of the other format, so a
+    /// refusal is the magic and not a header that stopped parsing.
+    #[test]
+    fn mxfp8_header_roundtrips_and_is_refused_as_any_other_format() {
+        let stride = mxfp8_expert_stride(4608, 2304);
+        let h = ExpertHeader::new(
+            MXFP8_MAGIC,
+            LayerDims {
+                layer: 47,
+                n_experts: 384,
+                expert_in: 4608,
+                moe_inter: 2304,
+                stride,
+            },
+        );
+        let back = ExpertHeader::from_bytes(&h.to_bytes(), RoutedFmt::MxFp8).unwrap();
+        assert_eq!(
+            (back.magic, back.layer, back.n_experts, back.stride),
+            (MXFP8_MAGIC, 47, 384, stride as u64)
+        );
+        for other in [RoutedFmt::Vq3, RoutedFmt::F4] {
+            assert!(
+                ExpertHeader::from_bytes(&h.to_bytes(), other).is_err(),
+                "a {other:?} reader accepted .mxfp8 magic"
+            );
+        }
+        let f4 = ExpertHeader::new(F4_MAGIC, dims_6144x2048(f4_expert_stride(6144, 2048)));
+        assert!(ExpertHeader::from_bytes(&f4.to_bytes(), RoutedFmt::MxFp8).is_err());
+        // And a corrupt magic inside an otherwise valid MXFP8 header is refused at its own
+        // reader, so the refusal above is not merely "the other formats are wrong".
+        let mut bad = h.to_bytes();
+        bad[0] = b'X';
+        assert!(ExpertHeader::from_bytes(&bad, RoutedFmt::MxFp8).is_err());
     }
 
     #[test]

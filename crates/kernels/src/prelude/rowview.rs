@@ -47,6 +47,20 @@ pub fn blk_shift(block: i32) -> i32 {
     31 - block.leading_zeros() as i32
 }
 
+/// Where a dword pass stops and its scalar tail resumes: the largest multiple of `step` not
+/// exceeding `dim`, or `0` when the packed row's bytes are not 4-byte aligned (a `u32` load
+/// would fault, so the tail takes every column). The two are a PARTITION of the columns, and
+/// `dim` need not be a multiple of `step` — hence the floor rather than a cast.
+///
+/// One helper because both dword dots had this spelled as the same five-line `if aligned {
+/// … } else { 0 }`, which `jscpd` paired (2026-11-25); the shape is the format-independent
+/// half of the loop, and the two formats keep only their own step.
+#[inline(always)]
+pub fn aligned_base(w: *const u8, dim: usize, step: usize) -> usize {
+    let floored = dim / step * step;
+    if w as usize & 3 == 0 { floored } else { 0 }
+}
+
 /// Sixteen bytes of activation, the `float4` the dword paths load.
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]

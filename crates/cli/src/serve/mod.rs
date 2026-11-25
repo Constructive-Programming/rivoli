@@ -63,7 +63,7 @@ mod oai;
 
 use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::tokenizer::{ChatOpts, Tokenizer};
-use rivoli_core::legality::{Arch, INKLING_ARM_NOT_BUILT, QWEN_ARM_NOT_BUILT};
+use rivoli_core::legality::{Arch, QWEN_ARM_NOT_BUILT};
 use rivoli_engine::{Decoded, Engine, GenSpec};
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
@@ -304,10 +304,13 @@ fn frame_prompt(
         // Inkling 2 Mini (S5, 2026-11-24): its own OpenAI-body renderer, which quotes the
         // checkpoint's `reasoning_effort` axis rather than collapsing it into a boolean — the
         // provider field `reasoning_effort` is passed through verbatim by `thinking_mode`.
-        Arch::Inkling2Loop => tok.encode(&inkling::inkling_prompt(body, (think, effort))?),
-        // Small is still ARMLESS (S6): the second door, quoting the table's const. `main`
-        // bails first; this holds if that door ever moves.
-        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
+        //
+        // **BOTH members (S6, 2026-11-25).** The two checkpoints ship a byte-identical
+        // `chat_template.jinja` (asserted by `inkling_pins.rs`), so the OpenAI-body renderer
+        // above serves both — one framing to keep in step with one splitter.
+        Arch::Inkling2Loop | Arch::Inkling2 => {
+            tok.encode(&inkling::inkling_prompt(body, (think, effort))?)
+        }
     }
 }
 
@@ -362,10 +365,8 @@ fn split_channels(text: &str, ask: &Ask, complete: bool) -> Result<(String, Stri
         // — `inkling_prompt` renders `<|message_model|><|content_thinking|>…` and
         // `split_inkling` reads exactly those markers back. Wiring one without the other is
         // the M11b revert this pair exists to prevent.
-        Arch::Inkling2Loop => Ok(inkling::split_inkling(text, complete)),
-        // Small, still armless: a refusal and not a panic, on the qwen arm's argument above —
-        // silently reading a reply with another model's channel markers is the M11b failure.
-        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
+        // Both Inkling members read back their own markers (S6): same template, same split.
+        Arch::Inkling2Loop | Arch::Inkling2 => Ok(inkling::split_inkling(text, complete)),
     }
 }
 
@@ -695,17 +696,7 @@ mod tests {
             e.contains("no decode path for this architecture yet"),
             "the refusal must be the table's own wording, not a second one invented here: {e}"
         );
-        // Inkling 2 SMALL still refuses on the table's wording (S6 owns its arm). Mini left
-        // this loop at S5 and is asserted below, from the other side.
-        let e = format!(
-            "{:#}",
-            split(Arch::Inkling2).expect_err("the armless inkling member must refuse")
-        );
-        assert!(
-            e.contains("no decode path for this architecture yet"),
-            "inkling's refusal must be the table's own wording: {e}"
-        );
-        // **The Mini round trip (S5, 2026-11-24).** A reply in Inkling's own channel markers —
+        // **The Inkling round trip (S5 for Mini, S6 for Small).** A reply in Inkling's own channel markers —
         // the pair `inkling_prompt` frames and `split_inkling` reads — must come back as
         // (thinking, content), with no marker text in either. A dispatch wired to GLM's
         // `</think>` reader would put the whole string in `reasoning` and leave `content`
@@ -730,9 +721,17 @@ mod tests {
         for part in [&reasoning, &content] {
             assert!(
                 !part.contains("<|"),
-                "a marker leaked into a channel: {part:?} — the reader is not Mini's"
+                "a marker leaked into a channel: {part:?} — the reader is not Inkling's"
             );
         }
+        // Small reads back IDENTICALLY (S6): both members ship the same `chat_template.jinja`
+        // and therefore the same channel markers, and the dispatch above sends both to the
+        // same splitter. A Small arm wired to any other reader reddens on this one line.
+        assert_eq!(
+            split_channels(mini_reply, &ask(Arch::Inkling2), true).ok(),
+            Some((reasoning, content)),
+            "Small must read its channels exactly as Mini does — one template, one splitter"
+        );
     }
 
     /// The ceiling contract, stated on the arithmetic rather than on a socket: one slot is

@@ -9,8 +9,8 @@
 //! module's LCOM4, and four formats, a k-means learner and three checkpoints' naming tables
 //! had accumulated here with no call edge between them. What stayed is exactly what more
 //! than one format needs — the byte readers, the GEMV entry contract, the three weight
-//! views, the shared row loop, and the routed-expert BLOCK geometry that all three routed
-//! formats walk. What left went by format: [`vq`], [`int4`], [`f4`], [`fp8`], plus
+//! views, the shared row loop, and the routed-expert BLOCK geometry that all four routed
+//! formats walk. What left went by format: [`vq`], [`int4`], [`f4`], [`mxfp8`], [`fp8`], plus
 //! [`kmeans`] (the codebook learner) and [`naming`] (what the checkpoints call things).
 //!
 //! **The split was a move, not a rewrite**: every body and every comment travelled verbatim,
@@ -27,6 +27,7 @@ pub mod f4;
 pub mod fp8;
 pub mod int4;
 pub mod kmeans;
+pub mod mxfp8;
 pub mod naming;
 pub mod vq;
 
@@ -47,6 +48,10 @@ pub use int4::{
     i4_row_bytes, i4_slot_offsets, matvec_i4, quant_i4, write_i4_proj,
 };
 pub use kmeans::{codebook_norms, learn_codebook, learn_codebook_k, sample_subvectors};
+pub use mxfp8::{
+    MXFP8_GROUP, MXFP8_NAN_SCALE, mxfp8_expert_bytes, mxfp8_expert_stride, mxfp8_groups,
+    mxfp8_proj_bytes, mxfp8_row_bytes, mxfp8_slot_offsets,
+};
 pub use naming::{
     ExpertProjs, K3_PACKED, K3_PROJ, K3_SCALE, K3_TEXT_PREFIX, PROJ, V4_PROJ, expert_base,
     expert_projs, k3_expert_base, v4_expert_base, v4_expert_projs,
@@ -202,13 +207,13 @@ pub fn matvec_i8(y: &mut [f32], x: &[f32], w: RowScaledW<'_>, shape: [usize; 2])
     });
 }
 
-// ── the routed-expert block: what all three routed formats share ─────────────
+// ── the routed-expert block: what all four routed formats share ────────────
 //
-// `.vq3`, `.i4` and `.f4` differ only in how many bytes a projection's packed rows and its
-// scales take. Everything else about a block — three projections in `vq_expert_layout`
+// `.vq3`, `.i4`, `.f4` and `.mxfp8` differ only in how many bytes a projection's packed rows
+// and its scales take. Everything else about a block — three projections in `vq_expert_layout`
 // order, each `packed ‖ scales`, tightly packed, the whole padded up to `VQ_ALIGN` so one
 // expert is one O_DIRECT read — is format-independent and is written down exactly once
-// here. Three hand-written copies of that walk is what `slot_offsets` exists to prevent,
+// here. Hand-written copies of that walk is what `slot_offsets` exists to prevent,
 // and the `.i4` copy had already drifted into a different SHAPE from the `.vq3` one while
 // computing the same thing before it was folded in.
 
@@ -244,7 +249,7 @@ pub fn vq_expert_layout(expert_in: usize, moe_inter: usize) -> [(usize, usize); 
 
 /// Sum one format's `*_proj_bytes` over an expert's three projections. The `(o, i)` dims
 /// are format-independent, so this is the one place the "an expert is gate‖up‖down"
-/// structure is written; the three formats differ only in `proj`.
+/// structure is written; the four formats differ only in `proj`.
 fn expert_bytes(expert_in: usize, moe_inter: usize, proj: fn(usize, usize) -> usize) -> usize {
     vq_expert_layout(expert_in, moe_inter)
         .iter()
@@ -253,7 +258,7 @@ fn expert_bytes(expert_in: usize, moe_inter: usize, proj: fn(usize, usize) -> us
 }
 
 /// Round an expert's unpadded size up to [`VQ_ALIGN`], so one expert is a single
-/// block-aligned O_DIRECT read. Shared by all three routed formats.
+/// block-aligned O_DIRECT read. Shared by all four routed formats.
 fn expert_stride(bytes: usize) -> usize {
     bytes.div_ceil(VQ_ALIGN) * VQ_ALIGN
 }
@@ -261,7 +266,7 @@ fn expert_stride(bytes: usize) -> usize {
 /// The six byte offsets within one expert block, in expert-descriptor field order:
 /// `[gate_packed, gate_scale, up_packed, up_scale, down_packed, down_scale]`.
 ///
-/// **ONE definition for all three routed formats.** The STRUCTURE — three projections in
+/// **ONE definition for all four routed formats.** The STRUCTURE — three projections in
 /// [`vq_expert_layout`] order, each `packed rows ‖ group scales`, tightly packed — is
 /// format-independent; the formats differ only in the two byte counts, which is what
 /// `span` supplies. Three hand-written copies of this walk is what
@@ -411,6 +416,11 @@ mod tests {
             ),
             ("i4", i4_slot_offsets(expert_in, inter), i4_proj_bytes),
             ("f4", f4_slot_offsets(expert_in, inter), f4_proj_bytes),
+            (
+                "mxfp8",
+                mxfp8_slot_offsets(expert_in, inter),
+                mxfp8_proj_bytes,
+            ),
         ] {
             assert_eq!(
                 off[0], 0,

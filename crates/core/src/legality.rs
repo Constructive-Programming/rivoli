@@ -59,9 +59,8 @@ pub enum Arch {
     /// since S5 (2026-11-24)**; the port plan is `docs/investigations/inkling2-port.md` and the
     /// math `docs/reference/inkling2-architecture.md`.
     Inkling2Loop,
-    /// Inkling 2 Small — the `inkling2` member: 48 layers, no loop, MXFP8 experts throughout.
-    /// The P1 bigger-than-memory streaming case; shares Mini's text stack and its port plan.
-    /// Armless as of S1 (2026-11-23).
+    /// Inkling 2 Small — 48 layers, no loop, MXFP8 experts; the P1 bigger-than-memory case,
+    /// sharing Mini's text stack. **Armed since S6 (2026-11-25)** on native `.mxfp8` slots.
     Inkling2,
 }
 
@@ -453,8 +452,7 @@ const K3_MTP_NEEDS_TWO_KERNELS: &str = "speculative decode on this architecture 
 /// can independently judge one configuration" hazard the header opens with. It stops being
 /// `pub` at S6, when the arm lands and the doors close.
 ///
-/// > **CORRECTED 2026-11-23 (inkling S1).** This opened "the only refusal text in this table
-/// > that is `pub`"; [`INKLING_ARM_NOT_BUILT`] is the second, for the same reason.
+/// > Inkling's arm-not-built const was the second `pub` one until S6 deleted it (2026-11-25).
 pub const QWEN_ARM_NOT_BUILT: &str = "there is no decode path for this architecture yet, so \
      there is nothing for a flag to be legal ABOUT: the sniff recognises the artifact and \
      everything behind it is owed — no config type, no converter, no kernel, no arm. This was \
@@ -490,19 +488,15 @@ const QWEN_MTP_NOT_LOADED: &str = "speculative decode on this architecture is bl
      routed-expert range would be instantiated at one row only, as on every arm here. And in \
      front of all three, this architecture has no decode arm at all — see its other refusals";
 
-/// Inkling 2 SMALL's arm-not-built refusal — **Small's door since S5 (2026-11-24)**. Mini's
-/// looped bf16 arm IS built; this text quotes only the member still owed, the MXFP8 streaming
-/// case, so a Small refusal no longer claims a text stack that exists.
-///
-/// `pub` for the same reason as [`QWEN_ARM_NOT_BUILT`]: `main.rs`, `bench.rs` and `serve/mod.rs`
-/// quote it at their doors, and Small's door keeps quoting it until S6.
-pub const INKLING_ARM_NOT_BUILT: &str = "no decode path for this architecture yet — Inkling 2 SMALL's MXFP8 \
-     streaming arm is not built. Mini's looped bf16 arm IS built (S5); Small is the \
-     bigger-than-memory case: 48 layers of MXFP8 experts (~600 GB) whose blocks must stream from \
-     NVMe overlapped with compute, which is S6. The block-residual attention (learned query \
-     mixing, per-head sinks, relative bias, short convolutions) and the softcapped MoE come \
-     with it. The pinned checkpoint, tokenizer and config are vendored under \
-     docs/measurement/inkling2-reference/; the plan is docs/investigations/inkling2-port.md.";
+/// `--mode` on Small: a loud fallback on [`INKLING_MINI_FORMAT_IS_BF16`]'s argument — the
+/// checkpoint ships MXFP8, repacked byte for byte into `.mxfp8`, and `Refuse` would kill the
+/// no-flags invocation on a clap default. Residency moves with `--max-mem`.
+const INKLING_SMALL_FORMAT_IS_MXFP8: &str = "--mode names how ROUTED EXPERTS are stored, and \
+     this artifact has no such container to choose: Inkling 2 Small ships its 384 experts per \
+     layer as native MXFP8 (one e4m3 value per byte, one ue8m0 exponent per 32 weights), \
+     repacked byte-for-byte into .mxfp8 with nothing quantized. The flag is ignored, and \
+     nothing in the run is stored in the format you named. What moves residency here is \
+     --max-mem, which decides how much of the ~600 GB routed set is pinned";
 
 /// `--mtp` on Inkling 2: refused for TWO facts, and the wording carries both. (1) The draft
 /// stack is not in the artifact: `mtp.safetensors` (635,801,416 B, sha256-verified beside the Mini
@@ -532,12 +526,11 @@ const INKLING_MINI_FORMAT_IS_BF16: &str = "--mode names how ROUTED EXPERTS are s
      ignored, and nothing in the run is stored in the format you named. What moves residency \
      here is --max-mem, which decides how many of the 24 blocks are pinned";
 
-/// The three sparse selections on Mini: its attention is a HYBRID of sliding-window and full
-/// layers with relative bias and per-head sinks — a mask over the causal prefix, not a row
-/// selection — so none of `streaming`, `dsa` or `misa` names what any layer does. `dense` is
-/// `Support` because the full layers genuinely are (K3's MLA cell sets the precedent).
+/// The three sparse selections on Inkling 2 — BOTH members, hence the architecture's name: the
+/// attention is a HYBRID of sliding-window and full layers with bias and sinks — a mask over the
+/// causal prefix, not a row selection. `dense` is what the full layers genuinely do.
 const INKLING_SPARSE_ATTN_UNSUPPORTED: &str = "--attn names how attention SELECTS the rows it \
-     reads, and Inkling 2 Mini does not offer the choice: its attention is a HYBRID of \
+     reads, and Inkling 2 does not offer the choice: its attention is a HYBRID of \
      sliding-window layers and full layers, with relative bias and per-head sinks — a mask over \
      the causal prefix, not a row selection. streaming, dsa and misa all name selections this \
      model does not perform. --attn dense is what the full layers genuinely do";
@@ -728,66 +721,76 @@ fn deepseek_v4(flag: Flag) -> Outcome {
 /// flips at S6 (`docs/investigations/qwen-flash-next-port.md`), in one commit with the arm and
 /// `tests/smoke-qwen.sh`.
 ///
-/// > **FACTORED 2026-11-23 (inkling S1).** The by-value match moved to [`armless_row`] when
-/// > inkling became the second armless architecture: a second copy of the seven-line pattern is
-/// > a jscpd clone at the gate's 5-line floor. Every cell is still spelled BY VALUE there, so a
-/// > new `Mode`, `AttnKind` or valueless flag is a compile error, not a wildcard.
+/// > **FACTORED 2026-11-23 (inkling S1), UNFACTORED AT S6 (2026-11-25).** The by-value match
+/// > moved to an `armless_row` helper when inkling became the second armless architecture; S6
+/// > landed Inkling's arm, so the helper had one caller and its body lives here again. Every
+/// > cell is still spelled BY VALUE, so a new `Mode`, `AttnKind` or valueless flag is a compile
+/// > error here, not a wildcard.
 fn qwen_flash_next(flag: Flag) -> Outcome {
-    armless_row(flag, QWEN_ARM_NOT_BUILT, QWEN_MTP_NOT_LOADED)
-}
-
-/// **Inkling 2 Mini's row, as of S5 (2026-11-24)** — the arm that decodes, and the whole row is
-/// two facts worked out flag by flag: **the artifact stores dequantized bf16 experts**, and **the
-/// attention is a hybrid sliding/full mask, not a row selection.**
-///
-/// `--mode` falls back loudly (`Refuse` would kill the no-flags invocation on a clap default and
-/// `Support` would record a knob nothing spent — [`muse_glimmer`]'s doc carries the argument);
-/// `--attn dense` is honest on its own merits and the three sparse values refuse with Mini's OWN
-/// reason. `--cache-policy` refuses because the block partition is a fixed layer prefix
-/// (Glimmer's cyclic-scan argument), `--trace` because the bf16 arm has no v2 trace, and `--mtp`
-/// with [`INKLING_MTP_NOT_LOADED`] — the ONE cell that would refuse even if a draft head were
-/// loaded. `--max-mem` and `--ctx` are `Support`: every one of the 24 expert blocks streams from
-/// NVMe, so residency and the KV ceiling govern every token. Pinned by
-/// `inkling2_loop_row_is_the_s5_truth`.
-fn inkling2_loop(flag: Flag) -> Outcome {
     match flag {
-        Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid) => {
-            Outcome::FallbackLoudly(INKLING_MINI_FORMAT_IS_BF16)
-        }
-        Flag::Attn(AttnKind::Dense) => Outcome::Support,
-        Flag::Attn(AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa) => {
-            Outcome::Refuse(INKLING_SPARSE_ATTN_UNSUPPORTED)
-        }
-        Flag::CachePolicy => Outcome::Refuse(INKLING_MINI_CACHE_POLICY_IS_PREFIX),
-        Flag::MaxMem | Flag::Ctx => Outcome::Support,
-        Flag::Trace => Outcome::Refuse(INKLING_MINI_HAS_NO_EXPERT_TRACE),
-        Flag::Mtp => Outcome::Refuse(INKLING_MTP_NOT_LOADED),
-    }
-}
-
-/// Inkling 2 SMALL's row, which is still ARMLESS — the reddening gate S1 put here, now covering
-/// one member: Mini's row above flipped at S5, and Small stays on the shared refusal until S6
-/// gives it the bigger-than-memory streaming arm. The pinned test is
-/// `inkling2_row_refuses_every_flag_as_of_s5`.
-fn inkling2(flag: Flag) -> Outcome {
-    armless_row(flag, INKLING_ARM_NOT_BUILT, INKLING_MTP_NOT_LOADED)
-}
-
-/// The shape every ARMLESS row shares: `--mtp` refuses with the draft-stack reason, every other
-/// cell with the arm-not-built reason (two callers: [`qwen_flash_next`], [`inkling2`]; the
-/// factoring argument is on the first one's dated note). Spelled BY VALUE, so a new `Mode`,
-/// `AttnKind` or valueless flag is a compile error here, not a wildcard.
-fn armless_row(flag: Flag, arm_not_built: &'static str, mtp_not_loaded: &'static str) -> Outcome {
-    match flag {
-        // Each caller's OWN wording, not the shared `MTP_DEFERRED`: that one says the draft
-        // head is not loaded, while an armless architecture's draft stack is not even converted.
-        Flag::Mtp => Outcome::Refuse(mtp_not_loaded),
+        Flag::Mtp => Outcome::Refuse(QWEN_MTP_NOT_LOADED),
         Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid)
         | Flag::Attn(AttnKind::Dense | AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa)
         | Flag::CachePolicy
         | Flag::MaxMem
         | Flag::Ctx
-        | Flag::Trace => Outcome::Refuse(arm_not_built),
+        | Flag::Trace => Outcome::Refuse(QWEN_ARM_NOT_BUILT),
+    }
+}
+
+/// **Inkling 2 Mini's row, as of S5 (2026-11-24)** — the looped bf16 member. Its own three
+/// cells say what a fixed layer prefix costs: `--mode` names a container the converted artifact
+/// no longer has, `--cache-policy` names a choice a static prefix does not offer, and `--trace`
+/// an instrument this arm does not write. Everything else is [`inkling_row`]'s. Pinned by
+/// `inkling2_loop_row_is_the_s5_truth`.
+fn inkling2_loop(flag: Flag) -> Outcome {
+    inkling_row(
+        flag,
+        Members {
+            format: INKLING_MINI_FORMAT_IS_BF16,
+            cache_policy: Outcome::Refuse(INKLING_MINI_CACHE_POLICY_IS_PREFIX),
+            trace: Outcome::Refuse(INKLING_MINI_HAS_NO_EXPERT_TRACE),
+        },
+    )
+}
+
+/// **Inkling 2 Small's row, as of S6 (2026-11-25)** — the bigger-than-memory member, and the
+/// first Inkling row with a routed pool: the ~600 GB `.mxfp8` set makes `--cache-policy`,
+/// `--max-mem`, `--ctx` and `--trace` REAL where Mini refuses or ignores them. Everything else
+/// is [`inkling_row`]'s. Pinned by `inkling2_row_is_the_s6_truth`.
+fn inkling2(flag: Flag) -> Outcome {
+    inkling_row(
+        flag,
+        Members {
+            format: INKLING_SMALL_FORMAT_IS_MXFP8,
+            cache_policy: Outcome::Support,
+            trace: Outcome::Support,
+        },
+    )
+}
+
+/// The three cells where the members differ, named so a transposed pair is visible.
+#[derive(Clone, Copy)]
+struct Members {
+    format: &'static str,
+    cache_policy: Outcome,
+    trace: Outcome,
+}
+
+/// One Inkling row: **the text stack is ONE stack**, so `--attn`, the budget, the KV ceiling and
+/// `--mtp` are the ARCHITECTURE's answers, written once. BY VALUE, so a new flag is a compile
+/// error here rather than a wildcard.
+fn inkling_row(flag: Flag, own: Members) -> Outcome {
+    match flag {
+        Flag::Mode(Mode::Int3Vq | Mode::Int4 | Mode::Hybrid) => Outcome::FallbackLoudly(own.format),
+        Flag::Attn(AttnKind::Dense) => Outcome::Support,
+        Flag::Attn(AttnKind::Streaming | AttnKind::Dsa | AttnKind::Misa) => {
+            Outcome::Refuse(INKLING_SPARSE_ATTN_UNSUPPORTED)
+        }
+        Flag::CachePolicy => own.cache_policy,
+        Flag::MaxMem | Flag::Ctx => Outcome::Support,
+        Flag::Trace => own.trace,
+        Flag::Mtp => Outcome::Refuse(INKLING_MTP_NOT_LOADED),
     }
 }
 

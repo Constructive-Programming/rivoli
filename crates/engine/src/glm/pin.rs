@@ -161,6 +161,9 @@ fn expert_bytes(cfg: &ModelConfig, fmt: RoutedFmt) -> Result<usize> {
             cfg.moe_inter,
         )),
         RoutedFmt::F4 => anyhow::bail!("GLM streams .vq3 or .i4; .f4 is a V4 format"),
+        // S6's container, refused for F4's reason one arm over: it is Inkling 2 Small's, and
+        // its slot is a different six-pointer descriptor this engine never builds.
+        RoutedFmt::MxFp8 => anyhow::bail!("GLM streams .vq3 or .i4; .mxfp8 is Inkling 2 Small's"),
     }
 }
 

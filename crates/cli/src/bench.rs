@@ -16,9 +16,7 @@
 use crate::{BENCH_PROMPT, args::Args};
 use anyhow::{Context, Result, bail, ensure};
 use rivoli_artifact::tokenizer::Tokenizer;
-use rivoli_core::legality::{
-    ATTNS, Arch, INKLING_ARM_NOT_BUILT, MODES, QWEN_ARM_NOT_BUILT, name_in,
-};
+use rivoli_core::legality::{ATTNS, Arch, MODES, QWEN_ARM_NOT_BUILT, name_in};
 use rivoli_engine::{Engine, GenSpec};
 use std::io::Write as _;
 
@@ -121,17 +119,17 @@ fn frame_prompt(tok: &Tokenizer, arch: Arch, text: &str) -> Result<Vec<u32>> {
         // `reasoning_effort: Some("none")` on the Glimmer arm's argument above, not the
         // template's default `0.9`: `--bench N` is timing the decode, and a reasoning block
         // would spend the whole budget in the thinking channel.
-        Arch::Inkling2Loop => tok.encode(&inkling_encoding::render(
+        //
+        // **BOTH members share it (S6, 2026-11-25).** Mini and Small ship the same text stack
+        // and the same `chat_template.jinja` — `inkling_pins.rs` asserts the two files are
+        // byte-identical — so one arm renders for both and there is no small-only framing to
+        // get wrong.
+        Arch::Inkling2Loop | Arch::Inkling2 => tok.encode(&inkling_encoding::render(
             &[serde_json::json!({"role": "user", "content": text})],
             &inkling_encoding::InklingChatOpts {
                 reasoning_effort: Some("none"),
             },
         )?),
-        // The THIRD door quoting the table's const (inkling S1, 2026-11-23): same reachability
-        // argument as qwen above — a bench framed in some model's markers, counted against
-        // `--ctx` and reported as run, is the failure this bail hides. Small only since S5:
-        // Mini's arm is the match arm above, and this one stays until S6.
-        Arch::Inkling2 => bail!("{INKLING_ARM_NOT_BUILT}"),
     }
 }
 

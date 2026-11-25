@@ -130,6 +130,7 @@ impl FormatMeta {
 
 /// The two directories an artifact finish reads and writes — one value because the pair
 /// travels together and swapping them is a plausible, silent call-site error.
+#[derive(Clone, Copy)]
 pub struct ArtifactDirs<'a> {
     pub out: &'a str,
     pub src: &'a str,

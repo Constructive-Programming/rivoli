@@ -1,15 +1,18 @@
 //! The per-layer repack driver: write an `.f4` layer if it is absent, then optionally read
-//! it back and prove it byte-for-byte against the source.
+//! it back and prove it byte-for-byte against the source — and `LayerRepack`, the resume /
+//! verify / report policy BOTH routed formats share, which is why this file is the home of the
+//! windowed verify read rather than of one model's converter.
 //!
 //! Sits above [`super::expert`] (one expert's spans) and [`super::layer`] (the bounded,
 //! atomic write), and exists because `convert_v4` and `convert_k3` differ in exactly one
 //! thing — how an expert's tensor prefix is spelled — and a copied verify loop is the shape
-//! where one model's converter gets a fix the other's silently does not.
+//! where one model's converter gets a fix the other's silently does not. `.mxfp8` is the third
+//! caller of that lesson, and the first one whose FORMAT differs as well as its names.
 
 use anyhow::{Context, Result, ensure};
 
 use super::expert::{F4Expert, F4Naming};
-use super::header::{ExpertHeader, F4_MAGIC, LayerDims};
+use super::header::{EXPERT_HEADER_BYTES, ExpertHeader, F4_MAGIC, LayerDims};
 use super::layer::{ExpertFile, LAYER_WINDOW, write_expert_layer};
 use super::tensors::Safetensors;
 use crate::quant::{ExpertBlocks, VQ_ALIGN, f4_expert_bytes, f4_expert_stride};
@@ -54,6 +57,240 @@ struct LayerPlan {
     reused: bool,
 }
 
+/// The blocks of one layer file as a VERIFIER walks them: where block 0 starts, how far apart
+/// blocks are, how many payload bytes each carries, and how many there are.
+///
+/// Bundled rather than passed as four `usize`s beside a path, for the reason
+/// [`crate::quant::ExpertBlocks`] gives about `stride`/`bytes`/`count`: a swap here is a
+/// correct-length comparison against the wrong pair of numbers, which is exactly the failure a
+/// verifier exists to catch and would instead commit.
+#[derive(Clone, Copy)]
+pub(super) struct LayerBlocks<'a> {
+    pub(super) path: &'a str,
+    /// Where block 0 starts — [`crate::quant::VQ_ALIGN`] for every header-carrying format.
+    pub(super) hbytes: usize,
+    pub(super) stride: usize,
+    /// Useful bytes at the start of a block; the padding to `stride` is never compared.
+    pub(super) bytes: usize,
+    pub(super) count: usize,
+}
+
+impl<'a> LayerBlocks<'a> {
+    /// One layer file's block geometry, from the `(stride, useful bytes, block count)` a
+    /// format's own plan resolved.
+    ///
+    /// `hbytes` is [`VQ_ALIGN`] here rather than a parameter because the two formats that
+    /// reach this — `.f4` and `.mxfp8` — both carry a 40-byte header in an aligned first
+    /// block ([`RoutedFmt::hbytes`](super::header::RoutedFmt::hbytes) derives it from the
+    /// magic, and both have one).
+    pub(super) fn new(path: &'a str, geom: (usize, usize, usize)) -> Self {
+        let (stride, bytes, count) = geom;
+        Self {
+            path,
+            hbytes: VQ_ALIGN,
+            stride,
+            bytes,
+            count,
+        }
+    }
+}
+
+/// Re-read `blocks` from disk, ONE BLOCK AT A TIME, and return how many bytes `compare`
+/// reported as differing across all of them.
+///
+/// Bounded by one block, never by the file, and that is the point: the first version of this
+/// loop in `convert_v4` read a whole 3.42 GB layer, which was survivable, and the same line
+/// against K3's 896 experts is a 15.72 GB allocation per layer on a box whose LPDDR5 is shared
+/// with the GPU. Small's `.mxfp8` layer is 12.61 GB for the same reason. The length check
+/// comes first so a short or long file is named as such rather than read past its end.
+///
+/// `compare` gets the block INDEX as well as its bytes, because a message that names expert 91
+/// is the difference between a five-minute fix and a bisect.
+fn differing_bytes(
+    blocks: LayerBlocks<'_>,
+    mut compare: impl FnMut(usize, &[u8]) -> Result<usize>,
+) -> Result<usize> {
+    let LayerBlocks {
+        path,
+        hbytes,
+        stride,
+        bytes,
+        count,
+    } = blocks;
+    let f = std::fs::File::open(path).with_context(|| format!("re-read {path}"))?;
+    let len = f.metadata()?.len();
+    ensure!(
+        len == (hbytes + count * stride) as u64,
+        "{path}: {len} bytes on disk, expected {}",
+        hbytes + count * stride
+    );
+    let mut win = vec![0u8; bytes];
+    let mut differing = 0usize;
+    for e in 0..count {
+        let off = hbytes + e * stride;
+        std::os::unix::fs::FileExt::read_exact_at(&f, &mut win, off as u64)
+            .with_context(|| format!("{path}: block {e} at byte {off}"))?;
+        differing += compare(e, &win)?;
+    }
+    Ok(differing)
+}
+
+/// One routed layer file's identity, geometry and the status of the run that asked for it.
+///
+/// The bundle both format writers hand to [`Self::run`]: paths and geometry belong to each
+/// format (`.f4` and `.mxfp8` differ in stride, in magic and in how an expert is packed), but
+/// the POLICIES — resume by reusing an existing file, never write on a verify-only pass, judge
+/// every verify by the same threshold and say it in the same words — belong to the container.
+/// Two hand-written copies of those is what this struct exists to prevent, and the duplication
+/// gate found the second copy the day `.mxfp8` landed.
+pub(super) struct LayerRepack<'a> {
+    tool: &'a str,
+    ext: &'a str,
+    layer: usize,
+    reused: bool,
+    write: bool,
+    verify: bool,
+    blocks: LayerBlocks<'a>,
+}
+
+impl<'a> LayerRepack<'a> {
+    /// `ident` is `(tool, extension, layer)` and `flags` is `(write, verify, reused)` — tuples
+    /// rather than six positionals, and rather than a seven-field literal at each call site,
+    /// which is the shape the gate refused.
+    pub(super) fn new(
+        ident: (&'a str, &'a str, usize),
+        flags: (bool, bool, bool),
+        blocks: LayerBlocks<'a>,
+    ) -> Self {
+        let (tool, ext, layer) = ident;
+        let (write, verify, reused) = flags;
+        Self {
+            tool,
+            ext,
+            layer,
+            reused,
+            write,
+            verify,
+            blocks,
+        }
+    }
+
+    /// The whole of a layer's work: produce the file when asked, refuse to verify what was
+    /// never produced, then prove whatever is on disk.
+    ///
+    /// **`--verify-only` writes NOTHING, and that is a deliberate behaviour change** made when
+    /// this loop was factored out of `convert_v4` (2026-08-11) and spotted by review rather
+    /// than by me. The old inline form was `if !reused { write… }` with no verify-only guard,
+    /// so `convert_v4 --verify-only` over a range containing an unconverted layer silently
+    /// CONVERTED it — against that flag's own `--help`, which promises the run is read-only.
+    /// Refusing here is what the flag says; the message has to be explicit, because the
+    /// alternative is `std::fs::read` failing with a bare ENOENT and a reader concluding the
+    /// artifact is damaged rather than incomplete.
+    pub(super) fn run(
+        &self,
+        produce: impl FnOnce() -> Result<()>,
+        prove: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.write {
+            produce()?;
+        } else {
+            ensure!(
+                self.reused,
+                "{} does not exist, so there is nothing to verify — layer {} has never been \
+                 converted. `--verify-only` is read-only by contract and will not create it; \
+                 drop the flag to convert, or narrow the layer range to what this artifact \
+                 holds.",
+                self.blocks.path,
+                self.layer
+            );
+        }
+        if self.verify {
+            prove()?;
+        }
+        Ok(())
+    }
+
+    /// Say "reusing" and report whether the write was skipped. Said only where there WAS a
+    /// write to skip: on a `--verify-only` run the file is the thing being checked, not
+    /// something being reused, and saying so 92 times above 92 "verified" lines is noise a
+    /// reader has to learn to ignore.
+    pub(super) fn skip_reused(&self) -> bool {
+        if !self.reused {
+            return false;
+        }
+        eprintln!("{}: {} exists, reusing", self.tool, self.blocks.path);
+        true
+    }
+
+    /// The 40-byte header block 0 carries. `dims` is `(expert_in, moe_inter)` — the two widths
+    /// the caller's config holds and this geometry does not.
+    pub(super) fn header(&self, magic: [u8; 4], dims: (usize, usize)) -> [u8; EXPERT_HEADER_BYTES] {
+        ExpertHeader::new(
+            magic,
+            LayerDims {
+                layer: self.layer,
+                n_experts: self.blocks.count,
+                expert_in: dims.0,
+                moe_inter: dims.1,
+                stride: self.blocks.stride,
+            },
+        )
+        .to_bytes()
+    }
+
+    /// Write the file: one aligned header block, then `count` blocks `stride` apart, streamed
+    /// in [`LAYER_WINDOW`] windows.
+    pub(super) fn write(
+        &self,
+        header: [u8; EXPERT_HEADER_BYTES],
+        fill: impl Fn(usize, &mut [u8]) -> Result<()> + Sync,
+    ) -> Result<()> {
+        let b = self.blocks;
+        let file = ExpertFile {
+            path: b.path,
+            header: &header,
+        };
+        let blocks = ExpertBlocks {
+            stride: b.stride,
+            bytes: b.bytes,
+            count: b.count,
+        };
+        let n = write_expert_layer(file, blocks, LAYER_WINDOW, fill)
+            .with_context(|| format!("write L{:02}.{} (repack or I/O)", self.layer, self.ext))?;
+        eprintln!("{}: wrote {} ({n} bytes)", self.tool, b.path);
+        Ok(())
+    }
+
+    /// How many of this file's bytes disagree with a source read by `compare`, ONE block at a
+    /// time — a routed layer is up to 15.7 GB and this box's LPDDR5 is shared with the GPU.
+    pub(super) fn differing(
+        &self,
+        compare: impl FnMut(usize, &[u8]) -> Result<usize>,
+    ) -> Result<usize> {
+        differing_bytes(self.blocks, compare)
+    }
+
+    /// Judge and announce a verify pass. ONE wording and one threshold for every format: the
+    /// repack is a COPY, so any differing byte is a defect and not a tolerance.
+    ///
+    /// A verify runs on a REUSED layer too — that is precisely the layer whose bytes nobody has
+    /// ever checked.
+    pub(super) fn report(&self, differing: usize) -> Result<()> {
+        ensure!(
+            differing == 0,
+            "L{:02}.{}: {differing} bytes differ from the source — the repack is supposed to \
+             be a COPY",
+            self.layer,
+            self.ext
+        );
+        eprintln!(
+            "{}: verified L{:02}.{} — {} experts, 0 bytes differ",
+            self.tool, self.layer, self.ext, self.blocks.count
+        );
+        Ok(())
+    }
+}
+
 impl RoutedRepack<'_> {
     /// Convert layer `l`. `base(e)` gives expert `e`'s source tensor prefix — the ONLY thing
     /// that differs between the two models, which is why it is a closure and everything else
@@ -66,17 +303,25 @@ impl RoutedRepack<'_> {
     /// `Sync`, so leaving it off is a compile error, which is the good outcome.)
     pub fn layer(&self, l: usize, base: impl Fn(usize) -> String + Sync) -> Result<()> {
         let plan = self.plan(l);
-        // A run either produces the file or it does not touch it; there is no third mode, and
-        // the read-only branch is the one `--verify-only` promised in its `--help`.
-        if self.write {
-            self.write_layer(&plan, &base)?;
-        } else {
-            self.require_converted(&plan)?;
-        }
-        if self.verify {
-            self.verify_layer(&plan, &base)?;
-        }
-        Ok(())
+        let file = self.file(&plan);
+        // The policy (write, or refuse; then verify) is [`LayerRepack::run`]'s, shared with
+        // the `.mxfp8` writer: a run either produces the file or it does not touch it, and the
+        // read-only branch is the one `--verify-only` promised in its `--help`.
+        file.run(
+            || self.write_layer(&file, &base),
+            || self.verify_layer(&file, &base),
+        )
+    }
+
+    /// This layer's file identity: what [`Self::plan`] resolved, plus the format name the log
+    /// lines and the header magic are read from.
+    fn file<'b>(&'b self, plan: &'b LayerPlan) -> LayerRepack<'b> {
+        let blocks = LayerBlocks::new(&plan.path, (plan.stride, plan.ebytes, self.n_experts));
+        LayerRepack::new(
+            (self.tool, "f4", plan.layer),
+            (self.write, self.verify, plan.reused),
+            blocks,
+        )
     }
 
     /// Locate layer `l`'s file and its block geometry, and stat it — the one place the path
@@ -106,76 +351,24 @@ impl RoutedRepack<'_> {
 
     /// Write the layer, or report that there was nothing to write.
     ///
-    /// "reusing" is said only here, where there was a write to skip. On a `--verify-only` run
-    /// the file is the thing being checked, not something being reused, and saying so 92 times
-    /// above 92 "verified" lines is noise a reader has to learn to ignore.
+    /// Everything after the format's own two facts — the magic and how one expert is packed —
+    /// is [`LayerRepack`]'s: the header, the windowed write and the "reusing" line are the
+    /// same for `.mxfp8` and must not drift apart.
     fn write_layer(
         &self,
-        plan: &LayerPlan,
+        file: &LayerRepack<'_>,
         base: &(impl Fn(usize) -> String + Sync),
     ) -> Result<()> {
-        let (ne, tool) = (self.n_experts, self.tool);
-        if plan.reused {
-            eprintln!("{tool}: {} exists, reusing", plan.path);
+        if file.skip_reused() {
             return Ok(());
         }
-        // One aligned block for the header, then `ne` routed blocks — and NO shared block,
-        // unlike `.vq3`/`.i4`. Neither model's shared expert is FP4 (V4's is fp8 e4m3, K3's
-        // is BF16 at full width), so a block written past `ne` would be the wrong
+        // One aligned block for the header, then `n_experts` routed blocks — and NO shared
+        // block, unlike `.vq3`/`.i4`. Neither model's shared expert is FP4 (V4's is fp8 e4m3,
+        // K3's is BF16 at full width), so a block written past `n_experts` would be the wrong
         // ARITHMETIC, not just the wrong weights. Streamed in `LAYER_WINDOW` windows: a K3
         // layer is 15.72 GB and buffering one would be host RAM the GPU shares.
-        let header = ExpertHeader::new(
-            F4_MAGIC,
-            LayerDims {
-                layer: plan.layer,
-                n_experts: ne,
-                expert_in: self.expert_in,
-                moe_inter: self.moe_inter,
-                stride: plan.stride,
-            },
-        )
-        .to_bytes();
-        let n = write_expert_layer(
-            ExpertFile {
-                path: &plan.path,
-                header: &header,
-            },
-            ExpertBlocks {
-                stride: plan.stride,
-                bytes: plan.ebytes,
-                count: ne,
-            },
-            LAYER_WINDOW,
-            |e, slot| self.expert(base, e).pack(slot),
-        )
-        .with_context(|| format!("write layer {} (repack or I/O)", plan.layer))?;
-        eprintln!("{tool}: wrote {} ({n} bytes)", plan.path);
-        Ok(())
-    }
-
-    /// A read-only pass needs the layer to exist already.
-    ///
-    /// **`--verify-only` writes NOTHING, and that is a deliberate behaviour change** made when
-    /// this loop was factored out of `convert_v4` (2026-08-11) and spotted by review rather
-    /// than by me. The old inline form was `if !reused { write… }` with no verify-only guard,
-    /// so `convert_v4 --verify-only` over a range containing an unconverted layer silently
-    /// CONVERTED it — against that flag's own `--help`, which promises the run is read-only.
-    /// Refusing here is what the flag says; the message has to be explicit, because the
-    /// alternative is `std::fs::read` failing with a bare ENOENT and a reader concluding the
-    /// artifact is damaged rather than incomplete.
-    fn require_converted(&self, plan: &LayerPlan) -> Result<()> {
-        if plan.reused {
-            return Ok(());
-        }
-        ensure!(
-            !self.verify,
-            "{} does not exist, so there is nothing to verify — layer {} has never been \
-             converted. `--verify-only` is read-only by contract and will not create it; drop \
-             the flag to convert, or narrow the layer range to what this artifact holds.",
-            plan.path,
-            plan.layer
-        );
-        Ok(())
+        let header = file.header(F4_MAGIC, (self.expert_in, self.moe_inter));
+        file.write(header, |e, slot| self.expert(base, e).pack(slot))
     }
 
     /// Read the FILE back and compare it against the mmap'd source, so this tests the writer's
@@ -192,38 +385,13 @@ impl RoutedRepack<'_> {
     /// uses to justify bounding the WRITE side, promoted to the read side by sharing this loop
     /// (review 2026-08-11). The one-expert measurement in
     /// `docs/measurement/k3-reference/repack-one-expert.md` could not have caught it: at
-    /// `ne = 1` the buffer is 17.5 MB. `diff` only ever looks at `ebytes` bytes at `off`.
-    fn verify_layer(&self, plan: &LayerPlan, base: &impl Fn(usize) -> String) -> Result<()> {
-        use std::os::unix::fs::FileExt;
-        let (ne, tool) = (self.n_experts, self.tool);
-        let f =
-            std::fs::File::open(&plan.path).with_context(|| format!("re-read {}", plan.path))?;
-        let len = f.metadata()?.len();
-        ensure!(
-            len == (VQ_ALIGN + ne * plan.stride) as u64,
-            "{}: {len} bytes on disk, expected {}",
-            plan.path,
-            VQ_ALIGN + ne * plan.stride
-        );
-        let mut differing = 0usize;
-        let mut win = vec![0u8; plan.ebytes];
-        for e in 0..ne {
-            let off = VQ_ALIGN + e * plan.stride;
-            f.read_exact_at(&mut win, off as u64)
-                .with_context(|| format!("{}: expert {e}'s block at byte {off}", plan.path))?;
-            differing += self.expert(base, e).diff(&win)?.len();
-        }
-        ensure!(
-            differing == 0,
-            "layer {}: {differing} bytes differ from the source — the repack is supposed \
-             to be a COPY",
-            plan.layer
-        );
-        eprintln!(
-            "{tool}: verified L{:02}.f4 — {ne} experts, 0 bytes differ",
-            plan.layer
-        );
-        Ok(())
+    /// `ne = 1` the buffer is 17.5 MB. `diff` only ever looks at the block's usable bytes.
+    ///
+    /// The walk, the threshold and the closing line are [`LayerRepack`]'s; only the
+    /// comparison — `F4Expert::diff`'s source spans — is this format's.
+    fn verify_layer(&self, file: &LayerRepack<'_>, base: &impl Fn(usize) -> String) -> Result<()> {
+        let differing = file.differing(|e, win| Ok(self.expert(base, e).diff(win)?.len()))?;
+        file.report(differing)
     }
 }
 

@@ -29,7 +29,7 @@ use core::intrinsics::fmuladd;
 
 use super::formats::e2m1f;
 use super::reduce::{WAVE, wave_sum};
-use super::rowview::{F32x4, RowsView, for_strided, quad};
+use super::rowview::{F32x4, RowsView, aligned_base, for_strided, quad};
 
 /// What separates the two nibble formats: the weight decode, the scale's storage type and
 /// decode, and the group width.
@@ -137,13 +137,8 @@ pub unsafe fn dot_nib_wave_r<const R: usize, const U: usize, F: NibFormat>(
     lane: usize,
 ) -> [f32; R] {
     let (mut a0, mut a1) = ([0.0f32; R], [0.0f32; R]);
-    let aligned = w.w as usize & 3 == 0;
     // Where the dword pass stops and the tail resumes: the two are a PARTITION of the columns.
-    let base = if aligned {
-        w.dim / DWORD_STEP * DWORD_STEP
-    } else {
-        0
-    };
+    let base = aligned_base(w.w, w.dim, DWORD_STEP);
     // SAFETY (both passes): the caller's obligation; the dword pass reads columns
     // `col..col+8 <= base <= dim`, the tail `i < dim`.
     unsafe {

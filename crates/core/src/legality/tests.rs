@@ -197,12 +197,12 @@ fn muse_glimmer_row_is_the_m7_truth() {
 /// > would have failed OPEN — a sixth architecture would have gone unchecked here instead of
 /// > reddening until someone said which side of the line it is on.
 ///
-/// > **GREW 2026-11-23 (inkling S1), SHRANK 2026-11-24 (inkling S5).** The armless list went to
-/// > THREE when Inkling 2's two members landed armless, and back to TWO when Mini's row flipped
-/// > and `rivoli_engine::seam::Engine` gained its `InklingLoop` arm. The excluded ones are
-/// > asserted from the other side by [`qwen_flash_next_row_refuses_every_flag_as_of_s1`] and
-/// > [`inkling2_row_refuses_every_flag_as_of_s5`]. The fail-closed argument is unchanged: a new
-/// > variant reddens here until someone says which side of the line it is on.
+/// > **GREW 2026-11-23 (inkling S1), SHRANK TWICE (inkling S5, S6).** The armless list went to
+/// > THREE when Inkling 2's two members landed armless, to TWO when Mini's row flipped, and to
+/// > ONE at S6 when Small's `.mxfp8` streaming arm landed — Qwen is the only architecture here
+/// > with no engine arm. It is asserted from the other side by
+/// > [`qwen_flash_next_row_refuses_every_flag_as_of_s1`]. The fail-closed argument is unchanged:
+/// > a new variant reddens here until someone says which side of the line it is on.
 #[test]
 fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
     let default_mode = parse_in(&MODES, "--mode", "int3-vq").expect("int3-vq parses");
@@ -211,7 +211,7 @@ fn every_architecture_with_an_arm_decodes_with_no_flags_typed() {
     // the statement. `main`'s `the_arms_and_the_legality_table_agree_about_who_can_start` is
     // the cross-check that this exclusion and the arms `main` dispatches to are the same
     // set — including, since S1, its previously unexercised no-arm branch.
-    const ARMLESS: [Arch; 2] = [Arch::QwenFlashNext, Arch::Inkling2];
+    const ARMLESS: [Arch; 1] = [Arch::QwenFlashNext];
     for arch in Arch::ALL.into_iter().filter(|a| !ARMLESS.contains(a)) {
         for flag in [Flag::Mode(default_mode), Flag::Attn(default_attn)] {
             assert!(
@@ -333,7 +333,22 @@ fn kimi_k3_row_is_the_m9_truth() {
 /// > `a_qwen_mtp_invocation_is_refused_by_the_mode_cell_first`.
 #[test]
 fn qwen_flash_next_row_refuses_every_flag_as_of_s1() {
-    assert_row_refuses_everywhere(Arch::QwenFlashNext, QWEN_ARM_NOT_BUILT, QWEN_MTP_NOT_LOADED);
+    // EVERY cell, with the row's own two consts. The per-cell loop lived in a helper while
+    // inkling shared the armless shape; S6 landed Inkling's arm, so it has one caller.
+    for flag in Flag::ALL {
+        let want = if flag == Flag::Mtp {
+            QWEN_MTP_NOT_LOADED
+        } else {
+            QWEN_ARM_NOT_BUILT
+        };
+        assert_eq!(
+            decide(Arch::QwenFlashNext, flag),
+            Outcome::Refuse(want),
+            "--mode/--attn/… on qwen must REFUSE while the arm does not exist — a Support cell \
+             would let a run start into a dispatch that bails, and a FallbackLoudly cell would \
+             promise a run that never happens"
+        );
+    }
     // The two fragments the smoke script quotes. `--mtp` is the cell that stays refused after
     // the arm lands, so its reason must name the DRAFT LAYER's absence from the artifact and
     // the recurrence, not a decode-loop increment on a batch shape that already exists.
@@ -350,23 +365,11 @@ fn qwen_flash_next_row_refuses_every_flag_as_of_s1() {
     );
 }
 
-/// The cell-by-cell claim every ARMLESS row's test makes: refuse EVERY flag, with the row's own
-/// two consts. Hoisted when inkling's two members became the second and third armless rows
-/// (2026-11-23): the per-cell assert is nine lines carrying one long message, and a second copy
-/// is a jscpd clone at the gate's 5-line floor — the same forced factoring `armless_row` records
-/// on the production side. The fragment pins stay per-test: they are what differs between rows.
-fn assert_row_refuses_everywhere(arch: Arch, arm: &'static str, mtp: &'static str) {
-    for flag in Flag::ALL {
-        let want = if flag == Flag::Mtp { mtp } else { arm };
-        assert_eq!(
-            decide(arch, flag),
-            Outcome::Refuse(want),
-            "{} must REFUSE on {} while the arm does not exist — a Support cell would let a \
-             run start into a dispatch that bails, and a FallbackLoudly cell would promise a \
-             run that never happens",
-            flag.spelling(),
-            arch.name()
-        );
+/// Pin a row's consts against the fragments its smoke script greps. ONE author for both Inkling
+/// rows, so a reworded const reddens in every place it is quoted rather than in one of two.
+fn assert_fragments(pairs: &[(&str, &str)]) {
+    for (text, frag) in pairs {
+        assert!(text.contains(frag), "missing fragment {frag:?} in {text:?}");
     }
 }
 
@@ -396,46 +399,44 @@ fn inkling2_loop_row_is_the_s5_truth() {
     ] {
         assert_eq!(mini(flag), Outcome::Refuse(want), "{}", flag.spelling());
     }
-    for (text, frag) in [
+    assert_fragments(&[
         (INKLING_MINI_FORMAT_IS_BF16, "bf16"),
         (INKLING_MINI_FORMAT_IS_BF16, "DEQUANTIZED"),
         (INKLING_SPARSE_ATTN_UNSUPPORTED, "HYBRID"),
         (INKLING_MINI_CACHE_POLICY_IS_PREFIX, "LAYER PREFIX"),
         (INKLING_MINI_HAS_NO_EXPERT_TRACE, "expert-fetch trace"),
-    ] {
-        assert!(text.contains(frag), "missing fragment {frag:?} in {text:?}");
-    }
+    ]);
 }
 
-/// Inkling 2 SMALL's row, cell by cell, as of S5 — the armless gate S1 wrote, reduced to the
-/// member that is still armless when Mini's row flipped (`docs/investigations/inkling2-port.md`:
-/// Mini first, Small as the bigger-than-memory streaming case at S6).
+/// **Inkling 2 Small's row, cell by cell, as of S6** — the change-detector for the arm that
+/// landed, on the five rows' precedent: the total and anti-vacuity checks above would not
+/// notice a cell being flipped, which is the one edit that changes what the engine accepts.
 ///
-/// Pinned to the consts and their fragments for the same reason as qwen's row:
-/// `tests/smoke-inkling.sh` runs against a MINI artifact, so Small has no smoke cells — this
-/// test is the whole gate until S6 gives it an arm and a script.
+/// Every cell is asserted because this row's value IS the distinction against Mini's: Small
+/// accepts the three routed-pool knobs (`--cache-policy`, `--max-mem`, `--trace`) that Mini
+/// refuses, because its experts stream through a real pool rather than a fixed layer prefix.
+/// The fragment pins are what `tests/smoke-inkling-small.sh` asserts the CLI's own stderr
+/// against, so a reworded const here reddens before it can silently stop matching there.
 #[test]
-fn inkling2_row_refuses_every_flag_as_of_s5() {
-    assert_row_refuses_everywhere(
-        Arch::Inkling2,
-        INKLING_ARM_NOT_BUILT,
-        INKLING_MTP_NOT_LOADED,
-    );
-    assert!(
-        INKLING_ARM_NOT_BUILT.contains("no decode path for this architecture yet")
-            && INKLING_ARM_NOT_BUILT.contains("SMALL's MXFP8 streaming arm is not built")
-            && INKLING_ARM_NOT_BUILT.contains("Mini's looped bf16 arm IS built"),
-        "the arm-not-built refusal must say there is no decode path, name the MXFP8 streaming arm \
-         that is owed, and record that Mini's bf16 arm exists — the one fact that tells the two \
-         Inkling members' refusals apart"
-    );
-    assert!(
-        INKLING_MTP_NOT_LOADED.contains("DRAFT STACK IS NOT IN THE ARTIFACT")
-            && INKLING_MTP_NOT_LOADED.contains("loop"),
-        "inkling's --mtp reason must name the excluded draft file AND the looped recurrence a \
-         verify pass would have to replay: quoting another arm's wording tells the user to wait \
-         for the wrong thing"
-    );
+fn inkling2_row_is_the_s6_truth() {
+    let small = |f| decide(Arch::Inkling2, f);
+    every_mode_falls_back_loudly(Arch::Inkling2);
+    sparse_selections_refuse(Arch::Inkling2);
+    // The knobs a routed pool spends — the capture first, so this list is not a suffix of
+    // `Flag::ALL` (token-sequential prefill makes the trace faithful, K3's argument).
+    for f in [Flag::Trace, Flag::CachePolicy, Flag::MaxMem, Flag::Ctx] {
+        assert_eq!(small(f), Outcome::Support, "{} must decode", f.spelling());
+    }
+    assert_eq!(small(Flag::Attn(AttnKind::Dense)), Outcome::Support);
+    // The shared refusals are `inkling_row`'s and are pinned to their consts in Mini's test —
+    // the same arm — so this one carries only what differs plus the MXFP8 wording.
+    assert_fragments(&[
+        (INKLING_SMALL_FORMAT_IS_MXFP8, "MXFP8"),
+        (INKLING_SMALL_FORMAT_IS_MXFP8, ".mxfp8"),
+        (INKLING_SMALL_FORMAT_IS_MXFP8, "ue8m0"),
+        (INKLING_SPARSE_ATTN_UNSUPPORTED, "HYBRID"),
+        (INKLING_MTP_NOT_LOADED, "DRAFT STACK IS NOT IN THE ARTIFACT"),
+    ]);
 }
 
 /// Every spelling parses back to the variant it names, which is what makes

@@ -60,6 +60,7 @@ mod mla;
 pub mod prelude;
 mod moe;
 mod moe_f4;
+mod moe_mxfp8;
 #[cfg(feature = "probes")]
 mod probes;
 mod recurrent;

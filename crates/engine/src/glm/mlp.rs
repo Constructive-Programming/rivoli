@@ -573,6 +573,10 @@ impl GlmEngine<'_> {
                     "an .f4 expert reached GLM's MoE dispatch — it needs ExpertDescF4 and \
                      launch_moe_expert_range_f4, not this descriptor"
                 ),
+                RoutedFmt::MxFp8 => anyhow::bail!(
+                    "an .mxfp8 expert reached GLM's MoE dispatch — it needs ExpertDescF4 and \
+                     launch_moe_expert_range_mxfp8_situ, not this descriptor"
+                ),
             }
         }
     }

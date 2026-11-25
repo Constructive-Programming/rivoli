@@ -24,7 +24,7 @@ use anyhow::Result;
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::glimmer_config::GlimmerConfig;
 use rivoli_artifact::glm_config::ModelConfig;
-use rivoli_artifact::inkling_config::Inkling2LoopConfig;
+use rivoli_artifact::inkling_config::{Inkling2Config, Inkling2LoopConfig};
 use rivoli_artifact::k3_config::K3Config;
 use rivoli_artifact::v4_config::V4Config;
 use rivoli_core::cache::TwoQSplit;
@@ -322,6 +322,12 @@ pub enum ArchCfg<'a> {
     /// that reason, and `--mode` falls back loudly. The budget and the context ride in
     /// [`OpenSpec`], which is what this arm actually spends.
     InklingLoop(&'a Inkling2LoopConfig),
+    /// Inkling 2 Small — the same text stack with ~600 GB of native `.mxfp8` experts, so it
+    /// takes [`PoolKnobs`] like every routed arm: the policy, the 2Q split and the trace path
+    /// all describe a pool, and Small has one. Its format is NOT a knob — the checkpoint ships
+    /// MXFP8 and the converter repacks it byte for byte — which is why this arm carries no
+    /// [`RoutedFmt`] and `--mode` falls back loudly.
+    Inkling(&'a Inkling2Config, PoolKnobs<'a>),
 }
 
 impl ArchCfg<'_> {
@@ -348,6 +354,7 @@ impl ArchCfg<'_> {
             Self::V4(..) => Arch::DeepseekV4,
             Self::K3(..) => Arch::KimiK3,
             Self::InklingLoop(..) => Arch::Inkling2Loop,
+            Self::Inkling(..) => Arch::Inkling2,
         }
     }
 }
@@ -355,9 +362,10 @@ impl ArchCfg<'_> {
 /// The decode engines, one variant per architecture that has a loop.
 ///
 /// GLM-5.2 (MoE, streamed experts), Muse Glimmer-30B (dense, streamed whole layers),
-/// DeepSeek-V4-Flash, Kimi-K3 and Inkling 2 Mini (24 layers, 12 looped ×3, streamed bf16
-/// blocks); `rivoli_core::legality::decide` is what tells a user of an artifact with no arm —
-/// Inkling 2 SMALL today — that there is none, in the same breath as it tells them why.
+/// DeepSeek-V4-Flash, Kimi-K3, and BOTH Inkling 2 members behind ONE variant: a 24-layer looped
+/// bf16 stack and a 48-layer `.mxfp8` pool differ in the pin, not in the input, the decode loop
+/// or the output. `rivoli_core::legality::decide` is what tells a user of the one artifact with
+/// no arm (Qwen) that there is none, in the same breath as it tells them why.
 ///
 /// **`large_enum_variant` is allowed, and boxing would be the wrong fix here.** The arms are
 /// 1792 and 632 bytes (clippy, 2026-08-16), so the enum is the larger of the two — and that
@@ -376,7 +384,7 @@ pub enum Engine<'a> {
     Glimmer(crate::glimmer::engine::GlimmerEngine<'a>),
     V4(crate::v4::engine::V4Engine<'a>),
     K3(crate::k3::engine::K3Engine<'a>),
-    InklingLoop(crate::inkling::engine::InklingEngine<'a>),
+    Inkling(crate::inkling::engine::InklingEngine<'a>),
 }
 
 /// A backendless build has no arm at all, and says so in the type: `Infallible` makes the
@@ -457,7 +465,20 @@ impl<'a> Engine<'a> {
                 use crate::inkling::engine::InklingEngine;
                 let n_ctx = spec.max_ctx;
                 let e = InklingEngine::open(dir, &cfg.text, capacity, n_ctx)?;
-                Ok(Engine::InklingLoop(e))
+                Ok(Engine::Inkling(e))
+            }
+            // Small's floor charges KV and activation scratch before the pool is sized, and
+            // its experts stream through a pool, so it takes the same `pin_cfg` every routed
+            // arm builds — one construction site for the budget and the four pool knobs.
+            ArchCfg::Inkling(cfg, knobs) => {
+                let pin = pin_cfg(capacity, knobs);
+                let e = crate::inkling::engine::InklingEngine::open_mxfp8(
+                    dir,
+                    &cfg.text,
+                    pin,
+                    spec.max_ctx,
+                )?;
+                Ok(Engine::Inkling(e))
             }
         }
     }
@@ -506,7 +527,7 @@ impl<'a> Engine<'a> {
             #[cfg(feature = "rocm")]
             Engine::K3(e) => e.max_ctx(),
             #[cfg(feature = "rocm")]
-            Engine::InklingLoop(e) => e.max_ctx(),
+            Engine::Inkling(e) => e.max_ctx(),
             #[cfg(not(feature = "rocm"))]
             Engine::Never(never, _) => match *never {},
         }
@@ -601,7 +622,7 @@ impl<'a> Engine<'a> {
                 Engine::Glimmer(e) => e.decode(req, sink),
                 Engine::V4(e) => e.decode(req, sink),
                 Engine::K3(e) => e.decode(req, sink),
-                Engine::InklingLoop(e) => e.decode(req, sink),
+                Engine::Inkling(e) => e.decode(req, sink),
             }
         }
     }
@@ -641,7 +662,7 @@ impl<'a> Engine<'a> {
                 Engine::Glimmer(e) => e.score(ids),
                 Engine::V4(e) => e.score(ids),
                 Engine::K3(e) => e.score(ids),
-                Engine::InklingLoop(e) => e.score(ids),
+                Engine::Inkling(e) => e.score(ids),
             }
         }
     }
