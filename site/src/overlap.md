@@ -1,19 +1,19 @@
 # The overlap
 
 A decode step walks the model one layer at a time. On a model bigger than memory, some of
-each layer's weights live on NVMe. rivoli's job is to make sure that, by the time the GPU
-reaches a layer, the bytes it needs have already arrived.
+each layer's weights live on NVMe. rivoli's job is to keep the GPU
+busy while the missing bytes arrive.
 
 ## Three tiers
 
 | tier | holds | reached by |
 |---|---|---|
-| **Pin** | whatever the memory budget leaves room for | the GPU directly, through GTT |
-| **Cache** | recently or frequently used experts and layers | the GPU directly, through GTT |
+| **Pin** | whatever the memory budget leaves room for | the GPU directly, from shared RAM |
+| **Cache** | recently or frequently used experts and layers | the GPU directly, from shared RAM |
 | **Stream** | everything else | NVMe reads into staging slots, then a copy the GPU waits on |
 
-Strix Halo's LPDDR5 is unified. The GPU reads system memory through GTT, so "resident" just
-means "already in RAM", with no separate VRAM copy. The NVMe-to-RAM leg is what has to hide
+On a unified memory system the GPU reads system RAM directly, so "resident" just means
+"already in RAM", with no separate VRAM copy. The NVMe-to-RAM leg is what has to hide
 behind compute.
 
 ## The pin is a function of free memory

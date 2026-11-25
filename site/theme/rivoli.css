@@ -5,7 +5,8 @@
  * indigo: #3b3b8c light / #7878d6 dark, the same values as eo/fixed's
  * Helium ThemeColors. rivoli adds ONE warm accent, ember, which stands for
  * Rust and for the NVMe stream in diagrams. Indigo is compute and ember is
- * the stream, so the palette tells the overlap story.
+ * the stream, so the palette tells the overlap story. Teal, from the hummingbird's
+ * throat, marks CPU work in the same diagram.
  *
  * Sizes are in em: mdBook sets html font-size to 62.5%, so 1rem is 10px.
  *
@@ -24,6 +25,10 @@
     "Helvetica Neue", Arial, sans-serif;
 }
 html { font-family: var(--rv-sans); }
+/* Wider than mdBook's 750px so the models tables fit without a scrollbar at 1400px. */
+:root { --content-max-width: 920px; }
+.content table { font-size: .9em; }
+.content table th, .content table td { padding: .35em .6em; }
 
 /* ---- Light ---------------------------------------------------------- */
 .light, html:not(.js) {
@@ -33,6 +38,7 @@ html { font-family: var(--rv-sans); }
   --rv-ember: #c2410c;
   --rv-ember-fill: #e8590c;
   --rv-ember-soft: #fdeee4;
+  --rv-teal: #0f9b9b;
 
   --bg: #ffffff;
   --fg: #23272e;
@@ -68,6 +74,7 @@ html { font-family: var(--rv-sans); }
   --rv-ember: #ff8a3d;
   --rv-ember-fill: #ff8a3d;
   --rv-ember-soft: #3a2a22;
+  --rv-teal: #2ec4c4;
 
   --bg: #1f242b;
   --fg: #e6edf3;
@@ -107,6 +114,8 @@ html { font-family: var(--rv-sans); }
 .content h2 { border-bottom: 2px solid var(--rv-indigo-soft); padding-bottom: .2em; }
 .menu-title { color: var(--rv-indigo); font-weight: 700; }
 .chapter li a.active { font-weight: 600; }
+/* Pages under a part heading (References) sit visibly beneath it. */
+.chapter li.part-title ~ li.chapter-item { padding-left: 1.25em; }
 .content a:hover { color: var(--rv-ember); }
 
 /* ---- Brand icon in the top bar (rivoli.js) ---------------------------- */
@@ -123,7 +132,7 @@ html { font-family: var(--rv-sans); }
     linear-gradient(135deg, var(--rv-indigo-soft) 0%, var(--bg) 70%);
   border: 1px solid var(--rv-indigo-soft);
 }
-.rv-hero h1 { margin: 0; font-size: 3em; line-height: 1; }
+.rv-hero h1 { color: var(--rv-indigo); margin: 0; font-size: 3em; line-height: 1; }
 .rv-hero h1 span { color: var(--rv-ember); }
 .rv-hero .rv-tagline { font-size: 1.25em; margin: .75em 0 1.25em; }
 .rv-pill {
@@ -138,6 +147,24 @@ html { font-family: var(--rv-sans); }
 }
 .rv-pill.ember { border-color: var(--rv-ember-fill); color: var(--rv-ember); }
 
+/* Hero bird: a background-removed cutout (CC BY 2.0, so the caption says it was edited),
+ * floating free of the hero box. Mirrored in CSS so it flies toward the text. */
+.rv-hero { display: flex; gap: 1.5em; align-items: center; }
+.rv-hero-text { flex: 1 1 auto; min-width: 0; }
+.rv-hero-photo { flex: 0 0 38%; margin: 0; order: 2; }
+.rv-hero-photo img { display: block; width: 100%; height: auto; transform: scaleX(-1);
+  filter: drop-shadow(0 14px 18px rgba(0, 0, 0, .25)); animation: rv-hover 4s ease-in-out infinite; }
+.rv-hero-photo figcaption { font-size: .7em; opacity: .75; margin-top: .6em; line-height: 1.3; }
+@keyframes rv-hover {
+  0%, 100% { translate: 0 0; }
+  50% { translate: 0 -6px; }
+}
+@media (prefers-reduced-motion: reduce) { .rv-hero-photo img { animation: none; } }
+@media (max-width: 640px) {
+  .rv-hero { flex-direction: column; align-items: stretch; }
+  .rv-hero-photo { order: 0; flex-basis: auto; max-width: 60%; align-self: center; }
+}
+
 /* ---- Overlap diagram (inline SVG, so it follows the theme) ----------- */
 .rv-overlap { width: 100%; height: auto; margin: 1em 0; }
 .rv-overlap text { font-family: var(--mono-font); font-size: 12px; fill: var(--fg); }
@@ -146,6 +173,8 @@ html { font-family: var(--rv-sans); }
 .rv-overlap .stream { fill: var(--rv-ember-fill); }
 .rv-overlap .on-compute { fill: var(--bg); font-size: 11px; }
 .rv-overlap .on-stream { fill: #1f242b; font-size: 11px; }
+.rv-overlap .cpu { fill: var(--rv-teal); }
+.rv-overlap .on-cpu { fill: #1f242b; font-size: 11px; }
 .rv-overlap .axis { stroke: var(--icons); stroke-width: 1; }
 
 /* ---- Principle cards ------------------------------------------------- */
@@ -159,3 +188,22 @@ html { font-family: var(--rv-sans); }
 .rv-card.ember { border-left-color: var(--rv-ember-fill); background: var(--rv-ember-soft); }
 .rv-card > :first-child { margin-top: 0; }
 .rv-card > :last-child { margin-bottom: 0; }
+
+/* ---- Docs / source link lists (sister projects) --------------------
+ * Book and GitHub-mark icons in place of bullets, chosen by link target. Paths are
+ * GitHub Octicons (MIT): book-16 and mark-github-16. Masked, so they take the link colour. */
+.rv-links ul { list-style: none; padding-left: 0; display: flex; gap: 1.5em; }
+.rv-links li a { display: inline-flex; align-items: center; gap: .4em; }
+.rv-links li a::before {
+  content: ""; width: 1.1em; height: 1.1em; background-color: currentColor;
+  -webkit-mask: var(--rv-icon) center / contain no-repeat; mask: var(--rv-icon) center / contain no-repeat;
+  --rv-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 1.75A.75.75 0 0 1 .75 1h4.253c1.227 0 2.317.59 3 1.501A3.743 3.743 0 0 1 11.006 1h4.245a.75.75 0 0 1 .75.75v10.5a.75.75 0 0 1-.75.75h-4.507a2.25 2.25 0 0 0-1.591.659l-.622.621a.75.75 0 0 1-1.06 0l-.622-.621A2.25 2.25 0 0 0 5.258 13H.75a.75.75 0 0 1-.75-.75Zm7.251 10.324.004-5.073-.002-2.253A2.25 2.25 0 0 0 5.003 2.5H1.5v9h3.757a3.75 3.75 0 0 1 1.994.574ZM8.755 4.75l-.004 7.322a3.752 3.752 0 0 1 1.992-.572H14.5v-9h-3.495a2.25 2.25 0 0 0-2.25 2.25Z'/%3E%3C/svg%3E");
+}
+.rv-links li a[href*="github.com"]::before { --rv-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z'/%3E%3C/svg%3E"); }
+
+/* ---- Sortable table headers (rivoli.js) ----------------------------- */
+.rv-sort { all: unset; cursor: pointer; display: inline; }
+.rv-sort:focus-visible { outline: 2px solid var(--rv-indigo); outline-offset: 2px; }
+.rv-sort::after { content: " ↕"; opacity: .35; font-size: .85em; }
+th[aria-sort="ascending"] .rv-sort::after { content: " ↑"; opacity: 1; color: var(--rv-ember); }
+th[aria-sort="descending"] .rv-sort::after { content: " ↓"; opacity: 1; color: var(--rv-ember); }

@@ -5,9 +5,9 @@ one is wrong even if every test passes.
 
 <div class="rv-card ember">
 
-## P1 — Decode models bigger than memory, on this one box
+## P1 — Decode models bigger than memory, on one box
 
-AMD Strix Halo, unified LPDDR5 via GTT, weights streamed from NVMe **overlapped with
+A ROCm unified memory system, with weights streamed from NVMe **overlapped with
 compute**. The overlap is the whole design; everything else serves it. A model that fits
 is the trivial case of the streaming path, never a separate resident-only design.
 
@@ -22,7 +22,7 @@ not a detail hidden behind a cache.
 ## P3 — Maximize hardware features
 
 Running everywhere is not a goal when it costs performance: **hardware compatibility is
-always traded away for efficiency**. gfx1151-specific kernel decisions need no apology. If
+always traded away for efficiency**. Hardware-specific kernel decisions need no apology. If
 the NPU becomes valuable, rivoli will use it.
 
 ## P4 — The memory knob trades speed, never text

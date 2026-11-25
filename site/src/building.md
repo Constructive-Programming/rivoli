@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- An AMD Strix Halo (gfx1151) machine with ROCm: device bitcode (`ocml.bc` and friends)
+- A ROCm unified memory system (an AMD APU), with ROCm's device bitcode (`ocml.bc` and friends)
   and `libamdhip64`.
 - `rustup`, with the nightly toolchain pinned in `crates/kernels/rust-toolchain.toml` for
   the device crate.

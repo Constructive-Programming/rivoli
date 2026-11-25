@@ -4,7 +4,7 @@
 # which overrides mdBook's own Light and Navy themes rather than vendoring its templates.
 [book]
 title = "rivoli"
-description = "Decode LLMs bigger than memory: weights streamed from NVMe, overlapped with compute, on AMD Strix Halo."
+description = "Decode LLMs bigger than memory: weights streamed from NVMe, overlapped with compute, on ROCm unified memory systems."
 authors = ["Constructive Programming"]
 language = "en"
 src = "src"
@@ -16,3 +16,4 @@ git-repository-url = "https://github.com/Constructive-Programming/rivoli"
 site-url = "/"
 additional-css = ["theme/rivoli.css"]
 additional-js = ["theme/rivoli.js"]
+no-section-label = true
