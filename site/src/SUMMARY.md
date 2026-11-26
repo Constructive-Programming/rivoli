@@ -8,6 +8,7 @@
 - [Models](models.md)
 - [Quality gates](quality.md)
 - [Building](building.md)
+- [Running behind llama-swap](llama-swap.md)
 
 # References
 
