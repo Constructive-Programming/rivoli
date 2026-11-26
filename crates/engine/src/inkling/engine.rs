@@ -342,9 +342,32 @@ pub struct InklingEngine<'a> {
     pub(super) row_host: Vec<u8>,
     /// `argmax`'s two outputs, read back together.
     pub(super) pick_host: Vec<u8>,
-    /// Small's routed dispatch state and streams; `None` on Mini's bf16 backend, so the loop
-    /// Mini runs is exactly what it ran before this field existed.
+    /// The pool-backed routed dispatch state and streams (`.mxfp8` and `.f4` alike — the scratch
+    /// is the POOL's, not the container's); `None` on Mini's bf16 backend, so the loop Mini runs
+    /// is exactly what it ran before this field existed.
     pub(super) moe8: Option<MxFp8MoeScratch>,
+}
+
+/// The two routed containers' opens, emitted from one body.
+///
+/// **The constructors differ in ONE identifier.** `.mxfp8` and `.f4` are the same text stack, the
+/// same pin and the same floor discipline over different expert bytes, so a hand-written pair is a
+/// five-line parameter list followed by a shared `Self::open_with(cfg, n_ctx, || InklingPin::`
+/// prefix — six lines and 66 tokens, measured 2026-11-25 against this tree's `.jscpd.json`, which
+/// the build's duplication gate refuses. One body, two names, nothing to drift — the same reason
+/// `device.rs`'s `tier_used_accessor` is a macro.
+macro_rules! open_routed {
+    ($( $(#[$doc:meta])* $open:ident => $build:ident ),+ $(,)?) => {$(
+        $(#[$doc])*
+        pub fn $open(
+            dir: &str,
+            cfg: &'a InklingTextConfig,
+            pin: PinCfg<'_>,
+            n_ctx: usize,
+        ) -> Result<Self> {
+            Self::open_with(cfg, n_ctx, || InklingPin::$build(dir, cfg, pin, n_ctx))
+        }
+    )+};
 }
 
 impl<'a> InklingEngine<'a> {
@@ -367,18 +390,22 @@ impl<'a> InklingEngine<'a> {
         Self::open_with(cfg, n_ctx, || InklingPin::build(dir, cfg, capacity, n_ctx))
     }
 
-    /// Open Inkling 2 Small: the same text stack and the same floor discipline as [`Self::open`],
-    /// with the routed experts behind [`crate::routed::RoutedPool`].
-    ///
-    /// The door check runs first, for [`Self::open`]'s reason: a `--ctx` past the attend
-    /// kernel's ceiling is unservable, and it must cost a message rather than a placement.
-    pub fn open_mxfp8(
-        dir: &str,
-        cfg: &'a InklingTextConfig,
-        pin: PinCfg<'_>,
-        n_ctx: usize,
-    ) -> Result<Self> {
-        Self::open_with(cfg, n_ctx, || InklingPin::build_mxfp8(dir, cfg, pin, n_ctx))
+    open_routed! {
+        /// Open Inkling 2 Small: the same text stack and the same floor discipline as
+        /// [`Self::open`], with the routed experts behind [`crate::routed::RoutedPool`].
+        ///
+        /// The door check runs first, for [`Self::open`]'s reason: a `--ctx` past the attend
+        /// kernel's ceiling is unservable, and it must cost a message rather than a placement.
+        open_mxfp8 => build_mxfp8,
+        /// Open an Inkling 2 member whose routed experts are MXFP4 (`.f4`): [`Self::open_mxfp8`]'s
+        /// stack, floor and door check over the pool's group-32 fp4 blocks — half the expert
+        /// bytes, so the same budget pins nearly twice as many of them.
+        ///
+        /// **A separate constructor rather than a format argument**, because the container is the
+        /// ARTIFACT's statement and not the caller's: `seam.rs` picks between these two by
+        /// sniffing `manifest.json` (`has_f4_source`/`has_mxfp8_source`), exactly as it picks
+        /// between them and [`Self::open`].
+        open_f4 => build_f4,
     }
 
     /// Shared door-first open: validate the scratch ceiling BEFORE placing a byte, then build the
@@ -395,8 +422,9 @@ impl<'a> InklingEngine<'a> {
     /// Build the engine over an already-placed `pin`.
     pub fn new(pin: InklingPin, cfg: &'a InklingTextConfig, n_ctx: usize) -> Result<Self> {
         let n_experts = cfg.n_routed_experts;
-        // The pool's streams and descriptor table exist only where the pool does. `is_mxfp8`
-        // is read off the pin the caller just built, so there is no second source of truth.
+        // The pool's streams and descriptor table exist only where the pool does — for `.mxfp8`
+        // and `.f4` both, since they share it. `is_mxfp8` is read off the pin the caller just
+        // built, so there is no second source of truth.
         let moe8 = match pin.is_mxfp8() {
             true => Some(MxFp8MoeScratch::new(cfg)?),
             false => None,

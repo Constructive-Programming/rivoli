@@ -75,7 +75,7 @@ pub use meta::{ArtifactDirs, FormatMeta, I4Source, finish_artifact, require_aux}
 pub use mxfp8_repack::{LayerInputs, LayerShape, Mxfp8Expert, Mxfp8Layer, mxfp8_expert_prefix};
 pub use repack::RoutedRepack;
 pub use set::{
-    ExpertSet, SetDims, f4_layer_range, f4_source, has_mxfp8_source, load_codebooks,
+    ExpertSet, SetDims, f4_layer_range, f4_source, has_f4_source, has_mxfp8_source, load_codebooks,
     mxfp8_layer_range, mxfp8_source,
 };
 pub use tensors::{SafeWriter, Safetensors, TensorData};

@@ -1,0 +1,8 @@
+.git
+.claude
+target
+dist
+site
+/var/cache
+*.tar.gz
+*.sha256

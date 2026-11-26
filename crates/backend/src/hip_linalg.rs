@@ -17,8 +17,9 @@
 use crate::hip::{HashSpan, ensure_hip_status, launchers};
 use crate::launch::{
     rivoli_argmax, rivoli_embed_bf16_row_bcast, rivoli_embed_i8_row, rivoli_flag_nonfinite,
-    rivoli_gemm_bf16, rivoli_gemv_f32, rivoli_gemv_fp8, rivoli_gemv_fp8_bf16, rivoli_gemv_i4,
-    rivoli_gemv_i8, rivoli_gemv_vq, rivoli_hash_rows, rivoli_vadd, rivoli_vq_encode,
+    rivoli_gemm_bf16, rivoli_gemv_bf16, rivoli_gemv_f32, rivoli_gemv_fp8, rivoli_gemv_fp8_bf16,
+    rivoli_gemv_i4, rivoli_gemv_i8, rivoli_gemv_vq, rivoli_hash_rows, rivoli_vadd,
+    rivoli_vq_encode,
 };
 use anyhow::Result;
 use rivoli_abi::kernarg::{
@@ -292,6 +293,27 @@ launchers! {
         o_dim: usize as i32,
         i_dim: usize as i32,
         nrow: usize as i32,
+        y: *mut f32,
+        stream: *mut c_void,
+    );
+
+    /// bf16 GEMV `y = W·x` at ONE token row — the decode projections' shape, and the only
+    /// bf16 path in the tree that loads 16 bytes per lane.
+    ///
+    /// NOT a widening of [`launch_gemm_bf16`], which computes the same row at `m = 1`: that
+    /// kernel is the scalar port `tests/bit-identity.sh` holds byte-for-byte to hipcc, so its
+    /// inner loop cannot change. A caller with more than one row (`rel_logits` at
+    /// `m = num_heads`) keeps the GEMM; this kernel has no `R` and no `m`.
+    ///
+    /// # Safety
+    /// Async device pointers live until `stream`'s completion: `x` (`i_dim` f32), `w`
+    /// (`o_dim·i_dim` u16), `y` (`o_dim` f32), none aliasing another. `stream` is a live
+    /// `hipStream_t`, or null for the default stream.
+    launch_gemv_bf16 => rivoli_gemv_bf16(Gemv { x, w, y, o_dim: o_dim as i32, i_dim: i_dim as i32 }, stream), "gemv_bf16" (
+        x: *const f32,
+        w: *const u16,
+        o_dim: usize as i32,
+        i_dim: usize as i32,
         y: *mut f32,
         stream: *mut c_void,
     );

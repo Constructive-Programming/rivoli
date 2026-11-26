@@ -15,7 +15,7 @@ use std::path::Path;
 /// phase reads as missing from both populations, like any unrowed kernel. That a row reaches
 /// EVERY phase or selectable instantiation (a split needs a shape that splits) is argued by
 /// the row's shapes, at the row.
-pub(super) const LAUNCHED_BY: [(&str, &str); 27] = [
+pub(super) const LAUNCHED_BY: [(&str, &str); 29] = [
     // `rivoli_mla_attend`: the split-KV attend, then (when the plan splits) the combine. Its
     // gate row's shapes reach both: `nr` from 1 (one split) past 2048 (16).
     ("mla_latent_attend", "mla_attend"),
@@ -49,6 +49,8 @@ pub(super) const LAUNCHED_BY: [(&str, &str); 27] = [
     ("moe_down_f4", "moe_expert_range_f4"),
     ("moe_gateup_f4_situ", "moe_expert_range_f4_situ"),
     ("moe_down_f4_weighted", "moe_expert_range_f4_situ"),
+    ("moe_gateup_f4_situ_f32", "moe_expert_range_f4_situ_f32"),
+    ("moe_down_f4_weighted_f32", "moe_expert_range_f4_situ_f32"),
     // Inkling-2 Small's MXFP8 pair (S6, 2026-11-25): the same two-pass shape as the fp4
     // twins, and no C twin, so it is `ORACLE_VALIDATED` in `kernel_coverage.rs` rather than
     // rowed by a bit-identity `ROWS` entry — the two census questions stay separate.

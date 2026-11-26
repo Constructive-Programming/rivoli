@@ -26,7 +26,8 @@ use crate::launch::{
     DescRows, Rows, rivoli_attn_res, rivoli_gated_residual_collapse_f32, rivoli_hc_head_collapse,
     rivoli_hc_post, rivoli_hc_pre, rivoli_moe_acc_drain_s, rivoli_moe_acc_drain_to_s,
     rivoli_moe_expert_range, rivoli_moe_expert_range_f4, rivoli_moe_expert_range_f4_situ,
-    rivoli_moe_expert_range_i4, rivoli_moe_expert_range_mxfp8_situ,
+    rivoli_moe_expert_range_f4_situ_f32, rivoli_moe_expert_range_i4,
+    rivoli_moe_expert_range_mxfp8_situ,
 };
 use anyhow::Result;
 use rivoli_abi::kernarg::{
@@ -264,11 +265,35 @@ launchers! {
         stream: *mut c_void,
     );
 
+    /// **Inkling-2's fp32-latent MXFP4 routed-expert range** — [`launch_moe_expert_range_f4_situ`]
+    /// without Kimi-K3's between-pass `rbf16` rounding on `h` and `dv`. Same ABI, same guards
+    /// (1001–1006), same `.f4` storage, zero extra bandwidth.
+    ///
+    /// # Safety
+    /// Same buffer sizing, alignment, and stream-lifetime contract as
+    /// [`launch_moe_expert_range_f4_situ`].
+    launch_moe_expert_range_f4_situ_f32 => rivoli_moe_expert_range_f4_situ_f32(MoeF4Situ { range: MoeRange { x, descs, h, wexpert, acc, span: MoeSpan { hidden: expert_in as i32, inter: inter as i32, e_start: e_start as i32, e_count: e_count as i32 } }, b1, b2 }, DescRows { n_desc: n_desc as i32, nrow: nrow as i32 }, stream), "moe_expert_range_f4_situ_f32" (
+        x: *const f32,
+        expert_in: usize as i32,
+        inter: usize as i32,
+        e_start: usize as i32,
+        e_count: usize as i32,
+        n_desc: usize as i32,
+        descs: *const ExpertDescF4,
+        wexpert: *const f32,
+        b1: f32,
+        b2: f32,
+        h: *mut f32,
+        acc: *mut u64,
+        nrow: usize as i32,
+        stream: *mut c_void,
+    );
+
     /// **Inkling-2 Small's routed expert range** — the K3 pair's SiTU-GLU arithmetic at
     /// MXFP8's weight format: one e4m3 value per byte with ONE raw ue8m0 exponent per 32
     /// values along the reduction dim, ROW-wise `[1, 32]` (`inkling_dequant::Mxfp8`, trap T1:
-    /// the scale byte is an exponent, not an e4m3 code — reading it through the fp8 LUT would
-    /// decode `0x80` as `-0`).
+    /// the scale byte is an exponent, not an e4m3 code — decoded as e4m3, `0x80` would be
+    /// `-0` and `0x70` would be `224`).
     ///
     /// Everything else is [`launch_moe_expert_range_f4_situ`]'s contract, because MXFP8's
     /// group is 32 columns like fp4's: the same 1001/1002/1003/1004/1006 refusals, the same

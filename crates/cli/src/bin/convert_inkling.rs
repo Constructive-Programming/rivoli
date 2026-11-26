@@ -18,6 +18,13 @@
 //! `unembed` keeps the first 200058 rows. The output names are the first-party text model's
 //! state-dict names (`text-model-names.tsv`, 693 params), gated by `tests/inkling_convert.rs`.
 //!
+//! **Two further format knobs, both P5 (bytes/token) and both orthogonal to the expert choice.**
+//! `--f4` writes the 24 layers as `L{ll}.f4` — MXFP4, half of `--mxfp8`'s bytes — quantizing
+//! whichever source encoding the layer ships (NVFP4 for 0..20, MXFP8 for 20..24) through the
+//! shared [`f4`] module; it is the one LOSSY path here. `--fp8` quantizes the five large dense
+//! attention projections per layer to block-scaled FP8 in `resident.safetensors`, cutting the
+//! bf16 trunk roughly in half at `FP8_BLOCK`-tiled scales.
+//!
 //! Plan of record: `docs/investigations/inkling2-port.md` (stage S2).
 
 use anyhow::{Context, Result, bail, ensure};
@@ -25,13 +32,13 @@ use clap::Parser;
 use rivoli_artifact::census::inkling::Census;
 use rivoli_artifact::format::{
     Dtype, ExpertFile, ExpertHeader, FormatMeta, LAYER_WINDOW, LayerDims, LayerInputs, LayerShape,
-    MXFP8_MAGIC, Mxfp8Layer, SafeWriter, Safetensors, TensorData, finish_artifact, mxfp8_source,
-    write_expert_layer,
+    MXFP8_MAGIC, Mxfp8Layer, SafeWriter, Safetensors, TensorData, f4_source, finish_artifact,
+    mxfp8_source, write_expert_layer,
 };
 use rivoli_artifact::inkling_config::{Inkling2LoopConfig, InklingTextConfig};
 use rivoli_artifact::inkling_convert::{
-    INKLING_AUX, VocabRows, copy_tiktoken, emit_lm_head, emit_verbatim, preflight, query_target,
-    rename_verbatim,
+    INKLING_AUX, VocabRows, copy_tiktoken, emit_lm_head, emit_verbatim_fmt, preflight,
+    query_target, rename_verbatim,
 };
 use rivoli_artifact::inkling_dequant::{Mxfp8, Nvfp4, merge_message_queries};
 use rivoli_artifact::quant::{
@@ -39,6 +46,17 @@ use rivoli_artifact::quant::{
     mxfp8_slot_offsets, quantize_mxfp8_row, read_f32,
 };
 use std::collections::HashSet;
+
+// `#[path]` because a bin root resolves its children against `src/bin/` and cargo
+// autobin-discovers every `src/bin/*.rs` as its own executable — so a module shared with the
+// Small converter cannot sit beside the roots as a bare `.rs` (the `convert/gpu.rs` precedent).
+#[path = "inkling/f4.rs"]
+mod f4;
+
+// `--f4`'s expert pass, which is Mini's alone (Small's experts arrive at MXFP8 and never take
+// the NVFP4 branch), split out for the 800-line soft cap.
+#[path = "convert_inkling/f4_pass.rs"]
+mod f4_pass;
 
 /// The single text shard. `mtp.safetensors` is NEVER named here — it is a separate file the text
 /// converter does not open. `open_file` (not `open_dir`) so the directory's `mtp.safetensors` is
@@ -55,9 +73,9 @@ const MIDDLE_CYCLE_KV: &str = "model.llm.middle_cycle_cross_pass_kv_queries";
 #[derive(Parser)]
 #[command(
     name = "convert_inkling",
-    about = "Inkling 2 Mini checkpoint → a rivoli text artifact (routed experts either \
-             dequantized to bf16 or streamed as per-layer .mxfp8 files, vision excluded by \
-             name, MTP never opened)"
+    about = "Inkling 2 Mini checkpoint → a rivoli text artifact (routed experts dequantized to \
+             bf16 or streamed as per-layer .mxfp8/.f4 files, dense attention optionally fp8, \
+             vision excluded by name, MTP never opened)"
 )]
 struct Args {
     /// The checkpoint directory: config.json, model-00001-of-00001.safetensors, tiktoken/, and the
@@ -73,6 +91,27 @@ struct Args {
     /// re-quantized row-wise (a re-rounding this flag is the only thing that pays for).
     #[arg(long)]
     mxfp8: bool,
+
+    /// Emit `L{ll}.f4` per-layer MXFP4 expert files — half the bytes of `--mxfp8` and the format
+    /// the FP4 streaming descriptor reads. LOSSY: both source encodings are re-quantized row-wise,
+    /// so score the artifact with the paired-dNLL gate. Exclusive with `--mxfp8`.
+    #[arg(long)]
+    f4: bool,
+
+    /// Quantize the five large dense attention projections per layer (q/k/v/attn-gate/o) to
+    /// block-scaled FP8-E4M3 at `FP8_BLOCK` in `resident.safetensors`, with the matching
+    /// `weight_scale_inv` grids. Absent, the trunk stays bf16.
+    #[arg(long)]
+    fp8: bool,
+}
+
+/// The three artifact-shape flags, bundled because `build_manifest` reads all of them and a
+/// three-element tuple at the call site is a value no reader can check against the field order.
+#[derive(Clone, Copy)]
+struct Mode {
+    mxfp8: bool,
+    f4: bool,
+    fp8: bool,
 }
 
 /// One expert projection: the source suffix, the target suffix, and whether `w13`'s gate/up rows
@@ -101,6 +140,10 @@ struct Conv<'a> {
     src: &'a Safetensors,
     t: &'a InklingTextConfig,
     w: SafeWriter<'a>,
+    /// `--fp8`'s tile size, or `None` for a bf16 trunk — the value
+    /// [`emit_verbatim_fmt`](rivoli_artifact::inkling_convert::emit_verbatim_fmt) dispatches on
+    /// and the one the loader sniffs back from layer 0's `q_proj` dtype.
+    fp8_block: Option<usize>,
 }
 
 impl<'a> Conv<'a> {
@@ -262,8 +305,10 @@ impl<'a> Conv<'a> {
             // The two engine-layout fixes (exact bf16→f32 widening of the f32-consumed
             // norms/clip-scales/sconv weights, and the `rel_proj` transpose for the m=heads
             // GEMM) live in `inkling_convert::emit_verbatim`, which the Small converter calls
-            // too — one definition, so a fix to either lands in both artifacts.
-            emit_verbatim(&mut self.w, target, (b, dt, sh))?;
+            // too — one definition, so a fix to either lands in both artifacts. The `_fmt`
+            // wrapper adds `--fp8`'s dense-trunk rewrite and delegates every other tensor, so
+            // one loop still serves both artifact shapes.
+            emit_verbatim_fmt(&mut self.w, target, (b, dt, sh), self.fp8_block)?;
             consumed.insert(name.clone());
         }
         Ok(())
@@ -326,14 +371,7 @@ impl<'a> Mxfp8Layers<'a> {
     /// [`Mxfp8Layer`] write AND verify it. Byte identity is the claim `--verify` there demands,
     /// which is exactly right for a repack that fits nothing and re-rounds nothing.
     fn repack_native(&self, consumed: &mut HashSet<String>, l: usize) -> Result<()> {
-        for suffix in [
-            "w13_weight",
-            "w13_weight_scale",
-            "w2_weight",
-            "w2_weight_scale",
-        ] {
-            consumed.insert(format!("{}{suffix}", expert_prefix(l)));
-        }
+        mark_mxfp8_consumed(consumed, &expert_prefix(l));
         let inputs = LayerInputs {
             tool: "convert_inkling",
             out_dir: self.out_dir,
@@ -360,34 +398,43 @@ impl<'a> Mxfp8Layers<'a> {
         );
         let path = format!("{}/L{l:02}.mxfp8", self.out_dir);
         let stride = mxfp8_expert_stride(h, i);
-        let header = ExpertHeader::new(
-            MXFP8_MAGIC,
-            LayerDims {
-                layer: l,
-                n_experts: n,
-                expert_in: h,
-                moe_inter: i,
-                stride,
-            },
-        )
-        .to_bytes();
-        let file = ExpertFile {
-            path: &path,
-            header: &header,
+        let dims = LayerDims {
+            layer: l,
+            n_experts: n,
+            expert_in: h,
+            moe_inter: i,
+            stride,
+        };
+        let header = ExpertHeader::new(MXFP8_MAGIC, dims).to_bytes();
+        let blocks = ExpertBlocks {
+            stride,
+            bytes: mxfp8_expert_bytes(h, i),
+            count: n,
         };
         write_expert_layer(
-            file,
-            ExpertBlocks {
-                stride,
-                bytes: mxfp8_expert_bytes(h, i),
-                count: n,
+            ExpertFile {
+                path: &path,
+                header: &header,
             },
+            blocks,
             LAYER_WINDOW,
             |e, slot| plane.pack_expert(e, slot),
         )
         .with_context(|| format!("write layer {l} (NVFP4 → MXFP8 re-quantization)"))?;
         eprintln!("convert_inkling: wrote {path} ({n} experts re-quantized from NVFP4)");
         Ok(())
+    }
+}
+
+/// Mark one native-MXFP8 layer's four source tensors consumed (shared by `--mxfp8` and `--f4`).
+fn mark_mxfp8_consumed(consumed: &mut HashSet<String>, prefix: &str) {
+    for suffix in [
+        "w13_weight",
+        "w13_weight_scale",
+        "w2_weight",
+        "w2_weight_scale",
+    ] {
+        consumed.insert(format!("{prefix}{suffix}"));
     }
 }
 
@@ -585,14 +632,21 @@ fn put_mxfp8_row(slot: &mut [u8], at: (usize, usize), row: &[f32]) -> Result<()>
 }
 
 /// `manifest.json` = the source config VERBATIM (wrapper and all) + the `format` section +
-/// `inkling_source` provenance, plus `mxfp8_source` under `--mxfp8` (the streaming loader's sole
-/// source for which layers exist). `fp8_block` is inert in both modes (Glimmer's precedent).
-fn build_manifest(src_dir: &str, (mxfp8, n_layers): (bool, usize)) -> Result<serde_json::Value> {
+/// `inkling_source` provenance, plus exactly one `<fmt>_source` block when the experts are
+/// streamed (the loader's sole source for which layers exist).
+///
+/// **The two source blocks are exclusive and that is load-bearing**: the loader sniffs
+/// `mxfp8_source` before it sniffs anything else, so an artifact carrying both would commit to
+/// `.mxfp8` layer files an `--f4` run never wrote.
+///
+/// `fp8_block` in `format` is inert (Glimmer's precedent); `--fp8`'s presence is recorded in
+/// `inkling_source.dense`, which nothing reads — it is there for a human six months later.
+fn build_manifest(src_dir: &str, mode: Mode, n_layers: usize) -> Result<serde_json::Value> {
     let mut manifest = FormatMeta::manifest_from_config(src_dir, FP8_BLOCK)?;
-    let experts = if mxfp8 {
-        "mxfp8-streamed"
-    } else {
-        "dequantized-to-bf16"
+    let experts = match (mode.f4, mode.mxfp8) {
+        (true, _) => "f4-streamed",
+        (false, true) => "mxfp8-streamed",
+        (false, false) => "dequantized-to-bf16",
     };
     manifest["inkling_source"] = serde_json::json!({
         "tool": "convert_inkling",
@@ -600,32 +654,75 @@ fn build_manifest(src_dir: &str, (mxfp8, n_layers): (bool, usize)) -> Result<ser
         "member": "inkling2_loop",
         "experts": experts,
     });
-    if mxfp8 {
+    if mode.fp8 {
+        manifest["inkling_source"]["dense"] = serde_json::json!("fp8-block128");
+    }
+    if mode.mxfp8 {
         manifest["mxfp8_source"] = mxfp8_source("convert_inkling", src_dir, 0..n_layers);
         // The shared producer's chain names ONE source encoding; Mini is mixed (0..20 NVFP4
         // re-quantized, 20..24 repacked), so the truthful string is stamped here.
         manifest["mxfp8_source"]["chain"] = serde_json::json!("nvfp4+fp8 -> fp8 (quantize/repack)");
     }
+    if mode.f4 {
+        manifest["f4_source"] = f4_source("convert_inkling", src_dir, 0..n_layers);
+        // Same mixed-source argument as the `.mxfp8` chain above: `f4_source`'s literal says
+        // `fp4->fp4 (repack)`, which is true of V4 and K3 and false of this checkpoint.
+        manifest["f4_source"]["chain"] = serde_json::json!("nvfp4+fp8 -> fp4 (quantize)");
+    }
     Ok(manifest)
 }
 
 fn main() -> Result<()> {
-    let Args {
-        src_dir,
-        out_dir,
-        mxfp8,
-    } = Args::parse();
-    // The aux, write-into-source and tiktoken refusals, shared with the Small converter: all
-    // three must land before the weight pass, not after it.
+    let a = Args::parse();
+    ensure!(
+        !(a.mxfp8 && a.f4),
+        "--mxfp8 and --f4 both claim the routed experts, and they are two different containers: \
+         the artifact would hold one set of layer files and a manifest promising the other. Pick \
+         one."
+    );
+    let mode = Mode {
+        mxfp8: a.mxfp8,
+        f4: a.f4,
+        fp8: a.fp8,
+    };
     let dirs = preflight(rivoli_artifact::format::ArtifactDirs {
-        src: &src_dir,
-        out: &out_dir,
+        src: &a.src_dir,
+        out: &a.out_dir,
     })?;
-    let cfg = Inkling2LoopConfig::load(&src_dir)?;
+    let cfg = Inkling2LoopConfig::load(&a.src_dir)?;
     let census = Census::load()?;
-    let src = Safetensors::open_file(&format!("{src_dir}/{SHARD}"))?;
+    let src = Safetensors::open_file(&format!("{}/{SHARD}", a.src_dir))?;
+    let sum = confront_shard(&src, &census)?;
+    std::fs::create_dir_all(&a.out_dir)?;
+    let n = run_convert(
+        &src,
+        &cfg.text,
+        (&census, &a.out_dir),
+        (mode, sum.text_tensors),
+    )?;
+    copy_tiktoken(dirs)?;
+    finish_artifact(
+        "convert_inkling",
+        dirs,
+        &build_manifest(&a.src_dir, mode, cfg.text.num_hidden_layers)?,
+        INKLING_AUX,
+    )?;
+    let label = match (mode.f4, mode.mxfp8) {
+        (true, _) => "f4",
+        (false, true) => "mxfp8-streamed",
+        (false, false) => "bf16",
+    };
+    eprintln!(
+        "convert_inkling: done — {} → {} ({n} TEXT tensors, experts {label})",
+        a.src_dir, a.out_dir
+    );
+    Ok(())
+}
 
-    // The exhaustive census closure before a byte is converted.
+fn confront_shard(
+    src: &Safetensors,
+    census: &Census,
+) -> Result<rivoli_artifact::census::inkling::Summary> {
     let names = src.names();
     let mut tensors: Vec<(&str, Dtype, &[usize], u64)> = Vec::with_capacity(names.len());
     for n in &names {
@@ -634,47 +731,35 @@ fn main() -> Result<()> {
     }
     let sum = census.confront(&tensors)?;
     eprintln!("convert_inkling: {}", sum.line());
+    Ok(sum)
+}
 
-    std::fs::create_dir_all(&out_dir)?;
+fn run_convert(
+    src: &Safetensors,
+    t: &InklingTextConfig,
+    (census, out_dir): (&Census, &str),
+    (mode, want): (Mode, u64),
+) -> Result<usize> {
     let mut consumed: HashSet<String> = HashSet::new();
     let mut conv = Conv {
-        src: &src,
-        t: &cfg.text,
+        src,
+        t,
         w: SafeWriter::new(),
+        fp8_block: mode.fp8.then_some(FP8_BLOCK),
     };
-    if mxfp8 {
-        Mxfp8Layers {
-            src: &src,
-            t: &cfg.text,
-            out_dir: &out_dir,
-        }
-        .layers(&mut consumed)?;
-    } else {
-        conv.experts(&mut consumed)?;
+    match (mode.f4, mode.mxfp8) {
+        (true, _) => f4_pass::Pass { src, t, out_dir }.layers(&mut consumed)?,
+        (false, true) => Mxfp8Layers { src, t, out_dir }.layers(&mut consumed)?,
+        (false, false) => conv.experts(&mut consumed)?,
     }
     conv.queries(&mut consumed)?;
     conv.unembed(&mut consumed)?;
-    conv.verbatim(&census, &mut consumed)?;
+    conv.verbatim(census, &mut consumed)?;
     ensure!(
-        consumed.len() as u64 == sum.text_tensors,
-        "consumed {} TEXT tensors but the census counts {} — a family was dropped or double-counted",
+        consumed.len() as u64 == want,
+        "consumed {} TEXT tensors but the census counts {want} — a family was dropped or double-counted",
         consumed.len(),
-        sum.text_tensors
     );
     conv.w.write(&format!("{out_dir}/resident.safetensors"))?;
-
-    // The tiktoken rank file: nested in the source, flat in the artifact (the loader's name).
-    copy_tiktoken(dirs)?;
-    finish_artifact(
-        "convert_inkling",
-        dirs,
-        &build_manifest(&src_dir, (mxfp8, cfg.text.num_hidden_layers))?,
-        INKLING_AUX,
-    )?;
-    eprintln!(
-        "convert_inkling: done — {src_dir} → {out_dir} ({} TEXT tensors consumed, experts {})",
-        consumed.len(),
-        if mxfp8 { "streamed" } else { "bf16" }
-    );
-    Ok(())
+    Ok(consumed.len())
 }

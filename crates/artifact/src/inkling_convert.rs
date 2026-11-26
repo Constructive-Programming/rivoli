@@ -44,7 +44,12 @@ pub fn preflight<'a>(dirs: ArtifactDirs<'a>) -> Result<ArtifactDirs<'a>> {
 /// Not part of [`INKLING_AUX`]: that list is what `finish_artifact` copies SAME-NAME, and this
 /// one changes name on the way in.
 pub fn copy_tiktoken(dirs: ArtifactDirs<'_>) -> Result<()> {
-    let src = std::path::Path::new(dirs.src).join("tiktoken/tokenizer.model");
+    copy_tiktoken_from(dirs, "tiktoken/tokenizer.model")
+}
+
+/// Copy a tiktoken rank file at relative path `rel` inside `dirs.src` to its flat artifact name.
+pub fn copy_tiktoken_from(dirs: ArtifactDirs<'_>, rel: &str) -> Result<()> {
+    let src = std::path::Path::new(dirs.src).join(rel);
     let dst = std::path::Path::new(dirs.out).join(TIKTOKEN_ARTIFACT);
     std::fs::copy(&src, &dst)
         .with_context(|| format!("copy {} into the artifact", src.display()))?;
@@ -339,6 +344,34 @@ pub fn widen_bf16_f32(b: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// The five large attention projections `--fp8` quantizes, as target-name SUFFIXES.
+///
+/// These are the dense trunk's matmuls — the only Inkling tensors whose every byte is spent in
+/// a GEMV — so they are the ones a block-scaled fp8 container pays for: bf16→fp8 halves each,
+/// which takes Mini's trunk from 2.72 GB to ~1.4 GB and Small's from 9.59 GB to ~4.8 GB, and the
+/// bytes that stop being streamed become pinned experts under the same memory knob (P5's whole
+/// currency). Everything else (`sink_proj`, the sconv weights, the norms, the router, `embed`,
+/// `lm_head`) stays bf16: its quality is load-bearing at the PPL floor and its size is noise.
+///
+/// Suffix matching (rather than equality) because the caller holds a fully-qualified target
+/// name, and the two members index layers differently — `model.layers.{L}.` for both, but Mini's
+/// loop and Small's 48 layers are otherwise unrelated namespaces.
+pub const DENSE_FP8_SUFFIXES: &[&str] = &[
+    "self_attn.q_proj.linear.weight",
+    "self_attn.k_proj.linear.weight",
+    "self_attn.v_proj.linear.weight",
+    "self_attn.o_proj.gate_proj.weight",
+    "self_attn.o_proj.linear.weight",
+];
+
+/// True when `target` is one of the five projections [`DENSE_FP8_SUFFIXES`] names — the
+/// predicate both `--fp8` converters and the engine's pin sniff are written against.
+pub fn is_dense_fp8_target(target: &str) -> bool {
+    DENSE_FP8_SUFFIXES
+        .iter()
+        .any(|suffix| target.ends_with(suffix))
+}
+
 /// Emit one verbatim TEXT tensor under its target name, applying the two engine-layout fixes:
 /// the f32-consumed norms/clip-scales/sconv weights are widened bf16→f32 (exact — the
 /// rmsnorm/clip/sconv launchers take f32), and `rel_proj` is transposed
@@ -374,6 +407,71 @@ pub fn emit_verbatim<'a>(
         return Ok(());
     }
     w.add(target, dt, TensorData::new(sh.to_vec(), b));
+    Ok(())
+}
+
+/// [`emit_verbatim`] with the `--fp8` trunk rewrite: when `fp8_block` is `Some(block)` and
+/// `target` is one of [`DENSE_FP8_SUFFIXES`], the bf16 matrix is quantized to block-scaled
+/// fp8-e4m3 and emitted as the `<base>.weight` + `<base>.weight_scale_inv` pair the resident fp8
+/// path reads ([`SafeWriter::copy_fp8`]'s convention, and the one `pin.rs` sniffs a layer by).
+/// Every other tensor — and every tensor of a `--fp8`-less run — delegates to [`emit_verbatim`]
+/// untouched, which is what keeps ONE conversion loop serving both artifact shapes.
+///
+/// **`None` is the compatibility arm, not a default.** A bf16 artifact has no `weight_scale_inv`
+/// tensor anywhere, and the loader tells the two apart by layer 0's `q_proj.linear.weight`
+/// dtype alone (`Dtype::Bf16` ⇒ bf16, `Dtype::F8E4M3` ⇒ fp8 at `FormatMeta::fp8_block`), so the
+/// emitter and the pin sniff are two halves of one decision.
+///
+/// The quantization itself is [`crate::quant::quantize_fp8_block`]'s — the same function
+/// Glimmer's bf16 trunk rides — because the scale rule is a property of the container, not of
+/// the model: a second implementation here would be a second set of scales for one format.
+pub fn emit_verbatim_fmt<'a>(
+    w: &mut SafeWriter<'a>,
+    target: String,
+    raw: (&'a [u8], Dtype, &[usize]),
+    fp8_block: Option<usize>,
+) -> Result<()> {
+    let quant = fp8_block.filter(|_| raw.1 == Dtype::Bf16 && is_dense_fp8_target(&target));
+    match quant {
+        Some(block) => emit_quantized_fp8(w, target, raw, block),
+        None => emit_verbatim(w, target, raw),
+    }
+}
+
+/// The fp8 half of [`emit_verbatim_fmt`]: bf16 bytes at `block`-sized tiles into the pair
+/// `pin.rs` reads. `target` still carries `.weight`, so the base comes off the name that was
+/// matched — one string, so the weight and its grid cannot be named apart.
+fn emit_quantized_fp8<'a>(
+    w: &mut SafeWriter<'a>,
+    target: String,
+    raw: (&'a [u8], Dtype, &[usize]),
+    block: usize,
+) -> Result<()> {
+    let (b, _, sh) = raw;
+    ensure!(
+        sh.len() == 2 && b.len() == sh[0] * sh[1] * 2,
+        "{target}: expected a 2-D bf16 weight, got {sh:?} ({} B)",
+        b.len()
+    );
+    let (o_dim, i_dim) = (sh[0], sh[1]);
+    let base = target
+        .strip_suffix(".weight")
+        .with_context(|| format!("{target}: an fp8 projection does not end in `.weight`"))?;
+    let vals: Vec<f32> = b
+        .chunks_exact(2)
+        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let (packed, scale) = crate::quant::quantize_fp8_block(&vals, [o_dim, i_dim], block)
+        .with_context(|| target.clone())?;
+    let sbytes: Vec<u8> = scale.iter().flat_map(|s| s.to_le_bytes()).collect();
+    // The grid's name comes off `base`, so it is built before `target` moves into `add`.
+    let grid = format!("{base}.weight_scale_inv");
+    w.add(target, Dtype::F8E4M3, TensorData::new(sh.to_vec(), packed));
+    w.add(
+        grid,
+        Dtype::F32,
+        TensorData::new(vec![o_dim.div_ceil(block), i_dim.div_ceil(block)], sbytes),
+    );
     Ok(())
 }
 
@@ -471,5 +569,186 @@ mod tests {
         assert_eq!(merged_range(h(), 0..2).unwrap(), 0..3);
         assert!(merged_range(Some(0..3), 5..6).is_err());
         assert!(merged_range(None, 4..4).is_err());
+    }
+
+    /// The five projections [`DENSE_FP8_SUFFIXES`] names — and the tensors that share their
+    /// prefixes but must NOT be rewritten: the sconv weights, the norms, the near-miss suffix,
+    /// the routed experts and the embedding.
+    #[test]
+    fn dense_fp8_targets_are_the_five_attention_projections() {
+        assert_eq!(
+            DENSE_FP8_SUFFIXES.len(),
+            5,
+            "a projection joined or left the fp8 trunk set"
+        );
+        for suffix in DENSE_FP8_SUFFIXES {
+            assert!(
+                is_dense_fp8_target(&format!("model.layers.7.{suffix}")),
+                "{suffix} is a dense target but was not recognised"
+            );
+        }
+        for other in [
+            "model.layers.7.self_attn.sink_proj.weight",
+            "model.layers.7.self_attn.q_proj.sconv.conv1d.weight",
+            "model.layers.7.self_attn.k_proj.sconv.weight_proj.weight",
+            "model.layers.7.self_attn.q_proj.norm.scale",
+            "model.layers.7.self_attn.o_proj.gate_proj_bias.weight",
+            "model.layers.7.mlp.experts.w2_weight",
+            "model.embed_tokens.weight",
+        ] {
+            assert!(
+                !is_dense_fp8_target(other),
+                "{other} was taken for a dense fp8 target"
+            );
+        }
+    }
+
+    /// The `[8, 8]` fixture both emitter tests read, as f32 and as the bf16 bytes a converter
+    /// holds: alternating signs, magnitudes `1/8 ..= 4`, so every value sits far enough above a
+    /// tile's scale that e4m3's half-ulp is the only error the decode check can see.
+    fn fixture_weights() -> (Vec<f32>, Vec<u8>) {
+        let src: Vec<f32> = (0..64)
+            .map(|k| {
+                let mag = (k / 2 + 1) as f32 / 8.0;
+                if k % 2 == 0 { mag } else { -mag }
+            })
+            .collect();
+        let bytes = src
+            .iter()
+            .flat_map(|v| rivoli_core::num::f32_to_bf16(*v).to_le_bytes())
+            .collect();
+        (src, bytes)
+    }
+
+    /// **The quantizing arm, on disk.** A dense target under `Some(block)` becomes the
+    /// `<base>.weight` + `.weight_scale_inv` pair the resident fp8 path reads, at the grid shape
+    /// the block implies — and a block larger than both dims is ONE tile.
+    ///
+    /// The payload equality with [`crate::quant::quantize_fp8_block`] is a WIRING check, not a
+    /// numerics one — the scale rule is scored in `quant::fp8` and restating it here would let
+    /// this test pass while both copies were wrong. What it pins is the naming, the dtypes and
+    /// the grid's shape, which are this function's own.
+    #[test]
+    fn emit_verbatim_fmt_quantizes_a_dense_target_into_an_fp8_pair() {
+        let dir = std::env::temp_dir().join("rivoli_inkling_fmt_fp8");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| format!("{}/{name}", dir.display());
+
+        let (src, bf16) = fixture_weights();
+        let (o_dim, i_dim, block) = (8usize, 8usize, 4usize);
+        let shape = [o_dim, i_dim];
+        let dense = "model.layers.0.self_attn.q_proj.linear.weight".to_string();
+        let raw: (&[u8], Dtype, &[usize]) = (&bf16, Dtype::Bf16, shape.as_slice());
+
+        let mut q = SafeWriter::new();
+        emit_verbatim_fmt(&mut q, dense.clone(), raw, Some(block)).unwrap();
+        q.write(&path("fp8.safetensors")).unwrap();
+
+        let quantized = crate::format::Safetensors::open_file(&path("fp8.safetensors")).unwrap();
+        let (packed, psh) = quantized.typed(&dense, Dtype::F8E4M3).unwrap();
+        assert_eq!(
+            psh,
+            shape.as_slice(),
+            "the fp8 weight lost its [o, i] shape"
+        );
+        let grid = format!(
+            "{}.weight_scale_inv",
+            dense.strip_suffix(".weight").unwrap()
+        );
+        let (sb, ssh) = quantized.typed(&grid, Dtype::F32).unwrap();
+        assert_eq!(ssh, &[o_dim.div_ceil(block), i_dim.div_ceil(block)][..]);
+        let (want_packed, want_scale) =
+            crate::quant::quantize_fp8_block(&src, shape, block).unwrap();
+        assert_eq!(
+            packed,
+            want_packed.as_slice(),
+            "the fp8 payload was rewritten"
+        );
+        let scales: Vec<f32> = sb
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(scales, want_scale);
+        // And the pair DECODES back inside e4m3's three-mantissa-bit half-ulp (2^-4).
+        let view = crate::quant::Fp8W {
+            packed,
+            scale: &scales,
+            block,
+        };
+        let got = crate::quant::dequant_fp8_block(view, shape);
+        for (k, want) in src.iter().enumerate() {
+            assert!(
+                (got[k] - want).abs() <= 0.0625 * want.abs() + 1e-6,
+                "weight {k}: {want} decoded to {}",
+                got[k]
+            );
+        }
+
+        // A block larger than both dims — the block-128 shape every real Inkling projection takes
+        // — is ONE tile, which is the `div_ceil` boundary the small matrix above cannot reach.
+        let mut big = SafeWriter::new();
+        emit_verbatim_fmt(&mut big, dense.clone(), raw, Some(128)).unwrap();
+        let p128 = path("dense128.safetensors");
+        big.write(&p128).unwrap();
+        let coarse = crate::format::Safetensors::open_file(&p128).unwrap();
+        assert_eq!(
+            coarse.typed(&dense, Dtype::F8E4M3).unwrap().1,
+            shape.as_slice()
+        );
+        assert_eq!(coarse.typed(&grid, Dtype::F32).unwrap().1, &[1, 1][..]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Non-dense targets and `fp8_block = None` stay verbatim bf16 without a scale grid.
+    #[test]
+    fn emit_verbatim_fmt_leaves_every_other_tensor_bf16_verbatim() {
+        let dir = format!(
+            "{}/rivoli_inkling_fmt_bf16_{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| format!("{dir}/{name}");
+
+        let (_, bf16) = fixture_weights();
+        let shape = [8usize, 8];
+        let dense = "model.layers.0.self_attn.q_proj.linear.weight".to_string();
+        let sink = "model.layers.0.self_attn.sink_proj.weight".to_string();
+        let raw: (&[u8], Dtype, &[usize]) = (&bf16, Dtype::Bf16, shape.as_slice());
+
+        let mut b = SafeWriter::new();
+        emit_verbatim_fmt(&mut b, dense.clone(), raw, None).unwrap();
+        emit_verbatim_fmt(&mut b, sink.clone(), raw, None).unwrap();
+        b.write(&path("plain.safetensors")).unwrap();
+        let mut s = SafeWriter::new();
+        emit_verbatim_fmt(&mut s, sink.clone(), raw, Some(128)).unwrap();
+        s.write(&path("sink.safetensors")).unwrap();
+
+        for name in ["plain.safetensors", "sink.safetensors"] {
+            let verbatim = crate::format::Safetensors::open_file(&path(name)).unwrap();
+            let (bytes, vsh) = verbatim.typed(&sink, Dtype::Bf16).unwrap();
+            assert_eq!(vsh, shape.as_slice(), "{name}: the sink lost its shape");
+            assert_eq!(
+                bytes,
+                bf16.as_slice(),
+                "{name}: a bf16 tensor's bytes were rewritten"
+            );
+            assert!(
+                verbatim
+                    .typed(&format!("{sink}.weight_scale_inv"), Dtype::F32)
+                    .is_err(),
+                "{name}: a bf16 tensor grew a scale grid"
+            );
+        }
+        let plain = crate::format::Safetensors::open_file(&path("plain.safetensors")).unwrap();
+        let (bytes, _) = plain.typed(&dense, Dtype::Bf16).unwrap();
+        assert_eq!(
+            bytes,
+            bf16.as_slice(),
+            "fp8_block None rewrote a dense target"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -357,8 +357,9 @@ pub fn load_codebooks(dir: &str) -> Result<[Vec<f32>; 3]> {
     ])
 }
 
-/// The `f4_source` provenance block, written by both `.f4` converters and read by
-/// [`f4_layer_range`].
+/// The `f4_source` provenance block, written by every `.f4` converter (`convert_v4`,
+/// `convert_k3` and — since 2026-11-25 — `convert_inkling`/`convert_inkling_small`) and read
+/// by [`f4_layer_range`].
 ///
 /// **Deliberately adjacent to its only reader.** `layers` is not decoration — `f4_layer_range` is
 /// the loader's sole source for which layers an artifact holds, and treats the block's absence as
@@ -370,11 +371,19 @@ pub fn load_codebooks(dir: &str) -> Result<[Vec<f32>; 3]> {
 /// `tool` and `chain` are for a human reading a manifest six months later — two `.f4` sets built
 /// from different checkpoints are byte-indistinguishable on disk. `src` is the checkpoint path.
 ///
-/// `chain` is a literal at each producer rather than something a converter passes, because both
-/// `.f4` producers' sources are the SAME encoding — OCP MX e2m1 nibbles with e8m0 group scales —
+/// `chain` is a literal at each producer rather than something a converter passes, because the
+/// `.f4` REPACKERS' sources are the SAME encoding — OCP MX e2m1 nibbles with e8m0 group scales —
 /// so both really are `fp4 -> fp4`, and `tool` already says which converter ran. (It became a
 /// parameter of [`source_block`] only when `.mxfp8` joined, whose chain is `fp8->fp8`; the
 /// per-format literal stayed.)
+///
+/// **CORRECTED 2026-11-25: two producers QUANTIZE, and both overwrite `chain`.** `--f4` on
+/// `convert_inkling` (Mini's NVFP4/MXFP8 experts) and on `convert_inkling_small` (Small's
+/// MXFP8 experts) route bf16/decoded weights through `quant::quantize_f4_row`, so their chain
+/// is a measured lossy one rather than `fp4 -> fp4` — an artifact whose provenance claims a
+/// bit-exact repack it did not perform is worse than one that says nothing. Same mechanism the
+/// `.mxfp8` block's doc records for `convert_inkling --mxfp8`: the converter stamps its own
+/// chain beside this block instead of widening this function for one caller's distinction.
 pub fn f4_source(tool: &str, src_dir: &str, layers: std::ops::Range<usize>) -> serde_json::Value {
     source_block((tool, "fp4->fp4 (repack)"), src_dir.as_ref(), layers)
 }
@@ -444,13 +453,17 @@ fn source_block(
 /// One function rather than a type with a `load` and a `range`: the two were only ever
 /// called together, in that order, and the pair's only other caller was a test.
 pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usize>> {
-    // Both converters that produce `.f4` are named, because the message is the first thing a
+    // EVERY converter that produces `.f4` is named, because the message is the first thing a
     // reader sees and "not a convert_v4 artifact" in front of a Kimi-K3 directory sends them
     // looking for the wrong bug. `convert_k3` shipped without this stamp for exactly one
-    // commit, and this is the error it produced.
+    // commit, and this is the error it produced; the two Inkling members joined 2026-11-25,
+    // when `--f4` became the format's first QUANTIZING producer.
     source_layer_range(
         std::path::Path::new(dir),
-        ("f4_source", "convert_v4 or convert_k3"),
+        (
+            "f4_source",
+            "convert_v4, convert_k3, convert_inkling, or convert_inkling_small",
+        ),
         n_layers,
     )
 }
@@ -469,12 +482,36 @@ pub fn f4_layer_range(dir: &str, n_layers: usize) -> Result<std::ops::Range<usiz
 ///
 /// One file read, once per engine open — `manifest.json` and nothing else.
 pub fn has_mxfp8_source(dir: &str) -> bool {
+    has_source_key(dir, "mxfp8_source")
+}
+
+/// Whether `dir` is an `.f4` artifact at all — the sniff the loader makes before it commits to
+/// the FP4 backend, and the exact counterpart of [`has_mxfp8_source`].
+///
+/// The question asked is one: does `<dir>/manifest.json` parse and carry a top-level
+/// `f4_source` key? The two formats are the same container at the same block size and differ
+/// only in the packed width, so a sniff that asked anything less specific would commit the
+/// loader to `.f4` layer files in a `.mxfp8` directory (or the reverse). As with `.mxfp8`, a
+/// `false` is the safe answer: it sends the loader down the bf16 container, which either loads
+/// or names the tensor that is missing, while every real check — the key's `layers`, the dims,
+/// each layer file's length and header — stays with [`f4_layer_range`] and
+/// [`ExpertSet::open_routed`].
+pub fn has_f4_source(dir: &str) -> bool {
+    has_source_key(dir, "f4_source")
+}
+
+/// Whether `<dir>/manifest.json` parses and carries a top-level `key` block — the one statement
+/// [`has_mxfp8_source`] and [`has_f4_source`] both make, written once because the two formats
+/// are told apart by the KEY alone and a second copy is how one of them gets a fix the other
+/// does not.
+///
+/// An absent manifest, an unreadable one and malformed JSON all answer `false`.
+fn has_source_key(dir: &str, key: &str) -> bool {
     let path = std::path::Path::new(dir).join("manifest.json");
     let Ok(raw) = std::fs::read(&path) else {
         return false;
     };
-    let parsed = serde_json::from_slice::<serde_json::Value>(&raw);
-    parsed.is_ok_and(|v| v.get("mxfp8_source").is_some())
+    serde_json::from_slice::<serde_json::Value>(&raw).is_ok_and(|v| v.get(key).is_some())
 }
 
 /// The layer range an `.mxfp8` artifact holds, from `manifest.json`'s `mxfp8_source`.
@@ -538,4 +575,53 @@ fn source_layer_range(
          [0, num_hidden_layers={n_layers})"
     );
     Ok(from..to)
+}
+
+#[cfg(test)]
+mod tests {
+    // One `manifest.json` per case, written to disk: the subject is a sniff over real JSON, so
+    // a fixture that bypassed the parse would not exercise it. Crate-wide `unwrap`/`expect` are
+    // `deny`; a firing one IS the report.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{has_f4_source, has_mxfp8_source};
+
+    /// **The two formats are told apart by the manifest KEY alone** — same block size, same
+    /// scale encoding, different packed width — so an artifact of one must never answer `true`
+    /// to the other's sniff. A missing, empty or malformed manifest answers `false` to both:
+    /// the loader then falls back to the bf16 container, which either loads or names the
+    /// tensor that is missing, while a false `true` would commit it to layer files that are
+    /// not there.
+    #[test]
+    fn the_source_key_alone_tells_f4_from_mxfp8() {
+        let dir = std::env::temp_dir().join("rivoli_has_source_key");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().to_string();
+        let write = |body: &str| std::fs::write(format!("{dir}/manifest.json"), body).unwrap();
+
+        write(r#"{"f4_source": {"layers": [0, 3]}}"#);
+        assert!(has_f4_source(&dir));
+        assert!(
+            !has_mxfp8_source(&dir),
+            "an .f4 manifest answered the .mxfp8 sniff"
+        );
+
+        write(r#"{"mxfp8_source": {"layers": [0, 3]}}"#);
+        assert!(has_mxfp8_source(&dir));
+        assert!(
+            !has_f4_source(&dir),
+            "a .mxfp8 manifest answered the .f4 sniff"
+        );
+
+        for body in ["{}", "not json"] {
+            write(body);
+            assert!(
+                !has_f4_source(&dir) && !has_mxfp8_source(&dir),
+                "`{body}` was taken for a routed artifact"
+            );
+        }
+        std::fs::remove_file(format!("{dir}/manifest.json")).unwrap();
+        assert!(!has_f4_source(&dir) && !has_mxfp8_source(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

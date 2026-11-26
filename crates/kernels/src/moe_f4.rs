@@ -26,7 +26,7 @@ const _: () = assert!(F4_GROUP == rivoli_abi::geom::F4_GROUP as usize);
 /// Both pass-1 kernels' row mapping and dots (`moe_f4.hip::f4_gate_up_dots`); `store(e·R + t,
 /// g, u)` is the value lane 0 writes — the two kernels' activations.
 #[inline(always)]
-unsafe fn gateup_f4(r: &MoeRange<ExpertDescF4>, store: impl Fn(usize, f32, f32) -> f32) {
+pub(crate) unsafe fn gateup_f4(r: &MoeRange<ExpertDescF4>, store: impl Fn(usize, f32, f32) -> f32) {
     let hidden = r.span.hidden;
     let dots = |d: &ExpertDescF4, j, x, lane| {
         let g = nib_row::<F4>(d.gate_packed, d.gate_scale, (j, hidden));
@@ -41,7 +41,7 @@ unsafe fn gateup_f4(r: &MoeRange<ExpertDescF4>, store: impl Fn(usize, f32, f32) 
 
 /// Both pass-2 kernels: the fp4 down dot, `contribution(e·R + t, dv)` deciding what is added.
 #[inline(always)]
-unsafe fn down_f4(r: &MoeRange<ExpertDescF4>, contribution: impl Fn(usize, f32) -> Option<f32>) {
+pub(crate) unsafe fn down_f4(r: &MoeRange<ExpertDescF4>, contribution: impl Fn(usize, f32) -> Option<f32>) {
     let inter = r.span.inter;
     let dot = |d: &ExpertDescF4, o, h, lane| {
         dot_nib_wave_r::<1, U, F4>(

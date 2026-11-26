@@ -17,16 +17,17 @@
 use super::decode::LayerStep;
 use super::engine::{InklingEngine, InklingScratch};
 use super::geometry::{ScratchSizes, qk_scale, sconv_dynamic_divisor, sconv_static_divisor};
-use super::pin::{InklingLayerPin, LayerSconv};
+use super::pin::{DenseWeight, InklingLayerPin, LayerSconv};
 use crate::device::DeviceBuf;
 use crate::resident::Bf16Weight;
 use anyhow::{Result, ensure};
 use rivoli_artifact::inkling_config::InklingTextConfig;
 use rivoli_backend::{
-    NULL_STREAM, launch_gemm_bf16, launch_kv_scatter, launch_l2_clip, launch_log_scaled_l2_clip,
-    launch_logit_softcap, launch_message_gate, launch_rel_bias_gather, launch_rmsnorm_single,
-    launch_rmsnorm_weightless_batch, launch_scaled_l2_clip, launch_sconv, launch_sconv_dynamic,
-    launch_sigmoid_gate, launch_sink_attend, memcpy_dtod_async,
+    NULL_STREAM, launch_gemm_bf16, launch_gemv_bf16, launch_gemv_fp8, launch_kv_scatter,
+    launch_l2_clip, launch_log_scaled_l2_clip, launch_logit_softcap, launch_message_gate,
+    launch_rel_bias_gather, launch_rmsnorm_single, launch_rmsnorm_weightless_batch,
+    launch_scaled_l2_clip, launch_sconv, launch_sconv_dynamic, launch_sigmoid_gate,
+    launch_sink_attend, memcpy_dtod_async,
 };
 
 /// A buffer's device address as an f32 pointer. `DeviceBuf::ptr` takes `&self`, so the pointer is
@@ -50,22 +51,60 @@ pub(super) unsafe fn copy_dev(dst: *mut f32, src: *const f32, n: usize) -> Resul
     unsafe { memcpy_dtod_async(dst as *mut u8, src as *const u8, n * 4, NULL_STREAM) }
 }
 
-/// One projection on a single row: `out = w · x`, `w` being `[o_dim, i_dim]` bf16. A GEMM at
-/// `m = 1` because the tree has no bf16 GEMV. The `i_dim` agreement is checked here: a mismatch
-/// reads past a live buffer and produces fluent wrong text.
+/// The `i_dim` agreement every projection launch owes its weight — written once because both
+/// storage widths check the same thing and a second copy of the message is a clone the build
+/// refuses. A mismatch here reads past the end of a live buffer and produces fluent wrong text.
+fn check_i_dim(want: usize, got: usize) -> Result<()> {
+    ensure!(
+        want == got,
+        "projection expects an activation of {want} but was handed {got} — a shape mismatch here \
+         reads past the end of a live buffer and produces fluent wrong text"
+    );
+    Ok(())
+}
+
+/// One projection on a single row: `out = w · x`, `w` being `[o_dim, i_dim]` bf16. `m = 1` is
+/// the GEMV's shape, so this is [`launch_gemv_bf16`] — the wide-load kernel — and not the
+/// scalar [`launch_gemm_bf16`] that `rel_logits` still needs at `m = num_heads`.
 ///
 /// # Safety
 /// `x` is `i_dim` live f32, `out` is `w.o_dim` live f32, `w.packed` is `w.o_dim·w.i_dim` live
 /// bf16; all outlive the null-stream launch's completion.
 pub unsafe fn proj(x: *const f32, w: &Bf16Weight, out: *mut f32, i_dim: usize) -> Result<()> {
-    ensure!(
-        w.i_dim == i_dim,
-        "projection expects an activation of {} but was handed {i_dim} — a shape mismatch here \
-         reads past the end of a live buffer and produces fluent wrong text",
-        w.i_dim
-    );
+    check_i_dim(w.i_dim, i_dim)?;
     // SAFETY: the caller's contract, plus the `i_dim` agreement checked above.
-    unsafe { launch_gemm_bf16(x, w.packed, out, 1, w.o_dim, w.i_dim, NULL_STREAM) }
+    unsafe { launch_gemv_bf16(x, w.packed, w.o_dim, w.i_dim, out, NULL_STREAM) }
+}
+
+/// One projection on a single row, in whichever container the artifact stores it in: bf16
+/// ([`proj`]) or fp8-e4m3 block-scaled ([`launch_gemv_fp8`]).
+///
+/// **The two arms are the same arithmetic on the same null stream.** `launch_gemv_fp8` takes no
+/// stream and defaults to it exactly as `proj` passes [`NULL_STREAM`] to the bf16 GEMV, so a
+/// dispatch here cannot reorder against the rest of the layer's chain. Only the five large
+/// attention projections are [`DenseWeight`]s; every other projection in this file is bf16 on
+/// every artifact and stays on [`proj`].
+///
+/// # Safety
+/// `x` is `i_dim` live f32, `out` is the weight's `o_dim` live f32, and the weight's own bytes
+/// (bf16, or e4m3 plus its `ceil(o/block)·ceil(i/block)` scale grid) are live and outlive the
+/// null-stream launch's completion.
+pub unsafe fn proj_dense(
+    x: *const f32,
+    w: &DenseWeight,
+    out: *mut f32,
+    i_dim: usize,
+) -> Result<()> {
+    check_i_dim(w.i_dim(), i_dim)?;
+    match w {
+        // SAFETY: the caller's contract; `proj` re-checks the same agreement for its own callers.
+        DenseWeight::Bf16(b) => unsafe { proj(x, b, out, i_dim) },
+        // SAFETY: the caller's contract, plus the agreement checked above; the scale grid is the
+        // one `place_fp8` verified against this weight's shape.
+        DenseWeight::Fp8(f) => unsafe {
+            launch_gemv_fp8(x, f.packed, f.scale, f.o_dim, f.i_dim, f.block, 1, out)
+        },
+    }
 }
 
 /// The logit tail's weights and dims: the final norm, the lm_head (live rows only, T14), the
@@ -227,7 +266,8 @@ struct GatedOutIo {
 ///
 /// # Safety
 /// `x`/`out` are `hidden` live f32, `attn`/`gate` are `heads·head_dim` live f32; the pin's
-/// `attn_gate`/`o` weights are live bf16.
+/// `attn_gate`/`o` weights are live in whichever container the artifact stores them (bf16, or
+/// e4m3 with its scale grid).
 unsafe fn gated_output(
     pin: &InklingLayerPin,
     io: &GatedOutIo,
@@ -236,11 +276,11 @@ unsafe fn gated_output(
 ) -> Result<()> {
     let qd = d.heads * d.head_dim;
     // SAFETY: the caller's contract.
-    unsafe { proj(io.x, &pin.attn_gate, io.gate, hidden) }?;
+    unsafe { proj_dense(io.x, &pin.attn_gate, io.gate, hidden) }?;
     // SAFETY: `attn`/`gate` are `qd` live f32.
     unsafe { launch_sigmoid_gate(io.attn, io.gate, qd, NULL_STREAM) }?;
-    // SAFETY: `attn` is `qd` f32, `out` is `hidden` f32; `proj` checks the agreement.
-    unsafe { proj(io.attn, &pin.o, io.out, qd) }
+    // SAFETY: `attn` is `qd` f32, `out` is `hidden` f32; `proj_dense` checks the agreement.
+    unsafe { proj_dense(io.attn, &pin.o, io.out, qd) }
 }
 
 /// One k/v side's short-convolution form. The weights are COPIED (`Bf16Weight` is `Copy`) rather
@@ -256,7 +296,10 @@ enum SconvSide {
 /// One k/v path's operands. `buf` is the projection's scratch (the sconv reads it as `current` and
 /// writes it as `out`, safe in place); `cache` is this cache layer's deinterleaved K or V.
 struct KvPath {
-    pub proj_w: Bf16Weight,
+    /// `k_proj.linear` / `v_proj.linear` — a [`DenseWeight`], because both are among the five
+    /// projections an fp8 converter rewrites. The dynamic sconv's tap projection is NOT, and
+    /// rides [`SconvSide::Dynamic`] as a plain [`Bf16Weight`].
+    pub proj_w: DenseWeight,
     pub sconv: SconvSide,
     pub state: *mut f32,
     pub buf: *mut f32,
@@ -280,7 +323,7 @@ unsafe fn kv_path(
     let channels = d.kv_heads * d.head_dim;
     // SAFETY: the caller's contract; the sconv `current`/`out` alias is read-then-write.
     unsafe {
-        proj(x, &k.proj_w, k.buf, hidden)?;
+        proj_dense(x, &k.proj_w, k.buf, hidden)?;
         match k.sconv {
             SconvSide::Static(w) => launch_sconv(
                 w,
@@ -621,7 +664,7 @@ pub(super) unsafe fn attention(io: &LayerCall<'_>) -> Result<()> {
     let q = p(&sc.q);
     // SAFETY: the caller's contract; every buffer is the scratch's live allocation.
     unsafe {
-        proj(q_in, &pin.q, q, g.hidden)?;
+        proj_dense(q_in, &pin.q, q, g.hidden)?;
         q_norm(q, pin.q_norm_scale, &g.attn, c.tau)?;
         let rbp = RelBiasPath {
             linear: &pin.rel_linear,

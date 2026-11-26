@@ -18,6 +18,7 @@ static GEMV_I8: Kernel<Gemv<Scaled>> = Kernel::new(c"gemv_i8");
 static GEMV_I8_R2: Kernel<Gemv<Scaled>> = Kernel::new(c"gemv_i8_r2");
 static GEMV_F32: Kernel<Gemv<*const f32>> = Kernel::new(c"gemv_f32");
 static GEMV_F32_R2: Kernel<Gemv<*const f32>> = Kernel::new(c"gemv_f32_r2");
+static GEMV_BF16: Kernel<Gemv<*const u16>> = Kernel::new(c"gemv_bf16");
 static GEMV_I4: Kernel<Gemv<Scaled>> = Kernel::new(c"gemv_i4");
 static GEMV_VQ: Kernel<Gemv<Vq>> = Kernel::new(c"gemv_vq");
 static VQ_ENCODE: Kernel<VqEncode> = Kernel::new(c"vq_encode");
@@ -131,6 +132,16 @@ pub(crate) unsafe fn rivoli_gemv_f32(a: Gemv<*const f32>, nrow: i32, stream: *mu
     } else {
         unsafe { run(&GEMV_F32, checked, stream, &a) }
     }
+}
+
+/// The bf16 GEMV's refusals and grid are the family's: extents (1001), then the row grid with
+/// no LDS. Single-row only — a batched caller keeps `gemm_bf16`, whose `R`-row shapes this
+/// kernel does not have.
+///
+/// # Safety
+/// The `launch_gemv_bf16` contract.
+pub(crate) unsafe fn rivoli_gemv_bf16(a: Gemv<*const u16>, stream: *mut c_void) -> i32 {
+    unsafe { run(&GEMV_BF16, row_grid(&a, 0), stream, &a) }
 }
 
 /// # Safety
