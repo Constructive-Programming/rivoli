@@ -41,3 +41,21 @@ rivoli /path/to/artifact --port 8080
 ```
 
 Artifacts are built from Hugging Face checkpoints with the per-model `convert_*` binaries.
+
+## Container image
+
+Prebuilt ROCm (`gfx1151`) images containing `rivoli` and all offline converters are
+published to GitHub Packages on every version tag:
+
+```bash
+docker pull ghcr.io/constructive-programming/rivoli:latest
+docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
+  -v /var/db/rivoli:/models:ro ghcr.io/constructive-programming/rivoli:latest \
+  /models/inkling-2-small-fp8-f4-art --max-mem 100 --bench 64
+```
+
+To put several models behind one OpenAI endpoint, with swapping, idle unload and a clean
+SIGTERM path, run rivoli as a llama-swap backend: see
+[Running behind llama-swap](llama-swap.md) for the verified `config.yaml` and the one
+constraint that shapes it (rivoli's `--max-mem` is a literal GPU-memory claim, so it cannot
+share the device with another loaded model).

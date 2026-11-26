@@ -174,8 +174,9 @@ html { font-family: var(--rv-sans); }
 .rv-overlap .on-compute { fill: var(--bg); font-size: 11px; }
 .rv-overlap .on-stream { fill: #1f242b; font-size: 11px; }
 .rv-overlap .cpu { fill: var(--rv-teal); }
-.rv-overlap .on-cpu { fill: #1f242b; font-size: 11px; }
+.rv-overlap .cpu-label { fill: var(--fg); font-size: 11px; }
 .rv-overlap .axis { stroke: var(--icons); stroke-width: 1; }
+.rv-overlap .divider { stroke: var(--icons); stroke-width: 1; stroke-dasharray: 4 3; opacity: .55; }
 
 /* ---- Principle cards ------------------------------------------------- */
 .rv-card {
