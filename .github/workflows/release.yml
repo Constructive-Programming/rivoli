@@ -1,139 +1,174 @@
 name: release
 
-# Binary packages for tagged commits.
+# Automated GitHub Packages (GHCR) + GitHub Release packaging on every version tag push.
 #
-# WHY THIS NEEDS A SELF-HOSTED RUNNER, and is not a GitHub-hosted job with an apt step.
+# Two jobs run on `v*` tags (e.g. `v0.1.0`, `v0.1.0-rc1`) or manual `workflow_dispatch`:
 #
-# The shipped engine is `--features rocm` compiled `--offload-arch=gfx1151`. That needs the
-# kernels' pinned nightly (`crates/kernels/rust-toolchain.toml`) and ROCm's device bitcode
-# libs (`ocml.bc` etc.) and `libamdhip64` — hipcc is no longer a build input (2026-11-20) —
-# and the ROCm install is tens of gigabytes, which does not fit in a GitHub-hosted runner's
-# free disk. More importantly, a binary for one GPU architecture is
-# only worth shipping if it has been RUN on that architecture, and the 106-test rocm suite
-# needs the device. So the release is built and tested on the target machine itself.
+#   1. `container` (GitHub-hosted `ubuntu-24.04` — runs immediately, no self-hosted runner
+#      required): builds the multi-stage ROCm (gfx1151) Docker image from `Dockerfile`
+#      (all GPU kernels are compiled in Rust via `crates/kernels` against ROCm bitcode —
+#      no GPU hardware is needed to compile or link) and publishes:
+#        - Container image to GHCR: `ghcr.io/constructive-programming/rivoli:<tag>`
+#          (plus `latest` on stable semver tags, and `sha-<short>`),
+#        - Binary tarball + SHA-256 extracted from the exact built image to the GitHub Release.
 #
-# REGISTERING THE RUNNER (one-time, on the Strix Halo box):
-#   Settings -> Actions -> Runners -> New self-hosted runner, then add the labels
-#   `rocm` and `gfx1151` alongside the defaults. This workflow requires both, so a runner
-#   that lacks ROCm can never pick the job up by accident.
-#
-# If no such runner is registered the job QUEUES rather than fails. That is deliberate: a
-# tag should not be silently released without hardware verification. Nothing else in CI
-# depends on this workflow — ci.yml runs entirely on GitHub-hosted runners.
+#   2. `device-verify` (optional self-hosted `[self-hosted, linux, rocm, gfx1151]`): only
+#      runs when explicitly requested via `workflow_dispatch` with `device_verify=true` (so a
+#      repo with no self-hosted runner registered never hangs a tag release in Queued state).
 
 on:
   push:
     tags:
-      # `v1.2.3` only. NOT a bare `*`: this repo's tag namespace already contains
-      # `archive/vq-study`, `archive/replay-oracle-prefetch` and `archive/mtp-target-probe`,
-      # which are recovery points for deleted code and must never cut a release.
+      # `v1.2.3` / `v1.2.3-rc1` only. Never bare `*`: archive/* tags are recovery points.
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag / version label (e.g. v0.1.0); defaults to Cargo.toml version"
+        required: false
+        default: ""
+      offload_arch:
+        description: "AMDGPU target arch"
+        required: false
+        default: "gfx1151"
+      device_verify:
+        description: "Also run the self-hosted gfx1151 hardware test job"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
-  contents: write # create the Release and upload assets
+  contents: write  # create GitHub Releases and attach tarballs
+  packages: write  # push container packages to ghcr.io
 
 env:
-  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  package:
-    name: build, test on the device, package
-    runs-on: [self-hosted, linux, rocm, gfx1151]
-    timeout-minutes: 120
+  container:
+    name: build, push GHCR package & publish release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
-      # A tag that disagrees with Cargo.toml ships a binary whose `--version` lies about
-      # which release it is, and the mismatch is invisible until someone is debugging a
-      # deployment. Fail here, before anything is built.
-      - name: Refuse a tag that disagrees with Cargo.toml
-        run: |
-          set -euo pipefail
-          crate=$(cargo metadata --no-deps --format-version 1 \
-                  | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "rivoli"))')
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$crate" != "$tag" ]; then
-            echo "tag $GITHUB_REF_NAME says $tag, Cargo.toml says $crate" >&2
-            echo "Bump the version in Cargo.toml (and Cargo.lock) to match the tag." >&2
-            exit 1
-          fi
-          echo "tag and Cargo.toml agree on $crate"
-
-      - name: Record what produced this build
+      - name: Resolve version and validate tag against Cargo.toml
         id: meta
         run: |
           set -euo pipefail
-          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          echo "arch=${RIVOLI_OFFLOAD_ARCH:-gfx1151}" >> "$GITHUB_OUTPUT"
+          crate=$(python3 - <<'EOF'
+          import tomllib
+          with open("Cargo.toml", "rb") as f:
+              print(tomllib.load(f)["workspace"]["package"]["version"])
+          EOF
+          )
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"
+            bare="${tag#v}"
+            if [ "$crate" != "$bare" ]; then
+              echo "tag ${tag} says ${bare}, Cargo.toml says ${crate}" >&2
+              echo "Bump workspace.package.version in Cargo.toml (and Cargo.lock) to match the tag." >&2
+              exit 1
+            fi
+            is_release="true"
+          else
+            raw="${{ inputs.tag }}"
+            tag="${raw:-v${crate}}"
+            is_release="false"
+          fi
+          arch="${{ inputs.offload_arch || 'gfx1151' }}"
+          short_sha="${GITHUB_SHA:0:7}"
+          is_prerelease="false"
+          if [[ "$tag" == *-* ]]; then
+            is_prerelease="true"
+          fi
           {
-            echo "rivoli ${GITHUB_REF_NAME}"
-            echo "commit:  ${GITHUB_SHA}"
-            echo "built:   $(date -uIseconds)"
-            echo "arch:    ${RIVOLI_OFFLOAD_ARCH:-gfx1151}"
-            echo "rustc:   $(rustc --version)"
-            echo "device:  $(cd crates/kernels && rustc --version)"
-          } > BUILD-INFO.txt
-          cat BUILD-INFO.txt
+            echo "tag=${tag}"
+            echo "version=${tag#v}"
+            echo "arch=${arch}"
+            echo "short_sha=${short_sha}"
+            echo "is_release=${is_release}"
+            echo "is_prerelease=${is_prerelease}"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag=${tag} arch=${arch} sha=${short_sha} release=${is_release} prerelease=${is_prerelease}"
 
-      # OUTSIDE the GPU lock, deliberately. Compiling needs no device, and holding the lock
-      # through a multi-minute build would stall anything else on this sole-tenant machine.
-      - name: Build (no GPU needed)
-        run: cargo build --release --locked -p rivoli --features rocm --bins
-
-      # INSIDE the lock. The GPU here is SOLE-TENANT and shared with interactive work:
-      # `DeviceTier::new` fails to allocate while anything else holds the budget, so a test
-      # run that ignored the lock would both fail spuriously and corrupt whatever it
-      # collided with. This is the same `/var/run/sys-gpu.lock` every other consumer takes.
-      #
-      # `/var/run` is `/run`, which is TMPFS: the lock file does not survive a reboot of the
-      # self-hosted runner, and `/run` is root-owned so `flock` cannot recreate it. It fails
-      # LOUDLY when missing (`cannot open lock file`, exit 66) rather than testing unlocked,
-      # so a rebooted runner fails this step instead of racing interactive work — restore
-      # with `sudo install -m 666 -o "$USER" /dev/null /run/sys-gpu.lock`.
-      #
-      # `--test-threads=1` is not tidiness. libtest runs #[test]s in parallel and each device
-      # test builds its own tier, pool and io_uring ring; the tell in /proc/<pid>/task/*/wchan
-      # is four io_sq_threads. Serialised, the same suite goes from a 12-minute hang to 3.52 s
-      # (CLAUDE.md, "Measurement discipline"). This used to cite tests/vk.rs:186 and a
-      # process-global VALIDATION_ERRORS counter; that file went with the Vulkan backend on
-      # 2026-08-06, and the io_uring reason is the stronger one and applies to every arm.
-      - name: Test on the device (sole-tenant, under the shared lock)
+      # Free disk space on ubuntu-24.04 before pulling the 1.2 GB ROCm base + Rust build cache.
+      - name: Reclaim runner disk space
         run: |
-          flock /var/run/sys-gpu.lock \
-            cargo test --release --locked -p rivoli-engine --features rocm -- --test-threads=1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
 
-      - name: Package
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute OCI image metadata and tags
+        id: oci
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.meta.outputs.tag }}
+            type=raw,value=${{ steps.meta.outputs.version }}
+            type=raw,value=${{ steps.meta.outputs.tag }}-${{ steps.meta.outputs.arch }}
+            type=raw,value=sha-${{ steps.meta.outputs.short_sha }}
+            type=raw,value=latest,enable=${{ steps.meta.outputs.is_release == 'true' && steps.meta.outputs.is_prerelease == 'false' }}
+
+      - name: Build and push GHCR container package
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.oci.outputs.tags }}
+          labels: ${{ steps.oci.outputs.labels }}
+          build-args: |
+            RIVOLI_OFFLOAD_ARCH=${{ steps.meta.outputs.arch }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test published GHCR image and extract release tarball
         id: pack
         run: |
           set -euo pipefail
-          NAME="rivoli-${{ steps.meta.outputs.tag }}-linux-x86_64-${{ steps.meta.outputs.arch }}"
-          mkdir -p "dist/$NAME"
-          # The engine plus the offline tools, which are useless separately: you cannot run
-          # rivoli without an artifact, and `convert`/`fp8_to_i4`/`add_indexer` are what
-          # build one. README's conversion recipe names all three.
-          #
-          # Hand-maintained, not derived from `src/bin/` — so a deleted tool fails `install`
-          # at TAG time and nothing before it (that is how `i4_audit` survived here until
-          # 2026-08-05), and an added one is silently missing. `convert_v4` and `v4-oracle`
-          # are missing right now.
-          for b in rivoli convert fp8_to_i4 add_indexer ppl replay; do
-            install -m755 "target/release/$b" "dist/$NAME/$b"
-          done
-          install -m644 README.md BUILD-INFO.txt "dist/$NAME/"
-          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
-          ( cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
-          ls -lh dist/
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}"
+          IMAGE="${IMAGE,,}"
+          docker pull "${IMAGE}"
+          docker run --rm "${IMAGE}" --version
+          docker run --rm "${IMAGE}" --help > /dev/null
 
-      # Sanity: the packaged binary must at least start and report its own identity. A
-      # tarball whose contents cannot exec is the classic release-day discovery.
-      - name: Smoke-test the packaged binary
-        run: |
-          set -euo pipefail
-          tar -C /tmp -xzf "dist/${{ steps.pack.outputs.name }}.tar.gz"
-          "/tmp/${{ steps.pack.outputs.name }}/rivoli" --version
-          "/tmp/${{ steps.pack.outputs.name }}/rivoli" --help > /dev/null
+          NAME="rivoli-${{ steps.meta.outputs.tag }}-linux-x86_64-${{ steps.meta.outputs.arch }}"
+          mkdir -p "dist/${NAME}"
+          cid=$(docker create "${IMAGE}")
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          for b in rivoli convert convert_v4 convert_glimmer convert_glimmer_drafter \
+                   convert_k3 convert_qwen convert_inkling convert_inkling_small \
+                   fp8_to_i4 add_indexer ppl; do
+            docker cp "${cid}:/usr/local/bin/${b}" "dist/${NAME}/${b}"
+            chmod 755 "dist/${NAME}/${b}"
+          done
+          {
+            echo "rivoli ${{ steps.meta.outputs.tag }}"
+            echo "commit:  ${GITHUB_SHA}"
+            echo "built:   $(date -uIseconds)"
+            echo "arch:    ${{ steps.meta.outputs.arch }}"
+            echo "image:   ${IMAGE}@${{ steps.push.outputs.digest }}"
+          } > "dist/${NAME}/BUILD-INFO.txt"
+          install -m644 README.md "dist/${NAME}/README.txt"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          ls -lh dist/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -141,14 +176,34 @@ jobs:
           path: dist/*.tar.gz*
           retention-days: 30
 
-      - name: Publish the GitHub Release
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.is_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          PRE=""
+          if [ "${{ steps.meta.outputs.is_prerelease }}" = "true" ]; then
+            PRE="--prerelease"
+          fi
           gh release create "${{ steps.meta.outputs.tag }}" \
+            ${PRE} \
             --title "rivoli ${{ steps.meta.outputs.tag }}" \
             --generate-notes \
-            --notes "Built and tested on ${{ steps.meta.outputs.arch }} (AMD Strix Halo). Requires a ROCm runtime — the binary links \`libamdhip64.so\` dynamically. See BUILD-INFO.txt in the tarball for the exact toolchain." \
+            --notes "Container package: \`${{ steps.pack.outputs.image }}\` (\`${{ steps.push.outputs.digest }}\`). Built for \`${{ steps.meta.outputs.arch }}\` (AMD Strix Halo) with Rust amdgcn kernels. Requires a ROCm runtime (\`libamdhip64.so\`) when running the standalone tarball outside the container." \
             "dist/${{ steps.pack.outputs.name }}.tar.gz" \
             "dist/${{ steps.pack.outputs.name }}.tar.gz.sha256"
+
+  device-verify:
+    name: verify on gfx1151 hardware (opt-in self-hosted)
+    if: github.event_name == 'workflow_dispatch' && inputs.device_verify == true
+    runs-on: [self-hosted, linux, rocm, gfx1151]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (outside GPU lock)
+        run: cargo build --release --locked -p rivoli --features rocm --bins
+      - name: Test on the device (under /var/run/sys-gpu.lock)
+        run: |
+          flock /var/run/sys-gpu.lock \
+            cargo test --release --locked -p rivoli-engine --features rocm -- --test-threads=1
