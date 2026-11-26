@@ -96,3 +96,16 @@ pub unsafe extern "gpu-kernel" fn moe_gateup_mxfp8_situ(a: MoeF4Situ) {
 pub unsafe extern "gpu-kernel" fn moe_down_mxfp8_weighted(a: MoeF4Situ) {
     down_mxfp8(&a.range);
 }
+
+/// Inkling-2's fp32-latent MXFP4 pass 1: `situ_glu(g, u)` kept in f32 (no K3 `rbf16` store).
+#[unsafe(no_mangle)]
+pub unsafe extern "gpu-kernel" fn moe_gateup_f4_situ_f32(a: MoeF4Situ) {
+    crate::moe_f4::gateup_f4(&a.range, |_, g, u| situ_glu(g, u, a.b1, a.b2));
+}
+
+/// Inkling-2's fp32-latent MXFP4 pass 2: `fixed(dv · w)` in f32, skipped where `w == 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "gpu-kernel" fn moe_down_f4_weighted_f32(a: MoeF4Situ) {
+    let routed = routed(a.range.wexpert);
+    crate::moe_f4::down_f4(&a.range, |k, dv| routed(k, dv));
+}

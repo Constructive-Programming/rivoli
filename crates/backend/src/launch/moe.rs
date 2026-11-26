@@ -237,14 +237,14 @@ pub(crate) unsafe fn rivoli_moe_expert_range_f4(a: MoeF4, c: DescRows, stream: *
 unsafe fn situ_range(
     a: &MoeF4Situ,
     c: DescRows,
-    (kernels, lds): ((&Kernel<MoeF4Situ>, &Kernel<MoeF4Situ>), LdsBytes),
+    kernels: (&Kernel<MoeF4Situ>, &Kernel<MoeF4Situ>),
     launch: impl Fn(&Kernel<MoeF4Situ>, Geometry) -> i32,
 ) -> i32 {
     let (gateup, down) = kernels;
     let pass = |second: bool, g: Geometry| launch(if second { down } else { gateup }, g);
     let span = a.range.span;
     let checked = f4_checked(&span, (c.n_desc, c.nrow), F4_GROUP as i32, &[a.b1, a.b2]);
-    two_pass((span, checked), pass, lds)
+    two_pass((span, checked), pass, LdsBytes(0))
 }
 
 /// # Safety
@@ -254,14 +254,24 @@ pub(crate) unsafe fn rivoli_moe_expert_range_f4_situ(
     c: DescRows,
     stream: *mut c_void,
 ) -> i32 {
-    let kernels = (&MOE_GATEUP_F4_SITU, &MOE_DOWN_F4_WEIGHTED);
-    // SAFETY: the launcher contract covers both passes' buffers; neither kernel builds a
-    // decode table, so the grid asks for no dynamic LDS.
-    unsafe {
-        situ_range(&a, c, (kernels, LdsBytes(0)), |k, g| {
-            k.launch(g, stream, &a)
-        })
-    }
+    let kpair = (&MOE_GATEUP_F4_SITU, &MOE_DOWN_F4_WEIGHTED);
+    // SAFETY: the launcher contract covers both passes' buffers.
+    unsafe { situ_range(&a, c, kpair, |k, g| k.launch(g, stream, &a)) }
+}
+
+static MOE_GATEUP_F4_SITU_F32: Kernel<MoeF4Situ> = Kernel::new(c"moe_gateup_f4_situ_f32");
+static MOE_DOWN_F4_WEIGHTED_F32: Kernel<MoeF4Situ> = Kernel::new(c"moe_down_f4_weighted_f32");
+
+/// # Safety
+/// The `launch_moe_expert_range_f4_situ_f32` contract.
+pub(crate) unsafe fn rivoli_moe_expert_range_f4_situ_f32(
+    arg: MoeF4Situ,
+    dr: DescRows,
+    st: *mut c_void,
+) -> i32 {
+    let f32_pair = (&MOE_GATEUP_F4_SITU_F32, &MOE_DOWN_F4_WEIGHTED_F32);
+    // SAFETY: the launcher contract covers both passes' buffers.
+    unsafe { situ_range(&arg, dr, f32_pair, |k, g| k.launch(g, st, &arg)) }
 }
 
 static MOE_GATEUP_MXFP8_SITU: Kernel<MoeF4Situ> = Kernel::new(c"moe_gateup_mxfp8_situ");
@@ -269,28 +279,12 @@ static MOE_DOWN_MXFP8_WEIGHTED: Kernel<MoeF4Situ> = Kernel::new(c"moe_down_mxfp8
 
 /// # Safety
 /// The `launch_moe_expert_range_mxfp8_situ` contract.
-///
-/// Guards, order and codes are `rivoli_moe_expert_range_f4_situ`'s exactly — MXFP8's group is
-/// 32 columns like fp4's, so `F4_GROUP` is the reduction-dim unit here too and 1002 is the
-/// same refusal. The one difference is inside the kernels rather than in this guard: MXFP8's
-/// e4m3 weights decode arithmetically in registers, so neither pass builds a shared decode
-/// table and both grids request no dynamic LDS — `LdsBytes(0)`, as the fp4 pair does.
 pub(crate) unsafe fn rivoli_moe_expert_range_mxfp8_situ(
     a: MoeF4Situ,
     c: DescRows,
     s: *mut c_void,
 ) -> i32 {
-    // SAFETY: the launcher contract covers both passes' buffers, and neither kernel touches
-    // shared memory, so the grid's LDS request is zero.
-    unsafe {
-        situ_range(
-            &a,
-            c,
-            (
-                (&MOE_GATEUP_MXFP8_SITU, &MOE_DOWN_MXFP8_WEIGHTED),
-                LdsBytes(0),
-            ),
-            |k, g| k.launch(g, s, &a),
-        )
-    }
+    let mx8_pair = (&MOE_GATEUP_MXFP8_SITU, &MOE_DOWN_MXFP8_WEIGHTED);
+    // SAFETY: the launcher contract covers both passes' buffers.
+    unsafe { situ_range(&a, c, mx8_pair, |k, g| k.launch(g, s, &a)) }
 }

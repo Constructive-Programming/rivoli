@@ -1,7 +1,7 @@
 ---
 status: closed-shipped
 scope: inkling
-verdict: S0-S8 COMPLETE (MINI BF16, MINI MXFP8, AND SMALL MXFP8 WITNESSED ON HOT NVME END TO END; `tests/smoke-inkling-small.sh` 17/17 GREEN + RED-PROOFED) -- the Inkling 2 port (owner scope 2026-11-23 both members, Mini first, text-only v1, MTP refused) has both members built, audited, gated, and benchmarked on hot NVMe. Mini bf16 (`inkling2_loop`, 48.6 GiB tier): 8/8 greedy token-identical to first-party transformers on "Hi"; witnessed release 64-token decode on "The sky is blue because" (GTT 17-18 MiB pre-arm, empty KFD witness) 11.69 / 11.59 tok/s pinned (90 GiB, 24/24 layers, 85.6 ms/tok) and 2.25 tok/s streaming (20 GiB, 8/24 pinned), 64/64 ids identical A=A'=B; TF `--ppl` on TOUR.md (830 tok, PPL 9.6174) byte-identical A=A'=B; `tests/smoke-inkling.sh` 16/16 green + red-proofed. Mini MXFP8 (`convert_inkling --mxfp8`, 27 GB on disk, 3.0 GiB resident + 23.6 GiB pool, layers 20-23 repacked bit-exact and 0-19 quantized NVFP4->MXFP8, sniffed automatically via `has_mxfp8_source`): `inkling_mini_mxfp8.rs` 3/3 GPU green; **8/8 token-identical** to first-party transformers on "Hi"; witnessed release 64-token decode **14.75 / 14.30 tok/s** at 64 GiB (100% experts fit, 67.8 ms/tok, +26% vs bf16 at half the memory; 14.13 tok/s to EOS at 130 tok) and **12.60 tok/s** at 12 GiB streaming (37.2% experts pinned, 64/64 ids identical A=A'=B); paired dNLL vs Mini bf16 on TOUR.md (830 tok) mean `-0.00415` nats, 95% CI `[-0.01257, +0.00427]` (upper bound `< 0.00995` 1% bar, worse% `48.6%`, PPL `9.5776` vs `9.6174`). Small MXFP8 (`inkling2`, 564 GiB routed set on `/var/db/rivoli/inkling-2-small-mxfp8-art`, 996/996 resident match, L00/L47 0 bytes differ): fused `moe_gateup_mxfp8_situ` + `moe_down_mxfp8_weighted` kernels (79/79/0 census, 64 callers, 15 uncalled, 13 oracle-validated; 6/6 GPU oracle + 4/4 composition + §22h red-proofed); witnessed release 64-token decode **2.67 / 2.66 tok/s** at 100 GiB (15.5% pinned, 76.6% hit, 374.0 ms/tok) and **1.37 tok/s** at 32 GiB (3.4% pinned, 35.6% hit, 731.8 ms/tok), **64/64 ids identical** A=A'=B. The Small serve cell closed 2026-11-25 (`SMOKE GREEN: 17 cells`, exit 0): non-stream reply `'Hi there'`, `enable_thinking=false` content `'Hi'`, SSE frames + `[DONE]`, clean shutdown.
+verdict: S0-S8 COMPLETE + WAVES 1-3 PERF LANDED (2026-11-26) -- both Inkling 2 members (Mini `inkling2_loop` and Small `inkling2`, text-only v1, MTP refused) are built, gated, and witnessed on hot NVMe across BF16, MXFP8, FP8 dense trunk, and MXFP4 (`.f4`). Lossless Waves 1-2 (`gemv_bf16` 128-bit vector GEMV, 128-bit fused arithmetic MXFP8 MoE, zero-miss `NULL_STREAM` fast path, full-resident `RoutedPool::preload_all`): Mini MXFP8 14.75 -> **21.78 tok/s** (+48%, 0 decode misses), Small MXFP8 2.67 -> **3.05 tok/s** (+14%, 197 GB/s effective compute BW = 92% of 215 GB/s lm_head peak). Wave 3 P5 format work (FP8 block-128 attention trunk `q/k/v/attn_gate/o` + MXFP4 `.f4` routed experts with fp32-latent `moe_expert_range_f4_situ_f32`): Mini FP8+MXFP8 **24.19 tok/s** (1.64x, paired-dNLL PASS @ 5471 tok: `-0.00013` nats, 95% CI `[-0.00443, +0.00416]`); Small FP8+MXFP8 **3.31 tok/s** (1.24x, paired-dNLL PASS @ 803 tok: `-0.00034` nats, 95% CI `[-0.00784, +0.00716]`); Small FP8+F4 **6.39 tok/s** cold-64 / **7.54 tok/s** warmed-128 (2.39x-2.82x, 5722/18432 = 31% pinned, 90.5% hit; 2991-tok paired-dNLL `+0.00701` bf16-latent / `+0.00764` fp32-latent nats = `+0.70-0.77%` PPL, INCONCLUSIVE vs 1% bar; Mini FP8+F4 27.04 tok/s, `+1.22%` PPL COST ESTABLISHED on two-hop quant). Kernel census 81/81/0 (66 callers, 15 uncalled, 15 oracle-validated); `tests/smoke-inkling.sh` 16/16 and `tests/smoke-inkling-small.sh` 17/17 green + red-proofed.
 ---
 
 # Inkling 2: port plan of record
@@ -448,6 +448,32 @@ runs cleanly at 2.67 tok/s.
   - `resident.safetensors` (~13 GB): **996/996** tensor names and shapes match first-party `Inkling2ForCausalLM` meta `state_dict` (0 missing, 0 extra, 0 shape mismatches; 422 vision and 192 expert tensors excluded by name).
   - `L00.mxfp8`–`L47.mxfp8`: 48 files × `12,612,800,512 B` each (`~564 GiB` routed set); `L00.mxfp8` and `L47.mxfp8` verified byte-for-byte against source shards (`384 experts, 0 bytes differ`).
   - `tests/smoke-inkling-small.sh` **17/17 green** (`SMOKE GREEN: 17 cells`, exit 0, 2026-11-25) on `/var/db/rivoli/inkling-2-small-mxfp8-art` at `--max-mem 100`: all 6 refusals with the table's own wording, `--cache-policy 2q`, the `--mode int4` loud MXFP8 fallback, `bench` (4 ids), `determinism A-vs-A` (identical ids), P4 (identical ids at 100 vs 24 GiB), and the serve cell end to end -- readiness after load, `/v1/models`, non-stream reply `'Hi there'`, `enable_thinking=false` content `'Hi'`, SSE frames + `[DONE]`, clean shutdown. Red-proofed by a planted refusal fragment under `--expect-red='without the expected message'`, then restored byte-identical.
+
+## Performance waves (2026-11-25 – 2026-11-26)
+
+All arms witnessed on hot local NVMe (`flock /var/run/sys-gpu.lock`, empty KFD witness, pre-arm GTT 18 MiB, release+`teacher-forcing` build):
+
+### Waves 1–2 (lossless, commit `2ef6887`)
+- **`gemv_bf16`** (`crates/kernels/src/linalg.rs`): 128-bit vectorized `m=1` bf16 GEMV (68 VGPR, 0 scratch, 210–215 GB/s measured on `lm_head`), replacing scalar `gemm_bf16` in `inkling/forward.rs::proj`.
+- **128-bit fused arithmetic MXFP8 MoE** (`dot_mxfp8.rs`, `moe_mxfp8.rs`): `dot_mxfp8_pair_wave` reads `x` once for gate+up; branchless `E4M3_REBIAS` replaces the 256-entry LDS LUT (0 `ds_load_b32`, 0 LDS, 0 `s_barrier`; 96 VGPR gateup, 66 VGPR down at `DOWN_UNROLL=1`).
+- **Sync elimination & full-resident preload** (`inkling/moe_mxfp8.rs`, `routed/preload.rs`): deleted redundant JOIN 1 `device_sync()` (48/tok), added zero-miss `NULL_STREAM` fast path (eliminating JOIN 2 on resident layers), split `Phase::Ffn` vs `Phase::FetchWait` cleanly (`other` 0.02%), and preloaded fully-resident pools across 4 threads (~13–23 GiB/s).
+
+### Wave 3 (P5 bytes/token formats, commit `3230675` + fp32-latent `.f4` kernel)
+- **FP8 block-128 dense attention trunk** (`q/k/v/attn_gate/o` via `DenseWeight::Fp8`, sniffed from layer 0 `q_proj` dtype): halves attention trunk traffic (Mini 3.0 → 2.4 GiB resident, Small 12.4 → 8.2 GiB resident, +138 pinned Small experts). **Passes the ±1% paired-dNLL gate on both members.**
+- **MXFP4 (`.f4`) routed experts** (`quantize_f4_row`, `convert_inkling_small --from-mxfp8 --fp8 --f4`, fp32-latent `moe_expert_range_f4_situ_f32`): halves Small expert size (32.85 → 16.92 MB, 564 → 290 GiB routed set), more than doubling pinned Small experts at 100 GiB (2,806 → 5,722 = 31.0%) and cutting `fetch-wait` from 215 ms to 48–73 ms.
+- **Ablations (recorded so dead ends are not repeated)**:
+  - Replacing K3's `rbf16`-latent `moe_expert_range_f4_situ` with fp32-latent `moe_expert_range_f4_situ_f32` moved Small 2,991-tok dNLL `+0.00701 → +0.00764` nats (within ±0.004 SE noise; kept because Inkling's reference is fp32-latent and the kernel has zero bandwidth cost).
+  - MSE-optimal `ceil - 1` ue8m0 scale clipping cut raw weight MSE by 8.6% on Mini L20, but **worsened** Mini 5,471-tok PPL from `+1.22%` to `+1.82%` (`+0.01802` vs `+0.01210` nats) because clipping outlier weights hurts MoE routing/outputs; reverted to non-clipping `ceil` scale.
+
+| arm (hot NVMe, release) | budget | residency / hit | decode tok/s | wall (ms/tok) | paired-dNLL vs MXFP8 baseline (`±0.00995` = 1% PPL) |
+|---|---|---|---|---|---|
+| Mini BF16 + `.mxfp8` (Wave 2, 64 tok) | 64 GiB | 3072/3072 (100%, 0 misses) | **21.78** | 45.9 (`att 2.3 + ffn 39.1 + fw 0.0 + hd 4.3`) | baseline (5471 tok PPL 4.1474) |
+| Mini **FP8 + `.mxfp8`** (64 tok) | 64 GiB | 3072/3072 (100%, 0 misses) | **24.19** | 41.3 (`att 2.3 + ffn 34.5 + fw 0.0 + hd 4.3`) | **PASS** @ 5471 tok: `-0.00013` nats (`-0.013%` PPL), 95% CI `[-0.00443, +0.00416]` |
+| Mini FP8 + `.f4` (64 tok) | 64 GiB | 3072/3072 (100%, 0 misses) | **27.04** | 37.0 (`att 2.0 + ffn 30.6 + fw 0.0 + hd 4.2`) | **COST ESTABLISHED** @ 5471 tok: `+0.01210` nats (`+1.22%` PPL), 95% CI `[+0.00396, +0.02024]` |
+| Small BF16 + `.mxfp8` (Wave 2, 64 tok, `2q`) | 100 GiB | 2806/18432 (15.2%, 76.4% hit) | **2.96–3.05** | 327.7 (`att 2.2 + ffn 111.4 + fw 205.5 + hd 8.5`) | baseline (803 tok PPL 3.5691; 2991 tok PPL 3.0081) |
+| Small **FP8 + `.mxfp8`** (64 tok, `2q`) | 100 GiB | 2944/18432 (16.0%, 76.8% hit) | **3.31** | 302.0 (`att 2.4 + ffn 91.9 + fw 199.1 + hd 8.5`) | **PASS** @ 803 tok: `-0.00034` nats (`-0.034%` PPL), 95% CI `[-0.00784, +0.00716]` |
+| Small **FP8 + `.f4`** (64 tok cold / 128 tok warmed, `2q`) | 100 GiB | **5722/18432 (31.0%, 83.8–89.6% hit)** | **6.39 / 7.54** | 156.4 / 132.6 (`ffn 73.1 + fw 72.6 / 47.8`) | **INCONCLUSIVE** @ 2991 tok: `+0.00701` / `+0.00764` nats (`+0.70–0.77%` PPL), 95% CI `[-0.00007, +0.01534]` (3.35× faster TF wall) |
+
 ## Integration surface (S1's edit list)
 
 - `crates/core/src/legality.rs`: Arch variants (proposed `Inkling2Loop` for Mini,
@@ -497,8 +523,8 @@ Model membership is data in the checked census tables.
    3 of 3, a five-trap defect matrix reddening on both draws with declared first-touched buckets,
    and carved fp32-vs-fp64 tolerance floors (the reference is fp32-locked). Record:
    `docs/measurement/inkling2-reference/anchor.md`; gate `crates/oracles/tests/inkling_anchor.rs`.
-5. **Kernel census both ends**: CLOSED (S4+S5+S6). `kernel_coverage.rs` checks all 79 launchers
-   (64 callers, 15 classified uncalled, 13 `ORACLE_VALIDATED`) both ends against `docs/reference/kernel-inventory.md`.
+5. **Kernel census both ends**: CLOSED (S4+S5+S6+Waves 1–3). `kernel_coverage.rs` checks all 81 launchers
+   (66 callers, 15 classified uncalled, 15 `ORACLE_VALIDATED`) both ends against `docs/reference/kernel-inventory.md`.
 6. **Registration in the SAME change**: this change adds `"inkling"` to SCOPES, both
    docs, and their INDEX rows. CLOSED with S0.
 7. **Thin smoke WITH the exit gate**: CLOSED (S5). `tests/smoke-inkling.sh` landed with Mini's exit gate

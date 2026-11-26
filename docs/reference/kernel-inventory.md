@@ -1,7 +1,7 @@
 ---
 status: live
 scope: engine
-verdict: Every GPU kernel launcher in the tree as a row — 80 of them, the same population `crates/cli/tests/kernel_coverage.rs` censuses at 80/80/0 (80 launchers, 80 with oracles, 0 deferred; its liveness census reads 65 with production callers, 15 classified uncalled, 14 oracle-validated) — with the models that call it, the production site that calls it, and the mode that reaches it, all derived from the `launchers!` DSL and from the engine's own call sites rather than from memory. It also carries the 15 launchers that NO production code calls, each classified with the evidence that puts it in a category: superseded by a shipped sibling, implemented ahead of the arm that will call it (qwen S3 vs S6), or pending a deferred milestone (M13's GLM DSA). Reuse is measured, not hoped for: V4 is the most-shared kernel consumer (22 launchers) and `gemv_fp8`, `argmax`, `vadd` and `sigmoid_gate` each serve three or four architectures through one implementation. The uncalled table is enforced, not remembered — `kernel_coverage.rs`'s liveness census refuses an uncalled launcher absent from it, a stale row, and a row naming a launcher that no longer exists.
+verdict: Every GPU kernel launcher in the tree as a row — 81 of them, the same population `crates/cli/tests/kernel_coverage.rs` censuses at 81/81/0 (81 launchers, 81 with oracles, 0 deferred; its liveness census reads 66 with production callers, 15 classified uncalled, 15 oracle-validated) — with the models that call it, the production site that calls it, and the mode that reaches it, all derived from the `launchers!` DSL and from the engine's own call sites rather than from memory. It also carries the 15 launchers that NO production code calls, each classified with the evidence that puts it in a category: superseded by a shipped sibling, implemented ahead of the arm that will call it (qwen S3 vs S6), or pending a deferred milestone (M13's GLM DSA). Reuse is measured, not hoped for: V4 is the most-shared kernel consumer (22 launchers) and `gemv_fp8`, `argmax`, `vadd` and `sigmoid_gate` each serve three or four architectures through one implementation. The uncalled table is enforced, not remembered — `kernel_coverage.rs`'s liveness census refuses an uncalled launcher absent from it, a stale row, and a row naming a launcher that no longer exists.
 ---
 
 # The kernel inventory
@@ -19,8 +19,8 @@ column is a query, and a query can be wrong.
   four were, until `hash_rows` (L1), the two block scorers (L3) and `gdn_recurrent_f32` (L2)
   became `launchers!` rows when their kernels moved to Rust — the scorers' rows live in
   `hip.rs`. The TU column names the Rust file for every launcher, every kernel being Rust after
-  the Phase 1 integration.) **80** in total, which is the same population
-  `kernel_coverage.rs` prints (`80 launchers: 80 with oracles, 0 deferred`, measured by
+  the Phase 1 integration.) **81** in total, which is the same population
+  `kernel_coverage.rs` prints (`81 launchers: 81 with oracles, 0 deferred`, measured by
   `--nocapture` on a deviceless run) — two independent derivations agreeing is the only reason
   the count is stated rather than counted. (CORRECTED 2026-11-25: the sentence read 66, the
   population before the inkling rows and S6's MXFP8 expert range landed — the census figure is
@@ -28,7 +28,7 @@ column is a query, and a query can be wrong.
 * **Model columns.** A cell is lit only by a **production** reference: an import from or a call
   through the ABI wall inside `crates/engine/src/**` or `crates/cli/src/**`. Test files never
   light a cell. That distinction is the table's whole point: `kernel_coverage.rs` asks *"does an
-  oracle exercise this launcher?"* and answers yes for all 80, while 15 of them have no caller in
+  oracle exercise this launcher?"* and answers yes for all 81, while 15 of them have no caller in
   any binary anyone ships. Coverage and liveness are different questions, and only this table
   asks the second one. (CORRECTED 2026-11-25: 66/13, from the same stale pair the Rows bullet
   records; the uncalled heading below is derived from its own table, so 15 there is checked.)
@@ -148,6 +148,7 @@ column is a query, and a query can be wrong.
 | `act_quant_f8` | `act_quant_f8` | activation.rs | · | **✓** | · | · | · | v4/moe :: shared_expert |
 | `moe_expert_range_f4` | `moe_expert_range_f4` | moe_f4.rs | **✓** | **✓** | · | · | · | glm/mlp; v4/moe :: expert_range |
 | `moe_expert_range_f4_situ` | `moe_expert_range_f4_situ` | moe_f4.rs | · | · | **✓** | · | · | k3/forward :: expert_range |
+| `moe_expert_range_f4_situ_f32` | *(no C twin)* | moe_mxfp8.rs | · | · | · | · | · | inkling/moe_mxfp8 :: range |
 | `moe_expert_range_mxfp8_situ` | *(no C twin)* | moe_mxfp8.rs | · | · | · | · | · | inkling/decode :: expert_range |
 | `gated_delta_recurrent_f32` | `gated_delta_recurrent_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |
 | `rmsnorm_gate_heads_f32` | `rmsnorm_gate_heads_f32` | recurrent.rs | · | · | **✓** | · | · | k3/forward :: kda_attention |

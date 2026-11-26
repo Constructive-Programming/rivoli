@@ -34,8 +34,8 @@ use anyhow::{Context, Result, bail};
 use rivoli_artifact::format::RoutedFmt;
 use rivoli_artifact::inkling_config::InklingTextConfig;
 use rivoli_backend::{
-    ExpertDescF4, NULL_STREAM, block_on, launch_moe_acc_drain_to, launch_moe_expert_range_f4_situ,
-    launch_moe_expert_range_mxfp8_situ, stream_signal,
+    ExpertDescF4, NULL_STREAM, block_on, launch_moe_acc_drain_to,
+    launch_moe_expert_range_f4_situ_f32, launch_moe_expert_range_mxfp8_situ, stream_signal,
 };
 use std::ffi::c_void;
 
@@ -329,7 +329,7 @@ impl MxFp8MoeScratch {
             },
             RoutedFmt::F4 => unsafe {
                 self.invoke_range(
-                    launch_moe_expert_range_f4_situ,
+                    launch_moe_expert_range_f4_situ_f32,
                     (x_in, (e_start, e_count), lane),
                 )
             },
