@@ -71,7 +71,9 @@ jobs:
             echo "gate unarmed (no CS_ACCESS_TOKEN) — cs not installed, test runs warn-and-skip"
             exit 0
           fi
-          curl -sSf https://downloads.codescene.io/enterprise/cli/install-cs-tool.sh | sh
+          # `-y` is the installer's headless flag: without it, the script prompts on
+          # /dev/tty before appending PATH, and an Actions runner has no tty (exit 2).
+          curl -sSf https://downloads.codescene.io/enterprise/cli/install-cs-tool.sh | sh -s -- -y
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/cs" version
       # DEV profile deliberately (this tree's own rule: a run that is not timing
