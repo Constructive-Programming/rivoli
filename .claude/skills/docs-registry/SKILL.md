@@ -62,6 +62,8 @@ its scope, and never widen one without new evidence under the wider scope.
   time; a number nothing re-derives will drift again.
 - **Superseded docs MOVE directory; they are never deleted.** The old file keeps its
   provenance and its verdict follows it, and its INDEX row moves with it.
+- **Retired-unstarted docs use `status: obsoleted` and stay in place.** Their verdict names
+  the replacement; nothing about the work is resumed, and the body remains as provenance.
 - A new doc's front matter, its INDEX row, and whatever it documents land in the **same
   change** — a doc added now and registered "next commit" is a red gate for whoever pulls.
 

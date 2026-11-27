@@ -1,10 +1,12 @@
 ---
-status: live
+status: obsoleted
 scope: engine
-verdict: The v3.0.0 cut plan (owner decisions 2026-08-20) — gates BEFORE tag; release defaults are FAST (both determinism flags opt-in, the GLM defect ships labeled with --arena-refresh quoted at 1-3%); the gate day is §2's ordered runbook (parity, both smokes, ppl-gates with the M10 engine halves, fp8 decode + SSE, determinism-512 on the mitigation arm, K3 first real decode, CodeScene once CS_ACCESS_TOKEN lands); the baseline is re-taken with the pinned prompt before notes are written; §4 is what v3.0.0 explicitly does NOT claim. Tag and push only after every §2 row is green or its red is fixed forward.
+verdict: OBSOLETED 2026-11-27 — v3.0.0 was never tagged; the unretired gate-day rows (ppl-gates, determinism-512, K3 first decode, CodeScene burn-down) and the §3 baseline/notes/tag steps are retired rather than executed, so no v3.0.0 claim is made. Superseded by frontier-flash-models.md, whose F8 carries the release labels forward. RECORD OF THE RETIRED PLAN: The v3.0.0 cut plan (owner decisions 2026-08-20) — gates BEFORE tag; release defaults are FAST (both determinism flags opt-in, the GLM defect ships labeled with --arena-refresh quoted at 1-3%); the gate day is §2's ordered runbook (parity, both smokes, ppl-gates with the M10 engine halves, fp8 decode + SSE, determinism-512 on the mitigation arm, K3 first real decode, CodeScene once CS_ACCESS_TOKEN lands); the baseline is re-taken with the pinned prompt before notes are written; §4 is what v3.0.0 explicitly does NOT claim. Tag and push only after every §2 row is green or its red is fixed forward.
 ---
 
 # Cutting v3.0.0
+
+> **OBSOLETED 2026-11-27.** Superseded by [frontier-flash-models.md](frontier-flash-models.md); the body is kept for provenance.
 
 Owner decisions, 2026-08-20: **(1)** release defaults are fast — `--arena-refresh` and
 `--copy-via-cpu` both opt-in; every recorded number carries its flag state and the release

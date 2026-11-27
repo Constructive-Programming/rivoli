@@ -25,12 +25,16 @@ use std::path::{Path, PathBuf};
 mod common;
 
 const INDEX: &str = "docs/00-orientation/INDEX.md";
-const STATUSES: [&str; 5] = [
+const STATUSES: [&str; 6] = [
     "live",
     "closed-negative",
     "closed-shipped",
     "closed-mixed",
     "data",
+    // Retired unstarted: the work is not delivered and will not be resumed under this doc.
+    // The verdict names what replaced it, so a reader can rule the file out without opening
+    // it, and the body stays as provenance rather than being deleted.
+    "obsoleted",
 ];
 // Whose evidence backs the verdict. A closed verdict rules its question out only for its
 // scope: in the old tree, npu-offload.md's closed-negative was measured on GLM-5.2 and
