@@ -71,7 +71,9 @@ jobs:
             echo "gate unarmed (no CS_ACCESS_TOKEN) — cs not installed, test runs warn-and-skip"
             exit 0
           fi
-          curl -sSf https://downloads.codescene.io/enterprise/cli/install-cs-tool.sh | sh
+          # `-y` is the installer's headless flag: without it, the script prompts on
+          # /dev/tty before appending PATH, and an Actions runner has no tty (exit 2).
+          curl -sSf https://downloads.codescene.io/enterprise/cli/install-cs-tool.sh | sh -s -- -y
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/cs" version
       # DEV profile deliberately (this tree's own rule: a run that is not timing
@@ -80,6 +82,9 @@ jobs:
       # release arm honest for the code the profile changes.
       - run: cargo test --workspace --locked --no-default-features
         env:
+          # The install step's env does not persist, and `cs` reads the token at review
+          # time. Without it the armed gate sees PAT prose and fails "cs did not run".
+          CS_ACCESS_TOKEN: ${{ secrets.CS_ACCESS_TOKEN }}
           # Hard-fail the CodeScene gate exactly when the license secret exists; without
           # it the gate warns-and-skips and the warning step below says so.
           RIVOLI_CS_REQUIRED: ${{ secrets.CS_ACCESS_TOKEN != '' && '1' || '' }}
