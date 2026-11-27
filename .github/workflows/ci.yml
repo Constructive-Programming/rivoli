@@ -82,6 +82,9 @@ jobs:
       # release arm honest for the code the profile changes.
       - run: cargo test --workspace --locked --no-default-features
         env:
+          # The install step's env does not persist, and `cs` reads the token at review
+          # time. Without it the armed gate sees PAT prose and fails "cs did not run".
+          CS_ACCESS_TOKEN: ${{ secrets.CS_ACCESS_TOKEN }}
           # Hard-fail the CodeScene gate exactly when the license secret exists; without
           # it the gate warns-and-skips and the warning step below says so.
           RIVOLI_CS_REQUIRED: ${{ secrets.CS_ACCESS_TOKEN != '' && '1' || '' }}
